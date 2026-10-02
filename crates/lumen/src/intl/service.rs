@@ -9,7 +9,7 @@ use crate::value::{Gc, Property, Value};
 /// The languages we ship formatting data for (plus common ones the conformance tests negotiate).
 /// Unknown languages resolve to `en`.
 pub fn supported_language(lang: &str) -> bool {
-    matches!(
+    super::data::locale_selected(lang) && matches!(
         lang,
         "en" | "de"
             | "fr"

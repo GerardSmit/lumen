@@ -31,9 +31,10 @@ use lumen_host::{
 mod child_realm;
 mod console;
 mod esm;
-mod jsx;
 mod process;
 mod process_env;
+#[cfg(all(feature = "parallel", not(target_os = "none")))]
+mod parallel;
 pub mod tsconfig;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
@@ -54,7 +55,7 @@ pub(crate) fn run_aot(
 ) -> Result<lumen::Completion, lumen::ParseError> {
     let tier = engine.tier();
     engine.set_tier(lumen_host::Tier::Interp);
-    let result = engine.load_precompiled(&lumen::Precompiled::from_static(blob));
+    let result = lumen_host::load_glue(engine, blob);
     engine.set_tier(tier);
     result
 }
@@ -210,6 +211,8 @@ pub struct Runtime {
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
+    #[cfg(feature = "aot-native")]
+    native_builtins_installed: bool,
     /// When the loop last collected because it was about to block, and the heap-object count it
     /// saw then (see `idle_collect`).
     idle_gc: (Instant, i64),
@@ -265,6 +268,24 @@ impl Drop for Runtime {
 }
 
 impl Runtime {
+    /// Freeze the host namespace identity before a target query or realm creation.
+    pub fn freeze_native_catalog() {
+        #[cfg(feature = "aot-native")]
+        {
+            static CATALOG: std::sync::Once = std::sync::Once::new();
+            CATALOG.call_once(|| {
+                let hash = lumen_common::aot::builtin_catalog::hash(lumen_common::aot::builtin_catalog::Features {
+                    node: true, parallel: cfg!(feature = "parallel"), http2: cfg!(feature = "http2"),
+                    cluster: cfg!(feature = "cluster"), dgram: cfg!(feature = "dgram"), wasi: cfg!(feature = "wasi"),bitnest_process:false,
+                });
+                lumen::target::set_builtin_modules_hash(hash).unwrap_or_else(|error| panic!("native runtime catalog: {error}"));
+            });
+        }
+    }
+    /// Install one standalone app's read-only filesystem assets at `/lumen-assets`.
+    pub fn install_embedded_assets(&mut self, blob: &[u8]) -> Result<(), String> {
+        lumen_os::vfs::install_assets(blob).map_err(String::from)
+    }
     /// End the process with `code` without tearing the realm down (freeing every object and
     /// collecting its cycles is wasted work when the OS reclaims the address space). A clean
     /// exit still runs what the drop would: addon cleanup hooks and closing SQLite databases.
@@ -326,6 +347,7 @@ impl Runtime {
     }
 
     fn build(embedding: Option<Embedding>, tree: Option<Arc<child_realm::RealmTree>>) -> Runtime {
+        Self::freeze_native_catalog();
         let boot = lumen_host::startup_timing().then(Instant::now);
         lumen_host::perf::start_clock();
         lumen_host::perf::mark(lumen_host::perf::Milestone::NodeStart);
@@ -333,6 +355,7 @@ impl Runtime {
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
         lumen::set_tail_calls(false);
         let mut engine = Engine::new();
+        engine.set_jsx_options_loader(|filename, defaults| tsconfig::load_jsx_for(std::path::Path::new(filename), defaults));
         lumen_host::perf::mark(lumen_host::perf::Milestone::V8Start);
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());
@@ -459,18 +482,18 @@ impl Runtime {
             .ctx()
             .get_member(&global, "__lumen_fire_rejection")
             .unwrap_or_else(|_| panic!("error-reporting shim installed"));
-        engine
-            .eval(
-                "delete globalThis.__lumen_fire_error; delete globalThis.__lumen_fire_rejection; \
-                 delete globalThis.__lumen_fire_handled;",
-                false,
-            )
-            .expect("shim cleanup");
+        let reflect = engine.ctx().get_member(&global, "Reflect").unwrap_or_else(|_| panic!("Reflect installed"));
+        let delete = engine.ctx().get_member(&reflect, "deleteProperty").unwrap_or_else(|_| panic!("Reflect.deleteProperty installed"));
+        for name in ["__lumen_fire_error", "__lumen_fire_rejection", "__lumen_fire_handled"] {
+            engine.call_function(&delete, reflect.clone(), &[global.clone(), Value::str(name)]).unwrap_or_else(|_| panic!("error shim globals configurable"));
+        }
         if let Some(t0) = boot {
             eprintln!("[startup] runtime built    {:?}", t0.elapsed());
         }
         lumen::memstats::phase("runtime built");
         lumen_host::perf::mark(lumen_host::perf::Milestone::BootstrapComplete);
+        #[cfg(all(feature = "parallel", not(target_os = "none")))]
+        parallel::install(&mut engine);
         Runtime {
             engine,
             pool,
@@ -484,6 +507,8 @@ impl Runtime {
             fire_rejection,
             fire_handled,
             fatal_exit: None,
+            #[cfg(feature = "aot-native")]
+            native_builtins_installed: false,
             idle_gc: (Instant::now(), 0),
             idle_gc_followup: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -529,8 +554,23 @@ impl Runtime {
     /// Give the engine the ESM loader (so dynamic `import()` works) and resolve bare relative
     /// specifiers against `path`.
     pub fn install_module_loader(&mut self, path: &str, has_source: bool) {
+        self.install_module_loader_with(path, has_source, |_| None);
+    }
+
+    /// Extend the runtime's module graph with host-provided source modules.
+    pub fn install_module_loader_with(
+        &mut self,
+        path: &str,
+        has_source: bool,
+        source: impl Fn(&str) -> Option<&'static str> + 'static,
+    ) {
         let loader = esm::make_loader(self.builtin_modules());
-        self.engine.set_module_loader_attrs(loader);
+        self.engine.set_module_loader_attrs(move |specifier, referrer, attributes| {
+            source(specifier)
+                .filter(|_| attributes.is_none())
+                .map(|text| (format!("host:{specifier}"), text.to_owned()))
+                .or_else(|| loader(specifier, referrer, attributes))
+        });
         match lumen_host::canonicalize(path) {
             Ok(abs) => self.engine.set_import_base(&abs.to_string_lossy()),
             Err(_) if has_source => self.engine.set_import_base(path),
@@ -570,14 +610,6 @@ impl Runtime {
         let source =
             lumen_host::sysfs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         let source = import_source_text(source);
-        // A `.jsx` entry is lowered to plain JS before the engine parses it.
-        let source = if path.ends_with(".jsx") {
-            jsx::transform(&source).map_err(|e| format!("JSX transform failed for {path}: {e}"))?
-        } else {
-            // A `.ts`/`.mts` entry is TypeScript: the engine parses it itself (the key keeps
-            // the extension), with Node's strip-only semantics and every offset kept.
-            source
-        };
         let key = lumen_host::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
             .to_string_lossy()
@@ -629,6 +661,7 @@ impl Runtime {
     /// it; `node:*` builtins come from the runtime, and anything else falls back to the usual
     /// disk resolution (bare packages from the current directory's `node_modules`). `Err` is the
     /// rendered uncaught error.
+    #[cfg(feature = "compiler")]
     pub fn run_precompiled(&mut self, blob: &lumen::Precompiled) -> Result<(), String> {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let loader = esm::make_loader(self.builtin_modules());
@@ -655,8 +688,91 @@ impl Runtime {
         }
     }
 
+    #[cfg(not(feature = "compiler"))]
+    pub fn run_precompiled(&mut self, _: &lumen::Precompiled) -> Result<(), String> {
+        Err("the Aot runtime requires a native payload".into())
+    }
+
+    #[cfg(feature = "compiler")]
     pub fn run_precompiled_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<(), String> {
         self.run_precompiled(&lumen::Precompiled::from_bytes(bytes))
+    }
+
+    #[cfg(not(feature = "compiler"))]
+    pub fn run_precompiled_owned(&mut self, _: std::sync::Arc<[u8]>) -> Result<(), String> {
+        Err("the Aot runtime requires a native payload".into())
+    }
+
+    #[cfg(feature = "aot-native")]
+    pub fn run_native_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<(), String> {
+        let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
+        self.install_native_builtins()?;
+        let entry = self.engine.load_native_value_owned(bytes, None, &[], true).map_err(|error| { self.fatal_exit = Some(1); error })?;
+        self.drive_native_entry(entry)
+    }
+
+    /// Execute a linker-produced payload whose code/GOT live for the process.
+    ///
+    /// # Safety
+    /// The ranges must be those exported by this payload's object and remain valid
+    /// while any native callable exists. External users must not mutate the GOT.
+    #[cfg(feature = "aot-native")]
+    pub unsafe fn run_native_linked(
+        &mut self, bytes: std::sync::Arc<[u8]>, code: *const u8, code_len: usize,
+        got: *mut usize, got_len: usize,
+    ) -> Result<(), String> {
+        static LINKED_ENTRY: Mutex<()> = Mutex::new(());
+        let _entry = LINKED_ENTRY.lock().map_err(|_| "linked native entry lock poisoned".to_string())?;
+        self.install_native_builtins()?;
+        let value = unsafe { self.engine.load_native_linked_value_owned(bytes, code, code_len, got, got_len) }
+            .map_err(|error| { self.fatal_exit = Some(1); error })?;
+        self.drive_native_entry(value)
+    }
+
+    #[cfg(feature = "aot-native")]
+    pub fn install_native_builtins(&mut self) -> Result<(), String> {
+        if self.native_builtins_installed { return Ok(()); }
+        let global = self.engine.global_this();
+        let getter = self.engine.ctx().get_member(&global, "__esmBuiltin").map_err(|_| "native Node builtin lookup is unavailable")?;
+        let modules = self.builtin_modules();
+        let mut modules: Vec<_> = modules.0.into_iter().collect();
+        modules.sort_by(|a, b| a.0.cmp(&b.0));
+        for (specifier, exports) in modules {
+            let name = specifier.strip_prefix("node:").unwrap();
+            if matches!(name, "http2") && !cfg!(feature = "http2") || matches!(name, "cluster") && !cfg!(feature = "cluster")
+                || matches!(name, "dgram") && !cfg!(feature = "dgram") || matches!(name, "wasi") && !cfg!(feature = "wasi") { continue; }
+            let default = self.engine.call_function(&getter, global.clone(), &[Value::from_string(name.into())])
+                .map_err(|error| describe_error(self.engine.ctx(), &error))?;
+            let namespace = self.engine.ctx().new_object_with_proto(&Value::Null);
+            self.engine.ctx().set_member(&namespace, "default", default.clone()).map_err(|_| "cannot initialize native builtin namespace")?;
+            for key in exports.split_whitespace() {
+                let value = self.engine.ctx().get_member(&default, key).map_err(|_| format!("cannot read native builtin export {specifier}:{key}"))?;
+                self.engine.ctx().set_member(&namespace, key, value).map_err(|_| "cannot initialize native builtin namespace")?;
+            }
+            let object = self.engine.ctx().get_member(&global, "Object").map_err(|_| "Object intrinsic is unavailable")?;
+            let freeze = self.engine.ctx().get_member(&object, "freeze").map_err(|_| "Object.freeze intrinsic is unavailable")?;
+            self.engine.call_function(&freeze, object, &[namespace.clone()]).map_err(|error| describe_error(self.engine.ctx(), &error))?;
+            self.engine.register_native_module(name.to_owned(), namespace.clone()).map_err(str::to_owned)?;
+            self.engine.register_native_module(specifier, namespace).map_err(str::to_owned)?;
+        }
+        self.native_builtins_installed = true;
+        Ok(())
+    }
+
+    #[cfg(feature = "aot-native")]
+    fn drive_native_entry(&mut self, entry: Value) -> Result<(), String> {
+        self.engine.ctx().observe_promise_for_host(&entry);
+        self.run_entry_loop();
+        match self.engine.ctx().promise_state_for_host(&entry) {
+            Some((2, error)) => { self.fatal_exit = Some(1); Err(describe_error(self.engine.ctx(), &error)) }
+            Some((0, _)) => {
+                // A pending entry with no live timers/tasks cannot make further progress.
+                self.fatal_exit = Some(13);
+                Err("native top-level await did not settle".into())
+            }
+            _ if self.fatal_exit.is_some() => Err(format!("native entry exited with status {}", self.fatal_exit.unwrap())),
+            _ => Ok(()),
+        }
     }
 
     /// Evaluate a Worker entry `source` (a module when `is_module`, else a classic script) WITHOUT
@@ -1040,38 +1156,28 @@ impl Runtime {
     /// Hand the parsed command-line options (a JSON object keyed by canonical option name) to the
     /// JS side, which answers `getOptionValue` from them.
     pub fn set_cli_options(&mut self, json: &str) {
-        let src = format!(
-            "Object.defineProperty(process, Symbol.for('lumen.options'), {{ value: JSON.parse({}), configurable: true }});\
-             if (process[Symbol.for('lumen.options')]['--experimental-fetch'] === false) {{\
-               for (const k of ['fetch', 'FormData', 'Headers', 'Request', 'Response']) delete globalThis[k];\
-               if (globalThis.WebAssembly) {{ delete WebAssembly.compileStreaming; delete WebAssembly.instantiateStreaming; }}\
-             }} \
-             const apply = globalThis.__lumenApplyOptions; delete globalThis.__lumenApplyOptions; if (apply) apply();",
-            js_source_string(json)
-        );
-        let _ = self.engine.eval(&src, false);
+        let global = self.engine.global_this();
+        if let Ok(function) = self.engine.ctx().get_member(&global, "__lumenSetCliOptions") {
+            let _ = self.engine.call_function(&function, Value::Undefined, &[Value::from_string(json.into())]);
+        }
     }
 
     /// Node's `--expose-gc`: define `globalThis.gc`, which runs lumen's cycle collector.
     pub fn expose_gc(&mut self) {
-        // `Bun.gc` is the JS-visible entry to the same collector; V8's `gc()` returns nothing.
-        let _ = self.engine.eval(
-            "globalThis.gc = function gc() { globalThis.Bun.gc(true); };",
-            false,
-        );
+        self.engine.define_global("gc", 0, |ctx, _, _| { ctx.collect_garbage_for_host(); Ok(Value::Undefined) });
     }
 
     /// V8's `--expose-externalize-string`: `externalizeString` (a no-op here, as lumen strings
     /// have no external representation) and `isOneByteString` (every code unit fits Latin-1).
     pub fn expose_externalize_string(&mut self) {
-        let _ = self.engine.eval(
-            "globalThis.externalizeString = function externalizeString(s) { \
-               if (typeof s !== 'string') throw new TypeError('First parameter is not a string'); }; \
-             globalThis.isOneByteString = function isOneByteString(s) { \
-               if (typeof s !== 'string') throw new TypeError('First parameter is not a string'); \
-               return !/[^\\u0000-\\u00ff]/.test(s); };",
-            false,
-        );
+        self.engine.define_global("externalizeString", 1, |ctx, _, args| {
+            if !matches!(args.first(), Some(Value::Str(_))) { return Err(ctx.make_error("TypeError", "First parameter is not a string")); }
+            Ok(Value::Undefined)
+        });
+        self.engine.define_global("isOneByteString", 1, |ctx, _, args| {
+            let Some(Value::Str(value)) = args.first() else { return Err(ctx.make_error("TypeError", "First parameter is not a string")); };
+            Ok(Value::Bool(value.chars().all(|character| character as u32 <= 0xff)))
+        });
     }
 
     /// Node's end-of-program protocol, for a CLI that has run the loop to quiescence: emit
@@ -1601,7 +1707,10 @@ impl Runtime {
     /// Node's prepareMainThreadExecution, as the CLI runs it: opens the IPC channel a parent
     /// passed in `NODE_CHANNEL_FD` and sets up a cluster worker.
     fn prepare_main(&mut self) {
-        let _ = self.eval("typeof __lumenPrepareMain === 'function' && __lumenPrepareMain()");
+        let global = self.engine.global_this();
+        if let Ok(function) = self.engine.ctx().get_member(&global, "__lumenPrepareMain") {
+            if function.is_callable() { let _ = self.engine.call_function(&function, Value::Undefined, &[]); }
+        }
     }
 
     fn finish_embedded(&mut self, result: Result<(), String>) -> RealmExit {

@@ -437,11 +437,7 @@ pub fn address_space() -> Option<AddressSpace> {
                     } else {
                         a.private_other += size;
                     }
-                    let min = a
-                        .largest
-                        .iter_mut()
-                        .min_by_key(|e| e.0)
-                        .expect("non-empty");
+                    let min = a.largest.iter_mut().min_by_key(|e| e.0).expect("non-empty");
                     if size > min.0 {
                         *min = (size, info.protect);
                     }
@@ -520,11 +516,22 @@ pub fn phase(label: &str) {
         ));
         if let Some(cats) = categories() {
             let slab = cats[Cat::Slab as usize].max(0) as usize;
-            line.push_str(&format!(" excl. slab chunks {:>9}", fmt_bytes(live.saturating_sub(slab))));
+            line.push_str(&format!(
+                " excl. slab chunks {:>9}",
+                fmt_bytes(live.saturating_sub(slab))
+            ));
             if std::env::var_os("LUMEN_MEM_CATS").is_some() {
                 line.push_str(&format!(" [shapes={}]", crate::value::shape_count()));
-                for (k, name) in CAT_NAMES.iter().enumerate().filter(|(k, _)| *k != Cat::Slab as usize) {
-                    line.push_str(&format!(" [{}={}]", name.split(' ').next().unwrap_or(""), cats[k] / 1024));
+                for (k, name) in CAT_NAMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != Cat::Slab as usize)
+                {
+                    line.push_str(&format!(
+                        " [{}={}]",
+                        name.split(' ').next().unwrap_or(""),
+                        cats[k] / 1024
+                    ));
                 }
             }
         }
@@ -607,7 +614,11 @@ impl crate::interpreter::Interp {
                     );
                 }
             }
-            eprintln!("[mem]   {:<26} {:>10}", "total", fmt_bytes(total.max(0) as usize));
+            eprintln!(
+                "[mem]   {:<26} {:>10}",
+                "total",
+                fmt_bytes(total.max(0) as usize)
+            );
             eprintln!("[mem]   by block size:            <=32    <=64   <=128   <=256    <=1K    <=4K   <=64K   larger");
             let sizes = size_buckets();
             for (k, name) in CAT_NAMES.iter().enumerate() {

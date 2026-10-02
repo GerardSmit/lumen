@@ -39,10 +39,16 @@ pub struct Frame {
     ctx_off: u32,
     save_off: u32,
     needs_ctx: bool,
+    wide: bool,
 }
 
 impl Frame {
-    pub fn new(alloc: &Allocation, outgoing: u32, needs_ctx: bool) -> Result<Frame, String> {
+    pub fn new(
+        alloc: &Allocation,
+        outgoing: u32,
+        needs_ctx: bool,
+        wide: bool,
+    ) -> Result<Frame, String> {
         let mut gprs = Vec::new();
         let mut fprs = Vec::new();
         for r in alloc.used_callee_saved.iter() {
@@ -51,8 +57,9 @@ impl Frame {
                 RegClass::Float => fprs.push(r.hw),
             }
         }
-        let slot_base = outgoing.div_ceil(8) * 8;
-        let ctx_off = slot_base + 8 * alloc.num_slots;
+        let stride = if wide { 16 } else { 8 };
+        let slot_base = outgoing.div_ceil(stride) * stride;
+        let ctx_off = slot_base + stride * alloc.num_slots;
         let save_off = ctx_off + 8;
         let size = (save_off + 8 * (gprs.len() + fprs.len()) as u32).div_ceil(16) * 16;
         if size > MAX_FRAME {
@@ -66,11 +73,12 @@ impl Frame {
             ctx_off,
             save_off,
             needs_ctx,
+            wide,
         })
     }
 
     fn slot(&self, s: u32) -> i64 {
-        (self.slot_base + 8 * s) as i64
+        (self.slot_base + (if self.wide { 16 } else { 8 }) * s) as i64
     }
 }
 
@@ -87,6 +95,11 @@ pub fn adjust_sp(a: &mut Asm, sub: bool, bytes: u32) {
 }
 
 pub struct Emitter<'a> {
+    cfi: crate::unwind::Cfi,
+    windows: bool,
+    win: crate::unwind::ArmWindows,
+    features: u64,
+    loop_alignment: usize,
     code: &'a VCode<MInst>,
     alloc: &'a Allocation,
     frame: &'a Frame,
@@ -99,6 +112,8 @@ pub struct Emitter<'a> {
     funcs: Vec<(u32, Label)>,
     tables: Vec<(Label, Vec<usize>)>,
     pub relocs: Vec<Reloc>,
+    pub direct_calls: Vec<Reloc>,
+    pub symbol_loads: Vec<Reloc>,
     /// Scratch registers assigned to spilled operands of the current instruction.
     map: Vec<(VReg, PReg)>,
     post: Vec<(PReg, Loc)>,
@@ -116,6 +131,11 @@ impl<'a> Emitter<'a> {
         let mut a = Asm::new();
         let blocks = (0..code.blocks.len()).map(|_| a.new_label()).collect();
         Emitter {
+            cfi: Default::default(),
+            windows: false,
+            win: Default::default(),
+            features: 0,
+            loop_alignment: 4,
             code,
             alloc,
             frame,
@@ -127,13 +147,64 @@ impl<'a> Emitter<'a> {
             funcs: Vec::new(),
             tables: Vec::new(),
             relocs: Vec::new(),
+            direct_calls: Vec::new(),
+            symbol_loads: Vec::new(),
             map: Vec::new(),
             post: Vec::new(),
         }
     }
 
+    pub fn with_loop_alignment(mut self, alignment: usize) -> Self {
+        self.loop_alignment = alignment;
+        self
+    }
+
+    pub fn with_windows(mut self, windows: bool) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    pub fn with_features(mut self, features: u64) -> Self {
+        self.features = features;
+        self
+    }
+
     fn loc(&self, v: VReg) -> Loc {
         self.alloc.loc(v)
+    }
+
+    // C ABI operands in x0/w1/w2; w0 is the old value. Caller-save registers
+    // are already clobbered by the intrinsic's CallInfo, including retry scratch.
+    fn atomic32(&mut self, id: u32) {
+        self.a.mov(true, 3, 0);
+        if self.features & lumen_common::target::aarch64::LSE != 0 {
+            if id == crate::atomics::ADD32 {
+                self.a.word(0xb8e0_0000 | (1 << 16) | (3 << 5)); // ldaddal w1,w0,[x3]
+            } else {
+                self.a.mov(false, 0, 1);
+                self.a.word(0x88e0_fc00 | (3 << 5) | 2); // casal w0,w2,[x3]
+            }
+            return;
+        }
+        let retry = self.a.new_label();
+        let mismatch = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.bind(retry);
+        self.a.word(0x885f_fc00 | (3 << 5)); // ldaxr w0,[x3]
+        if id == crate::atomics::ADD32 {
+            self.a.rrr(Rrr::Add, false, 4, 0, 1);
+            self.a.word(0x8800_fc00 | (5 << 16) | (3 << 5) | 4); // stlxr w5,w4,[x3]
+            self.a.cbz(true, false, 5, retry);
+        } else {
+            self.a.rrr(Rrr::Subs, false, ZR, 0, 1);
+            self.a.b_cond(Cond::Ne, mismatch);
+            self.a.word(0x8800_fc00 | (4 << 16) | (3 << 5) | 2); // stlxr w4,w2,[x3]
+            self.a.cbz(true, false, 4, retry);
+            self.a.b(done);
+            self.a.bind(mismatch);
+            self.a.word(0xd503_3f5f); // clrex
+            self.a.bind(done);
+        }
     }
 
     fn scratch(class: RegClass, i: usize) -> PReg {
@@ -158,16 +229,25 @@ impl<'a> Emitter<'a> {
         }
         let (ld, st) = match class {
             RegClass::Int => (LdSt::LdrX, LdSt::StrX),
+            RegClass::Float if self.frame.wide => (LdSt::LdrQ, LdSt::StrQ),
             RegClass::Float => (LdSt::LdrD, LdSt::StrD),
         };
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) => match class {
                 RegClass::Int => self.a.mov(true, d.hw, s.hw),
+                RegClass::Float if self.frame.wide => self
+                    .a
+                    .word(0x4ea0_1c00 | (s.hw as u32) << 16 | (s.hw as u32) << 5 | d.hw as u32),
                 RegClass::Float => self.a.fmov(d.hw, s.hw),
             },
             (Loc::Reg(s), _) => self.a.ldst(st, s.hw, SP, self.slot_of(dst)),
             (_, Loc::Reg(d)) => self.a.ldst(ld, d.hw, SP, self.slot_of(src)),
             _ => {
+                if class == RegClass::Float && self.frame.wide {
+                    self.a.ldst(ld, FSCRATCH[0].hw, SP, self.slot_of(src));
+                    self.a.ldst(st, FSCRATCH[0].hw, SP, self.slot_of(dst));
+                    return;
+                }
                 // Slot to slot: the raw bits through x16, for either class.
                 self.a.ldst(LdSt::LdrX, X16, SP, self.slot_of(src));
                 self.a.ldst(LdSt::StrX, X16, SP, self.slot_of(dst));
@@ -279,9 +359,33 @@ impl<'a> Emitter<'a> {
 
     // ----- function -----
 
-    pub fn emit(mut self) -> Result<(Vec<u8>, Vec<Reloc>), String> {
+    pub fn emit(
+        mut self,
+    ) -> Result<
+        (
+            Vec<u8>,
+            Vec<Reloc>,
+            Vec<Reloc>,
+            Vec<Reloc>,
+            Vec<u8>,
+            Vec<u8>,
+        ),
+        String,
+    > {
         self.prologue();
         for bi in 0..self.code.blocks.len() {
+            if self.loop_alignment > 4
+                && self
+                    .code
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .any(|(from, b)| from >= bi && b.succs.contains(&bi))
+            {
+                while self.a.pos() % self.loop_alignment != 0 {
+                    self.a.word(0xd503201f);
+                }
+            }
             let l = self.blocks[bi];
             self.a.bind(l);
             let b = &self.code.blocks[bi];
@@ -327,36 +431,104 @@ impl<'a> Emitter<'a> {
             }
         }
         self.a.finish()?;
-        Ok((self.a.buf, self.relocs))
+        let windows = if self.windows {
+            self.win.finish(self.a.buf.len())?
+        } else {
+            Vec::new()
+        };
+        Ok((
+            self.a.buf,
+            self.relocs,
+            self.direct_calls,
+            self.symbol_loads,
+            self.cfi.bytes,
+            windows,
+        ))
+    }
+
+    fn stack_adjust(&mut self, sub: bool, bytes: u32, prologue: bool, codes: &mut Vec<u8>) {
+        let hi = bytes >> 12;
+        let lo = bytes & 0xfff;
+        for (value, shifted) in [(hi, true), (lo, false)] {
+            if value == 0 {
+                continue;
+            }
+            self.a.add_imm(true, sub, SP, SP, value, shifted);
+            if self.windows {
+                let code = crate::unwind::arm_alloc(if shifted { value << 12 } else { value });
+                if prologue {
+                    self.win.prologue.push(code);
+                } else {
+                    codes.extend_from_slice(&code);
+                }
+            }
+        }
     }
 
     fn prologue(&mut self) {
         let fr = self.frame;
         self.a.pair(false, false, PairMode::Pre, FP, LR, SP, -16);
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(31, 16);
+        self.cfi.save(29, 16);
+        self.cfi.save(30, 8);
+        if self.windows {
+            self.win.prologue.push(vec![0x81]);
+        }
         self.a.mov_sp(FP, SP);
-        if fr.size > 0 {
-            // Touch each page in order so a guard-page-grown stack (Windows) keeps up.
-            for k in 1..=fr.size / 4096 {
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(29, 16);
+        if self.windows {
+            self.win.prologue.push(vec![0xe1]);
+        }
+        // Save registers before allocating the lower local area so Windows
+        // save_reg/save_freg offsets stay within their 504-byte encoding.
+        let lower = if self.windows { fr.save_off & !15 } else { 0 };
+        let upper = fr.size - lower;
+        let mut unused = Vec::new();
+        if !self.windows {
+            for k in 1..=upper / 4096 {
                 self.a.add_imm(true, true, X16, SP, k, true);
                 self.a.ldst(LdSt::LdrX, X17, X16, 0);
             }
-            adjust_sp(&mut self.a, true, fr.size);
         }
-        let mut off = fr.save_off as i64;
+        self.stack_adjust(true, upper, true, &mut unused);
+        let mut off = (fr.save_off - lower) as i64;
         for &g in &fr.gprs {
             self.a.ldst(LdSt::StrX, g, SP, off);
+            self.cfi.at(self.a.pos());
+            self.cfi.save(g, (upper as i64 + 16 - off) as u32);
+            if self.windows {
+                self.win
+                    .prologue
+                    .push(crate::unwind::arm_save(g, false, off as u32));
+            }
             off += 8;
         }
         for &f in &fr.fprs {
             self.a.ldst(LdSt::StrD, f, SP, off);
+            self.cfi.at(self.a.pos());
+            self.cfi.save(64 + f, (upper as i64 + 16 - off) as u32);
+            if self.windows {
+                self.win
+                    .prologue
+                    .push(crate::unwind::arm_save(f, true, off as u32));
+            }
             off += 8;
+        }
+        if self.windows {
+            for k in 1..=lower / 4096 {
+                self.a.add_imm(true, true, X16, SP, k, true);
+                self.a.ldst(LdSt::LdrX, X17, X16, 0);
+                self.win.prologue.extend([vec![0xe3], vec![0xe3]]);
+            }
+            self.stack_adjust(true, lower, true, &mut unused);
         }
         if fr.needs_ctx {
             self.a.ldst(LdSt::StrX, 0, SP, fr.ctx_off as i64);
         }
         if let Some(tc) = self.traps {
             if let Some((off, code)) = tc.stack_limit {
-                // ldr x16, [ctx + limit]; cmp sp, x16; b.lo overflow
                 self.a.ldst_any(LdSt::LdrX, X16, 0, off as i64, X17);
                 self.a.cmp_ext(SP, X16);
                 let l = self.trap_label(code);
@@ -366,19 +538,55 @@ impl<'a> Emitter<'a> {
     }
 
     fn epilogue(&mut self) {
+        self.cfi.at(self.a.pos());
+        self.cfi.remember();
+        let pc = self.a.pos();
         let fr = self.frame;
-        let mut off = fr.save_off as i64;
+        let lower = if self.windows { fr.save_off & !15 } else { 0 };
+        let upper = fr.size - lower;
+        let mut codes = Vec::new();
+        if self.windows {
+            self.stack_adjust(false, lower, false, &mut codes);
+        }
+        let mut off = (fr.save_off - lower) as i64;
         for &g in &fr.gprs {
             self.a.ldst(LdSt::LdrX, g, SP, off);
+            self.cfi.at(self.a.pos());
+            self.cfi.restore(g);
+            if self.windows {
+                codes.extend_from_slice(&crate::unwind::arm_save(g, false, off as u32));
+            }
             off += 8;
         }
         for &f in &fr.fprs {
             self.a.ldst(LdSt::LdrD, f, SP, off);
+            self.cfi.at(self.a.pos());
+            self.cfi.restore(64 + f);
+            if self.windows {
+                codes.extend_from_slice(&crate::unwind::arm_save(f, true, off as u32));
+            }
             off += 8;
         }
-        self.a.mov_sp(SP, FP);
+        if self.windows {
+            self.stack_adjust(false, upper, false, &mut codes);
+        } else {
+            self.a.mov_sp(SP, FP);
+        }
+        // From here the CFA uses SP, because the frame pointer is about to change.
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(31, 16);
         self.a.pair(true, false, PairMode::Post, FP, LR, SP, 16);
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(31, 0);
+        self.cfi.restore(29);
+        self.cfi.restore(30);
         self.a.ret();
+        if self.windows {
+            codes.extend_from_slice(&[0x81, 0xe4]);
+            self.win.epilogues.push((pc, codes));
+        }
+        self.cfi.at(self.a.pos());
+        self.cfi.reset();
     }
 
     fn amode_ldst(&mut self, op: LdSt, rt: u8, addr: &Amode) {
@@ -401,6 +609,39 @@ impl<'a> Emitter<'a> {
     fn inst(&mut self, inst: &MInst, bi: usize) -> Result<(), String> {
         self.prep(inst);
         match inst {
+            MInst::Prefetch { addr } => self.amode_ldst(LdSt::Prfm, 0, addr),
+            MInst::VZero { dst } => {
+                let d = self.r(*dst) as u32;
+                self.a.word(0x6e20_1c00 | d << 16 | d << 5 | d);
+            }
+            MInst::Vector { op, dst, a, b } => {
+                use crate::ir::VectorOp::*;
+                let (d, mut a, mut b) = (self.r(*dst) as u32, self.r(*a) as u32, self.r(*b) as u32);
+                let opcode = match op {
+                    I32x4Add => 0x4ea0_8400,
+                    I32x4Mul => 0x4ea0_9c00,
+                    I32x4Min => 0x4ea0_6c00,
+                    I32x4Max => 0x4ea0_6400,
+                    I32x4Eq => 0x6ea0_8c00,
+                    I32x4Lt => {
+                        std::mem::swap(&mut a, &mut b);
+                        0x4ea0_3400
+                    }
+                    F64x2Add => 0x4e60_d400,
+                    F64x2Mul => 0x6e60_dc00,
+                    F64x2Min => 0x4ee0_f400,
+                    F64x2Max => 0x4e60_f400,
+                    F64x2Eq => 0x4e60_e400,
+                    F64x2Lt => {
+                        std::mem::swap(&mut a, &mut b);
+                        0x6ee0_e400
+                    }
+                    And => 0x4e20_1c00,
+                    AndNot => 0x4e60_1c00,
+                    Or => 0x4ea0_1c00,
+                };
+                self.a.word(opcode | b << 16 | a << 5 | d);
+            }
             MInst::Args { regs, stack } => {
                 let moves = regs
                     .iter()
@@ -463,6 +704,15 @@ impl<'a> Emitter<'a> {
                     }
                 }
             },
+            MInst::SymbolAddr { dst, id } => {
+                let d = self.r(*dst);
+                self.symbol_loads.push(Reloc {
+                    offset: self.a.pos(),
+                    func_id: *id,
+                });
+                self.a.word(0x9000_0010); // adrp x16, GOT page
+                self.a.word(0xf940_0200 | d as u32); // ldr xd, [x16, #lo12]
+            }
             MInst::FMov { dst, src } => {
                 let (s, d) = (self.loc(*src), self.loc(*dst));
                 self.move_loc(s, d, RegClass::Float);
@@ -536,9 +786,17 @@ impl<'a> Emitter<'a> {
                 let (d, a, b, c) = (self.r(*dst), self.r(*a), self.r(*b), self.r(*c));
                 self.a.madd(size.w(), d, a, b, c);
             }
-            MInst::Bitfield { size, dst, src, signed, immr, imms } => {
+            MInst::Bitfield {
+                size,
+                dst,
+                src,
+                signed,
+                immr,
+                imms,
+            } => {
                 let (d, s) = (self.r(*dst), self.r(*src));
-                self.a.bfm(*signed, size.w(), d, s, *immr as u32, *imms as u32);
+                self.a
+                    .bfm(*signed, size.w(), d, s, *immr as u32, *imms as u32);
             }
             MInst::Bit { op, size, dst, src } => {
                 let (d, s, w) = (self.r(*dst), self.r(*src), size.w());
@@ -592,7 +850,13 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
-            MInst::CCmp { size, a, b, cc, nzcv } => {
+            MInst::CCmp {
+                size,
+                a,
+                b,
+                cc,
+                nzcv,
+            } => {
                 let (a, b) = (self.r(*a), self.r(*b));
                 self.a.ccmp(size.w(), a, b, *cc, *nzcv);
             }
@@ -604,7 +868,14 @@ impl<'a> Emitter<'a> {
                 let d = self.r(*dst);
                 self.a.cset(d, *cc);
             }
-            MInst::CSel { size, op, cc, dst, t, f } => {
+            MInst::CSel {
+                size,
+                op,
+                cc,
+                dst,
+                t,
+                f,
+            } => {
                 let (d, t, f) = (self.r(*dst), self.r(*t), self.r(*f));
                 self.a.csel(size.w(), d, t, f, *cc, *op);
             }
@@ -707,9 +978,16 @@ impl<'a> Emitter<'a> {
                     .collect();
                 self.parallel(moves);
                 match target {
+                    CallTarget::Func(id) if crate::atomics::signature(*id).is_some() => {
+                        self.atomic32(*id);
+                    }
                     CallTarget::Func(id) => {
                         // ldr x16, =addr (patched literal); blr x16
                         let l = self.func_label(*id);
+                        self.direct_calls.push(Reloc {
+                            offset: self.a.pos(),
+                            func_id: *id,
+                        });
                         self.a.ldr_lit(X16, false, true, l);
                         self.a.blr(X16);
                     }
@@ -788,19 +1066,32 @@ impl<'a> Emitter<'a> {
                     self.a.b(n);
                 }
             }
-            MInst::TestBit { reg, bit, nz, taken, not_taken } => {
+            MInst::TestBit {
+                reg,
+                bit,
+                nz,
+                taken,
+                not_taken,
+            } => {
                 let r = self.r(*reg);
                 let (mut t, mut n, mut nz) = (*taken, *not_taken, *nz);
-                if t == bi + 1 { core::mem::swap(&mut t, &mut n); nz = !nz; }
+                if t == bi + 1 {
+                    core::mem::swap(&mut t, &mut n);
+                    nz = !nz;
+                }
                 if t == n {
-                    if t != bi + 1 { self.a.b(self.blocks[t]); }
+                    if t != bi + 1 {
+                        self.a.b(self.blocks[t]);
+                    }
                 } else {
                     // A local skip keeps TBZ's 14-bit reach independent of function size.
                     let skip = self.a.new_label();
                     self.a.tbz(!nz, *bit, r, skip);
                     self.a.b(self.blocks[t]);
                     self.a.bind(skip);
-                    if n != bi + 1 { self.a.b(self.blocks[n]); }
+                    if n != bi + 1 {
+                        self.a.b(self.blocks[n]);
+                    }
                 }
             }
             MInst::BrTable {

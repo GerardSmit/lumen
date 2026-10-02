@@ -1,10 +1,10 @@
 use super::{Limits, Parcel};
-use crate::{Engine, embed::Completer};
+use crate::{embed::Completer, Engine};
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -99,6 +99,8 @@ pub(crate) struct Link {
     pub interrupt: Arc<AtomicBool>,
     pub finished: AtomicBool,
     pub parent_alive: AtomicBool,
+    #[cfg(feature = "aot-native")]
+    pub native_glue: Mutex<Option<&'static [u8]>>,
 }
 impl Link {
     pub(crate) fn new(host: Arc<dyn ParallelHost>, limits: Limits) -> Arc<Self> {
@@ -107,6 +109,8 @@ impl Link {
             id: NEXT.fetch_add(1, Ordering::Relaxed),
             host,
             limits,
+            #[cfg(feature = "aot-native")]
+            native_glue: Mutex::new(None),
             queues: Mutex::new(Queues::default()),
             interrupt: Arc::new(AtomicBool::new(false)),
             finished: AtomicBool::new(false),
@@ -327,20 +331,39 @@ pub struct Worker {
     link: Arc<Link>,
     spawn: bool,
 }
+fn install_worker_glue(engine: &mut Engine, link: &Arc<Link>) -> Result<(), String> {
+    #[cfg(feature = "compiler")]
+    { super::install_with_limits(engine, link.host.clone(), link.limits); Ok(()) }
+    #[cfg(not(feature = "compiler"))]
+    { let _ = (engine, link); Err("native parallel glue is unavailable".into()) }
+}
 impl Worker {
     pub fn new(job: Job, configure: impl FnOnce(&mut Engine)) -> Self {
         let mut engine = Engine::new();
         configure(&mut engine);
         engine.set_jit_mode(job.jit_mode);
         engine.set_can_block(true);
-        super::install_with_limits(&mut engine, job.link.host.clone(), job.link.limits);
+        #[cfg(feature = "aot-native")]
+        let native_glue = job.link.native_glue.lock().unwrap().clone();
+        #[cfg(feature = "aot-native")]
+        let installed = if let Some(bytes) = native_glue {
+            super::install_native_with_limits(&mut engine, job.link.host.clone(), job.link.limits, bytes)
+        } else { install_worker_glue(&mut engine, &job.link) };
+        #[cfg(not(feature = "aot-native"))]
+        let installed = install_worker_glue(&mut engine, &job.link);
+        if let Err(message) = installed {
+            let error = engine.interp.make_error("EvalError", &message);
+            super::api::complete(&mut engine.interp, &job.link, error, true);
+            let mut worker = Self { engine: Some(engine), link: job.link, spawn: job.spawn };
+            worker.finish();
+            return worker;
+        }
         engine.set_interrupt(job.link.interrupt.clone());
         engine.ctx().host_mut::<super::api::Realm>().unwrap().worker = Some(job.handle());
-        let root = engine.interp.adopt(job.parcel);
         let mode = crate::value::Value::Bool(job.spawn);
-        if let Err(error) =
-            super::api::invoke(&mut engine.interp, "__parallelWorkerStart", &[root, mode])
-        {
+        let started = engine.interp.try_adopt(job.parcel).and_then(|root|
+            super::api::invoke(&mut engine.interp, "__parallelWorkerStart", &[root, mode]));
+        if let Err(error) = started {
             super::api::complete(&mut engine.interp, &job.link, error, true);
         }
         Self {
@@ -419,15 +442,17 @@ impl Worker {
         };
         let engine = self.engine.as_mut().unwrap();
         if let Some(reason) = abort {
-            let reason = engine.interp.adopt(reason);
+            let reason = engine.interp.try_adopt(reason).unwrap_or_else(|error| error);
             let _ = super::api::invoke(&mut engine.interp, "__parallelWorkerAbort", &[reason]);
         } else if let Some((message, code)) = cancel {
             let reason = super::api::abort_error(&engine.interp, message, code);
             let _ = super::api::invoke(&mut engine.interp, "__parallelWorkerAbort", &[reason]);
         }
         for parcel in messages {
-            let message = engine.interp.adopt(parcel);
-            let _ = super::api::invoke(&mut engine.interp, "__parallelWorkerMessage", &[message]);
+            match engine.interp.try_adopt(parcel) {
+                Ok(message) => { let _ = super::api::invoke(&mut engine.interp, "__parallelWorkerMessage", &[message]); }
+                Err(error) => super::api::complete(&mut engine.interp, &self.link, error, true),
+            }
         }
         if closed {
             let _ = super::api::invoke(&mut engine.interp, "__parallelWorkerClose", &[]);
@@ -483,12 +508,16 @@ impl Drop for Worker {
 #[cfg(not(target_os = "none"))]
 pub struct ThreadHost {
     configure: Arc<dyn Fn(&mut Engine) + Send + Sync>,
+    turn: Arc<dyn Fn(&mut Engine) -> Result<(), String> + Send + Sync>,
+    can_migrate: bool,
 }
 #[cfg(not(target_os = "none"))]
 impl Default for ThreadHost {
     fn default() -> Self {
         Self {
             configure: Arc::new(|_| {}),
+            turn: Arc::new(|_| Ok(())),
+            can_migrate: true,
         }
     }
 }
@@ -497,14 +526,25 @@ impl ThreadHost {
     pub fn with_configure(configure: impl Fn(&mut Engine) + Send + Sync + 'static) -> Self {
         Self {
             configure: Arc::new(configure),
+            turn: Arc::new(|_| Ok(())),
+            can_migrate: true,
         }
+    }
+
+    pub fn with_turn(
+        configure: impl Fn(&mut Engine) + Send + Sync + 'static,
+        turn: impl Fn(&mut Engine) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        Self { configure: Arc::new(configure), turn: Arc::new(turn), can_migrate: false }
     }
 }
 #[cfg(not(target_os = "none"))]
 impl ParallelHost for ThreadHost {
+    fn can_migrate(&self, _: &mut crate::embed::Ctx) -> bool { self.can_migrate }
     fn spawn(&self, cpu: CpuHint, job: Job) -> Result<(Placement, TaskHandle), SpawnError> {
         let handle = job.handle();
         let configure = self.configure.clone();
+        let turn = self.turn.clone();
         static NEXT_CORE: AtomicU64 = AtomicU64::new(1);
         let core = u32::try_from(NEXT_CORE.fetch_add(1, Ordering::Relaxed)).unwrap_or(u32::MAX);
         let placement = Placement {
@@ -522,7 +562,16 @@ impl ParallelHost for ThreadHost {
                 let owner = std::thread::current();
                 let mut worker = Worker::new(job, |engine| configure(engine));
                 worker.set_waker(Arc::new(move || owner.unpark()));
-                while worker.turn() != Turn::Done {
+                loop {
+                    if worker.engine.is_none() { break; }
+                    if let Err(message) = turn(worker.engine()) {
+                        let link = worker.link.clone();
+                        let error = worker.engine().interp.make_error("EvalError", &message);
+                        super::api::complete(&mut worker.engine().interp, &link, error, true);
+                        worker.finish();
+                        break;
+                    }
+                    if worker.turn() == Turn::Done { break; }
                     if let Some((cpu, job)) = worker.take_migration(placement.core) {
                         if host.spawn(cpu, job).is_err() {
                             TaskHandle(worker.link.clone()).migration_failed();

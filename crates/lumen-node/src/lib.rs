@@ -32,6 +32,7 @@ mod bunhash;
 #[cfg(not(target_arch = "wasm32"))]
 mod child;
 mod codec;
+#[cfg(feature = "compiler")]
 mod glue_dev;
 #[cfg(windows)]
 mod win_spawn;
@@ -45,8 +46,6 @@ mod dylib;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod ffi;
 use lumen_common::hash;
-#[path = "../../lumen-runtime/src/jsx.rs"]
-mod jsx;
 #[cfg(not(target_arch = "wasm32"))]
 mod napi;
 mod fsb;
@@ -83,7 +82,10 @@ fn spawn_handle(ctx: &mut Ctx) -> SpawnHandle {
 pub use signals::SigintBreak;
 
 pub fn extension() -> Extension {
+    #[cfg(feature = "compiler")]
     let dev_glue = glue_dev::source();
+    #[cfg(not(feature = "compiler"))]
+    let dev_glue = None;
     Extension {
         name: "node",
         modules: &[lumen_host::namespace::<oscon::Module>],
@@ -135,7 +137,7 @@ pub fn extension() -> Extension {
                     "setMultipleResolvesHook" (1) => op_set_multiple_resolves_hook,
                     "heapObjectCount" (0) => op_heap_object_count,
                     "drainMicrotasks" (0) => op_drain_microtasks,
-                    "transformJsx" (1) => op_transform_jsx,
+                    "transformJsx" (2) => op_transform_jsx,
                     "stripTypes" (1) => op_strip_types,
                     "compileCommonJS" (3) => op_compile_commonjs,
                 ],
@@ -482,9 +484,12 @@ fn op_transform_jsx(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     let source = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    jsx::transform(&source)
+    let ts = args.get(1).is_some_and(|value| matches!(value, Value::Bool(true)));
+    // Bun's default classic output keeps transformSync usable as a standalone script.
+    let options = lumen::JsxOptions { runtime: lumen::JsxRuntime::Classic, ..Default::default() };
+    lumen::transpile_jsx(&source, ts, &options)
         .map(Value::from_string)
-        .map_err(|message| ctx.make_error("SyntaxError", message))
+        .map_err(|error| ctx.make_error("SyntaxError", format!("{} (line {})", error.message, error.line)))
 }
 
 /// `stripTypes(code)`: Node's strip-only TypeScript erasure (the engine parser's TypeScript

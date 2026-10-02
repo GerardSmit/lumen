@@ -35,7 +35,10 @@ pub(super) fn collection_for_each(
     let mut idx = 0usize;
     let mut f = crate::bytecode::PreparedCall::new(i, cb, cb_this);
     loop {
-        let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
+        let entry = i
+            .map_data
+            .get(&ptr)
+            .and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
         let (k, v) = match entry {
             Some(kv) => kv,
             None => break,
@@ -139,7 +142,11 @@ pub(crate) fn map_set_iter_drain(i: &mut Interp, obj: &Gc) -> Vec<Value> {
     }
     let mut out = Vec::new();
     let mut pairs: Vec<(Value, Value)> = Vec::new();
-    if let Some(data) = coll.as_ref().and_then(map_ptr).and_then(|p| i.map_data.get(&p)) {
+    if let Some(data) = coll
+        .as_ref()
+        .and_then(map_ptr)
+        .and_then(|p| i.map_data.get(&p))
+    {
         while let Some((k, v)) = data.next(&mut idx) {
             match kind {
                 1 => out.push(k.unpack()),
@@ -210,7 +217,14 @@ pub(crate) fn map_set_iter_try_step(i: &mut Interp, obj: &Gc) -> Option<Option<V
     }
 }
 
-fn step_at(i: &mut Interp, obj: &Gc, coll: Gc, mut idx: usize, kind: u8, is: usize) -> Option<Value> {
+fn step_at(
+    i: &mut Interp,
+    obj: &Gc,
+    coll: Gc,
+    mut idx: usize,
+    kind: u8,
+    is: usize,
+) -> Option<Value> {
     let entry = i
         .map_data
         .get(&(Gc::as_ptr(&coll) as usize))
@@ -255,9 +269,11 @@ fn learn_iter_layout(obj: &Gc) {
     if p.slot_of("__ci_done").is_some() {
         return;
     }
-    if let (Some(cs), Some(is), Some(ks)) =
-        (p.slot_of("__ci_coll"), p.slot_of("__ci_index"), p.slot_of("__ci_kind"))
-    {
+    if let (Some(cs), Some(is), Some(ks)) = (
+        p.slot_of("__ci_coll"),
+        p.slot_of("__ci_index"),
+        p.slot_of("__ci_kind"),
+    ) {
         ITER_LAYOUT.with(|l| l.set((p.shape(), cs, is, ks)));
     }
 }

@@ -302,7 +302,11 @@ pub(crate) fn reflect_define(i: &mut Interp, _t: Value, a: &[Value]) -> Result<V
     Ok(Value::Bool(ok))
 }
 
-pub(crate) fn reflect_is_extensible(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn reflect_is_extensible(
+    i: &mut Interp,
+    _t: Value,
+    a: &[Value],
+) -> Result<Value, Value> {
     let obj = arg(a, 0);
     if !matches!(obj, Value::Obj(_)) {
         return Err(i.make_error("TypeError", "Reflect.isExtensible called on non-object"));

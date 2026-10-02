@@ -57,7 +57,11 @@ fn has(i: &mut Interp, o: &Value, key: &Value) -> Result<bool, Value> {
 
 fn set(i: &mut Interp, o: &Value, key: &Value, v: &Value, recv: &Value) -> Result<bool, Value> {
     Ok(matches!(
-        reflect_set(i, Value::Undefined, &[o.clone(), key.clone(), v.clone(), recv.clone()])?,
+        reflect_set(
+            i,
+            Value::Undefined,
+            &[o.clone(), key.clone(), v.clone(), recv.clone()]
+        )?,
         Value::Bool(true)
     ))
 }
@@ -177,7 +181,9 @@ fn trap_get(i: &mut Interp, h: Value, a: &[Value]) -> Result<Value, Value> {
 fn trap_has(i: &mut Interp, h: Value, a: &[Value]) -> Result<Value, Value> {
     let (target, key) = (arg(a, 0), arg(a, 1));
     let sandbox = internal(&h, SANDBOX_KEY);
-    Ok(Value::Bool(has(i, &sandbox, &key)? || has(i, &target, &key)?))
+    Ok(Value::Bool(
+        has(i, &sandbox, &key)? || has(i, &target, &key)?,
+    ))
 }
 
 fn trap_set(i: &mut Interp, h: Value, a: &[Value]) -> Result<Value, Value> {
@@ -299,19 +305,22 @@ impl Interp {
         self.def_method(&handler, "deleteProperty", 2, trap_delete);
         self.def_method(&handler, "ownKeys", 1, trap_own_keys);
         set_internal(&handler, SANDBOX_KEY, sandbox.clone());
-        let proxy = match super::proxy::make_proxy(self, global.clone(), Value::Obj(handler.clone())) {
-            Ok(p) => p,
-            Err(e) => {
-                self.restore_realm(&saved);
-                return Err(e);
-            }
-        };
+        let proxy =
+            match super::proxy::make_proxy(self, global.clone(), Value::Obj(handler.clone())) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.restore_realm(&saved);
+                    return Err(e);
+                }
+            };
         set_internal(&handler, PROXY_KEY, proxy.clone());
         set_builtin(g, "globalThis", proxy.clone());
         if let Some(b) = self.global_env.borrow_mut().vars.get_mut("this") {
             b.value = proxy.clone();
         }
-        let Value::Obj(p) = &proxy else { unreachable!() };
+        let Value::Obj(p) = &proxy else {
+            unreachable!()
+        };
         self.global_proxy = Some(p.clone());
         let mut state = self.snapshot_realm();
         state.collectable = true;
@@ -498,7 +507,13 @@ impl Interp {
     }
 
     /// A SyntaxError whose stack is prefixed by V8's source arrow for the last parse error.
-    fn vm_syntax_error(&mut self, message: String, src: &str, filename: &str, line_offset: i32) -> Value {
+    fn vm_syntax_error(
+        &mut self,
+        message: String,
+        src: &str,
+        filename: &str,
+        line_offset: i32,
+    ) -> Value {
         let err = self.make_error("SyntaxError", message);
         let (start, end) = crate::parser::last_error_span();
         let arrow = error_arrow(src, filename, line_offset, start as usize, end as usize);
@@ -516,7 +531,10 @@ impl Interp {
             return;
         };
         let decorated = format!("{arrow}\n{stack}");
-        if self.set_member(err, "stack", Value::from_string(decorated)).is_ok() {
+        if self
+            .set_member(err, "stack", Value::from_string(decorated))
+            .is_ok()
+        {
             set_internal(o, DECORATED_KEY, Value::Bool(true));
         }
     }
@@ -549,7 +567,11 @@ impl Interp {
         if raw_line < 1 {
             return;
         }
-        let raw_col = if raw_line == 1 { col - column_offset } else { col };
+        let raw_col = if raw_line == 1 {
+            col - column_offset
+        } else {
+            col
+        };
         let Some(line_start) = line_start_offset(src, raw_line as usize) else {
             return;
         };

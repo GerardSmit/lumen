@@ -97,7 +97,10 @@ impl Props {
         if !self.elems.packed_is_some() {
             self.install_empty_packed();
         }
-        let packed = self.elems.packed_mut().expect("packed storage installed above");
+        let packed = self
+            .elems
+            .packed_mut()
+            .expect("packed storage installed above");
         let before = packed.len();
         packed.reserve(values.size_hint().0);
         packed.extend(values.map(crate::value::PackedValue::pack));
@@ -146,7 +149,10 @@ mod tests {
         let mut shape = None;
         for len in [0, 1, 10, 11, 32] {
             let props = Props::packed_array_from_values((0..len).map(|n| Value::Num(n as f64)));
-            assert_eq!(props.elems.packed_ref().map(<[_]>::len), (len != 0).then_some(len));
+            assert_eq!(
+                props.elems.packed_ref().map(<[_]>::len),
+                (len != 0).then_some(len)
+            );
             let length = props.get("length").unwrap();
             assert!(length.writable() && !length.enumerable() && !length.configurable());
             assert!(matches!(length.value(), Value::Num(n) if n == len as f64));

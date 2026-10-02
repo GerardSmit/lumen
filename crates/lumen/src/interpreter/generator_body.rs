@@ -6,6 +6,40 @@ use crate::value::{Gc, Value};
 use std::rc::Rc;
 
 impl Interp {
+    #[cfg(feature = "aot-native")]
+    pub(crate) fn call_native_coroutine(&mut self, mut native: crate::native_aot::coroutines::NativeCoro, flags: u32) -> Result<Value, Abrupt> {
+        use crate::coroutine::{Coroutine, Resume, Suspend};
+        let function = self.fn_frames.last().filter(|frame| frame.fn_ptr != 0).map(|frame| frame.callee());
+        let resume_frame = function.as_ref().map(|function| super::stack_trace::ResumeFrame::Fn { f: Gc::downgrade(function), skip_first: flags & 4 == 0 }).unwrap_or_default();
+        if flags & 4 != 0 {
+            native.prologue(self)?;
+            let mut coroutine = Coroutine::Native(native);
+            coroutine.set_frame(resume_frame);
+            let prototype = function.as_ref().and_then(|function| function.borrow().props.get("prototype").map(|property| property.value()));
+            let generator = self.make_generator(flags & 8 != 0, prototype);
+            if let Value::Obj(object) = &generator {
+                self.gc_pin(object);
+                self.generators.insert(Gc::as_ptr(object) as usize, coroutine);
+                if flags & 8 != 0 { self.async_gens.insert(Gc::as_ptr(object) as usize); }
+            }
+            return Ok(generator);
+        }
+        let early = self.promise_hooks.is_some().then(|| self.new_promise());
+        let mut coroutine = Coroutine::Native(native);
+        coroutine.set_frame(resume_frame);
+        let suspend = coroutine.resume(self, Resume::Next(Value::Undefined));
+        let promise = early.unwrap_or_else(|| self.new_promise());
+        match suspend {
+            Suspend::Await(awaited) => {
+                self.park_async_coro(&promise, coroutine);
+                if let Err(error) = self.await_subscribe(awaited, &promise) { self.drive_async(promise.clone(), Resume::Throw(error)); }
+            }
+            Suspend::Done(value) | Suspend::Yield(value) => self.resolve_promise(&promise, value),
+            Suspend::Throw(error) => self.reject_promise(&promise, error),
+        }
+        Ok(promise)
+    }
+
     /// A call of the (possibly async) generator function `fn_obj` on the bytecode tier: tier it up like any
     /// call, then — when its body compiled — bind `this`, run the prologue (parameters,
     /// declarations) to its initial suspension and return the generator object. `None`: the

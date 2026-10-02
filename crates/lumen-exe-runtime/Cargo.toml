@@ -1,0 +1,35 @@
+[package]
+name = "lumen-exe-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+lumen = { path = "../lumen", default-features = false }
+lumen-runtime = { path = "../lumen-runtime", default-features = false }
+
+[features]
+default = ["full"]
+full = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi"]
+nojit = ["compiler", "aot-native", "intl", "typed"]
+aot = ["aot-native"]
+compiler = ["lumen/compiler", "lumen-runtime/compiler"]
+jit = ["lumen/jit", "lumen-runtime/jit"]
+aot-native = ["lumen/aot-native", "lumen-runtime/aot-native"]
+parallel = ["lumen/parallel", "lumen-runtime/parallel"]
+intl = ["lumen-runtime/intl"]
+typed = ["lumen-runtime/typed"]
+bundled-sqlite = ["lumen-runtime/bundled-sqlite"]
+http2 = ["lumen-runtime/http2"]
+cluster = ["lumen-runtime/cluster"]
+dgram = ["lumen-runtime/dgram"]
+wasi = ["lumen-runtime/wasi"]
+bun = ["lumen-runtime/bun"]
+
+[lints]
+workspace = true

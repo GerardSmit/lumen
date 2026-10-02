@@ -124,11 +124,7 @@ fn zlib_max_output_length_stops_a_decompression_bomb() {
 
 #[test]
 fn timeout_stops_catastrophic_regex_backtracking() {
-    let (out, elapsed) = lumen(&[
-        "--timeout=300",
-        "-e",
-        "/(x+x+)+y/.test('x'.repeat(1e6))",
-    ]);
+    let (out, elapsed) = lumen(&["--timeout=300", "-e", "/(x+x+)+y/.test('x'.repeat(1e6))"]);
     assert_eq!(out.status.code(), Some(124), "{out:?}");
     assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
 }
@@ -155,7 +151,10 @@ fn assert_times_out(out: &Output, elapsed: Duration, limit_ms: u64) {
         stderr.contains(&format!("timed out after {limit_ms} ms")),
         "{stderr}"
     );
-    assert!(elapsed < Duration::from_millis(limit_ms + 2_500), "{elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(limit_ms + 2_500),
+        "{elapsed:?}"
+    );
 }
 
 #[test]
@@ -187,11 +186,8 @@ fn timeout_stops_a_run_waiting_for_stdin() {
     let sync_read = "console.log('started'); require('fs').readSync(0, Buffer.alloc(16))";
     let stream_read = "console.log('started'); process.stdin.on('data', () => {})";
     for src in [sync_read, stream_read] {
-        let (out, elapsed) = lumen_with_stdin(
-            &["--timeout=300", "-e", src],
-            Stdio::piped(),
-            |stdin| stdin,
-        );
+        let (out, elapsed) =
+            lumen_with_stdin(&["--timeout=300", "-e", src], Stdio::piped(), |stdin| stdin);
         assert_times_out(&out, elapsed, 300);
         assert_eq!(stdout(&out), "started\n", "{src}");
     }

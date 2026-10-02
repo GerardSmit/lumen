@@ -78,7 +78,7 @@ fn size_of(t: Type) -> Size {
 }
 
 fn class_of(t: Type) -> RegClass {
-    if t.is_float() {
+    if t.is_float() || t == Type::V128 {
         RegClass::Float
     } else {
         RegClass::Int
@@ -116,6 +116,11 @@ struct Lower<'a> {
 }
 
 pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowered, String> {
+    if f.sig.params.iter().chain(&f.sig.results)
+        .chain(f.sigs.iter().flat_map(|s| s.params.iter().chain(&s.results)))
+        .any(|t| *t == Type::V128) {
+        return Err("x64: vectors are internal values, not C ABI parameters/results".into());
+    }
     if f.sig.results.len() > 1 {
         return Err("x64: multiple results are not supported".into());
     }
@@ -175,7 +180,11 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowe
         rotate_loops(
             f,
             cfg,
-            f.layout.iter().copied().filter(|&b| cfg.is_reachable(b)).collect(),
+            f.layout
+                .iter()
+                .copied()
+                .filter(|&b| cfg.is_reachable(b))
+                .collect(),
         ),
     );
     let mut bmap = vec![usize::MAX; f.blocks.len()];
@@ -336,7 +345,9 @@ impl Lower<'_> {
     /// `v` in a virtual register, rematerializing constants at the use.
     fn use_val(&mut self, v: Value) -> VReg {
         match self.def(v).cloned() {
-            Some(InstData::Iconst { .. }) | Some(InstData::F32const { .. }) | Some(InstData::F64const { .. }) => {
+            Some(InstData::Iconst { .. })
+            | Some(InstData::F32const { .. })
+            | Some(InstData::F64const { .. }) => {
                 let r = self.fresh(self.ty(self.alias[v.index()]));
                 self.copy_into(r, v);
                 r
@@ -368,7 +379,7 @@ impl Lower<'_> {
             }),
             _ => {
                 let src = self.vreg(v);
-                if self.ty(v).is_float() {
+                if self.ty(v).is_float() || self.ty(v) == Type::V128 {
                     self.push(MInst::XmmMov {
                         double: true,
                         dst,
@@ -587,10 +598,36 @@ impl Lower<'_> {
             }
         }
         match data {
+            InstData::Prefetch { addr, offset } => {
+                let addr = self.amode(*addr, *offset);
+                self.push(MInst::Prefetch { addr });
+            }
+            InstData::Vzero => {
+                let dst = self.vreg(res[0]);
+                self.push(MInst::XmmConst { double: true, dst, bits: 0 });
+            }
+            InstData::VectorBinary { op, args } => {
+                self.vector(*op, args[0], args[1], res[0]);
+            }
             InstData::Iconst { .. } | InstData::F32const { .. } | InstData::F64const { .. } => {}
+            InstData::SymbolAddr { id } => {
+                let dst = self.vreg(res[0]);
+                self.push(MInst::SymbolAddr { dst, id: *id });
+            }
             InstData::Unary { op, arg } => self.unary(*op, *arg, res[0])?,
             InstData::Binary { op, args } => self.binary(*op, args[0], args[1], res[0])?,
-            InstData::CheckedBinary { .. } => return Err("unlegalized checked arithmetic".into()),
+            InstData::CheckedBinary { op, args } => {
+                let dst = self.vreg(res[0]);
+                let src = self.use_val(args[1]);
+                self.copy_into(dst, args[0]);
+                match op {
+                    CheckedOp::ImulOv => self.push(MInst::Imul { size: Size::S32, dst, src }),
+                    _ => self.push(MInst::Alu { op: if *op == CheckedOp::IaddOv { AluOp::Add } else { AluOp::Sub },
+                        size: Size::S32, dst, src: RegImm::Reg(src) }),
+                }
+                let flag = self.vreg(res[1]);
+                self.push(MInst::Setcc { cc: CC::O, dst: flag });
+            }
             InstData::IntCmp { cc, args } => {
                 let dst = self.vreg(res[0]);
                 let cc = self.int_cmp(*cc, args[0], args[1]);
@@ -636,11 +673,27 @@ impl Lower<'_> {
                     MemKind::I64 => LoadKind::Plain(Size::S64),
                     MemKind::F32 => LoadKind::F32,
                     MemKind::F64 => LoadKind::F64,
-                    MemKind::I32S8 => LoadKind::Ext(Ext::S { from: 8, to: Size::S32 }),
-                    MemKind::I32S16 => LoadKind::Ext(Ext::S { from: 16, to: Size::S32 }),
-                    MemKind::I64S8 => LoadKind::Ext(Ext::S { from: 8, to: Size::S64 }),
-                    MemKind::I64S16 => LoadKind::Ext(Ext::S { from: 16, to: Size::S64 }),
-                    MemKind::I64S32 => LoadKind::Ext(Ext::S { from: 32, to: Size::S64 }),
+                    MemKind::V128 => LoadKind::V128,
+                    MemKind::I32S8 => LoadKind::Ext(Ext::S {
+                        from: 8,
+                        to: Size::S32,
+                    }),
+                    MemKind::I32S16 => LoadKind::Ext(Ext::S {
+                        from: 16,
+                        to: Size::S32,
+                    }),
+                    MemKind::I64S8 => LoadKind::Ext(Ext::S {
+                        from: 8,
+                        to: Size::S64,
+                    }),
+                    MemKind::I64S16 => LoadKind::Ext(Ext::S {
+                        from: 16,
+                        to: Size::S64,
+                    }),
+                    MemKind::I64S32 => LoadKind::Ext(Ext::S {
+                        from: 32,
+                        to: Size::S64,
+                    }),
                     MemKind::I32U8 | MemKind::I64U8 => LoadKind::Ext(Ext::Z { from: 8 }),
                     MemKind::I32U16 | MemKind::I64U16 => LoadKind::Ext(Ext::Z { from: 16 }),
                 };
@@ -659,7 +712,10 @@ impl Lower<'_> {
                     MemKind::I64 => StoreKind::B64,
                     MemKind::F32 => StoreKind::F32,
                     MemKind::F64 => StoreKind::F64,
-                    MemKind::I32S8 | MemKind::I32U8 | MemKind::I64S8 | MemKind::I64U8 => StoreKind::B8,
+                    MemKind::V128 => StoreKind::V128,
+                    MemKind::I32S8 | MemKind::I32U8 | MemKind::I64S8 | MemKind::I64U8 => {
+                        StoreKind::B8
+                    }
                     MemKind::I32S16 | MemKind::I32U16 | MemKind::I64S16 | MemKind::I64U16 => {
                         StoreKind::B16
                     }
@@ -669,7 +725,19 @@ impl Lower<'_> {
             InstData::Call { func, args } => {
                 let ext = &f.funcs[func.index()];
                 let sig = f.sigs[ext.sig.index()].clone();
-                self.call(&sig, CallTarget::Func(ext.id), args, res)?;
+                if let Some(expected) = crate::atomics::signature(ext.id) {
+                    if sig != expected { return Err("x64: invalid atomic intrinsic signature".into()); }
+                    let addr = self.use_val(args[0]);
+                    let dst = self.vreg(res[0]);
+                    if ext.id == crate::atomics::ADD32 {
+                        self.copy_into(dst, args[1]);
+                        self.push(MInst::AtomicAdd { addr, dst });
+                    } else {
+                        let expected = self.use_val(args[1]);
+                        let replacement = self.use_val(args[2]);
+                        self.push(MInst::AtomicCas { addr, expected, replacement, dst });
+                    }
+                } else { self.call(&sig, CallTarget::Func(ext.id), args, res)?; }
             }
             InstData::CallIndirect { sig, callee, args } => {
                 let sig = f.sigs[sig.index()].clone();
@@ -732,6 +800,90 @@ impl Lower<'_> {
         Ok(())
     }
 
+    fn packed(&mut self, opcode: u16, imm: Option<u8>, dst: VReg, src: VReg) {
+        self.push(MInst::Packed { opcode, imm, dst, src });
+    }
+
+    fn vector_copy(&mut self, src: VReg) -> VReg {
+        let dst = self.fresh(Type::V128);
+        self.push(MInst::XmmMov { double: true, dst, src });
+        dst
+    }
+
+    fn vector_select(&mut self, mask: VReg, yes: VReg, no: VReg) -> VReg {
+        let dst = self.vector_copy(mask);
+        self.packed(0xdb, None, dst, yes); // PAND
+        let other = self.vector_copy(mask);
+        self.packed(0xdf, None, other, no); // PANDN
+        self.packed(0xeb, None, dst, other);
+        dst
+    }
+
+    fn vector(&mut self, op: VectorOp, a: Value, b: Value, result: Value) {
+        use VectorOp::*;
+        let (a, b) = (self.use_val(a), self.use_val(b));
+        let dst = self.vreg(result);
+        let mut value = self.vector_copy(a);
+        match op {
+            I32x4Add => self.packed(0xfe, None, value, b),
+            I32x4Eq => self.packed(0x76, None, value, b),
+            I32x4Lt => {
+                value = self.vector_copy(b);
+                self.packed(0x66, None, value, a); // PCMPGTD
+            }
+            I32x4Mul if self.feat.sse41 => self.packed(0x3840, None, value, b),
+            I32x4Mul => {
+                // SSE2 multiplies the even unsigned lanes; low products are identical
+                // for signed lanes. Shuffle odd lanes into that position and interleave.
+                let odd_a = self.vector_copy(a);
+                let odd_b = self.vector_copy(b);
+                self.packed(0x70, Some(0xf5), odd_a, a);
+                self.packed(0x70, Some(0xf5), odd_b, b);
+                self.packed(0xf4, None, value, b);
+                self.packed(0xf4, None, odd_a, odd_b);
+                self.packed(0x70, Some(0x88), value, value);
+                self.packed(0x70, Some(0x88), odd_a, odd_a);
+                self.packed(0x62, None, value, odd_a); // PUNPCKLDQ
+            }
+            I32x4Min | I32x4Max if self.feat.sse41 =>
+                self.packed(if op == I32x4Min { 0x3839 } else { 0x383d }, None, value, b),
+            I32x4Min | I32x4Max => {
+                let mask = self.vector_copy(a);
+                self.packed(0x66, None, mask, b);
+                value = if op == I32x4Min { self.vector_select(mask, b, a) }
+                    else { self.vector_select(mask, a, b) };
+            }
+            F64x2Add => self.packed(0x58, None, value, b),
+            F64x2Mul => self.packed(0x59, None, value, b),
+            F64x2Eq => self.packed(0xc2, Some(0), value, b),
+            F64x2Lt => self.packed(0xc2, Some(1), value, b),
+            F64x2Min | F64x2Max => {
+                // MINPD/MAXPD do not implement the IR's NaN and signed-zero rules.
+                let less = self.vector_copy(a);
+                self.packed(0xc2, Some(1), less, b);
+                value = if op == F64x2Min { self.vector_select(less, a, b) }
+                    else { self.vector_select(less, b, a) };
+                let equal = self.vector_copy(a);
+                self.packed(0xc2, Some(0), equal, b);
+                let zeros = self.vector_copy(a);
+                self.packed(if op == F64x2Min { 0xeb } else { 0xdb }, None, zeros, b);
+                value = self.vector_select(equal, zeros, value);
+                let unordered = self.vector_copy(a);
+                self.packed(0xc2, Some(3), unordered, b);
+                let sum = self.vector_copy(a);
+                self.packed(0x58, None, sum, b);
+                value = self.vector_select(unordered, sum, value);
+            }
+            And => self.packed(0xdb, None, value, b),
+            Or => self.packed(0xeb, None, value, b),
+            AndNot => {
+                value = self.vector_copy(b);
+                self.packed(0xdf, None, value, a);
+            }
+        }
+        self.push(MInst::XmmMov { double: true, dst, src: value });
+    }
+
     fn unary(&mut self, op: UnaryOp, arg: Value, r: Value) -> Result<(), String> {
         let ty = self.ty(arg);
         let size = size_of(ty);
@@ -769,7 +921,11 @@ impl Lower<'_> {
                 });
             }
             UnaryOp::Fneg | UnaryOp::Fabs => {
-                let sign = if double { 1u64 << 63 } else { 0x8000_0000_8000_0000 };
+                let sign = if double {
+                    1u64 << 63
+                } else {
+                    0x8000_0000_8000_0000
+                };
                 let (op, mask) = if op == UnaryOp::Fneg {
                     (MaskOp::Xor, sign)
                 } else {
@@ -819,11 +975,12 @@ impl Lower<'_> {
         let dst = self.vreg(r);
         match op {
             Iadd | Isub | Band | Bor | Bxor => {
-                let (a, b) = if op != Isub && self.imm(b, size).is_none() && self.imm(a, size).is_some() {
-                    (b, a)
-                } else {
-                    (a, b)
-                };
+                let (a, b) =
+                    if op != Isub && self.imm(b, size).is_none() && self.imm(a, size).is_some() {
+                        (b, a)
+                    } else {
+                        (a, b)
+                    };
                 let aop = match op {
                     Iadd => AluOp::Add,
                     Isub => AluOp::Sub,
@@ -843,10 +1000,20 @@ impl Lower<'_> {
             Imul => {
                 if let Some(imm) = self.imm(b, size) {
                     let src = self.use_val(a);
-                    self.push(MInst::Imul3 { size, dst, src, imm });
+                    self.push(MInst::Imul3 {
+                        size,
+                        dst,
+                        src,
+                        imm,
+                    });
                 } else if let Some(imm) = self.imm(a, size) {
                     let src = self.use_val(b);
-                    self.push(MInst::Imul3 { size, dst, src, imm });
+                    self.push(MInst::Imul3 {
+                        size,
+                        dst,
+                        src,
+                        imm,
+                    });
                 } else {
                     let src = self.use_val(b);
                     self.copy_into(dst, a);
@@ -962,7 +1129,10 @@ impl Lower<'_> {
             ConvOp::Sext => {
                 let src = self.use_val(arg);
                 self.push(MInst::MovX {
-                    ext: Ext::S { from: 32, to: Size::S64 },
+                    ext: Ext::S {
+                        from: 32,
+                        to: Size::S64,
+                    },
                     dst,
                     src,
                 });

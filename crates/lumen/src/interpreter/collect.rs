@@ -159,6 +159,8 @@ impl Interp {
     /// The scopes `o` refers to: a user function's closure environment, a mapped `arguments`
     /// object's aliased parameter scope, and a class constructor's field-initializer environment.
     fn visit_object_scopes(&self, o: &Gc, f: &mut impl FnMut(&Env)) {
+        #[cfg(feature = "aot-native")]
+        if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) { f(&class.env); }
         // Only a user function (a class constructor) can have `class_info`, and only an
         // arguments exotic object `mapped_arguments`: the rest of the heap skips both probes.
         let (user, arguments) = {
@@ -167,6 +169,8 @@ impl Interp {
                 f(&user.env);
                 true
             } else {
+                #[cfg(feature = "aot-native")]
+                if let Callable::Aot(native) = &b.call { f(&native.env); }
                 false
             };
             (user, matches!(b.exotic, Exotic::Arguments))
@@ -215,6 +219,10 @@ impl Interp {
             }
         }
         self.visit_object_scopes(&o, &mut |e| tr.mark_scope(Rc::as_ptr(e)));
+        #[cfg(feature = "aot-native")]
+        if let Some(class) = self.native_classes.get(&(p as usize)) {
+            class.visit_values(|value| { if let Value::Obj(object) = value { tr.mark_obj(object); } });
+        }
         if !self.proxies.is_empty() {
             if let Some((t, h)) = self.proxies.get(&(p as usize)) {
                 for v in [t, h] {
@@ -246,9 +254,15 @@ impl Interp {
         let start = std::time::Instant::now();
         self.gc_collect_cycles();
         let duration = start.elapsed();
-        let Some(observer) = self.host_state.get_mut::<GcObserver>() else { return };
+        let Some(observer) = self.host_state.get_mut::<GcObserver>() else {
+            return;
+        };
         let forced = std::mem::take(&mut observer.forced_next);
-        observer.events.push(GcEvent { start: start.saturating_duration_since(epoch), duration, forced });
+        observer.events.push(GcEvent {
+            start: start.saturating_duration_since(epoch),
+            duration,
+            forced,
+        });
         if !std::mem::replace(&mut observer.queued, true) {
             let callback = observer.callback.clone();
             self.queue_microtask(callback);
@@ -256,6 +270,8 @@ impl Interp {
     }
 
     fn gc_collect_cycles(&mut self) {
+        #[cfg(feature = "embed")]
+        crate::embed_convert::retain_host_identities(self);
         self.str_units.clear();
         super::GC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -270,6 +286,10 @@ impl Interp {
         value::gc_for_each_live(|o| {
             visit_object_refs(&o.borrow(), &mut |c| c.gc_add_ref());
             self.visit_object_scopes(o, &mut |e| counts.add(Rc::as_ptr(e)));
+            #[cfg(feature = "aot-native")]
+            if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) {
+                class.visit_values(|value| { if let Value::Obj(object) = value { object.gc_add_ref(); } });
+            }
         });
         // The first registry walk purges dead entries; the later ones rely on that.
         value::scope_registry_with(|reg| {
@@ -327,6 +347,20 @@ impl Interp {
         // Roots: nodes with a reference from outside the heap graph (the Rust call stack, the
         // Interp's own fields, module/realm registries, coroutine threads).
         let mut tr = Tracer::default();
+        #[cfg(all(feature = "compiler", feature = "jit"))]
+        if let Some(units) = &self.snapshot_cjs {
+            for unit in units.borrow().iter().flatten() {
+                tr.mark_scope(Rc::as_ptr(&unit.env));
+                if let Value::Obj(module) = &unit.module { tr.mark_obj(module); }
+                if let Value::Obj(require) = &unit.require { tr.mark_obj(require); }
+            }
+        }
+        #[cfg(feature = "aot-native")]
+        for unit in self.native_units.values().flatten() {
+            tr.mark_scope(Rc::as_ptr(&unit.env));
+            if let Value::Obj(namespace) = &unit.namespace { tr.mark_obj(namespace); }
+            if let Some(Value::Obj(promise)) = &unit.evaluation { tr.mark_obj(promise); }
+        }
         value::gc_for_each_live(|o| {
             if Gc::strong_count(o) > o.gc_refs() as usize {
                 tr.mark_obj(o);
@@ -490,6 +524,8 @@ impl Interp {
                 module_ns,
                 gc_pins
             );
+            #[cfg(feature = "aot-native")]
+            self.native_classes.remove(&ptr);
             let mut b = o.borrow_mut();
             b.props.clear();
             b.proto = None;

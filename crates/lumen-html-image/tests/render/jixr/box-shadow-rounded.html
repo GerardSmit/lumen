@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- jixr-compare: threshold=32 max-diff-ratio=0.07
+  Sharp rounded shadows are exact everywhere: the even-odd donut clip reproduces Chromium's
+  corner arcs. The blurred rows inherit the documented truncated-Gaussian tolerance from
+  box-shadow-blur: the managed Window oracle and ImageSharp approximate Skia's box-blur, and
+  the PDF backend paints filter-group content unblurred, so those rows carry the same
+  threshold=16 / max-diff-ratio=0.07 margin at a 1.5x safety factor.
+-->
+<style>
+html,body{margin:0;background:#fff}
+main{position:relative;width:240px;height:150px}
+.a{position:absolute;left:10px;top:10px;width:40px;height:40px;background:#00f;
+border-radius:20px;box-shadow:30px 30px 0 #f00}
+.b{position:absolute;left:110px;top:10px;width:40px;height:40px;background:#0a0;
+border-radius:12px;box-shadow:8px 8px 6px #f80}
+.c{position:absolute;left:180px;top:10px;width:36px;height:36px;background:#08f;
+border-radius:18px;box-shadow:0 0 10px 4px #f0f}
+.d{position:absolute;left:10px;top:90px;width:60px;height:30px;background:#04a;
+border-radius:15px;box-shadow:-14px 10px 0 2px #fa0}
+</style>
+<main>
+<div class=a></div>
+<div class=b></div>
+<div class=c></div>
+<div class=d></div>
+</main>

@@ -16,7 +16,9 @@
 //! CreatePerIterationEnvironment (a sibling env with every binding copied); `BlkLoad`,
 //! `BlkStore`, `BlkInit` and `BlkUpdate` access one binding; `InEnv(slot)` runs the closure-,
 //! class- or method-creating op that follows it with the block env as the new function's scope.
-use super::{step_and_store, Bail, Compiler, Op, PushValue, BLK_BIT};
+#[cfg(feature = "compiler")]
+use super::{Bail, Compiler, BLK_BIT};
+use super::{step_and_store, Op, PushValue};
 use crate::interpreter::{new_scope, Abrupt, Binding, Env, Interp};
 use crate::value::{Callable, Object, Value};
 use std::rc::Rc;
@@ -58,7 +60,7 @@ fn with_env<R>(v: &Value, f: impl FnOnce(&Env) -> R) -> R {
 
 /// The block env a carrier slot holds.
 #[inline]
-pub(super) fn env_of(v: &Value) -> Env {
+pub(crate) fn env_of(v: &Value) -> Env {
     match v {
         Value::Obj(o) => match &o.borrow().call {
             Callable::User(u) => u.env.clone(),
@@ -69,7 +71,7 @@ pub(super) fn env_of(v: &Value) -> Env {
 }
 
 /// `BlkNew(dst, parent)`.
-pub(super) fn new_env(frame_env: &Env, slots: &mut [Value], dst: u16, parent: u16) {
+pub(crate) fn new_env(frame_env: &Env, slots: &mut [Value], dst: u16, parent: u16) {
     let parent = if parent == u16::MAX {
         frame_env.clone()
     } else {
@@ -97,16 +99,17 @@ fn set_env(slot: &mut Value, env: Env) {
 }
 
 /// `BlkDecl(slot, name, is_const)`: an uninitialized (TDZ) binding.
-pub(super) fn declare(slots: &[Value], slot: u16, name: &Rc<str>, is_const: bool) {
+pub(crate) fn declare(slots: &[Value], slot: u16, name: &Rc<str>, is_const: bool) {
     let env = env_of(&slots[slot as usize]);
-    env.borrow_mut()
-        .vars
-        .insert(name.clone(), Binding::data(Value::Undefined, !is_const, false));
+    env.borrow_mut().vars.insert(
+        name.clone(),
+        Binding::data(Value::Undefined, !is_const, false),
+    );
 }
 
 /// `BlkCopy(slot)`: CreatePerIterationEnvironment — a fresh sibling env (same parent) holding a
 /// copy of every binding.
-pub(super) fn copy(slots: &mut [Value], slot: u16) {
+pub(crate) fn copy(slots: &mut [Value], slot: u16) {
     // Nothing else holds the env (no closure, child env or suspended frame captured it this
     // iteration): a copy would be indistinguishable from it, so it serves the next one too.
     if with_env(&slots[slot as usize], |e| Rc::strong_count(e) == 1) {
@@ -132,7 +135,12 @@ fn tdz(i: &mut Interp, name: &str) -> Abrupt {
 
 /// `BlkLoad(slot, name)`.
 #[inline]
-pub(super) fn load(i: &mut Interp, slots: &[Value], slot: u16, name: &Rc<str>) -> Result<Value, Abrupt> {
+pub(crate) fn load(
+    i: &mut Interp,
+    slots: &[Value],
+    slot: u16,
+    name: &Rc<str>,
+) -> Result<Value, Abrupt> {
     match load_opt(slots, slot, name) {
         Some(v) => Ok(v),
         None => Err(tdz(i, name)),
@@ -141,7 +149,7 @@ pub(super) fn load(i: &mut Interp, slots: &[Value], slot: u16, name: &Rc<str>) -
 
 /// The binding's value, `None` in its TDZ.
 #[inline]
-pub(super) fn load_opt(slots: &[Value], slot: u16, name: &Rc<str>) -> Option<Value> {
+pub(crate) fn load_opt(slots: &[Value], slot: u16, name: &Rc<str>) -> Option<Value> {
     with_env(&slots[slot as usize], |env| {
         let b = env.borrow();
         let bd = b.vars.get_rc(name).expect("block binding declared");
@@ -151,7 +159,7 @@ pub(super) fn load_opt(slots: &[Value], slot: u16, name: &Rc<str>) -> Option<Val
 
 /// `BlkStore(slot, name)` (assignment: TDZ is a ReferenceError, a `const` a TypeError) and
 /// `BlkInit(slot, name)` (the declaration's initialization).
-pub(super) fn store(
+pub(crate) fn store(
     i: &mut Interp,
     slots: &[Value],
     slot: u16,
@@ -193,7 +201,7 @@ fn const_assign(i: &mut Interp) -> Abrupt {
 /// the expression produces, `None` for a discarded one), or `None` when the general path must
 /// run (TDZ, `const`, a non-Number).
 #[inline]
-pub(super) fn update_num(
+pub(crate) fn update_num(
     slots: &[Value],
     slot: u16,
     name: &Rc<str>,
@@ -219,7 +227,7 @@ pub(super) fn update_num(
 }
 
 /// `BlkUpdate(slot, name, kind)`: `++`/`--` on a (mutable) block binding.
-pub(super) fn update(
+pub(crate) fn update(
     i: &mut Interp,
     stack: &mut impl PushValue,
     slots: &[Value],
@@ -246,12 +254,13 @@ pub(super) fn update(
     })
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// Open a block env holding `names` ((name, is_const), declared in TDZ) as a child of the
     /// innermost enclosing one, bind them in the current (already pushed) scope, and make it
     /// the innermost. Returns the carrier slot and the parent operand (for re-creation per
     /// iteration, see [`Compiler::blk_renew`]). The caller truncates `blk_envs` on scope exit.
-    pub(super) fn blk_open(&mut self, names: &[(String, bool)]) -> Result<(u16, u16), Bail> {
+    pub(crate) fn blk_open(&mut self, names: &[(String, bool)]) -> Result<(u16, u16), Bail> {
         if self.slot_names.len() >= (BLK_BIT - 1) as usize {
             return Err(Bail);
         }
@@ -269,7 +278,7 @@ impl Compiler {
 
     /// A fresh env (same parent, same declarations in TDZ) in carrier slot `slot` — a loop
     /// head's binding for the next iteration.
-    pub(super) fn blk_renew(&mut self, slot: u16, parent: u16, names: &[(String, bool)]) {
+    pub(crate) fn blk_renew(&mut self, slot: u16, parent: u16, names: &[(String, bool)]) {
         self.emit(Op::BlkNew(slot, parent));
         for (n, k) in names {
             let ni = self.name_idx(n);
@@ -280,7 +289,7 @@ impl Compiler {
     /// Open a block env for the captured declarations queued by `declare_lexical_pattern` /
     /// `declare_block_lexicals` (`pending_blk`), if any.
     #[allow(clippy::type_complexity)]
-    pub(super) fn blk_flush(&mut self) -> Result<Option<(u16, u16, Vec<(String, bool)>)>, Bail> {
+    pub(crate) fn blk_flush(&mut self) -> Result<Option<(u16, u16, Vec<(String, bool)>)>, Bail> {
         if self.pending_blk.is_empty() {
             return Ok(None);
         }
@@ -291,7 +300,7 @@ impl Compiler {
 
     /// Before an op that creates a function or class: route its scope through the innermost
     /// block env.
-    pub(super) fn env_prefix(&mut self) {
+    pub(crate) fn env_prefix(&mut self) {
         if let Some(&s) = self.blk_envs.last() {
             self.emit(Op::InEnv(s));
         }
@@ -337,7 +346,10 @@ mod tests {
             function t11(k) { { function inner(x) { return x <= 0 ? 'z' : inner(x - 1) + k; } return inner(2); } }
             [t1(), t2(), t3(), t4(), t5(), t6(), t7(), t8(), t9(), t10(), t11('k')].join('|')",
         );
-        assert_eq!(r, "0,1,2|1,2|a,b|3,7|0,2|5|0,1|ReferenceError|TypeError|0,1|zkk");
+        assert_eq!(
+            r,
+            "0,1,2|1,2|a,b|3,7|0,2|5|0,1|ReferenceError|TypeError|0,1|zkk"
+        );
     }
 
     #[test]
@@ -362,4 +374,3 @@ mod tests {
         assert_eq!(r, "done|100000|1|;00|B,A|1,2,9,3,4|1,2,3|2");
     }
 }
-

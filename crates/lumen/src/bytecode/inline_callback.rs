@@ -65,7 +65,9 @@
 //! Known differences from the uninlined call: an element *getter* invoked by the step shows an
 //! arrow frame above `Array.map`; legacy `f.caller` of a sloppy function called from the body
 //! names the enclosing function instead of the arrow.
-use super::{Bail, CResult, Chunk, CmpKind, Compiler, Op, UpdKind};
+#[cfg(feature = "compiler")]
+use super::{Bail, CResult, Compiler};
+use super::{Chunk, CmpKind, Op, UpdKind};
 use crate::ast::{ArrayElem, Expr, Function, HoistOp, Pattern, Stmt};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Callable, Exotic, Gc, Value};
@@ -107,7 +109,10 @@ const METHODS: [CbMethod; 10] = [
 impl CbMethod {
     /// The method the compiler lowers for property name `n`: only the [`CbMethod::lowered`] ones.
     fn from_name(n: &str) -> Option<CbMethod> {
-        METHODS.iter().copied().find(|m| m.name() == n && m.lowered())
+        METHODS
+            .iter()
+            .copied()
+            .find(|m| m.name() == n && m.lowered())
     }
 
     /// Whether call sites of this method are lowered at all. All are: `map`'s per-element
@@ -314,14 +319,20 @@ fn check(i: &Interp, kind: u8, o: &Value, f: &Value) -> Option<usize> {
         return None;
     };
     let x = intrinsics(i)?;
-    if !x.methods[m.slot()].as_ref().is_some_and(|g| Gc::ptr_eq(g, fg)) {
+    if !x.methods[m.slot()]
+        .as_ref()
+        .is_some_and(|g| Gc::ptr_eq(g, fg))
+    {
         return None;
     }
     let len = {
         let b = a.try_borrow().ok()?;
         if !b.ic_plain.get()
             || !matches!(b.exotic, Exotic::Array)
-            || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+            || !b
+                .proto
+                .as_ref()
+                .is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
         {
             return None;
         }
@@ -351,7 +362,7 @@ fn check(i: &Interp, kind: u8, o: &Value, f: &Value) -> Option<usize> {
 /// [`Op::ArrayCbGuard`] at `pc`: `[O, F]` → `[O, F, ok]`. Never
 /// throws. Publishes `pc` as the frame's call site: until the body makes a call, a trace taken
 /// in the loop shows the inlined frames (see [`Chunk::inline_regions_at`]).
-pub(super) fn guard(i: &mut Interp, kind: u8, pc: usize, s: &mut Vec<Value>) {
+pub(crate) fn guard(i: &mut Interp, kind: u8, pc: usize, s: &mut Vec<Value>) {
     let n = s.len();
     let len = check(i, kind, &s[n - 2], &s[n - 1]);
     if len.is_some() {
@@ -365,7 +376,7 @@ pub(super) fn guard(i: &mut Interp, kind: u8, pc: usize, s: &mut Vec<Value>) {
 
 /// [`Op::ArrayCbHas`]: HasProperty(a, k), run only after `Get(a, k)` produced `undefined` (see
 /// the module docs for why that order is unobservable here).
-pub(super) fn has(i: &mut Interp, a: &Value, k: &Value) -> Result<bool, Abrupt> {
+pub(crate) fn has(i: &mut Interp, a: &Value, k: &Value) -> Result<bool, Abrupt> {
     let k = match k {
         Value::Num(k) if *k >= 0.0 && k.fract() == 0.0 => *k,
         _ => return Err(i.throw("TypeError", "array callback index out of range")),
@@ -445,7 +456,8 @@ impl Chunk {
         hits.sort_by_key(|r| std::cmp::Reverse(r.start));
         hits.iter()
             .map(|r| {
-                let name = CbMethod::from_u8(r.kind).map_or("Array.<anonymous>", |m| m.frame_name());
+                let name =
+                    CbMethod::from_u8(r.kind).map_or("Array.<anonymous>", |m| m.frame_name());
                 (r.pos, name)
             })
             .collect()
@@ -457,7 +469,10 @@ impl Chunk {
 /// position (the call op's own, or none), and per region, innermost first, the method call's
 /// position and the builtin's frame name. `None` when `pc` lies in no region.
 #[allow(clippy::type_complexity)]
-pub(crate) fn expand(callee: &Gc, pc: usize) -> Option<(Rc<Function>, u32, Vec<(u32, &'static str)>)> {
+pub(crate) fn expand(
+    callee: &Gc,
+    pc: usize,
+) -> Option<(Rc<Function>, u32, Vec<(u32, &'static str)>)> {
     let func = match &callee.borrow().call {
         Callable::User(u) => u.func.clone(),
         _ => return None,
@@ -546,6 +561,7 @@ struct Loop {
     r: u16,
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
@@ -618,7 +634,12 @@ impl Compiler {
 
     /// `obj.<prop>(args)` as an inlined callback loop when it qualifies (see the module docs).
     /// `true` = emitted; `false` = nothing emitted, compile the generic call.
-    pub(super) fn inline_array_callback(&mut self, obj: &Expr, prop: &str, args: &[ArrayElem]) -> bool {
+    pub(super) fn inline_array_callback(
+        &mut self,
+        obj: &Expr,
+        prop: &str,
+        args: &[ArrayElem],
+    ) -> bool {
         let Some(m) = CbMethod::from_name(prop) else {
             return false;
         };
@@ -803,7 +824,11 @@ impl Compiler {
                             }
                             continue;
                         }
-                        if self.scopes.last().is_some_and(|s| s.iter().any(|(n, ..)| *n == name)) {
+                        if self
+                            .scopes
+                            .last()
+                            .is_some_and(|s| s.iter().any(|(n, ..)| *n == name))
+                        {
                             continue;
                         }
                         let s = self.fresh_slot(&name);
@@ -970,7 +995,10 @@ impl Compiler {
             self.patch(j_go);
             seed_fail = Some((j_fail, lp.a, lp.len));
         }
-        let has = !matches!(kind, M::Find | M::FindIndex | M::FindLast | M::FindLastIndex);
+        let has = !matches!(
+            kind,
+            M::Find | M::FindIndex | M::FindLast | M::FindLastIndex
+        );
         let reverse = matches!(kind, M::FindLast | M::FindLastIndex);
         // Loop head.
         let top = self.ops.len();
@@ -1097,4 +1125,3 @@ fn disabled_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("LUMEN_INLINE_CB").map_or(true, |v| v != "0"))
 }
-

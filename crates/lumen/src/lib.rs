@@ -33,6 +33,13 @@ mod coroutine;
 #[cfg(feature = "embed")]
 mod embed_convert;
 mod eval;
+mod native_ops;
+#[cfg(feature = "compiler")]
+pub mod feedback;
+#[cfg(feature = "compiler")]
+pub mod heap_snapshot;
+#[cfg(all(feature = "compiler", feature = "jit"))]
+mod snapshot_cjs;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
 /// per JS object/scope) run 15-30% faster than on the system allocator. NOT registered here: a
 /// library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
@@ -49,6 +56,7 @@ mod interpreter;
 mod intl;
 mod jit_ir;
 mod jstr;
+#[cfg(feature = "compiler")]
 mod lexer;
 mod lstr;
 mod modules;
@@ -61,7 +69,14 @@ mod numbering;
 use lumen_common::lzh;
 /// Opt-in memory accounting (`LUMEN_MEM_STATS=1`).
 pub mod memstats;
+mod parser_support;
+#[cfg(feature = "compiler")]
 mod parser;
+#[cfg(not(feature = "compiler"))]
+#[path = "parser_unavailable.rs"]
+mod parser;
+#[cfg(feature = "aot-native")]
+pub mod native_aot;
 pub mod precompiled;
 pub mod target;
 mod regex;
@@ -107,7 +122,7 @@ use value::Value;
 pub mod bench_api {
     pub use crate::ast::Stmt;
     pub use crate::lexer::tokenize;
-    pub use crate::parser::{parse_module, parse_module_ts, parse_script};
+    pub use crate::parser::{parse_module, parse_module_jsx, parse_module_ts, parse_script};
     pub use crate::snapshot::{decode, encode};
 }
 
@@ -166,7 +181,25 @@ pub(crate) fn host_now_ms() -> Option<f64> {
     HOST_CLOCK.get().map(|f| f())
 }
 
-pub use lumen_codegen::jitmem::{NativeBackend, install_native_backend as install_native_jit_backend};
+pub use lumen_os::jitmem::{NativeBackend, install_native_backend as install_native_jit_backend};
+
+/// Native code lifetime notification. The name is borrowed only during the callback.
+pub struct JitCodeEvent<'a> {
+    pub name: &'a str,
+    pub start: usize,
+    pub length: usize,
+    pub loaded: bool,
+}
+static JIT_CODE_HOOK: std::sync::OnceLock<fn(JitCodeEvent<'_>)> = std::sync::OnceLock::new();
+
+/// Install once before creating realms. Called on each realm's owner thread, outside IRQs.
+pub fn set_jit_code_hook(hook: fn(JitCodeEvent<'_>)) -> Result<(), fn(JitCodeEvent<'_>)> {
+    JIT_CODE_HOOK.set(hook)
+}
+
+pub(crate) fn jit_code_event(event: JitCodeEvent<'_>) {
+    if let Some(hook) = JIT_CODE_HOOK.get() { hook(event); }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JitStats {
@@ -178,6 +211,19 @@ pub struct JitStats {
     pub compile_nanoseconds: u64,
     pub failed_compilations: u64,
     pub allocation_failures: u64,
+    /// Compiled units released to make room for new code (memory pressure).
+    pub evictions: u64,
+    pub evicted_bytes: usize,
+}
+
+#[cfg(feature = "bench")]
+#[derive(Clone, Copy, Debug)]
+pub struct JitCompilation {
+    pub function_index: Option<usize>,
+    pub bytecode_bytes: Option<usize>,
+    pub kind: &'static str,
+    pub op_count: usize,
+    pub native_bytes: usize,
 }
 
 impl core::ops::AddAssign for JitStats {
@@ -188,6 +234,8 @@ impl core::ops::AddAssign for JitStats {
         self.compile_nanoseconds += other.compile_nanoseconds;
         self.failed_compilations += other.failed_compilations;
         self.allocation_failures += other.allocation_failures;
+        self.evictions += other.evictions;
+        self.evicted_bytes += other.evicted_bytes;
     }
 }
 
@@ -214,7 +262,10 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 }
 
 pub use parser::with_eager_bodies;
-pub use stack::{set_thread_stack_size, THREAD_STACK_SIZE};
+pub use parser::{JsxOptions, JsxRuntime};
+#[cfg(feature = "compiler")]
+pub use parser::transpile_jsx;
+pub use stack::{set_thread_stack_bounds, set_thread_stack_size, THREAD_STACK_SIZE};
 
 /// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
 /// module body (where a top-level `return` is legal). Node's `--check`.
@@ -376,8 +427,24 @@ impl Engine {
     pub fn set_jit_mode(&mut self, mode: JitMode) {
         self.interp.jit_mode = mode;
     }
+    /// Select compact (16) or measured hot (64) native code alignment for future compilations.
+    /// Existing code remains valid; extra padding stays subject to the host arena budget.
+    pub fn set_jit_alignment(&mut self, alignment: usize) -> bool {
+        if !matches!(alignment, 16 | 64) { return false; }
+        self.interp.jit_alignment = alignment;
+        true
+    }
     pub fn jit_stats(&self) -> JitStats {
         self.interp.jit_stats.get()
+    }
+    /// Experimental native loop prefetches for future compilations; disabled by default.
+    pub fn set_jit_prefetch(&mut self, enabled: bool) {
+        self.interp.jit_prefetch = enabled;
+    }
+
+    #[cfg(feature = "bench")]
+    pub fn jit_compilations(&self) -> Vec<JitCompilation> {
+        self.interp.jit_compilations.borrow().clone()
     }
 
     /// Collect unreachable object/scope cycles between evaluations. External
@@ -427,6 +494,9 @@ impl Engine {
     /// Parse and run `src`. `strict` forces strict mode (used for the test262 strict variant); a
     /// `"use strict"` directive in the source also enables it.
     pub fn eval(&mut self, src: &str, strict: bool) -> Result<Completion, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+        }
         let body = parser::parse_script(src, strict).map_err(|e| ParseError {
             message: e.message,
             line: e.line,
@@ -461,6 +531,9 @@ impl Engine {
         src: &str,
         strict: bool,
     ) -> Result<Completion, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError { message: "source snapshots are unavailable in the Aot profile".into(), line: 0, at_eof: false });
+        }
         let body = snapshot::decode(bytes, src).map_err(|message| ParseError {
             message,
             line: 0,
@@ -487,6 +560,9 @@ impl Engine {
     /// [`set_module_loader`](Engine::set_module_loader) (install it before this call). A blob
     /// that fails validation (built by another lumen version, corrupt) is `Err(ParseError)`.
     pub fn load_precompiled(&mut self, blob: &Precompiled) -> Result<Completion, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError { message: "bytecode loading is unavailable in native execution".into(), line: 0, at_eof: false });
+        }
         let bad = |message: String| ParseError {
             message,
             line: 0,
@@ -530,6 +606,19 @@ impl Engine {
     /// modules retain the blob's backing until their last reference is released.
     pub fn load_precompiled_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<Completion, ParseError> {
         self.load_precompiled(&Precompiled::from_bytes(bytes))
+    }
+
+    /// Load an authenticated native image and retain its code with its functions.
+    #[cfg(feature = "aot-native")]
+    pub fn load_native_owned(
+        &mut self,
+        bytes: std::sync::Arc<[u8]>,
+        signature: Option<[u8; 64]>,
+        allowed_keys: &[[u8; 32]],
+        allow_unsigned: bool,
+    ) -> Result<Completion, String> {
+        let value = native_aot::load_engine(&mut self.interp, bytes, signature, allowed_keys, allow_unsigned)?;
+        Ok(Completion::Value(self.render(&value)))
     }
 
     /// Register a precompiled blob's modules with the realm without running anything, so a
@@ -589,6 +678,32 @@ impl Engine {
         self.eval_module_attrs(src, key, move |s, r, _a| loader(s, r))
     }
 
+    /// JSX module defaults for `.jsx`/`.tsx` and embedders using [`Engine::eval_module_jsx`].
+    pub fn set_jsx_options(&mut self, options: JsxOptions) {
+        self.interp.jsx_options = options;
+    }
+
+    pub fn jsx_options(&self) -> &JsxOptions {
+        &self.interp.jsx_options
+    }
+
+    /// Resolve host JSX configuration per source file, before applying its pragmas.
+    pub fn set_jsx_options_loader(&mut self, loader: impl Fn(&str, &JsxOptions) -> Result<JsxOptions, String> + 'static) {
+        self.interp.jsx_options_loader = Some(std::rc::Rc::new(loader));
+    }
+
+    /// Evaluate JSX or TSX under an arbitrary module key (which need not have a file extension).
+    pub fn eval_module_jsx(
+        &mut self,
+        src: &str,
+        key: &str,
+        typescript: bool,
+        loader: impl Fn(&str, &str) -> Option<(String, String)> + 'static,
+    ) -> Result<Completion, ParseError> {
+        self.interp.jsx_module_keys.insert(key.to_string(), typescript);
+        self.eval_module(src, key, loader)
+    }
+
     /// [`Engine::eval_module`] with an attribute-aware loader (see
     /// [`Engine::set_module_loader_attrs`] for the contract).
     pub fn eval_module_attrs(
@@ -597,6 +712,9 @@ impl Engine {
         key: &str,
         loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
     ) -> Result<Completion, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+        }
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
         let result = self.interp.load_module(key, src);
         self.interp.run_agent_event_loop();
@@ -618,6 +736,28 @@ impl Engine {
     /// promise reactions run.
     pub fn set_interrupt(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
         self.interp.stop.set_interrupt(flag);
+        self.interp.sync_regex_poll();
+    }
+
+    /// Cooperative time-slicing. When `flag` is observed set at a safe point (the same safe points
+    /// as [`set_interrupt`](Engine::set_interrupt): calls, loop back-edges, bytecode and JIT loop
+    /// polls, long native BigInt and regex work), Lumen clears `flag` and calls `hook` on the
+    /// current native stack. The realm is quiescent during the call, so other engines may run on
+    /// the same thread before `hook` returns (an embedder that switches stacks must give each
+    /// engine its own thread-local block, and call [`set_thread_stack_bounds`] for a stack Lumen
+    /// cannot query). When `hook` returns, execution continues where it stopped. A pending hard
+    /// interrupt takes priority over a yield.
+    pub fn set_yield_hook(
+        &mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        hook: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.interp.stop.set_yield_hook(flag, hook);
+        self.interp.sync_regex_poll();
+    }
+
+    pub fn clear_yield_hook(&mut self) {
+        self.interp.stop.clear_yield_hook();
         self.interp.sync_regex_poll();
     }
 
@@ -773,6 +913,7 @@ pub mod embed {
     pub use crate::embed_convert::{
         class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
         JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
+        WeakValue,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
@@ -793,10 +934,102 @@ impl Engine {
         &mut self.interp
     }
 
+    /// Load compiled-in bootstrap glue with the baseline, import-free glue contract.
+    #[cfg(feature = "aot-native")]
+    pub fn load_native_glue_value(&mut self, bytes: &'static [u8]) -> Result<embed::Value, String> {
+        native_aot::load_static_glue_engine(&mut self.interp, bytes)
+    }
+
+    #[cfg(feature = "aot-native")]
+    pub fn validate_native_install(&self, bytes: &[u8], additional_modules: &[&str]) -> Result<(), String> {
+        native_aot::validate_install(&self.interp, bytes, additional_modules)
+    }
+
+    /// Native entry value without rendering, so an embedder can await its promise.
+    #[cfg(feature = "aot-native")]
+    pub fn load_native_value_owned(
+        &mut self,
+        bytes: std::sync::Arc<[u8]>,
+        signature: Option<[u8; 64]>,
+        allowed_keys: &[[u8; 32]],
+        allow_unsigned: bool,
+    ) -> Result<embed::Value, String> {
+        native_aot::load_engine(&mut self.interp, bytes, signature, allowed_keys, allow_unsigned)
+    }
+
+    /// Load process-linked code and its writable GOT without copying executable pages.
+    ///
+    /// # Safety
+    /// Code and GOT must remain valid for every resulting callable. GOT publication
+    /// must be serialized with all other loads of this same linked image.
+    #[cfg(feature = "aot-native")]
+    pub unsafe fn load_native_linked_value_owned(
+        &mut self, bytes: std::sync::Arc<[u8]>, code: *const u8, code_len: usize,
+        got: *mut usize, got_len: usize,
+    ) -> Result<embed::Value, String> {
+        unsafe { native_aot::load_linked_engine(&mut self.interp, bytes, code, code_len, got, got_len) }
+    }
+
     /// The realm's global object — the root from which an embedder reaches user-defined JS
     /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
     pub fn global_this(&self) -> embed::Value {
         Value::Obj(self.interp.global.clone())
+    }
+
+    /// Register an embedder-provided module namespace before loading a native image.
+    /// Its identity is covered by the target's built-in module table hash.
+    pub fn register_native_module(
+        &mut self,
+        specifier: impl Into<String>,
+        namespace: embed::Value,
+    ) -> Result<(), &'static str> {
+        let specifier = specifier.into();
+        if specifier.is_empty() || !matches!(&namespace, Value::Obj(_)) {
+            return Err("native module requires a name and namespace object");
+        }
+        let catalog = target::host().builtin_modules_hash;
+        if catalog == target::EMPTY_BUILTIN_MODULES_HASH
+            || (catalog == target::PARALLEL_BUILTIN_MODULES_HASH
+                && specifier != "lumen:parallel")
+        {
+            return Err("module is absent from the built-in native catalog");
+        }
+        if self.interp.modules.contains_key(&specifier) {
+            return Err("native module already registered");
+        }
+        self.interp.native_module_names.insert(specifier.clone());
+        self.interp.modules.insert(specifier, namespace);
+        Ok(())
+    }
+
+    /// Register one entry from an embedder-defined native binding catalog.
+    ///
+    /// # Safety
+    /// `address` must be a live function with the ABI identified by
+    /// `signature_hash` for every image loaded by this realm.
+    pub unsafe fn register_native_binding(
+        &mut self,
+        module: impl Into<String>,
+        name: impl Into<String>,
+        signature_hash: u64,
+        address: usize,
+    ) -> Result<(), &'static str> {
+        let module = module.into();
+        let name = name.into();
+        if module.is_empty() || name.is_empty() || signature_hash == 0 || address == 0 {
+            return Err("invalid native binding registration");
+        }
+        let catalog = target::host().builtin_modules_hash;
+        if catalog == target::EMPTY_BUILTIN_MODULES_HASH
+            || catalog == target::PARALLEL_BUILTIN_MODULES_HASH
+        {
+            return Err("native binding is absent from the built-in catalog");
+        }
+        if self.interp.native_bindings.contains_key(&(module.clone(), name.clone())) {
+            return Err("native binding already registered");
+        }
+        self.interp.native_bindings.insert((module, name), (signature_hash, address));
+        Ok(())
     }
 
     /// [`eval`](Engine::eval), but the completion comes back as real values (`Err` = the
@@ -807,6 +1040,9 @@ impl Engine {
         &mut self,
         src: &str,
     ) -> Result<Result<embed::Value, embed::Value>, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+        }
         let body = parser::parse_script(src, false).map_err(|e| ParseError {
             message: e.message,
             line: e.line,

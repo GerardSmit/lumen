@@ -11,11 +11,11 @@ use std::rc::Rc;
 // Per-object modules split out of this file (behavior-preserving). Shared helpers remain here and
 // are reachable from each submodule via `use super::*`.
 mod array_fast;
-mod num_fmt;
 mod array_iterator;
 mod atomics;
 pub(crate) mod collection_data;
 pub(crate) mod collections;
+mod num_fmt;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 pub(crate) mod dataview;
 mod date;
@@ -32,15 +32,15 @@ pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
 pub(crate) use promise::{make_aggregate_error_value, promise_then_is_silent};
-mod proxy;
+pub(crate) mod proxy;
 mod reflect;
 mod regexp;
 mod shadowrealm;
-pub(crate) mod vm_context;
 mod string_code_point;
 mod string_substring;
-pub(crate) use string_code_point::nf_code_point_at;
+pub(crate) mod vm_context;
 pub(crate) use collections::make_collection_iterator;
+pub(crate) use string_code_point::nf_code_point_at;
 pub(crate) mod typedarray;
 pub(crate) mod weakrefs;
 
@@ -380,7 +380,10 @@ pub(crate) fn proxy_own_keys(
         let result_set: std::collections::HashSet<&str> =
             key_strs.iter().map(|s| s.as_str()).collect();
         if result_set.len() != key_strs.len() {
-            return Err(i.make_error("TypeError", "'ownKeys' on proxy: trap returned duplicate entries"));
+            return Err(i.make_error(
+                "TypeError",
+                "'ownKeys' on proxy: trap returned duplicate entries",
+            ));
         }
         // Invariants relative to the target's own keys / extensibility.
         if let Value::Obj(t) = target {
@@ -1929,7 +1932,8 @@ fn advance_string_index(index: usize, s: &str, unicode: bool) -> usize {
     let mut it = crate::jstr::UnitIter::new(&s[b..]);
     match (it.next(), it.next()) {
         (Some(hi), Some(lo))
-            if (0xD800..0xDC00).contains(&(hi as u32)) && (0xDC00..0xE000).contains(&(lo as u32)) =>
+            if (0xD800..0xDC00).contains(&(hi as u32))
+                && (0xDC00..0xE000).contains(&(lo as u32)) =>
         {
             index + 2
         }
@@ -3751,52 +3755,54 @@ pub(crate) fn nf_has_own_property(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-        // A string key on an ordinary object or array (no proxy, namespace or typed array —
-        // those clear `ic_plain`): the own entries decide, with no key copy.
-        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
-            if let Ok(b) = o.try_borrow() {
-                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
-                    && b.ic_plain.get()
-                    && !Interp::is_private_key(k)
-                {
-                    return Ok(Value::Bool(b.props.contains(k)));
-                }
+    // A string key on an ordinary object or array (no proxy, namespace or typed array —
+    // those clear `ic_plain`): the own entries decide, with no key copy.
+    if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
+        if let Ok(b) = o.try_borrow() {
+            if matches!(
+                b.exotic,
+                crate::value::Exotic::None | crate::value::Exotic::Array
+            ) && b.ic_plain.get()
+                && !Interp::is_private_key(k)
+            {
+                return Ok(Value::Bool(b.props.contains(k)));
             }
         }
-        let key = ab(i.to_property_key(&arg(args, 0)))?;
-        // A private-name slot (`#x`) is never an observable own property.
-        if Interp::is_private_key(&key) {
-            return Ok(Value::Bool(false));
+    }
+    let key = ab(i.to_property_key(&arg(args, 0)))?;
+    // A private-name slot (`#x`) is never an observable own property.
+    if Interp::is_private_key(&key) {
+        return Ok(Value::Bool(false));
+    }
+    let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+    i.materialize_fn(&o);
+    if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+        return Ok(Value::Bool(true));
+    }
+    // A TypedArray index in range is an own property even though it isn't in the property map;
+    // a canonical-numeric non-index is never an own property.
+    if let Some(info) = ta_info(i, &o) {
+        match i.ta_index_kind(&info, &key) {
+            crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
+            crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
+            crate::value::TaIndex::Ordinary => {}
         }
-        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
-        i.materialize_fn(&o);
-        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+    }
+    // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        let desc = proxy_gopd_value(i, &target, &handler, &key)?;
+        return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
+    }
+    // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
+    let ptr = Gc::as_ptr(&o) as usize;
+    if i.is_namespace(ptr) {
+        if let Some(res) = i.namespace_own_property(ptr, &key) {
+            ab(res)?;
             return Ok(Value::Bool(true));
         }
-        // A TypedArray index in range is an own property even though it isn't in the property map;
-        // a canonical-numeric non-index is never an own property.
-        if let Some(info) = ta_info(i, &o) {
-            match i.ta_index_kind(&info, &key) {
-                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
-                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
-                crate::value::TaIndex::Ordinary => {}
-            }
-        }
-        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
-        }
-        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Gc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                ab(res)?;
-                return Ok(Value::Bool(true));
-            }
-        }
-        let has = o.borrow().props.contains(&key);
-        Ok(Value::Bool(has))
+    }
+    let has = o.borrow().props.contains(&key);
+    Ok(Value::Bool(has))
 }
 
 pub(crate) fn nf_object_has_own(
@@ -3994,7 +4000,13 @@ pub(crate) fn object_define_property(
             &descriptor,
         ))? {
             if vm_context::is_vm_handler(&handler) {
-                return Err(i.make_error("TypeError", format!("Cannot redefine property: {}", vm_context::key_display(i, &key))));
+                return Err(i.make_error(
+                    "TypeError",
+                    format!(
+                        "Cannot redefine property: {}",
+                        vm_context::key_display(i, &key)
+                    ),
+                ));
             }
             return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
         }
@@ -4060,6 +4072,8 @@ fn define_own_property_ordinary(
     key: &str,
     d: &PartialDesc,
 ) -> Result<bool, Abrupt> {
+    #[cfg(feature = "embed")]
+    crate::embed_convert::retain_identity_receiver(i, &Value::Obj(o.clone()));
     // A defineProperty can rewrite attributes (data → accessor, writable → false) without a
     // structural change: conservatively invalidate the property-creation inline caches, whose
     // fill-time chain walks assumed no such shadow could appear (the op is rare).
@@ -4438,11 +4452,16 @@ fn install_array(it: &mut Interp) {
 /// ordinary Array with a writable whole-number `length` at its dense frontier and no elements
 /// on the array prototypes. Returns the new length, or hands `v` back (nothing changed).
 pub(crate) fn array_push_one(i: &Interp, o: &Gc, v: Value) -> Result<f64, Value> {
-    let Ok(mut b) = o.try_borrow_mut() else { return Err(v) };
+    let Ok(mut b) = o.try_borrow_mut() else {
+        return Err(v);
+    };
     if !matches!(b.exotic, Exotic::Array)
         || !b.extensible
         || !b.ic_plain.get()
-        || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+        || !b
+            .proto
+            .as_ref()
+            .is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
         || !i.array_prototypes_unshadowed()
     {
         return Err(v);
@@ -5815,7 +5834,10 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         }
     };
     i.park_async_coro(&promise, coro);
-    i.drive_async(promise.clone(), crate::coroutine::Resume::Next(Value::Undefined));
+    i.drive_async(
+        promise.clone(),
+        crate::coroutine::Resume::Next(Value::Undefined),
+    );
     Ok(promise)
 }
 
@@ -7197,7 +7219,6 @@ fn drive_generator(
     }
 }
 
-
 pub(crate) fn generator_next(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     drive_generator(i, &this, crate::coroutine::Resume::Next(arg(args, 0)))
 }
@@ -7605,7 +7626,9 @@ pub(crate) fn nf_str_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
-    Ok(Value::Num(str_find(i, &s, &needle, pos).map_or(-1.0, |k| k as f64)))
+    Ok(Value::Num(
+        str_find(i, &s, &needle, pos).map_or(-1.0, |k| k as f64),
+    ))
 }
 
 /// Whether byte matches of `needle` are exactly its UTF-16 matches: it doesn't begin with a
@@ -7658,7 +7681,9 @@ pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Re
     let needle = ab(i.to_string(&arg(args, 0)))?;
     if s.ascii_hint() {
         let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
-        return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
+        return Ok(Value::Bool(
+            needle.is_ascii() && s[pos..].contains(&*needle),
+        ));
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -7666,7 +7691,11 @@ pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Re
 }
 
 /// `String.prototype.startsWith`.
-pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_starts_with(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::StartsWith, &this, args) {
         return Ok(v);
     }
@@ -7680,7 +7709,9 @@ pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) ->
             None | Some(Value::Undefined) => 0,
             v => str_clamp_pos(i, v, s.len() as i64)?,
         };
-        return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
+        return Ok(Value::Bool(
+            s.as_bytes()[pos..].starts_with(needle.as_bytes()),
+        ));
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -7688,7 +7719,11 @@ pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) ->
 }
 
 /// `String.prototype.endsWith`.
-pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_ends_with(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::EndsWith, &this, args) {
         return Ok(v);
     }
@@ -7699,12 +7734,12 @@ pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> R
     let needle = ab(i.to_string(&arg(args, 0)))?;
     if s.ascii_hint() {
         let end = match args.get(1) {
-            Some(v) if !matches!(v, Value::Undefined) => {
-                str_clamp_pos(i, Some(v), s.len() as i64)?
-            }
+            Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), s.len() as i64)?,
             _ => s.len(),
         };
-        return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
+        return Ok(Value::Bool(
+            s.as_bytes()[..end].ends_with(needle.as_bytes()),
+        ));
     }
     let len = i.str_len(&s) as i64;
     // endsWith's optional argument is the END position (default = length).
@@ -7713,11 +7748,17 @@ pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> R
         _ => len as usize,
     };
     let n = crate::str_index::unit_len(&needle);
-    Ok(Value::Bool(end >= n && str_match_at(i, &s, end - n, &needle)))
+    Ok(Value::Bool(
+        end >= n && str_match_at(i, &s, end - n, &needle),
+    ))
 }
 
 /// `String.prototype.toUpperCase`.
-pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_to_upper_case(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::ToUpperCase, &this, args) {
         return Ok(v);
     }
@@ -7732,7 +7773,11 @@ pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) 
 }
 
 /// `String.prototype.toLowerCase`.
-pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_to_lower_case(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::ToLowerCase, &this, args) {
         return Ok(v);
     }
@@ -7741,7 +7786,9 @@ pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) 
         if !s.bytes().any(|b| b.is_ascii_uppercase()) {
             return Ok(Value::Str(s));
         }
-        return Ok(Value::from_string(lumen_common::scan::ascii_case(&s, false)));
+        return Ok(Value::from_string(lumen_common::scan::ascii_case(
+            &s, false,
+        )));
     }
     Ok(Value::from_string(s.to_lowercase()))
 }
@@ -7764,7 +7811,11 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
     if s.ascii_hint() {
         let len = s.len() as i64;
         let n = ab(i.to_number(&arg(args, 0)))?;
-        let mut idx = if n.is_nan() { 0 } else { n.trunc().clamp(-1e18, 1e18) as i64 };
+        let mut idx = if n.is_nan() {
+            0
+        } else {
+            n.trunc().clamp(-1e18, 1e18) as i64
+        };
         if idx < 0 {
             idx += len;
         }
@@ -7790,7 +7841,11 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
 }
 
 /// `String.prototype.trimStart`.
-pub(crate) fn nf_str_trim_start(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_trim_start(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::TrimStart, &this, args) {
         return Ok(v);
     }
@@ -7843,7 +7898,10 @@ pub(crate) fn str_fast_of(f: crate::value::NativeFn) -> Option<StrFast> {
         (nf_str_to_upper_case, StrFast::ToUpperCase),
         (nf_str_to_lower_case, StrFast::ToLowerCase),
     ];
-    table.iter().find(|(g, _)| *g as usize == f as usize).map(|&(_, k)| k)
+    table
+        .iter()
+        .find(|(g, _)| *g as usize == f as usize)
+        .map(|&(_, k)| k)
 }
 
 /// The first index of `n` in `h`: a plain scan for a short search (`str::find`'s two-way
@@ -7853,7 +7911,9 @@ fn find_str(h: &str, n: &str) -> Option<usize> {
         return h.find(n);
     }
     let (h, n) = (h.as_bytes(), n.as_bytes());
-    let Some((&first, rest)) = n.split_first() else { return Some(0) };
+    let Some((&first, rest)) = n.split_first() else {
+        return Some(0);
+    };
     let last = h.len().checked_sub(n.len())?;
     (0..=last).find(|&k| h[k] == first && &h[k + 1..k + n.len()] == rest)
 }
@@ -9042,4 +9102,3 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
         _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
     }
 }
-

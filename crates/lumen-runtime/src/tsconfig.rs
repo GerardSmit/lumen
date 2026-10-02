@@ -20,6 +20,10 @@ pub struct RawOptions {
     pub check_js: Option<bool>,
     pub allow_js: Option<bool>,
     pub target: Option<String>,
+    pub jsx: Option<String>,
+    pub jsx_factory: Option<String>,
+    pub jsx_fragment_factory: Option<String>,
+    pub jsx_import_source: Option<String>,
 }
 
 impl RawOptions {
@@ -36,7 +40,11 @@ impl RawOptions {
             use_define_for_class_fields,
             check_js,
             allow_js,
-            target
+            target,
+            jsx,
+            jsx_factory,
+            jsx_fragment_factory,
+            jsx_import_source
         );
     }
 
@@ -61,6 +69,24 @@ impl RawOptions {
             allow_js: self.allow_js.unwrap_or(false),
             source,
         }
+    }
+
+    /// JSX options override the embedder defaults; the native parser applies file pragmas last.
+    pub fn resolve_jsx(&self, defaults: &lumen::JsxOptions) -> Result<lumen::JsxOptions, String> {
+        let mut options = defaults.clone();
+        if let Some(jsx) = &self.jsx {
+            options.runtime = match jsx.as_str() {
+                "react" => lumen::JsxRuntime::Classic,
+                "react-jsx" => lumen::JsxRuntime::Automatic,
+                "react-jsxdev" => lumen::JsxRuntime::Development,
+                "preserve" => lumen::JsxRuntime::Preserve,
+                _ => return Err(format!("unsupported tsconfig jsx option: {jsx}")),
+            };
+        }
+        if let Some(value) = &self.jsx_factory { options.factory = value.clone(); }
+        if let Some(value) = &self.jsx_fragment_factory { options.fragment_factory = value.clone(); }
+        if let Some(value) = &self.jsx_import_source { options.import_source = value.clone(); }
+        Ok(options)
     }
 }
 
@@ -90,6 +116,9 @@ fn raw_from(json: &Json) -> RawOptions {
     raw.allow_js = b("allowJs");
     if let Some(Json::Str(t)) = opts.get("target") {
         raw.target = Some(t.clone());
+    }
+    for (name, field) in [("jsx", &mut raw.jsx), ("jsxFactory", &mut raw.jsx_factory), ("jsxFragmentFactory", &mut raw.jsx_fragment_factory), ("jsxImportSource", &mut raw.jsx_import_source)] {
+        if let Some(Json::Str(value)) = opts.get(name) { *field = Some(value.clone()); }
     }
     raw
 }
@@ -164,6 +193,20 @@ pub fn parse(text: &str) -> Result<CompilerOptions, String> {
 /// The options for `file`: the nearest `tsconfig.json` in its directory or an ancestor, or
 /// lumen's defaults if there is none.
 pub fn load_for(file: &Path) -> Result<CompilerOptions, String> {
+    match find_config(file)? {
+        Some(path) => load(&path),
+        None => Ok(CompilerOptions::default()),
+    }
+}
+
+pub fn load_jsx_for(file: &Path, defaults: &lumen::JsxOptions) -> Result<lumen::JsxOptions, String> {
+    match find_config(file)? {
+        Some(path) => load_raw(&path, 0)?.resolve_jsx(defaults),
+        None => Ok(defaults.clone()),
+    }
+}
+
+fn find_config(file: &Path) -> Result<Option<PathBuf>, String> {
     let abs = if file.is_absolute() {
         file.to_path_buf()
     } else {
@@ -175,16 +218,31 @@ pub fn load_for(file: &Path) -> Result<CompilerOptions, String> {
     while let Some(d) = dir {
         let candidate = d.join("tsconfig.json");
         if candidate.fs_is_file() {
-            return load(&candidate);
+            return Ok(Some(candidate));
         }
         dir = d.parent();
     }
-    Ok(CompilerOptions::default())
+    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jsx_options_and_inherited_fields() {
+        let mut raw = raw_from(&parse_jsonc(r#"{"compilerOptions":{"jsx":"react-jsxdev","jsxFactory":"h","jsxFragmentFactory":"F","jsxImportSource":"preact"}}"#).unwrap());
+        raw.merge_from(&raw_from(&parse_jsonc(r#"{"compilerOptions":{"jsx":"react"}}"#).unwrap()));
+        let options = raw.resolve_jsx(&lumen::JsxOptions::default()).unwrap();
+        assert_eq!(options.runtime, lumen::JsxRuntime::Classic);
+        assert_eq!(options.factory, "h");
+        assert_eq!(options.fragment_factory, "F");
+        assert_eq!(options.import_source, "preact");
+        raw.jsx = Some("preserve".into());
+        assert_eq!(raw.resolve_jsx(&options).unwrap().runtime, lumen::JsxRuntime::Preserve);
+        raw.jsx = Some("unknown".into());
+        assert!(raw.resolve_jsx(&options).is_err());
+    }
 
     #[test]
     fn tsconfig_jsonc_and_defaults() {

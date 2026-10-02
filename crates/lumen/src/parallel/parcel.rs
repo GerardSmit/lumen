@@ -1,4 +1,4 @@
-use crate::value::{Callable, Gc, GcState, Value, enter_gc_state, gc_snapshot};
+use crate::value::{enter_gc_state, gc_snapshot, Callable, Gc, GcState, Value};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +61,30 @@ pub(crate) struct Buffer {
     pub readonly: bool,
 }
 
+#[cfg(feature = "aot-native")]
+pub(crate) struct NativeFunction {
+    pub trusted_glue: bool,
+    pub object: Gc,
+    pub bytes: Arc<[u8]>,
+    pub hash: [u8; 32],
+    pub index: u32,
+    pub env: Option<crate::interpreter::Env>,
+}
+
+#[cfg(feature = "aot-native")]
+pub(crate) struct NativeClass {
+    pub trusted_glue: bool,
+    pub object: Gc,
+    pub bytes: Arc<[u8]>,
+    pub hash: [u8; 32],
+    pub env: crate::interpreter::Env,
+    pub derived: bool,
+    pub body: Option<u32>,
+    pub fields: Vec<crate::native_aot::classes::Field>,
+    pub private_members: Vec<(String, crate::value::Property)>,
+    pub initializers: Vec<Value>,
+}
+
 /// A closed value graph in an exclusively owned heap. No handles are exposed
 /// until adoption; sender handles are always deeply copied.
 pub struct Parcel {
@@ -73,6 +97,10 @@ pub struct Parcel {
         std::rc::Rc<crate::ast::Function>,
         Option<crate::interpreter::Env>,
     )>,
+    #[cfg(feature = "aot-native")]
+    pub(crate) native_functions: Vec<NativeFunction>,
+    #[cfg(feature = "aot-native")]
+    pub(crate) native_classes: Vec<NativeClass>,
     pub(crate) scopes: Vec<crate::interpreter::Env>,
     pub(crate) scope_intrinsics: Vec<(crate::interpreter::Env, String, Intrinsic)>,
     pub(crate) class_protos: Vec<(Gc, Value)>,
@@ -94,6 +122,10 @@ impl Parcel {
             protos: Vec::new(),
             side: SideTables::default(),
             functions: Vec::new(),
+            #[cfg(feature = "aot-native")]
+            native_functions: Vec::new(),
+            #[cfg(feature = "aot-native")]
+            native_classes: Vec::new(),
             scopes: Vec::new(),
             scope_intrinsics: Vec::new(),
             class_protos: Vec::new(),
@@ -129,6 +161,10 @@ impl Drop for Parcel {
         self.protos.clear();
         self.side = SideTables::default();
         self.functions.clear();
+        #[cfg(feature = "aot-native")]
+        self.native_functions.clear();
+        #[cfg(feature = "aot-native")]
+        self.native_classes.clear();
         self.scopes.clear();
         self.scope_intrinsics.clear();
         self.class_protos.clear();

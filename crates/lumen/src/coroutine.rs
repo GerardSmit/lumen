@@ -110,6 +110,8 @@ pub fn in_async_gen() -> bool {
 pub enum Coroutine {
     Thread(ThreadCoro),
     Vm(crate::bytecode::VmCoro),
+    #[cfg(feature = "aot-native")]
+    Native(crate::native_aot::coroutines::NativeCoro),
 }
 
 impl Coroutine {
@@ -121,11 +123,15 @@ impl Coroutine {
         let frame = match self {
             Coroutine::Thread(c) => &c.frame,
             Coroutine::Vm(c) => &c.frame,
+            #[cfg(feature = "aot-native")]
+            Coroutine::Native(c) => &c.frame,
         };
         let pushed = i.enter_resume_frame(frame, started);
         let s = match self {
             Coroutine::Thread(c) => c.resume(i, signal),
             Coroutine::Vm(c) => c.resume(i, signal),
+            #[cfg(feature = "aot-native")]
+            Coroutine::Native(c) => c.resume(i, signal),
         };
         i.leave_resume_frame(pushed);
         s
@@ -135,6 +141,8 @@ impl Coroutine {
         match self {
             Coroutine::Thread(c) => c.frame = frame,
             Coroutine::Vm(c) => c.frame = frame,
+            #[cfg(feature = "aot-native")]
+            Coroutine::Native(c) => c.frame = frame,
         }
     }
     /// Whether the body has finished (further resumes are no-ops).
@@ -143,6 +151,8 @@ impl Coroutine {
         match self {
             Coroutine::Thread(c) => c.done,
             Coroutine::Vm(c) => c.done,
+            #[cfg(feature = "aot-native")]
+            Coroutine::Native(c) => c.done,
         }
     }
     /// Whether the first resume has happened (distinguishes suspendedStart from a suspended yield).
@@ -151,6 +161,8 @@ impl Coroutine {
         match self {
             Coroutine::Thread(c) => c.started,
             Coroutine::Vm(c) => c.started,
+            #[cfg(feature = "aot-native")]
+            Coroutine::Native(c) => c.started,
         }
     }
 }
@@ -306,13 +318,18 @@ fn park_message(i: &mut Interp, msg: WorkerMessage) -> Resume {
             loop {
                 std::thread::park();
             }
-        },
+        }
     }
 }
 
 /// Run a thread-affine host call on the realm's driver while the coroutine is parked.
-pub(crate) fn driver_call(i: &mut Interp, call: Box<dyn FnOnce(&mut Interp) -> Result<Value, Value>>) -> Result<Value, Value> {
-    if !in_coroutine() { return call(i); }
+pub(crate) fn driver_call(
+    i: &mut Interp,
+    call: Box<dyn FnOnce(&mut Interp) -> Result<Value, Value>>,
+) -> Result<Value, Value> {
+    if !in_coroutine() {
+        return call(i);
+    }
     match park_message(i, WorkerMessage::DriverCall(call)) {
         Resume::Next(value) => Ok(value),
         Resume::Throw(error) => Err(error),
@@ -427,7 +444,8 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
 /// back — the same leak-at-teardown as the pre-pool one-thread-per-coroutine design.
 fn worker_loop(job_rx: Receiver<Job>, self_tx: Sender<Job>) {
     let identity = std::sync::Arc::new(());
-    while let Ok(job) = receive_after_quiet_trim(&job_rx, || IDLE.lock().unwrap().retire(&identity)) {
+    while let Ok(job) = receive_after_quiet_trim(&job_rx, || IDLE.lock().unwrap().retire(&identity))
+    {
         run_job(job);
         if !IDLE
             .lock()
@@ -522,7 +540,9 @@ mod idle_tests {
     #[test]
     fn suspended_activation_resumes_after_the_quiet_trim_deadline() {
         let mut engine = crate::Engine::new();
-        let first = engine.eval(r#"
+        let first = engine
+            .eval(
+                r#"
             let suspended = (function* (value) {
                 "use strict";
                 const text = "a captured string";
@@ -530,10 +550,15 @@ mod idle_tests {
                 return value + next + (text === "a captured string" ? 1 : 0);
             })(40);
             suspended.next().value;
-        "#, false).unwrap();
+        "#,
+                false,
+            )
+            .unwrap();
         assert!(matches!(first, crate::Completion::Value(value) if value == "41"));
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let resumed = engine.eval("$262.gc(); suspended.next(8).value;", false).unwrap();
+        let resumed = engine
+            .eval("$262.gc(); suspended.next(8).value;", false)
+            .unwrap();
         assert!(matches!(resumed, crate::Completion::Value(value) if value == "49"));
     }
 
@@ -622,9 +647,8 @@ fn run_job(job: Job) {
         suspend_tx,
     } = job;
     // The body's `Symbol.for` lookups must see the driver's table, not this thread's.
-    let _restore_syms = RestoreDriverTables(
-        crate::interpreter::sym_for_enter(syms.0 as *const _) as *const (),
-    );
+    let _restore_syms =
+        RestoreDriverTables(crate::interpreter::sym_for_enter(syms.0 as *const _) as *const ());
     let SendBody(body) = body;
     // Everything this job drops — the captured closure on an undriven job, the values a body
     // leaves behind — belongs to the driver's registry, so route it there until the job is done.

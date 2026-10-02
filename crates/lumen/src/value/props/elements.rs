@@ -12,7 +12,8 @@ impl Props {
     pub(crate) fn reserve_dense_exact(&mut self, len: usize, numeric: bool) {
         if (1..=32).contains(&len) {
             self.entries.reserve_exact(1); // own `length`
-            self.elems.install_packed(super::PackedVec::with_capacity(len));
+            self.elems
+                .install_packed(super::PackedVec::with_capacity(len));
         } else {
             self.entries.reserve_exact(len.saturating_add(1));
             self.elems.reserve_exact(len);
@@ -26,7 +27,11 @@ impl Props {
     /// its own `length` and no elements yet (a split view materializing in place: see
     /// `crate::split_view`). The same storage a compact builtin array of that length gets.
     pub(crate) fn adopt_packed_elements(&mut self, elems: Vec<PackedValue>) {
-        debug_assert!(self.elem_mode.get() && self.elems.packed_ref().is_none_or(|p| p.is_empty()) && self.elems.len() == 0);
+        debug_assert!(
+            self.elem_mode.get()
+                && self.elems.packed_ref().is_none_or(|p| p.is_empty())
+                && self.elems.len() == 0
+        );
         if elems.is_empty() {
             return;
         }
@@ -53,7 +58,9 @@ impl Props {
     /// Hands `v` back when this array isn't that simple.
     #[inline]
     pub(crate) fn push_array_element(&mut self, v: Value) -> Result<f64, Value> {
-        let Some(slot) = self.find("length") else { return Err(v) };
+        let Some(slot) = self.find("length") else {
+            return Err(v);
+        };
         let lp = &self.entries[slot];
         let len = match lp.num_value() {
             // `as u32` saturates (NaN and negatives to 0): the round trip proves a whole
@@ -84,7 +91,10 @@ impl Props {
     #[inline]
     pub(crate) fn get_index(&self, n: u32) -> Option<PropRef<'_>> {
         if let Some(packed) = self.elems.packed_ref() {
-            return packed.get(n as usize).filter(|p| !p.is_hole()).map(PropRef::elem);
+            return packed
+                .get(n as usize)
+                .filter(|p| !p.is_hole())
+                .map(PropRef::elem);
         }
         let slot = *self.elems.get(n as usize)?;
         if slot == NO_SLOT {
@@ -96,7 +106,9 @@ impl Props {
     /// Move packed elements to classic storage: an element is about to need descriptor bits
     /// (or a `&mut Property`) that a packed word cannot hold.
     pub(super) fn unpack_elements(&mut self) {
-        let Some(packed) = self.elems.packed_mut() else { return };
+        let Some(packed) = self.elems.packed_mut() else {
+            return;
+        };
         let words = std::mem::take(packed).into_vec(0);
         self.note_structural();
         self.elems.drop_packed();
@@ -112,7 +124,8 @@ impl Props {
         self.elems.classic_mut();
         self.elems.mirror_off();
         self.elems.reserve_exact(words.len());
-        self.entries.reserve_exact(words.iter().filter(|w| !w.is_hole()).count());
+        self.entries
+            .reserve_exact(words.iter().filter(|w| !w.is_hole()).count());
         for w in words {
             if w.is_hole() {
                 self.elems.push(NO_SLOT);
@@ -230,7 +243,10 @@ impl Props {
             };
             // The run ends at the first hole; one exact-size extend copies it (each value one
             // full-width store, see `push_value`).
-            let n = run.iter().position(PackedValue::is_hole).unwrap_or(run.len());
+            let n = run
+                .iter()
+                .position(PackedValue::is_hole)
+                .unwrap_or(run.len());
             out.extend(run[..n].iter().map(PackedValue::unpack));
             return n as u32;
         }
@@ -247,7 +263,11 @@ impl Props {
 
     /// A copy of packed elements `start..end` when every one of them is a plain data element
     /// (no holes or accessors): each property is cloned as it stands (a refcount bump at most).
-    pub(in crate::value) fn clone_packed_run(&self, start: usize, end: usize) -> Option<super::PackedVec> {
+    pub(in crate::value) fn clone_packed_run(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Option<super::PackedVec> {
         if let Some(pv) = self.elems.packed_vec() {
             if start <= end && end <= pv.len() && pv.all_flat() {
                 return Some(pv.copy_flat(start, end));
@@ -346,7 +366,10 @@ impl Props {
             return None;
         }
         self.note_structural();
-        self.elems.packed_mut()?.pop_front().map(PackedValue::into_value)
+        self.elems
+            .packed_mut()?
+            .pop_front()
+            .map(PackedValue::into_value)
     }
 
     /// `unshift(...items)` on a packed array of `len` plain elements with no far keys. The
@@ -364,7 +387,9 @@ impl Props {
             }
             _ => return false,
         }
-        let Some(packed) = self.elems.packed_mut() else { return false };
+        let Some(packed) = self.elems.packed_mut() else {
+            return false;
+        };
         if !packed.all_plain() {
             return false;
         }

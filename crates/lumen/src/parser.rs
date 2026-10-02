@@ -7,19 +7,12 @@ use crate::token::{RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
 mod ts;
-pub use ts::{error_code, side_table_for, ParamTy, SideFn, SideTable, Span as TsSpan};
+mod jsx;
+pub use crate::parser_support::*;
+pub(crate) use ts::error_span as ts_error_span;
 #[cfg(feature = "typed")]
 pub(crate) use ts::side_analysis;
-pub(crate) use ts::error_span as ts_error_span;
-
-#[derive(Debug, Clone)]
-pub struct ParseError {
-    pub message: String,
-    pub line: u32,
-    /// The parse failed because the input ended too soon (error at the EOF token, or the lexer ran
-    /// out mid-construct). A REPL uses this to keep reading lines instead of reporting the error.
-    pub at_eof: bool,
-}
+pub use ts::{error_code, side_table_for, ParamTy, SideFn, SideTable, Span as TsSpan};
 
 thread_local! {
     static ERROR_SPAN: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
@@ -119,6 +112,7 @@ fn parse_script_inner(
         eager_outermost,
         false,
         false,
+        None,
     )
     .map(|r| r.0)
 }
@@ -132,10 +126,11 @@ struct Lexed {
 
 /// Lex a whole source for a parse, in TypeScript mode when `ts`. JSDoc comment spans are
 /// recorded only with the `typed` feature.
-fn lex_source(src: &str, html: bool, ts: bool) -> Result<Lexed, ParseError> {
+fn lex_source(src: &str, html: bool, ts: bool, jsx: bool) -> Result<Lexed, ParseError> {
     crate::bytecode::reflect::note_source(src);
     let opts = LexOpts {
         ts,
+        jsx,
         docs: cfg!(feature = "typed"),
         start_div: false,
         offset: 0,
@@ -211,13 +206,14 @@ fn parse_script_impl(
     eager_outermost: bool,
     ts: bool,
     cjs: bool,
+    jsx_options: Option<&JsxOptions>,
 ) -> Result<(Vec<Stmt>, Option<String>, bool), ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let Lexed {
         tokens,
         ts: ts_state,
         docs,
-    } = lex_source(src, true, ts)?;
+    } = lex_source(src, true, ts, jsx_options.is_some())?;
     let private_scope = (!private_names.is_empty()).then(|| {
         Rc::new(PrivateScope {
             names: std::cell::OnceCell::from(private_names.to_vec()),
@@ -225,6 +221,7 @@ fn parse_script_impl(
         })
     });
     let mut p = Parser {
+        jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
         pos: 0,
@@ -273,7 +270,10 @@ fn parse_script_impl(
     p.strict = p.strict || strict_prologue;
     let body = p.parse_stmts_until_eof();
     let (body, text) = match body {
-        Ok(b) => (b, finish_parse(&mut p, &docs, Ok(()), ts)?),
+        Ok(mut b) => {
+            if let Some(jsx) = &p.jsx { jsx.requires(&mut b); }
+            (b, finish_parse(&mut p, &docs, Ok(()), ts)?)
+        },
         Err(e) => {
             finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
             return Err(e);
@@ -323,22 +323,54 @@ fn release_parse_scratch(src_len: usize) {
 /// Parse a module (always strict; `import`/`export` are allowed only here). Modules permit top-level
 /// `await`, so `await` is treated as a keyword at the module's top level.
 pub fn parse_module(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    parse_module_impl(src, false, false, lazy_bodies()).map(|r| r.0)
+    parse_module_impl(src, false, false, lazy_bodies(), None, false).map(|r| r.0)
 }
 
 /// Parse a TypeScript module with Node's strip-only semantics (see `parser/ts.rs`). The
 /// erased TypeScript becomes whitespace in the functions' source text, so every position is
 /// the file's.
 pub fn parse_module_ts(src: &str) -> Result<Vec<Stmt>, ParseError> {
-    parse_module_impl(src, true, false, lazy_bodies()).map(|r| r.0)
+    parse_module_impl(src, true, false, lazy_bodies(), None, false).map(|r| r.0)
+}
+
+/// Parse JSX or TSX natively, with the same expression grammar and source coordinates as JS/TS.
+pub fn parse_module_jsx(src: &str, ts: bool, options: &JsxOptions) -> Result<Vec<Stmt>, ParseError> {
+    let options = options.with_pragmas(src)?;
+    parse_module_impl(src, ts, false, false, Some(&options), false).map(|r| r.0)
+}
+
+/// Print lowered JSX from the native syntax tree, preserving other JS and erased TS positions.
+pub fn transpile_jsx(src: &str, ts: bool, options: &JsxOptions) -> Result<String, ParseError> {
+    let options = options.with_pragmas(src)?;
+    parse_module_impl(src, ts, false, false, Some(&options), true).map(|r| r.1.unwrap_or_default())
+}
+
+pub(crate) fn jsx_path(key: &str) -> Option<bool> {
+    let path = key.split(['?', '#']).next().unwrap_or(key);
+    if path.ends_with(".tsx") { Some(true) } else if path.ends_with(".jsx") { Some(false) } else { None }
 }
 
 /// A CommonJS module as the function `function (params…) { src }`, parsed with no synthesized
 /// header: the body is the file itself, so every position (function text, stack frames, type
 /// side table keys) is the file's. TypeScript when `ts`.
 pub fn parse_cjs_function(src: &str, params: &[&str], ts: bool) -> Result<Function, ParseError> {
-    let (body, _, strict) =
-        parse_script_impl(src, false, false, false, &[], lazy_bodies(), false, ts, true)?;
+    parse_cjs_function_jsx(src, params, ts, None)
+}
+
+pub(crate) fn parse_cjs_function_jsx(src: &str, params: &[&str], ts: bool, jsx: Option<&JsxOptions>) -> Result<Function, ParseError> {
+    let options = jsx.map(|options| options.with_pragmas(src)).transpose()?;
+    let (body, _, strict) = parse_script_impl(
+        src,
+        false,
+        false,
+        false,
+        &[],
+        jsx.is_none() && lazy_bodies(),
+        false,
+        ts,
+        true,
+        options.as_ref(),
+    )?;
     let params: Vec<Param> = params
         .iter()
         .map(|p| Param {
@@ -354,8 +386,8 @@ pub fn parse_cjs_function(src: &str, params: &[&str], ts: bool) -> Result<Functi
             at_eof: false,
         });
     }
-    let source = crate::interpreter::stack_trace::take_parsed_source()
-        .map_or(FnSource::None, |(src, _)| {
+    let source =
+        crate::interpreter::stack_trace::take_parsed_source().map_or(FnSource::None, |(src, _)| {
             let end = src.len() as u32;
             FnSource::Range { src, start: 0, end }
         });
@@ -386,11 +418,11 @@ pub fn parse_cjs_function(src: &str, params: &[&str], ts: bool) -> Result<Functi
 /// also allows a top-level `return` (as CommonJS code may have), else as a script. On failure,
 /// the error and the byte offset of the unsupported syntax, when that is the cause.
 pub fn strip_types(src: &str) -> Result<String, (ParseError, Option<(u32, u32)>)> {
-    match parse_module_impl(src, true, true, true) {
+    match parse_module_impl(src, true, true, true, None, false) {
         Ok((_, text)) => Ok(text.unwrap_or_default()),
         Err(e) => {
             let at = ts::error_span();
-            match parse_script_impl(src, false, false, false, &[], true, false, true, false) {
+            match parse_script_impl(src, false, false, false, &[], true, false, true, false, None) {
                 Ok((_, text, _)) => Ok(text.unwrap_or_default()),
                 Err(_) => Err((e, at)),
             }
@@ -403,14 +435,17 @@ fn parse_module_impl(
     ts: bool,
     allow_return: bool,
     lazy: bool,
+    jsx_options: Option<&JsxOptions>,
+    print_jsx: bool,
 ) -> Result<(Vec<Stmt>, Option<String>), ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let Lexed {
         tokens,
         ts: ts_state,
         docs,
-    } = lex_source(src, false, ts)?;
+    } = lex_source(src, false, ts, jsx_options.is_some())?;
     let mut p = Parser {
+        jsx: jsx_options.map(|options| Rc::new(jsx::JsxState::new(src, options))),
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
         pos: 0,
@@ -456,8 +491,11 @@ fn parse_module_impl(
         ts: ts_state,
     };
     let body = p.parse_stmts_until_eof();
-    let (body, text) = match body {
-        Ok(b) => (b, finish_parse(&mut p, &docs, Ok(()), ts)?),
+    let (body, mut text) = match body {
+        Ok(mut b) => {
+            if let Some(jsx) = &p.jsx { jsx.imports(&mut b); }
+            (b, finish_parse(&mut p, &docs, Ok(()), ts)?)
+        },
         Err(e) => {
             finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
             return Err(e);
@@ -474,6 +512,7 @@ fn parse_module_impl(
         message,
         line: 0,
     })?;
+    if print_jsx { text = Some(p.print_jsx(text.as_deref().unwrap_or(src))?); }
     // The caller running this module names its stack-trace frames after this source.
     crate::interpreter::stack_trace::note_parsed_source(p.src.src.clone(), None);
     drop(p);
@@ -642,16 +681,15 @@ fn collect_top_decl(stmt: &Stmt, lexical: &mut Vec<String>, vars: &mut Vec<Strin
 pub fn parse_lazy_body(lazy: &LazyBody, func: &Function) -> Result<Vec<Stmt>, ParseError> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::Parse);
     let (s, e) = (lazy.start as usize, lazy.end as usize);
-    let tokens =
-        crate::lexer::tokenize_range(&lazy.src[s..e], lazy.html_comments, lazy.line).map_err(
-            |e| ParseError {
-                message: e.message,
-                line: e.line,
-                at_eof: false,
-            },
-        )?;
+    let tokens = crate::lexer::tokenize_range(&lazy.src[s..e], lazy.html_comments, lazy.line)
+        .map_err(|e| ParseError {
+            message: e.message,
+            line: e.line,
+            at_eof: false,
+        })?;
     let ctx = lazy.ctx;
     let mut p = Parser {
+        jsx: None,
         toks: Rc::new(tokens),
         bracket_tables: Default::default(),
         pos: 0,
@@ -771,6 +809,7 @@ impl SrcMap {
 }
 
 struct Parser {
+    jsx: Option<Rc<jsx::JsxState>>,
     /// Shared with the template token a substitution's parser was made from (see `TplPart::Sub`).
     toks: Rc<TokVec>,
     /// See [`Parser::bracket_match`]: `[mixed brackets, braces only]`.
@@ -879,62 +918,6 @@ struct PendingPrivate {
 
 /// Template identities belong to a driver, including lazy parsing on its coroutine workers.
 /// Thread-local counters would let worker site 1 alias driver site 1 in GetTemplateObject.
-#[derive(Default)]
-pub(crate) struct TemplateSites {
-    state: std::cell::RefCell<(
-        crate::fasthash::FastMap<(usize, u32, u64), (std::rc::Weak<str>, u32)>,
-        u32,
-    )>,
-}
-// The driver and its coroutine access this registry exclusively under the existing handoff;
-// like GcState, the Rc/Weak handles must never be touched by both threads concurrently.
-unsafe impl Send for TemplateSites {}
-unsafe impl Sync for TemplateSites {}
-thread_local! {
-    static TEMPLATE_SITES: std::cell::RefCell<std::sync::Arc<TemplateSites>> =
-        std::cell::RefCell::new(std::sync::Arc::new(TemplateSites::default()));
-}
-pub(crate) fn template_sites_handle() -> std::sync::Arc<TemplateSites> {
-    TEMPLATE_SITES.with(|current| current.borrow().clone())
-}
-pub(crate) fn enter_template_sites(
-    state: std::sync::Arc<TemplateSites>,
-) -> std::sync::Arc<TemplateSites> {
-    TEMPLATE_SITES.with(|current| std::mem::replace(&mut *current.borrow_mut(), state))
-}
-
-fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]) -> u32 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for (_, raw) in quasis {
-        raw.hash(&mut h);
-    }
-    let key = (Rc::as_ptr(src) as *const u8 as usize, offset, h.finish());
-    TEMPLATE_SITES.with(|t| {
-        let registry = t.borrow();
-        let (map, next) = &mut *registry.state.borrow_mut();
-        match map.get(&key) {
-            Some((live, id)) if live.strong_count() != 0 => *id,
-            _ => {
-                *next += 1;
-                map.insert(key, (Rc::downgrade(src), *next));
-                *next
-            }
-        }
-    })
-}
-
-/// A template-site id no parsed site shares (snapshot-decoded templates, whose bodies are never
-/// released).
-pub(crate) fn fresh_template_site() -> u32 {
-    TEMPLATE_SITES.with(|t| {
-        let registry = t.borrow();
-        let (_, next) = &mut *registry.state.borrow_mut();
-        *next += 1;
-        *next
-    })
-}
-
 impl Parser {
     /// Wrap a parsed function node. Bodies with reload metadata register with the collector,
     /// which releases their AST once cold (see `Function::release_cold_body`). Explicit eager
@@ -1016,7 +999,10 @@ impl Parser {
     /// The source position ([`NO_POS`] convention) of token `idx`: its byte offset in the file.
     fn tok_pos(&self, idx: usize) -> u32 {
         match self.toks.get(idx) {
-            Some(t) => self.src.byte_range(t.start, t.start).map_or(NO_POS, |(b, _)| b),
+            Some(t) => self
+                .src
+                .byte_range(t.start, t.start)
+                .map_or(NO_POS, |(b, _)| b),
             None => NO_POS,
         }
     }
@@ -1100,7 +1086,8 @@ impl Parser {
             self.ts_note_error();
         }
         let message = msg.into();
-        let message = if message.starts_with("expected ") || message.starts_with("unexpected token") {
+        let message = if message.starts_with("expected ") || message.starts_with("unexpected token")
+        {
             self.unexpected_message()
         } else {
             message
@@ -1121,6 +1108,7 @@ impl Parser {
             Tok::Num(_) | Tok::BigInt(_) => "Unexpected number".to_string(),
             Tok::Str(_) => "Unexpected string".to_string(),
             Tok::Template(_) => "Unexpected template string".to_string(),
+            Tok::Jsx(_) => "Unexpected JSX element".to_string(),
             Tok::Ident(name) => format!("Unexpected identifier '{name}'"),
             Tok::Keyword(word) => format!("Unexpected token '{word}'"),
             Tok::Punct(p) => format!("Unexpected token '{p}'"),
@@ -1968,7 +1956,6 @@ impl Parser {
         self.last_for_await = enclosing_await;
         r
     }
-
 
     fn parse_for_inner(&mut self) -> Result<Stmt, ParseError> {
         self.advance();
@@ -2897,10 +2884,7 @@ impl Parser {
         if self.eat_punct("?") {
             // The consequent is always `AssignmentExpression[+In]`; the alternative keeps the outer
             // `[?In]`, so a `for (a ? b in c : d ;;)` head allows `in` in the consequent branch.
-            let saved = self
-                .ts
-                .as_mut()
-                .map(|t| t.set_no_ret_arrow(true));
+            let saved = self.ts.as_mut().map(|t| t.set_no_ret_arrow(true));
             let cons = self.parse_assign_allow_in();
             if let (Some(t), Some(v)) = (self.ts.as_mut(), saved) {
                 t.set_no_ret_arrow(v);
@@ -3447,6 +3431,11 @@ impl Parser {
                 self.advance();
                 self.build_template(*parts)
             }
+            Tok::Jsx(element) => {
+                self.advance();
+                self.jsx.as_ref().expect("JSX parser context").elements.borrow_mut().push(element.clone());
+                self.build_jsx(&element)
+            }
             Tok::Regex(re) => {
                 self.advance();
                 let RegexTok { body, flags } = *re;
@@ -3617,7 +3606,9 @@ impl Parser {
                 self.last_paren = false;
                 e
             }
-            Tok::Punct("%") if crate::builtins::natives::syntax_allowed() => self.parse_native_call(),
+            Tok::Punct("%") if crate::builtins::natives::syntax_allowed() => {
+                self.parse_native_call()
+            }
             other => self.err(format!("unexpected token {other:?}")),
         }
     }
@@ -3648,8 +3639,12 @@ impl Parser {
 
     /// Parse a template substitution from its tokens (see [`TplPart::Sub`]).
     fn parse_template_sub(&mut self, toks: &SubToks) -> Result<Expr, ParseError> {
-        let end = toks.0.get(toks.0.len().wrapping_sub(1)).map_or(0, |t| t.start);
+        let end = toks
+            .0
+            .get(toks.0.len().wrapping_sub(1))
+            .map_or(0, |t| t.start);
         let mut sub = Parser {
+            jsx: self.jsx.clone(),
             toks: toks.0.clone(),
             bracket_tables: Default::default(),
             pos: 0,
@@ -4193,7 +4188,10 @@ impl Parser {
             && !decorators.is_empty()
             && self.is_ident_word("abstract")
             && first > 0
-            && matches!(self.toks[first - 1].kind, Tok::Keyword("export" | "default"))
+            && matches!(
+                self.toks[first - 1].kind,
+                Tok::Keyword("export" | "default")
+            )
         {
             // Node (swc) rejects `export @dec abstract class` (decorators go before `export`).
             return self.err("Expected '{', got 'abstract'");
@@ -4281,8 +4279,10 @@ impl Parser {
             if matches!(m.kind, MemberKind::Constructor) {
                 if let Some(f) = &mut m.func {
                     if let Some(fm) = Rc::get_mut(f) {
-                        if let (FnSource::Range { start: from, .. }, FnSource::Range { start: to, .. }) =
-                            (&fm.source, &class_src)
+                        if let (
+                            FnSource::Range { start: from, .. },
+                            FnSource::Range { start: to, .. },
+                        ) = (&fm.source, &class_src)
                         {
                             remap = Some((*from, *to));
                         }
@@ -4314,7 +4314,8 @@ impl Parser {
         matches!(
             self.peek_kind(ahead),
             Tok::Punct("(") | Tok::Punct("=") | Tok::Punct(";") | Tok::Punct("}")
-        ) || (self.ts.is_some() && matches!(self.peek_kind(ahead), Tok::Punct("?" | "!" | ":" | "<")))
+        ) || (self.ts.is_some()
+            && matches!(self.peek_kind(ahead), Tok::Punct("?" | "!" | ":" | "<")))
     }
 
     /// A method's parameter list starts here (`(`, or TypeScript type parameters).
@@ -4831,7 +4832,8 @@ impl Parser {
                 // The private-name check [`parse_lazy_body`] runs: names a class inside the body
                 // declares resolve now; the rest wait in `pending_private` until the enclosing
                 // classes are complete.
-                let outer = PN_UNRESOLVED.with(|u| u.replace(Some(std::mem::take(&mut unresolved))));
+                let outer =
+                    PN_UNRESOLVED.with(|u| u.replace(Some(std::mem::take(&mut unresolved))));
                 let r = pn_stmt(&stmt, &mut Vec::new());
                 unresolved = PN_UNRESOLVED.with(|u| u.replace(outer)).unwrap_or_default();
                 r.map_err(|message| ParseError {
@@ -5022,7 +5024,8 @@ impl Parser {
             let private_scope = self.private_scope.clone();
             let expr = self.nested(Self::parse_assign)?;
             let lazy = if self.lazy {
-                let (start, end) = self.src
+                let (start, end) = self
+                    .src
                     .byte_range(expression_start, self.prev_end())
                     .expect("expression tokens lie inside the lexed source");
                 Some(Box::new(LazyBody {

@@ -138,7 +138,7 @@ pub use desc::{
     ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,
 };
 pub use host::{
-    Class, ClassItem, ConstItem, FnItem, Host, IntKind, Make, Methods, Module, ModuleItems, Native, SpawnHost, State,
+    Class, ClassItem, ConstItem, FnItem, Host, Inheritance, IntKind, Make, Methods, Module, ModuleItems, Native, SpawnHost, State,
     StateHost, This,
 };
 pub use lumen_bind_macros::{class, methods, module, op};

@@ -383,7 +383,7 @@ fn symbols() {
         "1"
     );
     assert_eq!(run("Symbol.for('k') === Symbol.for('k')"), "true"); // registry
-    // A generator body runs on a coroutine worker thread; it shares its driver's registry.
+                                                                    // A generator body runs on a coroutine worker thread; it shares its driver's registry.
     assert_eq!(
         run("var k = Symbol.for('g'); function* g() { yield Symbol.for('g') === k; yield Symbol.keyFor(k); } var it = g(); it.next().value + ',' + it.next().value"),
         "true,g"
@@ -1036,7 +1036,11 @@ fn gc_heap_reuses_dead_object_slots() {
 #[test]
 fn gc_heap_returns_chunks_emptied_by_refcount() {
     let base = crate::value::gc_heap_chunks();
-    let burst = || -> Vec<_> { (0..400_000).map(|_| crate::value::Object::new(None)).collect() };
+    let burst = || -> Vec<_> {
+        (0..400_000)
+            .map(|_| crate::value::Object::new(None))
+            .collect()
+    };
     let objects = burst();
     let grown = crate::value::gc_heap_chunks();
     assert!(grown > base + 100, "{base} -> {grown} chunks");
@@ -1057,7 +1061,10 @@ fn gc_heap_returns_chunks_emptied_by_refcount() {
     crate::value::gc_expire_purge_delay();
     crate::value::gc_trim_emptied();
     let after = crate::value::gc_heap_chunks();
-    assert!(after <= base + 4 * 16 + 1, "{base} -> {grown} -> {after} chunks");
+    assert!(
+        after <= base + 4 * 16 + 1,
+        "{base} -> {grown} -> {after} chunks"
+    );
 
     // Objects that die when a script's function returns are reclaimed through the engine's
     // safe points (the interpreter's GC poll and the microtask checkpoint).
@@ -1074,7 +1081,10 @@ fn gc_heap_returns_chunks_emptied_by_refcount() {
     crate::value::gc_expire_purge_delay();
     e.interp.drain_microtasks();
     let after = crate::value::gc_heap_chunks();
-    assert!(after <= before + 4 * 16 + 1, "{before} -> {peak} -> {after} chunks");
+    assert!(
+        after <= before + 4 * 16 + 1,
+        "{before} -> {peak} -> {after} chunks"
+    );
 }
 
 #[test]
@@ -2131,7 +2141,10 @@ fn poison_pill() {
     // Function.prototype's poison pill, which throws.
     assert_eq!(run("function f(){}; String(f.caller)"), "null");
     assert_eq!(run("function f(){}; String(f.arguments)"), "null");
-    assert_eq!(run("function f(){}; f.caller = 1; String(f.caller)"), "null");
+    assert_eq!(
+        run("function f(){}; f.caller = 1; String(f.caller)"),
+        "null"
+    );
     assert_eq!(
         throws("function f(){}; (function(){ 'use strict'; f.caller = 1; })()"),
         "TypeError"
@@ -4196,7 +4209,10 @@ fn regex_no_line_terminator() {
 #[test]
 fn regex_dot_and_anchors_line_terminators() {
     // `.` excludes \n, \r, U+2028, U+2029 (greedy runs, lazy runs and single steps alike).
-    assert_eq!(run(r#"JSON.stringify("Cookie: a=b\r\nH".match(/^Cookie: .+$/m))"#), r#"["Cookie: a=b"]"#);
+    assert_eq!(
+        run(r#"JSON.stringify("Cookie: a=b\r\nH".match(/^Cookie: .+$/m))"#),
+        r#"["Cookie: a=b"]"#
+    );
     assert_eq!(run(r#""Cookie: a=b\r\nH".match(/^Cookie: .+$/)"#), "null");
     assert_eq!(run(r#""a\rb".match(/a.*/)[0]"#), "a");
     assert_eq!(run(r#""a\u2028b".match(/a.*/)[0].length"#), "1");
@@ -4207,7 +4223,10 @@ fn regex_dot_and_anchors_line_terminators() {
     assert_eq!(run(r#"/^.$/u.test("\u2028")"#), "false");
     assert_eq!(run(r#"/[^]/.test("\r")"#), "true");
     // Multiline anchors treat all four terminators as line boundaries.
-    assert_eq!(run(r#""a\rb\u2028c\u2029d".match(/^\w$/gm).join()"#), "a,b,c,d");
+    assert_eq!(
+        run(r#""a\rb\u2028c\u2029d".match(/^\w$/gm).join()"#),
+        "a,b,c,d"
+    );
     assert_eq!(run(r#""ab\r".match(/b$/m)[0]"#), "b");
     assert_eq!(run(r#"/b$/.test("ab\r")"#), "false");
     assert_eq!(run(r#""x\r\ny\rz".split(/^/m).length"#), "4");
@@ -4302,7 +4321,10 @@ fn ta_prototype_accessors() {
         "7"
     );
     // Huge stores reduce modulo 2^bits (no saturation).
-    assert_eq!(run("var t=new Int8Array(2); t[0]=1e20; t[1]=-3e20; t.join()"), "0,0");
+    assert_eq!(
+        run("var t=new Int8Array(2); t[0]=1e20; t[1]=-3e20; t.join()"),
+        "0,0"
+    );
 }
 
 #[test]
@@ -4313,14 +4335,23 @@ fn finalization_registry_cleanup_after_gc() {
         fr.register({}, 'plain'); var kept={}; fr.register(kept,'kept');
         var tok={}; fr.register({}, 'unreg', tok); var un=fr.unregister(tok);
         var wr; (function(){ wr=new WeakRef({v:1}); })(); var sync=wr.deref().v; $262.gc(); 0";
-    assert!(matches!(e.eval(setup, false).expect("parse"), Completion::Value(_)));
-    match e.eval("fired.sort().join()+' '+un+' '+sync+' '+(wr.deref()===undefined)", false) {
+    assert!(matches!(
+        e.eval(setup, false).expect("parse"),
+        Completion::Value(_)
+    ));
+    match e.eval(
+        "fired.sort().join()+' '+un+' '+sync+' '+(wr.deref()===undefined)",
+        false,
+    ) {
         // The WeakRef target was kept only until the end of that job (then freed).
         Ok(Completion::Value(v)) => assert_eq!(v, "c0,c1,c2,plain true 1 true"),
         _ => panic!("eval failed"),
     }
     // Live and already-cleaned registrations never fire (again).
-    assert!(matches!(e.eval("$262.gc(); 0", false).expect("parse"), Completion::Value(_)));
+    assert!(matches!(
+        e.eval("$262.gc(); 0", false).expect("parse"),
+        Completion::Value(_)
+    ));
     match e.eval("fired.length", false) {
         Ok(Completion::Value(v)) => assert_eq!(v, "4"),
         _ => panic!("eval failed"),
@@ -11758,7 +11789,10 @@ fn regexp_backtrack_limit_throws_range_error() {
         assert_eq!(throws(&format!("{evil} {call}")), "RangeError", "{call}");
     }
     assert_eq!(run("/(a|b)*c/.test('ab'.repeat(5e5) + 'c')"), "true");
-    assert_eq!(run("'ab ab '.repeat(2e5).replace(/\\w+/g, 'x').length"), "800000");
+    assert_eq!(
+        run("'ab ab '.repeat(2e5).replace(/\\w+/g, 'x').length"),
+        "800000"
+    );
 }
 
 #[test]
@@ -11784,7 +11818,9 @@ fn hash_flooding_keys_stay_fast_and_js_order_stays_insertion_order() {
         )
     };
     let hostile = old_colliding_keys(&OldFx::default(), 5_000);
-    let benign: Vec<String> = (0..hostile.len()).map(|i| format!("benign-{i:05}")).collect();
+    let benign: Vec<String> = (0..hostile.len())
+        .map(|i| format!("benign-{i:05}"))
+        .collect();
     let time = |keys: &[String]| {
         let src = script(keys);
         let start = Instant::now();

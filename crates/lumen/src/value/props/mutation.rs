@@ -14,7 +14,9 @@ impl Props {
         &mut self,
         memo: &mut std::collections::HashMap<u32, Rc<Shape>>,
     ) {
-        let Some(old) = self.shape_rc.as_ref() else { return };
+        let Some(old) = self.shape_rc.as_ref() else {
+            return;
+        };
         let shape = if old.owned() {
             // Owned shapes must never become shared between objects.
             shape_owned_from(Some(old))

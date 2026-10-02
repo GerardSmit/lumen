@@ -51,6 +51,8 @@ use super::helpers::{self, FastArg, Helper, MathFn};
 
 #[path = "call.rs"]
 mod call;
+#[path = "vector.rs"]
+mod vector;
 #[path = "inline.rs"]
 mod inline;
 #[path = "inline_this.rs"]
@@ -59,10 +61,11 @@ mod inline_this;
 pub(super) mod new_plan;
 use super::layout;
 use super::*;
-use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
 use crate::bytecode::verify::successors;
+use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
+pub(crate) use crate::bytecode::op_slots;
 use lumen_codegen::{
-    BinaryOp, Block, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC, MemKind,
+    BinaryOp, Block, CheckedOp, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC, MemKind,
     Signature, Type, UnaryOp, Value as V, Variable,
 };
 use std::collections::{HashMap, HashSet};
@@ -105,7 +108,7 @@ pub(crate) fn build(
     header: usize,
     backedge: usize,
     slots: &[Value],
-    widen: &[bool],
+    widen: &[Widen],
     undef_ok: &[bool],
     this_val: &Value,
 ) -> Result<Built, String> {
@@ -118,7 +121,7 @@ pub(crate) fn build(
     let mut fresh = vec![false; n_slots];
     let lenient = undef_ok.iter().any(|&u| u);
     for s in 0..n_slots {
-        if an.touched[s] && !widen.get(s).copied().unwrap_or(false) {
+        if an.touched[s] && widen.get(s) != Some(&Widen::Boxed) {
             kinds[s] = slots.get(s).map(Kind::of).unwrap_or(Kind::Boxed);
             let local = s >= chunk.n_params
                 && chunk.arguments_slot != Some(s as u16)
@@ -161,6 +164,7 @@ pub(crate) fn build(
         fresh,
         false,
         this_val,
+        widen,
     )
 }
 
@@ -179,7 +183,7 @@ pub(crate) fn build_fn(
     env: &Env,
     chunk: &Chunk,
     slots: &[Value],
-    widen: &[bool],
+    widen: &[Widen],
     not_num: &[bool],
     guess: bool,
     this_val: &Value,
@@ -193,7 +197,7 @@ pub(crate) fn build_fn(
     }
     let an = analyze(chunk, 0, n - 1, true)?;
     let (kinds, fresh) = fn_kinds(chunk, &an, slots, widen, not_num, guess);
-    build_region(interp, env, chunk, 0, n - 1, slots, an, kinds, fresh, true, this_val)
+    build_region(interp, env, chunk, 0, n - 1, slots, an, kinds, fresh, true, this_val, widen)
 }
 
 /// Whether the method-lookup inline cache `cache` (a `GetMethod`'s ways) resolved the name on
@@ -227,13 +231,13 @@ fn fn_kinds(
     chunk: &Chunk,
     an: &Analysis,
     slots: &[Value],
-    widen: &[bool],
+    widen: &[Widen],
     not_num: &[bool],
     guess: bool,
 ) -> (Vec<Kind>, Vec<bool>) {
     let n_slots = chunk.n_slots;
     let ops = &chunk.ops;
-    let widened = |s: usize| widen.get(s).copied().unwrap_or(false);
+    let widened = |s: usize| widen.get(s) == Some(&Widen::Boxed);
     let mut kinds = vec![Kind::Boxed; n_slots];
     let mut cand = vec![false; n_slots];
     for s in 0..n_slots {
@@ -276,7 +280,7 @@ fn fn_kinds(
             _ => {}
         }
     }
-    let num_slot = |cand: &[bool], s: u16| cand[s as usize] || kinds[s as usize] == Kind::Num;
+    let num_slot = |cand: &[bool], s: u16| cand[s as usize] || kinds[s as usize].is_num();
     loop {
         let mut changed = false;
         for pc in 0..ops.len() {
@@ -367,6 +371,7 @@ fn build_region(
     fresh: Vec<bool>,
     func_mode: bool,
     this_val: &Value,
+    widen: &[Widen],
 ) -> Result<Built, String> {
     let n_slots = chunk.n_slots;
     let mut kinds = kinds;
@@ -380,11 +385,29 @@ fn build_region(
     if let Some(base) = chunk.virt_base {
         // A virtual `arguments` / rest object's count and elements are read by index from
         // memory (never written: see `Chunk::virt_base`).
-        let s = chunk.arguments_slot.or(chunk.rest_slot).map_or(0, |s| s as usize);
+        let s = chunk
+            .arguments_slot
+            .or(chunk.rest_slot)
+            .map_or(0, |s| s as usize);
         for k in (base as usize..chunk.n_params).chain([s]) {
             if let Some(k) = kinds.get_mut(k) {
                 *k = Kind::Boxed;
             }
+        }
+    }
+    for s in 0..n_slots {
+        let integer_init = fresh[s] && chunk.ops.iter().enumerate().find_map(|(pc, op)| {
+            match *op {
+                Op::StoreLocal(dst) if dst as usize == s => Some(pc.checked_sub(1)
+                    .is_some_and(|p| matches!(chunk.ops[p], Op::Const(k)
+                        if matches!(chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some())))),
+                _ => None,
+            }
+        }).unwrap_or(false);
+        if kinds[s] == Kind::Num && widen.get(s).copied().unwrap_or_default() == Widen::None
+            && ((!fresh[s] && slots.get(s).is_some_and(|v| Kind::Int32.accepts(v))) || integer_init)
+        {
+            kinds[s] = Kind::Int32;
         }
     }
     let defd = Defd::new(chunk, header, backedge, &an, &fresh, None);
@@ -392,8 +415,12 @@ fn build_region(
         .map(|s| an.tdz[s] && kinds[s] != Kind::Boxed)
         .collect();
     let tdzd = Defd::new(chunk, header, backedge, &an, &tdz_ssa, Some(func_mode));
-    let mut plan = plan(interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd);
-    call::plan_direct(&mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode);
+    let mut plan = plan(
+        interp, env, chunk, header, backedge, slots, &an, &kinds, &defd, &tdzd,
+    );
+    call::plan_direct(
+        &mut plan, interp, env, chunk, header, backedge, slots, this_val, &an, &kinds, func_mode,
+    );
     // A `get` / `set` / ... site that became a direct JS call is a user method: keep that.
     {
         let (direct, dmethod) = (&plan.direct, &plan.dmethod);
@@ -430,9 +457,9 @@ fn build_region(
 
     let mut func = Function::new(
         if func_mode {
-            format!("fn_{}", chunk.ops.len())
+            format!("{}@{:p}", chunk.debug_name, chunk)
         } else {
-            format!("loop_{header}_{backedge}")
+            format!("{}@{:p}:loop_{header}_{backedge}", chunk.debug_name, chunk)
         },
         Signature::new(vec![PTR], vec![Type::I64]),
     );
@@ -470,6 +497,7 @@ fn build_region(
         }
 
         let mut tr = Tr {
+            prefetch: interp.jit_prefetch,
             pending_seal: Vec::new(),
             chunk,
             ops: &chunk.ops,
@@ -565,7 +593,9 @@ fn build_region(
         let size = frame_bytes(n_slots, max_stack) as i64;
         for v in self_sizes {
             if let lumen_codegen::ir::ValueDef::Result(inst, _) = func.values[v.index()].def {
-                if let lumen_codegen::ir::InstData::Iconst { imm, .. } = &mut func.insts[inst.index()] {
+                if let lumen_codegen::ir::InstData::Iconst { imm, .. } =
+                    &mut func.insts[inst.index()]
+                {
                     *imm = size;
                 }
             }
@@ -753,30 +783,6 @@ impl Defd {
     }
 }
 
-/// The slots `op` reads or writes.
-pub(crate) fn op_slots(op: &Op) -> Vec<u16> {
-    match *op {
-        Op::LoadLocal(s)
-        | Op::StoreLocal(s)
-        | Op::UpdateLocal(s, _)
-        | Op::Tdz(s)
-        | Op::GetPropLocal(s, ..)
-        | Op::SetPropLocalDrop(s, ..)
-        | Op::GetElemLocal(s)
-        | Op::SetElemLocal(s)
-        | Op::SetElemLocalDrop(s)
-        | Op::ToPropKeyLocal(s)
-        | Op::IterCloseL(s)
-        | Op::IterAbortL(s) => vec![s],
-        Op::IterStepL(a, b) | Op::IterRestL(a, b) | Op::JumpIfNotCmpLL(_, a, b, _) => vec![a, b],
-        Op::JumpIfNotCmpLK(_, a, ..) => vec![a],
-        Op::ArithLL(_, d, a, b) => vec![d, a, b],
-        Op::ArithLK(_, d, a, _) => vec![d, a],
-        Op::ForInStepL(a, b, c) => vec![a, b, c],
-        _ => Vec::new(),
-    }
-}
-
 fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<Analysis, String> {
     let ops = &chunk.ops;
     if header > backedge || backedge >= ops.len() {
@@ -787,7 +793,8 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
             "op at {backedge} is not the backward jump to {header}"
         ));
     }
-    let (depth, hs, _) = crate::bytecode::verify::stack_region(chunk, header, backedge, func, true)?;
+    let (depth, hs, _) =
+        crate::bytecode::verify::stack_region(chunk, header, backedge, func, true)?;
     let inr = |pc: usize| pc >= header && pc <= backedge;
     let n = backedge - header + 1;
     let mut leader = vec![false; n];
@@ -842,7 +849,8 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
     // the stretch from pc 0 to the first `await` has a loop (ops reachable without passing an
     // `await`; see also `resume_on`).
     let awaits = func
-        && (header..=backedge).any(|pc| depth[pc - header].is_some() && matches!(ops[pc], Op::Await));
+        && (header..=backedge)
+            .any(|pc| depth[pc - header].is_some() && matches!(ops[pc], Op::Await));
     if awaits {
         let mut seen = vec![false; n];
         let mut work = vec![header];
@@ -934,6 +942,7 @@ impl Src {
 /// What the translator decides before emitting anything (see [`plan`]).
 #[derive(Default)]
 struct Plan {
+    atomic_calls: HashSet<usize>,
     /// `GetPropLocal` sites seen producing a non-Number at translation (see [`Tr::want_num`]).
     not_num: HashSet<usize>,
     /// `LoadName` sites translated as a borrowed binding address.
@@ -1067,9 +1076,29 @@ fn plan(
     let ops = &chunk.ops;
     let reach = |pc: usize| an.depth[pc - header].is_some();
     let lead = |pc: usize| an.leader[pc - header];
-    let num_slot = |s: u16| kinds[s as usize] == Kind::Num;
+    let num_slot = |s: u16| kinds[s as usize].is_num();
     let is_len = |n: u32| chunk.names.get(n as usize).is_some_and(|x| &**x == "length");
     let mut p = Plan::default();
+    if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        for pc in header + 1..=backedge {
+            let Op::GetMethod(name, _) = ops[pc] else { continue };
+            let argc = match &*chunk.names[name as usize] {
+                "add" => 3, "compareExchange" => 4, _ => continue,
+            };
+            let Op::LoadName(object, _) = ops[pc - 1] else { continue };
+            if &*chunk.names[object as usize] != "Atomics" { continue; }
+            let Some(depth) = an.depth[pc - header] else { continue };
+            for q in pc + 1..=backedge {
+                if lead(q) { break; }
+                if matches!(ops[q], Op::CallWithThis(n) | Op::TailCall(n, true) if n == argc)
+                    && an.depth[q - header] == Some(depth + 1 + argc as usize)
+                {
+                    p.atomic_calls.insert(q);
+                    break;
+                }
+            }
+        }
+    }
     let add_ptr = |p: &mut Plan, s: Src| {
         if !p.ptr_srcs.contains(&s) {
             p.ptr_srcs.push(s);
@@ -1082,75 +1111,81 @@ fn plan(
     // `plain`: the window ends in a `Call` (a callee without receiver) instead.
     // `nest`: the arguments may hold `Math.g(<Number args>)` sites (one level deep), each
     // collected into the third result by its `LoadName` pc.
-    let site_args_n = |from: usize, plain: bool, nest: bool| -> Option<(usize, Vec<bool>, Vec<usize>)> {
-        let mut st: Vec<bool> = Vec::new();
-        let mut outer: Option<(Vec<bool>, usize, usize)> = None;
-        let mut inner: Vec<usize> = Vec::new();
-        let mut q = from;
-        while q <= backedge {
-            if lead(q) {
-                return None;
-            }
-            match ops[q] {
-                Op::LoadName(..) if nest && outer.is_none() && q + 1 <= backedge && !lead(q + 1) => {
-                    let Op::GetMethod(m, _) = ops[q + 1] else { return None };
-                    let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
-                    if helpers::math_site_failed(chunk, q) {
-                        return None;
+    let site_args_n =
+        |from: usize, plain: bool, nest: bool| -> Option<(usize, Vec<bool>, Vec<usize>)> {
+            let mut st: Vec<bool> = Vec::new();
+            let mut outer: Option<(Vec<bool>, usize, usize)> = None;
+            let mut inner: Vec<usize> = Vec::new();
+            let mut q = from;
+            while q <= backedge {
+                if lead(q) {
+                    return None;
+                }
+                match ops[q] {
+                    Op::LoadName(..)
+                        if nest && outer.is_none() && q + 1 <= backedge && !lead(q + 1) =>
+                    {
+                        let Op::GetMethod(m, _) = ops[q + 1] else {
+                            return None;
+                        };
+                        let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
+                        if helpers::math_site_failed(chunk, q) {
+                            return None;
+                        }
+                        outer = Some((std::mem::take(&mut st), q, f.arity()));
+                        q += 2;
+                        continue;
                     }
-                    outer = Some((std::mem::take(&mut st), q, f.arity()));
-                    q += 2;
-                    continue;
-                }
-                Op::CallWithThis(argc) if outer.is_some() => {
-                    let (prev, at, arity) = outer.take().expect("nested site");
-                    if argc as usize != st.len() || st.len() != arity || !st.iter().all(|&n| n) {
-                        return None;
+                    Op::CallWithThis(argc) if outer.is_some() => {
+                        let (prev, at, arity) = outer.take().expect("nested site");
+                        if argc as usize != st.len() || st.len() != arity || !st.iter().all(|&n| n)
+                        {
+                            return None;
+                        }
+                        st = prev;
+                        st.push(true);
+                        inner.push(at);
                     }
-                    st = prev;
-                    st.push(true);
-                    inner.push(at);
-                }
-                Op::CallWithThis(argc) if !plain => {
-                    return (argc as usize == st.len()).then_some((q, st, inner));
-                }
-                Op::Call(argc) if plain && outer.is_none() => {
-                    return (argc as usize == st.len()).then_some((q, st, inner));
-                }
-                Op::LoadLocal(s)
-                    if !tdzd.maybe_undef(s as usize, q)
-                        && !defd.maybe_undef(s as usize, q)
-                        && kinds[s as usize] != Kind::Boxed =>
-                {
-                    st.push(num_slot(s))
-                }
-                Op::Const(k) => match chunk.consts[k as usize] {
-                    Value::Num(_) => st.push(true),
-                    Value::Bool(_) => st.push(false),
+                    Op::CallWithThis(argc) if !plain => {
+                        return (argc as usize == st.len()).then_some((q, st, inner));
+                    }
+                    Op::Call(argc) if plain && outer.is_none() => {
+                        return (argc as usize == st.len()).then_some((q, st, inner));
+                    }
+                    Op::LoadLocal(s)
+                        if !tdzd.maybe_undef(s as usize, q)
+                            && !defd.maybe_undef(s as usize, q)
+                            && kinds[s as usize] != Kind::Boxed =>
+                    {
+                        st.push(num_slot(s))
+                    }
+                    Op::Const(k) => match chunk.consts[k as usize] {
+                        Value::Num(_) => st.push(true),
+                        Value::Bool(_) => st.push(false),
+                        _ => return None,
+                    },
+                    Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
+                    | Op::BitAnd
+                    | Op::BitOr
+                    | Op::BitXor
+                    | Op::Shl
+                    | Op::Shr
+                    | Op::UShr
+                        if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
+                    {
+                        st.pop();
+                    }
+                    Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
                     _ => return None,
-                },
-                Op::Add
-                | Op::Sub
-                | Op::Mul
-                | Op::Div
-                | Op::Mod
-                | Op::BitAnd
-                | Op::BitOr
-                | Op::BitXor
-                | Op::Shl
-                | Op::Shr
-                | Op::UShr
-                    if st.len() >= 2 && st[st.len() - 1] && st[st.len() - 2] =>
-                {
-                    st.pop();
                 }
-                Op::Neg | Op::Plus | Op::BitNot if st.last() == Some(&true) => {}
-                _ => return None,
+                q += 1;
             }
-            q += 1;
-        }
-        None
-    };
+            None
+        };
     let site_args = |from: usize, plain: bool| -> Option<(usize, Vec<bool>)> {
         site_args_n(from, plain, false).map(|(c, st, _)| (c, st))
     };
@@ -1172,7 +1207,9 @@ fn plan(
         let (call, args, inner) = site_args_n(pc + if lfc { 1 } else { 2 }, false, true)?;
         if !inner.is_empty() {
             // Nested sites: only for an outer `Math` intrinsic (its guard checks them too).
-            let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) else { return None };
+            let (false, Op::GetMethod(m, _)) = (lfc, ops[pc + 1]) else {
+                return None;
+            };
             let f = helpers::math_intrinsic(chunk.names.get(m as usize)?)?;
             if args.len() != f.arity() || !args.iter().all(|&n| n) {
                 return None;
@@ -1305,7 +1342,9 @@ fn plan(
                     add_ptr(&mut p, Src::Glob(n));
                     let num = chunk.name_global_slot(interp, env, c).is_some_and(|s| {
                         interp.global.try_borrow().is_ok_and(|g| {
-                            g.props.entry_at(s).is_some_and(|e| matches!(e.value(), Value::Num(_)))
+                            g.props
+                                .entry_at(s)
+                                .is_some_and(|e| matches!(e.value(), Value::Num(_)))
                         })
                     });
                     if num {
@@ -1359,8 +1398,14 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, c) = ops[pc] else { continue };
-        if chunk.names.get(m as usize).and_then(|n| helpers::str_intrinsic(n)).is_none()
+        let Op::GetMethod(m, c) = ops[pc] else {
+            continue;
+        };
+        if chunk
+            .names
+            .get(m as usize)
+            .and_then(|n| helpers::str_intrinsic(n))
+            .is_none()
             || ic_saw_object(interp, chunk, c)
         {
             continue;
@@ -1383,7 +1428,9 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, c) = ops[pc] else { continue };
+        let Op::GetMethod(m, c) = ops[pc] else {
+            continue;
+        };
         if !chunk
             .names
             .get(m as usize)
@@ -1449,7 +1496,9 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        let Op::GetMethod(m, _) = ops[pc] else {
+            continue;
+        };
         let Some((_, set)) = chunk
             .names
             .get(m as usize)
@@ -1466,7 +1515,12 @@ fn plan(
             match ops[q] {
                 Op::CallWithThis(n) => {
                     let n = n as usize;
-                    let ok = n == st.len() && if set { (2..=3).contains(&n) } else { (1..=2).contains(&n) };
+                    let ok = n == st.len()
+                        && if set {
+                            (2..=3).contains(&n)
+                        } else {
+                            (1..=2).contains(&n)
+                        };
                     break ok.then_some(q);
                 }
                 Op::LoadLocal(s)
@@ -1517,7 +1571,9 @@ fn plan(
         {
             continue;
         }
-        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        let Op::GetMethod(m, _) = ops[pc] else {
+            continue;
+        };
         if !chunk
             .names
             .get(m as usize)
@@ -1573,18 +1629,32 @@ fn plan(
     // `GetMethod` (see `Tr::arr_begin`); the one argument is a pure value (it runs after the
     // guard, so it can't invalidate it).
     for pc in header..=backedge {
-        if !reach(pc) || helpers::math_site_failed(chunk, pc) || p.math.contains_key(&pc.wrapping_sub(1)) {
+        if !reach(pc)
+            || helpers::math_site_failed(chunk, pc)
+            || p.math.contains_key(&pc.wrapping_sub(1))
+        {
             continue;
         }
-        let Op::GetMethod(m, _) = ops[pc] else { continue };
+        let Op::GetMethod(m, _) = ops[pc] else {
+            continue;
+        };
         if chunk.names.get(m as usize).map(|n| &**n) != Some("push") {
             continue;
         }
         let call = match site_args(pc + 1, false) {
             Some((call, args)) if args.len() == 1 => Some(call),
-            _ if pc + 2 <= backedge && !lead(pc + 1) && !lead(pc + 2) && matches!(ops[pc + 2], Op::CallWithThis(1)) => {
+            _ if pc + 2 <= backedge
+                && !lead(pc + 1)
+                && !lead(pc + 2)
+                && matches!(ops[pc + 2], Op::CallWithThis(1)) =>
+            {
                 match ops[pc + 1] {
-                    Op::LoadLocal(s) if !tdzd.maybe_undef(s as usize, pc + 1) && !defd.maybe_undef(s as usize, pc + 1) => Some(pc + 2),
+                    Op::LoadLocal(s)
+                        if !tdzd.maybe_undef(s as usize, pc + 1)
+                            && !defd.maybe_undef(s as usize, pc + 1) =>
+                    {
+                        Some(pc + 2)
+                    }
                     Op::Const(_) | Op::Undef => Some(pc + 2),
                     _ => None,
                 }
@@ -1651,9 +1721,13 @@ fn plan(
     for pc in header..=backedge.min(ops.len() - 1) {
         if let Op::GetPropLocal(s, n, _) = ops[pc] {
             if reach(pc)
-                && slots.get(s as usize).zip(chunk.names.get(n as usize)).is_some_and(|(o, name)| {
-                    helpers::own_data(interp, o, name).is_some_and(|v| !matches!(v, Value::Num(_)))
-                })
+                && slots
+                    .get(s as usize)
+                    .zip(chunk.names.get(n as usize))
+                    .is_some_and(|(o, name)| {
+                        helpers::own_data(interp, o, name)
+                            .is_some_and(|v| !matches!(v, Value::Num(_)))
+                    })
             {
                 p.not_num.insert(pc);
             }
@@ -1762,6 +1836,7 @@ enum Opnd {
 }
 
 struct Tr<'a, 'f> {
+    prefetch: bool,
     /// See [`Built::num_exits`].
     num_exits: Vec<usize>,
     /// The shared ends of exits (see [`Tr::exit_tail`]): `[without, with]` the write-back of
@@ -1947,6 +2022,58 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn call(&mut self, h: Helper, args: &[V]) -> Option<V> {
         let f = self.helper(h);
         self.fb.call_fn(f, args).first().copied()
+    }
+
+    /// All guards precede the lease. The inlined operation cannot call JS or exit
+    /// until the shared backing lock is released, so fallback never repeats an RMW.
+    fn atomic_call_begin(&mut self, base: usize, argc: usize) -> Block {
+        let slow = self.fb.create_block();
+        let done = self.fb.create_block();
+        let mut numbers = Vec::new();
+        for at in base + 3..base + 2 + argc {
+            let tag = self.stack_tag(at);
+            let number = self.i32c(TAG_NUM as i64);
+            let ok = self.fb.icmp(IntCC::Eq, tag, number);
+            self.guard_to(ok, slow);
+            numbers.push(self.stack_num(at));
+        }
+        let mut operands = Vec::new();
+        for &n in &numbers[1..] {
+            let (v, bad) = self.int32_parts(n);
+            let zero = self.i32c(0);
+            let ok = self.fb.icmp(IntCC::Eq, bad, zero);
+            self.guard_to(ok, slow);
+            operands.push(v);
+        }
+        let callee = self.sptr(base + 1);
+        let target = self.sptr(base + 2);
+        let count = self.i32c(argc as i64);
+        let tagged = self.call(Helper::AtomicPrepare, &[self.frame, callee, target, numbers[0], count])
+            .expect("AtomicPrepare returns a pointer");
+        let zero = self.ptrc(0);
+        let ok = self.fb.icmp(IntCC::Ne, tagged, zero);
+        self.guard_to(ok, slow);
+        let mask = self.ptrc(-4);
+        let pointer = self.fb.binary(BinaryOp::Band, tagged, mask);
+        let id = if argc == 3 { lumen_codegen::atomics::ADD32 } else { lumen_codegen::atomics::COMPARE_EXCHANGE32 };
+        let function = self.fb.func.import_function(lumen_codegen::atomics::signature(id).unwrap(), id);
+        let mut args = vec![pointer];
+        args.extend(operands);
+        let old = self.fb.call_fn(function, &args)[0];
+        self.call(Helper::AtomicRelease, &[self.frame]);
+        let signed = self.fb.convert(ConvOp::FromSint, Type::F64, old);
+        let wide = self.fb.convert(ConvOp::Uext, Type::I64, old);
+        let unsigned = self.fb.convert(ConvOp::FromSint, Type::F64, wide);
+        let one = self.ptrc(1);
+        let kind = self.fb.binary(BinaryOp::Band, tagged, one);
+        let is_unsigned = self.fb.icmp(IntCC::Ne, kind, zero);
+        let result = self.fb.select(is_unsigned, unsigned, signed);
+        for at in base..self.stack.len() { self.drop_at(at); }
+        self.store_entry(base, Entry::Num(result));
+        self.fb.jump(done, &[]);
+        self.fb.seal_block(slow);
+        self.fb.switch_to_block(slow);
+        done
     }
 
     fn call_status(&mut self, h: Helper, args: &[V]) -> V {
@@ -2305,7 +2432,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         // out.
         let zero = self.i32c(0);
         let is2 = self.fb.icmp(IntCC::Eq, s2, zero);
-        let w = self.fb.load(MemKind::I32, gc, crate::value::GC_WEAK_OFFSET as i32);
+        let w = self
+            .fb
+            .load(MemKind::I32, gc, crate::value::GC_WEAK_OFFSET as i32);
         let flag = self.i32c(crate::value::FN_PAIR_FLAG as i64);
         let fl = self.fb.binary(BinaryOp::Band, w, flag);
         let paired = self.fb.icmp(IntCC::Ne, fl, zero);
@@ -2354,9 +2483,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 continue;
             }
             let off = s as i32 * VALUE_SIZE;
-            let v = self.fb.use_var(var);
+            let mut v = self.fb.use_var(var);
+            if self.kinds[s] == Kind::Int32 {
+                v = self.fb.convert(ConvOp::FromSint, Type::F64, v);
+            }
             let tag = match self.kinds[s] {
-                Kind::Num => {
+                Kind::Num | Kind::Int32 => {
                     self.fb
                         .store(MemKind::F64, self.slots, v, off + VALUE_PAYLOAD);
                     TAG_NUM
@@ -2688,7 +2820,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         for s in 0..self.kinds.len() {
             let ty = match self.kinds[s] {
                 Kind::Num => Type::F64,
-                Kind::Bool => Type::I32,
+                Kind::Bool | Kind::Int32 => Type::I32,
                 Kind::Boxed => continue,
             };
             self.vars[s] = Some(self.fb.declare_var(ty));
@@ -2719,7 +2851,7 @@ impl<'a, 'f> Tr<'a, 'f> {
         });
         for s in 0..self.kinds.len() {
             let tag = match self.kinds[s] {
-                Kind::Num => TAG_NUM,
+                Kind::Num | Kind::Int32 => TAG_NUM,
                 Kind::Bool => TAG_BOOL,
                 Kind::Boxed => continue,
             };
@@ -2744,6 +2876,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let p = self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD);
                 let z = self.fb.f64const(0.0);
                 let v = self.fb.select(is_num, p, z);
+                let v = if self.kinds[s] == Kind::Int32 {
+                    let (i, bad) = self.int32_parts(v);
+                    let next = self.fb.create_block();
+                    self.fb.brif(bad, fail, &[], next, &[]);
+                    self.fb.seal_block(next);
+                    self.fb.switch_to_block(next);
+                    i
+                } else { v };
                 self.fb.def_var(var, v);
                 let one = self.i32c(1);
                 let zero = self.i32c(0);
@@ -2753,7 +2893,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             if self.fresh[s] {
                 // `undefined` at every entry: nothing to load or guard.
-                let z = self.fb.f64const(0.0);
+                let z = if self.kinds[s] == Kind::Int32 { self.i32c(0) } else { self.fb.f64const(0.0) };
                 self.fb.def_var(var, z);
                 let one = self.i32c(1);
                 self.fb.def_var(self.undef[s].expect("declared"), one);
@@ -2768,9 +2908,17 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(next);
             self.fb.switch_to_block(next);
             let v = match self.kinds[s] {
-                Kind::Num => self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD),
+                Kind::Num | Kind::Int32 => self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD),
                 _ => self.fb.load(MemKind::I32U8, self.slots, off + VALUE_BOOL),
             };
+            let v = if self.kinds[s] == Kind::Int32 {
+                let (i, bad) = self.int32_parts(v);
+                let next = self.fb.create_block();
+                self.fb.brif(bad, fail, &[], next, &[]);
+                self.fb.seal_block(next);
+                self.fb.switch_to_block(next);
+                i
+            } else { v };
             self.fb.def_var(var, v);
         }
         if let Some((_, join)) = resume {
@@ -2811,7 +2959,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             let op = self.ops[pc];
             let (elem, local) = match op {
                 Op::GetElem | Op::SetElem | Op::SetElemDrop => (true, None),
-                Op::GetElemLocal(s) | Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => (true, Some(s)),
+                Op::GetElemLocal(s) | Op::SetElemLocal(s) | Op::SetElemLocalDrop(s) => {
+                    (true, Some(s))
+                }
                 Op::GetProp(..) | Op::GetPropThis(..) => (false, None),
                 Op::GetPropLocal(s, ..) => (false, Some(s)),
                 _ => continue,
@@ -2824,8 +2974,14 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             if elem {
                 elem_sites.push(pc);
-            } else if let Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) = op {
-                if self.chunk.names.get(n as usize).is_some_and(|x| &**x == "length") {
+            } else if let Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) = op
+            {
+                if self
+                    .chunk
+                    .names
+                    .get(n as usize)
+                    .is_some_and(|x| &**x == "length")
+                {
                     len_sites.push(pc);
                 }
             }
@@ -2892,7 +3048,13 @@ impl<'a, 'f> Tr<'a, 'f> {
                 epoch: self.fb.declare_var(Type::I32),
             };
             let (zp, z32) = (self.ptrc(0), self.i32c(0));
-            for (v, z) in [(t.obj, zp), (t.ok, z32), (t.data, zp), (t.len, zp), (t.epoch, z32)] {
+            for (v, z) in [
+                (t.obj, zp),
+                (t.ok, z32),
+                (t.data, zp),
+                (t.len, zp),
+                (t.epoch, z32),
+            ] {
                 self.fb.def_var(v, z);
             }
             self.dv_vars.insert(pc, t);
@@ -2902,7 +3064,12 @@ impl<'a, 'f> Tr<'a, 'f> {
                 Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) => n,
                 _ => continue,
             };
-            if self.chunk.names.get(n as usize).is_none_or(|x| &**x != "byteLength") {
+            if self
+                .chunk
+                .names
+                .get(n as usize)
+                .is_none_or(|x| &**x != "byteLength")
+            {
                 continue;
             }
             let t = DvVars {
@@ -2984,7 +3151,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn resume_slots(&mut self, an: &Analysis, fail: Block) {
         for s in 0..self.kinds.len() {
             let (num, tag) = match self.kinds[s] {
-                Kind::Num => (true, TAG_NUM),
+                Kind::Num | Kind::Int32 => (true, TAG_NUM),
                 Kind::Bool => (false, TAG_BOOL),
                 Kind::Boxed => continue,
             };
@@ -3011,6 +3178,18 @@ impl<'a, 'f> Tr<'a, 'f> {
             } else {
                 self.fb.load(MemKind::I32U8, self.slots, off + VALUE_BOOL)
             };
+            let v = if self.kinds[s] == Kind::Int32 {
+                // An Empty payload is unspecified; its value is hidden until the TDZ clears.
+                let z = self.fb.f64const(0.0);
+                let unset = self.fb.binary(BinaryOp::Bor, is_empty, is_undef);
+                let v = self.fb.select(unset, z, v);
+                let (i, bad) = self.int32_parts(v);
+                let next = self.fb.create_block();
+                self.fb.brif(bad, fail, &[], next, &[]);
+                self.fb.seal_block(next);
+                self.fb.switch_to_block(next);
+                i
+            } else { v };
             self.fb.def_var(self.vars[s].expect("declared"), v);
             if let Some(f) = self.undef[s] {
                 self.fb.def_var(f, is_undef);
@@ -3082,6 +3261,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                 "abstract depth at {pc}"
             );
             self.hs_cur.clone_from(&an.hs[i]);
+            if self.stack.is_empty() { self.vector_prefix(pc); }
             self.op(pc)?;
         }
         Ok(())
@@ -3126,7 +3306,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                     | Op::Le
                     | Op::Ge => true,
                     Op::JumpIfNotCmp(k, _) => !is_eq_kind(k),
-                    Op::StoreLocal(s) => self.kinds[s as usize] == Kind::Num,
+                    Op::StoreLocal(s) => self.kinds[s as usize].is_num(),
                     // `+` concatenates strings: only speculate when the other side is a Number.
                     Op::Add => {
                         (pos == 1
@@ -3136,7 +3316,7 @@ impl<'a, 'f> Tr<'a, 'f> {
                             || (pos == 0
                                 && q == pc + 2
                                 && match self.ops[pc + 1] {
-                                    Op::LoadLocal(s) => self.kinds[s as usize] == Kind::Num,
+                                    Op::LoadLocal(s) => self.kinds[s as usize].is_num(),
                                     Op::Const(k) => {
                                         matches!(self.chunk.consts[k as usize], Value::Num(_))
                                     }
@@ -3242,36 +3422,38 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// come out of that reduction as NaN, which saturates to 0 — ToInt32's answer.
     fn to_int32(&mut self, x: V) -> V {
         #[cfg(target_arch = "aarch64")]
-        { return self.fb.convert(ConvOp::ToJsInt32, Type::I32, x); }
+        {
+            return self.fb.convert(ConvOp::ToJsInt32, Type::I32, x);
+        }
         #[cfg(not(target_arch = "aarch64"))]
         {
-        // |x| < 2^63: the truncation to I64 is exact and its low 32 bits are ToInt32 (native
-        // targets use the plain conversion, as in `to_index`; wasm32's traps, so it saturates).
-        // Otherwise (huge, infinite, NaN) reduce modulo 2^32 first, out of line.
-        let ax = self.fb.unary(UnaryOp::Fabs, x);
-        let lim = self.fb.f64const(9223372036854775808.0);
-        let small = self.fb.fcmp(FloatCC::Lt, ax, lim);
-        let fast = self.fb.create_block();
-        let big = self.fb.create_block();
-        let done = self.fb.create_block();
-        let r = self.fb.append_block_param(done, Type::I32);
-        self.fb.brif(small, fast, &[], big, &[]);
-        self.fb.seal_block(fast);
-        self.fb.seal_block(big);
-        self.fb.switch_to_block(fast);
-        #[cfg(target_arch = "wasm32")]
-        let op = ConvOp::ToSintSat;
-        #[cfg(not(target_arch = "wasm32"))]
-        let op = ConvOp::ToSint;
-        let t = self.fb.convert(op, Type::I64, x);
-        let w = self.fb.convert(ConvOp::Wrap, Type::I32, t);
-        self.fb.jump(done, &[w]);
-        self.fb.switch_to_block(big);
-        let w = self.to_int32_big(x);
-        self.fb.jump(done, &[w]);
-        self.fb.seal_block(done);
-        self.fb.switch_to_block(done);
-        r
+            // |x| < 2^63: the truncation to I64 is exact and its low 32 bits are ToInt32 (native
+            // targets use the plain conversion, as in `to_index`; wasm32's traps, so it saturates).
+            // Otherwise (huge, infinite, NaN) reduce modulo 2^32 first, out of line.
+            let ax = self.fb.unary(UnaryOp::Fabs, x);
+            let lim = self.fb.f64const(9223372036854775808.0);
+            let small = self.fb.fcmp(FloatCC::Lt, ax, lim);
+            let fast = self.fb.create_block();
+            let big = self.fb.create_block();
+            let done = self.fb.create_block();
+            let r = self.fb.append_block_param(done, Type::I32);
+            self.fb.brif(small, fast, &[], big, &[]);
+            self.fb.seal_block(fast);
+            self.fb.seal_block(big);
+            self.fb.switch_to_block(fast);
+            #[cfg(target_arch = "wasm32")]
+            let op = ConvOp::ToSintSat;
+            #[cfg(not(target_arch = "wasm32"))]
+            let op = ConvOp::ToSint;
+            let t = self.fb.convert(op, Type::I64, x);
+            let w = self.fb.convert(ConvOp::Wrap, Type::I32, t);
+            self.fb.jump(done, &[w]);
+            self.fb.switch_to_block(big);
+            let w = self.to_int32_big(x);
+            self.fb.jump(done, &[w]);
+            self.fb.seal_block(done);
+            self.fb.switch_to_block(done);
+            r
         }
     }
 
@@ -3525,7 +3707,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(n4);
         self.fb.switch_to_block(b_str);
         let h = self.fb.load(PTR_MEM, p, VALUE_PAYLOAD);
-        let len = self.fb.load(MemKind::I32, h, crate::lstr::LSTR_LEN_OFFSET as i32);
+        let len = self
+            .fb
+            .load(MemKind::I32, h, crate::lstr::LSTR_LEN_OFFSET as i32);
         let t = self.fb.icmp(IntCC::Ne, len, zero);
         if let Some(i) = drop_idx {
             self.drop_at(i);
@@ -3805,6 +3989,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 };
                 let base = d - argc as usize - 1 - with_this as usize;
                 self.box_from(base);
+                let atomic_done = if self.plan.atomic_calls.contains(&pc) {
+                    Some(self.atomic_call_begin(base, argc as usize))
+                } else { None };
                 let (bv, av, wv) = (
                     self.i32c(base as i64),
                     self.i32c(argc as i64),
@@ -3816,6 +4003,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.throw_if(st, pc, &below, base);
                 self.stack.truncate(base);
                 self.stack.push(Entry::Boxed);
+                if let Some(done) = atomic_done {
+                    self.fb.jump(done, &[]);
+                    self.fb.seal_block(done);
+                    self.fb.switch_to_block(done);
+                }
             }
             Op::CallSpread(argc) | Op::CallSpreadThis(argc) => {
                 let with_this = matches!(op, Op::CallSpreadThis(_));
@@ -3886,7 +4078,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                     Op::MakeArray(_) => {
                         self.call(Helper::AllocArr, &[self.frame, bp, nv]);
                     }
-                    Op::MakeObject(start, _, tidx) if self.lit_template(start, n, tidx).is_some() => {
+                    Op::MakeObject(start, _, tidx)
+                        if self.lit_template(start, n, tidx).is_some() =>
+                    {
                         let t = self.lit_template(start, n, tidx).expect("checked");
                         let tp = self.ptrc(t as i64);
                         self.call(Helper::AllocObj, &[self.frame, tp, bp, nv]);
@@ -4017,7 +4211,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 _ if matches!(op, Op::Neg | Op::Plus) => {
                     self.box_from(d - 1);
                     let plus = matches!(op, Op::Plus);
-                    let code = if plus { helpers::BIN_PLUS } else { helpers::BIN_NEG };
+                    let code = if plus {
+                        helpers::BIN_PLUS
+                    } else {
+                        helpers::BIN_NEG
+                    };
                     let code = self.i32c(code as i64);
                     // The result lands in the operand's slot (the helper moves the operand out
                     // first).
@@ -4138,12 +4336,32 @@ impl<'a, 'f> Tr<'a, 'f> {
                 (Entry::Boxed, Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let obj = self.sptr(d - 2);
-                    self.elem_read(pc, obj, key, Some(d - 2), d - 2, want, Slow::Generic, None, None);
+                    self.elem_read(
+                        pc,
+                        obj,
+                        key,
+                        Some(d - 2),
+                        d - 2,
+                        want,
+                        Slow::Generic,
+                        None,
+                        None,
+                    );
                 }
                 (Entry::Ref(obj, src), Entry::Num(key)) => {
                     let want = self.want_num(pc, d - 2);
                     let fact = self.idx_fact_at(pc, src);
-                    self.elem_read(pc, obj, key, None, d - 2, want, Slow::Generic, fact, Some(src));
+                    self.elem_read(
+                        pc,
+                        obj,
+                        key,
+                        None,
+                        d - 2,
+                        want,
+                        Slow::Generic,
+                        fact,
+                        Some(src),
+                    );
                 }
                 (o @ (Entry::Boxed | Entry::Ref(..)), Entry::Boxed) => {
                     // A String key on a plain object: a data property natively.
@@ -4311,7 +4529,17 @@ impl<'a, 'f> Tr<'a, 'f> {
                         let want = self.want_num(pc, d - 1);
                         let obj = self.slot_ptr(s as usize);
                         let fact = self.idx_fact_at(pc, Src::Slot(s));
-                        self.elem_read(pc, obj, key, None, d - 1, want, Slow::Generic, fact, Some(Src::Slot(s)));
+                        self.elem_read(
+                            pc,
+                            obj,
+                            key,
+                            None,
+                            d - 1,
+                            want,
+                            Slow::Generic,
+                            fact,
+                            Some(Src::Slot(s)),
+                        );
                     }
                     _ => self.generic(pc),
                 }
@@ -4319,12 +4547,40 @@ impl<'a, 'f> Tr<'a, 'f> {
             Op::SetElem | Op::SetElemDrop => {
                 let keep = matches!(op, Op::SetElem);
                 match (self.stack[d - 3], self.stack[d - 2], self.stack[d - 1]) {
-                    (Entry::Boxed, Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
+                    (
+                        Entry::Boxed,
+                        Entry::Num(key),
+                        v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..)),
+                    ) => {
                         let obj = self.sptr(d - 3);
-                        self.elem_write(pc, obj, key, v, Some(d - 3), keep, d - 3, Slow::Generic, None);
+                        self.elem_write(
+                            pc,
+                            obj,
+                            key,
+                            v,
+                            Some(d - 3),
+                            keep,
+                            d - 3,
+                            Slow::Generic,
+                            None,
+                        );
                     }
-                    (Entry::Ref(obj, src), Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..))) => {
-                        self.elem_write(pc, obj, key, v, None, keep, d - 3, Slow::Generic, Some(src));
+                    (
+                        Entry::Ref(obj, src),
+                        Entry::Num(key),
+                        v @ (Entry::Num(_) | Entry::Boxed | Entry::Ref(..)),
+                    ) => {
+                        self.elem_write(
+                            pc,
+                            obj,
+                            key,
+                            v,
+                            None,
+                            keep,
+                            d - 3,
+                            Slow::Generic,
+                            Some(src),
+                        );
                     }
                     _ => self.generic(pc),
                 }
@@ -4338,7 +4594,17 @@ impl<'a, 'f> Tr<'a, 'f> {
                 match (self.stack[d - 2], self.stack[d - 1]) {
                     (Entry::Num(key), v @ (Entry::Num(_) | Entry::Boxed)) => {
                         let obj = self.slot_ptr(s as usize);
-                        self.elem_write(pc, obj, key, v, None, keep, d - 2, Slow::Generic, Some(Src::Slot(s)));
+                        self.elem_write(
+                            pc,
+                            obj,
+                            key,
+                            v,
+                            None,
+                            keep,
+                            d - 2,
+                            Slow::Generic,
+                            Some(Src::Slot(s)),
+                        );
                     }
                     _ => self.generic(pc),
                 }
@@ -4450,7 +4716,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.call(Helper::BlkCopy, &[self.frame, a]);
             }
             Op::BlkDecl(s, n, k) => {
-                let (a, b, c) = (self.i32c(s as i64), self.i32c(n as i64), self.i32c(k as i64));
+                let (a, b, c) = (
+                    self.i32c(s as i64),
+                    self.i32c(n as i64),
+                    self.i32c(k as i64),
+                );
                 self.call(Helper::BlkDecl, &[self.frame, a, b, c]);
             }
             Op::BlkLoad(s, n) => {
@@ -4585,7 +4855,10 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn ssa_entry(&mut self, s: usize) -> Entry {
         let var = self.vars[s].expect("SSA slot");
         let v = self.fb.use_var(var);
-        if self.kinds[s] == Kind::Num {
+        if self.kinds[s].is_num() {
+            let v = if self.kinds[s] == Kind::Int32 {
+                self.fb.convert(ConvOp::FromSint, Type::F64, v)
+            } else { v };
             Entry::Num(v)
         } else {
             Entry::Bool(v)
@@ -4674,12 +4947,14 @@ impl<'a, 'f> Tr<'a, 'f> {
                 };
                 let nv = self.i32c(n as i64);
                 let cv = self.i32c(cache.unwrap_or(u32::MAX) as i64);
-                self.call(h, &[self.frame, nv, cv]).expect("returns an address")
+                self.call(h, &[self.frame, nv, cv])
+                    .expect("returns an address")
             }
             Src::Slot(s) => self.slot_ptr(s as usize),
             Src::This => self.fb.load(PTR_MEM, self.frame, FRAME_THIS),
             Src::Pin | Src::Borrow => {
-                self.err.get_or_insert_with(|| "pinned or lent value resolved as a binding".into());
+                self.err
+                    .get_or_insert_with(|| "pinned or lent value resolved as a binding".into());
                 self.ptrc(0)
             }
         }
@@ -4991,7 +5266,14 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// read and the consumer's slow path too — the inline paths just failed, so emitting them
     /// again would only duplicate code — except a `.length` consumer, which stays inline (a
     /// string's length). `body` skips the consumer.
-    fn chain_read(&mut self, pc: usize, obj: V, c: u32, at: usize, slow: Slow) -> Result<(), String> {
+    fn chain_read(
+        &mut self,
+        pc: usize,
+        obj: V,
+        c: u32,
+        at: usize,
+        slow: Slow,
+    ) -> Result<(), String> {
         let ic = layout::prop_ic(self.chunk, c).ok_or("chained read without a cache")?;
         let pre = self.stack.clone();
         let other = self.fb.create_block();
@@ -5174,7 +5456,15 @@ impl<'a, 'f> Tr<'a, 'f> {
             let pre = self.stack.clone();
             let miss = self.fb.create_block();
             let done = self.fb.create_block();
-            layout::accessor_probe(&mut self.fb, obj, &a.shapes, a.slot, a.word as u64, true, miss);
+            layout::accessor_probe(
+                &mut self.fb,
+                obj,
+                &a.shapes,
+                a.slot,
+                a.word as u64,
+                true,
+                miss,
+            );
             let arg = match pre[d - 1] {
                 Entry::Boxed => Entry::Ref(self.sptr(d - 1), Src::Pin),
                 e => e,
@@ -5296,8 +5586,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.switch_to_block(join);
         self.stack.truncate(base);
         // A property store (even an inline one) may be an array's `length`: drop the views.
-        let views: Vec<(Variable, Type)> =
-            self.arr_vars.values().map(|a| (a.kind, Type::I32)).collect();
+        let views: Vec<(Variable, Type)> = self
+            .arr_vars
+            .values()
+            .map(|a| (a.kind, Type::I32))
+            .collect();
         self.reset_vars(&views);
         Ok(())
     }
@@ -5425,7 +5718,13 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// since the last check (exit before the site when it fails: the interpreter makes the
     /// call), then push the placeholder receiver.
     fn math_begin(&mut self, pc: usize) -> Result<(), String> {
-        if let Some(site) = self.plan.math.get(&pc).copied().filter(|s| s.slot.is_some()) {
+        if let Some(site) = self
+            .plan
+            .math
+            .get(&pc)
+            .copied()
+            .filter(|s| s.slot.is_some())
+        {
             return self.slot_site_begin(pc, site);
         }
         if self.plan.nested.contains_key(&pc) {
@@ -5449,8 +5748,13 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(check);
         self.fb.switch_to_block(check);
         let mut g = self.site_guard(pc);
-        let mut inner: Vec<usize> =
-            self.plan.nested.iter().filter(|(_, &o)| o == pc).map(|(&q, _)| q).collect();
+        let mut inner: Vec<usize> = self
+            .plan
+            .nested
+            .iter()
+            .filter(|(_, &o)| o == pc)
+            .map(|(&q, _)| q)
+            .collect();
         inner.sort_unstable();
         for q in inner {
             let gi = self.site_guard(q);
@@ -5615,7 +5919,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         let argc = fs.args.len();
         let mut params = Vec::with_capacity(argc);
         let mut args = Vec::with_capacity(argc);
-        for (e, kind) in self.stack[d - argc..].to_vec().into_iter().zip(fs.args.iter().copied()) {
+        for (e, kind) in self.stack[d - argc..]
+            .to_vec()
+            .into_iter()
+            .zip(fs.args.iter().copied())
+        {
             let v = match (e, kind) {
                 (Entry::Num(x), FastKind::F64) => {
                     params.push(Type::F64);
@@ -5630,7 +5938,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                     b
                 }
                 (other, kind) => {
-                    return Err(format!("fast call argument {other:?} at {pc} is not {kind:?}"))
+                    return Err(format!(
+                        "fast call argument {other:?} at {pc} is not {kind:?}"
+                    ))
                 }
             };
             args.push(v);
@@ -5640,10 +5950,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             FastKind::Void => vec![],
             _ => vec![Type::I32],
         };
-        let f = self.fb.func.import_function(
-            Signature::new(params, ret),
-            EXT_BASE + fs.ext as u32,
-        );
+        let f = self
+            .fb
+            .func
+            .import_function(Signature::new(params, ret), EXT_BASE + fs.ext as u32);
         let r = self.fb.call_fn(f, &args).first().copied();
         self.stack.truncate(d - argc - 2);
         let at = self.stack.len();
@@ -5969,11 +6279,11 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// The I32 `x` when F64 `v` is `x` converted (then ToInt32(v) is `x`).
     fn int32_of(&self, v: V) -> Option<V> {
         match self.def_data(v)? {
-            lumen_codegen::InstData::Convert { op: ConvOp::FromSint, arg, .. }
-                if self.fb.func.value_type(arg) == Type::I32 =>
-            {
-                Some(arg)
-            }
+            lumen_codegen::InstData::Convert {
+                op: ConvOp::FromSint,
+                arg,
+                ..
+            } if self.fb.func.value_type(arg) == Type::I32 => Some(arg),
             _ => None,
         }
     }
@@ -6205,7 +6515,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                     K::I16 | K::U16 => {
                         let x = self.fb.load(MemKind::I32U16, at, 0);
                         let x = self.dv_order(x, 2, little);
-                        let x = if kind == K::I16 { self.fb.unary(UnaryOp::Sext16, x) } else { x };
+                        let x = if kind == K::I16 {
+                            self.fb.unary(UnaryOp::Sext16, x)
+                        } else {
+                            x
+                        };
                         self.fb.convert(ConvOp::FromSint, Type::F64, x)
                     }
                     K::I32 => {
@@ -6410,7 +6724,13 @@ impl<'a, 'f> Tr<'a, 'f> {
         if pc < self.header + 2 || self.is_leader(pc) || self.is_leader(pc - 1) {
             return;
         }
-        let at = |q: usize| if q >= self.header { Some(self.ops[q]) } else { None };
+        let at = |q: usize| {
+            if q >= self.header {
+                Some(self.ops[q])
+            } else {
+                None
+            }
+        };
         let fact = match (self.ops[pc - 1], self.ops[pc - 2]) {
             (Op::GetPropLocal(s, ..), Op::LoadLocal(i)) => Some((Src::Slot(s), i)),
             (Op::GetProp(..), obj) if !self.is_leader(pc - 2) => {
@@ -6453,14 +6773,18 @@ impl<'a, 'f> Tr<'a, 'f> {
         let d = self.stack.len();
         let e = self.stack[d - 1];
         match (self.kinds[s], e) {
+            (Kind::Int32, Entry::Num(x)) => {
+                let x = self.int32_or_exit(x, pc);
+                self.fb.def_var(self.vars[s].expect("SSA slot"), x);
+            }
             (Kind::Num, Entry::Num(x)) | (Kind::Bool, Entry::Bool(x)) => {
                 self.fb.def_var(self.vars[s].expect("SSA slot"), x);
             }
-            (Kind::Num | Kind::Bool, Entry::Boxed) => {
+            (Kind::Num | Kind::Int32 | Kind::Bool, Entry::Boxed) => {
                 // Guard the value keeps the slot's kind; otherwise the interpreter stores it
                 // (and the next entry guard fails, recompiling for the new kind).
                 let (tag, num) = match self.kinds[s] {
-                    Kind::Num => (TAG_NUM, true),
+                    Kind::Num | Kind::Int32 => (TAG_NUM, true),
                     _ => (TAG_BOOL, false),
                 };
                 let t = self.stack_tag(d - 1);
@@ -6473,9 +6797,10 @@ impl<'a, 'f> Tr<'a, 'f> {
                 } else {
                     self.stack_bool(d - 1)
                 };
+                let x = if self.kinds[s] == Kind::Int32 { self.int32_or_exit(x, pc) } else { x };
                 self.fb.def_var(self.vars[s].expect("SSA slot"), x);
             }
-            (Kind::Num | Kind::Bool, _) => {
+            (Kind::Num | Kind::Int32 | Kind::Bool, _) => {
                 self.exit_now(pc);
                 return;
             }
@@ -6507,6 +6832,20 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn update_local(&mut self, pc: usize, s: usize, k: UpdKind) {
         let inc = matches!(k, UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard);
         let (old, new) = match self.kinds[s] {
+            Kind::Int32 => {
+                self.tdz_guard(s, pc);
+                let var = self.vars[s].expect("SSA slot");
+                let old = self.fb.use_var(var);
+                let one = self.i32c(1);
+                let op = if inc { CheckedOp::IaddOv } else { CheckedOp::IsubOv };
+                let (new, bad) = self.fb.checked_binary(op, old, one);
+                let snap = self.stack.clone();
+                self.exit_if(bad, pc, EXIT_RESUME, &snap, snap.len());
+                self.fb.def_var(var, new);
+                let old = self.fb.convert(ConvOp::FromSint, Type::F64, old);
+                let new = self.fb.convert(ConvOp::FromSint, Type::F64, new);
+                (old, new)
+            }
             Kind::Num => {
                 self.tdz_guard(s, pc);
                 let var = self.vars[s].expect("SSA slot");
@@ -6552,14 +6891,127 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
     }
 
-    /// A fused-op operand's F64 when it is statically a Number (an SSA `Num` slot — after its
+    /// Saturating conversion plus round trip avoids undefined conversions on guard failure.
+    fn int32_parts(&mut self, x: V) -> (V, V) {
+        let i = self.fb.convert(ConvOp::ToSintSat, Type::I32, x);
+        let f = self.fb.convert(ConvOp::FromSint, Type::F64, i);
+        let inexact = self.fb.fcmp(FloatCC::Ne, x, f);
+        let bits = self.fb.convert(ConvOp::Bitcast, Type::I64, x);
+        let negzero = self.i64c(i64::MIN);
+        let negzero = self.fb.icmp(IntCC::Eq, bits, negzero);
+        let bad = self.fb.binary(BinaryOp::Bor, inexact, negzero);
+        (i, bad)
+    }
+
+    fn int32_or_exit(&mut self, x: V, pc: usize) -> V {
+        let (i, bad) = self.int32_parts(x);
+        let snap = self.stack.clone();
+        self.exit_if(bad, pc, EXIT_RESUME, &snap, snap.len());
+        i
+    }
+
+    fn opnd_static_i32(&self, o: Opnd) -> bool {
+        match o {
+            Opnd::Slot(s) => self.kinds[s as usize] == Kind::Int32,
+            Opnd::Const(k) => matches!(self.chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some()),
+        }
+    }
+
+    fn opnd_i32(&mut self, o: Opnd, pc: usize) -> Option<V> {
+        match o {
+            Opnd::Slot(s) if self.kinds[s as usize] == Kind::Int32 => {
+                self.tdz_guard(s as usize, pc);
+                Some(self.fb.use_var(self.vars[s as usize].expect("SSA slot")))
+            }
+            Opnd::Const(k) => match self.chunk.consts[k as usize] {
+                Value::Num(n) => Kind::int32(n).map(|i| self.i32c(i as i64)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The destination remains Int32 only while JS would produce an exact I32 Number.
+    fn i32_arith(&mut self, kind: ArithKind, x: V, y: V, pc: usize) -> V {
+        let snap = self.stack.clone();
+        let d = snap.len();
+        let zero = self.i32c(0);
+        let r = match kind {
+            ArithKind::Add | ArithKind::Sub | ArithKind::Mul => {
+                let op = match kind {
+                    ArithKind::Add => CheckedOp::IaddOv,
+                    ArithKind::Sub => CheckedOp::IsubOv,
+                    _ => CheckedOp::ImulOv,
+                };
+                let (r, overflow) = self.fb.checked_binary(op, x, y);
+                self.exit_if(overflow, pc, EXIT_RESUME, &snap, d);
+                if kind == ArithKind::Mul {
+                    let signs = self.fb.binary(BinaryOp::Bxor, x, y);
+                    let negative = self.fb.icmp(IntCC::Slt, signs, zero);
+                    let is_zero = self.fb.icmp(IntCC::Eq, r, zero);
+                    let negzero = self.fb.binary(BinaryOp::Band, negative, is_zero);
+                    self.exit_if(negzero, pc, EXIT_RESUME, &snap, d);
+                }
+                r
+            }
+            ArithKind::Div | ArithKind::Mod => {
+                let by_zero = self.fb.icmp(IntCC::Eq, y, zero);
+                self.exit_if(by_zero, pc, EXIT_RESUME, &snap, d);
+                let min = self.i32c(i32::MIN as i64);
+                let minus_one = self.i32c(-1);
+                let min = self.fb.icmp(IntCC::Eq, x, min);
+                let minus_one = self.fb.icmp(IntCC::Eq, y, minus_one);
+                let overflow = self.fb.binary(BinaryOp::Band, min, minus_one);
+                self.exit_if(overflow, pc, EXIT_RESUME, &snap, d);
+                let rem = self.fb.binary(BinaryOp::Srem, x, y);
+                if kind == ArithKind::Div {
+                    let fractional = self.fb.icmp(IntCC::Ne, rem, zero);
+                    self.exit_if(fractional, pc, EXIT_RESUME, &snap, d);
+                    let is_zero = self.fb.icmp(IntCC::Eq, x, zero);
+                    let negative = self.fb.icmp(IntCC::Slt, y, zero);
+                    let negzero = self.fb.binary(BinaryOp::Band, is_zero, negative);
+                    self.exit_if(negzero, pc, EXIT_RESUME, &snap, d);
+                    self.fb.binary(BinaryOp::Sdiv, x, y)
+                } else {
+                    let is_zero = self.fb.icmp(IntCC::Eq, rem, zero);
+                    let negative = self.fb.icmp(IntCC::Slt, x, zero);
+                    let negzero = self.fb.binary(BinaryOp::Band, is_zero, negative);
+                    self.exit_if(negzero, pc, EXIT_RESUME, &snap, d);
+                    rem
+                }
+            }
+            _ => {
+                let op = match kind {
+                    ArithKind::BitAnd => BinaryOp::Band,
+                    ArithKind::BitOr => BinaryOp::Bor,
+                    ArithKind::BitXor => BinaryOp::Bxor,
+                    ArithKind::Shl => BinaryOp::Ishl,
+                    ArithKind::Shr => BinaryOp::Sshr,
+                    ArithKind::UShr => BinaryOp::Ushr,
+                    _ => unreachable!(),
+                };
+                let r = self.fb.binary(op, x, y);
+                if kind == ArithKind::UShr {
+                    let unsigned = self.fb.icmp(IntCC::Slt, r, zero);
+                    self.exit_if(unsigned, pc, EXIT_RESUME, &snap, d);
+                }
+                r
+            }
+        };
+        r
+    }
+
+    /// A fused-op operand's F64 when it is statically a Number (an SSA numeric slot — after its
     /// TDZ guard — or a Number constant).
     fn opnd_num(&mut self, o: Opnd, pc: usize) -> Option<V> {
         match o {
-            Opnd::Slot(s) if self.kinds[s as usize] == Kind::Num => {
+            Opnd::Slot(s) if self.kinds[s as usize].is_num() => {
                 self.tdz_guard(s as usize, pc);
                 let var = self.vars[s as usize].expect("SSA slot");
-                Some(self.fb.use_var(var))
+                let v = self.fb.use_var(var);
+                Some(if self.kinds[s as usize] == Kind::Int32 {
+                    self.fb.convert(ConvOp::FromSint, Type::F64, v)
+                } else { v })
             }
             Opnd::Const(k) => match self.chunk.consts[k as usize] {
                 Value::Num(n) => Some(self.fb.f64const(n)),
@@ -6573,7 +7025,7 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// slot (checked at run time).
     fn quick_num_ok(&self, o: Opnd) -> bool {
         match o {
-            Opnd::Slot(s) => self.kinds[s as usize] == Kind::Num || self.vars[s as usize].is_none(),
+            Opnd::Slot(s) => self.kinds[s as usize].is_num() || self.vars[s as usize].is_none(),
             Opnd::Const(k) => matches!(self.chunk.consts[k as usize], Value::Num(_)),
         }
     }
@@ -6597,7 +7049,7 @@ impl<'a, 'f> Tr<'a, 'f> {
 
     fn opnd_static_num(&self, o: Opnd) -> bool {
         match o {
-            Opnd::Slot(s) => self.kinds[s as usize] == Kind::Num,
+            Opnd::Slot(s) => self.kinds[s as usize].is_num(),
             Opnd::Const(k) => matches!(self.chunk.consts[k as usize], Value::Num(_)),
         }
     }
@@ -6654,6 +7106,14 @@ impl<'a, 'f> Tr<'a, 'f> {
         a: Opnd,
         b: Opnd,
     ) -> Result<(), String> {
+        if self.kinds[dst] == Kind::Int32 && self.opnd_static_i32(a) && self.opnd_static_i32(b) {
+            let x = self.opnd_i32(a, pc).expect("static Int32");
+            let y = self.opnd_i32(b, pc).expect("static Int32");
+            let r = self.i32_arith(kind, x, y, pc);
+            self.fb.def_var(self.vars[dst].expect("SSA slot"), r);
+            self.clear_tdz(dst);
+            return Ok(());
+        }
         if self.opnd_static_num(a) && self.opnd_static_num(b) {
             if self.kinds[dst] == Kind::Bool {
                 self.exit_now(pc);
@@ -6663,6 +7123,11 @@ impl<'a, 'f> Tr<'a, 'f> {
             let y = self.opnd_num(b, pc).expect("static Num");
             let r = self.num_arith(kind, x, y)?;
             match self.kinds[dst] {
+                Kind::Int32 => {
+                    let r = self.int32_or_exit(r, pc);
+                    self.fb.def_var(self.vars[dst].expect("SSA slot"), r);
+                    self.clear_tdz(dst);
+                }
                 Kind::Num => {
                     self.fb.def_var(self.vars[dst].expect("SSA slot"), r);
                     self.clear_tdz(dst);
@@ -6761,7 +7226,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             k => {
                 // The op ran; a result of another kind goes into the slot and the interpreter
                 // continues after the op.
-                let tag = if k == Kind::Num { TAG_NUM } else { TAG_BOOL };
+                let tag = if k.is_num() { TAG_NUM } else { TAG_BOOL };
                 let t = self.stack_tag(d + 2);
                 let want = self.i32c(tag as i64);
                 let bad = self.fb.icmp(IntCC::Ne, t, want);
@@ -6773,11 +7238,23 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.emit_exit(pc + 1, EXIT_RESUME, &snap, d, Some((dst, d + 2)));
                 self.fb.seal_block(cont);
                 self.fb.switch_to_block(cont);
-                let x = if k == Kind::Num {
+                let x = if k.is_num() {
                     self.stack_num(d + 2)
                 } else {
                     self.stack_bool(d + 2)
                 };
+                let x = if k == Kind::Int32 {
+                    let (i, bad) = self.int32_parts(x);
+                    let ex = self.fb.create_block();
+                    let cont = self.fb.create_block();
+                    self.fb.brif(bad, ex, &[], cont, &[]);
+                    self.fb.seal_block(ex);
+                    self.fb.switch_to_block(ex);
+                    self.emit_exit(pc + 1, EXIT_RESUME, &snap, d, Some((dst, d + 2)));
+                    self.fb.seal_block(cont);
+                    self.fb.switch_to_block(cont);
+                    i
+                } else { x };
                 self.fb.def_var(self.vars[dst].expect("SSA slot"), x);
                 self.clear_tdz(dst);
             }
@@ -6794,7 +7271,19 @@ impl<'a, 'f> Tr<'a, 'f> {
         b: Opnd,
         target: usize,
     ) -> Result<(), String> {
-        let cond = if self.opnd_static_num(a) && self.opnd_static_num(b) {
+        let cond = if self.opnd_static_i32(a) && self.opnd_static_i32(b) {
+            let x = self.opnd_i32(a, pc).expect("static Int32");
+            let y = self.opnd_i32(b, pc).expect("static Int32");
+            let cc = match kind {
+                CmpKind::Lt => IntCC::Slt,
+                CmpKind::Gt => IntCC::Sgt,
+                CmpKind::Le => IntCC::Sle,
+                CmpKind::Ge => IntCC::Sge,
+                CmpKind::EqEq | CmpKind::StrictEq => IntCC::Eq,
+                CmpKind::NotEq | CmpKind::StrictNotEq => IntCC::Ne,
+            };
+            self.fb.icmp(cc, x, y)
+        } else if self.opnd_static_num(a) && self.opnd_static_num(b) {
             let x = self.opnd_num(a, pc).expect("static Num");
             let y = self.opnd_num(b, pc).expect("static Num");
             self.fb.fcmp(fcc(kind), x, y)
@@ -6985,7 +7474,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(b_same);
                 self.fb.seal_block(b_gen);
                 self.fb.switch_to_block(b_same);
-                let sk = if neg { CmpKind::StrictNotEq } else { CmpKind::StrictEq };
+                let sk = if neg {
+                    CmpKind::StrictNotEq
+                } else {
+                    CmpKind::StrictEq
+                };
                 let r = self.strict_cmp(sk, d - 2, pa, pb).expect("strict kind");
                 self.fb.jump(join, &[r]);
                 self.fb.switch_to_block(b_gen);
@@ -7028,7 +7521,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         let empty = self.i32c(TAG_EMPTY as i64);
         let objt = self.i32c(TAG_OBJ as i64);
         let not_empty = self.fb.icmp(IntCC::Ne, tag, empty);
-        let prim_kind = matches!(kind, K::Boolean | K::Number | K::BigInt | K::String | K::Symbol);
+        let prim_kind = matches!(
+            kind,
+            K::Boolean | K::Number | K::BigInt | K::String | K::Symbol
+        );
         let dec = if prim_kind {
             not_empty
         } else {
@@ -7048,7 +7544,8 @@ impl<'a, 'f> Tr<'a, 'f> {
         let r = match want {
             Some(t) => {
                 let c = self.i32c(t as i64);
-                self.fb.icmp(if neg { IntCC::Ne } else { IntCC::Eq }, tag, c)
+                self.fb
+                    .icmp(if neg { IntCC::Ne } else { IntCC::Eq }, tag, c)
             }
             None => self.i32c(neg as i64),
         };
@@ -7116,7 +7613,14 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// with `ic_plain` set, or to `slow` (a TDZ marker, or an object that might be
     /// `[[IsHTMLDDA]]`). When `drop_idx` names the stack entry at `p`, the value is released on
     /// the inline paths. Seals the blocks it creates, not `join` / `slow`.
-    fn nullish_inline(&mut self, p: V, neg: bool, drop_idx: Option<usize>, join: Block, slow: Block) {
+    fn nullish_inline(
+        &mut self,
+        p: V,
+        neg: bool,
+        drop_idx: Option<usize>,
+        join: Block,
+        slow: Block,
+    ) {
         let tag = self.fb.load(MemKind::I32U8, p, 0);
         let yes = self.i32c(!neg as i64);
         let no = self.i32c(neg as i64);
@@ -7176,7 +7680,9 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn opnd_ptr(&mut self, o: Opnd) -> Option<V> {
         match o {
             Opnd::Const(k) => Some(self.const_ptr(k as usize)),
-            Opnd::Slot(s) if self.vars[s as usize].is_none() && self.kinds[s as usize] == Kind::Boxed => {
+            Opnd::Slot(s)
+                if self.vars[s as usize].is_none() && self.kinds[s as usize] == Kind::Boxed =>
+            {
                 Some(self.slot_ptr(s as usize))
             }
             Opnd::Slot(_) => None,
@@ -7332,8 +7838,7 @@ impl<'a, 'f> Tr<'a, 'f> {
             (
                 Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
                 Entry::Num(_) | Entry::Boxed | Entry::Ref(..),
-            ) if !matches!(op, Op::Mod) =>
-            {
+            ) if !matches!(op, Op::Mod) => {
                 // Ops whose result is a Number unless an operand is a BigInt: the join takes it
                 // unboxed (the slow path exits on the rare other result), so later ops see a Num.
                 let numeric = matches!(
@@ -7486,7 +7991,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         }
         // The typed-array path (`ic_plain` clear, which every ordinary path requires set) goes
         // first when the receiver is one now, else after the ordinary path missed.
-        let slow_b = if ta_first { miss } else { self.fb.create_block() };
+        let slow_b = if ta_first {
+            miss
+        } else {
+            self.fb.create_block()
+        };
         if ta_first {
             let ord = self.fb.create_block();
             if let Some(x) = self.ta_access(pc, obj, key, None, ord, slow_b, src) {
@@ -7500,7 +8009,10 @@ impl<'a, 'f> Tr<'a, 'f> {
         // the walk for every non-number element).
         let word_first = !want
             && matches!(slow, Slow::Generic)
-            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem);
+            && matches!(
+                self.ops[pc],
+                Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem
+            );
         if word_first {
             let bits = layout::elem_get_word(&mut self.fb, obj, key, miss);
             self.word_hit(bits, drop, at, join, miss);
@@ -7524,41 +8036,44 @@ impl<'a, 'f> Tr<'a, 'f> {
         // interpreter's fast paths before the generic op.
         if !want
             && matches!(slow, Slow::Generic)
-            && matches!(self.ops[pc], Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem)
+            && matches!(
+                self.ops[pc],
+                Op::GetElem | Op::GetElemLocal(_) | Op::GetMethodElem
+            )
         {
             // An object element, inline: a retained handle word.
             let helper_b = self.fb.create_block();
             if word_first {
                 self.fb.jump(helper_b, &[]);
             } else {
-            let bits = layout::elem_get_word(&mut self.fb, obj, key, helper_b);
-            let (is_obj, is_str, w) = layout::word_counted(&mut self.fb, bits);
-            let rc_so = layout::rc_strong_offset();
-            let counted = match rc_so {
-                Some(_) => self.fb.binary(BinaryOp::Bor, is_obj, is_str),
-                None => is_obj,
-            };
-            let obj_b = self.fb.create_block();
-            self.fb.brif(counted, obj_b, &[], helper_b, &[]);
-            self.fb.seal_block(obj_b);
-            self.fb.switch_to_block(obj_b);
-            let gc = if PTR == Type::I64 {
-                w
-            } else {
-                self.fb.convert(ConvOp::Wrap, PTR, w)
-            };
-            let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
-            self.retain_inline(gc, so);
-            if let Some(i) = drop {
-                self.drop_at(i);
-            }
-            let o = self.soff(at);
-            let to = self.i32c(TAG_OBJ as i64);
-            let ts = self.i32c(TAG_STR as i64);
-            let t = self.fb.select(is_obj, to, ts);
-            self.fb.store(MemKind::I32U8, self.stackp, t, o);
-            self.fb.store(PTR_MEM, self.stackp, gc, o + VALUE_PAYLOAD);
-            self.fb.jump(join, &[]);
+                let bits = layout::elem_get_word(&mut self.fb, obj, key, helper_b);
+                let (is_obj, is_str, w) = layout::word_counted(&mut self.fb, bits);
+                let rc_so = layout::rc_strong_offset();
+                let counted = match rc_so {
+                    Some(_) => self.fb.binary(BinaryOp::Bor, is_obj, is_str),
+                    None => is_obj,
+                };
+                let obj_b = self.fb.create_block();
+                self.fb.brif(counted, obj_b, &[], helper_b, &[]);
+                self.fb.seal_block(obj_b);
+                self.fb.switch_to_block(obj_b);
+                let gc = if PTR == Type::I64 {
+                    w
+                } else {
+                    self.fb.convert(ConvOp::Wrap, PTR, w)
+                };
+                let so = rc_so.unwrap_or(crate::value::GC_STRONG_OFFSET as i32);
+                self.retain_inline(gc, so);
+                if let Some(i) = drop {
+                    self.drop_at(i);
+                }
+                let o = self.soff(at);
+                let to = self.i32c(TAG_OBJ as i64);
+                let ts = self.i32c(TAG_STR as i64);
+                let t = self.fb.select(is_obj, to, ts);
+                self.fb.store(MemKind::I32U8, self.stackp, t, o);
+                self.fb.store(PTR_MEM, self.stackp, gc, o + VALUE_PAYLOAD);
+                self.fb.jump(join, &[]);
             }
             self.fb.seal_block(helper_b);
             self.fb.switch_to_block(helper_b);
@@ -7661,14 +8176,21 @@ impl<'a, 'f> Tr<'a, 'f> {
         // Typed arrays first or after the ordinary path (see `elem_read`).
         if ta_first {
             let ord = self.fb.create_block();
-            if self.ta_access(pc, obj, key, Some(vf), ord, slow_b, src).is_some() {
+            if self
+                .ta_access(pc, obj, key, Some(vf), ord, slow_b, src)
+                .is_some()
+            {
                 self.write_hit(drop, keep && boxed, base, join, vf);
             }
             self.fb.seal_block(ord);
             self.fb.switch_to_block(ord);
             self.stack = pre.clone();
         }
-        let miss = if ta_first { slow_b } else { self.fb.create_block() };
+        let miss = if ta_first {
+            slow_b
+        } else {
+            self.fb.create_block()
+        };
         layout::elem_set_num(&mut self.fb, obj, key, vf, miss);
         self.seal_current();
         self.write_hit(drop, keep && boxed, base, join, vf);
@@ -7676,7 +8198,10 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(miss);
             self.fb.switch_to_block(miss);
             self.stack = pre.clone();
-            if self.ta_access(pc, obj, key, Some(vf), slow_b, slow_b, src).is_some() {
+            if self
+                .ta_access(pc, obj, key, Some(vf), slow_b, slow_b, src)
+                .is_some()
+            {
                 self.write_hit(drop, keep && boxed, base, join, vf);
             }
         }
@@ -7877,7 +8402,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         let none = self.fb.icmp(IntCC::Eq, k, z);
         self.fb.brif(none, slow, &[], have, &[k, data, len]);
         let done = self.fb.create_block();
-        let res = store.is_none().then(|| self.fb.append_block_param(done, Type::F64));
+        let res = store
+            .is_none()
+            .then(|| self.fb.append_block_param(done, Type::F64));
         // The specialized access.
         if let Some((fb_, fd, fl)) = fast {
             self.fb.seal_block(fb_);
@@ -8110,7 +8637,15 @@ impl<'a, 'f> Tr<'a, 'f> {
             let d = pre.len();
             let miss = self.fb.create_block();
             let join = self.fb.create_block();
-            layout::accessor_probe(&mut self.fb, obj, &a.shapes, a.slot, a.word as u64, false, miss);
+            layout::accessor_probe(
+                &mut self.fb,
+                obj,
+                &a.shapes,
+                a.slot,
+                a.word as u64,
+                false,
+                miss,
+            );
             self.accessor_call(pc, obj, None);
             if let Some(i) = drop {
                 self.drop_at(i);
@@ -8223,7 +8758,8 @@ impl<'a, 'f> Tr<'a, 'f> {
                     let w = self.fb.append_block_param(b, Type::I64);
                     (b, w)
                 });
-                let (tag, payload) = layout::prop_get(&mut self.fb, obj, ic, miss, refc.map(|r| r.0));
+                let (tag, payload) =
+                    layout::prop_get(&mut self.fb, obj, ic, miss, refc.map(|r| r.0));
                 // Both paths releasing the receiver: one shared copy of the release and the
                 // result stores, entered with the result's tag and payload.
                 let fin = (refc.is_some() && drop.is_some()).then(|| {

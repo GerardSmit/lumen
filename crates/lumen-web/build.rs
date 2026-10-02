@@ -99,7 +99,11 @@ fn main() {
     glue.push_str("\n})();");
 
     // An ahead-of-time blob: AST, bytecode and the compressed function text (for `toString`).
-    let blob = lumen::precompiled::precompile_glue(&glue, "web-glue")
+    let blob = if std::env::var_os("CARGO_FEATURE_COMPILER").is_some() {
+        lumen::precompiled::precompile_glue(&glue, "web-glue")
+    } else {
+        lumen_aot::native::precompile_glue_for_build(&glue, "web-glue")
+    }
         .unwrap_or_else(|e| panic!("web glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());

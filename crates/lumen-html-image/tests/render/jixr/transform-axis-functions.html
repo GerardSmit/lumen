@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- jixr-compare: threshold=32 max-diff-ratio=0
+  Integer-producing geometry: scale factors land edges on whole pixels. -->
+<style>
+html,body{margin:0;background:#fff}
+main{position:relative;width:240px;height:150px}
+.a{position:absolute;left:0;top:0;width:20px;height:10px;background:#174ea6;
+transform-origin:0 0;transform:scale(2,3)}
+.b{position:absolute;left:60px;top:0;width:20px;height:10px;background:#e8710a;
+transform-origin:0 0;transform:scaleX(2)}
+.c{position:absolute;left:120px;top:0;width:20px;height:10px;background:#188448;
+transform-origin:0 0;transform:scaleY(3)}
+.d{position:absolute;left:10px;top:60px;width:30px;height:10px;background:#fbbc04;
+transform:translateY(20px)}
+.e{position:absolute;left:10px;top:100px;width:40px;height:10px;background:#5f6368;
+transform:translateX(50%)}
+</style>
+<main>
+<div class=a></div>
+<div class=b></div>
+<div class=c></div>
+<div class=d></div>
+<div class=e></div>
+</main>

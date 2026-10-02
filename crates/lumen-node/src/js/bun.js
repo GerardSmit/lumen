@@ -1626,8 +1626,8 @@ class Transpiler {
     const context = typeof loaderOrContext === "string" ? { loader: loaderOrContext } : (loaderOrContext || {});
     const loader = sourceLoader(context.loader, this.loader);
     source = replaceDefines(source, { ...(this.options.define || {}), ...(context.define || {}) });
-    if (loader === "ts" || loader === "tsx") source = globalThis.__lumenStripTypeScriptTypes(source);
-    if (loader === "jsx" || loader === "tsx") source = __node.transformJsx(source);
+    if (loader === "ts") source = globalThis.__lumenStripTypeScriptTypes(source);
+    if (loader === "jsx" || loader === "tsx") source = __node.transformJsx(source, loader === "tsx");
     if (loader === "json") source = `export default ${source.trim()};`;
     if (loader === "text") source = `export default ${JSON.stringify(source)};`;
     return source;

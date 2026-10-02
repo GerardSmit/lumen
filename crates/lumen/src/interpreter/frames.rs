@@ -85,7 +85,8 @@ pub const PRIM_NAMES: [&str; 5] = ["String", "Number", "Boolean", "Symbol", "Big
 /// native dispatchers keep an object receiver alive for the call (see [`NativeCtx::this`]), so
 /// a program that never takes a trace through a builtin pays no refcount traffic for it. Only
 /// that first trace can name a subclass or borrowed-method receiver by the method's home.
-pub static RECORD_RECEIVERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static RECORD_RECEIVERS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// [`NativeCtx::recv_kind`] of `v`.
 #[inline(always)]

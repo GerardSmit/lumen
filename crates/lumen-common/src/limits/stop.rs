@@ -67,21 +67,37 @@ impl fmt::Debug for InterruptHandle {
     }
 }
 
+/// A cooperative time-slice request: when `flag` is raised at a safe point the poll lowers it and
+/// runs `hook` on the current native stack, then carries on.
+#[derive(Clone)]
+struct YieldHook {
+    flag: Arc<AtomicBool>,
+    hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl fmt::Debug for YieldHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("YieldHook").field("pending", &self.flag.load(Relaxed)).finish()
+    }
+}
+
 /// The flags a host raises to stop a run, polled from safe points: `interrupt` ends the run for
 /// good, `deadline` is a script timeout the host converts to a catchable error and later lowers.
+/// An optional yield hook time-slices the run without ending it.
 #[derive(Clone, Debug, Default)]
 pub struct StopFlags {
     interrupt: Option<Arc<AtomicBool>>,
     deadline: Option<Arc<AtomicBool>>,
+    yield_hook: Option<YieldHook>,
 }
 
 impl StopFlags {
     pub const fn new() -> StopFlags {
-        StopFlags { interrupt: None, deadline: None }
+        StopFlags { interrupt: None, deadline: None, yield_hook: None }
     }
 
     pub fn from_handle(handle: &InterruptHandle) -> StopFlags {
-        StopFlags { interrupt: Some(handle.flag.clone()), deadline: None }
+        StopFlags { interrupt: Some(handle.flag.clone()), deadline: None, yield_hook: None }
     }
 
     pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
@@ -101,9 +117,32 @@ impl StopFlags {
         self.deadline.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone()
     }
 
-    /// Whichever flag is raised, the interrupt first.
+    /// Install the cooperative yield: see [`StopFlags::poll`].
+    pub fn set_yield_hook(&mut self, flag: Arc<AtomicBool>, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.yield_hook = Some(YieldHook { flag, hook });
+    }
+
+    pub fn clear_yield_hook(&mut self) {
+        self.yield_hook = None;
+    }
+
+    /// Whichever flag is raised, the interrupt first. A raised yield flag is lowered and its hook
+    /// run (on the caller's stack) only when no hard stop is pending; the hard flags are read again
+    /// after the hook, since it may have raised one.
     #[inline]
     pub fn poll(&self) -> Abort {
+        let hard = self.poll_hard();
+        if hard != Abort::None {
+            return hard;
+        }
+        match &self.yield_hook {
+            Some(y) if y.flag.load(Relaxed) => self.run_yield(y),
+            _ => Abort::None,
+        }
+    }
+
+    #[inline]
+    fn poll_hard(&self) -> Abort {
         if self.interrupt.as_ref().is_some_and(|f| f.load(Relaxed)) {
             return Abort::Interrupt;
         }
@@ -111,6 +150,16 @@ impl StopFlags {
             return Abort::Deadline;
         }
         Abort::None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn run_yield(&self, y: &YieldHook) -> Abort {
+        if y.flag.swap(false, SeqCst) {
+            let hook = y.hook.clone();
+            hook();
+        }
+        self.poll_hard()
     }
 }
 
@@ -133,6 +182,34 @@ mod tests {
         assert_eq!(woken.load(Relaxed), 1);
         handle.clear();
         assert!(!copy.is_interrupted());
+    }
+
+    #[test]
+    fn yield_runs_the_hook_once_and_the_interrupt_wins() {
+        let handle = InterruptHandle::new();
+        let mut stop = StopFlags::from_handle(&handle);
+        let flag = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (c, h) = (calls.clone(), handle.clone());
+        stop.set_yield_hook(
+            flag.clone(),
+            Arc::new(move || {
+                if c.fetch_add(1, Relaxed) == 1 {
+                    h.interrupt();
+                }
+            }),
+        );
+        assert_eq!(stop.poll(), Abort::None);
+        assert_eq!(calls.load(Relaxed), 0);
+        flag.store(true, Relaxed);
+        assert_eq!(stop.poll(), Abort::None);
+        assert!(!flag.load(Relaxed));
+        flag.store(true, Relaxed);
+        assert_eq!(stop.poll(), Abort::Interrupt);
+        assert_eq!(calls.load(Relaxed), 2);
+        flag.store(true, Relaxed);
+        assert_eq!(stop.poll(), Abort::Interrupt);
+        assert_eq!(calls.load(Relaxed), 2);
     }
 
     #[test]

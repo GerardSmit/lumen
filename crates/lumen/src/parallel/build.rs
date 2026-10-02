@@ -2,7 +2,7 @@ use super::parcel::{Buffer, HeapGuard, Intrinsic};
 use super::{Limits, Parcel};
 use crate::{
     interpreter::Interp,
-    value::{Exotic, Gc, Object, Value, set_data},
+    value::{set_data, Exotic, Gc, Object, Value},
 };
 use std::collections::HashMap;
 
@@ -134,11 +134,15 @@ impl Builder {
                 if let Some(copied) = self.memo.get(&pointer) {
                     return Ok(Value::Obj(copied.clone()));
                 }
+                #[cfg(feature = "aot-native")]
+                let native_callable = matches!(object.borrow().call, crate::value::Callable::Aot(_)) || interp.native_classes.contains_key(&pointer);
+                #[cfg(not(feature = "aot-native"))]
+                let native_callable = false;
                 if interp.proxies.contains_key(&pointer)
                     || (!matches!(
                         object.borrow().call,
                         crate::value::Callable::None | crate::value::Callable::User(_)
-                    ) && !(self.class_objects.contains(&pointer)
+                    ) && !native_callable && !(self.class_objects.contains(&pointer)
                         && matches!(
                             object.borrow().call,
                             crate::value::Callable::AccessorGet(_)
@@ -150,6 +154,10 @@ impl Builder {
                 interp.materialize(object);
                 if interp.class_info.contains_key(&pointer) {
                     self.register_class(interp, object)?;
+                }
+                #[cfg(feature = "aot-native")]
+                if let Some(class) = interp.native_classes.get(&pointer).cloned() {
+                    self.register_native_class(interp, object, &class);
                 }
                 let array = object.borrow().exotic == Exotic::Array;
                 let exotic = object.borrow().exotic;
@@ -169,6 +177,10 @@ impl Builder {
                 };
                 self.memo.insert(pointer, copied.clone());
                 self.parcel.protos.push((copied.clone(), intrinsic));
+                #[cfg(feature = "aot-native")]
+                if let Some(class) = interp.native_classes.get(&pointer).cloned() {
+                    self.copy_native_class(interp, &copied, &class, depth)?;
+                }
                 match &object.borrow().call {
                     crate::value::Callable::AccessorGet(key)
                     | crate::value::Callable::AccessorSet(key) => {
@@ -196,6 +208,29 @@ impl Builder {
                 };
                 if let Some((function, environment)) = function {
                     self.copy_function(interp, object, &copied, function, environment, depth)?;
+                }
+                #[cfg(feature = "aot-native")]
+                {
+                    let native = match &object.borrow().call {
+                        crate::value::Callable::Aot(native) => Some((native.program.clone(), native.function_index, native.env.clone())),
+                        _ => None,
+                    };
+                    if let Some((program, index, env)) = native {
+                        let env = if std::rc::Rc::ptr_eq(&env, &interp.global_env) { None } else {
+                            let mut scope = Some(env.clone());
+                            while let Some(current) = scope {
+                                if std::rc::Rc::ptr_eq(&current, &interp.global_env) { break; }
+                                self.class_scopes.insert(std::rc::Rc::as_ptr(&current) as usize);
+                                scope = current.borrow().parent.clone();
+                            }
+                            Some(self.copy_environment(interp, &env, depth + 1)?)
+                        };
+                        self.parcel.native_functions.push(super::parcel::NativeFunction {
+                            trusted_glue: program.trusted_glue,
+                            object: copied.clone(), bytes: program.bytes.clone(),
+                            hash: program.image.blob_hash(), index, env,
+                        });
+                    }
                 }
                 self.copy_slots(interp, object, &copied, pointer, depth)?;
                 let keys = if self.class_objects.contains(&pointer) {
@@ -273,6 +308,7 @@ impl Builder {
                 }
                 if self.class_objects.contains(&pointer)
                     && (interp.class_info.contains_key(&pointer)
+                        || native_callable
                         || matches!(object.borrow().call, crate::value::Callable::None))
                 {
                     self.copy_class_prototype(interp, object, &copied, depth + 1)?;
@@ -283,6 +319,19 @@ impl Builder {
     }
 
     fn intrinsic(&self, interp: &Interp, object: &Gc, pointer: usize) -> Result<Intrinsic, Value> {
+        #[cfg(feature = "aot-native")]
+        {
+            if interp.native_classes.contains_key(&pointer) { return Ok(Intrinsic::Function); }
+            if let crate::value::Callable::Aot(native) = &object.borrow().call {
+                let flags = native.program.metadata.functions[native.function_index as usize].flags;
+                return Ok(match (flags & 8 != 0, flags & 4 != 0) {
+                    (true, true) => Intrinsic::Extra("%AsyncGeneratorFunction.prototype%"),
+                    (true, false) => Intrinsic::Extra("%AsyncFunction.prototype%"),
+                    (false, true) => Intrinsic::Extra("%GeneratorFunction.prototype%"),
+                    _ => Intrinsic::Function,
+                });
+            }
+        }
         if self.class_objects.contains(&pointer)
             && matches!(
                 object.borrow().call,

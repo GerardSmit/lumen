@@ -181,6 +181,7 @@ impl RealmLauncher for ChildRealms {
             interrupt,
             owned_fds,
             resources,
+            ipc: _,
         } = request;
         let script = argv
             .get(1)

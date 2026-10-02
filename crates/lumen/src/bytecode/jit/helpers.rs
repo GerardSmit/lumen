@@ -307,12 +307,15 @@ pub(crate) enum Helper {
     /// ArrayBuffer or DataView getter and it returns (see
     /// `builtins::dataview::jit_byte_length`); else -1. Pure.
     ByteLength,
+    /// Prepare a guarded shared Int32/Uint32 atomic access; tagged pointer, zero on miss.
+    AtomicPrepare,
+    AtomicRelease,
 }
 
 /// [`Helper::IterStep`]'s throw result.
 pub(crate) const ITER_THREW: u32 = 4;
 
-pub(crate) const ALL: [Helper; 79] = [
+pub(crate) const ALL: [Helper; 81] = [
     Helper::LoadLocal,
     Helper::StoreLocal,
     Helper::StoreLocalNum,
@@ -392,6 +395,8 @@ pub(crate) const ALL: [Helper; 79] = [
     Helper::CallSpread,
     Helper::DvView,
     Helper::ByteLength,
+    Helper::AtomicPrepare,
+    Helper::AtomicRelease,
 ];
 
 /// The IR signature of `h`.
@@ -473,6 +478,8 @@ pub(crate) fn signature(h: Helper) -> Signature {
         Helper::CallSpread => (&[P, I32, I32, I32], &[I32]),
         Helper::DvView => (&[P, P, I32], &[I32]),
         Helper::ByteLength => (&[P, P], &[F64]),
+        Helper::AtomicPrepare => (&[P, P, P, F64, I32], &[P]),
+        Helper::AtomicRelease => (&[P], &[]),
     };
     Signature::new(p.to_vec(), r.to_vec())
 }
@@ -560,6 +567,8 @@ pub(crate) fn address(id: u32) -> Option<u64> {
         Helper::CallSpread => call_spread as *const () as usize,
         Helper::DvView => dv_view as *const () as usize,
         Helper::ByteLength => byte_length as *const () as usize,
+        Helper::AtomicPrepare => atomic_prepare as *const () as usize,
+        Helper::AtomicRelease => atomic_release as *const () as usize,
     } as u64)
 }
 
@@ -790,11 +799,11 @@ pub(crate) fn generic_ok(op: &Op) -> bool {
         // `super(…)`: the parent construct runs as the interpreter's op.
         SuperCtor | SuperCall(_) | SuperCallSpread(_) => true,
         // The widened subset (bytecode/ext_ops.rs): operand/env/this-only helpers.
-        GetPrivate(_) | SetPrivate(_) | GetPrivateMethod(_) | PrivateIn(_)
-        | UpdatePrivate(..) | NewObject | InitProp(..) | InitPropComputed(_)
-        | InitMethod(..) | CopyDataProps | SetProtoLit | MakeClass(..) | Nip | SuperGet(_)
-        | SuperGetElem | SuperBase | SuperMethod(..) | SuperMethodElem(_) | ObjRest(..)
-        | NewArrayLit | ArrayAppend | ArrayAppendSpread | ArrayHole => true,
+        GetPrivate(_) | SetPrivate(_) | GetPrivateMethod(_) | PrivateIn(_) | UpdatePrivate(..)
+        | NewObject | InitProp(..) | InitPropComputed(_) | InitMethod(..) | CopyDataProps
+        | SetProtoLit | MakeClass(..) | Nip | SuperGet(_) | SuperGetElem | SuperBase
+        | SuperMethod(..) | SuperMethodElem(_) | ObjRest(..) | NewArrayLit | ArrayAppend
+        | ArrayAppendSpread | ArrayHole => true,
         // Class field DefineField (bytecode/class_fields.rs): operands only.
         DefineField(..) => true,
     }
@@ -1362,7 +1371,10 @@ struct ArgBuf {
 impl ArgBuf {
     #[inline(always)]
     fn new() -> ArgBuf {
-        ArgBuf { vals: [const { std::mem::MaybeUninit::uninit() }; ARGBUF], len: 0 }
+        ArgBuf {
+            vals: [const { std::mem::MaybeUninit::uninit() }; ARGBUF],
+            len: 0,
+        }
     }
     #[inline]
     fn push(&mut self, v: Value) {
@@ -1425,7 +1437,8 @@ unsafe fn unwrap_adaptor(
                     Value::Undefined | Value::Null => {}
                     Value::Obj(a) => {
                         if !i.ordinary_get_ptr(crate::value::Gc::as_ptr(a) as usize)
-                            || i.mapped_arguments.contains_key(&(crate::value::Gc::as_ptr(a) as usize))
+                            || i.mapped_arguments
+                                .contains_key(&(crate::value::Gc::as_ptr(a) as usize))
                         {
                             return None;
                         }
@@ -1476,12 +1489,7 @@ pub(crate) const CALL_AWAIT: u32 = 2;
 /// returns it), as the interpreter's generic call-out of the op does.
 pub(crate) const CALL_TAIL: u32 = 4;
 
-pub(crate) unsafe extern "C" fn call(
-    f: *mut JitFrame,
-    base: u32,
-    argc: u32,
-    flags: u32,
-) -> u32 {
+pub(crate) unsafe extern "C" fn call(f: *mut JitFrame, base: u32, argc: u32, flags: u32) -> u32 {
     let s = (*f).stack;
     let (base, argc) = (base as usize, argc as usize);
     let (this, callee, at) = if flags & 1 != 0 {
@@ -1504,7 +1512,9 @@ pub(crate) unsafe extern "C" fn call(
         && callee.is_callable()
         && i.leaf_native(&callee).is_none()
     {
-        let args = (0..argc).map(|k| std::ptr::replace(s.add(at + k), Value::Undefined)).collect();
+        let args = (0..argc)
+            .map(|k| std::ptr::replace(s.add(at + k), Value::Undefined))
+            .collect();
         i.pending_tail = Some(Box::new((callee, this, args)));
         std::ptr::write(s.add(base), Value::Undefined);
         return STATUS_OK;
@@ -1614,7 +1624,9 @@ unsafe fn apply_args(
         }),
         _ => false,
     };
-    let Some(&Value::Num(n)) = slots.get(s as usize) else { return None };
+    let Some(&Value::Num(n)) = slots.get(s as usize) else {
+        return None;
+    };
     let first = (tag & !crate::bytecode::VIRT_REST) as usize;
     let n = n as usize;
     if !intrinsic || !(*st.add(base)).is_callable() || n > ARGBUF || first + n > slots.len() {
@@ -1874,12 +1886,23 @@ unsafe fn call_native(
     // --- run ---
     let mut stack: Vec<Value> = Vec::new();
     let mut pc = 0usize;
-    let r = match super::enter(i, chunk, &env, slots, &mut stack, &mut pc, &this_val, None, &native, 0)
-    {
+    let r = match super::enter(
+        i, chunk, &env, slots, &mut stack, &mut pc, &this_val, None, &native, 0,
+    ) {
         Ok(Some(step)) => Ok(step),
         Ok(None) => {
             let mut handlers = Vec::new();
-            drive_vm(i, chunk, &env, slots, &mut stack, &mut pc, &this_val, &mut handlers, None)
+            drive_vm(
+                i,
+                chunk,
+                &env,
+                slots,
+                &mut stack,
+                &mut pc,
+                &this_val,
+                &mut handlers,
+                None,
+            )
         }
         Err(e) => Err(e),
     };
@@ -2115,11 +2138,16 @@ pub(crate) unsafe extern "C" fn math_guard(f: *mut JitFrame, pc: u32) -> u32 {
 unsafe fn arr_push_check(f: *mut JitFrame, recv: &Value) -> Option<()> {
     let Value::Obj(o) = recv else { return None };
     let i = &*(*f).interp;
-    (!i.multi_realm() && crate::bytecode::iter_fast::array_push_ok(i, o, crate::builtins::nf_array_push))
-        .then_some(())
+    (!i.multi_realm()
+        && crate::bytecode::iter_fast::array_push_ok(i, o, crate::builtins::nf_array_push))
+    .then_some(())
 }
 
-pub(crate) unsafe extern "C" fn arr_push_guard(f: *mut JitFrame, pc: u32, recv: *const Value) -> u32 {
+pub(crate) unsafe extern "C" fn arr_push_guard(
+    f: *mut JitFrame,
+    pc: u32,
+    recv: *const Value,
+) -> u32 {
     if arr_push_check(f, &*recv).is_some() {
         return 1;
     }
@@ -2130,11 +2158,17 @@ pub(crate) unsafe extern "C" fn arr_push_guard(f: *mut JitFrame, pc: u32, recv: 
     0
 }
 
-pub(crate) unsafe extern "C" fn arr_push(f: *mut JitFrame, recv: *mut Value, arg: *mut Value) -> u32 {
+pub(crate) unsafe extern "C" fn arr_push(
+    f: *mut JitFrame,
+    recv: *mut Value,
+    arg: *mut Value,
+) -> u32 {
     let i = &mut *(*f).interp;
     let this = crate::value::take_value_words(recv);
     let v = crate::value::take_value_words(arg);
-    let Value::Obj(o) = &this else { unreachable!("guarded push receiver") };
+    let Value::Obj(o) = &this else {
+        unreachable!("guarded push receiver")
+    };
     let v = match crate::builtins::array_push_one(i, o, v) {
         Ok(n) => {
             std::ptr::write(recv, Value::Num(n));
@@ -2143,7 +2177,11 @@ pub(crate) unsafe extern "C" fn arr_push(f: *mut JitFrame, recv: *mut Value, arg
         Err(v) => v,
     };
     // The generic builtin may run setters or proxy traps: the caller's caches go stale.
-    match i.call_native_fast(crate::builtins::nf_array_push, this, std::slice::from_ref(&v)) {
+    match i.call_native_fast(
+        crate::builtins::nf_array_push,
+        this,
+        std::slice::from_ref(&v),
+    ) {
         Ok(r) => {
             std::ptr::write(recv, r);
             STATUS_OK_SLOW
@@ -2184,7 +2222,10 @@ unsafe fn str_check(f: *mut JitFrame, pc: usize, recv: &Value) -> Option<()> {
         let sb = i.string_proto.try_borrow().ok()?;
         // `String.prototype` is itself a String wrapper (of ""): its named properties are
         // ordinary.
-        if !matches!(sb.exotic, crate::value::Exotic::None | crate::value::Exotic::StrWrap) {
+        if !matches!(
+            sb.exotic,
+            crate::value::Exotic::None | crate::value::Exotic::StrWrap
+        ) {
             return None;
         }
         let p = sb.props.entry_at(sb.props.slot_of(name)?)?;
@@ -2239,14 +2280,18 @@ pub(crate) struct StrSite {
 /// Whether `name` on a primitive String reads a native `String.prototype` method now (a
 /// planning hint: [`str_method`] checks again at every call).
 pub(crate) fn str_native_method(i: &Interp, name: &str) -> bool {
-    let Ok(sb) = i.string_proto.try_borrow() else { return false };
+    let Ok(sb) = i.string_proto.try_borrow() else {
+        return false;
+    };
     let Some(p) = sb.props.slot_of(name).and_then(|k| sb.props.entry_at(k)) else {
         return false;
     };
     if p.accessor() {
         return false;
     }
-    let Value::Obj(fo) = p.value() else { return false };
+    let Value::Obj(fo) = p.value() else {
+        return false;
+    };
     let native = fo
         .try_borrow()
         .is_ok_and(|fb| matches!(fb.call, crate::value::Callable::Native(_)));
@@ -2258,12 +2303,19 @@ pub(crate) fn str_native_method(i: &Interp, name: &str) -> bool {
 /// `Interp::leaf_native`) in a one-realm engine: calling that code is then exactly what the
 /// `GetMethod` + `CallWithThis` pair does. The slot is cached by shape; the value is read at
 /// every call.
-fn str_site_native(i: &Interp, cell: &std::cell::Cell<StrSite>, name: &str) -> Option<crate::value::NativeFn> {
+fn str_site_native(
+    i: &Interp,
+    cell: &std::cell::Cell<StrSite>,
+    name: &str,
+) -> Option<crate::value::NativeFn> {
     if i.multi_realm() {
         return None;
     }
     let sb = i.string_proto.try_borrow().ok()?;
-    if !matches!(sb.exotic, crate::value::Exotic::None | crate::value::Exotic::StrWrap) {
+    if !matches!(
+        sb.exotic,
+        crate::value::Exotic::None | crate::value::Exotic::StrWrap
+    ) {
         return None;
     }
     let mut c = cell.get();
@@ -2277,7 +2329,9 @@ fn str_site_native(i: &Interp, cell: &std::cell::Cell<StrSite>, name: &str) -> O
     if p.accessor() {
         return None;
     }
-    let Value::Obj(fo) = p.value() else { return None };
+    let Value::Obj(fo) = p.value() else {
+        return None;
+    };
     let fb = fo.try_borrow().ok()?;
     match fb.call {
         crate::value::Callable::Native(fp) if fb.ic_plain.get() => Some(fp),
@@ -2307,7 +2361,8 @@ pub(crate) unsafe extern "C" fn str_method(
         let e = i.throw("TypeError", "compiled code used a bad method site");
         return fail(f, e);
     };
-    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize)) else {
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize))
+    else {
         let e = i.throw("TypeError", "compiled code used a bad property cache");
         return fail(f, e);
     };
@@ -2407,7 +2462,9 @@ fn coll_site_native(
     if p.accessor() {
         return None;
     }
-    let Value::Obj(fo) = p.value() else { return None };
+    let Value::Obj(fo) = p.value() else {
+        return None;
+    };
     let fb = fo.try_borrow().ok()?;
     match fb.call {
         crate::value::Callable::Native(fp) if fb.ic_plain.get() => Some(fp),
@@ -2437,7 +2494,8 @@ pub(crate) unsafe extern "C" fn coll_method(
         let e = i.throw("TypeError", "compiled code used a bad method site");
         return fail(f, e);
     };
-    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize)) else {
+    let (Some(name), Some(cache)) = (chunk.names.get(n as usize), chunk.caches.get(c as usize))
+    else {
         let e = i.throw("TypeError", "compiled code used a bad property cache");
         return fail(f, e);
     };
@@ -2494,7 +2552,11 @@ pub(crate) fn fast_sig(i: &Interp, callee: &Value) -> Option<(Vec<FastArg>, Fast
         Scalar::Bool => FastArg::Bool,
         Scalar::Void => FastArg::Void,
     };
-    Some((sig.args.iter().map(k).collect(), k(&sig.ret), sig.ptr.0 as usize as u64))
+    Some((
+        sig.args.iter().map(k).collect(),
+        k(&sig.ret),
+        sig.ptr.0 as usize as u64,
+    ))
 }
 
 #[cfg(not(feature = "embed"))]
@@ -2554,7 +2616,10 @@ pub(crate) unsafe extern "C" fn fast_guard(f: *mut JitFrame, pc: u32, expect: *c
     let i = &*(*f).interp;
     // The common free-name callee, compared in place (no clone of the function object).
     if let Some(&Op::LoadNameForCall(_, c)) = chunk.ops.get(pc as usize) {
-        if chunk.name_ic_obj_ptr(i, env, c).is_some_and(|p| p as usize == expect as usize) {
+        if chunk
+            .name_ic_obj_ptr(i, env, c)
+            .is_some_and(|p| p as usize == expect as usize)
+        {
             return 1;
         }
     }
@@ -2601,7 +2666,12 @@ pub(crate) unsafe extern "C" fn set_exception(f: *mut JitFrame, src: *mut Value)
     (*f).exception = std::ptr::replace(src, Value::Undefined);
 }
 
-pub(crate) unsafe extern "C" fn iter_step(f: *mut JitFrame, is: u32, ns: u32, dst: *mut Value) -> u32 {
+pub(crate) unsafe extern "C" fn iter_step(
+    f: *mut JitFrame,
+    is: u32,
+    ns: u32,
+    dst: *mut Value,
+) -> u32 {
     let chunk = &*(*f).chunk;
     let (is, ns) = (is as usize, ns as usize);
     if is >= chunk.n_slots || ns >= chunk.n_slots {
@@ -2752,6 +2822,39 @@ pub(crate) fn take_ta_exit(chunk: &Chunk, pc: usize) -> bool {
     })
 }
 
+unsafe extern "C" fn atomic_prepare(f: *mut JitFrame, callee: *const Value, target: *const Value,
+    index: f64, argc: u32) -> usize {
+    let i = &mut *(*f).interp;
+    if i.jit_atomic_lease.is_some() { return 0; }
+    let Value::Obj(callee) = &*callee else { return 0 };
+    let Ok(callee) = callee.try_borrow() else { return 0 };
+    let crate::value::Callable::Native(function) = &callee.call else { return 0 };
+    let which = match argc { 3 => 0, 4 => 1, _ => return 0 };
+    if *function as *const () as usize != i.atomic_intrinsics[which] { return 0; }
+    let Value::Obj(target) = &*target else { return 0 };
+    let Some(info) = i.typed_arrays.get(&(crate::value::Gc::as_ptr(target) as usize)).copied() else { return 0 };
+    if !matches!(info.kind, crate::value::TaKind::I32 | crate::value::TaKind::U32) { return 0; }
+    let Some(&id) = i.shared_buffers.get(&info.buffer) else { return 0 };
+    let index = if index.is_nan() { 0.0 } else { index.trunc() };
+    if index < 0.0 || !index.is_finite() || index >= i.ta_len(&info).unwrap_or(0) as f64 { return 0; }
+    let Some(memory) = crate::interpreter::shared_mem_get(id) else { return 0 };
+    let Ok(mut guard) = memory.lock() else { return 0 };
+    let Some(offset) = (index as usize).checked_mul(4).and_then(|n| info.offset.checked_add(n)) else { return 0 };
+    if offset.checked_add(4).map_or(true, |end| end > guard.len()) { return 0; }
+    let pointer = guard.as_mut_ptr().add(offset) as usize;
+    if pointer & 3 != 0 { return 0; }
+    // The Arc owns the mutex for the lease's lifetime. No JS call or guard exit is
+    // emitted between prepare and release; a native entry also releases on return.
+    let guard = std::mem::transmute::<std::sync::MutexGuard<'_, Vec<u8>>,
+        std::sync::MutexGuard<'static, Vec<u8>>>(guard);
+    i.jit_atomic_lease = Some(crate::interpreter::AtomicLease { _guard: guard, _memory: memory });
+    pointer | usize::from(info.kind == crate::value::TaKind::U32)
+}
+
+unsafe extern "C" fn atomic_release(f: *mut JitFrame) {
+    (&mut *(*f).interp).jit_atomic_lease = None;
+}
+
 pub(crate) unsafe extern "C" fn ta_view(f: *mut JitFrame, v: *const Value, write: u32) -> u32 {
     let code = ta_view_code(f, v, write & 1);
     // An uncached site (`write` bit 1, its pc above): count the fresh views it takes.
@@ -2838,7 +2941,9 @@ pub(crate) unsafe extern "C" fn dv_view(f: *mut JitFrame, v: *const Value, pc: u
     let Some(Op::GetMethod(n, _)) = chunk.ops.get(pc as usize).copied() else {
         return 0;
     };
-    let Some(name) = chunk.names.get(n as usize) else { return 0 };
+    let Some(name) = chunk.names.get(n as usize) else {
+        return 0;
+    };
     match crate::builtins::dataview::dv_jit_view(&mut *(*f).interp, o, name) {
         Some((data, len)) => {
             (*f).ta_data = data;
@@ -2934,7 +3039,17 @@ pub(crate) unsafe fn finish_exit(
             if let (Some(n), true) = (&native, current) {
                 super::fn_entry_failed(chunk, slots, n);
             }
-            drive_vm(i, chunk, env, slots, &mut stack, &mut pc, this_val, &mut handlers, None)
+            drive_vm(
+                i,
+                chunk,
+                env,
+                slots,
+                &mut stack,
+                &mut pc,
+                this_val,
+                &mut handlers,
+                None,
+            )
         }
         EXIT_THROW => {
             // As `on_entry`: the interpreter unwinds from the exit state (no handler of the
@@ -2942,7 +3057,17 @@ pub(crate) unsafe fn finish_exit(
             stack.extend((0..depth).map(|k| std::ptr::replace(area.add(k), Value::Undefined)));
             pc = exit_pc;
             let e = std::mem::take(&mut (*nf).exception);
-            drive_vm(i, chunk, env, slots, &mut stack, &mut pc, this_val, &mut handlers, Some(e))
+            drive_vm(
+                i,
+                chunk,
+                env,
+                slots,
+                &mut stack,
+                &mut pc,
+                this_val,
+                &mut handlers,
+                Some(e),
+            )
         }
         _ => {
             stack.extend((0..depth).map(|k| std::ptr::replace(area.add(k), Value::Undefined)));
@@ -2954,9 +3079,9 @@ pub(crate) unsafe fn finish_exit(
                 .checked_sub(1)
                 .and_then(|k| native.as_ref()?.hsets.get(k).cloned());
             let first = match set {
-                Some(set) => {
-                    super::finish_handlers(i, chunk, env, slots, &mut stack, &mut pc, this_val, &set)
-                }
+                Some(set) => super::finish_handlers(
+                    i, chunk, env, slots, &mut stack, &mut pc, this_val, &set,
+                ),
                 None => Ok(None),
             };
             match first {
@@ -3053,9 +3178,15 @@ pub(crate) unsafe extern "C" fn bound_this(
     v: *const Value,
     need_obj: u32,
 ) -> *const Value {
-    let Value::Obj(o) = &*v else { return std::ptr::null() };
-    let Ok(b) = o.try_borrow() else { return std::ptr::null() };
-    let crate::value::Callable::Bound(bc) = &b.call else { return std::ptr::null() };
+    let Value::Obj(o) = &*v else {
+        return std::ptr::null();
+    };
+    let Ok(b) = o.try_borrow() else {
+        return std::ptr::null();
+    };
+    let crate::value::Callable::Bound(bc) = &b.call else {
+        return std::ptr::null();
+    };
     if !bc.args.is_empty() || (need_obj != 0 && !matches!(bc.this, Value::Obj(_))) {
         return std::ptr::null();
     }
@@ -3114,6 +3245,7 @@ pub(crate) unsafe extern "C" fn new_this(
 ) {
     let i = &mut *(*f).interp;
     let ctor = &(*cell).pin;
+    let _pin = super::pin(i);
     let Value::Obj(o) = ctor else {
         std::ptr::write(out, Value::Undefined);
         return;
@@ -3121,10 +3253,12 @@ pub(crate) unsafe extern "C" fn new_this(
     // A user function's `prototype` is an own data property (non-configurable): read it in
     // place rather than through a full `[[Get]]`.
     i.materialize_fn(o);
-    let own = o
-        .try_borrow()
-        .ok()
-        .and_then(|b| b.props.get("prototype").filter(|p| !p.accessor()).map(|p| p.value()));
+    let own = o.try_borrow().ok().and_then(|b| {
+        b.props
+            .get("prototype")
+            .filter(|p| !p.accessor())
+            .map(|p| p.value())
+    });
     let proto = match own {
         Some(v) => v,
         None => i.get_member(ctor, "prototype").unwrap_or(Value::Undefined),
@@ -3224,7 +3358,8 @@ pub(crate) unsafe extern "C" fn strict_eq_ref(
 pub(crate) unsafe extern "C" fn unpack_clone(dst: *mut Value, bits: u64, consume: u32) {
     // SAFETY: `bits` is a live property's word (`PackedValue` is a transparent `u64`); the
     // `ManuallyDrop` keeps the property's own reference, `unpack` takes a new one.
-    let word = std::mem::ManuallyDrop::new(std::mem::transmute::<u64, crate::value::PackedValue>(bits));
+    let word =
+        std::mem::ManuallyDrop::new(std::mem::transmute::<u64, crate::value::PackedValue>(bits));
     let v = word.unpack();
     if consume != 0 {
         drop(std::ptr::replace(dst, Value::Undefined));
@@ -3401,13 +3536,23 @@ pub(crate) unsafe extern "C" fn drop_env(env: *mut crate::interpreter::Env) {
     std::ptr::drop_in_place(env);
 }
 
-pub(crate) unsafe extern "C" fn make_closure(f: *mut JitFrame, fidx: u32, name: u32, dst: *mut Value) {
+pub(crate) unsafe extern "C" fn make_closure(
+    f: *mut JitFrame,
+    fidx: u32,
+    name: u32,
+    dst: *mut Value,
+) {
     let i = &mut *(*f).interp;
     let v = crate::bytecode::make_closure(i, &*(*f).chunk, fidx, name, &*(*f).env);
     std::ptr::write(dst, v);
 }
 
-pub(crate) unsafe extern "C" fn make_rest(f: *mut JitFrame, dst: *mut Value, src: *mut Value, n: u32) {
+pub(crate) unsafe extern "C" fn make_rest(
+    f: *mut JitFrame,
+    dst: *mut Value,
+    src: *mut Value,
+    n: u32,
+) {
     let i = &*(*f).interp;
     let vals = (0..n as usize).map(|k| std::ptr::replace(src.add(k), Value::Undefined));
     std::ptr::write(dst, i.make_array_iter(vals));

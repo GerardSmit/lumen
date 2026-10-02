@@ -32,6 +32,9 @@ thread_local! {
     static LIMIT: Cell<usize> = const { Cell::new(0) };
     /// `(base, size)` an embedder recorded for this thread (see [`set_thread_stack_size`]).
     static RECORDED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// `(lowest address, size)` of a host-provided stack (see [`set_thread_stack_bounds`]); wins over
+    /// the queried bounds.
+    static EXPLICIT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 #[inline(always)]
@@ -85,10 +88,24 @@ pub fn set_thread_stack_size(bytes: usize) {
     LIMIT.with(|l| l.set(0));
 }
 
+/// Declare the stack the current thread's code now runs on: `low` is its lowest address and `size`
+/// its length in bytes. For an embedder that runs an engine on a stack it allocated itself (a
+/// cooperative scheduler giving each realm its own stack); the queried thread bounds would
+/// describe the wrong stack. The bounds are per thread-local state: call it on a stack's first
+/// entry, and again whenever the thread-local block is shared between stacks. `size == 0` goes
+/// back to the queried bounds.
+pub fn set_thread_stack_bounds(low: usize, size: usize) {
+    EXPLICIT.with(|e| e.set((low, size)));
+    LIMIT.with(|l| l.set(0));
+}
+
 #[cold]
 #[inline(never)]
 fn init() -> usize {
-    let lim = bounds()
+    let explicit = EXPLICIT.with(Cell::get);
+    let lim = (explicit.1 != 0)
+        .then_some(explicit)
+        .or_else(bounds)
         .or_else(|| {
             let (base, size) = RECORDED.with(Cell::get);
             (size != 0).then(|| (base.saturating_sub(size), size))

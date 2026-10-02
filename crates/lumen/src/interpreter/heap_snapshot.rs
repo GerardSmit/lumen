@@ -18,8 +18,21 @@ use std::io::{self, Write};
 use std::rc::Rc;
 
 const NODE_TYPES: &[&str] = &[
-    "hidden", "array", "string", "object", "code", "closure", "regexp", "number", "native",
-    "synthetic", "concatenated string", "sliced string", "symbol", "bigint", "object shape",
+    "hidden",
+    "array",
+    "string",
+    "object",
+    "code",
+    "closure",
+    "regexp",
+    "number",
+    "native",
+    "synthetic",
+    "concatenated string",
+    "sliced string",
+    "symbol",
+    "bigint",
+    "object shape",
 ];
 const T_STRING: u8 = 2;
 const T_OBJECT: u8 = 3;
@@ -27,7 +40,9 @@ const T_CLOSURE: u8 = 5;
 const T_SYNTHETIC: u8 = 9;
 const T_SLICED: u8 = 11;
 
-const EDGE_TYPES: &[&str] = &["context", "element", "property", "internal", "hidden", "shortcut", "weak"];
+const EDGE_TYPES: &[&str] = &[
+    "context", "element", "property", "internal", "hidden", "shortcut", "weak",
+];
 const E_CONTEXT: u8 = 0;
 const E_ELEMENT: u8 = 1;
 const E_PROPERTY: u8 = 2;
@@ -153,7 +168,10 @@ fn display_key(it: &Interp, key: &str) -> Result<String, String> {
         return Err(key.trim_start_matches('\u{0}').to_string());
     }
     if key.starts_with('#') && key.contains('\u{0}') {
-        return Err(key.trim_start_matches('#').trim_end_matches('\u{0}').replace('\u{0}', ""));
+        return Err(key
+            .trim_start_matches('#')
+            .trim_end_matches('\u{0}')
+            .replace('\u{0}', ""));
     }
     Ok(key.to_string())
 }
@@ -208,7 +226,12 @@ impl Interp {
     fn snapshot_edges(&self, g: &Graph, n: u32, out: &mut Vec<Edge>) {
         out.clear();
         if n == ROOT {
-            out.push(Edge { kind: E_ELEMENT, name: Name::Index(1), target: Target::Node(GC_ROOTS), owned: false });
+            out.push(Edge {
+                kind: E_ELEMENT,
+                name: Name::Index(1),
+                target: Target::Node(GC_ROOTS),
+                owned: false,
+            });
             out.push(Edge {
                 kind: E_SHORTCUT,
                 name: Name::Static("global"),
@@ -219,7 +242,12 @@ impl Interp {
         }
         if n == GC_ROOTS {
             for (i, &r) in g.roots.iter().enumerate() {
-                out.push(Edge { kind: E_ELEMENT, name: Name::Index(i as u32 + 1), target: Target::Node(r), owned: false });
+                out.push(Edge {
+                    kind: E_ELEMENT,
+                    name: Name::Index(i as u32 + 1),
+                    target: Target::Node(r),
+                    owned: false,
+                });
             }
             return;
         }
@@ -232,17 +260,37 @@ impl Interp {
             for (name, b) in s.vars.iter() {
                 if let Some(t) = value_target(&b.value) {
                     let owned = matches!(b.value, Value::Obj(_));
-                    out.push(Edge { kind: E_CONTEXT, name: Name::Key(name.clone()), target: t, owned });
+                    out.push(Edge {
+                        kind: E_CONTEXT,
+                        name: Name::Key(name.clone()),
+                        target: t,
+                        owned,
+                    });
                 }
             }
             if let Some(Value::Obj(o)) = s.with_obj() {
-                out.push(Edge { kind: E_INTERNAL, name: Name::Static("with"), target: Target::Obj(Gc::as_ptr(o)), owned: true });
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("with"),
+                    target: Target::Obj(Gc::as_ptr(o)),
+                    owned: true,
+                });
             }
             if let Some(p) = &s.parent {
-                out.push(Edge { kind: E_INTERNAL, name: Name::Static("previous"), target: Target::Scope(Rc::as_ptr(p)), owned: true });
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("previous"),
+                    target: Target::Scope(Rc::as_ptr(p)),
+                    owned: true,
+                });
             }
             for imp in s.import_envs() {
-                out.push(Edge { kind: E_INTERNAL, name: Name::Static("import"), target: Target::Scope(Rc::as_ptr(imp)), owned: true });
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("import"),
+                    target: Target::Scope(Rc::as_ptr(imp)),
+                    owned: true,
+                });
             }
         }
     }
@@ -284,40 +332,89 @@ impl Interp {
                 let v = p.value();
                 if let Some(t) = value_target(&v) {
                     let owned = matches!(v, Value::Obj(_));
-                    out.push(Edge { kind, name, target: t, owned });
+                    out.push(Edge {
+                        kind,
+                        name,
+                        target: t,
+                        owned,
+                    });
                 }
             }
         });
         if let Some(proto) = &b.proto {
-            out.push(Edge { kind: E_PROPERTY, name: Name::Static("__proto__"), target: Target::Obj(Gc::as_ptr(proto)), owned: true });
+            out.push(Edge {
+                kind: E_PROPERTY,
+                name: Name::Static("__proto__"),
+                target: Target::Obj(Gc::as_ptr(proto)),
+                owned: true,
+            });
         }
         let obj = |g: &Gc| Target::Obj(Gc::as_ptr(g));
         match &b.call {
+            #[cfg(feature = "aot-native")]
+            Callable::Aot(native) => {
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("context"),
+                    target: Target::Scope(Rc::as_ptr(&native.env)),
+                    owned: true,
+                });
+            }
             Callable::User(u) => {
-                out.push(Edge { kind: E_INTERNAL, name: Name::Static("context"), target: Target::Scope(Rc::as_ptr(&u.env)), owned: true });
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("context"),
+                    target: Target::Scope(Rc::as_ptr(&u.env)),
+                    owned: true,
+                });
             }
             Callable::Bound(bound) => {
-                out.push(Edge { kind: E_INTERNAL, name: Name::Static("bound_function"), target: obj(&bound.target), owned: true });
+                out.push(Edge {
+                    kind: E_INTERNAL,
+                    name: Name::Static("bound_function"),
+                    target: obj(&bound.target),
+                    owned: true,
+                });
                 if let Some(t) = value_target(&bound.this) {
                     let owned = matches!(bound.this, Value::Obj(_));
-                    out.push(Edge { kind: E_INTERNAL, name: Name::Static("bound_this"), target: t, owned });
+                    out.push(Edge {
+                        kind: E_INTERNAL,
+                        name: Name::Static("bound_this"),
+                        target: t,
+                        owned,
+                    });
                 }
                 for (i, a) in bound.args.iter().enumerate() {
                     if let Some(t) = value_target(a) {
                         let owned = matches!(a, Value::Obj(_));
-                        out.push(Edge { kind: E_INTERNAL, name: Name::Owned(format!("bound_argument_{i}")), target: t, owned });
+                        out.push(Edge {
+                            kind: E_INTERNAL,
+                            name: Name::Owned(format!("bound_argument_{i}")),
+                            target: t,
+                            owned,
+                        });
                     }
                 }
             }
             Callable::Promise(slot) => {
                 slot.visit_object_refs(&mut |g| {
-                    out.push(Edge { kind: E_INTERNAL, name: Name::Static("promise_reaction"), target: obj(g), owned: true });
+                    out.push(Edge {
+                        kind: E_INTERNAL,
+                        name: Name::Static("promise_reaction"),
+                        target: obj(g),
+                        owned: true,
+                    });
                 });
             }
             Callable::Resolver(cell, resolve) => {
                 if let Value::Obj(p) = &cell.promise {
                     // The pair shares one counted reference (see `gc_edges::visit_object_head`).
-                    out.push(Edge { kind: E_INTERNAL, name: Name::Static("promise"), target: obj(p), owned: *resolve });
+                    out.push(Edge {
+                        kind: E_INTERNAL,
+                        name: Name::Static("promise"),
+                        target: obj(p),
+                        owned: *resolve,
+                    });
                 }
             }
             _ => {}
@@ -330,12 +427,22 @@ impl Interp {
                 let (k, v) = (k.unpack(), v.unpack());
                 if let Some(t) = value_target(&k) {
                     let owned = matches!(k, Value::Obj(_));
-                    out.push(Edge { kind: if weak { E_WEAK } else { E_INTERNAL }, name: Name::Static("key"), target: t, owned });
+                    out.push(Edge {
+                        kind: if weak { E_WEAK } else { E_INTERNAL },
+                        name: Name::Static("key"),
+                        target: t,
+                        owned,
+                    });
                 }
                 if values {
                     if let Some(t) = value_target(&v) {
                         let owned = matches!(v, Value::Obj(_));
-                        out.push(Edge { kind: E_INTERNAL, name: Name::Static("value"), target: t, owned });
+                        out.push(Edge {
+                            kind: E_INTERNAL,
+                            name: Name::Static("value"),
+                            target: t,
+                            owned,
+                        });
                     }
                 }
             }
@@ -343,15 +450,37 @@ impl Interp {
         if let Some((t, h)) = self.proxies.get(&ptr) {
             for (label, v) in [("target", t), ("handler", h)] {
                 if let Value::Obj(g) = v {
-                    out.push(Edge { kind: E_INTERNAL, name: Name::Static(label), target: obj(g), owned: true });
+                    out.push(Edge {
+                        kind: E_INTERNAL,
+                        name: Name::Static(label),
+                        target: obj(g),
+                        owned: true,
+                    });
                 }
             }
         }
         if let Some((env, _)) = self.mapped_arguments.get(&ptr) {
-            out.push(Edge { kind: E_INTERNAL, name: Name::Static("context"), target: Target::Scope(Rc::as_ptr(env)), owned: true });
+            out.push(Edge {
+                kind: E_INTERNAL,
+                name: Name::Static("context"),
+                target: Target::Scope(Rc::as_ptr(env)),
+                owned: true,
+            });
         }
         if let Some(ci) = self.class_info.get(&ptr) {
-            out.push(Edge { kind: E_INTERNAL, name: Name::Static("field_context"), target: Target::Scope(Rc::as_ptr(&ci.field_env)), owned: true });
+            out.push(Edge {
+                kind: E_INTERNAL,
+                name: Name::Static("field_context"),
+                target: Target::Scope(Rc::as_ptr(&ci.field_env)),
+                owned: true,
+            });
+        }
+        #[cfg(feature = "aot-native")]
+        if let Some(class) = self.native_classes.get(&ptr) {
+            out.push(Edge { kind: E_INTERNAL, name: Name::Static("field_context"), target: Target::Scope(Rc::as_ptr(&class.env)), owned: true });
+            class.visit_values(|value| {
+                if let Some(target) = value_target(value) { out.push(Edge { kind: E_INTERNAL, name: Name::Static("class_initializer"), target, owned: matches!(value, Value::Obj(_)) }); }
+            });
         }
     }
 
@@ -361,7 +490,9 @@ impl Interp {
             GC_ROOTS => (T_SYNTHETIC, "(GC roots)".to_string(), 0),
             _ if n < g.first_scope() => {
                 let o = g.objects[(n - FIRST_OBJECT) as usize].borrow();
-                let size = std::mem::size_of::<Object>() + 16 + o.props.census().entries_cap * crate::value::memwalk::property_size();
+                let size = std::mem::size_of::<Object>()
+                    + 16
+                    + o.props.census().entries_cap * crate::value::memwalk::property_size();
                 if o.call.is_fn() {
                     (T_CLOSURE, function_name(&o), size)
                 } else {
@@ -370,7 +501,11 @@ impl Interp {
             }
             _ if n < g.first_string() => {
                 let s = g.scopes[(n - g.first_scope()) as usize].borrow();
-                (T_OBJECT, "system / Context".to_string(), 64 + s.vars.census().1 * 48)
+                (
+                    T_OBJECT,
+                    "system / Context".to_string(),
+                    64 + s.vars.census().1 * 48,
+                )
             }
             _ => {
                 let s = &g.strings[(n - g.first_string()) as usize];
@@ -404,12 +539,14 @@ impl Interp {
         };
         g.object_index.reserve(g.objects.len());
         for (i, o) in g.objects.iter().enumerate() {
-            g.object_index.insert(Gc::as_ptr(o) as usize, FIRST_OBJECT + i as u32);
+            g.object_index
+                .insert(Gc::as_ptr(o) as usize, FIRST_OBJECT + i as u32);
         }
         let first_scope = g.first_scope();
         g.scope_index.reserve(g.scopes.len());
         for (i, e) in g.scopes.iter().enumerate() {
-            g.scope_index.insert(Rc::as_ptr(e) as usize, first_scope + i as u32);
+            g.scope_index
+                .insert(Rc::as_ptr(e) as usize, first_scope + i as u32);
         }
         g.name_id("");
 
@@ -442,16 +579,31 @@ impl Interp {
         }
         // Each handle in `objects` / `scopes` is one strong reference of the snapshot's own.
         for (i, o) in g.objects.iter().enumerate() {
-            if Gc::strong_count(o).saturating_sub(1) > incoming[FIRST_OBJECT as usize + i] as usize {
+            if Gc::strong_count(o).saturating_sub(1) > incoming[FIRST_OBJECT as usize + i] as usize
+            {
                 g.roots.push(FIRST_OBJECT + i as u32);
             }
         }
         for (i, e) in g.scopes.iter().enumerate() {
-            if Rc::strong_count(e).saturating_sub(1) > incoming[(first_scope as usize) + i] as usize {
+            if Rc::strong_count(e).saturating_sub(1) > incoming[(first_scope as usize) + i] as usize
+            {
                 g.roots.push(first_scope + i as u32);
             }
         }
         drop(incoming);
+        #[cfg(feature = "aot-native")]
+        for unit in self.native_units.values().flatten() {
+            if let Some(&node) = g.scope_index.get(&(Rc::as_ptr(&unit.env) as usize)) {
+                if !g.roots.contains(&node) { g.roots.push(node); }
+            }
+            for value in std::iter::once(&unit.namespace).chain(unit.evaluation.iter()) {
+              if let Value::Obj(namespace) = value {
+                if let Some(&node) = g.object_index.get(&(Gc::as_ptr(namespace) as usize)) {
+                    if !g.roots.contains(&node) { g.roots.push(node); }
+                }
+              }
+            }
+        }
         edge_counts[GC_ROOTS as usize] = g.roots.len() as u32;
         let node_count = g.node_count();
         let edge_total: u64 = edge_counts.iter().map(|&c| c as u64).sum();
@@ -481,7 +633,11 @@ impl Interp {
                 _ => 2 * n as u64 + 3,
             };
             let sep = if n == 0 { "" } else { "," };
-            writeln!(out, "{sep}{kind},{name},{id},{size},{},0,0", edge_counts[n as usize])?;
+            writeln!(
+                out,
+                "{sep}{kind},{name},{id},{size},{},0,0",
+                edge_counts[n as usize]
+            )?;
         }
         out.write_all(b"],\n\"edges\":[")?;
 
@@ -490,7 +646,9 @@ impl Interp {
         for n in 0..node_count {
             self.snapshot_edges(&g, n, &mut edges);
             for e in edges.drain(..) {
-                let Some(to) = g.resolve(e.target) else { continue };
+                let Some(to) = g.resolve(e.target) else {
+                    continue;
+                };
                 let name = match e.name {
                     Name::Index(i) => i,
                     Name::Static(s) => g.name_id(s),

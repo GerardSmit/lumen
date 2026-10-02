@@ -120,6 +120,8 @@ impl Writer {
 #[derive(Default, Debug, Clone)]
 pub struct Deps {
     pub dynamic_imports: Vec<String>,
+    pub computed_dynamic_imports: usize,
+    pub dynamic_code_sites: Vec<(u32, &'static str)>,
     pub requires: Vec<String>,
 }
 
@@ -161,7 +163,10 @@ impl KeepMap {
 
     /// `start..end` in kept-text coordinates (`None`: not inside one kept span).
     fn map(&self, start: u32, end: u32) -> Option<(u32, u32)> {
-        let i = self.spans.partition_point(|s| s.0 <= start).checked_sub(1)?;
+        let i = self
+            .spans
+            .partition_point(|s| s.0 <= start)
+            .checked_sub(1)?;
         let (s, e, off) = self.spans[i];
         (end <= e).then(|| (off + (start - s), off + (end - s)))
     }
@@ -646,9 +651,7 @@ impl SplitUnit {
     /// Row `i` of the function table: (owner stream, descendants' end, header offset, body
     /// offset); row `n` holds the totals in the offset columns.
     fn row(&self, i: usize) -> (u64, usize, usize, usize) {
-        let u = |at: usize| {
-            u32::from_le_bytes(self.ast[at..at + 4].try_into().unwrap()) as usize
-        };
+        let u = |at: usize| u32::from_le_bytes(self.ast[at..at + 4].try_into().unwrap()) as usize;
         if i == self.n {
             return (0, self.n, u(self.headers - 8), self.bodies_len);
         }
@@ -1381,6 +1384,16 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             optional,
             pos,
         } => {
+            if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
+                if matches!(name.as_str(), "eval" | "Function" | "AsyncFunction" | "GeneratorFunction") {
+                    deps.dynamic_code_sites.push((*pos, match name.as_str() {
+                        "eval" => "eval",
+                        "Function" => "Function",
+                        "AsyncFunction" => "AsyncFunction",
+                        _ => "GeneratorFunction",
+                    }));
+                }
+            }
             if let (Some(deps), Expr::Ident(name), [ArrayElem::Item(Expr::Str(spec))]) =
                 (&mut w.deps, &**callee, args.as_slice())
             {
@@ -1395,6 +1408,15 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             enc_pos(w, *pos);
         }
         Expr::New { callee, args, pos } => {
+            if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
+                if matches!(name.as_str(), "Function" | "AsyncFunction" | "GeneratorFunction") {
+                    deps.dynamic_code_sites.push((*pos, match name.as_str() {
+                        "Function" => "Function",
+                        "AsyncFunction" => "AsyncFunction",
+                        _ => "GeneratorFunction",
+                    }));
+                }
+            }
             w.u8(25);
             enc_expr(w, callee);
             enc_array_elems(w, args);
@@ -1450,11 +1472,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             phase,
             options,
         } => {
-            if let (Some(deps), Expr::Str(s), ImportPhase::Evaluation, None) =
-                (&mut w.deps, &**spec, phase, options)
-            {
-                if !deps.dynamic_imports.iter().any(|d| **d == **s) {
-                    deps.dynamic_imports.push(s.to_string());
+            if let Some(deps) = &mut w.deps {
+                if let (Expr::Str(s), ImportPhase::Evaluation, None) = (&**spec, phase, options) {
+                    if !deps.dynamic_imports.iter().any(|d| **d == **s) {
+                        deps.dynamic_imports.push(s.to_string());
+                    }
+                } else {
+                    deps.computed_dynamic_imports += 1;
                 }
             }
             w.u8(32);
@@ -2369,7 +2393,8 @@ mod tests {
     #[test]
     fn expression_arrow_reload_metadata_roundtrips_and_executes() {
         assert_roundtrips("const arrow = value => ({text: 'é', value: value + 3});");
-        check_snapshot(r#"
+        check_snapshot(
+            r#"
             const tag = strings => strings;
             const template = () => tag`é`;
             const first = template();
@@ -2377,7 +2402,8 @@ mod tests {
             assert(read() === 41);
             $262.gc(); $262.gc();
             assert(read() === 42 && template() === first);
-        "#);
+        "#,
+        );
     }
 
     #[test]
@@ -2450,7 +2476,10 @@ mod tests {
                         },
                         e => panic!("unexpected callee {e:?}"),
                     };
-                    assert!(f.parsed_body().is_none(), "an IIFE decodes with reload metadata");
+                    assert!(
+                        f.parsed_body().is_none(),
+                        "an IIFE decodes with reload metadata"
+                    );
                     assert!(f.lazy.borrow().is_some());
                     assert_eq!(f.source.as_str(), Some("function iife() { return 3; }"));
                 }

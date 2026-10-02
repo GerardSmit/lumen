@@ -1,0 +1,14 @@
+<!doctype html>
+<!--
+  jixr-compare: threshold=120 max-diff-ratio=0.006
+  The Window oracle tessellates the ellipse into a vertex polygon, so its antialiased boundary
+  ring differs from Chromium's true ellipse by a small fraction of pixels (measured ~0.15%); the
+  Pdf and Image backends already match exactly. The ratio keeps a 4x margin.
+-->
+<style>
+html,body{margin:0;background:#fff}
+.stage{width:340px;height:150px;background:#e8eef8;padding:10px;font:12px sans-serif}
+.a{width:100px;height:60px;background:#174ea6;clip-path:ellipse();display:inline-block}
+.b{width:100px;height:60px;background:#d93025;clip-path:ellipse(50% 80% at center);display:inline-block}
+.c{width:100px;height:60px;background:#fbbc04;clip-path:ellipse(30px 20px at 25% 50%);display:inline-block}
+</style><div class=stage><div class=a></div><div class=b></div><div class=c></div></div>

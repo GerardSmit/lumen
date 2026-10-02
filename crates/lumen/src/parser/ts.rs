@@ -726,6 +726,7 @@ impl Parser {
                 line,
                 LexOpts {
                     ts: true,
+                    jsx: self.jsx.is_some(),
                     docs: false,
                     start_div: !regex,
                     offset: c as u32,

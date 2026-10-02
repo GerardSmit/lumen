@@ -1,0 +1,17 @@
+<!doctype html><!--
+  jixr-compare: threshold=16 max-diff-ratio=0.07
+  The sharp inset matches exactly; the blurred inset's inner edge differs from Skia's
+  inner-shadow approximation along the hole corner by the same truncated-Gaussian class the
+  outer box-shadow-blur case records.
+--><style>
+html,body{margin:0;background:#fff}
+main{position:relative;width:220px;height:140px;background:none}
+.inset{width:120px;height:100px;background:#e8710a;
+box-shadow:inset 12px 10px 0 #174ea6}
+.blurred{width:120px;height:60px;background:#fbbc04;margin-top:8px;
+box-shadow:inset -8px -6px 6px #174ea6}
+</style>
+<main>
+<div class=inset></div>
+<div class=blurred></div>
+</main>

@@ -1582,6 +1582,7 @@ fn wire_child_realm(
     }
     Ok(Wired {
         request: ChildRealmRequest {
+            ipc: None,
             argv,
             env,
             cwd,

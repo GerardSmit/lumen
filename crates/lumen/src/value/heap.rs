@@ -48,8 +48,9 @@ pub(crate) const ARRAY_SLOTS_MAX: usize = 4;
 /// Number of slot classes.
 pub(crate) const CLASSES: usize = 7;
 /// Slot class names, by index (the `LUMEN_MEM_STATS` report).
-pub(crate) const CLASS_NAMES: [&str; CLASSES] =
-    ["plain", "inline2", "inline4", "inline8", "array0", "array2", "array4"];
+pub(crate) const CLASS_NAMES: [&str; CLASSES] = [
+    "plain", "inline2", "inline4", "inline8", "array0", "array2", "array4",
+];
 /// How long empty chunks must stay unused before [`ObjHeap::trim_if_emptied`] returns them.
 const PURGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -246,12 +247,8 @@ mod os {
     pub const PAGE_READWRITE: u32 = 0x04;
     #[link(name = "kernel32")]
     extern "system" {
-        pub fn VirtualAlloc(
-            addr: *mut c_void,
-            size: usize,
-            kind: u32,
-            protect: u32,
-        ) -> *mut c_void;
+        pub fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32)
+            -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
     }
 }
@@ -445,7 +442,8 @@ impl ObjHeap {
                 target.chunks().push(chunk);
             }
         }
-        self.emptied.set(self.emptied.get().saturating_add(other.emptied.replace(0)));
+        self.emptied
+            .set(self.emptied.get().saturating_add(other.emptied.replace(0)));
         other.purge_at.set(None);
     }
 

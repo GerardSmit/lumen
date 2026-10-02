@@ -8,7 +8,7 @@
 //! [rbp]           caller's rbp
 //! [rbp - 8 ..]    saved callee-saved GPRs
 //!                 context pointer (parameter 0), for trap stubs
-//!                 spill slots, 8 bytes each
+//!                 spill slots, 8 bytes each (16 when the function uses vectors)
 //!                 saved callee-saved XMMs (Win64)
 //! [rsp ..]        outgoing arguments
 //! ```
@@ -32,10 +32,20 @@ pub struct Frame {
     slot_base: i32,
     xmm_off: i32,
     needs_ctx: bool,
+    vectors: bool,
 }
 
 impl Frame {
     pub fn new(alloc: &Allocation, outgoing: u32, needs_ctx: bool) -> Frame {
+        Self::with_vectors(alloc, outgoing, needs_ctx, false)
+    }
+
+    pub fn with_vectors(
+        alloc: &Allocation,
+        outgoing: u32,
+        needs_ctx: bool,
+        vectors: bool,
+    ) -> Frame {
         let mut gprs = Vec::new();
         let mut xmms = Vec::new();
         for r in alloc.used_callee_saved.iter() {
@@ -46,8 +56,14 @@ impl Frame {
         }
         let base = 8 * gprs.len() as i32;
         let ctx_off = -(base + 8);
-        let slot_base = -(base + 16);
-        let after_slots = base + 8 + 8 * alloc.num_slots as i32;
+        let stride = if vectors { 16 } else { 8 };
+        let slots_start = if vectors {
+            (base + 8 + 15) & !15
+        } else {
+            base + 8
+        };
+        let slot_base = -(slots_start + stride);
+        let after_slots = slots_start + stride * alloc.num_slots as i32;
         let xmm_off = -(after_slots + 16 * xmms.len() as i32);
         let mut size = (after_slots - base) as u32 + 16 * xmms.len() as u32 + outgoing;
         // rsp is 16-aligned at the call into us minus the return address; rbp is aligned.
@@ -62,11 +78,15 @@ impl Frame {
             slot_base,
             xmm_off,
             needs_ctx,
+            vectors,
         }
     }
 
     fn slot(&self, s: u32) -> RM {
-        RM::mem(asm::RBP, self.slot_base - 8 * s as i32)
+        RM::mem(
+            asm::RBP,
+            self.slot_base - (if self.vectors { 16 } else { 8 }) * s as i32,
+        )
     }
 }
 
@@ -82,9 +102,13 @@ pub struct Emitter<'a> {
     consts: Vec<(u64, u64, Label)>,
     tables: Vec<(Label, Vec<usize>)>,
     pub relocs: Vec<Reloc>,
+    pub symbol_loads: Vec<Reloc>,
     /// Scratch registers assigned to spilled operands of the current instruction.
     map: Vec<(VReg, PReg)>,
     post: Vec<(PReg, Loc)>,
+    alignment: usize,
+    cfi: crate::unwind::Cfi,
+    prologue_len: usize,
 }
 
 fn is_reg(l: Loc) -> bool {
@@ -114,9 +138,18 @@ impl<'a> Emitter<'a> {
             consts: Vec::new(),
             tables: Vec::new(),
             relocs: Vec::new(),
+            symbol_loads: Vec::new(),
             map: Vec::new(),
             post: Vec::new(),
+            alignment: 1,
+            cfi: Default::default(),
+            prologue_len: 0,
         }
+    }
+
+    pub fn with_alignment(mut self, alignment: usize) -> Self {
+        self.alignment = alignment;
+        self
     }
 
     fn loc(&self, v: VReg) -> Loc {
@@ -179,10 +212,26 @@ impl<'a> Emitter<'a> {
         self.a.op(0, false, &[0x0f, 0x28], d, RM::Reg(s), false, 0);
     }
     fn movsd_load(&mut self, d: u8, rm: RM) {
-        self.a.op(0xf2, false, &[0x0f, 0x10], d, rm, false, 0);
+        self.a.op(
+            if self.frame.vectors { 0 } else { 0xf2 },
+            false,
+            &[0x0f, 0x10],
+            d,
+            rm,
+            false,
+            0,
+        );
     }
     fn movsd_store(&mut self, s: u8, rm: RM) {
-        self.a.op(0xf2, false, &[0x0f, 0x11], s, rm, false, 0);
+        self.a.op(
+            if self.frame.vectors { 0 } else { 0xf2 },
+            false,
+            &[0x0f, 0x11],
+            s,
+            rm,
+            false,
+            0,
+        );
     }
     fn xorps(&mut self, d: u8, s: u8) {
         self.a.op(0, false, &[0x0f, 0x57], d, RM::Reg(s), false, 0);
@@ -297,10 +346,28 @@ impl<'a> Emitter<'a> {
 
     // ----- function -----
 
-    pub fn emit(mut self) -> Result<(Vec<u8>, Vec<bool>, Vec<Reloc>), String> {
+    pub fn emit(
+        mut self,
+    ) -> Result<(Vec<u8>, Vec<bool>, Vec<Reloc>, Vec<Reloc>, Vec<u8>, Vec<u8>), String> {
         self.prologue();
         for bi in 0..self.code.blocks.len() {
             let l = self.blocks[bi];
+            if self.alignment > 1
+                && self.code.blocks.iter().enumerate().any(|(from, block)| {
+                    from >= bi
+                        && self.code.insts[block.start..block.end]
+                            .iter()
+                            .any(|i| match i {
+                                MInst::Jmp { target, .. } => *target == bi,
+                                MInst::Jcc {
+                                    taken, not_taken, ..
+                                } => *taken == bi || *not_taken == bi,
+                                _ => false,
+                            })
+                })
+            {
+                self.a.align(self.alignment, 0x90);
+            }
             self.a.bind(l);
             let b = &self.code.blocks[bi];
             for i in b.start..b.end {
@@ -337,28 +404,67 @@ impl<'a> Emitter<'a> {
             }
         }
         let fits = self.a.finish()?;
-        Ok((self.a.buf, fits, self.relocs))
+        let windows = if self.abi.win64 {
+            self.cfi.windows(self.prologue_len)?
+        } else {
+            Vec::new()
+        };
+        Ok((
+            self.a.buf,
+            fits,
+            self.relocs,
+            self.symbol_loads,
+            self.cfi.bytes,
+            windows,
+        ))
     }
 
     fn prologue(&mut self) {
         let fr = self.frame;
         self.a.push(asm::RBP);
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(7, 16);
+        self.cfi.save(6, 16);
+        self.cfi.win(self.a.pos(), 5 << 4, &[]);
         self.a.mov_rr(asm::RBP, asm::RSP);
-        for &g in &fr.gprs {
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(6, 16);
+        for (index, &g) in fr.gprs.iter().enumerate() {
             self.a.push(g);
+            self.cfi.at(self.a.pos());
+            self.cfi
+                .save(crate::unwind::x64_register(g), 24 + index as u32 * 8);
+            self.cfi.win(self.a.pos(), g << 4, &[]);
         }
         if fr.size > 0 {
             // Touch each page in order so the OS guard page grows the stack (Win64).
             for k in 1..=fr.size / 4096 {
                 let disp = -(4096 * k as i32);
-                self.a.op(0, false, &[0x85], asm::RAX, RM::mem(asm::RSP, disp), false, 0);
+                self.a.op(
+                    0,
+                    false,
+                    &[0x85],
+                    asm::RAX,
+                    RM::mem(asm::RSP, disp),
+                    false,
+                    0,
+                );
             }
             self.a.alu_imm(true, 5, RM::Reg(asm::RSP), fr.size as i32);
+            self.cfi.win(self.a.pos(), 0x11, &fr.size.to_le_bytes());
         }
         for (k, &x) in fr.xmms.iter().enumerate() {
             let m = RM::mem(asm::RBP, fr.xmm_off + 16 * k as i32);
             self.a.op(0xf3, false, &[0x0f, 0x7f], x, m, false, 0);
+            self.cfi.at(self.a.pos());
+            self.cfi
+                .save(17 + x, (16 - fr.xmm_off - 16 * k as i32) as u32);
+            let offset =
+                (fr.size as i32 + 8 * fr.gprs.len() as i32 + fr.xmm_off + 16 * k as i32) as u32;
+            self.cfi
+                .win(self.a.pos(), (x << 4) | 9, &offset.to_le_bytes());
         }
+        self.prologue_len = self.a.pos();
         let a0 = self.abi.int_args[0].hw;
         if fr.needs_ctx {
             self.a.mov_store(true, a0, RM::mem(asm::RBP, fr.ctx_off));
@@ -366,7 +472,8 @@ impl<'a> Emitter<'a> {
         if let Some(tc) = self.traps {
             if let Some((off, code)) = tc.stack_limit {
                 // cmp rsp, [ctx + limit]; jb overflow
-                self.a.op(0, true, &[0x3b], asm::RSP, RM::mem(a0, off), false, 0);
+                self.a
+                    .op(0, true, &[0x3b], asm::RSP, RM::mem(a0, off), false, 0);
                 let l = self.trap_label(code);
                 self.a.jcc(CC::B.code(), l);
             }
@@ -374,22 +481,31 @@ impl<'a> Emitter<'a> {
     }
 
     fn epilogue(&mut self) {
+        self.cfi.at(self.a.pos());
+        self.cfi.remember();
         let fr = self.frame;
         for (k, &x) in fr.xmms.iter().enumerate() {
             let m = RM::mem(asm::RBP, fr.xmm_off + 16 * k as i32);
             self.a.op(0xf3, false, &[0x0f, 0x6f], x, m, false, 0);
+            self.cfi.at(self.a.pos());
+            self.cfi.restore(17 + x);
         }
-        if fr.gprs.is_empty() {
-            self.a.mov_rr(asm::RSP, asm::RBP);
-        } else {
-            let disp = -(8 * fr.gprs.len() as i32);
-            self.a.op(0, true, &[0x8d], asm::RSP, RM::mem(asm::RBP, disp), false, 0);
-            for &g in fr.gprs.iter().rev() {
-                self.a.pop(g);
-            }
+        // Windows recognizes a fixed stack adjustment followed by register pops.
+        if fr.size > 0 {
+            self.a.alu_imm(true, 0, RM::Reg(asm::RSP), fr.size as i32);
+        }
+        for &g in fr.gprs.iter().rev() {
+            self.a.pop(g);
+            self.cfi.at(self.a.pos());
+            self.cfi.restore(crate::unwind::x64_register(g));
         }
         self.a.pop(asm::RBP);
+        self.cfi.at(self.a.pos());
+        self.cfi.cfa(7, 8);
+        self.cfi.restore(6);
         self.a.ret();
+        self.cfi.at(self.a.pos());
+        self.cfi.reset();
     }
 
     fn inst(&mut self, inst: &MInst, bi: usize) -> Result<(), String> {
@@ -425,6 +541,63 @@ impl<'a> Emitter<'a> {
         }
         self.prep(inst);
         match inst {
+            MInst::Packed {
+                opcode,
+                imm,
+                dst,
+                src,
+            } => {
+                let d = self.r(*dst);
+                let rm = self.rm(*src);
+                if *opcode > 0xff {
+                    self.a.op(
+                        0x66,
+                        false,
+                        &[0x0f, 0x38, *opcode as u8],
+                        d,
+                        rm,
+                        false,
+                        usize::from(imm.is_some()),
+                    );
+                } else {
+                    self.a.op(
+                        0x66,
+                        false,
+                        &[0x0f, *opcode as u8],
+                        d,
+                        rm,
+                        false,
+                        usize::from(imm.is_some()),
+                    );
+                }
+                if let Some(imm) = imm {
+                    self.a.byte(*imm);
+                }
+            }
+            MInst::Prefetch { addr } => {
+                let rm = self.amode(addr);
+                self.a.op(0, false, &[0x0f, 0x18], 1, rm, false, 0); // PREFETCHT0
+            }
+            MInst::AtomicAdd { addr, dst } => {
+                let (p, d) = (self.r(*addr), self.r(*dst));
+                self.a
+                    .op(0xf0, false, &[0x0f, 0xc1], d, RM::mem(p, 0), false, 0);
+            }
+            MInst::AtomicCas {
+                addr,
+                expected,
+                replacement,
+                dst,
+            } => {
+                let (p, r) = (self.r(*addr), self.r(*replacement));
+                // Fixed operands reserve/hint RAX in this allocator; the emitter
+                // still performs the ABI-style input/output moves explicitly.
+                self.a
+                    .mov_load(false, asm::RAX, self.loc_rm(self.loc(*expected)));
+                self.a
+                    .op(0xf0, false, &[0x0f, 0xb1], r, RM::mem(p, 0), false, 0);
+                self.move_loc(Loc::Reg(super::regs::RAX), self.loc(*dst), RegClass::Int);
+            }
             MInst::Args { regs, stack } => {
                 let moves = regs
                     .iter()
@@ -440,7 +613,7 @@ impl<'a> Emitter<'a> {
                     let src = RM::mem(asm::RBP, off);
                     match self.loc(v) {
                         Loc::Reg(r) if class == RegClass::Int => self.a.mov_load(true, r.hw, src),
-                        Loc::Reg(r) => self.movsd_load(r.hw, src),
+                        Loc::Reg(r) => self.a.op(0xf2, false, &[0x0f, 0x10], r.hw, src, false, 0),
                         Loc::Stack(s) => {
                             self.a.mov_load(true, asm::R10, src);
                             self.a.mov_store(true, asm::R10, self.frame.slot(s));
@@ -480,7 +653,8 @@ impl<'a> Emitter<'a> {
                     RegImm::Imm(i) => self.a.alu_imm(size.w(), op.digit(), RM::Reg(d), *i),
                     RegImm::Reg(s) => {
                         let rm = self.rm(*s);
-                        self.a.op(0, size.w(), &[op.digit() << 3 | 3], d, rm, false, 0);
+                        self.a
+                            .op(0, size.w(), &[op.digit() << 3 | 3], d, rm, false, 0);
                     }
                 }
             }
@@ -503,7 +677,12 @@ impl<'a> Emitter<'a> {
                 let rm = self.rm(*src);
                 self.a.op(0, size.w(), &[0x0f, 0xaf], d, rm, false, 0);
             }
-            MInst::Imul3 { size, dst, src, imm } => {
+            MInst::Imul3 {
+                size,
+                dst,
+                src,
+                imm,
+            } => {
                 let d = self.r(*dst);
                 let rm = self.rm(*src);
                 if let Ok(b) = i8::try_from(*imm) {
@@ -524,14 +703,16 @@ impl<'a> Emitter<'a> {
             }
             MInst::ShiftImm { op, size, dst, amt } => {
                 let d = self.r(*dst);
-                self.a.op(0, size.w(), &[0xc1], *op as u8, RM::Reg(d), false, 1);
+                self.a
+                    .op(0, size.w(), &[0xc1], *op as u8, RM::Reg(d), false, 1);
                 self.a.byte(*amt);
             }
             MInst::ShiftCl { op, size, dst, amt } => {
                 let src = self.loc(*amt);
                 self.move_loc(src, Loc::Reg(super::regs::RCX), RegClass::Int);
                 let d = self.r(*dst);
-                self.a.op(0, size.w(), &[0xd3], *op as u8, RM::Reg(d), false, 0);
+                self.a
+                    .op(0, size.w(), &[0xd3], *op as u8, RM::Reg(d), false, 0);
             }
             MInst::ShiftX {
                 op,
@@ -569,8 +750,20 @@ impl<'a> Emitter<'a> {
                     self.a.bytes(&[0x31, 0xd2]);
                 }
                 let rm = self.rm(*divisor);
-                self.a.op(0, size.w(), &[0xf7], if *signed { 7 } else { 6 }, rm, false, 0);
-                let out = if *rem { super::regs::RDX } else { super::regs::RAX };
+                self.a.op(
+                    0,
+                    size.w(),
+                    &[0xf7],
+                    if *signed { 7 } else { 6 },
+                    rm,
+                    false,
+                    0,
+                );
+                let out = if *rem {
+                    super::regs::RDX
+                } else {
+                    super::regs::RAX
+                };
                 let d = self.loc(*dst);
                 self.move_loc(Loc::Reg(out), d, RegClass::Int);
             }
@@ -587,13 +780,15 @@ impl<'a> Emitter<'a> {
                         // clz = (bits - 1) ^ bsr, and (2 * bits - 1) ^ (bits - 1) = bits for 0.
                         self.a.op(0, w, &[0x0f, 0xbd], d, rm, false, 0);
                         self.a.mov_imm(asm::R11, 2 * bits as u64 - 1, true);
-                        self.a.op(0, w, &[0x0f, 0x44], d, RM::Reg(asm::R11), false, 0);
+                        self.a
+                            .op(0, w, &[0x0f, 0x44], d, RM::Reg(asm::R11), false, 0);
                         self.a.alu_imm(w, 6, RM::Reg(d), bits as i32 - 1);
                     }
                     BitOp::CtzBsf => {
                         self.a.op(0, w, &[0x0f, 0xbc], d, rm, false, 0);
                         self.a.mov_imm(asm::R11, bits as u64, true);
-                        self.a.op(0, w, &[0x0f, 0x44], d, RM::Reg(asm::R11), false, 0);
+                        self.a
+                            .op(0, w, &[0x0f, 0x44], d, RM::Reg(asm::R11), false, 0);
                     }
                 }
             }
@@ -609,8 +804,19 @@ impl<'a> Emitter<'a> {
                     LoadKind::Plain(s) => self.a.mov_load(s.w(), d, m),
                     LoadKind::Ext(e) => self.movx(*e, d, m),
                     LoadKind::F32 => self.a.op(0xf3, false, &[0x0f, 0x10], d, m, false, 0),
-                    LoadKind::F64 => self.movsd_load(d, m),
+                    LoadKind::F64 => self.a.op(0xf2, false, &[0x0f, 0x10], d, m, false, 0),
+                    LoadKind::V128 => self.a.op(0, false, &[0x0f, 0x10], d, m, false, 0),
                 }
+            }
+            MInst::SymbolAddr { dst, id } => {
+                let d = self.r(*dst);
+                self.a
+                    .bytes(&[0x48 | ((d >> 3) << 2), 0x8b, 0x05 | ((d & 7) << 3)]);
+                self.symbol_loads.push(Reloc {
+                    offset: self.a.pos(),
+                    func_id: *id,
+                });
+                self.a.u32(0);
             }
             MInst::Store { kind, src, addr } => {
                 let s = self.r(*src);
@@ -648,13 +854,16 @@ impl<'a> Emitter<'a> {
                 let w = size.w();
                 match cc {
                     CC::FNe => {
-                        self.a.op(0, w, &[0x0f, 0x40 + CC::NE.code()], d, rm, false, 0);
-                        self.a.op(0, w, &[0x0f, 0x40 + CC::P.code()], d, rm, false, 0);
+                        self.a
+                            .op(0, w, &[0x0f, 0x40 + CC::NE.code()], d, rm, false, 0);
+                        self.a
+                            .op(0, w, &[0x0f, 0x40 + CC::P.code()], d, rm, false, 0);
                     }
                     CC::FEq => {
                         let skip = self.a.new_label();
                         self.a.jcc(CC::P.code(), skip);
-                        self.a.op(0, w, &[0x0f, 0x40 + CC::E.code()], d, rm, false, 0);
+                        self.a
+                            .op(0, w, &[0x0f, 0x40 + CC::E.code()], d, rm, false, 0);
                         self.a.bind(skip);
                     }
                     c => self.a.op(0, w, &[0x0f, 0x40 + c.code()], d, rm, false, 0),
@@ -671,7 +880,8 @@ impl<'a> Emitter<'a> {
                 } else {
                     let l = self.constant(*bits, 0);
                     let pfx = if *double { 0xf2 } else { 0xf3 };
-                    self.a.op(pfx, false, &[0x0f, 0x10], d, RM::Rip(l), false, 0);
+                    self.a
+                        .op(pfx, false, &[0x0f, 0x10], d, RM::Rip(l), false, 0);
                 }
             }
             MInst::XmmAlu {
@@ -715,7 +925,8 @@ impl<'a> Emitter<'a> {
             MInst::XmmMask { op, dst, mask, .. } => {
                 let d = self.r(*dst);
                 let l = self.constant(*mask, *mask);
-                self.a.op(0, false, &[0x0f, *op as u8], d, RM::Rip(l), false, 0);
+                self.a
+                    .op(0, false, &[0x0f, *op as u8], d, RM::Rip(l), false, 0);
             }
             MInst::XmmRound {
                 double,
@@ -784,7 +995,9 @@ impl<'a> Emitter<'a> {
             MInst::XmmToGpr { size, dst, src } => {
                 let d = self.r(*dst);
                 match self.rm(*src) {
-                    RM::Reg(s) => self.a.op(0x66, size.w(), &[0x0f, 0x7e], s, RM::Reg(d), false, 0),
+                    RM::Reg(s) => self
+                        .a
+                        .op(0x66, size.w(), &[0x0f, 0x7e], s, RM::Reg(d), false, 0),
                     m => self.a.mov_load(size.w(), d, m),
                 }
             }
@@ -800,7 +1013,9 @@ impl<'a> Emitter<'a> {
                     let dst = RM::mem(asm::RSP, off);
                     match (self.code.class(v), self.loc(v)) {
                         (RegClass::Int, Loc::Reg(r)) => self.a.mov_store(true, r.hw, dst),
-                        (RegClass::Float, Loc::Reg(r)) => self.movsd_store(r.hw, dst),
+                        (RegClass::Float, Loc::Reg(r)) => {
+                            self.a.op(0xf2, false, &[0x0f, 0x11], r.hw, dst, false, 0)
+                        }
                         (_, l) => {
                             self.a.mov_load(true, asm::R10, self.loc_rm(l));
                             self.a.mov_store(true, asm::R10, dst);
@@ -889,14 +1104,16 @@ impl<'a> Emitter<'a> {
                 self.a.jcc(CC::AE.code(), dl);
                 let table = self.a.new_label();
                 // lea r11, [rip + table]; movsxd r10, [r11 + i*4]; add r10, r11; jmp r10
-                self.a.op(0, true, &[0x8d], asm::R11, RM::Rip(table), false, 0);
+                self.a
+                    .op(0, true, &[0x8d], asm::R11, RM::Rip(table), false, 0);
                 let entry = RM::Mem {
                     base: asm::R11,
                     index: Some((i, 2)),
                     disp: 0,
                 };
                 self.a.op(0, true, &[0x63], asm::R10, entry, false, 0);
-                self.a.op(0, true, &[0x01], asm::R11, RM::Reg(asm::R10), false, 0);
+                self.a
+                    .op(0, true, &[0x01], asm::R11, RM::Reg(asm::R10), false, 0);
                 self.a.op(0, false, &[0xff], 4, RM::Reg(asm::R10), false, 0);
                 self.tables.push((table, targets.clone()));
             }
@@ -932,7 +1149,8 @@ impl<'a> Emitter<'a> {
             StoreKind::B32 => self.a.mov_store(false, s, m),
             StoreKind::B64 => self.a.mov_store(true, s, m),
             StoreKind::F32 => self.a.op(0xf3, false, &[0x0f, 0x11], s, m, false, 0),
-            StoreKind::F64 => self.movsd_store(s, m),
+            StoreKind::F64 => self.a.op(0xf2, false, &[0x0f, 0x11], s, m, false, 0),
+            StoreKind::V128 => self.a.op(0, false, &[0x0f, 0x11], s, m, false, 0),
         }
     }
 

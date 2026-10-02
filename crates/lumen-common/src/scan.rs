@@ -6,6 +6,34 @@ pub fn utf8_bmp_prefix(text: &str, out: &mut Vec<u16>) -> usize {
     let bytes = text.as_bytes();
     let mut at = 0;
     while at < bytes.len() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use core::arch::x86_64::*;
+            if bytes.len() - at >= 16 {
+                let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+                let zero = _mm_setzero_si128();
+                if _mm_movemask_epi8(block) == 0 {
+                    let mut units = [0; 16];
+                    _mm_storeu_si128(units.as_mut_ptr().cast(), _mm_unpacklo_epi8(block, zero));
+                    _mm_storeu_si128(units.as_mut_ptr().add(8).cast(), _mm_unpackhi_epi8(block, zero));
+                    out.extend_from_slice(&units);
+                    at += 16;
+                    continue;
+                }
+                // Validated UTF-8 plus this lane pattern proves eight two-byte scalars.
+                let pattern = _mm_and_si128(block, _mm_set1_epi16(0xc0e0u16 as i16));
+                if _mm_movemask_epi8(_mm_cmpeq_epi16(pattern, _mm_set1_epi16(0x80c0u16 as i16))) == 0xffff {
+                    let units = _mm_or_si128(
+                        _mm_slli_epi16::<6>(_mm_and_si128(block, _mm_set1_epi16(31))),
+                        _mm_and_si128(_mm_srli_epi16::<8>(block), _mm_set1_epi16(63)));
+                    let mut lanes = [0; 8];
+                    _mm_storeu_si128(lanes.as_mut_ptr().cast(), units);
+                    out.extend_from_slice(&lanes);
+                    at += 16;
+                    continue;
+                }
+            }
+        }
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         unsafe {
             use core::arch::aarch64::*;
@@ -66,6 +94,36 @@ pub fn utf8_bmp_prefix(text: &str, out: &mut Vec<u16>) -> usize {
 pub fn utf16_bmp_prefix(units: &[u16], out: &mut String) -> usize {
     let mut at = 0;
     while at < units.len() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use core::arch::x86_64::*;
+            if units.len() - at >= 8 {
+                let block = _mm_loadu_si128(units.as_ptr().add(at).cast());
+                let zero = _mm_setzero_si128();
+                let mut bytes = [0; 16];
+                let ascii = _mm_cmpeq_epi16(_mm_and_si128(block, _mm_set1_epi16(0xff80u16 as i16)), zero);
+                let count = if _mm_movemask_epi8(ascii) == 0xffff {
+                    _mm_storel_epi64(bytes.as_mut_ptr().cast(), _mm_packus_epi16(block, zero));
+                    8
+                } else {
+                    let high = _mm_and_si128(block, _mm_set1_epi16(0xf800u16 as i16));
+                    let below = _mm_cmpeq_epi16(high, zero);
+                    let above = _mm_cmpgt_epi16(block, _mm_set1_epi16(127));
+                    if _mm_movemask_epi8(_mm_and_si128(below, above)) == 0xffff {
+                        let lead = _mm_or_si128(_mm_srli_epi16::<6>(block), _mm_set1_epi16(0xc0));
+                        let tail = _mm_or_si128(_mm_slli_epi16::<8>(_mm_and_si128(block, _mm_set1_epi16(63))),
+                            _mm_set1_epi16(0x8000u16 as i16));
+                        _mm_storeu_si128(bytes.as_mut_ptr().cast(), _mm_or_si128(lead, tail));
+                        16
+                    } else { 0 }
+                };
+                if count != 0 {
+                    out.push_str(core::str::from_utf8_unchecked(&bytes[..count]));
+                    at += 8;
+                    continue;
+                }
+            }
+        }
         #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
         unsafe {
             use core::arch::aarch64::*;
@@ -111,6 +169,17 @@ pub fn latin1_to_utf16(bytes: &[u8]) -> Vec<u16> {
     let mut out = vec![0; bytes.len()];
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let zero = _mm_setzero_si128();
+        while bytes.len() - at >= 16 {
+            let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            _mm_storeu_si128(out.as_mut_ptr().add(at).cast(), _mm_unpacklo_epi8(block, zero));
+            _mm_storeu_si128(out.as_mut_ptr().add(at+8).cast(), _mm_unpackhi_epi8(block, zero));
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -130,6 +199,18 @@ pub fn utf16_to_ascii(units: &[u16]) -> Option<String> {
     let mut out = vec![0; units.len()];
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while units.len() - at >= 16 {
+            let a = _mm_loadu_si128(units.as_ptr().add(at).cast());
+            let b = _mm_loadu_si128(units.as_ptr().add(at+8).cast());
+            let high = _mm_and_si128(_mm_or_si128(a,b), _mm_set1_epi16(0xff80u16 as i16));
+            if _mm_movemask_epi8(_mm_cmpeq_epi16(high, _mm_setzero_si128())) != 0xffff { return None; }
+            _mm_storeu_si128(out.as_mut_ptr().add(at).cast(), _mm_packus_epi16(a,b));
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -154,6 +235,19 @@ pub fn ascii_case(text: &str, upper: bool) -> String {
     let mut out = text.as_bytes().to_vec();
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let first = _mm_set1_epi8(if upper { b'a' as i8 } else { b'A' as i8 });
+        while out.len() - at >= 16 {
+            let block = _mm_loadu_si128(out.as_ptr().add(at).cast());
+            let letters = _mm_cmpeq_epi8(_mm_subs_epu8(_mm_sub_epi8(block, first), _mm_set1_epi8(25)),
+                _mm_setzero_si128());
+            let result = _mm_xor_si128(block, _mm_and_si128(letters, _mm_set1_epi8(32)));
+            _mm_storeu_si128(out.as_mut_ptr().add(at).cast(), result);
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -193,6 +287,45 @@ pub fn numeric_find(bytes: &[u8], kind: crate::buffer::ElemKind, needle: f64, na
     assert!(bytes.len() % width == 0 && !kind.is_64bit_int());
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        use crate::buffer::ElemKind;
+        match kind {
+            ElemKind::U8 | ElemKind::U8Clamped => {
+                if needle != needle as u8 as f64 { return None; }
+                let value = _mm_set1_epi8(needle as u8 as i8);
+                while bytes.len() - at >= 16 {
+                    let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+                    let matches = _mm_movemask_epi8(_mm_cmpeq_epi8(block, value)) as u32;
+                    if matches != 0 { return Some(at + matches.trailing_zeros() as usize); }
+                    at += 16;
+                }
+            }
+            ElemKind::I32 => {
+                if needle != needle as i32 as f64 { return None; }
+                let value = _mm_set1_epi32(needle as i32);
+                while bytes.len() - at >= 16 {
+                    let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+                    let matches = _mm_movemask_epi8(_mm_cmpeq_epi32(block, value)) as u32;
+                    if matches != 0 { return Some(at/4 + matches.trailing_zeros() as usize/4); }
+                    at += 16;
+                }
+            }
+            ElemKind::F64 => {
+                let value = _mm_set1_pd(needle);
+                while bytes.len() - at >= 16 {
+                    let block = _mm_loadu_pd(bytes.as_ptr().add(at).cast());
+                    let mask = if nan_equal && needle.is_nan() { _mm_cmpunord_pd(block, block) }
+                        else { _mm_cmpeq_pd(block, value) };
+                    let matches = _mm_movemask_pd(mask) as u32;
+                    if matches != 0 { return Some(at/8 + matches.trailing_zeros() as usize); }
+                    at += 16;
+                }
+            }
+            _ => {},
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon", target_endian = "little"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -244,6 +377,20 @@ pub fn json_ascii_prefix(bytes: &[u8]) -> usize {
 fn json_prefix(bytes: &[u8], ascii: bool) -> usize {
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while bytes.len() - at >= 16 {
+            let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            let control = _mm_cmpeq_epi8(_mm_subs_epu8(block, _mm_set1_epi8(31)), _mm_setzero_si128());
+            let stop = _mm_or_si128(control, _mm_or_si128(
+                _mm_cmpeq_epi8(block, _mm_set1_epi8(b'"' as i8)),
+                _mm_cmpeq_epi8(block, _mm_set1_epi8(b'\\' as i8))));
+            let mask = (_mm_movemask_epi8(stop) | if ascii { _mm_movemask_epi8(block) } else { 0 }) as u32;
+            if mask != 0 { return at + mask.trailing_zeros() as usize; }
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -273,6 +420,17 @@ pub fn common_prefix(a: &[u8], b: &[u8]) -> usize {
     let length = a.len().min(b.len());
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while length - at >= 16 {
+            let x = _mm_loadu_si128(a.as_ptr().add(at).cast());
+            let y = _mm_loadu_si128(b.as_ptr().add(at).cast());
+            let mismatch = (!_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u32) & 0xffff;
+            if mismatch != 0 { return at + mismatch.trailing_zeros() as usize; }
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -291,6 +449,22 @@ pub fn utf16_find(haystack: &[u16], needle: &[u16]) -> Option<usize> {
     let candidates = haystack.len().checked_sub(needle.len())? + 1;
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        let first = _mm_set1_epi16(needle[0] as i16);
+        while candidates - at >= 8 {
+            let block = _mm_loadu_si128(haystack.as_ptr().add(at).cast());
+            let mut mask = _mm_movemask_epi8(_mm_cmpeq_epi16(block, first)) as u32;
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize / 2;
+                let k = at + lane;
+                if haystack[k..k+needle.len()] == *needle { return Some(k); }
+                mask &= !(3 << (lane*2));
+            }
+            at += 8;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -311,6 +485,20 @@ pub fn utf16_find(haystack: &[u16], needle: &[u16]) -> Option<usize> {
 pub fn json_whitespace_prefix(bytes: &[u8]) -> usize {
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while bytes.len() - at >= 16 {
+            let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            let space = _mm_or_si128(_mm_cmpeq_epi8(block, _mm_set1_epi8(b' ' as i8)),
+                _mm_or_si128(_mm_cmpeq_epi8(block, _mm_set1_epi8(b'\t' as i8)),
+                    _mm_or_si128(_mm_cmpeq_epi8(block, _mm_set1_epi8(b'\n' as i8)),
+                        _mm_cmpeq_epi8(block, _mm_set1_epi8(b'\r' as i8)))));
+            let mask = (!_mm_movemask_epi8(space) as u32) & 0xffff;
+            if mask != 0 { return at + mask.trailing_zeros() as usize; }
+            at += 16;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;
@@ -331,6 +519,16 @@ pub fn json_whitespace_prefix(bytes: &[u8]) -> usize {
 pub fn utf16_is_ascii(units: &[u16]) -> bool {
     #[allow(unused_mut)]
     let mut at = 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::*;
+        while units.len() - at >= 8 {
+            let block = _mm_loadu_si128(units.as_ptr().add(at).cast());
+            let high = _mm_and_si128(block, _mm_set1_epi16(0xff80u16 as i16));
+            if _mm_movemask_epi8(_mm_cmpeq_epi16(high, _mm_setzero_si128())) != 0xffff { return false; }
+            at += 8;
+        }
+    }
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     unsafe {
         use core::arch::aarch64::*;

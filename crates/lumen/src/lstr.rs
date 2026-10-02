@@ -327,7 +327,10 @@ impl LStr {
         }
         let (root, off) = unsafe {
             let v = &*(self.p.as_ptr() as *const ViewHdr);
-            (std::mem::ManuallyDrop::new(LStr { p: v.root }), v.off as usize)
+            (
+                std::mem::ManuallyDrop::new(LStr { p: v.root }),
+                v.off as usize,
+            )
         };
         let start = off.checked_sub(prefix.len())?;
         let whole = root.as_str();
@@ -512,7 +515,8 @@ impl From<char> for LStr {
 
 impl PartialEq for LStr {
     fn eq(&self, other: &LStr) -> bool {
-        LStr::ptr_eq(self, other) || lumen_common::scan::bytes_equal(self.as_bytes(), other.as_bytes())
+        LStr::ptr_eq(self, other)
+            || lumen_common::scan::bytes_equal(self.as_bytes(), other.as_bytes())
     }
 }
 impl Eq for LStr {}

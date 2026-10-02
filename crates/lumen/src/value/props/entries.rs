@@ -92,7 +92,10 @@ impl EntryVec {
     #[inline(always)]
     fn check_inline_home(&self) {
         let d = (self.ptr.as_ptr() as usize).wrapping_sub(self as *const EntryVec as usize);
-        assert!(d < INLINE_REACH, "inline property storage moved out of its object");
+        assert!(
+            d < INLINE_REACH,
+            "inline property storage moved out of its object"
+        );
     }
 
     /// Use `n` uninitialized property slots at `buf` as this vector's storage. Only on a vector
@@ -118,7 +121,11 @@ impl EntryVec {
     /// As [`adopt_inline`](Self::adopt_inline); the value must be written into the box that
     /// owns `buf` before anything reads it.
     #[inline(always)]
-    pub(in crate::value) const unsafe fn inline_raw(buf: *mut Property, len: usize, cap: usize) -> EntryVec {
+    pub(in crate::value) const unsafe fn inline_raw(
+        buf: *mut Property,
+        len: usize,
+        cap: usize,
+    ) -> EntryVec {
         EntryVec {
             ptr: NonNull::new_unchecked(buf),
             len: len as u32,

@@ -25,7 +25,13 @@
       static abort(reason) { const controller = new AbortController(); controller.abort(reason); return controller.signal; }
       static any(signals) {
         const controller = new AbortController(), listeners = [];
-        const finish = reason => { controller.abort(reason); for (const [signal, listener] of listeners) signal.removeEventListener("abort", listener); };
+        const finish = reason => {
+          controller.abort(reason);
+          for (let i = 0; i < listeners.length; i++) {
+            const pair = listeners[i];
+            pair[0].removeEventListener("abort", pair[1]);
+          }
+        };
         for (const signal of signals) {
           if (signal.aborted) { finish(signal.reason); break; }
           const listener = () => finish(signal.reason);

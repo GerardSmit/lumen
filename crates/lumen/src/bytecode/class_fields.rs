@@ -9,7 +9,9 @@
 //!   from bytecode enters an inline frame ([`inline_class_ctor`]); other constructs
 //!   ([`construct_class`]) and `super(…)` reaching a class parent ([`run_class_ctor_on`]) run
 //!   the body on a fresh driver.
-use super::{ArrayElem, Bail, CResult, Compiler, Op};
+#[cfg(feature = "compiler")]
+use super::{Bail, CResult, Compiler};
+use super::{ArrayElem, Op};
 use crate::ast::Expr;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Callable, Gc, Value};
@@ -18,6 +20,7 @@ use std::rc::Rc;
 /// The intrinsic's callee name.
 pub(crate) const DEFINE_FIELD: &str = "%definefield%";
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// `%definefield%("key", init, named)`: evaluates to undefined.
     pub(super) fn define_field_intrinsic(&mut self, args: &[ArrayElem]) -> CResult {
@@ -37,7 +40,7 @@ impl Compiler {
 
 /// `Op::DefineField`: name an anonymous function value after the field, then DefineField.
 #[inline]
-pub(super) fn define_field(
+pub(crate) fn define_field(
     i: &mut Interp,
     this: Value,
     key: &Rc<str>,
@@ -55,7 +58,11 @@ pub(super) fn define_field(
 /// `Interp::call_user_inner`); `allow_derived` admits derived classes at all. The instance
 /// fields are the caller's job.
 #[inline]
-fn class_ctor(i: &Interp, callee: &Value, allow_derived: bool) -> Option<(super::InlineCallee, bool)> {
+fn class_ctor(
+    i: &Interp,
+    callee: &Value,
+    allow_derived: bool,
+) -> Option<(super::InlineCallee, bool)> {
     let Value::Obj(o) = callee else {
         return None;
     };
@@ -221,7 +228,15 @@ pub(crate) fn construct_class(
             return Some(Err(e));
         }
     }
-    let r = run_class_body(i, callee, inst.clone(), args, ic, new_target.clone(), derived);
+    let r = run_class_body(
+        i,
+        callee,
+        inst.clone(),
+        args,
+        ic,
+        new_target.clone(),
+        derived,
+    );
     Some(r.map(|v| {
         i.observe_construct_capacity(c, &inst);
         match v {

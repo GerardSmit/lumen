@@ -19,7 +19,10 @@ pub fn verify(func: &Function) -> Result<(), String> {
         .map(|&p| func.value_type(p))
         .collect();
     if entry_tys != func.sig.params {
-        err(format!("entry parameters {entry_tys:?} != signature {:?}", func.sig.params));
+        err(format!(
+            "entry parameters {entry_tys:?} != signature {:?}",
+            func.sig.params
+        ));
     }
 
     // Placement.
@@ -68,7 +71,11 @@ pub fn verify(func: &Function) -> Result<(), String> {
                 match def_pos(v) {
                     None => err(format!("{inst}: {v} is an alias or not placed")),
                     Some((db, di)) => {
-                        let ok = if db == b { di < i as isize } else { cfg.dominates(db, b) };
+                        let ok = if db == b {
+                            di < i as isize
+                        } else {
+                            cfg.dominates(db, b)
+                        };
                         if !ok {
                             err(format!("{b}: {inst} uses {v} which does not dominate it"));
                         }
@@ -81,7 +88,10 @@ pub fn verify(func: &Function) -> Result<(), String> {
             for call in data.successors() {
                 let params = &func.blocks[call.block.index()].params;
                 if !seen_block[call.block.index()] {
-                    err(format!("{inst}: branch to {} outside the layout", call.block));
+                    err(format!(
+                        "{inst}: branch to {} outside the layout",
+                        call.block
+                    ));
                 } else if call.block == entry {
                     err(format!("{inst}: branch to the entry block"));
                 }
@@ -124,10 +134,18 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
         if ty(v).is_int() {
             Ok(())
         } else {
-            Err(format!("{v} is {:?}, expected an I32 or I64 address", ty(v)))
+            Err(format!(
+                "{v} is {:?}, expected an I32 or I64 address",
+                ty(v)
+            ))
         }
     };
     match data {
+        InstData::Vzero => Ok(()),
+        InstData::VectorBinary { args, .. } => {
+            want(args[0], Type::V128)?;
+            want(args[1], Type::V128)
+        }
         InstData::Iconst { ty: t, imm } => {
             if !t.is_int() {
                 return Err("iconst of a float type".into());
@@ -137,7 +155,10 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             }
             Ok(())
         }
-        InstData::F32const { .. } | InstData::F64const { .. } | InstData::Trap { .. } => Ok(()),
+        InstData::F32const { .. }
+        | InstData::F64const { .. }
+        | InstData::SymbolAddr { .. }
+        | InstData::Trap { .. } => Ok(()),
         InstData::Unary { op, arg } => {
             use UnaryOp::*;
             let t = ty(*arg);
@@ -146,14 +167,22 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
                 Sext32 => t == Type::I64,
                 _ => t.is_float(),
             };
-            if ok { Ok(()) } else { Err(format!("{op:?} on {t:?}")) }
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("{op:?} on {t:?}"))
+            }
         }
         InstData::Binary { op, args } => {
             use BinaryOp::*;
             want(args[1], ty(args[0]))?;
             let t = ty(args[0]);
             let int = !matches!(op, Fadd | Fsub | Fmul | Fdiv | Fmin | Fmax | Fcopysign);
-            if int == t.is_int() { Ok(()) } else { Err(format!("{op:?} on {t:?}")) }
+            if (int && t.is_int()) || (!int && t.is_float()) {
+                Ok(())
+            } else {
+                Err(format!("{op:?} on {t:?}"))
+            }
         }
         InstData::CheckedBinary { args, .. } => {
             want(args[0], Type::I32)?;
@@ -161,11 +190,19 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
         }
         InstData::IntCmp { args, .. } => {
             want(args[1], ty(args[0]))?;
-            if ty(args[0]).is_int() { Ok(()) } else { Err("icmp on floats".into()) }
+            if ty(args[0]).is_int() {
+                Ok(())
+            } else {
+                Err("icmp on floats".into())
+            }
         }
         InstData::FloatCmp { args, .. } => {
             want(args[1], ty(args[0]))?;
-            if ty(args[0]).is_float() { Ok(()) } else { Err("fcmp on ints".into()) }
+            if ty(args[0]).is_float() {
+                Ok(())
+            } else {
+                Err("fcmp on ints".into())
+            }
         }
         InstData::Select {
             cond,
@@ -173,6 +210,9 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             if_false,
         } => {
             want(*cond, Type::I32)?;
+            if ty(*if_true) == Type::V128 {
+                return Err("use vector_select for vector masks".into());
+            }
             want(*if_false, ty(*if_true))
         }
         InstData::Convert { op, to, arg } => {
@@ -188,15 +228,25 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
                 Demote => from == Type::F64 && *to == Type::F32,
                 Bitcast => from.bits() == to.bits() && from.is_int() != to.is_int(),
             };
-            if ok { Ok(()) } else { Err(format!("{op:?} {from:?} -> {to:?}")) }
+            if ok {
+                Ok(())
+            } else {
+                Err(format!("{op:?} {from:?} -> {to:?}"))
+            }
         }
-        InstData::Load { addr, .. } => want_ptr(*addr),
-        InstData::Store { kind, addr, value, .. } => {
+        InstData::Load { addr, .. } | InstData::Prefetch { addr, .. } => want_ptr(*addr),
+        InstData::Store {
+            kind, addr, value, ..
+        } => {
             want_ptr(*addr)?;
             want(*value, kind.ty())
         }
         InstData::Call { func: f, args } => {
-            let sig = &func.sigs[func.funcs[f.index()].sig.index()];
+            let external = &func.funcs[f.index()];
+            let sig = &func.sigs[external.sig.index()];
+            if crate::atomics::signature(external.id).is_some_and(|required| required != *sig) {
+                return Err("atomic intrinsic signature mismatch".into());
+            }
             check_args(func, &sig.params, args)
         }
         InstData::CallIndirect { sig, callee, args } => {

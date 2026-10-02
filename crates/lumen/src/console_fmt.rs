@@ -31,9 +31,11 @@ impl Interp {
     pub fn own_getter_is(&self, obj: &Value, key: &str, getter: &Value) -> bool {
         let Value::Obj(o) = obj else { return false };
         let Ok(b) = o.try_borrow() else { return false };
-        b.props
-            .get(key)
-            .is_some_and(|p| p.accessor() && p.getter().is_some_and(|g| self.values_strict_equal(g, getter)))
+        b.props.get(key).is_some_and(|p| {
+            p.accessor()
+                && p.getter()
+                    .is_some_and(|g| self.values_strict_equal(g, getter))
+        })
     }
 }
 
@@ -52,8 +54,14 @@ fn has_lone_surrogate(s: &str) -> bool {
 fn is_js_whitespace(c: char) -> bool {
     matches!(
         c,
-        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'..='\u{200a}'
-            | '\u{2028}' | '\u{2029}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+        '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
     )
 }
 
@@ -86,7 +94,14 @@ fn str_escape(s: &str) -> R<String> {
         }
     }
     use lumen_common::json::{quote as quoted, Escapes, Quote};
-    Ok(quoted(s, &Quote { quote, escapes: Escapes::Inspect, ..Quote::JSON }))
+    Ok(quoted(
+        s,
+        &Quote {
+            quote,
+            escapes: Escapes::Inspect,
+            ..Quote::JSON
+        },
+    ))
 }
 
 fn json_quote(s: &str) -> R<String> {
@@ -114,7 +129,10 @@ fn parse_int(s: &str) -> R<f64> {
         Some("0x" | "0X") => (16, &t[2..]),
         _ => (10, t),
     };
-    let end = t.bytes().take_while(|b| (*b as char).is_digit(radix)).count();
+    let end = t
+        .bytes()
+        .take_while(|b| (*b as char).is_digit(radix))
+        .count();
     let digits = &t[..end];
     let magnitude = if digits.is_empty() {
         return Ok(f64::NAN);
@@ -141,7 +159,11 @@ fn parse_float(s: &str) -> R<f64> {
         p = 1;
     }
     if t[p..].starts_with("Infinity") {
-        return Ok(if b.first() == Some(&b'-') { f64::NEG_INFINITY } else { f64::INFINITY });
+        return Ok(if b.first() == Some(&b'-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
     }
     let int_start = p;
     while p < b.len() && b[p].is_ascii_digit() {
@@ -461,7 +483,10 @@ impl Inspector<'_> {
             }
             let id: u64 = k[1..].parse().map_err(|_| Bail)?;
             let data = self.i.sym_registry.get(&id).ok_or(Bail)?;
-            if matches!(data.description.as_deref(), Some("Symbol.toStringTag" | "nodejs.util.inspect.custom")) {
+            if matches!(
+                data.description.as_deref(),
+                Some("Symbol.toStringTag" | "nodejs.util.inspect.custom")
+            ) {
                 return Err(Bail);
             }
         }
@@ -497,7 +522,8 @@ impl Inspector<'_> {
     fn ctor_name_if_instance(&self, holder: &Gc, f: &Gc, instance: &Gc) -> R<Option<String>> {
         self.i.materialize(f);
         let fb = f.try_borrow().map_err(|_| Bail)?;
-        let native_ok = (Gc::ptr_eq(holder, &self.i.object_proto) || Gc::ptr_eq(holder, &self.i.array_proto))
+        let native_ok = (Gc::ptr_eq(holder, &self.i.object_proto)
+            || Gc::ptr_eq(holder, &self.i.array_proto))
             && !matches!(fb.call, Callable::User(_));
         if !matches!(fb.call, Callable::User(_)) && !native_ok {
             return Err(Bail);
@@ -573,7 +599,11 @@ impl Inspector<'_> {
         self.i.materialize(o);
         let (exotic, ic_plain, callable) = {
             let b = o.try_borrow().map_err(|_| Bail)?;
-            (b.exotic, b.ic_plain.get(), !matches!(b.call, Callable::None))
+            (
+                b.exotic,
+                b.ic_plain.get(),
+                !matches!(b.call, Callable::None),
+            )
         };
         if !ic_plain || callable || self.i.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
             return Err(Bail);
@@ -692,7 +722,10 @@ impl Inspector<'_> {
         }
         if len > shown {
             let remaining = len - shown;
-            output.push(format!("... {remaining} more item{}", if remaining > 1 { "s" } else { "" }));
+            output.push(format!(
+                "... {remaining} more item{}",
+                if remaining > 1 { "s" } else { "" }
+            ));
         }
         for (key, slot) in &extras {
             let text = self.slot_text(slot, recurse)?;
@@ -780,9 +813,11 @@ impl Inspector<'_> {
         if actual_max * 3 + self.indentation < BREAK_LENGTH
             && (total_length as f64 / actual_max as f64 > 5.0 || max_length <= 6)
         {
-            let average_bias = (actual_max as f64 - total_length as f64 / output.len() as f64).sqrt();
+            let average_bias =
+                (actual_max as f64 - total_length as f64 / output.len() as f64).sqrt();
             let biased_max = (actual_max as f64 - 3.0 - average_bias).max(1.0);
-            let by_shape = ((2.5 * biased_max * output_length as f64).sqrt() / biased_max + 0.5).floor();
+            let by_shape =
+                ((2.5 * biased_max * output_length as f64).sqrt() / biased_max + 0.5).floor();
             let by_width = ((BREAK_LENGTH - self.indentation) / actual_max) as f64;
             let columns = by_shape.min(by_width).min((COMPACT * 4) as f64).min(15.0);
             if columns <= 1.0 {
@@ -827,7 +862,8 @@ impl Inspector<'_> {
                 }
                 let j = max - 1;
                 if pad_start {
-                    let width = max_line_length[j - row] + output[j].len() - data_len[j] - SEPARATOR_SPACE;
+                    let width =
+                        max_line_length[j - row] + output[j].len() - data_len[j] - SEPARATOR_SPACE;
                     line.push_str(&" ".repeat(width.saturating_sub(output[j].len())));
                 }
                 line.push_str(&output[j]);

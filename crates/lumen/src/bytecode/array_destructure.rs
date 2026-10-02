@@ -32,12 +32,7 @@ pub(crate) fn remember_values(i: &mut Interp, values: &Value) {
 /// `false` is a pure miss (nothing was pushed): the caller still owns the original input, and
 /// must run the complete existing DestructureArr opcode, including its IteratorClose. `true`:
 /// exactly `count` values were handed to `push`, in order.
-pub(super) fn try_dense(
-    i: &Interp,
-    input: &Value,
-    count: u16,
-    push: impl FnMut(Value),
-) -> bool {
+pub(super) fn try_dense(i: &Interp, input: &Value, count: u16, push: impl FnMut(Value)) -> bool {
     try_dense_opt(i, input, count, push).is_some()
 }
 
@@ -51,12 +46,7 @@ pub(crate) fn dense_ok(i: &Interp, input: &Value) -> bool {
     super::iter_fast::array_ok(i, array) && i.array_iter_return_absent()
 }
 
-fn try_dense_opt(
-    i: &Interp,
-    input: &Value,
-    count: u16,
-    mut push: impl FnMut(Value),
-) -> Option<()> {
+fn try_dense_opt(i: &Interp, input: &Value, count: u16, mut push: impl FnMut(Value)) -> Option<()> {
     let count = usize::from(count);
     if count > LIMIT {
         return None;

@@ -48,7 +48,12 @@ pub(super) fn own_elem(o: &Gc, k: usize) -> Option<Value> {
 /// Scan the packed plain elements `from..len` of `o` under one borrow for the first `hit`:
 /// `Some(found)` when the whole range was read natively (no holes or accessors, which need the
 /// generic per-index steps), `None` to fall back. Reading them runs no user code.
-fn dense_find(o: &Gc, from: usize, len: usize, mut hit: impl FnMut(&Value) -> bool) -> Option<Option<usize>> {
+fn dense_find(
+    o: &Gc,
+    from: usize,
+    len: usize,
+    mut hit: impl FnMut(&Value) -> bool,
+) -> Option<Option<usize>> {
     let b = o.borrow();
     if !plain_elems(&b) {
         return None;
@@ -154,7 +159,8 @@ pub(super) fn len_of(i: &mut Interp, o: &Gc) -> Result<usize, Value> {
     {
         let b = o.borrow();
         // (A split view's `length` is the same kind of own data property.)
-        if (b.ic_plain.get() && matches!(b.exotic, Exotic::Array)) || b.exotic == Exotic::SplitView {
+        if (b.ic_plain.get() && matches!(b.exotic, Exotic::Array)) || b.exotic == Exotic::SplitView
+        {
             if let Some(p) = b.props.length_property() {
                 if !p.accessor() {
                     if let Value::Num(n) = p.value() {
@@ -243,7 +249,11 @@ fn species_is_default_array(i: &Interp, ctor: &Gc) -> bool {
 /// unreachable from JS until the caller returns it) is reported as `None` so the caller can
 /// accumulate elements natively. `Some(a)` is the (possibly species-constructed) result the
 /// caller must fill with the generic CreateDataPropertyOrThrow steps.
-pub(super) fn species(i: &mut Interp, original: &Value, len: usize) -> Result<Option<Value>, Value> {
+pub(super) fn species(
+    i: &mut Interp,
+    original: &Value,
+    len: usize,
+) -> Result<Option<Value>, Value> {
     // Fast proof that the default route would be taken without running any user code: an
     // ordinary Array with no own `constructor`, whose prototype is the realm's Array.prototype
     // holding the unmodified Array constructor as a data property.
@@ -251,8 +261,11 @@ pub(super) fn species(i: &mut Interp, original: &Value, len: usize) -> Result<Op
         let fast = {
             let b = o.borrow();
             // (A split view's property map holds only `length`.)
-            ((b.ic_plain.get() && matches!(b.exotic, Exotic::Array)) || b.exotic == Exotic::SplitView)
-                && b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+            ((b.ic_plain.get() && matches!(b.exotic, Exotic::Array))
+                || b.exotic == Exotic::SplitView)
+                && b.proto
+                    .as_ref()
+                    .is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
                 && b.props.get("constructor").is_none()
         };
         if fast {
@@ -339,7 +352,11 @@ impl Out {
     }
 
     /// The finished array; `explicit_len` is a trailing Set(A, "length", n, true).
-    pub(super) fn finish(self, i: &mut Interp, explicit_len: Option<usize>) -> Result<Value, Value> {
+    pub(super) fn finish(
+        self,
+        i: &mut Interp,
+        explicit_len: Option<usize>,
+    ) -> Result<Value, Value> {
         match self.slow {
             Some(r) => {
                 if let Some(n) = explicit_len {
@@ -459,11 +476,19 @@ fn filter_view(
                 kept.push(k as u32);
             } else {
                 eager
-                    .get_or_insert_with(|| kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect())
+                    .get_or_insert_with(|| {
+                        kept.iter()
+                            .map(|&j| Value::Str(snap.piece(j as usize)))
+                            .collect()
+                    })
                     .push(v);
             }
         } else if !lazy && eager.is_none() {
-            eager = Some(kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect());
+            eager = Some(
+                kept.iter()
+                    .map(|&j| Value::Str(snap.piece(j as usize)))
+                    .collect(),
+            );
         }
     }
     f.finish(i);
@@ -472,7 +497,11 @@ fn filter_view(
         None if !kept.is_empty() && kept.len() >= crate::split_view::min_pieces() => {
             crate::split_view::make_view(&i.array_proto, snap.subset(&kept))
         }
-        None => i.make_array(kept.iter().map(|&j| Value::Str(snap.piece(j as usize))).collect()),
+        None => i.make_array(
+            kept.iter()
+                .map(|&j| Value::Str(snap.piece(j as usize)))
+                .collect(),
+        ),
     })
 }
 
@@ -502,7 +531,9 @@ pub(super) fn array_reduce(
         // Seed with the first present element in visit order (holes are skipped).
         loop {
             if s >= len {
-                return Err(i.make_error("TypeError", "Reduce of empty array with no initial value"));
+                return Err(
+                    i.make_error("TypeError", "Reduce of empty array with no initial value")
+                );
             }
             let k = at(s);
             s += 1;
@@ -591,7 +622,9 @@ pub(super) fn array_some_every_impl(
 fn strict_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Num(x), Value::Num(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => crate::lstr::LStr::ptr_eq(x, y) || x.as_str() == y.as_str(),
+        (Value::Str(x), Value::Str(y)) => {
+            crate::lstr::LStr::ptr_eq(x, y) || x.as_str() == y.as_str()
+        }
         (Value::Obj(x), Value::Obj(y)) => Gc::ptr_eq(x, y),
         (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -624,7 +657,12 @@ pub(super) fn array_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Res
     };
     let simple = matches!(
         target,
-        Value::Num(_) | Value::Str(_) | Value::Obj(_) | Value::Undefined | Value::Null | Value::Bool(_)
+        Value::Num(_)
+            | Value::Str(_)
+            | Value::Obj(_)
+            | Value::Undefined
+            | Value::Null
+            | Value::Bool(_)
     );
     if simple {
         if let Some(r) = dense_find(&o, from, len, |v| strict_eq(v, &target)) {
@@ -640,7 +678,11 @@ pub(super) fn array_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Res
                 None => continue, // indexOf skips holes
             },
         };
-        if if simple { strict_eq(&v, &target) } else { i.strict_equals(&v, &target) } {
+        if if simple {
+            strict_eq(&v, &target)
+        } else {
+            i.strict_equals(&v, &target)
+        } {
             return Ok(Value::Num(k as f64));
         }
     }
@@ -709,7 +751,9 @@ pub(super) fn array_includes(i: &mut Interp, this: Value, args: &[Value]) -> Res
             }
         }
     };
-    if let Some(r) = dense_find(&o, k as usize, len as usize, |v| same_value_zero(v, &target)) {
+    if let Some(r) = dense_find(&o, k as usize, len as usize, |v| {
+        same_value_zero(v, &target)
+    }) {
         return Ok(Value::Bool(r.is_some()));
     }
     let ov = Value::Obj(o.clone());
@@ -790,7 +834,10 @@ pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result
     // A split view's slice is a view of the same source (the offsets of the sliced run).
     if custom.is_none() && count > 0 && count >= crate::split_view::min_pieces() {
         if let Some(v) = crate::split_view::view_of(&o) {
-            return Ok(crate::split_view::make_view(&i.array_proto, v.slice(start as usize, end as usize)));
+            return Ok(crate::split_view::make_view(
+                &i.array_proto,
+                v.slice(start as usize, end as usize),
+            ));
         }
     }
     // Dense fast path: clone the packed run property by property into the result's storage.
@@ -798,7 +845,14 @@ pub(super) fn array_slice(i: &mut Interp, this: Value, args: &[Value]) -> Result
         let copy = {
             let b = o.borrow();
             plain_elems(&b)
-                .then(|| crate::value::Object::slice_packed(&b, start as usize, end as usize, i.array_proto.clone()))
+                .then(|| {
+                    crate::value::Object::slice_packed(
+                        &b,
+                        start as usize,
+                        end as usize,
+                        i.array_proto.clone(),
+                    )
+                })
                 .flatten()
         };
         if let Some(a) = copy {
@@ -917,7 +971,8 @@ pub(super) fn array_splice_impl(
         let new_len = len - delete_count + item_count;
         if plain_len(&b) == Some(len as u32) && new_len <= u32::MAX as i64 {
             if let Some(removed) =
-                b.props.splice_packed(len as u32, start as usize, delete_count as usize, items)
+                b.props
+                    .splice_packed(len as u32, start as usize, delete_count as usize, items)
             {
                 store_len(&mut b, new_len as u32);
                 drop(b);
@@ -966,7 +1021,9 @@ pub(super) fn array_splice_impl(
 fn plain_len(o: &crate::value::Object) -> Option<u32> {
     match o.props.length_property() {
         Some(p) if !p.accessor() && p.writable() => match p.value() {
-            Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => Some(n as u32),
+            Value::Num(n) if n.trunc() == n && (0.0..=u32::MAX as f64).contains(&n) => {
+                Some(n as u32)
+            }
             _ => None,
         },
         _ => None,
@@ -975,7 +1032,10 @@ fn plain_len(o: &crate::value::Object) -> Option<u32> {
 
 fn store_len(o: &mut crate::value::Object, n: u32) {
     let s = o.props.slot_of("length").unwrap();
-    o.props.entry_at_mut(s).unwrap().set_value(Value::Num(n as f64));
+    o.props
+        .entry_at_mut(s)
+        .unwrap()
+        .set_value(Value::Num(n as f64));
 }
 
 pub(super) fn array_shift(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
@@ -1094,7 +1154,8 @@ pub(super) fn array_fill(i: &mut Interp, this: Value, args: &[Value]) -> Result<
     // A real Array's filled span is bounded by the engine cap (it materializes one property
     // per index); a generic array-like iterates lazily — its accessors typically throw or
     // the per-op caps stop runaway growth.
-    if matches!(o.borrow().exotic, Exotic::Array) && (end - start).max(0) as usize > MAX_ARRAY_OP_LEN
+    if matches!(o.borrow().exotic, Exotic::Array)
+        && (end - start).max(0) as usize > MAX_ARRAY_OP_LEN
     {
         return Err(i.make_error("RangeError", "array length exceeds engine limit"));
     }
@@ -1121,7 +1182,10 @@ pub(super) fn array_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<Va
 pub(super) fn array_sort(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     let cmp = arg(args, 0);
     if !matches!(cmp, Value::Undefined) && !cmp.is_callable() {
-        return Err(i.make_error("TypeError", "the comparator must be a function or undefined"));
+        return Err(i.make_error(
+            "TypeError",
+            "the comparator must be a function or undefined",
+        ));
     }
     let o = arr_to_object(i, &this)?;
     i.materialize(&o);
@@ -1162,9 +1226,16 @@ pub(super) fn cmp_str_units(a: &crate::lstr::LStr, b: &crate::lstr::LStr) -> Ord
 /// SortIndexedProperties' sort: stable, `undefined`s last, comparator `cmp` (or the default
 /// string order). An abrupt comparator (or ToString) aborts the sort with that error; an
 /// inconsistent comparator yields an implementation-defined order (never a panic).
-pub(super) fn sort_values(i: &mut Interp, items: &mut Vec<Value>, cmp: &Value) -> Result<(), Value> {
+pub(super) fn sort_values(
+    i: &mut Interp,
+    items: &mut Vec<Value>,
+    cmp: &Value,
+) -> Result<(), Value> {
     // `undefined` always sorts to the end, without being passed to the comparator.
-    let undefs = items.iter().filter(|v| matches!(v, Value::Undefined)).count();
+    let undefs = items
+        .iter()
+        .filter(|v| matches!(v, Value::Undefined))
+        .count();
     if undefs > 0 {
         items.retain(|v| !matches!(v, Value::Undefined));
     }
@@ -1180,10 +1251,12 @@ pub(super) fn sort_values(i: &mut Interp, items: &mut Vec<Value>, cmp: &Value) -
             Ok(n > 0.0)
         };
         merge_sort_by(i, items, &mut cmp_fn)?;
-    } else if items
-        .iter()
-        .all(|v| matches!(v, Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null))
-    {
+    } else if items.iter().all(|v| {
+        matches!(
+            v,
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) | Value::Null
+        )
+    }) {
         // ToString of these primitives is unobservable: compute each key once.
         let mut keyed: Vec<(crate::lstr::LStr, Value)> = Vec::with_capacity(items.len());
         for v in items.drain(..) {
@@ -1313,15 +1386,8 @@ pub(super) fn flatten_into_out(
                     to_length_val(i, &len_val)?
                 }
             };
-            target_index = flatten_into_out(
-                i,
-                target,
-                &element,
-                el_len,
-                target_index,
-                depth - 1,
-                None,
-            )?;
+            target_index =
+                flatten_into_out(i, target, &element, el_len, target_index, depth - 1, None)?;
         } else {
             // Compared as u64: usize is 32-bit on wasm32, where 2^53 - 1 overflows the type.
             if target_index as u64 >= 9_007_199_254_740_991 {
@@ -1363,7 +1429,10 @@ pub(super) fn array_flat_map(i: &mut Interp, this: Value, args: &[Value]) -> Res
     let len = len_of(i, &o)?;
     let cb = arg(args, 0);
     if !cb.is_callable() {
-        return Err(i.make_error("TypeError", "Array.prototype.flatMap mapper is not callable"));
+        return Err(i.make_error(
+            "TypeError",
+            "Array.prototype.flatMap mapper is not callable",
+        ));
     }
     let cb_this = arg(args, 1);
     let custom = species(i, &this, 0)?;

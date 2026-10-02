@@ -282,7 +282,11 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
     );
     assert_eq!(keys(&p), names);
     let listed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
-    assert_eq!(flat_lists(&p), listed, "iterating materialises the leaf's list");
+    assert_eq!(
+        flat_lists(&p),
+        listed,
+        "iterating materialises the leaf's list"
+    );
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
         assert_eq!(p.slot_of(k), Some(i));

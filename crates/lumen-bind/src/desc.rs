@@ -56,16 +56,20 @@ pub enum Role {
 impl Role {
     /// Whether the fn receives an instance.
     pub fn has_receiver(self) -> bool {
-        matches!(self, Role::Method | Role::Getter | Role::Setter | Role::Proto(_))
+        matches!(
+            self,
+            Role::Method | Role::Getter | Role::Setter | Role::Proto(_)
+        )
     }
 }
 
 /// The neutral protocol names `#[proto(..)]` accepts.
 pub const PROTOCOLS: &[&str] = &[
-    "init", "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "reversed", "repr", "str", "hash",
-    "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul",
-    "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int",
-    "float", "call", "copy", "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
+    "init", "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "reversed", "repr",
+    "str", "hash", "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub",
+    "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or", "ror", "ior", "xor",
+    "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int", "float", "call", "copy",
+    "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
 ];
 
 /// The declaration a fn belongs to.
@@ -100,7 +104,10 @@ pub mod flags {
 pub type Hints = &'static [(&'static str, &'static str, &'static str)];
 
 fn hint_in(hints: Hints, host: &str, key: &str) -> Option<&'static str> {
-    hints.iter().find(|(h, k, _)| *h == host && *k == key).map(|(_, _, v)| *v)
+    hints
+        .iter()
+        .find(|(h, k, _)| *h == host && *k == key)
+        .map(|(_, _, v)| *v)
 }
 
 /// A bindable fn: generated as `<fn>::DESC` (ops) or per member (classes).
@@ -127,11 +134,17 @@ pub struct FnDesc {
     pub max_pos: u16,
     pub min_pos: u16,
     pub flags: u32,
+    /// Generated Rust argument/return types, role and binding flags.
+    pub rust_signature: &'static str,
     /// The unboxed entry (emitted when every parameter and the result is a scalar).
     pub scalar: Option<ScalarEntry>,
 }
 
 impl FnDesc {
+    pub fn signature_hash(&self) -> u64 {
+        lumen_common::aot::fingerprint::binding_signature_hash(self.rust_signature)
+    }
+
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
     }
@@ -232,8 +245,16 @@ fn exposed(only: &[&str], skip: &[&str], host: &str) -> bool {
     (only.is_empty() || only.contains(&host)) && !skip.contains(&host)
 }
 
-fn fixed(renames: &[(&'static str, &'static str)], explicit: Option<&'static str>, host: &str) -> Option<&'static str> {
-    renames.iter().find(|(h, _)| *h == host).map(|(_, n)| *n).or(explicit)
+fn fixed(
+    renames: &[(&'static str, &'static str)],
+    explicit: Option<&'static str>,
+    host: &str,
+) -> Option<&'static str> {
+    renames
+        .iter()
+        .find(|(h, _)| *h == host)
+        .map(|(_, n)| *n)
+        .or(explicit)
 }
 
 /// `snake_case` -> `camelCase` (JS-style hosts derive member names this way).
@@ -300,16 +321,25 @@ pub struct Slot {
 
 impl Slot {
     /// The receiver.
-    pub const THIS: Slot = Slot { arg: u32::MAX, elem: u32::MAX };
+    pub const THIS: Slot = Slot {
+        arg: u32::MAX,
+        elem: u32::MAX,
+    };
 
     /// Named parameter `i` (0-based; for `*args`, `max_pos + k`).
     pub const fn arg(i: u32) -> Slot {
-        Slot { arg: i, elem: u32::MAX }
+        Slot {
+            arg: i,
+            elem: u32::MAX,
+        }
     }
 
     /// Element `i` of the sequence at this slot.
     pub const fn elem(self, i: u32) -> Slot {
-        Slot { arg: self.arg, elem: i }
+        Slot {
+            arg: self.arg,
+            elem: i,
+        }
     }
 
     pub fn is_this(self) -> bool {

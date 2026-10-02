@@ -1,7 +1,7 @@
-use super::{Limits, Parcel, parcel::HeapGuard};
+use super::{parcel::HeapGuard, Limits, Parcel};
 use crate::{
+    value::{live_objects, set_data, Value},
     Completion, Engine,
-    value::{Value, live_objects, set_data},
 };
 
 fn value(engine: &mut Engine, name: &str) -> Value {
@@ -868,15 +868,13 @@ fn transfer_moves_backing_pointer_and_detaches_only_after_success() {
     let backing = sender.interp.array_buffers[&pointer].as_ptr() as usize;
     evaluate(&mut sender, "var unsupported=Symbol('x');");
     let unsupported = value(&mut sender, "unsupported");
-    assert!(
-        Parcel::build_with_transfer(
-            &mut sender.interp,
-            &unsupported,
-            std::slice::from_ref(&buffer),
-            Limits::default()
-        )
-        .is_err()
-    );
+    assert!(Parcel::build_with_transfer(
+        &mut sender.interp,
+        &unsupported,
+        std::slice::from_ref(&buffer),
+        Limits::default()
+    )
+    .is_err());
     assert!(sender.interp.is_transferable_array_buffer(&buffer));
     let parcel = Parcel::build_with_transfer(
         &mut sender.interp,

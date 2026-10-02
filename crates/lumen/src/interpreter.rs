@@ -40,6 +40,12 @@ pub struct AgentChannels {
 /// Process-global backing store for SharedArrayBuffer memory, keyed by a unique id so it can be
 /// shared across agent threads (each agent runs its own single-threaded `Interp`).
 pub type SharedMem = Arc<Mutex<Vec<u8>>>;
+/// Owner-thread lease for the short inlined atomic sequence. The guard drops before
+/// its Arc; this keeps both the mutex and its backing allocation at stable addresses.
+pub(crate) struct AtomicLease {
+    pub(crate) _guard: std::sync::MutexGuard<'static, Vec<u8>>,
+    pub(crate) _memory: SharedMem,
+}
 /// An opaque, thread-safe shared-memory capability. Only a context that already owns a
 /// genuine SharedArrayBuffer can export one; importing it aliases that exact backing store.
 #[derive(Clone)]
@@ -309,6 +315,19 @@ pub(crate) const SCOPE_VAR_BOUNDARY: u8 = 2;
 pub(crate) const SCOPE_CATCH_PARAM: u8 = 4;
 
 impl Scope {
+    #[cfg(feature = "aot-native")]
+    pub(crate) fn restore_snapshot_state(&mut self, parent: Option<Env>, flags: u8, with_object: Option<Value>, lexical_names: Vec<Rc<str>>) {
+        self.parent = parent;
+        self.vars.clear();
+        self.vars.set_scope_flags(flags);
+        self.rare = None;
+        if let Some(object) = with_object { self.rare_mut().with_obj = Some(object); }
+        if !lexical_names.is_empty() { self.rare_mut().lexical_names = lexical_names; }
+    }
+    #[cfg(feature = "compiler")]
+    pub(crate) fn snapshot_lexical_names(&self) -> &[Rc<str>] {
+        self.rare.as_ref().map_or(&[], |rare| rare.lexical_names.as_slice())
+    }
     fn new(vars: VarMap, parent: Option<Env>, flags: u8, rare: Option<Box<ScopeRare>>) -> Scope {
         let mut s = Scope {
             vars,
@@ -828,6 +847,14 @@ impl Interp {
 pub struct Interp {
     pub(crate) global: Gc,
     pub(crate) global_env: Env,
+    #[cfg(feature = "aot-native")]
+    pub(crate) native_units: HashMap<[u8; 32], Vec<crate::native_aot::UnitState>>,
+    #[cfg(all(feature = "compiler", feature = "jit"))]
+    pub(crate) snapshot_cjs: Option<crate::snapshot_cjs::Units>,
+    #[cfg(all(feature = "compiler", feature = "jit"))]
+    pub(crate) snapshot_cjs_require: Option<Value>,
+    #[cfg(feature = "aot-native")]
+    pub(crate) native_tail_call: bool,
     pub(crate) object_proto: Gc,
     pub(crate) function_proto: Gc,
     pub(crate) array_proto: Gc,
@@ -910,6 +937,8 @@ pub struct Interp {
     /// constructor object's pointer (`Rc::as_ptr(..) as usize`). Lets `construct`/`super` run field
     /// initializers without attaching engine data to the `Object` itself.
     pub(crate) class_info: crate::fasthash::FastMap<usize, ClassInfo>,
+    #[cfg(feature = "aot-native")]
+    pub(crate) native_classes: HashMap<usize, Rc<crate::native_aot::classes::NativeClass>>,
     /// Constructor templates of plain constructor functions, keyed by the `Function`'s address
     /// (kept alive by the entry). See [`crate::bytecode::ctor_plan`].
     pub(crate) ctor_plans: crate::fasthash::FastMap<
@@ -949,6 +978,10 @@ pub struct Interp {
     pub(crate) import_base: String,
     /// Loaded module namespace objects, keyed by canonical specifier (for `import()` + caching).
     pub(crate) modules: std::collections::HashMap<String, Value>,
+    /// Names explicitly supplied by the host's fingerprinted native module table.
+    pub(crate) native_module_names: std::collections::HashSet<String>,
+    /// Host native bindings, keyed by the manifest's module and exported name.
+    pub(crate) native_bindings: std::collections::HashMap<(String, String), (u64, usize)>,
     /// Full module records (parsed body, environment, resolved export tables, evaluation status),
     /// keyed by canonical specifier. Drives the two-phase Instantiate/Evaluate module linking.
     pub(crate) module_recs: std::collections::HashMap<String, crate::modules::ModuleRec>,
@@ -959,6 +992,10 @@ pub struct Interp {
     #[allow(clippy::type_complexity)]
     pub(crate) module_loader:
         Option<Rc<dyn Fn(&str, &str, Option<&str>) -> Option<(String, String)>>>,
+    pub(crate) jsx_options: crate::parser::JsxOptions,
+    #[allow(clippy::type_complexity)]
+    pub(crate) jsx_options_loader: Option<Rc<dyn Fn(&str, &crate::JsxOptions) -> Result<crate::JsxOptions, String>>>,
+    pub(crate) jsx_module_keys: crate::fasthash::FastMap<String, bool>,
     /// Live module-namespace state keyed by the namespace object's pointer: for each exported name,
     /// how to read its current value (a live binding in some module scope, or a static value for a
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
@@ -1137,7 +1174,14 @@ pub struct Interp {
     /// coroutine handoffs. Compiled code loads it from its current frame.
     pub(crate) jit_shadow: Option<Box<crate::bytecode::jit::Shadow>>,
     pub(crate) jit_stats: std::cell::Cell<crate::JitStats>,
+    pub(crate) jit_evict: crate::bytecode::jit::EngineJit,
+    #[cfg(feature = "bench")]
+    pub(crate) jit_compilations: std::cell::RefCell<Vec<crate::JitCompilation>>,
     pub(crate) jit_mode: crate::JitMode,
+    pub(crate) jit_alignment: usize,
+    pub(crate) jit_prefetch: bool,
+    pub(crate) atomic_intrinsics: [usize; 2],
+    pub(crate) jit_atomic_lease: Option<AtomicLease>,
     /// The innermost running native function's [`frames::NativeCtx`] (its address on the
     /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
     pub(crate) native_top: usize,
@@ -1495,6 +1539,9 @@ impl Interp {
 
     /// Run `src` as a script in the realm whose global is `realm_global`.
     pub fn eval_in_realm(&mut self, realm_global: &Value, src: &str) -> Result<Value, Abrupt> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(self.throw("EvalError", "dynamic code is unavailable in native execution"));
+        }
         let ptr = match realm_global {
             Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
@@ -1601,6 +1648,14 @@ impl Interp {
         Interp {
             global,
             global_env,
+            #[cfg(feature = "aot-native")]
+            native_units: HashMap::new(),
+            #[cfg(all(feature = "compiler", feature = "jit"))]
+            snapshot_cjs: None,
+            #[cfg(all(feature = "compiler", feature = "jit"))]
+            snapshot_cjs_require: None,
+            #[cfg(feature = "aot-native")]
+            native_tail_call: false,
             object_proto,
             function_proto,
             array_proto,
@@ -1617,6 +1672,8 @@ impl Interp {
             depth_limit: 0,
             max_depth: MAX_EVAL_DEPTH,
             class_info: Default::default(),
+            #[cfg(feature = "aot-native")]
+            native_classes: HashMap::new(),
             ctor_plans: Default::default(),
             plan_cache: None,
             eval_fn: None,
@@ -1628,8 +1685,13 @@ impl Interp {
             import_meta: None,
             import_base: String::new(),
             modules: Default::default(),
+            native_module_names: Default::default(),
+            native_bindings: Default::default(),
             module_recs: Default::default(),
             module_loader: None,
+            jsx_options: Default::default(),
+            jsx_options_loader: None,
+            jsx_module_keys: Default::default(),
             module_ns: Default::default(),
             // "jit" (and anything unrecognized) selects bytecode: native tier being rewritten;
             // see docs/jit.md.
@@ -1711,7 +1773,14 @@ impl Interp {
             jit_frames: 0,
             jit_shadow: None,
             jit_stats: std::cell::Cell::new(crate::JitStats::default()),
+            jit_evict: crate::bytecode::jit::EngineJit::default(),
+            #[cfg(feature = "bench")]
+            jit_compilations: std::cell::RefCell::new(Vec::new()),
             jit_mode: crate::JitMode::Hot,
+            jit_alignment: 16,
+            jit_prefetch: false,
+            atomic_intrinsics: [0; 2],
+            jit_atomic_lease: None,
             native_top: 0,
             cur_site: frames::NO_SITE,
             sources: Default::default(),
@@ -2088,6 +2157,15 @@ impl Interp {
     /// render promises the way Node's `util.inspect` does. `None` for a non-promise.
     pub fn promise_state_for_host(&self, v: &Value) -> Option<(u8, Value)> {
         crate::eval::promise_fast::promise_state(v)
+    }
+
+    /// A host consuming a promise's settlement reports its rejection itself.
+    pub fn observe_promise_for_host(&mut self, value: &Value) {
+        if crate::eval::promise_fast::promise_state(value).is_some() {
+            self.perform_then(value.as_obj().unwrap(), crate::eval::promise_fast::Reaction::then(
+                Value::Undefined, Value::Undefined, Value::Undefined, self.async_context.clone(),
+            ));
+        }
     }
 
     /// `(target, handler)` of a proxy, for `util.inspect(proxy, { showProxy: true })`.
@@ -2909,6 +2987,54 @@ impl Interp {
             obj.borrow_mut().is_constructor = true;
         }
         (Value::Obj(obj), named_done || name.is_none())
+    }
+
+    #[cfg(feature = "aot-native")]
+    pub(crate) fn make_native_function(
+        &self,
+        program: Rc<crate::native_aot::NativeProgram>,
+        function_index: u32,
+        env: Env,
+    ) -> Value {
+        let function = &program.metadata.functions[function_index as usize];
+        let arrow = function.flags & 1 != 0;
+        let generator = function.flags & 4 != 0;
+        let asynchronous = function.flags & 8 != 0;
+        let method = function.flags & 16 != 0;
+        let prototype = match (arrow, asynchronous, generator) {
+            (false, false, true) => self.extra_protos.get("%GeneratorFunction.prototype%"),
+            (_, true, false) => self.extra_protos.get("%AsyncFunction.prototype%"),
+            (false, true, true) => self.extra_protos.get("%AsyncGeneratorFunction.prototype%"),
+            _ => None,
+        }.cloned().unwrap_or_else(|| self.function_proto.clone());
+        let mut props = crate::value::Props::new();
+        props.insert(crate::value::fn_key(0), Property::data(Value::Num(function.length as f64), false, false, true));
+        props.insert(crate::value::fn_key(1), Property::data(Value::str(&function.name), false, false, true));
+        if function.flags & (1 | 2 | 4 | 8 | 16) == 0 {
+            for (key, property) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
+                props.insert(key, property);
+            }
+        }
+        let has_prototype = !arrow && (generator || (!asynchronous && !method));
+        if has_prototype {
+            props.insert(crate::value::fn_key(2), Property::data(Value::Undefined, true, false, false));
+        }
+        let object = Object::new_with_parts(Some(prototype), props, Exotic::None);
+        if has_prototype {
+            let parent = match (generator, asynchronous) {
+                (true, false) => self.extra_protos.get("%GeneratorPrototype%"),
+                (true, true) => self.extra_protos.get("%AsyncGeneratorPrototype%"),
+                _ => None,
+            }.cloned().unwrap_or_else(|| self.object_proto.clone());
+            let mut prototype_props = crate::value::Props::new();
+            if !generator {
+                prototype_props.insert(crate::value::fn_key(3), Property::builtin(Value::Undefined));
+            }
+            Self::attach_fn_prototype(&object, Some(&prototype_props), parent, !generator);
+        }
+        object.borrow_mut().is_constructor = !arrow && !method && !asynchronous && !generator;
+        object.borrow_mut().call = Callable::Aot(Box::new(crate::value::AotCallable { program, function_index, env }));
+        Value::Obj(object)
     }
 
     /// Give function `f`, whose map holds the `prototype` placeholder, a fresh `.prototype` on
@@ -4480,6 +4606,8 @@ impl Interp {
         value: Value,
         receiver: Value,
     ) -> Result<bool, Abrupt> {
+        #[cfg(feature = "embed")]
+        crate::embed_convert::retain_identity_receiver(self, &receiver);
         // A mapped `arguments` index aliases its parameter binding: writes update the parameter
         // (and the own property, so unmapped reads and enumeration stay consistent).
         if !self.mapped_arguments.is_empty() {
@@ -5153,6 +5281,7 @@ impl Interp {
     /// collector; if genuine retention still exceeds `MAX_LIVE`, throw rather than exhaust RAM.
     pub(crate) fn gc_check(&mut self) -> Result<(), Abrupt> {
         self.poll_interrupt()?;
+        crate::bytecode::jit::trim_check(self);
         self.check_heap(0)?;
         // Scope churn is tracked separately: call-heavy code can retire millions of scopes while
         // allocating few objects, and each dead weak registry entry pins its allocation.
@@ -5776,6 +5905,20 @@ impl Interp {
                     self.call_user(&user.func, user.env.clone(), this, args, false, &obj)
                 }
             }
+            #[cfg(feature = "aot-native")]
+            Callable::Aot(native) => {
+                if self.native_classes.contains_key(&(Gc::as_ptr(&obj) as usize)) {
+                    return Err(self.throw("TypeError", "Class constructor cannot be invoked without 'new'"));
+                }
+                let depth = self.fn_frames.len();
+                let pointer = Gc::as_ptr(&obj) as usize;
+                self.fn_frames.push(FnFrame { fn_ptr: pointer, coro: self.cur_coro, caller_site: std::mem::replace(&mut self.cur_site, frames::NO_SITE), strict: native.program.metadata.functions[native.function_index as usize].flags & 2 != 0, construct: false, extra: None });
+                let saved_tail = std::mem::replace(&mut self.native_tail_call, true);
+                let result = crate::native_aot::call(self, &native.program, native.function_index, &native.env, this, args);
+                self.native_tail_call = saved_tail;
+                self.pop_pushed_frame(depth, pointer);
+                result
+            }
             Callable::Bound(bound) => {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
@@ -6358,6 +6501,9 @@ impl Interp {
         is_construct: bool,
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
+        if !cfg!(feature = "compiler") {
+            return Err(self.throw("Error", "interpreted functions are unavailable in the Aot profile"));
+        }
         crate::bytecode::jit::sync_frames(self);
         self.fn_frames.push(FnFrame {
             fn_ptr: Gc::as_ptr(fn_obj) as usize,
@@ -7438,6 +7584,10 @@ impl Interp {
                 return Ok(result);
             }
         }
+        #[cfg(feature = "aot-native")]
+        if self.native_classes.contains_key(&(Gc::as_ptr(&obj) as usize)) {
+            return crate::native_aot::classes::construct(self, callee, args, new_target);
+        }
         let call = obj.borrow().call.clone();
         match call {
             Callable::Native(_) | Callable::NativeData(_) => {
@@ -7553,6 +7703,8 @@ impl Interp {
             | Callable::AccessorSet(_)
             | Callable::PropGet(_)
             | Callable::PropSet(_) => Err(self.throw("TypeError", "value is not a constructor")),
+            #[cfg(feature = "aot-native")]
+            Callable::Aot(_) => crate::native_aot::classes::construct(self, callee, args, new_target),
         }
     }
 
@@ -7621,6 +7773,9 @@ impl Interp {
     }
 
     pub(crate) fn run_program(&mut self, body: &[Stmt]) -> Result<Value, Value> {
+        if !cfg!(feature = "compiler") {
+            return Err(self.make_error("Error", "AST execution is unavailable in the Aot profile"));
+        }
         // GlobalDeclarationInstantiation early checks, before any binding is created. A probe
         // hoist into a throwaway scope yields this script's VarDeclaredNames.
         let probe = new_scope(None);

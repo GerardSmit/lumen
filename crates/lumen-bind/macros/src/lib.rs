@@ -85,7 +85,7 @@ fn expand_op(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
 
 fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let opts = parse_opts(attr)?;
-    opts.check(&["name", "rename", "only", "skip", "module", "generic", "hint"])?;
+    opts.check(&["name", "rename", "only", "skip", "module", "generic", "hint", "extends"])?;
     let toks: Vec<TokenTree> = item.clone().into_iter().collect();
     let doc = doc_of(&toks);
     let (_, mut i) = take_attrs(&toks, 0);
@@ -109,10 +109,21 @@ fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         Some(m) => format!("::core::option::Option::Some({m:?})"),
         None => "::core::option::Option::None".into(),
     };
+    let inheritance = match opts.get("extends") {
+        Some(base) => format!(
+            "fn view(&self, ty: ::std::any::TypeId) -> Option<&dyn ::std::any::Any> {{ if ty == ::std::any::TypeId::of::<Self>() {{ Some(self) }} else {{ <{base} as {B}::Class>::view(&self.base, ty) }} }}
+             fn view_mut(&mut self, ty: ::std::any::TypeId) -> Option<&mut dyn ::std::any::Any> {{ if ty == ::std::any::TypeId::of::<Self>() {{ Some(self) }} else {{ <{base} as {B}::Class>::view_mut(&mut self.base, ty) }} }}"
+        ),
+        None => String::new(),
+    };
+    let base_impl = match opts.get("extends") {
+        Some(base) => format!("impl<H: {B}::Host> {B}::Inheritance<H> for {ty} where {base}: {B}::Methods<H> {{ fn base_class(ctx: &mut H::Ctx) -> Result<Option<H::Value>, H::Error> {{ H::class_object::<{base}>(ctx).map(Some) }} }}"),
+        None => format!("impl<H: {B}::Host> {B}::Inheritance<H> for {ty} {{ fn base_class(_: &mut H::Ctx) -> Result<Option<H::Value>, H::Error> {{ Ok(None) }} }}"),
+    };
     let code = format!(
         "impl {B}::Class for {ty} {{\n\
            const DESC: &'static {B}::ClassDesc = &{B}::ClassDesc {{ name: {ty:?}, {}, module: {module}, doc: {doc}, flags: {flags} }};\n\
-         }}\n\
+         {inheritance}}}\n{base_impl}\n\
          impl {B}::Elem for {ty} {{}}\n\
          impl<H: {B}::Host> {B}::IntoRet<H> for {ty} {{\n\
            const MAY_RUN: bool = false;\n\
@@ -254,7 +265,8 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         "#[doc(hidden)]\n#[allow(non_snake_case, non_upper_case_globals, unused_imports, unused_mut, unused_variables, clippy::all)]\n\
          mod {modname} {{\nuse super::*;\n{gen_items}}}\n\
          #[allow(private_bounds)]\n\
-         impl<H: {B}::Host> {B}::Methods<H> for {self_ty} where {bounds} {{\n\
+         impl<H: {B}::Host> {B}::Methods<H> for {self_ty} where {self_ty}: {B}::Inheritance<H>, {bounds} {{\n\
+           fn base_class(ctx: &mut H::Ctx) -> Result<Option<H::Value>, H::Error> {{ <Self as {B}::Inheritance<H>>::base_class(ctx) }}\n\
            fn members(out: &mut ::std::vec::Vec<{B}::FnItem<H>>) {{\n{pushes}\n}}\n\
          }}\n"
     );

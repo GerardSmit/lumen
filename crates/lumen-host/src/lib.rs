@@ -157,8 +157,9 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         if let Some(blob) = aot {
             let tier = engine.tier();
             engine.set_tier(lumen::bytecode::Tier::Interp);
-            let loaded = engine.load_precompiled(&lumen::Precompiled::from_static(blob));
+            let loaded = load_glue(engine, blob);
             let completion = match (loaded, ext.js_init) {
+                #[cfg(feature = "compiler")]
                 (Err(_), Some(src)) => engine.eval(src, false),
                 (r, _) => r,
             };
@@ -171,6 +172,10 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                 Err(e) => panic!("extension '{}' js_init: {}", ext.name, e.message),
             }
         } else if let Some(src) = ext.js_init {
+            #[cfg(not(feature = "compiler"))]
+            panic!("extension '{}' requires native initialization glue", ext.name);
+            #[cfg(feature = "compiler")]
+            {
             // The glue's setup path runs once, in the tree-walker: compiling it would parse the
             // body of every function it defines (the capture scan needs them) for code that
             // never runs again. Functions it defines tier up on their own calls as usual.
@@ -195,6 +200,7 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                     ext.name, e.message
                 ),
             }
+            }
         }
         if let Some(t0) = t0 {
             eprintln!("[startup] install {:<8} {:?}", ext.name, t0.elapsed());
@@ -203,6 +209,21 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             lumen::memstats::phase(&format!("install {}", ext.name));
         }
     }
+}
+
+/// Load build-produced extension glue in its recorded execution format.
+pub fn load_glue(engine: &mut Engine, blob: &'static [u8]) -> Result<Completion, ParseError> {
+    if blob.get(8..12) == Some(&lumen_common::aot::NATIVE_FORMAT_VERSION.to_le_bytes()[..]) {
+        #[cfg(feature = "aot-native")]
+        return engine.load_native_glue_value(blob).map(|_| Completion::Value(String::new()))
+            .map_err(|message| ParseError { message, line: 1, at_eof: false });
+        #[cfg(not(feature = "aot-native"))]
+        return Err(ParseError { message: "native extension glue is unavailable in this runtime".into(), line: 1, at_eof: false });
+    }
+    #[cfg(feature = "compiler")]
+    { engine.load_precompiled(&lumen::Precompiled::from_static(blob)) }
+    #[cfg(not(feature = "compiler"))]
+    { Err(ParseError { message: "Aot initialization requires native glue".into(), line: 1, at_eof: false }) }
 }
 
 /// Whether `LUMEN_STARTUP_TIMING` is set: startup phases then report their wall time on stderr.
@@ -684,6 +705,16 @@ pub struct ChildRealmRequest {
     /// Kept alive for as long as the realm runs and dropped after it ends (the realm's end of an
     /// IPC channel, say).
     pub resources: Vec<Box<dyn Send>>,
+    /// Optional packet transport supplied by an embedder without OS descriptors.
+    pub ipc: Option<std::sync::Arc<dyn RealmIpc>>,
+}
+
+/// An embedder's bounded, duplex child-realm packet channel.
+pub trait RealmIpc: Send + Sync {
+    fn send(&self, bytes: Vec<u8>) -> std::io::Result<()>;
+    fn receive(&self) -> std::io::Result<Option<Vec<u8>>>;
+    fn disconnect(&self);
+    fn connected(&self) -> bool;
 }
 
 /// How a child realm ended.

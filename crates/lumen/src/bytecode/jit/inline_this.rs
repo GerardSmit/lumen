@@ -269,7 +269,11 @@ fn dry(tb: &ThisBody, arg: &dyn Fn(usize) -> K) -> Option<K> {
                 if !numeric(x) || !numeric(y) {
                     return None;
                 }
-                st.push(if inline::arith_of(o).is_some() { K::Num } else { K::Bool });
+                st.push(if inline::arith_of(o).is_some() {
+                    K::Num
+                } else {
+                    K::Bool
+                });
             }
         }
     }
@@ -417,8 +421,11 @@ impl Tr<'_, '_> {
         }
         if !stored.is_empty() {
             // (As for any property store: drop the tracked array views.)
-            let views: Vec<(lumen_codegen::builder::Variable, Type)> =
-                self.arr_vars.values().map(|a| (a.kind, Type::I32)).collect();
+            let views: Vec<(lumen_codegen::builder::Variable, Type)> = self
+                .arr_vars
+                .values()
+                .map(|a| (a.kind, Type::I32))
+                .collect();
             self.reset_vars(&views);
         }
     }
@@ -456,8 +463,10 @@ impl Tr<'_, '_> {
                 }
                 self.fb.store(MemKind::I32U8, self.stackp, tag, o);
                 let byte = self.fb.convert(ConvOp::Wrap, Type::I32, payload);
-                self.fb.store(MemKind::I32U8, self.stackp, byte, o + VALUE_BOOL);
-                self.fb.store(MemKind::I64, self.stackp, payload, o + VALUE_PAYLOAD);
+                self.fb
+                    .store(MemKind::I32U8, self.stackp, byte, o + VALUE_BOOL);
+                self.fb
+                    .store(MemKind::I64, self.stackp, payload, o + VALUE_PAYLOAD);
                 self.fb.jump(done, &[]);
             }
             Res::Other(v) => {
@@ -468,12 +477,14 @@ impl Tr<'_, '_> {
                     Av::Num(x) => {
                         let t = self.i32c(TAG_NUM as i64);
                         self.fb.store(MemKind::I32U8, self.stackp, t, o);
-                        self.fb.store(MemKind::F64, self.stackp, x, o + VALUE_PAYLOAD);
+                        self.fb
+                            .store(MemKind::F64, self.stackp, x, o + VALUE_PAYLOAD);
                     }
                     Av::Bool(b) => {
                         let t = self.i32c(TAG_BOOL as i64);
                         self.fb.store(MemKind::I32U8, self.stackp, t, o);
-                        self.fb.store(MemKind::I32U8, self.stackp, b, o + VALUE_BOOL);
+                        self.fb
+                            .store(MemKind::I32U8, self.stackp, b, o + VALUE_BOOL);
                     }
                     _ => {
                         let t = self.i32c(TAG_UNDEFINED as i64);
@@ -524,14 +535,7 @@ impl Tr<'_, '_> {
         let eb = if tb.fresh {
             layout::probed_entries(&mut self.fb, this_p, tb.max_slot, tb.writes, full)
         } else {
-            layout::shaped_entries(
-                &mut self.fb,
-                this_p,
-                tb.shape,
-                tb.max_slot,
-                tb.writes,
-                full,
-            )
+            layout::shaped_entries(&mut self.fb, this_p, tb.shape, tb.max_slot, tb.writes, full)
         };
         let (res, stored) = self.this_emit(tb, eb, &entries, ab, argc, want, full);
         self.this_commit(eb, &stored);
@@ -627,7 +631,15 @@ impl Tr<'_, '_> {
         }
         let pre = self.stack.clone();
         let miss = self.fb.create_block();
-        layout::accessor_probe(&mut self.fb, obj, &g.shapes, g.slot, g.getter as u64, true, miss);
+        layout::accessor_probe(
+            &mut self.fb,
+            obj,
+            &g.shapes,
+            g.slot,
+            g.getter as u64,
+            true,
+            miss,
+        );
         let eb = layout::probed_entries(&mut self.fb, obj, g.body.max_slot, g.body.writes, miss);
         let (_, stored) = self.this_emit(&g.body, eb, &pre, d - 1, 1, false, miss);
         self.this_commit(eb, &stored);

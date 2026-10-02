@@ -38,6 +38,7 @@ pub fn valtype(t: Type) -> u8 {
         Type::I64 => 0x7e,
         Type::F32 => 0x7d,
         Type::F64 => 0x7c,
+        Type::V128 => 0x7b,
     }
 }
 

@@ -10,7 +10,12 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-common = { path = "../lumen-common", default-features = false }
+lumen-common = { path = "../lumen-common", default-features = false, features = ["native-sidecar"] }
+lumen-os = { path = "../lumen-os" }
+object = { version = "=0.36.7", default-features = false, features = ["write", "elf", "macho", "coff", "std"], optional = true }
+
+[features]
+standalone-object = ["dep:object"]
 
 [lints]
 workspace = true

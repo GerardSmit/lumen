@@ -143,4 +143,3 @@ fn analyze_mode(
     }
     Ok(())
 }
-

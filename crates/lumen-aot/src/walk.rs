@@ -3,7 +3,7 @@
 //! imports, literal dynamic `import()`s, literal `require()`s, and — with `node_modules` —
 //! bare package specifiers), compile every unit with lumen's parser and assemble the blob.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
 
 use lumen::precompiled::{CompileOptions, CompiledUnit, PrecompileBundle};
@@ -13,6 +13,12 @@ use lumen::SourceKind;
 /// invoking crate's `CARGO_MANIFEST_DIR` for the macro).
 #[derive(Clone, Debug, Default)]
 pub struct Spec {
+    pub extra_inputs: Vec<PathBuf>,
+    pub assets: Vec<String>,
+    pub asset_root: Option<PathBuf>,
+    pub trim_level: Option<String>,
+    pub keep: Vec<String>,
+    pub native_catalog: Option<Vec<(String, String, u64)>>,
     /// Classic scripts, run in this order before the entry module.
     pub scripts: Vec<PathBuf>,
     /// The entry ES module (evaluated by `load_precompiled`).
@@ -42,12 +48,36 @@ pub struct Spec {
     pub root: Option<PathBuf>,
     /// Leave out the precompiled bytecode (AST only; functions compile at run time).
     pub no_bytecode: bool,
+    /// Reject source imports whose target is not explicitly bundled.
+    pub closed_world: bool,
+    /// Disable source-store compression for size/decode comparisons.
+    pub uncompressed_source: bool,
+    /// Write a conservative module reachability report alongside host-tool output.
+    pub trim_modules: bool,
 }
 
 /// The finished blob and every file read to build it (for rebuild tracking).
 pub struct Bundle {
+    pub assets: Option<Vec<u8>>,
     pub blob: Vec<u8>,
     pub inputs: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+    pub required_modules: Vec<String>,
+    pub links: Vec<(usize, String, usize)>,
+    pub entry: Option<usize>,
+}
+
+fn source_line_col(source: &str, offset: u32) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    let at = (offset as usize).min(bytes.len());
+    let line = 1 + bytes[..at].iter().filter(|&&byte| byte == b'\n').count();
+    let column = at
+        - bytes[..at]
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |i| i + 1)
+        + 1;
+    (line, column)
 }
 
 fn read(path: &Path) -> Result<String, String> {
@@ -159,7 +189,10 @@ const BUILTINS: &[&str] = &[
 ];
 
 fn is_builtin(spec: &str) -> bool {
-    spec.starts_with("node:") || BUILTINS.contains(&spec)
+    spec.starts_with("node:")
+        || spec.starts_with("lumen:")
+        || spec.starts_with("bitnest:")
+        || BUILTINS.contains(&spec)
 }
 
 /// A bare package specifier (not relative/absolute, no URL scheme, not a builtin).
@@ -200,7 +233,7 @@ fn segs_match(pat: &[&str], path: &[&str]) -> bool {
 
 /// Whether `glob` matches `rel` (a `/`-separated relative path) at any directory boundary; a
 /// glob starting with `/` or `./` is anchored at the start.
-fn glob_match(glob: &str, rel: &str) -> bool {
+pub(crate) fn glob_match(glob: &str, rel: &str) -> bool {
     let glob = glob.replace('\\', "/");
     let (anchored, g) = match glob.strip_prefix("./").or_else(|| glob.strip_prefix('/')) {
         Some(g) => (true, g.to_string()),
@@ -277,7 +310,7 @@ impl Resolver {
 
     fn classify(&mut self, file: &Path) -> FileKind {
         match file.extension().and_then(|e| e.to_str()) {
-            Some("mjs" | "mts") => FileKind::Esm,
+            Some("mjs" | "mts" | "jsx" | "tsx") => FileKind::Esm,
             Some("cjs" | "cts") => FileKind::Cjs,
             Some("json") => FileKind::Json,
             _ => match self.package_type(file).as_deref() {
@@ -292,8 +325,8 @@ impl Resolver {
             return Some(p.to_path_buf());
         }
         let exts: &[&str] = match mode {
-            Mode::Import => &[".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts"],
-            Mode::Require => &[".js", ".json", ".cjs", ".mjs", ".ts", ".cts"],
+            Mode::Import => &[".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts", ".jsx", ".tsx"],
+            Mode::Require => &[".js", ".json", ".cjs", ".mjs", ".ts", ".cts", ".jsx", ".tsx"],
         };
         exts.iter().map(|e| with_suffix(p, e)).find(|c| c.is_file())
     }
@@ -319,7 +352,8 @@ impl Resolver {
 
     fn relative(&mut self, from: &Path, spec: &str, mode: Mode) -> Option<PathBuf> {
         let base = clean(&from.parent()?.join(spec));
-        self.as_file(&base, mode).or_else(|| self.as_dir(&base, mode))
+        self.as_file(&base, mode)
+            .or_else(|| self.as_dir(&base, mode))
     }
 
     /// A bare specifier through the `node_modules` walk from `from`'s directory.
@@ -356,7 +390,8 @@ impl Resolver {
             return self.as_dir(pkg_dir, mode);
         }
         let base = pkg_dir.join(sub);
-        self.as_file(&base, mode).or_else(|| self.as_dir(&base, mode))
+        self.as_file(&base, mode)
+            .or_else(|| self.as_dir(&base, mode))
     }
 }
 
@@ -497,8 +532,10 @@ fn is_module_syntax(src: &str) -> bool {
     let candidate = src.lines().any(|line| {
         let l = line.trim_start();
         let after = |kw: &str| l.strip_prefix(kw).and_then(|r| r.chars().next());
-        matches!(after("import"), Some(' ' | '\t' | '{' | '*' | '"' | '\'' | '.'))
-            || matches!(after("export"), Some(' ' | '\t' | '{' | '*'))
+        matches!(
+            after("import"),
+            Some(' ' | '\t' | '{' | '*' | '"' | '\'' | '.')
+        ) || matches!(after("export"), Some(' ' | '\t' | '{' | '*'))
     });
     candidate
         && CompiledUnit::compile_with_options(
@@ -515,9 +552,8 @@ fn is_module_syntax(src: &str) -> bool {
 /// The ES module an `import` of a CommonJS unit links to: it `require`s the unit (same key,
 /// found through `import.meta.url`) and re-exports it as the default plus each static name.
 fn cjs_facade(names: &[String]) -> String {
-    let mut out = String::from(
-        "const __m = globalThis.require(import.meta.url);\nexport default __m;\n",
-    );
+    let mut out =
+        String::from("const __m = globalThis.require(import.meta.url);\nexport default __m;\n");
     for (i, n) in names.iter().enumerate() {
         out.push_str(&format!(
             "const __e{i} = __m == null ? undefined : __m[{}];\nexport {{ __e{i} as {n} }};\n",
@@ -540,6 +576,17 @@ struct Built {
 }
 
 pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
+    bundle_with(base, spec, &mut |_, _, _, _| Ok(()))
+}
+
+pub fn bundle_with(
+    base: &Path,
+    spec: &Spec,
+    visit: &mut impl FnMut(&str, SourceKind, &CompiledUnit, &Path) -> Result<(), String>,
+) -> Result<Bundle, String> {
+    if spec.closed_world && !spec.walk {
+        return Err("closed-world compilation requires module walking".into());
+    }
     let abs = |p: &PathBuf| clean(&base.join(p));
     let rel_to_base = |p: &Path| -> String {
         let r = p.strip_prefix(base).unwrap_or(p);
@@ -550,34 +597,83 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
     };
     let keep = |p: &Path| -> bool {
         let r = rel_to_base(p);
-        spec.keep_source.iter().any(|g| g == "**" || glob_match(g, &r))
+        spec.keep_source
+            .iter()
+            .any(|g| g == "**" || glob_match(g, &r))
     };
     let excluded = |p: &Path| -> bool {
         let r = rel_to_base(p);
-        spec.exclude
-            .iter()
-            .any(|g| glob_match(g, &r))
+        spec.exclude.iter().any(|g| glob_match(g, &r))
     };
     let opts = |p: &Path| CompileOptions {
         bytecode: !spec.no_bytecode,
         keep_source: keep(p),
     };
     let mut inputs = Vec::new();
+    let mut warnings = Vec::new();
+    let mut required_modules = BTreeSet::new();
     let mut out = PrecompileBundle::new();
+    out.set_compress_source(!spec.uncompressed_source);
     let mut res = Resolver {
         pkg_cache: HashMap::new(),
         pkg_inputs: Vec::new(),
     };
+    let mut script_deps: Vec<(Node, Option<PathBuf>)> = Vec::new();
 
     for (i, script) in spec.scripts.iter().enumerate() {
         let path = abs(script);
         let src = read(&path)?;
         let unit = CompiledUnit::compile_with_options(&src, SourceKind::Script, opts(&path))
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        if spec.closed_world {
+            if unit.computed_dynamic_imports() != 0 && spec.modules.is_empty() {
+                return Err(format!(
+                    "{}: {} computed dynamic import(s) require an explicit module list",
+                    path.display(),
+                    unit.computed_dynamic_imports()
+                ));
+            }
+            for &(offset, kind) in unit.dynamic_code_sites() {
+                let (line, column) = source_line_col(&src, offset);
+                warnings.push(format!(
+                    "{}:{line}:{column}: {kind} is unavailable in an AOT build",
+                    path.display()
+                ));
+            }
+            for (s, mode) in unit
+                .dynamic_imports()
+                .iter()
+                .map(|s| (s, Mode::Import))
+                .chain(unit.requires().iter().map(|s| (s, Mode::Require)))
+            {
+                if is_builtin(s) {
+                    required_modules.insert(s.clone());
+                    continue;
+                }
+                let target = (if is_relative(s) {
+                    res.relative(&path, s, mode)
+                } else if spec.node_modules && is_bare_package(s) {
+                    res.package(&path, s, mode)
+                } else {
+                    None
+                })
+                .ok_or_else(|| format!("{}: cannot bundle import {s:?}", path.display()))?;
+                if excluded(&target) {
+                    return Err(format!("{}: excluded import {s:?}", path.display()));
+                }
+                let kind = if mode == Mode::Import {
+                    SourceKind::Module
+                } else {
+                    SourceKind::CommonJs
+                };
+                script_deps.push(((target, kind), Some(path.clone())));
+            }
+        }
         let label = format!(
             "script{i}:{}",
             script.file_name().unwrap_or_default().to_string_lossy()
         );
+        visit(&label, SourceKind::Script, &unit, &path)?;
         out.add_compiled(&label, unit)?;
         inputs.push(path);
     }
@@ -593,6 +689,7 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
     for m in &spec.modules {
         queue.push_back(((abs(m), SourceKind::Module), None));
     }
+    queue.extend(script_deps);
     // Entry and `modules` are ES modules by contract, whatever their extension says.
     let explicit: Vec<PathBuf> = spec
         .entry
@@ -674,29 +771,53 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
             }
             (SourceKind::Module, FileKind::Esm) => {
                 let src = read(&path).map_err(with_importer)?;
-                CompiledUnit::compile_with_options(&src, SourceKind::Module, opts(&path))
+                let extension = path.extension().and_then(|e| e.to_str());
+                let jsx_options = lumen::JsxOptions { filename: path.display().to_string(), ..Default::default() };
+                let jsx = matches!(extension, Some("jsx" | "tsx")).then_some((extension == Some("tsx"), &jsx_options));
+                CompiledUnit::compile_with_jsx_options(&src, SourceKind::Module, opts(&path), jsx)
                     .map_err(|e| format!("{}: {e}", path.display()))?
             }
             (SourceKind::Script, _) => unreachable!("scripts are not walked"),
         };
 
+        if spec.closed_world && unit.computed_dynamic_imports() != 0 && spec.modules.is_empty() {
+            return Err(format!(
+                "{}: {} computed dynamic import(s) require an explicit module list",
+                path.display(),
+                unit.computed_dynamic_imports()
+            ));
+        }
+        if spec.closed_world && !unit.dynamic_code_sites().is_empty() {
+            let source = read(&path)?;
+            for &(offset, kind) in unit.dynamic_code_sites() {
+                let (line, column) = source_line_col(&source, offset);
+                warnings.push(format!(
+                    "{}:{line}:{column}: {kind} is unavailable in an AOT build",
+                    path.display()
+                ));
+            }
+        }
+
         if spec.walk && !(kind == SourceKind::Module && file_kind != FileKind::Esm) {
-            // (specifier, mode, required): a static import must resolve (relative) — the rest
-            // are best-effort (optional dependencies, feature-detected requires).
+            // (specifier, mode, required): native closed-world mode resolves
+            // every literal dependency; bytecode mode keeps optional requires.
             let mut deps: Vec<(String, Mode, bool)> = Vec::new();
             for s in unit.imports() {
-                deps.push((s.clone(), Mode::Import, is_relative(s)));
+                deps.push((s.clone(), Mode::Import, spec.closed_world || is_relative(s)));
             }
             for s in unit.dynamic_imports() {
-                deps.push((s.clone(), Mode::Import, false));
+                deps.push((s.clone(), Mode::Import, spec.closed_world));
             }
             if kind == SourceKind::CommonJs {
                 for s in unit.requires() {
-                    deps.push((s.clone(), Mode::Require, false));
+                    deps.push((s.clone(), Mode::Require, spec.closed_world));
                 }
             }
             for (s, mode, required) in deps {
                 if is_builtin(&s) {
+                    if spec.closed_world {
+                        required_modules.insert(s);
+                    }
                     continue;
                 }
                 let target = if is_relative(&s) {
@@ -704,6 +825,9 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
                 } else if spec.node_modules && is_bare_package(&s) {
                     res.package(&path, &s, mode)
                 } else {
+                    if required {
+                        return Err(format!("{}: cannot bundle import {s:?}", path.display()));
+                    }
                     continue;
                 };
                 let Some(target) = target else {
@@ -713,6 +837,9 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
                     continue;
                 };
                 if excluded(&target) {
+                    if spec.closed_world {
+                        return Err(format!("{}: excluded import {s:?}", path.display()));
+                    }
                     continue;
                 }
                 let tkind = match mode {
@@ -783,24 +910,40 @@ pub fn bundle(base: &Path, spec: &Spec) -> Result<Bundle, String> {
         if *kind == SourceKind::Module && entry.as_ref() == Some(path) {
             entry_rel = Some(rel.clone());
         }
+        visit(&rel, *kind, &b.unit, path)?;
         let i = out.add_compiled(&rel, b.unit)?;
         index.insert(b.node.clone(), i);
         pending_links.push((i, b.links));
     }
+    let mut resolved_links = Vec::new();
     for (from, links) in pending_links {
         for (s, target) in links {
             if let Some(&to) = index.get(&fix(&target)) {
                 out.link(from, &s, to)?;
+                resolved_links.push((from, s, to));
             }
         }
     }
+    let entry_index = entry.as_ref().and_then(|path| index.get(&(path.clone(), SourceKind::Module))).copied();
     if let Some(e) = entry_rel {
         out.set_entry(&e)?;
     }
     inputs.extend(res.pkg_inputs);
+    inputs.extend(spec.extra_inputs.iter().map(|path| base.join(path).canonicalize()
+        .map_err(|error| format!("{}: {error}", path.display()))).collect::<Result<Vec<_>, _>>()?);
+    let asset_root = spec.asset_root.as_ref().or(spec.root.as_ref()).map(|root| base.join(root)).unwrap_or_else(|| base.to_owned());
+    let (assets, asset_inputs) = crate::assets::collect(&asset_root, &spec.assets)?;
+    inputs.extend(asset_inputs);
+    let blob = out.finish();
+    let blob = if let Some(archive) = &assets { lumen_common::aot::assets::attach(&blob, archive, 1)? } else { blob };
     Ok(Bundle {
-        blob: out.finish(),
+        blob,
+        assets,
         inputs,
+        warnings,
+        required_modules: required_modules.into_iter().collect(),
+        links: resolved_links,
+        entry: entry_index,
     })
 }
 
@@ -810,14 +953,20 @@ mod tests {
 
     #[test]
     fn globs() {
-        assert!(glob_match("puppeteer-core/**", "node_modules/puppeteer-core/lib/a.js"));
+        assert!(glob_match(
+            "puppeteer-core/**",
+            "node_modules/puppeteer-core/lib/a.js"
+        ));
         assert!(glob_match("**", "a/b.js"));
         assert!(glob_match("*.mjs", "js/test.mjs"));
         assert!(glob_match("js/*.mjs", "x/js/test.mjs"));
         assert!(!glob_match("./js/*.mjs", "x/js/test.mjs"));
         assert!(glob_match("./x/js/*.mjs", "x/js/test.mjs"));
         assert!(!glob_match("puppeteer-core/**", "node_modules/ws/index.js"));
-        assert!(glob_match("lib/**/bidi/*", "node_modules/p/lib/puppeteer/bidi/x.js"));
+        assert!(glob_match(
+            "lib/**/bidi/*",
+            "node_modules/p/lib/puppeteer/bidi/x.js"
+        ));
     }
 
     #[test]
@@ -827,15 +976,27 @@ mod tests {
                 "./internal/*": {"import": "./lib/*"}, "./*": "./*", "./package.json": "./package.json"}"#,
         )
         .unwrap();
-        assert_eq!(resolve_exports(&j, ".", Mode::Import).as_deref(), Some("./esm.mjs"));
-        assert_eq!(resolve_exports(&j, ".", Mode::Require).as_deref(), Some("./cjs.js"));
+        assert_eq!(
+            resolve_exports(&j, ".", Mode::Import).as_deref(),
+            Some("./esm.mjs")
+        );
+        assert_eq!(
+            resolve_exports(&j, ".", Mode::Require).as_deref(),
+            Some("./cjs.js")
+        );
         assert_eq!(
             resolve_exports(&j, "./internal/a.js", Mode::Import).as_deref(),
             Some("./lib/a.js")
         );
-        assert_eq!(resolve_exports(&j, "./x/y.js", Mode::Import).as_deref(), Some("./x/y.js"));
+        assert_eq!(
+            resolve_exports(&j, "./x/y.js", Mode::Import).as_deref(),
+            Some("./x/y.js")
+        );
         let s = parse_json(r#""./main.js""#).unwrap();
-        assert_eq!(resolve_exports(&s, ".", Mode::Import).as_deref(), Some("./main.js"));
+        assert_eq!(
+            resolve_exports(&s, ".", Mode::Import).as_deref(),
+            Some("./main.js")
+        );
         assert_eq!(split_package("@a/b/c/d"), Some(("@a/b", "c/d")));
         assert_eq!(split_package("ws"), Some(("ws", "")));
     }

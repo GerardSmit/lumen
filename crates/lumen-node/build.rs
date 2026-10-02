@@ -379,7 +379,11 @@ fn main() {
     let mem_marks = std::env::var_os("LUMEN_GLUE_MEM_MARKS").is_some();
     let glue = glue::assemble(&entries, read, feature_on, mem_marks);
 
-    let blob = lumen::precompiled::precompile_glue(&glue, "node-glue")
+    let blob = if std::env::var_os("CARGO_FEATURE_COMPILER").is_some() {
+        lumen::precompiled::precompile_glue(&glue, "node-glue")
+    } else {
+        lumen_aot::native::precompile_glue_for_build(&glue, "node-glue")
+    }
         .unwrap_or_else(|e| panic!("node glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());

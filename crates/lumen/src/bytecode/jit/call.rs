@@ -224,7 +224,10 @@ pub(super) fn scope_offs() -> Option<&'static ScopeOffs> {
         let gen_off = {
             let mut m = VarMap::default();
             let read = |m: &VarMap, off: usize| unsafe {
-                (m as *const VarMap as *const u8).add(off).cast::<u32>().read_unaligned()
+                (m as *const VarMap as *const u8)
+                    .add(off)
+                    .cast::<u32>()
+                    .read_unaligned()
             };
             let n = size_of::<VarMap>();
             let mut cands: Vec<usize> = (0..=n.checked_sub(4)?)
@@ -381,7 +384,12 @@ struct AccFb {
 
 /// The getter (`set`: setter) `recv.<name>` resolves to along a chain of ordinary plain
 /// objects of shared shapes (at most 4 levels): the shapes, the holder's slot and the function.
-fn accessor_chain(i: &Interp, recv: &Value, name: &str, set: bool) -> Option<(Vec<u32>, u32, Value)> {
+fn accessor_chain(
+    i: &Interp,
+    recv: &Value,
+    name: &str,
+    set: bool,
+) -> Option<(Vec<u32>, u32, Value)> {
     let Value::Obj(o) = recv else { return None };
     let mut cur = o.clone();
     let mut shapes = Vec::new();
@@ -423,7 +431,13 @@ fn act_ok(cc: &Chunk) -> bool {
 }
 
 /// A direct call site for accessor `f` called with `nargs` arguments and a receiver.
-fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs: usize) -> Option<DSite> {
+fn accessor_dsite(
+    p: &mut Plan,
+    interp: &Interp,
+    chunk: &Chunk,
+    f: &Value,
+    nargs: usize,
+) -> Option<DSite> {
     let ic = crate::bytecode::inline_callee(interp, f)?;
     let (env_addr, fn_ptr) = super::callee_env_addr(f)?;
     let word = super::value_word(f);
@@ -434,7 +448,10 @@ fn accessor_dsite(p: &mut Plan, interp: &Interp, chunk: &Chunk, f: &Value, nargs
         || (cc.virt_base.is_some() && nargs > cc.n_params)
         || cc.derived
         || cc.n_slots > MAX_DIRECT_SLOTS
-        || cc.var_force_resets.iter().any(|&s| (s as usize) < cc.n_params.min(nargs))
+        || cc
+            .var_force_resets
+            .iter()
+            .any(|&s| (s as usize) < cc.n_params.min(nargs))
         || std::ptr::eq(cc, chunk)
     {
         return None;
@@ -508,10 +525,20 @@ fn plan_accessor(
             .fb_get::<AccFb>(q)
             .and_then(|fb| Some((fb.shapes, fb.slot, Value::Obj(fb.f.upgrade()?)))),
     };
-    let Some((shapes, slot, f)) = found else { return };
+    let Some((shapes, slot, f)) = found else {
+        return;
+    };
     if let Some(site) = accessor_dsite(p, interp, chunk, &f, set as usize) {
         let word = super::value_word(&f);
-        p.dacc.insert(q, AccSite { shapes, slot, word, site });
+        p.dacc.insert(
+            q,
+            AccSite {
+                shapes,
+                slot,
+                word,
+                site,
+            },
+        );
     }
 }
 
@@ -603,7 +630,9 @@ pub(super) fn plan_direct(
         Some(v)
     };
     for q in header..=backedge {
-        let Some(d) = an.depth[q - header] else { continue };
+        let Some(d) = an.depth[q - header] else {
+            continue;
+        };
         let (argc, wt, construct) = match ops[q] {
             Op::Call(a) => (a as usize, 0, false),
             Op::CallWithThis(a) => (a as usize, 1, false),
@@ -617,9 +646,13 @@ pub(super) fn plan_direct(
         {
             continue;
         }
-        let Some(base) = d.checked_sub(argc + 1 + wt) else { continue };
+        let Some(base) = d.checked_sub(argc + 1 + wt) else {
+            continue;
+        };
         let ci = base + wt;
-        let Some((pp, pos)) = producer(q, ci) else { continue };
+        let Some((pp, pos)) = producer(q, ci) else {
+            continue;
+        };
         if p.math.contains_key(&pp) || (pp > 0 && p.math.contains_key(&(pp - 1))) {
             continue;
         }
@@ -684,24 +717,24 @@ pub(super) fn plan_direct(
                     method = chain.filter(|_| !failed);
                     (Some(r.clone()), false)
                 } else {
-                let fb = match recv {
-                    Some(Value::Obj(_)) => None,
-                    _ => chunk.jit.fb_get::<MethodFb>(pp),
-                };
-                if let Some((fb, f)) = fb.and_then(|fb| {
-                    let f = fb.callee.upgrade()?;
-                    Some((fb, Value::Obj(f)))
-                }) {
-                    // A receiver seen by an earlier compile: its callee, chain and body (the
-                    // call guards the chain and the callee at run time).
-                    method = (!failed).then(|| fb.chain.clone());
-                    method_fb = Some(fb);
-                    (Some(f), false)
-                } else {
-                    method = chain.filter(|_| !failed);
-                    recv_now = recv;
-                    (f, false)
-                }
+                    let fb = match recv {
+                        Some(Value::Obj(_)) => None,
+                        _ => chunk.jit.fb_get::<MethodFb>(pp),
+                    };
+                    if let Some((fb, f)) = fb.and_then(|fb| {
+                        let f = fb.callee.upgrade()?;
+                        Some((fb, Value::Obj(f)))
+                    }) {
+                        // A receiver seen by an earlier compile: its callee, chain and body (the
+                        // call guards the chain and the callee at run time).
+                        method = (!failed).then(|| fb.chain.clone());
+                        method_fb = Some(fb);
+                        (Some(f), false)
+                    } else {
+                        method = chain.filter(|_| !failed);
+                        recv_now = recv;
+                        (f, false)
+                    }
                 }
             }
             _ => continue,
@@ -751,7 +784,15 @@ pub(super) fn plan_direct(
                     continue;
                 };
                 let word = super::value_word(&callee);
-                (ic.chunk.clone(), ic.strict, ic.arrow, word, fn_ptr, env_addr, callee)
+                (
+                    ic.chunk.clone(),
+                    ic.strict,
+                    ic.arrow,
+                    word,
+                    fn_ptr,
+                    env_addr,
+                    callee,
+                )
             }
             _ => {
                 let t = match ops[pp] {
@@ -795,8 +836,7 @@ pub(super) fn plan_direct(
         {
             continue;
         }
-        let self_call =
-            func_mode && std::ptr::eq(cc, chunk) && !cfg!(target_arch = "wasm32");
+        let self_call = func_mode && std::ptr::eq(cc, chunk) && !cfg!(target_arch = "wasm32");
         if let Some(ap) = adaptor_pin {
             let ap = Box::new(ap);
             let at = &*ap as *const Value as usize;
@@ -921,7 +961,9 @@ pub(super) fn plan_direct(
                 (slots.get(s as usize).cloned(), n)
             }
             Op::GetProp(n, _) => {
-                let Some(d) = an.depth[q - header] else { continue };
+                let Some(d) = an.depth[q - header] else {
+                    continue;
+                };
                 let r = match d.checked_sub(1).and_then(|t| producer(q, t)) {
                     Some((rp, 0)) => match ops[rp] {
                         Op::LoadLocal(s) if kinds.get(s as usize) == Some(&Kind::Boxed) => {
@@ -970,7 +1012,9 @@ pub(super) fn plan_direct(
     }
     // Property stores through a setter with an inlinable body.
     for q in header..=backedge {
-        let Some(d) = an.depth[q - header] else { continue };
+        let Some(d) = an.depth[q - header] else {
+            continue;
+        };
         let (recv, n) = match ops[q] {
             Op::SetPropThisDrop(n, _) => (Some(this_val.clone()), n),
             Op::SetPropLocalDrop(s, n, _) if kinds.get(s as usize) == Some(&Kind::Boxed) => {
@@ -1024,8 +1068,7 @@ pub(super) fn plan_direct(
 }
 
 /// `(code, strict, arrow, through a bound function)` by `(chunk, call pc)`.
-type Feedback =
-    std::collections::HashMap<(usize, usize), (std::rc::Weak<Chunk>, bool, bool, bool)>;
+type Feedback = std::collections::HashMap<(usize, usize), (std::rc::Weak<Chunk>, bool, bool, bool)>;
 
 thread_local! {
     /// The code each direct call site was resolved to, by `(chunk, call pc)`: a later compile
@@ -1065,11 +1108,7 @@ fn feedback(chunk: &Chunk, q: usize) -> Option<((std::rc::Rc<Chunk>, bool, bool)
 /// only values local `s` is ever assigned (`MakeClosure(k) StoreLocal(s)` in one basic block;
 /// the local is otherwise only read, or put in its TDZ).
 /// For a constructor (`ctor`) the function must be one: not an arrow or a method.
-fn closure_template(
-    chunk: &Chunk,
-    s: u16,
-    ctor: bool,
-) -> Option<(std::rc::Rc<Chunk>, bool, bool)> {
+fn closure_template(chunk: &Chunk, s: u16, ctor: bool) -> Option<(std::rc::Rc<Chunk>, bool, bool)> {
     if (s as usize) < chunk.n_params
         || chunk.arguments_slot == Some(s)
         || chunk.rest_slot == Some(s)
@@ -1090,7 +1129,10 @@ fn closure_template(
                     return None;
                 };
                 // Nothing may jump between the two.
-                if ops.iter().any(|o| crate::jit_ir::jump_target(o) == Some(pc)) {
+                if ops
+                    .iter()
+                    .any(|o| crate::jit_ir::jump_target(o) == Some(pc))
+                {
                     return None;
                 }
                 match k {
@@ -1153,7 +1195,11 @@ impl Tr<'_, '_> {
         let cont = self.fb.create_block();
         let full = self.fb.create_block();
         let glob = self.plan.dglobal.get(&pc).copied();
-        let miss1 = if glob.is_some() { self.fb.create_block() } else { full };
+        let miss1 = if glob.is_some() {
+            self.fb.create_block()
+        } else {
+            full
+        };
         // The name cache's scope mode, inline: the cache names this frame's scope, the scope's
         // map is structurally unchanged since the fill (so the binding pointer is live), and
         // the binding holds the function.
@@ -1293,7 +1339,9 @@ impl Tr<'_, '_> {
                 _ => (s.word, s.pin, s.method.clone()),
             }
         };
-        let Some((shapes, slot)) = method else { return false };
+        let Some((shapes, slot)) = method else {
+            return false;
+        };
         let d = self.stack.len();
         let recv = match self.stack[d - 1] {
             Entry::Ref(p, _) => p,
@@ -1451,11 +1499,15 @@ impl Tr<'_, '_> {
         let mut vals: Vec<Option<V>> = vec![None; np];
         for k in 0..np {
             let (num, tag) = match self.kinds[k] {
-                Kind::Num => (true, TAG_NUM),
+                Kind::Num | Kind::Int32 => (true, TAG_NUM),
                 Kind::Bool => (false, TAG_BOOL),
                 Kind::Boxed => continue,
             };
-            let e = if k < argc { Some(entries[ab + k]) } else { None };
+            let e = if k < argc {
+                Some(entries[ab + k])
+            } else {
+                None
+            };
             let v = match e {
                 Some(Entry::Num(x)) if num => x,
                 Some(Entry::Bool(b)) if !num => b,
@@ -1479,6 +1531,13 @@ impl Tr<'_, '_> {
                     }
                 }
             };
+            let v = if self.kinds[k] == Kind::Int32 {
+                let (i, bad) = self.int32_parts(v);
+                let z = self.i32c(0);
+                let ok = self.fb.icmp(IntCC::Eq, bad, z);
+                self.guard_to(ok, norm);
+                i
+            } else { v };
             vals[k] = Some(v);
         }
         // ---- commit ----
@@ -1496,7 +1555,9 @@ impl Tr<'_, '_> {
             let four = self.i32c(TAG_NUM as i64);
             let mut any = None;
             for &s in &boxed {
-                let t = self.fb.load(MemKind::I32U8, self.slots, s as i32 * VALUE_SIZE);
+                let t = self
+                    .fb
+                    .load(MemKind::I32U8, self.slots, s as i32 * VALUE_SIZE);
                 let big = self.fb.icmp(IntCC::Ugt, t, four);
                 any = Some(match any {
                     None => big,
@@ -1522,12 +1583,14 @@ impl Tr<'_, '_> {
                         Entry::Num(x) => {
                             let t = self.i32c(TAG_NUM as i64);
                             self.fb.store(MemKind::I32U8, self.slots, t, off);
-                            self.fb.store(MemKind::F64, self.slots, x, off + VALUE_PAYLOAD);
+                            self.fb
+                                .store(MemKind::F64, self.slots, x, off + VALUE_PAYLOAD);
                         }
                         Entry::Bool(b) => {
                             let t = self.i32c(TAG_BOOL as i64);
                             self.fb.store(MemKind::I32U8, self.slots, t, off);
-                            self.fb.store(MemKind::I32U8, self.slots, b, off + VALUE_BOOL);
+                            self.fb
+                                .store(MemKind::I32U8, self.slots, b, off + VALUE_BOOL);
                         }
                         _ => {
                             let so = self.soff(ab + s);
@@ -1608,7 +1671,10 @@ impl Tr<'_, '_> {
         // A receiver or callee borrowed from an environment could move (or die) while the
         // callee runs.
         let list_pos = (matches!(site.adaptor, Adaptor::Apply(..)) && argc == 2).then_some(ci + 2);
-        for k in [Some(base), Some(ci), this_pos, list_pos].into_iter().flatten() {
+        for k in [Some(base), Some(ci), this_pos, list_pos]
+            .into_iter()
+            .flatten()
+        {
             if matches!(self.stack[k], Entry::Ref(_, s) if s.in_env()) {
                 self.force(k);
             }
@@ -1739,8 +1805,12 @@ impl Tr<'_, '_> {
         // `call_native` does). An arrow keeps them (its `new.target` is its scope's).
         let marks = (!site.arrow).then(|| {
             let nt_tag = self.fb.load(MemKind::I32U8, interp, o.new_target);
-            let nt_bool = self.fb.load(MemKind::I32U8, interp, o.new_target + VALUE_BOOL);
-            let nt_word = self.fb.load(MemKind::I64, interp, o.new_target + VALUE_PAYLOAD);
+            let nt_bool = self
+                .fb
+                .load(MemKind::I32U8, interp, o.new_target + VALUE_BOOL);
+            let nt_word = self
+                .fb
+                .load(MemKind::I64, interp, o.new_target + VALUE_PAYLOAD);
             let fi = self.fb.load(MemKind::I32U8, interp, o.field_init);
             let agb = self.fb.load(MemKind::I32U8, interp, o.agb);
             (nt_tag, nt_bool, nt_word, fi, agb)
@@ -1788,9 +1858,7 @@ impl Tr<'_, '_> {
             _ => self.ptrc(UNDEF.as_ptr() as usize as i64),
         };
         // (A bound `this` was checked by the planner.)
-        if let (false, true, false, Some(t)) =
-            (site.strict, site.uses_this, construct, this_pos)
-        {
+        if let (false, true, false, Some(t)) = (site.strict, site.uses_this, construct, this_pos) {
             // A sloppy callee binds a primitive or nullish receiver differently.
             match entries[t] {
                 Entry::Num(_) | Entry::Bool(_) => {
@@ -1961,7 +2029,10 @@ impl Tr<'_, '_> {
             // The activation environment, owned by the call record; the frame reads it there.
             let eo = self.ptrc(REC_ENV as i64);
             let envw = self.fb.binary(BinaryOp::Iadd, rec, eo);
-            self.call(Helper::ActEnv, &[self.frame, cellp, cp, this_p, slots_p, envw]);
+            self.call(
+                Helper::ActEnv,
+                &[self.frame, cellp, cp, this_p, slots_p, envw],
+            );
             self.fb.store(PTR_MEM, nf, envw, FRAME_ENV);
         }
         // ---- the call ----
@@ -2020,7 +2091,10 @@ impl Tr<'_, '_> {
         self.fb.switch_to_block(post);
         // ---- after the call ----
         if construct {
-            self.call(Helper::NewDone, &[self.frame, cellp, top0, stack_p, st_post]);
+            self.call(
+                Helper::NewDone,
+                &[self.frame, cellp, top0, stack_p, st_post],
+            );
         }
         if site.act {
             let eo = self.ptrc(REC_ENV as i64);
@@ -2088,8 +2162,10 @@ impl Tr<'_, '_> {
         if let Some((nt_tag, nt_bool, nt_word, fi, agb)) = marks {
             // (The callee left `new.target` `undefined`: a `new` it made took its own back.)
             self.fb.store(MemKind::I32U8, interp, nt_tag, o.new_target);
-            self.fb.store(MemKind::I32U8, interp, nt_bool, o.new_target + VALUE_BOOL);
-            self.fb.store(MemKind::I64, interp, nt_word, o.new_target + VALUE_PAYLOAD);
+            self.fb
+                .store(MemKind::I32U8, interp, nt_bool, o.new_target + VALUE_BOOL);
+            self.fb
+                .store(MemKind::I64, interp, nt_word, o.new_target + VALUE_PAYLOAD);
             self.fb.store(MemKind::I32U8, interp, fi, o.field_init);
             self.fb.store(MemKind::I32U8, interp, agb, o.agb);
         }
@@ -2129,7 +2205,11 @@ impl Tr<'_, '_> {
             );
             self.call_status(Helper::Generic, &[self.frame, r, bv, dv])
         } else {
-            let tail = if site.tail { helpers::CALL_TAIL as i64 } else { 0 };
+            let tail = if site.tail {
+                helpers::CALL_TAIL as i64
+            } else {
+                0
+            };
             let (bv, av, wv) = (
                 self.i32c(base as i64),
                 self.i32c(argc as i64),
@@ -2153,8 +2233,12 @@ impl Tr<'_, '_> {
 /// Record `dglobal` for the by-name callee producer at `pp` when its name cache is in
 /// global-object mode on this realm's global scope (see [`Tr::direct_name`]).
 fn global_name(interp: &Interp, chunk: &Chunk, pp: usize, op: Op, p: &mut Plan) {
-    let (Op::LoadName(_, c) | Op::LoadNameForCall(_, c)) = op else { return };
-    let Some(cell) = chunk.name_caches.get(c as usize) else { return };
+    let (Op::LoadName(_, c) | Op::LoadNameForCall(_, c)) = op else {
+        return;
+    };
+    let Some(cell) = chunk.name_caches.get(c as usize) else {
+        return;
+    };
     let ic = cell.get();
     if ic.env != std::rc::Rc::as_ptr(&interp.global_env) as usize | 1 {
         return;

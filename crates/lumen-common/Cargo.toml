@@ -10,6 +10,8 @@ publish = false
 test-support = []
 # Exact allocation counters in `fastalloc` (see the engine's `memstats`); they sit on the allocation fast path.
 mem-stats = []
+native-signing = ["dep:ed25519-dalek"]
+native-sidecar = ["dep:sha2"]
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
 # `compress`: zlib / gzip / raw deflate, Brotli and Zstandard over maintained crates.
@@ -18,6 +20,9 @@ compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
+unicode-linebreak = { version = "=0.1.5", default-features = false }
+unicode-segmentation = { version = "=1.12.0", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
@@ -34,11 +39,11 @@ libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "r
 brotli = { version = "8", optional = true }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
-# the browser build uses the pure-Rust ruzstd.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# browser and bare-metal builds use the pure-Rust ruzstd.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "none")))'.dependencies]
 zstd = { version = "0.13", optional = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+[target.'cfg(any(target_arch = "wasm32", target_os = "none"))'.dependencies]
 ruzstd = { version = "0.8", optional = true }
 
 [lints]

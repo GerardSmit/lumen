@@ -38,7 +38,7 @@
 //! prototype-chain guard, and [`construct_with_plan`] is the whole operation.
 use crate::ast::{ArrayElem, Expr, Function, Pattern, Stmt};
 use crate::interpreter::{Abrupt, Interp};
-use crate::value::{Callable, Exotic, Gc, Object, Props, Property, Value, WeakGc};
+use crate::value::{Callable, Exotic, Gc, Object, Property, Props, Value, WeakGc};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -321,8 +321,7 @@ fn build(
             let Pattern::Ident(n) = &p.pattern else {
                 return None;
             };
-            if p.rest || p.default.is_some() || params.contains(&n.as_str()) || params.len() >= 64
-            {
+            if p.rest || p.default.is_some() || params.contains(&n.as_str()) || params.len() >= 64 {
                 return None;
             }
             params.push(n);
@@ -377,11 +376,9 @@ fn build(
             });
         }
         parts.set_keys.extend(pp.set_keys.iter().cloned());
-        parts.guards.extend(
-            pp.guards
-                .iter()
-                .map(|(c, p)| (c.clone(), p.clone())),
-        );
+        parts
+            .guards
+            .extend(pp.guards.iter().map(|(c, p)| (c.clone(), p.clone())));
         parts
             .guards
             .push((Gc::downgrade(class), Gc::downgrade(parent_ctor)));
@@ -414,7 +411,12 @@ fn build(
         }
     }
     for s in stmts {
-        let Stmt::Expr(Expr::Assign { op: "=", target, value }) = s else {
+        let Stmt::Expr(Expr::Assign {
+            op: "=",
+            target,
+            value,
+        }) = s
+        else {
             return None;
         };
         let Expr::Member {
@@ -755,7 +757,8 @@ mod tests {
 
     #[test]
     fn target_shapes_get_plans() {
-        let base = "class R { height; width; constructor(h, w) { this.height = h; this.width = w; } } \
+        let base =
+            "class R { height; width; constructor(h, w) { this.height = h; this.width = w; } } \
                     class R2 { constructor(h, w) { this.height = h; this.width = w; } } \
                     class P { #h; #w; constructor(h, w) { this.#h = h; this.#w = w; } \
                     get area() { return this.#h * this.#w; } } \
@@ -815,9 +818,7 @@ mod tests {
 /// object: `!new.target`, `new.target == null`, `new.target === undefined` (either operand order).
 fn new_target_guard(s: &Stmt) -> bool {
     let Stmt::If {
-        test,
-        alt: None,
-        ..
+        test, alt: None, ..
     } = s
     else {
         return false;
@@ -825,9 +826,8 @@ fn new_target_guard(s: &Stmt) -> bool {
     match test {
         Expr::Unary { op: "!", arg } => matches!(**arg, Expr::NewTarget),
         Expr::Binary { op, left, right } if matches!(*op, "==" | "===") => {
-            let nullish = |e: &Expr| {
-                matches!(e, Expr::Undefined) || (*op == "==" && matches!(e, Expr::Null))
-            };
+            let nullish =
+                |e: &Expr| matches!(e, Expr::Undefined) || (*op == "==" && matches!(e, Expr::Null));
             (matches!(**left, Expr::NewTarget) && nullish(right))
                 || (matches!(**right, Expr::NewTarget) && nullish(left))
         }

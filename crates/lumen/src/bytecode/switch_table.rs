@@ -61,6 +61,7 @@ fn chain_at(ops: &[Op], pc: usize) -> Option<(u16, usize)> {
 
 /// Insert an [`Op::SwitchLK`] before every case chain of at least [`MIN_CASES`] tests (jumps to
 /// the chain's head now reach the table op). Returns how many tables the chunk needs.
+#[cfg(feature = "compiler")]
 pub(super) fn switch_pass(ops: &mut Vec<Op>) -> usize {
     let n = ops.len();
     let mut out = Vec::with_capacity(n);

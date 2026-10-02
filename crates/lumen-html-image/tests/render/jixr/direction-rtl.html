@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+html, body { margin: 0; line-height: 0; background: #fff; }
+.flex { display: flex; width: 200px; direction: rtl; }
+.flex div { width: 40px; height: 20px; }
+.grid { display: grid; grid-template-columns: 60px 60px; width: 200px; direction: rtl; }
+.grid div { height: 20px; }
+table { width: 200px; border-collapse: collapse; direction: rtl; }
+td { padding: 0; }
+td div { width: 30px; height: 20px; }
+</style>
+</head>
+<body>
+<div class="flex"><div style="background:#c00"></div><div style="background:#0c0"></div></div>
+<div class="grid"><div style="background:#00c"></div><div style="background:#cc0"></div></div>
+<table><tr><td><div style="background:#0cc"></div></td><td><div style="background:#c0c"></div></td></tr></table>
+</body>
+</html>

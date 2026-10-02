@@ -89,11 +89,18 @@ pub enum LdSt {
     LdrS = 0xBD40_0000,
     StrD = 0xFD00_0000,
     LdrD = 0xFD40_0000,
+    StrQ = 0x3D80_0000,
+    LdrQ = 0x3DC0_0000,
+    Prfm = 0xF980_0000,
 }
 
 impl LdSt {
     pub fn log2(self) -> u32 {
-        (self as u32) >> 30
+        if matches!(self, Self::StrQ | Self::LdrQ) {
+            4
+        } else {
+            (self as u32) >> 30
+        }
     }
     /// Whether `off` is encodable directly (scaled unsigned 12-bit, or unscaled signed 9-bit).
     pub fn offset_ok(self, off: i64) -> bool {
@@ -307,8 +314,13 @@ impl Asm {
     }
     pub fn tbz(&mut self, nz: bool, bit: u8, rt: u8, l: Label) {
         self.fixup(l, Kind::B14);
-        self.word(0x3600_0000 | (nz as u32) << 24 | ((bit as u32 & 32) << 26)
-            | ((bit as u32 & 31) << 19) | r(rt));
+        self.word(
+            0x3600_0000
+                | (nz as u32) << 24
+                | ((bit as u32 & 32) << 26)
+                | ((bit as u32 & 31) << 19)
+                | r(rt),
+        );
     }
     pub fn br(&mut self, rn: u8) {
         self.word(0xD61F_0000 | r(rn) << 5);
@@ -384,8 +396,9 @@ impl Asm {
         self.word(sf(w64) | 0x1B00_0000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd));
     }
     pub fn ccmp(&mut self, w64: bool, rn: u8, rm: u8, cc: Cond, nzcv: u8) {
-        self.word(sf(w64) | 0x7a40_0000 | r(rm) << 16 | (cc as u32) << 12
-            | r(rn) << 5 | nzcv as u32);
+        self.word(
+            sf(w64) | 0x7a40_0000 | r(rm) << 16 | (cc as u32) << 12 | r(rn) << 5 | nzcv as u32,
+        );
     }
     /// Logical immediate with a pre-encoded `N:immr:imms` (see [`logical_imm`]).
     pub fn log_imm(&mut self, op: LogImm, w64: bool, rd: u8, rn: u8, enc: u32) {
@@ -426,7 +439,9 @@ impl Asm {
     }
     /// `csel rd, rn, rm, c` (`rd = c ? rn : rm`).
     pub fn csel(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, c: Cond, op: SelectOp) {
-        self.word(sf(w64) | 0x1A80_0000 | op as u32 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd));
+        self.word(
+            sf(w64) | 0x1A80_0000 | op as u32 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd),
+        );
     }
     /// `cset wd, c` (`csinc wd, wzr, wzr, !c`).
     pub fn cset(&mut self, rd: u8, c: Cond) {

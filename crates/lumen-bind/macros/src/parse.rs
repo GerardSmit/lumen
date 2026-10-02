@@ -166,6 +166,9 @@ pub fn parse_opts(ts: TokenStream) -> Res<Opts> {
             [TokenTree::Ident(i), TokenTree::Punct(p), TokenTree::Literal(l)] if p.as_char() == '=' => {
                 o.kv.push((i.to_string(), string_lit(l)?, i.span()))
             }
+            [TokenTree::Ident(i), TokenTree::Punct(p), rest @ ..] if i.to_string() == "extends" && p.as_char() == '=' && !rest.is_empty() => {
+                o.kv.push((i.to_string(), type_str(rest), i.span()))
+            }
             [TokenTree::Ident(i), TokenTree::Group(g)] if g.delimiter() == Delimiter::Parenthesis && i.to_string() == "hint" => {
                 let inner: Vec<TokenTree> = g.stream().into_iter().collect();
                 for p in split_commas(&inner) {
@@ -564,7 +567,7 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
         let p = &raw[start..];
         let span = p.first().map_or(pg.span(), |t| t.span());
         let colon = (0..p.len()).find(|&k| {
-            matches!(&p[k], TokenTree::Punct(c) if c.as_char() == ':' && c.spacing() == Spacing::Alone)
+            matches!(&p[k], TokenTree::Punct(c) if c.as_char() == ':')
                 && !(k > 0 && matches!(&p[k - 1], TokenTree::Punct(c) if c.as_char() == ':' && c.spacing() == Spacing::Joint))
         });
         let Some(colon) = colon else {

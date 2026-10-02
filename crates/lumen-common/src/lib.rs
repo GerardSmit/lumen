@@ -11,6 +11,7 @@ pub mod scan;
 pub mod civil;
 pub mod codec;
 pub mod csv;
+pub mod executable;
 #[cfg(feature = "compress")]
 pub mod compress;
 #[cfg(not(target_arch = "wasm32"))]

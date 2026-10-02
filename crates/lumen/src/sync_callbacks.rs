@@ -39,7 +39,8 @@ pub struct SyncFn<'call> {
 impl<'call> SyncFn<'call> {
     /// Call it; a JS exception comes back as `OpError::thrown`, so `?` rethrows it unchanged.
     pub fn call(&self, ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, OpError> {
-        ctx.invoke(self.f.clone(), this, args).map_err(OpError::thrown)
+        ctx.invoke(self.f.clone(), this, args)
+            .map_err(OpError::thrown)
     }
 }
 
@@ -49,7 +50,10 @@ impl<'a> lumen_bind::FromArg<'a, JsHost> for SyncFn<'a> {
 
     fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
         if v.is_callable() {
-            Ok(SyncFn { f: v, _not_send: PhantomData })
+            Ok(SyncFn {
+                f: v,
+                _not_send: PhantomData,
+            })
         } else {
             Err(cx.type_error(at, "must be a function"))
         }

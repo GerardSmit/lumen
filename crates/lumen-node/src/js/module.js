@@ -614,7 +614,7 @@ function compileCommonJS(module, filename, source, detectEsm = false, ts = false
   const require = makeRequireFunction(module);
   let compiled;
   try {
-    if (ts) {
+    if (ts || /\.[jt]sx$/.test(filename)) {
       compiled = __node.compileCommonJS(source, filename, true);
     } else if (wrapperPatched) {
       compiled = (0, eval)(Module.wrap(source));
@@ -998,6 +998,16 @@ const _extensions = {
   },
   ".mts": function (module, filename) {
     loadESM(module, filename);
+  },
+  ".jsx": function (module, filename) {
+    const type = packageScopeType(filename);
+    if (type === "module") return loadESM(module, filename);
+    if (module._compile(readSource(filename), filename, type === undefined, false) === false) loadESM(module, filename);
+  },
+  ".tsx": function (module, filename) {
+    const type = packageScopeType(filename);
+    if (type === "module") return loadESM(module, filename);
+    if (module._compile(readSource(filename), filename, type === undefined, true) === false) loadESM(module, filename);
   },
   ".cts": function (module, filename) {
     module._compile(readSource(filename), filename, false, true);
@@ -1597,7 +1607,7 @@ const __BUILTIN_NAMES = [
   "perf_hooks", "fs/promises", "path/posix", "path/win32", "child_process",
   "dns", "dns/promises",
   "v8", "inspector", "inspector/promises", "worker_threads", "readline",
-  "readline/promises", "test", "tls", "process",
+  "readline/promises", "test", "test/reporters", "tls", "process",
   "diagnostics_channel", "domain", "trace_events",
   "vm", "repl", "cluster", "dgram", "wasi",
 ];

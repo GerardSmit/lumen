@@ -1,0 +1,25 @@
+<!doctype html>
+<style>
+  html, body { margin: 0; background: white; }
+  .stage { padding: 18px; width: 284px; height: 164px; background: #e8eef8; }
+  .card {
+    box-sizing: border-box;
+    width: 110px;
+    height: 72px;
+    background: #fef3c7;
+    border: 9px double #174ea6;
+    border-radius: 24px;
+  }
+  .pill {
+    margin-top: 18px;
+    width: 184px;
+    height: 42px;
+    border-radius: 21px;
+    border-color: #a50e0e;
+    background: #d2e3fc;
+  }
+</style>
+<div class="stage"><div class="card"></div><div class="card pill"></div></div>
+<!-- jixr-compare: threshold=236 max-diff-ratio=0
+     Double borders use two rounded centered strokes. Geometry is exact; only the documented
+     curved-stroke antialias coverage differs between Blink, PDF, and ImageSharp. -->

@@ -806,6 +806,7 @@ dependencies = [
  "hmac",
  "libz-rs-sys",
  "md-5",
+ "memchr",
  "pbkdf2",
  "ripemd",
  "ruzstd",
@@ -815,13 +816,6 @@ dependencies = [
  "sha3",
  "sm3",
  "zstd",
-]
-
-[[package]]
-name = "lumen-fs"
-version = "0.1.3"
-dependencies = [
- "lumen-host",
 ]
 
 [[package]]
@@ -912,6 +906,7 @@ dependencies = [
  "getrandom 0.2.17",
  "libc",
  "lumen-common",
+ "web-time",
 ]
 
 [[package]]
@@ -920,7 +915,6 @@ version = "0.1.3"
 dependencies = [
  "lumen",
  "lumen-common",
- "lumen-fs",
  "lumen-host",
  "lumen-node",
  "lumen-os",

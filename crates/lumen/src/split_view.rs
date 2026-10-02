@@ -58,9 +58,7 @@ impl SplitView {
     #[inline]
     pub(crate) fn range(&self, k: usize) -> (usize, usize) {
         match &self.offs {
-            Offsets::Contig { starts, sep } => {
-                (starts[k] as usize, (starts[k + 1] - sep) as usize)
-            }
+            Offsets::Contig { starts, sep } => (starts[k] as usize, (starts[k + 1] - sep) as usize),
             Offsets::Pairs(p) => (p[2 * k] as usize, p[2 * k + 1] as usize),
         }
     }
@@ -109,7 +107,11 @@ impl SplitView {
             },
             Offsets::Pairs(p) => Offsets::Pairs(p[2 * from..2 * to].into()),
         };
-        SplitView { src: self.src.clone(), offs, reads: Default::default() }
+        SplitView {
+            src: self.src.clone(),
+            offs,
+            reads: Default::default(),
+        }
     }
 
     /// The view of the pieces `keep` selects, in order.
@@ -186,7 +188,10 @@ pub(crate) fn split_offsets(src: &LStr, sep: &str, limit: usize) -> Option<Split
     starts.push((last_end + sep.len()) as u32);
     Some(SplitView {
         src: src.clone(),
-        offs: Offsets::Contig { starts: starts.into_boxed_slice(), sep: sep.len() as u32 },
+        offs: Offsets::Contig {
+            starts: starts.into_boxed_slice(),
+            sep: sep.len() as u32,
+        },
         reads: Default::default(),
     })
 }
@@ -270,7 +275,9 @@ fn materialize(o: &Gc) {
     let n = view.len();
     let mut elems: Vec<crate::value::PackedValue> = Vec::with_capacity(n);
     for k in 0..n {
-        elems.push(crate::value::PackedValue::pack(Value::Str(view.piece_kept(k))));
+        elems.push(crate::value::PackedValue::pack(Value::Str(
+            view.piece_kept(k),
+        )));
     }
     drop(view);
     let mut b = o.borrow_mut();
@@ -298,7 +305,9 @@ pub(crate) fn fast_get(o: &Gc, k: usize) -> Option<Value> {
         if b.exotic != Exotic::SplitView {
             return None;
         }
-        let Callable::SplitView(view) = &b.call else { return None };
+        let Callable::SplitView(view) = &b.call else {
+            return None;
+        };
         let r = view.reads.get().saturating_add(1);
         view.reads.set(r);
         (view.get(k)?, r as usize > 2 * view.len())
@@ -367,7 +376,10 @@ mod tests {
     fn same(src: &str) -> String {
         let lazy = eval_with(0, src);
         let eager = eval_with(usize::MAX, src);
-        assert_eq!(lazy, eager, "split view diverges from eager split for:\n{src}");
+        assert_eq!(
+            lazy, eager,
+            "split view diverges from eager split for:\n{src}"
+        );
         assert!(!lazy.starts_with("THREW"), "{lazy}");
         lazy
     }
@@ -405,7 +417,13 @@ mod tests {
         let before = views_alive();
         val(&mut e, "var big = 'a,b,c,d,e,f'.split(','); var s = big.slice(1, 4); var f = big.filter(x => x > 'c');");
         assert_eq!(views_alive(), before + 3);
-        assert_eq!(val(&mut e, "s.join() + '|' + f.join() + '|' + s.length + f.length"), "b,c,d|d,e,f|33");
+        assert_eq!(
+            val(
+                &mut e,
+                "s.join() + '|' + f.join() + '|' + s.length + f.length"
+            ),
+            "b,c,d|d,e,f|33"
+        );
         super::TEST_MIN.with(|m| m.set(Some(usize::MAX)));
         let before = views_alive();
         val(&mut e, "var w = 'a,b,c'.split(',')");

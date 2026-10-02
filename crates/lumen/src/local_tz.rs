@@ -2,10 +2,10 @@
 //! `Intl.DateTimeFormat` and `Temporal.Now.timeZoneId`. The zone itself and its offsets live in
 //! [`lumen_common::local_tz`]; this adds the en-US display names `Date` and Intl show.
 
-pub(crate) use lumen_common::local_tz::{id, local_to_utc, offset_ms, set};
 #[cfg(feature = "intl")]
 pub(crate) use lumen_common::local_tz::zone_index;
 use lumen_common::local_tz::{gmt_format, local_zone_index, zone_offset_sec};
+pub(crate) use lumen_common::local_tz::{id, local_to_utc, offset_ms, set};
 
 /// The name `Date.prototype.toString` shows for the local zone at `t`
 /// ("Central European Summer Time", or "GMT+03:00" where ICU has no name).
@@ -53,15 +53,27 @@ mod tests {
     #[test]
     fn local_tz_display_names() {
         let ny = zone_index("America/New_York").unwrap();
-        assert_eq!(zone_display_name(ny, 1_704_067_200, "longOffset"), "GMT-05:00");
+        assert_eq!(
+            zone_display_name(ny, 1_704_067_200, "longOffset"),
+            "GMT-05:00"
+        );
         #[cfg(feature = "intl")]
         {
             use lumen_common::tzdata::ZONES;
-            assert_eq!(zone_display_name(ny, 1_720_000_000, "long"), "Eastern Daylight Time");
+            assert_eq!(
+                zone_display_name(ny, 1_720_000_000, "long"),
+                "Eastern Daylight Time"
+            );
             assert_eq!(zone_display_name(ny, 1_704_067_200, "short"), "EST");
             let dublin = zone_index("Europe/Dublin").unwrap();
-            assert_eq!(zone_display_name(dublin, 1_720_000_000, "long"), "Irish Standard Time");
-            assert_eq!(zone_display_name(dublin, 1_704_067_200, "long"), "Greenwich Mean Time");
+            assert_eq!(
+                zone_display_name(dublin, 1_720_000_000, "long"),
+                "Irish Standard Time"
+            );
+            assert_eq!(
+                zone_display_name(dublin, 1_704_067_200, "long"),
+                "Greenwich Mean Time"
+            );
             assert_eq!(crate::tznames::zone_names(ZONES.len()), [""; 6]);
             assert_ne!(crate::tznames::zone_names(ZONES.len() - 1)[0], "");
         }

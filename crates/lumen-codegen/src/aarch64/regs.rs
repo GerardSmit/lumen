@@ -61,7 +61,10 @@ pub fn host_abi() -> Abi {
     } else if cfg!(windows) {
         windows()
     } else {
-        Abi { softfloat_calls: cfg!(target_abi = "softfloat"), ..aapcs64() }
+        Abi {
+            softfloat_calls: cfg!(target_abi = "softfloat"),
+            ..aapcs64()
+        }
     }
 }
 

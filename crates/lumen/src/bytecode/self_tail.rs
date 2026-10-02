@@ -175,7 +175,10 @@ mod tests {
             function inForOf(n) { 'use strict'; for (const x of [n]) return x === 0 ? 0 : inForOf(x - 1); }
             function r(f) { try { return String(f(100000)); } catch (e) { return e.name; } }
             [r(sloppy), r(inTry), r(inForOf), inTry(10), inForOf(10)].join()";
-        assert_eq!(run(src, Tier::Bytecode), "RangeError,RangeError,RangeError,0,0");
+        assert_eq!(
+            run(src, Tier::Bytecode),
+            "RangeError,RangeError,RangeError,0,0"
+        );
     }
 
     /// A non-callable callee's TypeError names it as the tree-walker does, in every call shape.

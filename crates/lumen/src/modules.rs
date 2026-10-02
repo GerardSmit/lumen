@@ -83,6 +83,15 @@ pub(crate) struct ModuleRec {
     cycle_root: Option<String>,
 }
 
+#[cfg(feature = "compiler")]
+impl ModuleRec {
+    pub(crate) fn snapshot_ready(&self) -> bool {
+        self.evaluated && !self.evaluating && self.eval_error.is_none()
+            && self.pending_async == 0
+    }
+    pub(crate) fn snapshot_env(&self) -> Env { self.env.clone() }
+}
+
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).
 enum ImportOrigin {
     /// `import * as x from 'dep'` — resolves to `dep`'s namespace object.
@@ -275,6 +284,19 @@ impl Interp {
         let t_parse = std::time::Instant::now();
         let body = match crate::precompiled::module_body(self, key) {
             Some(decoded) => decoded.map_err(|e| self.throw("SyntaxError", e))?,
+            None if crate::parser::jsx_path(key).is_some() || self.jsx_module_keys.contains_key(key) => {
+                let ts = self.jsx_module_keys.get(key).copied().or_else(|| crate::parser::jsx_path(key)).unwrap_or(false);
+                let mut options = self.jsx_options.clone();
+                if let Some(loader) = self.jsx_options_loader.clone() {
+                    options = loader(key, &options).map_err(|message| self.throw("SyntaxError", message))?;
+                }
+                options.filename = key.to_string();
+                crate::parser::parse_module_jsx(&src, ts, &options).map_err(|e| {
+                    let (start, _) = crate::parser::last_error_span();
+                    let column = src.get(..start as usize).unwrap_or("").rsplit('\n').next().unwrap_or("").encode_utf16().count() + 1;
+                    self.throw("SyntaxError", format!("{key}:{}:{column}: {}", e.line, e.message))
+                })?
+            },
             // A `.ts`/`.mts`/`.cts` module is TypeScript (the parser's strip-only mode).
             None if crate::typescript::is_ts_path(key) => crate::parser::parse_module_ts(&src)
                 .map_err(|e| self.throw_ts_syntax(e, &file_url(key), &src))?,
@@ -483,9 +505,20 @@ impl Interp {
     ) -> Result<(String, String), Abrupt> {
         #[cfg(feature = "parallel")]
         if specifier == "lumen:parallel" {
-            if !self.host_state.has::<crate::parallel::api::Realm>() { return Err(self.throw("TypeError", "parallel host is not installed")); }
-            if attr_type.is_some() { return Err(self.throw("TypeError", "lumen:parallel does not accept import attributes")); }
-            return Ok((specifier.into(), "export const run = Lumen.parallel.run; export const spawn = Lumen.parallel.spawn;".into()));
+            if !self.host_state.has::<crate::parallel::api::Realm>() {
+                return Err(self.throw("TypeError", "parallel host is not installed"));
+            }
+            if attr_type.is_some() {
+                return Err(self.throw(
+                    "TypeError",
+                    "lumen:parallel does not accept import attributes",
+                ));
+            }
+            return Ok((
+                specifier.into(),
+                "export const run = Lumen.parallel.run; export const spawn = Lumen.parallel.spawn;"
+                    .into(),
+            ));
         }
         // A specifier naming a module of a loaded precompiled bundle resolves inside the bundle
         // (its AST is decoded in `parse_and_register`); no host loader is consulted.
@@ -559,7 +592,7 @@ impl Interp {
     /// prototype). For a file-backed module the `url` is a `file://` URL (as Node's is, so
     /// `new URL(rel, import.meta.url)` resolves), and `filename`/`dirname` (Node 20.11+) are the
     /// plain paths.
-    fn build_import_meta(&mut self, key: &str) -> Value {
+    pub(crate) fn build_import_meta(&mut self, key: &str) -> Value {
         let meta = Object::new(None);
         let is_path = key.starts_with('/');
         let url = if is_path {
@@ -1059,7 +1092,12 @@ impl Interp {
 
         let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.src.clone(),
+            )
         };
         let saved_meta = self.import_meta.take();
         let saved_strict = self.strict;
@@ -1091,7 +1129,9 @@ impl Interp {
     /// initialization statements cannot execute again, but graph metadata is still needed
     /// by subsequent imports, including deferred imports through an evaluated module.
     fn retire_module_body(&mut self, key: &str) {
-        let Some(rec) = self.module_recs.get(key) else { return };
+        let Some(rec) = self.module_recs.get(key) else {
+            return;
+        };
         if !rec.evaluated || rec.retired_eager_order.is_some() {
             return;
         }
@@ -1385,7 +1425,12 @@ impl Interp {
         let top = self.module_recs[key].top_promise.clone();
         let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.src.clone(),
+            )
         };
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
@@ -1429,10 +1474,7 @@ impl Interp {
             // Every step of the body, the first included, runs under the module's frame.
             coro.set_frame(Interp::resume_frame_script(src));
             self.park_async_coro(&top, coro);
-            self.drive_async(
-                top,
-                crate::coroutine::Resume::Next(Value::Undefined),
-            );
+            self.drive_async(top, crate::coroutine::Resume::Next(Value::Undefined));
             return;
         }
         let saved_meta = self.import_meta.take();
@@ -1889,7 +1931,8 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                 block.iter().any(stmt)
                     || handler
                         .as_ref()
-                        .map(|h| &h.1).map(|h| h.iter().any(stmt))
+                        .map(|h| &h.1)
+                        .map(|h| h.iter().any(stmt))
                         .unwrap_or(false)
                     || finalizer
                         .as_ref()
@@ -2093,7 +2136,11 @@ pub mod load_stats {
         c.2.fetch_add(bytes as u64, Relaxed);
     }
     pub fn get(c: &Counter) -> (f64, u64, u64) {
-        (c.0.load(Relaxed) as f64 / 1e6, c.1.load(Relaxed), c.2.load(Relaxed))
+        (
+            c.0.load(Relaxed) as f64 / 1e6,
+            c.1.load(Relaxed),
+            c.2.load(Relaxed),
+        )
     }
 }
 
@@ -2106,10 +2153,7 @@ fn file_url(key: &str) -> String {
     if has_scheme {
         return key.to_string();
     }
-    let path = key
-        .strip_prefix(r"\\?\")
-        .unwrap_or(key)
-        .replace('\\', "/");
+    let path = key.strip_prefix(r"\\?\").unwrap_or(key).replace('\\', "/");
     if path.starts_with('/') {
         format!("file://{path}")
     } else {
@@ -2290,11 +2334,9 @@ mod namespace_lifetime_tests {
         assert!(!interp.gc_pins.contains_key(&ptr));
         let ordinary = Value::Obj(Object::new(None));
         interp.strict = true;
-        assert!(
-            interp
-                .set_member(&ordinary, "PATH", Value::str("fixture"))
-                .is_ok()
-        );
+        assert!(interp
+            .set_member(&ordinary, "PATH", Value::str("fixture"))
+            .is_ok());
     }
 
     fn live_scopes() -> usize {

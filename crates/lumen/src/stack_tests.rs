@@ -91,7 +91,10 @@ fn json_parse_deep_nesting_throws() {
         on_small_stack("JSON.rawJSON('['.repeat(1e6) + ']'.repeat(1e6))"),
         "SyntaxError: JSON.rawJSON value must be a primitive"
     );
-    assert_eq!(on_small_stack("JSON.stringify(JSON.parse('[[[1]]]'))"), "[[[1]]]");
+    assert_eq!(
+        on_small_stack("JSON.stringify(JSON.parse('[[[1]]]'))"),
+        "[[[1]]]"
+    );
 }
 
 #[test]
@@ -166,13 +169,19 @@ fn regexp_deep_match_on_small_stack() {
 #[test]
 fn deep_expression_nesting_on_small_stack() {
     let r = on_small_stack("eval('('.repeat(1e5) + '1' + ')'.repeat(1e5))");
-    assert!(r.starts_with("SyntaxError") || r == OVERFLOW, "unexpected: {r}");
+    assert!(
+        r.starts_with("SyntaxError") || r == OVERFLOW,
+        "unexpected: {r}"
+    );
 }
 
 #[test]
 fn deep_statement_nesting_on_small_stack() {
     let r = on_small_stack("eval('{'.repeat(1e5) + '}'.repeat(1e5))");
-    assert!(r.starts_with("SyntaxError") || r == OVERFLOW, "unexpected: {r}");
+    assert!(
+        r.starts_with("SyntaxError") || r == OVERFLOW,
+        "unexpected: {r}"
+    );
 }
 
 #[test]

@@ -291,6 +291,7 @@ impl FileSystem for OsFs {
 /// The process's file system: the OS natively, the process-wide [`mem`] tree on targets
 /// without one (`wasm32-unknown-unknown`).
 pub fn host() -> &'static dyn FileSystem {
+    if let Some(overlay) = EMBEDDED_ASSETS.get() { return overlay; }
     #[cfg(not(target_arch = "wasm32"))]
     {
         &OsFs
@@ -299,6 +300,21 @@ pub fn host() -> &'static dyn FileSystem {
     {
         mem()
     }
+}
+
+static EMBEDDED_ASSETS: std::sync::OnceLock<Overlay> = std::sync::OnceLock::new();
+
+/// Mount application assets read-only at `/lumen-assets` for filesystem APIs.
+/// The process-wide mount is intended for a standalone executable's one app.
+pub fn install_assets(blob: &[u8]) -> Result<(), &'static str> {
+    let Some(archive) = lumen_common::aot::assets::from_blob(blob)? else { return Ok(()); };
+    if EMBEDDED_ASSETS.get().is_some() { return Err("embedded assets already installed"); }
+    let upper = MemFs::with_fd_base(1 << 28);
+    for (name, bytes) in archive.entries() {
+        upper.insert(&format!("/lumen-assets/{name}"), bytes.to_vec(), 0o444, 0o555);
+    }
+    let lower: Arc<dyn FileSystem> = Arc::new(OsFs);
+    EMBEDDED_ASSETS.set(Overlay::new(Arc::new(upper), lower, true)).map_err(|_| "embedded assets already installed")
 }
 
 /// `upper` layered over `lower`: an absolute path that exists in `upper` (other than `/`) is

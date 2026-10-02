@@ -24,13 +24,16 @@
 //! An async generator's `yield*` is an explicit loop of ordinary `Await`s and `Yield`s around
 //! a few `AsyncDelegate*` ops (see [`Compiler::async_yield_delegate`]), following the
 //! tree-walker's `Interp::yield_delegate_async` step for step.
-use super::{CResult, Compiler, Op, PushValue};
+#[cfg(feature = "compiler")]
+use super::{CResult, Compiler, Op};
+use super::PushValue;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// `yield arg` / `yield* arg` (`yield*` in sync generators only).
-    pub(super) fn yield_expr(&mut self, delegate: bool, arg: Option<&crate::ast::Expr>) -> CResult {
+    pub(crate) fn yield_expr(&mut self, delegate: bool, arg: Option<&crate::ast::Expr>) -> CResult {
         if !self.generator {
             return Err(super::Bail);
         }
@@ -74,6 +77,7 @@ impl Compiler {
     }
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// `yield* v` in an async generator (14.4.14, async): the operand is on the stack; leaves
     /// the delegation's result value. Hidden slots: iterator, `next`, from-sync flag, mode
@@ -166,7 +170,11 @@ const NO_THROW: &str = "the delegated iterator has no 'throw' method";
 
 /// `AsyncDelegateInit`: GetIterator(value, async) — the @@asyncIterator, else a sync iterator
 /// whose values are awaited. Pushes iterator, `next`, from-sync flag.
-pub(super) fn async_init(i: &mut Interp, stack: &mut impl PushValue, value: Value) -> Result<(), Abrupt> {
+pub(crate) fn async_init(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    value: Value,
+) -> Result<(), Abrupt> {
     let akey = crate::builtins::async_iterator_key(i);
     let amethod = match &akey {
         Some(k) => i.get_member(&value, k)?,
@@ -193,7 +201,7 @@ pub(super) fn async_init(i: &mut Interp, stack: &mut impl PushValue, value: Valu
 }
 
 /// `AsyncDelegateCall(it, md, rt)`: forward the received value (popped) per the mode.
-pub(super) fn async_call(
+pub(crate) fn async_call(
     i: &mut Interp,
     stack: &mut impl PushValue,
     slots: &mut [Value],
@@ -249,7 +257,7 @@ pub(super) fn async_call(
 
 /// `AsyncDelegateResult(fs, dn)`: validate the awaited inner result (popped), record `done`,
 /// push its value and whether that value must be awaited too (a from-sync source).
-pub(super) fn async_result(
+pub(crate) fn async_result(
     i: &mut Interp,
     stack: &mut impl PushValue,
     slots: &mut [Value],
@@ -271,7 +279,13 @@ pub(super) fn async_result(
 
 /// `AsyncDelegateCloseReject(it, dn)`: a from-sync value rejected — close the sync iterator
 /// unless the step was done (closeOnRejection), rethrow.
-pub(super) fn async_close_reject(i: &mut Interp, slots: &[Value], it: u16, dn: u16, exc: Value) -> Abrupt {
+pub(crate) fn async_close_reject(
+    i: &mut Interp,
+    slots: &[Value],
+    it: u16,
+    dn: u16,
+    exc: Value,
+) -> Abrupt {
     if !matches!(slots[dn as usize], Value::Bool(true)) {
         let iterator = slots[it as usize].clone();
         i.iterator_close(&iterator);
@@ -282,7 +296,12 @@ pub(super) fn async_close_reject(i: &mut Interp, slots: &[Value], it: u16, dn: u
 /// `AsyncDelegateSpecial(md, err)`: after the special path's await (`err`: it rejected, the
 /// reason popped). Mode 3 (the throw-less close) always ends in the TypeError; mode 2 (the
 /// awaited return value, left on the stack) rethrows a rejection.
-pub(super) fn async_special(i: &mut Interp, slots: &[Value], md: u16, err: Option<Value>) -> Result<(), Abrupt> {
+pub(crate) fn async_special(
+    i: &mut Interp,
+    slots: &[Value],
+    md: u16,
+    err: Option<Value>,
+) -> Result<(), Abrupt> {
     if matches!(slots[md as usize], Value::Num(n) if n == 3.0) {
         return Err(i.throw("TypeError", NO_THROW));
     }
@@ -295,7 +314,7 @@ pub(super) fn async_special(i: &mut Interp, slots: &[Value], md: u16, err: Optio
 /// One `Op::YieldDelegate` step over the inner iterator in `slots[it]` / `slots[it + 1]`, with
 /// `[received, mode]` on top of `stack`. `Ok(None)`: the delegation finished and `[value,
 /// returning]` was pushed. `Ok(Some(result))`: park, forwarding the inner result object.
-pub(super) fn delegate_step(
+pub(crate) fn delegate_step(
     i: &mut Interp,
     slots: &[Value],
     it: u16,

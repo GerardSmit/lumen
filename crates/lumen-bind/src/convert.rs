@@ -431,6 +431,17 @@ impl<H: Host, T: IntoRet<H> + Elem> IntoRet<H> for Vec<T> {
 
 macro_rules! tuple_ret {
     ($($n:ident),+) => {
+        impl<'a,H:Host,$($n:FromArg<'a,H>),+> FromArg<'a,H> for ($($n,)+) {
+            #[allow(unused_assignments)]
+            fn from_arg(cx:&'a H::Cx<'_>,value:&'a H::Value,at:Slot)->Result<Self,H::Error> {
+                let items=H::to_seq(cx,value,at)?;
+                if items.len()!=[$(stringify!($n)),+].len() {
+                    return Err(H::with_ctx(cx,|ctx|H::error(ctx,NativeError::value_error("tuple has the wrong number of elements"))));
+                }
+                let mut index=0u32;
+                Ok(($({let position=index;index+=1;$n::from_arg(cx,&items[position as usize],at.elem(position))?},)+))
+            }
+        }
         impl<H: Host, $($n: IntoRet<H>),+> IntoRet<H> for ($($n,)+) {
             const MAY_RUN: bool = false $(|| $n::MAY_RUN)+;
             /// A tuple (hosts without tuples: an array).

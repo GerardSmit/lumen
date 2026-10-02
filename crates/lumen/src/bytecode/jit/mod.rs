@@ -57,6 +57,7 @@
 //! entry of the region's external addresses (`#[op(fast)]` entries called directly).
 
 pub(super) mod build;
+pub(crate) mod aot;
 pub(super) mod helpers;
 pub(super) mod layout;
 
@@ -250,6 +251,8 @@ pub(crate) const STATUS_THROW: u32 = 1;
 /// How a local (or an operand-stack entry) is represented in native code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
+    /// Exact signed I32 Number, excluding negative zero.
+    Int32,
     /// Unboxed F64 in SSA.
     Num,
     /// Unboxed I32 0/1 in SSA.
@@ -259,6 +262,26 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    pub(crate) fn is_num(self) -> bool {
+        matches!(self, Self::Int32 | Self::Num)
+    }
+
+    pub(crate) fn accepts(self, v: &Value) -> bool {
+        match (self, v) {
+            (Self::Int32, Value::Num(n)) => Self::int32(*n).is_some(),
+            _ => Self::of(v) == self,
+        }
+    }
+
+    pub(crate) fn int32(n: f64) -> Option<i32> {
+        let i = n as i32;
+        (n == i as f64 && n.to_bits() != (-0.0f64).to_bits()).then_some(i)
+    }
+
+    fn wider(self) -> Widen {
+        if self == Self::Int32 { Widen::Number } else { Widen::Boxed }
+    }
+
     pub(crate) fn of(v: &Value) -> Kind {
         match v {
             Value::Num(_) => Kind::Num,
@@ -266,6 +289,14 @@ impl Kind {
             _ => Kind::Boxed,
         }
     }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Widen {
+    #[default]
+    None,
+    Number,
+    Boxed,
 }
 
 pub(crate) type NativeFn = unsafe extern "C" fn(*mut JitFrame) -> u64;
@@ -301,6 +332,12 @@ const FN_CALLS_PER_OP: u32 = 16;
 /// Resume exits at one pc of function code before its speculation there is widened (the
 /// function recompiles with the slots involved kept in memory).
 const DEOPT_LIMIT: u32 = 32;
+/// Eviction rounds after a failed executable allocation (each frees twice the bytes asked).
+const EVICT_ROUNDS: usize = 3;
+/// Retries of a compile that found no executable memory back off by this many calls (or loop
+/// ticks), doubling per failure up to `1 << STARVED_MAX_SHIFT` times.
+const STARVED_BACKOFF: u32 = 1 << 10;
+const STARVED_MAX_SHIFT: u32 = 6;
 
 /// Function-tier states ([`ChunkJit::fstate`]).
 const FS_COLD: u8 = 0;
@@ -310,6 +347,23 @@ const FS_CODE: u8 = 1;
 const FS_PENDING: u8 = 2;
 /// Never compile (unsupported, or out of compiles).
 const FS_DEAD: u8 = 3;
+
+/// Whether a compile that found no executable memory still waits, given `starved` (see
+/// [`FuncState::starved`]): until its retry count `at`, or the earlier `soon` once memory was
+/// freed since (`freed` is the [`lumen_os::jitmem::exec_freed_generation`] it failed at).
+fn starved_waits(now: u32, (soon, at, freed): (u32, u32, u64)) -> bool {
+    let before = |t: u32| (now.wrapping_sub(t) as i32) < 0;
+    before(at) && (before(soon) || lumen_os::jitmem::exec_freed_generation() == freed)
+}
+
+fn starved_until(now: u32, failures: u32, unit: u32) -> (u32, u32, u64) {
+    let wait = unit << (failures - 1).min(STARVED_MAX_SHIFT);
+    (
+        now.wrapping_add(unit / 8),
+        now.wrapping_add(wait),
+        lumen_os::jitmem::exec_freed_generation(),
+    )
+}
 
 /// Per-chunk tier state, stored in [`Chunk`].
 #[derive(Default)]
@@ -334,6 +388,53 @@ pub(crate) struct ChunkJit {
     /// whole-function tier compiles at entry, before the locals are set). Every use is guarded
     /// at run time, so a stale entry only costs a miss. See `build::call`.
     site_fb: RefCell<Vec<(usize, Box<dyn std::any::Any>)>>,
+    /// The [`EngineJit::epoch`] when native code of this chunk last ran (or compiled), and the
+    /// id of the engine that owns that code: what eviction orders and filters by.
+    used: Cell<u64>,
+    owner: Cell<u64>,
+}
+
+/// Per-engine state of JIT code eviction (see [`evict_lru`]).
+pub(crate) struct EngineJit {
+    id: u64,
+    /// Bumped by every native entry.
+    epoch: Cell<u64>,
+    /// Nonzero while native call sequences hold entry addresses across Rust code that may
+    /// reach a safe point: nothing is released then.
+    pin: Cell<u32>,
+    trim_seen: Cell<u64>,
+    /// The epoch at this engine's last trim: code not run since is cold.
+    trim_stamp: Cell<u64>,
+}
+
+impl Default for EngineJit {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        EngineJit {
+            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            epoch: Cell::new(0),
+            pin: Cell::new(0),
+            trim_seen: Cell::new(lumen_os::jitmem::exec_trim_generation()),
+            trim_stamp: Cell::new(0),
+        }
+    }
+}
+
+pub(crate) struct Pin(*const Cell<u32>);
+
+impl Drop for Pin {
+    fn drop(&mut self) {
+        // SAFETY: the engine outlives every call it makes, and its fields never move apart.
+        let pin = unsafe { &*self.0 };
+        pin.set(pin.get() - 1);
+    }
+}
+
+/// Hold off eviction while Rust code runs between a native caller's read of a callee's entry
+/// address and the call.
+pub(crate) fn pin(i: &Interp) -> Pin {
+    i.jit_evict.pin.set(i.jit_evict.pin.get() + 1);
+    Pin(&i.jit_evict.pin)
 }
 
 impl ChunkJit {
@@ -416,6 +517,121 @@ pub unsafe fn evict_quiescent_code() -> usize {
     })
 }
 
+/// Release this engine's least recently run native code until `want` bytes are freed (0: all of
+/// it), skipping code that is executing or suspended: a chunk with a direct-call frame on the
+/// shadow stack, or with a native entry some Rust frame still holds. With `cold_since`, only
+/// code not run since that epoch goes. Returns the bytes freed.
+fn evict_lru(i: &Interp, want: usize, cold_since: Option<u64>) -> usize {
+    let state = &i.jit_evict;
+    if state.pin.get() != 0 {
+        return 0;
+    }
+    if cold_since.is_none() {
+        state.trim_seen.set(lumen_os::jitmem::exec_trim_generation());
+    }
+    let mut live = Vec::new();
+    let mut rec = i.jit_frames as *const CallRec;
+    // SAFETY: see `pending_recs`; every linked record has its frame header right after it.
+    unsafe {
+        while !rec.is_null() {
+            live.push((*((rec as usize + REC_BYTES) as *const JitFrame)).chunk as usize);
+            rec = (*rec).link as *const CallRec;
+        }
+    }
+    let mut chunks: Vec<std::rc::Rc<Chunk>> = CODE_CACHE.with(|cache| match cache.try_borrow() {
+        Ok(cache) => cache
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|c| {
+                c.jit.owner.get() == state.id && cold_since.is_none_or(|t| c.jit.used.get() <= t)
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    });
+    chunks.sort_by_key(|c| c.jit.used.get());
+    let mut released = Vec::new();
+    let mut freed = 0;
+    for chunk in &chunks {
+        if live.contains(&(std::rc::Rc::as_ptr(chunk) as usize)) {
+            continue;
+        }
+        let Some(natives) = take_code(chunk) else { continue };
+        freed += natives.iter().map(|n| n.code_len).sum::<usize>();
+        released.extend(natives);
+        if want != 0 && freed >= want {
+            break;
+        }
+    }
+    if released.is_empty() {
+        return 0;
+    }
+    let mut stats = i.jit_stats.get();
+    stats.evictions += released.len() as u64;
+    stats.evicted_bytes += freed;
+    i.jit_stats.set(stats);
+    drop(released);
+    freed
+}
+
+/// Detach every native unit of `chunk`, and reset its tiers to cold with their compile budgets
+/// refunded. `None` when it has none, is being compiled, or one is entered right now.
+fn take_code(chunk: &Chunk) -> Option<Vec<std::rc::Rc<Native>>> {
+    let jit = &chunk.jit;
+    let (Ok(mut fs), Ok(mut loops)) = (jit.func.try_borrow_mut(), jit.loops.try_borrow_mut()) else {
+        return None;
+    };
+    let busy = |n: &std::rc::Rc<Native>| std::rc::Rc::strong_count(n) > 1;
+    if fs.code.iter().chain(fs.retired.iter()).any(busy)
+        || loops.iter().filter_map(|l| l.code.as_ref()).any(busy)
+    {
+        return None;
+    }
+    let mut out: Vec<_> = fs.code.take().into_iter().collect();
+    out.append(&mut fs.retired);
+    if !out.is_empty() {
+        jit.set_direct_none();
+        fs.compiles = 0;
+        fs.entry_fails = 0;
+        fs.deopts.clear();
+        fs.starved = None;
+        fs.starved_count = 0;
+        jit.calls.set(0);
+        jit.fstate.set(FS_COLD);
+    }
+    for l in loops.iter_mut() {
+        if let Some(code) = l.code.take() {
+            out.push(code);
+            l.compiles = l.compiles.saturating_sub(1);
+            l.entry_fails = 0;
+            l.starved = None;
+            l.starved_count = 0;
+        }
+    }
+    jit.has_code.set(false);
+    (!out.is_empty()).then_some(out)
+}
+
+/// The safe-point check of [`lumen_os::jitmem::request_exec_trim`] (and of failed executable
+/// allocations anywhere): when the pressure generation moved, release the code this engine has
+/// not run since its previous trim.
+#[inline(always)]
+pub(crate) fn trim_check(i: &Interp) {
+    if lumen_os::jitmem::exec_trim_generation() != i.jit_evict.trim_seen.get() {
+        trim_slow(i);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn trim_slow(i: &Interp) {
+    if i.jit_evict.pin.get() != 0 {
+        return;
+    }
+    i.jit_evict.trim_seen.set(lumen_os::jitmem::exec_trim_generation());
+    evict_lru(i, 0, Some(i.jit_evict.trim_stamp.get()));
+    i.jit_evict.trim_stamp.set(i.jit_evict.epoch.get());
+}
+
 /// Byte offsets of [`ChunkJit`]'s direct-call view inside a [`Chunk`].
 pub(crate) const CHUNK_DENTRY: usize =
     std::mem::offset_of!(Chunk, jit) + std::mem::offset_of!(ChunkJit, dentry);
@@ -450,7 +666,7 @@ pub(crate) struct Shadow {
 }
 
 enum ShadowStorage {
-    Pages(lumen_codegen::jitmem::DataMemory),
+    Pages(lumen_os::jitmem::DataMemory),
     Heap(Box<[u128]>),
 }
 
@@ -480,7 +696,7 @@ pub(crate) fn shadow(i: &mut Interp) -> *mut Shadow {
 }
 
 fn new_shadow(bytes: usize) -> Box<Shadow> {
-    let storage = match lumen_codegen::jitmem::DataMemory::new(bytes) {
+    let storage = match lumen_os::jitmem::DataMemory::new(bytes) {
         Some(memory) => ShadowStorage::Pages(memory),
         None => ShadowStorage::Heap(vec![0u128; bytes / 16].into_boxed_slice()),
     };
@@ -497,6 +713,8 @@ fn new_shadow(bytes: usize) -> Box<Shadow> {
 
 #[cfg(test)]
 mod shadow_tests;
+#[cfg(test)]
+mod int32_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside
@@ -557,7 +775,7 @@ struct FuncState {
     compiles: u32,
     entry_fails: u32,
     /// Slots kept Boxed on the next compile (their speculated kind failed).
-    widen: Vec<bool>,
+    widen: Vec<Widen>,
     /// A local speculated `Num` from its writes alone (see `build::fn_kinds`) was widened:
     /// later compiles guess only from arithmetic.
     guess_failed: bool,
@@ -568,6 +786,10 @@ struct FuncState {
     deopts: Vec<(u32, u32)>,
     /// Retired code (see [`retire_fn`]).
     retired: Vec<std::rc::Rc<Native>>,
+    /// A compile found no executable memory: see [`starved_waits`]. Entries stay interpreted
+    /// until the backoff (in calls) passes or memory is freed.
+    starved: Option<(u32, u32, u64)>,
+    starved_count: u32,
 }
 
 struct LoopState {
@@ -578,13 +800,18 @@ struct LoopState {
     entry_fails: u32,
     /// Slots kept Boxed on the next compile: they failed the entry guards (a recursive function
     /// entering its loop with locals of another kind than the compile saw mid-loop).
-    widen: Vec<bool>,
+    widen: Vec<Widen>,
     /// `Num` slots that failed the entry guards holding `undefined` (a local the body assigns,
     /// unset on a new call's first entry): the next compile accepts either at entry.
     undef_ok: Vec<bool>,
+    /// As [`FuncState::starved`], in backedge ticks.
+    starved: Option<(u32, u32, u64)>,
+    starved_count: u32,
 }
 
 struct Native {
+    code_name: String,
+    code_len: usize,
     /// Keeps the code alive (executable memory on native hosts; nothing on wasm32, where the
     /// instantiated module lives in the engine's function table).
     _keep: Box<dyn std::any::Any>,
@@ -607,6 +834,16 @@ struct Native {
     resumes: Vec<(usize, usize)>,
     /// See [`build::Built::num_exits`].
     num_exits: Vec<usize>,
+}
+
+impl Drop for Native {
+    fn drop(&mut self) {
+        if self.code_len != 0 {
+            crate::jit_code_event(crate::JitCodeEvent {
+                name: &self.code_name, start: self.entry as usize, length: self.code_len, loaded: false,
+            });
+        }
+    }
 }
 
 fn log_enabled() -> bool {
@@ -637,7 +874,7 @@ fn eager(i: &Interp) -> bool {
 fn jit_enabled(i: &Interp) -> bool {
     if i.jit_mode == crate::JitMode::Disabled { return false; }
     if cfg!(target_os = "none") {
-        return cfg!(target_arch = "aarch64") && lumen_codegen::jitmem::native_backend_available();
+        return cfg!(target_arch = "aarch64") && lumen_os::jitmem::native_backend_available();
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -657,7 +894,7 @@ fn compile(
     header: usize,
     backedge: usize,
     slots: &[Value],
-    widen: &[bool],
+    widen: &[Widen],
     undef_ok: &[bool],
     this_val: &Value,
 ) -> Result<Native, String> {
@@ -673,8 +910,8 @@ fn compile(
     let r = build::build(
         i, env, chunk, header, backedge, slots, widen, undef_ok, this_val,
     )
-    .and_then(|built| finish(built, header, backedge));
-    record_compilation(i, &r, started.elapsed());
+    .and_then(|built| finish(built, header, backedge, i.jit_alignment, &mut |want| evict_lru(i, want, None) != 0));
+    record_compilation(i, chunk, "loop", &r, started.elapsed());
     stats_end(t, "loop", &r);
     r
 }
@@ -685,7 +922,7 @@ fn compile_fn(
     env: &Env,
     chunk: &Chunk,
     slots: &[Value],
-    widen: &[bool],
+    widen: &[Widen],
     not_num: &[bool],
     guess: bool,
     this_val: &Value,
@@ -697,30 +934,52 @@ fn compile_fn(
     let started = std::time::Instant::now();
     let t = stats_start();
     let r = build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val)
-        .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1)));
-    record_compilation(i, &r, started.elapsed());
+        .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1), i.jit_alignment, &mut |want| evict_lru(i, want, None) != 0));
+    record_compilation(i, chunk, "fn", &r, started.elapsed());
     stats_end(t, "fn", &r);
     r
 }
 
-fn record_compilation(i: &Interp, result: &Result<Native, String>, elapsed: std::time::Duration) {
+fn record_compilation(
+    i: &Interp,
+    chunk: &Chunk,
+    kind: &'static str,
+    result: &Result<Native, String>,
+    elapsed: std::time::Duration,
+) {
+    #[cfg(not(feature = "bench"))]
+    let _ = kind;
     let mut stats = i.jit_stats.get();
     stats.compile_nanoseconds = stats.compile_nanoseconds.saturating_add(
         u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     if let Ok(native) = result {
+        chunk.jit.owner.set(i.jit_evict.id);
+        chunk.jit.used.set(i.jit_evict.epoch.get());
         stats.compiled_units += 1;
-        stats.code_bytes += native._keep.downcast_ref::<lumen_codegen::jitmem::ExecMemory>()
+        let code_bytes = native._keep.downcast_ref::<lumen_os::jitmem::ExecMemory>()
             .map_or(0, |memory| memory.len());
+        stats.code_bytes += code_bytes;
+        #[cfg(feature = "bench")]
+        i.jit_compilations.borrow_mut().push(crate::JitCompilation {
+            function_index: chunk.precompiled_origin.map(|origin| origin.0),
+            bytecode_bytes: chunk.precompiled_origin.map(|origin| origin.1),
+            kind,
+            op_count: chunk.ops.len(),
+            native_bytes: code_bytes,
+        });
     } else {
         stats.failed_compilations += 1;
-        if result.as_ref().err().is_some_and(|error| error == "jit: cannot allocate executable memory") {
+        if result.as_ref().err().is_some_and(|error| error == lumen_os::jitmem::EXEC_EXHAUSTED) {
             stats.allocation_failures += 1;
         }
     }
     i.jit_stats.set(stats);
 }
 
-fn record_execution(i: &Interp) {
+fn record_execution(i: &Interp, chunk: &Chunk) {
+    let epoch = i.jit_evict.epoch.get() + 1;
+    i.jit_evict.epoch.set(epoch);
+    chunk.jit.used.set(epoch);
     let mut stats = i.jit_stats.get();
     stats.executed_entries += 1;
     i.jit_stats.set(stats);
@@ -760,8 +1019,15 @@ fn stats_end(t: Option<std::time::Instant>, kind: &str, r: &Result<Native, Strin
     );
 }
 
-fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native, String> {
+fn finish(
+    built: build::Built,
+    header: usize,
+    backedge: usize,
+    alignment: usize,
+    evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<Native, String> {
     let mut func = built.func;
+    let code_name = func.name.clone();
     let t0 = stats_start();
     let n0 = (func.insts.len(), func.blocks.len());
     // Cheap next to compilation, and a malformed function must never reach the backend.
@@ -773,7 +1039,12 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
     }
     let t2 = stats_start();
     let n1 = (func.insts.len(), func.blocks.len());
-    let (keep, entry) = emit(func, &built.externs, header, backedge)?;
+    let (keep, entry, code_len) = emit(func, &built.externs, header, backedge, alignment, evict)?;
+    if code_len != 0 {
+        crate::jit_code_event(crate::JitCodeEvent {
+            name: &code_name, start: entry as usize, length: code_len, loaded: true,
+        });
+    }
     if let (Some(t0), Some(t1), Some(t2)) = (t0, t1, t2) {
         eprintln!(
             "[jit-stats]   ir {} insts/{} blocks -> {} insts/{} blocks; verify {} us, opt {} us, emit {} us",
@@ -791,6 +1062,8 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
         unsafe { (*(built.self_entry as *const Cell<usize>)).set(entry as usize) };
     }
     Ok(Native {
+        code_name,
+        code_len,
         _keep: keep,
         entry,
         max_stack: built.max_stack,
@@ -814,6 +1087,7 @@ fn finish(built: build::Built, header: usize, backedge: usize) -> Result<Native,
     allow(dead_code)
 )]
 fn import_address(externs: &[u64], id: u32) -> Option<u64> {
+    if let Some(address) = lumen_codegen::atomics::address(id) { return Some(address); }
     if id >= EXT_BASE {
         externs.get((id - EXT_BASE) as usize).copied()
     } else {
@@ -832,7 +1106,9 @@ fn emit(
     externs: &[u64],
     header: usize,
     backedge: usize,
-) -> Result<(Box<dyn std::any::Any>, NativeFn), String> {
+    _alignment: usize,
+    evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
     #[cfg(target_arch = "x86_64")]
     use lumen_codegen::x64 as native;
     #[cfg(target_arch = "aarch64")]
@@ -840,14 +1116,31 @@ fn emit(
     let cfg = native::Config::host(None);
     #[cfg(target_arch = "aarch64")]
     let cfg = native::Config { features: crate::target::cpu_features(), ..cfg };
-    let compiled = native::compile_owned(func, &cfg)?;
-    let (mem, addrs) = native::load(&[compiled], |id, addrs| {
+    #[cfg(target_arch = "x86_64")]
+    let cfg = native::Config { features: native::Features::from_bits(crate::target::cpu_features()), ..cfg };
+    #[cfg(target_arch = "aarch64")]
+    let compiled = native::compile_owned_aligned(func, &cfg, if _alignment == 64 { 64 } else { 4 })?;
+    #[cfg(target_arch = "x86_64")]
+    let compiled = native::compile_owned_aligned(func, &cfg, if _alignment == 64 { 64 } else { 1 })?;
+    let resolve = |id, addrs: &[u64]| {
         if id == SELF_ID {
             addrs.first().copied()
         } else {
             import_address(externs, id)
         }
-    })?;
+    };
+    let compiled = [compiled];
+    let mut loaded = native::load_aligned(&compiled, _alignment, &resolve);
+    for round in 0..EVICT_ROUNDS {
+        if !matches!(&loaded, Err(e) if e == lumen_os::jitmem::EXEC_EXHAUSTED) {
+            break;
+        }
+        if !evict(lumen_os::jitmem::last_failed_len().max(1) << round) {
+            break;
+        }
+        loaded = native::load_aligned(&compiled, _alignment, &resolve);
+    }
+    let (mem, addrs) = loaded?;
     if let Some(dir) = std::env::var_os("LUMEN_JIT_DUMP") {
         let path = std::path::Path::new(&dir).join(format!("loop_{header}_{backedge}.bin"));
         // SAFETY: `mem` holds `mem.len()` initialized bytes.
@@ -859,7 +1152,8 @@ fn emit(
     }
     // SAFETY: the code was generated for exactly this signature.
     let entry = unsafe { std::mem::transmute::<usize, NativeFn>(addrs[0] as usize) };
-    Ok((Box::new(mem), entry))
+    let code_len = mem.len();
+    Ok((Box::new(mem), entry, code_len))
 }
 
 /// wasm32: a WebAssembly module over the engine's own memory and function table, instantiated
@@ -872,7 +1166,9 @@ fn emit(
     externs: &[u64],
     _header: usize,
     _backedge: usize,
-) -> Result<(Box<dyn std::any::Any>, NativeFn), String> {
+    _alignment: usize,
+    _evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
     let cfg = lumen_codegen::wasm::Config { ptr32: true };
     let bytes = lumen_codegen::wasm::compile_module(std::slice::from_ref(&func), &cfg, |id| {
         import_address(externs, id).map(|a| a as u32)
@@ -882,7 +1178,7 @@ fn emit(
     // SAFETY: the table entry is the module's `f0`, of wasm type (i32) -> i64 — exactly
     // `NativeFn` on wasm32.
     let entry = unsafe { std::mem::transmute::<usize, NativeFn>(index as usize) };
-    Ok((Box::new(()), entry))
+    Ok((Box::new(()), entry, 0))
 }
 
 #[cfg(not(any(
@@ -895,7 +1191,9 @@ fn emit(
     _externs: &[u64],
     _header: usize,
     _backedge: usize,
-) -> Result<(Box<dyn std::any::Any>, NativeFn), String> {
+    _alignment: usize,
+    _evict: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Box<dyn std::any::Any>, NativeFn, usize), String> {
     Err("no JIT backend for this target".into())
 }
 
@@ -957,6 +1255,8 @@ pub(super) fn on_backedge(
                     entry_fails: 0,
                     widen: Vec::new(),
                     undef_ok: Vec::new(),
+                    starved: None,
+                    starved_count: 0,
                 });
                 loops.len() - 1
             }
@@ -965,6 +1265,9 @@ pub(super) fn on_backedge(
         if l.code.is_none() {
             // Not compiled: only look again on a tick boundary.
             if l.compiles >= MAX_COMPILES || t & TICK_MASK != 0 {
+                return Ok(None);
+            }
+            if l.starved.is_some_and(|s| starved_waits(t, s)) {
                 return Ok(None);
             }
             {
@@ -1009,11 +1312,19 @@ pub(super) fn on_backedge(
                     }
                     l.code = Some(std::rc::Rc::new(n));
                     l.entry_fails = 0;
+                    l.starved = None;
+                    l.starved_count = 0;
                     jit.has_code.set(true);
                 }
                 Err(e) => {
                     if log_enabled() {
                         eprintln!("[jit] loop {header}..={backedge} not compiled: {e}");
+                    }
+                    if e == lumen_os::jitmem::EXEC_EXHAUSTED {
+                        l.compiles -= 1;
+                        l.starved_count = l.starved_count.saturating_add(1);
+                        l.starved = Some(starved_until(t, l.starved_count, 8 * (TICK_MASK + 1)));
+                        return Ok(None);
                     }
                     l.compiles = MAX_COMPILES;
                     return Ok(None);
@@ -1081,6 +1392,12 @@ pub(super) fn on_entry(
                 jit.fstate.set(FS_DEAD);
                 return Ok(None);
             }
+            if let Some(starved) = fs.starved {
+                if starved_waits(jit.calls.get(), starved) {
+                    jit.fstate.set(FS_COLD);
+                    return Ok(None);
+                }
+            }
             fs.compiles += 1;
             match compile_fn(
                 i,
@@ -1104,6 +1421,8 @@ pub(super) fn on_entry(
                     jit.set_direct(chunk, Some(&n));
                     fs.code = Some(n.clone());
                     fs.entry_fails = 0;
+                    fs.starved = None;
+                    fs.starved_count = 0;
                     fs.deopts.clear();
                     jit.fstate.set(FS_CODE);
                     n
@@ -1111,6 +1430,13 @@ pub(super) fn on_entry(
                 Err(e) => {
                     if log_enabled() {
                         eprintln!("[jit] function ({} ops) not compiled: {e}", chunk.ops.len());
+                    }
+                    if e == lumen_os::jitmem::EXEC_EXHAUSTED {
+                        fs.compiles -= 1;
+                        fs.starved_count = fs.starved_count.saturating_add(1);
+                        fs.starved = Some(starved_until(jit.calls.get(), fs.starved_count, STARVED_BACKOFF));
+                        jit.fstate.set(FS_COLD);
+                        return Ok(None);
                     }
                     jit.fstate.set(FS_DEAD);
                     return Ok(None);
@@ -1294,7 +1620,8 @@ fn enter(
     // SAFETY: the frame points at live state for the whole call; native code follows the
     // contract above (it touches only `slots`, `area` and the frame, and calls helpers).
     let word = unsafe { (native.entry)(&mut frame) };
-    record_execution(i);
+    i.jit_atomic_lease = None;
+    record_execution(i, chunk);
     let kind = word & 0xff;
     let exit_pc = (word >> 8) as usize;
     let depth = (frame.exit_depth as usize).min(area.len());
@@ -1328,16 +1655,16 @@ fn enter(
                             // between kinds otherwise, each recompile guessing one of them).
                             let n = native.kinds.len();
                             if l.widen.len() < n {
-                                l.widen.resize(n, false);
+                                l.widen.resize(n, Widen::None);
                                 l.undef_ok.resize(n, false);
                             }
                             for (s, &k) in native.kinds.iter().enumerate() {
                                 match slots.get(s) {
-                                    Some(Value::Undefined) if k == Kind::Num && !l.undef_ok[s] => {
+                                    Some(Value::Undefined) if k.is_num() && !l.undef_ok[s] => {
                                         l.undef_ok[s] = true
                                     }
-                                    Some(v) if k != Kind::Boxed && Kind::of(v) != k => {
-                                        l.widen[s] = true
+                                    Some(v) if k != Kind::Boxed && !k.accepts(v) => {
+                                        l.widen[s] = k.wider()
                                     }
                                     _ => {}
                                 }
@@ -1418,11 +1745,11 @@ fn fn_entry_failed(chunk: &Chunk, slots: &[Value], native: &Native) {
     }
     let n = native.kinds.len();
     if fs.widen.len() < n {
-        fs.widen.resize(n, false);
+        fs.widen.resize(n, Widen::None);
     }
     for (s, &k) in native.kinds.iter().enumerate() {
-        if k != Kind::Boxed && slots.get(s).is_some_and(|v| Kind::of(v) != k) {
-            fs.widen[s] = true;
+        if k != Kind::Boxed && slots.get(s).is_some_and(|v| !k.accepts(v)) {
+            fs.widen[s] = k.wider();
         }
     }
     retire_fn(jit, &mut fs);
@@ -1489,20 +1816,20 @@ fn fn_deopt(chunk: &Chunk, pc: usize, native: &Native) {
     }
     let n = native.kinds.len();
     if fs.widen.len() < n {
-        fs.widen.resize(n, false);
+        fs.widen.resize(n, Widen::None);
     }
     let mut widened = false;
     for q in [Some(pc), pc.checked_sub(1)].into_iter().flatten() {
         let Some(op) = chunk.ops.get(q) else { continue };
         for s in build::op_slots(op) {
             let s = s as usize;
-            if native.kinds.get(s).is_some_and(|&k| k != Kind::Boxed) && !fs.widen[s] {
-                fs.widen[s] = true;
+            if native.kinds.get(s).is_some_and(|&k| k != Kind::Boxed) && fs.widen[s] != Widen::Boxed {
+                fs.widen[s] = native.kinds[s].wider();
                 widened = true;
                 let at_entry = s < chunk.n_params
                     || chunk.arguments_slot == Some(s as u16)
                     || chunk.rest_slot == Some(s as u16);
-                if !at_entry {
+                if !at_entry && native.kinds[s] != Kind::Int32 {
                     fs.guess_failed = true;
                 }
             }
@@ -1590,46 +1917,7 @@ fn finish_handlers(
 // stack, oldest first, is therefore `fn_frames` followed by [`pending_frames`]. A stack trace
 // reads it that way; code that needs `&mut` access to a frame calls `sync_frames` first.
 
-/// Parameter values for a directly entered frame (see [`call_direct`]): at most `cap` are
-/// kept, surplus ones dropped.
-pub(crate) struct Seed {
-    p: *mut Value,
-    n: usize,
-    cap: usize,
-}
-
-impl Seed {
-    #[inline(always)]
-    pub(crate) fn push(&mut self, v: Value) {
-        if self.n < self.cap {
-            // SAFETY: `p[..cap]` are the frame's (uninitialized) parameter slots.
-            unsafe { self.p.add(self.n).write(v) };
-            self.n += 1;
-        } else {
-            super::drop_value_fast(v);
-        }
-    }
-
-    /// Whether another parameter would be kept.
-    #[inline(always)]
-    pub(crate) fn wants(&self) -> bool {
-        self.n < self.cap
-    }
-}
-
-/// Run `seed` into `p` (room for `chunk`'s parameters): the number of values written.
-///
-/// # Safety
-/// `p` has room for `min(n_params, n_slots)` values.
-pub(crate) unsafe fn seed_raw(p: *mut Value, chunk: &Chunk, seed: impl FnOnce(&mut Seed)) -> usize {
-    let mut s = Seed {
-        p,
-        n: 0,
-        cap: chunk.n_params.min(chunk.n_slots),
-    };
-    seed(&mut s);
-    s.n
-}
+pub(crate) use super::seed::{Seed, seed_raw};
 
 /// Whether [`call_direct`] can run `chunk` now: it has function code and the shadow stack has
 /// room for its frame.
@@ -1665,6 +1953,7 @@ pub(crate) unsafe fn call_direct(
     this: &Value,
     seed: impl FnOnce(&mut Seed),
 ) -> Result<Value, Abrupt> {
+    let pinned = pin(i);
     let entry = chunk.jit.dentry.get();
     let sh = shadow(i);
     let top0 = (*sh).top;
@@ -1737,9 +2026,11 @@ pub(crate) unsafe fn call_direct(
     (*rec).fn_ptr = fn_ptr;
     i.jit_frames = rec as usize;
     // --- run ---
+    drop(pinned);
     let code: NativeFn = std::mem::transmute::<usize, NativeFn>(entry);
     let word = code(nf);
-    record_execution(i);
+    i.jit_atomic_lease = None;
+    record_execution(i, chunk);
     let r = if word & 0xff == EXIT_RETURN {
         let v = std::ptr::replace((*nf).stack, Value::Undefined);
         for k in 0..n {

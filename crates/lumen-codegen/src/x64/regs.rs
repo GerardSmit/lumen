@@ -46,7 +46,16 @@ pub struct Abi {
 const WIN_INT_ARGS: [PReg; 4] = [RCX, RDX, R8, R9];
 const WIN_FLOAT_ARGS: [PReg; 4] = [xmm(0), xmm(1), xmm(2), xmm(3)];
 const SYSV_INT_ARGS: [PReg; 6] = [RDI, RSI, RDX, RCX, R8, R9];
-const SYSV_FLOAT_ARGS: [PReg; 8] = [xmm(0), xmm(1), xmm(2), xmm(3), xmm(4), xmm(5), xmm(6), xmm(7)];
+const SYSV_FLOAT_ARGS: [PReg; 8] = [
+    xmm(0),
+    xmm(1),
+    xmm(2),
+    xmm(3),
+    xmm(4),
+    xmm(5),
+    xmm(6),
+    xmm(7),
+];
 
 pub fn host_abi() -> Abi {
     if cfg!(windows) {

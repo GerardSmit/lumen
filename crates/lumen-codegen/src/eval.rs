@@ -10,6 +10,7 @@ pub fn norm(ty: Type, bits: u64) -> u64 {
     match ty {
         Type::I32 | Type::F32 => bits & 0xffff_ffff,
         Type::I64 | Type::F64 => bits,
+        Type::V128 => panic!("vector values require 128 bits"),
     }
 }
 
@@ -33,6 +34,7 @@ fn bf64(v: f64) -> u64 {
 pub fn unary(op: UnaryOp, ty: Type, a: u64) -> u64 {
     use UnaryOp::*;
     match (ty, op) {
+        (Type::V128, _) => panic!("use vector operations for V128"),
         (Type::I32, _) => {
             let x = a as u32;
             (match op {
@@ -192,6 +194,7 @@ pub fn binary(op: BinaryOp, ty: Type, a: u64, b: u64) -> Option<u64> {
                 _ => unreachable!("{op:?} on F64"),
             }
         }
+        Type::V128 => return None,
     })
 }
 
@@ -315,4 +318,36 @@ pub fn pure_inst(func: &Function, data: &InstData, arg: impl Fn(Value) -> u64) -
         InstData::Convert { op, to, arg: a } => convert(*op, ty(*a), *to, arg(*a))?,
         _ => return None,
     })
+}
+
+pub fn vector(op: VectorOp, a: u128, b: u128) -> u128 {
+    use VectorOp::*;
+    match op {
+        And => return a & b, AndNot => return a & !b, Or => return a | b,
+        _ => {}
+    }
+    let floating = matches!(op, F64x2Add | F64x2Mul | F64x2Min | F64x2Max | F64x2Eq | F64x2Lt);
+    let width = if floating { 64 } else { 32 };
+    let mut result = 0u128;
+    for lane in 0..128 / width {
+        let x = (a >> (lane * width)) as u64;
+        let y = (b >> (lane * width)) as u64;
+        let bits = match op {
+            I32x4Add => (x as u32).wrapping_add(y as u32) as u64,
+            I32x4Mul => (x as u32).wrapping_mul(y as u32) as u64,
+            I32x4Min => (x as i32).min(y as i32) as u32 as u64,
+            I32x4Max => (x as i32).max(y as i32) as u32 as u64,
+            I32x4Eq => if x as u32 == y as u32 { u32::MAX as u64 } else { 0 },
+            I32x4Lt => if (x as i32) < y as i32 { u32::MAX as u64 } else { 0 },
+            F64x2Eq => if f64of(x) == f64of(y) { u64::MAX } else { 0 },
+            F64x2Lt => if f64of(x) < f64of(y) { u64::MAX } else { 0 },
+            F64x2Add | F64x2Mul | F64x2Min | F64x2Max => binary(match op {
+                F64x2Add => BinaryOp::Fadd, F64x2Mul => BinaryOp::Fmul,
+                F64x2Min => BinaryOp::Fmin, _ => BinaryOp::Fmax,
+            }, Type::F64, x, y).unwrap(),
+            _ => unreachable!(),
+        };
+        result |= (bits as u128) << (lane * width);
+    }
+    result
 }

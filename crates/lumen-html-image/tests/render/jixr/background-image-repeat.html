@@ -1,0 +1,10 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+.stage{width:200px;padding:12px;background:#fafafa}
+.tile{width:64px;height:32px;background-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAIUlEQVR42mMQ91v2H4R/72EFY3Q+A0EFuCRgfMIKBoEbAJHKmKFnaCjvAAAAAElFTkSuQmCC");margin-bottom:8px}
+.strip{width:64px;height:24px;background-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAIUlEQVR42mMQ91v2H4R/72EFY3Q+A0EFuCRgfMIKBoEbAJHKmKFnaCjvAAAAAElFTkSuQmCC");background-repeat:repeat-x}
+</style><div class=stage><div class=tile></div><div class=strip></div></div>
+<!-- jixr-compare: max-diff-ratio=0.03
+     Poppler rasterizes the PDF's Image XObject with its own filtering, which this
+     repository does not control, so the PDF render differs slightly at image edges.
+     The window and ImageSharp backends are still asserted to match Chromium exactly. -->

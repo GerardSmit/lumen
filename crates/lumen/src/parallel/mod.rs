@@ -6,6 +6,8 @@ mod classes;
 mod parcel;
 mod runtime;
 pub use api::{install, install_with_limits, shutdown};
+#[cfg(feature = "aot-native")]
+pub use api::install_native_with_limits;
 pub use parcel::{Limits, Parcel};
 #[cfg(not(target_os = "none"))]
 pub use runtime::ThreadHost;

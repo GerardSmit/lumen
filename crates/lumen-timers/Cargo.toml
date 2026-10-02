@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen", default-features = false, features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
-lumen-host = { path = "../lumen-host", optional = true }
+lumen-host = { path = "../lumen-host", default-features = false, optional = true }
 
 [features]
 default = ["hosted"]

@@ -224,7 +224,9 @@ fn set(parsed: &mut Parsed, name: &str, value: Value) {
             match parsed.options.get_mut(name) {
                 Some(Value::List(l)) => l.push(s),
                 _ => {
-                    parsed.options.insert(name.to_string(), Value::List(vec![s]));
+                    parsed
+                        .options
+                        .insert(name.to_string(), Value::List(vec![s]));
                 }
             }
         }
@@ -284,9 +286,7 @@ pub fn parse(
         let (resolved, spec, negated) = match lookup(&name) {
             Some((n, s)) => (n.to_string(), s, false),
             None => {
-                let base = name
-                    .strip_prefix("--no-")
-                    .map(|b| format!("--{b}"));
+                let base = name.strip_prefix("--no-").map(|b| format!("--{b}"));
                 match base.as_deref().and_then(lookup) {
                     Some((n, s)) => {
                         if s.kind != Kind::Bool {
@@ -328,7 +328,12 @@ pub fn parse(
                         if !from_env {
                             parsed.exec_argv.push(code.clone());
                         }
-                        parsed.eval = Some(code.strip_prefix('\\').filter(|r| r.starts_with('-')).unwrap_or(&code).to_string());
+                        parsed.eval = Some(
+                            code.strip_prefix('\\')
+                                .filter(|r| r.starts_with('-'))
+                                .unwrap_or(&code)
+                                .to_string(),
+                        );
                         set(parsed, "--eval", Value::Str(parsed.eval.clone().unwrap()));
                     }
                     continue;
@@ -366,7 +371,13 @@ pub fn parse(
                     }
                 };
                 if resolved == "--eval" {
-                    parsed.eval = Some(value.strip_prefix('\\').filter(|r| r.starts_with('-')).unwrap_or(&value).to_string());
+                    parsed.eval = Some(
+                        value
+                            .strip_prefix('\\')
+                            .filter(|r| r.starts_with('-'))
+                            .unwrap_or(&value)
+                            .to_string(),
+                    );
                     set(parsed, &resolved, Value::Str(parsed.eval.clone().unwrap()));
                 } else {
                     set(parsed, &resolved, Value::Str(value));

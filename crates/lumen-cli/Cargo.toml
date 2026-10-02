@@ -11,11 +11,19 @@ publish = false
 
 [dependencies]
 lumen = { path = "../lumen" }
-lumen-aot = { path = "../lumen-aot" }
-lumen-common = { path = "../lumen-common" }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
+lumen-common = { path = "../lumen-common", features = ["native-sidecar", "native-signing"] }
+lumen-codegen = { path = "../lumen-codegen", features = ["standalone-object"] }
 lumen-host = { path = "../lumen-host" }
+lumen-os = { path = "../lumen-os" }
+lumen-html-image = { path = "../lumen-html-image" }
+lumen-html-js = { path = "../lumen-html-js" }
+lumen-html-text = { path = "../lumen-html-text" }
 lumen-repl = { path = "../lumen-repl" }
 lumen-runtime = { path = "../lumen-runtime" }
+serialport = { version = "4.10", default-features = false }
+serde_json = "1"
+toml = "0.8"
 
 [features]
 default = ["typed"]

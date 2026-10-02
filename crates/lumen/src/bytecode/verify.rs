@@ -242,6 +242,27 @@ pub(crate) fn stack_region(
     func: bool,
     jit: bool,
 ) -> Result<(Vec<Option<usize>>, Vec<Vec<(usize, usize)>>, usize), String> {
+    stack_region_inner(chunk, header, backedge, func, jit, jit)
+}
+
+/// Native safepoints and helper failures can enter any lexical catch, including
+/// a handler whose source body contains only non-throwing bytecode operations.
+#[cfg(feature = "jit")]
+pub(crate) fn native_stack_region(
+    chunk: &Chunk,
+) -> Result<(Vec<Option<usize>>, Vec<Vec<(usize, usize)>>, usize), String> {
+    let end = chunk.ops.len().checked_sub(1).ok_or("bytecode: empty chunk")?;
+    stack_region_inner(chunk, 0, end, true, false, true)
+}
+
+fn stack_region_inner(
+    chunk: &Chunk,
+    header: usize,
+    backedge: usize,
+    func: bool,
+    jit: bool,
+    handler_roots: bool,
+) -> Result<(Vec<Option<usize>>, Vec<Vec<(usize, usize)>>, usize), String> {
     let ops = &chunk.ops;
     if header > backedge || backedge >= ops.len() {
         return Err("bytecode: invalid analysis region".into());
@@ -327,7 +348,7 @@ pub(crate) fn stack_region(
         match *op {
             Op::PushHandler(t) => {
                 h_after.push((t as usize, d));
-                if jit {
+                if handler_roots {
                     edges.push((t as usize, d + 1, h.clone()));
                 }
             }

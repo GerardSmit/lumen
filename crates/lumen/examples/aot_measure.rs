@@ -3,9 +3,23 @@
 use lumen::precompiled::{CompiledUnit, PrecompileBundle, SEC_MANIFEST};
 use lumen::{Completion, Engine, SourceKind};
 use lumen_common::{aot, lzh};
+#[cfg(feature = "bench")]
+use std::io::Write;
 use std::time::Instant;
 
 fn main() -> Result<(), String> {
+    #[cfg(feature = "bench")]
+    let mut function_report = std::env::var_os("LUMEN_AOT_FUNCTION_CSV")
+        .map(|path| std::fs::File::create(path).map_err(|e| e.to_string()))
+        .transpose()?;
+    #[cfg(feature = "bench")]
+    if let Some(report) = &mut function_report {
+        writeln!(
+            report,
+            "program,function_index,kind,ops,bytecode_bytes,native_bytes"
+        )
+        .map_err(|e| e.to_string())?;
+    }
     println!("program,source_bytes,functions,chunks,refused,blob_bytes,raw_blob_bytes,bytecode_store_bytes,bytecode_lzh_bytes,lzh_decode_mbps,jit_units,jit_bytes,native_entries,eval_ms");
     for path in std::env::args().skip(1) {
         let src = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
@@ -45,7 +59,10 @@ fn main() -> Result<(), String> {
         let mut engine = Engine::new();
         engine.set_tier_threshold(0);
         let start = Instant::now();
-        match engine.eval(&src, false).map_err(|e| e.message)? {
+        match engine
+            .load_precompiled_owned(blob.clone().into())
+            .map_err(|e| e.message)?
+        {
             Completion::Value(_) => {}
             Completion::Throw { name, message } => {
                 return Err(format!("{path}: {name}: {message}"))
@@ -53,6 +70,26 @@ fn main() -> Result<(), String> {
         }
         let ms = start.elapsed().as_secs_f64() * 1000.0;
         let jit = engine.jit_stats();
+        #[cfg(feature = "bench")]
+        if let Some(report) = &mut function_report {
+            for record in engine.jit_compilations() {
+                writeln!(
+                    report,
+                    "\"{}\",{},{},{},{},{}",
+                    path.replace('"', "\"\""),
+                    record
+                        .function_index
+                        .map_or(String::new(), |n| n.to_string()),
+                    record.kind,
+                    record.op_count,
+                    record
+                        .bytecode_bytes
+                        .map_or(String::new(), |n| n.to_string()),
+                    record.native_bytes,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
         println!(
             "\"{}\",{},{},{},{},{},{},{},{},{:.2},{},{},{},{:.2}",
             path.replace('"', "\"\""),

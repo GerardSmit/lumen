@@ -71,7 +71,11 @@ impl Props {
     /// there is no such property.
     pub(crate) fn set_existing_value(&mut self, key: &str, v: crate::value::Value) -> bool {
         if let Some(n) = canonical_index(key) {
-            if let Some(w) = self.elems.packed_mut().and_then(|p| p.get_value_mut(n as usize)) {
+            if let Some(w) = self
+                .elems
+                .packed_mut()
+                .and_then(|p| p.get_value_mut(n as usize))
+            {
                 if !w.is_hole() {
                     *w = PackedValue::pack(v);
                     return true;

@@ -6,6 +6,80 @@ fn env() -> BufferEnv {
 }
 
 #[test]
+fn vectors_preserve_high_lanes_through_optimization_and_backends() {
+    use VectorOp::*;
+    for op in [I32x4Add, I32x4Mul, I32x4Min, I32x4Max, I32x4Eq, I32x4Lt,
+        F64x2Add, F64x2Mul, F64x2Min, F64x2Max, F64x2Eq, F64x2Lt, And, AndNot, Or] {
+        let mut f = Function::new("vector_memory", Signature::new(vec![Type::I64], vec![]));
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let pointer = b.block_params(entry)[0];
+        let a = b.load(MemKind::V128, pointer, 0);
+        let rhs = b.load(MemKind::V128, pointer, 16);
+        let result = b.vector_binary(op, a, rhs);
+        b.store(MemKind::V128, pointer, result, 32);
+        b.ret(&[]);
+        b.finish();
+        let original = f.clone();
+        opt::optimize(&mut f);
+        verify::verify(&f).unwrap();
+        aarch64::compile(&f, &aarch64::Config::host(None)).unwrap();
+        let module = wasm::compile_module(&[f.clone()], &wasm::Config::default(), |_| None).unwrap();
+        assert!(!module.is_empty());
+        for a in [0u128, u128::MAX, 0x8000_0000_7fff_ffff_ffff_ffff_0000_0001,
+            0x7ff8_0000_0000_0000_8000_0000_0000_0000] {
+            for rhs in [0u128, u128::MAX, 0x3ff0_0000_0000_0000_bff0_0000_0000_0000] {
+                let expected = eval::vector(op, a, rhs).to_le_bytes();
+                for function in [&original, &f] {
+                    let mut memory = env();
+                    memory.mem[..16].copy_from_slice(&a.to_le_bytes());
+                    memory.mem[16..32].copy_from_slice(&rhs.to_le_bytes());
+                    run(function, &mut memory, &[0]).unwrap();
+                    assert_eq!(&memory.mem[32..48], &expected, "{op:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn signed_i32_float_roundtrips_fold_without_losing_high_bits() {
+    for op in [ConvOp::ToJsInt32, ConvOp::ToSintSat] {
+        for to in [Type::I32, Type::I64] {
+            if op == ConvOp::ToJsInt32 && to == Type::I64 { continue; }
+            let mut f = Function::new("i32_roundtrip", Signature::new(vec![Type::I32], vec![to]));
+            let mut b = FunctionBuilder::new(&mut f);
+            let entry = b.create_entry_block();
+            let x = b.block_params(entry)[0];
+            let float = b.convert(ConvOp::FromSint, Type::F64, x);
+            let result = b.convert(op, to, float);
+            b.ret(&[result]);
+            b.finish();
+            let original = f.clone();
+            opt::optimize(&mut f);
+            assert!(!f.layout.iter().flat_map(|b| &f.blocks[b.index()].insts)
+                .any(|i| matches!(f.inst(*i), InstData::Convert { op: ConvOp::FromSint | ConvOp::ToJsInt32 | ConvOp::ToSintSat, .. })));
+            for x in [i32::MIN, -16777217, -1, 0, 1, 16777217, i32::MAX] {
+                assert_eq!(run(&f, &mut env(), &[x as u32 as u64]).unwrap(),
+                    run(&original, &mut env(), &[x as u32 as u64]).unwrap());
+            }
+        }
+    }
+    // I64 -> F64 may round; never erase that round trip.
+    let mut f = Function::new("i64_roundtrip", Signature::new(vec![Type::I64], vec![Type::I64]));
+    let mut b = FunctionBuilder::new(&mut f);
+    let entry = b.create_entry_block();
+    let x = b.block_params(entry)[0];
+    let float = b.convert(ConvOp::FromSint, Type::F64, x);
+    let result = b.convert(ConvOp::ToSintSat, Type::I64, float);
+    b.ret(&[result]);
+    b.finish();
+    opt::optimize(&mut f);
+    let x = (1u64 << 53) + 1;
+    assert_eq!(run(&f, &mut env(), &[x]).unwrap(), vec![x - 1]);
+}
+
+#[test]
 fn checked_i32_keeps_both_results_through_optimization_and_legalization() {
     for op in [CheckedOp::IaddOv, CheckedOp::IsubOv, CheckedOp::ImulOv] {
         let mut f = Function::new("checked", Signature::new(vec![Type::I32; 2], vec![Type::I64]));

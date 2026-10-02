@@ -9,6 +9,85 @@ use crate::unicode_norm_impl::{self as norm, NormData};
 
 pub use db::UNIDATA_VERSION;
 
+/// Unicode versions used by the independent segmentation data providers.
+pub const GRAPHEME_UNICODE_VERSION: (u64, u64, u64) = unicode_segmentation::UNICODE_VERSION;
+pub const LINE_BREAK_UNICODE_VERSION: (u8, u8, u8) = unicode_linebreak::UNICODE_VERSION;
+pub use unicode_linebreak::{BreakOpportunity, break_property, BreakClass};
+
+/// Allocation-free UAX #14 opportunities as UTF-8 byte offsets, including end of text.
+/// Mandatory breaks include paragraph separators and the end of text.
+/// Complex-context scripts use the provider's alphabetic fallback; dictionary breaking is absent.
+pub fn line_breaks(text: &str) -> impl Iterator<Item = (usize, BreakOpportunity)> + '_ {
+    unicode_linebreak::linebreaks(text)
+}
+
+/// Allocation-free extended grapheme clusters (UAX #29), with UTF-8 byte offsets.
+pub fn graphemes(text: &str) -> unicode_segmentation::GraphemeIndices<'_> {
+    unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+}
+
+/// First caret boundary strictly before a byte offset. Out-of-range offsets clamp to end.
+pub fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    unicode_segmentation::GraphemeCursor::new(offset, text.len(), true)
+        .prev_boundary(text, 0).ok().flatten().unwrap_or(0)
+}
+
+/// First caret boundary strictly after a byte offset; out-of-range offsets clamp to end.
+pub fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = scalar_boundary(text, offset);
+    unicode_segmentation::GraphemeCursor::new(offset, text.len(), true)
+        .next_boundary(text, 0).ok().flatten().unwrap_or(text.len())
+}
+
+fn scalar_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+#[cfg(test)]
+mod segmentation_tests {
+    use super::*;
+
+    #[test]
+    fn caret_boundaries_preserve_clusters() {
+        assert_eq!(GRAPHEME_UNICODE_VERSION, (16, 0, 0));
+        assert_eq!(LINE_BREAK_UNICODE_VERSION, (15, 0, 0));
+        for cluster in ["e\u{301}", "\r\n", "🇳🇱", "👩🏽‍💻", "\u{1100}\u{1161}\u{11a8}"] {
+            let text = format!("a{cluster}z");
+            let end = 1 + cluster.len();
+            assert_eq!(graphemes(&text).count(), 3, "{cluster}");
+            for offset in 1..end {
+                assert_eq!(next_grapheme_boundary(&text, offset), end);
+            }
+            for offset in 2..=end {
+                assert_eq!(previous_grapheme_boundary(&text, offset), 1);
+            }
+        }
+        assert_eq!(next_grapheme_boundary("", 100), 0);
+        assert_eq!(previous_grapheme_boundary("", 100), 0);
+        assert_eq!(next_grapheme_boundary("a", 100), 1);
+        assert_eq!(previous_grapheme_boundary("a", 100), 0);
+    }
+
+    #[test]
+    fn line_breaks_preserve_joiners_and_mandatory_breaks() {
+        use BreakOpportunity::{Allowed, Mandatory};
+        assert_eq!(line_breaks("a b").collect::<Vec<_>>(), [(2, Allowed), (3, Mandatory)]);
+        assert_eq!(line_breaks("a\r\nb").collect::<Vec<_>>(), [(3, Mandatory), (4, Mandatory)]);
+        for text in ["a\u{a0}b", "a\u{2060}b", "e\u{301}", "👩🏽‍💻"] {
+            assert_eq!(line_breaks(text).collect::<Vec<_>>(), [(text.len(), Mandatory)]);
+        }
+        assert_eq!(line_breaks("中文").collect::<Vec<_>>(), [(3, Allowed), (6, Mandatory)]);
+    }
+}
+
 /// Which database version answers: the current one or the UCD 3.2.0 deltas.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Version {

@@ -1,13 +1,16 @@
-//! Engine-neutral OS services: `errno` maps OS errors to libuv names and numeric errnos, `fs`
-//! holds the file-system primitives both the Node and the Python runtimes are built on.
+//! Engine-neutral OS services: files, networking, process primitives, and
+//! executable memory mappings shared by language runtimes and code generators.
 
 pub mod child;
 pub mod consts;
 pub mod errno;
+pub mod embedded;
 pub mod fdctl;
 pub mod fs;
 pub mod ident;
+pub mod jitmem;
 pub mod net;
+pub mod native;
 pub mod poll;
 pub mod proc;
 pub mod signal;

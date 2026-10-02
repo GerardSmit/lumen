@@ -306,7 +306,7 @@ pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, Str
     decompress_with(31, data, "gzip", limit)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "none")))]
 pub fn zstd_compress(data: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(data, 0).expect("in-memory zstd compression")
 }
@@ -328,16 +328,16 @@ pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd_decompress_limited(data, usize::MAX)
 }
 /// [`zstd_decompress`], failing with [`OUTPUT_LIMIT`] once the output passes `limit` bytes.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "none")))]
 pub fn zstd_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut decoder = zstd::stream::read::Decoder::new(data).map_err(|e| e.to_string())?;
     read_limited(&mut decoder, limit)
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "none"))]
 pub fn zstd_compress(data: &[u8]) -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "none"))]
 pub fn zstd_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| e.to_string())?;
     read_limited(&mut decoder, limit)

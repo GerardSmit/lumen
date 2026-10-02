@@ -1,4 +1,4 @@
-// DOMException + the DOM event model, flattened: one target, no tree, no capture phase.
+// DOMException and tree-aware event dispatch, also used by standalone worker targets.
 
 const domExceptionCodes = [
   "IndexSizeError", "DOMStringSizeError", "HierarchyRequestError", "WrongDocumentError",
@@ -125,7 +125,7 @@ class Event {
     const bubbles = !!options?.bubbles;
     const cancelable = !!options?.cancelable;
     const composed = !!options?.composed;
-    const state = { cancelable, bubbles, composed, defaultPrevented: false, propagationStopped: false, timeStamp: performance.now() };
+    const state = { cancelable, bubbles, composed, defaultPrevented: false, propagationStopped: false, passive: false, currentTarget: null, phase: 0, path: [], timeStamp: performance.now() };
     Object.defineProperty(this, kEventState, { value: state, enumerable: false });
   }
   [inspectCustom](depth, options, inspect) {
@@ -138,7 +138,7 @@ class Event {
   }
   preventDefault() {
     if (!isEvent(this)) throw invalidThis("Event");
-    this[kEventState].defaultPrevented = true;
+    if (!this[kEventState].passive) this[kEventState].defaultPrevented = true;
   }
   get target() {
     if (!isEvent(this)) throw invalidThis("Event");
@@ -146,7 +146,7 @@ class Event {
   }
   get currentTarget() {
     if (!isEvent(this)) throw invalidThis("Event");
-    return this[kDispatching] ? this[kTarget] : null;
+    return this[kEventState].currentTarget;
   }
   get srcElement() {
     if (!isEvent(this)) throw invalidThis("Event");
@@ -170,7 +170,7 @@ class Event {
   }
   composedPath() {
     if (!isEvent(this)) throw invalidThis("Event");
-    return this[kDispatching] ? [this[kTarget]] : [];
+    return this[kDispatching] ? this[kEventState].path.slice() : [];
   }
   get returnValue() {
     if (!isEvent(this)) throw invalidThis("Event");
@@ -186,7 +186,7 @@ class Event {
   }
   get eventPhase() {
     if (!isEvent(this)) throw invalidThis("Event");
-    return this[kDispatching] ? Event.AT_TARGET : Event.NONE;
+    return this[kEventState].phase;
   }
   get cancelBubble() {
     if (!isEvent(this)) throw invalidThis("Event");
@@ -401,55 +401,96 @@ class EventTarget {
     return new NodeCustomEvent(type, { detail: nodeValue });
   }
   [kHybridDispatch](nodeValue, type, event) {
+    const path = [this];
+    let parent = this.parentNode;
+    while (parent && isEventTarget(parent)) {
+      if (path.includes(parent)) throw new DOMException("Cyclic event target tree", "HierarchyRequestError");
+      path.push(parent);
+      parent = parent.parentNode;
+    }
+    const view = path[path.length - 1]?.defaultView;
+    if (view && isEventTarget(view) && !path.includes(view)) path.push(view);
     const createEvent = () => {
       if (event === undefined) {
         event = this[kCreateEvent](nodeValue, type);
         event[kTarget] = this;
         event[kDispatching] = true;
       }
+      event[kEventState].path = path;
       return event;
     };
     if (event !== undefined) {
       event[kTarget] = this;
       event[kDispatching] = true;
+      event[kStop] = false;
+      event[kEventState].propagationStopped = false;
+      event[kEventState].path = path;
     }
-    const list = this[kEvents].get(type);
-    if (list === undefined || list.length === 0) {
-      if (event !== undefined) event[kDispatching] = false;
-      return true;
-    }
+    const invoke = (target, capture, phase) => {
+    const list = target[kEvents].get(type);
+    if (list === undefined || list.length === 0) return;
     for (const entry of [...list]) {
       if (event?.[kStop] === true && !entry.resist) break;
       if (entry.removed) continue;
+      if (entry.capture !== capture) continue;
       const callback = entryCallback(entry);
       if (callback === undefined) {
-        this.removeEventListener(type, undefined, { capture: entry.capture });
+        target.removeEventListener(type, undefined, { capture: entry.capture });
         continue;
       }
       if (entry.once) {
         entry.removed = true;
-        const live = this[kEvents].get(type);
+        const live = target[kEvents].get(type);
         const at = live?.indexOf(entry) ?? -1;
         if (at >= 0) {
           live.splice(at, 1);
-          if (live.length === 0) this[kEvents].delete(type);
-          this[kRemoveListener](live.length, type, callback, entry.capture);
+          if (live.length === 0) target[kEvents].delete(type);
+          target[kRemoveListener](live.length, type, callback, entry.capture);
         }
       }
       try {
         const arg = entry.nodeStyle ? nodeValue : createEvent();
+        if (event !== undefined) {
+          event[kEventState].currentTarget = target;
+          event[kEventState].phase = phase;
+          event[kEventState].passive = entry.passive;
+        }
         let result;
-        if (typeof callback === "function") result = Reflect.apply(callback, this, [arg]);
+        if (typeof callback === "function") result = Reflect.apply(callback, target, [arg]);
         else result = callback.handleEvent(arg);
-        if (!entry.nodeStyle) arg[kDispatching] = false;
         if (result !== undefined && result !== null && typeof result.then === "function") {
           result.then(undefined, reportUncaught);
         }
       } catch (error) {
         reportUncaught(error);
+      } finally {
+        if (event !== undefined) event[kEventState].passive = false;
       }
     }
-    if (event !== undefined) event[kDispatching] = false;
+    };
+    try {
+      for (let i = path.length - 1; i > 0; i--) {
+        invoke(path[i], true, Event.CAPTURING_PHASE);
+        if (event?.[kEventState].propagationStopped) break;
+      }
+      if (!event?.[kEventState].propagationStopped) {
+        invoke(this, true, Event.AT_TARGET);
+        if (!event?.[kStop]) invoke(this, false, Event.AT_TARGET);
+      }
+      if (event?.bubbles && !event[kEventState].propagationStopped) {
+        for (let i = 1; i < path.length; i++) {
+          invoke(path[i], false, Event.BUBBLING_PHASE);
+          if (event[kEventState].propagationStopped) break;
+        }
+      }
+    } finally {
+      if (event !== undefined) {
+        event[kDispatching] = false;
+        event[kEventState].currentTarget = null;
+        event[kEventState].phase = Event.NONE;
+        event[kEventState].path = [];
+      }
+    }
     return true;
   }
   [inspectCustom](depth, options, inspect) {

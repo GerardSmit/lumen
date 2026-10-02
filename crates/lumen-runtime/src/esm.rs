@@ -49,8 +49,8 @@ pub fn builtin_source(name: &str, exports: &str) -> String {
     src
 }
 
-const EXTENSIONS: [&str; 8] = [
-    ".mjs", ".js", ".jsx", ".json", ".cjs", ".ts", ".mts", ".cts",
+const EXTENSIONS: [&str; 9] = [
+    ".mjs", ".js", ".jsx", ".tsx", ".json", ".cjs", ".ts", ".mts", ".cts",
 ];
 
 /// Build the loader closure `eval_module` wants. It owns everything (`'static`); the engine
@@ -674,12 +674,8 @@ fn load_as_module(file: &Path, cjs_default: bool) -> Option<(String, String)> {
         }
         // `.mjs` is always ESM regardless of package type; `.cjs` is always CommonJS.
         "mjs" => Some((key.clone(), lumen_host::sysfs::read_to_string(file).ok()?)),
-        // `.jsx` is JSX-over-ESM: transpile to plain JS, then load as a module.
-        "jsx" => {
-            let text = lumen_host::sysfs::read_to_string(file).ok()?;
-            let js = crate::jsx::transform(&text).unwrap_or(text);
-            Some((key, js))
-        }
+        // The bare engine parses JSX/TSX natively, keeping the original source coordinates.
+        "jsx" | "tsx" => Some((key, lumen_host::sysfs::read_to_string(file).ok()?)),
         "cjs" => Some((key.clone(), cjs_wrapper(&key, source_of(file)))),
         // TypeScript: the engine parses it itself by the key's extension (Node's strip-only
         // semantics, every offset kept; `require` of a `.cts`/CJS `.ts` goes through
@@ -1255,6 +1251,26 @@ fn normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn malformed_jsx_dependency_reports_native_parse_error() {
+        let file = std::env::temp_dir().join(format!("lumen-malformed-{}.jsx", std::process::id()));
+        std::fs::write(&file, "export default <div>").unwrap();
+        let (key, source) = super::load_as_module(&file, false).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(source, "export default <div>");
+        let mut engine = lumen::Engine::new();
+        let result = engine.eval_module(&source, &key, |_, _| None).unwrap();
+        match result {
+            lumen::Completion::Throw { name, message } => {
+                assert_eq!(name, "SyntaxError");
+                assert!(message.contains(&key), "{message}");
+                assert!(message.contains(":1:21:"), "{message}");
+                assert!(message.contains("unterminated JSX element"), "{message}");
+            }
+            lumen::Completion::Value(_) => panic!("malformed JSX evaluated"),
+        }
+    }
+
     #[test]
     fn source_cache_bounds_bytes_and_keeps_recent_sources() {
         use super::*;

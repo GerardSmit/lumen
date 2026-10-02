@@ -19,9 +19,13 @@ use lumen_host::Completion;
 use lumen_repl::Repl;
 use lumen_runtime::Runtime;
 
-mod dotenv;
 mod aot;
+mod aot_config;
+mod aot_runtime_plan;
+mod aot_transport;
+mod dotenv;
 mod options;
+mod render;
 mod typed;
 
 /// The engine's size-class allocator: JS workloads are dominated by millions of short-lived
@@ -65,6 +69,29 @@ fn main() {
 
 fn real_main() {
     let all_args: Vec<String> = std::env::args().collect();
+    match lumen_os::embedded::blob() {
+        Ok(Some(blob)) => {
+            let mut runtime = Runtime::new();
+            if let Err(message) = runtime.install_embedded_assets(blob) { die(1, &message); }
+            runtime.set_process_args(&all_args[0], &[], &all_args);
+            let native = blob.get(8..12).is_some_and(|bytes| bytes == 7u32.to_le_bytes());
+            let result = if native {
+                runtime.run_native_owned(blob.into())
+            } else {
+                runtime.run_precompiled(&lumen::Precompiled::from_static(blob))
+            };
+            if let Err(message) = result { die(1, &message); }
+            finish(&mut runtime);
+            return;
+        }
+        Ok(None) => {}
+        Err(message) => die(1, &message),
+    }
+    if all_args.get(1).map(String::as_str) == Some("record-profile")
+        || (all_args.get(1).map(String::as_str) == Some("run") && all_args.iter().any(|arg| arg == "--record-profile")) {
+        if let Err(message) = aot::record_profile(&all_args[2..]) { die(1, &message); }
+        return;
+    }
     if all_args.get(1).map(String::as_str) == Some("compile") {
         if let Err(message) = aot::compile(&all_args[2..]) {
             die(1, &message);
@@ -73,6 +100,54 @@ fn real_main() {
     }
     if all_args.get(1).map(String::as_str) == Some("target") {
         if let Err(message) = aot::write_target(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("target-device") {
+        if let Err(message) = aot_transport::target_device(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("upload") {
+        if let Err(message) = aot_transport::upload(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("inventory") {
+        if let Err(message) = aot_transport::inventory(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("pack-install") {
+        if let Err(message) = aot::pack_install(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("sign-native") {
+        if let Err(message) = aot::sign_native(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("symbolize-native") {
+        if let Err(message) = aot::symbolize_native(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("runtime-imports") {
+        if let Err(message) = aot::runtime_imports(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("render") {
+        if let Err(message) = render::run(&all_args[2..]) {
             die(1, &message);
         }
         return;
@@ -88,7 +163,9 @@ fn real_main() {
     let mut args: Vec<String> = all_args.iter().skip(1).cloned().collect();
     if args.first().map(String::as_str) == Some("run") {
         args.remove(0);
-        if args.is_empty() { die(1, "run requires an entry file"); }
+        if args.is_empty() {
+            die(1, "run requires an entry file");
+        }
     }
     let force_repl = args.first().map(String::as_str) == Some("repl");
     if force_repl {
@@ -100,9 +177,7 @@ fn real_main() {
         die(e.status, &e.message);
     }
     if cli.help {
-        println!(
-            "usage: lumen-cli [repl | file.js [args...] | -e code] [--tier=interp|bytecode]"
-        );
+        println!("usage: lumen-cli [repl | file.js [args...] | -e code] [--tier=interp|bytecode]");
         return;
     }
     if cli.version {
@@ -123,17 +198,28 @@ fn real_main() {
     }
 
     let permission = opts.flag("--experimental-permission") || opts.flag("--permission");
-    if !permission && (!opts.list("--allow-fs-read").is_empty() || !opts.list("--allow-fs-write").is_empty()) {
+    if !permission
+        && (!opts.list("--allow-fs-read").is_empty() || !opts.list("--allow-fs-write").is_empty())
+    {
         let flag = if opts.list("--allow-fs-read").is_empty() {
             "--allow-fs-write"
         } else {
             "--allow-fs-read"
         };
-        die(1, &format!("{argv0}: --experimental-permission is required for {flag}"));
+        die(
+            1,
+            &format!("{argv0}: --experimental-permission is required for {flag}"),
+        );
     }
     if let Some(mode) = opts.string("--unhandled-rejections") {
-        if !matches!(mode, "strict" | "warn" | "none" | "throw" | "warn-with-error-code") {
-            die(9, &format!("{argv0}: invalid value for --unhandled-rejections"));
+        if !matches!(
+            mode,
+            "strict" | "warn" | "none" | "throw" | "warn-with-error-code"
+        ) {
+            die(
+                9,
+                &format!("{argv0}: invalid value for --unhandled-rejections"),
+            );
         }
     }
     if opts.flag("--test") {
@@ -147,14 +233,23 @@ fn real_main() {
             None
         };
         if let Some(other) = conflict {
-            die(9, &format!("{argv0}: either --test or {other} can be used, not both"));
+            die(
+                9,
+                &format!("{argv0}: either --test or {other} can be used, not both"),
+            );
         }
         if opts.string("--watch-path").is_some() {
-            die(9, &format!("{argv0}: --watch-path cannot be used in combination with --test"));
+            die(
+                9,
+                &format!("{argv0}: --watch-path cannot be used in combination with --test"),
+            );
         }
     }
     if opts.check && opts.eval.is_some() {
-        die(9, &format!("{argv0}: either --check or --eval can be used, not both"));
+        die(
+            9,
+            &format!("{argv0}: either --check or --eval can be used, not both"),
+        );
     }
     let module_input = match opts.string("--input-type") {
         None => false,
@@ -166,7 +261,10 @@ fn real_main() {
         ),
     };
     if module_input && opts.print {
-        die(1, &format!("{argv0}: --print cannot be used with ESM input"));
+        die(
+            1,
+            &format!("{argv0}: --print cannot be used with ESM input"),
+        );
     }
 
     let tier = match opts.string("--tier") {
@@ -175,7 +273,9 @@ fn real_main() {
         Some("interp") => Some(lumen_host::Tier::Interp),
         Some(other) => die(2, &format!("unknown tier '{other}' (interp|bytecode)")),
     };
-    let threshold = opts.string("--tier-threshold").and_then(|n| n.parse::<u32>().ok());
+    let threshold = opts
+        .string("--tier-threshold")
+        .and_then(|n| n.parse::<u32>().ok());
     let expose_gc = opts.flag("--expose-gc");
 
     // `--test`: the operands are test files or directories, not a script.
@@ -187,7 +287,9 @@ fn real_main() {
     };
     let script_args: Vec<String> = match &file {
         Some(_) => opts.rest[1..].to_vec(),
-        None if opts.stdin_dash => std::iter::once("-".to_string()).chain(opts.rest.iter().cloned()).collect(),
+        None if opts.stdin_dash => std::iter::once("-".to_string())
+            .chain(opts.rest.iter().cloned())
+            .collect(),
         None => opts.rest.clone(),
     };
 
@@ -222,7 +324,10 @@ fn real_main() {
         None => None,
         Some(n) => match n.parse::<f64>() {
             Ok(mb) if mb > 0.0 => Some(mb),
-            _ => die(2, &format!("{argv0}: invalid value for --max-old-space-size={n}")),
+            _ => die(
+                2,
+                &format!("{argv0}: invalid value for --max-old-space-size={n}"),
+            ),
         },
     };
     let timeout_ms = match opts.string("--timeout") {
@@ -342,7 +447,9 @@ fn js_string_array(items: &[String]) -> String {
 fn eval_checked(runtime: &mut Runtime, code: &str) -> String {
     match runtime.eval(code) {
         Ok(Completion::Value(v)) => v,
-        Ok(Completion::Throw { name, message }) if name.is_empty() => die(1, &format!("Uncaught {message}")),
+        Ok(Completion::Throw { name, message }) if name.is_empty() => {
+            die(1, &format!("Uncaught {message}"))
+        }
         Ok(Completion::Throw { name, message }) => die(1, &format!("Uncaught {name}: {message}")),
         Err(e) => die(1, &format!("SyntaxError: {} (line {})", e.message, e.line)),
     }
@@ -366,10 +473,16 @@ fn run_entry(runtime: &mut Runtime, path: &str) {
 
 fn build_snapshot(runtime: &mut Runtime, opts: &options::Parsed, argv0: &str, file: Option<&str>) {
     let Some(entry) = file else {
-        die(9, &format!("{argv0}: --build-snapshot must be used with an entry point script."));
+        die(
+            9,
+            &format!("{argv0}: --build-snapshot must be used with an entry point script."),
+        );
     };
     if entry == "node:embedded_snapshot_main" {
-        die(9, &format!("{argv0}: Node.js was built without embedded snapshot"));
+        die(
+            9,
+            &format!("{argv0}: Node.js was built without embedded snapshot"),
+        );
     }
     let entry = absolute(entry);
     run_entry(runtime, &entry);
@@ -392,7 +505,10 @@ fn replay_snapshot(runtime: &mut Runtime, opts: &options::Parsed, argv0: &str, b
     let mut lines = text.lines();
     let (magic, entry, flags) = (lines.next(), lines.next(), lines.next().unwrap_or(""));
     let Some(entry) = entry.filter(|_| magic == Some(SNAPSHOT_MAGIC)) else {
-        die(14, &format!("{argv0}: Failed to load the startup snapshot {blob}"));
+        die(
+            14,
+            &format!("{argv0}: Failed to load the startup snapshot {blob}"),
+        );
     };
     if flags != v8_flag_signature(opts) {
         die(14, &format!("{argv0}: Failed to load the startup snapshot {blob}: V8 flags differ from those it was built with"));
@@ -405,9 +521,11 @@ fn replay_snapshot(runtime: &mut Runtime, opts: &options::Parsed, argv0: &str, b
 /// Load each `--env-file` into the process environment. Variables already set in the real
 /// environment win; a later file overrides an earlier one.
 fn load_env_files(argv0: &str, cli: &options::Parsed) {
-    let original: std::collections::HashSet<String> =
-        std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
-    let optional: std::collections::HashSet<&String> = cli.list("--env-file-if-exists").iter().collect();
+    let original: std::collections::HashSet<String> = std::env::vars_os()
+        .map(|(k, _)| k.to_string_lossy().into_owned())
+        .collect();
+    let optional: std::collections::HashSet<&String> =
+        cli.list("--env-file-if-exists").iter().collect();
     let files = cli
         .list("--env-file")
         .iter()
@@ -436,10 +554,7 @@ fn run_preloads(runtime: &mut Runtime, opts: &options::Parsed, cwd: &str) {
             .filter(|r| seen.insert(r.as_str()))
             .map(|r| js_string_literal(r))
             .collect();
-        let src = format!(
-            "require('module')._preloadModules([{}]);",
-            unique.join(",")
-        );
+        let src = format!("require('module')._preloadModules([{}]);", unique.join(","));
         run_prelude(runtime, &src);
     }
     let imports = opts.list("--import");
@@ -466,7 +581,10 @@ fn run_prelude(runtime: &mut Runtime, src: &str) {
 }
 
 fn run_module_text(runtime: &mut Runtime, src: &str, cwd: &str, name: &str) {
-    let key = std::path::Path::new(cwd).join(name).to_string_lossy().into_owned();
+    let key = std::path::Path::new(cwd)
+        .join(name)
+        .to_string_lossy()
+        .into_owned();
     if let Err(e) = runtime.run_module_source(src, &key) {
         die(1, &format!("Uncaught {e}"));
     }
@@ -484,11 +602,18 @@ fn finish(runtime: &mut Runtime) {
 fn check_only(runtime: &mut Runtime, file: Option<&str>, module_input: bool) {
     let (name, source, module) = match file {
         Some(path) => {
-            let resolved = resolve_script(path)
-                .unwrap_or_else(|| die(1, &format!("Error: Cannot find module '{}'", absolute(path))));
+            let resolved = resolve_script(path).unwrap_or_else(|| {
+                die(
+                    1,
+                    &format!("Error: Cannot find module '{}'", absolute(path)),
+                )
+            });
             match std::fs::read_to_string(&resolved) {
                 Ok(s) => (resolved.clone(), s, is_esm_entry(&resolved)),
-                Err(_) => die(1, &format!("Error: Cannot find module '{}'", absolute(path))),
+                Err(_) => die(
+                    1,
+                    &format!("Error: Cannot find module '{}'", absolute(path)),
+                ),
             }
         }
         None => {
@@ -505,11 +630,16 @@ fn check_only(runtime: &mut Runtime, file: Option<&str>, module_input: bool) {
     };
     let wrapper = patched_wrapper(runtime);
     let result = match (&wrapper, module) {
-        (Some((open, close)), false) => lumen::check_script_syntax(&format!("{open}{source}{close}")),
+        (Some((open, close)), false) => {
+            lumen::check_script_syntax(&format!("{open}{source}{close}"))
+        }
         _ => lumen::check_syntax(&source, module),
     };
     if let Err(e) = result {
-        let text = source.lines().nth((e.line as usize).saturating_sub(1)).unwrap_or("");
+        let text = source
+            .lines()
+            .nth((e.line as usize).saturating_sub(1))
+            .unwrap_or("");
         die(
             1,
             &format!(
@@ -696,12 +826,16 @@ const TIMEOUT_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(5
 /// finish within a few seconds does the watchdog exit the process itself.
 fn start_watchdog(runtime: &mut Runtime, ms: u64) {
     let handle = runtime.interrupt_handle();
-    lumen::limits::Deadline::start("lumen-timeout", std::time::Duration::from_millis(ms), move || {
-        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-        handle.interrupt();
-        std::thread::sleep(TIMEOUT_EXIT_GRACE);
-        exit_if_timed_out();
-    })
+    lumen::limits::Deadline::start(
+        "lumen-timeout",
+        std::time::Duration::from_millis(ms),
+        move || {
+            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+            handle.interrupt();
+            std::thread::sleep(TIMEOUT_EXIT_GRACE);
+            exit_if_timed_out();
+        },
+    )
     .detach();
 }
 

@@ -13,6 +13,17 @@ pub mod aarch64 {
     pub const ALL: u64 = (1 << 8) - 1;
 }
 
+/// Stable x86-64 extensions above the architectural SSE2 baseline.
+/// Bit meanings are architecture-specific; AVX state is not required by these paths.
+pub mod x64 {
+    pub const LZCNT: u64 = 1 << 0;
+    pub const BMI1: u64 = 1 << 1;
+    pub const BMI2: u64 = 1 << 2;
+    pub const POPCNT: u64 = 1 << 3;
+    pub const SSE41: u64 = 1 << 4;
+    pub const ALL: u64 = (1 << 5) - 1;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Arch {
@@ -51,24 +62,38 @@ pub struct TargetSpec {
     pub arch: Arch,
     pub abi: Abi,
     pub pointer_width: u8,
+    /// Runtime memory page size used for the native code/GOT boundary.
+    pub page_size: u32,
     pub features: u64,
+    /// Hash of built-in module names and native signatures available on device.
+    pub builtin_modules_hash: u64,
     pub profile: Profile,
     pub code_placement: Placement,
 }
 
 impl TargetSpec {
-    pub const ENCODED_LEN: usize = 72;
+    pub const ENCODED_LEN: usize = 88;
 
     /// Check a blob's requirements against the executing engine.
     pub fn supported_by(&self, host: &Self) -> Result<(), &'static str> {
         self.validate()?;
         host.validate()?;
-        if self.lumen_version != host.lumen_version || self.bytecode_fp != host.bytecode_fp
-            || self.native_fp != host.native_fp {
+        if self.lumen_version != host.lumen_version
+            || self.bytecode_fp != host.bytecode_fp
+            || self.native_fp != host.native_fp
+        {
             return Err("target version or layout fingerprint mismatch");
         }
-        if self.arch != host.arch || self.abi != host.abi || self.pointer_width != host.pointer_width {
+        if self.arch != host.arch
+            || self.abi != host.abi
+            || self.pointer_width != host.pointer_width
+        {
             return Err("target architecture or ABI mismatch");
+        }
+        if self.page_size != host.page_size
+            || self.builtin_modules_hash != host.builtin_modules_hash
+        {
+            return Err("target page size or built-in modules mismatch");
         }
         if self.features & !host.features != 0 {
             return Err("target requires unavailable CPU features");
@@ -82,7 +107,8 @@ impl TargetSpec {
     pub fn validate(&self) -> Result<(), &'static str> {
         let valid = match self.arch {
             Arch::Aarch64 => {
-                self.pointer_width == 64 && matches!(self.abi, Abi::Aapcs64 | Abi::Apple64)
+                self.pointer_width == 64
+                    && matches!(self.abi, Abi::Aapcs64 | Abi::Apple64 | Abi::Win64)
             }
             Arch::X86_64 => {
                 self.pointer_width == 64 && matches!(self.abi, Abi::SysV64 | Abi::Win64)
@@ -92,9 +118,15 @@ impl TargetSpec {
         if !valid {
             return Err("inconsistent architecture, ABI or pointer width");
         }
-        if (self.arch == Arch::Aarch64 && self.features & !aarch64::ALL != 0)
-            || (self.arch != Arch::Aarch64 && self.features != 0)
-        {
+        if self.page_size < 4096 || self.page_size > 65536 || !self.page_size.is_power_of_two() {
+            return Err("invalid native page size");
+        }
+        let allowed = match self.arch {
+            Arch::Aarch64 => aarch64::ALL,
+            Arch::X86_64 => x64::ALL,
+            Arch::Wasm32 => 0,
+        };
+        if self.features & !allowed != 0 {
             return Err("unknown CPU features for architecture");
         }
         match self.profile {
@@ -107,7 +139,11 @@ impl TargetSpec {
             _ => {}
         }
         if let Placement::ExecuteInPlace { base, len } = self.code_placement {
-            if len == 0 || base.checked_add(len).is_none() {
+            if len == 0
+                || base.checked_add(len).is_none()
+                || base % u64::from(self.page_size) != 0
+                || len % u64::from(self.page_size) != 0
+            {
                 return Err("invalid execute-in-place range");
             }
         }
@@ -118,7 +154,7 @@ impl TargetSpec {
     pub fn encode(&self) -> Result<[u8; Self::ENCODED_LEN], &'static str> {
         self.validate()?;
         let mut b = [0; Self::ENCODED_LEN];
-        b[..8].copy_from_slice(b"LUMTGT01");
+        b[..8].copy_from_slice(b"LUMTGT02");
         b[8..24].copy_from_slice(&self.lumen_version);
         b[24..32].copy_from_slice(&self.bytecode_fp.to_le_bytes());
         b[32..40].copy_from_slice(&self.native_fp.to_le_bytes());
@@ -132,17 +168,31 @@ impl TargetSpec {
             b[56..64].copy_from_slice(&base.to_le_bytes());
             b[64..72].copy_from_slice(&len.to_le_bytes());
         }
+        b[72..76].copy_from_slice(&self.page_size.to_le_bytes());
+        b[80..88].copy_from_slice(&self.builtin_modules_hash.to_le_bytes());
         Ok(b)
     }
 
     pub fn decode(b: &[u8]) -> Result<Self, &'static str> {
-        if b.len() != Self::ENCODED_LEN || &b[..8] != b"LUMTGT01" {
+        let legacy = b.len() == 72 && &b[..8] == b"LUMTGT01";
+        if !legacy && (b.len() != Self::ENCODED_LEN || &b[..8] != b"LUMTGT02") {
             return Err("invalid target header");
         }
-        if b[45..48] != [0; 3] {
+        if b[45..48] != [0; 3] || (!legacy && b[76..80] != [0; 4]) {
             return Err("unsupported target flags");
         }
         let u64_at = |at| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        if legacy && u64_at(32) != 0 {
+            return Err("legacy target cannot advertise native ABI");
+        }
+        let abi = match b[41] {
+            1 => Abi::Aapcs64,
+            2 => Abi::Apple64,
+            3 => Abi::SysV64,
+            4 => Abi::Win64,
+            5 => Abi::Wasm,
+            _ => return Err("unknown ABI"),
+        };
         let spec = Self {
             lumen_version: b[8..24].try_into().unwrap(),
             bytecode_fp: u64_at(24),
@@ -153,15 +203,17 @@ impl TargetSpec {
                 3 => Arch::Wasm32,
                 _ => return Err("unknown architecture"),
             },
-            abi: match b[41] {
-                1 => Abi::Aapcs64,
-                2 => Abi::Apple64,
-                3 => Abi::SysV64,
-                4 => Abi::Win64,
-                5 => Abi::Wasm,
-                _ => return Err("unknown ABI"),
-            },
+            abi,
             pointer_width: b[42],
+            page_size: if legacy {
+                match abi {
+                    Abi::Apple64 => 16384,
+                    Abi::Wasm => 65536,
+                    _ => 4096,
+                }
+            } else {
+                u32::from_le_bytes(b[72..76].try_into().unwrap())
+            },
             profile: match b[43] {
                 1 => Profile::Full,
                 2 => Profile::NoJit,
@@ -169,6 +221,7 @@ impl TargetSpec {
                 _ => return Err("unknown profile"),
             },
             features: u64_at(48),
+            builtin_modules_hash: if legacy { 0 } else { u64_at(80) },
             code_placement: match b[44] {
                 0 if u64_at(56) == 0 && u64_at(64) == 0 => Placement::Ram,
                 1 => Placement::ExecuteInPlace {
@@ -195,7 +248,9 @@ mod tests {
             arch: Arch::Aarch64,
             abi: Abi::Aapcs64,
             pointer_width: 64,
+            page_size: 4096,
             features: 0,
+            builtin_modules_hash: 0,
             profile: Profile::Full,
             code_placement: Placement::Ram,
         }
@@ -220,6 +275,11 @@ mod tests {
                 assert!(TargetSpec::decode(&b[..n]).is_err());
             }
         }
+        let encoded = spec().encode().unwrap();
+        let mut legacy = [0; 72];
+        legacy.copy_from_slice(&encoded[..72]);
+        legacy[..8].copy_from_slice(b"LUMTGT01");
+        assert_eq!(TargetSpec::decode(&legacy).unwrap(), spec());
     }
 
     #[test]
@@ -249,7 +309,7 @@ mod tests {
         .encode()
         .is_err());
         assert!(TargetSpec {
-            abi: Abi::Win64,
+            abi: Abi::SysV64,
             ..spec()
         }
         .encode()
@@ -263,10 +323,32 @@ mod tests {
         assert!(TargetSpec {
             arch: Arch::X86_64,
             abi: Abi::SysV64,
-            features: aarch64::LSE,
+            features: x64::ALL + 1,
             ..spec()
         }
         .encode()
         .is_err());
+    }
+
+    #[test]
+    fn x64_features_roundtrip_and_require_an_available_subset() {
+        let host = TargetSpec {
+            arch: Arch::X86_64,
+            abi: Abi::Win64,
+            features: x64::ALL,
+            ..spec()
+        };
+        assert_eq!(TargetSpec::decode(&host.encode().unwrap()).unwrap(), host);
+        let required = TargetSpec {
+            features: x64::BMI2 | x64::SSE41,
+            ..host
+        };
+        assert!(required.supported_by(&host).is_ok());
+        assert!(required
+            .supported_by(&TargetSpec {
+                features: x64::BMI2,
+                ..host
+            })
+            .is_err());
     }
 }

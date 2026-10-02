@@ -1,0 +1,16 @@
+<!-- A self-contained 1x1 opaque black PNG. Luminance mode must hide the red box even though
+     source alpha is 1; alpha mode would instead preserve it.  Its uniform tile avoids every
+     antialiased sampling boundary, making the managed/PDF/ImageSharp comparison exact. -->
+<style>
+html, body { margin: 0; padding: 0; background: white; }
+#masked {
+  width: 20px;
+  height: 20px;
+  background: #e11;
+  mask-image: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==');
+  mask-size: 20px 20px;
+  mask-repeat: no-repeat;
+  mask-mode: luminance;
+}
+</style>
+<div id="masked"></div>

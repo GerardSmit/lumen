@@ -24,7 +24,9 @@ pub fn units(s: &str) -> Vec<u16> {
     let mut at = 0;
     while at < s.len() {
         at += lumen_common::scan::utf8_bmp_prefix(&s[at..], &mut out);
-        if at == s.len() { break; }
+        if at == s.len() {
+            break;
+        }
         let c = s[at..].chars().next().unwrap();
         match smuggled(c) {
             Some(u) => out.push(u),
@@ -65,7 +67,9 @@ pub fn from_units(units: &[u16]) -> String {
     let mut i = 0;
     while i < units.len() {
         i += lumen_common::scan::utf16_bmp_prefix(&units[i..], &mut out);
-        if i == units.len() { break; }
+        if i == units.len() {
+            break;
+        }
         let u = units[i] as u32;
         if (0xD800..0xDC00).contains(&u)
             && i + 1 < units.len()
@@ -122,8 +126,12 @@ pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
     // boundary, so its units are a prefix too).
     let (x, y) = (a.as_bytes(), b.as_bytes());
     let k = lumen_common::scan::common_prefix(x, y);
-    if k == x.len().min(y.len()) { return x.len().cmp(&y.len()); }
-    if x[k] < 0x80 && y[k] < 0x80 { return x[k].cmp(&y[k]); }
+    if k == x.len().min(y.len()) {
+        return x.len().cmp(&y.len());
+    }
+    if x[k] < 0x80 && y[k] < 0x80 {
+        return x[k].cmp(&y[k]);
+    }
     let mut ia = UnitIter::new(a);
     let mut ib = UnitIter::new(b);
     loop {
@@ -308,7 +316,13 @@ mod tests {
     fn well_formed_undoes_smuggling() {
         // U+10FFFF and U+10F800 (stored as smuggled pairs), a lone low and a lone high surrogate.
         let s = super::from_units(&[0x78, 0xDBFF, 0xDFFF, 0xDBFE, 0xDC00, 0xDC00, 0xD800, 0x79]);
-        assert_eq!(super::well_formed(&s), "x\u{10FFFF}\u{10F800}\u{FFFD}\u{FFFD}y");
-        assert!(matches!(super::well_formed("plain é"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            super::well_formed(&s),
+            "x\u{10FFFF}\u{10F800}\u{FFFD}\u{FFFD}y"
+        );
+        assert!(matches!(
+            super::well_formed("plain é"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

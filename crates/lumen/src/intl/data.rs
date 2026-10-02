@@ -1,5 +1,11 @@
 //! Embedded CLDR-derived formatting data (a deliberate subset). Grown as the intl402 score climbs.
 
+include!(concat!(env!("OUT_DIR"), "/lumen_locales.rs"));
+
+pub fn locale_selected(language: &str) -> bool {
+    SELECTED_LANGUAGES.is_none_or(|languages| languages.binary_search(&language).is_ok())
+}
+
 /// The (decimal, group) separators for a locale's `latn` number symbols, and the grouping sizes
 /// (primary, secondary) — e.g. Indian `en-IN` groups as 3;2.
 pub fn number_symbols(lang: &str, region: &str) -> (&'static str, &'static str, (usize, usize)) {
@@ -84,6 +90,7 @@ pub fn plural_cardinal(lang: &str, i: u64, has_fraction: bool, e: i32) -> &'stat
             }
         }
         // French: one iff i = 0,1; many when e=0 and i is a non-zero whole 10^6 multiple, or e∉0..5.
+        #[cfg(any(lumen_all_locales, lumen_locale = "fr"))]
         "fr" => {
             if i == 0 || i == 1 {
                 "one"
@@ -96,6 +103,7 @@ pub fn plural_cardinal(lang: &str, i: u64, has_fraction: bool, e: i32) -> &'stat
             }
         }
         // Manx (gv): one/two/few on i mod 10/100 with v=0; many when v!=0.
+        #[cfg(any(lumen_all_locales, lumen_locale = "gv"))]
         "gv" => {
             if has_fraction {
                 "many"
@@ -111,6 +119,7 @@ pub fn plural_cardinal(lang: &str, i: u64, has_fraction: bool, e: i32) -> &'stat
         }
         // Polish (pl) — also ru/uk/be: one iff i=1; few for i%10=2..4 (excluding i%100=12..14);
         // everything else (integers) many; fractions other.
+        #[cfg(any(lumen_all_locales, lumen_locale = "pl"))]
         "pl" => {
             if has_fraction {
                 "other"
@@ -123,6 +132,7 @@ pub fn plural_cardinal(lang: &str, i: u64, has_fraction: bool, e: i32) -> &'stat
             }
         }
         // Slovenian (sl): one/two/few on i mod 100 with v=0; few also when v!=0.
+        #[cfg(any(lumen_all_locales, lumen_locale = "sl"))]
         "sl" => {
             if !has_fraction && i % 100 == 1 {
                 "one"
@@ -150,11 +160,15 @@ pub fn plural_cardinal(lang: &str, i: u64, has_fraction: bool, e: i32) -> &'stat
 pub fn plural_categories(lang: &str) -> &'static [&'static str] {
     match lang {
         "ja" | "zh" | "ko" | "th" | "id" | "vi" => &["other"],
+        #[cfg(any(lumen_all_locales, lumen_locale = "ar"))]
         "ar" => &["zero", "one", "two", "few", "many", "other"],
         "ru" | "uk" | "pl" => &["one", "few", "many", "other"],
         "cs" | "sk" => &["one", "few", "many", "other"],
+        #[cfg(any(lumen_all_locales, lumen_locale = "fr"))]
         "fr" => &["one", "many", "other"],
+        #[cfg(any(lumen_all_locales, lumen_locale = "gv"))]
         "gv" => &["one", "two", "few", "many", "other"],
+        #[cfg(any(lumen_all_locales, lumen_locale = "sl"))]
         "sl" => &["one", "two", "few", "other"],
         _ => &["one", "other"],
     }

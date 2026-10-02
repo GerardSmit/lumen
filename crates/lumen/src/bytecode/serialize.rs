@@ -545,6 +545,7 @@ fn enc_chunk(
     // Exhaustive: a new `Chunk` field is a compile error here until the codec decides whether
     // it is compile output (serialize it) or runtime state (rebuild it in `dec_chunk`).
     let Chunk {
+        debug_name: _,
         ops,
         consts,
         names,
@@ -563,6 +564,8 @@ fn enc_chunk(
         env_this,
         caches,
         jit: _, // runtime state
+        #[cfg(feature = "bench")]
+        precompiled_origin: _, // measurement-only runtime state
         obj_maps,
         name_caches,
         name_paths,
@@ -574,6 +577,8 @@ fn enc_chunk(
         reflect_args,
         positions,
         inline_cbs: _, // runtime state; rescanned from the ops
+        #[cfg(feature = "compiler")]
+        feedback_key: _,
     } = chunk;
     if !classes.is_empty() {
         return Err("class definitions are not carried by the codec".into());
@@ -813,6 +818,7 @@ fn dec_chunk(
     if n_switch_tables > ops.len() { return Err("bytecode: bad switch table count".into()); }
     let activation_layout = activation::ActivationLayout::new(&cap_inits, env_this, &names);
     Ok(Chunk {
+        debug_name: "<precompiled>".into(),
         ops,
         consts,
         names,
@@ -831,6 +837,8 @@ fn dec_chunk(
         env_this,
         caches: (0..n_caches).map(|_| Cell::new(IcState::EMPTY)).collect(),
         jit: Default::default(),
+        #[cfg(feature = "bench")]
+        precompiled_origin: None,
         obj_maps: (0..n_obj_maps).map(|_| OnceCell::new()).collect(),
         name_pins: RefCell::new(vec![None; n_name_caches]),
         name_paths: (0..n_name_caches).map(|_| RefCell::new(None)).collect(),
@@ -844,6 +852,8 @@ fn dec_chunk(
         reflect_args: flags & 32 != 0,
         positions,
         inline_cbs: Default::default(),
+        #[cfg(feature = "compiler")]
+        feedback_key: Default::default(),
     })
 }
 
@@ -1052,7 +1062,20 @@ impl LazyUnit {
         let end = (start as usize).checked_add(len as usize).ok_or("bytecode: bad chunk length")?;
         let bytes = self.section.get(start as usize..end).ok_or("bytecode: bad chunk range")?;
         let lookup = |i: usize| ast.function(i).ok();
-        dec_chunk_at(bytes, &mut self.strings.borrow_mut(), &lookup).map(Some)
+        let mut chunk = dec_chunk_at(bytes, &mut self.strings.borrow_mut(), &lookup)?;
+        if let Ok(function) = ast.function(idx) {
+            chunk.debug_name = function.name.clone().unwrap_or_else(|| "<anonymous>".into());
+        }
+        #[cfg(feature = "bench")]
+        {
+            let mut chunk = chunk;
+            chunk.precompiled_origin = Some((idx, len as usize));
+            Ok(Some(chunk))
+        }
+        #[cfg(not(feature = "bench"))]
+        {
+            Ok(Some(chunk))
+        }
     }
 }
 

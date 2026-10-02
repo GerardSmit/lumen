@@ -5,6 +5,8 @@
 use crate::token::{Name, RegexTok, SubToks, Tok, TokVec, Token, TplPart};
 use std::rc::Rc;
 
+mod jsx;
+
 #[derive(Debug, Clone)]
 pub struct LexError {
     pub message: String,
@@ -50,6 +52,7 @@ struct Lexer<'a> {
     /// TypeScript source: a postfix non-null `!` (`x!`) ends an expression, so a `/` after it is
     /// a division.
     ts: bool,
+    jsx: bool,
     /// Where `/**` comments go (their byte ranges), when the caller asked for them (the typed
     /// tier's JSDoc side table). Only a JSDoc comment costs anything.
     docs: Option<Vec<(u32, u32)>>,
@@ -98,6 +101,7 @@ pub(crate) struct Lexed {
 pub(crate) struct LexOpts {
     /// TypeScript source (see `Lexer::ts`).
     pub ts: bool,
+    pub jsx: bool,
     /// Record the byte ranges of `/** */` comments.
     pub docs: bool,
     /// A leading `/` is a division.
@@ -132,6 +136,7 @@ pub(crate) fn tokenize_opts(
         pending_fn: Vec::new(),
         pending_class: None,
         ts: opts.ts,
+        jsx: opts.jsx,
         docs: opts.docs.then(Vec::new),
         start_div: opts.start_div,
         idents: Default::default(),
@@ -199,7 +204,8 @@ impl Lexer<'_> {
         c
     }
     fn err(&self, message: impl Into<String>) -> LexError {
-        crate::parser::set_error_span(self.pos as u32, self.pos as u32 + 1);
+        let start = self.pos as u32 + self.offset;
+        crate::parser::set_error_span(start, start + u32::from(self.pos < self.bytes.len()));
         LexError {
             message: message.into(),
             line: self.line,
@@ -213,7 +219,7 @@ impl Lexer<'_> {
     fn regex_allowed(&self) -> bool {
         match self.tok_back(0).map(|t| &t.kind) {
             None => !self.start_div,
-            Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Regex(_)) => {
+            Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Jsx(_) | Tok::Regex(_)) => {
                 false
             }
             // `await`/`yield` are contextual: when they are keywords (module top level, async or
@@ -426,6 +432,15 @@ impl Lexer<'_> {
         {
             // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
             self.skip_line_comment();
+        } else if c == '<' && self.jsx && self.regex_allowed() && self.jsx_starts() {
+            let (start, nl) = (self.tok_start, std::mem::take(&mut self.nl_pending));
+            let element = self.read_jsx_element()?;
+            self.tok_start = start;
+            self.nl_pending = nl;
+            self.push(Tok::Jsx(Rc::new(element)));
+            if let Some(token) = self.out.last_mut() {
+                if let Tok::Jsx(element) = &token.kind { token.line = element.line; }
+            }
         } else if c == '/' && self.regex_allowed() {
             if self.ts {
                 // A guess the parser may overturn: when no regex ends on this line, it is a
@@ -501,7 +516,10 @@ impl Lexer<'_> {
         // escaped code point too — so `#x` (escaped `#`) and a leading combining mark are errors.
         let mut first = true;
         // The ASCII run in one go (an ASCII IdentifierStart: digits went to `read_number`).
-        if self.peek().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$') {
+        if self
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        {
             let from = self.pos;
             let mut end = from;
             while let Some(&c) = self.bytes.get(end) {
@@ -512,7 +530,11 @@ impl Lexer<'_> {
                 }
             }
             self.pos = end;
-            if !self.bytes.get(end).is_some_and(|&b| b == b'\\' || b >= 0x80) {
+            if !self
+                .bytes
+                .get(end)
+                .is_some_and(|&b| b == b'\\' || b >= 0x80)
+            {
                 // The whole identifier was that run: no copy beyond the interned name.
                 let text = &self.src[self.tok_start..end];
                 match keyword(text) {

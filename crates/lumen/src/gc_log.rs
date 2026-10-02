@@ -24,6 +24,13 @@ pub struct GcObserver {
 
 impl GcObserver {
     pub fn new(callback: Value) -> Self {
-        GcObserver { callback, epoch: Instant::now(), epoch_ms: 0.0, events: Vec::new(), forced_next: false, queued: false }
+        GcObserver {
+            callback,
+            epoch: Instant::now(),
+            epoch_ms: 0.0,
+            events: Vec::new(),
+            forced_next: false,
+            queued: false,
+        }
     }
 }

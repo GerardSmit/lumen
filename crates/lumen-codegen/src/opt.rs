@@ -10,13 +10,22 @@ use crate::ir::*;
 use std::collections::HashMap;
 
 pub fn optimize(func: &mut Function) {
+    optimize_impl(func, true);
+}
+
+/// AOT size mode keeps the scalar loop body instead of cloning it.
+pub fn optimize_for_size(func: &mut Function) {
+    optimize_impl(func, false);
+}
+
+fn optimize_impl(func: &mut Function, unroll: bool) {
     remove_unreachable(func);
     simplify_params(func);
     gvn(func);
     remove_unreachable(func);
     simplify_params(func);
     // Small constant-trip loops: unroll fully, then fold their induction values.
-    if crate::unroll::unroll(func) {
+    if unroll && crate::unroll::unroll(func) {
         simplify_params(func);
         gvn(func);
         remove_unreachable(func);
@@ -138,6 +147,7 @@ fn const_data(ty: Type, bits: u64) -> InstData {
         },
         Type::F32 => InstData::F32const { bits: bits as u32 },
         Type::F64 => InstData::F64const { bits },
+        Type::V128 => unreachable!("vector constants are not scalar-folded"),
     }
 }
 
@@ -236,6 +246,28 @@ pub fn gvn(func: &mut Function) {
                 let mut d = f.inst(inst).clone();
                 d.map_args(|a| f.resolve(a));
                 func.insts[inst.index()] = d;
+            }
+            // Every signed I32 is exactly representable as F64. Recover it without an FP
+            // conversion when JS bit operations or array indexing consume an unboxed local.
+            if let InstData::Convert { op: ConvOp::ToJsInt32 | ConvOp::ToSintSat, to, arg } = func.inst(inst) {
+                if let ValueDef::Result(source, 0) = func.values[arg.index()].def {
+                    if let InstData::Convert { op: ConvOp::FromSint, to: Type::F64, arg: integer } = *func.inst(source) {
+                        if func.value_type(integer) == Type::I32 {
+                            match *to {
+                                Type::I32 => {
+                                    let result = func.results(inst)[0];
+                                    func.replace_uses(result, integer);
+                                    removed.push(inst);
+                                    continue;
+                                }
+                                Type::I64 => func.insts[inst.index()] = InstData::Convert {
+                                    op: ConvOp::Sext, to: Type::I64, arg: integer,
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                }
             }
             let data = func.inst(inst).clone();
 

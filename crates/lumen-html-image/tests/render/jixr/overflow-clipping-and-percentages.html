@@ -1,0 +1,10 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+.clip{position:relative;width:160px;height:80px;overflow:hidden;background:#dbe7ff}
+.wide{width:220px;height:34px;background:#174ea6}
+.half{width:50%;height:30px;margin-top:12px;background:#fbbc04}
+</style><div class=clip><div class=wide></div><div class=half></div></div>
+<!-- jixr-compare: threshold=32
+     Chromium antialiases the clipped edge of the overflowing box one channel step
+     differently than the managed backends, so compare per-channel with a tolerance
+     rather than exactly. -->

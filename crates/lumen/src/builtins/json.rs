@@ -369,8 +369,7 @@ impl JsonSer<'_> {
                                     let mut keys: Vec<Rc<str>> =
                                         (0..n).map(|k| Rc::from(k.to_string())).collect();
                                     keys.extend(ordered_enum_keys(o).into_iter().filter(|k| {
-                                        k.parse::<usize>().is_err()
-                                            && !TA_META_KEYS.contains(&&**k)
+                                        k.parse::<usize>().is_err() && !TA_META_KEYS.contains(&&**k)
                                     }));
                                     keys
                                 }
@@ -616,7 +615,11 @@ struct JsSink<'i, 'a> {
 
 impl<'i, 'a> JsSink<'i, 'a> {
     fn new(i: &'i mut Interp, src: &'a str) -> Self {
-        JsSink { i, src, keys: Default::default() }
+        JsSink {
+            i,
+            src,
+            keys: Default::default(),
+        }
     }
 }
 

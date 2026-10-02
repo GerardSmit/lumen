@@ -569,6 +569,10 @@ fn bun_jsc_uses_live_heap_gc_and_microtask_instrumentation() {
 
 #[test]
 fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
+    std::thread::Builder::new().stack_size(lumen::THREAD_STACK_SIZE).spawn(bun_transpiler_transforms_typescript_jsx_and_scans_modules_body).unwrap().join().unwrap();
+}
+
+fn bun_transpiler_transforms_typescript_jsx_and_scans_modules_body() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
         &mut rt,
@@ -579,6 +583,9 @@ fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
         console.log(js.includes(": number"), js.includes("if (false)"), Function(`${js}; return answer`)());
         const jsx = new Transpiler({ loader: "jsx" }).transformSync("const el = <div id=\"x\">hello</div>;");
         console.log(jsx.includes('React.createElement("div"'), jsx.includes('"hello"'));
+        const tsx = new Transpiler({ loader: "tsx" }).transformSync("const id=<T,>(x:T):T=>x; const n:number=3; const el=<a value={id<number>(n)}>{n+1}</a>;");
+        const el = Function("React", `${tsx}; return el;`)({ createElement(type, props, ...children) { return { type, props, children }; } });
+        console.log(el.type, el.props.value, el.children[0]);
         const scan = ts.scan('import value from "pkg"; export { value as result }; const lazy = import("later");');
         console.log(scan.exports.join(","), scan.imports.map(item => `${item.kind}:${item.path}`).join(","));
         ts.transform("const value: string = 'ok'").then(code => console.log(!code.includes(": string")));
@@ -589,10 +596,29 @@ fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
         [
             "false true 42",
             "true true",
+            "a 3 4",
             "result import-statement:pkg,dynamic-import:later",
             "true",
         ]
     );
+}
+
+#[test]
+fn jsx_tsx_entry_dependencies_commonjs_and_tsconfig() {
+    let dir = TempDir::new("native-jsx");
+    std::fs::create_dir_all(dir.0.join("runtime")).unwrap();
+    std::fs::write(dir.0.join("runtime/jsx-runtime.mjs"), "export function jsx(type,props,key){return {type,props,key};} export const jsxs=jsx;").unwrap();
+    std::fs::write(dir.0.join("tsconfig.json"), r#"{"compilerOptions":{"jsx":"react-jsx","jsxImportSource":"./runtime"}}"#).unwrap();
+    std::fs::write(dir.0.join("label.jsx"), "export const label=<b>&copy;</b>;").unwrap();
+    std::fs::write(dir.0.join("app.tsx"), "import {label} from './label.jsx'; const id=<T,>(x:T):T=>x; const n:number=3; console.log(JSON.stringify(<section n={id<number>(n)}>{label}</section>));").unwrap();
+    std::fs::write(dir.0.join("common.tsx"), "/** @jsxRuntime classic @jsx h */ const id=<T,>(x:T):T=>x; function h(type,props,...children){return {type,props,children};} module.exports=<a n={id<number>(5)}>{6}</a>;").unwrap();
+    let (mut rt, out, _) = test_runtime();
+    rt.run_module(&dir.path("app.tsx")).unwrap();
+    eval_ok(&mut rt, &format!("console.log(JSON.stringify(require({:?})));", dir.path("common.tsx")));
+    assert_eq!(out.lines(), [
+        r#"{"type":"section","props":{"n":3,"children":{"type":"b","props":{"children":"©"}}}}"#,
+        r#"{"type":"a","props":{"n":5},"children":[6]}"#,
+    ]);
 }
 
 #[test]

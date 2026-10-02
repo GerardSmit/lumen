@@ -4,10 +4,10 @@
 
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
+use lumen_common::buffer::{self, ByteOrder, ElemKind};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
 use std::sync::Arc;
-use lumen_common::buffer::{self, ByteOrder, ElemKind};
 
 /// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
 /// than `Rc`/`RefCell` directly, so the storage underneath can move to a traced heap without
@@ -339,7 +339,11 @@ unsafe fn gc_drop_slow(p: std::ptr::NonNull<GcBox>) {
     DROP_DEPTH.set(depth + 1);
     gc_drop_box(p);
     if depth == 0 {
-        while let Some(q) = DROP_PENDING.try_with(|q| q.borrow_mut().pop()).ok().flatten() {
+        while let Some(q) = DROP_PENDING
+            .try_with(|q| q.borrow_mut().pop())
+            .ok()
+            .flatten()
+        {
             gc_drop_box(q);
         }
     }
@@ -562,7 +566,10 @@ pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
 #[inline(always)]
 pub(crate) unsafe fn take_value_words(p: *mut Value) -> Value {
     let w = p as *mut u64;
-    let (tag, payload) = (std::ptr::read_volatile(w), std::ptr::read_volatile(w.add(1)));
+    let (tag, payload) = (
+        std::ptr::read_volatile(w),
+        std::ptr::read_volatile(w.add(1)),
+    );
     std::ptr::write_volatile(w, 0);
     value_from_words(tag, payload)
 }
@@ -580,7 +587,10 @@ pub(crate) fn push_value(out: &mut Vec<Value>, v: Value) {
     }
     unsafe {
         let n = out.len();
-        out.as_mut_ptr().add(n).cast::<std::mem::MaybeUninit<[u64; 2]>>().write(bits);
+        out.as_mut_ptr()
+            .add(n)
+            .cast::<std::mem::MaybeUninit<[u64; 2]>>()
+            .write(bits);
         out.set_len(n + 1);
     }
 }
@@ -717,8 +727,8 @@ impl PackedValue {
     #[inline(always)]
     pub(crate) fn as_num(&self) -> Option<f64> {
         match self.tag() {
-            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR | PACK_SYM
-            | PACK_OBJ => None,
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR
+            | PACK_SYM | PACK_OBJ => None,
             _ => Some(f64::from_bits(self.0)),
         }
     }
@@ -843,14 +853,20 @@ impl<'a> PropRef<'a> {
     #[inline(always)]
     pub(crate) fn of(p: &'a Property) -> PropRef<'a> {
         // SAFETY: a bitwise copy that is never dropped, borrowed no longer than `p`.
-        PropRef(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p) }), std::marker::PhantomData)
+        PropRef(
+            std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p) }),
+            std::marker::PhantomData,
+        )
     }
 
     /// The plain data element held in packed word `w`.
     #[inline(always)]
     pub(crate) fn elem(w: &'a PackedValue) -> PropRef<'a> {
         PropRef(
-            std::mem::ManuallyDrop::new(Property { packed: PackedValue(w.0), meta: PROP_PLAIN }),
+            std::mem::ManuallyDrop::new(Property {
+                packed: PackedValue(w.0),
+                meta: PROP_PLAIN,
+            }),
             std::marker::PhantomData,
         )
     }
@@ -1037,7 +1053,10 @@ impl Value {
     }
     /// Exact little-endian magnitude words and sign for the native BigInt bridge.
     pub fn bigint_words(&self) -> Option<(bool, &[u64])> {
-        match self { Value::BigInt(value) => Some(value.words()), _ => None }
+        match self {
+            Value::BigInt(value) => Some(value.words()),
+            _ => None,
+        }
     }
     pub fn as_obj(&self) -> Option<&Gc> {
         match self {
@@ -1084,6 +1103,8 @@ pub enum Callable {
     NativeData(Rc<NativeCallable>),
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(Box<UserCallable>),
+    #[cfg(feature = "aot-native")]
+    Aot(Box<AotCallable>),
     /// The result of `Function.prototype.bind`.
     Bound(Box<BoundCallable>),
     /// A ShadowRealm wrapped function: `target` is a callable inside the sub-realm identified by
@@ -1132,6 +1153,14 @@ pub struct UserCallable {
     pub(crate) env: Env,
 }
 
+#[cfg(feature = "aot-native")]
+#[derive(Clone)]
+pub struct AotCallable {
+    pub(crate) program: Rc<crate::native_aot::NativeProgram>,
+    pub(crate) function_index: u32,
+    pub(crate) env: Env,
+}
+
 #[derive(Clone)]
 pub struct WrappedShadowCallable {
     pub(crate) realm: usize,
@@ -1149,7 +1178,10 @@ impl Callable {
     /// Whether this is a function behavior (neither `None` nor a non-callable slot variant).
     #[inline]
     pub(crate) fn is_fn(&self) -> bool {
-        !matches!(self, Callable::None | Callable::Promise(_) | Callable::SplitView(_))
+        !matches!(
+            self,
+            Callable::None | Callable::Promise(_) | Callable::SplitView(_)
+        )
     }
 
     pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
@@ -1365,7 +1397,8 @@ impl Object {
     where
         I: ExactSizeIterator<Item = Value>,
     {
-        if template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == template.entries.len() {
+        if template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == template.entries.len()
+        {
             return Self::alloc_from_template_iter(template, proto, values);
         }
         if values.len() <= heap::INLINE_PROPS && template.can_instantiate_inline() {
@@ -1475,8 +1508,11 @@ impl Object {
             let p = state.heap.alloc(&state.live, class);
             let named = heap::inline_props(p);
             named.write(array_length(len));
-            let elems =
-                props::DenseStorage::write_in_box(heap::inline_dense(p), class.array_slots(), values);
+            let elems = props::DenseStorage::write_in_box(
+                heap::inline_dense(p),
+                class.array_slots(),
+                values,
+            );
             p.write(ObjCell::new(Object {
                 proto,
                 props: Props::array_inline_raw(shape, named, heap::ARRAY_NAMED, elems),
@@ -1501,9 +1537,13 @@ impl Object {
         if len <= heap::ARRAY_SLOTS_MAX {
             return Self::alloc_array_iter(proto, values);
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, k| unsafe {
-            d.adopt_in_box(slot, k, values)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, k| unsafe { d.adopt_in_box(slot, k, values) },
+        )
     }
 
     /// [`Object::new_array_from_iter`] over an owned vector.
@@ -1514,9 +1554,13 @@ impl Object {
         }
         let len = values.len();
         let packed: Vec<PackedValue> = values.into_iter().map(PackedValue::pack).collect();
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
-            d.install_in_box(slot, props::PackedVec::from(packed))
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, _| unsafe { d.install_in_box(slot, props::PackedVec::from(packed)) },
+        )
     }
 
     /// A new plain Array holding a copy of `src`'s packed plain elements `start..end`, or `None`
@@ -1532,11 +1576,22 @@ impl Object {
     fn new_array_from_packed(proto: Option<Gc>, packed: props::PackedVec) -> Gc {
         let len = packed.len();
         if len <= heap::ARRAY_SLOTS_MAX {
-            return Self::new_array_from_iter(proto, packed.iter().map(PackedValue::unpack).collect::<Vec<_>>().into_iter());
+            return Self::new_array_from_iter(
+                proto,
+                packed
+                    .iter()
+                    .map(PackedValue::unpack)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
-            d.install_in_box(slot, packed)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, _| unsafe { d.install_in_box(slot, packed) },
+        )
     }
 
     /// The `RegExp.prototype.exec` match array: packed captures plus the `index`, `input` and
@@ -1555,9 +1610,13 @@ impl Object {
             Property::plain(input),
             Property::plain(groups),
         ];
-        Self::new_array_parts(proto, Props::exec_result_shell(), len, named, |d, slot, k| unsafe {
-            d.adopt_in_box(slot, k, values)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::exec_result_shell(),
+            len,
+            named,
+            |d, slot, k| unsafe { d.adopt_in_box(slot, k, values) },
+        )
     }
 
     /// An Array around a shell map (see [`Props::array_shell`]): its named entries (in shape
@@ -1579,7 +1638,11 @@ impl Object {
             let mut b = obj.borrow_mut();
             b.props.entries.extend_exact(named.into_iter());
             // An array-class box: its sidecar area is unused until now.
-            fill(&mut b.props.elems, heap::inline_dense(bx), class.array_slots());
+            fill(
+                &mut b.props.elems,
+                heap::inline_dense(bx),
+                class.array_slots(),
+            );
         }
         obj
     }
@@ -1708,8 +1771,12 @@ impl GcState {
         });
         self.heap.absorb(&other.heap, &self.live);
         self.live.set(self.live.get() + other.live.replace(0));
-        self.scopes.borrow_mut().append(&mut other.scopes.borrow_mut());
-        self.lazy_fns.borrow_mut().append(&mut other.lazy_fns.borrow_mut());
+        self.scopes
+            .borrow_mut()
+            .append(&mut other.scopes.borrow_mut());
+        self.lazy_fns
+            .borrow_mut()
+            .append(&mut other.lazy_fns.borrow_mut());
     }
 }
 
@@ -1818,9 +1885,7 @@ pub(crate) fn gc_allocator_trim_due() -> bool {
     once_a_second(&LAST)
 }
 
-fn once_a_second(
-    last: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>,
-) -> bool {
+fn once_a_second(last: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>) -> bool {
     let now = std::time::Instant::now();
     last.with(|l| match l.get() {
         Some(t) if now.duration_since(t) < std::time::Duration::from_secs(1) => false,
@@ -1839,7 +1904,11 @@ pub(crate) fn gc_trim_heap() {
     thread_local! {
         static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     }
-    let keep = if once_a_second(&LAST) { 1 } else { SPARE_CHUNKS };
+    let keep = if once_a_second(&LAST) {
+        1
+    } else {
+        SPARE_CHUNKS
+    };
     with_gc_state(|state| state.heap.trim(keep));
 }
 
@@ -2310,7 +2379,11 @@ impl Property {
     /// The number held by a data property, if any (no clone).
     #[inline]
     pub(crate) fn num_value(&self) -> Option<f64> {
-        if self.accessor() { None } else { self.packed.as_num() }
+        if self.accessor() {
+            None
+        } else {
+            self.packed.as_num()
+        }
     }
     /// The object this data property holds, as [`Gc::as_ptr`] gives it (no clone).
     #[inline]
@@ -2340,7 +2413,10 @@ impl Property {
     /// The plain data property for packed element word `w`.
     #[inline]
     pub(crate) fn from_elem(w: PackedValue) -> Property {
-        Property { packed: w, meta: PROP_PLAIN }
+        Property {
+            packed: w,
+            meta: PROP_PLAIN,
+        }
     }
     /// Overwrite a data property that holds a number with the number `n` (no drop needed).
     #[inline]
