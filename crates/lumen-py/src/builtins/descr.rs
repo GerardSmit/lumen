@@ -193,9 +193,9 @@ impl CallSlot {
         it.call(&slf, args.to_vec(), kwargs.to_vec())
     }
 
-    /// `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
-    /// `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as
-    /// its name.
+    // `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
+    // `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as
+    // its name.
     #[method(name = "__reduce__")]
     fn reduce(slf: This<&Value>, it: &mut Interp) -> R<Value> {
         let bound_to = match &*slf {
