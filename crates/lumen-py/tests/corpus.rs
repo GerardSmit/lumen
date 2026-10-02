@@ -1,6 +1,6 @@
 //! End-to-end corpus: runs every `tests/py/**/X.py` entry script through the
 //! `lumen-py` binary and compares stdout (and, when `X.err` exists, the exit code
-//! and last stderr line) with the committed expected files.
+//! and last stderr line) with the committed expected files. No `X.err` means exit 0.
 //!
 //! Every failing script must be listed in `tests/py/expected-failures.txt` as
 //! `path  # reason`, one per line; a listed script without a reason fails the run.
