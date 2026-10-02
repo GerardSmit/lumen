@@ -7,14 +7,10 @@
 //! completion.
 
 use js_sys::{Array, Uint8Array};
-use lumen_bind::NativeError;
-use lumen_host::browser::{arg_value, call_host, decode_event, Arg, Event};
+use lumen_bind::{Data, NativeError};
+use lumen_host::browser::{arg_value, call_host, decode_event, unsupported, Arg, Event};
 use lumen_host::{Ctx, OpError, Value};
 use wasm_bindgen::JsValue;
-
-fn unsupported(what: &str) -> NativeError {
-    NativeError::runtime(format!("{what} is not supported in the browser")).with_code("ERR_NOT_SUPPORTED_IN_BROWSER")
-}
 
 pub(crate) mod http_ops {
     use super::*;
@@ -71,19 +67,24 @@ pub(crate) mod http_ops {
         let event = *payload.downcast::<Event>().expect("fetch payload");
         if event.kind != "ok" {
             let message = match event.args.into_iter().next() {
-                Some(Arg::Str(s)) => s,
+                Some(Arg::Data(Data::Str(s))) => s,
                 _ => "fetch failed".to_string(),
             };
             return Err(ctx.make_error("TypeError", message));
         }
         let mut it = event.args.into_iter();
-        let (Some(Arg::Num(status)), Some(Arg::Str(status_text)), Some(Arg::Str(url)), Some(Arg::Bytes(body))) =
+        let (
+            Some(Arg::Data(Data::Float(status))),
+            Some(Arg::Data(Data::Str(status_text))),
+            Some(Arg::Data(Data::Str(url))),
+            Some(Arg::Data(Data::Bytes(body))),
+        ) =
             (it.next(), it.next(), it.next(), it.next())
         else {
             return Err(ctx.make_error("TypeError", "fetch: malformed response from the host"));
         };
         let mut pairs = Vec::new();
-        while let (Some(Arg::Str(k)), Some(Arg::Str(v))) = (it.next(), it.next()) {
+        while let (Some(Arg::Data(Data::Str(k))), Some(Arg::Data(Data::Str(v)))) = (it.next(), it.next()) {
             pairs.push(ctx.make_array(vec![Value::from_string(k), Value::from_string(v)]));
         }
         let obj = Value::Obj(ctx.new_object());
@@ -92,7 +93,7 @@ pub(crate) mod http_ops {
         let _ = ctx.set_member(&obj, "url", Value::from_string(url));
         let headers = ctx.make_array(pairs);
         let _ = ctx.set_member(&obj, "headers", headers);
-        let body = arg_value(ctx, Arg::Bytes(body))?;
+        let body = arg_value(ctx, body.into())?;
         let _ = ctx.set_member(&obj, "body", body);
         Ok(vec![obj])
     }

@@ -106,17 +106,17 @@ fn to_arg(v: &JsValue) -> Arg {
     if v.is_null() || v.is_undefined() {
         Arg::Null
     } else if let Some(b) = v.as_bool() {
-        Arg::Bool(b)
+        Arg::from(b)
     } else if let Some(n) = v.as_f64() {
-        Arg::Num(n)
+        Arg::from(n)
     } else if let Some(s) = v.as_string() {
-        Arg::Str(s)
+        Arg::from(s)
     } else if let Some(a) = v.dyn_ref::<Uint8Array>() {
-        Arg::Bytes(a.to_vec())
+        Arg::from(a.to_vec())
     } else if let Some(b) = v.dyn_ref::<js_sys::ArrayBuffer>() {
-        Arg::Bytes(Uint8Array::new(b).to_vec())
+        Arg::from(Uint8Array::new(b).to_vec())
     } else {
-        Arg::Str(format!("{v:?}"))
+        Arg::from(format!("{v:?}"))
     }
 }
 

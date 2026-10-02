@@ -6,7 +6,7 @@ use lumen::embed::OpError;
 use lumen_host::{Ctx, Value};
 
 fn unsupported_error() -> OpError {
-    OpError::error("this API is not available in the browser runtime").with_code("ERR_NOT_SUPPORTED_IN_BROWSER")
+    lumen_host::browser::unsupported("this API").into()
 }
 
 pub mod child {

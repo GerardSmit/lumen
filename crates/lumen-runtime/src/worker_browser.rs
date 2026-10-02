@@ -1,6 +1,7 @@
 //! `Worker` on a target with no threads: the op table keeps its names, spawning throws, and the
 //! hidden `__lumenWorkerOps` handle that `node:worker_threads` reads still exists.
 
+use lumen_bind::NativeError;
 use lumen_host::{Ctx, Extension, Value};
 
 #[lumen_bind::module(name = "__worker")]
@@ -8,13 +9,8 @@ mod bindings {
     use super::*;
 
     #[op(name = "spawn")]
-    fn op_spawn(ctx: &mut Ctx, #[varargs] _args: &[Value]) -> Result<(), Value> {
-        let err = ctx.make_error(
-            "Error",
-            "Worker is not available in the browser runtime".to_string(),
-        );
-        let _ = ctx.set_member(&err, "code", Value::str("ERR_NOT_SUPPORTED_IN_BROWSER"));
-        Err(err)
+    fn op_spawn(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
+        Err(lumen_host::browser::unsupported("Worker"))
     }
 
     #[op(name = "post")]

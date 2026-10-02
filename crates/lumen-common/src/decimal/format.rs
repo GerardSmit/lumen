@@ -94,7 +94,7 @@ pub fn parse_format_spec(text: &str) -> Result<FormatSpec, FormatError> {
 }
 
 /// Widths no allocation could satisfy; libmpdec rejects them as an invalid specifier.
-const MAX_WIDTH: usize = 1 << 48;
+const MAX_WIDTH: usize = if usize::BITS >= 64 { usize::MAX >> 16 } else { usize::MAX >> 1 };
 
 fn format_sign(negative: bool, spec: &FormatSpec) -> &'static str {
     if negative {
