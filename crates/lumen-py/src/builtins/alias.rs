@@ -21,7 +21,7 @@ pub struct AliasData {
 /// Represent a PEP 604 union type
 ///
 /// E.g. for int | str
-#[lumen_bind::class(name = "UnionType", module = "types")]
+#[lumen_bind::class(name = "Union", module = "typing")]
 pub struct UnionData {
     args: Vec<Value>,
 }
@@ -574,6 +574,27 @@ impl UnionData {
         Value::tuple(self.args.clone())
     }
 
+    #[getter(name = "__origin__")]
+    fn origin(&self, it: &mut Interp) -> Value {
+        Value::Obj(type_object::<UnionData>(it))
+    }
+
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(_cls: This<Value>, it: &mut Interp, params: &Value) -> R<Value> {
+        let items = match params.tuple_items() {
+            Some(t) => t.to_vec(),
+            None => vec![params.clone()],
+        };
+        if items.is_empty() {
+            return Err(it.type_error("Cannot take a Union of no types."));
+        }
+        let mut checked = Vec::with_capacity(items.len());
+        for item in &items {
+            checked.push(super::typingm::type_check(it, item, "Union[arg, ...]: each arg must be a type.")?);
+        }
+        it.make_union(checked)
+    }
+
     /// Type variables in the types.UnionType.
     #[getter(name = "__parameters__")]
     fn parameters(&self, it: &mut Interp) -> R<Value> {
@@ -586,5 +607,5 @@ pub fn init(it: &mut Interp) {
     let generic = type_object::<AliasData>(it);
     super::descr::install_getsets::<AliasData>(it, &generic, &["__origin__", "__args__", "__unpacked__"]);
     let union = type_object::<UnionData>(it);
-    super::descr::install_getsets::<UnionData>(it, &union, &["__args__"]);
+    super::descr::install_getsets::<UnionData>(it, &union, &["__args__", "__origin__"]);
 }

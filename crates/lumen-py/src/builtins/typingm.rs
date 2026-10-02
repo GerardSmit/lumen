@@ -59,6 +59,8 @@ pub struct TypeVar {
     covariant: bool,
     contravariant: bool,
     infer_variance: bool,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
 }
 
 #[lumen_bind::class(name = "ParamSpec", module = "typing", hint(py(final)))]
@@ -112,6 +114,8 @@ pub struct ParamSpec {
     covariant: bool,
     contravariant: bool,
     infer_variance: bool,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
 }
 
 #[lumen_bind::class(name = "ParamSpecArgs", module = "typing", hint(py(final, unhashable)))]
@@ -186,6 +190,46 @@ pub struct ParamSpecKwargs {
 ///
 pub struct TypeVarTuple {
     name: Value,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
+}
+
+#[lumen_bind::class(name = "NoDefaultType", module = "typing", hint(py(final)))]
+/// The type of the NoDefault singleton.
+pub struct NoDefaultType;
+
+/// `typing.NoDefault`, the value of `__default__` of a type parameter without a default.
+pub fn no_default(it: &mut Interp) -> Value {
+    if let Some(v) = it.native_state::<NoDefaultSingleton>().0.clone() {
+        return v;
+    }
+    let v = Py::new(it, NoDefaultType).into_value();
+    it.native_state::<NoDefaultSingleton>().0 = Some(v.clone());
+    v
+}
+
+#[derive(Default)]
+struct NoDefaultSingleton(Option<Value>);
+
+fn is_no_default(it: &mut Interp, v: &Value) -> bool {
+    v.is(&no_default(it))
+}
+
+/// The `default` argument of a type parameter constructor: `None` for `NoDefault`.
+fn default_arg(it: &mut Interp, default: Option<&Value>) -> Option<Value> {
+    default.filter(|d| !is_no_default(it, d)).cloned()
+}
+
+/// A type parameter's `__default__`: evaluated on first use when it came from the type
+/// parameter syntax, `NoDefault` when there is none.
+fn default_of(it: &mut Interp, default: Option<Value>, evaluate: Option<Value>) -> R<(Value, bool)> {
+    if let Some(d) = default {
+        return Ok((d, false));
+    }
+    match evaluate {
+        Some(f) => Ok((it.call(&f, Vec::new(), Vec::new())?, true)),
+        None => Ok((no_default(it), false)),
+    }
 }
 
 #[lumen_bind::class(name = "TypeAliasType", module = "typing", hint(py(final)))]
@@ -256,7 +300,7 @@ fn call_typing(it: &mut Interp, name: &str, args: Vec<Value>, kw: Vec<(Obj, Valu
 }
 
 /// `typing._type_check(arg, msg)`, with `None` meaning `type(None)` as in CPython's C helper.
-fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
+pub(crate) fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
     if arg.is_none() {
         return Ok(Value::Obj(it.types.none_type.clone()));
     }
@@ -333,7 +377,7 @@ fn no_subclass(it: &mut Interp, what: &str) -> Obj {
 
 /// `T | other` for a type variable: `typing.Union[...]`.
 fn make_union(it: &mut Interp, a: &Value, b: &Value) -> R<Value> {
-    call_typing(it, "_make_union", vec![a.clone(), b.clone()], Vec::new())
+    it.make_union(vec![a.clone(), b.clone()])
 }
 
 // ---- TypeVar ----
@@ -351,8 +395,10 @@ impl TypeVar {
         #[kwonly] #[default(false)] covariant: bool,
         #[kwonly] #[default(false)] contravariant: bool,
         #[kwonly] #[default(false)] infer_variance: bool,
+        #[kwonly] default: Option<&Value>,
     ) -> R<Value> {
         variance_checks(it, covariant, contravariant, infer_variance)?;
+        let default = default_arg(it, default);
         let bound = match bound {
             Some(b) => Some(type_check(it, b, "Bound must be a type.")?),
             None => None,
@@ -373,6 +419,8 @@ impl TypeVar {
             covariant,
             contravariant,
             infer_variance,
+            default,
+            evaluate_default: None,
         };
         let v = Py::new(it, data).into_value();
         set_module(it, &v, module);
@@ -382,6 +430,20 @@ impl TypeVar {
     #[getter(name = "__name__")]
     fn name(&self) -> Value {
         self.name.clone()
+    }
+
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
+
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
     }
 
     #[getter(name = "__bound__")]
@@ -468,11 +530,13 @@ impl ParamSpec {
         #[kwonly] #[default(false)] covariant: bool,
         #[kwonly] #[default(false)] contravariant: bool,
         #[kwonly] #[default(false)] infer_variance: bool,
+        #[kwonly] default: Option<&Value>,
     ) -> R<Value> {
         variance_checks(it, covariant, contravariant, infer_variance)?;
+        let default = default_arg(it, default);
         let bound = type_check(it, bound.unwrap_or(&Value::None), "Bound must be a type.")?;
         let module = caller_module(it);
-        let data = ParamSpec { name: name.0.clone(), bound: Some(bound), covariant, contravariant, infer_variance };
+        let data = ParamSpec { name: name.0.clone(), bound: Some(bound), covariant, contravariant, infer_variance, default, evaluate_default: None };
         let v = Py::new(it, data).into_value();
         set_module(it, &v, module);
         Ok(v)
@@ -486,6 +550,20 @@ impl ParamSpec {
     #[getter(name = "__bound__")]
     fn bound(&self) -> Value {
         self.bound.clone().unwrap_or(Value::None)
+    }
+
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
+
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
     }
 
     #[getter(name = "__covariant__")]
@@ -657,9 +735,10 @@ impl ParamSpecKwargs {
 #[lumen_bind::methods]
 impl TypeVarTuple {
     #[constructor(hint(py(text_signature = "", arg_name = "typevartuple")))]
-    fn new(_cls: This<Value>, it: &mut Interp, #[kw] name: StrRef<'_>) -> R<Value> {
+    fn new(_cls: This<Value>, it: &mut Interp, #[kw] name: StrRef<'_>, #[kwonly] default: Option<&Value>) -> R<Value> {
         let module = caller_module(it);
-        let v = Py::new(it, TypeVarTuple { name: name.0.clone() }).into_value();
+        let default = default_arg(it, default);
+        let v = Py::new(it, TypeVarTuple { name: name.0.clone(), default, evaluate_default: None }).into_value();
         set_module(it, &v, module);
         Ok(v)
     }
@@ -667,6 +746,20 @@ impl TypeVarTuple {
     #[getter(name = "__name__")]
     fn name(&self) -> Value {
         self.name.clone()
+    }
+
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
+
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
     }
 
     #[proto(repr)]
@@ -815,6 +908,24 @@ fn alias_attr_error(it: &mut Interp, name: &Value) -> Obj {
     it.new_exc_str("AttributeError", &msg)
 }
 
+#[lumen_bind::methods]
+impl NoDefaultType {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(_cls: This<Value>, it: &mut Interp) -> Value {
+        no_default(it)
+    }
+
+    #[proto(repr)]
+    fn repr(&self) -> &'static str {
+        "typing.NoDefault"
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> &'static str {
+        "NoDefault"
+    }
+}
+
 // ---- Generic ----
 
 #[lumen_bind::methods]
@@ -857,14 +968,16 @@ pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
                 covariant: false,
                 contravariant: false,
                 infer_variance: true,
+                default: None,
+                evaluate_default: None,
             },
         )
         .into_value()),
         INTRINSIC1_PARAMSPEC => {
-            let data = ParamSpec { name: v, bound: None, covariant: false, contravariant: false, infer_variance: true };
+            let data = ParamSpec { name: v, bound: None, covariant: false, contravariant: false, infer_variance: true, default: None, evaluate_default: None };
             Ok(Py::new(it, data).into_value())
         }
-        INTRINSIC1_TYPEVARTUPLE => Ok(Py::new(it, TypeVarTuple { name: v }).into_value()),
+        INTRINSIC1_TYPEVARTUPLE => Ok(Py::new(it, TypeVarTuple { name: v, default: None, evaluate_default: None }).into_value()),
         INTRINSIC1_SUBSCRIPT_GENERIC => {
             let params = unpack_typevartuples(it, &v)?;
             let generic = generic_type(it);
@@ -899,6 +1012,8 @@ pub fn intrinsic2(it: &mut Interp, k: u32, a: Value, b: Value) -> R<Value> {
                 covariant: false,
                 contravariant: false,
                 infer_variance: true,
+                default: None,
+                evaluate_default: None,
             };
             Ok(Py::new(it, data).into_value())
         }
@@ -970,7 +1085,12 @@ pub mod _typing {
         let ta = type_object::<TypeAliasType>(it);
         install_getsets::<TypeAliasType>(it, &ta, &["__name__"]);
         let generic = generic_type(it);
+        let union = type_object::<crate::builtins::alias::UnionData>(it);
+        let no_default_type = type_object::<NoDefaultType>(it);
+        let _ = no_default_type;
+        dict_set_str(&d, "NoDefault", no_default(it));
         for (n, t) in [
+            ("Union", union),
             ("TypeVar", tv),
             ("ParamSpec", ps),
             ("ParamSpecArgs", psa),
