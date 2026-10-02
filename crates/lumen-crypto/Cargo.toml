@@ -1,9 +1,10 @@
 # Language-neutral asymmetric cryptography and bignum operations shared by Node's crypto and
 # Python's _hashlib / _ssl: RSA (OAEP, PKCS#1 v1.5, raw, PSS), finite-field Diffie-Hellman, DSA,
-# primes and key generation, behind one backend trait. The system OpenSSL (loaded at runtime with
-# the loader shared with lumen-tls) is the first choice; RustCrypto is the fallback, and the only
-# backend on targets without `dlopen` (wasm). Keys and results cross the trait as plain big-endian
-# byte strings; nothing here knows about a language runtime.
+# primes and key generation, behind one backend trait. The operating system's own cryptography is
+# the first choice (Security.framework on Apple targets, CNG on Windows), then the system OpenSSL
+# (loaded at runtime with the loader shared with lumen-tls), then RustCrypto, which is the only
+# backend on targets with neither (Android, wasm). Keys and results cross the trait as plain
+# big-endian byte strings; nothing here knows about a language runtime.
 [package]
 name = "lumen-crypto"
 version.workspace = true
@@ -11,21 +12,56 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+build = "build.rs"
+
+[features]
+# Every feature is a no-op on a target that cannot host it, so the defaults give each target its
+# own set: Linux openssl + rustcrypto, Apple apple + openssl + rustcrypto, Windows cng +
+# rustcrypto, Android and wasm rustcrypto. `--no-default-features --features apple` is the
+# system-only build: no RustCrypto asymmetric crates at all.
+default = ["openssl", "apple", "cng", "rustcrypto"]
+# The system OpenSSL 3 through `dlopen` (unix, not Android).
+openssl = []
+# Security.framework (macOS, iOS and the other Apple targets).
+apple = ["dep:security-framework", "dep:security-framework-sys", "dep:core-foundation", "dep:core-foundation-sys"]
+# Windows CNG (bcrypt.dll).
+cng = ["dep:windows-sys"]
+# `rsa`, `dsa`, `crypto-bigint`, `crypto-primes`: everything, on every target; also the per-operation
+# fallback of the system backends.
+rustcrypto = [
+    "dep:rsa",
+    "dep:dsa",
+    "dep:signature",
+    "dep:digest",
+    "dep:num-bigint-dig",
+    "dep:crypto-bigint",
+    "dep:crypto-primes",
+    "dep:rand_core10",
+]
 
 [dependencies]
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-os = { path = "../lumen-os" }
-rsa = { version = "0.9", features = ["sha2", "sha1", "hazmat"] }
-dsa = "0.6"
-signature = "2"
-digest = "0.10"
-num-bigint-dig = { version = "0.8", features = ["prime", "rand"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rsa = { version = "0.9", features = ["sha2", "sha1", "hazmat"], optional = true }
+dsa = { version = "0.6", optional = true }
+signature = { version = "2", optional = true }
+digest = { version = "0.10", optional = true }
+num-bigint-dig = { version = "0.8", features = ["prime", "rand"], optional = true }
 # Constant-time bignum arithmetic and prime generation for finite-field DH and prime generation.
 # They speak rand_core 0.10; `SysRng` serves both rand_core generations.
-crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core"] }
-crypto-primes = "0.7"
-rand_core10 = { package = "rand_core", version = "0.10", default-features = false }
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core"], optional = true }
+crypto-primes = { version = "0.7", optional = true }
+rand_core10 = { package = "rand_core", version = "0.10", default-features = false, optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+security-framework = { version = "3", optional = true }
+security-framework-sys = { version = "2", optional = true }
+core-foundation = { version = "0.10", optional = true }
+core-foundation-sys = { version = "0.8", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
 
 [lints]
 workspace = true

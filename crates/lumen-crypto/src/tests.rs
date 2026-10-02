@@ -1,5 +1,6 @@
-//! Behaviour tests. They run on the backend `LUMEN_CRYPTO_BACKEND` selects (OpenSSL when it loads
-//! and nothing is forced); the `cross_*` tests exercise both backends against each other.
+//! Behaviour tests. They run on the backend `LUMEN_CRYPTO_BACKEND` selects (the first of
+//! [`backends`] when nothing is forced); the `cross_*` tests exercise every backend of the build
+//! against each other.
 
 use super::*;
 use lumen_common::hash::digest;
@@ -59,11 +60,17 @@ fn be() -> &'static dyn Backend {
 }
 
 fn both() -> Vec<&'static dyn Backend> {
-    let mut all = vec![rustcrypto()];
-    if let Ok(openssl) = openssl() {
-        all.push(openssl);
-    }
-    all
+    backends()
+}
+
+/// Whether the selected backend does DSA, finite-field DH and primes (the system backends hand them
+/// to RustCrypto, which a system-only build lacks).
+fn full() -> bool {
+    probe(be())
+}
+
+fn probe(backend: &dyn Backend) -> bool {
+    backend.prime_check(&[7], 0).is_ok()
 }
 
 fn pkcs1(hash: Algo) -> RsaScheme {
@@ -81,9 +88,8 @@ fn oaep(hash: Algo, label: &[u8]) -> RsaPadding {
 #[test]
 fn selection_honours_the_environment() {
     match std::env::var("LUMEN_CRYPTO_BACKEND").as_deref() {
-        Ok("rustcrypto") => assert_eq!(be().name(), "rustcrypto"),
-        Ok("openssl") => assert_eq!(be().name(), "openssl"),
-        _ => assert!(matches!(be().name(), "openssl" | "rustcrypto")),
+        Ok(forced) => assert_eq!(be().name(), forced),
+        _ => assert_eq!(be().name(), backends()[0].name()),
     }
 }
 
@@ -168,6 +174,9 @@ fn pss_with_distinct_mgf1_digest() {
 
 #[test]
 fn oaep_decrypts_openssl_ciphertext_with_label() {
+    if !full() {
+        return;
+    }
     let k = key();
     let label = [0x00, 0xff, 0x10];
     assert_eq!(be().rsa_decrypt(&k, &oaep(Algo::Sha256, &label), &hex(OAEP_SHA256_LABEL)).unwrap(), PLAIN);
@@ -176,6 +185,17 @@ fn oaep_decrypts_openssl_ciphertext_with_label() {
 #[test]
 fn oaep_failures_are_indistinguishable() {
     let k = key();
+    let own = be().rsa_encrypt(&k.public, &oaep(Algo::Sha256, &[]), PLAIN).unwrap();
+    let mut flipped_own = own.clone();
+    flipped_own[77] ^= 1;
+    for ct in [&flipped_own, &hex(PKCS1_ENCRYPTED)] {
+        let err = be().rsa_decrypt(&k, &oaep(Algo::Sha256, &[]), ct).unwrap_err();
+        assert_eq!(err.message, "error:02000079:rsa routines::oaep decoding error");
+    }
+    assert!(be().rsa_decrypt(&k, &oaep(Algo::Sha1, &[]), &own).is_err());
+    if !full() {
+        return;
+    }
     let ct = hex(OAEP_SHA256_LABEL);
     let label = [0x00, 0xff, 0x10];
     let message = |padding: RsaPadding, input: &[u8]| be().rsa_decrypt(&k, &padding, input).unwrap_err();
@@ -195,6 +215,14 @@ fn oaep_failures_are_indistinguishable() {
 #[test]
 fn oaep_roundtrip_digests_and_labels() {
     let k = key();
+    for algo in [Algo::Sha1, Algo::Sha224, Algo::Sha256, Algo::Sha384] {
+        let ct = be().rsa_encrypt(&k.public, &oaep(algo, b""), b"hello").unwrap();
+        assert_eq!(be().rsa_decrypt(&k, &oaep(algo, b""), &ct).unwrap(), b"hello");
+    }
+    assert!(be().rsa_encrypt(&k.public, &oaep(Algo::Sha256, &[]), &[0u8; 100]).is_err());
+    if !full() {
+        return;
+    }
     for algo in [Algo::Sha1, Algo::Sha224, Algo::Sha256, Algo::Sha384, Algo::Sha3_256, Algo::Ripemd160] {
         let ct = be().rsa_encrypt(&k.public, &oaep(algo, b"label"), b"hello").unwrap();
         assert_eq!(be().rsa_decrypt(&k, &oaep(algo, b"label"), &ct).unwrap(), b"hello");
@@ -204,7 +232,21 @@ fn oaep_roundtrip_digests_and_labels() {
     let ct = be().rsa_encrypt(&k.public, &split, b"hello").unwrap();
     assert_eq!(be().rsa_decrypt(&k, &split, &ct).unwrap(), b"hello");
     assert!(be().rsa_decrypt(&k, &oaep(Algo::Sha256, b""), &ct).is_err());
-    assert!(be().rsa_encrypt(&k.public, &oaep(Algo::Sha256, &[]), &[0u8; 100]).is_err());
+}
+
+#[test]
+fn system_only_builds_report_unsupported_operations() {
+    if full() {
+        return;
+    }
+    let k = key();
+    for padding in [oaep(Algo::Sha256, b"label"), RsaPadding::Oaep { hash: Algo::Sha256, mgf1: Algo::Sha1, label: Vec::new() }] {
+        let err = be().rsa_encrypt(&k.public, &padding, b"x").unwrap_err();
+        assert_eq!(err.code.as_deref(), Some("ERR_CRYPTO_UNSUPPORTED_OPERATION"));
+        assert_eq!(err.message, "Unsupported crypto operation");
+    }
+    assert!(be().dsa_generate(1024, None).is_err());
+    assert!(be().prime_check(&[7], 0).is_err());
 }
 
 #[test]
@@ -255,11 +297,17 @@ fn generated_rsa_key_works() {
     let ct = be().rsa_encrypt(&k.public, &oaep(Algo::Sha1, b""), b"x").unwrap();
     assert_eq!(be().rsa_decrypt(&k, &oaep(Algo::Sha1, b""), &ct).unwrap(), b"x");
     assert!(be().rsa_generate(1024, &[2]).is_err());
+    if !full() {
+        return;
+    }
     assert_eq!(be().rsa_generate(256, &[1, 0, 1]).unwrap_err().code.as_deref(), Some("ERR_OSSL_KEY_SIZE_TOO_SMALL"));
 }
 
 #[test]
 fn dsa_roundtrip() {
+    if !full() {
+        return;
+    }
     let k = be().dsa_generate(1024, Some(160)).unwrap();
     let hashed = digest(Algo::Sha1, MSG);
     let sig = be().dsa_sign(&k, &hashed).unwrap();
@@ -280,6 +328,9 @@ const MODP2: &str = "ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a6
 
 #[test]
 fn dh_parameters_verify_and_flags() {
+    if !full() {
+        return;
+    }
     let params = modp(MODP2);
     assert_eq!(be().dh_check(&params).unwrap(), 0);
     let mut composite = params.clone();
@@ -293,6 +344,9 @@ fn dh_parameters_verify_and_flags() {
 
 #[test]
 fn dh_key_agreement() {
+    if !full() {
+        return;
+    }
     let params = modp(MODP1);
     let (x1, y1) = be().dh_generate_key(&params, None).unwrap();
     let (x2, y2) = be().dh_generate_key(&params, None).unwrap();
@@ -307,6 +361,9 @@ fn dh_key_agreement() {
 
 #[test]
 fn dh_public_range_flags() {
+    if !full() {
+        return;
+    }
     let params = modp(MODP1);
     assert_ne!(be().dh_check_public(&params, &[1]).unwrap() & DH_CHECK_PUBKEY_TOO_SMALL, 0);
     let mut p_minus_1 = params.p.clone();
@@ -317,6 +374,9 @@ fn dh_public_range_flags() {
 
 #[test]
 fn dh_generated_prime_is_safe_and_suits_the_generator() {
+    if !full() {
+        return;
+    }
     for g in [2u32, 5] {
         let p = be().dh_generate_prime(512, g).unwrap();
         let flags = be().dh_check(&DhParams { p, g: vec![g as u8] }).unwrap();
@@ -326,6 +386,9 @@ fn dh_generated_prime_is_safe_and_suits_the_generator() {
 
 #[test]
 fn primes_generate_and_check() {
+    if !full() {
+        return;
+    }
     for bits in [8u32, 64, 257] {
         let p = be().prime_generate(bits, false, None, None).unwrap();
         assert_eq!(trim_be(&p).len() * 8 - trim_be(&p)[0].leading_zeros() as usize, bits as usize);
@@ -351,6 +414,9 @@ fn primes_generate_and_check() {
 
 #[test]
 fn prime_with_add_and_rem() {
+    if !full() {
+        return;
+    }
     let p = be().prime_generate(64, false, Some(&[0x0c]), Some(&[0x01])).unwrap();
     let low = p.iter().fold(0u32, |acc, &b| (acc * 256 + b as u32) % 12);
     assert_eq!(low, 1);
@@ -383,6 +449,11 @@ fn cross_backend_rsa_signatures_and_encryption() {
                 );
             }
             let padding = RsaPadding::Oaep { hash: Algo::Sha384, mgf1: Algo::Sha1, label: b"cross".to_vec() };
+            if probe(*signer) && probe(*verifier) {
+                let ct = signer.rsa_encrypt(&k.public, &padding, b"cross backend").unwrap();
+                assert_eq!(verifier.rsa_decrypt(&k, &padding, &ct).unwrap(), b"cross backend");
+            }
+            let padding = oaep(Algo::Sha256, b"");
             let ct = signer.rsa_encrypt(&k.public, &padding, b"cross backend").unwrap();
             assert_eq!(verifier.rsa_decrypt(&k, &padding, &ct).unwrap(), b"cross backend");
         }
@@ -391,7 +462,10 @@ fn cross_backend_rsa_signatures_and_encryption() {
 
 #[test]
 fn cross_backend_dsa_and_dh() {
-    let backends = both();
+    let backends: Vec<_> = both().into_iter().filter(|b| probe(*b)).collect();
+    if backends.is_empty() {
+        return;
+    }
     for signer in &backends {
         let k = signer.dsa_generate(1024, None).unwrap();
         let hashed = digest(Algo::Sha256, MSG);

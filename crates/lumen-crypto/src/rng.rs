@@ -1,7 +1,9 @@
-//! The system CSPRNG (`lumen_os::proc::entropy`) as a generator for the RustCrypto crates, which
-//! come in two `rand_core` generations: 0.6 (`rsa`, the curve crates) and 0.10 (`crypto-bigint`,
+//! The system CSPRNG (`lumen_os::proc::entropy`: `getentropy` on Apple targets, the source
+//! `CCRandomGenerateBytes` draws from, and `BCryptGenRandom` on Windows) as a generator for the
+//! RustCrypto crates, which come in two `rand_core` generations: 0.6 (`rsa`, the curve crates) and 0.10 (`crypto-bigint`,
 //! `crypto-primes`).
 
+#[cfg(crypto_rustcrypto)]
 use std::convert::Infallible;
 
 pub struct SysRng;
@@ -35,6 +37,7 @@ impl rand_core::RngCore for SysRng {
 
 impl rand_core::CryptoRng for SysRng {}
 
+#[cfg(crypto_rustcrypto)]
 impl rand_core10::TryRng for SysRng {
     type Error = Infallible;
 
@@ -56,4 +59,5 @@ impl rand_core10::TryRng for SysRng {
     }
 }
 
+#[cfg(crypto_rustcrypto)]
 impl rand_core10::TryCryptoRng for SysRng {}

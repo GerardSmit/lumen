@@ -1,5 +1,6 @@
-//! The RustCrypto backend: `rsa`, `dsa`, `crypto-bigint` and `crypto-primes`. Always compiled;
-//! the only backend on targets that cannot load OpenSSL.
+//! The RustCrypto backend: `rsa`, `dsa`, `crypto-bigint` and `crypto-primes`. Compiled with
+//! the `rustcrypto` feature; the only backend on targets without a system one and the
+//! per-operation fallback of the system backends.
 //!
 //! Differences from OpenSSL: finite-field DH needs an odd modulus; PSS refuses `md5-sha1`;
 //! `prime_check` ignores the round count; primality of safe primes and generation with `add` /
@@ -10,10 +11,8 @@ mod bignum;
 mod dh;
 mod dsa;
 mod prime;
-mod rng;
 mod rsa;
 
-pub use rng::SysRng;
 
 use crate::error::Result;
 use crate::{

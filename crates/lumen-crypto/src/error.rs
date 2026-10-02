@@ -92,6 +92,11 @@ impl CryptoError {
         self
     }
 
+    /// What Node says for an operation the selected backend cannot do and has no fallback for.
+    pub fn unsupported() -> CryptoError {
+        CryptoError::error("Unsupported crypto operation").with_code("ERR_CRYPTO_UNSUPPORTED_OPERATION")
+    }
+
     /// A failed operation without an OpenSSL error behind it (`ERR_CRYPTO_OPERATION_FAILED`).
     pub fn failed(message: impl Into<String>) -> CryptoError {
         CryptoError::error(message).with_code("ERR_CRYPTO_OPERATION_FAILED")

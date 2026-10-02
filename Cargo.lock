@@ -903,6 +903,8 @@ dependencies = [
 name = "lumen-crypto"
 version = "0.1.3"
 dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
  "crypto-bigint 0.7.5",
  "crypto-primes",
  "digest",
@@ -913,7 +915,10 @@ dependencies = [
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "rsa",
+ "security-framework",
+ "security-framework-sys",
  "signature",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

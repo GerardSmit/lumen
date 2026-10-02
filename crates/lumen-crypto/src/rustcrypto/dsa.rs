@@ -5,8 +5,8 @@ use signature::hazmat::{PrehashVerifier, RandomizedPrehashSigner};
 use signature::SignatureEncoding;
 
 use super::bignum::{generate_prime, is_prime, modpow, random_range};
-use super::rng::SysRng;
-use super::rsa::decoder_unsupported;
+use crate::rng::SysRng;
+use crate::rsa_util::decoder_unsupported;
 use crate::error::{CryptoError, Result};
 use crate::{DsaParams, DsaPrivateKey, DsaPublicKey};
 

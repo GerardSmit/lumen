@@ -9,7 +9,7 @@ use crypto_primes::hazmat::{SetBits, SmallFactorsSieveFactory};
 use crypto_primes::{is_prime as primes_is_prime, random_prime, sieve_and_find, Flavor};
 use num_bigint_dig::BigUint;
 
-use super::rng::SysRng;
+use crate::rng::SysRng;
 
 fn limb_bits(bytes: usize) -> u32 {
     (bytes.max(1) as u32 * 8).next_multiple_of(64)
