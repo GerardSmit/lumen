@@ -116,6 +116,17 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                 InstData::Return { args } => {
                     return Ok(args.iter().map(|&v| get(&vals, v)).collect());
                 }
+                InstData::CheckedBinary { op, args } => {
+                    let a = get(&vals, args[0]) as i32;
+                    let b = get(&vals, args[1]) as i32;
+                    let (value, overflow) = match op {
+                        CheckedOp::IaddOv => a.overflowing_add(b),
+                        CheckedOp::IsubOv => a.overflowing_sub(b),
+                        CheckedOp::ImulOv => a.overflowing_mul(b),
+                    };
+                    vals[results[0].index()] = value as u32 as u64;
+                    vals[results[1].index()] = overflow as u64;
+                }
                 _ => {
                     let v = eval::pure_inst(func, d, |v| get(&vals, v))
                         .unwrap_or_else(|| panic!("{inst}: undefined operation {d:?}"));

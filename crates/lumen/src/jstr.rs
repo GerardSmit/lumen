@@ -18,10 +18,14 @@ pub use lumen_common::smuggle::{
 pub fn units(s: &str) -> Vec<u16> {
     // ASCII fast path: units are exactly the bytes (no surrogates, no smuggling possible).
     if s.is_ascii() {
-        return s.as_bytes().iter().map(|&b| b as u16).collect();
+        return lumen_common::scan::latin1_to_utf16(s.as_bytes());
     }
     let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
+    let mut at = 0;
+    while at < s.len() {
+        at += lumen_common::scan::utf8_bmp_prefix(&s[at..], &mut out);
+        if at == s.len() { break; }
+        let c = s[at..].chars().next().unwrap();
         match smuggled(c) {
             Some(u) => out.push(u),
             None => {
@@ -29,6 +33,7 @@ pub fn units(s: &str) -> Vec<u16> {
                 out.extend_from_slice(c.encode_utf16(&mut buf));
             }
         }
+        at += c.len_utf8();
     }
     out
 }
@@ -53,13 +58,14 @@ pub fn unit_len(s: &str) -> usize {
 /// surrogates are smuggled.
 pub fn from_units(units: &[u16]) -> String {
     // ASCII fast path: no pairs or smuggling below 0x80.
-    if lumen_common::scan::utf16_is_ascii(units) {
-        let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
-        return String::from_utf8(bytes).unwrap();
+    if let Some(text) = lumen_common::scan::utf16_to_ascii(units) {
+        return text;
     }
     let mut out = String::with_capacity(units.len());
     let mut i = 0;
     while i < units.len() {
+        i += lumen_common::scan::utf16_bmp_prefix(&units[i..], &mut out);
+        if i == units.len() { break; }
         let u = units[i] as u32;
         if (0xD800..0xDC00).contains(&u)
             && i + 1 < units.len()

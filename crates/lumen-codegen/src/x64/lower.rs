@@ -590,6 +590,7 @@ impl Lower<'_> {
             InstData::Iconst { .. } | InstData::F32const { .. } | InstData::F64const { .. } => {}
             InstData::Unary { op, arg } => self.unary(*op, *arg, res[0])?,
             InstData::Binary { op, args } => self.binary(*op, args[0], args[1], res[0])?,
+            InstData::CheckedBinary { .. } => return Err("unlegalized checked arithmetic".into()),
             InstData::IntCmp { cc, args } => {
                 let dst = self.vreg(res[0]);
                 let cc = self.int_cmp(*cc, args[0], args[1]);

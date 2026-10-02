@@ -8,7 +8,7 @@
 //! arguments, which may use a spill slot directly. A spilled register operand is reloaded into a
 //! scratch register by the emitter (`x16`, `x17`, `x30`; `v30`, `v31`).
 
-use super::asm::{Cond, FOp1, FOp2, LdSt, Rrr};
+use super::asm::{Cond, FOp1, FOp2, LdSt, Rrr, SelectOp};
 use crate::machinst::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,7 @@ impl Size {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpRhs {
     Reg(VReg),
+    Sxtw(VReg),
     Imm { imm12: u16, shift: bool, neg: bool },
 }
 
@@ -43,6 +44,7 @@ pub enum CmpRhs {
 pub enum Amode {
     Imm(VReg, i32),
     Reg(VReg, VReg, bool),
+    Sxtw(VReg, VReg, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,6 +219,8 @@ pub enum MInst {
     },
     /// `dst = cc ? t : f`
     CSel {
+        size: Size,
+        op: SelectOp,
         cc: Cond,
         dst: VReg,
         t: VReg,
@@ -321,7 +325,7 @@ pub enum MInst {
 fn amode_uses(a: &Amode, out: &mut Vec<Operand>) {
     match *a {
         Amode::Imm(b, _) => out.push(Operand::use_reg(b)),
-        Amode::Reg(b, i, _) => {
+        Amode::Reg(b, i, _) | Amode::Sxtw(b, i, _) => {
             out.push(Operand::use_reg(b));
             if i != b {
                 out.push(Operand::use_reg(i));
@@ -398,7 +402,7 @@ impl MachInst for MInst {
             }
             Cmp { a, b, .. } => {
                 out.push(Operand::use_reg(*a));
-                if let CmpRhs::Reg(b) = b {
+                if let CmpRhs::Reg(b) | CmpRhs::Sxtw(b) = b {
                     if b != a {
                         out.push(Operand::use_reg(*b));
                     }

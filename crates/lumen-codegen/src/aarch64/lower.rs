@@ -11,7 +11,7 @@
 //!   (`[base, #imm]` or `[base, index]`);
 //! - `uext` is free: I32 values are always kept zero-extended in their 64-bit register.
 
-use super::asm::{logical_imm, Cond, FOp1, FOp2, LdSt, LogImm, Rrr};
+use super::asm::{logical_imm, Cond, FOp1, FOp2, LdSt, LogImm, Rrr, SelectOp};
 use super::inst::*;
 use super::regs::*;
 use crate::cfg::Cfg;
@@ -100,9 +100,106 @@ fn tested_bit(f: &Function, condition: Value) -> Option<(Value, Value, u8, bool)
     mask.is_power_of_two().then_some((masked, value, mask.trailing_zeros() as u8, nz))
 }
 
+fn select_transform(f: &Function, value: Value) -> Option<(Value, SelectOp)> {
+    let ValueDef::Result(i, 0) = f.values[value.index()].def else { return None };
+    let InstData::Binary { op, args: [a, b] } = f.inst(i) else { return None };
+    let constant = |value: Value, expected: i64| match f.values[value.index()].def {
+        ValueDef::Result(i, 0) => matches!(f.inst(i), InstData::Iconst { imm, .. }
+            if eval::norm(f.value_type(value), *imm as u64) == eval::norm(f.value_type(value), expected as u64)),
+        _ => false,
+    };
+    match op {
+        BinaryOp::Iadd if constant(*b, 1) => Some((*a, SelectOp::Inc)),
+        BinaryOp::Iadd if constant(*a, 1) => Some((*b, SelectOp::Inc)),
+        BinaryOp::Bxor if constant(*b, -1) => Some((*a, SelectOp::Inv)),
+        BinaryOp::Bxor if constant(*a, -1) => Some((*b, SelectOp::Inv)),
+        BinaryOp::Isub if constant(*a, 0) => Some((*b, SelectOp::Neg)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod softfloat_tests {
     use super::*;
+
+    #[test]
+    fn checked_i32_branches_use_flags_without_a_boolean_temporary() {
+        for op in [CheckedOp::IaddOv, CheckedOp::IsubOv, CheckedOp::ImulOv] {
+            let mut f = Function::new("checked_branch", Signature::new(vec![Type::I32; 2], vec![Type::I32]));
+            let mut b = crate::FunctionBuilder::new(&mut f);
+            let entry = b.create_entry_block();
+            let args = b.block_params(entry).to_vec();
+            let (value, overflow) = b.checked_binary(op, args[0], args[1]);
+            let yes = b.create_block();
+            let no = b.create_block();
+            b.brif(overflow, yes, &[], no, &[]);
+            b.switch_to_block(yes);
+            let zero = b.iconst(Type::I32, 0);
+            b.ret(&[zero]);
+            b.switch_to_block(no);
+            b.ret(&[value]);
+            b.finish();
+            let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+            assert!(!lowered.vcode.insts.iter().any(|i| matches!(i, MInst::CSet { .. })));
+            let expected = match op { CheckedOp::IaddOv => Rrr::Adds, CheckedOp::IsubOv => Rrr::Subs, CheckedOp::ImulOv => Rrr::Smull };
+            assert!(lowered.vcode.insts.iter().any(|i| matches!(i, MInst::Rrr { op, .. } if *op == expected)));
+            super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+        }
+    }
+
+    #[test]
+    fn conditional_select_folds_one_single_use_transformed_arm() {
+        for ty in [Type::I32, Type::I64] {
+            for op in [SelectOp::Inc, SelectOp::Inv, SelectOp::Neg] {
+                for true_arm in [false, true] {
+                    for shared in [false, true] {
+                        let mut f = Function::new("select_transform", Signature::new(vec![ty; 2], vec![ty]));
+                        let mut b = crate::FunctionBuilder::new(&mut f);
+                        let entry = b.create_entry_block();
+                        let args = b.block_params(entry).to_vec();
+                        let constant = b.iconst(ty, match op { SelectOp::Inc => 1, SelectOp::Inv => -1, _ => 0 });
+                        let transformed = match op {
+                            SelectOp::Inc => b.binary(BinaryOp::Iadd, args[0], constant),
+                            SelectOp::Inv => b.binary(BinaryOp::Bxor, args[0], constant),
+                            _ => b.binary(BinaryOp::Isub, constant, args[0]),
+                        };
+                        let cond = b.icmp(IntCC::Slt, args[0], args[1]);
+                        let selected = if true_arm { b.select(cond, transformed, args[1]) }
+                            else { b.select(cond, args[1], transformed) };
+                        let result = if shared { b.binary(BinaryOp::Bxor, selected, transformed) } else { selected };
+                        b.ret(&[result]);
+                        let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                        assert!(lowered.vcode.insts.iter().any(|i| matches!(i,
+                            MInst::CSel { op: found, size, .. }
+                                if *found == if shared { SelectOp::Plain } else { op } && *size == size_of(ty))));
+                        super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compare_chains_emit_ccmp_instead_of_boolean_temporaries() {
+        for ty in [Type::I32, Type::I64] {
+            for op in [BinaryOp::Band, BinaryOp::Bor] {
+                let mut f = Function::new("compare_chain", Signature::new(vec![ty; 2], vec![ty]));
+                let mut b = crate::FunctionBuilder::new(&mut f);
+                let entry = b.create_entry_block();
+                let args = b.block_params(entry).to_vec();
+                let zero = b.iconst(ty, 0);
+                let first = b.icmp(IntCC::Sge, args[0], zero);
+                let second = b.icmp(IntCC::Ult, args[0], args[1]);
+                let cond = b.binary(op, first, second);
+                let result = b.select(cond, args[0], args[1]);
+                b.ret(&[result]);
+                let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                assert_eq!(lowered.vcode.insts.iter().filter(|i| matches!(i, MInst::CCmp { .. })).count(), 1);
+                assert!(!lowered.vcode.insts.iter().any(|i| matches!(i, MInst::CSet { .. })));
+                super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn shift_pairs_extract_exact_signed_and_unsigned_bitfields() {
@@ -221,7 +318,7 @@ mod softfloat_tests {
         let mut portable = f.clone();
         crate::legalize::legalize(&mut portable, crate::legalize::Legal {
             from_u64: true, to_uint: true, to_int_sat: true,
-            srem_min_neg1: true, fcopysign: true, js_to_i32: false,
+            srem_min_neg1: true, fcopysign: true, checked_i32: false, js_to_i32: false,
         });
         crate::verify::verify(&portable).unwrap();
         for x in [0.0, -0.0, -1.75, 1.75, 2147483648.0, -2147483649.0,
@@ -252,6 +349,32 @@ mod softfloat_tests {
                     MInst::Load { addr: Amode::Reg(_, _, true), .. })), shift == width);
                 assert_eq!(lowered.vcode.insts.iter().any(|inst| matches!(inst,
                     MInst::ShiftImm { .. })), shift != width);
+            }
+        }
+    }
+
+    #[test]
+    fn signed_word_indices_fold_with_or_without_scale_and_constant_bases() {
+        for scaled in [false, true] {
+            for constant_base in [false, true] {
+                let mut f = Function::new("signed_index", Signature::new(vec![Type::I64, Type::I32], vec![Type::I64]));
+                let mut b = crate::FunctionBuilder::new(&mut f);
+                let entry = b.create_entry_block();
+                let args = b.block_params(entry).to_vec();
+                let base = if constant_base { b.iconst(Type::I64, 1024) } else { args[0] };
+                let mut index = b.convert(ConvOp::Sext, Type::I64, args[1]);
+                if scaled {
+                    let count = b.iconst(Type::I64, 3);
+                    index = b.binary(BinaryOp::Ishl, index, count);
+                }
+                let address = b.binary(BinaryOp::Iadd, base, index);
+                let result = b.load(MemKind::I64, address, 0);
+                b.ret(&[result]);
+                let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                assert!(lowered.vcode.insts.iter().any(|inst| matches!(inst,
+                    MInst::Load { addr: Amode::Sxtw(_, _, found), .. } if *found == scaled)));
+                assert!(!lowered.vcode.insts.iter().any(|inst| matches!(inst, MInst::Sext { .. } | MInst::ShiftImm { .. })));
+                super::super::compile(&f, &super::super::Config::host(None)).unwrap();
             }
         }
     }
@@ -400,6 +523,16 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
     }
     let mut sunk = vec![false; nv];
     for &b in &cfg.rpo {
+        for pair in f.blocks[b.index()].insts.windows(2) {
+            if !matches!(f.inst(pair[0]), InstData::CheckedBinary { .. }) { continue; }
+            let flag = f.results(pair[0])[1];
+            if uses[flag.index()] == 1 && matches!(f.inst(pair[1]),
+                InstData::Brif { cond, .. } | InstData::Select { cond, .. }
+                    | InstData::TrapIf { cond, .. } if *cond == flag)
+            { sunk[flag.index()] = true; }
+        }
+    }
+    for &b in &cfg.rpo {
         for &i in &f.blocks[b.index()].insts {
             let [r] = f.results(i) else { continue };
             let Some(u) = user[r.index()] else { continue };
@@ -452,6 +585,21 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
         }
     }
 
+    // Only one arm is transformed by CSINC/CSINV/CSNEG.
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Select { if_true, if_false, .. } = f.inst(i) else { continue };
+            for &value in [*if_false, *if_true].iter() {
+                let ValueDef::Result(def, 0) = f.values[value.index()].def else { continue };
+                if uses[value.index()] == 1 && inst_block[def.index()] == Some(b)
+                    && select_transform(f, value).is_some() {
+                    sunk[value.index()] = true;
+                    break;
+                }
+            }
+        }
+    }
+
     // Sink a single-use scaled index together with its single-use address add.
     // The shift must match the memory width, with no displacement to materialize.
     for &b in &cfg.rpo {
@@ -489,6 +637,29 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
             if let (InstData::Iconst { imm: left, .. }, InstData::Iconst { imm: right, .. }) = (f.inst(l), f.inst(r)) {
                 let mask = f.value_type(*result).bits() as i64 - 1;
                 if (right & mask) >= (left & mask) { sunk[result.index()] = true; }
+            }
+        }
+    }
+
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Convert { op: ConvOp::Sext, to: Type::I64, arg } = f.inst(i) else { continue };
+            if f.value_type(*arg) != Type::I32 { continue; }
+            let [result] = f.results(i) else { continue };
+            let Some(u) = user[result.index()] else { continue };
+            if uses[result.index()] != 1 || inst_block[u.index()] != Some(b) { continue; }
+            let [index] = f.results(u) else { continue };
+            let add = match f.inst(u) {
+                InstData::Binary { op: BinaryOp::Iadd, .. } if sunk[index.index()] => u,
+                InstData::Binary { op: BinaryOp::Ishl, .. } if sunk[index.index()] => {
+                    let Some(add) = user[index.index()] else { continue }; add
+                }
+                _ => continue,
+            };
+            let [address] = f.results(add) else { continue };
+            let Some(memory) = user[address.index()] else { continue };
+            if matches!(f.inst(memory), InstData::Load { offset: 0, .. } | InstData::Store { offset: 0, .. }) {
+                sunk[result.index()] = true;
             }
         }
     }
@@ -803,6 +974,11 @@ impl Lower<'_> {
         if !self.sunk[cond.index()] {
             return None;
         }
+        if let ValueDef::Result(i, 1) = self.f.values[cond.index()].def {
+            if let InstData::CheckedBinary { op, args } = *self.f.inst(i) {
+                return Some(self.checked(op, args, self.f.results(i)[0]));
+            }
+        }
         match self.def(cond).cloned() {
             Some(InstData::IntCmp { cc, args }) => Some(self.int_cmp(cc, args[0], args[1])),
             Some(InstData::FloatCmp { cc, args }) => Some(self.float_cmp(cc, args[0], args[1])),
@@ -850,6 +1026,22 @@ impl Lower<'_> {
         let mut base = None;
         if self.sunk[addr.index()] {
             if let Some(InstData::Binary { args: [a, b], .. }) = self.def(addr).cloned() {
+                // Consume sunk indices before considering a constant base as a displacement.
+                if offset == 0 {
+                    for (base, index) in [(a, b), (b, a)] {
+                        if !self.sunk[index.index()] { continue; }
+                        let (index, scaled) = match self.def(index).cloned() {
+                            Some(InstData::Binary { op: BinaryOp::Ishl, args: [index, _] }) => (index, true),
+                            _ => (index, false),
+                        };
+                        if self.sunk[index.index()] {
+                            if let Some(InstData::Convert { op: ConvOp::Sext, arg, .. }) = self.def(index).cloned() {
+                                return Amode::Sxtw(self.use_val(base), self.use_val(arg), scaled);
+                            }
+                        }
+                        return Amode::Reg(self.use_val(base), self.use_val(index), scaled);
+                    }
+                }
                 for (x, y) in [(a, b), (b, a)] {
                     let disp = self
                         .iconst(y)
@@ -857,15 +1049,6 @@ impl Lower<'_> {
                         .and_then(|c| c.checked_add(offset));
                     if let Some(d) = disp.filter(|&d| op.offset_ok(d as i64)) {
                         return Amode::Imm(self.use_val(x), d);
-                    }
-                }
-                if offset == 0 {
-                    for (base, index) in [(a, b), (b, a)] {
-                        if self.sunk[index.index()] {
-                            if let Some(InstData::Binary { op: BinaryOp::Ishl, args: [index, _] }) = self.def(index).cloned() {
-                                return Amode::Reg(self.use_val(base), self.use_val(index), true);
-                            }
-                        }
                     }
                 }
                 let (ra, rb) = (self.use_val(a), self.use_val(b));
@@ -975,6 +1158,12 @@ impl Lower<'_> {
             InstData::Iconst { .. } | InstData::F32const { .. } | InstData::F64const { .. } => {}
             InstData::Unary { op, arg } => self.unary(*op, *arg, res[0])?,
             InstData::Binary { op, args } => self.binary(*op, args[0], args[1], res[0])?,
+            InstData::CheckedBinary { op, args } => {
+                if self.sunk[res[1].index()] { return Ok(()); }
+                let cc = self.checked(*op, *args, res[0]);
+                let overflow = self.vreg(res[1]);
+                self.push(MInst::CSet { cc, dst: overflow });
+            }
             InstData::IntCmp { cc, args } => {
                 let dst = self.vreg(res[0]);
                 let cc = self.int_cmp(*cc, args[0], args[1]);
@@ -991,13 +1180,21 @@ impl Lower<'_> {
                 if_false,
             } => {
                 let dst = self.vreg(res[0]);
-                let t = self.use_val(*if_true);
-                let fv = self.use_val(*if_false);
+                let (t, fv, op, invert) = if self.sunk[if_false.index()] {
+                    let (value, op) = select_transform(self.f, *if_false).unwrap();
+                    (*if_true, value, op, false)
+                } else if self.sunk[if_true.index()] {
+                    let (value, op) = select_transform(self.f, *if_true).unwrap();
+                    (*if_false, value, op, true)
+                } else { (*if_true, *if_false, SelectOp::Plain, false) };
+                let t = self.use_val(t);
+                let fv = self.use_val(fv);
                 let cc = self.cond(*cond);
+                let cc = if invert { cc.invert() } else { cc };
                 self.push(if self.ty(res[0]).is_float() {
                     MInst::FCSel { cc, dst, t, f: fv }
                 } else {
-                    MInst::CSel { cc, dst, t, f: fv }
+                    MInst::CSel { size: size_of(self.ty(res[0])), op, cc, dst, t, f: fv }
                 });
             }
             InstData::Convert { op, to, arg } => self.convert(*op, *to, *arg, res[0])?,
@@ -1107,6 +1304,26 @@ impl Lower<'_> {
             }
         }
         Ok(())
+    }
+
+    fn checked(&mut self, op: CheckedOp, args: [Value; 2], result: Value) -> Cond {
+        let a = self.use_val(args[0]);
+        let b = self.use_val(args[1]);
+        let dst = self.vreg(result);
+        match op {
+            CheckedOp::IaddOv | CheckedOp::IsubOv => {
+                let op = if op == CheckedOp::IaddOv { Rrr::Adds } else { Rrr::Subs };
+                self.push(MInst::Rrr { op, size: Size::S32, dst, a, b });
+                Cond::Vs
+            }
+            CheckedOp::ImulOv => {
+                let wide = self.fresh(Type::I64);
+                self.push(MInst::Rrr { op: Rrr::Smull, size: Size::S64, dst: wide, a, b });
+                self.push(MInst::Cmp { size: Size::S64, a: wide, b: CmpRhs::Sxtw(wide) });
+                self.push(MInst::Mov { size: Size::S32, dst, src: wide });
+                Cond::Ne
+            }
+        }
     }
 
     fn unary(&mut self, op: UnaryOp, arg: Value, r: Value) -> Result<(), String> {

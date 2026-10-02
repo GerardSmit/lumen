@@ -54,7 +54,7 @@ pub fn compile_module(
         let mut f = f.clone();
         crate::legalize::legalize(&mut f, crate::legalize::Legal {
             from_u64: true, to_uint: true, to_int_sat: true,
-            srem_min_neg1: true, fcopysign: true, js_to_i32: false,
+            srem_min_neg1: true, fcopysign: true, checked_i32: false, js_to_i32: false,
         });
         f.resolve_aliases();
         crate::opt::remove_unreachable(&mut f);

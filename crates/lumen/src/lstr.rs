@@ -512,14 +512,14 @@ impl From<char> for LStr {
 
 impl PartialEq for LStr {
     fn eq(&self, other: &LStr) -> bool {
-        LStr::ptr_eq(self, other) || self.as_str() == other.as_str()
+        LStr::ptr_eq(self, other) || lumen_common::scan::bytes_equal(self.as_bytes(), other.as_bytes())
     }
 }
 impl Eq for LStr {}
 
 impl PartialEq<str> for LStr {
     fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
+        lumen_common::scan::bytes_equal(self.as_bytes(), other.as_bytes())
     }
 }
 

@@ -5,6 +5,57 @@ fn env() -> BufferEnv {
     BufferEnv { mem: vec![0; 256] }
 }
 
+#[test]
+fn checked_i32_keeps_both_results_through_optimization_and_legalization() {
+    for op in [CheckedOp::IaddOv, CheckedOp::IsubOv, CheckedOp::ImulOv] {
+        let mut f = Function::new("checked", Signature::new(vec![Type::I32; 2], vec![Type::I64]));
+        let mut b = FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let args = b.block_params(entry).to_vec();
+        let (value, overflow) = b.checked_binary(op, args[0], args[1]);
+        let value = b.convert(ConvOp::Uext, Type::I64, value);
+        let flag = b.convert(ConvOp::Uext, Type::I64, overflow);
+        let shift = b.iconst(Type::I64, 32);
+        let flag = b.binary(BinaryOp::Ishl, flag, shift);
+        let result = b.binary(BinaryOp::Bor, value, flag);
+        b.ret(&[result]);
+        b.finish();
+        verify::verify(&f).unwrap();
+        let mut optimized = f.clone();
+        opt::optimize(&mut optimized);
+        let mut portable = optimized.clone();
+        legalize::legalize(&mut portable, legalize::Legal {
+            from_u64: true, to_uint: true, to_int_sat: true, srem_min_neg1: true,
+            fcopysign: true, js_to_i32: true, checked_i32: false,
+        });
+        verify::verify(&portable).unwrap();
+        wasm::compile_module(&[optimized.clone()], &wasm::Config::default(), |_| None).unwrap();
+        #[cfg(target_arch = "x86_64")]
+        let native = {
+            let code = x64::compile(&optimized, &x64::Config::host(None)).unwrap();
+            jitmem::ExecMemory::new(&code.code).unwrap()
+        };
+        for a in [i32::MIN, -46341, -1, 0, 1, 46341, i32::MAX] {
+            for b in [i32::MIN, -46341, -1, 0, 1, 46341, i32::MAX] {
+                let (value, overflow) = match op {
+                    CheckedOp::IaddOv => a.overflowing_add(b),
+                    CheckedOp::IsubOv => a.overflowing_sub(b),
+                    CheckedOp::ImulOv => a.overflowing_mul(b),
+                };
+                let expected = vec![value as u32 as u64 | ((overflow as u64) << 32)];
+                for function in [&f, &optimized, &portable] {
+                    assert_eq!(run(function, &mut env(), &[a as u32 as u64, b as u32 as u64]).unwrap(), expected);
+                }
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    let call: unsafe extern "C" fn(u32, u32) -> u64 = std::mem::transmute(native.as_ptr());
+                    assert_eq!(call(a as u32, b as u32), expected[0]);
+                }
+            }
+        }
+    }
+}
+
 /// sum = 0; for i in 0..n { sum += i * k } ; return sum   (k is a loop invariant constant)
 fn sum_loop() -> Function {
     let mut f = Function::new("sum", Signature::new(vec![Type::I32], vec![Type::I32]));

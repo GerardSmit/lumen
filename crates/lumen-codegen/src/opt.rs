@@ -283,6 +283,8 @@ pub fn gvn(func: &mut Function) {
             if !data.is_pure() && !is_foldable_trapping(&data) {
                 continue;
             }
+            // Multi-result arithmetic must preserve both the value and overflow flag.
+            if func.results(inst).len() != 1 { continue; }
             let result = func.results(inst)[0];
             let ty = func.value_type(result);
 

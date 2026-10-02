@@ -541,6 +541,7 @@ impl Emitter<'_> {
                 self.operand(args[1])?;
                 self.op(binary(*op, ty(args[0]))?);
             }
+            InstData::CheckedBinary { .. } => return Err("unlegalized checked arithmetic".into()),
             InstData::IntCmp { cc, args } => {
                 self.operand(args[0])?;
                 self.operand(args[1])?;

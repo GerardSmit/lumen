@@ -7726,7 +7726,7 @@ pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) 
         if !s.bytes().any(|b| b.is_ascii_lowercase()) {
             return Ok(Value::Str(s));
         }
-        return Ok(Value::from_string(s.to_ascii_uppercase()));
+        return Ok(Value::from_string(lumen_common::scan::ascii_case(&s, true)));
     }
     Ok(Value::from_string(s.to_uppercase()))
 }
@@ -7741,7 +7741,7 @@ pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) 
         if !s.bytes().any(|b| b.is_ascii_uppercase()) {
             return Ok(Value::Str(s));
         }
-        return Ok(Value::from_string(s.to_ascii_lowercase()));
+        return Ok(Value::from_string(lumen_common::scan::ascii_case(&s, false)));
     }
     Ok(Value::from_string(s.to_lowercase()))
 }
@@ -7952,14 +7952,14 @@ pub(crate) fn str_fast(k: StrFast, s: &crate::lstr::LStr, args: &[Value]) -> Opt
         }
         StrFast::ToUpperCase => {
             if s.bytes().any(|b| b.is_ascii_lowercase()) {
-                Value::from_string(s.to_ascii_uppercase())
+                Value::from_string(lumen_common::scan::ascii_case(s, true))
             } else {
                 Value::Str(s.clone())
             }
         }
         StrFast::ToLowerCase => {
             if s.bytes().any(|b| b.is_ascii_uppercase()) {
-                Value::from_string(s.to_ascii_lowercase())
+                Value::from_string(lumen_common::scan::ascii_case(s, false))
             } else {
                 Value::Str(s.clone())
             }

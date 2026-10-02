@@ -339,6 +339,12 @@ impl<'a> FunctionBuilder<'a> {
         debug_assert_eq!(self.func.value_type(a), self.func.value_type(b), "{op:?}");
         self.push1(InstData::Binary { op, args: [a, b] })
     }
+    /// Signed I32 arithmetic returning `(wrapped_result, overflow)`.
+    pub fn checked_binary(&mut self, op: CheckedOp, a: Value, b: Value) -> (Value, Value) {
+        let inst = self.push(InstData::CheckedBinary { op, args: [a, b] });
+        let results = self.func.results(inst);
+        (results[0], results[1])
+    }
     pub fn icmp(&mut self, cc: IntCC, a: Value, b: Value) -> Value {
         self.push1(InstData::IntCmp { cc, args: [a, b] })
     }

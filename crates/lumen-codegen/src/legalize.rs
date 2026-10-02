@@ -20,6 +20,7 @@ pub struct Legal {
     pub srem_min_neg1: bool,
     pub fcopysign: bool,
     pub js_to_i32: bool,
+    pub checked_i32: bool,
 }
 
 pub fn legalize(func: &mut Function, legal: Legal) {
@@ -48,6 +49,29 @@ pub fn legalize(func: &mut Function, legal: Legal) {
             continue;
         };
         match data {
+            InstData::CheckedBinary { op, args: [a, b] } => {
+                let results = func.results(inst).to_vec();
+                let mut p = pos;
+                let mut ins = |func: &mut Function, data| {
+                    let value = insert(func, block, p, data);
+                    p += 1;
+                    value
+                };
+                let a = ins(func, InstData::Convert { op: ConvOp::Sext, to: Type::I64, arg: a });
+                let b = ins(func, InstData::Convert { op: ConvOp::Sext, to: Type::I64, arg: b });
+                let op = match op {
+                    CheckedOp::IaddOv => BinaryOp::Iadd,
+                    CheckedOp::IsubOv => BinaryOp::Isub,
+                    CheckedOp::ImulOv => BinaryOp::Imul,
+                };
+                let wide = ins(func, InstData::Binary { op, args: [a, b] });
+                let value = ins(func, InstData::Convert { op: ConvOp::Wrap, to: Type::I32, arg: wide });
+                let back = ins(func, InstData::Convert { op: ConvOp::Sext, to: Type::I64, arg: value });
+                let overflow = ins(func, InstData::IntCmp { cc: IntCC::Ne, args: [wide, back] });
+                func.replace_uses(results[0], value);
+                func.replace_uses(results[1], overflow);
+                func.blocks[block.index()].insts.retain(|&i| i != inst);
+            }
             InstData::Unary {
                 op: UnaryOp::Eqz,
                 arg,
@@ -194,6 +218,7 @@ pub fn legalize(func: &mut Function, legal: Legal) {
 /// Whether `legalize` rewrites an instruction of this shape (its match arms' patterns).
 fn needs_rewrite(data: &InstData, legal: Legal) -> bool {
     match data {
+        InstData::CheckedBinary { .. } => !legal.checked_i32,
         InstData::Unary { op: UnaryOp::Eqz, .. } => true,
         InstData::Binary { op: BinaryOp::Srem, .. } => !legal.srem_min_neg1,
         InstData::Binary { op: BinaryOp::Fcopysign, .. } => !legal.fcopysign,

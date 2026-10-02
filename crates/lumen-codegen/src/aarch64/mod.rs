@@ -95,7 +95,7 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
             to_int_sat: true,
             srem_min_neg1: true,
             fcopysign: false,
-            js_to_i32: cfg.features & lumen_common::target::aarch64::JSCVT != 0,
+            checked_i32: true, js_to_i32: cfg.features & lumen_common::target::aarch64::JSCVT != 0,
         },
     );
     crate::opt::remove_unreachable(&mut f);

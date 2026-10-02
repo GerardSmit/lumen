@@ -155,6 +155,10 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
             let int = !matches!(op, Fadd | Fsub | Fmul | Fdiv | Fmin | Fmax | Fcopysign);
             if int == t.is_int() { Ok(()) } else { Err(format!("{op:?} on {t:?}")) }
         }
+        InstData::CheckedBinary { args, .. } => {
+            want(args[0], Type::I32)?;
+            want(args[1], Type::I32)
+        }
         InstData::IntCmp { args, .. } => {
             want(args[1], ty(args[0]))?;
             if ty(args[0]).is_int() { Ok(()) } else { Err("icmp on floats".into()) }

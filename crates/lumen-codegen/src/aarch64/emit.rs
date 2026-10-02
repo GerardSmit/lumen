@@ -389,7 +389,11 @@ impl<'a> Emitter<'a> {
             }
             Amode::Reg(b, i, scaled) => {
                 let (b, i) = (self.r(b), self.r(i));
-                self.a.ldst_reg(op, rt, b, i, scaled);
+                self.a.ldst_reg(op, rt, b, i, scaled, false);
+            }
+            Amode::Sxtw(b, i, scaled) => {
+                let (b, i) = (self.r(b), self.r(i));
+                self.a.ldst_reg(op, rt, b, i, scaled, true);
             }
         }
     }
@@ -579,6 +583,10 @@ impl<'a> Emitter<'a> {
                         let rb = self.r(b);
                         self.a.rrr(Rrr::Subs, size.w(), ZR, ra, rb);
                     }
+                    CmpRhs::Sxtw(b) => {
+                        let rb = self.r(b);
+                        self.a.cmp_sxtw(ra, rb);
+                    }
                     CmpRhs::Imm { imm12, shift, neg } => {
                         self.a.cmp_imm(size.w(), neg, ra, imm12 as u32, shift)
                     }
@@ -596,9 +604,9 @@ impl<'a> Emitter<'a> {
                 let d = self.r(*dst);
                 self.a.cset(d, *cc);
             }
-            MInst::CSel { cc, dst, t, f } => {
+            MInst::CSel { size, op, cc, dst, t, f } => {
                 let (d, t, f) = (self.r(*dst), self.r(*t), self.r(*f));
-                self.a.csel(true, d, t, f, *cc);
+                self.a.csel(size.w(), d, t, f, *cc, *op);
             }
             MInst::FCSel { cc, dst, t, f } => {
                 let (d, t, f) = (self.r(*dst), self.r(*t), self.r(*f));
@@ -814,7 +822,7 @@ impl<'a> Emitter<'a> {
                 let table = self.a.new_label();
                 // adr x17, table; ldrsw x16, [x17, xi, lsl #2]; add x17, x17, x16; br x17
                 self.a.adr(X17, table);
-                self.a.ldst_reg(LdSt::LdrSw, X16, X17, i, true);
+                self.a.ldst_reg(LdSt::LdrSw, X16, X17, i, true, false);
                 self.a.rrr(Rrr::Add, true, X17, X17, X16);
                 self.a.br(X17);
                 self.tables.push((table, targets.clone()));

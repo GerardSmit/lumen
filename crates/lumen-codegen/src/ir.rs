@@ -326,6 +326,11 @@ pub enum InstData {
         op: BinaryOp,
         args: [Value; 2],
     },
+    /// Signed I32 arithmetic: wrapped I32 result and I32 overflow flag (0/1).
+    CheckedBinary {
+        op: CheckedOp,
+        args: [Value; 2],
+    },
     /// `args[0] cc args[1]` as I32 0/1.
     IntCmp {
         cc: IntCC,
@@ -401,6 +406,9 @@ pub enum InstData {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckedOp { IaddOv, IsubOv, ImulOv }
+
 impl InstData {
     pub fn is_terminator(&self) -> bool {
         matches!(
@@ -422,6 +430,7 @@ impl InstData {
                 | InstData::F32const { .. }
                 | InstData::F64const { .. }
                 | InstData::Unary { .. }
+                | InstData::CheckedBinary { .. }
                 | InstData::IntCmp { .. }
                 | InstData::FloatCmp { .. }
                 | InstData::Select { .. }
@@ -440,6 +449,7 @@ impl InstData {
             | InstData::Trap { .. } => {}
             InstData::Unary { arg, .. } | InstData::Convert { arg, .. } => f(*arg),
             InstData::Binary { args, .. }
+            | InstData::CheckedBinary { args, .. }
             | InstData::IntCmp { args, .. }
             | InstData::FloatCmp { args, .. } => {
                 f(args[0]);
@@ -499,6 +509,7 @@ impl InstData {
             | InstData::Trap { .. } => {}
             InstData::Unary { arg, .. } | InstData::Convert { arg, .. } => *arg = f(*arg),
             InstData::Binary { args, .. }
+            | InstData::CheckedBinary { args, .. }
             | InstData::IntCmp { args, .. }
             | InstData::FloatCmp { args, .. } => {
                 args[0] = f(args[0]);
@@ -680,6 +691,7 @@ impl Function {
             InstData::F64const { .. } => vec![Type::F64],
             InstData::Unary { op, arg } => vec![if *op == UnaryOp::Eqz { Type::I32 } else { ty(*arg) }],
             InstData::Binary { args, .. } => vec![ty(args[0])],
+            InstData::CheckedBinary { .. } => vec![Type::I32, Type::I32],
             InstData::IntCmp { .. } | InstData::FloatCmp { .. } => vec![Type::I32],
             InstData::Select { if_true, .. } => vec![ty(*if_true)],
             InstData::Convert { to, .. } => vec![*to],

@@ -18,6 +18,14 @@ pub const LR: u8 = 30;
 pub const X16: u8 = 16;
 pub const X17: u8 = 17;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectOp {
+    Plain = 0,
+    Inc = 0x400,
+    Inv = 0x40000000,
+    Neg = 0x40000400,
+}
+
 /// Condition codes (hardware encoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cond {
@@ -98,6 +106,7 @@ impl LdSt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Rrr {
+    Adds = 0x2B00_0000,
     Add = 0x0B00_0000,
     Sub = 0x4B00_0000,
     Subs = 0x6B00_0000,
@@ -105,6 +114,7 @@ pub enum Rrr {
     Orr = 0x2A00_0000,
     Eor = 0x4A00_0000,
     Mul = 0x1B00_7C00,
+    Smull = 0x9B20_7C00,
     Udiv = 0x1AC0_0800,
     Sdiv = 0x1AC0_0C00,
     Lslv = 0x1AC0_2000,
@@ -355,6 +365,10 @@ impl Asm {
     pub fn cmp_ext(&mut self, rn: u8, rm: u8) {
         self.word(0xEB20_6000 | r(rm) << 16 | r(rn) << 5 | 31);
     }
+    /// `cmp xn, wm, sxtw`: compare a wide result with its signed low word.
+    pub fn cmp_sxtw(&mut self, rn: u8, rm: u8) {
+        self.word(0xEB20_C000 | r(rm) << 16 | r(rn) << 5 | 31);
+    }
     pub fn mov(&mut self, w64: bool, rd: u8, rm: u8) {
         self.rrr(Rrr::Orr, w64, rd, ZR, rm);
     }
@@ -411,8 +425,8 @@ impl Asm {
         self.word(sf(w64) | 0x5AC0_0000 | r(rn) << 5 | r(rd));
     }
     /// `csel rd, rn, rm, c` (`rd = c ? rn : rm`).
-    pub fn csel(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, c: Cond) {
-        self.word(sf(w64) | 0x1A80_0000 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd));
+    pub fn csel(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, c: Cond, op: SelectOp) {
+        self.word(sf(w64) | 0x1A80_0000 | op as u32 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd));
     }
     /// `cset wd, c` (`csinc wd, wzr, wzr, !c`).
     pub fn cset(&mut self, rd: u8, c: Cond) {
@@ -494,11 +508,11 @@ impl Asm {
         }
     }
     /// `op rt, [rn, rm]` (register offset, no shift).
-    pub fn ldst_reg(&mut self, op: LdSt, rt: u8, rn: u8, rm: u8, shift: bool) {
+    pub fn ldst_reg(&mut self, op: LdSt, rt: u8, rn: u8, rm: u8, shift: bool, sxtw: bool) {
         let w = (op as u32 & !0x0100_0000)
             | 1 << 21
             | r(rm) << 16
-            | 0b011 << 13
+            | (if sxtw { 0b110 } else { 0b011 }) << 13
             | (shift as u32) << 12
             | 0b10 << 10;
         self.word(w | r(rn) << 5 | r(rt));
@@ -514,7 +528,7 @@ impl Asm {
             self.ldst(op, rt, rn, off);
         } else {
             self.mov_imm(tmp, off as u64);
-            self.ldst_reg(op, rt, rn, tmp, false);
+            self.ldst_reg(op, rt, rn, tmp, false, false);
         }
     }
     /// `stp`/`ldp` of 64-bit GPRs (`fp: false`) or d registers, offset a multiple of 8 in
