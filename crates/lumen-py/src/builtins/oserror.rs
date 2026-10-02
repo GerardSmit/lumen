@@ -36,7 +36,7 @@ pub fn errno_exception(errno: i32) -> Option<&'static str> {
 fn inherits(it: &Interp, cls: &Obj, name: &str) -> bool {
     use lumen_bind::Class;
     matches!(it.lookup_mro(cls, name), Some(Value::Obj(o))
-        if matches!(&o.kind, Kind::Native(n) if n.desc.and_then(|d| d.class()).is_some_and(|c| std::ptr::eq(c, OSErrorType::DESC))))
+        if matches!(&o.kind, Kind::Native(n) if n.desc.and_then(|d| d.class()).is_some_and(|c| c.name == OSErrorType::DESC.name)))
 }
 
 /// CPython's `oserror_use_init`: a subclass that overrides `__init__` but not `__new__` parses its
