@@ -96,6 +96,8 @@ impl fmt::Display for Error {
 pub struct Field {
     pub text: String,
     pub numeric: bool,
+    /// An empty unquoted field under `QUOTE_STRINGS` / `QUOTE_NOTNULL`, read as `None`.
+    pub null: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,11 +124,12 @@ pub struct Parser {
     field: String,
     field_len: i64,
     numeric: bool,
+    quoted: bool,
 }
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser { state: State::StartRecord, fields: Vec::new(), field: String::new(), field_len: 0, numeric: false }
+        Parser { state: State::StartRecord, fields: Vec::new(), field: String::new(), field_len: 0, numeric: false, quoted: false }
     }
 }
 
@@ -157,7 +160,7 @@ impl Parser {
         if d.strict {
             return Err(Error::UnexpectedEnd);
         }
-        self.save_field();
+        self.save_field(d);
         Ok(true)
     }
 
@@ -165,11 +168,13 @@ impl Parser {
         std::mem::take(&mut self.fields)
     }
 
-    fn save_field(&mut self) {
+    fn save_field(&mut self, d: &Dialect) {
         let text = std::mem::take(&mut self.field);
-        self.fields.push(Field { text, numeric: self.numeric });
+        let null = !self.quoted && text.is_empty() && matches!(d.quoting, Quoting::Strings | Quoting::NotNull);
+        self.fields.push(Field { text, numeric: self.numeric, null });
         self.field_len = 0;
         self.numeric = false;
+        self.quoted = false;
     }
 
     fn add_char(&mut self, c: char, limit: i64) -> Result<(), Error> {
@@ -208,20 +213,21 @@ impl Parser {
         match state {
             State::StartField => {
                 if is_nl(c) || c == EOL {
-                    self.save_field();
+                    self.save_field(d);
                     self.state = end_state(c);
                 } else if is_quote(c) {
+                    self.quoted = true;
                     self.state = State::InQuotedField;
                 } else if is_escape(c) {
-                    if d.quoting == Quoting::NonNumeric {
+                    if matches!(d.quoting, Quoting::NonNumeric | Quoting::Strings) {
                         self.numeric = true;
                     }
                     self.state = State::EscapedChar;
                 } else if c == Some(' ') && d.skipinitialspace {
                 } else if is_delim(c) {
-                    self.save_field();
+                    self.save_field(d);
                 } else {
-                    if d.quoting == Quoting::NonNumeric {
+                    if matches!(d.quoting, Quoting::NonNumeric | Quoting::Strings) {
                         self.numeric = true;
                     }
                     self.add_char(c.unwrap_or('\n'), limit)?;
@@ -239,12 +245,12 @@ impl Parser {
             }
             State::InField => {
                 if is_nl(c) || c == EOL {
-                    self.save_field();
+                    self.save_field(d);
                     self.state = end_state(c);
                 } else if is_escape(c) {
                     self.state = State::EscapedChar;
                 } else if is_delim(c) {
-                    self.save_field();
+                    self.save_field(d);
                     self.state = State::StartField;
                 } else {
                     self.add_char(c.unwrap_or('\n'), limit)?;
@@ -270,10 +276,10 @@ impl Parser {
                     self.add_char(c.unwrap_or('\n'), limit)?;
                     self.state = State::InQuotedField;
                 } else if is_delim(c) {
-                    self.save_field();
+                    self.save_field(d);
                     self.state = State::StartField;
                 } else if is_nl(c) || c == EOL {
-                    self.save_field();
+                    self.save_field(d);
                     self.state = end_state(c);
                 } else if !d.strict {
                     self.add_char(c.unwrap_or('\n'), limit)?;
