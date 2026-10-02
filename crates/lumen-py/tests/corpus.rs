@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -70,23 +70,9 @@ fn run_script(script: &Path) -> Result<Outcome, String> {
         .map_err(|e| format!("spawn failed: {e}"))?;
     let out_h = drain(child.stdout.take().unwrap());
     let err_h = drain(child.stderr.take().unwrap());
-    let start = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => {
-                if start.elapsed() > TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => return Err(format!("wait failed: {e}")),
-        }
-    };
+    let status = lumen_os::child::wait_timeout(&mut child, TIMEOUT, Duration::from_millis(5))
+        .map_err(|e| format!("wait failed: {e}"))?;
+    let timed_out = status.is_none();
     let stdout = out_h.join().unwrap_or_default();
     let stderr = err_h.join().unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr);

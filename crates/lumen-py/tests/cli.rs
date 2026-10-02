@@ -39,17 +39,10 @@ fn finish(mut child: std::process::Child, limit: Duration) -> Run {
         let _ = err.read_to_string(&mut s);
         s
     });
-    let code = loop {
-        match child.try_wait().unwrap() {
-            Some(status) => break status.code(),
-            None if started.elapsed() > limit => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("process did not exit within {limit:?}");
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
-        }
-    };
+    let code = lumen_os::child::wait_timeout(&mut child, limit, Duration::from_millis(10))
+        .unwrap()
+        .unwrap_or_else(|| panic!("process did not exit within {limit:?}"))
+        .code();
     Run { code, out: out_h.join().unwrap(), err: err_h.join().unwrap(), elapsed: started.elapsed() }
 }
 
