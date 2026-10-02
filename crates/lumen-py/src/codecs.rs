@@ -1639,6 +1639,14 @@ pub fn register_error(it: &mut Interp, name: &str, handler: Value) -> R<()> {
     Ok(())
 }
 
+pub fn unregister_error(it: &mut Interp, name: &str) -> R<bool> {
+    ensure_errors(it);
+    if BUILTIN_ERRORS.iter().any(|(n, _)| *n == name) {
+        return Err(it.value_error(&format!("cannot un-register built-in error handler '{name}'")));
+    }
+    Ok(it.codecs.errors.remove(name).is_some())
+}
+
 // The built-in handlers as Python callables (`codecs.strict_errors`, ...), working from the
 // exception's attributes as CPython's `PyCodec_*Errors` do.
 

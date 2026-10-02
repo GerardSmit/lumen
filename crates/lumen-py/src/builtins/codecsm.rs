@@ -135,6 +135,20 @@ pub mod _codecs {
         codecs::register_error(it, errors, handler.clone())
     }
 
+    /// Un-register the specified error handler for the error handling `errors'.
+    ///
+    /// Only custom error handlers can be un-registered. An exception is raised
+    /// if the error handling is a built-in one (e.g., 'strict'), or if an error
+    /// occurs.
+    ///
+    /// Otherwise, this returns True if a custom handler has been successfully
+    /// un-registered, and False if no custom handler for the specified error
+    /// handling exists.
+    #[op]
+    fn _unregister_error(it: &mut Interp, errors: &str) -> R<bool> {
+        codecs::unregister_error(it, errors)
+    }
+
     /// lookup_error(errors) -> handler
     ///
     /// Return the error handler for the specified error handling name or raise a

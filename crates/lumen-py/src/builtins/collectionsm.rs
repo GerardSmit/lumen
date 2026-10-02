@@ -733,6 +733,18 @@ impl DefaultDict {
         Ok(())
     }
 
+    /// Factory called by `__missing__` to make the default value.
+    #[getter]
+    fn default_factory(slf: This<Dd<'_>>, it: &mut Interp) -> Value {
+        factory_of(it, slf.0 .0)
+    }
+
+    #[setter]
+    fn set_default_factory(slf: This<Dd<'_>>, it: &mut Interp, value: &Value) {
+        let d = it.instance_dict(slf.0 .0);
+        dict_set_str(&d, "default_factory", value.clone());
+    }
+
     /// __missing__(key) # Called by __getitem__ for missing key; pseudo-code:
     ///   if self.default_factory is None: raise KeyError((key,))
     ///   self[key] = value = self.default_factory()

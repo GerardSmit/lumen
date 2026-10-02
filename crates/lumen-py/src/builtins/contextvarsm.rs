@@ -326,6 +326,19 @@ pub mod _contextvars {
             self.var.clone()
         }
 
+        #[proto(enter)]
+        fn enter(slf: This<Py<Self>>) -> Value {
+            slf.0.value().clone()
+        }
+
+        #[proto(exit)]
+        fn exit(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value]) -> R<()> {
+            let _ = args;
+            let var = slf.0.borrow(it)?.var.clone();
+            it.call_method(&var, "reset", vec![slf.0.value().clone()])?;
+            Ok(())
+        }
+
         #[getter]
         fn old_value(&self, it: &mut Interp) -> R<Value> {
             match &self.old {
