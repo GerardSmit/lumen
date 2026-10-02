@@ -4,6 +4,7 @@ static ALLOC: lumen_common::fastalloc::ClassAlloc = lumen_common::fastalloc::Cla
 const STACK_SIZE: usize = 1 << 28;
 
 fn main() {
+    lumen_os::signal::ignore_file_size_limit_signal();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let interp = std::thread::Builder::new()
         .stack_size(STACK_SIZE)

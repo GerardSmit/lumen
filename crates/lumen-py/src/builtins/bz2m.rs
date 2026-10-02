@@ -142,6 +142,7 @@ pub mod _bz2 {
         unused_data: Vec<u8>,
         eof: bool,
         needs_input: bool,
+        failed: bool,
     }
 
     impl BZ2Decompressor {
@@ -190,6 +191,7 @@ pub mod _bz2 {
                 unused_data: Vec::new(),
                 eof: false,
                 needs_input: true,
+                failed: false,
             };
             Ok(opaque_instance(cls, d))
         }
@@ -216,11 +218,17 @@ pub mod _bz2 {
                 drop(guard);
                 return Err(it.new_exc_str("EOFError", "End of stream already reached"));
             }
+            if s.failed {
+                // libbzip2 can write out of bounds when re-entered after an error
+                drop(guard);
+                return Err(it.value_error("Decompressor is unusable after a previous error"));
+            }
             s.pending.extend_from_slice(&data);
             let max = (max_length >= 0).then_some(max_length as usize);
             match s.drive(max) {
                 Err(e) => {
                     s.needs_input = false;
+                    s.failed = true;
                     s.pending.clear();
                     drop(guard);
                     Err(bz2_error(it, e))

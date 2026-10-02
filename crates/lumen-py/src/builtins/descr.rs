@@ -320,6 +320,14 @@ impl FunctionType {
         Ok(it.special_attr(&slf, "__code__")?.unwrap_or(Value::None))
     }
 
+    #[setter(name = "__code__")]
+    fn set_code(slf: This<&Value>, it: &mut Interp, v: &Value) -> R<()> {
+        match &*slf {
+            Value::Obj(o) => it.set_function_code(o, v),
+            _ => Err(it.type_error("__code__ is only settable on functions")),
+        }
+    }
+
     #[getter(name = "__globals__")]
     fn globals(slf: This<&Value>, it: &mut Interp) -> R<Value> {
         Ok(it.special_attr(&slf, "__globals__")?.unwrap_or(Value::None))

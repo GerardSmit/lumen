@@ -1203,6 +1203,19 @@ impl Interp {
         Ok(())
     }
 
+    pub fn set_function_code(&mut self, o: &Obj, v: &Value) -> R<()> {
+        let Kind::Function(f) = &o.kind else { return Err(self.type_error("__code__ is only settable on functions")) };
+        let Value::Obj(c) = v else { return Err(self.type_error("__code__ must be set to a code object")) };
+        let Kind::Code(code) = &c.kind else { return Err(self.type_error("__code__ must be set to a code object")) };
+        if code.freevars.len() != f.closure.len() {
+            let msg = format!("{}() requires a code object with {} free vars, not {}", f.name.borrow(), f.closure.len(), code.freevars.len());
+            return Err(self.value_error(&msg));
+        }
+        *f.code.borrow_mut() = code.clone();
+        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(v));
+        Ok(())
+    }
+
     pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
         self.check_mutable_type(obj, &nm)?;
@@ -1285,16 +1298,7 @@ impl Interp {
                         *f.kwdefaults.borrow_mut() = pairs;
                         self.func_event(crate::watch::FuncEvent::ModifyKwDefaults, o, Some(&v));
                     }
-                    "__code__" => {
-                        let Value::Obj(c) = &v else { return Err(self.type_error("__code__ must be set to a code object")) };
-                        let Kind::Code(code) = &c.kind else { return Err(self.type_error("__code__ must be set to a code object")) };
-                        if code.freevars.len() != f.closure.len() {
-                            let msg = format!("{}() requires a code object with {} free vars, not {}", f.name.borrow(), f.closure.len(), code.freevars.len());
-                            return Err(self.value_error(&msg));
-                        }
-                        *f.code.borrow_mut() = code.clone();
-                        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(&v));
-                    }
+                    "__code__" => self.set_function_code(o, &v)?,
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
                     "__type_params__" => {
                         if v.tuple_items().is_none() {
