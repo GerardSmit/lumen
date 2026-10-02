@@ -89,6 +89,22 @@ pub enum Rounding {
     Up05,
 }
 
+impl From<Rounding> for crate::rounding::Mode {
+    fn from(r: Rounding) -> Self {
+        use crate::rounding::Mode;
+        match r {
+            Rounding::Up => Mode::Up,
+            Rounding::Down => Mode::Down,
+            Rounding::HalfUp => Mode::HalfUp,
+            Rounding::HalfEven => Mode::HalfEven,
+            Rounding::HalfDown => Mode::HalfDown,
+            Rounding::Ceiling => Mode::Ceiling,
+            Rounding::Floor => Mode::Floor,
+            Rounding::Up05 => Mode::Up05,
+        }
+    }
+}
+
 impl Rounding {
     pub const ALL: [Rounding; 8] = [
         Rounding::Up,

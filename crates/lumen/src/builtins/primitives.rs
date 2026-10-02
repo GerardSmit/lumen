@@ -171,7 +171,8 @@ pub(super) fn install_number(it: &mut Interp) {
     set_builtin(&it.global, "Number", Value::Obj(ctor));
 }
 
-use lumen_common::float::format::{self as numfmt, Rounding::HalfAwayFromZero as AWAY};
+use lumen_common::float::format as numfmt;
+use lumen_common::rounding::Mode::HalfUp as AWAY;
 
 /// `Number.prototype.toPrecision(p)`: `p` significant digits, fixed or exponential per the exponent.
 fn to_precision(n: f64, p: usize) -> String {

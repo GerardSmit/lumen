@@ -2,6 +2,7 @@
 
 use super::Rounding;
 use crate::bigint::BigInt;
+use crate::rounding::{round_up, Tail};
 use std::cell::RefCell;
 use std::cmp::Ordering;
 
@@ -126,13 +127,7 @@ pub fn round_div_pow10(c: &BigInt, k: u64, negative: bool, mode: Rounding) -> R<
     }
     let nd = ndigits(c);
     if k > nd {
-        let up = match mode {
-            Rounding::Up => true,
-            Rounding::Ceiling => !negative,
-            Rounding::Floor => negative,
-            Rounding::Up05 => true,
-            _ => false,
-        };
+        let up = round_up(mode.into(), negative, Tail { nonzero: true, half: Ordering::Less }, false, true);
         return Ok((BigInt::from_u64(up as u64), true));
     }
     if let (Some(v), true) = (c.to_i128(), k <= 38) {
@@ -140,7 +135,7 @@ pub fn round_div_pow10(c: &BigInt, k: u64, negative: bool, mode: Rounding) -> R<
         let d = 10u128.pow(k as u32);
         let (q, r) = (v / d, v % d);
         let half = if r == 0 { Ordering::Less } else { (r.checked_mul(2).unwrap_or(u128::MAX)).cmp(&d) };
-        let inc = decide(mode, negative, r != 0, half, q & 1 == 1, q % 5 == 0);
+        let inc = round_up(mode.into(), negative, Tail { nonzero: r != 0, half }, q & 1 == 1, q % 5 == 0);
         let q = BigInt::from_i128(q as i128);
         return Ok((if inc { q.add(&BigInt::from_u64(1)) } else { q }, r != 0));
     }
@@ -150,25 +145,8 @@ pub fn round_div_pow10(c: &BigInt, k: u64, negative: bool, mode: Rounding) -> R<
         return Ok((q, false));
     }
     let half = r.add(&r).cmp(&d);
-    let inc = decide(mode, negative, true, half, is_odd(&q), q.rem(&BigInt::from_u64(5)).is_some_and(|m| m.is_zero()));
+    let inc = round_up(mode.into(), negative, Tail { nonzero: true, half }, is_odd(&q), q.rem(&BigInt::from_u64(5)).is_some_and(|m| m.is_zero()));
     Ok((if inc { q.add(&BigInt::from_u64(1)) } else { q }, true))
-}
-
-/// `half` compares twice the discarded tail with the unit of the last kept digit.
-fn decide(mode: Rounding, negative: bool, nonzero: bool, half: Ordering, odd: bool, mult5: bool) -> bool {
-    if !nonzero {
-        return false;
-    }
-    match mode {
-        Rounding::Up => true,
-        Rounding::Down => false,
-        Rounding::Ceiling => !negative,
-        Rounding::Floor => negative,
-        Rounding::HalfUp => half != Ordering::Less,
-        Rounding::HalfDown => half == Ordering::Greater,
-        Rounding::HalfEven => half == Ordering::Greater || (half == Ordering::Equal && odd),
-        Rounding::Up05 => mult5,
-    }
 }
 
 /// Removes up to `limit` trailing zeros: returns the stripped coefficient and the count removed.

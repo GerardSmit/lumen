@@ -224,7 +224,7 @@ fn round_number(it: &mut Interp, x: &Value, nd: Option<&Value>) -> R<Value> {
                     return Ok(Value::Float(0.0 * f));
                 }
                 if n >= 0 {
-                    let s = lumen_common::float::format::fixed(f, n as usize, lumen_common::float::format::Rounding::HalfEven);
+                    let s = lumen_common::float::format::fixed(f, n as usize, lumen_common::rounding::Mode::HalfEven);
                     Ok(Value::Float(s.parse::<f64>().map_or(f, |r| r.copysign(f))))
                 } else {
                     let p = fmath::powi(10.0, (-n) as i32);

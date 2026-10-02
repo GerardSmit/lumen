@@ -2,7 +2,8 @@
 
 use crate::pyint::{BigInt, PyInt};
 use crate::fmath;
-use lumen_common::float::format::{fixed, significant, Rounding};
+use lumen_common::float::format::{fixed, significant};
+use lumen_common::rounding::Mode;
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
 use crate::vm::*;
@@ -336,9 +337,9 @@ impl Interp {
             "inf".to_string()
         } else {
             match ty {
-                Some('f') | Some('F') => fixed(a, sp.precision.unwrap_or(6), Rounding::HalfEven),
+                Some('f') | Some('F') => fixed(a, sp.precision.unwrap_or(6), Mode::HalfEven),
                 Some('e') | Some('E') => fmt_exp(a, sp.precision.unwrap_or(6), sp.alt),
-                Some('%') => fixed(a * 100.0, sp.precision.unwrap_or(6), Rounding::HalfEven),
+                Some('%') => fixed(a * 100.0, sp.precision.unwrap_or(6), Mode::HalfEven),
                 Some('g') | Some('G') | Some('n') => fmt_general(a, sp.precision.unwrap_or(6), sp.alt),
                 _ => match sp.precision {
                     None => float_repr(a),
@@ -547,7 +548,7 @@ impl Interp {
 }
 
 fn fmt_exp(a: f64, prec: usize, alt: bool) -> String {
-    let (digits, ev) = significant(a, prec + 1, Rounding::HalfEven);
+    let (digits, ev) = significant(a, prec + 1, Mode::HalfEven);
     let mut m = digits[..1].to_string();
     if prec > 0 || alt {
         m.push('.');
@@ -564,13 +565,13 @@ fn fmt_general(a: f64, prec: usize, alt: bool) -> String {
 /// no type letter switches one digit earlier than `'g'`).
 fn fmt_general_with(a: f64, prec: usize, alt: bool, shorten: i32) -> String {
     let p = if prec == 0 { 1 } else { prec };
-    let (_, x) = significant(a, p, Rounding::HalfEven);
+    let (_, x) = significant(a, p, Mode::HalfEven);
     if a == 0.0 && shorten == 0 {
         return if alt { format!("0.{}", "0".repeat(p - 1)) } else { "0".into() };
     }
     if x >= -4 && x < p as i32 - shorten {
         let decimals = (p as i32 - 1 - x).max(0) as usize;
-        let s = fixed(a, decimals, Rounding::HalfEven);
+        let s = fixed(a, decimals, Mode::HalfEven);
         if alt {
             if s.contains('.') {
                 s

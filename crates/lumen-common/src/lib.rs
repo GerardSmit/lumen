@@ -35,6 +35,7 @@ pub mod pytime;
 pub mod pickle;
 pub mod stack;
 pub mod regex;
+pub mod rounding;
 pub mod search;
 pub mod siphash;
 pub mod smuggle;
