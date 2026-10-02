@@ -328,8 +328,9 @@ pub trait Sink<'a> {
     type Error;
 
     fn error(&mut self, e: Error) -> Self::Error;
-    /// Entering an object or array (a depth check).
-    fn enter(&mut self) -> Result<(), Self::Error> {
+    /// Entering an object or an array (a depth check).
+    fn enter(&mut self, array: bool) -> Result<(), Self::Error> {
+        let _ = array;
         Ok(())
     }
     fn leave(&mut self) {}
@@ -446,13 +447,13 @@ impl<'a> Parser<'a> {
                 sink.string(s)
             }
             b'{' => {
-                sink.enter()?;
+                sink.enter(false)?;
                 let r = self.object(sink);
                 sink.leave();
                 r
             }
             b'[' => {
-                sink.enter()?;
+                sink.enter(true)?;
                 let r = self.array(sink);
                 sink.leave();
                 r
@@ -761,7 +762,7 @@ impl<'a> Sink<'a> for TreeSink {
     fn error(&mut self, e: Error) -> Error {
         e
     }
-    fn enter(&mut self) -> Result<(), Error> {
+    fn enter(&mut self, _array: bool) -> Result<(), Error> {
         self.depth += 1;
         if self.depth > TREE_DEPTH {
             return Err(Error { kind: ErrorKind::TooDeep, pos: 0 });

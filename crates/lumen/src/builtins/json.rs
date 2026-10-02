@@ -630,7 +630,7 @@ impl<'a> json::Sink<'a> for JsSink<'_, 'a> {
     fn error(&mut self, e: json::Error) -> Value {
         parse_error(self.i, self.src, e)
     }
-    fn enter(&mut self) -> Result<(), Value> {
+    fn enter(&mut self, _array: bool) -> Result<(), Value> {
         ab(self.i.check_native_stack())
     }
     fn null(&mut self) -> Result<Value, Value> {
@@ -706,7 +706,7 @@ impl<'a> json::Sink<'a> for RecordSink<'_, 'a> {
     fn error(&mut self, e: json::Error) -> Value {
         parse_error(self.i, self.src, e)
     }
-    fn enter(&mut self) -> Result<(), Value> {
+    fn enter(&mut self, _array: bool) -> Result<(), Value> {
         ab(self.i.check_native_stack())
     }
     fn null(&mut self) -> Result<Self::Value, Value> {

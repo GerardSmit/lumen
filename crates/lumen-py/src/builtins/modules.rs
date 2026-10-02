@@ -24,6 +24,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_heapq", bound::<super::heapqm::_heapq::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
+    ("_json", bound::<super::jsonm::_json::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
     ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
