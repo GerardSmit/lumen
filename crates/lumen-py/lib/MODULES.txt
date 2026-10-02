@@ -296,6 +296,8 @@ multiprocessing/dummy/connection.py
 # 3.13/3.14 additions: annotations, warnings, opcode metadata, compression package
 annotationlib.py
 _colorize.py
+code.py
+codeop.py
 _py_warnings.py
 _opcode_metadata.py
 _ast_unparse.py

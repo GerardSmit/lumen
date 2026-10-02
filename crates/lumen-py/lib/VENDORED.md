@@ -283,6 +283,8 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `multiprocessing/dummy/connection.py`
 - `annotationlib.py`
 - `_colorize.py`
+- `code.py`
+- `codeop.py`
 - `_py_warnings.py`
 - `_opcode_metadata.py`
 - `_ast_unparse.py`
