@@ -103,20 +103,8 @@ pub fn times() -> R<[f64; 5]> {
 
 /// `(columns, lines)` of the terminal behind `fd`.
 pub fn terminal_size(fd: i32) -> R<(u32, u32)> {
-    #[cfg(unix)]
-    {
-        // SAFETY: a zeroed winsize is a valid out-parameter for TIOCGWINSZ.
-        let mut w: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut w) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok((w.ws_col as u32, w.ws_row as u32))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = fd;
-        Err(FsError("ENOSYS"))
-    }
+    let (rows, cols) = crate::tty::get_winsize(fd)?;
+    Ok((cols as u32, rows as u32))
 }
 
 /// Fills `buf` from the operating system's CSPRNG: `/dev/urandom` on Unix (opened once),
