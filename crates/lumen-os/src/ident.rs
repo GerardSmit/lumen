@@ -317,28 +317,8 @@ pub fn initgroups(user: &str, group: u32) -> R<()> {
 
 /// `execve(2)`: replaces the process image; returns only on failure.
 pub fn execve(path: &str, argv: &[&str], env: &[&str]) -> FsError {
-    #[cfg(unix)]
-    {
-        let (Ok(path), Ok(argv), Ok(env)) = (
-            cstr(path),
-            argv.iter().map(|a| cstr(a)).collect::<R<Vec<_>>>(),
-            env.iter().map(|e| cstr(e)).collect::<R<Vec<_>>>(),
-        ) else {
-            return FsError("EINVAL");
-        };
-        let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
-        argv_ptrs.push(std::ptr::null());
-        let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
-        env_ptrs.push(std::ptr::null());
-        // SAFETY: every pointer array is NUL-terminated and its strings outlive the call.
-        unsafe { libc::execve(path.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
-        std::io::Error::last_os_error().into()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, argv, env);
-        FsError("ENOSYS")
-    }
+    let bytes = |l: &[&str]| l.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>();
+    crate::posix::exec(path.as_bytes(), None, &bytes(argv), Some(&bytes(env)))
 }
 
 #[cfg(all(test, unix))]

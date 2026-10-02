@@ -593,23 +593,34 @@ pub mod posix {
     #[op]
     fn chown(
         it: &mut Interp,
-        #[kw] path: PathArg,
-        #[kw] uid: i64,
-        #[kw] gid: i64,
+        #[kw] path: PathOrFd,
+        #[kw] uid: &Value,
+        #[kw] gid: &Value,
         #[kwonly] dir_fd: Option<i32>,
         #[kwonly]
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<()> {
+        let (uid, gid) = (id_arg(it, uid, "uid")?, id_arg(it, gid, "gid")?);
+        if let Some(fd) = path.fd {
+            if dir_fd.is_some() {
+                return Err(it.value_error("chown: can't specify both dir_fd and fd"));
+            }
+            if !follow_symlinks {
+                return Err(it.value_error("chown: cannot use fd and follow_symlinks together"));
+            }
+            return lumen_os::posix::fchown(fd, uid, gid).map_err(|e| fs_path_err(it, e, &path));
+        }
         let rp = at_path(it, dir_fd, &path)?;
-        let r = it.platform.borrow_mut().chown(&rp, uid as u32, gid as u32, follow_symlinks);
+        let r = it.platform.borrow_mut().chown(&rp, uid, gid, follow_symlinks);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     /// Change the owner and group id of path to the numeric uid and gid, without following links.
     #[op]
-    fn lchown(it: &mut Interp, #[kw] path: PathArg, #[kw] uid: i64, #[kw] gid: i64) -> R<()> {
-        let r = it.platform.borrow_mut().chown(&path.path, uid as u32, gid as u32, false);
+    fn lchown(it: &mut Interp, #[kw] path: PathArg, #[kw] uid: &Value, #[kw] gid: &Value) -> R<()> {
+        let (uid, gid) = (id_arg(it, uid, "uid")?, id_arg(it, gid, "gid")?);
+        let r = it.platform.borrow_mut().chown(&path.path, uid, gid, false);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -2164,7 +2175,7 @@ pub mod posix {
             return Err(it.value_error("too many groups"));
         }
         let gids = items.iter().map(|g| id_arg(it, g, "gid")).collect::<R<Vec<_>>>()?;
-        lumen_os::posix::setgroups(&gids).map_err(|e| fs_err(it, e))
+        lumen_os::ident::setgroups(&gids).map_err(|e| fs_err(it, e))
     }
 
     /// Initialize the group access list.
@@ -2175,7 +2186,7 @@ pub mod posix {
     #[op]
     fn initgroups(it: &mut Interp, username: &str, gid: &Value) -> R<()> {
         let gid = id_arg(it, gid, "gid")?;
-        lumen_os::posix::initgroups(username, gid).map_err(|e| fs_err(it, e))
+        lumen_os::ident::initgroups(username, gid).map_err(|e| fs_err(it, e))
     }
 
     /// Returns a list of groups to which a user belongs.
