@@ -245,6 +245,9 @@ impl Interp {
                 if let Value::Obj(fo) = f {
                     if let Kind::Native(n) = &fo.kind {
                         let t = self.type_of(this);
+                        if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) {
+                            return Ok(format!("<method-wrapper '{}' of {} object at {:#x}>", n.name, self.type_display(&t), self.id_of(this)));
+                        }
                         return Ok(format!("<built-in method {} of {} object at {:#x}>", n.name, self.type_display(&t), self.id_of(this)));
                     }
                 }

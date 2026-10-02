@@ -105,6 +105,10 @@ impl Interp {
             (t.function.clone(), obj.clone()),
             (t.method.clone(), obj.clone()),
             (t.builtin_function.clone(), obj.clone()),
+            (t.method_descriptor.clone(), obj.clone()),
+            (t.wrapper_descriptor.clone(), obj.clone()),
+            (t.classmethod_descriptor.clone(), obj.clone()),
+            (t.method_wrapper.clone(), obj.clone()),
             (t.module.clone(), obj.clone()),
             (t.cell.clone(), obj.clone()),
             (t.code.clone(), obj.clone()),
@@ -307,9 +311,15 @@ impl Interp {
             Kind::ByteArray(_) => t.bytearray.clone(),
             Kind::Type(_) => t.type_.clone(),
             Kind::Function(_) => t.function.clone(),
+            Kind::Method(Value::Obj(f), _) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some_and(crate::bind::args::is_slot_wrapper)) => {
+                t.method_wrapper.clone()
+            }
             Kind::Method(Value::Obj(f), _) if matches!(f.kind, Kind::Native(_)) => t.builtin_function.clone(),
             Kind::Method(..) => t.method.clone(),
+            Kind::Native(n) if n.method && n.desc.is_some_and(crate::bind::args::is_slot_wrapper) => t.wrapper_descriptor.clone(),
+            Kind::Native(n) if n.method => t.method_descriptor.clone(),
             Kind::Native(_) => t.builtin_function.clone(),
+            Kind::ClassMethod(Value::Obj(f)) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some()) => t.classmethod_descriptor.clone(),
             Kind::Module => t.module.clone(),
             Kind::Cell(_) => t.cell.clone(),
             Kind::Code(_) => t.code.clone(),
@@ -886,7 +896,7 @@ impl Interp {
                 // Other attributes not defined by the method type come from the function.
                 _ => {
                     let mt = self.type_of_obj(o);
-                    if !nm.starts_with("__") && self.lookup_mro(&mt, nm).is_none() {
+                    if nm != "__class__" && self.lookup_mro(&mt, nm).is_none() {
                         let f = f.clone();
                         return self.get_attr_str(&f, nm).map(Some);
                     }
@@ -1013,6 +1023,14 @@ impl Interp {
                 if nm == "__isabstractmethod__" {
                     let f = f.clone();
                     return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
+                }
+                if matches!(nm, "__module__" | "__name__" | "__qualname__" | "__annotations__") {
+                    let f = f.clone();
+                    match self.get_attr_str(&f, nm) {
+                        Ok(v) => return Ok(Some(v)),
+                        Err(e) if self.exc_is(&e, "AttributeError") => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             Kind::Complex(re, im) => match nm {
@@ -1248,6 +1266,10 @@ impl Interp {
                         let msg = format!("'{}' object has no attribute '{}'", self.tp_name(cls), nm);
                         return Err(self.new_exc_str("AttributeError", &msg));
                     }
+                    let dd = self.instance_dict(o);
+                    dict_set_name(&dd, name, v);
+                    Ok(())
+                } else if matches!(o.kind, Kind::ClassMethod(_) | Kind::StaticMethod(_)) {
                     let dd = self.instance_dict(o);
                     dict_set_name(&dd, name, v);
                     Ok(())

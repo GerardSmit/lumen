@@ -26,6 +26,10 @@ pub struct UnionData {
     args: Vec<Value>,
 }
 
+fn is_type_obj(v: &Value) -> bool {
+    matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Type(_)))
+}
+
 pub fn union_members(v: &Value) -> Option<Vec<Value>> {
     with_opaque::<UnionData, _>(v, |u| u.args.clone())
 }
@@ -117,25 +121,33 @@ impl Interp {
         Ok(parts.join(", "))
     }
 
+    /// `getattr(v, name)` where an `AttributeError` means `None`.
+    fn opt_attr(&mut self, v: &Value, name: &str) -> R<Option<Value>> {
+        match self.get_attr_str(v, name) {
+            Ok(x) => Ok(Some(x)),
+            Err(e) if self.exc_is(&e, "AttributeError") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `_Py_make_parameters`: the distinct type variables of `args`, in order.
     fn collect_parameters(&mut self, args: &[Value]) -> R<Vec<Value>> {
         let mut out: Vec<Value> = Vec::new();
         for a in args {
-            if let Value::Obj(o) = a {
-                if matches!(o.kind, Kind::Type(_)) {
-                    continue;
+            if is_type_obj(a) {
+                continue;
+            }
+            if self.opt_attr(a, "__typing_subst__")?.is_some() {
+                if !out.iter().any(|x| x.is(a)) {
+                    out.push(a.clone());
                 }
-                if self.get_attr_str(a, "__typing_subst__").is_ok() {
-                    if !self.contains_value(&out, a)? {
-                        out.push(a.clone());
-                    }
-                    continue;
-                }
-                if let Ok(p) = self.get_attr_str(a, "__parameters__") {
-                    if let Some(items) = p.tuple_items() {
-                        for x in items.iter().cloned() {
-                            if !self.contains_value(&out, &x)? {
-                                out.push(x);
-                            }
+                continue;
+            }
+            if let Some(p) = self.opt_attr(a, "__parameters__")? {
+                if let Some(items) = p.tuple_items() {
+                    for x in items {
+                        if !out.iter().any(|y| y.is(x)) {
+                            out.push(x.clone());
                         }
                     }
                 }
@@ -153,56 +165,117 @@ impl Interp {
         Ok(false)
     }
 
-    /// `alias[key]` for a generic alias or union with type parameters: `args` with each
-    /// parameter replaced by its argument (nested generics substituted in turn).
+    /// `_unpacked_tuple_args`: the arguments of `*tuple[...]` / `Unpack[tuple[...]]`.
+    fn unpacked_tuple_args(&mut self, arg: &Value) -> R<Option<Vec<Value>>> {
+        let fast = with_opaque::<AliasData, _>(arg, |d| (d.starred, d.origin.clone(), d.args.clone()));
+        if let Some((true, Value::Obj(o), args)) = fast {
+            if Rc::ptr_eq(&o, &self.types.tuple) {
+                return Ok(Some(args));
+            }
+        }
+        match self.opt_attr(arg, "__typing_unpacked_tuple_args__")? {
+            Some(Value::None) | None => Ok(None),
+            Some(v) => Ok(v.tuple_items().map(|t| t.to_vec())),
+        }
+    }
+
+    fn is_unpacked_typevartuple(&mut self, arg: &Value) -> R<bool> {
+        if is_type_obj(arg) {
+            return Ok(false);
+        }
+        match self.opt_attr(arg, "__typing_is_unpacked_typevartuple__")? {
+            Some(v) => self.truthy(&v),
+            None => Ok(false),
+        }
+    }
+
+    /// `_unpack_args`: `item` as a tuple with `*tuple[X, Y]` members spliced in.
+    fn unpack_args(&mut self, item: &Value) -> R<Vec<Value>> {
+        let items: Vec<Value> = match item.tuple_items() {
+            Some(t) => t.to_vec(),
+            None => vec![item.clone()],
+        };
+        let mut out = Vec::with_capacity(items.len());
+        for x in items {
+            if !is_type_obj(&x) {
+                if let Some(sub) = self.unpacked_tuple_args(&x)? {
+                    if !matches!(sub.last(), Some(Value::Ellipsis)) {
+                        out.extend(sub);
+                        continue;
+                    }
+                }
+            }
+            out.push(x);
+        }
+        Ok(out)
+    }
+
+    /// `subs_tvars`: `obj[...]` with the parameters of `obj` replaced from `argitems`.
+    fn subs_tvars(&mut self, obj: &Value, params: &[Value], argitems: &[Value]) -> R<Value> {
+        let Some(subparams) = self.opt_attr(obj, "__parameters__")? else { return Ok(obj.clone()) };
+        let Some(subparams) = subparams.tuple_items().map(|t| t.to_vec()).filter(|t| !t.is_empty()) else {
+            return Ok(obj.clone());
+        };
+        let mut subargs: Vec<Value> = Vec::with_capacity(subparams.len());
+        for arg in &subparams {
+            match params.iter().position(|p| p.is(arg)) {
+                Some(i) => {
+                    let param_type = self.type_of(&params[i]);
+                    let replacement = &argitems[i];
+                    match replacement.tuple_items() {
+                        Some(t) if self.lookup_mro(&param_type, "__iter__").is_some() => subargs.extend(t.iter().cloned()),
+                        _ => subargs.push(replacement.clone()),
+                    }
+                }
+                None => subargs.push(arg.clone()),
+            }
+        }
+        self.getitem(obj, &Value::tuple(subargs))
+    }
+
+    /// `_Py_subs_parameters`: `args` with each of `parameters` replaced by its member of `key`.
     fn subst_args(&mut self, this: &Value, args: &[Value], key: &Value) -> R<Vec<Value>> {
         let params = self.collect_parameters(args)?;
         if params.is_empty() {
             let r = self.repr_of(this)?;
             return Err(self.type_error(&format!("{} is not a generic class", r)));
         }
-        let given = match key.tuple_items() {
-            Some(t) => t.to_vec(),
-            None => vec![key.clone()],
+        let mut item = Value::tuple(self.unpack_args(key)?);
+        for param in &params {
+            let Some(prepare) = self.opt_attr(param, "__typing_prepare_subst__")? else { continue };
+            if prepare.is_none() {
+                continue;
+            }
+            let arg = if item.tuple_items().is_some() { item.clone() } else { Value::tuple(vec![item.clone()]) };
+            item = self.call(&prepare, vec![this.clone(), arg], Vec::new())?;
+        }
+        let Some(given) = item.tuple_items().map(|t| t.to_vec()) else {
+            return Err(self.type_error("__typing_prepare_subst__ must return a tuple"));
         };
         if given.len() != params.len() {
             let r = self.repr_of(this)?;
             let word = if given.len() > params.len() { "many" } else { "few" };
             return Err(self.type_error(&format!("Too {} arguments for {}; actual {}, expected {}", word, r, given.len(), params.len())));
         }
-        let mut new_args = Vec::new();
+        let mut new_args = Vec::with_capacity(args.len());
         for arg in args {
-            let mut replaced = None;
-            for (p, g) in params.iter().zip(given.iter()) {
-                if arg.is(p) || self.values_eq(arg, p)? {
-                    replaced = Some(g.clone());
-                    break;
-                }
-            }
-            if let Some(v) = replaced {
-                new_args.push(v);
+            if is_type_obj(arg) {
+                new_args.push(arg.clone());
                 continue;
             }
-            if let Value::Obj(o) = arg {
-                if !matches!(o.kind, Kind::Type(_)) && self.get_attr_str(arg, "__parameters__").is_ok() {
-                    let sub = self.get_attr_str(arg, "__parameters__")?;
-                    let sub_params = sub.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
-                    if !sub_params.is_empty() {
-                        let mut pick = Vec::new();
-                        for sp in &sub_params {
-                            for (p, g) in params.iter().zip(given.iter()) {
-                                if sp.is(p) || self.values_eq(sp, p)? {
-                                    pick.push(g.clone());
-                                }
-                            }
-                        }
-                        let r = self.getitem(arg, &Value::tuple(pick))?;
-                        new_args.push(r);
-                        continue;
-                    }
+            let unpack = self.is_unpacked_typevartuple(arg)?;
+            let replaced = match self.opt_attr(arg, "__typing_subst__")? {
+                Some(subst) => {
+                    let i = params.iter().position(|p| p.is(arg)).unwrap_or(0);
+                    self.call(&subst, vec![given[i].clone()], Vec::new())?
                 }
+                None => self.subs_tvars(arg, &params, &given)?,
+            };
+            if unpack {
+                new_args.extend(self.iterate_to_vec(&replaced)?);
+            } else {
+                new_args.push(replaced);
             }
-            new_args.push(arg.clone());
         }
         Ok(new_args)
     }
@@ -310,12 +383,12 @@ impl AliasData {
     #[proto(getitem)]
     fn getitem(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<Value> {
         let this = slf.0.value().clone();
-        let (origin, args) = {
+        let (origin, args, starred) = {
             let d = slf.0.borrow(it)?;
-            (d.origin.clone(), d.args.clone())
+            (d.origin.clone(), d.args.clone(), d.starred)
         };
         let new_args = it.subst_args(&this, &args, key)?;
-        Ok(it.new_alias(origin, new_args, false))
+        Ok(it.new_alias(origin, new_args, starred))
     }
 
     #[proto(eq)]
@@ -340,6 +413,30 @@ impl AliasData {
     fn mro_entries(&self, bases: &Value) -> (Value,) {
         let _ = bases;
         (self.origin.clone(),)
+    }
+
+    #[method(name = "__dir__", hint(py(text_signature = "")))]
+    fn dir(&self, it: &mut Interp) -> R<Value> {
+        let mut names = it.dir_names(&self.origin)?;
+        for extra in [
+            "__class__",
+            "__bases__",
+            "__origin__",
+            "__args__",
+            "__unpacked__",
+            "__parameters__",
+            "__typing_unpacked_tuple_args__",
+            "__mro_entries__",
+            "__reduce_ex__",
+            "__reduce__",
+            "__copy__",
+            "__deepcopy__",
+        ] {
+            if !names.iter().any(|n| n == extra) {
+                names.push(extra.to_string());
+            }
+        }
+        Ok(Value::list(names.into_iter().map(Value::string).collect()))
     }
 
     #[method(name = "__instancecheck__", hint(py(text_signature = "")))]
@@ -464,7 +561,12 @@ impl UnionData {
         let this = slf.0.value().clone();
         let args = slf.0.borrow(it)?.args.clone();
         let new_args = it.subst_args(&this, &args, key)?;
-        it.make_union(new_args)
+        let mut rest = new_args.into_iter();
+        let Some(mut res) = rest.next() else { return it.make_union(Vec::new()) };
+        for arg in rest {
+            res = it.binary_op(crate::ast::BinOp::BitOr, &res, &arg)?;
+        }
+        Ok(res)
     }
 
     #[getter(name = "__args__")]

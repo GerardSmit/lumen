@@ -1612,6 +1612,9 @@ impl<'a> Compiler<'a> {
         if self.st.scopes[p.scope].ann == Some(AnnKind::TypeParams) && self.units.len() >= 2 {
             p = &self.units[self.units.len() - 2];
         }
+        if p.kind != UnitKind::Module && self.st.scopes[p.scope].sym_scope(&mangle(&p.private, name)) == Sc::GlobalExplicit {
+            return name.into();
+        }
         match p.kind {
             UnitKind::Module => name.into(),
             UnitKind::Class => format!("{}.{}", p.qualname, name).into(),

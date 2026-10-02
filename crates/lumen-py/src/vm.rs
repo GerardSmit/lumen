@@ -77,6 +77,10 @@ types! {
     function: "function", Layout::Function;
     method: "method", Layout::Other;
     builtin_function: "builtin_function_or_method", Layout::Other;
+    method_descriptor: "method_descriptor", Layout::Other;
+    wrapper_descriptor: "wrapper_descriptor", Layout::Other;
+    classmethod_descriptor: "classmethod_descriptor", Layout::Other;
+    method_wrapper: "method-wrapper", Layout::Other;
     module: "module", Layout::Module;
     cell: "cell", Layout::Other;
     code: "code", Layout::Other;
@@ -344,7 +348,12 @@ impl Interp {
 
     /// Runs `code` as a module-style frame: names resolve through `locals` then `globals`.
     pub fn run_code(&mut self, code: Rc<Code>, globals: Obj, locals: Obj) -> R<Value> {
-        let frame = self.new_frame(code, globals, Some(locals), None, &[]);
+        self.run_code_closure(code, globals, locals, &[])
+    }
+
+    /// `run_code` for a code object with free variables bound to `closure`'s cells.
+    pub fn run_code_closure(&mut self, code: Rc<Code>, globals: Obj, locals: Obj, closure: &[Obj]) -> R<Value> {
+        let frame = self.new_frame(code, globals, Some(locals), None, closure);
         self.push_frame(frame)?;
         let entry = self.frames.len() - 1;
         self.run(entry, None)

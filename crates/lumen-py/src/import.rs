@@ -81,6 +81,7 @@ impl Interp {
             false => format!("{l}\n"),
         });
         let text = text.map_or(Value::None, Value::string);
+        let col = col.or((line > 0).then_some(0));
         let offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 1));
         let end_offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 2));
         let detail = Value::tuple(vec![Value::str(file), Value::Int(line as i64), offset, text, Value::Int(line as i64), end_offset]);

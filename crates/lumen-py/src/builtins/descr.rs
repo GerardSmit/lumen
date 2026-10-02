@@ -180,6 +180,19 @@ impl ProxyOf {
     }
 }
 
+/// `__class_getitem__` of the core types PEP 585 makes subscriptable.
+#[lumen_bind::class(name = "generic", hint(py(shared)))]
+pub struct ClassGetitem;
+
+#[lumen_bind::methods]
+impl ClassGetitem {
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
+    }
+}
+
 // ---- function, method, builtin_function_or_method and module ------------------------------------
 
 /// `__call__` of the callable core types.
@@ -201,7 +214,7 @@ impl CallSlot {
         let bound_to = match &*slf {
             Value::Obj(o) => match &o.kind {
                 Kind::Method(_, this) => Some(this.clone()),
-                Kind::Native(NativeData { method: true, owner: Some(NativeOwner::Class(c)), .. }) => Some(Value::Obj(c.clone())),
+                Kind::Native(NativeData { owner: Some(NativeOwner::Class(c)), .. }) => Some(Value::Obj(c.clone())),
                 _ => None,
             },
             _ => None,
@@ -341,11 +354,32 @@ pub fn init(it: &mut Interp) {
     extend_type::<ModuleType>(it, &module_ty);
     let method_ty = it.types.method.clone();
     extend_type::<MethodType>(it, &method_ty);
-    for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()] {
-        install_into::<CallSlot>(&ty, &["__call__"]);
+    for ty in [
+        it.types.list.clone(),
+        it.types.tuple.clone(),
+        it.types.dict.clone(),
+        it.types.set.clone(),
+        it.types.frozenset.clone(),
+        it.types.generator.clone(),
+        it.types.coroutine.clone(),
+        it.types.async_generator.clone(),
+    ] {
+        install_into::<ClassGetitem>(&ty, &["__class_getitem__"]);
     }
-    for ty in [it.types.method.clone(), it.types.builtin_function.clone()] {
-        install_into::<CallSlot>(&ty, &["__reduce__"]);
+    let native_descr = [
+        it.types.method_descriptor.clone(),
+        it.types.wrapper_descriptor.clone(),
+        it.types.classmethod_descriptor.clone(),
+        it.types.method_wrapper.clone(),
+    ];
+    for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()].iter().chain(&native_descr) {
+        install_into::<CallSlot>(ty, &["__call__"]);
+    }
+    for ty in [it.types.method.clone(), it.types.builtin_function.clone()].iter().chain(&native_descr) {
+        install_into::<CallSlot>(ty, &["__reduce__"]);
+    }
+    for ty in &native_descr[..3] {
+        super::objectm::install_descr_methods_get(ty);
     }
     super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
