@@ -24,19 +24,20 @@ pub mod ev {
     pub const LINE: u32 = 1 << 5;
     pub const INSTRUCTION: u32 = 1 << 6;
     pub const JUMP: u32 = 1 << 7;
-    pub const BRANCH: u32 = 1 << 8;
-    pub const STOP_ITERATION: u32 = 1 << 9;
-    pub const RAISE: u32 = 1 << 10;
-    pub const EXCEPTION_HANDLED: u32 = 1 << 11;
-    pub const PY_UNWIND: u32 = 1 << 12;
-    pub const PY_THROW: u32 = 1 << 13;
-    pub const RERAISE: u32 = 1 << 14;
-    pub const C_RETURN: u32 = 1 << 15;
-    pub const C_RAISE: u32 = 1 << 16;
+    pub const BRANCH_LEFT: u32 = 1 << 8;
+    pub const BRANCH_RIGHT: u32 = 1 << 9;
+    pub const STOP_ITERATION: u32 = 1 << 10;
+    pub const RAISE: u32 = 1 << 11;
+    pub const EXCEPTION_HANDLED: u32 = 1 << 12;
+    pub const PY_UNWIND: u32 = 1 << 13;
+    pub const PY_THROW: u32 = 1 << 14;
+    pub const RERAISE: u32 = 1 << 15;
+    pub const C_RETURN: u32 = 1 << 16;
+    pub const C_RAISE: u32 = 1 << 17;
 }
 
 /// The event names in bit order (`sys.monitoring.events` attributes).
-pub const EVENT_NAMES: [&str; 17] = [
+pub const EVENT_NAMES: [&str; 18] = [
     "PY_START",
     "PY_RESUME",
     "PY_RETURN",
@@ -45,7 +46,8 @@ pub const EVENT_NAMES: [&str; 17] = [
     "LINE",
     "INSTRUCTION",
     "JUMP",
-    "BRANCH",
+    "BRANCH_LEFT",
+    "BRANCH_RIGHT",
     "STOP_ITERATION",
     "RAISE",
     "EXCEPTION_HANDLED",
@@ -57,8 +59,10 @@ pub const EVENT_NAMES: [&str; 17] = [
 ];
 
 pub const EVENT_COUNT: usize = EVENT_NAMES.len();
+/// The deprecated `sys.monitoring.events.BRANCH`: both branch events.
+pub const BRANCH_ALIAS: u32 = 1 << EVENT_COUNT;
 /// Events a code object can enable locally (`set_local_events`) and a callback can `DISABLE`.
-pub const LOCAL_EVENTS: u32 = (1 << 10) - 1;
+pub const LOCAL_EVENTS: u32 = (1 << 11) - 1;
 pub const C_RETURN_EVENTS: u32 = ev::C_RETURN | ev::C_RAISE;
 pub const TOOLS: usize = 8;
 /// The tool ids `sys.setprofile` and `sys.settrace` occupy.
@@ -383,7 +387,7 @@ impl Interp {
     /// A conditional jump at `src` either went to `target` (`taken`) or fell through.
     pub(crate) fn branch_event(&mut self, src: usize, target: usize, taken: bool) -> R<()> {
         let dst = if taken { target } else { src + 1 };
-        self.jump_event(ev::BRANCH, src, dst)
+        self.jump_event(if taken { ev::BRANCH_RIGHT } else { ev::BRANCH_LEFT }, src, dst)
     }
 
     /// The running frame returns or yields `value`.
