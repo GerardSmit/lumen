@@ -319,14 +319,7 @@ impl Interp {
     pub fn run_atexit(&mut self) {
         while let Some((f, args, kw)) = self.atexit.pop() {
             if let Err(e) = self.call(&f, args, kw) {
-                if self.exc_is(&e, "SystemExit") {
-                    continue;
-                }
-                self.flush_out();
-                let repr = self.repr_of(&f).unwrap_or_default();
-                self.write_stderr(&format!("Exception ignored in atexit callback {}:\n", repr));
-                let text = self.format_exception(&e);
-                self.write_stderr(&text);
+                self.write_unraisable(&e, Some("Exception ignored in atexit callback"), Some(&f));
             }
         }
     }

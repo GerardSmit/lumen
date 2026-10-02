@@ -382,7 +382,7 @@ impl Interp {
     /// other threads run, signals and the interrupt being serviced between slices. A no-op while
     /// no other thread exists, so single-threaded programs keep their plain blocking calls.
     pub fn wait_fd(&mut self, fd: i32, events: i16) -> R<()> {
-        if self.threads.gil.is_none() {
+        if self.threads.gil.is_none() && !self.catching_signals {
             return Ok(());
         }
         loop {
@@ -407,7 +407,10 @@ impl Interp {
             let mut fds = [lumen_os::poll::PollFd::new(fd, events)];
             lumen_os::poll::poll(&mut fds, ms)
         });
-        !matches!(r, Ok(0))
+        match r {
+            Ok(n) => n > 0,
+            Err(e) => e.errno() != 4,
+        }
     }
 
     /// `waitpid`, which waits for the child in slices while other threads exist.

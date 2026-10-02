@@ -220,6 +220,8 @@ pub struct Interp {
     pub interrupted: bool,
     /// Runs Python signal handlers at `poll` (the interpreter of the thread that owns signals).
     pub handles_signals: bool,
+    /// A Python signal handler was installed: blocking reads wait in slices to run it.
+    pub catching_signals: bool,
     pub heap: HeapBudget,
     pub int_max_str_digits: usize,
     pub codecs: crate::codecs::CodecState,
@@ -294,6 +296,7 @@ impl Interp {
             interrupt: InterruptHandle::new(),
             interrupted: false,
             handles_signals: false,
+            catching_signals: false,
             heap: HeapBudget::NONE,
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
             codecs: Default::default(),

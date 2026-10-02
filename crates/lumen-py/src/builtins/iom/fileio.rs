@@ -107,7 +107,7 @@ pub fn native_fd(it: &mut Interp, v: &Value) -> Option<(i32, bool, bool)> {
 }
 
 /// One `read(2)`; standard input first flushes pending standard output.
-pub fn read_fd(it: &mut Interp, fd: i32, buf: &mut [u8]) -> Result<usize, IoError> {
+pub fn read_fd(it: &mut Interp, fd: i32, buf: &mut [u8]) -> R<Result<usize, IoError>> {
     read_some(it, fd, buf)
 }
 
@@ -265,12 +265,12 @@ fn init(it: &mut Interp, slf: &Py<FileIO>, file: &Value, mode: &str, closefd: bo
     Ok(())
 }
 
-fn read_some(it: &mut Interp, fd: i32, buf: &mut [u8]) -> Result<usize, IoError> {
+fn read_some(it: &mut Interp, fd: i32, buf: &mut [u8]) -> R<Result<usize, IoError>> {
     if fd == 0 {
         it.flush_out();
     }
-    it.wait_fd_quiet(fd, lumen_os::poll::POLLIN);
-    it.platform.borrow_mut().fd_read(fd, buf, None)
+    it.wait_fd(fd, lumen_os::poll::POLLIN)?;
+    Ok(it.platform.borrow_mut().fd_read(fd, buf, None))
 }
 
 fn readall_fd(it: &mut Interp, slf: &Py<FileIO>) -> R<Value> {
@@ -293,7 +293,7 @@ fn readall_fd(it: &mut Interp, slf: &Py<FileIO>) -> R<Value> {
         let want = if out.len() < size_hint { size_hint - out.len() } else { SMALLCHUNK.max(out.len() / 4) };
         let start = out.len();
         out.resize(start + want, 0);
-        match read_some(it, fd, &mut out[start..]) {
+        match read_some(it, fd, &mut out[start..])? {
             Ok(0) => {
                 out.truncate(start);
                 break;
@@ -347,7 +347,7 @@ impl FileIO {
             return readall_fd(it, &slf.0);
         }
         let mut buf = vec![0u8; size as usize];
-        match read_some(it, fd, &mut buf) {
+        match read_some(it, fd, &mut buf)? {
             Ok(n) => {
                 buf.truncate(n);
                 Ok(Value::bytes(buf))
@@ -368,7 +368,7 @@ impl FileIO {
         if !slf.0.borrow(it)?.readable {
             return Err(mode_err(it, "reading"));
         }
-        match read_some(it, fd, buffer) {
+        match read_some(it, fd, buffer)? {
             Ok(n) => Ok(Some(n)),
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(os_err(it, e)),

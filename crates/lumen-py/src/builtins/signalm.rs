@@ -240,6 +240,9 @@ pub mod _signal {
             return Err(it.os_error_errno(22, None, None));
         }
         os::set_disposition(sig, disposition, true).map_err(|e| os_error(it, e))?;
+        if disposition == Disposition::Catch && it.handles_signals {
+            it.catching_signals = true;
+        }
         let st = it.native_state::<State>();
         let old = std::mem::replace(&mut st.handlers[sig as usize], handler.clone());
         Ok(old)

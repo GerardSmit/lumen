@@ -131,7 +131,7 @@ fn check_closed(it: &mut Interp, v: &Value, msg: &str) -> R<Value> {
 fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
     if let Some((fd, true, _)) = native_fd(it, raw) {
         let mut buf = vec![0u8; n];
-        return match read_fd(it, fd, &mut buf) {
+        return match read_fd(it, fd, &mut buf)? {
             Ok(k) => {
                 buf.truncate(k);
                 Ok(Some(buf))
