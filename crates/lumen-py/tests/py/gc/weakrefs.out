@@ -1,0 +1,16 @@
+alive: True
+cyclic referent still alive: True []
+cleared and called: True ['callback']
+['__del__ sees live ref: False']
+weakref in the same garbage gets no callback: True []
+5
+proxy dead: ReferenceError ['proxy callback']
+weak values before: 3
+weak values after: 0
+weak keys before: 3
+weak keys after: 0
+weak set before: 3
+weak set after: 0
+finalize pending: []
+finalize ran: ['finalized']
+['cb ran'] True

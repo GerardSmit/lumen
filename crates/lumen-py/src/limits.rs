@@ -81,6 +81,9 @@ impl Interp {
             return Err(self.interrupt_exc());
         }
         crate::builtins::signalm::check(self)?;
+        if crate::gc::due() {
+            self.gc_auto();
+        }
         if self.heap.is_set() {
             return self.check_heap(0);
         }
@@ -100,6 +103,9 @@ impl Interp {
 
     fn check_heap(&mut self, extra: usize) -> R<()> {
         if self.heap.exceeded_by(extra) {
+            if self.gc_reclaim() && !self.heap.exceeded_by(extra) {
+                return Ok(());
+            }
             return Err(self.memory_error());
         }
         Ok(())

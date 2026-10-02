@@ -1114,7 +1114,7 @@ impl Interp {
             "__bases__" => {
                 let items: Vec<Obj> = v.tuple_items().unwrap_or(&[]).iter().filter_map(|b| b.as_obj().cloned()).collect();
                 self.set_bases(o, items);
-                self.type_epoch += 1;
+                self.bump_type_epoch();
                 return Ok(());
             }
             "__abstractmethods__" => {
@@ -1130,7 +1130,7 @@ impl Interp {
         let d = self.instance_dict(o);
         dict_set_name(&d, name, v);
         if nm.starts_with("__") {
-            self.type_epoch += 1;
+            self.bump_type_epoch();
         }
         Ok(())
     }
@@ -1366,7 +1366,7 @@ impl Interp {
             if let Some(dd) = dd {
                 if dict_del_name(&dd, name).is_some() {
                     if matches!(o.kind, Kind::Type(_)) && nm.starts_with("__") {
-                        self.type_epoch += 1;
+                        self.bump_type_epoch();
                     }
                     return Ok(());
                 }
@@ -1638,10 +1638,11 @@ impl Interp {
             }
         };
         let cls_field = if Rc::ptr_eq(meta, &self.types.type_) { None } else { Some(meta.clone()) };
-        let ty = Rc::new(Object {
+        let ty = Object::alloc(Object {
             cls: cls_field,
             dict: RefCell::new(Some(dict.clone())),
             id: std::cell::Cell::new(0),
+            gc: GcCell::new(),
             kind: Kind::Type(TypeData {
                 name: RefCell::new(name.into()),
                 qualname: RefCell::new(qualname),
@@ -1651,6 +1652,7 @@ impl Interp {
                 flags: Cell::new(TF_HEAP),
                 hooks: Cell::new((u64::MAX, 0)),
                 slots: RefCell::new(slots),
+                del_cache: Cell::new((u64::MAX, false)),
             }),
         });
         match self.compute_mro(&ty, &bases) {
@@ -1664,7 +1666,7 @@ impl Interp {
                 return Err(self.type_error("Cannot create a consistent method resolution order (MRO) for bases"));
             }
         }
-        self.type_epoch += 1;
+        self.bump_type_epoch();
         self.subclass_registry.push(Rc::downgrade(&ty));
         let entries: Vec<(Value, Value)> = match &dict.kind {
             Kind::Dict(d) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),

@@ -172,7 +172,7 @@ pub mod sys {
     /// Return True if Python is exiting.
     #[op]
     fn is_finalizing() -> bool {
-        false
+        crate::gc::is_finalizing()
     }
 
     /// Return the global debug tracing function set with sys.settrace.
@@ -296,6 +296,21 @@ pub mod sys {
             }
         };
         it.write_stderr(&text);
+        Ok(())
+    }
+
+    /// Handle an unraisable exception.
+    ///
+    /// Called when an exception has occurred but there is no way for Python to handle it.
+    /// For example, when a destructor raises an exception.
+    #[op]
+    fn unraisablehook(it: &mut Interp, unraisable: &Value) -> R<()> {
+        let get = |it: &mut Interp, name: &str| it.get_attr_str(unraisable, name);
+        let exc = get(it, "exc_value")?;
+        let msg = get(it, "err_msg")?;
+        let obj = get(it, "object")?;
+        let Value::Obj(exc) = exc else { return Ok(()) };
+        it.default_unraisable(&exc, msg.as_str(), Some(&obj));
         Ok(())
     }
 
@@ -499,7 +514,7 @@ pub mod sys {
         if let Ok(std_names) = it.new_frozenset_from(std_names) {
             dict_set_str(&d, "stdlib_module_names", std_names);
         }
-        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook")] {
+        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook"), ("__unraisablehook__", "unraisablehook")] {
             if let Some(f) = dict_get_str(&d, name) {
                 dict_set_str(&d, alias, f);
             }

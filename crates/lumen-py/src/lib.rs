@@ -23,6 +23,8 @@ pub mod iter;
 pub mod lexer;
 pub mod fmath;
 pub mod frozen;
+pub mod gc;
+pub mod gc_traverse;
 pub mod limits;
 pub mod num;
 pub mod object;

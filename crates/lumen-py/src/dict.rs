@@ -447,6 +447,12 @@ impl PyDict {
         Some(e)
     }
 
+    /// Empties the table and returns its former contents (so they can be released later).
+    pub fn take_all(&mut self) -> PyDict {
+        let fresh = PyDict { set_mode: self.set_mode, ..PyDict::default() };
+        std::mem::replace(self, fresh)
+    }
+
     pub fn clear(&mut self) {
         self.dummy.clear();
         self.fill = 0;
