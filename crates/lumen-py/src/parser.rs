@@ -8,31 +8,9 @@ mod fstring;
 mod pattern;
 mod stmt;
 
-use std::fmt;
-
 use crate::ast::{self, Expr, Ident, Pos};
 use crate::lexer::{self, Tok, Token};
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SyntaxError {
-    pub msg: String,
-    pub line: u32,
-    pub col: u32,
-}
-
-impl fmt::Display for SyntaxError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "SyntaxError: {} (line {}, column {})",
-            self.msg,
-            self.line,
-            self.col + 1
-        )
-    }
-}
-
-impl std::error::Error for SyntaxError {}
+pub use crate::syntax_error::SyntaxError;
 
 type PResult<T> = Result<T, SyntaxError>;
 

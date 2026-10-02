@@ -1,0 +1,22 @@
+# Modules left out of the embedded stdlib unless the `py-stdlib-full` feature is on.
+# `name` matches any path component of that name, `a/b` a path prefix. Add more at build
+# time with LUMEN_PY_STDLIB_EXCLUDE=name1,name2.
+
+# GUI toolkits and IDEs: need Tk, which Lumen does not provide.
+tkinter
+idlelib
+turtle.py
+turtledemo
+
+# Installers, packaging scripts and their bundled wheels.
+ensurepip
+venv
+lib2to3
+
+# Windows-only.
+msilib
+
+# Tests and their data.
+test
+tests
+idle_test
