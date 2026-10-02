@@ -287,6 +287,11 @@ impl Interp {
         let (dirs, parent_mod) = match parent_name {
             Some(p) => {
                 let pm = self.import_module(p)?;
+                // Importing the parent may itself register the child (`collections.abc` is
+                // `_collections_abc` since 3.14).
+                if let Some(Value::Obj(m)) = dict_get_str(&self.modules, full) {
+                    return Ok(m);
+                }
                 let pd = self.module_dict(&pm);
                 let path = match dict_get_str(&pd, "__path__") {
                     Some(v) => v,
