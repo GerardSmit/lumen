@@ -41,6 +41,12 @@ const SLOT_PROTOS: &[&str] = &[
     "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert",
 ];
 
+/// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
+/// receiver errors read `descriptor '__init__' requires a 'X' object but received a 'Y'`.
+pub fn is_slot_wrapper(d: &FnDesc) -> bool {
+    matches!(d.role, Role::Proto(p) if p == "init" || SLOT_PROTOS.contains(&p))
+}
+
 /// `__len__` for `len`, ... (every neutral protocol is a dunder of the same name).
 fn dunder(p: &'static str) -> &'static str {
     macro_rules! table {

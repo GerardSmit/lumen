@@ -86,6 +86,16 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     ty
 }
 
+/// Install `T`'s members into the existing type `ty` and make `ty` `T`'s type object: the
+/// methods of a core type (`str`, `OSError`, ...) whose instances are the interpreter's own
+/// kinds rather than opaque native state. `T` is a marker struct named after the type.
+pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
+    it.native_types.insert(TypeId::of::<T>(), ty.clone());
+    let mut members = Vec::new();
+    T::members(&mut members);
+    install_members(ty, &members);
+}
+
 /// The class `module.name` of a `base` hint, imported on first use of the native class.
 fn python_base(it: &mut Interp, path: &str) -> Option<Obj> {
     let (module, name) = path.rsplit_once('.')?;

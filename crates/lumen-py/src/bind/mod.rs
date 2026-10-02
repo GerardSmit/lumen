@@ -28,7 +28,7 @@ mod convert;
 pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
-pub use class::{is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
+pub use class::{extend_type, is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
 pub use convert::{buffer_error, index, native_error};
 pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
@@ -214,6 +214,10 @@ impl<'s> PyCx<'s> {
         if at.is_this() {
             let t = it.type_name_of(v);
             let owner = d.class().map(args::class_qualname).unwrap_or_default();
+            if args::is_slot_wrapper(d) {
+                let msg = format!("descriptor '{}' requires a '{}' object but received a '{}'", args::py_name(d), owner, t);
+                return it.type_error(&msg);
+            }
             let msg = format!("descriptor '{}' for '{}' objects doesn't apply to a '{}' object", args::py_name(d), owner, t);
             return it.type_error(&msg);
         }
@@ -623,6 +627,21 @@ impl<'a> FromArg<'a, PyHost> for &'a Value {
     #[inline(always)]
     fn from_arg(_: &'a PyCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Obj> {
         Ok(v)
+    }
+}
+
+/// An exception instance (`BaseException` or a subclass), e.g. the receiver of a core
+/// exception type's method.
+#[derive(Clone, Copy)]
+pub struct Exc<'a>(pub &'a Obj);
+
+impl<'a> FromArg<'a, PyHost> for Exc<'a> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Ok(Exc(o)),
+            _ => Err(cx.arg_error(at, "BaseException", v)),
+        }
     }
 }
 
