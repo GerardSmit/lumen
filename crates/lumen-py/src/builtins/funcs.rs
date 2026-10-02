@@ -634,8 +634,8 @@ fn round(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     return Ok(Value::Float(0.0 * f));
                 }
                 if n >= 0 {
-                    let s = format!("{:.*}", n as usize, f);
-                    Ok(Value::Float(s.parse().unwrap_or(f)))
+                    let s = lumen_common::float::format::fixed(f, n as usize, lumen_common::float::format::Rounding::HalfEven);
+                    Ok(Value::Float(s.parse::<f64>().map_or(f, |r| r.copysign(f))))
                 } else {
                     let p = fmath::powi(10.0, (-n) as i32);
                     Ok(Value::Float(round_half_even(f / p) * p))
