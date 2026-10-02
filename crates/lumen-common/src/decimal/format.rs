@@ -1,4 +1,4 @@
-//! The format mini-language of `Decimal.__format__`: `[[fill]align][sign][z][#][0][width][,][.precision][type]`.
+//! The format mini-language of `Decimal.__format__`: `[[fill]align][sign][z][#][0][width][,_][.precision[,_]][type]`.
 
 use super::coef::Mem;
 use super::{Context, Decimal, Kind};
@@ -48,7 +48,10 @@ pub struct FormatSpec {
     pub alt: bool,
     pub zeropad: bool,
     pub min_width: usize,
-    pub thousands: bool,
+    /// `,` or `_`: the thousands separator.
+    pub thousands: Option<char>,
+    /// `,` or `_` after the precision: separates the fractional digits in threes.
+    pub frac_sep: Option<char>,
     pub precision: Option<usize>,
     /// `e E f F g G %`, or `None` when absent. `n` is stored as `g` with `locale` set.
     pub ty: Option<char>,
@@ -64,7 +67,7 @@ pub fn parse_format_spec(text: &str) -> Result<FormatSpec, FormatError> {
         SpecError::TooManyDigits => FormatError::Overflow,
         _ => FormatError::Invalid,
     })?;
-    if spec.grouping == Some('_') || spec.ty.is_some_and(|t| !matches!(t, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%')) {
+    if spec.ty.is_some_and(|t| !matches!(t, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%')) {
         return Err(FormatError::Invalid);
     }
     if spec.zero && (spec.fill.is_some() || spec.align.is_some()) {
@@ -86,7 +89,8 @@ pub fn parse_format_spec(text: &str) -> Result<FormatSpec, FormatError> {
         alt: spec.alt,
         zeropad: spec.zero,
         min_width: spec.width.unwrap_or(0),
-        thousands: spec.grouping.is_some(),
+        thousands: spec.grouping,
+        frac_sep: spec.frac_grouping,
         precision,
         ty: if locale { Some('g') } else { spec.ty },
         locale,
@@ -184,6 +188,14 @@ fn format_number(
 ) -> Result<String, FormatError> {
     let sign = format_sign(negative, spec);
     let ty = spec.ty.unwrap_or('g');
+    let grouped_frac;
+    let fracpart = match spec.frac_sep {
+        Some(sep) if !fracpart.is_empty() => {
+            grouped_frac = crate::fmtspec::group_fraction(fracpart, sep);
+            grouped_frac.as_str()
+        }
+        _ => fracpart,
+    };
     let mut frac = if !fracpart.is_empty() || spec.alt { format!("{point}{fracpart}") } else { String::new() };
     if exp != 0 || matches!(ty, 'e' | 'E') {
         let echar = if matches!(ty, 'E' | 'G') { 'E' } else { 'e' };
@@ -204,7 +216,7 @@ impl Decimal {
         if spec.min_width > MAX_WIDTH {
             return Err(FormatError::Invalid);
         }
-        let fixed = Locale { decimal_point: ".".into(), thousands_sep: if spec.thousands { ",".into() } else { String::new() }, grouping: vec![3, 0] };
+        let fixed = Locale { decimal_point: ".".into(), thousands_sep: spec.thousands.map(String::from).unwrap_or_default(), grouping: vec![3, 0] };
         let loc = match (locale, spec.locale) {
             (Some(l), _) => l.clone(),
             (None, true) => Locale::default(),

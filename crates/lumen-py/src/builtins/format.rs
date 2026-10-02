@@ -53,6 +53,16 @@ impl Interp {
             Some(m) => self.value_error(m),
             None => self.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname)),
         })?;
+        let bad_type = match (s.grouping, s.ty) {
+            (Some(g), Some(ty)) if !matches!(ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F') && !(g == '_' && matches!(ty, 'b' | 'o' | 'x' | 'X')) => {
+                Some((g, ty))
+            }
+            _ => s.frac_grouping.zip(s.ty.filter(|&t| t == 'n')),
+        };
+        if let Some((g, ty)) = bad_type {
+            let ty = if ty.is_ascii_graphic() { ty.to_string() } else { format!("\\x{:x}", ty as u32) };
+            return Err(self.value_error(&format!("Cannot specify '{g}' with '{ty}'.")));
+        }
         if let Some(w) = s.width {
             self.check_str_len(w)?;
         }
@@ -109,8 +119,11 @@ impl Interp {
                 if matches!(sp.align, Some('=')) {
                     return Err(self.value_error("'=' alignment flag is not allowed in complex format specifier"));
                 }
+                if let Some(c) = sp.ty.filter(|c| !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n')) {
+                    return Err(self.value_error(&format!("Unknown format code '{c}' for object of type 'complex'")));
+                }
                 let body = match sp.ty {
-                    None if sp.precision.is_none() && sp.grouping.is_none() => crate::repr::complex_repr(*re, *im),
+                    None if sp.precision.is_none() && sp.grouping.is_none() && sp.frac_grouping.is_none() => crate::repr::complex_repr(*re, *im),
                     ty => {
                         let ty = ty.unwrap_or('r');
                         let part_spec = |plus: bool| {
@@ -129,8 +142,14 @@ impl Interp {
                             if let Some(g) = sp.grouping {
                                 s.push(g);
                             }
+                            if sp.precision.is_some() || sp.frac_grouping.is_some() {
+                                s.push('.');
+                            }
                             if let Some(p) = sp.precision {
-                                s.push_str(&format!(".{}", p));
+                                s.push_str(&p.to_string());
+                            }
+                            if let Some(g) = sp.frac_grouping {
+                                s.push(g);
                             }
                             if ty != 'r' {
                                 s.push(ty);
@@ -363,6 +382,13 @@ impl Interp {
         if upper {
             body = body.to_uppercase();
         }
+        if let Some(g) = sp.frac_grouping {
+            if let Some(dot) = body.find('.') {
+                let frac_len = body[dot + 1..].find(|c: char| !c.is_ascii_digit()).unwrap_or(body.len() - dot - 1);
+                let grouped = lumen_common::fmtspec::group_fraction(&body[dot + 1..dot + 1 + frac_len], g);
+                body = format!("{}.{}{}", &body[..dot], grouped, &body[dot + 1 + frac_len..]);
+            }
+        }
         if let Some(g) = sp.grouping {
             let (int_part, rest) = match body.find(|c: char| !c.is_ascii_digit()) {
                 Some(i) => (body[..i].to_string(), body[i..].to_string()),
@@ -370,7 +396,7 @@ impl Interp {
             };
             body = format!("{}{}", group_digits(&int_part, g, 3), rest);
         }
-        let neg = neg && !(sp.z && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
+        let neg = neg && !(sp.z && a.is_finite() && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
         let sign = if neg {
             "-"
         } else {
@@ -380,6 +406,10 @@ impl Interp {
                 _ => "",
             }
         };
+        if !a.is_finite() && sp.grouping.is_some() {
+            let plain = Spec { grouping: None, ..sp.clone() };
+            return Ok(self.apply_number_layout(&plain, sign, "", &body, '>'));
+        }
         Ok(self.apply_number_layout(&sp, sign, "", &body, '>'))
     }
 
