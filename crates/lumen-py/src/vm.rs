@@ -343,7 +343,7 @@ impl Interp {
 
     /// `write(2)` through the platform; descriptors 1 and 2 go to the output sink when one is
     /// set, after the buffered print output.
-    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> crate::platform::PResult<usize> {
+    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> R<crate::platform::PResult<usize>> {
         if fd == 1 || fd == 2 {
             self.flush_out();
             if let Some(s) = &mut self.sink {
@@ -353,13 +353,16 @@ impl Interp {
                 } else {
                     s.write_stderr(data);
                 }
-                return Ok(data.len());
+                return Ok(Ok(data.len()));
             }
         }
         if fd > 2 {
-            self.wait_fd_quiet(fd, lumen_os::poll::POLLOUT);
+            self.wait_fd(fd, lumen_os::poll::POLLOUT)?;
+            // a write to a full pipe or socket can block for as long as its reader takes
+            let fs = self.platform.borrow().filesystem();
+            return Ok(self.unlocked(move || fs.write(fd, data, None)).map_err(Into::into));
         }
-        self.platform.borrow_mut().fd_write(fd, data, None)
+        Ok(self.platform.borrow_mut().fd_write(fd, data, None))
     }
 
     pub fn write_stderr(&mut self, s: &str) {

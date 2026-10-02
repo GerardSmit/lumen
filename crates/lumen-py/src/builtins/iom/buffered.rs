@@ -157,7 +157,7 @@ fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
 /// One raw write; `None` when it would block.
 fn raw_write(it: &mut Interp, raw: &Value, data: &[u8]) -> R<Option<usize>> {
     if let Some((fd, _, true)) = native_fd(it, raw) {
-        return match it.fd_write(fd, data) {
+        return match it.fd_write(fd, data)? {
             Ok(n) => Ok(Some(n)),
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(it.os_error_io(&e, None)),

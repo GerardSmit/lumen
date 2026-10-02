@@ -270,6 +270,11 @@ fn thread_main(boot: Boot, started: std::sync::mpsc::Sender<u64>) {
     gil.release();
 }
 
+/// A non-blocking descriptor never needs waiting for: the operation itself reports `EAGAIN`.
+fn nonblocking(fd: i32) -> bool {
+    matches!(lumen_os::fdctl::get_blocking(fd), Ok(false))
+}
+
 impl Interp {
     pub fn is_main_thread(&self) -> bool {
         lumen_os::thread::ident() == self.threads.main_ident
@@ -382,7 +387,7 @@ impl Interp {
     /// other threads run, signals and the interrupt being serviced between slices. A no-op while
     /// no other thread exists, so single-threaded programs keep their plain blocking calls.
     pub fn wait_fd(&mut self, fd: i32, events: i16) -> R<()> {
-        if self.threads.gil.is_none() && !self.catching_signals {
+        if (self.threads.gil.is_none() && !self.catching_signals) || nonblocking(fd) {
             return Ok(());
         }
         loop {
@@ -391,14 +396,6 @@ impl Interp {
             }
             self.poll()?;
         }
-    }
-
-    /// [`Interp::wait_fd`] for operations that cannot raise (writes).
-    pub fn wait_fd_quiet(&mut self, fd: i32, events: i16) {
-        if self.threads.gil.is_none() {
-            return;
-        }
-        while !self.poll_fd_slice(fd, events) {}
     }
 
     fn poll_fd_slice(&mut self, fd: i32, events: i16) -> bool {
