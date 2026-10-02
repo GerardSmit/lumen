@@ -8,6 +8,8 @@
 //! [`tokenize_extra`] is the `tokenize` module's view of the same scan: every token with its
 //! source text and end position, plus comments, `NL` and the PEP 701 f-string tokens.
 
+// The path keeps the module resolvable when `build.rs` includes this file from the crate root.
+#[path = "lexer/string.rs"]
 pub(crate) mod string;
 
 use std::rc::Rc;

@@ -417,6 +417,25 @@ impl BrotliEncoder {
     }
 }
 
+/// Compress `data` into one complete Brotli stream at `quality` (0..=11) with a `1 << lgwin`
+/// byte window.
+pub fn brotli_compress(data: &[u8], quality: u32, lgwin: u32) -> Vec<u8> {
+    const PARAM_QUALITY: u32 = 1;
+    const PARAM_LGWIN: u32 = 2;
+    const OPERATION_FINISH: u32 = 2;
+    let mut enc = BrotliEncoder::new(&[(PARAM_QUALITY, quality), (PARAM_LGWIN, lgwin)]);
+    let mut out = Vec::with_capacity(data.len() / 3 + 64);
+    let mut consumed = 0;
+    while !enc.is_finished() {
+        let start = out.len();
+        out.resize(start + 65536, 0);
+        let (used, produced) = enc.run(OPERATION_FINISH, &data[consumed..], &mut out[start..]).expect("brotli encoder failed");
+        consumed += used;
+        out.truncate(start + produced);
+    }
+    out
+}
+
 /// How a [`BrotliDecoder::run`] step ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BrotliStatus {

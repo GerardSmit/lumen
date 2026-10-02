@@ -6,7 +6,6 @@ use crate::object::*;
 use crate::vm::{dict_get_str, Interp};
 use lumen_common::bigint::digits_exceed;
 use lumen_common::limits::{size, HeapBudget, InterruptHandle};
-use std::cell::Cell;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -17,41 +16,14 @@ pub const MAX_STR_LEN: usize = 1 << 30;
 /// Longest bytes or bytearray a script may build in one operation.
 pub const MAX_BYTES_LEN: usize = 1 << 30;
 
-/// CPython's default for `sys.get_int_max_str_digits()`.
-pub const DEFAULT_INT_MAX_STR_DIGITS: usize = 4300;
 /// The smallest non-zero value `sys.set_int_max_str_digits` accepts.
 pub const INT_MAX_STR_DIGITS_THRESHOLD: usize = 640;
 
 /// Exit status of a script stopped by an interrupt (the shell convention for SIGINT).
 pub const EXIT_INTERRUPTED: i32 = 130;
 
-thread_local! {
-    static LITERAL_DIGITS: Cell<usize> = const { Cell::new(DEFAULT_INT_MAX_STR_DIGITS) };
-}
-
-/// The digit limit the lexer applies to decimal integer literals while [`Interp::compile_source`]
-/// is running.
-pub(crate) fn literal_digit_limit() -> usize {
-    LITERAL_DIGITS.with(|c| c.get())
-}
-
-pub(crate) fn with_literal_digit_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
-    let prev = LITERAL_DIGITS.with(|c| c.replace(limit));
-    let out = f();
-    LITERAL_DIGITS.with(|c| c.set(prev));
-    out
-}
-
-pub fn digit_limit_message(limit: usize, found: Option<usize>) -> String {
-    match found {
-        Some(n) => format!(
-            "Exceeds the limit ({limit} digits) for integer string conversion: value has {n} digits; use sys.set_int_max_str_digits() to increase the limit"
-        ),
-        None => format!(
-            "Exceeds the limit ({limit} digits) for integer string conversion; use sys.set_int_max_str_digits() to increase the limit"
-        ),
-    }
-}
+pub use crate::digits::{digit_limit_message, DEFAULT_INT_MAX_STR_DIGITS};
+pub(crate) use crate::digits::{literal_digit_limit, with_literal_digit_limit};
 
 impl Interp {
     pub fn interrupt_handle(&self) -> InterruptHandle {
