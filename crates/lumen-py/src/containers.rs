@@ -60,12 +60,11 @@ impl Interp {
                     let t = self.tp_name_of(v);
                     return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                 }
-                // A native `tp_hash` slot returns the hash itself, not an int to hash again.
-                let slot = matches!(&m, Value::Obj(f) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some_and(|d| d.role == lumen_bind::Role::Proto("hash"))));
+                // As CPython's slot_tp_hash: a result that fits a machine word is the hash itself
+                // (bar -1); only a larger int is hashed again.
                 let r = self.call_user_special(v, &m, Vec::new())?;
                 return match r {
-                    Value::Int(i) if slot => Ok(if i == -1 { -2 } else { i }),
-                    Value::Int(i) => Ok(hash_int(i)),
+                    Value::Int(i) => Ok(if i == -1 { -2 } else { i }),
                     Value::Bool(b) => Ok(b as i64),
                     Value::Obj(ro) if matches!(ro.kind, Kind::Int(_)) => self.native_hash(&Value::Obj(ro)),
                     _ => Err(self.type_error("__hash__ method should return an integer")),
