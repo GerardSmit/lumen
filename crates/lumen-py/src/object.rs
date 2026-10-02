@@ -30,7 +30,32 @@ pub struct Object {
     /// Lazily assigned identity number; recycled on drop so that short-lived temporaries reuse
     /// ids the way CPython reuses addresses.
     pub id: Cell<u32>,
+    pub gc: GcCell,
     pub kind: Kind,
+}
+
+/// The cycle collector's per-object state: the slot in its generation list, the generation
+/// (`gc::UNTRACKED` when not in any list), an allocation sequence number and flag bits.
+pub struct GcCell {
+    pub idx: Cell<u32>,
+    pub seq: Cell<u32>,
+    pub gen: Cell<u8>,
+    pub flags: Cell<u8>,
+}
+
+/// `__del__` / generator finalization already ran (PEP 442: it runs once per object).
+pub const GC_FINALIZED: u8 = 1;
+
+impl GcCell {
+    pub const fn new() -> GcCell {
+        GcCell { idx: Cell::new(0), seq: Cell::new(0), gen: Cell::new(0), flags: Cell::new(0) }
+    }
+}
+
+impl Default for GcCell {
+    fn default() -> GcCell {
+        GcCell::new()
+    }
 }
 
 thread_local! {
@@ -60,6 +85,12 @@ impl Object {
 impl Drop for Object {
     fn drop(&mut self) {
         crate::watch::object_dropped(self);
+        if self.gc.idx.get() != 0 {
+            crate::gc::untrack(self);
+        }
+        if self.gc.flags.get() & GC_FINALIZED == 0 && crate::gc::defer_finalizer(self) {
+            return;
+        }
         let id = self.id.get();
         if id != 0 {
             crate::weak::on_object_drop(id);
@@ -186,6 +217,8 @@ pub struct TypeData {
     pub version: Cell<u64>,
     /// The type watchers (`tp_watched`), one bit each.
     pub watched: Cell<u8>,
+    /// Whether instances have a `__del__`, as of the type epoch in the first field.
+    pub del_cache: Cell<(u64, bool)>,
 }
 
 pub struct Function {
@@ -343,16 +376,27 @@ pub enum Kind {
 }
 
 impl Object {
+    /// Allocates `o` and registers it with the cycle collector when it can be part of a cycle.
+    #[inline]
+    pub fn alloc(o: Object) -> Obj {
+        let track = o.cls.is_some() || o.dict.borrow().is_some() || kind_tracked(&o.kind);
+        let rc = Rc::new(o);
+        if track {
+            crate::gc::track(&rc);
+        }
+        rc
+    }
+
     pub fn new(kind: Kind) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(None), id: Cell::new(0), kind })
+        Object::alloc(Object { cls: None, dict: RefCell::new(None), id: Cell::new(0), gc: GcCell::new(), kind })
     }
 
     pub fn with_cls(cls: Obj, kind: Kind) -> Obj {
-        Rc::new(Object { cls: Some(cls), dict: RefCell::new(None), id: Cell::new(0), kind })
+        Object::alloc(Object { cls: Some(cls), dict: RefCell::new(None), id: Cell::new(0), gc: GcCell::new(), kind })
     }
 
     pub fn with_dict(kind: Kind, dict: Obj) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(Some(dict)), id: Cell::new(0), kind })
+        Object::alloc(Object { cls: None, dict: RefCell::new(Some(dict)), id: Cell::new(0), gc: GcCell::new(), kind })
     }
 
     pub fn type_data(&self) -> Option<&TypeData> {
@@ -561,4 +605,14 @@ pub fn set_of(v: &Value) -> Option<&RefCell<PyDict>> {
 /// The store of a new `bytearray` holding `v`.
 pub fn ba_store(v: Vec<u8>) -> Rc<ByteStore> {
     Rc::new(ByteStore::new(v).growable())
+}
+
+/// Whether objects of this kind can take part in a reference cycle (CPython's `PyObject_IS_GC`
+/// types); tuples only when they hold something that can.
+pub fn kind_tracked(k: &Kind) -> bool {
+    match k {
+        Kind::Str(_) | Kind::Int(_) | Kind::Float(_) | Kind::Complex(..) | Kind::Bytes(_) | Kind::ByteArray(_) | Kind::Code(_) | Kind::Range(_) | Kind::BigRange(_) | Kind::Frame => false,
+        Kind::Tuple(items) => items.iter().any(|v| matches!(v, Value::Obj(_))),
+        _ => true,
+    }
 }

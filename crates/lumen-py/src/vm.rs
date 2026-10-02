@@ -54,10 +54,12 @@ macro_rules! types {
     };
 }
 
+/// A builtin (static) type: like CPython's, never tracked by the cycle collector.
 pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
     Rc::new(Object {
         cls: None,
         id: std::cell::Cell::new(0),
+        gc: GcCell::new(),
         dict: RefCell::new(Some(Object::new(Kind::Dict(RefCell::new(PyDict::new()))))),
         kind: Kind::Type(TypeData {
             name: RefCell::new(name.into()),
@@ -70,6 +72,7 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
             slots: RefCell::new(None),
             version: std::cell::Cell::new(0),
             watched: std::cell::Cell::new(0),
+            del_cache: std::cell::Cell::new((u64::MAX, false)),
         }),
     })
 }
@@ -210,7 +213,6 @@ pub struct Interp {
     pub subclass_registry: Vec<std::rc::Weak<Object>>,
     pub ret_val: Value,
     pub atexit: Vec<(Value, Vec<Value>, Vec<(Obj, Value)>)>,
-    pub gc_enabled: bool,
     pub simple_namespace: Option<Obj>,
     pub interrupt: InterruptHandle,
     pub interrupted: bool,
@@ -285,7 +287,6 @@ impl Interp {
             subclass_registry: Vec::new(),
             ret_val: Value::None,
             atexit: Vec::new(),
-            gc_enabled: true,
             simple_namespace: None,
             interrupt: InterruptHandle::new(),
             interrupted: false,
@@ -561,6 +562,13 @@ impl Interp {
                 fr!().stack.pop().unwrap()
             };
         }
+        macro_rules! drain {
+            () => {
+                if crate::weak::has_pending() {
+                    self.run_weak_callbacks();
+                }
+            };
+        }
         loop {
             let op = {
                 let fr = fr!();
@@ -575,6 +583,7 @@ impl Interp {
                 Op::Nop => {}
                 Op::Pop => {
                     pop!();
+                    drain!();
                 }
                 Op::Dup => {
                     let fr = fr!();
@@ -631,6 +640,7 @@ impl Interp {
                     let fr = fr!();
                     let v = fr.stack.pop().unwrap();
                     fr.locals[i as usize] = Some(v);
+                    drain!();
                 }
                 Op::DelFast(i) => {
                     let fr = fr!();
@@ -676,6 +686,7 @@ impl Interp {
                     } else {
                         dict_set_name(&ns, &name, v);
                     }
+                    drain!();
                 }
                 Op::DelName(i) => {
                     let fr = fr!();
@@ -709,6 +720,7 @@ impl Interp {
                     let v = fr.stack.pop().unwrap();
                     let g = fr.globals.clone();
                     dict_set_name(&g, &name, v);
+                    drain!();
                 }
                 Op::DelGlobal(i) => {
                     let fr = fr!();
@@ -750,12 +762,14 @@ impl Interp {
                     if let Kind::Cell(c) = &fr.cells[i as usize].kind {
                         *c.borrow_mut() = Some(v);
                     }
+                    drain!();
                 }
                 Op::DelDeref(i) => {
                     let fr = fr!();
                     if let Kind::Cell(c) = &fr.cells[i as usize].kind {
                         *c.borrow_mut() = None;
                     }
+                    drain!();
                 }
                 Op::LoadClosure(i) => {
                     let fr = fr!();
@@ -795,6 +809,7 @@ impl Interp {
                     let obj = pop!();
                     let v = pop!();
                     self.set_attr(&obj, &name, v)?;
+                    drain!();
                     if crate::watch::has_pending() {
                         self.flush_watchers();
                     }
@@ -803,6 +818,7 @@ impl Interp {
                     let name = fr!().code.names[i as usize].clone();
                     let obj = pop!();
                     self.del_attr(&obj, &name)?;
+                    drain!();
                     if crate::watch::has_pending() {
                         self.flush_watchers();
                     }
@@ -819,6 +835,7 @@ impl Interp {
                     let obj = pop!();
                     let v = pop!();
                     self.setitem(&obj, key, v)?;
+                    drain!();
                     if crate::watch::has_pending() {
                         self.flush_watchers();
                     }
@@ -827,6 +844,7 @@ impl Interp {
                     let key = pop!();
                     let obj = pop!();
                     self.delitem(&obj, &key)?;
+                    drain!();
                     if crate::watch::has_pending() {
                         self.flush_watchers();
                     }

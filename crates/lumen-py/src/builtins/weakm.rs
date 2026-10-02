@@ -664,20 +664,3 @@ pub mod _weakref {
     }
 }
 
-impl Interp {
-    /// Runs the callbacks of weak references whose referent has died since the last check.
-    pub fn run_weak_callbacks(&mut self) {
-        while weak::has_pending() {
-            for r in weak::take_pending() {
-                if let Some(cb) = weak::take_callback(&r) {
-                    if let Err(e) = self.call(&cb, vec![Value::Obj(r.clone())], Vec::new()) {
-                        let repr = self.repr_of(&cb).unwrap_or_default();
-                        self.write_stderr(&format!("Exception ignored in: {}\n", repr));
-                        let text = self.format_exception(&e);
-                        self.write_stderr(&text);
-                    }
-                }
-            }
-        }
-    }
-}

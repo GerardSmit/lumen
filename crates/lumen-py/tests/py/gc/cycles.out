@@ -1,0 +1,19 @@
+alive before collect: True True
+collected something: True
+alive after collect: False False
+list cycle collected: True
+subclass alive: True
+subclass dead: True
+dict cycle collected: True
+closure alive: True
+closure dead: True
+holder dead: True
+tuple cycle collected: True
+ring alive: True
+ring dead: True
+referenced cycle survives: True
+then dies: True
+parent child dead: True
+generation arg: True True True
+ValueError: invalid generation
+ValueError: invalid generation

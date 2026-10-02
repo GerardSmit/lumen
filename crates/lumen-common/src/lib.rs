@@ -10,6 +10,7 @@ pub mod codec;
 pub mod csv;
 pub mod decimal;
 pub mod editdist;
+pub mod cycle;
 #[cfg(feature = "compress")]
 pub mod compress;
 #[cfg(not(target_arch = "wasm32"))]

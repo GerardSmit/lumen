@@ -1116,7 +1116,7 @@ impl Interp {
             "__bases__" => {
                 let items: Vec<Obj> = v.tuple_items().unwrap_or(&[]).iter().filter_map(|b| b.as_obj().cloned()).collect();
                 self.set_bases(o, items);
-                self.type_epoch += 1;
+                self.bump_type_epoch();
                 self.type_modified(o);
                 return Ok(());
             }
@@ -1134,7 +1134,7 @@ impl Interp {
         let d = self.instance_dict(o);
         dict_set_name(&d, name, v);
         if nm.starts_with("__") {
-            self.type_epoch += 1;
+            self.bump_type_epoch();
         }
         if nm == "__call__" {
             self.type_call_changed(o);
@@ -1401,7 +1401,7 @@ impl Interp {
             if let Some(dd) = dd {
                 if dict_del_name(&dd, name).is_some() {
                     if matches!(o.kind, Kind::Type(_)) && nm.starts_with("__") {
-                        self.type_epoch += 1;
+                        self.bump_type_epoch();
                     }
                     if matches!(o.kind, Kind::Type(_)) {
                         if nm == "__call__" {
@@ -1686,10 +1686,11 @@ impl Interp {
             }
         };
         let cls_field = if Rc::ptr_eq(meta, &self.types.type_) { None } else { Some(meta.clone()) };
-        let ty = Rc::new(Object {
+        let ty = Object::alloc(Object {
             cls: cls_field,
             dict: RefCell::new(Some(dict.clone())),
             id: std::cell::Cell::new(0),
+            gc: GcCell::new(),
             kind: Kind::Type(TypeData {
                 name: RefCell::new(name.into()),
                 qualname: RefCell::new(qualname),
@@ -1701,6 +1702,7 @@ impl Interp {
                 slots: RefCell::new(slots),
                 version: Cell::new(0),
                 watched: Cell::new(0),
+                del_cache: Cell::new((u64::MAX, false)),
             }),
         });
         match self.compute_mro(&ty, &bases) {
@@ -1714,7 +1716,7 @@ impl Interp {
                 return Err(self.type_error("Cannot create a consistent method resolution order (MRO) for bases"));
             }
         }
-        self.type_epoch += 1;
+        self.bump_type_epoch();
         self.subclass_registry.push(Rc::downgrade(&ty));
         if let Kind::Type(td) = &ty.kind {
             let inherits = td.bases.borrow().first().and_then(|b| b.type_data().map(|d| d.flags.get() & TF_VECTORCALL != 0)).unwrap_or(false);

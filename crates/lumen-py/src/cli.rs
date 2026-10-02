@@ -151,6 +151,9 @@ pub fn run_main(args: &[String]) -> i32 {
             it.run_source(src, "<string>")
         }
     };
+    if !it.interrupt.is_interrupted() {
+        it.finalize_modules();
+    }
     it.flush_out();
     let ms = TIMED_OUT_AFTER.load(Ordering::SeqCst);
     if ms != 0 && it.was_interrupted() {

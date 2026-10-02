@@ -172,7 +172,7 @@ pub mod sys {
     /// Return True if Python is exiting.
     #[op]
     fn is_finalizing() -> bool {
-        false
+        crate::gc::is_finalizing()
     }
 
     /// Return the global debug tracing function set with sys.settrace.
@@ -314,15 +314,16 @@ pub mod sys {
 
     /// Handle an unraisable exception.
     ///
-    /// The argument is an object with the attributes exc_type, exc_value, exc_traceback,
-    /// err_msg and object.
+    /// Called when an exception has occurred but there is no way for Python to handle it.
+    /// For example, when a destructor raises an exception.
     #[op]
     fn unraisablehook(it: &mut Interp, unraisable: &Value) -> R<()> {
-        let exc = it.getitem(unraisable, &Value::Int(1))?;
-        let err_msg = it.getitem(unraisable, &Value::Int(3))?;
-        let object = it.getitem(unraisable, &Value::Int(4))?;
-        let Value::Obj(e) = &exc else { return Ok(()) };
-        it.default_unraisable(e, Some(&err_msg), Some(&object));
+        let get = |it: &mut Interp, name: &str| it.get_attr_str(unraisable, name);
+        let exc = get(it, "exc_value")?;
+        let msg = get(it, "err_msg")?;
+        let obj = get(it, "object")?;
+        let Value::Obj(exc) = exc else { return Ok(()) };
+        it.default_unraisable(&exc, msg.as_str(), Some(&obj));
         Ok(())
     }
 
