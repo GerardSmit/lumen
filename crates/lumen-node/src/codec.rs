@@ -1,5 +1,5 @@
-//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url) and byte
-//! search, with Node's exact semantics — including its lenient decoders: base64 skips characters
+//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url),
+//! with Node's exact semantics — including its lenient decoders: base64 skips characters
 //! outside the alphabet and stops at `=`, hex stops at the first invalid pair, utf8 decodes with
 //! U+FFFD replacement of maximal subparts (WHATWG / V8).
 //!
@@ -302,65 +302,6 @@ pub fn write(dst: &mut [u8], s: &str, enc: u32) -> usize {
     }
 }
 
-// ---- search -------------------------------------------------------------------------------------
-
-/// Index of the first `b` in `hay` (word-at-a-time: 8 bytes per step on the long runs between
-/// candidates, which is what a byte search spends its time on).
-pub fn memchr(b: u8, hay: &[u8]) -> Option<usize> {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let pat = LO.wrapping_mul(b as u64);
-    let mut i = 0;
-    while i + 8 <= hay.len() {
-        let w = u64::from_le_bytes(hay[i..i + 8].try_into().unwrap()) ^ pat;
-        if (w.wrapping_sub(LO) & !w & HI) != 0 {
-            break; // a match in this word: finish bytewise
-        }
-        i += 8;
-    }
-    hay[i..].iter().position(|&x| x == b).map(|p| p + i)
-}
-
-/// First index >= `from` where `needle` occurs in `hay`.
-pub fn index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if from > hay.len() {
-        return None;
-    }
-    if needle.is_empty() {
-        return Some(from);
-    }
-    let first = needle[0];
-    let last_start = hay.len().checked_sub(needle.len())?;
-    let mut i = from;
-    while i <= last_start {
-        match memchr(first, &hay[i..=last_start]) {
-            None => return None,
-            Some(p) => {
-                i += p;
-                if &hay[i..i + needle.len()] == needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-/// Last index <= `from` where `needle` occurs in `hay`.
-pub fn last_index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.len() > hay.len() {
-        return None;
-    }
-    let start = from.min(hay.len() - needle.len());
-    if needle.is_empty() {
-        return Some(start);
-    }
-    (0..=start)
-        .rev()
-        .find(|&i| hay[i] == needle[0] && &hay[i..i + needle.len()] == needle)
-}
-
 // ---- validation ---------------------------------------------------------------------------------
 
 pub fn is_utf8(bytes: &[u8]) -> bool {
@@ -429,21 +370,5 @@ mod tests {
         assert_eq!(write(&mut d, "ab\u{e9}", UTF8), 2);
         let mut d = [0u8; 3];
         assert_eq!(write(&mut d, "ab", UTF16LE), 2);
-    }
-
-    #[test]
-    fn search() {
-        assert_eq!(index_of(b"abcabc", b"ca", 0), Some(2));
-        assert_eq!(index_of(b"abcabc", b"abc", 1), Some(3));
-        assert_eq!(index_of(b"abc", b"", 2), Some(2));
-        assert_eq!(index_of(b"abc", b"d", 0), None);
-        assert_eq!(last_index_of(b"abcabc", b"abc", 6), Some(3));
-        assert_eq!(last_index_of(b"abcabc", b"abc", 2), Some(0));
-        let hay: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
-        for b in 0..=255u8 {
-            assert_eq!(memchr(b, &hay), hay.iter().position(|&x| x == b), "byte {b}");
-            assert_eq!(memchr(b, &hay[3..17]), hay[3..17].iter().position(|&x| x == b));
-        }
-        assert_eq!(index_of(&hay, &hay[500..505], 0), Some(500 % 256));
     }
 }

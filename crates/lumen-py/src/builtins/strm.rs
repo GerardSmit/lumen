@@ -6,6 +6,7 @@ use crate::object::*;
 use crate::vm::*;
 use crate::unicode::Case;
 use lumen_common::smuggle::{code_points, may_contain};
+use lumen_common::search;
 use lumen_common::ucd::{char_type, flag};
 use std::rc::Rc;
 
@@ -449,7 +450,7 @@ fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool)
         let bs = s.byte_offset(st);
         let be = s.byte_offset(en);
         let hay = &s.s[bs..be];
-        let pos = if right { hay.rfind(sub) } else { hay.find(sub) };
+        let pos = if right { hay.rfind(sub) } else { search::find(hay.as_bytes(), sub.as_bytes()) };
         pos.map(|p| if s.ascii { bs + p } else { lumen_common::smuggle::count_code_points(&s.s[..bs + p]) })
     };
     match found {
@@ -495,7 +496,7 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if sub.is_empty() {
         return Ok(Value::Int(lumen_common::smuggle::count_code_points(hay) as i64 + 1));
     }
-    Ok(Value::Int(hay.matches(sub).count() as i64))
+    Ok(Value::Int(search::count(hay.as_bytes(), sub.as_bytes(), usize::MAX) as i64))
 }
 
 fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Value> {

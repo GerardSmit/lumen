@@ -1,7 +1,7 @@
 //! Shared, engine-independent building blocks (big integers, Unicode tables, hashing, byte codecs,
-//! calendar and time-zone data) used by the JavaScript engine (`lumen`) and `lumen-py`. Std only;
-//! the `hash` and `compress` features add the RustCrypto / zlib / Brotli / Zstandard crates, and
-//! are off by default so the engine itself carries no dependencies.
+//! calendar and time-zone data) used by the JavaScript engine (`lumen`) and `lumen-py`. Std and
+//! `memchr` (vectorized search) only; the `hash` and `compress` features add the RustCrypto / zlib
+//! / Brotli / Zstandard crates, and are off by default so the engine carries no others.
 
 pub mod bigint;
 pub mod buffer;
@@ -25,6 +25,7 @@ pub mod mt19937;
 pub mod native;
 pub mod stack;
 pub mod regex;
+pub mod search;
 pub mod siphash;
 pub mod smuggle;
 pub mod strftime;

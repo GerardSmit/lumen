@@ -7,6 +7,7 @@
 //! on the JS thread when it finishes (see `lumen::embed::AsyncHost`), so a 100k-iteration PBKDF2
 //! or an 8 MB file read no longer blocks timers and I/O.
 
+use lumen_common::search;
 use lumen::embed::{Ctx, SendError, Value};
 
 use crate::codec;
@@ -85,9 +86,9 @@ fn search(hay: &[u8], needle: &[u8], offset: f64, forward: bool, ucs2: bool) -> 
         return search_ucs2(hay, needle, start, forward);
     }
     let found = if forward {
-        codec::index_of(hay, needle, start)
+        search::find_from(hay, needle, start)
     } else {
-        codec::last_index_of(hay, needle, start)
+        search::rfind_upto(hay, needle, start)
     };
     found.map_or(-1.0, |i| i as f64)
 }
@@ -104,13 +105,16 @@ fn search_ucs2(hay: &[u8], needle: &[u8], start: usize, forward: bool) -> f64 {
     if nu > units {
         return -1.0;
     }
-    let at = |i: usize| hay[i * 2..i * 2 + needle.len()] == *needle;
-    let last = units - nu;
-    let from = start / 2;
-    if forward {
-        (from..=last).find(|&i| at(i)).map_or(-1.0, |i| (i * 2) as f64)
-    } else {
-        (0..=from.min(last)).rev().find(|&i| at(i)).map_or(-1.0, |i| (i * 2) as f64)
+    let hay = &hay[..units * 2];
+    let mut at = start / 2 * 2;
+    loop {
+        let found = if forward { search::find_from(hay, needle, at) } else { search::rfind_upto(hay, needle, at) };
+        match found {
+            Some(i) if i % 2 == 0 => return i as f64,
+            Some(i) if forward => at = i + 1,
+            None => return -1.0,
+            Some(i) => at = i - 1,
+        }
     }
 }
 
