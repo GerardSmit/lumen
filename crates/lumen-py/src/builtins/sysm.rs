@@ -4,6 +4,7 @@
 /// interpreter and to functions that interact strongly with the interpreter.
 #[lumen_bind::module(name = "sys")]
 pub mod sys {
+    use crate::builtins::genm::AsyncGenHooks;
     use crate::builtins::sysextra::{new_structseq_type, structseq};
     use crate::object::*;
     use crate::vm::*;
@@ -220,6 +221,45 @@ pub mod sys {
     #[op]
     fn addaudithook(#[kw] hook: &Value) {
         let _ = hook;
+    }
+
+    /// Return the installed asynchronous generators hooks.
+    ///
+    /// This returns a namedtuple of the form (firstiter, finalizer).
+    #[op]
+    fn get_asyncgen_hooks(it: &mut Interp) -> Value {
+        let h = it.native_state::<AsyncGenHooks>();
+        let vals = vec![h.firstiter.clone().unwrap_or(Value::None), h.finalizer.clone().unwrap_or(Value::None)];
+        let ty = crate::builtins::sysextra::structseq_type::<AsyncGenHooks>(it, "builtins", "asyncgen_hooks", &["firstiter", "finalizer"], 2);
+        structseq(&ty, vals)
+    }
+
+    /// set_asyncgen_hooks([firstiter] [, finalizer])
+    ///
+    /// Set a finalizer for async generators objects.
+    #[op]
+    fn set_asyncgen_hooks(it: &mut Interp, #[kw] firstiter: lumen_bind::Passed<&Value>, #[kw] finalizer: lumen_bind::Passed<&Value>) -> R<()> {
+        let check = |it: &mut Interp, name: &str, v: Option<&Value>| -> R<Option<Option<Value>>> {
+            match v {
+                None => Ok(None),
+                Some(Value::None) => Ok(Some(None)),
+                Some(v) if it.is_callable(v) => Ok(Some(Some(v.clone()))),
+                Some(v) => {
+                    let t = it.tp_name_of(v);
+                    Err(it.type_error(&format!("callable {name} expected, got {t}")))
+                }
+            }
+        };
+        let fin = check(it, "finalizer", finalizer.0)?;
+        let first = check(it, "firstiter", firstiter.0)?;
+        let h = it.native_state::<AsyncGenHooks>();
+        if let Some(f) = fin {
+            h.finalizer = f;
+        }
+        if let Some(f) = first {
+            h.firstiter = f;
+        }
+        Ok(())
     }
 
     /// Return the current thread switch interval; see sys.setswitchinterval().

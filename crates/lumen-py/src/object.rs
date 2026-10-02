@@ -215,6 +215,7 @@ pub struct GenData {
     pub name: RefCell<Rc<str>>,
     pub qualname: RefCell<Rc<str>>,
     pub running_async: Cell<bool>,
+    pub hooks_inited: Cell<bool>,
 }
 
 #[derive(Clone)]

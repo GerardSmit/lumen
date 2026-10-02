@@ -286,7 +286,7 @@ pub fn gen(s: &Spec) -> Res<String> {
         };
         params_src.push(format!(
             "{B}::Param {{ name: {:?}, kind: {B}::ParamKind::{kind}, default: {} }}",
-            p.name.trim_start_matches('_'),
+            p.name.trim_start_matches("r#").trim_start_matches('_'),
             opt_str(default.as_deref())
         ));
     }
@@ -363,7 +363,7 @@ pub fn gen(s: &Spec) -> Res<String> {
         "pub static {}: {B}::FnDesc = {B}::FnDesc {{ name: {:?}, {}, owner: {}, role: {}, doc: {}, params: &[{}], \
          max_pos: {max_pos}, min_pos: {min_pos}, flags: {flags}, scalar: {scalar} }};\n",
         s.desc,
-        sig.name,
+        sig.name.strip_prefix("r#").unwrap_or(&sig.name),
         names_fields(s.opts),
         s.owner,
         s.role.expr(),

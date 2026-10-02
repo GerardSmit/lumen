@@ -8,6 +8,7 @@ pub mod csvm;
 pub mod posixsubprocessm;
 pub mod selectm;
 pub mod signalm;
+pub mod socketm;
 pub mod descr;
 pub mod dictm;
 pub mod excgroup;

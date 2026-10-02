@@ -388,6 +388,7 @@ impl Interp {
             name: RefCell::new(name),
             qualname: RefCell::new(qualname),
             running_async: Cell::new(false),
+            hooks_inited: Cell::new(false),
         }))))
     }
 

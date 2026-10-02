@@ -1,5 +1,2 @@
 # Corpus scripts that are known to fail: `path  # reason`, one per line.
-realworld/home_automation.py  # asyncio needs _socket
-realworld/llm_client.py  # needs binascii, _socket, _md5/_sha1/_blake2
-stdlib/asyncio_basic.py  # asyncio needs _socket
-stdlib/asyncio_mod.py  # asyncio needs _socket
+realworld/llm_client.py  # needs binascii, _md5/_sha1/_blake2

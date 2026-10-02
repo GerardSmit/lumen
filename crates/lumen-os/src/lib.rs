@@ -5,6 +5,7 @@ pub mod consts;
 pub mod errno;
 pub mod fdctl;
 pub mod fs;
+pub mod net;
 pub mod poll;
 pub mod proc;
 pub mod signal;

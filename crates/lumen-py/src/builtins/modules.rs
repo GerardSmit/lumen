@@ -23,6 +23,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_random", bound::<super::randomm::_random::Module>),
     ("_sha2", |it| Some(super::sha2m::make(it))),
     ("_signal", bound::<super::signalm::_signal::Module>),
+    ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", |it| Some(super::sre::make(it))),
     ("_string", |it| Some(super::stringm::make(it))),
     ("_struct", bound::<super::structm::_struct::Module>),

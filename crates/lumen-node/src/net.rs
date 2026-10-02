@@ -1770,43 +1770,11 @@ fn invalid_argument_errno() -> i32 {
 
 #[cfg(unix)]
 pub(crate) fn sockaddr_of(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    // SAFETY: an all-zero sockaddr_storage is a valid value; the family-specific struct written
-    // into it below is no larger than the storage.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        SocketAddr::V4(a) => {
-            let sin = libc::sockaddr_in {
-                #[cfg(target_vendor = "apple")]
-                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(a.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin) };
-            std::mem::size_of::<libc::sockaddr_in>()
-        }
-        SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                #[cfg(target_vendor = "apple")]
-                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin6) };
-            std::mem::size_of::<libc::sockaddr_in6>()
-        }
+    let addr = match *addr {
+        SocketAddr::V4(a) => lumen_os::net::SockAddr::V4(a),
+        SocketAddr::V6(a) => lumen_os::net::SockAddr::V6(a),
     };
-    (storage, len as libc::socklen_t)
+    addr.to_raw().expect("an IP socket address always converts")
 }
 
 /// Bind a UDP socket with the libuv bind flags std cannot express (`UV_UDP_IPV6ONLY` = 1,

@@ -338,7 +338,7 @@ pub mod _signal {
         match cls {
             Some(c) => {
                 let msg = Value::string(lumen_os::errno::strerror(errno));
-                it.new_exc(&c, vec![Value::Int(errno as i64), msg])
+                it.os_error_of(&c, vec![Value::Int(errno as i64), msg])
             }
             None => it.os_error_errno(errno, None, None),
         }

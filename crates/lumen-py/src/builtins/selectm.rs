@@ -9,7 +9,7 @@ const SLICE_MS: i64 = 20;
 
 /// Repeats `wait_once(slice_ms)` (which reports whether anything is ready) until something is
 /// ready or `timeout_ms` passes (`None`: forever), servicing signals between slices.
-fn wait<T>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_once: impl FnMut(i32) -> Result<(bool, T), FsError>) -> R<T> {
+pub(crate) fn wait<T>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_once: impl FnMut(i32) -> Result<(bool, T), FsError>) -> R<T> {
     it.flush_out();
     let start = it.platform.borrow().monotonic_ns();
     loop {

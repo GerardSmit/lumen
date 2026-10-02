@@ -198,8 +198,14 @@ impl Interp {
     }
 
     fn os_error_args(&mut self, args: Vec<Value>) -> Obj {
-        let cls = Value::Obj(self.exc_type("OSError"));
-        match self.call(&cls, args, Vec::new()) {
+        let cls = self.exc_type("OSError");
+        self.os_error_of(&cls, args)
+    }
+
+    /// An instance of the `OSError` subclass `cls` built by calling it, so `errno`, `strerror`
+    /// and the filenames are set from `args`.
+    pub fn os_error_of(&mut self, cls: &Obj, args: Vec<Value>) -> Obj {
+        match self.call(&Value::Obj(cls.clone()), args, Vec::new()) {
             Ok(Value::Obj(o)) => o,
             Ok(_) => self.new_exc_str("OSError", ""),
             Err(e) => e,
