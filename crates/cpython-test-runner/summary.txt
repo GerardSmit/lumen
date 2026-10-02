@@ -1,0 +1,31 @@
+files run: 406  skipped (skip.txt): 0
+  import-error  406
+file-level errors: 406
+tests: pass 0  fail 0  error 0  skip 0
+
+top file-level failure reasons:
+   169  ModuleNotFoundError: No module named '_io'
+   151  ImportError: no os specific module found
+    29  ModuleNotFoundError: No module named '_ast'
+    15  ModuleNotFoundError: No module named 'errno'
+     7  ModuleNotFoundError: No module named 'array'
+     5  ModuleNotFoundError: No module named '_imp'
+     5  ModuleNotFoundError: No module named 'binascii'
+     3  ModuleNotFoundError: No module named '_contextvars'
+     3  ModuleNotFoundError: No module named '_socket'
+     2  AttributeError: module 'calendar' has no attribute '__dict__'
+     2  ModuleNotFoundError: No module named 'unicodedata'
+     1  AttributeError: 'function' object has no attribute '__func__'
+     1  ModuleNotFoundError: No module named '_locale'
+     1  ModuleNotFoundError: No module named '_multibytecodec'
+     1  ModuleNotFoundError: No module named '_symtable'
+     1  ModuleNotFoundError: No module named 'cmath'
+     1  ModuleNotFoundError: No module named 'faulthandler'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CEDILLA'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CHEROKEE LETTER A'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CYRILLIC SMALL LETTER ZHE'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'LATIN SMALL LETTER Y WITH CIRCUMFLEX'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'LONG RIGHTWARDS SQUIGGLE ARROW'
+     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'RS'
+     1  SyntaxError: no binding for nonlocal 'GLOBAL_VAR' found
+     1  TypeError: Template.__init_subclass__() missing 1 required positional argument: 'cls'

@@ -14,7 +14,7 @@
 //!   --skip FILE      files to skip (default: crates/cpython-test-runner/skip.txt)
 //!   --baseline FILE  expected results (default: crates/cpython-test-runner/baseline.txt)
 //!   --check          exit 1 if any file regressed against the baseline
-//!   --bless          rewrite the baseline from this run
+//!   --bless          rewrite the baseline (and summary.txt beside it) from this run
 
 mod parse;
 
@@ -271,24 +271,28 @@ fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std:
     Ok(text)
 }
 
-/// One baseline line: `name<TAB>status<TAB>pass`.
+/// One baseline line: `name<TAB>status<TAB>pass<TAB>fail<TAB>error<TAB>skip`.
 fn read_baseline(path: &Path) -> BTreeMap<String, (String, u32)> {
     let mut map = BTreeMap::new();
     for line in fs::read_to_string(path).unwrap_or_default().lines() {
         let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() == 3 && !line.starts_with('#') {
+        if parts.len() >= 3 && !line.starts_with('#') {
             map.insert(parts[0].to_string(), (parts[1].to_string(), parts[2].parse().unwrap_or(0)));
         }
     }
     map
 }
 
-fn write_baseline(path: &Path, results: &[FileResult]) -> std::io::Result<()> {
-    let mut out = String::from("# file\tstatus\tpass  (regenerate with cpython-test-runner --bless)\n");
+/// Writes the per-file baseline and, next to it, `summary.txt` (the run's totals), so the
+/// committed files show the score without a local report directory.
+fn write_baseline(path: &Path, results: &[FileResult], summary: &str) -> std::io::Result<()> {
+    let mut out = String::from("# file\tstatus\tpass\tfail\terror\tskip  (regenerate with cpython-test-runner --bless)\n");
     for r in results {
-        out.push_str(&format!("{}\t{}\t{}\n", r.name, r.status.label(), r.counts.pass));
+        let c = &r.counts;
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", r.name, r.status.label(), c.pass, c.fail, c.error, c.skip));
     }
-    fs::write(path, out)
+    fs::write(path, out)?;
+    fs::write(path.with_file_name("summary.txt"), summary)
 }
 
 fn regressions(baseline: &BTreeMap<String, (String, u32)>, results: &[FileResult]) -> Vec<String> {
@@ -356,16 +360,19 @@ fn main() {
     });
     eprintln!("running {} files with {} jobs ({} skipped)", names.len(), o.jobs, skipped.len());
     let results = run_all(&o, names, &log_dir);
-    match write_report(&o, &results, &skipped) {
-        Ok(text) => print!("{text}"),
+    let summary = match write_report(&o, &results, &skipped) {
+        Ok(text) => {
+            print!("{text}");
+            text
+        }
         Err(e) => {
             eprintln!("cpython-test-runner: cannot write report: {e}");
             std::process::exit(2);
         }
-    }
+    };
     println!("\nreport: {}", o.report.display());
     if o.bless {
-        match write_baseline(&o.baseline, &results) {
+        match write_baseline(&o.baseline, &results, &summary) {
             Ok(()) => println!("baseline written: {}", o.baseline.display()),
             Err(e) => eprintln!("cpython-test-runner: cannot write baseline: {e}"),
         }

@@ -16,7 +16,7 @@ flt = args[0] if args else ""
 
 scripts = []
 for d, dirs, files in os.walk(root):
-    dirs[:] = sorted(x for x in dirs if not x.startswith("_") and x != "stdlib")
+    dirs[:] = sorted(x for x in dirs if not x.startswith("_"))
     for f in sorted(files):
         if f.endswith(".py") and not f.startswith("_"):
             scripts.append(os.path.join(d, f))

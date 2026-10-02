@@ -1,15 +1,11 @@
-# Blocked on the missing os/posix module.
-# typing -> contextlib -> `import os`
-classes/pep695_classes.py
-stdlib/enum_typing.py
-stdlib/typing_enum.py
-stdlib/typing_features.py
-# random -> `from os import urandom`
-stdlib/random_basic.py
-stdlib/random_mod.py
-# dataclasses -> inspect -> ast (needs _ast), dis, os
-stdlib/dataclasses_basic.py
-stdlib/dataclasses_mod.py
-# asyncio is not vendored; it needs os, socket, select and selectors
-stdlib/asyncio_basic.py
-stdlib/asyncio_mod.py
+# Corpus scripts that are known to fail: `path  # reason`, one per line.
+classes/pep695_classes.py  # typing -> contextlib -> `import os`: no os/posix module
+stdlib/asyncio_basic.py  # asyncio is not vendored (needs os, socket, select, selectors)
+stdlib/asyncio_mod.py  # asyncio is not vendored (needs os, socket, select, selectors)
+stdlib/dataclasses_basic.py  # dataclasses -> inspect -> ast (needs _ast), dis, os
+stdlib/dataclasses_mod.py  # dataclasses -> inspect -> ast (needs _ast), dis, os
+stdlib/enum_typing.py  # typing -> contextlib -> `import os`: no os/posix module
+stdlib/random_basic.py  # random -> `from os import urandom`: no os/posix module
+stdlib/random_mod.py  # random -> `from os import urandom`: no os/posix module
+stdlib/typing_enum.py  # typing -> contextlib -> `import os`: no os/posix module
+stdlib/typing_features.py  # typing -> contextlib -> `import os`: no os/posix module

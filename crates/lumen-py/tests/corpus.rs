@@ -2,10 +2,14 @@
 //! `lumen-py` binary and compares stdout (and, when `X.err` exists, the exit code
 //! and last stderr line) with the committed expected files.
 //!
+//! Every failing script must be listed in `tests/py/expected-failures.txt` as
+//! `path  # reason`, one per line; a listed script without a reason fails the run.
+//!
 //! Env: `LUMEN_PY_CORPUS_FILTER=substr` runs a subset;
-//! `LUMEN_PY_CORPUS_BLESS=1` rewrites `tests/py/expected-failures.txt`.
+//! `LUMEN_PY_CORPUS_BLESS=1` rewrites `tests/py/expected-failures.txt` (existing reasons are
+//! kept; new entries get the failure description).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,7 +20,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const ALWAYS_ALLOWED_DIR: &str = "stdlib";
 
 fn corpus_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("py")
@@ -161,14 +164,22 @@ fn rel(root: &Path, p: &Path) -> String {
     p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/")
 }
 
-fn read_baseline(path: &Path) -> BTreeSet<String> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(String::from)
-        .collect()
+/// `path -> reason` from `expected-failures.txt`; lines without a reason are returned separately.
+fn read_baseline(path: &Path) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut map = BTreeMap::new();
+    let mut missing = Vec::new();
+    for line in fs::read_to_string(path).unwrap_or_default().lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (p, reason) = line.split_once('#').unwrap_or((line, ""));
+        let (p, reason) = (p.trim().to_string(), reason.trim().to_string());
+        if reason.is_empty() {
+            missing.push(p.clone());
+        }
+        map.insert(p, reason);
+    }
+    (map, missing)
 }
 
 #[test]
@@ -224,10 +235,8 @@ fn corpus() {
     println!("overall: {passed}/{total}");
 
     let baseline_path = root.join("expected-failures.txt");
-    let baseline = read_baseline(&baseline_path);
-    let allowed = |path: &str| {
-        baseline.contains(path) || path.starts_with(&format!("{ALWAYS_ALLOWED_DIR}/"))
-    };
+    let (baseline, missing_reasons) = read_baseline(&baseline_path);
+    let allowed = |path: &str| baseline.contains_key(path);
 
     let failing: Vec<&(String, Option<String>)> = results.iter().filter(|(_, r)| r.is_some()).collect();
     for (path, r) in &failing {
@@ -235,7 +244,7 @@ fn corpus() {
         println!("{tag}: {path}: {}", r.as_deref().unwrap_or(""));
     }
     for (path, r) in &results {
-        if r.is_none() && baseline.contains(path) {
+        if r.is_none() && baseline.contains_key(path) {
             println!("fixed: remove from expected-failures: {path}");
         }
     }
@@ -244,16 +253,27 @@ fn corpus() {
         if filter.is_some() {
             panic!("LUMEN_PY_CORPUS_BLESS=1 cannot be combined with LUMEN_PY_CORPUS_FILTER");
         }
-        let mut text = String::new();
-        for (path, _) in &failing {
-            text.push_str(path);
-            text.push('\n');
+        let mut text = String::from(
+            "# Corpus scripts that are known to fail: `path  # reason`, one per line.\n",
+        );
+        for (path, r) in &failing {
+            let reason = baseline
+                .get(path.as_str())
+                .filter(|r| !r.is_empty())
+                .cloned()
+                .unwrap_or_else(|| r.clone().unwrap_or_default().replace('\n', " "));
+            text.push_str(&format!("{path}  # {reason}\n"));
         }
         fs::write(&baseline_path, text).expect("write expected-failures.txt");
         println!("blessed {} expected failures", failing.len());
         return;
     }
 
+    assert!(
+        missing_reasons.is_empty(),
+        "expected-failures.txt entries need a `# reason`:\n{}",
+        missing_reasons.join("\n")
+    );
     let unexpected: Vec<&str> =
         failing.iter().map(|(p, _)| p.as_str()).filter(|p| !allowed(p)).collect();
     assert!(
