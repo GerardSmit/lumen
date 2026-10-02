@@ -3,7 +3,7 @@
 //! is driven through its methods, with direct descriptor access when it is a native `FileIO`.
 
 use super::fileio::{native_fd, read_fd};
-use super::{chain, getattr_opt, is_eagain, size_arg, tp_name, unsupported};
+use super::{chain, getattr_opt, is_eagain, size_arg, unsupported};
 use crate::bind::{KwArgs, Py, This};
 use crate::object::*;
 use crate::vm::Interp;
@@ -647,8 +647,8 @@ fn raw_attr(it: &mut Interp, v: &Value, name: &str) -> R<Value> {
     it.get_attr_str(&raw, name)
 }
 
-fn repr<T: lumen_bind::Class + lumen_bind::Methods<super::PyHost>>(it: &mut Interp, v: &Value, native: &str) -> R<String> {
-    let tn = tp_name::<T>(it, v, native);
+fn repr(it: &mut Interp, v: &Value) -> R<String> {
+    let tn = it.tp_name_of(v);
     match it.get_attr_str(v, "name") {
         Ok(n) => {
             let r = it.repr_of(&n)?;
@@ -850,7 +850,7 @@ impl BufferedReader {
 
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
-        repr::<BufferedReader>(it, slf.0.value(), "BufferedReader")
+        repr(it, slf.0.value())
     }
 }
 
@@ -937,7 +937,7 @@ impl BufferedWriter {
 
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
-        repr::<BufferedWriter>(it, slf.0.value(), "BufferedWriter")
+        repr(it, slf.0.value())
     }
 }
 
@@ -1059,7 +1059,7 @@ impl BufferedRandom {
 
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
-        repr::<BufferedRandom>(it, slf.0.value(), "BufferedRandom")
+        repr(it, slf.0.value())
     }
 }
 

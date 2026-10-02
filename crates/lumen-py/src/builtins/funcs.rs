@@ -771,17 +771,17 @@ impl Interp {
         let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(text, filename));
         let module = match parsed {
             Ok(m) => m,
-            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, e.col)),
+            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), text)),
         };
         if module.body.len() == 1 {
             if let StmtKind::Expr(e) = &module.body[0].kind {
                 return match crate::compile::compile_eval(e, filename) {
                     Ok(c) => Ok(c),
-                    Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, 0)),
+                    Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, text)),
                 };
             }
         }
-        Err(self.syntax_error("invalid syntax", filename, 1, 0))
+        Err(self.syntax_error("invalid syntax", filename, 1, None, text))
     }
 }
 

@@ -577,24 +577,12 @@ impl MemoryView {
     #[method(hint(py(text_signature = "($self, /, sep=<unrepresentable>, bytes_per_sep=1)")))]
     fn hex(&self, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<String> {
         let data = self.bytes(it)?;
-        let sep = match sep {
-            Some(v) if !v.is_none() => {
-                let s = match v.as_str() {
-                    Some(s) => s.to_string(),
-                    None => String::from_utf8_lossy(&it.bytes_of(v)?).into_owned(),
-                };
-                if lumen_common::smuggle::count_code_points(&s) != 1 {
-                    return Err(it.value_error("sep must be length 1."));
-                }
-                Some(s)
-            }
-            _ => None,
-        };
+        let sep = hex_sep_arg(it, sep)?;
         let per = match bytes_per_sep {
             Some(v) => it.index_of(v)?,
             None => 1,
         };
-        Ok(hex_with_sep(&data, sep.as_deref(), per))
+        Ok(lumen_common::codec::hex_encode_sep(&data, sep, per))
     }
 
     #[method(hint(py(text_signature = "($self, /)")))]
@@ -752,25 +740,24 @@ impl MemoryView {
     }
 }
 
-fn hex_with_sep(data: &[u8], sep: Option<&str>, per: i64) -> String {
-    let hex: Vec<String> = data.iter().map(|b| format!("{:02x}", b)).collect();
-    let Some(sep) = sep else { return hex.concat() };
-    if per == 0 || data.is_empty() {
-        return hex.concat();
-    }
-    let n = per.unsigned_abs() as usize;
-    let groups: Vec<String> = if per > 0 {
-        let first = data.len() % n;
-        let mut out = Vec::new();
-        if first > 0 {
-            out.push(hex[..first].concat());
+/// The `sep` argument of `bytes.hex()` and friends: one ASCII character (from a str or a
+/// bytes-like object), or `None`.
+pub fn hex_sep_arg(it: &mut Interp, sep: Option<&Value>) -> R<Option<char>> {
+    let Some(v) = sep.filter(|v| !v.is_none()) else { return Ok(None) };
+    let chars: Vec<char> = match v.as_str() {
+        Some(s) => s.chars().collect(),
+        None => {
+            it.len_of(v)?;
+            it.bytes_of(v)?.iter().map(|&b| b as char).collect()
         }
-        out.extend(hex[first..].chunks(n).map(|c| c.concat()));
-        out
-    } else {
-        hex.chunks(n).map(|c| c.concat()).collect()
     };
-    groups.join(sep)
+    let [c] = chars[..] else {
+        return Err(it.value_error("sep must be length 1."));
+    };
+    if !c.is_ascii() {
+        return Err(it.value_error("sep must be ASCII."));
+    }
+    Ok(Some(c))
 }
 
 /// Where a C-contiguous memoryview's bytes live, for zero-copy borrows.

@@ -59,6 +59,26 @@ pub fn hex_encode_upper(bytes: &[u8]) -> String {
     hex_encode_with(bytes, HEX_UPPER)
 }
 
+/// Lowercase hex of `bytes` with `sep` between groups of `per` bytes, the groups counted from
+/// the end when `per` > 0 and from the start when it is negative (CPython's `bytes.hex(sep,
+/// bytes_per_sep)`); no separator when `sep` is `None` or `per` is 0.
+pub fn hex_encode_sep(bytes: &[u8], sep: Option<char>, per: i64) -> String {
+    let Some(sep) = sep.filter(|_| per != 0 && !bytes.is_empty()) else {
+        return hex_encode(bytes);
+    };
+    let n = per.unsigned_abs() as usize;
+    let mut out = String::with_capacity(bytes.len() * 3);
+    let lead = if per > 0 { bytes.len() % n } else { 0 };
+    for (k, &b) in bytes.iter().enumerate() {
+        if k > 0 && (k + n - lead).is_multiple_of(n) {
+            out.push(sep);
+        }
+        out.push(HEX_LOWER[(b >> 4) as usize] as char);
+        out.push(HEX_LOWER[(b & 15) as usize] as char);
+    }
+    out
+}
+
 fn hex_encode_with(bytes: &[u8], digits: &[u8; 16]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {

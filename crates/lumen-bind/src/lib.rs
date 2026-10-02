@@ -75,7 +75,8 @@
 //!
 //! # Parameters
 //! Named parameters are positional-only unless marked `#[kw]` (positional or keyword) or
-//! `#[kwonly]`. `#[default(expr)]` gives a default; a trailing `Option<T>` is optional (`None`).
+//! `#[kwonly]`. `#[default(expr)]` gives a default; a trailing `Option<T>` is optional (`None`), and so is a
+//! trailing `Passed<T>`, which also tells an omitted argument from an explicit `None` / `null`.
 //! `#[varargs] rest: Vec<T>` / `&[Value]` takes the remaining positional arguments,
 //! `#[varkw] kw: Vec<(String, T)>` the extra keywords. Injected (not script arguments):
 //! `&mut Ctx` (the engine context; ties the fn to the host whose `Host::Ctx` it is),
@@ -130,7 +131,7 @@ mod convert;
 mod desc;
 mod host;
 
-pub use convert::{CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet};
+pub use convert::{CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed};
 pub use desc::{
     camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner, Param, ParamKind, Role, Scalar,
     ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,

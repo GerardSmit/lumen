@@ -57,7 +57,7 @@ impl Interp {
         if let Value::Obj(_) = v {
             if let Some(m) = self.user_special(v, "__hash__") {
                 if m.is_none() {
-                    let t = self.type_name_of(v);
+                    let t = self.tp_name_of(v);
                     return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                 }
                 // A native `tp_hash` slot returns the hash itself, not an int to hash again.

@@ -165,14 +165,10 @@ fn idfunc(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(a[0].clone())
 }
 
-fn final_type_init_subclass(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some(Value::Obj(cls)) = a.first() else { return Ok(Value::None) };
-    let base = cls.type_data().and_then(|td| td.mro.borrow().get(1).cloned());
-    let name = match base {
-        Some(b) => it.type_display(&b),
-        None => "?".into(),
-    };
-    Err(it.type_error(&format!("type '{name}' is not an acceptable base type")))
+fn set_final(t: &Obj) {
+    if let Kind::Type(td) = &t.kind {
+        td.flags.set(td.flags.get() | TF_FINAL);
+    }
 }
 
 // ---- TypeVar ----
@@ -737,7 +733,7 @@ pub fn make(it: &mut Interp) -> Obj {
     ] {
         it.reg_prop(&typevar, n, f);
     }
-    it.reg_class(&typevar, "__init_subclass__", final_type_init_subclass);
+    set_final(&typevar);
     set_type(&d, "TypeVar", &typevar);
 
     let paramspec = new_type(it, "typing", "ParamSpec", None, Layout::Other);
@@ -766,7 +762,7 @@ pub fn make(it: &mut Interp) -> Obj {
     ] {
         it.reg_prop(&paramspec, n, f);
     }
-    it.reg_class(&paramspec, "__init_subclass__", final_type_init_subclass);
+    set_final(&paramspec);
     set_type(&d, "ParamSpec", &paramspec);
 
     for (name, repr, mro) in [
@@ -784,7 +780,7 @@ pub fn make(it: &mut Interp) -> Obj {
         if let Some(td) = ty.dict.borrow().as_ref() {
             dict_set_str(td, "__hash__", Value::None);
         }
-        it.reg_class(&ty, "__init_subclass__", final_type_init_subclass);
+        set_final(&ty);
         set_type(&d, name, &ty);
     }
 
@@ -803,7 +799,7 @@ pub fn make(it: &mut Interp) -> Obj {
         it.reg(&tvt, n, *f);
     }
     it.reg_prop(&tvt, "__name__", tvt_name);
-    it.reg_class(&tvt, "__init_subclass__", final_type_init_subclass);
+    set_final(&tvt);
     set_type(&d, "TypeVarTuple", &tvt);
 
     let alias = new_type(it, "typing", "TypeAliasType", None, Layout::Other);
@@ -829,7 +825,7 @@ pub fn make(it: &mut Interp) -> Obj {
     ] {
         it.reg_prop(&alias, n, f);
     }
-    it.reg_class(&alias, "__init_subclass__", final_type_init_subclass);
+    set_final(&alias);
     set_type(&d, "TypeAliasType", &alias);
 
     let generic = new_type(it, "typing", "Generic", None, Layout::Object);

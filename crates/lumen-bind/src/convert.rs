@@ -179,6 +179,29 @@ impl<'a, H: Host> FromArg<'a, H> for Vec<u8> {
     }
 }
 
+/// An optional parameter that tells "not passed" (`Passed(None)`) apart from every passed
+/// value, the host's "no value" included (`Option<T>` maps both to `None`).
+pub struct Passed<T>(pub Option<T>);
+
+impl<'a, H: Host, T: FromArg<'a, H>> FromArg<'a, H> for Passed<T> {
+    const CALLBACK: bool = T::CALLBACK;
+
+    #[inline(always)]
+    fn from_arg(cx: &'a H::Cx<'_>, v: &'a H::Value, at: Slot) -> Result<Self, H::Error> {
+        T::from_arg(cx, v, at).map(|v| Passed(Some(v)))
+    }
+
+    #[inline(always)]
+    fn from_missing(_: &'a H::Cx<'_>, _: Slot) -> Result<Self, H::Error> {
+        Ok(Passed(None))
+    }
+
+    #[inline(always)]
+    fn reserve(cx: &'a H::Cx<'_>, v: &'a H::Value, at: Slot) -> Result<(), H::Error> {
+        T::reserve(cx, v, at)
+    }
+}
+
 impl<'a, H: Host, T: FromArg<'a, H>> FromArg<'a, H> for Option<T> {
     const CALLBACK: bool = T::CALLBACK;
 

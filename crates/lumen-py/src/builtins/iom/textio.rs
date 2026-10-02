@@ -1110,7 +1110,7 @@ impl TextIOWrapper {
 
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
-        let tn = super::tp_name::<TextIOWrapper>(it, slf.0.value(), "TextIOWrapper");
+        let tn = it.tp_name_of(slf.0.value());
         let mut out = format!("<{}", tn);
         match it.get_attr_str(slf.0.value(), "name") {
             Ok(n) => {

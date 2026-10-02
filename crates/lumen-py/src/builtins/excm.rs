@@ -270,26 +270,58 @@ fn name_error_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(Value::None)
 }
 
+const SYNTAX_FIELDS: [&str; 7] = ["filename", "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line"];
+
+/// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
 fn syntax_error_init(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let e = exc_args_cell(it, a)?.clone();
+    let args = &a[1..];
     if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(a[1..].to_vec());
+        d.borrow_mut().args = Value::tuple(args.to_vec());
     }
     let d = it.instance_dict(&e);
-    dict_set_str(&d, "msg", a.get(1).cloned().unwrap_or(Value::None));
-    if let Some(Value::Obj(det)) = a.get(2) {
-        if let Kind::Tuple(t) = &det.kind {
-            for (n, v) in ["filename", "lineno", "offset", "text"].iter().zip(t.iter()) {
-                dict_set_str(&d, n, v.clone());
-            }
-        }
-    }
-    for n in ["filename", "lineno", "offset", "text"] {
+    for n in ["msg"].iter().chain(SYNTAX_FIELDS.iter()) {
         if dict_get_str(&d, n).is_none() {
             dict_set_str(&d, n, Value::None);
         }
     }
+    if let Some(m) = args.first() {
+        dict_set_str(&d, "msg", m.clone());
+    }
+    if args.len() == 2 {
+        let info = it.iterate_to_vec(&args[1])?;
+        if !(4..=6).contains(&info.len()) {
+            let msg = if info.len() < 4 {
+                format!("function takes at least 4 arguments ({} given)", info.len())
+            } else {
+                format!("function takes at most 6 arguments ({} given)", info.len())
+            };
+            return Err(it.type_error(&msg));
+        }
+        for (n, v) in SYNTAX_FIELDS.iter().zip(info.iter()) {
+            dict_set_str(&d, n, v.clone());
+        }
+    }
     Ok(Value::None)
+}
+
+/// `msg (file, line N)` with the file's base name, as CPython's `SyntaxError_str`.
+pub fn syntax_error_str(it: &mut Interp, e: &Obj) -> R<String> {
+    let field = |n: &str| e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, n)).unwrap_or(Value::None);
+    let msg = field("msg");
+    let msg = it.str_of(&msg)?;
+    let filename = field("filename");
+    let file = filename.as_str().map(|f| f.rsplit('/').next().unwrap_or(f).to_string());
+    let line = match field("lineno") {
+        Value::Int(n) => Some(n),
+        _ => None,
+    };
+    Ok(match (file, line) {
+        (Some(f), Some(l)) => format!("{msg} ({f}, line {l})"),
+        (Some(f), None) => format!("{msg} ({f})"),
+        (None, Some(l)) => format!("{msg} (line {l})"),
+        (None, None) => msg,
+    })
 }
 
 pub fn init(it: &mut Interp) {

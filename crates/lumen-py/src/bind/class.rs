@@ -2,7 +2,8 @@
 //! `#[methods]` block installs, typed instance handles ([`Py`]) and native iterators.
 //!
 //! Python hints on `#[class]`: `hint(py(unhashable))` (`__hash__ = None`), `hint(py(native_iter))`
-//! (the constructor returns a [`NativeIter`] the VM steps directly).
+//! (the constructor returns a [`NativeIter`] the VM steps directly), `hint(py(final))` (cannot be
+//! subclassed).
 
 use super::args::{self, py_name, HOST};
 use super::PyHost;
@@ -34,6 +35,11 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let module = c.module.unwrap_or("builtins");
     let ty = new_type(it, module, c.name_for(HOST), None, Layout::Other);
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
+    if c.hint(HOST, "final").is_some() {
+        if let Kind::Type(td) = &ty.kind {
+            td.flags.set(td.flags.get() | TF_FINAL);
+        }
+    }
     if c.hint(HOST, "native_iter").is_some() {
         if let Kind::Type(td) = &ty.kind {
             td.flags.set(td.flags.get() & !TF_DISPATCH);

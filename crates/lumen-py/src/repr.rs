@@ -425,6 +425,9 @@ impl Interp {
                             return Ok(s);
                         }
                     }
+                    if self.exc_is(o, "SyntaxError") {
+                        return crate::builtins::excm::syntax_error_str(self, o);
+                    }
                     if self.exc_is(o, "UnicodeError") {
                         if let Some(s) = self.unicode_exc_str(o)? {
                             return Ok(s);

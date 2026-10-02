@@ -51,6 +51,7 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
             layout: std::cell::Cell::new(layout),
             flags: std::cell::Cell::new(0),
             hooks: std::cell::Cell::new((u64::MAX, 0)),
+            slots: RefCell::new(None),
         }),
     })
 }
@@ -180,6 +181,8 @@ pub struct Interp {
     pub codecs: crate::codecs::CodecState,
     /// Type objects of the native classes bound with `#[class]` (see `bind::type_object`).
     pub native_types: std::collections::HashMap<std::any::TypeId, Obj>,
+    /// The current `contextvars.Context`, created on first use.
+    pub context: Option<Value>,
 }
 
 pub enum GenResult {
@@ -238,6 +241,7 @@ impl Interp {
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
             codecs: Default::default(),
             native_types: std::collections::HashMap::new(),
+            context: None,
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);

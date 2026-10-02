@@ -1,6 +1,6 @@
 //! `FileIO`: raw unbuffered I/O on a file descriptor, through the platform layer.
 
-use super::{call, is_eagain, tp_name, unsupported};
+use super::{call, is_eagain, unsupported};
 use crate::bind::{type_object, KwArgs, Py, This};
 use crate::object::*;
 use crate::platform::{IoError, PlatformRef};
@@ -511,7 +511,7 @@ impl FileIO {
 
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
-        let tn = tp_name::<FileIO>(it, slf.0.value(), "FileIO");
+        let tn = it.tp_name_of(slf.0.value());
         let (fd, mode, closefd) = {
             let s = slf.0.borrow(it)?;
             (s.fd, s.mode_string(), s.closefd)

@@ -158,6 +158,8 @@ pub const TF_NO_INSTANCE_DICT: u32 = 2;
 pub const TF_ABSTRACT: u32 = 4;
 /// Special methods defined in the type's own dict are dispatched like those of a heap class.
 pub const TF_DISPATCH: u32 = 8;
+/// The type cannot be subclassed (no `Py_TPFLAGS_BASETYPE`).
+pub const TF_FINAL: u32 = 16;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,
@@ -168,6 +170,8 @@ pub struct TypeData {
     pub layout: Cell<Layout>,
     pub flags: Cell<u32>,
     pub hooks: Cell<(u64, u8)>,
+    /// The (mangled) names a class statement's `__slots__` declares; `None` without `__slots__`.
+    pub slots: RefCell<Option<Rc<[Rc<str>]>>>,
 }
 
 pub struct Function {

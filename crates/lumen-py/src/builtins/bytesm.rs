@@ -100,14 +100,15 @@ fn decode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(Value::string(it.decode_bytes(&d, &enc, &errs)?))
 }
 
-fn hex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+fn hex(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let d = data(it, &a[0])?;
-    let sep = match a.get(1) {
-        Some(v) => Some(it.str_arg(v, "sep")?),
-        None => None,
+    let b = it.bind_args("hex", &a[1..], kw, &["sep", "bytes_per_sep"], 0)?;
+    let sep = super::memview::hex_sep_arg(it, b[0].as_ref())?;
+    let per = match &b[1] {
+        Some(v) => it.index_of(v)?,
+        None => 1,
     };
-    let parts: Vec<String> = d.iter().map(|b| format!("{:02x}", b)).collect();
-    Ok(Value::string(parts.join(sep.as_deref().unwrap_or(""))))
+    Ok(Value::string(lumen_common::codec::hex_encode_sep(&d, sep, per)))
 }
 
 fn fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {

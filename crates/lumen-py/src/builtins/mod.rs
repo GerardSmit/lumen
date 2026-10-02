@@ -3,6 +3,7 @@
 pub mod alias;
 pub mod args;
 pub mod bytesm;
+pub mod contextvarsm;
 pub mod descr;
 pub mod dictm;
 pub mod excgroup;
@@ -23,7 +24,10 @@ pub mod objectm;
 pub mod slots;
 pub mod strm;
 pub mod sysextra;
+pub mod sysm;
 pub mod sysmods;
+pub mod threadm;
+pub mod tokenizem;
 pub mod weakm;
 pub mod stringm;
 pub mod warningsm;

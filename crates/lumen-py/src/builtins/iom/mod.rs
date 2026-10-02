@@ -9,7 +9,7 @@ pub mod fileio;
 pub mod stringio;
 pub mod textio;
 
-use crate::bind::{type_object, Py};
+use crate::bind::Py;
 use crate::object::*;
 use crate::vm::Interp;
 use lumen_bind::{Class, Methods};
@@ -112,17 +112,6 @@ pub fn exact<T: Class + Methods<PyHost>>(it: &mut Interp, v: &Value) -> Option<P
         return None;
     }
     Py::from_value(it, v)
-}
-
-/// CPython's `Py_TYPE(self)->tp_name`: `_io.X` for the native class, the bare name for subclasses.
-pub fn tp_name<T: Class + Methods<PyHost>>(it: &mut Interp, v: &Value, native: &str) -> String {
-    let t = type_object::<T>(it);
-    let vt = it.type_of(v);
-    if std::rc::Rc::ptr_eq(&vt, &t) {
-        format!("_io.{}", native)
-    } else {
-        it.type_name(&vt)
-    }
 }
 
 /// `warnings.warn(msg, category, stacklevel)`.

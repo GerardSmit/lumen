@@ -233,9 +233,10 @@ pub fn gen(s: &Spec) -> Res<String> {
         _ => {}
     }
 
-    // Optional parameters: a default, or an `Option<T>` with nothing required after it among
-    // the positional ones (a keyword-only `Option<T>` is always optional).
-    let is_option = |k: usize| base_name(&sig.params[k].ts) == "Option";
+    // Optional parameters: a default, or an `Option<T>` / `Passed<T>` with nothing required
+    // after it among the positional ones (a keyword-only one is always optional).
+    let is_option = |k: usize| matches!(base_name(&sig.params[k].ts), "Option" | "Passed");
+    let none_text = |k: usize| if base_name(&sig.params[k].ts) == "Passed" { "<unrepresentable>" } else { "None" };
     let mut optional = vec![false; named.len()];
     let mut default_text: Vec<Option<String>> = vec![None; named.len()];
     for u in &uses {
@@ -250,7 +251,7 @@ pub fn gen(s: &Spec) -> Res<String> {
         if kind == Kind::KwOnly {
             if is_option(k) && default_text[i].is_none() {
                 optional[i] = true;
-                default_text[i] = Some("None".into());
+                default_text[i] = Some(none_text(k).into());
             }
             continue;
         }
@@ -259,7 +260,7 @@ pub fn gen(s: &Spec) -> Res<String> {
         }
         if is_option(k) && tail_ok {
             optional[i] = true;
-            default_text[i] = Some("None".into());
+            default_text[i] = Some(none_text(k).into());
         } else {
             tail_ok = false;
         }

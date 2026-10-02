@@ -30,24 +30,34 @@ impl Interp {
         dict_set_str(&self.modules.clone(), name, Value::Obj(m.clone()));
     }
 
-    pub fn syntax_error(&mut self, msg: &str, file: &str, line: u32, col: u32) -> Obj {
-        let e = self.new_exc_str("SyntaxError", msg);
-        self.set_exc_attr(&e, "msg", Value::str(msg));
-        self.set_exc_attr(&e, "filename", Value::str(file));
-        self.set_exc_attr(&e, "lineno", Value::Int(line as i64));
-        self.set_exc_attr(&e, "offset", Value::Int(col as i64));
-        e
+    /// A `SyntaxError` (or the `IndentationError` / `TabError` its message calls for) at
+    /// `line`, 0-based column `col` (`None`: unknown) of `src`.
+    pub fn syntax_error(&mut self, msg: &str, file: &str, line: u32, col: Option<u32>, src: &str) -> Obj {
+        let text = src.split_inclusive('\n').nth((line as usize).wrapping_sub(1)).map(|l| match l.ends_with('\n') {
+            true => l.to_string(),
+            false => format!("{l}\n"),
+        });
+        let text = text.map_or(Value::None, Value::string);
+        let offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 1));
+        let end_offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 2));
+        let detail = Value::tuple(vec![Value::str(file), Value::Int(line as i64), offset, text, Value::Int(line as i64), end_offset]);
+        let cls = Value::Obj(self.exc_type(syntax_error_kind(msg)));
+        match self.call(&cls, vec![Value::str(msg), detail], Vec::new()) {
+            Ok(Value::Obj(e)) => e,
+            Ok(_) => self.new_exc_str("SyntaxError", msg),
+            Err(e) => e,
+        }
     }
 
     pub fn compile_source(&mut self, src: &str, filename: &str) -> R<Rc<crate::bytecode::Code>> {
         let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(src, filename));
         let module = match parsed {
             Ok(m) => m,
-            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, e.col)),
+            Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), src)),
         };
         match crate::compile::compile_module(&module, filename) {
             Ok(c) => Ok(c),
-            Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, 0)),
+            Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, src)),
         }
     }
 
@@ -88,7 +98,17 @@ impl Interp {
             let abs = self.platform.borrow_mut().canonicalize(path);
             self.set_path(&[parent_dir(&abs)]);
         }
-        self.run_source(&src, path)
+        // CPython runs the script under its absolute path (`__file__`, tracebacks), joined to
+        // the working directory without resolving links.
+        let cwd = self.platform.borrow_mut().getcwd();
+        let filename = match cwd {
+            Ok(cwd) if !path.starts_with('/') => format!("{}/{}", cwd.trim_end_matches('/'), path),
+            _ => path.to_string(),
+        };
+        if self.argv.is_empty() {
+            self.set_argv(&[path.to_string()]);
+        }
+        self.run_source(&src, &filename)
     }
 
     /// Runs `src` as the `__main__` module and returns its exit status (`SystemExit` codes
@@ -353,5 +373,16 @@ impl Interp {
             dict_set_name(ns, &no, v);
         }
         Ok(())
+    }
+}
+
+/// The `SyntaxError` subclass CPython raises for a tokenizer / parser message.
+pub fn syntax_error_kind(msg: &str) -> &'static str {
+    if msg.starts_with("inconsistent use of tabs") {
+        "TabError"
+    } else if msg.contains("indent") {
+        "IndentationError"
+    } else {
+        "SyntaxError"
     }
 }
