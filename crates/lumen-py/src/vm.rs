@@ -176,6 +176,8 @@ pub struct Interp {
     pub mappingproxy_type: Option<Obj>,
     pub interrupt: InterruptHandle,
     pub interrupted: bool,
+    /// Runs Python signal handlers at `poll` (the interpreter of the thread that owns signals).
+    pub handles_signals: bool,
     pub heap: HeapBudget,
     pub int_max_str_digits: usize,
     pub codecs: crate::codecs::CodecState,
@@ -245,6 +247,7 @@ impl Interp {
             mappingproxy_type: None,
             interrupt: InterruptHandle::new(),
             interrupted: false,
+            handles_signals: false,
             heap: HeapBudget::NONE,
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
             codecs: Default::default(),

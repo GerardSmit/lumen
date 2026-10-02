@@ -68,6 +68,26 @@ pub fn fspath(it: &mut Interp, v: &Value) -> R<Value> {
     Err(it.type_error(&format!("expected {}.__fspath__() to return str or bytes, not {}", n, rn)))
 }
 
+/// `PyUnicode_FSConverter` to raw bytes: `str` is encoded as `utf-8`/`surrogateescape`.
+pub fn fs_bytes(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
+    let mut p = fspath(it, v)?;
+    if p.as_str().is_some() {
+        let args = vec![Value::string("utf-8".to_string()), Value::string("surrogateescape".to_string())];
+        p = it.call_method(&p, "encode", args)?;
+    }
+    let b = match &p {
+        Value::Obj(o) => match &o.kind {
+            Kind::Bytes(b) => b.to_vec(),
+            _ => unreachable!("fspath returns str or bytes"),
+        },
+        _ => unreachable!("fspath returns str or bytes"),
+    };
+    if b.contains(&0) {
+        return Err(it.value_error("embedded null byte"));
+    }
+    Ok(b)
+}
+
 fn convert<const FD: bool>(it: &mut Interp, d: &'static FnDesc, at: Slot, v: &Value) -> R<FsPath<FD>> {
     let fname = args::py_name(d);
     let argname = at.index().and_then(|i| d.named().nth(i as usize)).map(|p| p.name).unwrap_or("path");

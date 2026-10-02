@@ -5,7 +5,10 @@ pub mod consts;
 pub mod errno;
 pub mod fdctl;
 pub mod fs;
+pub mod poll;
 pub mod proc;
+pub mod signal;
+pub mod spawn;
 pub mod time;
 
 pub use errno::FsError;

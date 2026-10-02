@@ -59,18 +59,13 @@ pub(super) fn wait(fd: RawFd, events: libc::c_short, cancelled: &AtomicBool) -> 
         if cancelled.load(Ordering::SeqCst) {
             return Ok(false);
         }
-        let mut fds = [
-            libc::pollfd { fd, events, revents: 0 },
-            libc::pollfd { fd: epoch.read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-        ];
-        // SAFETY: `fds` is a valid array of two pollfd entries.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
+        use lumen_os::poll::{poll, PollFd, POLLIN};
+        let mut fds = [PollFd::new(fd, events), PollFd::new(epoch.read.as_raw_fd(), POLLIN)];
+        if let Err(e) = poll(&mut fds, -1) {
+            if e.errno() == libc::EINTR {
                 continue;
             }
-            return Err(error);
+            return Err(std::io::Error::from_raw_os_error(e.errno()));
         }
         if fds[0].revents != 0 {
             return Ok(true);

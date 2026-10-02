@@ -98,7 +98,7 @@ pub fn run_main(args: &[String]) -> i32 {
     if let Some(ms) = opts.timeout_ms.filter(|&ms| ms > 0) {
         start_watchdog(&it, ms);
     }
-    sigint::install(&it);
+    crate::builtins::signalm::install_default_handlers(&mut it);
     it.set_argv(&opts.script_args);
     if let Ok(extra) = std::env::var("PYTHONPATH") {
         let abs = it.platform.borrow_mut().canonicalize(path);
@@ -126,38 +126,3 @@ fn start_watchdog(it: &Interp, ms: u64) {
     .detach();
 }
 
-#[cfg(unix)]
-mod sigint {
-    use crate::vm::Interp;
-    use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-    use std::sync::Arc;
-
-    static TARGET: AtomicPtr<AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
-    const SIGINT: i32 = 2;
-
-    extern "C" {
-        fn signal(signum: i32, handler: usize) -> usize;
-    }
-
-    extern "C" fn on_sigint(_: i32) {
-        let p = TARGET.load(Ordering::Relaxed);
-        if !p.is_null() {
-            // The flag lives for the rest of the process (see `install`), so the pointer stays valid.
-            unsafe { (*p).store(true, Ordering::Relaxed) };
-        }
-    }
-
-    /// Maps Ctrl-C to the interpreter's interrupt, so it surfaces as `KeyboardInterrupt`.
-    pub fn install(it: &Interp) {
-        let flag: Arc<AtomicBool> = it.interrupt.flag().clone();
-        TARGET.store(Arc::into_raw(flag) as *mut AtomicBool, Ordering::SeqCst);
-        unsafe { signal(SIGINT, on_sigint as *const () as usize) };
-    }
-}
-
-#[cfg(not(unix))]
-mod sigint {
-    use crate::vm::Interp;
-
-    pub fn install(_it: &Interp) {}
-}

@@ -17,6 +17,9 @@ lumen-common = { path = "../lumen-common", features = ["compress"] }
 
 web-time = "1"
 
+[target.'cfg(unix)'.dependencies]
+lumen-os = { path = "../lumen-os" }
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 wasm-bindgen = "=0.2.127"

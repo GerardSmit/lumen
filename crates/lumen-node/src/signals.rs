@@ -1,7 +1,8 @@
-//! Process signals as Node's `process.on('SIGUSR2', ...)` sees them: a listener installs an
-//! OS handler that writes the signal number to a self-pipe; one watcher thread (started on the
-//! first listener) reads it and wakes every realm listening for that signal through its event
-//! loop. Nothing is installed until a program listens for a signal.
+//! Process signals as Node's `process.on('SIGUSR2', ...)` sees them: a listener installs the
+//! shared `lumen_os::signal` handler, which writes the signal number to this runtime's
+//! self-pipe; one watcher thread (started on the first listener) reads it and wakes every realm
+//! listening for that signal through its event loop. Nothing is installed until a program
+//! listens for a signal.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -55,30 +56,6 @@ mod imp {
     static WATCH: Mutex<Watch> = Mutex::new(Watch { depth: 0, pending: false, targets: Vec::new() });
     static WATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
-    extern "C" fn on_signal(sig: libc::c_int) {
-        let fd = WRITE_FD.load(Ordering::Relaxed);
-        if fd >= 0 {
-            // SAFETY: write(2) and errno access are async-signal-safe; errno is restored so the
-            // interrupted code does not observe the handler's.
-            unsafe {
-                let errno = errno_ptr();
-                let saved = *errno;
-                let byte = sig as u8;
-                libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
-                *errno = saved;
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe fn errno_ptr() -> *mut libc::c_int {
-        libc::__error()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
-    unsafe fn errno_ptr() -> *mut libc::c_int {
-        libc::__errno_location()
-    }
-
     fn start_watcher() -> bool {
         START.call_once(|| {
             use std::os::fd::IntoRawFd;
@@ -120,6 +97,7 @@ mod imp {
                 });
             if spawned.is_ok() {
                 WRITE_FD.store(write_fd, Ordering::Relaxed);
+                lumen_os::signal::set_wakeup_fd(lumen_os::signal::WAKE_NODE, write_fd);
             }
         });
         WRITE_FD.load(Ordering::Relaxed) >= 0
@@ -140,19 +118,12 @@ mod imp {
     }
 
     fn set_handler(sig: i32, install: bool) -> bool {
-        // SAFETY: a zeroed sigaction with a valid handler and an empty mask.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            let handler: extern "C" fn(libc::c_int) = on_signal;
-            action.sa_sigaction = if install { handler as usize } else { libc::SIG_DFL };
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, std::ptr::null_mut()) == 0
-        }
+        use lumen_os::signal::{set_disposition, Disposition};
+        set_disposition(sig, if install { Disposition::Catch } else { Disposition::Default }, true).is_ok()
     }
 
     pub(super) fn catchable(sig: i32) -> bool {
-        sig != libc::SIGKILL && sig != libc::SIGSTOP
+        lumen_os::signal::catchable(sig)
     }
 
     /// Start delivering `sig` to `task` on `sender`'s loop; the key identifies the watch.

@@ -365,3 +365,18 @@ mod tests {
         assert_eq!(errno(&kind_only), errno_of_code("EACCES").unwrap());
     }
 }
+
+/// The calling thread's `errno` cell (for code that must save, clear or set it directly, such as
+/// a signal handler or a forked child).
+#[cfg(unix)]
+pub fn errno_location() -> *mut libc::c_int {
+    // SAFETY: both accessors just return the thread's errno address.
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    unsafe {
+        libc::__errno_location()
+    }
+}

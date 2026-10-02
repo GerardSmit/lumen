@@ -760,20 +760,7 @@ pub fn read_stdin_fd(ctx: &mut Ctx, buf: &mut [u8]) -> std::io::Result<usize> {
 /// nobody writes to cannot be cancelled, so it is only entered once it will not block.
 #[cfg(unix)]
 fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    #[cfg(target_vendor = "apple")]
-    type NFds = std::ffi::c_uint;
-    #[cfg(not(target_vendor = "apple"))]
-    type NFds = std::ffi::c_ulong;
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: NFds, timeout: i32) -> i32;
-    }
-    const POLLIN: i16 = 1;
+    use lumen_os::poll::{poll, PollFd, POLLIN};
     if ctx.interrupt_for_host().is_none() {
         return Ok(());
     }
@@ -784,15 +771,8 @@ fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
                 "realm terminated",
             ));
         }
-        let mut fd = PollFd {
-            fd: 0,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; a negative result (EINTR, EBADF) falls through to the read,
-        // which reports it.
-        let ready = unsafe { poll(&mut fd, 1, 20) };
-        if ready != 0 {
+        // An error (EINTR, EBADF) falls through to the read, which reports it.
+        if poll(&mut [PollFd::new(0, POLLIN)], 20) != Ok(0) {
             return Ok(());
         }
     }

@@ -9,7 +9,7 @@ pub mod _thread {
     use crate::object::*;
     use crate::vm::{dict_set_str, Interp};
 
-    const MAIN_THREAD: i64 = 0x1000;
+    pub const MAIN_THREAD: i64 = 0x1000;
 
     /// `(blocking, timeout)` checked as CPython's `lock_acquire_parse_args`.
     fn acquire_args(it: &mut Interp, blocking: bool, timeout: Option<&Value>) -> R<(bool, f64)> {
@@ -313,8 +313,7 @@ pub mod _thread {
     /// where the corresponding signal handler will be executed.
     #[op]
     fn interrupt_main(it: &mut Interp, #[default(2)] signum: i64) -> R<()> {
-        let _ = signum;
-        Err(it.new_exc_str("KeyboardInterrupt", ""))
+        crate::builtins::signalm::simulate(it, signum)
     }
 
     #[init]

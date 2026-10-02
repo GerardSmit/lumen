@@ -80,6 +80,7 @@ impl Interp {
         if self.interrupt.is_interrupted() {
             return Err(self.interrupt_exc());
         }
+        crate::builtins::signalm::check(self)?;
         if self.heap.is_set() {
             return self.check_heap(0);
         }
@@ -89,7 +90,8 @@ impl Interp {
     #[cold]
     #[inline(never)]
     pub(crate) fn interrupt_exc(&mut self) -> Obj {
-        self.new_exc_str("KeyboardInterrupt", "")
+        let cls = self.exc_type("KeyboardInterrupt");
+        self.new_exc(&cls, Vec::new())
     }
 
     pub fn memory_error(&mut self) -> Obj {

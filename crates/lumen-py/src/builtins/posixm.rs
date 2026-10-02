@@ -3,6 +3,25 @@
 //!
 //! [`Platform`]: crate::platform::Platform
 
+/// `PyObject_AsFileDescriptor`: an int, or the result of the object's `fileno()`.
+pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) -> crate::object::R<i32> {
+    let fd = if v.is_int_like() {
+        it.index_of(v)?
+    } else if it.get_attr_str(v, "fileno").is_ok() {
+        let f = it.call_method(v, "fileno", Vec::new())?;
+        if !f.is_int_like() {
+            return Err(it.type_error("fileno() returned a non-integer"));
+        }
+        it.index_of(&f)?
+    } else {
+        return Err(it.type_error("argument must be an int, or have a fileno() method."));
+    };
+    if fd < 0 {
+        return Err(it.value_error(&format!("file descriptor cannot be a negative integer ({fd})")));
+    }
+    i32::try_from(fd).map_err(|_| it.overflow_err("Python int too large to convert to C int"))
+}
+
 /// This module provides access to operating system functionality that is
 /// standardized by the C Standard and the POSIX standard (a thinly
 /// disguised Unix interface).  Refer to the library manual and
@@ -765,18 +784,10 @@ pub mod posix {
         r.map_err(|e| os_err(it, e))
     }
 
-    fn fileno_of(it: &mut Interp, v: &Value) -> R<i32> {
-        if v.is_int_like() {
-            return Ok(it.index_of(v)? as i32);
-        }
-        let f = it.call_method(v, "fileno", Vec::new())?;
-        Ok(it.index_of(&f)? as i32)
-    }
-
     /// Force write of fd to disk.
     #[op]
     fn fsync(it: &mut Interp, #[kw] fd: &Value) -> R<()> {
-        let fd = fileno_of(it, fd)?;
+        let fd = super::as_file_descriptor(it, fd)?;
         let r = it.platform.borrow_mut().fd_sync(fd, false);
         r.map_err(|e| os_err(it, e))
     }
@@ -970,7 +981,8 @@ pub mod posix {
     #[op]
     fn kill(it: &mut Interp, pid: i32, signal: i32) -> R<()> {
         let r = it.platform.borrow_mut().kill(pid, signal);
-        r.map_err(|e| os_err(it, e))
+        r.map_err(|e| os_err(it, e))?;
+        crate::builtins::signalm::check(it)
     }
 
     /// Kill a process group with a signal.

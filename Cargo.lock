@@ -868,6 +868,7 @@ dependencies = [
  "lumen",
  "lumen-bind",
  "lumen-common",
+ "lumen-os",
  "wasm-bindgen",
  "web-time",
 ]

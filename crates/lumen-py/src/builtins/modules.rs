@@ -19,8 +19,10 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_csv", bound::<super::csvm::_csv::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
+    ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_sha2", |it| Some(super::sha2m::make(it))),
+    ("_signal", bound::<super::signalm::_signal::Module>),
     ("_sre", |it| Some(super::sre::make(it))),
     ("_string", |it| Some(super::stringm::make(it))),
     ("_struct", bound::<super::structm::_struct::Module>),
@@ -38,6 +40,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("marshal", bound::<super::marshalm::marshal::Module>),
     ("math", bound::<super::mathm::math::Module>),
     ("posix", bound::<super::posixm::posix::Module>),
+    ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
     ("time", bound::<super::timem::time::Module>),
 ];
