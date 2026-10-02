@@ -241,46 +241,10 @@ fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
 fn op_atob(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let mut data: Vec<u8> = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ') {
-            continue;
-        }
-        if !c.is_ascii() {
-            return Ok(Value::Null);
-        }
-        data.push(c as u8);
-    }
-    if data.len() % 4 == 0 {
-        for _ in 0..2 {
-            if data.last() == Some(&b'=') {
-                data.pop();
-            }
-        }
-    }
-    if data.len() % 4 == 1 {
-        return Ok(Value::Null);
-    }
-    let mut out = String::with_capacity(data.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &b in &data {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return Ok(Value::Null),
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(char::from((acc >> bits) as u8));
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Ok(Value::from_string(out))
+    Ok(match lumen_common::codec::base64_decode_forgiving(s.as_bytes()) {
+        Some(bytes) => Value::from_string(bytes.into_iter().map(char::from).collect::<String>()),
+        None => Value::Null,
+    })
 }
 
 // ---- url ----

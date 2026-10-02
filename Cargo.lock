@@ -882,7 +882,6 @@ dependencies = [
  "aes-kw",
  "argon2",
  "base64",
- "base64ct",
  "bcrypt",
  "cbc",
  "ccm",

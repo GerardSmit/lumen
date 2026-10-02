@@ -183,6 +183,13 @@ pub fn crc32_from(seed: u32, data: &[u8]) -> u32 {
     unsafe { z::crc32_z(seed as _, data.as_ptr(), data.len()) as u32 }
 }
 
+/// Adler-32 of `data`, continued from `seed` (1 for a fresh checksum).
+#[inline]
+pub fn adler32_from(seed: u32, data: &[u8]) -> u32 {
+    // SAFETY: the pointer and length describe a live slice.
+    unsafe { z::adler32_z(seed as _, data.as_ptr(), data.len()) as u32 }
+}
+
 fn compress_with(window_bits: i32, data: &[u8]) -> Vec<u8> {
     let mut z = ZStream::deflate(-1, window_bits, 8, 0).expect("deflate init");
     let mut out = Vec::with_capacity(data.len() / 2 + 64);

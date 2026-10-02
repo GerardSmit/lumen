@@ -2,7 +2,7 @@
 //! including passphrase protection: PKCS#8 PBES2 (via `pkcs8` / `pkcs5`) and the legacy OpenSSL
 //! `Proc-Type: 4,ENCRYPTED` PEM headers (EVP_BytesToKey over MD5, CBC ciphers).
 
-use base64ct::{Base64, Encoding};
+use lumen_common::codec::{self, Padding};
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use der::{Decode, Encode};
 use md5::Digest;
@@ -59,7 +59,7 @@ pub fn pem_blocks(text: &[u8]) -> Vec<PemBlock> {
             }
             b64.push_str(line);
         }
-        if let Ok(data) = Base64::decode_vec(&b64) {
+        if let Ok(data) = codec::base64_decode_strict(b64.as_bytes(), false, Padding::Required) {
             out.push(PemBlock { label, headers, data });
         }
     }
@@ -68,7 +68,7 @@ pub fn pem_blocks(text: &[u8]) -> Vec<PemBlock> {
 
 /// PEM text with 64-column base64 lines.
 pub fn pem_encode(label: &str, headers: &[(&str, String)], data: &[u8]) -> String {
-    let b64 = Base64::encode_string(data);
+    let b64 = codec::base64_encode(data, false, true);
     let mut out = format!("-----BEGIN {label}-----\n");
     for (k, v) in headers {
         out.push_str(&format!("{k}: {v}\n"));
@@ -190,9 +190,6 @@ fn random(len: usize) -> Vec<u8> {
     v
 }
 
-fn hex_upper(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02X}")).collect()
-}
 
 fn check_passphrase(passphrase: Option<&[u8]>) -> KResult<&[u8]> {
     match passphrase {
@@ -210,7 +207,7 @@ fn legacy_decrypt(block: &PemBlock, passphrase: Option<&[u8]>) -> KResult<Option
     let dek = block.headers.iter().find(|(k, _)| k == "DEK-Info").map(|(_, v)| v.as_str()).ok_or_else(decoder_unsupported)?;
     let (name, iv_hex) = dek.split_once(',').ok_or_else(decoder_unsupported)?;
     let cipher = KeyCipher::from_name(name.trim()).ok_or_else(decoder_unsupported)?;
-    let iv = super::curves::hex_decode(iv_hex.trim());
+    let iv = codec::hex_decode_strict(iv_hex.trim().as_bytes()).map_err(|_| decoder_unsupported())?;
     if iv.len() != cipher.iv_len() {
         return Err(decoder_unsupported());
     }
@@ -400,7 +397,7 @@ fn legacy_pem(label: &str, der: &[u8], cipher: Option<KeyCipher>, pass: Option<&
     let body = cipher.encrypt(&key, &iv, der);
     let headers = [
         ("Proc-Type", "4,ENCRYPTED".to_string()),
-        ("DEK-Info", format!("{},{}", cipher.pem_name(), hex_upper(&iv))),
+        ("DEK-Info", format!("{},{}", cipher.pem_name(), codec::hex_encode_upper(&iv))),
     ];
     Ok(Exported::Pem(pem_encode(label, &headers, &body)))
 }

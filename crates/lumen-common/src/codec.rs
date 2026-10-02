@@ -106,6 +106,31 @@ pub fn hex_decode_strict(s: &[u8]) -> Result<Vec<u8>, DecodeError> {
     Ok(out)
 }
 
+/// The outcome of a bounded decode: `read` input bytes were consumed (through the last complete
+/// group) producing `bytes`; `error` is set when decoding stopped at malformed input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialDecode {
+    pub read: usize,
+    pub bytes: Vec<u8>,
+    pub error: bool,
+}
+
+/// Hex pairs until `max_len` bytes are decoded or the input ends; an invalid pair or a lone
+/// trailing digit stops with `error`. (`Uint8Array.fromHex` checks the input's UTF-16 length
+/// parity itself, before decoding anything.)
+pub fn hex_decode_partial(src: &[u8], max_len: usize) -> PartialDecode {
+    let mut bytes = Vec::with_capacity((src.len() / 2).min(max_len));
+    let mut read = 0;
+    while read < src.len() && bytes.len() < max_len {
+        match (hex_digit(src[read]), src.get(read + 1).copied().and_then(hex_digit)) {
+            (Some(hi), Some(lo)) => bytes.push(hi << 4 | lo),
+            _ => return PartialDecode { read, bytes, error: true },
+        }
+        read += 2;
+    }
+    PartialDecode { read, bytes, error: false }
+}
+
 // ---- base64 -------------------------------------------------------------------------------------
 
 #[inline]
@@ -318,6 +343,190 @@ pub fn base64_decode_strict(src: &[u8], url: bool, padding: Padding) -> Result<V
     Ok(out)
 }
 
+#[inline]
+fn is_ascii_whitespace(c: u8) -> bool {
+    matches!(c, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
+}
+
+/// WHATWG forgiving-base64 decode (`atob`, `data:` URLs): ASCII whitespace is ignored, padding is
+/// optional, only the standard alphabet is accepted and stray bits in the last group are dropped.
+/// `None` for anything else.
+pub fn base64_decode_forgiving(src: &[u8]) -> Option<Vec<u8>> {
+    let mut data: Vec<u8> = src.iter().copied().filter(|&c| !is_ascii_whitespace(c)).collect();
+    if data.len().is_multiple_of(4) {
+        for _ in 0..2 {
+            if data.last() == Some(&b'=') {
+                data.pop();
+            }
+        }
+    }
+    if data.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in &data {
+        let v = UNB64_STD[c as usize];
+        if v == 0xff {
+            return None;
+        }
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// How [`base64_decode_partial`] treats a final group of fewer than four characters (the
+/// `lastChunkHandling` option of `Uint8Array.fromBase64`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastChunk {
+    /// Decode it; padding is optional and stray low bits are ignored.
+    Loose,
+    /// It must be padded, with zero low bits.
+    Strict,
+    /// Leave it (and any padding) unread.
+    StopBeforePartial,
+}
+
+/// FromBase64 of `Uint8Array.fromBase64` / `setFromBase64`: ASCII whitespace is skipped, one
+/// alphabet is accepted, and decoding stops once `max_len` bytes are produced or before a group
+/// that would not fit.
+pub fn base64_decode_partial(src: &[u8], url: bool, last: LastChunk, max_len: usize) -> PartialDecode {
+    let table = if url { &UNB64_URL } else { &UNB64_STD };
+    let len = src.len();
+    let mut bytes = Vec::new();
+    let (mut read, mut index) = (0usize, 0usize);
+    let done = |read, bytes, error| PartialDecode { read, bytes, error };
+    if max_len == 0 {
+        return done(0, bytes, false);
+    }
+    let decode_group = |group: &[u8], strict: bool, bytes: &mut Vec<u8>| -> bool {
+        let mut n = 0u32;
+        for (k, &v) in group.iter().enumerate() {
+            n |= (v as u32) << (18 - 6 * k);
+        }
+        match group.len() {
+            2 if strict && n & 0xFFFF != 0 => return false,
+            2 => bytes.push((n >> 16) as u8),
+            3 if strict && n & 0xFF != 0 => return false,
+            3 => bytes.extend([(n >> 16) as u8, (n >> 8) as u8]),
+            _ => bytes.extend([(n >> 16) as u8, (n >> 8) as u8, n as u8]),
+        }
+        true
+    };
+    let skip_whitespace = |index: &mut usize| {
+        while *index < len && is_ascii_whitespace(src[*index]) {
+            *index += 1;
+        }
+    };
+    let mut group: Vec<u8> = Vec::with_capacity(4);
+    loop {
+        skip_whitespace(&mut index);
+        if index == len {
+            if !group.is_empty() {
+                match last {
+                    LastChunk::StopBeforePartial => return done(read, bytes, false),
+                    LastChunk::Loose if group.len() > 1 && decode_group(&group, false, &mut bytes) => {}
+                    _ => return done(read, bytes, true),
+                }
+            }
+            return done(len, bytes, false);
+        }
+        let c = src[index];
+        index += 1;
+        if c == b'=' {
+            if group.len() < 2 {
+                return done(read, bytes, true);
+            }
+            skip_whitespace(&mut index);
+            if group.len() == 2 {
+                if index == len {
+                    return done(read, bytes, last != LastChunk::StopBeforePartial);
+                }
+                if src[index] != b'=' {
+                    return done(read, bytes, true);
+                }
+                index += 1;
+                skip_whitespace(&mut index);
+            }
+            if index < len || !decode_group(&group, last == LastChunk::Strict, &mut bytes) {
+                return done(read, bytes, true);
+            }
+            return done(len, bytes, false);
+        }
+        let v = table[c as usize];
+        if v == 0xff {
+            return done(read, bytes, true);
+        }
+        let remaining = max_len - bytes.len();
+        if (remaining == 1 && group.len() == 2) || (remaining == 2 && group.len() == 3) {
+            return done(read, bytes, false);
+        }
+        group.push(v);
+        if group.len() == 4 {
+            decode_group(&group, false, &mut bytes);
+            group.clear();
+            read = index;
+            if bytes.len() == max_len {
+                return done(read, bytes, false);
+            }
+        }
+    }
+}
+
+// ---- percent-encoding ---------------------------------------------------------------------------
+
+/// The byte a `%XX` escape at `at` stands for; `None` when `src[at..]` doesn't start with one.
+#[inline]
+pub fn percent_escape_at(src: &[u8], at: usize) -> Option<u8> {
+    match src.get(at..at + 3)? {
+        [b'%', hi, lo] => Some(hex_digit(*hi)? << 4 | hex_digit(*lo)?),
+        _ => None,
+    }
+}
+
+/// WHATWG percent-decode: every valid `%XX` becomes its byte, everything else is copied.
+pub fn percent_decode(src: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if let Some(b) = percent_escape_at(src, i) {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Appends `%XX` (upper-case hex) for `b`.
+#[inline]
+pub fn push_percent_escape(out: &mut String, b: u8) {
+    out.push('%');
+    out.push(HEX_UPPER[(b >> 4) as usize] as char);
+    out.push(HEX_UPPER[(b & 15) as usize] as char);
+}
+
+/// Percent-encodes each byte in `escape`; the others are copied as (Latin-1) characters.
+pub fn percent_encode(src: &[u8], escape: impl Fn(u8) -> bool) -> String {
+    let mut out = String::with_capacity(src.len());
+    for &b in src {
+        if escape(b) {
+            push_percent_escape(&mut out, b);
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +576,50 @@ mod tests {
         assert_eq!(base64_decode_strict(b"-_8", true, Padding::Forbidden).unwrap(), vec![0xfb, 0xff]);
         assert_eq!(base64_decode_strict(b"+/8", true, Padding::Forbidden), Err(DecodeError::InvalidByte(0)));
         assert_eq!(base64_decode_strict(b"Zg===", false, req), Err(DecodeError::InvalidPadding(4)));
+    }
+
+    #[test]
+    fn base64_forgiving() {
+        assert_eq!(base64_decode_forgiving(b" Y W J j ").unwrap(), b"abc");
+        assert_eq!(base64_decode_forgiving(b"YQ==").unwrap(), b"a");
+        assert_eq!(base64_decode_forgiving(b"YQ").unwrap(), b"a");
+        assert_eq!(base64_decode_forgiving(b"YR").unwrap(), b"a");
+        assert_eq!(base64_decode_forgiving(b"YQ="), None);
+        assert_eq!(base64_decode_forgiving(b"YQ==="), None);
+        assert_eq!(base64_decode_forgiving(b"Y"), None);
+        assert_eq!(base64_decode_forgiving(b"Y-_="), None);
+    }
+
+    #[test]
+    fn base64_partial() {
+        let p = |s: &[u8], last, max| {
+            let d = base64_decode_partial(s, false, last, max);
+            (d.read, d.bytes, d.error)
+        };
+        assert_eq!(p(b"SGVsbG8=", LastChunk::Loose, usize::MAX), (8, b"Hello".to_vec(), false));
+        assert_eq!(p(b"SGVsbA", LastChunk::Loose, usize::MAX), (6, b"Hell".to_vec(), false));
+        assert_eq!(p(b"SGVsbA", LastChunk::Strict, usize::MAX), (4, b"Hel".to_vec(), true));
+        assert_eq!(p(b"SGVsbA", LastChunk::StopBeforePartial, usize::MAX), (4, b"Hel".to_vec(), false));
+        assert_eq!(p(b"SGVsbB==", LastChunk::Strict, usize::MAX), (4, b"Hel".to_vec(), true));
+        assert_eq!(p(b"SGVsbG8=extra", LastChunk::Loose, usize::MAX), (4, b"Hel".to_vec(), true));
+        assert_eq!(p(b"SGVs bG8g", LastChunk::Loose, 4), (4, b"Hel".to_vec(), false));
+        assert_eq!(base64_decode_partial(b"-_8", true, LastChunk::Loose, 9).bytes, vec![0xfb, 0xff]);
+        assert!(base64_decode_partial(b"+/8", true, LastChunk::Loose, 9).error);
+    }
+
+    #[test]
+    fn hex_partial() {
+        assert_eq!(hex_decode_partial(b"0aff", 9), PartialDecode { read: 4, bytes: vec![10, 255], error: false });
+        assert_eq!(hex_decode_partial(b"0aff", 1), PartialDecode { read: 2, bytes: vec![10], error: false });
+        assert_eq!(hex_decode_partial(b"0azz", 9), PartialDecode { read: 2, bytes: vec![10], error: true });
+        assert_eq!(hex_decode_partial(b"0af", 9), PartialDecode { read: 2, bytes: vec![10], error: true });
+    }
+
+    #[test]
+    fn percent() {
+        assert_eq!(percent_decode(b"a%20b%zz%4"), b"a b%zz%4");
+        assert_eq!(percent_escape_at(b"x%4a", 1), Some(0x4a));
+        assert_eq!(percent_escape_at(b"x%4", 1), None);
+        assert_eq!(percent_encode(b"a b", |c| c == b' '), "a%20b");
     }
 }

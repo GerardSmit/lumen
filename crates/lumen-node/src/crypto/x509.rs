@@ -4,7 +4,7 @@
 //! OpenSSL's `X509_NAME_print_ex`, `ASN1_TIME_print` and Node's `PrintGeneralName`. Signatures and
 //! key checks use the RustCrypto crates.
 
-use base64::Engine;
+use lumen_common::codec::{self, Padding};
 use lumen::embed::OpError;
 
 use crate::hash::{self, Algo};
@@ -359,9 +359,7 @@ fn escape_chars(chars: &[Vec<u8>], ctrl: bool, out: &mut Vec<u8>) {
     }
 }
 
-fn hex_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect()
-}
+use codec::hex_encode_upper as hex_upper;
 
 // ---- names --------------------------------------------------------------------------------------
 
@@ -1246,7 +1244,7 @@ fn check_name(name: &str) -> Result<&[u8], OpError> {
 // ---- PEM ----------------------------------------------------------------------------------------
 
 fn pem_encode(label: &str, der: &[u8]) -> String {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let b64 = codec::base64_encode(der, false, true);
     let mut out = format!("-----BEGIN {label}-----\n");
     for chunk in b64.as_bytes().chunks(64) {
         out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
@@ -1282,7 +1280,7 @@ fn pem_find(input: &[u8], labels: &[&str]) -> Result<Vec<u8>, PemError> {
             .filter(|l| !l.contains(':'))
             .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
             .collect();
-        return base64::engine::general_purpose::STANDARD.decode(lines).map_err(|_| PemError::BadBase64);
+        return codec::base64_decode_strict(lines.as_bytes(), false, Padding::Required).map_err(|_| PemError::BadBase64);
     }
     Err(PemError::NoStartLine)
 }
@@ -1534,10 +1532,7 @@ fn spkac_decode(input: &[u8]) -> Option<Vec<u8>> {
         end -= 1;
     }
     let text = &input[start..end];
-    base64::engine::general_purpose::STANDARD
-        .decode(text)
-        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(text))
-        .ok()
+    codec::base64_decode_strict(text, false, Padding::Optional).ok()
 }
 
 struct Spkac<'a> {

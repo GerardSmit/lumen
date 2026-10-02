@@ -1603,14 +1603,7 @@ fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
 /// surrogate, or > U+10FFFF is a URIError -> None). An escape whose decoded octet is an ASCII
 /// character in `preserve` (decodeURI's reservedSet) keeps its original `%XX` text instead.
 fn uri_decode(s: &str, preserve: &str) -> Option<String> {
-    fn hex_at(bytes: &[u8], i: usize) -> Option<u8> {
-        if i + 2 >= bytes.len() || bytes[i] != b'%' {
-            return None;
-        }
-        let h = (bytes[i + 1] as char).to_digit(16)?;
-        let l = (bytes[i + 2] as char).to_digit(16)?;
-        Some((h * 16 + l) as u8)
-    }
+    use lumen_common::codec::percent_escape_at as hex_at;
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0;
@@ -1771,7 +1764,7 @@ fn uri_encode(s: &str, keep: &str) -> Option<String> {
         } else {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{b:02X}"));
+                lumen_common::codec::push_percent_escape(&mut out, b);
             }
         }
     }

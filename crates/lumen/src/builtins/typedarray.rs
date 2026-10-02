@@ -1910,143 +1910,14 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
 
 // --- Uint8Array base64 / hex (the Stage-3 proposal) -------------------------------------------
 
-const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+use lumen_common::codec::{self, LastChunk, PartialDecode};
 
-use lumen_common::codec::base64_encode as b64_encode;
-
-/// FromBase64: decode at most `max_len` bytes honoring `handling` (loose / strict /
-/// stop-before-partial). Returns `(read, bytes)` where `read` is the code units consumed through
-/// the last fully decoded chunk; `Err(())` is a syntax error.
-fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let is_ws = |c: char| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ');
-    let decode_chunk = |chunk: &[u8], throw_extra: bool, bytes: &mut Vec<u8>| -> Result<(), ()> {
-        let mut n = 0u32;
-        for (idx, &v) in chunk.iter().enumerate() {
-            n |= (v as u32) << (18 - 6 * idx);
-        }
-        match chunk.len() {
-            2 => {
-                if throw_extra && n & 0xFFFF != 0 {
-                    return Err(());
-                }
-                bytes.push((n >> 16) as u8);
-            }
-            3 => {
-                if throw_extra && n & 0xFF != 0 {
-                    return Err(());
-                }
-                bytes.extend([(n >> 16) as u8, (n >> 8) as u8]);
-            }
-            _ => bytes.extend([(n >> 16) as u8, (n >> 8) as u8, n as u8]),
-        }
-        Ok(())
-    };
-    let mut bytes = Vec::new();
-    if max_len == 0 {
-        return (0, bytes, false);
+/// FromHex: an odd UTF-16 length is an error before anything is decoded.
+fn hex_decode_spec(s: &str, max_len: usize) -> PartialDecode {
+    if !crate::jstr::unit_len(s).is_multiple_of(2) {
+        return PartialDecode { read: 0, bytes: Vec::new(), error: true };
     }
-    let (mut read, mut index) = (0usize, 0usize);
-    let mut chunk: Vec<u8> = Vec::new();
-    loop {
-        while index < len && is_ws(chars[index]) {
-            index += 1;
-        }
-        if index == len {
-            if !chunk.is_empty() {
-                match handling {
-                    "stop-before-partial" => return (read, bytes, false),
-                    "loose" => {
-                        if chunk.len() == 1 {
-                            return (read, bytes, true);
-                        }
-                        if decode_chunk(&chunk, false, &mut bytes).is_err() {
-                            return (read, bytes, true);
-                        }
-                    }
-                    _ => return (read, bytes, true), // strict: a partial chunk must be padded
-                }
-            }
-            return (len, bytes, false);
-        }
-        let mut c = chars[index];
-        index += 1;
-        if c == '=' {
-            if chunk.len() < 2 {
-                return (read, bytes, true);
-            }
-            while index < len && is_ws(chars[index]) {
-                index += 1;
-            }
-            if chunk.len() == 2 {
-                if index == len {
-                    if handling == "stop-before-partial" {
-                        return (read, bytes, false);
-                    }
-                    return (read, bytes, true);
-                }
-                if chars[index] != '=' {
-                    return (read, bytes, true);
-                }
-                index += 1;
-                while index < len && is_ws(chars[index]) {
-                    index += 1;
-                }
-            }
-            if index < len {
-                return (read, bytes, true); // trailing characters after padding
-            }
-            if decode_chunk(&chunk, handling == "strict", &mut bytes).is_err() {
-                return (read, bytes, true);
-            }
-            return (len, bytes, false);
-        }
-        if url {
-            c = match c {
-                '+' | '/' => return (read, bytes, true),
-                '-' => '+',
-                '_' => '/',
-                other => other,
-            };
-        }
-        let Some(v) = B64_STD.iter().position(|&a| a as char == c) else {
-            return (read, bytes, true);
-        };
-        let remaining = max_len - bytes.len();
-        if (remaining == 1 && chunk.len() == 2) || (remaining == 2 && chunk.len() == 3) {
-            return (read, bytes, false); // the next chunk wouldn't fit: stop before it
-        }
-        chunk.push(v as u8);
-        if chunk.len() == 4 {
-            if decode_chunk(&chunk, false, &mut bytes).is_err() {
-                return (read, bytes, true);
-            }
-            chunk.clear();
-            read = index;
-            if bytes.len() == max_len {
-                return (read, bytes, false);
-            }
-        }
-    }
-}
-/// FromHex: decode at most `max_len` bytes; `read` is the number of code units consumed.
-fn hex_decode_spec(s: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = Vec::new();
-    if !chars.len().is_multiple_of(2) {
-        return (0, out, true);
-    }
-    let mut index = 0;
-    while index < chars.len() && out.len() < max_len {
-        let (Some(hi), Some(lo)) = (chars[index].to_digit(16), chars[index + 1].to_digit(16))
-        else {
-            return (index, out, true);
-        };
-        out.push((hi * 16 + lo) as u8);
-        index += 2;
-    }
-    (index, out, false)
+    codec::hex_decode_partial(s.as_bytes(), max_len)
 }
 
 /// Read a Uint8Array receiver's bytes; errors if `this` isn't a (non-detached) Uint8Array.
@@ -2094,12 +1965,14 @@ fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
 }
 
 /// Read `{alphabet, lastChunkHandling}` for the base64 decode methods.
-fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), Value> {
+fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, LastChunk), Value> {
     let url = b64_option_url(i, opts)?;
     let handling = if let Value::Obj(_) = opts {
         match ab(i.get_member(opts, "lastChunkHandling"))? {
-            Value::Undefined => crate::lstr::LStr::from("loose"),
-            Value::Str(s) if matches!(&*s, "loose" | "strict" | "stop-before-partial") => s,
+            Value::Undefined => LastChunk::Loose,
+            Value::Str(s) if &*s == "loose" => LastChunk::Loose,
+            Value::Str(s) if &*s == "strict" => LastChunk::Strict,
+            Value::Str(s) if &*s == "stop-before-partial" => LastChunk::StopBeforePartial,
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -2108,9 +1981,9 @@ fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), V
             }
         }
     } else {
-        crate::lstr::LStr::from("loose")
+        LastChunk::Loose
     };
-    Ok((url, (&handling).into()))
+    Ok((url, handling))
 }
 
 pub(super) fn install_uint8_base64(it: &mut Interp) {
@@ -2127,11 +2000,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
     };
     it.def_method(&proto, "toHex", 0, |i, this, _| {
         let bytes = u8_bytes(i, &this)?;
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push_str(&format!("{b:02x}"));
-        }
-        Ok(Value::from_string(s))
+        Ok(Value::from_string(codec::hex_encode(&bytes)))
     });
     it.def_method(&proto, "toBase64", 0, |i, this, a| {
         // Receiver validation, then options, then the (detachment-sensitive) byte read.
@@ -2144,15 +2013,15 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             false
         };
         let bytes = u8_bytes(i, &this)?;
-        Ok(Value::from_string(b64_encode(&bytes, url, !omit_padding)))
+        Ok(Value::from_string(codec::base64_encode(&bytes, url, !omit_padding)))
     });
     it.def_method(&ctor, "fromHex", 1, |i, _t, a| {
         let s = match arg(a, 0) {
             Value::Str(s) => s,
             _ => return Err(i.make_error("TypeError", "fromHex requires a string")),
         };
-        let (_, bytes, err) = hex_decode_spec(&s, usize::MAX);
-        if err {
+        let PartialDecode { bytes, error, .. } = hex_decode_spec(&s, usize::MAX);
+        if error {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
         }
         make_u8array(i, bytes)
@@ -2163,8 +2032,9 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "fromBase64 requires a string")),
         };
         let (url, handling) = b64_decode_options(i, &arg(a, 1))?;
-        let (_, bytes, err) = b64_decode_spec(&s, url, &handling, usize::MAX);
-        if err {
+        let PartialDecode { bytes, error, .. } =
+            codec::base64_decode_partial(s.as_bytes(), url, handling, usize::MAX);
+        if error {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));
         }
         make_u8array(i, bytes)
@@ -2179,9 +2049,9 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = hex_decode_spec(&s, max);
+        let PartialDecode { read, bytes, error } = hex_decode_spec(&s, max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
-        if err {
+        if error {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
         }
         Ok(result)
@@ -2197,9 +2067,10 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = b64_decode_spec(&s, url, &handling, max);
+        let PartialDecode { read, bytes, error } =
+            codec::base64_decode_partial(s.as_bytes(), url, handling, max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
-        if err {
+        if error {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));
         }
         Ok(result)

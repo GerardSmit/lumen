@@ -199,6 +199,8 @@ pub fn extension() -> Extension {
                     "murmur32v2" (2) => bunhash::op_murmur32v2,
                     "murmur64v2" (2) => bunhash::op_murmur64v2,
                     "rapidhash" (2) => bunhash::op_rapidhash,
+                    "crc32" (1) => bunhash::op_crc32,
+                    "adler32" (1) => bunhash::op_adler32,
                 ],
             ),
             ("__child", child::CHILD_OPS),
