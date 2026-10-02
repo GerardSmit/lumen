@@ -645,6 +645,24 @@ impl<'a> FromArg<'a, PyHost> for Exc<'a> {
     }
 }
 
+/// An instance of the core type `T` was installed into ([`extend_type`]), or of a subclass:
+/// the receiver of a core type's method when its instances share a kind with other types
+/// (`BaseExceptionGroup` among the exceptions).
+pub struct Inst<'a, T>(pub &'a Obj, PhantomData<fn() -> T>);
+
+impl<'a, T: Class> FromArg<'a, PyHost> for Inst<'a, T> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        let it = cx.it();
+        if let (Value::Obj(o), Some(t)) = (v, it.native_types.get(&TypeId::of::<T>())) {
+            if it.is_subtype(&it.type_of_obj(o), t) {
+                return Ok(Inst(o, PhantomData));
+            }
+        }
+        Err(cx.arg_error(at, &args::class_qualname(T::DESC), v))
+    }
+}
+
 impl<'a, T: Class> FromArg<'a, PyHost> for Py<T> {
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
         if is_instance::<T>(cx.it(), v) {

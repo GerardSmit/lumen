@@ -1,18 +1,12 @@
 //! `BaseExceptionGroup` / `ExceptionGroup`: construction, `split`, `subgroup`, `derive` and the
 //! helpers behind `except*`.
 
+use crate::bind::{Inst, KwArgs, This};
 use crate::object::*;
 use crate::vm::*;
 use std::rc::Rc;
 
-type Kw<'a> = &'a [(Obj, Value)];
-
-fn group_obj<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a Obj> {
-    match a.first() {
-        Some(Value::Obj(o)) if matches!(o.kind, Kind::Exception(_)) && it.exc_is(o, "BaseExceptionGroup") => Ok(o),
-        _ => Err(it.type_error("descriptor requires a 'BaseExceptionGroup' object")),
-    }
-}
+type Group<'a> = Inst<'a, BaseExceptionGroup>;
 
 pub fn is_group(it: &Interp, v: &Value) -> bool {
     matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) && it.exc_is(o, "BaseExceptionGroup"))
@@ -31,87 +25,101 @@ fn group_message(e: &Obj) -> Value {
     e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "message")).unwrap_or_else(|| Value::str(""))
 }
 
-fn group_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let cls = match a.first() {
-        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => c.clone(),
-        _ => return Err(it.type_error("BaseExceptionGroup.__new__(X): X is not a type object")),
-    };
-    let cname = it.type_name(&cls);
-    if !kw.is_empty() {
-        return Err(it.type_error(&format!("{}() takes no keyword arguments", cname)));
-    }
-    if a.len() != 3 {
-        return Err(it.type_error(&format!("{}() takes exactly 2 arguments ({} given)", cname, a.len() - 1)));
-    }
-    let Some(msg) = a[1].as_str().map(str::to_string) else {
-        let t = it.type_name_of(&a[1]);
-        return Err(it.type_error(&format!("argument 1 must be str, not {}", t)));
-    };
-    let seq_ok = matches!(&a[2], Value::Obj(o) if matches!(o.kind, Kind::List(_) | Kind::Tuple(_)));
-    if !seq_ok {
-        return Err(it.type_error("second argument (exceptions) must be a sequence"));
-    }
-    let items = it.iterate_to_vec(&a[2])?;
-    if items.is_empty() {
-        return Err(it.value_error("second argument (exceptions) must be a non-empty sequence"));
-    }
-    let base_exc = Value::Obj(it.exc_type("BaseException"));
-    let exc_cls = Value::Obj(it.exc_type("Exception"));
-    let mut all_exc = true;
-    for (i, x) in items.iter().enumerate() {
-        if !it.isinstance_value(x, &base_exc)? {
-            return Err(it.value_error(&format!("Item {} of second argument (exceptions) is not an exception", i)));
-        }
-        if !it.isinstance_value(x, &exc_cls)? {
-            all_exc = false;
-        }
-    }
-    let beg = it.exc_type("BaseExceptionGroup");
-    let eg = it.exc_type("ExceptionGroup");
-    let target = if Rc::ptr_eq(&cls, &beg) {
-        if all_exc {
-            eg
-        } else {
-            beg
-        }
-    } else {
-        if !all_exc && it.is_subtype(&cls, &exc_cls_obj(it)) {
-            let msg = if Rc::ptr_eq(&cls, &eg) { "Cannot nest BaseExceptions in an ExceptionGroup".to_string() } else { format!("Cannot nest BaseExceptions in '{}'", cname) };
-            return Err(it.type_error(&msg));
-        }
-        cls.clone()
-    };
-    let o = it.alloc_instance(&target)?;
-    if let Value::Obj(e) = &o {
-        if let Kind::Exception(d) = &e.kind {
-            d.borrow_mut().args = Value::tuple(vec![a[1].clone(), a[2].clone()]);
-        }
-        let d = it.instance_dict(e);
-        dict_set_str(&d, "message", Value::string(msg));
-        dict_set_str(&d, "exceptions", Value::tuple(items));
-    }
-    Ok(o)
-}
-
-fn exc_cls_obj(it: &Interp) -> Obj {
-    it.exc_type("Exception")
-}
-
-fn group_init(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let _ = group_obj(it, a)?;
-    Ok(Value::None)
-}
-
-fn group_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__str__", a, 1, 1)?;
-    let e = group_obj(it, a)?.clone();
-    Ok(Value::string(group_text(&e)))
-}
-
 pub fn group_text(e: &Obj) -> String {
     let n = group_items(e).len();
     let msg = group_message(e);
     format!("{} ({} sub-exception{})", msg.as_str().unwrap_or(""), n, if n == 1 { "" } else { "s" })
+}
+
+/// `BaseExceptionGroup`'s members (installed into the core type).
+#[lumen_bind::class(name = "BaseExceptionGroup")]
+pub struct BaseExceptionGroup;
+
+#[lumen_bind::methods]
+impl BaseExceptionGroup {
+    #[constructor(hint(py(arg_style = "parse", arg_name = "BaseExceptionGroup.__new__", text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, message: &Value, exceptions: &Value, #[varkw] kw: KwArgs) -> R<Value> {
+        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let cname = it.type_name(cls);
+        if !kw.is_empty() {
+            return Err(it.type_error(&format!("{}() takes no keyword arguments", cname)));
+        }
+        let Some(msg) = message.as_str().map(str::to_string) else {
+            let t = it.type_name_of(message);
+            return Err(it.type_error(&format!("BaseExceptionGroup.__new__() argument 1 must be str, not {}", t)));
+        };
+        let seq_ok = matches!(exceptions, Value::Obj(o) if matches!(o.kind, Kind::List(_) | Kind::Tuple(_)));
+        if !seq_ok {
+            return Err(it.type_error("second argument (exceptions) must be a sequence"));
+        }
+        let items = it.iterate_to_vec(exceptions)?;
+        if items.is_empty() {
+            return Err(it.value_error("second argument (exceptions) must be a non-empty sequence"));
+        }
+        let base_exc = Value::Obj(it.exc_type("BaseException"));
+        let exc_cls = it.exc_type("Exception");
+        let exc_val = Value::Obj(exc_cls.clone());
+        let mut all_exc = true;
+        for (i, x) in items.iter().enumerate() {
+            if !it.isinstance_value(x, &base_exc)? {
+                return Err(it.value_error(&format!("Item {} of second argument (exceptions) is not an exception", i)));
+            }
+            if !it.isinstance_value(x, &exc_val)? {
+                all_exc = false;
+            }
+        }
+        let beg = it.exc_type("BaseExceptionGroup");
+        let eg = it.exc_type("ExceptionGroup");
+        let target = if Rc::ptr_eq(cls, &beg) {
+            if all_exc {
+                eg
+            } else {
+                beg
+            }
+        } else {
+            if !all_exc && it.is_subtype(cls, &exc_cls) {
+                let msg = if Rc::ptr_eq(cls, &eg) { "Cannot nest BaseExceptions in an ExceptionGroup".to_string() } else { format!("Cannot nest BaseExceptions in '{}'", cname) };
+                return Err(it.type_error(&msg));
+            }
+            cls.clone()
+        };
+        let o = it.alloc_instance(&target)?;
+        if let Value::Obj(e) = &o {
+            if let Kind::Exception(d) = &e.kind {
+                d.borrow_mut().args = Value::tuple(vec![message.clone(), exceptions.clone()]);
+            }
+            let d = it.instance_dict(e);
+            dict_set_str(&d, "message", Value::string(msg));
+            dict_set_str(&d, "exceptions", Value::tuple(items));
+        }
+        Ok(o)
+    }
+
+    #[proto(init)]
+    fn init(_slf: This<Group<'_>>, #[varargs] _args: &[Value], #[varkw] _kw: KwArgs) {}
+
+    #[proto(str)]
+    fn str(slf: This<Group<'_>>) -> String {
+        group_text(slf.0 .0)
+    }
+
+    #[method(hint(py(arg_style = "unpack", text_signature = "")))]
+    fn split(slf: This<Group<'_>>, it: &mut Interp, matcher_value: &Value) -> R<Value> {
+        let (m, r) = split_value(it, &Value::Obj(slf.0 .0.clone()), matcher_value)?;
+        Ok(Value::tuple(vec![m.unwrap_or(Value::None), r.unwrap_or(Value::None)]))
+    }
+
+    #[method(hint(py(arg_style = "unpack", text_signature = "")))]
+    fn subgroup(slf: This<Group<'_>>, it: &mut Interp, matcher_value: &Value) -> R<Value> {
+        let (m, _) = split_value(it, &Value::Obj(slf.0 .0.clone()), matcher_value)?;
+        Ok(m.unwrap_or(Value::None))
+    }
+
+    #[method(hint(py(arg_style = "unpack", text_signature = "")))]
+    fn derive(slf: This<Group<'_>>, it: &mut Interp, excs: &Value) -> R<Value> {
+        let beg = Value::Obj(it.exc_type("BaseExceptionGroup"));
+        it.call(&beg, vec![group_message(slf.0 .0), excs.clone()], Vec::new())
+    }
 }
 
 fn matches_cond(it: &mut Interp, e: &Value, cond: &Value) -> R<bool> {
@@ -180,27 +188,6 @@ fn split_value(it: &mut Interp, exc: &Value, cond: &Value) -> R<(Option<Value>, 
     Ok((m, r))
 }
 
-fn group_split(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("split", a, 2, 2)?;
-    group_obj(it, a)?;
-    let (m, r) = split_value(it, &a[0], &a[1])?;
-    Ok(Value::tuple(vec![m.unwrap_or(Value::None), r.unwrap_or(Value::None)]))
-}
-
-fn group_subgroup(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("subgroup", a, 2, 2)?;
-    group_obj(it, a)?;
-    let (m, _) = split_value(it, &a[0], &a[1])?;
-    Ok(m.unwrap_or(Value::None))
-}
-
-fn group_derive(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("derive", a, 2, 2)?;
-    let e = group_obj(it, a)?.clone();
-    let beg = Value::Obj(it.exc_type("BaseExceptionGroup"));
-    it.call(&beg, vec![group_message(&e), a[1].clone()], Vec::new())
-}
-
 /// Wraps a plain exception so `except*` can treat it as a group; remembers the original.
 pub fn star_wrap(it: &mut Interp, exc: &Value) -> R<Value> {
     if is_group(it, exc) {
@@ -244,10 +231,5 @@ pub fn star_split(it: &mut Interp, rem: &Value, cond: &Value) -> R<(Value, Value
 
 pub fn init(it: &mut Interp) {
     let beg = it.exc_type("BaseExceptionGroup");
-    it.reg_new(&beg, group_new);
-    it.reg(&beg, "__init__", group_init);
-    it.reg(&beg, "__str__", group_str);
-    it.reg(&beg, "split", group_split);
-    it.reg(&beg, "subgroup", group_subgroup);
-    it.reg(&beg, "derive", group_derive);
+    crate::bind::extend_type::<BaseExceptionGroup>(it, &beg);
 }

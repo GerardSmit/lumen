@@ -5,10 +5,11 @@
 //! The message family depends on the calling convention CPython would use for the same
 //! signature: `METH_NOARGS`, `METH_O`, positional-only Argument Clinic
 //! (`_PyArg_CheckPositional`), keyword Argument Clinic (`_PyArg_UnpackKeywords`), a slot wrapper,
-//! or `PyArg_ParseTuple` (`hint(py(arg_style = "parse"))`).
+//! `PyArg_ParseTuple` (`hint(py(arg_style = "parse"))`) or `PyArg_UnpackTuple`
+//! (`hint(py(arg_style = "unpack"))`, worded as the positional-only Clinic).
 //!
 //! Python hints (`hint(py(..))` on an `#[op]` / member): `text_signature = ".."` (`""`: none),
-//! `arg_style = "parse"`, `arg_name = ".."` (the name in argument errors), `aliases = "a, b"`.
+//! `arg_style = "parse" | "unpack"`, `arg_name = ".."` (the name in argument errors), `aliases = "a, b"`.
 
 use crate::object::*;
 use crate::vm::Interp;
@@ -148,6 +149,7 @@ impl PySig {
         let all_pos = posonly == n;
         let conv = match d.role {
             _ if d.hint(HOST, "arg_style") == Some("parse") => Conv::Parse,
+            _ if d.hint(HOST, "arg_style") == Some("unpack") => Conv::Positional,
             Role::Getter => Conv::NoArgs,
             Role::Setter => Conv::O,
             Role::Constructor if all_pos && !varkw => Conv::Positional,
@@ -297,7 +299,8 @@ pub fn bind_slow<'a>(
 ) -> R<()> {
     let sig = PySig::cached(d);
     if sig.conv != Conv::Keywords {
-        if !kw.is_empty() {
+        // A `#[varkw]` collector receives the keywords and judges them itself.
+        if !kw.is_empty() && !sig.varkw {
             return Err(no_kwargs_error(it, sig));
         }
         let n = args.len();

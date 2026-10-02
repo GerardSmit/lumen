@@ -257,7 +257,8 @@ impl Interp {
             }
             Kind::Native(n) => {
                 if let Some(d) = n.desc.filter(|d| n.method && d.class().is_some()) {
-                    Ok(format!("<method '{}' of '{}' objects>", n.name, crate::bind::owner_of(d)))
+                    let kind = if crate::bind::args::is_slot_wrapper(d) { "slot wrapper" } else { "method" };
+                    Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, crate::bind::owner_of(d)))
                 } else if n.method {
                     match &n.owner {
                         Some(NativeOwner::Class(c)) => Ok(format!("<method '{}' of '{}' objects>", n.name, self.type_name(c))),
