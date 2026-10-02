@@ -221,15 +221,8 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(doc) = desc.doc {
         dict_set_str(&d, "__doc__", Value::str(doc));
     }
+    install_functions::<M>(&d);
     let items = ModuleItems::<PyHost>::of::<M>();
-    for f in &items.functions {
-        if !f.desc.exposed_to(HOST) {
-            continue;
-        }
-        for n in std::iter::once(py_name(f.desc)).chain(args::aliases(f.desc)) {
-            dict_set_str(&d, n, native_value(f));
-        }
-    }
     for c in &items.classes {
         if !c.desc.exposed_to(HOST) {
             continue;
@@ -245,6 +238,20 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
         init(it, &Value::Obj(m.clone()))?;
     }
     Ok(m)
+}
+
+/// Install the functions `M` declares into the existing namespace `d` (the `builtins` functions
+/// live in the interpreter's own builtins dict).
+pub fn install_functions<M: Module<PyHost>>(d: &Obj) {
+    let items = ModuleItems::<PyHost>::of::<M>();
+    for f in &items.functions {
+        if !f.desc.exposed_to(HOST) {
+            continue;
+        }
+        for n in std::iter::once(py_name(f.desc)).chain(args::aliases(f.desc)) {
+            dict_set_str(d, n, native_value(f));
+        }
+    }
 }
 
 /// `__module__`/`__qualname__` owner of a bound native: the module of a function, the qualified

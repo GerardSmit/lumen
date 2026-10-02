@@ -405,7 +405,8 @@ pub fn bad_argument(it: &mut Interp, d: &'static FnDesc, i: usize, what: &str, v
             None => "argument".to_string(),
         }
     };
-    let t = it.type_name_of(v);
+    // `_PyArg_BadArgument` names `None` itself rather than its type.
+    let t = if v.is_none() { "None".to_string() } else { it.type_name_of(v) };
     it.type_error(&format!("{}() {} must be {}, not {}", sig.name, display, what, t))
 }
 
