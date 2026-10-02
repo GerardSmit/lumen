@@ -4,7 +4,13 @@
 //! Python hints on `#[class]`: `hint(py(unhashable))` (`__hash__ = None`), `hint(py(native_iter))`
 //! (the constructor returns a [`NativeIter`] the VM steps directly), `hint(py(final))` (cannot be
 //! subclassed), `hint(py(base = "module.Class"))` (a Python base class, imported when the type is
-//! first created).
+//! first created), `hint(py(shared))` (members installed into several core types with
+//! [`install_into`]; argument errors name the receiver's type).
+//!
+//! Core types (`str`, `list`, `OSError`, ...) keep their own type objects and instance kinds; a
+//! marker `#[class]` named after the type declares their members and [`extend_type`] installs
+//! them. Members are owned by the type they are installed in (`__qualname__`, `__objclass__`,
+//! repr, pickling).
 
 use super::args::{self, py_name, HOST};
 use super::PyHost;
@@ -58,7 +64,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     }
     let mut members = Vec::new();
     T::members(&mut members);
-    install_members(&ty, &members);
+    install_members(&ty, &members, None);
     if let Some(d) = ty.dict.borrow().as_ref() {
         if c.hint(HOST, "unhashable").is_some() {
             dict_set_str(d, "__hash__", Value::None);
@@ -93,7 +99,7 @@ pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
     let mut members = Vec::new();
     T::members(&mut members);
-    install_members(ty, &members);
+    install_members(ty, &members, None);
 }
 
 /// The class `module.name` of a `base` hint, imported on first use of the native class.
@@ -106,16 +112,30 @@ fn python_base(it: &mut Interp, path: &str) -> Option<Obj> {
     }
 }
 
-fn install_members(ty: &Obj, members: &[FnItem<PyHost>]) {
+/// Install `T`'s members named in `only` into the existing type `ty`: one declaration of members
+/// several core types share (the container slot wrappers), each owned by the type it is in.
+pub fn install_into<T: Methods<PyHost>>(ty: &Obj, only: &[&str]) {
+    let mut members = Vec::new();
+    T::members(&mut members);
+    install_members(ty, &members, Some(only));
+}
+
+fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) {
     let Some(d) = ty.dict.borrow().clone() else { return };
     for m in members {
         let desc = m.desc;
-        if !desc.exposed_to(HOST) {
+        if !desc.exposed_to(HOST) || only.is_some_and(|o| !o.contains(&py_name(desc))) {
             continue;
         }
         let names = std::iter::once(py_name(desc)).chain(args::aliases(desc));
         for name in names {
-            let f = native_value(m);
+            let f = Value::Obj(Object::new(Kind::Native(NativeData {
+                name: py_name(desc),
+                f: m.entry,
+                method: matches!(desc.role, Role::Method | Role::Proto(_)),
+                desc: Some(desc),
+                owner: Some(NativeOwner::Class(ty.clone())),
+            })));
             let v = match desc.role {
                 Role::Static if desc.has(flags::CLASS_RECV) => Value::Obj(Object::new(Kind::ClassMethod(f))),
                 Role::Static => Value::Obj(Object::new(Kind::StaticMethod(f))),

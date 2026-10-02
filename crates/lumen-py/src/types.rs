@@ -886,16 +886,15 @@ impl Interp {
             },
             Kind::Native(n) => match (nm, n.desc) {
                 ("__name__", _) => return Ok(Some(Value::str(n.name))),
-                ("__qualname__", Some(d)) if d.class().is_some() => {
-                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
-                }
-                ("__qualname__", None) if n.method => {
+                ("__qualname__", _) if matches!(n.owner, Some(NativeOwner::Class(_))) => {
                     if let Some(NativeOwner::Class(c)) = &n.owner {
                         return Ok(Some(Value::string(format!("{}.{}", self.type_name(c), n.name))));
                     }
-                    return Ok(Some(Value::str(n.name)));
                 }
-                ("__objclass__", None) if n.method => {
+                ("__qualname__", Some(d)) if d.class().is_some() => {
+                    return Ok(Some(Value::string(format!("{}.{}", crate::bind::args::class_name(d), n.name))));
+                }
+                ("__objclass__", _) if n.method => {
                     if let Some(NativeOwner::Class(c)) = &n.owner {
                         return Ok(Some(Value::Obj(c.clone())));
                     }

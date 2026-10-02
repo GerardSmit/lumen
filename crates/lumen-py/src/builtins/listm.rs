@@ -1,7 +1,7 @@
 //! `list` and `tuple` methods, and the stable sort shared with `sorted()`.
 
 use super::numeric::{reg_binops, reg_compare};
-use super::slots::reg_slots;
+use super::slots::{reg_method_forms, reg_slots};
 use crate::ast::CmpOp;
 use crate::object::*;
 use crate::vm::*;
@@ -423,7 +423,8 @@ pub fn init(it: &mut Interp) {
     if let Some(d) = list.dict.borrow().as_ref() {
         dict_set_str(d, "__hash__", Value::None);
     }
-    reg_slots(it, &list, &["__getitem__", "__setitem__", "__delitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
+    reg_slots(it, &list, &["__setitem__", "__delitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
+    reg_method_forms(&list, &["__getitem__"]);
     reg_binops(it, &list, &["__add__", "__mul__", "__rmul__"]);
     reg_compare(it, &list, true);
 

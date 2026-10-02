@@ -293,6 +293,7 @@ fn missing_error(it: &mut Interp, sig: &PySig, i: usize) -> Obj {
 pub fn bind_slow<'a>(
     it: &mut Interp,
     d: &'static FnDesc,
+    recv: &Value,
     args: &'a [Value],
     kw: &'a [(Obj, Value)],
     slots: &mut [Option<&'a Value>],
@@ -301,11 +302,11 @@ pub fn bind_slow<'a>(
     if sig.conv != Conv::Keywords {
         // A `#[varkw]` collector receives the keywords and judges them itself.
         if !kw.is_empty() && !sig.varkw {
-            return Err(no_kwargs_error(it, sig));
+            return Err(no_kwargs_error(it, &for_receiver(it, sig, d, recv)));
         }
         let n = args.len();
         if n < sig.minpos || (!sig.varargs && n > sig.maxpos) {
-            return Err(arity_error(it, sig, n));
+            return Err(arity_error(it, &for_receiver(it, sig, d, recv), n));
         }
         for (slot, a) in slots.iter_mut().zip(args) {
             *slot = Some(a);
@@ -313,6 +314,18 @@ pub fn bind_slow<'a>(
         return Ok(());
     }
     bind_keywords(it, sig, args, kw, slots)
+}
+
+/// The signature errors name the receiver's type for members of a class declared
+/// `hint(py(shared))`, whose members are installed into several types ([`super::install_into`]).
+#[cold]
+#[inline(never)]
+fn for_receiver(it: &Interp, sig: &PySig, d: &FnDesc, recv: &Value) -> PySig {
+    let mut s = PySig { name: sig.name.clone(), owner: sig.owner.clone(), names: sig.names.clone(), ..*sig };
+    if d.class().is_some_and(|c| c.hint(HOST, "shared").is_some()) {
+        s.owner = it.type_name_of(recv);
+    }
+    s
 }
 
 /// `_PyArg_UnpackKeywords`: positional and keyword arguments into `slots`. Keywords not

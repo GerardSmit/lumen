@@ -256,12 +256,13 @@ impl Interp {
                 Ok(format!("<bound method {} of {}>", name, r))
             }
             Kind::Native(n) => {
-                if let Some(d) = n.desc.filter(|d| n.method && d.class().is_some()) {
-                    let kind = if crate::bind::args::is_slot_wrapper(d) { "slot wrapper" } else { "method" };
-                    Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, crate::bind::owner_of(d)))
-                } else if n.method {
+                if n.method {
+                    let kind = if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) { "slot wrapper" } else { "method" };
                     match &n.owner {
-                        Some(NativeOwner::Class(c)) => Ok(format!("<method '{}' of '{}' objects>", n.name, self.type_name(c))),
+                        Some(NativeOwner::Class(c)) => Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, self.type_display(c))),
+                        _ if n.desc.is_some_and(|d| d.class().is_some()) => {
+                            Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, crate::bind::owner_of(n.desc.unwrap())))
+                        }
                         _ => Ok(format!("<method '{}' of object>", n.name)),
                     }
                 } else {
