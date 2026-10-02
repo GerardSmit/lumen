@@ -109,15 +109,13 @@ fn set_text_signature(d: &Obj, members: &[FnItem<PyHost>]) {
 /// [`extend_type`], plus the class docstring and `__text_signature__` of `T`: a core type whose
 /// marker carries CPython's class doc (`int`, `float`, ...).
 pub fn extend_type_documented<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
-    extend_type::<T>(it, ty);
+    it.native_types.insert(TypeId::of::<T>(), ty.clone());
     let mut members = Vec::new();
     T::members(&mut members);
+    install_members(ty, &members, None);
     if let Some(d) = ty.dict.borrow().as_ref() {
         dict_set_str(d, "__doc__", T::DESC.doc.map_or(Value::None, Value::str));
-        let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
-        if let Some(sig) = sig {
-            dict_set_str(d, "__text_signature__", Value::string(sig));
-        }
+        set_text_signature(d, &members);
     }
 }
 
