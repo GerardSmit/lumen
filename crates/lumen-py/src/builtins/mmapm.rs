@@ -51,6 +51,8 @@ pub mod mmap {
         offset: i64,
         access: i32,
         fd: i32,
+        trackfd: bool,
+        private: bool,
     }
 
     impl Drop for Mmap {
@@ -141,6 +143,9 @@ pub mod mmap {
             #[kw]
             #[default(0)]
             offset: i64,
+            #[kwonly]
+            #[default(true)]
+            trackfd: bool,
         ) -> R<Mmap> {
             let (mut flags, mut prot, mut access) = (flags, prot, access);
             if length < 0 {
@@ -189,12 +194,13 @@ pub mod mmap {
                     }
                 }
             }
-            let fd = if fileno == -1 {
+            let fd = if fileno == -1 || !trackfd {
                 -1
             } else {
                 lumen_os::fs::dup(fileno).map_err(|e| os_err(it, e))?
             };
-            let map = match Mapping::new(length as usize, prot, flags, fd, offset) {
+            let map_fd = if fileno == -1 { -1 } else { fileno };
+            let map = match Mapping::new(length as usize, prot, flags, map_fd, offset) {
                 Ok(m) => Rc::new(m),
                 Err(e) => {
                     if fd >= 0 {
@@ -204,7 +210,7 @@ pub mod mmap {
                 }
             };
             let store = store_for(&map, access == ACCESS_READ);
-            Ok(Mmap { map: Some(map), store: Some(store), pos: 0, offset, access, fd })
+            Ok(Mmap { map: Some(map), store: Some(store), pos: 0, offset, access, fd, trackfd, private: flags & lumen_os::mmap::MAP_PRIVATE != 0 })
         }
 
         fn close(&mut self, it: &mut Interp) -> R<()> {
@@ -319,6 +325,9 @@ pub mod mmap {
             if store.is_pinned() {
                 return Err(it.new_exc_str("BufferError", "mmap can't resize with extant buffers exported."));
             }
+            if !self.trackfd {
+                return Err(it.value_error("mmap can't resize with trackfd=False."));
+            }
             if self.access != ACCESS_WRITE && self.access != ACCESS_DEFAULT {
                 return Err(it.type_error("mmap can't resize a readonly or copy-on-write memory map."));
             }
@@ -327,6 +336,9 @@ pub mod mmap {
             }
             if !lumen_os::mmap::HAVE_MREMAP {
                 return Err(it.new_exc_str("SystemError", "mmap: resizing not available--no mremap()"));
+            }
+            if cfg!(target_os = "linux") && self.fd == -1 && !self.private && new_size as usize > store.len() {
+                return Err(it.value_error("mmap: can't expand a shared anonymous mapping"));
             }
             if self.fd != -1 {
                 lumen_os::fs::ftruncate(self.fd, (self.offset + new_size as i64) as u64).map_err(|e| os_err(it, e))?;
@@ -337,7 +349,7 @@ pub mod mmap {
             Ok(())
         }
 
-        fn seek(&mut self, it: &mut Interp, dist: isize, #[default(0)] how: i32) -> R<()> {
+        fn seek(&mut self, it: &mut Interp, dist: isize, #[default(0)] how: i32) -> R<usize> {
             let store = self.store(it)?;
             let size = store.len() as isize;
             let out_of_range = |it: &mut Interp| it.value_error("seek out of range");
@@ -361,18 +373,17 @@ pub mod mmap {
                 return Err(out_of_range(it));
             }
             self.pos = where_ as usize;
-            Ok(())
+            Ok(self.pos)
         }
 
         fn size(&mut self, it: &mut Interp) -> R<i64> {
-            let store = self.store(it)?;
-            if self.fd != -1 {
-                let st = lumen_os::fs::fstat(self.fd).map_err(|e| os_err(it, e))?;
-                if st.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFREG {
-                    return Ok(st.size as i64);
-                }
-            }
-            Ok(store.len() as i64)
+            self.store(it)?;
+            let st = lumen_os::fs::fstat(self.fd).map_err(|e| os_err(it, e))?;
+            Ok(st.size as i64)
+        }
+
+        fn seekable(&self) -> bool {
+            true
         }
 
         fn tell(&mut self, it: &mut Interp) -> R<usize> {

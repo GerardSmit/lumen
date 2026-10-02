@@ -166,7 +166,22 @@ pub fn constants() -> Vec<(&'static str, i64)> {
         ("MADV_HWPOISON", 100),
     ]);
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    v.push(("MADV_FREE", 5));
+    v.extend([
+        ("MADV_FREE", 5),
+        ("MADV_FREE_REUSABLE", 7),
+        ("MADV_FREE_REUSE", 8),
+        ("MAP_32BIT", 0x8000),
+        ("MAP_HASSEMAPHORE", 0x200),
+        ("MAP_JIT", 0x800),
+        ("MAP_NOCACHE", 0x400),
+        ("MAP_NOEXTEND", 0x100),
+        ("MAP_NORESERVE", 0x40),
+        ("MAP_RESILIENT_CODESIGN", 0x2000),
+        ("MAP_RESILIENT_MEDIA", 0x4000),
+        ("MAP_TPRO", 0x80000),
+        ("MAP_TRANSLATED_ALLOW_EXECUTE", 0x20000),
+        ("MAP_UNIX03", 0x40000),
+    ]);
     v.push(("PAGESIZE", pagesize()));
     v.push(("ALLOCATIONGRANULARITY", pagesize()));
     v

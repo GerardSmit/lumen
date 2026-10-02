@@ -1,0 +1,50 @@
+True False True True
+stat_result 10 22 3
+['st_atime', 'st_atime_ns', 'st_birthtime', 'st_blksize', 'st_blocks', 'st_ctime', 'st_ctime_ns', 'st_dev', 'st_flags', 'st_gen', 'st_gid', 'st_ino', 'st_mode', 'st_mtime', 'st_mtime_ns', 'st_nlink', 'st_rdev', 'st_size', 'st_uid']
+True True
+get_terminal_size terminal_size os.terminal_size(columns=80, lines=24)
+($module, fd, data, /) ($module, fd, length, /)
+True True True
+['chdir', 'chmod', 'chown', 'listdir', 'pathconf', 'scandir', 'stat', 'statvfs', 'truncate', 'utime']
+['access', 'chmod', 'chown', 'link', 'lstat', 'mkdir', 'mkfifo', 'mknod', 'open', 'readlink', 'rename', 'rmdir', 'stat', 'symlink', 'unlink', 'utime']
+['access', 'chflags', 'chmod', 'chown', 'link', 'stat', 'utime']
+['access']
+None 384
+0o640
+1
+2 b'zz' 1
+nodrives
+True no-affinity
+0 64 78 1 1 4 1 0 2
+posix / True /dev/null . .. . None :
+True True True
+['SC_2_CHAR_TERM', 'SC_2_C_BIND', 'SC_2_C_DEV', 'SC_2_FORT_DEV', 'SC_2_FORT_RUN'] True
+True 5 5
+No such file or directory True True
+('', '/', 'a/b') /b
+lchmod True
+chflags True
+lchflags True
+O_EXLOCK True
+O_SHLOCK True
+O_EVTONLY True
+O_NOFOLLOW_ANY True
+O_SYMLINK True
+O_EXEC True
+O_SEARCH True
+O_FSYNC True
+O_DSYNC True
+O_RSYNC False
+O_TTY_INIT False
+O_PATH False
+f True 2 True False
+DirEntry
+True True
+mach_absolute_time() True
+True True
+1970 True
+time.struct_time(tm_year=2001, tm_mon=9, tm_mday=9, tm_hour=1, tm_min=46, tm_sec=40, tm_wday=6, tm_yday=252, tm_isdst=0) UTC 0
+60 Sun Sep  9 01:46:40 2001 Thu
+8
+sleep length must be non-negative
+strftime(): illegal time tuple argument

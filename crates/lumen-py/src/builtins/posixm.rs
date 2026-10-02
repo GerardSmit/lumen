@@ -127,10 +127,11 @@ pub mod posix {
         it.new_exc(&cls, vec![Value::string(format!("{}: {} unavailable on this platform", fname, arg))])
     }
 
-    fn no_dir_fd(it: &mut Interp, fname: &str, dir_fd: Option<i32>) -> R<()> {
+    /// `path` resolved against the directory open on `dir_fd`, when one is given.
+    fn at_path<const FD: bool>(it: &mut Interp, dir_fd: Option<i32>, path: &crate::bind::FsPath<FD>) -> R<String> {
         match dir_fd {
-            Some(_) => Err(unavailable(it, fname, "dir_fd")),
-            None => Ok(()),
+            Some(fd) => lumen_os::posix::at_path(fd, &path.path).map_err(|e| fs_path_err(it, e, path)),
+            None => Ok(path.path.clone()),
         }
     }
 
@@ -163,10 +164,10 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<Value> {
-        no_dir_fd(it, "stat", dir_fd)?;
+        let rp = at_path(it, dir_fd, &path)?;
         let r = match path.fd {
             Some(fd) => it.platform.borrow_mut().fd_stat(fd),
-            None => it.platform.borrow_mut().stat(&path.path, follow_symlinks),
+            None => it.platform.borrow_mut().stat(&rp, follow_symlinks),
         };
         match r {
             Ok(s) => Ok(stat_value(it, &s)),
@@ -177,8 +178,8 @@ pub mod posix {
     /// Perform a stat system call on the given path, without following symbolic links.
     #[op]
     fn lstat(it: &mut Interp, #[kw] path: PathArg, #[kwonly] dir_fd: Option<i32>) -> R<Value> {
-        no_dir_fd(it, "lstat", dir_fd)?;
-        let r = it.platform.borrow_mut().stat(&path.path, false);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().stat(&rp, false);
         match r {
             Ok(s) => Ok(stat_value(it, &s)),
             Err(e) => Err(path_err(it, e, &path)),
@@ -209,14 +210,11 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<bool> {
-        no_dir_fd(it, "access", dir_fd)?;
-        if effective_ids {
-            return Err(unavailable(it, "access", "effective_ids"));
+        let rp = at_path(it, dir_fd, &path)?;
+        if effective_ids || !follow_symlinks {
+            return Ok(lumen_os::posix::access_ex(&rp, mode as u32, effective_ids, follow_symlinks).is_ok());
         }
-        if !follow_symlinks {
-            return Err(unavailable(it, "access", "follow_symlinks"));
-        }
-        Ok(it.platform.borrow_mut().access(&path.path, mode as u32).is_ok())
+        Ok(it.platform.borrow_mut().access(&rp, mode as u32).is_ok())
     }
 
     // ---- directories ---------------------------------------------------------------------------
@@ -244,10 +242,11 @@ pub mod posix {
 
     fn list_dir(it: &mut Interp, fname: &str, path: &Value) -> R<(PathOrFd, Vec<(String, DirentKind)>)> {
         let p: PathOrFd = convert_path(it, fname, "path", path, true, true)?;
-        if p.fd.is_some() {
-            return Err(unavailable(it, fname, "path should not be an integer;"));
-        }
-        let r = it.platform.borrow_mut().listdir(&p.path);
+        let dir = match p.fd {
+            Some(fd) => lumen_os::posix::fd_path(fd).map_err(|e| fs_err(it, e))?,
+            None => p.path.clone(),
+        };
+        let r = it.platform.borrow_mut().listdir(&dir);
         match r {
             Ok(v) => Ok((p, v)),
             Err(e) => Err(path_err(it, e, &p)),
@@ -265,8 +264,12 @@ pub mod posix {
     #[op]
     fn scandir(it: &mut Interp, #[kw] path: Option<&Value>) -> R<Py<ScandirIterator>> {
         let (p, entries) = list_dir(it, "scandir", path.unwrap_or(&Value::None))?;
-        let dir = if matches!(p.obj, Value::None) { ".".to_string() } else { p.path.clone() };
-        let it_state = ScandirIterator { dir, bytes: p.bytes, entries: entries.into_iter(), closed: false };
+        let dir = match p.fd {
+            Some(fd) => lumen_os::posix::fd_path(fd).map_err(|e| fs_err(it, e))?,
+            None if matches!(p.obj, Value::None) => ".".to_string(),
+            None => p.path.clone(),
+        };
+        let it_state = ScandirIterator { dir, bytes: p.bytes, by_fd: p.fd.is_some(), entries: entries.into_iter(), closed: false };
         Ok(Py::new(it, it_state))
     }
 
@@ -274,6 +277,7 @@ pub mod posix {
     pub struct ScandirIterator {
         dir: String,
         bytes: bool,
+        by_fd: bool,
         entries: std::vec::IntoIter<(String, DirentKind)>,
         closed: bool,
     }
@@ -289,16 +293,16 @@ pub mod posix {
         fn __next__(slf: This<Py<Self>>, it: &mut Interp) -> R<Option<Value>> {
             let next = {
                 let mut s = slf.0.borrow_mut(it)?;
-                if s.closed { None } else { s.entries.next().map(|e| (e, s.dir.clone(), s.bytes)) }
+                if s.closed { None } else { s.entries.next().map(|e| (e, s.dir.clone(), s.bytes, s.by_fd)) }
             };
-            let Some(((name, kind), dir, bytes)) = next else {
+            let Some(((name, kind), dir, bytes, by_fd)) = next else {
                 slf.0.borrow_mut(it)?.closed = true;
                 return Ok(None);
             };
             let path = if dir.ends_with('/') { format!("{}{}", dir, name) } else { format!("{}/{}", dir, name) };
             let entry = DirEntry {
-                name: wrap_path(bytes, name),
-                path: wrap_path(bytes, path.clone()),
+                name: wrap_path(bytes, name.clone()),
+                path: wrap_path(bytes, if by_fd { name.clone() } else { path.clone() }),
                 text: path,
                 kind,
                 stat: None,
@@ -438,46 +442,42 @@ pub mod posix {
         mode: i32,
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<()> {
-        no_dir_fd(it, "mkdir", dir_fd)?;
-        let r = it.platform.borrow_mut().mkdir(&path.path, mode as u32);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().mkdir(&rp, mode as u32);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     /// Remove a directory.
     #[op]
     fn rmdir(it: &mut Interp, #[kw] path: PathArg, #[kwonly] dir_fd: Option<i32>) -> R<()> {
-        no_dir_fd(it, "rmdir", dir_fd)?;
-        let r = it.platform.borrow_mut().rmdir(&path.path);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().rmdir(&rp);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     /// Remove a file (same as remove()).
     #[op]
     fn unlink(it: &mut Interp, #[kw] path: PathArg, #[kwonly] dir_fd: Option<i32>) -> R<()> {
-        no_dir_fd(it, "unlink", dir_fd)?;
-        let r = it.platform.borrow_mut().unlink(&path.path);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().unlink(&rp);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     /// Remove a file (same as unlink()).
     #[op]
     fn remove(it: &mut Interp, #[kw] path: PathArg, #[kwonly] dir_fd: Option<i32>) -> R<()> {
-        no_dir_fd(it, "remove", dir_fd)?;
-        let r = it.platform.borrow_mut().unlink(&path.path);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().unlink(&rp);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     fn do_rename(it: &mut Interp, fname: &str, src: &PathArg, dst: &PathArg, src_dir_fd: Option<i32>, dst_dir_fd: Option<i32>) -> R<()> {
-        if src_dir_fd.is_some() {
-            return Err(unavailable(it, fname, "src_dir_fd"));
-        }
-        if dst_dir_fd.is_some() {
-            return Err(unavailable(it, fname, "dst_dir_fd"));
-        }
         if src.bytes != dst.bytes {
             return Err(it.type_error(&format!("{}: src and dst must be the same type", fname)));
         }
-        let r = it.platform.borrow_mut().rename(&src.path, &dst.path);
+        let rsrc = at_path(it, src_dir_fd, src)?;
+        let rdst = at_path(it, dst_dir_fd, dst)?;
+        let r = it.platform.borrow_mut().rename(&rsrc, &rdst);
         r.map_err(|e| it.os_error_errno(e.errno, Some(&src.obj), Some(&dst.obj)))
     }
 
@@ -517,14 +517,16 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<()> {
-        if src_dir_fd.is_some() || dst_dir_fd.is_some() {
-            return Err(unavailable(it, "link", "src_dir_fd and dst_dir_fd"));
-        }
-        let _ = follow_symlinks;
         if src.bytes != dst.bytes {
             return Err(it.type_error("link: src and dst must be the same type"));
         }
-        let r = it.platform.borrow_mut().link(&src.path, &dst.path);
+        let rsrc = at_path(it, src_dir_fd, &src)?;
+        let rdst = at_path(it, dst_dir_fd, &dst)?;
+        let r = if follow_symlinks {
+            it.platform.borrow_mut().link(&rsrc, &rdst)
+        } else {
+            lumen_os::posix::link_ex(&rsrc, &rdst, false).map_err(IoError::from)
+        };
         r.map_err(|e| it.os_error_errno(e.errno, Some(&src.obj), Some(&dst.obj)))
     }
 
@@ -539,19 +541,19 @@ pub mod posix {
         target_is_directory: bool,
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<()> {
-        no_dir_fd(it, "symlink", dir_fd)?;
         if src.bytes != dst.bytes {
             return Err(it.type_error("symlink: src and dst must be the same type"));
         }
-        let r = it.platform.borrow_mut().symlink(&src.path, &dst.path, target_is_directory);
+        let rdst = at_path(it, dir_fd, &dst)?;
+        let r = it.platform.borrow_mut().symlink(&src.path, &rdst, target_is_directory);
         r.map_err(|e| it.os_error_errno(e.errno, Some(&src.obj), Some(&dst.obj)))
     }
 
     /// Return a string representing the path to which the symbolic link points.
     #[op]
     fn readlink(it: &mut Interp, #[kw] path: PathArg, #[kwonly] dir_fd: Option<i32>) -> R<Value> {
-        no_dir_fd(it, "readlink", dir_fd)?;
-        let r = it.platform.borrow_mut().readlink(&path.path);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().readlink(&rp);
         r.map(|s| path.wrap(s)).map_err(|e| path_err(it, e, &path))
     }
 
@@ -566,13 +568,16 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<()> {
-        no_dir_fd(it, "chmod", dir_fd)?;
+        let rp = at_path(it, dir_fd, &path)?;
         if !follow_symlinks {
+            if cfg!(target_vendor = "apple") && path.fd.is_none() {
+                return lumen_os::posix::lchmod(&rp, mode as u32).map_err(|e| fs_path_err(it, e, &path));
+            }
             return Err(unavailable(it, "chmod", "follow_symlinks"));
         }
         let r = match path.fd {
             Some(fd) => it.platform.borrow_mut().fd_chmod(fd, mode as u32),
-            None => it.platform.borrow_mut().chmod(&path.path, mode as u32),
+            None => it.platform.borrow_mut().chmod(&rp, mode as u32),
         };
         r.map_err(|e| path_err(it, e, &path))
     }
@@ -596,8 +601,8 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<()> {
-        no_dir_fd(it, "chown", dir_fd)?;
-        let r = it.platform.borrow_mut().chown(&path.path, uid as u32, gid as u32, follow_symlinks);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().chown(&rp, uid as u32, gid as u32, follow_symlinks);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -644,7 +649,7 @@ pub mod posix {
         #[default(true)]
         follow_symlinks: bool,
     ) -> R<()> {
-        no_dir_fd(it, "utime", dir_fd)?;
+        let rp = at_path(it, dir_fd, &path)?;
         let (atime, mtime) = match (times, ns) {
             (Some(_), Some(_)) => return Err(it.value_error("utime: you may specify either 'times' or 'ns' but not both")),
             (Some(t), None) => match t.tuple_items() {
@@ -669,7 +674,7 @@ pub mod posix {
         };
         let r = match path.fd {
             Some(fd) => it.platform.borrow_mut().fd_utimes(fd, atime, mtime),
-            None => it.platform.borrow_mut().utimes(&path.path, atime, mtime, follow_symlinks),
+            None => it.platform.borrow_mut().utimes(&rp, atime, mtime, follow_symlinks),
         };
         r.map_err(|e| path_err(it, e, &path))
     }
@@ -704,8 +709,8 @@ pub mod posix {
         mode: i32,
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<i32> {
-        no_dir_fd(it, "open", dir_fd)?;
-        let r = it.platform.borrow_mut().fd_open(&path.path, flags, mode as u32);
+        let rp = at_path(it, dir_fd, &path)?;
+        let r = it.platform.borrow_mut().fd_open(&rp, flags, mode as u32);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -1768,8 +1773,8 @@ pub mod posix {
     ///   If it is unavailable, using it will raise a NotImplementedError.
     #[op]
     fn mkfifo(it: &mut Interp, #[kw] path: PathArg, #[kw] #[default(438)] mode: i32, #[kwonly] dir_fd: Option<i32>) -> R<()> {
-        no_dir_fd(it, "mkfifo", dir_fd)?;
-        lumen_os::posix::mkfifo(&path.path, mode as u32).map_err(|e| fs_err(it, e))
+        let rp = at_path(it, dir_fd, &path)?;
+        lumen_os::posix::mkfifo(&rp, mode as u32).map_err(|e| fs_err(it, e))
     }
 
     /// Create a node in the file system.
@@ -1793,8 +1798,8 @@ pub mod posix {
         #[kw] #[default(0)] device: u64,
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<()> {
-        no_dir_fd(it, "mknod", dir_fd)?;
-        lumen_os::posix::mknod(&path.path, mode as u32, device).map_err(|e| fs_err(it, e))
+        let rp = at_path(it, dir_fd, &path)?;
+        lumen_os::posix::mknod(&rp, mode as u32, device).map_err(|e| fs_err(it, e))
     }
 
     /// Extracts a device major number from a raw device number.
@@ -2834,7 +2839,23 @@ pub mod posix {
         Ok(Value::list(names.into_iter().map(|n| p.wrap(n)).collect()))
     }
 
-    const HAVE_FUNCTIONS: [&str; 10] = [
+    const HAVE_FUNCTIONS: [&str; 26] = [
+        "HAVE_FACCESSAT",
+        "HAVE_FCHMODAT",
+        "HAVE_FCHOWNAT",
+        "HAVE_FDOPENDIR",
+        "HAVE_FSTATAT",
+        "HAVE_FUTIMENS",
+        "HAVE_LINKAT",
+        "HAVE_MKDIRAT",
+        "HAVE_MKFIFOAT",
+        "HAVE_MKNODAT",
+        "HAVE_OPENAT",
+        "HAVE_READLINKAT",
+        "HAVE_RENAMEAT",
+        "HAVE_SYMLINKAT",
+        "HAVE_UNLINKAT",
+        "HAVE_UTIMENSAT",
         "HAVE_FCHDIR",
         "HAVE_FCHMOD",
         "HAVE_FCHOWN",

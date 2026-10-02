@@ -1,0 +1,26 @@
+['close', 'closed', 'find', 'flush', 'madvise', 'move', 'read', 'read_byte', 'readline', 'resize', 'rfind', 'seek', 'seekable', 'size', 'tell', 'write', 'write_byte']
+True 3
+1100 True 0 -
+False b'hello' 5 6 1089
+b'rld'
+seek out of range
+True
+mmap closed or invalid
+20 
+OSError [Errno 9] Bad file descriptor
+ValueError mmap can't resize with trackfd=False.
+8192
+mmap can't modify a readonly memory map.
+mmap can't modify a readonly memory map.
+b'abclo'
+b'xyz\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' 121 b'y' b'\x00\x00\x00'
+ 1
+b'yz\x00\x00\x00'
+ValueError madvise start out of bounds
+None 
+True
+OSError [Errno 22] Invalid argument
+OverflowError memory mapped length must be positive
+mmap invalid access parameter.
+mmap can't specify both access and flags, prot.
+10

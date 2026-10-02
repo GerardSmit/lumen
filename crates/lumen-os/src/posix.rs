@@ -1612,6 +1612,70 @@ sys! {
     }
 }
 
+// ---- directory-relative paths ---------------------------------------------------------------------
+
+sys! {
+    /// The path the open descriptor `fd` refers to.
+    pub fn fd_path(fd: i32) -> R<String> {
+        ck(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
+        #[cfg(target_vendor = "apple")]
+        {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into the buffer.
+            ck_unit(unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) })?;
+            let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let p = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+            Ok(p.to_string_lossy().into_owned())
+        }
+    }
+}
+
+/// `path` as seen from the directory open on `dir_fd` (the `*at` calls' `dirfd`): absolute
+/// paths are returned unchanged.
+pub fn at_path(dir_fd: i32, path: &str) -> R<String> {
+    if path.starts_with('/') {
+        return Ok(path.to_string());
+    }
+    let dir = fd_path(dir_fd)?;
+    if !std::fs::metadata(&dir).map(|m| m.is_dir()).unwrap_or(false) {
+        return Err(FsError("ENOTDIR"));
+    }
+    if path.is_empty() {
+        return Err(FsError("ENOENT"));
+    }
+    Ok(if dir.ends_with('/') { format!("{dir}{path}") } else { format!("{dir}/{path}") })
+}
+
+sys! {
+    /// `faccessat(AT_FDCWD, ..)` with the `AT_EACCESS` and `AT_SYMLINK_NOFOLLOW` flags.
+    pub fn access_ex(path: &str, mode: u32, effective: bool, follow: bool) -> R<()> {
+        let p = cstr(path)?;
+        let mut flags = 0;
+        if effective {
+            flags |= libc::AT_EACCESS;
+        }
+        if !follow {
+            flags |= libc::AT_SYMLINK_NOFOLLOW;
+        }
+        // SAFETY: `p` is a valid NUL-terminated string.
+        ck_unit(unsafe { libc::faccessat(libc::AT_FDCWD, p.as_ptr(), mode as _, flags) })
+    }
+}
+
+sys! {
+    /// `linkat(AT_FDCWD, src, AT_FDCWD, dst, flags)`, following a symlink `src` when `follow`.
+    pub fn link_ex(src: &str, dst: &str, follow: bool) -> R<()> {
+        let (s, d) = (cstr(src)?, cstr(dst)?);
+        let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+        // SAFETY: both paths are valid NUL-terminated strings.
+        ck_unit(unsafe { libc::linkat(libc::AT_FDCWD, s.as_ptr(), libc::AT_FDCWD, d.as_ptr(), flags) })
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
