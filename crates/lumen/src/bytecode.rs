@@ -45,6 +45,7 @@ pub(crate) mod positions;
 mod prepared_call;
 pub(crate) use prepared_call::{call_once_direct, PreparedCall};
 pub(crate) mod serialize;
+mod verify;
 mod switch;
 mod switch_table;
 mod this_binding;
@@ -982,6 +983,7 @@ impl std::fmt::Debug for Chunk {
 /// past the activation to the wrong binding, so everything not fully understood returns `None`
 /// (direct eval, `with`, sloppy block function declarations, module syntax, …) and the caller
 /// bails to the tree-walker.
+#[derive(Clone)]
 struct CaptureScan {
     /// Declared-name scopes, innermost last, each tagged with the function-nesting depth it
     /// belongs to (0 = the function being compiled) and its push serial.
@@ -1165,7 +1167,22 @@ impl CaptureScan {
             self_name: func.name.clone().filter(|_| func.is_fn_expr), self_named: false,
             loop_depth: 0, next_serial: 0, env_this: false, arrow_path: vec![func.is_arrow],
         };
+        let mut defaults = scan.clone();
         scan.fn_body(func)?;
+        // Parameter initializers cannot see declarations from the function body.
+        let mut header = func.clone();
+        header.body = std::cell::RefCell::new(Some(Rc::new(Vec::new())));
+        header.lazy = std::cell::RefCell::new(None);
+        defaults.fn_body(&header)?;
+        let mut parameters = std::collections::HashSet::new();
+        for parameter in &func.params { pat_idents(&parameter.pattern, &mut parameters); }
+        if !func.is_arrow { parameters.insert("arguments".into()); }
+        if func.is_fn_expr {
+            if let Some(name) = &func.name { parameters.insert(name.clone()); }
+        }
+        defaults.push_scope(parameters);
+        for parameter in &func.params { defaults.pat_decl_exprs(&parameter.pattern)?; }
+        scan.free_refs.extend(defaults.free_refs);
         Some(scan.free_refs)
     }
 
@@ -2441,7 +2458,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
     let cap_cache_len = c.names.len();
     let activation_layout = activation::ActivationLayout::new(&c.cap_inits, c.env_this, &c.names);
     let positions = positions::encode(&c.ops, &c.sites);
-    Some(Rc::new(Chunk {
+    Some(jit::track_chunk(Rc::new(Chunk {
         ops: c.ops,
         consts: c.consts,
         names: c.names,
@@ -2481,7 +2498,7 @@ fn compile_fresh_with(func: &Function, virt_ok: bool, escaped: &mut bool) -> Opt
             && !func.is_async,
         positions,
         inline_cbs: Default::default(),
-    }))
+    })))
 }
 
 #[derive(Default)]
@@ -5378,14 +5395,14 @@ fn drive_vm(
     mut pending_throw: Option<Value>,
 ) -> Result<VmStep, Abrupt> {
     // --- whole-function JIT tier: a frame starting at pc 0 may run native function code ---
-    if *pc == 0 && pending_throw.is_none() && stack.is_empty() && jit::entry_due(chunk) {
+    if *pc == 0 && pending_throw.is_none() && stack.is_empty() && jit::entry_due(i, chunk) {
         match jit::on_entry(i, chunk, env, slots, stack, pc, this_val) {
             Ok(Some(step)) => return Ok(step),
             Ok(None) => {}
             Err(Abrupt::Throw(e)) => pending_throw = Some(e),
             Err(other) => return Err(other),
         }
-    } else if pending_throw.is_none() && handlers.is_empty() && jit::resume_due(chunk, *pc) {
+        } else if pending_throw.is_none() && handlers.is_empty() && jit::resume_due(i, chunk, *pc) {
         // An async body resumed after an `await`: its function code continues there.
         match jit::on_resume(i, chunk, env, slots, stack, pc, this_val) {
             Ok(Some(step)) => return Ok(step),
@@ -6223,7 +6240,7 @@ fn run_vm_frames<const ONE: bool>(
     // throw unwinds from the frame like any op's.
     macro_rules! jit_entry {
         () => {
-            if jit::entry_due(chunk) {
+            if jit::entry_due(i, chunk) {
                 let r = jit::on_entry(i, chunk, env, slots, stack.vec(), &mut pc.v, this_val);
                 unsafe { stack.reload() };
                 unsafe { *pc.dst = pc.v };
@@ -7048,7 +7065,7 @@ fn run_vm_frames<const ONE: bool>(
                     i.gc_check_amortized()?;
                     let backedge = *pc - 1;
                     *pc = t as usize;
-                    if jit::backedge_due(chunk) {
+                    if jit::backedge_due(i, chunk) {
                         // Through a temporary: taking `pc`'s address would pin it to memory.
                         let mut p = *pc;
                         let r = jit::on_backedge(

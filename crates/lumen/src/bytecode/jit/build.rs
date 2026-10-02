@@ -60,6 +60,7 @@ pub(super) mod new_plan;
 use super::layout;
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
+use crate::bytecode::verify::successors;
 use lumen_codegen::{
     BinaryOp, Block, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC, MemKind,
     Signature, Type, UnaryOp, Value as V, Variable,
@@ -611,26 +612,6 @@ struct Analysis {
     resumes: Vec<(usize, usize)>,
 }
 
-/// Whether control can continue to `pc + 1`, and the jump target.
-fn successors(op: &Op) -> (bool, Option<usize>) {
-    let falls = !matches!(
-        op,
-        Op::Jump(_)
-            | Op::Return
-            | Op::ReturnUndef
-            | Op::Throw
-            | Op::IterAbortL(_)
-            | Op::DerivedReturn
-    );
-    // A `PushHandler`'s catch pc is no jump: its throw edge is added separately (with the
-    // exception pushed and the handler popped).
-    let target = match op {
-        Op::PushHandler(_) => None,
-        _ => crate::jit_ir::jump_target(op),
-    };
-    (falls, target)
-}
-
 /// Function mode: for each pc, the `fresh` slots (see [`fn_kinds`]) definitely written before
 /// it on every path from the entry — their `undefined` flag is known clear there, so reads need
 /// no check. Catch pads know nothing (conservative). Every translated use of a fresh (`Num`)
@@ -806,80 +787,9 @@ fn analyze(chunk: &Chunk, header: usize, backedge: usize, func: bool) -> Result<
             "op at {backedge} is not the backward jump to {header}"
         ));
     }
+    let (depth, hs, _) = crate::bytecode::verify::stack_region(chunk, header, backedge, func, true)?;
     let inr = |pc: usize| pc >= header && pc <= backedge;
     let n = backedge - header + 1;
-    let mut depth: Vec<Option<usize>> = vec![None; n];
-    let mut hs: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-    depth[0] = Some(0);
-    let mut work = vec![header];
-    while let Some(pc) = work.pop() {
-        let op = &ops[pc];
-        match op {
-            // Function code leaves it to the interpreter (an exit before it).
-            Op::ForInStepL(..) if !func => {
-                return Err(format!("iteration op {op:?} at {pc}"));
-            }
-            _ => {}
-        }
-        let d = depth[pc - header].expect("queued ops have a depth");
-        let (pops, pushes) = chunk
-            .jit_stack_effect(pc)
-            .ok_or_else(|| format!("no stack effect for {op:?} at {pc}"))?;
-        if d < pops {
-            return Err(format!("stack underflow at {pc}"));
-        }
-        let after = d - pops + pushes;
-        let h = hs[pc - header].clone();
-        if matches!(op, Op::Await) && (!h.is_empty() || !func) {
-            // Under a region handler, the exit's handlers would be finished by a nested driver
-            // the suspension leaves. A loop would enter and exit its code once per iteration
-            // (until resume entries exist).
-            return Err(format!("await at {pc} inside a region handler or loop region"));
-        }
-        let mut h_after = h.clone();
-        // (successor pc, depth, handlers): the op's own edges, plus the throw edge of a region
-        // handler to its catch pad.
-        let mut edges: Vec<(usize, usize, Vec<(usize, usize)>)> = Vec::new();
-        match *op {
-            Op::PushHandler(t) => {
-                h_after.push((t as usize, d));
-                edges.push((t as usize, d + 1, h.clone()));
-            }
-            Op::PopHandler => {
-                if h_after.pop().is_none() {
-                    return Err(format!("PopHandler at {pc} pops a handler from outside the loop"));
-                }
-            }
-            _ => {}
-        }
-        let (falls, target) = successors(op);
-        for q in falls.then_some(pc + 1).into_iter().chain(target) {
-            edges.push((q, after, h_after.clone()));
-        }
-        for (q, dq, hq) in edges {
-            if !inr(q) {
-                continue;
-            }
-            match depth[q - header] {
-                None => {
-                    depth[q - header] = Some(dq);
-                    hs[q - header] = hq;
-                    work.push(q);
-                }
-                Some(e) if e != dq => {
-                    return Err(format!("inconsistent stack depth at {q}"));
-                }
-                Some(_) if hs[q - header] != hq => {
-                    return Err(format!("inconsistent handlers at {q}"));
-                }
-                Some(_) => {}
-            }
-        }
-    }
-    if !hs[0].is_empty() {
-        return Err("handlers at the loop header".into());
-    }
-
     let mut leader = vec![false; n];
     let mut preds = vec![0u32; n];
     let mut back = vec![0u32; n];
@@ -3331,6 +3241,10 @@ impl<'a, 'f> Tr<'a, 'f> {
     /// `x - 2^32 * floor(x / 2^32)` (exact) brings it into [0, 2^32) first. NaN and ±Infinity
     /// come out of that reduction as NaN, which saturates to 0 — ToInt32's answer.
     fn to_int32(&mut self, x: V) -> V {
+        #[cfg(target_arch = "aarch64")]
+        { return self.fb.convert(ConvOp::ToJsInt32, Type::I32, x); }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
         // |x| < 2^63: the truncation to I64 is exact and its low 32 bits are ToInt32 (native
         // targets use the plain conversion, as in `to_index`; wasm32's traps, so it saturates).
         // Otherwise (huge, infinite, NaN) reduce modulo 2^32 first, out of line.
@@ -3358,9 +3272,11 @@ impl<'a, 'f> Tr<'a, 'f> {
         self.fb.seal_block(done);
         self.fb.switch_to_block(done);
         r
+        }
     }
 
     /// ToInt32 of any F64 (the modular reduction).
+    #[cfg(not(target_arch = "aarch64"))]
     fn to_int32_big(&mut self, x: V) -> V {
         let ax = self.fb.unary(UnaryOp::Fabs, x);
         let lim = self.fb.f64const(9223372036854775808.0);

@@ -387,9 +387,9 @@ impl<'a> Emitter<'a> {
                 let b = self.r(b);
                 self.a.ldst(op, rt, b, off as i64);
             }
-            Amode::Reg(b, i) => {
+            Amode::Reg(b, i, scaled) => {
                 let (b, i) = (self.r(b), self.r(i));
-                self.a.ldst_reg(op, rt, b, i, false);
+                self.a.ldst_reg(op, rt, b, i, scaled);
             }
         }
     }
@@ -528,6 +528,14 @@ impl<'a> Emitter<'a> {
                 let (d, a, b, c) = (self.r(*dst), self.r(*a), self.r(*b), self.r(*c));
                 self.a.msub(size.w(), d, a, b, c);
             }
+            MInst::Madd { size, dst, a, b, c } => {
+                let (d, a, b, c) = (self.r(*dst), self.r(*a), self.r(*b), self.r(*c));
+                self.a.madd(size.w(), d, a, b, c);
+            }
+            MInst::Bitfield { size, dst, src, signed, immr, imms } => {
+                let (d, s) = (self.r(*dst), self.r(*src));
+                self.a.bfm(*signed, size.w(), d, s, *immr as u32, *imms as u32);
+            }
             MInst::Bit { op, size, dst, src } => {
                 let (d, s, w) = (self.r(*dst), self.r(*src), size.w());
                 match op {
@@ -576,6 +584,10 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            MInst::CCmp { size, a, b, cc, nzcv } => {
+                let (a, b) = (self.r(*a), self.r(*b));
+                self.a.ccmp(size.w(), a, b, *cc, *nzcv);
+            }
             MInst::FCmp { double, a, b } => {
                 let (a, b) = (self.r(*a), self.r(*b));
                 self.a.fcmp(*double, a, b);
@@ -618,6 +630,10 @@ impl<'a> Emitter<'a> {
             } => {
                 let (d, s) = (self.r(*dst), self.r(*src));
                 self.a.fcvt(*to_double, d, s);
+            }
+            MInst::FToJsInt32 { dst, src } => {
+                let (dst, src) = (self.r(*dst), self.r(*src));
+                self.a.word(0x1e7e0000 | (src as u32) << 5 | dst as u32);
             }
             MInst::IntToF {
                 signed,
@@ -762,6 +778,21 @@ impl<'a> Emitter<'a> {
                 } else {
                     self.a.cbz(true, false, r, t);
                     self.a.b(n);
+                }
+            }
+            MInst::TestBit { reg, bit, nz, taken, not_taken } => {
+                let r = self.r(*reg);
+                let (mut t, mut n, mut nz) = (*taken, *not_taken, *nz);
+                if t == bi + 1 { core::mem::swap(&mut t, &mut n); nz = !nz; }
+                if t == n {
+                    if t != bi + 1 { self.a.b(self.blocks[t]); }
+                } else {
+                    // A local skip keeps TBZ's 14-bit reach independent of function size.
+                    let skip = self.a.new_label();
+                    self.a.tbz(!nz, *bit, r, skip);
+                    self.a.b(self.blocks[t]);
+                    self.a.bind(skip);
+                    if n != bi + 1 { self.a.b(self.blocks[n]); }
                 }
             }
             MInst::BrTable {

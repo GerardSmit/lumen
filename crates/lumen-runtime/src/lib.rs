@@ -657,6 +657,10 @@ impl Runtime {
         }
     }
 
+    pub fn run_precompiled_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<(), String> {
+        self.run_precompiled(&lumen::Precompiled::from_bytes(bytes))
+    }
+
     /// Evaluate a Worker entry `source` (a module when `is_module`, else a classic script) WITHOUT
     /// running the loop — the caller arms the message inbox first, then pumps the loop itself so
     /// the worker stays alive for messages. `base` seeds relative-import resolution. `Err` is the

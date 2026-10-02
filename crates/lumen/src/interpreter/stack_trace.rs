@@ -111,14 +111,14 @@ pub(crate) struct LineTable {
     /// An ahead-of-time blob's encoded table ([`LineTable::lazy`]), decoded into `decoded` on
     /// the first lookup: a large bundle's table is sizeable and most runs
     /// never format a stack position in it.
-    encoded: Option<&'static [u8]>,
+    encoded: Option<lumen_common::bytes::Bytes>,
     decoded: std::cell::OnceCell<Option<Box<LineTable>>>,
 }
 
 impl LineTable {
     /// A table decoded from `b` ([`LineTable::encode`]'s form) on its first lookup; a malformed
     /// `b` then yields no positions.
-    pub(crate) fn lazy(b: &'static [u8]) -> LineTable {
+    pub(crate) fn lazy(b: lumen_common::bytes::Bytes) -> LineTable {
         LineTable {
             starts: Vec::new(),
             wide: Vec::new(),
@@ -174,7 +174,7 @@ impl LineTable {
 
     /// 1-based line and 0-based UTF-16 column of byte offset `p`.
     pub(crate) fn line_col(&self, p: u32) -> Option<(u32, u32)> {
-        if let Some(b) = self.encoded {
+        if let Some(b) = &self.encoded {
             return self
                 .decoded
                 .get_or_init(|| {

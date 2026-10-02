@@ -1004,6 +1004,7 @@ impl Lower<'_> {
             ConvOp::Uext
             | ConvOp::FromUint
             | ConvOp::ToUint
+            | ConvOp::ToJsInt32
             | ConvOp::ToSintSat
             | ConvOp::ToUintSat => return Err(format!("x64: {op:?} reached lowering")),
         }

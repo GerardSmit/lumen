@@ -20,6 +20,7 @@ use lumen_repl::Repl;
 use lumen_runtime::Runtime;
 
 mod dotenv;
+mod aot;
 mod options;
 mod typed;
 
@@ -64,6 +65,18 @@ fn main() {
 
 fn real_main() {
     let all_args: Vec<String> = std::env::args().collect();
+    if all_args.get(1).map(String::as_str) == Some("compile") {
+        if let Err(message) = aot::compile(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
+    if all_args.get(1).map(String::as_str) == Some("target") {
+        if let Err(message) = aot::write_target(&all_args[2..]) {
+            die(1, &message);
+        }
+        return;
+    }
     // `lumen typed ...`: the typed tier's analyzer / Node-compatible type stripper.
     if all_args.get(1).map(String::as_str) == Some("typed") {
         std::process::exit(typed::main(all_args[2..].to_vec()));
@@ -73,6 +86,10 @@ fn real_main() {
         .cloned()
         .unwrap_or_else(|| "lumen".to_string());
     let mut args: Vec<String> = all_args.iter().skip(1).cloned().collect();
+    if args.first().map(String::as_str) == Some("run") {
+        args.remove(0);
+        if args.is_empty() { die(1, "run requires an entry file"); }
+    }
     let force_repl = args.first().map(String::as_str) == Some("repl");
     if force_repl {
         args.remove(0);
@@ -267,7 +284,9 @@ fn real_main() {
     } else if let Some(path) = file {
         // ESM vs CommonJS like Node: .mjs -> module, .cjs -> commonjs, .js -> the nearest
         // package.json "type". A module runs through the import graph; CJS as `require.main`.
-        let result = if std::path::Path::new(&path).is_file() && is_esm_entry(&path) {
+        let result = if let Some(result) = aot::run_blob(&mut runtime, &path) {
+            result
+        } else if std::path::Path::new(&path).is_file() && is_esm_entry(&path) {
             runtime.run_module(&path)
         } else {
             runtime.run_main(&path)
@@ -330,7 +349,9 @@ fn eval_checked(runtime: &mut Runtime, code: &str) -> String {
 }
 
 fn run_entry(runtime: &mut Runtime, path: &str) {
-    let result = if is_esm_entry(path) {
+    let result = if let Some(result) = aot::run_blob(runtime, path) {
+        result
+    } else if is_esm_entry(path) {
         runtime.run_module(path)
     } else {
         runtime.run_main(path)

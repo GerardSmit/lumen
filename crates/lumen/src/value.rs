@@ -1843,6 +1843,11 @@ pub(crate) fn gc_trim_heap() {
     with_gc_state(|state| state.heap.trim(keep));
 }
 
+/// A disposed-realm boundary will not immediately refill its empty parcel chunks.
+pub(crate) fn gc_trim_quiescent_heap() {
+    with_gc_state(|state| state.heap.trim(1));
+}
+
 /// Return empty slab chunks to the system once objects dying by reference count (no sweep,
 /// e.g. a big array dropped) have left more than [`SPARE_CHUNKS`] of them empty for a while
 /// (see `ObjHeap::trim_if_emptied`). Polled from the interpreter's safe points.

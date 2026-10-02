@@ -552,6 +552,11 @@ impl ByteStore {
         Ok(r)
     }
 
+    /// Whether detachment can proceed without a live pin or bytes guard.
+    pub fn can_detach(&self) -> bool {
+        !self.is_detached() && !self.is_pinned() && self.borrow.get() == 0
+    }
+
     /// Detach: hand the bytes out (an external store's are copied) and leave the store empty and
     /// detached. Fails on a pinned or borrowed store, or one already detached. Readonly is a
     /// facade policy here (an immutable JS buffer is not detachable; that check precedes this).

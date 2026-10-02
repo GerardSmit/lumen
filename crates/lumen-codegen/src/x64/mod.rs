@@ -138,6 +138,7 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
     legalize(
         &mut f,
         Legal {
+            js_to_i32: false,
             from_u64: false,
             to_uint: false,
             to_int_sat: false,

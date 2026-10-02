@@ -50,6 +50,8 @@ pub struct SharedBufferHandle {
 #[cfg(feature = "parallel")]
 impl SharedBufferHandle {
     pub(crate) fn adopt_into(&self, interp: &mut Interp, pointer: usize) {
+        let length = self.backing.lock().unwrap().len();
+        interp.array_buffers.insert(pointer, ByteStore::zeroed(length).into());
         shared_mem_registry().lock().unwrap().entry(self.id).or_insert_with(|| self.backing.clone());
         interp.shared_buffers.insert(pointer, self.id);
     }
@@ -166,8 +168,10 @@ pub fn futex_block(
     };
     // On timeout, remove ourselves from the table (a notify may have already pulled us out).
     if !result {
-        if let Some(v) = wait_table().lock().unwrap().get_mut(&(id, index)) {
+        let mut table = wait_table().lock().unwrap();
+        if let Some(v) = table.get_mut(&(id, index)) {
             v.retain(|w| !Arc::ptr_eq(w, waiter));
+            if v.is_empty() { table.remove(&(id, index)); }
         }
     }
     result
@@ -182,7 +186,9 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
             } else {
                 (max as usize).min(v.len())
             };
-            v.drain(0..n).collect()
+            let waiters = v.drain(0..n).collect();
+            if v.is_empty() { t.remove(&(id, index)); }
+            waiters
         } else {
             Vec::new()
         }
@@ -1131,6 +1137,7 @@ pub struct Interp {
     /// coroutine handoffs. Compiled code loads it from its current frame.
     pub(crate) jit_shadow: Option<Box<crate::bytecode::jit::Shadow>>,
     pub(crate) jit_stats: std::cell::Cell<crate::JitStats>,
+    pub(crate) jit_mode: crate::JitMode,
     /// The innermost running native function's [`frames::NativeCtx`] (its address on the
     /// dispatcher's Rust stack; 0 = none), for the builtin frames of a stack trace.
     pub(crate) native_top: usize,
@@ -1704,6 +1711,7 @@ impl Interp {
             jit_frames: 0,
             jit_shadow: None,
             jit_stats: std::cell::Cell::new(crate::JitStats::default()),
+            jit_mode: crate::JitMode::Hot,
             native_top: 0,
             cur_site: frames::NO_SITE,
             sources: Default::default(),
@@ -2739,7 +2747,7 @@ impl Interp {
         let pointer = Gc::as_ptr(object) as usize;
         self.array_buffers
             .get(&pointer)
-            .is_some_and(|b| !b.is_readonly() && !b.is_pinned())
+            .is_some_and(|b| !b.is_readonly() && b.can_detach())
             && !self.shared_buffers.contains_key(&pointer)
             && !matches!(
                 object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),

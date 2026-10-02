@@ -10,6 +10,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+lumen-common = { path = "../lumen-common", default-features = false }
 
 [lints]
 workspace = true

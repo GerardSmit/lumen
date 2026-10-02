@@ -52,6 +52,10 @@ pub fn compile_module(
     let mut bodies = Vec::with_capacity(funcs.len());
     for f in funcs {
         let mut f = f.clone();
+        crate::legalize::legalize(&mut f, crate::legalize::Legal {
+            from_u64: true, to_uint: true, to_int_sat: true,
+            srem_min_neg1: true, fcopysign: true, js_to_i32: false,
+        });
         f.resolve_aliases();
         crate::opt::remove_unreachable(&mut f);
         func_types.push(types.index(&f.sig));

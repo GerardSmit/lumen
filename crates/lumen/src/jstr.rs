@@ -53,7 +53,7 @@ pub fn unit_len(s: &str) -> usize {
 /// surrogates are smuggled.
 pub fn from_units(units: &[u16]) -> String {
     // ASCII fast path: no pairs or smuggling below 0x80.
-    if units.iter().all(|&u| u < 0x80) {
+    if lumen_common::scan::utf16_is_ascii(units) {
         let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
         return String::from_utf8(bytes).unwrap();
     }
@@ -115,11 +115,9 @@ pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
     // two ASCII bytes, or when one string is a prefix of the other (it ends on a character
     // boundary, so its units are a prefix too).
     let (x, y) = (a.as_bytes(), b.as_bytes());
-    match x.iter().zip(y).position(|(p, q)| p != q) {
-        None => return x.len().cmp(&y.len()),
-        Some(k) if x[k] < 0x80 && y[k] < 0x80 => return x[k].cmp(&y[k]),
-        Some(_) => {}
-    }
+    let k = lumen_common::scan::common_prefix(x, y);
+    if k == x.len().min(y.len()) { return x.len().cmp(&y.len()); }
+    if x[k] < 0x80 && y[k] < 0x80 { return x[k].cmp(&y[k]); }
     let mut ia = UnitIter::new(a);
     let mut ib = UnitIter::new(b);
     loop {

@@ -1,56 +1,113 @@
-use super::parcel::{HeapGuard, Intrinsic};
+use super::parcel::{Buffer, HeapGuard, Intrinsic};
 use super::{Limits, Parcel};
-use crate::{interpreter::Interp, value::{Exotic, Gc, Object, Value, set_data}};
+use crate::{
+    interpreter::Interp,
+    value::{Exotic, Gc, Object, Value, set_data},
+};
 use std::collections::HashMap;
 
-struct Builder {
-    memo: HashMap<usize, Gc>,
+pub(super) struct Builder {
+    pub(super) memo: HashMap<usize, Gc>,
     limits: Limits,
     transfer: std::collections::HashSet<usize>,
-    // Memo roots must drop before the heap, including on clone failure.
-    parcel: Parcel,
+    pub(super) class_objects: std::collections::HashSet<usize>,
+    pub(super) class_scopes: std::collections::HashSet<usize>,
+    pub(super) environments: HashMap<usize, crate::interpreter::Env>,
+    pub(super) private_keys: HashMap<String, String>,
+    // Object and scope memo roots must drop before the heap on clone failure.
+    pub(super) parcel: Parcel,
 }
 impl Parcel {
-    pub(crate) fn build(interp: &mut Interp, value: &Value, limits: Limits) -> Result<Self, Value> {
+    /// Copy a supported graph into an exclusively owned heap. Getters run on the sender.
+    pub fn build(interp: &mut Interp, value: &Value, limits: Limits) -> Result<Self, Value> {
         Self::build_with_transfer(interp, value, &[], limits)
     }
-    pub(crate) fn build_with_transfer(interp: &mut Interp, value: &Value, transfer: &[Value], limits: Limits) -> Result<Self, Value> {
+    /// Build the graph, then detach validated buffers without copying their backing bytes.
+    pub fn build_with_transfer(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+    ) -> Result<Self, Value> {
+        Self::build_checked(interp, value, transfer, limits, |_| Ok(()))
+    }
+    pub(crate) fn build_checked(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+        validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
+    ) -> Result<Self, Value> {
         let mut pointers = std::collections::HashSet::new();
         for buffer in transfer {
             if !interp.is_transferable_array_buffer(buffer)
-                || !pointers.insert(Gc::as_ptr(buffer.as_obj().unwrap()) as usize) {
-                return Err(interp.make_error("DataCloneError", "transfer requires distinct attached ArrayBuffers"));
+                || !pointers.insert(Gc::as_ptr(buffer.as_obj().unwrap()) as usize)
+            {
+                return Err(interp.make_error(
+                    "DataCloneError",
+                    "transfer requires distinct attached ArrayBuffers",
+                ));
             }
         }
-        let mut builder = Builder { parcel: Self::empty(), memo: HashMap::new(), limits, transfer: pointers };
+        let mut builder = Builder {
+            parcel: Self::empty(),
+            memo: HashMap::new(),
+            limits,
+            transfer: pointers,
+            class_objects: Default::default(),
+            class_scopes: Default::default(),
+            environments: Default::default(),
+            private_keys: Default::default(),
+        };
         builder.parcel.root = builder.copy(interp, value, 0)?;
         // Getter code may have detached a buffer. Validate all entries before
         // detaching any; clone failure must leave the other buffers attached.
         for buffer in transfer {
             if !interp.is_transferable_array_buffer(buffer) {
-                return Err(interp.make_error("DataCloneError", "transfer buffer was detached during cloning"));
+                return Err(interp.make_error(
+                    "DataCloneError",
+                    "transfer buffer was detached during cloning",
+                ));
             }
         }
+        validate(interp)?;
         for pointer in &builder.transfer {
-            let bytes = interp.array_buffers.remove(pointer).expect("validated buffer")
-                .detach().expect("validated buffer is attached and unpinned");
+            let bytes = interp
+                .array_buffers
+                .remove(pointer)
+                .expect("validated buffer")
+                .detach()
+                .expect("validated buffer is attached and unpinned");
             if let Some(object) = builder.memo.get(pointer) {
-                builder.parcel.side.buffers.insert(Gc::as_ptr(object) as usize, bytes);
+                builder
+                    .parcel
+                    .side
+                    .buffers
+                    .get_mut(&(Gc::as_ptr(object) as usize))
+                    .expect("buffer metadata")
+                    .bytes = bytes;
             }
         }
         Ok(builder.parcel)
     }
 }
 impl Builder {
-    fn charge(&mut self, interp: &Interp, bytes: usize) -> Result<(), Value> {
+    pub(super) fn charge(&mut self, interp: &Interp, bytes: usize) -> Result<(), Value> {
         self.parcel.bytes = self.parcel.bytes.saturating_add(bytes);
         if self.parcel.bytes > self.limits.bytes || self.parcel.objects > self.limits.objects {
             return Err(interp.make_error("RangeError", "parcel limit exceeded"));
         }
         Ok(())
     }
-    fn copy(&mut self, interp: &mut Interp, value: &Value, depth: usize) -> Result<Value, Value> {
-        if depth > 256 { return Err(interp.make_error("RangeError", "parcel graph is too deep")); }
+    pub(super) fn copy(
+        &mut self,
+        interp: &mut Interp,
+        value: &Value,
+        depth: usize,
+    ) -> Result<Value, Value> {
+        if depth > 256 {
+            return Err(interp.make_error("RangeError", "parcel graph is too deep"));
+        }
         self.charge(interp, std::mem::size_of::<Value>())?;
         Ok(match value {
             Value::Empty | Value::Undefined => Value::Undefined,
@@ -64,16 +121,36 @@ impl Builder {
             Value::BigInt(number) => {
                 let (negative, words) = number.words();
                 self.charge(interp, words.len() * 8)?;
-                Value::BigInt(crate::bigint::JsBigInt::from_words(negative, words.to_vec()))
+                Value::BigInt(crate::bigint::JsBigInt::from_words(
+                    negative,
+                    words.to_vec(),
+                ))
             }
-            Value::Sym(_) => return Err(interp.make_error("DataCloneError", "Symbol cannot be cloned")),
+            Value::Sym(_) => {
+                return Err(interp.make_error("DataCloneError", "Symbol cannot be cloned"));
+            }
             Value::Obj(object) => {
                 let pointer = Gc::as_ptr(object) as usize;
-                if let Some(copied) = self.memo.get(&pointer) { return Ok(Value::Obj(copied.clone())); }
-                if interp.proxies.contains_key(&pointer) || !matches!(object.borrow().call, crate::value::Callable::None | crate::value::Callable::User(_)) {
+                if let Some(copied) = self.memo.get(&pointer) {
+                    return Ok(Value::Obj(copied.clone()));
+                }
+                if interp.proxies.contains_key(&pointer)
+                    || (!matches!(
+                        object.borrow().call,
+                        crate::value::Callable::None | crate::value::Callable::User(_)
+                    ) && !(self.class_objects.contains(&pointer)
+                        && matches!(
+                            object.borrow().call,
+                            crate::value::Callable::AccessorGet(_)
+                                | crate::value::Callable::AccessorSet(_)
+                        )))
+                {
                     return Err(interp.make_error("DataCloneError", "unsupported object"));
                 }
                 interp.materialize(object);
+                if interp.class_info.contains_key(&pointer) {
+                    self.register_class(interp, object)?;
+                }
                 let array = object.borrow().exotic == Exotic::Array;
                 let exotic = object.borrow().exotic;
                 if matches!(exotic, Exotic::SymWrap | Exotic::Arguments) {
@@ -84,36 +161,121 @@ impl Builder {
                 self.charge(interp, std::mem::size_of::<Object>())?;
                 let copied = {
                     let _entered = HeapGuard::enter(&self.parcel.heap);
-                    if array { Object::new_array_from_vec(None, Vec::new()) } else { Object::new(None) }
+                    if array {
+                        Object::new_array_from_vec(None, Vec::new())
+                    } else {
+                        Object::new(None)
+                    }
                 };
                 self.memo.insert(pointer, copied.clone());
                 self.parcel.protos.push((copied.clone(), intrinsic));
+                match &object.borrow().call {
+                    crate::value::Callable::AccessorGet(key)
+                    | crate::value::Callable::AccessorSet(key) => {
+                        let key = self
+                            .private_keys
+                            .get(&***key)
+                            .expect("class accessor backing key");
+                        let key = std::rc::Rc::new(std::rc::Rc::<str>::from(key.as_str()));
+                        copied.borrow_mut().call = if matches!(
+                            object.borrow().call,
+                            crate::value::Callable::AccessorGet(_)
+                        ) {
+                            crate::value::Callable::AccessorGet(key)
+                        } else {
+                            crate::value::Callable::AccessorSet(key)
+                        };
+                    }
+                    _ => {}
+                }
                 let function = match &object.borrow().call {
-                    crate::value::Callable::User(user) => Some((user.func.clone(), user.env.clone())),
+                    crate::value::Callable::User(user) => {
+                        Some((user.func.clone(), user.env.clone()))
+                    }
                     _ => None,
                 };
                 if let Some((function, environment)) = function {
                     self.copy_function(interp, object, &copied, function, environment, depth)?;
                 }
                 self.copy_slots(interp, object, &copied, pointer, depth)?;
-                let keys = object.borrow().props.ordered_keys();
+                let keys = if self.class_objects.contains(&pointer) {
+                    object.borrow().props.iter().map(|(key, _)| key).collect()
+                } else {
+                    object.borrow().props.ordered_keys()
+                };
                 for key in keys {
-                    if Interp::is_sym_key(&key) { continue; }
-                    let enumerable = object.borrow().props.get(&key).is_some_and(|property| property.enumerable());
-                    if !enumerable && !(array && &*key == "length") { continue; }
-                    self.charge(interp, key.len())?;
+                    if Interp::is_sym_key(&key) && !self.class_objects.contains(&pointer) {
+                        continue;
+                    }
+                    if self.class_objects.contains(&pointer) {
+                        self.charge(
+                            interp,
+                            key.len()
+                                .saturating_add(std::mem::size_of::<crate::value::Property>()),
+                        )?;
+                        let property = object.borrow().props.get(&key).unwrap().clone();
+                        let property = self.copy_descriptor(interp, &property, depth + 1)?;
+                        if Interp::is_sym_key(&key) {
+                            let name = interp
+                                .wk_syms
+                                .iter()
+                                .find(|(_, _, symbol)| &**symbol == &*key)
+                                .map(|(name, _, _)| *name)
+                                .ok_or_else(|| {
+                                    interp.make_error(
+                                        "DataCloneError",
+                                        "class has an unsupported symbol key",
+                                    )
+                                })?;
+                            self.parcel
+                                .symbol_keys
+                                .push((copied.clone(), key.to_string(), name));
+                        }
+                        let key = self
+                            .private_keys
+                            .get(&*key)
+                            .cloned()
+                            .unwrap_or_else(|| key.to_string());
+                        let _entered = HeapGuard::enter(&self.parcel.heap);
+                        copied.borrow_mut().props.insert(key, property);
+                        continue;
+                    }
+                    let enumerable = object
+                        .borrow()
+                        .props
+                        .get(&key)
+                        .is_some_and(|property| property.enumerable());
+                    if !enumerable && !(array && &*key == "length") {
+                        continue;
+                    }
+                    self.charge(
+                        interp,
+                        key.len()
+                            .saturating_add(std::mem::size_of::<crate::value::Property>()),
+                    )?;
                     // Getters execute with the sender current, outside the allocation guard.
-                    let member = interp.get_member(value, &key).map_err(|abrupt| match abrupt {
-                        crate::interpreter::Abrupt::Throw(value) => value,
-                        _ => interp.make_error("DataCloneError", "property read failed"),
-                    })?;
+                    let member = interp
+                        .get_member(value, &key)
+                        .map_err(|abrupt| match abrupt {
+                            crate::interpreter::Abrupt::Throw(value) => value,
+                            _ => interp.make_error("DataCloneError", "property read failed"),
+                        })?;
                     let member = self.copy(interp, &member, depth + 1)?;
                     let _entered = HeapGuard::enter(&self.parcel.heap);
                     if array && &*key == "length" {
-                        copied.borrow_mut().props.insert("length", crate::value::Property::data(member, true, false, false));
+                        copied.borrow_mut().props.insert(
+                            "length",
+                            crate::value::Property::data(member, true, false, false),
+                        );
                     } else {
                         set_data(&copied, &key, member);
                     }
+                }
+                if self.class_objects.contains(&pointer)
+                    && (interp.class_info.contains_key(&pointer)
+                        || matches!(object.borrow().call, crate::value::Callable::None))
+                {
+                    self.copy_class_prototype(interp, object, &copied, depth + 1)?;
                 }
                 Value::Obj(copied)
             }
@@ -121,6 +283,19 @@ impl Builder {
     }
 
     fn intrinsic(&self, interp: &Interp, object: &Gc, pointer: usize) -> Result<Intrinsic, Value> {
+        if self.class_objects.contains(&pointer)
+            && matches!(
+                object.borrow().call,
+                crate::value::Callable::AccessorGet(_) | crate::value::Callable::AccessorSet(_)
+            )
+        {
+            return Ok(Intrinsic::Function);
+        }
+        if self.class_objects.contains(&pointer)
+            && matches!(object.borrow().call, crate::value::Callable::None)
+        {
+            return Ok(Intrinsic::Object);
+        }
         if let crate::value::Callable::User(user) = &object.borrow().call {
             return Ok(match (user.func.is_async, user.func.is_generator) {
                 (true, true) => Intrinsic::Extra("%AsyncGeneratorFunction.prototype%"),
@@ -129,9 +304,20 @@ impl Builder {
                 _ => Intrinsic::Function,
             });
         }
-        if interp.generators.contains_key(&pointer) || interp.module_ns.contains_key(&pointer)
-            || object.borrow().props.iter().any(|(key, _)| Interp::is_private_key(&key) && &*key != crate::value::EXOTIC_SLOT) {
-            return Err(interp.make_error("DataCloneError", "object has unsupported internal slots"));
+        if interp.generators.contains_key(&pointer)
+            || interp.is_weak_object(pointer)
+            || interp.module_ns.contains_key(&pointer)
+            || object.borrow().props.iter().any(|(key, _)| {
+                Interp::is_private_key(&key)
+                    && !self.class_objects.contains(&pointer)
+                    && &*key != crate::value::EXOTIC_SLOT
+                    && !(object.borrow().exotic == Exotic::Error
+                        && matches!(&*key, "#\u{0}rawstack" | "#\u{0}stack"))
+            })
+        {
+            return Err(
+                interp.make_error("DataCloneError", "object has unsupported internal slots")
+            );
         }
         if let Some(data) = interp.map_data.get(&pointer) {
             use crate::builtins::collection_data::CollectionKind;
@@ -141,6 +327,29 @@ impl Builder {
                 _ => Err(interp.make_error("DataCloneError", "weak collections cannot be cloned")),
             };
         }
+        if let Some(info) = interp.typed_arrays.get(&pointer) {
+            return Ok(Intrinsic::Extra(info.kind.name()));
+        }
+        if interp.data_views.contains_key(&pointer) {
+            return Ok(Intrinsic::Extra("DataView"));
+        }
+        if interp.regexps.contains_key(&pointer) {
+            return Ok(Intrinsic::Extra("RegExp"));
+        }
+        if interp.shared_buffers.contains_key(&pointer) {
+            return Ok(Intrinsic::Extra("SharedArrayBuffer"));
+        }
+        if interp.array_buffers.contains_key(&pointer) {
+            return Ok(Intrinsic::Extra("ArrayBuffer"));
+        }
+        if object.borrow().props.contains("\u{0}ab_max_byte_length") {
+            return Err(
+                interp.make_error("DataCloneError", "detached ArrayBuffer cannot be cloned")
+            );
+        }
+        if object.borrow().props.contains("\u{0}date_ms") {
+            return Ok(Intrinsic::Extra("Date"));
+        }
         let object = object.borrow();
         let kind = match object.exotic {
             Exotic::Array => Intrinsic::Array,
@@ -149,45 +358,128 @@ impl Builder {
             Exotic::BoolWrap => Intrinsic::Boolean,
             Exotic::BigIntWrap => Intrinsic::Extra("BigInt"),
             Exotic::Error => {
-                let name = interp.error_protos.iter().find(|(_, proto)| object.proto.as_ref().is_some_and(|p| Gc::as_ptr(p) == Gc::as_ptr(proto))).map(|(name, _)| *name).unwrap_or("Error");
+                let name = interp
+                    .error_protos
+                    .iter()
+                    .find(|(_, proto)| {
+                        object
+                            .proto
+                            .as_ref()
+                            .is_some_and(|p| Gc::as_ptr(p) == Gc::as_ptr(proto))
+                    })
+                    .map(|(name, _)| *name)
+                    .unwrap_or("Error");
                 Intrinsic::Error(name)
             }
             _ => {
-                if let Some((name, _)) = interp.extra_protos.iter().find(|(_, proto)| object.proto.as_ref().is_some_and(|p| Gc::as_ptr(p) == Gc::as_ptr(proto))) {
+                if let Some((name, _)) = interp.extra_protos.iter().find(|(_, proto)| {
+                    object
+                        .proto
+                        .as_ref()
+                        .is_some_and(|p| Gc::as_ptr(p) == Gc::as_ptr(proto))
+                }) {
                     match *name {
-                        "ArrayBuffer" | "SharedArrayBuffer" | "DataView" | "RegExp" | "Date" |
-                        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array" |
-                        "Int32Array" | "Uint32Array" | "Float16Array" | "Float32Array" | "Float64Array" |
-                        "BigInt64Array" | "BigUint64Array" | "%GeneratorPrototype%" | "%AsyncGeneratorPrototype%" => Intrinsic::Extra(name),
-                        _ => return Err(interp.make_error("DataCloneError", "unsupported builtin object")),
+                        "ArrayBuffer"
+                        | "SharedArrayBuffer"
+                        | "DataView"
+                        | "RegExp"
+                        | "Date"
+                        | "Int8Array"
+                        | "Uint8Array"
+                        | "Uint8ClampedArray"
+                        | "Int16Array"
+                        | "Uint16Array"
+                        | "Int32Array"
+                        | "Uint32Array"
+                        | "Float16Array"
+                        | "Float32Array"
+                        | "Float64Array"
+                        | "BigInt64Array"
+                        | "BigUint64Array"
+                        | "%GeneratorPrototype%"
+                        | "%AsyncGeneratorPrototype%" => Intrinsic::Extra(name),
+                        _ => {
+                            return Err(
+                                interp.make_error("DataCloneError", "unsupported builtin object")
+                            );
+                        }
                     }
-                } else { Intrinsic::Object }
+                } else {
+                    Intrinsic::Object
+                }
             }
         };
         Ok(kind)
     }
 
-    fn copy_function(&mut self, interp: &mut Interp, source: &Gc, target: &Gc, function: std::rc::Rc<crate::ast::Function>, environment: crate::interpreter::Env, depth: usize) -> Result<(), Value> {
-        if function.is_method {
-            return Err(interp.make_error("DataCloneError", "methods and accessors cannot be cloned"));
+    fn copy_function(
+        &mut self,
+        interp: &mut Interp,
+        source: &Gc,
+        target: &Gc,
+        function: std::rc::Rc<crate::ast::Function>,
+        environment: crate::interpreter::Env,
+        depth: usize,
+    ) -> Result<(), Value> {
+        let class_member = self.class_objects.contains(&(Gc::as_ptr(source) as usize));
+        if function.is_method && !class_member {
+            return Err(
+                interp.make_error("DataCloneError", "methods and accessors cannot be cloned")
+            );
         }
-        let capture = |name: &str| interp.make_error("TypeError", format!("parallel function captures '{name}' from the outer scope; pass it in args"));
-        if environment.borrow().under_with() { return Err(capture("with")); }
+        let capture = |name: &str| {
+            interp.make_error(
+                "TypeError",
+                format!(
+                    "parallel function captures '{name}' from the outer scope; pass it in args"
+                ),
+            )
+        };
+        if environment.borrow().under_with() {
+            return Err(capture("with"));
+        }
         if function.is_arrow {
             let flags = function.scan_flags();
-            for (flag, name) in [(crate::ast::SCAN_THIS, "this"), (crate::ast::SCAN_ARGUMENTS, "arguments"), (crate::ast::SCAN_NEW_TARGET, "new.target")] {
-                if flags & flag != 0 { return Err(capture(name)); }
+            for (flag, name) in [
+                (crate::ast::SCAN_THIS, "this"),
+                (crate::ast::SCAN_ARGUMENTS, "arguments"),
+                (crate::ast::SCAN_NEW_TARGET, "new.target"),
+            ] {
+                if flags & flag != 0 {
+                    return Err(capture(name));
+                }
             }
         }
-        let names = crate::bytecode::function_free_identifiers(&function)
-            .ok_or_else(|| interp.make_error("TypeError", "parallel function contains dynamic scope; pass helpers in args"))?;
+        let names = crate::bytecode::function_free_identifiers(&function).ok_or_else(|| {
+            interp.make_error(
+                "TypeError",
+                "parallel function contains dynamic scope; pass helpers in args",
+            )
+        })?;
         for name in names {
             let mut scope = Some(environment.clone());
+            let mut class_binding = false;
             while let Some(current) = scope {
-                if current.borrow().vars.contains_key(&name) { return Err(capture(&name)); }
+                if current.borrow().vars.contains_key(&name) {
+                    if !self
+                        .class_scopes
+                        .contains(&(std::rc::Rc::as_ptr(&current) as usize))
+                    {
+                        return Err(capture(&name));
+                    }
+                    class_binding = true;
+                    break;
+                }
                 scope = current.borrow().parent.clone();
             }
-            if interp.global.borrow().props.get(&name).is_some_and(|property| property.enumerable()) {
+            if !class_binding
+                && interp
+                    .global
+                    .borrow()
+                    .props
+                    .get(&name)
+                    .is_some_and(|property| property.enumerable())
+            {
                 return Err(capture(&name));
             }
         }
@@ -195,45 +487,95 @@ impl Builder {
             crate::ast::FnSource::Range { src, .. } => &**src,
             _ => function.source.as_str().unwrap_or(""),
         };
-        let snapshot = crate::snapshot::encode(&[crate::ast::Stmt::FuncDecl(function.clone())], text);
+        let snapshot =
+            crate::snapshot::encode(&[crate::ast::Stmt::FuncDecl(function.clone())], text);
         self.charge(interp, snapshot.len().saturating_add(text.len()))?;
         let decoded = {
             let _entered = HeapGuard::enter(&self.parcel.heap);
             crate::snapshot::decode(&snapshot, text)
-        }.map_err(|message| interp.make_error("DataCloneError", message))?;
-        let crate::ast::Stmt::FuncDecl(decoded) = decoded.into_iter().next().expect("function snapshot") else { unreachable!() };
-        self.parcel.functions.push((target.clone(), decoded));
+        }
+        .map_err(|message| interp.make_error("DataCloneError", message))?;
+        let crate::ast::Stmt::FuncDecl(decoded) =
+            decoded.into_iter().next().expect("function snapshot")
+        else {
+            unreachable!()
+        };
+        let copied_env = if class_member {
+            Some(self.copy_environment(interp, &environment, depth + 1)?)
+        } else {
+            None
+        };
+        self.parcel
+            .functions
+            .push((target.clone(), decoded, copied_env));
+        if interp
+            .class_info
+            .contains_key(&(Gc::as_ptr(source) as usize))
+        {
+            self.copy_class_info(interp, source, target, &function, depth + 1)?;
+        }
         target.borrow_mut().is_constructor = source.borrow().is_constructor;
         for key in ["name", "length", "prototype"] {
-            if !source.borrow().props.contains(key) { continue; }
-            let value = interp.get_member(&Value::Obj(source.clone()), key).map_err(|abrupt| match abrupt {
-                crate::interpreter::Abrupt::Throw(value) => value,
-                _ => interp.make_error("DataCloneError", "function property read failed"),
-            })?;
+            if !source.borrow().props.contains(key) {
+                continue;
+            }
+            let value = interp
+                .get_member(&Value::Obj(source.clone()), key)
+                .map_err(|abrupt| match abrupt {
+                    crate::interpreter::Abrupt::Throw(value) => value,
+                    _ => interp.make_error("DataCloneError", "function property read failed"),
+                })?;
             let value = self.copy(interp, &value, depth + 1)?;
             let _entered = HeapGuard::enter(&self.parcel.heap);
             if key == "prototype" {
                 if let Value::Obj(prototype) = &value {
-                    prototype.borrow_mut().props.insert("constructor", crate::value::Property::builtin(Value::Obj(target.clone())));
+                    prototype.borrow_mut().props.insert(
+                        "constructor",
+                        crate::value::Property::builtin(Value::Obj(target.clone())),
+                    );
                 }
             }
-            target.borrow_mut().props.insert(key, crate::value::Property::builtin(value));
+            target
+                .borrow_mut()
+                .props
+                .insert(key, crate::value::Property::builtin(value));
         }
         Ok(())
     }
 
-    fn copy_slots(&mut self, interp: &mut Interp, source: &Gc, target: &Gc, pointer: usize, depth: usize) -> Result<(), Value> {
+    fn copy_slots(
+        &mut self,
+        interp: &mut Interp,
+        source: &Gc,
+        target: &Gc,
+        pointer: usize,
+        depth: usize,
+    ) -> Result<(), Value> {
         let target_pointer = Gc::as_ptr(target) as usize;
         let exotic = source.borrow().exotic;
         let payload = source.borrow().exotic_payload();
-        if let Some(payload) = payload {
+        if exotic == Exotic::Error {
+            // Raw trace frames retain sender functions. Only the formatted stack crosses.
+            let _entered = HeapGuard::enter(&self.parcel.heap);
+            target
+                .borrow_mut()
+                .set_exotic(Exotic::Error, Some(Value::Undefined));
+        } else if let Some(payload) = payload {
             let payload = self.copy(interp, &payload, depth + 1)?;
             let _entered = HeapGuard::enter(&self.parcel.heap);
             target.borrow_mut().set_exotic(exotic, Some(payload));
         }
         if let Some(data) = interp.map_data.get(&pointer) {
             let kind = data.kind();
-            let entries = data.iter().map(|(key, value)| (key.unpack(), value.unpack())).collect::<Vec<_>>();
+            self.charge(
+                interp,
+                data.len()
+                    .saturating_mul(std::mem::size_of::<(Value, Value)>()),
+            )?;
+            let entries = data
+                .iter()
+                .map(|(key, value)| (key.unpack(), value.unpack()))
+                .collect::<Vec<_>>();
             let mut copied = crate::builtins::collection_data::CollectionData::new(kind);
             for (key, value) in entries {
                 let key = self.copy(interp, &key, depth + 1)?;
@@ -242,14 +584,25 @@ impl Builder {
             }
             self.parcel.side.maps.insert(target_pointer, copied);
         }
-        if let Some(buffer) = interp.array_buffers.get(&pointer) {
-            let size = buffer.len();
-            let bytes = if self.transfer.contains(&pointer) { Vec::new() } else { buffer.to_vec() };
-            self.charge(interp, size)?;
-            self.parcel.side.buffers.insert(target_pointer, bytes);
-        }
         if let Some(shared) = interp.export_shared_array_buffer(&Value::Obj(source.clone()))? {
             self.parcel.side.shared.insert(target_pointer, shared);
+        } else if let Some(buffer) = interp.array_buffers.get(&pointer) {
+            let size = buffer.len();
+            let bytes = if self.transfer.contains(&pointer) {
+                Vec::new()
+            } else {
+                buffer
+                    .try_bytes()
+                    .map_err(|_| interp.make_error("DataCloneError", "buffer is borrowed"))?
+                    .to_vec()
+            };
+            self.charge(interp, size)?;
+            let metadata = Buffer {
+                bytes,
+                max_len: buffer.is_resizable().then(|| buffer.max_len()),
+                readonly: buffer.is_readonly(),
+            };
+            self.parcel.side.buffers.insert(target_pointer, metadata);
         }
         if let Some(mut info) = interp.typed_arrays.get(&pointer).copied() {
             let buffer = interp.ta_buffer[&pointer].clone();
@@ -262,35 +615,65 @@ impl Builder {
         if let Some((buffer, offset, length, track)) = interp.data_views.get(&pointer).copied() {
             let buffer = Value::Obj(interp.gc_pins[&buffer].clone());
             let buffer = self.copy(interp, &buffer, depth + 1)?;
-            self.parcel.side.views.insert(target_pointer, (Gc::as_ptr(buffer.as_obj().unwrap()) as usize, offset, length, track));
+            self.parcel.side.views.insert(
+                target_pointer,
+                (
+                    Gc::as_ptr(buffer.as_obj().unwrap()) as usize,
+                    offset,
+                    length,
+                    track,
+                ),
+            );
             let _entered = HeapGuard::enter(&self.parcel.heap);
-            target.borrow_mut().props.insert("\u{0}dv_buffer", crate::value::Property::builtin(buffer));
+            target
+                .borrow_mut()
+                .props
+                .insert("\u{0}dv_buffer", crate::value::Property::builtin(buffer));
         }
         if let Some(regex) = interp.regexps.get(&pointer) {
-            let regex = crate::regex::Regex::new(&regex.source, &regex.flags).map_err(|message| interp.make_error("DataCloneError", message))?;
-            self.parcel.side.regexps.insert(target_pointer, std::rc::Rc::new(regex));
+            let regex = crate::regex::Regex::new(&regex.source, &regex.flags)
+                .map_err(|message| interp.make_error("DataCloneError", message))?;
+            self.parcel
+                .side
+                .regexps
+                .insert(target_pointer, std::rc::Rc::new(regex));
         }
         // Hidden builtin properties carry Date/buffer metadata; Error fields are
         // non-enumerable. These are copied separately from ordinary own keys.
         let keys = match exotic {
-            Exotic::Error => vec!["name", "message", "stack", "cause", "code"],
+            Exotic::Error => vec!["name", "message", "stack", "cause", "code", "errors"],
             _ => {
                 let mut keys = Vec::new();
-                if interp.array_buffers.contains_key(&pointer) { keys.extend(["\u{0}ab_max_byte_length", "\u{0}ab_resizable", "\u{0}sab_id"]); }
-                if interp.regexps.contains_key(&pointer) { keys.push("lastIndex"); }
-                if source.borrow().proto.as_ref().is_some_and(|proto| interp.extra_protos.get("Date").is_some_and(|date| Gc::as_ptr(date) == Gc::as_ptr(proto))) { keys.push("\u{0}date_ms"); }
+                if interp.array_buffers.contains_key(&pointer) {
+                    keys.extend([
+                        "\u{0}ab_max_byte_length",
+                        "\u{0}ab_resizable",
+                        "\u{0}sab_id",
+                    ]);
+                }
+                if interp.regexps.contains_key(&pointer) {
+                    keys.push("lastIndex");
+                }
+                if source.borrow().props.contains("\u{0}date_ms") {
+                    keys.push("\u{0}date_ms");
+                }
                 keys
-            },
+            }
         };
         for key in keys {
-            if source.borrow().props.contains(key) {
-                let value = interp.get_member(&Value::Obj(source.clone()), key).map_err(|abrupt| match abrupt {
-                    crate::interpreter::Abrupt::Throw(value) => value,
-                    _ => interp.make_error("DataCloneError", "internal property read failed"),
-                })?;
+            if source.borrow().props.contains(key) || (exotic == Exotic::Error && key == "stack") {
+                let value = interp
+                    .get_member(&Value::Obj(source.clone()), key)
+                    .map_err(|abrupt| match abrupt {
+                        crate::interpreter::Abrupt::Throw(value) => value,
+                        _ => interp.make_error("DataCloneError", "internal property read failed"),
+                    })?;
                 let value = self.copy(interp, &value, depth + 1)?;
                 let _entered = HeapGuard::enter(&self.parcel.heap);
-                target.borrow_mut().props.insert(key, crate::value::Property::builtin(value));
+                target
+                    .borrow_mut()
+                    .props
+                    .insert(key, crate::value::Property::builtin(value));
             }
         }
         Ok(())

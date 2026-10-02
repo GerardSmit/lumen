@@ -817,6 +817,7 @@ name = "lumen-cli"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-aot",
  "lumen-host",
  "lumen-repl",
  "lumen-runtime",
@@ -825,6 +826,9 @@ dependencies = [
 [[package]]
 name = "lumen-codegen"
 version = "0.1.3"
+dependencies = [
+ "lumen-common",
+]
 
 [[package]]
 name = "lumen-common"

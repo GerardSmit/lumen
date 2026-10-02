@@ -52,20 +52,7 @@ fn put_uv(out: &mut Vec<u8>, mut v: u64) {
 }
 
 fn get_uv(data: &[u8], pos: &mut usize) -> R<u64> {
-    let mut v = 0u64;
-    let mut shift = 0;
-    loop {
-        let b = *data.get(*pos).ok_or_else(bad)?;
-        *pos += 1;
-        v |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return Ok(v);
-        }
-        shift += 7;
-        if shift >= 64 {
-            return Err(bad());
-        }
-    }
+    crate::aot::read_varint(data, pos).map_err(|_| bad())
 }
 
 fn len_code(len: usize) -> usize {
@@ -287,7 +274,7 @@ impl BitWriter {
 }
 
 /// `input` framed as stored (uncompressed) data.
-pub(crate) fn stored(input: &[u8]) -> Vec<u8> {
+pub fn stored(input: &[u8]) -> Vec<u8> {
     let mut stored = Vec::with_capacity(input.len() + 6);
     stored.push(0);
     put_uv(&mut stored, input.len() as u64);
@@ -296,7 +283,7 @@ pub(crate) fn stored(input: &[u8]) -> Vec<u8> {
 }
 
 /// Compress `input` (framed; see the module docs). Never larger than `input` plus the frame.
-pub(crate) fn compress(input: &[u8]) -> Vec<u8> {
+pub fn compress(input: &[u8]) -> Vec<u8> {
     let stored = stored(input);
     if input.len() < 64 {
         return stored;
@@ -469,10 +456,16 @@ impl BitReader<'_> {
 }
 
 /// Decompress a [`compress`] frame.
-pub(crate) fn decompress(data: &[u8]) -> R<Vec<u8>> {
+pub fn decompress(data: &[u8]) -> R<Vec<u8>> {
+    decompress_bounded(data, usize::MAX)
+}
+
+/// Reject an advertised output larger than the enclosing format permits before decoding.
+pub fn decompress_bounded(data: &[u8], max_len: usize) -> R<Vec<u8>> {
     let method = *data.first().ok_or_else(bad)?;
     let mut pos = 1;
     let len = usize::try_from(get_uv(data, &mut pos)?).map_err(|_| bad())?;
+    if len > max_len { return Err(bad()); }
     match method {
         0 => {
             let body = data.get(pos..).ok_or_else(bad)?;

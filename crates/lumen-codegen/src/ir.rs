@@ -243,6 +243,8 @@ pub enum ConvOp {
     ToSintSat,
     /// Float → unsigned int, truncating and saturating (NaN → 0).
     ToUintSat,
+    /// JavaScript ToInt32: truncate and reduce modulo 2^32; NaN/infinity -> 0.
+    ToJsInt32,
     /// F32 → F64.
     Promote,
     /// F64 → F32.

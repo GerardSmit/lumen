@@ -19,6 +19,7 @@ pub struct Legal {
     /// `srem` defined for `MIN % -1` (x64 `idiv` faults on it).
     pub srem_min_neg1: bool,
     pub fcopysign: bool,
+    pub js_to_i32: bool,
 }
 
 pub fn legalize(func: &mut Function, legal: Legal) {
@@ -166,6 +167,16 @@ pub fn legalize(func: &mut Function, legal: Legal) {
                     expand_to_u64(func, block, pos, inst, arg);
                 }
             }
+            InstData::Convert { op: ConvOp::ToJsInt32, arg, .. } if !legal.js_to_i32 => {
+                let x = insert(func, block, pos, InstData::Unary { op: UnaryOp::Trunc, arg });
+                let scale = insert(func, block, pos+1, InstData::F64const { bits: 4294967296.0f64.to_bits() });
+                let quotient = insert(func, block, pos+2, InstData::Binary { op: BinaryOp::Fdiv, args: [x, scale] });
+                let quotient = insert(func, block, pos+3, InstData::Unary { op: UnaryOp::Floor, arg: quotient });
+                let multiple = insert(func, block, pos+4, InstData::Binary { op: BinaryOp::Fmul, args: [quotient, scale] });
+                let reduced = insert(func, block, pos+5, InstData::Binary { op: BinaryOp::Fsub, args: [x, multiple] });
+                func.insts[inst.index()] = InstData::Convert { op: ConvOp::ToUintSat, to: Type::I32, arg: reduced };
+                work.push(inst);
+            }
             InstData::Convert {
                 op: op @ (ConvOp::ToSintSat | ConvOp::ToUintSat),
                 to,
@@ -189,6 +200,7 @@ fn needs_rewrite(data: &InstData, legal: Legal) -> bool {
         InstData::Convert { op: ConvOp::FromUint, .. } => !legal.from_u64,
         InstData::Convert { op: ConvOp::ToUint, .. } => !legal.to_uint,
         InstData::Convert { op: ConvOp::ToSintSat | ConvOp::ToUintSat, .. } => !legal.to_int_sat,
+        InstData::Convert { op: ConvOp::ToJsInt32, .. } => !legal.js_to_i32,
         _ => false,
     }
 }

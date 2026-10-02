@@ -7623,7 +7623,7 @@ fn str_find(i: &mut Interp, s: &crate::lstr::LStr, needle: &str, pos: usize) -> 
     }
     if !needle_bytewise(needle) {
         let (h, n) = (crate::jstr::units(s), crate::jstr::units(needle));
-        return (pos..=h.len()).find(|&k| k + n.len() <= h.len() && h[k..k + n.len()] == n[..]);
+        return lumen_common::scan::utf16_find(&h[pos..], &n).map(|k| pos + k);
     }
     let (mut b, mid) = i.unit_pos(s, pos);
     if mid {

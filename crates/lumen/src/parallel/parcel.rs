@@ -1,4 +1,4 @@
-use crate::value::{gc_snapshot, enter_gc_state, Callable, Gc, GcState, Value};
+use crate::value::{Callable, Gc, GcState, Value, enter_gc_state, gc_snapshot};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -10,7 +10,12 @@ pub struct Limits {
 }
 impl Default for Limits {
     fn default() -> Self {
-        Self { bytes: 128 << 20, objects: 2_000_000, queue_depth: 16, active_tasks: 8 }
+        Self {
+            bytes: 128 << 20,
+            objects: 2_000_000,
+            queue_depth: 16,
+            active_tasks: 8,
+        }
     }
 }
 
@@ -21,22 +26,39 @@ impl HeapGuard {
     }
 }
 impl Drop for HeapGuard {
-    fn drop(&mut self) { enter_gc_state(self.0.clone()); }
+    fn drop(&mut self) {
+        enter_gc_state(self.0.clone());
+    }
 }
 
 pub(crate) enum Intrinsic {
-    Object, Array, String, Number, Boolean, Function, Error(&'static str), Extra(&'static str),
+    Object,
+    Array,
+    String,
+    Number,
+    Boolean,
+    Function,
+    Error(&'static str),
+    Extra(&'static str),
+    Global(String),
 }
 
 #[derive(Default)]
 pub(crate) struct SideTables {
-    pub buffers: std::collections::HashMap<usize, Vec<u8>>,
+    pub buffers: std::collections::HashMap<usize, Buffer>,
     pub maps: std::collections::HashMap<usize, crate::builtins::collection_data::CollectionData>,
     pub typed: std::collections::HashMap<usize, crate::value::TaInfo>,
     pub ta_buffer: std::collections::HashMap<usize, Value>,
     pub views: std::collections::HashMap<usize, (usize, usize, usize, bool)>,
     pub regexps: std::collections::HashMap<usize, std::rc::Rc<crate::regex::Regex>>,
     pub shared: std::collections::HashMap<usize, crate::interpreter::SharedBufferHandle>,
+    pub classes: std::collections::HashMap<usize, crate::interpreter::ClassInfo>,
+}
+
+pub(crate) struct Buffer {
+    pub bytes: Vec<u8>,
+    pub max_len: Option<usize>,
+    pub readonly: bool,
 }
 
 /// A closed value graph in an exclusively owned heap. No handles are exposed
@@ -46,7 +68,16 @@ pub struct Parcel {
     pub(crate) root: Value,
     pub(crate) protos: Vec<(Gc, Intrinsic)>,
     pub(crate) side: SideTables,
-    pub(crate) functions: Vec<(Gc, std::rc::Rc<crate::ast::Function>)>,
+    pub(crate) functions: Vec<(
+        Gc,
+        std::rc::Rc<crate::ast::Function>,
+        Option<crate::interpreter::Env>,
+    )>,
+    pub(crate) scopes: Vec<crate::interpreter::Env>,
+    pub(crate) scope_intrinsics: Vec<(crate::interpreter::Env, String, Intrinsic)>,
+    pub(crate) class_protos: Vec<(Gc, Value)>,
+    pub(crate) symbol_keys: Vec<(Gc, String, &'static str)>,
+    pub(crate) field_symbols: Vec<(usize, usize, &'static str)>,
     pub(crate) bytes: usize,
     pub(crate) objects: usize,
     pub(crate) adopted: bool,
@@ -57,14 +88,34 @@ unsafe impl Send for Parcel {}
 
 impl Parcel {
     pub(crate) fn empty() -> Self {
-        Self { heap: GcState::new(), root: Value::Undefined, protos: Vec::new(), side: SideTables::default(), functions: Vec::new(), bytes: 0, objects: 0, adopted: false }
+        Self {
+            heap: GcState::new(),
+            root: Value::Undefined,
+            protos: Vec::new(),
+            side: SideTables::default(),
+            functions: Vec::new(),
+            scopes: Vec::new(),
+            scope_intrinsics: Vec::new(),
+            class_protos: Vec::new(),
+            symbol_keys: Vec::new(),
+            field_symbols: Vec::new(),
+            bytes: 0,
+            objects: 0,
+            adopted: false,
+        }
     }
-    pub fn bytes(&self) -> usize { self.bytes }
-    pub fn objects(&self) -> usize { self.objects }
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub fn objects(&self) -> usize {
+        self.objects
+    }
 }
 impl Drop for Parcel {
     fn drop(&mut self) {
-        if self.adopted { return; }
+        if self.adopted {
+            return;
+        }
         let _entered = HeapGuard::enter(&self.heap);
         // Keep every box alive while breaking cycles; a walk must not free slots.
         let objects = gc_snapshot();
@@ -78,6 +129,10 @@ impl Drop for Parcel {
         self.protos.clear();
         self.side = SideTables::default();
         self.functions.clear();
+        self.scopes.clear();
+        self.scope_intrinsics.clear();
+        self.class_protos.clear();
+        self.symbol_keys.clear();
         drop(objects);
     }
 }

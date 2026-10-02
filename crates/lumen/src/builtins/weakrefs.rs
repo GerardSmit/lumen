@@ -76,6 +76,11 @@ pub(crate) struct WeakState {
 }
 
 impl Interp {
+    #[cfg(feature = "parallel")]
+    pub(crate) fn is_weak_object(&self, pointer: usize) -> bool {
+        self.weak.refs.contains_key(&pointer) || self.weak.registries.contains_key(&pointer)
+    }
+
     /// AddToKeptObjects.
     fn keep_during_job(&mut self, v: &Value) {
         if let Value::Obj(o) = v {

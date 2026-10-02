@@ -37,6 +37,7 @@
 //!
 //! ## Chunk layout
 //! ```text
+//! max_stack      uv maximum operand-stack entries (checked by control-flow analysis)
 //! ops            uv count, then per op: u8 tag + operands (u32/u16 as uv, bool/enums as u8)
 //! consts         uv count, then per const: u8 tag (0 undefined, 1 null, 2 false, 3 true,
 //!                4 number: f64 bits LE, 5 string: uv string index, 6 bigint: u8 sign + uv
@@ -59,9 +60,9 @@
 //! so adding an `Op` variant (or changing an operand type) fails to compile here until the
 //! table is updated; the table's text is hashed into [`FINGERPRINT`], which the blob header
 //! records, so a blob built against a different op set is rejected on load rather than
-//! misdecoded. Operand *values* (slot/name/cache indices) are not range-checked on decode: a
-//! blob is trusted like the code it is linked into (version + fingerprint checked); structural
-//! corruption (truncation, bad tags, bad string/function indices) is a clean error.
+//! misdecoded. Decoded chunks validate operand ranges, stack depths and handler flow before
+//! entering the code cache. Invalid chunks use the existing AST compilation fallback;
+//! strict tooling validation reports the corruption instead.
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
@@ -138,22 +139,14 @@ impl<'a> Rd<'a> {
         Ok(v)
     }
     fn uv(&mut self) -> R<u64> {
-        let mut v = 0u64;
-        let mut shift = 0;
-        loop {
-            let b = self.u8()?;
-            v |= ((b & 0x7f) as u64) << shift;
-            if b & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err("bytecode: varint overflow".into());
-            }
-        }
+        lumen_common::aot::read_varint(self.b, &mut self.pos)
+            .map_err(|e| format!("bytecode: {e}"))
+    }
+    fn usize(&mut self) -> R<usize> {
+        usize::try_from(self.uv()?).map_err(|_| "bytecode: value exceeds pointer width".into())
     }
     fn len(&mut self) -> R<usize> {
-        let n = self.uv()? as usize;
+        let n = self.usize()?;
         // Every counted item takes at least one byte: a count past the remaining input is
         // corruption, not a reason to allocate.
         if n > self.b.len() - self.pos {
@@ -447,7 +440,7 @@ op_codec! {
 
 /// The chunk fields this codec writes, in order (hand-maintained next to `enc_chunk`, whose
 /// exhaustive destructuring of `Chunk` forces a look here when a field is added).
-const CHUNK_SIG: &str = "ops consts(undef null false true num str bigint) names slot_names \
+const CHUNK_SIG: &str = "max_stack ops consts(undef null false true num str bigint) names slot_names \
     n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args virt_base) var_force_resets funcs \
     cap_inits(param var fn lexical) caches obj_maps name_caches positions";
 
@@ -503,22 +496,22 @@ impl Strings {
 /// The decoded side: strings read in place from the section, interned on first use as a name.
 /// A unit's table runs to thousands of entries of which a run touches a few hundred, so nothing
 /// is built per string and only the pages of the strings used become resident.
-struct StrTable<'a> {
+struct StrTable {
     /// `u32` LE offset of each string within `data`.
-    offsets: &'a [u8],
+    offsets: lumen_common::bytes::Bytes,
     /// Each string as `uv len` + UTF-8 bytes.
-    data: &'a [u8],
+    data: lumen_common::bytes::Bytes,
     interned: crate::fasthash::FastMap<u32, Rc<str>>,
 }
 
-impl StrTable<'_> {
+impl StrTable {
     fn raw(&self, i: u64) -> R<&str> {
         let at = (i as usize)
             .checked_mul(4)
             .and_then(|o| self.offsets.get(o..o + 4))
             .ok_or("bytecode: bad string index")?;
         let mut r = Rd {
-            b: self.data,
+            b: &self.data,
             pos: u32::from_le_bytes([at[0], at[1], at[2], at[3]]) as usize,
         };
         let len = r.len()?;
@@ -593,6 +586,7 @@ fn enc_chunk(
     {
         return Err("chunk tables disagree with the compiler's invariants".into());
     }
+    uv(out, super::verify::validate(chunk)? as u64);
     uv(out, ops.len() as u64);
     for &op in ops {
         enc_op(out, op);
@@ -743,7 +737,7 @@ fn dec_chunk(
         let i = r.uv()?;
         slot_names.push(Rc::from(strings.raw(i)?));
     }
-    let n_params = r.uv()? as usize;
+    let n_params = r.usize()?;
     let flags = r.u8()?;
     let arguments_slot = if flags & 4 != 0 {
         Some(u16::get(r)?)
@@ -768,7 +762,7 @@ fn dec_chunk(
     let n = r.len()?;
     let mut funcs = Vec::with_capacity(n);
     for _ in 0..n {
-        let i = r.uv()? as usize;
+        let i = r.usize()?;
         funcs.push(funcs_of_unit(i).ok_or("bytecode: bad function index")?);
     }
     let n = r.len()?;
@@ -797,12 +791,12 @@ fn dec_chunk(
             t => return Err(format!("bytecode: bad cap init tag {t}")),
         });
     }
-    let n_caches = r.uv()? as usize;
-    let n_obj_maps = r.uv()? as usize;
-    let n_name_caches = r.uv()? as usize;
+    let n_caches = r.usize()?;
+    let n_obj_maps = r.usize()?;
+    let n_name_caches = r.usize()?;
     let n_positions = r.len()?;
     let positions: Box<[u8]> = r.bytes(n_positions)?.into();
-    if n_caches > u32::MAX as usize || n_obj_maps > u32::MAX as usize {
+    if n_caches > r.b.len() || n_obj_maps > r.b.len() || n_name_caches > r.b.len() {
         return Err("bytecode: bad cache count".into());
     }
     let env_this = flags & 2 != 0;
@@ -816,6 +810,7 @@ fn dec_chunk(
         })
         .max()
         .unwrap_or(0);
+    if n_switch_tables > ops.len() { return Err("bytecode: bad switch table count".into()); }
     let activation_layout = activation::ActivationLayout::new(&cap_inits, env_this, &names);
     Ok(Chunk {
         ops,
@@ -985,12 +980,12 @@ struct Section<'a> {
 
 fn parse_section(section: &[u8], fn_count: usize) -> R<Section<'_>> {
     let mut r = Rd { b: section, pos: 0 };
-    if r.uv()? as usize != fn_count {
+    if r.usize()? != fn_count {
         return Err("bytecode: function count does not match the unit's AST".into());
     }
-    let strings = r.uv()? as usize;
-    let data_len = r.uv()? as usize;
-    if r.uv()? as usize != section.len() {
+    let strings = r.usize()?;
+    let data_len = r.usize()?;
+    if r.usize()? != section.len() {
         return Err("bytecode: section length does not match".into());
     }
     let bad = || "bytecode: truncated tables".to_string();
@@ -1016,7 +1011,11 @@ fn dec_chunk_at(
     funcs: &dyn Fn(usize) -> Option<Rc<Function>>,
 ) -> R<Chunk> {
     let mut cr = Rd { b: bytes, pos: 0 };
+    let max_stack = cr.usize()?;
     let chunk = dec_chunk(&mut cr, strings, funcs)?;
+    if super::verify::validate(&chunk)? > max_stack {
+        return Err("bytecode: declared stack bound exceeded".into());
+    }
     if cr.pos != bytes.len() {
         return Err("bytecode: trailing bytes in chunk".into());
     }
@@ -1026,8 +1025,8 @@ fn dec_chunk_at(
 /// A unit whose chunks decode on demand (see [`attach_unit`]): the unit's AST holds it, and a
 /// function finds its chunk by its own index.
 pub(crate) struct LazyUnit {
-    section: &'static [u8],
-    strings: RefCell<StrTable<'static>>,
+    section: lumen_common::bytes::Bytes,
+    strings: RefCell<StrTable>,
     /// Where each function's entry begins within `section`, by function index: 8 bytes of
     /// `(start, len)` u32 LE, [`NO_ENTRY`], [`REFUSED`], or the chunk's range within `section`.
     entries_at: usize,
@@ -1044,6 +1043,27 @@ impl LazyUnit {
             None => NO_ENTRY,
         }
     }
+
+    fn chunk(&self, ast: &Rc<crate::snapshot::SplitUnit>, idx: usize) -> R<Option<Chunk>> {
+        let (start, len) = self.entry(idx);
+        if (start, len) == NO_ENTRY || (start, len) == REFUSED {
+            return Ok(None);
+        }
+        let end = (start as usize).checked_add(len as usize).ok_or("bytecode: bad chunk length")?;
+        let bytes = self.section.get(start as usize..end).ok_or("bytecode: bad chunk range")?;
+        let lookup = |i: usize| ast.function(i).ok();
+        dec_chunk_at(bytes, &mut self.strings.borrow_mut(), &lookup).map(Some)
+    }
+}
+
+/// Strict tooling validation, without running JavaScript or populating code caches.
+pub(crate) fn validate_unit(ast: &Rc<crate::snapshot::SplitUnit>) -> R<()> {
+    if let Some(unit) = ast.chunks() {
+        for idx in 0..ast.fn_count() {
+            unit.chunk(ast, idx)?;
+        }
+    }
+    Ok(())
 }
 
 const NO_ENTRY: (u32, u32) = (0, 0);
@@ -1057,15 +1077,20 @@ const REFUSED: (u32, u32) = (u32::MAX, 0);
 /// costs far more than the few compiles a typical load performs. A function whose cache is
 /// already filled is left alone.
 pub(crate) fn attach_unit(
-    section: &'static [u8],
+    section: impl Into<lumen_common::bytes::Bytes>,
     ast: &Rc<crate::snapshot::SplitUnit>,
 ) -> R<()> {
+    let section = section.into();
     let _mem = crate::memstats::enter(crate::memstats::Cat::ChunkDecode);
     let Section {
         offsets,
         data,
         entries_at,
-    } = parse_section(section, ast.fn_count())?;
+    } = parse_section(&section, ast.fn_count())?;
+    let offsets_start = offsets.as_ptr() as usize - section.as_ptr() as usize;
+    let data_start = data.as_ptr() as usize - section.as_ptr() as usize;
+    let offsets = section.slice(offsets_start..offsets_start + offsets.len()).unwrap();
+    let data = section.slice(data_start..data_start + data.len()).unwrap();
     let unit = Rc::new(LazyUnit {
         section,
         strings: RefCell::new(StrTable {
@@ -1127,16 +1152,9 @@ pub(crate) fn take_precompiled(func: &Function) -> Option<Rc<Chunk>> {
         (aot.unit.clone(), aot.idx)
     };
     let unit = ast.chunks()?;
-    let (start, len) = unit.entry(idx);
-    if (start, len) == NO_ENTRY || (start, len) == REFUSED {
-        return None;
-    }
-    let lookup = |i: usize| ast.function(i).ok();
-    let mut strings = unit.strings.borrow_mut();
-    let bytes = unit.section.get(start as usize..(start + len) as usize)?;
-    let chunk = dec_chunk_at(bytes, &mut strings, &lookup).ok()?;
+    let chunk = unit.chunk(&ast, idx).ok()??;
     ATTACHED.fetch_add(1, Relaxed);
-    Some(Rc::new(chunk))
+    Some(super::jit::track_chunk(Rc::new(chunk)))
 }
 
 /// Verification: for every function of a decoded unit, compile it afresh and compare with what
@@ -1309,6 +1327,43 @@ mod tests {
         let (funcs2, chunks, refusals) = attach_all(section, &unit);
         assert_eq!((chunks, refusals), (1, 1));
         assert!(matches!(funcs2[0].code.get(), Some(None)));
+    }
+
+    #[test]
+    fn invalid_chunk_operands_fall_back_to_compiling_the_ast() {
+        let (funcs, unit) = unit_of("function f(a) { return a * 2 + 1; }");
+        let (mut section, _) = encode_unit(&funcs);
+        let at = parse_section(&section, funcs.len()).unwrap().entries_at;
+        let start = u32::from_le_bytes(section[at..at + 4].try_into().unwrap()) as usize;
+        let mut r = Rd { b: &section, pos: start };
+        r.uv().unwrap(); // declared stack bound
+        r.uv().unwrap(); // instruction count
+        let op = r.pos;
+        assert!(matches!(dec_op(&mut r).unwrap(), Op::LoadLocal(0)));
+        // Same encoded width, but a constant index that cannot exist in this function.
+        section[op] = 0; // Const
+        section[op + 1] = 63;
+        attach_unit(lumen_common::bytes::Bytes::owned(section.into()), &unit).unwrap();
+        let f = unit.function(0).unwrap();
+        assert!(validate_unit(&unit).is_err());
+        assert!(take_precompiled(&f).is_none());
+        let compiled = super::super::compile(&f).unwrap();
+        assert!(matches!(compiled.ops.first(), Some(Op::LoadLocal(0))));
+    }
+
+    #[test]
+    fn declared_stack_bound_is_enforced() {
+        let (funcs, unit) = unit_of("function f(a) { return a * 2 + 1; }");
+        let (mut section, _) = encode_unit(&funcs);
+        let at = parse_section(&section, funcs.len()).unwrap().entries_at;
+        let start = u32::from_le_bytes(section[at..at + 4].try_into().unwrap()) as usize;
+        assert!(section[start] > 0 && section[start] < 128);
+        section[start] = 0;
+        attach_unit(lumen_common::bytes::Bytes::owned(section.into()), &unit).unwrap();
+        assert!(validate_unit(&unit).unwrap_err().contains("stack bound"));
+        let f = unit.function(0).unwrap();
+        assert!(take_precompiled(&f).is_none());
+        assert!(super::super::compile(&f).is_some());
     }
 
     #[test]

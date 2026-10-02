@@ -229,19 +229,11 @@ impl Reader<'_> {
         Ok(b)
     }
     fn uv(&mut self) -> R<u64> {
-        let mut result = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            result |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err("snapshot: varint overflow".into());
-            }
-        }
+        lumen_common::aot::read_varint(self.buf, &mut self.pos)
+            .map_err(|e| format!("snapshot: {e}"))
+    }
+    fn usize(&mut self) -> R<usize> {
+        usize::try_from(self.uv()?).map_err(|_| "snapshot: value exceeds pointer width".into())
     }
     fn f64(&mut self) -> R<f64> {
         let end = self.pos.checked_add(8).ok_or("snapshot: truncated f64")?;
@@ -256,7 +248,7 @@ impl Reader<'_> {
         Ok(self.u8()? != 0)
     }
     fn str(&mut self) -> R<String> {
-        let len = self.uv()? as usize;
+        let len = self.usize()?;
         let end = self.pos.checked_add(len).ok_or("snapshot: truncated str")?;
         let bytes = self
             .buf
@@ -572,7 +564,7 @@ pub(crate) type FunctionHook = Box<dyn Fn(usize, &Rc<Function>)>;
 /// when it first needs one (see [`crate::precompiled::decode_body`]). A program that never
 /// reaches most of a large bundle never pays for most of its function nodes.
 pub(crate) struct SplitUnit {
-    ast: &'static [u8],
+    ast: lumen_common::bytes::Bytes,
     n: usize,
     /// Byte offsets within `ast`: the per-function table, the headers, the top-level
     /// statements.
@@ -597,13 +589,14 @@ pub(crate) struct SplitUnit {
 impl SplitUnit {
     /// Read a split unit's framing. `src` is the unit's (empty) source marker.
     pub(crate) fn new(
-        ast: &'static [u8],
+        ast: impl Into<lumen_common::bytes::Bytes>,
         src: Rc<str>,
         kept: Option<Rc<crate::precompiled::KeptRef>>,
         bodies: BodyBytes,
     ) -> R<Rc<SplitUnit>> {
+        let ast = ast.into();
         let mut r = Reader {
-            buf: ast,
+            buf: &ast,
             pos: 0,
             src: src.clone(),
             scopes: Vec::new(),
@@ -616,7 +609,7 @@ impl SplitUnit {
         if r.uv()? != VERSION as u64 {
             return Err("snapshot: version mismatch".into());
         }
-        let n = r.uv()? as usize;
+        let n = r.usize()?;
         let table = r.pos;
         let headers = n
             .checked_mul(16)
@@ -628,13 +621,14 @@ impl SplitUnit {
             .checked_add(u32_at(headers - 8))
             .filter(|&t| t <= ast.len())
             .ok_or("snapshot: bad header length")?;
+        let bodies_len = u32_at(headers - 4);
         Ok(Rc::new(SplitUnit {
             ast,
             n,
             table,
             headers,
             top,
-            bodies_len: u32_at(headers - 4),
+            bodies_len,
             bodies,
             src,
             kept,
@@ -743,7 +737,7 @@ impl SplitUnit {
         let params_of = self.stream(i + 1, end, 2 * i as u64 + 2)?;
         let mut r = self.reader(&self.ast[start..stop], params_of);
         let name = dec_opt_str(&mut r)?;
-        let np = r.uv()? as usize;
+        let np = r.usize()?;
         let mut params = Vec::with_capacity(r.cap(np));
         for _ in 0..np {
             params.push(Param {
@@ -852,7 +846,7 @@ fn enc_stmts(w: &mut Writer, v: &[Stmt]) {
     }
 }
 fn dec_stmts(r: &mut Reader) -> R<Vec<Stmt>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_stmt(r)?);
@@ -867,7 +861,7 @@ fn enc_exprs(w: &mut Writer, v: &[Expr]) {
     }
 }
 fn dec_exprs(r: &mut Reader) -> R<Vec<Expr>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_expr(r)?);
@@ -1126,7 +1120,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         0 => Stmt::Expr(dec_expr(r)?),
         1 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
@@ -1210,7 +1204,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         }
         14 => {
             let disc = dec_expr(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut cases = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 cases.push(SwitchCase {
@@ -1236,7 +1230,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         19 => Stmt::Debugger,
         20 => {
             let source = r.rcstr()?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(dec_importspec(r)?);
@@ -1248,7 +1242,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             })
         }
         21 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(ExportSpec {
@@ -1502,7 +1496,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         },
         11 => Expr::Array(dec_array_elems(r)?),
         12 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(dec_propdef(r)?);
@@ -1575,7 +1569,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         28 => Expr::Seq(dec_exprs(r)?),
         29 => {
             let tag = Box::new(dec_expr(r)?);
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut quasis = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 quasis.push((dec_opt_str(r)?, r.str()?));
@@ -1631,7 +1625,7 @@ fn enc_array_elems(w: &mut Writer, elems: &[ArrayElem]) {
     }
 }
 fn dec_array_elems(r: &mut Reader) -> R<Vec<ArrayElem>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(match r.u8()? {
@@ -1784,7 +1778,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
     Ok(match r.u8()? {
         0 => Pattern::Ident(r.str()?),
         1 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut elems = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 elems.push(match r.u8()? {
@@ -1800,7 +1794,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
             Pattern::Array(elems)
         }
         2 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(ObjPatProp {
@@ -1925,7 +1919,7 @@ fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
     Ok(match r.u8()? {
         0 => None,
         1 => {
-            let id = r.uv()? as usize;
+            let id = r.usize()?;
             Some(
                 r.scopes
                     .get(id)
@@ -1935,7 +1929,7 @@ fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
         }
         2 => {
             let parent = dec_scope(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut names = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 names.push(r.str()?);
@@ -2103,7 +2097,7 @@ fn fn_flags(f: &Function) -> u8 {
 
 fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
     if r.split.is_some() {
-        let local = r.uv()? as usize;
+        let local = r.usize()?;
         let sp = r.split.as_ref().expect("split mode");
         let i = *sp
             .children
@@ -2116,7 +2110,7 @@ fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
         funcs.len() - 1
     });
     let name = dec_opt_str(r)?;
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut params = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         params.push(Param {
@@ -2207,7 +2201,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
     } else {
         None
     };
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut members = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         let key = dec_propkey(r)?;
@@ -2266,7 +2260,7 @@ fn dec_forinit(r: &mut Reader) -> R<ForInit> {
     Ok(match r.u8()? {
         0 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));

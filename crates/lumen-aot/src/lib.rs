@@ -119,6 +119,20 @@ pub mod build {
 
     pub use crate::walk::Spec;
 
+    /// Write a host-tool bundle, rejecting outputs that alias any bundled source.
+    /// Relative input paths resolve against `base`, not the caller's environment.
+    pub fn compile_to(base: impl AsRef<Path>, spec: &Spec, out: impl AsRef<Path>) -> Result<usize, String> {
+        let bundle = crate::walk::bundle(base.as_ref(), spec)?;
+        let out = out.as_ref();
+        if let Ok(output) = out.canonicalize() {
+            if bundle.inputs.iter().any(|p| p.canonicalize().is_ok_and(|p| p == output)) {
+                return Err("output would overwrite a bundled source".into());
+            }
+        }
+        std::fs::write(out, &bundle.blob).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(bundle.blob.len())
+    }
+
     /// Bundle the ES module graph rooted at `entry` (see [`precompile_spec`]).
     pub fn precompile_to(out: impl AsRef<Path>, entry: impl AsRef<Path>) -> Result<(), String> {
         precompile_spec(

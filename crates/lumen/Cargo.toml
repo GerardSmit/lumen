@@ -59,6 +59,11 @@ harness = false
 name = "collections"
 harness = false
 
+[[bench]]
+name = "graph_transfer"
+harness = false
+required-features = ["parallel", "bench"]
+
 # Internal-stage benchmarks (lexer/parser/snapshot). Needs the `bench` feature for `bench_api`.
 [[bench]]
 name = "internals"

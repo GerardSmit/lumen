@@ -254,6 +254,11 @@ pub fn convert(op: ConvOp, from: Type, to: Type, a: u64) -> Option<u64> {
                 _ => unreachable!(),
             }
         }
+        ToJsInt32 => {
+            let x = f64::from_bits(a);
+            let reduced = x.trunc() % 4294967296.0;
+            (reduced as i64 as i32 as u32) as u64
+        }
         ToSint | ToUint | ToSintSat | ToUintSat => {
             let x = fl(a);
             let signed = matches!(op, ToSint | ToSintSat);

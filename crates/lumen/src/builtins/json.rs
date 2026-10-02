@@ -167,11 +167,9 @@ fn json_quote_into(out: &mut String, s: &str) {
     let mut run = 0usize;
     let mut k = 0usize;
     while k < bytes.len() {
+        k += lumen_common::scan::json_ascii_prefix(&bytes[k..]);
+        if k == bytes.len() { break; }
         let b = bytes[k];
-        if b >= 0x20 && b != b'"' && b != b'\\' && b < 0x80 {
-            k += 1;
-            continue;
-        }
         out.push_str(&s[run..k]);
         if b >= 0x80 {
             // Non-ASCII tail: the character-level loop (smuggled surrogates).
@@ -658,13 +656,7 @@ impl<'a> JsonBytes<'a> {
 
     #[inline]
     fn ws(&mut self) {
-        while let Some(&c) = self.b.get(self.pos) {
-            if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
+        self.pos += lumen_common::scan::json_whitespace_prefix(&self.b[self.pos..]);
     }
 
     #[inline]
@@ -853,6 +845,7 @@ impl<'a> JsonBytes<'a> {
         self.pos += 1; // opening quote
         let start = self.pos;
         // Fast scan: the common escape-free literal is a slice of the (canonical) source.
+        self.pos += lumen_common::scan::json_string_prefix(&self.b[self.pos..]);
         loop {
             match self.b.get(self.pos) {
                 None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),
@@ -874,6 +867,7 @@ impl<'a> JsonBytes<'a> {
         let mut surrogate = false;
         loop {
             let run = self.pos;
+            self.pos += lumen_common::scan::json_string_prefix(&self.b[self.pos..]);
             loop {
                 match self.b.get(self.pos) {
                     None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),

@@ -3,8 +3,11 @@
 //! the `hash` and `compress` features add the RustCrypto / zlib / Brotli / Zstandard crates, and
 //! are off by default so the engine itself carries no dependencies.
 
+pub mod aot;
 pub mod bigint;
 pub mod buffer;
+pub mod bytes;
+pub mod scan;
 pub mod civil;
 pub mod codec;
 pub mod csv;
@@ -19,6 +22,7 @@ pub mod float16;
 pub mod hash;
 pub mod limits;
 pub mod local_tz;
+pub mod lzh;
 pub mod memcat;
 pub mod mt19937;
 pub mod native;
@@ -27,6 +31,7 @@ pub mod regex;
 pub mod siphash;
 pub mod smuggle;
 pub mod strftime;
+pub mod target;
 pub mod tz;
 #[rustfmt::skip]
 pub mod tzdata;

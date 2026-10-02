@@ -58,11 +58,12 @@ pub mod parallel;
 pub use modules::load_stats;
 #[cfg(feature = "intl")]
 mod numbering;
-mod lzh;
+use lumen_common::lzh;
 /// Opt-in memory accounting (`LUMEN_MEM_STATS=1`).
 pub mod memstats;
 mod parser;
 pub mod precompiled;
+pub mod target;
 mod regex;
 mod snapshot;
 mod split_view;
@@ -174,6 +175,29 @@ pub struct JitStats {
     /// Native entries that returned to the interpreter; generated direct calls
     /// inside one such entry are not counted separately.
     pub executed_entries: u64,
+    pub compile_nanoseconds: u64,
+    pub failed_compilations: u64,
+    pub allocation_failures: u64,
+}
+
+impl core::ops::AddAssign for JitStats {
+    fn add_assign(&mut self, other: Self) {
+        self.compiled_units += other.compiled_units;
+        self.code_bytes += other.code_bytes;
+        self.executed_entries += other.executed_entries;
+        self.compile_nanoseconds += other.compile_nanoseconds;
+        self.failed_compilations += other.failed_compilations;
+        self.allocation_failures += other.allocation_failures;
+    }
+}
+
+/// Owner-local JIT policy, independent of process environment variables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JitMode {
+    Disabled,
+    #[default]
+    Hot,
+    Eager,
 }
 
 /// Parse `src` as a script and encode its AST to a snapshot blob — a build-time helper (used
@@ -265,6 +289,17 @@ pub fn collect_disposed_realms() {
     collect_quiescent_realms();
 }
 
+/// Evict native code while retaining bytecode and realm state.
+///
+/// # Safety
+/// All engines on the calling thread must be idle, with no executing or suspended
+/// native frames or retained raw entry pointers. See the code-cache hook.
+pub unsafe fn evict_quiescent_jit_code() -> usize {
+    let evicted = unsafe { bytecode::jit::evict_quiescent_code() };
+    collect_quiescent_realms();
+    evicted
+}
+
 /// Collect retired realm cycles while other engines remain alive on this driver.
 /// Every engine must be idle: no suspended JS evaluation, callback, or borrowed
 /// object. Live engines and external value handles stay roots. Embedders that
@@ -282,6 +317,7 @@ pub fn collect_quiescent_realms() {
         previous = remaining;
     }
     drop(collector);
+    crate::value::gc_trim_quiescent_heap();
     if let Some(before) = before {
         eprintln!(
             "[disposed-realm] before={before} after={}",
@@ -327,6 +363,7 @@ impl Drop for Engine {
         }
         drop(std::mem::replace(&mut self.interp, Interp::uninitialized()));
         self.interp.gc_collect();
+        value::gc_trim_quiescent_heap();
         // Native owning cores stay online after their final worker exits. Return
         // cached free blocks now rather than waiting for nonexistent thread exit.
         #[cfg(target_os = "none")]
@@ -335,6 +372,10 @@ impl Drop for Engine {
 }
 
 impl Engine {
+    /// Select before evaluating scripts; existing chunks may retain native code.
+    pub fn set_jit_mode(&mut self, mode: JitMode) {
+        self.interp.jit_mode = mode;
+    }
     pub fn jit_stats(&self) -> JitStats {
         self.interp.jit_stats.get()
     }
@@ -346,6 +387,7 @@ impl Engine {
     }
 
     pub fn new() -> Engine {
+        let _ = target::cpu_features();
         interpreter::sym_for_reset();
         let _mem = memstats::enter(memstats::Cat::Builtins);
         let _ = LIVE_ENGINES.try_with(|n| n.set(n.get() + 1));
@@ -450,7 +492,7 @@ impl Engine {
             line: 0,
             at_eof: false,
         };
-        let parsed = precompiled::parse(blob.as_bytes()).map_err(bad)?;
+        let parsed = precompiled::parse_blob(blob).map_err(bad)?;
         precompiled::register_modules(&mut self.interp, &parsed);
         let mut last = Completion::Value(String::new());
         for unit in parsed.units.iter().filter(|u| u.kind == SourceKind::Script) {
@@ -484,6 +526,12 @@ impl Engine {
         Ok(last)
     }
 
+    /// Load uploaded bytes without requiring static storage. Functions and registered
+    /// modules retain the blob's backing until their last reference is released.
+    pub fn load_precompiled_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<Completion, ParseError> {
+        self.load_precompiled(&Precompiled::from_bytes(bytes))
+    }
+
     /// Register a precompiled blob's modules with the realm without running anything, so a
     /// later `import` (static from another module, or dynamic) of an `aot:/…` key — or of a
     /// relative specifier from such a module — resolves inside the blob. Returns the entry
@@ -492,7 +540,7 @@ impl Engine {
         &mut self,
         blob: &Precompiled,
     ) -> Result<Option<String>, ParseError> {
-        let parsed = precompiled::parse(blob.as_bytes()).map_err(|message| ParseError {
+        let parsed = precompiled::parse_blob(blob).map_err(|message| ParseError {
             message,
             line: 0,
             at_eof: false,

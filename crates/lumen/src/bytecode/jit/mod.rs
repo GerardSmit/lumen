@@ -372,6 +372,50 @@ impl ChunkJit {
     }
 }
 
+std::thread_local! {
+    static CODE_CACHE: RefCell<Vec<std::rc::Weak<Chunk>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) fn track_chunk(chunk: std::rc::Rc<Chunk>) -> std::rc::Rc<Chunk> {
+    CODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() % 256 == 255 { cache.retain(|chunk| chunk.strong_count() != 0); }
+        cache.push(std::rc::Rc::downgrade(&chunk));
+    });
+    chunk
+}
+
+/// Release this driver's native code at an embedder-controlled idle boundary.
+///
+/// # Safety
+/// All engines on this thread must be idle, with no executing or suspended native
+/// frames, borrowed chunks, or retained raw entry pointers. Other drivers own
+/// separate caches and are unaffected. Bytecode and language state stay live.
+pub unsafe fn evict_quiescent_code() -> usize {
+    CODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let chunks: Vec<_> = cache.iter().filter_map(std::rc::Weak::upgrade).collect();
+        cache.retain(|chunk| chunk.strong_count() != 0);
+        // Revoke every direct-call entry before releasing any dependent code.
+        for chunk in &chunks { chunk.jit.set_direct_none(); }
+        let mut evicted = 0;
+        for chunk in chunks {
+            let jit = &chunk.jit;
+            let mut fs = jit.func.borrow_mut();
+            evicted += usize::from(fs.code.is_some()) + fs.retired.len();
+            *fs = FuncState::default();
+            let mut loops = jit.loops.borrow_mut();
+            evicted += loops.iter().filter(|state| state.code.is_some()).count();
+            loops.clear();
+            jit.has_code.set(false);
+            jit.fstate.set(FS_COLD);
+            jit.ticks.set(0);
+            jit.calls.set(0);
+        }
+        evicted
+    })
+}
+
 /// Byte offsets of [`ChunkJit`]'s direct-call view inside a [`Chunk`].
 pub(crate) const CHUNK_DENTRY: usize =
     std::mem::offset_of!(Chunk, jit) + std::mem::offset_of!(ChunkJit, dentry);
@@ -584,12 +628,14 @@ fn dump_ops(chunk: &Chunk) {
     }
 }
 
-fn eager() -> bool {
+fn eager(i: &Interp) -> bool {
+    if i.jit_mode == crate::JitMode::Eager { return true; }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LUMEN_JIT_EAGER").is_some())
 }
 
-fn jit_enabled() -> bool {
+fn jit_enabled(i: &Interp) -> bool {
+    if i.jit_mode == crate::JitMode::Disabled { return false; }
     if cfg!(target_os = "none") {
         return cfg!(target_arch = "aarch64") && lumen_codegen::jitmem::native_backend_available();
     }
@@ -622,12 +668,13 @@ fn compile(
             chunk.ops.len()
         );
     }
+    let started = std::time::Instant::now();
     let t = stats_start();
     let r = build::build(
         i, env, chunk, header, backedge, slots, widen, undef_ok, this_val,
     )
     .and_then(|built| finish(built, header, backedge));
-    record_compilation(i, &r);
+    record_compilation(i, &r, started.elapsed());
     stats_end(t, "loop", &r);
     r
 }
@@ -647,22 +694,30 @@ fn compile_fn(
     if stats_enabled() {
         eprintln!("[jit-stats] fn of {} ops", chunk.ops.len());
     }
+    let started = std::time::Instant::now();
     let t = stats_start();
     let r = build::build_fn(i, env, chunk, slots, widen, not_num, guess, this_val)
         .and_then(|built| finish(built, 0, chunk.ops.len().saturating_sub(1)));
-    record_compilation(i, &r);
+    record_compilation(i, &r, started.elapsed());
     stats_end(t, "fn", &r);
     r
 }
 
-fn record_compilation(i: &Interp, result: &Result<Native, String>) {
+fn record_compilation(i: &Interp, result: &Result<Native, String>, elapsed: std::time::Duration) {
+    let mut stats = i.jit_stats.get();
+    stats.compile_nanoseconds = stats.compile_nanoseconds.saturating_add(
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     if let Ok(native) = result {
-        let mut stats = i.jit_stats.get();
         stats.compiled_units += 1;
         stats.code_bytes += native._keep.downcast_ref::<lumen_codegen::jitmem::ExecMemory>()
             .map_or(0, |memory| memory.len());
-        i.jit_stats.set(stats);
+    } else {
+        stats.failed_compilations += 1;
+        if result.as_ref().err().is_some_and(|error| error == "jit: cannot allocate executable memory") {
+            stats.allocation_failures += 1;
+        }
     }
+    i.jit_stats.set(stats);
 }
 
 fn record_execution(i: &Interp) {
@@ -783,6 +838,8 @@ fn emit(
     #[cfg(target_arch = "aarch64")]
     use lumen_codegen::aarch64 as native;
     let cfg = native::Config::host(None);
+    #[cfg(target_arch = "aarch64")]
+    let cfg = native::Config { features: crate::target::cpu_features(), ..cfg };
     let compiled = native::compile_owned(func, &cfg)?;
     let (mem, addrs) = native::load(&[compiled], |id, addrs| {
         if id == SELF_ID {
@@ -846,11 +903,12 @@ fn emit(
 /// [`on_backedge`] has anything to do (native code exists, or a tick boundary to look for a
 /// compile). Keeps the out-of-line hook's call off the interpreter's loop path.
 #[inline(always)]
-pub(super) fn backedge_due(chunk: &Chunk) -> bool {
+pub(super) fn backedge_due(i: &Interp, chunk: &Chunk) -> bool {
+    if i.jit_mode == crate::JitMode::Disabled { return false; }
     let jit = &chunk.jit;
     let t = jit.ticks.get().wrapping_add(1);
     jit.ticks.set(t);
-    t & TICK_MASK == 0 || jit.has_code.get() || eager()
+    t & TICK_MASK == 0 || jit.has_code.get() || eager(i)
 }
 
 /// The hook at a backward `Jump` from `backedge` to `header`; `*pc == header` (the interpreter
@@ -873,12 +931,12 @@ pub(super) fn on_backedge(
     let jit = &chunk.jit;
     // `LUMEN_JIT_EAGER` compiles at the first backedge (stress testing: every loop runs
     // natively as soon as possible).
-    let t = if eager() { 0 } else { jit.ticks.get() };
-    if !stack.is_empty() || !jit_enabled() {
+    let t = if eager(i) { 0 } else { jit.ticks.get() };
+    if !stack.is_empty() || !jit_enabled(i) {
         // A hot loop entered with operands pending (`s += a.map(x => …)`, see
         // `bytecode::inline_callback`) can't enter here: compile the whole function at its
         // next entry instead.
-        if !stack.is_empty() && jit_enabled() && t & TICK_MASK == 0 && jit.fstate.get() == FS_COLD {
+        if !stack.is_empty() && jit_enabled(i) && t & TICK_MASK == 0 && jit.fstate.get() == FS_COLD {
             jit.fstate.set(FS_PENDING);
         }
         return Ok(None);
@@ -926,7 +984,7 @@ pub(super) fn on_backedge(
             // loop with other locals.
             let st = jit.fstate.get();
             if (st == FS_COLD || st == FS_PENDING)
-                && !eager()
+                && !eager(i)
                 && chunk.ops.len() <= build::MAX_FN_OPS
                 && u64::from(jit.calls.get()) * u64::from(FEW_TRIPS) > u64::from(t)
             {
@@ -972,7 +1030,8 @@ pub(super) fn on_backedge(
 /// compiling one: every `CALL_MASK + 1` calls, after a loop of the chunk compiled, after a
 /// widening, or always under `LUMEN_JIT_EAGER`).
 #[inline(always)]
-pub(super) fn entry_due(chunk: &Chunk) -> bool {
+pub(super) fn entry_due(i: &Interp, chunk: &Chunk) -> bool {
+    if i.jit_mode == crate::JitMode::Disabled { return false; }
     let jit = &chunk.jit;
     let st = jit.fstate.get();
     if st == FS_CODE {
@@ -980,7 +1039,7 @@ pub(super) fn entry_due(chunk: &Chunk) -> bool {
     }
     let c = jit.calls.get().wrapping_add(1);
     jit.calls.set(c);
-    st != FS_DEAD && (c & CALL_MASK == 0 || st == FS_PENDING || jit.has_code.get() || eager())
+    st != FS_DEAD && (c & CALL_MASK == 0 || st == FS_PENDING || jit.has_code.get() || eager(i))
 }
 
 /// The hook at a frame's entry: `*pc == 0`, `stack` empty, no handlers. Runs the chunk's
@@ -1006,13 +1065,13 @@ pub(super) fn on_entry(
         },
         FS_DEAD => return Ok(None),
         _ => {
-            if !jit_enabled() || *pc != 0 || !stack.is_empty() {
+            if !jit_enabled(i) || *pc != 0 || !stack.is_empty() {
                 return Ok(None);
             }
             // A cold large function waits until it has made enough calls (a pending one was
             // asked for by a hot loop, or retired and wants its recompile now).
             if jit.fstate.get() == FS_COLD
-                && !eager()
+                && !eager(i)
                 && jit.calls.get() / FN_CALLS_PER_OP < chunk.ops.len() as u32
             {
                 return Ok(None);
@@ -1074,8 +1133,8 @@ pub(super) fn resume_on() -> bool {
 /// Whether the driver of an async body continuing at `pc` (just after an `await`) may enter
 /// its function code there (see [`on_resume`]).
 #[inline(always)]
-pub(super) fn resume_due(chunk: &Chunk, pc: usize) -> bool {
-    chunk.jit.fstate.get() == FS_CODE
+pub(super) fn resume_due(i: &Interp, chunk: &Chunk, pc: usize) -> bool {
+    jit_enabled(i) && chunk.jit.fstate.get() == FS_CODE
         && pc > 0
         && matches!(chunk.ops.get(pc - 1), Some(super::Op::Await))
 }

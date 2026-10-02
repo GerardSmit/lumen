@@ -19,30 +19,39 @@ fn absorb_preserves_addresses_and_rehomes_free_lists() {
     let receiver = GcState::new();
     let objects = {
         let _entered = Enter::new(parcel.clone());
-        (0..6000).map(|i| match i % 7 {
-            0 => Object::new_bare(None),
-            1 => Object::new_with_capacity(None, 2),
-            2 => Object::new_with_capacity(None, 4),
-            3 => Object::new_with_capacity(None, 8),
-            4 => Object::new_array_from_vec(None, vec![Value::Null; 10]),
-            5 => Object::new_array_from_vec(None, vec![Value::Null; 2]),
-            _ => Object::new_array_from_vec(None, vec![Value::Null; 4]),
-        }).collect::<Vec<_>>()
+        (0..6000)
+            .map(|i| match i % 7 {
+                0 => Object::new_bare(None),
+                1 => Object::new_with_capacity(None, 2),
+                2 => Object::new_with_capacity(None, 4),
+                3 => Object::new_with_capacity(None, 8),
+                4 => Object::new_array_from_vec(None, vec![Value::Null; 10]),
+                5 => Object::new_array_from_vec(None, vec![Value::Null; 2]),
+                _ => Object::new_array_from_vec(None, vec![Value::Null; 4]),
+            })
+            .collect::<Vec<_>>()
     };
     let addresses = objects.iter().map(Gc::as_ptr).collect::<Vec<_>>();
     // Free slots in several chunks before moving: both lists must remain usable.
     let mut kept = Vec::new();
     for (index, object) in objects.into_iter().enumerate() {
-        if index % 3 == 0 { kept.push(object); }
+        if index % 3 == 0 {
+            kept.push(object);
+        }
     }
     assert_eq!(parcel.live.get(), 2000);
     let _entered = Enter::new(receiver.clone());
     let existing = Object::new(None);
     receiver.heap.absorb(&parcel.heap, &receiver.live);
-    receiver.live.set(receiver.live.get() + parcel.live.replace(0));
+    receiver
+        .live
+        .set(receiver.live.get() + parcel.live.replace(0));
     assert_eq!(parcel.heap.chunk_count(), 0);
     assert_eq!(live_objects(), 2001);
-    assert!(kept.iter().enumerate().all(|(i, object)| Gc::as_ptr(object) == addresses[i * 3]));
+    assert!(kept
+        .iter()
+        .enumerate()
+        .all(|(i, object)| Gc::as_ptr(object) == addresses[i * 3]));
     let mut walked = 0;
     receiver.heap.for_each_live(|_| walked += 1);
     assert_eq!(walked, 2001);
@@ -61,22 +70,30 @@ fn absorb_preserves_addresses_and_rehomes_free_lists() {
 fn fastalloc_frees_sender_allocations_on_receiver_thread() {
     use std::alloc::{GlobalAlloc, Layout};
     let allocator = crate::fastalloc::ClassAlloc;
-    let blocks = (1..=128).map(|n| {
-        let layout = Layout::from_size_align(n * 17, 8).unwrap();
-        let pointer = unsafe { allocator.alloc(layout) };
-        assert!(!pointer.is_null());
-        unsafe { pointer.write_bytes(0x5a, layout.size()); }
-        (pointer as usize, layout)
-    }).collect::<Vec<_>>();
+    let blocks = (1..=128)
+        .map(|n| {
+            let layout = Layout::from_size_align(n * 17, 8).unwrap();
+            let pointer = unsafe { allocator.alloc(layout) };
+            assert!(!pointer.is_null());
+            unsafe {
+                pointer.write_bytes(0x5a, layout.size());
+            }
+            (pointer as usize, layout)
+        })
+        .collect::<Vec<_>>();
     std::thread::spawn(move || {
         for (address, layout) in blocks {
             let pointer = address as *mut u8;
             let bytes = unsafe { std::slice::from_raw_parts(pointer, layout.size()) };
             assert!(bytes.iter().all(|byte| *byte == 0x5a));
-            unsafe { allocator.dealloc(pointer, layout); }
+            unsafe {
+                allocator.dealloc(pointer, layout);
+            }
         }
         crate::fastalloc::trim();
-    }).join().unwrap();
+    })
+    .join()
+    .unwrap();
 }
 
 #[test]
@@ -84,7 +101,9 @@ fn remapped_shapes_survive_interpreter_bytecode_and_collection() {
     let mut engine = crate::Engine::new();
     let receiver = gc_state_handle();
     // Occupy ids in R so a parcel id is known to collide with unrelated keys.
-    engine.eval("var unrelated = {a: 1, b: 2, c: 3};", false).unwrap();
+    engine
+        .eval("var unrelated = {a: 1, b: 2, c: 3};", false)
+        .unwrap();
     let parcel = GcState::new();
     let (shared, shared_again, owned, cycle) = {
         let _entered = Enter::new(parcel.clone());
@@ -105,15 +124,23 @@ fn remapped_shapes_survive_interpreter_bytecode_and_collection() {
     for object in [&shared, &shared_again, &owned, &cycle] {
         object.borrow_mut().props.remap_shape(&mut memo);
     }
-    assert_eq!(shared.borrow().props.shape, shared_again.borrow().props.shape);
+    assert_eq!(
+        shared.borrow().props.shape,
+        shared_again.borrow().props.shape
+    );
     assert_ne!(shared.borrow().props.shape, owned.borrow().props.shape);
     receiver.heap.absorb(&parcel.heap, &receiver.live);
-    receiver.live.set(receiver.live.get() + parcel.live.replace(0));
+    receiver
+        .live
+        .set(receiver.live.get() + parcel.live.replace(0));
     drop(parcel);
     let global = engine.interp.global.clone();
     set_data(&global, "parcel", Value::Obj(shared));
     set_data(&global, "parcelOwned", Value::Obj(owned));
-    for tier in [crate::bytecode::Tier::Interp, crate::bytecode::Tier::Bytecode] {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+    ] {
         engine.set_tier(tier);
         let result = engine.eval("function read(x) { return x.value; } var sum = 0; for (var i=0; i<300; i++) sum += read(parcel) + read(parcelOwned); sum", false).unwrap();
         assert!(matches!(result, crate::Completion::Value(ref value) if value == "16500"));
@@ -130,7 +157,9 @@ fn remapped_shapes_survive_interpreter_bytecode_and_collection() {
 fn function_snapshot_owns_source_and_resets_tier_state() {
     let source = String::from("function copied(x) { return x * 3 + 1; }");
     let body = crate::parser::parse_script_lazy(&source).unwrap();
-    let crate::ast::Stmt::FuncDecl(sender) = &body[0] else { panic!("function") };
+    let crate::ast::Stmt::FuncDecl(sender) = &body[0] else {
+        panic!("function")
+    };
     sender.calls.set(777);
     sender.ensure_body().unwrap();
     let snapshot = crate::snapshot::encode(&body, &source);
@@ -162,22 +191,35 @@ fn getters_run_in_sender_heap_and_partial_parcel_cleans_up() {
     let sender = gc_state_handle();
     engine.eval("var graph={}; Object.defineProperty(graph,'value',{enumerable:true,get:function(){graph.added={v:7}; return 42;}}); Object.defineProperty(graph,'fail',{enumerable:true,get:function(){graph.other={}; throw Error('getter failure');}});", false).unwrap();
     let global = Value::Obj(engine.interp.global.clone());
-    let graph = engine.interp.get_member(&global, "graph").unwrap_or_else(|_| panic!("graph lookup"));
+    let graph = engine
+        .interp
+        .get_member(&global, "graph")
+        .unwrap_or_else(|_| panic!("graph lookup"));
     let parcel = GcState::new();
     let root = {
         let _entered = Enter::new(parcel.clone());
         Object::new(None)
     };
     let before = sender.live.get();
-    let copied = engine.interp.get_member(&graph, "value").unwrap_or_else(|_| panic!("getter failed"));
-    assert!(sender.live.get() > before, "getter allocation stayed in sender");
+    let copied = engine
+        .interp
+        .get_member(&graph, "value")
+        .unwrap_or_else(|_| panic!("getter failed"));
+    assert!(
+        sender.live.get() > before,
+        "getter allocation stayed in sender"
+    );
     assert_eq!(parcel.live.get(), 1);
     {
         let _entered = Enter::new(parcel.clone());
         set_data(&root, "value", copied);
     }
     assert!(engine.interp.get_member(&graph, "fail").is_err());
-    assert_eq!(parcel.live.get(), 1, "throwing getter did not allocate in parcel");
+    assert_eq!(
+        parcel.live.get(),
+        1,
+        "throwing getter did not allocate in parcel"
+    );
     {
         let _entered = Enter::new(parcel.clone());
         drop(root);

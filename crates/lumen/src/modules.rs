@@ -481,6 +481,12 @@ impl Interp {
         referrer: &str,
         attr_type: Option<&str>,
     ) -> Result<(String, String), Abrupt> {
+        #[cfg(feature = "parallel")]
+        if specifier == "lumen:parallel" {
+            if !self.host_state.has::<crate::parallel::api::Realm>() { return Err(self.throw("TypeError", "parallel host is not installed")); }
+            if attr_type.is_some() { return Err(self.throw("TypeError", "lumen:parallel does not accept import attributes")); }
+            return Ok((specifier.into(), "export const run = Lumen.parallel.run; export const spawn = Lumen.parallel.spawn;".into()));
+        }
         // A specifier naming a module of a loaded precompiled bundle resolves inside the bundle
         // (its AST is decoded in `parse_and_register`); no host loader is consulted.
         if let Some(key) = crate::precompiled::resolve(self, specifier, referrer, attr_type) {

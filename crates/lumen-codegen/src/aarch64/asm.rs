@@ -158,6 +158,7 @@ enum Kind {
     B26,
     /// `b.cond`/`cbz`/`cbnz`/`ldr` literal: imm19 at bit 5.
     B19,
+    B14,
     /// `adr`: 21-bit byte offset split immlo (29..31) / immhi (5..24).
     Adr,
     /// A jump-table entry: `label - base` as i32.
@@ -254,12 +255,13 @@ impl Asm {
                     }
                     w |= (d as u32) & 0x03ff_ffff;
                 }
-                Kind::B19 => {
+                Kind::B19 | Kind::B14 => {
                     let d = disp >> 2;
-                    if !(-(1 << 18)..(1 << 18)).contains(&d) {
+                    let bits = if matches!(f.kind, Kind::B14) { 14 } else { 19 };
+                    if !(-(1 << (bits - 1))..(1 << (bits - 1))).contains(&d) {
                         return Err("aarch64: conditional branch out of range".into());
                     }
-                    w |= ((d as u32) & 0x7_ffff) << 5;
+                    w |= ((d as u32) & ((1 << bits) - 1)) << 5;
                 }
                 Kind::Adr => {
                     if !(-(1 << 20)..(1 << 20)).contains(&disp) {
@@ -292,6 +294,11 @@ impl Asm {
     pub fn cbz(&mut self, nz: bool, w64: bool, rt: u8, l: Label) {
         self.fixup(l, Kind::B19);
         self.word(sf(w64) | 0x3400_0000 | (nz as u32) << 24 | r(rt));
+    }
+    pub fn tbz(&mut self, nz: bool, bit: u8, rt: u8, l: Label) {
+        self.fixup(l, Kind::B14);
+        self.word(0x3600_0000 | (nz as u32) << 24 | ((bit as u32 & 32) << 26)
+            | ((bit as u32 & 31) << 19) | r(rt));
     }
     pub fn br(&mut self, rn: u8) {
         self.word(0xD61F_0000 | r(rn) << 5);
@@ -358,6 +365,13 @@ impl Asm {
     /// `rd = ra - rn * rm`
     pub fn msub(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, ra: u8) {
         self.word(sf(w64) | 0x1B00_8000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd));
+    }
+    pub fn madd(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, ra: u8) {
+        self.word(sf(w64) | 0x1B00_0000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd));
+    }
+    pub fn ccmp(&mut self, w64: bool, rn: u8, rm: u8, cc: Cond, nzcv: u8) {
+        self.word(sf(w64) | 0x7a40_0000 | r(rm) << 16 | (cc as u32) << 12
+            | r(rn) << 5 | nzcv as u32);
     }
     /// Logical immediate with a pre-encoded `N:immr:imms` (see [`logical_imm`]).
     pub fn log_imm(&mut self, op: LogImm, w64: bool, rd: u8, rn: u8, enc: u32) {

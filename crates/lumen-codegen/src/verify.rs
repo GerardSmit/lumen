@@ -179,6 +179,7 @@ fn check_types(func: &Function, data: &InstData) -> Result<(), String> {
                 Sext | Uext => from == Type::I32 && *to == Type::I64,
                 FromSint | FromUint => from.is_int() && to.is_float(),
                 ToSint | ToUint | ToSintSat | ToUintSat => from.is_float() && to.is_int(),
+                ToJsInt32 => from == Type::F64 && *to == Type::I32,
                 Promote => from == Type::F32 && *to == Type::F64,
                 Demote => from == Type::F64 && *to == Type::F32,
                 Bitcast => from.bits() == to.bits() && from.is_int() != to.is_int(),

@@ -42,7 +42,7 @@ pub enum CmpRhs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Amode {
     Imm(VReg, i32),
-    Reg(VReg, VReg),
+    Reg(VReg, VReg, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,11 +155,26 @@ pub enum MInst {
         b: VReg,
         c: VReg,
     },
+    Madd {
+        size: Size,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+        c: VReg,
+    },
     Bit {
         op: BitOp,
         size: Size,
         dst: VReg,
         src: VReg,
+    },
+    Bitfield {
+        size: Size,
+        dst: VReg,
+        src: VReg,
+        signed: bool,
+        immr: u8,
+        imms: u8,
     },
     /// Sign-extend the low `from` bits.
     Sext {
@@ -182,6 +197,13 @@ pub enum MInst {
         size: Size,
         a: VReg,
         b: CmpRhs,
+    },
+    CCmp {
+        size: Size,
+        a: VReg,
+        b: VReg,
+        cc: Cond,
+        nzcv: u8,
     },
     FCmp {
         double: bool,
@@ -239,6 +261,7 @@ pub enum MInst {
         dst: VReg,
         src: VReg,
     },
+    FToJsInt32 { dst: VReg, src: VReg },
     /// Bit-exact `fmov` from a general register (`S32`: w → s, `S64`: x → d).
     GprToFpr {
         size: Size,
@@ -263,6 +286,13 @@ pub enum MInst {
     /// Branch on `reg != 0` (32-bit test).
     Cbnz {
         reg: VReg,
+        taken: usize,
+        not_taken: usize,
+    },
+    TestBit {
+        reg: VReg,
+        bit: u8,
+        nz: bool,
         taken: usize,
         not_taken: usize,
     },
@@ -291,7 +321,7 @@ pub enum MInst {
 fn amode_uses(a: &Amode, out: &mut Vec<Operand>) {
     match *a {
         Amode::Imm(b, _) => out.push(Operand::use_reg(b)),
-        Amode::Reg(b, i) => {
+        Amode::Reg(b, i, _) => {
             out.push(Operand::use_reg(b));
             if i != b {
                 out.push(Operand::use_reg(i));
@@ -344,12 +374,14 @@ impl MachInst for MInst {
             | FCvt { dst, src: a, .. }
             | IntToF { dst, src: a, .. }
             | FToInt { dst, src: a, .. }
+            | FToJsInt32 { dst, src: a }
+            | Bitfield { dst, src: a, .. }
             | GprToFpr { dst, src: a, .. }
             | FprToGpr { dst, src: a, .. } => {
                 out.push(Operand::use_reg(*a));
                 out.push(Operand::def_reg(*dst));
             }
-            Msub { dst, a, b, c, .. } => {
+            Msub { dst, a, b, c, .. } | Madd { dst, a, b, c, .. } => {
                 uses(out, &[*a, *b, *c]);
                 out.push(Operand::def_reg(*dst));
             }
@@ -372,7 +404,7 @@ impl MachInst for MInst {
                     }
                 }
             }
-            FCmp { a, b, .. } => uses(out, &[*a, *b]),
+            FCmp { a, b, .. } | CCmp { a, b, .. } => uses(out, &[*a, *b]),
             Call(c) => {
                 let CallInfo {
                     target,
@@ -402,7 +434,7 @@ impl MachInst for MInst {
                     out.push(Operand::use_any(a));
                 }
             }
-            BrTable { index: r, .. } | Cbnz { reg: r, .. } | TrapNz { reg: r, .. } => {
+            BrTable { index: r, .. } | Cbnz { reg: r, .. } | TestBit { reg: r, .. } | TrapNz { reg: r, .. } => {
                 out.push(Operand::use_reg(*r))
             }
             Ret { vals } => {

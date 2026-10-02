@@ -1553,6 +1553,7 @@ struct AsyncInbox {
     next: u64,
     pending: FastMap<u64, Deferred>,
     ready: std::sync::Arc<std::sync::Mutex<Vec<(u64, Settle)>>>,
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// An `OpError` that crosses threads: the class/message/code of an error built off the JS thread.
@@ -1612,6 +1613,14 @@ impl From<NativeError> for OpError {
 }
 
 impl Interp {
+    /// Wake an owner event loop when a fallback completer delivers a settlement.
+    pub fn set_async_waker(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if !self.host_state.has::<AsyncInbox>() {
+            self.host_state.put(AsyncInbox::default());
+        }
+        self.host_state.get_mut::<AsyncInbox>().unwrap().wake = Some(wake);
+    }
+
     /// Install the realm's event loop hooks (see [`AsyncHost`]).
     pub fn set_async_host(&mut self, host: impl AsyncHost) {
         self.host_state.put(AsyncHostSlot(Rc::new(host)));
@@ -1636,11 +1645,15 @@ impl Interp {
         inbox.next += 1;
         inbox.pending.insert(id, deferred);
         let ready = std::sync::Arc::clone(&inbox.ready);
+        let wake = inbox.wake.clone();
         Completer::new(move |settle| {
             ready
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((id, settle));
+            if let Some(wake) = wake {
+                wake();
+            }
         })
     }
 
@@ -2003,6 +2016,9 @@ impl Interp {
     pub fn global_object(&self) -> Value {
         Value::Obj(self.global.clone())
     }
+
+    /// Native-code compilation and execution counters for this realm.
+    pub fn jit_stats(&self) -> crate::JitStats { self.jit_stats.get() }
 
     /// `JSON.parse(text)` through the realm's `JSON` object.
     pub fn json_parse(&mut self, text: &str) -> Result<Value, Value> {

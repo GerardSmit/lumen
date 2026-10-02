@@ -82,9 +82,179 @@ fn class_of(t: Type) -> RegClass {
     }
 }
 
+fn tested_bit(f: &Function, condition: Value) -> Option<(Value, Value, u8, bool)> {
+    let constant = |v: Value| {
+        let ValueDef::Result(i, 0) = f.values[v.index()].def else { return None };
+        match f.inst(i) { InstData::Iconst { imm, .. } => Some(*imm), _ => None }
+    };
+    let ValueDef::Result(compare, 0) = f.values[condition.index()].def else { return None };
+    let InstData::IntCmp { cc, args: [a, b] } = f.inst(compare) else { return None };
+    let nz = match cc { IntCC::Eq => false, IntCC::Ne => true, _ => return None };
+    let masked = if constant(*b) == Some(0) { *a }
+        else if constant(*a) == Some(0) { *b } else { return None };
+    let ValueDef::Result(and, 0) = f.values[masked.index()].def else { return None };
+    let InstData::Binary { op: BinaryOp::Band, args: [a, b] } = f.inst(and) else { return None };
+    let (value, mask) = if let Some(mask) = constant(*b) { (*a, mask) }
+        else { (*b, constant(*a)?) };
+    let mask = if f.value_type(value) == Type::I32 { mask as u32 as u64 } else { mask as u64 };
+    mask.is_power_of_two().then_some((masked, value, mask.trailing_zeros() as u8, nz))
+}
+
 #[cfg(test)]
 mod softfloat_tests {
     use super::*;
+
+    #[test]
+    fn shift_pairs_extract_exact_signed_and_unsigned_bitfields() {
+        for ty in [Type::I32, Type::I64] {
+            let bits = ty.bits();
+            for left in [0, 1, 8, bits-1, bits+8] {
+                for right in [0, 1, 8, bits-1, bits+8] {
+                    for op in [BinaryOp::Ushr, BinaryOp::Sshr] {
+                        let mut f = Function::new("extract", Signature::new(vec![ty], vec![ty]));
+                        let mut b = crate::FunctionBuilder::new(&mut f);
+                        let entry = b.create_entry_block();
+                        let value = b.block_params(entry)[0];
+                        let l = b.iconst(ty, left as i64);
+                        let shifted = b.binary(BinaryOp::Ishl, value, l);
+                        let r = b.iconst(ty, right as i64);
+                        let result = b.binary(op, shifted, r);
+                        b.ret(&[result]);
+                        let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                        let field = lowered.vcode.insts.iter().find_map(|i| match i {
+                            MInst::Bitfield { signed, immr, imms, .. } => Some((*signed, *immr as u32, *imms as u32)),
+                            _ => None,
+                        });
+                        assert_eq!(field.is_some(), (right & (bits-1)) >= (left & (bits-1)));
+                        if let Some((signed, start, end)) = field {
+                            let width = end-start+1;
+                            let mask = u64::MAX >> (64-width);
+                            for value in [0, 1, 127, 255, 0x80000000, 0x8765432112345678, u64::MAX] {
+                                let field = (value >> start) & mask;
+                                let field = if signed { ((field << (64-width)) as i64 >> (64-width)) as u64 } else { field };
+                                let field = if ty == Type::I32 { field as u32 as u64 } else { field };
+                                let shifted = eval::binary(BinaryOp::Ishl, ty, value, left as u64).unwrap();
+                                assert_eq!(field, eval::binary(op, ty, shifted, right as u64).unwrap());
+                            }
+                        }
+                        super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_bit_branches_fold_only_single_bit_masks() {
+        for ty in [Type::I32, Type::I64] {
+            for mask in [1, 1 << 31, 1i64 << 63, 3] {
+                if ty == Type::I32 && mask == 1i64 << 63 { continue; }
+                for cc in [IntCC::Eq, IntCC::Ne] {
+                    let mut f = Function::new("test_bit", Signature::new(vec![ty], vec![ty]));
+                    let mut b = crate::FunctionBuilder::new(&mut f);
+                    let entry = b.create_entry_block();
+                    let value = b.block_params(entry)[0];
+                    let yes = b.create_block();
+                    let no = b.create_block();
+                    let mask_value = b.iconst(ty, mask);
+                    let masked = b.binary(BinaryOp::Band, value, mask_value);
+                    let zero = b.iconst(ty, 0);
+                    let cond = b.icmp(cc, masked, zero);
+                    b.brif(cond, yes, &[], no, &[]);
+                    b.switch_to_block(yes);
+                    b.ret(&[value]);
+                    b.switch_to_block(no);
+                    b.ret(&[zero]);
+                    let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                    assert_eq!(lowered.vcode.insts.iter().any(|i| matches!(i,
+                        MInst::TestBit { .. })), mask != 3);
+                    let compiled = super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+                    assert_eq!(compiled.code.chunks_exact(4).any(|word|
+                        u32::from_le_bytes(word.try_into().unwrap()) & 0x7e000000 == 0x36000000), mask != 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_multiply_add_fuses_single_use_products_in_both_widths() {
+        for ty in [Type::I32, Type::I64] {
+            for op in [BinaryOp::Iadd, BinaryOp::Isub] {
+                for shared in [false, true] {
+                    let mut f = Function::new("multiply_add", Signature::new(vec![ty; 3], vec![ty]));
+                    let mut b = crate::FunctionBuilder::new(&mut f);
+                    let entry = b.create_entry_block();
+                    let args = b.block_params(entry).to_vec();
+                    let product = b.binary(BinaryOp::Imul, args[0], args[1]);
+                    let sum = b.binary(op, args[2], product);
+                    let result = if shared { b.binary(BinaryOp::Bxor, sum, product) } else { sum };
+                    b.ret(&[result]);
+                    let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                    assert_eq!(lowered.vcode.insts.iter().filter(|i| matches!(i,
+                        MInst::Madd { .. } | MInst::Msub { .. })).count(), usize::from(!shared));
+                    assert_eq!(lowered.vcode.insts.iter().filter(|i| matches!(i,
+                        MInst::Rrr { op: Rrr::Mul, .. })).count(), usize::from(shared));
+                    super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn javascript_conversion_selects_jscvt_only_with_the_feature_bit() {
+        let mut f = Function::new("to_int32", Signature::new(vec![Type::F64], vec![Type::I32]));
+        let mut b = crate::FunctionBuilder::new(&mut f);
+        let entry = b.create_entry_block();
+        let x = b.block_params(entry)[0];
+        let result = b.convert(ConvOp::ToJsInt32, Type::I32, x);
+        b.ret(&[result]);
+        crate::verify::verify(&f).unwrap();
+        let baseline = super::super::compile(&f, &super::super::Config::host(None)).unwrap();
+        let mut config = super::super::Config::host(None);
+        config.features = lumen_common::target::aarch64::JSCVT;
+        let specialized = super::super::compile(&f, &config).unwrap();
+        let contains = |code: &[u8]| code.chunks_exact(4).any(|word|
+            u32::from_le_bytes(word.try_into().unwrap()) & 0xfffffc00 == 0x1e7e0000);
+        assert!(!contains(&baseline.code));
+        assert!(contains(&specialized.code));
+        assert!(specialized.code.len() < baseline.code.len());
+        let mut portable = f.clone();
+        crate::legalize::legalize(&mut portable, crate::legalize::Legal {
+            from_u64: true, to_uint: true, to_int_sat: true,
+            srem_min_neg1: true, fcopysign: true, js_to_i32: false,
+        });
+        crate::verify::verify(&portable).unwrap();
+        for x in [0.0, -0.0, -1.75, 1.75, 2147483648.0, -2147483649.0,
+            4294967297.75, -4294967297.75, f64::MIN_POSITIVE, f64::MAX, -f64::MAX,
+            f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut env = crate::interp::BufferEnv { mem: vec![] };
+            assert_eq!(crate::interp::run(&f, &mut env, &[x.to_bits()]),
+                crate::interp::run(&portable, &mut env, &[x.to_bits()]), "{x}");
+        }
+    }
+
+    #[test]
+    fn scaled_addresses_sink_only_matching_single_use_shifts() {
+        for (kind, width) in [(MemKind::I64, 3), (MemKind::I32, 2), (MemKind::F64, 3)] {
+            for shift in [width, width + 1] {
+                let mut f = Function::new("scaled", Signature::new(vec![Type::I64, Type::I64], vec![kind.ty()]));
+                let mut b = crate::FunctionBuilder::new(&mut f);
+                let entry = b.create_entry_block();
+                let base = b.block_params(entry)[0];
+                let index = b.block_params(entry)[1];
+                let count = b.iconst(Type::I64, shift);
+                let index = b.binary(BinaryOp::Ishl, index, count);
+                let address = b.binary(BinaryOp::Iadd, base, index);
+                let result = b.load(kind, address, 0);
+                b.ret(&[result]);
+                let lowered = lower(&f, &Cfg::new(&f), &aapcs64()).unwrap();
+                assert_eq!(lowered.vcode.insts.iter().any(|inst| matches!(inst,
+                    MInst::Load { addr: Amode::Reg(_, _, true), .. })), shift == width);
+                assert_eq!(lowered.vcode.insts.iter().any(|inst| matches!(inst,
+                    MInst::ShiftImm { .. })), shift != width);
+            }
+        }
+    }
 
     #[test]
     fn imported_float_calls_use_gprs_without_changing_generated_entries() {
@@ -250,6 +420,92 @@ pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi) -> Result<Lowered, String> {
                 _ => false,
             };
             sunk[r.index()] = ok;
+        }
+    }
+
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Brif { cond, .. } = f.inst(i) else { continue };
+            let Some((masked, _, _, _)) = tested_bit(f, *cond) else { continue };
+            let ValueDef::Result(and, 0) = f.values[masked.index()].def else { continue };
+            if sunk[cond.index()] && uses[masked.index()] == 1 && inst_block[and.index()] == Some(b) {
+                sunk[masked.index()] = true;
+            }
+        }
+    }
+
+    // Both operands must be canonical compare results, not arbitrary integer masks.
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Binary { op: BinaryOp::Band | BinaryOp::Bor, args } = f.inst(i) else { continue };
+            let [result] = f.results(i) else { continue };
+            let Some(u) = user[result.index()] else { continue };
+            if uses[result.index()] != 1 || inst_block[u.index()] != Some(b)
+                || !matches!(f.inst(u), InstData::Brif { cond, .. } | InstData::Select { cond, .. }
+                    | InstData::TrapIf { cond, .. } if cond == result) { continue; }
+            if !args.iter().all(|arg| uses[arg.index()] == 1 && match f.values[arg.index()].def {
+                ValueDef::Result(compare, 0) => inst_block[compare.index()] == Some(b)
+                    && matches!(f.inst(compare), InstData::IntCmp { .. }),
+                _ => false,
+            }) { continue; }
+            for &value in [*result, args[0], args[1]].iter() { sunk[value.index()] = true; }
+        }
+    }
+
+    // Sink a single-use scaled index together with its single-use address add.
+    // The shift must match the memory width, with no displacement to materialize.
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Binary { op: BinaryOp::Ishl, args: [_, count] } = f.inst(i) else { continue };
+            let [result] = f.results(i) else { continue };
+            let Some(add) = user[result.index()] else { continue };
+            if !matches!(f.inst(add), InstData::Binary { op: BinaryOp::Iadd, .. }) { continue; }
+            let [address] = f.results(add) else { continue };
+            if uses[result.index()] != 1 || !sunk[address.index()]
+                || f.value_type(*result) != Type::I64 || inst_block[add.index()] != Some(b) { continue; }
+            let Some(memory) = user[address.index()] else { continue };
+            let width = match f.inst(memory) {
+                InstData::Load { kind, offset: 0, .. } => load_op(*kind).log2(),
+                InstData::Store { kind, offset: 0, .. } => store_op(*kind).log2(),
+                _ => continue,
+            };
+            if let ValueDef::Result(constant, 0) = f.values[count.index()].def {
+                if matches!(f.inst(constant), InstData::Iconst { imm, .. } if *imm == width as i64) {
+                    sunk[result.index()] = true;
+                }
+            }
+        }
+    }
+
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            let InstData::Binary { op: BinaryOp::Ishl, args: [_, left] } = f.inst(i) else { continue };
+            let [result] = f.results(i) else { continue };
+            let Some(u) = user[result.index()] else { continue };
+            if uses[result.index()] != 1 || inst_block[u.index()] != Some(b) { continue; }
+            let InstData::Binary { op: BinaryOp::Ushr | BinaryOp::Sshr, args: [arg, right] } = f.inst(u) else { continue };
+            if arg != result { continue; }
+            let (ValueDef::Result(l, 0), ValueDef::Result(r, 0)) = (f.values[left.index()].def, f.values[right.index()].def) else { continue };
+            if let (InstData::Iconst { imm: left, .. }, InstData::Iconst { imm: right, .. }) = (f.inst(l), f.inst(r)) {
+                let mask = f.value_type(*result).bits() as i64 - 1;
+                if (right & mask) >= (left & mask) { sunk[result.index()] = true; }
+            }
+        }
+    }
+
+    // Integer multiply-add/subtract wraps exactly like the two original operations.
+    for &b in &cfg.rpo {
+        for &i in &f.blocks[b.index()].insts {
+            if !matches!(f.inst(i), InstData::Binary { op: BinaryOp::Imul, .. }) { continue; }
+            let [result] = f.results(i) else { continue };
+            let Some(u) = user[result.index()] else { continue };
+            let [sum] = f.results(u) else { continue };
+            if uses[result.index()] != 1 || inst_block[u.index()] != Some(b) || sunk[sum.index()] { continue; }
+            sunk[result.index()] = match f.inst(u) {
+                InstData::Binary { op: BinaryOp::Iadd, .. } => true,
+                InstData::Binary { op: BinaryOp::Isub, args: [_, rhs] } => rhs == result,
+                _ => false,
+            };
         }
     }
 
@@ -550,6 +806,23 @@ impl Lower<'_> {
         match self.def(cond).cloned() {
             Some(InstData::IntCmp { cc, args }) => Some(self.int_cmp(cc, args[0], args[1])),
             Some(InstData::FloatCmp { cc, args }) => Some(self.float_cmp(cc, args[0], args[1])),
+            Some(InstData::Binary { op: op @ (BinaryOp::Band | BinaryOp::Bor), args: [left, right] }) => {
+                let (Some(InstData::IntCmp { cc: first, args: a }),
+                    Some(InstData::IntCmp { cc: second, args: b })) = (self.def(left).cloned(), self.def(right).cloned()) else { return None };
+                let (ra, rb) = (self.use_val(b[0]), self.use_val(b[1]));
+                let size = size_of(self.ty(b[0]));
+                let cc = self.int_cmp(first, a[0], a[1]);
+                let (yes, no) = match second {
+                    IntCC::Eq => (4, 0), IntCC::Ne => (0, 4), IntCC::Slt => (8, 0),
+                    IntCC::Sle => (4, 0), IntCC::Sgt => (0, 4), IntCC::Sge => (0, 8),
+                    IntCC::Ult => (0, 2), IntCC::Ule => (4, 2),
+                    IntCC::Ugt | IntCC::Uge => (2, 0),
+                };
+                let or = op == BinaryOp::Bor;
+                self.push(MInst::CCmp { size, a: ra, b: rb,
+                    cc: if or { cc.invert() } else { cc }, nzcv: if or { yes } else { no } });
+                Some(int_cc(second))
+            }
             _ => None,
         }
     }
@@ -586,9 +859,18 @@ impl Lower<'_> {
                         return Amode::Imm(self.use_val(x), d);
                     }
                 }
+                if offset == 0 {
+                    for (base, index) in [(a, b), (b, a)] {
+                        if self.sunk[index.index()] {
+                            if let Some(InstData::Binary { op: BinaryOp::Ishl, args: [index, _] }) = self.def(index).cloned() {
+                                return Amode::Reg(self.use_val(base), self.use_val(index), true);
+                            }
+                        }
+                    }
+                }
                 let (ra, rb) = (self.use_val(a), self.use_val(b));
                 if offset == 0 {
-                    return Amode::Reg(ra, rb);
+                    return Amode::Reg(ra, rb, false);
                 }
                 let t = self.vc.new_vreg(RegClass::Int);
                 self.push(MInst::Rrr {
@@ -609,7 +891,7 @@ impl Lower<'_> {
             Amode::Imm(base, offset)
         } else {
             let idx = self.mov_imm(offset as i64 as u64);
-            Amode::Reg(base, idx)
+            Amode::Reg(base, idx, false)
         }
     }
 
@@ -773,6 +1055,13 @@ impl Lower<'_> {
                 }
                 let taken = self.bmap[then.block.index()];
                 let not_taken = self.bmap[else_.block.index()];
+                if let Some((masked, value, bit, nz)) = tested_bit(f, *cond) {
+                    if self.sunk[masked.index()] && self.sunk[cond.index()] {
+                        let reg = self.use_val(value);
+                        self.push(MInst::TestBit { reg, bit, nz, taken, not_taken });
+                        return Ok(());
+                    }
+                }
                 match self.sunk_cond(*cond) {
                     Some(cc) => self.push(MInst::Jcc {
                         cc,
@@ -881,6 +1170,17 @@ impl Lower<'_> {
         let dst = self.vreg(r);
         match op {
             Iadd | Isub => {
+                for (product, c) in [(b, a), (a, b)] {
+                    if op == Isub && product != b { continue; }
+                    if !self.sunk[product.index()] { continue; }
+                    let ValueDef::Result(i, 0) = self.f.values[product.index()].def else { continue };
+                    if let InstData::Binary { op: Imul, args: [x, y] } = self.f.inst(i) {
+                        let (a, b, c) = (self.use_val(*x), self.use_val(*y), self.use_val(c));
+                        self.push(if op == Iadd { MInst::Madd { size, dst, a, b, c } }
+                            else { MInst::Msub { size, dst, a, b, c } });
+                        return Ok(());
+                    }
+                }
                 let (a, b) = if op == Iadd && self.iconst(b).is_none() && self.iconst(a).is_some() {
                     (b, a)
                 } else {
@@ -982,6 +1282,22 @@ impl Lower<'_> {
                 });
             }
             Ishl | Ushr | Sshr | Rotl | Rotr => {
+                if matches!(op, Ushr | Sshr) && self.sunk[a.index()] {
+                    if let ValueDef::Result(i, 0) = self.f.values[a.index()].def {
+                        if let InstData::Binary { op: Ishl, args: [value, left] } = self.f.inst(i) {
+                            let mask = ty.bits() as u64 - 1;
+                            if let (Some(left), Some(right)) = (self.iconst(*left), self.iconst(b)) {
+                                let (left, right) = (left & mask, right & mask);
+                                if right >= left {
+                                    let src = self.use_val(*value);
+                                    self.push(MInst::Bitfield { size, dst, src, signed: op == Sshr,
+                                        immr: (right-left) as u8, imms: (mask-left) as u8 });
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(c) = self.iconst(b) {
                     let bits = ty.bits() as u64;
                     let mut amt = (c & (bits - 1)) as u8;
@@ -1076,6 +1392,7 @@ impl Lower<'_> {
         }
         let src = self.use_val(arg);
         self.push(match op {
+            ConvOp::ToJsInt32 => MInst::FToJsInt32 { dst, src },
             ConvOp::Wrap => MInst::Mov {
                 size: Size::S32,
                 dst,
