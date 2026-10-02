@@ -1,5 +1,3 @@
-/private/tmp/claude-501/w1.py:42: UserWarning: to stderr
-  warnings.warn("to stderr")
 True True True
 _Lock True
 default True

@@ -169,6 +169,33 @@ impl Cookie {
 }
 
 /// Character and line based layer over a BufferedIOBase object, buffer.
+///
+/// encoding gives the name of the encoding that the stream will be
+/// decoded or encoded with. It defaults to locale.getencoding().
+///
+/// errors determines the strictness of encoding and decoding (see
+/// help(codecs.Codec) or the documentation for codecs.register) and
+/// defaults to "strict".
+///
+/// newline controls how line endings are handled. It can be None, '',
+/// '\n', '\r', and '\r\n'.  It works as follows:
+///
+/// * On input, if newline is None, universal newlines mode is
+///   enabled. Lines in the input can end in '\n', '\r', or '\r\n', and
+///   these are translated into '\n' before being returned to the
+///   caller. If it is '', universal newline mode is enabled, but line
+///   endings are returned to the caller untranslated. If it has any of
+///   the other legal values, input lines are only terminated by the given
+///   string, and the line ending is returned to the caller untranslated.
+///
+/// * On output, if newline is None, any '\n' characters written are
+///   translated to the system default line separator, os.linesep. If
+///   newline is '' or '\n', no translation takes place. If newline is any
+///   of the other legal values, any '\n' characters written are translated
+///   to the given string.
+///
+/// If line_buffering is True, a call to flush is implied when a call to
+/// write contains a newline character.
 #[lumen_bind::class(module = "_io", name = "TextIOWrapper")]
 pub struct TextIOWrapper {
     ok: bool,
@@ -194,6 +221,7 @@ pub struct TextIOWrapper {
     snapshot: Option<(i64, Vec<u8>)>,
     b2cratio: f64,
     pending: Vec<u8>,
+    finalizing: bool,
 }
 
 impl Drop for TextIOWrapper {
@@ -233,6 +261,7 @@ impl TextIOWrapper {
             snapshot: None,
             b2cratio: 0.0,
             pending: Vec::new(),
+            finalizing: false,
         }
     }
 
@@ -823,7 +852,7 @@ fn opt_str<'a>(it: &mut Interp, v: Option<&'a Value>, func: &str, arg: &str) -> 
 
 #[lumen_bind::methods]
 impl TextIOWrapper {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(buffer, encoding=None, errors=None, newline=None,\n              line_buffering=False, write_through=False)")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> TextIOWrapper {
         let _ = (args, kwargs);
         TextIOWrapper::blank()
@@ -861,6 +890,7 @@ impl TextIOWrapper {
     }
 
     /// Read at most size characters from stream.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<String> {
         attached(it, &slf.0)?;
         let n = super::size_arg(it, size)?;
@@ -868,6 +898,7 @@ impl TextIOWrapper {
     }
 
     /// Read until newline or EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn readline(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<String> {
         attached(it, &slf.0)?;
         let n = match size {
@@ -890,6 +921,9 @@ impl TextIOWrapper {
         let buffer = attached(it, &slf.0)?;
         if buffer_closed(it, &buffer)? {
             return Ok(Value::None);
+        }
+        if slf.0.with(it, |s| s.finalizing)? {
+            super::dealloc_warn(it, &buffer, slf.0.value());
         }
         let r = it.call_method(slf.0.value(), "flush", Vec::new());
         let c = it.call_method(&buffer, "close", Vec::new());
@@ -929,6 +963,7 @@ impl TextIOWrapper {
     ///
     /// Any other argument combinations are invalid,
     /// and may raise exceptions.
+    #[method(hint(py(text_signature = "($self, cookie, whence=os.SEEK_SET, /)")))]
     fn seek(slf: This<Py<Self>>, it: &mut Interp, cookie: &Value, #[default(0)] whence: i32) -> R<Value> {
         seek(it, &slf.0, cookie, whence)
     }
@@ -952,6 +987,8 @@ impl TextIOWrapper {
     }
 
     /// Reconfigure the text stream with new parameters.
+    ///
+    /// This also does an implicit stream flush.
     #[allow(clippy::too_many_arguments)]
     fn reconfigure(
         slf: This<Py<Self>>,
@@ -1103,7 +1140,12 @@ impl TextIOWrapper {
 
     #[getter]
     fn _finalizing(&self) -> bool {
-        false
+        self.finalizing
+    }
+
+    #[setter(name = "_finalizing")]
+    fn set_finalizing(slf: This<Py<Self>>, it: &mut Interp, v: bool) -> R<()> {
+        slf.0.with(it, |s| s.finalizing = v)
     }
 
     #[proto(next)]
@@ -1154,6 +1196,13 @@ impl TextIOWrapper {
 }
 
 /// Codec used when reading a file in universal newlines mode.
+///
+/// It wraps another incremental decoder, translating \r\n and \r into \n.
+/// It also records the types of newlines encountered.  When used with
+/// translate=False, it ensures that the newline sequence is returned in
+/// one piece. When used with decoder=None, it expects unicode strings as
+/// decode input and translates newlines without first invoking an external
+/// decoder.
 #[lumen_bind::class(module = "_io", name = "IncrementalNewlineDecoder")]
 pub struct IncrementalNewlineDecoder {
     decoder: Option<Value>,
@@ -1170,7 +1219,7 @@ fn nld_decoder(it: &mut Interp, slf: &Py<IncrementalNewlineDecoder>) -> R<Value>
 
 #[lumen_bind::methods]
 impl IncrementalNewlineDecoder {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(decoder, translate, errors='strict')")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> IncrementalNewlineDecoder {
         let _ = (args, kwargs);
         IncrementalNewlineDecoder { decoder: None, nl: NlState::new(false), errors: Value::None }

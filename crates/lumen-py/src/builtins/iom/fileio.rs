@@ -1,6 +1,6 @@
 //! `FileIO`: raw unbuffered I/O on a file descriptor, through the platform layer.
 
-use super::{call, is_eagain, unsupported};
+use super::{call, dealloc_warn, is_eagain, resource_warning, unsupported};
 use crate::bind::{type_object, KwArgs, Py, This};
 use crate::object::*;
 use crate::platform::{IoError, PlatformRef};
@@ -10,7 +10,19 @@ use lumen_os::fs::flags;
 /// Bytes read per step when the size of the file is unknown.
 const SMALLCHUNK: usize = 8192;
 
-/// Raw I/O on an operating-system file descriptor.
+/// Open a file.
+///
+/// The mode can be 'r' (default), 'w', 'x' or 'a' for reading,
+/// writing, exclusive creation or appending.  The file will be created if it
+/// doesn't exist when opened for writing or appending; it will be truncated
+/// when opened for writing.  A FileExistsError will be raised if it already
+/// exists when opened for creating. Opening a file for creating implies
+/// writing so this mode behaves in a similar way to 'w'.Add a '+' to the mode
+/// to allow simultaneous reading and writing. A custom opener can be used by
+/// passing a callable as *opener*. The underlying file descriptor for the file
+/// object is then obtained by calling opener with (*name*, *flags*).
+/// *opener* must return an open file descriptor (passing os.open as *opener*
+/// results in functionality similar to passing None).
 #[lumen_bind::class(module = "_io", name = "FileIO")]
 pub struct FileIO {
     pub fd: i32,
@@ -21,6 +33,7 @@ pub struct FileIO {
     seekable: Option<bool>,
     closefd: bool,
     blksize: i64,
+    finalizing: bool,
     platform: Option<PlatformRef>,
 }
 
@@ -47,6 +60,7 @@ impl FileIO {
             seekable: None,
             closefd: true,
             blksize: 0,
+            finalizing: false,
             platform: None,
         }
     }
@@ -314,7 +328,7 @@ fn readall_fd(it: &mut Interp, slf: &Py<FileIO>) -> R<Value> {
 
 #[lumen_bind::methods]
 impl FileIO {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(file, mode='r', closefd=True, opener=None)")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> FileIO {
         let _ = (args, kwargs);
         FileIO::empty()
@@ -337,6 +351,16 @@ impl FileIO {
     }
 
     /// Read at most size bytes, returned as bytes.
+    ///
+    /// If size is less than 0, read all bytes in the file making multiple read calls.
+    /// See ``FileIO.readall``.
+    ///
+    /// Attempts to make only one system call, retrying only per PEP 475 (EINTR). This
+    /// means less data may be returned than requested.
+    ///
+    /// In non-blocking mode, returns None if no data is available. Return an empty
+    /// bytes object at EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         let fd = fd_of(it, &slf.0)?;
         if !slf.0.borrow(it)?.readable {
@@ -358,6 +382,12 @@ impl FileIO {
     }
 
     /// Read all data from the file, returned as bytes.
+    ///
+    /// Reads until either there is an error or read() returns size 0 (indicates EOF).
+    /// If the file is already at EOF, returns an empty bytes object.
+    ///
+    /// In non-blocking mode, returns as much data as could be read before EAGAIN. If no
+    /// data is available (EAGAIN is returned before bytes are read) returns None.
     fn readall(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         readall_fd(it, &slf.0)
     }
@@ -376,6 +406,10 @@ impl FileIO {
     }
 
     /// Write buffer b to file, return number of bytes written.
+    ///
+    /// Only makes one system call, so not all of the data may be written.
+    /// The number of bytes actually written is returned.  In non-blocking mode,
+    /// returns None if the write would block.
     fn write(slf: This<Py<Self>>, it: &mut Interp, b: &[u8]) -> R<Option<usize>> {
         let fd = fd_of(it, &slf.0)?;
         if !slf.0.borrow(it)?.writable {
@@ -389,6 +423,14 @@ impl FileIO {
     }
 
     /// Move to new file position and return the file position.
+    ///
+    /// Argument offset is a byte count.  Optional argument whence defaults to
+    /// SEEK_SET or 0 (offset from start of file, offset should be >= 0); other values
+    /// are SEEK_CUR or 1 (move relative to current position, positive or negative),
+    /// and SEEK_END or 2 (move relative to end of file, usually negative, although
+    /// many platforms allow seeking beyond the end of a file).
+    ///
+    /// Note that not all file objects are seekable.
     fn seek(slf: This<Py<Self>>, it: &mut Interp, pos: &Value, #[default(0)] whence: i32) -> R<u64> {
         let fd = fd_of(it, &slf.0)?;
         if matches!(pos, Value::Float(_)) || !it.has_index(pos) {
@@ -400,6 +442,8 @@ impl FileIO {
     }
 
     /// Current file position.
+    ///
+    /// Can raise OSError for non seekable files.
     fn tell(slf: This<Py<Self>>, it: &mut Interp) -> R<u64> {
         let fd = fd_of(it, &slf.0)?;
         let r = it.platform.borrow_mut().fd_seek(fd, 0, 1);
@@ -407,6 +451,9 @@ impl FileIO {
     }
 
     /// Truncate the file to at most size bytes and return the truncated size.
+    ///
+    /// Size defaults to the current file position, as returned by tell().
+    /// The current file position is changed to the value of size.
     fn truncate(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         let fd = fd_of(it, &slf.0)?;
         if !slf.0.borrow(it)?.writable {
@@ -460,7 +507,13 @@ impl FileIO {
     }
 
     /// Close the file.
+    ///
+    /// A closed file cannot be used for further I/O operations.  close() may be
+    /// called more than once without error.
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
+        if slf.0.borrow(it)?.finalizing {
+            dealloc_warn(it, slf.0.value(), slf.0.value());
+        }
         let base = type_object::<super::base::RawIOBase>(it);
         let f = it.get_attr_str(&Value::Obj(base), "close")?;
         let r = it.call(&f, vec![slf.0.value().clone()], Vec::new());
@@ -498,6 +551,7 @@ impl FileIO {
         self.mode_string()
     }
 
+    /// Stat st_blksize if available
     #[getter]
     fn _blksize(&self) -> i64 {
         self.blksize
@@ -505,7 +559,34 @@ impl FileIO {
 
     #[getter]
     fn _finalizing(&self) -> bool {
-        false
+        self.finalizing
+    }
+
+    #[setter]
+    fn set__finalizing(&mut self, v: bool) {
+        self.finalizing = v;
+    }
+
+    fn _dealloc_warn(slf: This<Py<Self>>, it: &mut Interp, object: &Value) -> R<()> {
+        let (open, closefd) = {
+            let s = slf.0.borrow(it)?;
+            (s.fd >= 0, s.closefd)
+        };
+        if open && closefd {
+            let r = it.repr_of(object)?;
+            if let Err(e) = resource_warning(it, object, &format!("unclosed file {r}")) {
+                if it.exc_is(&e, "Warning") {
+                    let msg = format!("Exception ignored while finalizing file {r}");
+                    it.write_unraisable(&e, Some(&msg), None);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn _isatty_open_only(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+        let fd = fd_of(it, &slf.0)?;
+        Ok(it.platform.borrow_mut().fd_isatty(fd))
     }
 
     fn __getstate__(slf: This<Value>, it: &mut Interp) -> R<Value> {
