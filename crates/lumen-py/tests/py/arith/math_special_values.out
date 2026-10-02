@@ -6,7 +6,7 @@ tan (inf,) ValueError math domain error
 tan (-inf,) ValueError math domain error
 atanh (1.0,) ValueError math domain error
 atanh (-1.0,) ValueError math domain error
-atanh (0.5,) 0.5493061443340549
+atanh (-0.0,) -0.0
 acosh (0.5,) ValueError math domain error
 asinh (-0.0,) -0.0
 lgamma (0.0,) ValueError math domain error

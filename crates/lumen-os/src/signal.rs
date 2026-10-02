@@ -78,9 +78,9 @@ pub fn constants() -> &'static [(&'static str, i32)] {
             ("SIG_BLOCK", libc::SIG_BLOCK),
             ("SIG_UNBLOCK", libc::SIG_UNBLOCK),
             ("SIG_SETMASK", libc::SIG_SETMASK),
-            ("ITIMER_REAL", libc::ITIMER_REAL),
-            ("ITIMER_VIRTUAL", libc::ITIMER_VIRTUAL),
-            ("ITIMER_PROF", libc::ITIMER_PROF),
+            ("ITIMER_REAL", 0),
+            ("ITIMER_VIRTUAL", 1),
+            ("ITIMER_PROF", 2),
         ]
     }
     #[cfg(not(unix))]

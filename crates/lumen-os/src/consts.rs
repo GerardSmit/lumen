@@ -3,8 +3,8 @@
 
 #[cfg(unix)]
 macro_rules! libc_table {
-    ($vis:vis $table:ident: $($name:ident),* $(,)?) => {
-        $vis static $table: &[(&str, i64)] = &[$((stringify!($name), libc::$name as i64),)*];
+    ($vis:vis $table:ident: $($(#[$m:meta])* $name:ident),* $(,)?) => {
+        $vis static $table: &[(&str, i64)] = &[$($(#[$m])* (stringify!($name), libc::$name as i64),)*];
     };
 }
 
@@ -89,7 +89,8 @@ static SYSEXITS: &[(&str, i64)] = &[
 #[cfg(unix)]
 mod unix {
     libc_table!(pub(super) OPEN: O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, O_CREAT, O_EXCL, O_TRUNC, O_NONBLOCK,
-        O_NDELAY, O_SYNC, O_DSYNC, O_NOCTTY, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_ACCMODE, O_ASYNC, O_FSYNC);
+        O_NDELAY, O_SYNC, O_DSYNC, O_NOCTTY, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_ACCMODE, O_ASYNC,
+        #[cfg(not(target_os = "android"))] O_FSYNC);
     libc_table!(pub(super) MISC: SEEK_DATA, SEEK_HOLE, WNOHANG, WUNTRACED, WCONTINUED, WEXITED, WSTOPPED, WNOWAIT,
         P_ALL, P_PID, P_PGID, PRIO_PROCESS, PRIO_PGRP, PRIO_USER, RTLD_LAZY, RTLD_NOW, RTLD_GLOBAL, RTLD_LOCAL,
         RTLD_NODELETE, RTLD_NOLOAD, F_LOCK, F_TLOCK, F_ULOCK, F_TEST);
