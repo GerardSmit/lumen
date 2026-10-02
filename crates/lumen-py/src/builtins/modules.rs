@@ -41,7 +41,7 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_struct", bound::<super::structm::_struct::Module>),
     ("_thread", bound::<super::threadm::_thread::Module>),
     ("_tokenize", bound::<super::tokenizem::_tokenize::Module>),
-    ("_typing", |it| Some(super::typingm::make(it))),
+    ("_typing", bound::<super::typingm::_typing::Module>),
     ("_warnings", bound::<super::warningsm::_warnings::Module>),
     ("_weakref", bound::<super::weakm::_weakref::Module>),
     ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
