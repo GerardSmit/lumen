@@ -268,6 +268,9 @@ const PROTOCOLS: &[&str] = &[
     "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul",
     "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int",
     "float", "call", "copy", "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
+    "truediv", "rtruediv", "itruediv", "floordiv", "rfloordiv", "ifloordiv", "mod", "rmod", "imod", "pow", "rpow",
+    "ipow", "lshift", "rlshift", "ilshift", "rshift", "rrshift", "irshift", "matmul", "rmatmul", "imatmul", "divmod",
+    "rdivmod", "getattribute", "setattr", "delattr",
 ];
 
 fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {

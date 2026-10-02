@@ -262,7 +262,7 @@ impl AliasData {
         new_opaque(cls, data.expect("a new alias"))
     }
 
-    #[method(name = "__getattribute__", hint(py(text_signature = "")))]
+    #[proto(getattribute)]
     fn getattribute(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<Value> {
         let this = slf.0.value().clone();
         let Value::Obj(n) = name else { return Err(it.type_error("attribute name must be string")) };
@@ -274,7 +274,7 @@ impl AliasData {
         it.get_attr(&origin, n)
     }
 
-    #[method(name = "__setattr__", hint(py(text_signature = "")))]
+    #[proto(setattr)]
     fn setattr(&self, it: &mut Interp, name: &Value, value: &Value) -> R<()> {
         if ALIAS_OWN.contains(&name.as_str().unwrap_or("")) {
             return Err(it.new_exc_str("AttributeError", "readonly attribute"));

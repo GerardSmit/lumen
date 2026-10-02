@@ -215,21 +215,21 @@ fn call_builtin(it: &mut Interp, name: &str, arg: Value) -> R<Value> {
 
 #[lumen_bind::methods]
 impl ProxyData {
-    #[method(name = "__getattribute__", hint(py(text_signature = "")))]
+    #[proto(getattribute)]
     fn getattribute(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<Value> {
         let t = proxy_target(it, &slf.0)?;
         let n = attr_name(it, name)?;
         it.get_attr(&t, n)
     }
 
-    #[method(name = "__setattr__", hint(py(text_signature = "")))]
+    #[proto(setattr)]
     fn setattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value, value: &Value) -> R<()> {
         let t = proxy_target(it, &slf.0)?;
         let n = attr_name(it, name)?;
         it.set_attr(&t, n, value.clone())
     }
 
-    #[method(name = "__delattr__", hint(py(text_signature = "")))]
+    #[proto(delattr)]
     fn delattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<()> {
         let t = proxy_target(it, &slf.0)?;
         let n = attr_name(it, name)?;
@@ -401,72 +401,72 @@ impl ProxyData {
         binop(it, BinOp::BitXor, value, &slf)
     }
 
-    #[method(name = "__truediv__", hint(py(text_signature = "")))]
+    #[proto(truediv)]
     fn truediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Div, &slf, value)
     }
 
-    #[method(name = "__rtruediv__", hint(py(text_signature = "")))]
+    #[proto(rtruediv)]
     fn rtruediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Div, value, &slf)
     }
 
-    #[method(name = "__floordiv__", hint(py(text_signature = "")))]
+    #[proto(floordiv)]
     fn floordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::FloorDiv, &slf, value)
     }
 
-    #[method(name = "__rfloordiv__", hint(py(text_signature = "")))]
+    #[proto(rfloordiv)]
     fn rfloordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::FloorDiv, value, &slf)
     }
 
-    #[method(name = "__mod__", hint(py(text_signature = "")))]
+    #[proto(mod)]
     fn r#mod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Mod, &slf, value)
     }
 
-    #[method(name = "__rmod__", hint(py(text_signature = "")))]
+    #[proto(rmod)]
     fn rmod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Mod, value, &slf)
     }
 
-    #[method(name = "__matmul__", hint(py(text_signature = "")))]
+    #[proto(matmul)]
     fn matmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::MatMult, &slf, value)
     }
 
-    #[method(name = "__rmatmul__", hint(py(text_signature = "")))]
+    #[proto(rmatmul)]
     fn rmatmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::MatMult, value, &slf)
     }
 
-    #[method(name = "__lshift__", hint(py(text_signature = "")))]
+    #[proto(lshift)]
     fn lshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::LShift, &slf, value)
     }
 
-    #[method(name = "__rlshift__", hint(py(text_signature = "")))]
+    #[proto(rlshift)]
     fn rlshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::LShift, value, &slf)
     }
 
-    #[method(name = "__rshift__", hint(py(text_signature = "")))]
+    #[proto(rshift)]
     fn rshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::RShift, &slf, value)
     }
 
-    #[method(name = "__rrshift__", hint(py(text_signature = "")))]
+    #[proto(rrshift)]
     fn rrshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::RShift, value, &slf)
     }
 
-    #[method(name = "__pow__", hint(py(text_signature = "")))]
+    #[proto(pow)]
     fn pow(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Pow, &slf, value)
     }
 
-    #[method(name = "__rpow__", hint(py(text_signature = "")))]
+    #[proto(rpow)]
     fn rpow(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
         binop(it, BinOp::Pow, value, &slf)
     }
@@ -501,37 +501,37 @@ impl ProxyData {
         inplace(it, BinOp::BitXor, &slf.0, value)
     }
 
-    #[method(name = "__itruediv__", hint(py(text_signature = "")))]
+    #[proto(itruediv)]
     fn itruediv(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::Div, &slf.0, value)
     }
 
-    #[method(name = "__ifloordiv__", hint(py(text_signature = "")))]
+    #[proto(ifloordiv)]
     fn ifloordiv(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::FloorDiv, &slf.0, value)
     }
 
-    #[method(name = "__imod__", hint(py(text_signature = "")))]
+    #[proto(imod)]
     fn imod(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::Mod, &slf.0, value)
     }
 
-    #[method(name = "__imatmul__", hint(py(text_signature = "")))]
+    #[proto(imatmul)]
     fn imatmul(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::MatMult, &slf.0, value)
     }
 
-    #[method(name = "__ilshift__", hint(py(text_signature = "")))]
+    #[proto(ilshift)]
     fn ilshift(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::LShift, &slf.0, value)
     }
 
-    #[method(name = "__irshift__", hint(py(text_signature = "")))]
+    #[proto(irshift)]
     fn irshift(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::RShift, &slf.0, value)
     }
 
-    #[method(name = "__ipow__", hint(py(text_signature = "")))]
+    #[proto(ipow)]
     fn ipow(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<Value> {
         inplace(it, BinOp::Pow, &slf.0, value)
     }

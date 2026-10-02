@@ -40,7 +40,9 @@ const SLOT_PROTOS: &[&str] = &[
     "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash", "bool", "eq", "ne", "lt",
     "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or",
     "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext",
-    "call",
+    "call", "truediv", "rtruediv", "itruediv", "floordiv", "rfloordiv", "ifloordiv", "mod", "rmod", "imod", "pow",
+    "rpow", "ipow", "lshift", "rlshift", "ilshift", "rshift", "rrshift", "irshift", "matmul", "rmatmul", "imatmul",
+    "divmod", "rdivmod", "getattribute", "setattr", "delattr",
 ];
 
 /// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
@@ -59,7 +61,10 @@ fn dunder(p: &'static str) -> &'static str {
     table!("init" "len" "getitem" "setitem" "delitem" "contains" "iter" "next" "reversed" "repr" "str" "hash"
         "bool" "eq" "ne" "lt" "le" "gt" "ge" "add" "radd" "iadd" "sub" "rsub" "isub" "mul" "rmul" "imul"
         "and" "rand" "iand" "or" "ror" "ior" "xor" "rxor" "ixor" "neg" "pos" "abs" "invert" "index" "int"
-        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext")
+        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext"
+        "truediv" "rtruediv" "itruediv" "floordiv" "rfloordiv" "ifloordiv" "mod" "rmod" "imod" "pow" "rpow" "ipow"
+        "lshift" "rlshift" "ilshift" "rshift" "rrshift" "irshift" "matmul" "rmatmul" "imatmul" "divmod" "rdivmod"
+        "getattribute" "setattr" "delattr")
 }
 
 /// The attribute name a fn gets in Python.
@@ -434,6 +439,9 @@ fn slot_text_sig(name: &str, nargs: usize) -> String {
     let names: &[&str] = match name {
         "__getitem__" | "__delitem__" | "__contains__" => &["key"],
         "__setitem__" => &["key", "value"],
+        "__getattribute__" | "__delattr__" => &["name"],
+        "__setattr__" => &["name", "value"],
+        "__pow__" | "__rpow__" => &["value", "mod=None"],
         _ => &["value"],
     };
     let mut parts = vec!["$self"];
@@ -492,6 +500,32 @@ fn slot_doc(name: &str) -> Option<&'static str> {
         "__setitem__" => "Set self[key] to value.",
         "__delitem__" => "Delete self[key].",
         "__contains__" => "Return bool(key in self).",
+        "__truediv__" => "Return self/value.",
+        "__rtruediv__" => "Return value/self.",
+        "__itruediv__" => "Return self/=value.",
+        "__floordiv__" => "Return self//value.",
+        "__rfloordiv__" => "Return value//self.",
+        "__ifloordiv__" => "Return self//=value.",
+        "__mod__" => "Return self%value.",
+        "__rmod__" => "Return value%self.",
+        "__imod__" => "Return self%=value.",
+        "__pow__" => "Return pow(self, value, mod).",
+        "__rpow__" => "Return pow(value, self, mod).",
+        "__ipow__" => "Return self**=value.",
+        "__lshift__" => "Return self<<value.",
+        "__rlshift__" => "Return value<<self.",
+        "__ilshift__" => "Return self<<=value.",
+        "__rshift__" => "Return self>>value.",
+        "__rrshift__" => "Return value>>self.",
+        "__irshift__" => "Return self>>=value.",
+        "__matmul__" => "Return self@value.",
+        "__rmatmul__" => "Return value@self.",
+        "__imatmul__" => "Return self@=value.",
+        "__divmod__" => "Return divmod(self, value).",
+        "__rdivmod__" => "Return divmod(value, self).",
+        "__getattribute__" => "Return getattr(self, name).",
+        "__setattr__" => "Implement setattr(self, name, value).",
+        "__delattr__" => "Implement delattr(self, name).",
         _ => return None,
     })
 }
