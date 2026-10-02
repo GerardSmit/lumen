@@ -257,15 +257,24 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
 /// Install the functions `M` declares into the existing namespace `d` (the `builtins` functions
 /// live in the interpreter's own builtins dict).
 pub fn install_functions<M: Module<PyHost>>(d: &Obj) {
+    for (n, v) in function_values::<M>() {
+        dict_set_str(d, n, v);
+    }
+}
+
+/// The functions `M` declares, by Python name (aliases included), as native values.
+pub fn function_values<M: Module<PyHost>>() -> Vec<(&'static str, Value)> {
     let items = ModuleItems::<PyHost>::of::<M>();
+    let mut out = Vec::new();
     for f in &items.functions {
         if !f.desc.exposed_to(HOST) {
             continue;
         }
         for n in std::iter::once(py_name(f.desc)).chain(args::aliases(f.desc)) {
-            dict_set_str(d, n, native_value(f));
+            out.push((n, native_value(f)));
         }
     }
+    out
 }
 
 /// `__module__`/`__qualname__` owner of a bound native: the module of a function, the qualified

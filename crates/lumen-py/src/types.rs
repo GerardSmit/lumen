@@ -1909,20 +1909,6 @@ impl Interp {
         Value::Obj(Object::new(Kind::Native(NativeData { name, f, method, desc: None, owner: None })))
     }
 
-    /// A module-level function of module `module`.
-    pub fn new_module_native(&self, module: &str, name: &'static str, f: NativeFn) -> Value {
-        let owner = Some(NativeOwner::Module(module.into()));
-        Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: false, desc: None, owner })))
-    }
-
-    pub fn reg_prop(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let g = self.new_native(name, f, false);
-        let p = Value::Obj(Object::new(Kind::Property(PropData { fget: g, fset: Value::None, fdel: Value::None, doc: Value::None })));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, p);
-        }
-    }
-
     pub fn module_globals(&self) -> Obj {
         self.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| self.builtins.clone())
     }

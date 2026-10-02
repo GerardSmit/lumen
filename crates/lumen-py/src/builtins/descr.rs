@@ -386,6 +386,19 @@ pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(it: &mut Int
     }
 }
 
+/// Installs `fget` into the builtin class `owner` as the read-only `member_descriptor` `name` (a
+/// plain property while the descriptor types do not exist yet).
+pub fn install_member(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value) {
+    if it.native_state::<DescrTypes>().member.is_none() {
+        let p = Value::Obj(Object::new(Kind::Property(PropData { fget, fset: Value::None, fdel: Value::None, doc: Value::None })));
+        if let Some(d) = owner.dict.borrow().as_ref() {
+            dict_set_str(d, name, p);
+        }
+        return;
+    }
+    put_descriptor(it, owner, name, fget, Value::None, Value::None, true);
+}
+
 fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, doc: Value, member: bool) {
     let types = it.native_state::<DescrTypes>();
     let Some(ty) = (if member { types.member.clone() } else { types.getset.clone() }) else { return };

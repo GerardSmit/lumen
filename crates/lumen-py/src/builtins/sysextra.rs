@@ -13,15 +13,6 @@ use std::rc::Rc;
 
 const HIDDEN: &str = "_structseq_hidden";
 
-fn field<const N: usize>(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some(v) = a.first() else { return Err(it.type_error("descriptor requires a struct sequence")) };
-    match v.tuple_items() {
-        Some(items) if N < items.len() => Ok(items[N].clone()),
-        Some(items) => Ok(structseq_hidden(v).get(N - items.len()).cloned().unwrap_or(Value::None)),
-        None => Err(it.type_error("descriptor requires a struct sequence")),
-    }
-}
-
 /// The fields of a struct sequence past `n_sequence_fields` (reachable by name only).
 pub fn structseq_hidden(v: &Value) -> Vec<Value> {
     let Value::Obj(o) = v else { return Vec::new() };
@@ -29,32 +20,126 @@ pub fn structseq_hidden(v: &Value) -> Vec<Value> {
     d.and_then(|d| dict_get_str(&d, HIDDEN)).and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default()
 }
 
-const GETTERS: [NativeFn; 24] = [
-    field::<0>,
-    field::<1>,
-    field::<2>,
-    field::<3>,
-    field::<4>,
-    field::<5>,
-    field::<6>,
-    field::<7>,
-    field::<8>,
-    field::<9>,
-    field::<10>,
-    field::<11>,
-    field::<12>,
-    field::<13>,
-    field::<14>,
-    field::<15>,
-    field::<16>,
-    field::<17>,
-    field::<18>,
-    field::<19>,
-    field::<20>,
-    field::<21>,
-    field::<22>,
-    field::<23>,
-];
+fn field(it: &mut Interp, seq: &Value, index: usize) -> R<Value> {
+    match seq.tuple_items() {
+        Some(items) if index < items.len() => Ok(items[index].clone()),
+        Some(items) => Ok(structseq_hidden(seq).get(index - items.len()).cloned().unwrap_or(Value::None)),
+        None => Err(it.type_error("descriptor requires a struct sequence")),
+    }
+}
+
+/// The getters of the struct sequence fields by index, installed under the field names.
+#[lumen_bind::class(name = "structseq_fields", hint(py(shared)))]
+struct Fields;
+
+#[lumen_bind::methods]
+impl Fields {
+    #[getter(name = "0")]
+    fn f0(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 0)
+    }
+    #[getter(name = "1")]
+    fn f1(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 1)
+    }
+    #[getter(name = "2")]
+    fn f2(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 2)
+    }
+    #[getter(name = "3")]
+    fn f3(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 3)
+    }
+    #[getter(name = "4")]
+    fn f4(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 4)
+    }
+    #[getter(name = "5")]
+    fn f5(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 5)
+    }
+    #[getter(name = "6")]
+    fn f6(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 6)
+    }
+    #[getter(name = "7")]
+    fn f7(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 7)
+    }
+    #[getter(name = "8")]
+    fn f8(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 8)
+    }
+    #[getter(name = "9")]
+    fn f9(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 9)
+    }
+    #[getter(name = "10")]
+    fn f10(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 10)
+    }
+    #[getter(name = "11")]
+    fn f11(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 11)
+    }
+    #[getter(name = "12")]
+    fn f12(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 12)
+    }
+    #[getter(name = "13")]
+    fn f13(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 13)
+    }
+    #[getter(name = "14")]
+    fn f14(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 14)
+    }
+    #[getter(name = "15")]
+    fn f15(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 15)
+    }
+    #[getter(name = "16")]
+    fn f16(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 16)
+    }
+    #[getter(name = "17")]
+    fn f17(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 17)
+    }
+    #[getter(name = "18")]
+    fn f18(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 18)
+    }
+    #[getter(name = "19")]
+    fn f19(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 19)
+    }
+    #[getter(name = "20")]
+    fn f20(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 20)
+    }
+    #[getter(name = "21")]
+    fn f21(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 21)
+    }
+    #[getter(name = "22")]
+    fn f22(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 22)
+    }
+    #[getter(name = "23")]
+    fn f23(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 23)
+    }
+}
+
+/// Installs field `index` of the struct sequence type `ty` as a `member_descriptor` named `name`.
+fn install_field(it: &mut Interp, ty: &Obj, name: &'static str, index: usize) {
+    let mut items = Vec::new();
+    <Fields as lumen_bind::Methods<PyHost>>::members(&mut items);
+    let Some(item) = items.get(index) else { return };
+    let fget = crate::bind::native_value(item);
+    super::descr::install_member(it, ty, name, fget);
+}
 
 /// An instance of a struct sequence type (a tuple subclass instance).
 #[derive(Clone, Copy)]
@@ -146,7 +231,7 @@ pub fn new_structseq_type(it: &mut Interp, module: &str, name: &str, fields: &[&
     let tuple = it.types.tuple.clone();
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
-        it.reg_prop(&ty, f, GETTERS[i]);
+        install_field(it, &ty, f, i);
     }
     crate::bind::install_into::<StructSeq>(&ty, &["__repr__"]);
     if let Some(d) = ty.dict.borrow().as_ref() {
@@ -179,7 +264,7 @@ pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields:
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
         if !f.is_empty() {
-            it.reg_prop(&ty, f, GETTERS[i]);
+            install_field(it, &ty, f, i);
         }
     }
     crate::bind::install_into::<StructSeq>(&ty, &["__new__", "__repr__", "__reduce__"]);

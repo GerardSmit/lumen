@@ -1615,10 +1615,10 @@ fn ensure_errors(it: &mut Interp) {
         return;
     }
     it.codecs.builtin_errors_ready = true;
-    let fns: [NativeFn; 8] = [strict_errors, ignore_errors, replace_errors, xmlcharrefreplace_errors, backslashreplace_errors, namereplace_errors, surrogateescape_errors, surrogatepass_errors];
-    for ((name, fname), f) in BUILTIN_ERRORS.iter().zip(fns) {
-        let v = it.new_native(fname, f, false);
-        it.codecs.errors.insert(name.to_string(), v);
+    for (fname, v) in crate::bind::function_values::<error_handlers::Module>() {
+        if let Some((name, _)) = BUILTIN_ERRORS.iter().find(|(_, f)| *f == fname) {
+            it.codecs.errors.insert(name.to_string(), v);
+        }
     }
 }
 
@@ -1657,13 +1657,11 @@ fn exc_kind_of(it: &mut Interp, v: &Value) -> Option<ExcKind> {
     })
 }
 
-fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
-    it.check_args(name, a, 1, 1)?;
-    let Some(kind) = exc_kind_of(it, &a[0]) else {
-        let t = it.type_name_of(&a[0]);
-        return Err(it.type_error(&format!("don't know how to handle {} in error callback", t)));
+fn exc_view(it: &mut Interp, exc: &Value) -> R<ExcView> {
+    let Some(kind) = exc_kind_of(it, exc) else {
+        return Err(unhandled(it, exc));
     };
-    let object = it.get_attr_str(&a[0], "object")?;
+    let object = it.get_attr_str(exc, "object")?;
     let len = match kind {
         ExcKind::Decode => it.bytes_of(&object)?.len(),
         _ => match object.as_pystr() {
@@ -1671,8 +1669,8 @@ fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
             None => return Err(it.type_error("object attribute must be unicode")),
         },
     };
-    let sv = it.get_attr_str(&a[0], "start")?;
-    let ev = it.get_attr_str(&a[0], "end")?;
+    let sv = it.get_attr_str(exc, "start")?;
+    let ev = it.get_attr_str(exc, "end")?;
     let start = it.index_of(&sv)?;
     let end = it.index_of(&ev)?;
     let start = if start < 0 { 0 } else if start as usize >= len { len.saturating_sub(1) } else { start as usize };
@@ -1685,8 +1683,8 @@ fn view_chars(v: &ExcView) -> Vec<u32> {
     code_points(s).skip(v.start).take(v.end.saturating_sub(v.start)).collect()
 }
 
-fn unhandled(it: &mut Interp, a: &[Value]) -> Obj {
-    let t = it.type_name_of(&a[0]);
+fn unhandled(it: &mut Interp, exc: &Value) -> Obj {
+    let t = it.type_name_of(exc);
     it.type_error(&format!("don't know how to handle {} in error callback", t))
 }
 
@@ -1697,98 +1695,117 @@ fn raise_exc(it: &mut Interp, v: &Value) -> Obj {
     }
 }
 
-fn strict_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    it.check_args("strict_errors", a, 1, 1)?;
-    match &a[0] {
-        Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Err(o.clone()),
-        _ => Err(it.type_error("codec must pass exception instance")),
-    }
-}
+/// The built-in error handlers (`codecs.lookup_error("strict")`, ...).
+#[lumen_bind::module(name = "builtins")]
+mod error_handlers {
+    use super::*;
 
-fn ignore_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "ignore_errors")?;
-    Ok(Value::tuple(vec![Value::str(""), Value::Int(v.end as i64)]))
-}
-
-fn replace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "replace_errors")?;
-    let n = v.end.saturating_sub(v.start);
-    let r = match v.kind {
-        ExcKind::Encode => "?".repeat(n),
-        ExcKind::Decode => "\u{fffd}".to_string(),
-        ExcKind::Translate => "\u{fffd}".repeat(n),
-    };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
-}
-
-fn xmlcharrefreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "xmlcharrefreplace_errors")?;
-    if v.kind != ExcKind::Encode {
-        return Err(unhandled(it, a));
-    }
-    Ok(Value::tuple(vec![Value::string(xmlcharref_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
-}
-
-fn backslashreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "backslashreplace_errors")?;
-    let r = match v.kind {
-        ExcKind::Decode => {
-            let b = it.bytes_of(&v.object)?;
-            backslash_bytes(&b[v.start..v.end.max(v.start)])
+    /// Implements the 'strict' error handling, which raises a UnicodeError on coding errors.
+    #[op(hint(py(text_signature = "")))]
+    fn strict_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        match exception {
+            Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Err(o.clone()),
+            _ => Err(it.type_error("codec must pass exception instance")),
         }
-        _ => backslash_chars(&view_chars(&v)),
-    };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
-}
-
-fn namereplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "namereplace_errors")?;
-    if v.kind != ExcKind::Encode {
-        return Err(unhandled(it, a));
     }
-    Ok(Value::tuple(vec![Value::string(namereplace_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
-}
 
-fn surrogateescape_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "surrogateescape")?;
-    match v.kind {
-        ExcKind::Encode => match surrogateescape_encode(&view_chars(&v)) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
-            None => Err(raise_exc(it, &a[0])),
-        },
-        ExcKind::Decode => {
-            let b = it.bytes_of(&v.object)?;
-            match surrogateescape_decode(&b, v.start, v.end) {
-                Some((s, end)) => Ok(Value::tuple(vec![Value::string(s), Value::Int(end as i64)])),
-                None => Err(raise_exc(it, &a[0])),
+    /// Implements the 'ignore' error handling, which ignores malformed data and continues.
+    #[op(hint(py(text_signature = "")))]
+    fn ignore_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        Ok(Value::tuple(vec![Value::str(""), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'replace' error handling, which replaces malformed data with a replacement marker.
+    #[op(hint(py(text_signature = "")))]
+    fn replace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        let n = v.end.saturating_sub(v.start);
+        let r = match v.kind {
+            ExcKind::Encode => "?".repeat(n),
+            ExcKind::Decode => "\u{fffd}".to_string(),
+            ExcKind::Translate => "\u{fffd}".repeat(n),
+        };
+        Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'xmlcharrefreplace' error handling, which replaces an unencodable character with the appropriate XML character reference.
+    #[op(hint(py(text_signature = "")))]
+    fn xmlcharrefreplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind != ExcKind::Encode {
+            return Err(unhandled(it, exception));
+        }
+        Ok(Value::tuple(vec![Value::string(xmlcharref_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'backslashreplace' error handling, which replaces malformed data with a backslashed escape sequence.
+    #[op(hint(py(text_signature = "")))]
+    fn backslashreplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        let r = match v.kind {
+            ExcKind::Decode => {
+                let b = it.bytes_of(&v.object)?;
+                backslash_bytes(&b[v.start..v.end.max(v.start)])
             }
-        }
-        ExcKind::Translate => Err(unhandled(it, a)),
+            _ => backslash_chars(&view_chars(&v)),
+        };
+        Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
     }
-}
 
-fn surrogatepass_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "surrogatepass")?;
-    if v.kind == ExcKind::Translate {
-        return Err(unhandled(it, a));
+    /// Implements the 'namereplace' error handling, which replaces an unencodable character with a \\N{...} escape sequence.
+    #[op(hint(py(text_signature = "")))]
+    fn namereplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind != ExcKind::Encode {
+            return Err(unhandled(it, exception));
+        }
+        Ok(Value::tuple(vec![Value::string(namereplace_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
     }
-    let enc = it.get_attr_str(&a[0], "encoding")?;
-    let form = enc.as_str().and_then(SurrogateForm::from_name);
-    let Some(form) = form else { return Err(raise_exc(it, &a[0])) };
-    match v.kind {
-        ExcKind::Encode => match surrogatepass_encode(&view_chars(&v), form) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
-            None => Err(raise_exc(it, &a[0])),
-        },
-        _ => {
-            let b = it.bytes_of(&v.object)?;
-            match form.read(&b[v.start.min(b.len())..]) {
-                Some(cp) => {
-                    let mut s = String::new();
-                    push_cp(&mut s, cp);
-                    Ok(Value::tuple(vec![Value::string(s), Value::Int((v.start + form.len()) as i64)]))
+
+    #[op(name = "surrogateescape", hint(py(text_signature = "")))]
+    fn surrogateescape_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        match v.kind {
+            ExcKind::Encode => match surrogateescape_encode(&view_chars(&v)) {
+                Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+                None => Err(raise_exc(it, exception)),
+            },
+            ExcKind::Decode => {
+                let b = it.bytes_of(&v.object)?;
+                match surrogateescape_decode(&b, v.start, v.end) {
+                    Some((s, end)) => Ok(Value::tuple(vec![Value::string(s), Value::Int(end as i64)])),
+                    None => Err(raise_exc(it, exception)),
                 }
-                None => Err(raise_exc(it, &a[0])),
+            }
+            ExcKind::Translate => Err(unhandled(it, exception)),
+        }
+    }
+
+    #[op(name = "surrogatepass", hint(py(text_signature = "")))]
+    fn surrogatepass_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind == ExcKind::Translate {
+            return Err(unhandled(it, exception));
+        }
+        let enc = it.get_attr_str(exception, "encoding")?;
+        let form = enc.as_str().and_then(SurrogateForm::from_name);
+        let Some(form) = form else { return Err(raise_exc(it, exception)) };
+        match v.kind {
+            ExcKind::Encode => match surrogatepass_encode(&view_chars(&v), form) {
+                Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+                None => Err(raise_exc(it, exception)),
+            },
+            _ => {
+                let b = it.bytes_of(&v.object)?;
+                match form.read(&b[v.start.min(b.len())..]) {
+                    Some(cp) => {
+                        let mut s = String::new();
+                        push_cp(&mut s, cp);
+                        Ok(Value::tuple(vec![Value::string(s), Value::Int((v.start + form.len()) as i64)]))
+                    }
+                    None => Err(raise_exc(it, exception)),
+                }
             }
         }
     }
