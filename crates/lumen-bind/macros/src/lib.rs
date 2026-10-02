@@ -267,7 +267,7 @@ const PROTOCOLS: &[&str] = &[
     "init", "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "reversed", "repr", "str", "hash",
     "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul",
     "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int",
-    "float", "call", "copy", "deepcopy", "reduce", "sizeof", "enter", "exit",
+    "float", "call", "copy", "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
 ];
 
 fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {

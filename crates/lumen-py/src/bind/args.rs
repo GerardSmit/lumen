@@ -39,7 +39,7 @@ pub enum Conv {
 const SLOT_PROTOS: &[&str] = &[
     "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash", "bool", "eq", "ne", "lt",
     "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or",
-    "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert",
+    "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext",
 ];
 
 /// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
@@ -58,7 +58,7 @@ fn dunder(p: &'static str) -> &'static str {
     table!("init" "len" "getitem" "setitem" "delitem" "contains" "iter" "next" "reversed" "repr" "str" "hash"
         "bool" "eq" "ne" "lt" "le" "gt" "ge" "add" "radd" "iadd" "sub" "rsub" "isub" "mul" "rmul" "imul"
         "and" "rand" "iand" "or" "ror" "ior" "xor" "rxor" "ixor" "neg" "pos" "abs" "invert" "index" "int"
-        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit")
+        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext")
 }
 
 /// The attribute name a fn gets in Python.

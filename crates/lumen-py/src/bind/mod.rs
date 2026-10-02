@@ -208,7 +208,7 @@ impl<'s> PyCx<'s> {
     /// `f() argument 'x' must be str, not int` (or the receiver / element variant).
     #[cold]
     #[inline(never)]
-    fn arg_error(&self, at: Slot, what: &str, v: &Value) -> Obj {
+    pub fn arg_error(&self, at: Slot, what: &str, v: &Value) -> Obj {
         let it = self.it();
         let d = self.desc;
         if at.is_this() {
@@ -717,6 +717,15 @@ impl IntoRet<PyHost> for Value {
     const MAY_RUN: bool = false;
     #[inline(always)]
     fn into_ret(self, _: &mut Interp) -> Result<Value, Obj> {
+        Ok(self)
+    }
+}
+
+/// A `__next__` returning a plain `Value` raises `StopIteration` itself (e.g. with the
+/// generator's return value).
+impl NextRet<PyHost> for Value {
+    #[inline(always)]
+    fn into_next(self, _: &mut Interp) -> Result<Value, Obj> {
         Ok(self)
     }
 }
