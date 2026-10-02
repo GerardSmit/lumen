@@ -309,6 +309,21 @@ pub mod math {
         x.copysign(y)
     }
 
+    /// Fused multiply-add operation.
+    ///
+    /// Compute (x * y) + z with a single round.
+    #[op]
+    fn fma(x: f64, y: f64, z: f64) -> NativeResult<f64> {
+        let r = x.mul_add(y, z);
+        if r.is_nan() && !x.is_nan() && !y.is_nan() && !z.is_nan() {
+            return Err(NativeError::value_error("invalid operation in fma"));
+        }
+        if r.is_infinite() && x.is_finite() && y.is_finite() && z.is_finite() {
+            return Err(NativeError::overflow("overflow in fma"));
+        }
+        Ok(r)
+    }
+
     /// Return the floating-point value the given number of steps after x towards y.
     ///
     /// If steps is not specified or is None, it defaults to 1.
