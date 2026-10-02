@@ -312,17 +312,19 @@ pub struct FrameObj {
     code: Rc<Code>,
     globals: Obj,
     line: u32,
+    lasti: u32,
 }
 
 impl Interp {
     pub fn frame_object(&mut self, depth: usize) -> Value {
         let f = &self.frames[depth];
-        let data = FrameObj { depth: Some(depth), code: f.code.clone(), globals: f.globals.clone(), line: f.code.line_at(f.pc.saturating_sub(1)) };
+        let lasti = f.pc.saturating_sub(1);
+        let data = FrameObj { depth: Some(depth), code: f.code.clone(), globals: f.globals.clone(), line: f.code.line_at(lasti), lasti: lasti as u32 };
         new_opaque(&self.types.frame.clone(), data)
     }
 
-    pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32) -> Value {
-        new_opaque(&self.types.frame, FrameObj { depth: None, code, globals, line })
+    pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32, lasti: u32) -> Value {
+        new_opaque(&self.types.frame, FrameObj { depth: None, code, globals, line, lasti })
     }
 }
 
@@ -358,8 +360,16 @@ fn f_lineno(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::Int(line as i64))
 }
 
-fn f_lasti(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(0))
+fn f_lasti(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let (live, lasti) = frame_data(it, &a[0], |d| (d.depth.map(|x| (x, d.code.clone())), d.lasti))?;
+    if let Some((depth, code)) = live {
+        if let Some(f) = it.frames.get(depth) {
+            if Rc::ptr_eq(&f.code, &code) {
+                return Ok(Value::Int(2 * f.pc.saturating_sub(1) as i64));
+            }
+        }
+    }
+    Ok(Value::Int(2 * lasti as i64))
 }
 
 fn f_none(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
@@ -411,6 +421,52 @@ fn f_locals(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn f_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let (code, line) = frame_data(it, &a[0], |d| (d.code.clone(), d.line))?;
     Ok(Value::string(format!("<frame at {:#x}, file '{}', line {}, code {}>", it.id_of(&a[0]), code.filename, line, code.name)))
+}
+
+// ---- code objects ---------------------------------------------------------------------------------
+
+fn code_of(it: &mut Interp, v: &Value) -> R<Rc<Code>> {
+    match v {
+        Value::Obj(o) => match &o.kind {
+            Kind::Code(c) => Ok(c.clone()),
+            _ => Err(it.self_state_err("code")),
+        },
+        _ => Err(it.self_state_err("code")),
+    }
+}
+
+/// `code.co_positions()`: (lineno, end_lineno, col, end_col) per instruction; columns are not
+/// tracked, so they are None (tracebacks then print no carets).
+fn co_positions(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let code = code_of(it, &a[0])?;
+    let items = (0..code.ops.len())
+        .map(|i| {
+            let line = Value::Int(code.line_at(i) as i64);
+            Value::tuple(vec![line.clone(), line, Value::None, Value::None])
+        })
+        .collect();
+    it.get_iter(&Value::list(items))
+}
+
+/// `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
+fn co_lines(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let code = code_of(it, &a[0])?;
+    let mut items = Vec::new();
+    let mut start = 0;
+    for i in 1..=code.ops.len() {
+        if i == code.ops.len() || code.line_at(i) != code.line_at(start) {
+            let line = Value::Int(code.line_at(start) as i64);
+            items.push(Value::tuple(vec![Value::Int(2 * start as i64), Value::Int(2 * i as i64), line]));
+            start = i;
+        }
+    }
+    it.get_iter(&Value::list(items))
+}
+
+pub fn init_code_type(it: &mut Interp) {
+    let ty = it.types.code.clone();
+    it.reg(&ty, "co_positions", co_positions);
+    it.reg(&ty, "co_lines", co_lines);
 }
 
 pub fn init_frame_type(it: &mut Interp) {

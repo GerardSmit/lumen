@@ -222,6 +222,9 @@ pub struct GenData {
 pub struct TbEntry {
     pub file: Rc<str>,
     pub line: u32,
+    /// Index of the instruction that raised (`tb_lasti` is twice this, as in CPython's
+    /// 2-byte code units).
+    pub lasti: u32,
     pub name: Rc<str>,
     pub code: Rc<Code>,
     pub globals: Obj,

@@ -384,8 +384,16 @@ impl Interp {
         loop {
             let fr = self.frames.last_mut().unwrap();
             if add_tb {
-                let line = fr.code.line_at(fr.pc.saturating_sub(1));
-                let entry_tb = TbEntry { file: fr.code.filename.clone(), line, name: fr.code.name.clone(), code: fr.code.clone(), globals: fr.globals.clone() };
+                let lasti = fr.pc.saturating_sub(1);
+                let line = fr.code.line_at(lasti);
+                let entry_tb = TbEntry {
+                    file: fr.code.filename.clone(),
+                    line,
+                    lasti: lasti as u32,
+                    name: fr.code.name.clone(),
+                    code: fr.code.clone(),
+                    globals: fr.globals.clone(),
+                };
                 if let Kind::Exception(d) = &exc.kind {
                     d.borrow_mut().tb.push(entry_tb);
                 }

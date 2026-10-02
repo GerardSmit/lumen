@@ -74,6 +74,7 @@ pub fn init(it: &mut Interp) {
     excgroup::init(it);
     funcs::init(it);
     sysextra::init_frame_type(it);
+    sysextra::init_code_type(it);
     descr::init(it);
     modules::init(it);
     register_names(it);

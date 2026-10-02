@@ -1219,8 +1219,8 @@ impl Interp {
             let d = self.instance_dict(&o);
             dict_set_str(&d, "tb_lineno", Value::Int(e.line as i64));
             dict_set_str(&d, "tb_next", next);
-            dict_set_str(&d, "tb_frame", self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line));
-            dict_set_str(&d, "tb_lasti", Value::Int(0));
+            dict_set_str(&d, "tb_frame", self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti));
+            dict_set_str(&d, "tb_lasti", Value::Int(2 * e.lasti as i64));
             next = Value::Obj(o);
         }
         next
