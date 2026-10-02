@@ -711,6 +711,7 @@ impl DefaultDict {
     ///   if self.default_factory is None: raise KeyError((key,))
     ///   self[key] = value = self.default_factory()
     ///   return value
+    ///
     #[method(name = "__missing__", hint(py(text_signature = "")))]
     fn missing(slf: This<Dd<'_>>, it: &mut Interp, key: &Value) -> R<Value> {
         let o = slf.0 .0;
@@ -814,6 +815,7 @@ fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
 /// High performance data structures.
 /// - deque:        ordered collection accessible from endpoints only
 /// - defaultdict:  dict subclass with a default value factory
+///
 #[lumen_bind::module(name = "_collections")]
 pub mod _collections {
     use super::*;
