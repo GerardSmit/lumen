@@ -32,6 +32,7 @@ pub mod platform;
 pub mod pyint;
 pub mod repr;
 pub mod symtable;
+pub mod threads;
 pub mod types;
 pub mod unicode;
 pub mod vm;

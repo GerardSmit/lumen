@@ -79,6 +79,19 @@ pub mod _struct {
         static CACHE: RefCell<FastMap<Vec<u8>, Rc<Fmt>>> = RefCell::new(FastMap::default());
     }
 
+    /// The format cache, moved out of this thread's slot when the thread gives up the GIL (its
+    /// `Rc`s are not atomic, so they must follow the interpreter, not the OS thread).
+    pub(crate) fn tls_take() -> Box<dyn std::any::Any> {
+        Box::new(CACHE.with(|c| std::mem::take(&mut *c.borrow_mut())))
+    }
+
+    pub(crate) fn tls_put(state: Box<dyn std::any::Any>) {
+        if let Ok(v) = state.downcast::<FastMap<Vec<u8>, Rc<Fmt>>>() {
+            let old = CACHE.with(|c| std::mem::replace(&mut *c.borrow_mut(), *v));
+            drop(old);
+        }
+    }
+
     #[init]
     fn init(it: &mut Interp, m: &Value) {
         let Value::Obj(m) = m else { return };

@@ -13,6 +13,7 @@ pub mod proc;
 pub mod signal;
 pub mod spawn;
 pub mod sysinfo;
+pub mod thread;
 pub mod time;
 pub mod uv;
 pub mod vfs;

@@ -185,6 +185,8 @@ pub struct Interp {
     pub native_state: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
     /// The current `contextvars.Context`, created on first use.
     pub context: Option<Value>,
+    /// The GIL and the bookkeeping of the interpreter's Python threads (see `threads`).
+    pub threads: crate::threads::Threads,
 }
 
 pub enum GenResult {
@@ -250,6 +252,7 @@ impl Interp {
             native_types: std::collections::HashMap::new(),
             native_state: std::collections::HashMap::new(),
             context: None,
+            threads: Default::default(),
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -300,6 +303,9 @@ impl Interp {
                 return Ok(data.len());
             }
         }
+        if fd > 2 {
+            self.wait_fd_quiet(fd, lumen_os::poll::POLLOUT);
+        }
         self.platform.borrow_mut().fd_write(fd, data, None)
     }
 
@@ -337,6 +343,7 @@ impl Interp {
         if self.frames.len() >= self.recursion_limit || lumen_common::stack::exhausted() {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
+        self.preempt();
         self.poll()?;
         self.frames.push(frame);
         Ok(())
@@ -734,6 +741,7 @@ impl Interp {
                     let back = (t as usize) < fr.pc;
                     fr.pc = t as usize;
                     if back {
+                        self.preempt();
                         self.poll()?;
                     }
                 }

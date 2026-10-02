@@ -264,8 +264,8 @@ pub mod sys {
 
     /// Return the current thread switch interval; see sys.setswitchinterval().
     #[op]
-    fn getswitchinterval() -> f64 {
-        0.005
+    fn getswitchinterval(it: &mut Interp) -> f64 {
+        it.threads.switch_interval_us as f64 / 1e6
     }
 
     /// Set the ideal thread switching delay inside the Python interpreter.
@@ -278,10 +278,34 @@ pub mod sys {
     /// A typical value is 0.005 (5 milliseconds).
     #[op]
     fn setswitchinterval(it: &mut Interp, interval: f64) -> R<()> {
-        if interval <= 0.0 {
+        if interval <= 0.0 || interval.is_nan() {
             return Err(it.value_error("switch interval must be strictly positive"));
         }
+        it.set_switch_interval(interval);
         Ok(())
+    }
+
+    /// Return a dictionary mapping each thread's identifier to the topmost stack frame
+    /// currently active in that thread at the time the function is called.
+    #[op]
+    fn _current_frames(it: &mut Interp) -> R<Value> {
+        let frames = it.current_frames();
+        let d = it.new_dict();
+        for (ident, frame) in frames {
+            it.dict_set(&d, Value::Int(ident as i64), frame)?;
+        }
+        Ok(Value::Obj(d))
+    }
+
+    /// Return a dict mapping each thread's identifier to its currently handled exception.
+    #[op]
+    fn _current_exceptions(it: &mut Interp) -> R<Value> {
+        let excs = it.current_exceptions();
+        let d = it.new_dict();
+        for (ident, exc) in excs {
+            it.dict_set(&d, Value::Int(ident as i64), exc)?;
+        }
+        Ok(Value::Obj(d))
     }
 
     /// Handle an exception by displaying it with a traceback on sys.stderr.

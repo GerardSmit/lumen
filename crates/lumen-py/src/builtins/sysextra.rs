@@ -424,18 +424,46 @@ pub struct FrameObj {
     globals: Obj,
     line: u32,
     lasti: u32,
+    /// `f_back` of a frame that is not on the running thread's stack (another thread's frames).
+    back: Value,
 }
 
 impl Interp {
     pub fn frame_object(&mut self, depth: usize) -> Value {
         let f = &self.frames[depth];
         let lasti = f.pc.saturating_sub(1);
-        let data = FrameObj { depth: Some(depth), code: f.code.clone(), globals: f.globals.clone(), line: f.code.line_at(lasti), lasti: lasti as u32 };
+        let data = FrameObj {
+            depth: Some(depth),
+            code: f.code.clone(),
+            globals: f.globals.clone(),
+            line: f.code.line_at(lasti),
+            lasti: lasti as u32,
+            back: Value::None,
+        };
         new_opaque(&self.types.frame.clone(), data)
     }
 
     pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32, lasti: u32) -> Value {
-        new_opaque(&self.types.frame, FrameObj { depth: None, code, globals, line, lasti })
+        new_opaque(&self.types.frame, FrameObj { depth: None, code, globals, line, lasti, back: Value::None })
+    }
+
+    /// The innermost of `frames` (a suspended thread's stack, outermost first) as a snapshot
+    /// chained to its callers through `f_back`.
+    pub fn frame_chain_snapshot(&self, frames: &[Frame]) -> Value {
+        let mut back = Value::None;
+        for f in frames {
+            let lasti = f.pc.saturating_sub(1);
+            let data = FrameObj {
+                depth: None,
+                code: f.code.clone(),
+                globals: f.globals.clone(),
+                line: f.code.line_at(lasti),
+                lasti: lasti as u32,
+                back,
+            };
+            back = new_opaque(&self.types.frame, data);
+        }
+        back
     }
 }
 
@@ -486,7 +514,8 @@ impl FrameObj {
     fn f_back(&self, it: &mut Interp) -> Value {
         match self.live_depth(it) {
             Some(d) if d > 0 => it.frame_object(d - 1),
-            _ => Value::None,
+            Some(_) => Value::None,
+            None => self.back.clone(),
         }
     }
 
