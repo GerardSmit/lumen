@@ -10,9 +10,10 @@ use std::io;
 
 macro_rules! errno_table {
     ($($name:ident = $fallback:expr, $msg:expr;)*) => {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "android")))]
         pub(super) static TABLE: &[(&str, i32, &str)] = &[$((stringify!($name), libc::$name, $msg),)*];
-        #[cfg(not(unix))]
+        // Android uses Linux's numbers, which the fallbacks are, but its libc bindings omit some.
+        #[cfg(any(not(unix), target_os = "android"))]
         pub(super) static TABLE: &[(&str, i32, &str)] = &[$((stringify!($name), $fallback, $msg),)*];
     };
 }
@@ -395,7 +396,11 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe {
         libc::__error()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    #[cfg(target_os = "android")]
+    unsafe {
+        libc::__errno()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "android")))]
     unsafe {
         libc::__errno_location()
     }

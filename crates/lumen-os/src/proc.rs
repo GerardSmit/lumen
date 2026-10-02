@@ -136,7 +136,7 @@ pub fn current_user() -> PasswdEntry {
 
 /// The 1, 5 and 15 minute load averages (zeros where the OS has none).
 pub fn loadavg() -> [f64; 3] {
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     {
         let mut out = [0f64; 3];
         // SAFETY: `out` has room for the three samples requested.
