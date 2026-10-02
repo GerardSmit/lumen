@@ -5,7 +5,15 @@ use crate::vm::Interp;
 use lumen_common::limits::Deadline;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const USAGE: &str = "usage: lumen-py [--timeout=MS] [--max-memory=MB] [-X int_max_str_digits=N] <script.py> [args]\n";
+const USAGE: &str =
+    "usage: lumen-py [--timeout=MS] [--max-memory=MB] [-X int_max_str_digits=N] (<script.py> | -m module | -c command) [args]\n";
+
+/// What runs as `__main__`.
+enum Target<'a> {
+    Script(&'a str),
+    Module(&'a str),
+    Command(&'a str),
+}
 
 /// The `--timeout` budget in ms once it ran out (0 while it has not).
 static TIMED_OUT_AFTER: AtomicU64 = AtomicU64::new(0);
@@ -87,9 +95,20 @@ pub fn run_main(args: &[String]) -> i32 {
             return if msg.starts_with("Fatal") { 1 } else { 2 };
         }
     };
-    let Some(path) = opts.script_args.first() else {
-        it.write_stderr(USAGE);
-        return 2;
+    let target = match opts.script_args.first().map(String::as_str) {
+        Some(flag @ ("-m" | "-c")) => match opts.script_args.get(1) {
+            Some(arg) if flag == "-m" => Target::Module(arg),
+            Some(arg) => Target::Command(arg),
+            None => {
+                it.write_stderr(&format!("Argument expected for the {flag} option\n{USAGE}"));
+                return 2;
+            }
+        },
+        Some(path) => Target::Script(path),
+        None => {
+            it.write_stderr(USAGE);
+            return 2;
+        }
     };
     it.set_int_max_str_digits(opts.int_max_str_digits);
     if let Some(mb) = opts.max_memory_mb.filter(|&mb| mb > 0) {
@@ -99,14 +118,39 @@ pub fn run_main(args: &[String]) -> i32 {
         start_watchdog(&it, ms);
     }
     crate::builtins::signalm::install_default_handlers(&mut it);
-    it.set_argv(&opts.script_args);
+    // `sys.path[0]` is the script's directory, or the working directory for -m and -c.
+    let first_dir = match target {
+        Target::Script(path) => {
+            let abs = it.platform.borrow_mut().canonicalize(path);
+            crate::platform::parent_dir(&abs)
+        }
+        _ => it.platform.borrow_mut().getcwd().unwrap_or_else(|_| ".".into()),
+    };
+    let mut dirs = vec![first_dir];
     if let Ok(extra) = std::env::var("PYTHONPATH") {
-        let abs = it.platform.borrow_mut().canonicalize(path);
-        let mut dirs = vec![crate::platform::parent_dir(&abs)];
         dirs.extend(extra.split(':').filter(|d| !d.is_empty()).map(String::from));
-        it.set_path(&dirs);
     }
-    let code = it.run_file(path);
+    it.set_path(&dirs);
+    let code = match target {
+        Target::Script(path) => {
+            it.set_argv(&opts.script_args);
+            it.run_file(path)
+        }
+        Target::Module(name) => {
+            // runpy replaces argv[0] with the module's path once it finds it.
+            let mut argv = vec!["-m".to_string()];
+            argv.extend(opts.script_args[2..].iter().cloned());
+            it.set_argv(&argv);
+            let name = name.replace('\\', "\\\\").replace('\'', "\\'");
+            it.run_source(&format!("import runpy\nrunpy._run_module_as_main('{name}')\n"), "<string>")
+        }
+        Target::Command(src) => {
+            let mut argv = vec!["-c".to_string()];
+            argv.extend(opts.script_args[2..].iter().cloned());
+            it.set_argv(&argv);
+            it.run_source(src, "<string>")
+        }
+    };
     it.flush_out();
     let ms = TIMED_OUT_AFTER.load(Ordering::SeqCst);
     if ms != 0 && it.was_interrupted() {

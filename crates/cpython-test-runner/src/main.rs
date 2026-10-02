@@ -1,7 +1,8 @@
 //! Runs CPython's `Lib/test/test_*.py` files against the `lumen-py` binary.
 //!
 //! Every test file runs in its own process (so a crash or hang costs one file), in parallel, with
-//! a wall-clock timeout. `unittest -v` output is parsed for per-file pass/fail/error/skip counts;
+//! a wall-clock timeout, loaded as regrtest does: `python -m unittest -v test.<name>` (a file's
+//! own `__main__` block does not run). `unittest -v` output is parsed for per-file pass/fail/error/skip counts;
 //! a file that produces no results (import failure, crash, timeout) counts as one file-level error.
 //!
 //! Usage:
@@ -119,8 +120,8 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     };
     let lib = fs::canonicalize(o.root.join("Lib")).unwrap_or_else(|_| o.root.join("Lib"));
     let spawned = Command::new(&o.bin)
-        .arg(format!("{name}.py"))
-        .arg("-v")
+        .args(["-m", "unittest", "-v"])
+        .arg(format!("test.{name}"))
         .current_dir(&test_dir)
         .env("PYTHONPATH", &lib)
         .env("PYTHONDONTWRITEBYTECODE", "1")

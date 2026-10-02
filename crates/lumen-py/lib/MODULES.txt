@@ -64,6 +64,7 @@ json/__init__.py
 json/decoder.py
 json/encoder.py
 json/scanner.py
+json/tool.py
 
 # os and file system
 os.py
@@ -217,3 +218,6 @@ opcode.py
 secrets.py
 uuid.py
 gzip.py
+# running modules as scripts (-m)
+runpy.py
+pkgutil.py

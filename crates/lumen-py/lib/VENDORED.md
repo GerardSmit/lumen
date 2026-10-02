@@ -74,6 +74,7 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `json/decoder.py`
 - `json/encoder.py`
 - `json/scanner.py`
+- `json/tool.py`
 - `os.py`
 - `posixpath.py`
 - `genericpath.py`
@@ -209,3 +210,5 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `secrets.py`
 - `uuid.py`
 - `gzip.py`
+- `runpy.py`
+- `pkgutil.py`
