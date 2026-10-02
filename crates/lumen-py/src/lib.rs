@@ -35,6 +35,7 @@ pub mod symtable;
 pub mod types;
 pub mod unicode;
 pub mod vm;
+pub mod watch;
 pub mod weak;
 
 pub use parser::{parse, SyntaxError};

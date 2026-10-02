@@ -110,6 +110,9 @@ fn discover(test_dir: &Path, filters: &[String]) -> Vec<String> {
     names
 }
 
+/// Tests that skip unless `sysconfig.is_python_build()`: the checkout stands in for a build tree.
+const PROJECT_BASE_TESTS: &[&str] = &["test_asdl_parser"];
+
 fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     let test_dir = o.root.join("Lib").join("test");
     let log_path = log_dir.join(format!("{name}.log"));
@@ -122,6 +125,9 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     let mut cmd = Command::new(&o.bin);
     // Tests that spawn children (signal, subprocess, multiprocessing) can leave them running;
     // the whole group is killed when the file finishes or times out.
+    if PROJECT_BASE_TESTS.contains(&name) {
+        cmd.env("_PYTHON_PROJECT_BASE", &o.root);
+    }
     let spawned = lumen_os::child::new_group(&mut cmd)
         .args(["-m", "unittest", "-v"])
         .arg(format!("test.{name}"))

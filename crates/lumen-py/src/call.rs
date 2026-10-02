@@ -144,7 +144,7 @@ impl Interp {
             Kind::Function(f) => f,
             _ => unreachable!(),
         };
-        let code = func.code.clone();
+        let code = func.code.borrow().clone();
         let mut frame = self.new_frame(code.clone(), func.globals.clone(), None, Some(func_obj.clone()), &func.closure);
         let argcount = code.argcount as usize;
         let kwonly = code.kwonly as usize;
@@ -309,7 +309,7 @@ impl Interp {
         let f = Function {
             name: RefCell::new(code.name.clone()),
             qualname: RefCell::new(code.qualname.clone()),
-            code,
+            code: RefCell::new(code),
             globals,
             defaults: RefCell::new(defaults),
             kwdefaults: RefCell::new(kwdefaults),
@@ -434,6 +434,7 @@ impl Interp {
         if let Some(v) = send {
             frame.stack.push(v);
         }
+        frame.generator = Some(Rc::downgrade(g));
         if let Err(e) = self.push_frame(frame) {
             *gd.state.borrow_mut() = GenState::Done;
             return Err(e);

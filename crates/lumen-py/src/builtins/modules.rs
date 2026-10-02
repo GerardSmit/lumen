@@ -47,11 +47,21 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_statistics", bound::<super::statisticsm::_statistics::Module>),
     ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),
+    ("_testbuffer", bound::<super::testbufferm::testbuffer::Module>),
+    ("_testcapi", bound::<super::testcapi::_testcapi::Module>),
+    ("_testimportmultiple", bound::<super::testextm::_testimportmultiple::Module>),
+    ("_testimportmultiple_bar", bound::<super::testextm::_testimportmultiple_bar::Module>),
+    ("_testimportmultiple_foo", bound::<super::testextm::_testimportmultiple_foo::Module>),
+    ("_testinternalcapi", bound::<super::testcapi::internal::_testinternalcapi::Module>),
+    ("_testmultiphase", bound::<super::testextm::_testmultiphase::Module>),
+    ("_testsinglephase", bound::<super::singlephasem::_testsinglephase::Module>),
     ("_thread", bound::<super::threadm::_thread::Module>),
     ("_tokenize", bound::<super::tokenizem::_tokenize::Module>),
     ("_typing", bound::<super::typingm::_typing::Module>),
     ("_warnings", bound::<super::warningsm::_warnings::Module>),
     ("_weakref", bound::<super::weakm::_weakref::Module>),
+    ("_xxinterpchannels", bound::<super::interpchanm::_xxinterpchannels::Module>),
+    ("_xxsubinterpreters", bound::<super::subinterpm::_xxsubinterpreters::Module>),
     ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
     ("array", bound::<super::arraym::array::Module>),
     ("atexit", bound::<super::sysmods::atexit::Module>),
@@ -77,6 +87,8 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("termios", bound::<super::termiosm::termios::Module>),
     ("time", bound::<super::timem::time::Module>),
     ("unicodedata", bound::<super::unicodedatam::unicodedata::Module>),
+    ("xxlimited", bound::<super::xxlimitedm::xxlimited::Module>),
+    ("xxlimited_35", bound::<super::xxlimitedm::xxlimited_35::Module>),
     ("zlib", bound::<super::zlibm::zlib::Module>),
 ];
 
@@ -117,7 +129,7 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
     for (k, v) in strs {
         dict_set_str(&vars, k, Value::string(v));
     }
-    for (k, v) in [("Py_DEBUG", 0), ("Py_ENABLE_SHARED", 0), ("WITH_DOC_STRINGS", 1), ("SIZEOF_VOID_P", 8)] {
+    for (k, v) in [("Py_DEBUG", 0), ("Py_ENABLE_SHARED", 0), ("WITH_DOC_STRINGS", 1), ("SIZEOF_VOID_P", 8), ("PY_HAVE_PERF_TRAMPOLINE", 0)] {
         dict_set_str(&vars, k, Value::Int(v));
     }
     dict_set_str(&d, "build_time_vars", Value::Obj(vars));

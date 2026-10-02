@@ -717,8 +717,12 @@ impl Builder {
                         c = self.parent_of(c);
                     }
                     let target_kind = self.scopes[c].kind;
+                    let declared_global = {
+                        let key = mangle(&self.scopes[c].private, id);
+                        self.scopes[c].index.get(&key).is_some_and(|&i| self.scopes[c].syms[i].1.flags & DEF_GLOBAL != 0)
+                    };
                     for p in &path {
-                        if target_kind == ScopeKind::Function {
+                        if target_kind == ScopeKind::Function && !declared_global {
                             self.add(*p, id, DEF_NONLOCAL);
                         } else {
                             self.add(*p, id, DEF_GLOBAL);

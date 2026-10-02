@@ -7,7 +7,8 @@
 //! macrotask (microtasks run between messages, as with Node's per-message callback scopes).
 use crate::clone_transfer::{self, CloneAttachment, CloneMessage};
 use lumen_host::{ops, CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
-use std::collections::{HashMap, VecDeque};
+use lumen_os::channel::{Pop, Queue};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -17,11 +18,10 @@ struct Waker {
 }
 
 struct Endpoint {
-    queue: Mutex<VecDeque<CloneMessage>>,
+    /// Closed on both endpoints by either side's `close()` (or its realm going away): no message
+    /// is accepted any more, and the receiver reports the close once its queue is drained.
+    queue: Queue<CloneMessage>,
     peer: Mutex<Weak<Endpoint>>,
-    /// Set on both endpoints by either side's `close()` (or its realm going away): no message is
-    /// accepted any more, and the receiver reports the close once its queue is drained.
-    closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
     wake_pending: AtomicBool,
     /// A BroadcastChannel endpoint: posts fan out to every other endpoint of this name.
@@ -34,9 +34,8 @@ impl Endpoint {
     fn new(group: Option<String>) -> Arc<Endpoint> {
         Arc::new(Endpoint {
             group,
-            queue: Mutex::new(VecDeque::new()),
+            queue: Queue::new(),
             peer: Mutex::new(Weak::new()),
-            closed: AtomicBool::new(false),
             waker: Mutex::new(None),
             wake_pending: AtomicBool::new(false),
         })
@@ -60,18 +59,18 @@ impl Endpoint {
 
     fn close_both(self: &Arc<Self>) {
         if let Some(name) = &self.group {
-            self.closed.store(true, Ordering::SeqCst);
-            self.queue.lock().unwrap().clear();
+            self.queue.close();
+            self.queue.clear();
             if let Some(members) = GROUPS.lock().unwrap().as_mut().and_then(|g| g.get_mut(name)) {
                 members.retain(|m| m.strong_count() > 0 && !std::ptr::eq(m.as_ptr(), Arc::as_ptr(self)));
             }
             self.wake();
             return;
         }
-        self.closed.store(true, Ordering::SeqCst);
+        self.queue.close();
         self.wake();
         if let Some(peer) = self.peer() {
-            peer.closed.store(true, Ordering::SeqCst);
+            peer.queue.close();
             peer.wake();
         }
     }
@@ -163,7 +162,7 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
         .ok_or_else(|| ctx.make_error("TypeError", "port post expects bytes"))?;
     let message = clone_transfer::take_message(ctx, bytes);
     if let Some(name) = &port.0.group {
-        if port.0.closed.load(Ordering::SeqCst) {
+        if port.0.queue.is_closed() {
             return Ok(Value::Bool(false));
         }
         let members: Vec<Arc<Endpoint>> = GROUPS
@@ -177,7 +176,7 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
             })
             .unwrap_or_default();
         for member in members {
-            if Arc::ptr_eq(&member, &port.0) || member.closed.load(Ordering::SeqCst) {
+            if Arc::ptr_eq(&member, &port.0) || member.queue.is_closed() {
                 continue;
             }
             let attachments = message
@@ -188,7 +187,7 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
                     CloneAttachment::Port(_) => None,
                 })
                 .collect();
-            member.queue.lock().unwrap().push_back(CloneMessage {
+            let _ = member.queue.push(CloneMessage {
                 bytes: message.bytes.clone(),
                 attachments,
             });
@@ -199,7 +198,7 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let Some(peer) = port.0.peer() else {
         return Ok(Value::Bool(false));
     };
-    if port.0.closed.load(Ordering::SeqCst) || peer.closed.load(Ordering::SeqCst) {
+    if port.0.queue.is_closed() || peer.queue.is_closed() {
         return Ok(Value::Bool(false));
     }
     let carries_target = message.attachments.iter().any(|a| match a {
@@ -211,7 +210,9 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
         port.0.close_both();
         return Ok(Value::from_string("lost".into()));
     }
-    peer.queue.lock().unwrap().push_back(message);
+    if peer.queue.push(message).is_err() {
+        return Ok(Value::Bool(false));
+    }
     peer.wake();
     Ok(Value::Bool(true))
 }
@@ -220,15 +221,13 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 /// channel is closed and everything sent before the close has been received.
 fn poll(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let port = lookup(ctx, args)?;
-    let message = port.0.queue.lock().unwrap().pop_front();
-    if let Some(message) = message {
-        let bytes = clone_transfer::install_message(ctx, message);
-        return ctx.make_uint8array(&bytes);
-    }
-    Ok(if port.0.closed.load(Ordering::SeqCst) {
-        Value::Bool(false)
-    } else {
-        Value::Undefined
+    Ok(match port.0.queue.pop() {
+        Pop::Message(message) => {
+            let bytes = clone_transfer::install_message(ctx, message);
+            return ctx.make_uint8array(&bytes);
+        }
+        Pop::Closed => Value::Bool(false),
+        Pop::Empty => Value::Undefined,
     })
 }
 
@@ -252,10 +251,10 @@ fn broadcast(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 /// is closed and drained.
 fn peek(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let port = lookup(ctx, args)?;
-    let queued = !port.0.queue.lock().unwrap().is_empty();
+    let queued = !port.0.queue.is_empty();
     Ok(Value::Num(if queued {
         1.0
-    } else if port.0.closed.load(Ordering::SeqCst) {
+    } else if port.0.queue.is_closed() {
         -1.0
     } else {
         0.0
@@ -303,7 +302,7 @@ fn listen(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     }
     *port.0.waker.lock().unwrap() = Some(Waker { sender, task });
     port.0.wake_pending.store(false, Ordering::SeqCst);
-    if port.0.closed.load(Ordering::SeqCst) || !port.0.queue.lock().unwrap().is_empty() {
+    if port.0.queue.is_closed() || !port.0.queue.is_empty() {
         port.0.wake();
     }
     Ok(Value::Undefined)
@@ -355,7 +354,7 @@ fn import(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 
 fn is_closed(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let port = lookup(ctx, args)?;
-    Ok(Value::Bool(port.0.closed.load(Ordering::SeqCst)))
+    Ok(Value::Bool(port.0.queue.is_closed()))
 }
 
 fn detach(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {

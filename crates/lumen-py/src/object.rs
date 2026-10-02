@@ -59,6 +59,7 @@ impl Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
+        crate::watch::object_dropped(self);
         let id = self.id.get();
         if id != 0 {
             crate::weak::on_object_drop(id);
@@ -162,6 +163,12 @@ pub const TF_DISPATCH: u32 = 8;
 pub const TF_FINAL: u32 = 16;
 /// A core builtin type: setting or deleting its attributes is a TypeError.
 pub const TF_IMMUTABLE: u32 = 32;
+/// `Py_TPFLAGS_METHOD_DESCRIPTOR`: instances bind like functions.
+pub const TF_METHOD_DESCRIPTOR: u32 = 64;
+/// `Py_TPFLAGS_HAVE_VECTORCALL`.
+pub const TF_VECTORCALL: u32 = 128;
+/// Watched by a type watcher (`PyType_Watch`).
+pub const TF_WATCHED: u32 = 256;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,
@@ -174,10 +181,15 @@ pub struct TypeData {
     pub hooks: Cell<(u64, u8)>,
     /// The (mangled) names a class statement's `__slots__` declares; `None` without `__slots__`.
     pub slots: RefCell<Option<Rc<[Rc<str>]>>>,
+    /// `tp_version_tag`: the type-cache epoch in the high half, the tag in the low half; valid
+    /// only while the epoch is current ([`crate::watch::type_version`]).
+    pub version: Cell<u64>,
+    /// The type watchers (`tp_watched`), one bit each.
+    pub watched: Cell<u8>,
 }
 
 pub struct Function {
-    pub code: Rc<Code>,
+    pub code: RefCell<Rc<Code>>,
     pub globals: Obj,
     pub defaults: RefCell<Vec<Value>>,
     pub kwdefaults: RefCell<Vec<(Obj, Value)>>,

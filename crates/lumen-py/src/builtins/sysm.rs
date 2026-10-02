@@ -299,6 +299,26 @@ pub mod sys {
         Ok(())
     }
 
+    /// Handle an unraisable exception.
+    ///
+    /// The argument is an object with the attributes exc_type, exc_value, exc_traceback,
+    /// err_msg and object.
+    #[op]
+    fn unraisablehook(it: &mut Interp, unraisable: &Value) -> R<()> {
+        let exc = it.getitem(unraisable, &Value::Int(1))?;
+        let err_msg = it.getitem(unraisable, &Value::Int(3))?;
+        let object = it.getitem(unraisable, &Value::Int(4))?;
+        let Value::Obj(e) = &exc else { return Ok(()) };
+        it.default_unraisable(e, Some(&err_msg), Some(&object));
+        Ok(())
+    }
+
+    /// Clear the internal type lookup cache.
+    #[op]
+    fn _clear_type_cache() {
+        crate::watch::clear_type_cache();
+    }
+
     /// Print an object to sys.stdout and also save it in builtins._
     #[op]
     fn displayhook(it: &mut Interp, object: &Value) -> R<()> {
@@ -476,7 +496,7 @@ pub mod sys {
         dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
         dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
         dict_set_str(&d, "byteorder", Value::str("little"));
-        dict_set_str(&d, "version", Value::str("3.12.15 (lumen-py)"));
+        dict_set_str(&d, "version", Value::str("3.12.15 (main, Jan  1 2026, 00:00:00) [lumen-py]"));
         dict_set_str(&d, "hexversion", Value::Int(0x030c0ff0));
         let (platform, executable, argv) = {
             let p = it.platform.borrow();
@@ -499,7 +519,7 @@ pub mod sys {
         if let Ok(std_names) = it.new_frozenset_from(std_names) {
             dict_set_str(&d, "stdlib_module_names", std_names);
         }
-        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook")] {
+        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook"), ("__unraisablehook__", "unraisablehook")] {
             if let Some(f) = dict_get_str(&d, name) {
                 dict_set_str(&d, alias, f);
             }

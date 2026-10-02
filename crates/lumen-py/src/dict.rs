@@ -3,7 +3,34 @@
 //! the candidates that need a full `__eq__`.
 
 use crate::object::{Kind, Value};
+use crate::watch::{self, DictEvent};
+use std::cell::Cell;
 use std::rc::Rc;
+
+thread_local! {
+    static NEXT_VERSION: Cell<u64> = const { Cell::new(1) };
+}
+
+/// PEP 509's version tag: assigned on first request from a counter shared by every dict, and
+/// dropped by each mutation so the next request hands out a fresh one. A copy starts untagged.
+#[derive(Default)]
+struct Version(Cell<u64>);
+
+impl Clone for Version {
+    fn clone(&self) -> Version {
+        Version::default()
+    }
+}
+
+/// Bit `i` set: watcher `i` is told of the changes. A copy is not watched.
+#[derive(Default)]
+struct Watch(Cell<u8>);
+
+impl Clone for Watch {
+    fn clone(&self) -> Watch {
+        Watch::default()
+    }
+}
 
 #[derive(Clone)]
 pub struct Entry {
@@ -30,6 +57,8 @@ pub struct PyDict {
     set_mode: bool,
     dummy: Vec<bool>,
     fill: usize,
+    version: Version,
+    watch: Watch,
 }
 
 const SET_MIN: usize = 8;
@@ -256,9 +285,42 @@ impl PyDict {
     }
 
     pub fn set_val(&mut self, idx: usize, val: Value) {
+        let mask = self.watch.0.get();
         if let Some(Some(e)) = self.entries.get_mut(idx) {
+            if !e.val.is(&val) {
+                self.version.0.set(0);
+            }
+            if mask != 0 {
+                watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Modified, Some(&e.key), Some(&val));
+            }
             e.val = val;
         }
+    }
+
+    /// The watchers of the dict, one bit each.
+    pub fn watch(&self) -> u8 {
+        self.watch.0.get()
+    }
+
+    pub fn set_watch(&self, mask: u8) {
+        self.watch.0.set(mask);
+    }
+
+    /// Tells the watchers that the dict was filled from another one in one step.
+    pub fn notify_cloned(&self) {
+        let mask = self.watch.0.get();
+        if mask != 0 {
+            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Cloned, None, None);
+        }
+    }
+
+    /// The PEP 509 version tag (`ma_version_tag`).
+    pub fn version(&self) -> u64 {
+        if self.version.0.get() == 0 {
+            let v = NEXT_VERSION.with(|n| n.replace(n.get() + 1));
+            self.version.0.set(v);
+        }
+        self.version.0.get()
     }
 
     pub fn next_live(&self, mut pos: usize) -> Option<usize> {
@@ -400,6 +462,11 @@ impl PyDict {
 
     /// Appends a key known to be absent.
     pub fn insert_new(&mut self, hash: i64, key: Value, val: Value) -> usize {
+        self.version.0.set(0);
+        let mask = self.watch.0.get();
+        if mask != 0 && !self.set_mode {
+            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Added, Some(&key), Some(&val));
+        }
         if self.set_mode {
             return self.set_insert(hash, key, val);
         }
@@ -417,6 +484,13 @@ impl PyDict {
     }
 
     pub fn remove(&mut self, idx: usize) -> Option<Entry> {
+        self.version.0.set(0);
+        let mask = self.watch.0.get();
+        if mask != 0 && !self.set_mode {
+            if let Some(Some(e)) = self.entries.get(idx) {
+                watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Deleted, Some(&e.key), None);
+            }
+        }
         if self.set_mode {
             let e = self.entries.get_mut(idx)?.take()?;
             self.dummy[idx] = true;
@@ -448,6 +522,13 @@ impl PyDict {
     }
 
     pub fn clear(&mut self) {
+        let mask = self.watch.0.get();
+        if mask != 0 && !self.set_mode {
+            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Cleared, None, None);
+        }
+        if self.live > 0 {
+            self.version.0.set(0);
+        }
         self.dummy.clear();
         self.fill = 0;
         self.entries.clear();
@@ -461,6 +542,7 @@ impl PyDict {
         if other.live == 0 {
             return;
         }
+        self.version.0.set(0);
         if self.entries.is_empty() {
             self.entries = vec![None; SET_MIN];
             self.dummy = vec![false; SET_MIN];
@@ -564,5 +646,14 @@ mod tests {
             }
         }
         assert_eq!(order(&d), (0..40).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+    }
+}
+
+impl Drop for PyDict {
+    fn drop(&mut self) {
+        let mask = self.watch.0.get();
+        if mask != 0 && !self.set_mode {
+            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Deallocated, None, None);
+        }
     }
 }

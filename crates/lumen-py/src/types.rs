@@ -419,6 +419,7 @@ impl Interp {
     pub fn lookup_mro(&self, cls: &Obj, name: &str) -> Option<Value> {
         let h = hash_str(name);
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -439,6 +440,7 @@ impl Interp {
             _ => return None,
         };
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -457,6 +459,7 @@ impl Interp {
     pub fn lookup_mro_with_owner(&self, cls: &Obj, name: &str) -> Option<(Obj, Value)> {
         let h = hash_str(name);
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -829,7 +832,7 @@ impl Interp {
             Kind::Function(f) => match nm {
                 "__name__" => return Ok(Some(Value::str(&f.name.borrow()))),
                 "__qualname__" => return Ok(Some(Value::str(&f.qualname.borrow()))),
-                "__doc__" => return Ok(Some(f.code.doc.clone().unwrap_or(Value::None))),
+                "__doc__" => return Ok(Some(f.code.borrow().doc.clone().unwrap_or(Value::None))),
                 "__module__" => {
                     return Ok(Some(dict_get_str(&f.globals, "__name__").unwrap_or(Value::None)));
                 }
@@ -849,7 +852,7 @@ impl Interp {
                     return Ok(Some(Value::dict(pd)));
                 }
                 "__globals__" => return Ok(Some(Value::Obj(f.globals.clone()))),
-                "__code__" => return Ok(Some(Value::Obj(Object::new(Kind::Code(f.code.clone()))))),
+                "__code__" => return Ok(Some(Value::Obj(Object::new(Kind::Code(f.code.borrow().clone()))))),
                 "__closure__" => {
                     if f.closure.is_empty() {
                         return Ok(Some(Value::None));
@@ -1115,6 +1118,7 @@ impl Interp {
                 let items: Vec<Obj> = v.tuple_items().unwrap_or(&[]).iter().filter_map(|b| b.as_obj().cloned()).collect();
                 self.set_bases(o, items);
                 self.type_epoch += 1;
+                self.type_modified(o);
                 return Ok(());
             }
             "__abstractmethods__" => {
@@ -1123,6 +1127,7 @@ impl Interp {
                 dict_set_name(&d, name, v);
                 let f = td.flags.get();
                 td.flags.set(if abstract_ { f | TF_ABSTRACT } else { f & !TF_ABSTRACT });
+                self.type_modified(o);
                 return Ok(());
             }
             _ => {}
@@ -1132,6 +1137,10 @@ impl Interp {
         if nm.starts_with("__") {
             self.type_epoch += 1;
         }
+        if nm == "__call__" {
+            self.type_call_changed(o);
+        }
+        self.type_modified(o);
         Ok(())
     }
 
@@ -1214,7 +1223,30 @@ impl Interp {
                     "__name__" => *f.name.borrow_mut() = v.as_str().unwrap_or("").into(),
                     "__qualname__" => *f.qualname.borrow_mut() = v.as_str().unwrap_or("").into(),
                     "__defaults__" => {
+                        if !v.is_none() && v.tuple_items().is_none() {
+                            return Err(self.type_error("__defaults__ must be set to a tuple object"));
+                        }
                         *f.defaults.borrow_mut() = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
+                        self.func_event(crate::watch::FuncEvent::ModifyDefaults, o, Some(&v));
+                    }
+                    "__kwdefaults__" => {
+                        let pairs = match &v {
+                            Value::None => Vec::new(),
+                            Value::Obj(d) if matches!(d.kind, Kind::Dict(_)) => self.dict_to_kwargs(&v)?,
+                            _ => return Err(self.type_error("__kwdefaults__ must be set to a dict object")),
+                        };
+                        *f.kwdefaults.borrow_mut() = pairs;
+                        self.func_event(crate::watch::FuncEvent::ModifyKwDefaults, o, Some(&v));
+                    }
+                    "__code__" => {
+                        let Value::Obj(c) = &v else { return Err(self.type_error("__code__ must be set to a code object")) };
+                        let Kind::Code(code) = &c.kind else { return Err(self.type_error("__code__ must be set to a code object")) };
+                        if code.freevars.len() != f.closure.len() {
+                            let msg = format!("{}() requires a code object with {} free vars, not {}", f.name.borrow(), f.closure.len(), code.freevars.len());
+                            return Err(self.value_error(&msg));
+                        }
+                        *f.code.borrow_mut() = code.clone();
+                        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(&v));
                     }
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
                     "__type_params__" => {
@@ -1368,6 +1400,12 @@ impl Interp {
                     if matches!(o.kind, Kind::Type(_)) && nm.starts_with("__") {
                         self.type_epoch += 1;
                     }
+                    if matches!(o.kind, Kind::Type(_)) {
+                        if nm == "__call__" {
+                            self.type_call_changed(o);
+                        }
+                        self.type_modified(o);
+                    }
                     return Ok(());
                 }
             }
@@ -1456,6 +1494,13 @@ impl Interp {
     }
 
     pub fn alloc_instance(&mut self, cls: &Obj) -> R<Value> {
+        if let Some(nm) = self.nomemory.as_mut() {
+            // An instance takes two allocations in CPython: the object and its values.
+            let failed = nm.request() | nm.request();
+            if failed {
+                return Err(self.memory_error());
+            }
+        }
         if matches!(&cls.kind, Kind::Type(td) if td.flags.get() & TF_ABSTRACT != 0) {
             self.check_abstract(cls)?;
         }
@@ -1651,6 +1696,8 @@ impl Interp {
                 flags: Cell::new(TF_HEAP),
                 hooks: Cell::new((u64::MAX, 0)),
                 slots: RefCell::new(slots),
+                version: Cell::new(0),
+                watched: Cell::new(0),
             }),
         });
         match self.compute_mro(&ty, &bases) {
@@ -1666,6 +1713,13 @@ impl Interp {
         }
         self.type_epoch += 1;
         self.subclass_registry.push(Rc::downgrade(&ty));
+        if let Kind::Type(td) = &ty.kind {
+            let inherits = td.bases.borrow().first().and_then(|b| b.type_data().map(|d| d.flags.get() & TF_VECTORCALL != 0)).unwrap_or(false);
+            let own_call = matches!(&dict.kind, Kind::Dict(d) if d.borrow().find_str(hash_str("__call__"), "__call__").is_some());
+            if inherits && !own_call {
+                td.flags.set(td.flags.get() | TF_VECTORCALL);
+            }
+        }
         let entries: Vec<(Value, Value)> = match &dict.kind {
             Kind::Dict(d) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
             _ => Vec::new(),

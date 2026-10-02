@@ -439,6 +439,13 @@ impl Interp {
     }
 }
 
+/// The generator or coroutine whose body is the executing frame `v`, else `None`.
+pub fn frame_generator(it: &Interp, v: &Value) -> Option<Value> {
+    let live = crate::builtins::native::with_opaque::<FrameObj, _>(v, |f| f.live_depth(it))?;
+    let owner = it.frames.get(live?)?.generator.as_ref()?.upgrade()?;
+    Some(Value::Obj(owner))
+}
+
 impl FrameObj {
     /// The depth of the frame on the interpreter stack while it is still executing.
     fn live_depth(&self, it: &Interp) -> Option<usize> {

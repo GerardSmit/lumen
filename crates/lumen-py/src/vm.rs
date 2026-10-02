@@ -25,6 +25,8 @@ pub struct Frame {
     pub names: Option<Obj>,
     pub blocks: Vec<Block>,
     pub func: Option<Obj>,
+    /// The generator or coroutine this frame is the body of, while it runs.
+    pub generator: Option<std::rc::Weak<Object>>,
 }
 
 macro_rules! types {
@@ -52,6 +54,8 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
             flags: std::cell::Cell::new(TF_IMMUTABLE),
             hooks: std::cell::Cell::new((u64::MAX, 0)),
             slots: RefCell::new(None),
+            version: std::cell::Cell::new(0),
+            watched: std::cell::Cell::new(0),
         }),
     })
 }
@@ -141,6 +145,21 @@ impl Output for ProcessOutput {
     }
 }
 
+/// Failure injection of `_testcapi.set_nomemory(start, stop)`: allocation requests after the
+/// first `start` fail, until `stop` requests (never, when `stop <= 0`).
+pub struct NoMemory {
+    pub start: i64,
+    pub stop: i64,
+    pub count: i64,
+}
+
+impl NoMemory {
+    pub fn request(&mut self) -> bool {
+        self.count += 1;
+        self.count > self.start && (self.stop <= 0 || self.count <= self.stop)
+    }
+}
+
 pub struct Interp {
     pub frames: Vec<Frame>,
     pub types: Types,
@@ -150,6 +169,13 @@ pub struct Interp {
     pub sys_module: Option<Obj>,
     pub handled: Option<Obj>,
     pub recursion_limit: usize,
+    /// `_testcapi.set_nomemory`: instance allocations fail inside the window.
+    pub nomemory: Option<NoMemory>,
+    /// `_testinternalcapi.set_eval_frame_record`: the list that receives the name of every
+    /// Python function entered.
+    pub eval_record: Option<Obj>,
+    /// What `_thread.get_ident()` reports; `_testcapi` runs callbacks as other threads.
+    pub thread_ident: i64,
     pub yielded: Option<Frame>,
     pub no_tb: bool,
     pub repr_stack: Vec<usize>,
@@ -219,6 +245,9 @@ impl Interp {
             sys_module: None,
             handled: None,
             recursion_limit: 1000,
+            nomemory: None,
+            eval_record: None,
+            thread_ident: crate::builtins::threadm::_thread::MAIN_THREAD,
             yielded: None,
             no_tb: false,
             repr_stack: Vec::new(),
@@ -330,6 +359,7 @@ impl Interp {
             globals,
             names,
             func,
+            generator: None,
         }
     }
 
@@ -338,6 +368,13 @@ impl Interp {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
         self.poll()?;
+        if let Some(list) = &self.eval_record {
+            if frame.func.is_some() {
+                if let Kind::List(items) = &list.kind {
+                    items.borrow_mut().push(Value::str(&frame.code.name));
+                }
+            }
+        }
         self.frames.push(frame);
         Ok(())
     }
@@ -540,6 +577,9 @@ impl Interp {
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
                     }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::LoadName(i) => {
                     let fr = fr!();
@@ -580,6 +620,9 @@ impl Interp {
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
                     }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::LoadGlobal(i) => {
                     let fr = fr!();
@@ -609,6 +652,9 @@ impl Interp {
                     }
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
+                    }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
                     }
                 }
                 Op::LoadDeref(i) => {
@@ -682,11 +728,17 @@ impl Interp {
                     let obj = pop!();
                     let v = pop!();
                     self.set_attr(&obj, &name, v)?;
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::DelAttr(i) => {
                     let name = fr!().code.names[i as usize].clone();
                     let obj = pop!();
                     self.del_attr(&obj, &name)?;
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::LoadMethod(_) | Op::CallMethod(_) => {}
                 Op::Subscr => {
@@ -700,11 +752,17 @@ impl Interp {
                     let obj = pop!();
                     let v = pop!();
                     self.setitem(&obj, key, v)?;
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::DelSubscr => {
                     let key = pop!();
                     let obj = pop!();
                     self.delitem(&obj, &key)?;
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                 }
                 Op::Binary(op) => {
                     let b = pop!();
@@ -965,11 +1023,17 @@ impl Interp {
                     let kwd = if flags & MF_KWDEFAULTS != 0 { Some(pop!()) } else { None };
                     let defaults = if flags & MF_DEFAULTS != 0 { Some(pop!()) } else { None };
                     let f = self.make_function(code, closure, ann, kwd, defaults)?;
+                    if let Value::Obj(fo) = &f {
+                        self.func_created(fo);
+                    }
                     push!(f);
                 }
                 Op::Call(argc) => {
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
+                    }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
                     }
                     let fr = fr!();
                     let at = fr.stack.len() - argc as usize;
@@ -982,6 +1046,9 @@ impl Interp {
                 Op::CallKw(argc) => {
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
+                    }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
                     }
                     let names = pop!();
                     let fr = fr!();
@@ -1004,6 +1071,9 @@ impl Interp {
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
                     }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
+                    }
                     let kwd = if flags & 1 != 0 { Some(pop!()) } else { None };
                     let args = pop!();
                     let f = pop!();
@@ -1024,6 +1094,9 @@ impl Interp {
                     self.frames.pop();
                     if crate::weak::has_pending() {
                         self.run_weak_callbacks();
+                    }
+                    if crate::watch::has_pending() {
+                        self.flush_watchers();
                     }
                     if self.frames.len() == entry {
                         return Ok(v);
