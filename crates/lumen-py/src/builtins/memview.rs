@@ -944,6 +944,7 @@ pub fn is_buffer_object(it: &Interp, v: &Value) -> bool {
 /// Installs `memoryview` in `builtins`.
 pub fn init(it: &mut Interp) {
     let ty = crate::bind::type_object::<MemoryView>(it);
+    crate::bind::install_into::<super::descr::ClassGetitem>(&ty, &["__class_getitem__"]);
     let b = it.builtins.clone();
     dict_set_str(&b, "memoryview", Value::Obj(ty));
 }

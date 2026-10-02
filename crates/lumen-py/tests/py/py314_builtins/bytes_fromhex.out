@@ -1,0 +1,37 @@
+b'\xab\xcd'
+bytearray(b'\xab\xcd')
+b'\n\x0c'
+ValueError fromhex() arg must contain an even number of hexadecimal digits
+ValueError fromhex() arg must contain an even number of hexadecimal digits
+ValueError fromhex() arg must contain an even number of hexadecimal digits
+b''
+b''
+TypeError fromhex() argument must be str or bytes-like, not int
+TypeError fromhex() argument must be str or bytes-like, not NoneType
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+b'\xab\xcd'
+b'\xab\xcd'
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 1
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 0
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+ValueError non-hexadecimal number found in fromhex() arg at position 2
+<class '__main__.B'>
+<class 'bytearray'>

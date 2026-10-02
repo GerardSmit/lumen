@@ -52,6 +52,7 @@ const EXC_TABLE: &[(&str, &str)] = &[
     ("RuntimeError", "Exception"),
     ("NotImplementedError", "RuntimeError"),
     ("RecursionError", "RuntimeError"),
+    ("PythonFinalizationError", "RuntimeError"),
     ("SyntaxError", "Exception"),
     ("IndentationError", "SyntaxError"),
     ("TabError", "IndentationError"),
@@ -1808,7 +1809,7 @@ impl Interp {
         };
         for (k, v) in &entries {
             if let (Some(kn), Value::Obj(vo)) = (k.as_str(), v) {
-                if matches!(vo.kind, Kind::Instance) {
+                if matches!(vo.kind, Kind::Instance | Kind::Property(_)) {
                     let vc = self.type_of_obj(vo);
                     if let Some(sn) = self.lookup_mro(&vc, "__set_name__") {
                         let b = self.bind_descr(&sn, v, &vc)?;

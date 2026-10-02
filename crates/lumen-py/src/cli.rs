@@ -149,7 +149,7 @@ pub fn run_main(args: &[String]) -> i32 {
             let mut argv = vec!["-c".to_string()];
             argv.extend(opts.script_args[2..].iter().cloned());
             it.set_argv(&argv);
-            it.run_source(src, "<string>")
+            it.run_source(&lumen_common::dedent::dedent(src), "<string>")
         }
     };
     if !it.interrupt.is_interrupted() {

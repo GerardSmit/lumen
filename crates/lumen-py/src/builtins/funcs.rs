@@ -1010,14 +1010,39 @@ pub mod builtin_fns {
         if let (Some(x), Some(e), Some(md)) = (base.as_bigint(), exp.as_bigint(), m.as_bigint()) {
             return it.int_pow_mod(&x, &e, &md);
         }
-        if it.user_special(base, "__pow__").is_some() {
-            return it.call_method(base, "__pow__", vec![exp.clone(), m.clone()]);
+        let (tb, te) = (it.type_of(base), it.type_of(exp));
+        let differ = !Rc::ptr_eq(&tb, &te);
+        let exp_first = differ && it.is_subtype(&te, &tb);
+        for step in 0..2 {
+            let (recv, other, name) = if (step == 0) == exp_first { (exp, base, "__rpow__") } else { (base, exp, "__pow__") };
+            if name == "__rpow__" && !differ {
+                continue;
+            }
+            if let Some(f) = it.user_special(recv, name) {
+                let r = it.call_user_special(recv, &f, vec![other.clone(), m.clone()])?;
+                if !matches!(r, Value::NotImplemented) {
+                    return Ok(r);
+                }
+            }
         }
+        let is_real = |v: &Value| match v {
+            Value::Int(_) | Value::Float(_) | Value::Bool(_) => true,
+            Value::Obj(o) => matches!(o.kind, Kind::Int(_) | Kind::Float(_)),
+            _ => false,
+        };
+        let is_float = |v: &Value| matches!(v, Value::Float(_)) || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Float(_)));
         let is_complex = |v: &Value| matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Complex(..)));
-        if is_complex(base) || is_complex(exp) {
-            return Err(it.value_error("complex modulo"));
+        // The numeric slots of the operands, tried in order as `ternary_op` does.
+        for v in [base, exp, m] {
+            if is_float(v) && is_real(base) && is_real(exp) {
+                return Err(it.type_error("pow() 3rd argument not allowed unless all arguments are integers"));
+            }
+            if is_complex(v) && (is_real(base) || is_complex(base)) && (is_real(exp) || is_complex(exp)) {
+                return Err(it.value_error("complex modulo"));
+            }
         }
-        Err(it.type_error("pow() 3rd argument not allowed unless all arguments are integers"))
+        let (a, b, c) = (it.tp_name_of(base), it.tp_name_of(exp), it.tp_name_of(m));
+        Err(it.type_error(&format!("unsupported operand type(s) for ** or pow(): '{a}', '{b}', '{c}'")))
     }
 
     /// Return the canonical string representation of the object.
@@ -1146,8 +1171,8 @@ pub mod builtin_fns {
     /// The globals must be a dictionary and locals can be any mapping,
     /// defaulting to the current globals and locals.
     /// If only globals is given, locals defaults to it.
-    #[op(hint(py(text_signature = "($module, source, globals=None, locals=None, /)")))]
-    fn eval(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>) -> R<Value> {
+    #[op(hint(py(text_signature = "($module, source, /, globals=None, locals=None)")))]
+    fn eval(it: &mut Interp, source: &Value, #[kw] globals: Option<&Value>, #[kw] locals: Option<&Value>) -> R<Value> {
         eval_exec(it, source, globals, locals, None, true)
     }
 
@@ -1160,8 +1185,8 @@ pub mod builtin_fns {
     /// If only globals is given, locals defaults to it.
     /// The closure must be a tuple of cellvars, and can only be used
     /// when source is a code object requiring exactly that many cellvars.
-    #[op(hint(py(text_signature = "($module, source, globals=None, locals=None, /, *, closure=None)")))]
-    fn exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, #[kwonly] closure: Option<&Value>) -> R<Value> {
+    #[op(hint(py(text_signature = "($module, source, /, globals=None, locals=None, *, closure=None)")))]
+    fn exec(it: &mut Interp, source: &Value, #[kw] globals: Option<&Value>, #[kw] locals: Option<&Value>, #[kwonly] closure: Option<&Value>) -> R<Value> {
         eval_exec(it, source, globals, locals, closure, false)
     }
 

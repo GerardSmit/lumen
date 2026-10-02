@@ -591,33 +591,131 @@ pub fn rect(r: f64, phi: f64) -> CResult {
     ok(c(r * phi.cos(), r * phi.sin()))
 }
 
-/// `a / b` (`_Py_c_quot`): scaled by the larger part of `b`; `None` for a zero divisor.
+/// `a / b` (`_Py_c_quot`): scaled by the larger part of `b`, with the infinities and zeros that
+/// came out as nan+nanj recovered (C11 Annex G.5.2); `None` for a zero divisor.
 pub fn quot(a: Complex, b: Complex) -> Option<Complex> {
     let (abs_br, abs_bi) = (b.re.abs(), b.im.abs());
-    if abs_br >= abs_bi {
+    let mut r = if abs_br >= abs_bi {
         if abs_br == 0.0 {
             return None;
         }
         let ratio = b.im / b.re;
         let denom = b.re + b.im * ratio;
-        Some(c(
-            (a.re + a.im * ratio) / denom,
-            (a.im - a.re * ratio) / denom,
-        ))
+        c((a.re + a.im * ratio) / denom, (a.im - a.re * ratio) / denom)
     } else if abs_bi >= abs_br {
         let ratio = b.re / b.im;
         let denom = b.re * ratio + b.im;
-        Some(c(
-            (a.re * ratio + a.im) / denom,
-            (a.im * ratio - a.re) / denom,
-        ))
+        c((a.re * ratio + a.im) / denom, (a.im * ratio - a.re) / denom)
     } else {
-        Some(c(f64::NAN, f64::NAN))
+        c(f64::NAN, f64::NAN)
+    };
+    if r.re.is_nan() && r.im.is_nan() {
+        if (a.re.is_infinite() || a.im.is_infinite()) && b.re.is_finite() && b.im.is_finite() {
+            let x = (if a.re.is_infinite() { 1.0f64 } else { 0.0 }).copysign(a.re);
+            let y = (if a.im.is_infinite() { 1.0f64 } else { 0.0 }).copysign(a.im);
+            r = c(f64::INFINITY * (x * b.re + y * b.im), f64::INFINITY * (y * b.re - x * b.im));
+        } else if (abs_br.is_infinite() || abs_bi.is_infinite()) && a.re.is_finite() && a.im.is_finite() {
+            let x = (if b.re.is_infinite() { 1.0f64 } else { 0.0 }).copysign(b.re);
+            let y = (if b.im.is_infinite() { 1.0f64 } else { 0.0 }).copysign(b.im);
+            r = c(0.0 * (a.re * x + a.im * y), 0.0 * (a.im * x - a.re * y));
+        }
     }
+    Some(r)
 }
 
-pub fn prod(a: Complex, b: Complex) -> Complex {
-    c(a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+/// `a * b` (`_Py_c_prod`), recovering infinities that came out as nan+nanj (C11 Annex G.5.1).
+pub fn prod(z: Complex, w: Complex) -> Complex {
+    let (mut a, mut b, mut cc, mut d) = (z.re, z.im, w.re, w.im);
+    let (ac, bd, ad, bc) = (a * cc, b * d, a * d, b * cc);
+    let mut r = c(ac - bd, ad + bc);
+    if r.re.is_nan() && r.im.is_nan() {
+        let mut recalc = false;
+        if a.is_infinite() || b.is_infinite() {
+            a = (if a.is_infinite() { 1.0f64 } else { 0.0 }).copysign(a);
+            b = (if b.is_infinite() { 1.0f64 } else { 0.0 }).copysign(b);
+            if cc.is_nan() {
+                cc = 0.0f64.copysign(cc);
+            }
+            if d.is_nan() {
+                d = 0.0f64.copysign(d);
+            }
+            recalc = true;
+        }
+        if cc.is_infinite() || d.is_infinite() {
+            cc = (if cc.is_infinite() { 1.0f64 } else { 0.0 }).copysign(cc);
+            d = (if d.is_infinite() { 1.0f64 } else { 0.0 }).copysign(d);
+            if a.is_nan() {
+                a = 0.0f64.copysign(a);
+            }
+            if b.is_nan() {
+                b = 0.0f64.copysign(b);
+            }
+            recalc = true;
+        }
+        if !recalc && (ac.is_infinite() || bd.is_infinite() || ad.is_infinite() || bc.is_infinite()) {
+            for v in [&mut a, &mut b, &mut cc, &mut d] {
+                if v.is_nan() {
+                    *v = 0.0f64.copysign(*v);
+                }
+            }
+            recalc = true;
+        }
+        if recalc {
+            r = c(f64::INFINITY * (a * cc - b * d), f64::INFINITY * (a * d + b * cc));
+        }
+    }
+    r
+}
+
+/// `a + b` for a real `b` (`_Py_cr_sum`): only the real part changes, the imaginary part is not
+/// touched (so `-0.0` survives).
+pub fn sum_real(a: Complex, b: f64) -> Complex {
+    c(a.re + b, a.im)
+}
+
+/// `a - b` for a real `b` (`_Py_cr_diff`).
+pub fn diff_real(a: Complex, b: f64) -> Complex {
+    c(a.re - b, a.im)
+}
+
+/// `a - b` for a real `a` (`_Py_rc_diff`).
+pub fn real_diff(a: f64, b: Complex) -> Complex {
+    c(a - b.re, -b.im)
+}
+
+/// `a * b` for a real `b` (`_Py_cr_prod`).
+pub fn prod_real(a: Complex, b: f64) -> Complex {
+    c(a.re * b, a.im * b)
+}
+
+/// `a / b` for a real `b` (`_Py_cr_quot`); `None` for a zero divisor.
+pub fn quot_real(a: Complex, b: f64) -> Option<Complex> {
+    (b != 0.0).then(|| c(a.re / b, a.im / b))
+}
+
+/// `a / b` for a real `a` (`_Py_rc_quot`); `None` for a zero divisor.
+pub fn real_quot(a: f64, b: Complex) -> Option<Complex> {
+    let (abs_br, abs_bi) = (b.re.abs(), b.im.abs());
+    let mut r = if abs_br >= abs_bi {
+        if abs_br == 0.0 {
+            return None;
+        }
+        let ratio = b.im / b.re;
+        let denom = b.re + b.im * ratio;
+        c(a / denom, (-a * ratio) / denom)
+    } else if abs_bi >= abs_br {
+        let ratio = b.re / b.im;
+        let denom = b.re * ratio + b.im;
+        c((a * ratio) / denom, (-a) / denom)
+    } else {
+        c(f64::NAN, f64::NAN)
+    };
+    if r.re.is_nan() && r.im.is_nan() && a.is_finite() && (abs_br.is_infinite() || abs_bi.is_infinite()) {
+        let x = (if b.re.is_infinite() { 1.0f64 } else { 0.0 }).copysign(b.re);
+        let y = (if b.im.is_infinite() { 1.0f64 } else { 0.0 }).copysign(b.im);
+        r = c(0.0 * (a * x), 0.0 * (-a * y));
+    }
+    Some(r)
 }
 
 /// `a ** b` (`complex_pow`): repeated squaring for small integral exponents, polar form

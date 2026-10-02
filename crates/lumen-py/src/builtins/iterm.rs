@@ -275,26 +275,41 @@ impl Zip {
     }
 }
 
-/// map(func, *iterables) --> map object
-///
 /// Make an iterator that computes the function using arguments from
 /// each of the iterables.  Stops when the shortest iterable is exhausted.
+///
+/// If strict is true and one of the arguments is exhausted before the others,
+/// raise a ValueError.
 #[lumen_bind::class(name = "map")]
 pub struct Map;
 
 #[lumen_bind::methods]
 impl Map {
-    #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
+    #[constructor(hint(py(text_signature = "(function, iterable, /, *iterables, strict=False)")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[kwonly] strict: Option<&Value>) -> R<Value> {
         if args.len() < 2 {
             return Err(it.type_error("map() must have at least two arguments."));
         }
+        let strict = match strict {
+            Some(v) => it.truthy(v)?,
+            None => false,
+        };
         let mut its = Vec::with_capacity(args.len() - 1);
         for v in &args[1..] {
             its.push(it.get_iter(v)?);
         }
         let base = it.types.map.clone();
-        Ok(new_iter(it, &cls, &base, IterState::Map { f: args[0].clone(), its }))
+        Ok(new_iter(it, &cls, &base, IterState::Map { f: args[0].clone(), its, strict }))
+    }
+
+    /// Set state information for unpickling.
+    #[method(name = "__setstate__", hint(py(text_signature = "")))]
+    fn setstate(slf: This<IterRef<'_>>, it: &mut Interp, state: &Value) -> R<()> {
+        let flag = it.truthy(state)?;
+        if let IterState::Map { strict, .. } = &mut *slf.0 .1.borrow_mut() {
+            *strict = flag;
+        }
+        Ok(())
     }
 }
 
@@ -416,6 +431,7 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Range(i64, i64, i64),
         Args(&'static str, Vec<Value>),
         Zip(Vec<Value>, bool),
+        Map(Vec<Value>, bool),
         Unpicklable,
     }
     let plan = match &*st.borrow() {
@@ -443,10 +459,10 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         IterState::Reversed { seq, idx } => Plan::Indexed("reversed", seq.clone(), *idx),
         IterState::Enumerate { it: inner, idx } => Plan::Args("enumerate", vec![inner.clone(), Value::Int(*idx)]),
         IterState::Zip { its, strict } => Plan::Zip(its.clone(), *strict),
-        IterState::Map { f, its } => {
+        IterState::Map { f, its, strict } => {
             let mut args = vec![f.clone()];
             args.extend(its.iter().cloned());
-            Plan::Args("map", args)
+            Plan::Map(args, *strict)
         }
         IterState::Filter { f, it: inner } => Plan::Args("filter", vec![f.clone(), inner.clone()]),
         IterState::Empty => Plan::Done("iter", Value::tuple(Vec::new())),
@@ -471,6 +487,14 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Plan::Args(f, args) => {
             let f = builtin_fn(it, f)?;
             Value::tuple(vec![f, Value::tuple(args)])
+        }
+        Plan::Map(args, strict) => {
+            let f = builtin_fn(it, "map")?;
+            let mut out = vec![f, Value::tuple(args)];
+            if strict {
+                out.push(Value::Bool(true));
+            }
+            Value::tuple(out)
         }
         Plan::Zip(its, strict) => {
             let zip = Value::Obj(it.types.zip.clone());

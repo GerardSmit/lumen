@@ -406,19 +406,42 @@ fn hex_impl(it: &mut Interp, d: &[u8], sep: Passed<&Value>, bytes_per_sep: isize
 
 /// `bytes.fromhex(string)` / `bytearray.fromhex(string)` for class `cls` (a subclass is called
 /// with the exact-type result, as CPython does).
-fn fromhex_impl(it: &mut Interp, cls: &Value, string: &str, array: bool) -> R<Value> {
-    let digits: Vec<char> = string.chars().filter(|c| !c.is_whitespace()).collect();
-    let mut out = Vec::with_capacity(digits.len() / 2);
-    for (i, pair) in digits.chunks(2).enumerate() {
-        let hi = pair[0].to_digit(16);
-        let lo = pair.get(1).and_then(|c| c.to_digit(16));
-        match (hi, lo) {
-            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
-            _ => {
-                let at = if hi.is_none() { i * 2 } else { i * 2 + 1 };
-                return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {}", at)));
-            }
+fn fromhex_impl(it: &mut Interp, cls: &Value, string: &Value, array: bool) -> R<Value> {
+    let digits: Vec<u32> = if let Some(s) = string.as_str() {
+        let cps: Vec<u32> = lumen_common::smuggle::code_points(s).collect();
+        if let Some(at) = cps.iter().position(|&c| c >= 128) {
+            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {at}")));
         }
+        cps
+    } else if it.is_buffer(string) {
+        it.bytes_of(string)?.into_iter().map(u32::from).collect()
+    } else {
+        let t = it.type_name_of(string);
+        return Err(it.type_error(&format!("fromhex() argument must be str or bytes-like, not {t}")));
+    };
+    let is_space = |c: u32| matches!(c, 0x20 | 0x09..=0x0d);
+    let digit = |c: u32| char::from_u32(c).and_then(|c| c.to_digit(16)).filter(|_| c < 128);
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    let mut i = 0;
+    loop {
+        while i < digits.len() && is_space(digits[i]) {
+            i += 1;
+        }
+        if i >= digits.len() {
+            break;
+        }
+        let Some(hi) = digit(digits[i]) else {
+            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {i}")));
+        };
+        i += 1;
+        if i >= digits.len() {
+            return Err(it.value_error("fromhex() arg must contain an even number of hexadecimal digits"));
+        }
+        let Some(lo) = digit(digits[i]) else {
+            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {i}")));
+        };
+        i += 1;
+        out.push((hi * 16 + lo) as u8);
     }
     let exact = if array { Value::Obj(Object::new(Kind::ByteArray(ba_store(out)))) } else { Value::bytes(out) };
     let base = if array { &it.types.bytearray } else { &it.types.bytes };
@@ -1012,7 +1035,7 @@ impl Bytes {
     /// Spaces between two numbers are accepted.
     /// Example: bytes.fromhex('B9 01EF') -> b'\\xb9\\x01\\xef'.
     #[classmethod]
-    fn fromhex(cls: This<Value>, it: &mut Interp, string: &str) -> R<Value> {
+    fn fromhex(cls: This<Value>, it: &mut Interp, string: &Value) -> R<Value> {
         fromhex_impl(it, &cls, string, false)
     }
 
@@ -1207,7 +1230,7 @@ impl ByteArray {
     /// Spaces between two numbers are accepted.
     /// Example: bytearray.fromhex('B9 01EF') -> bytearray(b'\\xb9\\x01\\xef')
     #[classmethod]
-    fn fromhex(cls: This<Value>, it: &mut Interp, string: &str) -> R<Value> {
+    fn fromhex(cls: This<Value>, it: &mut Interp, string: &Value) -> R<Value> {
         fromhex_impl(it, &cls, string, true)
     }
 

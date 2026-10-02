@@ -22,6 +22,8 @@ pub struct Spec {
     /// `,` or `_`.
     pub grouping: Option<char>,
     pub precision: Option<usize>,
+    /// `,` or `_` after the precision: groups the fractional digits in threes.
+    pub frac_grouping: Option<char>,
     pub ty: Option<char>,
 }
 
@@ -50,6 +52,18 @@ impl SpecError {
             SpecError::MissingPrecision => Some("Format specifier missing precision"),
         }
     }
+}
+
+/// The fractional digits `frac` in groups of three from the decimal point, joined by `sep`.
+pub fn group_fraction(frac: &str, sep: char) -> String {
+    let mut out = String::with_capacity(frac.len() + frac.len() / 3);
+    for (i, c) in frac.chars().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(sep);
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn is_align(c: char) -> bool {
@@ -132,13 +146,32 @@ fn parse_with(spec: &str, strict_digits: bool) -> Result<Spec, SpecError> {
     if i < n && chars[i] == '.' {
         i += 1;
         let p = digits(&mut i);
-        if p.is_empty() {
+        let mut consumed = p.len();
+        if !p.is_empty() {
+            if strict_digits && chars[p.start] == '0' && p.len() > 1 {
+                return Err(SpecError::Invalid);
+            }
+            s.precision = Some(number(p)?);
+        }
+        if i < n && chars[i] == ',' {
+            s.frac_grouping = Some(',');
+            i += 1;
+            consumed += 1;
+        }
+        if i < n && chars[i] == '_' {
+            if s.frac_grouping.is_some() {
+                return Err(SpecError::BothSeparators);
+            }
+            s.frac_grouping = Some('_');
+            i += 1;
+            consumed += 1;
+        }
+        if i < n && chars[i] == ',' && s.frac_grouping == Some('_') {
+            return Err(SpecError::BothSeparators);
+        }
+        if consumed == 0 {
             return Err(SpecError::MissingPrecision);
         }
-        if strict_digits && chars[p.start] == '0' && p.len() > 1 {
-            return Err(SpecError::Invalid);
-        }
-        s.precision = Some(number(p)?);
     }
     if i < n {
         s.ty = Some(chars[i]);
@@ -180,6 +213,23 @@ mod tests {
         assert_eq!(parse("."), Err(SpecError::MissingPrecision));
         assert_eq!(parse("99999999999999999999"), Err(SpecError::TooManyDigits));
         assert_eq!(parse("fx"), Err(SpecError::Invalid));
+        assert_eq!(parse(".3_,f"), Err(SpecError::BothSeparators));
+        assert_eq!(parse(".,6f"), Err(SpecError::Invalid));
+    }
+
+    #[test]
+    fn groups_fraction_from_the_point() {
+        assert_eq!(group_fraction("1234567", '_'), "123_456_7");
+        assert_eq!(group_fraction("12", ','), "12");
+        assert_eq!(group_fraction("", ','), "");
+    }
+
+    #[test]
+    fn fractional_grouping() {
+        let s = parse(",.6_f").unwrap();
+        assert_eq!((s.grouping, s.precision, s.frac_grouping, s.ty), (Some(','), Some(6), Some('_'), Some('f')));
+        let s = parse("._f").unwrap();
+        assert_eq!((s.precision, s.frac_grouping), (None, Some('_')));
     }
 
     #[test]

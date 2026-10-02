@@ -321,6 +321,8 @@ pub struct PropData {
     pub fset: Value,
     pub fdel: Value,
     pub doc: Value,
+    /// `__name__`: set by `__set_name__` or assignment; `None` falls back to the getter's name.
+    pub name: RefCell<Option<Value>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -343,7 +345,7 @@ pub enum IterState {
     Reversed { seq: Value, idx: i64 },
     Enumerate { it: Value, idx: i64 },
     Zip { its: Vec<Value>, strict: bool },
-    Map { f: Value, its: Vec<Value> },
+    Map { f: Value, its: Vec<Value>, strict: bool },
     Filter { f: Value, it: Value },
     Native(Box<dyn FnMut(&mut Interp) -> R<Option<Value>>>),
     /// A `Native` iterator whose step is running (its closure is out of the cell).

@@ -523,6 +523,19 @@ fn check_special_set(it: &mut Interp, cls: &Obj, name: &str) -> R<()> {
     Ok(())
 }
 
+fn del_property_name(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+    match a.first() {
+        Some(Value::Obj(o)) => match &o.kind {
+            Kind::Property(p) => {
+                *p.name.borrow_mut() = None;
+                Ok(Value::None)
+            }
+            _ => Err(it.type_error("descriptor '__name__' for 'property' objects doesn't apply to this object")),
+        },
+        _ => Err(it.type_error("descriptor '__name__' for 'property' objects doesn't apply to this object")),
+    }
+}
+
 /// The deleter of the `type` slots that cannot be deleted: always a `TypeError` (CPython's
 /// setters receive a NULL value).
 fn del_special(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
@@ -962,7 +975,7 @@ impl PropRef<'_> {
     /// A copy of the property with accessor `slot` (0 get, 1 set, 2 delete) replaced by `f`.
     fn with(&self, slot: usize, f: &Value) -> Value {
         let p = self.1;
-        let mut np = PropData { fget: p.fget.clone(), fset: p.fset.clone(), fdel: p.fdel.clone(), doc: p.doc.clone() };
+        let mut np = PropData { fget: p.fget.clone(), fset: p.fset.clone(), fdel: p.fdel.clone(), doc: p.doc.clone(), name: p.name.clone() };
         match slot {
             0 => np.fget = f.clone(),
             1 => np.fset = f.clone(),
@@ -1025,7 +1038,7 @@ impl Property {
                 }
             }
         }
-        let kind = Kind::Property(PropData { fget: get(fget), fset: get(fset), fdel: get(fdel), doc });
+        let kind = Kind::Property(PropData { fget: get(fget), fset: get(fset), fdel: get(fdel), doc, name: Default::default() });
         Value::Obj(if Rc::ptr_eq(cls, &it.types.property) { Object::new(kind) } else { Object::with_cls(cls.clone(), kind) })
     }
 
@@ -1055,7 +1068,30 @@ impl Property {
     /// Method to set name of a property.
     #[method(name = "__set_name__", hint(py(text_signature = "")))]
     fn set_name(slf: This<PropRef<'_>>, owner: &Value, name: &Value) {
-        let _ = (slf, owner, name);
+        let _ = owner;
+        *slf.0 .1.name.borrow_mut() = Some(name.clone());
+    }
+
+    #[getter(name = "__name__")]
+    fn get_name(slf: This<PropRef<'_>>, it: &mut Interp) -> R<Value> {
+        let stored = slf.0 .1.name.borrow().clone();
+        if let Some(n) = stored {
+            return Ok(n);
+        }
+        let fget = &slf.0 .1.fget;
+        if !fget.is_none() {
+            match it.get_attr_str(fget, "__name__") {
+                Ok(n) => return Ok(n),
+                Err(e) if it.exc_is(&e, "AttributeError") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(it.new_exc_str("AttributeError", "'property' object has no attribute '__name__'"))
+    }
+
+    #[setter(name = "__name__")]
+    fn set_name_attr(slf: This<PropRef<'_>>, value: &Value) {
+        *slf.0 .1.name.borrow_mut() = Some(value.clone());
     }
 }
 
@@ -1377,6 +1413,12 @@ impl NotImplementedType {
         let _ = slf;
         "NotImplemented".to_string()
     }
+
+    #[method(name = "__bool__", hint(py(text_signature = "")))]
+    fn bool(slf: This<&Value>, it: &mut Interp) -> R<bool> {
+        let _ = slf;
+        it.truthy(&Value::NotImplemented)
+    }
 }
 
 pub fn init(it: &mut Interp) {
@@ -1429,6 +1471,9 @@ pub fn install_getset_descriptors(it: &mut Interp) {
             ("__abstractmethods__", del_abstractmethods),
         ],
     );
+    let property = it.types.property.clone();
+    super::descr::install_getsets::<Property>(it, &property, &[]);
+    super::descr::install_deleters(it, &property, &[("__name__", del_property_name)]);
     super::descr::install_getsets::<Super>(it, &super_, &["__thisclass__", "__self__", "__self_class__"]);
 }
 

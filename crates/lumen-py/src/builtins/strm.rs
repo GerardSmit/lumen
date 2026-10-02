@@ -593,7 +593,7 @@ impl Str {
     /// If the optional argument count is given, only the first count occurrences are
     /// replaced.
     #[method]
-    fn replace(slf: This<StrRef<'_>>, it: &mut Interp, old: &str, new: &str, #[default(-1)] count: isize) -> R<Value> {
+    fn replace(slf: This<StrRef<'_>>, it: &mut Interp, old: &str, new: &str, #[kw] #[default(-1)] count: isize) -> R<Value> {
         let s = slf.0 .1;
         let count = count as i64;
         let growth = new.len().saturating_sub(old.len());

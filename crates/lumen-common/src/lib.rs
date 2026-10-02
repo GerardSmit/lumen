@@ -9,6 +9,7 @@ pub mod civil;
 pub mod codec;
 pub mod csv;
 pub mod decimal;
+pub mod dedent;
 pub mod editdist;
 pub mod cycle;
 #[cfg(feature = "compress")]
