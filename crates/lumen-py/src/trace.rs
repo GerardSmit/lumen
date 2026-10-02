@@ -474,7 +474,7 @@ impl Interp {
                 let Some(Value::Obj(e)) = args.get(1) else { return Ok(()) };
                 let ty = Value::Obj(self.type_of_obj(e));
                 let tb = match &e.kind {
-                    Kind::Exception(d) => self.make_tb(&d.borrow().tb),
+                    Kind::Exception(d) => self.exc_tb(d),
                     _ => Value::None,
                 };
                 self.trace_call("exception", Value::tuple(vec![ty, Value::Obj(e.clone()), tb]))

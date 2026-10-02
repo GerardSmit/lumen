@@ -57,7 +57,7 @@ pub mod sys {
             Some(e) => {
                 let t = Value::Obj(it.type_of_obj(&e));
                 let tb = match &e.kind {
-                    Kind::Exception(d) => it.make_tb(&d.borrow().tb),
+                    Kind::Exception(d) => it.exc_tb(d),
                     _ => Value::None,
                 };
                 Value::tuple(vec![t, Value::Obj(e), tb])

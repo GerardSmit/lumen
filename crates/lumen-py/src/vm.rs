@@ -1431,7 +1431,7 @@ impl Interp {
                     let prev = self.handled.replace(exc.as_obj().cloned().unwrap());
                     let tb = match &exc {
                         Value::Obj(e) => match &e.kind {
-                            Kind::Exception(d) => self.make_tb(&d.borrow().tb),
+                            Kind::Exception(d) => self.exc_tb(d),
                             _ => Value::None,
                         },
                         _ => Value::None,

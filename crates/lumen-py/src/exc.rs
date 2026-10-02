@@ -209,7 +209,7 @@ impl Interp {
         };
         let t = Value::Obj(self.type_of_obj(exc));
         let tb = match &exc.kind {
-            Kind::Exception(d) => self.make_tb(&d.borrow().tb),
+            Kind::Exception(d) => self.exc_tb(d),
             _ => Value::None,
         };
         if let Err(e) = self.call(&hook, vec![t, Value::Obj(exc.clone()), tb], Vec::new()) {

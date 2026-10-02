@@ -259,6 +259,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
         )
     }
@@ -857,15 +858,15 @@ impl Interp {
         };
         match &o.kind {
             Kind::Exception(d) => {
+                if nm == "__traceback__" {
+                    return Ok(Some(self.exc_tb(d)));
+                }
                 let d = d.borrow();
                 match nm {
                     "args" => return Ok(Some(d.args.clone())),
                     "__cause__" => return Ok(Some(d.cause.clone().map(Value::Obj).unwrap_or(Value::None))),
                     "__context__" => return Ok(Some(d.context.clone().map(Value::Obj).unwrap_or(Value::None))),
                     "__suppress_context__" => return Ok(Some(Value::Bool(d.suppress_context))),
-                    "__traceback__" => {
-                        return Ok(Some(self.make_tb(&d.tb)));
-                    }
                     _ => {}
                 }
             }
@@ -1268,7 +1269,9 @@ impl Interp {
                     "__suppress_context__" => d.borrow_mut().suppress_context = self.truthy(&v)?,
                     "__traceback__" => {
                         if v.is_none() {
-                            d.borrow_mut().tb.clear();
+                            let mut dm = d.borrow_mut();
+                            dm.tb.clear();
+                            dm.tb_cache = None;
                         }
                     }
                     _ => {
@@ -1350,9 +1353,26 @@ impl Interp {
         }
     }
 
+    /// The traceback chain of an exception; the chain built earlier is reused and only entries
+    /// added since are put on top of it.
+    pub fn exc_tb(&self, d: &RefCell<ExcData>) -> Value {
+        let mut d = d.borrow_mut();
+        let n = d.tb.len();
+        let (done, head) = match d.tb_cache.take() {
+            Some((k, head)) if k <= n => (k, head),
+            _ => (0, Value::None),
+        };
+        let head = self.make_tb_onto(head, &d.tb[done..]);
+        d.tb_cache = Some((n, head.clone()));
+        head
+    }
+
     /// Builds a traceback chain; entries are stored innermost first.
     pub fn make_tb(&self, entries: &[TbEntry]) -> Value {
-        let mut next = Value::None;
+        self.make_tb_onto(Value::None, entries)
+    }
+
+    fn make_tb_onto(&self, mut next: Value, entries: &[TbEntry]) -> Value {
         for e in entries {
             let o = Object::with_cls(self.types.traceback.clone(), Kind::Instance);
             let d = self.instance_dict(&o);
@@ -1579,6 +1599,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
             Layout::Int => Kind::Int(crate::pyint::BigInt::zero()),
             Layout::Float => Kind::Float(0.0),
