@@ -1,5 +1,6 @@
 //! Container slot wrappers (`__getitem__`, `__len__`, ...) shared by the builtin collection types.
 
+use crate::ast::{BinOp, CmpOp};
 use crate::bind::This;
 use crate::object::*;
 use crate::vm::*;
@@ -93,6 +94,214 @@ impl Iterator {
     fn next(slf: This<&Value>, it: &mut Interp) -> R<Option<Value>> {
         it.native_iter_next(&slf)
     }
+}
+
+/// The binary operator and rich comparison slot wrappers of the builtin types, declared once and
+/// installed into each type that has the slot.
+#[lumen_bind::class(name = "operators", hint(py(shared)))]
+pub struct Operators;
+
+#[lumen_bind::methods]
+impl Operators {
+    #[proto(add)]
+    fn add(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Add, &slf, value, false)
+    }
+
+    #[proto(radd)]
+    fn radd(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Add, &slf, value, true)
+    }
+
+    #[proto(sub)]
+    fn sub(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Sub, &slf, value, false)
+    }
+
+    #[proto(rsub)]
+    fn rsub(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Sub, &slf, value, true)
+    }
+
+    #[proto(mul)]
+    fn mul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mult, &slf, value, false)
+    }
+
+    #[proto(rmul)]
+    fn rmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mult, &slf, value, true)
+    }
+
+    #[proto(matmul)]
+    fn matmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::MatMult, &slf, value, false)
+    }
+
+    #[proto(rmatmul)]
+    fn rmatmul(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::MatMult, &slf, value, true)
+    }
+
+    #[proto(truediv)]
+    fn truediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Div, &slf, value, false)
+    }
+
+    #[proto(rtruediv)]
+    fn rtruediv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Div, &slf, value, true)
+    }
+
+    #[proto(floordiv)]
+    fn floordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::FloorDiv, &slf, value, false)
+    }
+
+    #[proto(rfloordiv)]
+    fn rfloordiv(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::FloorDiv, &slf, value, true)
+    }
+
+    #[proto(mod)]
+    fn r#mod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mod, &slf, value, false)
+    }
+
+    #[proto(rmod)]
+    fn rmod(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::Mod, &slf, value, true)
+    }
+
+    #[proto(lshift)]
+    fn lshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::LShift, &slf, value, false)
+    }
+
+    #[proto(rlshift)]
+    fn rlshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::LShift, &slf, value, true)
+    }
+
+    #[proto(rshift)]
+    fn rshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::RShift, &slf, value, false)
+    }
+
+    #[proto(rrshift)]
+    fn rrshift(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::RShift, &slf, value, true)
+    }
+
+    #[proto(and)]
+    fn and(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitAnd, &slf, value, false)
+    }
+
+    #[proto(rand)]
+    fn rand(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitAnd, &slf, value, true)
+    }
+
+    #[proto(or)]
+    fn or(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitOr, &slf, value, false)
+    }
+
+    #[proto(ror)]
+    fn ror(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitOr, &slf, value, true)
+    }
+
+    #[proto(xor)]
+    fn xor(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitXor, &slf, value, false)
+    }
+
+    #[proto(rxor)]
+    fn rxor(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        binop(it, BinOp::BitXor, &slf, value, true)
+    }
+
+    #[proto(eq)]
+    fn eq(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::Eq, &slf, value)
+    }
+
+    #[proto(ne)]
+    fn ne(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::NotEq, &slf, value)
+    }
+
+    #[proto(lt)]
+    fn lt(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::Lt, &slf, value)
+    }
+
+    #[proto(le)]
+    fn le(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::LtE, &slf, value)
+    }
+
+    #[proto(gt)]
+    fn gt(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::Gt, &slf, value)
+    }
+
+    #[proto(ge)]
+    fn ge(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        compare(it, CmpOp::GtE, &slf, value)
+    }
+}
+
+/// The rank of a builtin number in the `int` < `float` < `complex` tower.
+fn numeric_rank(v: &Value) -> Option<u8> {
+    match v {
+        Value::Int(_) | Value::Bool(_) => Some(0),
+        Value::Float(_) => Some(1),
+        Value::Obj(o) => match o.kind {
+            Kind::Int(_) => Some(0),
+            Kind::Float(_) => Some(1),
+            Kind::Complex(..) => Some(2),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `other` is a number of a wider type than `slf`: a number's slot leaves that operand
+/// to the wider type (`int.__add__(1, 2.0)` is `NotImplemented`).
+pub fn numeric_wider(slf: &Value, other: &Value) -> bool {
+    matches!((numeric_rank(slf), numeric_rank(other)), (Some(a), Some(b)) if b > a)
+}
+
+fn binop(it: &mut Interp, op: BinOp, slf: &Value, other: &Value, reflected: bool) -> R<Value> {
+    if numeric_wider(slf, other) {
+        return Ok(Value::NotImplemented);
+    }
+    let (a, b) = if reflected { (other, slf) } else { (slf, other) };
+    Ok(it.native_binop(op, a, b)?.unwrap_or(Value::NotImplemented))
+}
+
+fn compare(it: &mut Interp, op: CmpOp, slf: &Value, other: &Value) -> R<Value> {
+    if numeric_wider(slf, other) {
+        return Ok(Value::NotImplemented);
+    }
+    Ok(match it.native_compare(op, slf, other)? {
+        Some(b) => Value::Bool(b),
+        None => Value::NotImplemented,
+    })
+}
+
+/// The binary operator slot wrappers named in `which`.
+pub fn reg_binops(_it: &mut Interp, ty: &Obj, which: &[&str]) {
+    crate::bind::install_into::<Operators>(ty, which);
+}
+
+/// `__eq__` / `__ne__`, plus the ordering comparisons when `ordering`.
+pub fn reg_compare(_it: &mut Interp, ty: &Obj, ordering: bool) {
+    let names: &[&str] = if ordering { &["__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"] } else { &["__eq__", "__ne__"] };
+    crate::bind::install_into::<Operators>(ty, names);
 }
 
 pub fn reg_slots(_it: &mut Interp, ty: &Obj, which: &[&str]) {

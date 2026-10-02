@@ -1,6 +1,6 @@
 //! `range`, `slice`, `enumerate`, `zip`, `map`, `filter`, `reversed` and the iterator types.
 
-use super::numeric::reg_compare;
+use super::slots::reg_compare;
 use super::slots::{reg_iterator, reg_slots};
 use crate::bind::{Inst, PyCx, PyHost, This};
 use crate::object::*;

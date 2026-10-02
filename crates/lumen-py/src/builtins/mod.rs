@@ -85,6 +85,7 @@ pub fn init(it: &mut Interp) {
     sysextra::init_frame_type(it);
     sysextra::init_code_type(it);
     descr::init(it);
+    numeric::init_descriptors(it);
     alias::init(it);
     modules::init(it);
     register_names(it);

@@ -1,6 +1,6 @@
 //! `str` methods.
 
-use super::numeric::{reg_binops, reg_compare};
+use super::slots::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;

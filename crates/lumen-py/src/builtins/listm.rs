@@ -1,7 +1,6 @@
 //! `list` and `tuple` methods, and the stable sort shared with `sorted()`.
 
-use super::numeric::{reg_binops, reg_compare};
-use super::slots::{reg_method_forms, reg_slots};
+use super::slots::{reg_binops, reg_compare, reg_method_forms, reg_slots};
 use crate::ast::CmpOp;
 use crate::bind::{KwArgs, PyCx, PyHost, This};
 use crate::object::*;

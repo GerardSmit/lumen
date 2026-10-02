@@ -72,8 +72,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         if dict_get_str(d, "__doc__").is_none() {
             dict_set_str(d, "__doc__", c.doc.map_or(Value::None, Value::str));
         }
-        let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
-        dict_set_str(d, "__text_signature__", sig.map_or(Value::None, Value::string));
+        set_text_signature(d, &members);
         if !members.iter().any(|m| m.desc.role == Role::Constructor) {
             let f = Value::Obj(Object::new(Kind::Native(NativeData { name: "__new__", f: no_new, method: false, desc: None, owner: None })));
             dict_set_str(d, "__new__", f);
@@ -100,6 +99,23 @@ pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
     let mut members = Vec::new();
     T::members(&mut members);
     install_members(ty, &members, None);
+}
+
+fn set_text_signature(d: &Obj, members: &[FnItem<PyHost>]) {
+    let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
+    dict_set_str(d, "__text_signature__", sig.map_or(Value::None, Value::string));
+}
+
+/// [`extend_type`], plus the class docstring and `__text_signature__` of `T`: a core type whose
+/// marker carries CPython's class doc (`int`, `float`, ...).
+pub fn extend_type_documented<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
+    extend_type::<T>(it, ty);
+    let mut members = Vec::new();
+    T::members(&mut members);
+    if let Some(d) = ty.dict.borrow().as_ref() {
+        dict_set_str(d, "__doc__", T::DESC.doc.map_or(Value::None, Value::str));
+        set_text_signature(d, &members);
+    }
 }
 
 /// The class `module.name` of a `base` hint, imported on first use of the native class.

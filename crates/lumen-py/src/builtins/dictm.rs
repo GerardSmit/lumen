@@ -1,6 +1,6 @@
 //! `dict`, dict views, `set` and `frozenset`.
 
-use super::numeric::{reg_binops, reg_compare};
+use super::slots::{reg_binops, reg_compare};
 use super::slots::{reg_method_forms, reg_slots};
 use crate::containers::pydict_of;
 use crate::dict::PyDict;

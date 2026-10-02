@@ -1,7 +1,7 @@
 //! `bytes` and `bytearray`.
 
 use lumen_common::search;
-use super::numeric::{reg_binops, reg_compare};
+use super::slots::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;

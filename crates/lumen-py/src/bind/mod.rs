@@ -28,7 +28,7 @@ mod convert;
 pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
-pub use class::{extend_type, install_all, install_into, is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
+pub use class::{extend_type, extend_type_documented, install_all, install_into, is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
 pub use convert::{buffer_error, index, native_error};
 pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
