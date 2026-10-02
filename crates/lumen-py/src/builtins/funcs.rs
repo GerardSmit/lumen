@@ -820,7 +820,7 @@ fn eval_exec(it: &mut Interp, a: &[Value], name: &str, is_eval: bool) -> R<Value
                 }
             }
             Kind::Bytes(b) => {
-                let s = String::from_utf8_lossy(b).into_owned();
+                let s = it.decode_source(b, "<string>")?;
                 if is_eval {
                     it.compile_eval_str(&s, "<string>")?
                 } else {
@@ -845,11 +845,37 @@ fn exec(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     eval_exec(it, a, "exec", false)
 }
 
+/// `PyUnicode_FSDecoder`: a `str`, `bytes` or path-like filename as text.
+fn fs_filename(it: &mut Interp, v: &Value) -> R<String> {
+    let p = crate::bind::path::fspath(it, v)?;
+    match &p {
+        Value::Obj(o) => match &o.kind {
+            Kind::Bytes(b) => Ok(crate::bind::path::bytes_path(b)),
+            _ => Ok(p.as_str().unwrap_or("").to_string()),
+        },
+        _ => Ok(String::new()),
+    }
+}
+
 fn compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let b = it.bind_args("compile", a, kw, &["source", "filename", "mode", "flags", "dont_inherit", "optimize"], 3)?;
-    let src = it.str_arg(&b[0].clone().unwrap_or(Value::None), "compile() arg 1")?;
-    let filename = it.str_arg(&b[1].clone().unwrap_or(Value::None), "compile() arg 2")?;
+    let source = b[0].clone().unwrap_or(Value::None);
+    let filename = fs_filename(it, &b[1].clone().unwrap_or(Value::None))?;
     let mode = it.str_arg(&b[2].clone().unwrap_or(Value::None), "compile() arg 3")?;
+    let src = match &source {
+        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => o.as_str_kind().unwrap_or("").to_string(),
+        _ => match crate::builtins::memview::contiguous_bytes(it, &source)? {
+            Some(bytes) => it.decode_source(&bytes, &filename)?,
+            None => return Err(it.type_error("compile() arg 1 must be a string, bytes or AST object")),
+        },
+    };
+    if src.contains('\0') {
+        let e = it.syntax_error("source code string cannot contain null bytes", &filename, 0, None, "");
+        if let Some(d) = e.dict.borrow().as_ref() {
+            crate::vm::dict_set_str(d, "lineno", Value::None);
+        }
+        return Err(e);
+    }
     let code = match mode.as_str() {
         "eval" => it.compile_eval_str(&src, &filename)?,
         "exec" | "single" => it.compile_source(&src, &filename)?,

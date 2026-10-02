@@ -55,8 +55,8 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         if c.hint(HOST, "unhashable").is_some() {
             dict_set_str(d, "__hash__", Value::None);
         }
-        if let Some(doc) = c.doc {
-            dict_set_str(d, "__doc__", Value::str(doc));
+        if dict_get_str(d, "__doc__").is_none() {
+            dict_set_str(d, "__doc__", c.doc.map_or(Value::None, Value::str));
         }
         let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
         dict_set_str(d, "__text_signature__", sig.map_or(Value::None, Value::string));

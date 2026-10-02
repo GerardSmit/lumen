@@ -12,9 +12,11 @@ fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<
 
 /// The native modules, sorted by name (also `sys.builtin_module_names`).
 const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
+    ("_ast", bound::<super::astm::_ast::Module>),
     ("_codecs", |it| Some(super::codecsm::make(it))),
     ("_collections", |it| Some(super::collectionsm::make(it))),
     ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
+    ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_sha2", |it| Some(super::sha2m::make(it))),
@@ -24,14 +26,15 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_thread", bound::<super::threadm::_thread::Module>),
     ("_tokenize", bound::<super::tokenizem::_tokenize::Module>),
     ("_typing", |it| Some(super::typingm::make(it))),
-    ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
     ("_warnings", |it| Some(super::warningsm::make(it))),
     ("_weakref", |it| Some(super::weakm::make(it))),
+    ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
     ("atexit", |it| Some(super::sysmods::make_atexit(it))),
     ("builtins", |it| Some(super::sysmods::make_builtins(it))),
     ("errno", bound::<super::errnom::errno::Module>),
     ("gc", |it| Some(super::sysmods::make_gc(it))),
     ("itertools", bound::<super::itertools::itertools::Module>),
+    ("marshal", bound::<super::marshalm::marshal::Module>),
     ("math", bound::<super::mathm::math::Module>),
     ("posix", bound::<super::posixm::posix::Module>),
     ("sys", |it| it.sys_module.clone()),

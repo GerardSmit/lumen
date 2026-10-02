@@ -8,6 +8,49 @@ use std::cell::RefCell;
 use crate::platform::{parent_dir, FoundModule};
 use std::rc::Rc;
 
+/// The encoding a `coding[:=]` comment line declares (`^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)`).
+fn coding_cookie(line: &[u8]) -> Option<String> {
+    let rest = line.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\x0c')).map(|i| &line[i..])?;
+    if rest.first() != Some(&b'#') {
+        return None;
+    }
+    let at = rest.windows(7).position(|w| w.starts_with(b"coding") && matches!(w[6], b':' | b'='))?;
+    let tail = &rest[at + 7..];
+    let tail = &tail[tail.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(tail.len())..];
+    let n = tail.iter().take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')).count();
+    (n > 0).then(|| String::from_utf8_lossy(&tail[..n]).into_owned())
+}
+
+/// The tokenizer's `get_normal_name`: UTF-8 and Latin-1 aliases spelled one way.
+fn normal_encoding_name(enc: &str) -> String {
+    let low: String = enc.chars().take(12).map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() }).collect();
+    let is = |name: &str| low == name || low.starts_with(&format!("{name}-"));
+    if is("utf-8") {
+        "utf-8".to_string()
+    } else if is("latin-1") || is("iso-8859-1") || is("iso-latin-1") {
+        "iso-8859-1".to_string()
+    } else {
+        enc.to_string()
+    }
+}
+
+/// `^[ \t\f]*(?:[#\r\n]|$)`: only a comment or nothing.
+fn is_blank_or_comment(line: &[u8]) -> bool {
+    match line.iter().find(|&&b| !matches!(b, b' ' | b'\t' | b'\x0c')) {
+        None => true,
+        Some(b) => matches!(b, b'#' | b'\r'),
+    }
+}
+
+/// What a natively imported module's `__spec__` is made with, once importlib is installed.
+#[derive(Default)]
+struct ImportlibHooks {
+    spec_from_file: Option<Value>,
+    spec_from_loader: Option<Value>,
+    builtin_importer: Option<Value>,
+    init_module_attrs: Option<Value>,
+}
+
 impl Interp {
     pub fn new_module(&mut self, name: &str) -> Obj {
         let d = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
@@ -46,6 +89,44 @@ impl Interp {
             Ok(Value::Obj(e)) => e,
             Ok(_) => self.new_exc_str("SyntaxError", msg),
             Err(e) => e,
+        }
+    }
+
+    /// Source bytes as text, as CPython's tokenizer decodes them (PEP 263): a UTF-8 BOM, else a
+    /// `coding` cookie on the first or second line, else UTF-8.
+    pub fn decode_source(&mut self, data: &[u8], filename: &str) -> R<String> {
+        let (bom, body) = match data.strip_prefix(b"\xef\xbb\xbf") {
+            Some(rest) => (true, rest),
+            None => (false, data),
+        };
+        let mut lines = body.split(|&b| b == b'\n');
+        let first = lines.next().unwrap_or_default();
+        let mut cookie = coding_cookie(first).map(|c| (c, 1));
+        if cookie.is_none() && is_blank_or_comment(first) {
+            cookie = lines.next().and_then(coding_cookie).map(|c| (c, 2));
+        }
+        let enc = cookie.map_or_else(|| "utf-8".to_string(), |(c, _)| normal_encoding_name(&c));
+        if bom && enc != "utf-8" {
+            return Err(self.syntax_error(&format!("encoding problem: {enc} with BOM"), filename, 0, None, ""));
+        }
+        match self.decode_bytes(body, &enc, "strict") {
+            Ok(s) => Ok(s),
+            Err(e) if self.exc_is(&e, "LookupError") => Err(self.syntax_error(&format!("unknown encoding: {enc}"), filename, 0, None, "")),
+            Err(e) => {
+                // CPython's tokenizer reports the line holding the bad bytes, decoding only those.
+                let field = |n: &str| e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, n));
+                let (start, end) = match (field("start"), field("end")) {
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => (a as usize, b as usize),
+                    _ => (0, 0),
+                };
+                let e = match start < end && end <= body.len() {
+                    true => self.decode_bytes(&body[start..end], &enc, "strict").err().unwrap_or(e),
+                    false => e,
+                };
+                let msg = self.str_of(&Value::Obj(e)).unwrap_or_default();
+                let line = body[..start.min(body.len())].iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+                Err(self.syntax_error(&format!("(unicode error) {msg}"), filename, line, None, ""))
+            }
         }
     }
 
@@ -88,7 +169,13 @@ impl Interp {
     pub fn run_file(&mut self, path: &str) -> i32 {
         let read = self.platform.borrow_mut().read_file(path);
         let src = match read {
-            Ok(b) => lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&b).into_owned()),
+            Ok(b) => match self.decode_source(&b, path) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.flush_out();
+                    return self.report_uncaught(&e);
+                }
+            },
             Err(e) => {
                 self.write_stderr(&format!("lumen-py: can't open file '{}': {}\n", path, e));
                 return 2;
@@ -182,6 +269,7 @@ impl Interp {
         }
         if let Some(m) = crate::builtins::modules::builtin_module(self, full) {
             self.register_module(full, &m);
+            self.set_builtin_spec(&m, full)?;
             return Ok(m);
         }
         let (parent_name, leaf) = match full.rfind('.') {
@@ -208,7 +296,7 @@ impl Interp {
         let Some(FoundModule { filename: file_s, source, is_package: is_pkg }) = found else {
             return Err(self.module_not_found(full, format!("No module named '{}'", full)));
         };
-        let src = lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&source).into_owned());
+        let src = self.decode_source(&source, &file_s)?;
         let m = self.new_module(full);
         let g = self.module_dict(&m);
         dict_set_str(&g, "__file__", Value::str(&file_s));
@@ -220,6 +308,7 @@ impl Interp {
             dict_set_str(&g, "__package__", Value::str(parent_name.unwrap_or("")));
         }
         self.register_module(full, &m);
+        self.set_module_spec(&m, full, &file_s)?;
         let code = match self.compile_source(&src, &file_s) {
             Ok(c) => c,
             Err(e) => {
@@ -231,11 +320,83 @@ impl Interp {
             dict_del_str(&self.modules.clone(), full);
             return Err(e);
         }
+        if full == "importlib" {
+            self.install_importlib()?;
+        }
         if let Some(pm) = parent_mod {
             let pd = self.module_dict(&pm);
             dict_set_str(&pd, leaf, Value::Obj(m.clone()));
         }
         Ok(m)
+    }
+
+    /// CPython installs importlib's finders at startup (`_bootstrap._install` and
+    /// `_bootstrap_external._install`); here it happens when `importlib` is first imported, and
+    /// the modules imported so far get their `__spec__` and `__loader__` then.
+    fn install_importlib(&mut self) -> R<()> {
+        let bootstrap = Value::Obj(self.import_module("importlib._bootstrap")?);
+        let external = Value::Obj(self.import_module("importlib._bootstrap_external")?);
+        let Some(sys) = self.sys_module.clone() else { return Ok(()) };
+        let meta_path = self.get_attr_str(&Value::Obj(sys), "meta_path")?;
+        for name in ["BuiltinImporter", "FrozenImporter"] {
+            let finder = self.get_attr_str(&bootstrap, name)?;
+            self.call_method(&meta_path, "append", vec![finder])?;
+        }
+        let install = self.get_attr_str(&external, "_install")?;
+        self.call(&install, vec![bootstrap.clone()], Vec::new())?;
+        let hooks = ImportlibHooks {
+            spec_from_file: Some(self.get_attr_str(&external, "spec_from_file_location")?),
+            spec_from_loader: Some(self.get_attr_str(&bootstrap, "spec_from_loader")?),
+            builtin_importer: Some(self.get_attr_str(&bootstrap, "BuiltinImporter")?),
+            init_module_attrs: Some(self.get_attr_str(&bootstrap, "_init_module_attrs")?),
+        };
+        *self.native_state::<ImportlibHooks>() = hooks;
+        let loaded: Vec<(Value, Value)> = match &self.modules.kind {
+            Kind::Dict(d) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
+            _ => Vec::new(),
+        };
+        for (name, m) in loaded {
+            let (Some(name), Value::Obj(m)) = (name.as_str(), m) else { continue };
+            if name == "__main__" || !matches!(m.kind, Kind::Module) {
+                continue;
+            }
+            let d = self.module_dict(&m);
+            let has_spec = dict_get_str(&d, "__spec__").is_some_and(|s| !s.is_none());
+            let file = dict_get_str(&d, "__file__").and_then(|f| f.as_str().map(str::to_string));
+            if let (false, Some(file)) = (has_spec, file) {
+                self.set_module_spec(&m, name, &file)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `__spec__` and `__loader__` of a source module, once importlib is installed.
+    fn set_module_spec(&mut self, m: &Obj, name: &str, file: &str) -> R<()> {
+        let Some(spec_fn) = self.native_state::<ImportlibHooks>().spec_from_file.clone() else { return Ok(()) };
+        let spec = self.call(&spec_fn, vec![Value::str(name), Value::str(file)], Vec::new())?;
+        self.init_module_attrs(m, spec)
+    }
+
+    /// `BuiltinImporter.find_spec`'s spec for a native module, once importlib is installed.
+    fn set_builtin_spec(&mut self, m: &Obj, name: &str) -> R<()> {
+        let hooks = self.native_state::<ImportlibHooks>();
+        let (Some(spec_fn), Some(importer)) = (hooks.spec_from_loader.clone(), hooks.builtin_importer.clone()) else { return Ok(()) };
+        let d = self.module_dict(m);
+        if dict_get_str(&d, "__spec__").is_some_and(|s| !s.is_none()) {
+            return Ok(());
+        }
+        let origin = self.str_obj("origin");
+        let spec = self.call(&spec_fn, vec![Value::str(name), importer], vec![(origin, Value::str("built-in"))])?;
+        self.init_module_attrs(m, spec)
+    }
+
+    fn init_module_attrs(&mut self, m: &Obj, spec: Value) -> R<()> {
+        let Some(init) = self.native_state::<ImportlibHooks>().init_module_attrs.clone() else { return Ok(()) };
+        if spec.is_none() {
+            return Ok(());
+        }
+        self.call(&init, vec![spec, Value::Obj(m.clone())], Vec::new())?;
+        Ok(())
     }
 
     fn resolve_relative(&mut self, name: &str, level: usize) -> R<String> {

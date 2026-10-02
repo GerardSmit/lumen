@@ -449,7 +449,7 @@ fn int_to_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn int_from_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let cls = cls_of(it, a, "int")?;
     let b = it.bind_args("from_bytes", &a[1..], kw, &["bytes", "byteorder", "signed"], 1)?;
-    let data = it.bytes_of(&b[0].clone().unwrap_or(Value::None))?;
+    let data = it.bytes_from_object(&b[0].clone().unwrap_or(Value::None))?;
     let big_endian = match &b[1] {
         Some(o) => match o.as_str() {
             Some("big") => true,

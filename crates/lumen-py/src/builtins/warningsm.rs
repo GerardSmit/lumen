@@ -43,8 +43,14 @@ fn matches_opt(it: &mut Interp, pat: &Value, text: &Value) -> R<bool> {
     if pat.is_none() {
         return Ok(true);
     }
+    // `check_matched`: an exact `str` is one of the internal default filters, matched by equality.
+    if let Value::Obj(o) = pat {
+        if matches!(o.kind, Kind::Str(_)) && o.cls.is_none() {
+            return it.values_eq(pat, text);
+        }
+    }
     let m = it.call_method(pat, "match", vec![text.clone()])?;
-    Ok(!m.is_none())
+    it.truthy(&m)
 }
 
 fn get_action(it: &mut Interp, text: &Value, category: &Value, module: &Value, lineno: i64) -> R<Value> {

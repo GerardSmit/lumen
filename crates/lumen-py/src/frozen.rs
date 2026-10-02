@@ -5,7 +5,7 @@ use crate::platform::MemFs;
 
 /// Virtual directory that holds the embedded modules; `__file__` of an embedded module is
 /// `<FROZEN_DIR>/<relative path>`.
-pub const FROZEN_DIR: &str = "<frozen>/lib";
+pub const FROZEN_DIR: &str = "/<frozen>/lib";
 
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/frozen_table.rs"));

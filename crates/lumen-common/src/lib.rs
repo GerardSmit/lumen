@@ -23,6 +23,7 @@ pub mod mt19937;
 pub mod native;
 pub mod stack;
 pub mod regex;
+pub mod siphash;
 pub mod smuggle;
 pub mod strftime;
 pub mod tz;

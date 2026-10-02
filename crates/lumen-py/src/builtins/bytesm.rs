@@ -62,7 +62,7 @@ fn build(it: &mut Interp, a: &[Value], kw: Kw, array: bool) -> R<Vec<u8>> {
         }
         Value::Bool(n) => zeroed(it, *n as usize),
         Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => Err(it.overflow_err("cannot fit 'int' into an index-sized integer")),
-        _ => it.bytes_of(src),
+        _ => it.bytes_from_object(src),
     }
 }
 

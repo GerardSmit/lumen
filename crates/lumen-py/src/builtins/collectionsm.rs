@@ -7,9 +7,59 @@ use crate::object::*;
 use crate::vm::*;
 use std::collections::VecDeque;
 
+#[lumen_bind::class(name = "_tuplegetter", module = "collections")]
 pub struct TupleGetter {
-    pub index: usize,
-    pub doc: Value,
+    index: i64,
+    doc: Value,
+}
+
+#[lumen_bind::methods]
+impl TupleGetter {
+    #[constructor]
+    fn new(it: &mut Interp, index: &Value, doc: &Value) -> R<TupleGetter> {
+        let index = it.index_of(index)?;
+        Ok(TupleGetter { index, doc: doc.clone() })
+    }
+
+    #[method(name = "__get__")]
+    fn get(slf: This<Value>, it: &mut Interp, obj: &Value, owner: Option<&Value>) -> R<Value> {
+        if obj.is_none() {
+            if owner.is_none_or(|o| o.is_none()) {
+                return Err(it.type_error("__get__(None, None) is invalid"));
+            }
+            return Ok(slf.0);
+        }
+        tuple_getter_get(it, &slf.0, obj)
+    }
+
+    #[method(name = "__set__")]
+    fn set(&self, it: &mut Interp, obj: &Value, value: &Value) -> R<()> {
+        let _ = (obj, value);
+        Err(it.new_exc_str("AttributeError", "can't set attribute"))
+    }
+
+    #[method(name = "__delete__")]
+    fn delete(&self, it: &mut Interp, obj: &Value) -> R<()> {
+        let _ = obj;
+        Err(it.new_exc_str("AttributeError", "can't delete attribute"))
+    }
+
+    #[getter(name = "__doc__")]
+    fn doc(&self) -> Value {
+        self.doc.clone()
+    }
+
+    #[setter(name = "__doc__")]
+    fn set_doc(&mut self, v: &Value) {
+        self.doc = v.clone();
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
+        let Some((index, doc)) = with_opaque::<TupleGetter, _>(&slf.0, |g| (g.index, g.doc.clone())) else { return Err(it.self_state_err("_tuplegetter")) };
+        let t = it.type_of(&slf.0);
+        Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(vec![Value::Int(index), doc])]))
+    }
 }
 
 const MUTATED: &str = "deque mutated during iteration";
@@ -706,29 +756,10 @@ fn dd_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 // ---- helpers ------------------------------------------------------------------------------------
 
-fn tg_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("_tuplegetter", kw)?;
-    it.check_args("_tuplegetter", &a[1.min(a.len())..], 2, 2)?;
-    let index = it.index_of(&a[1])?;
-    if index < 0 {
-        return Err(it.value_error("index must be non-negative"));
-    }
-    let Value::Obj(cls) = &a[0] else { unreachable!() };
-    Ok(new_opaque(cls, TupleGetter { index: index as usize, doc: a[2].clone() }))
-}
-
-fn tg_get(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__get__", a, 2, 3)?;
-    if a[1].is_none() {
-        return Ok(a[0].clone());
-    }
-    tuple_getter_get(it, &a[0], &a[1])
-}
-
-pub fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
+fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
     let Some(index) = with_opaque::<TupleGetter, _>(getter, |g| g.index) else { return Err(it.self_state_err("_tuplegetter")) };
     match obj.tuple_items() {
-        Some(items) => match items.get(index) {
+        Some(items) => match usize::try_from(index).ok().and_then(|i| items.get(i)) {
             Some(v) => Ok(v.clone()),
             None => Err(it.new_exc_str("IndexError", "tuple index out of range")),
         },
@@ -737,14 +768,6 @@ pub fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value
             Err(it.type_error(&format!("descriptor for index '{}' for tuple subclasses doesn't apply to '{}' object", index, t)))
         }
     }
-}
-
-fn tg_set(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.new_exc_str("AttributeError", "can't set attribute"))
-}
-
-fn tg_doc(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(with_opaque::<TupleGetter, _>(&a[0], |g| g.doc.clone()).unwrap_or(Value::None))
 }
 
 fn count_elements(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -790,12 +813,7 @@ pub fn make(it: &mut Interp) -> Obj {
     it.reg_class(&dd, "__class_getitem__", class_getitem);
     set_type(&d, "defaultdict", &dd);
 
-    let tg = new_type(it, "_collections", "_tuplegetter", None, Layout::Other);
-    it.reg_new(&tg, tg_new);
-    it.reg(&tg, "__get__", tg_get);
-    it.reg(&tg, "__set__", tg_set);
-    it.reg(&tg, "__delete__", tg_set);
-    it.reg_prop(&tg, "__doc__", tg_doc);
+    let tg = type_object::<TupleGetter>(it);
     set_type(&d, "_tuplegetter", &tg);
 
     set_fn(it, &d, "_count_elements", count_elements);

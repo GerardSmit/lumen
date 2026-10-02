@@ -254,10 +254,26 @@ fn method_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::Obj(Object::new(Kind::Method(a[1].clone(), a[2].clone()))))
 }
 
+/// `module_dir`: the module's `__dict__` keys, or what its own `__dir__` returns.
+fn module_dir(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__dir__", a, 1, 1)?;
+    let d = it.get_attr_str(&a[0], "__dict__")?;
+    let Value::Obj(dobj) = &d else { return Err(it.type_error("<module>.__dict__ is not a dictionary")) };
+    if !matches!(dobj.kind, Kind::Dict(_)) {
+        return Err(it.type_error("<module>.__dict__ is not a dictionary"));
+    }
+    if let Some(f) = dict_get_str(dobj, "__dir__") {
+        return it.call(&f, Vec::new(), Vec::new());
+    }
+    let keys = it.call_method(&d, "keys", Vec::new())?;
+    Ok(Value::list(it.iterate_to_vec(&keys)?))
+}
+
 pub fn init(it: &mut Interp) {
     let module_ty = it.types.module.clone();
     it.reg_new(&module_ty, module_new);
     it.reg(&module_ty, "__init__", module_init);
+    it.reg(&module_ty, "__dir__", module_dir);
     let method_ty = it.types.method.clone();
     it.reg_new(&method_ty, method_new);
     for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()] {
@@ -269,13 +285,57 @@ pub fn init(it: &mut Interp) {
     super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
     let member = new_type(it, "builtins", "member_descriptor", None, Layout::Other);
-    let func = it.types.function.clone();
-    let entries: [(&'static str, NativeFn, &Obj); 3] = [("__code__", function_code, &getset), ("__globals__", function_globals, &member), ("__closure__", function_closure, &member)];
-    for (name, f, ty) in entries {
-        let g = it.new_native(name, f, false);
-        let p = Object::with_cls(ty.clone(), Kind::Property(PropData { fget: g, fset: Value::None, fdel: Value::None, doc: Value::None }));
-        if let Some(d) = func.dict.borrow().as_ref() {
-            dict_set_str(d, name, Value::Obj(p));
-        }
+    for ty in [&getset, &member] {
+        it.reg(ty, "__get__", super::objectm::prop_get);
+        it.reg(ty, "__set__", super::objectm::prop_set);
+        it.reg(ty, "__repr__", descriptor_repr);
     }
+    *it.native_state::<DescrTypes>() = DescrTypes { getset: Some(getset), member: Some(member) };
+    let func = it.types.function.clone();
+    let entries: [(&'static str, NativeFn, bool); 3] = [("__code__", function_code, false), ("__globals__", function_globals, true), ("__closure__", function_closure, true)];
+    for (name, f, is_member) in entries {
+        add_getset(it, &func, name, f, None, is_member);
+    }
+    let type_ = it.types.type_.clone();
+    for (name, get, set) in super::objectm::TYPE_GETSETS {
+        add_getset(it, &type_, name, *get, *set, false);
+    }
+}
+
+#[derive(Default)]
+struct DescrTypes {
+    getset: Option<Obj>,
+    member: Option<Obj>,
+}
+
+/// Puts a native attribute on a builtin class as CPython's `getset_descriptor` (or
+/// `member_descriptor`) that names its owner.
+pub fn add_getset(it: &mut Interp, owner: &Obj, name: &'static str, get: NativeFn, set: Option<NativeFn>, member: bool) {
+    let types = it.native_state::<DescrTypes>();
+    let Some(ty) = (if member { types.member.clone() } else { types.getset.clone() }) else { return };
+    let fget = it.new_native(name, get, false);
+    let fset = set.map_or(Value::None, |f| it.new_native(name, f, false));
+    let p = Object::with_cls(ty, Kind::Property(PropData { fget, fset, fdel: Value::None, doc: Value::None }));
+    let d = it.instance_dict(&p);
+    let owner_name = it.type_name(owner);
+    dict_set_str(&d, "__name__", Value::str(name));
+    dict_set_str(&d, "__qualname__", Value::string(format!("{owner_name}.{name}")));
+    dict_set_str(&d, "__objclass__", Value::Obj(owner.clone()));
+    if let Some(od) = owner.dict.borrow().as_ref() {
+        dict_set_str(od, name, Value::Obj(p));
+    }
+}
+
+fn descriptor_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__repr__", a, 1, 1)?;
+    let name = it.get_attr_str(&a[0], "__name__")?;
+    let name = it.str_of(&name)?;
+    let owner = it.get_attr_str(&a[0], "__objclass__")?;
+    let owner = match &owner {
+        Value::Obj(o) => it.type_name(o),
+        _ => String::new(),
+    };
+    let is_member = matches!(&a[0], Value::Obj(o) if o.cls.as_ref().is_some_and(|c| it.type_name(c) == "member_descriptor"));
+    let kind = if is_member { "member" } else { "attribute" };
+    Ok(Value::string(format!("<{kind} '{name}' of '{owner}' objects>")))
 }

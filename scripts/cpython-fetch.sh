@@ -2,7 +2,8 @@
 #
 # Fetch the latest CPython 3.12.x release into ./cpython (gitignored) as a shallow, blobless,
 # sparse clone containing only Lib/ (standard library and its test suite), Modules/ (the C
-# sources of the native modules, the spec for lumen-py's Rust ports) and LICENSE.
+# sources of the native modules, the spec for lumen-py's Rust ports), the AST definition
+# (Parser/Python.asdl, its tooling and the generated Python/Python-ast.c) and LICENSE.
 # Idempotent: an existing checkout is fetched and moved to the newest tag in place.
 # Set CPYTHON_TAG to pin a tag instead of the newest v3.12.*.
 set -euo pipefail
@@ -30,7 +31,7 @@ if [ ! -d "$DEST/.git" ]; then
   $GIT -C "$DEST" config extensions.partialClone origin
 fi
 $GIT -C "$DEST" sparse-checkout init --no-cone
-$GIT -C "$DEST" sparse-checkout set '/Lib/' '/LICENSE' '/Modules/'
+$GIT -C "$DEST" sparse-checkout set '/Lib/' '/LICENSE' '/Modules/' '/Parser/Python.asdl' '/Parser/asdl.py' '/Parser/asdl_c.py' '/Python/Python-ast.c'
 $GIT -C "$DEST" fetch -q --depth 1 --filter=blob:none origin "refs/tags/$TAG:refs/tags/$TAG"
 $GIT -C "$DEST" checkout -q "$TAG"
 

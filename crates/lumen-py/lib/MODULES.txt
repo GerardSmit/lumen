@@ -144,6 +144,25 @@ asyncio/transports.py
 asyncio/trsock.py
 asyncio/unix_events.py
 
+# importlib
+importlib/__init__.py
+importlib/_abc.py
+importlib/_bootstrap.py
+importlib/_bootstrap_external.py
+importlib/abc.py
+importlib/machinery.py
+importlib/readers.py
+importlib/simple.py
+importlib/util.py
+importlib/resources/__init__.py
+importlib/resources/_adapters.py
+importlib/resources/_common.py
+importlib/resources/_itertools.py
+importlib/resources/_legacy.py
+importlib/resources/abc.py
+importlib/resources/readers.py
+importlib/resources/simple.py
+
 # zoneinfo
 sysconfig.py
 _osx_support.py
@@ -156,6 +175,7 @@ zoneinfo/_zoneinfo.py
 urllib/__init__.py
 urllib/error.py
 urllib/parse.py
+ipaddress.py
 urllib/request.py
 urllib/response.py
 http/__init__.py

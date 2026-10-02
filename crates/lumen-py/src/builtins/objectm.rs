@@ -417,7 +417,7 @@ fn none_bool(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     Ok(Value::Bool(false))
 }
 
-fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+pub(crate) fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__get__", a, 2, 3)?;
     if a[1].is_none() {
         return Ok(a[0].clone());
@@ -426,7 +426,7 @@ fn prop_get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.bind_descr(&a[0], &a[1], &cls)
 }
 
-fn prop_set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+pub(crate) fn prop_set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__set__", a, 3, 3)?;
     if let Value::Obj(o) = &a[0] {
         if let Kind::Property(p) = &o.kind {
@@ -528,6 +528,71 @@ fn super_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
 
 fn super_init(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     Ok(Value::None)
+}
+
+/// A getter of `type`'s own getset descriptors: the class's slot, else its own dict entry.
+fn type_getset(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let cls = match a.first() {
+        Some(Value::Obj(o)) if matches!(o.kind, Kind::Type(_)) => o.clone(),
+        _ => {
+            let t = a.first().map(|v| it.tp_name_of(v)).unwrap_or_default();
+            return Err(it.type_error(&format!("descriptor '{name}' for 'type' objects doesn't apply to a '{t}' object")));
+        }
+    };
+    let is_type = Rc::ptr_eq(&cls, &it.types.type_);
+    let own = match is_type {
+        true => None,
+        false => cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name)),
+    };
+    match (name, own) {
+        ("__module__", Some(v)) => Ok(v),
+        ("__doc__", Some(v)) => it.bind_descr_cls(&v, &cls),
+        ("__module__", None) => Ok(Value::str("builtins")),
+        ("__doc__", None) => Ok(Value::None),
+        _ => match it.type_special_attr(&cls, name) {
+            Some(v) => Ok(v),
+            None => Err(it.new_exc_str("AttributeError", &format!("type object '{}' has no attribute '{name}'", it.type_name(&cls)))),
+        },
+    }
+}
+
+fn type_getset_store(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
+    let (Some(Value::Obj(o)), Some(v)) = (a.first(), a.get(1)) else { return Ok(Value::None) };
+    if !matches!(o.kind, Kind::Type(_)) {
+        return Ok(Value::None);
+    }
+    let n = match Value::str(name) {
+        Value::Obj(n) => n,
+        _ => unreachable!(),
+    };
+    it.type_store_attr(o, &n, v.clone())?;
+    Ok(Value::None)
+}
+
+macro_rules! type_getsets {
+    ($($name:literal => $get:ident $(, $set:ident)?;)*) => {
+        $(fn $get(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            type_getset(it, a, $name)
+        })*
+        $($(fn $set(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
+            type_getset_store(it, a, $name)
+        })?)*
+        type GetSet = (&'static str, NativeFn, Option<NativeFn>);
+        pub(crate) const TYPE_GETSETS: &[GetSet] = &[$(($name, $get, type_getsets!(@set $($set)?))),*];
+    };
+    (@set) => { None };
+    (@set $set:ident) => { Some($set) };
+}
+
+type_getsets! {
+    "__name__" => type_get_name, type_set_name;
+    "__qualname__" => type_get_qualname, type_set_qualname;
+    "__bases__" => type_get_bases, type_set_bases;
+    "__base__" => type_get_base;
+    "__mro__" => type_get_mro;
+    "__module__" => type_get_module, type_set_module;
+    "__doc__" => type_get_doc, type_set_doc;
+    "__dict__" => type_get_dict;
 }
 
 pub fn init(it: &mut Interp) {

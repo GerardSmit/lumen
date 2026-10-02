@@ -1782,6 +1782,47 @@ impl Interp {
         }
     }
 
+    /// `PyObject_Bytes`: `__bytes__`, a buffer, or an iterable of ints (never a str).
+    pub fn bytes_from_object(&mut self, v: &Value) -> R<Vec<u8>> {
+        if self.user_special(v, "__bytes__").is_some() {
+            let r = self.call_special(v, "__bytes__", Vec::new())?;
+            return match &r {
+                Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => self.bytes_of(&r),
+                _ => {
+                    let t = self.type_name_of(&r);
+                    Err(self.type_error(&format!("__bytes__ returned non-bytes (type {t})")))
+                }
+            };
+        }
+        if matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_) | Kind::List(_) | Kind::Tuple(_) | Kind::Range(_))) {
+            return self.bytes_of(v);
+        }
+        if let Some(b) = crate::builtins::memview::contiguous_bytes(self, v)? {
+            return Ok(b);
+        }
+        let iterable = match v {
+            Value::Obj(o) => !matches!(o.kind, Kind::Str(_)) && {
+                let c = self.type_of(v);
+                self.lookup_mro(&c, "__iter__").is_some()
+            },
+            _ => false,
+        };
+        if !iterable {
+            let t = self.type_name_of(v);
+            return Err(self.type_error(&format!("cannot convert '{t}' object to bytes")));
+        }
+        let iter = self.get_iter(v)?;
+        let mut out = Vec::new();
+        while let Some(i) = self.iter_next(&iter)? {
+            let n = self.index_of(&i)?;
+            if !(0..256).contains(&n) {
+                return Err(self.value_error("bytes must be in range(0, 256)"));
+            }
+            out.push(n as u8);
+        }
+        Ok(out)
+    }
+
     pub fn bytes_of(&mut self, v: &Value) -> R<Vec<u8>> {
         match v {
             Value::Obj(o) => match &o.kind {
