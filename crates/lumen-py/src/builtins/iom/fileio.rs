@@ -381,7 +381,7 @@ impl FileIO {
         if !slf.0.borrow(it)?.writable {
             return Err(mode_err(it, "writing"));
         }
-        match it.fd_write(fd, b) {
+        match it.fd_write(fd, b)? {
             Ok(n) => Ok(Some(n)),
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(os_err(it, e)),

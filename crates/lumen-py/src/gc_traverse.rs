@@ -258,6 +258,9 @@ pub fn traverse(o: &Object, visit: &mut dyn FnMut(&Obj)) {
                 for t in &e.tb {
                     visit(&t.globals);
                 }
+                if let Some((_, tb)) = &e.tb_cache {
+                    val(tb, visit);
+                }
             }
         }
         Kind::Slice(a, b, c) | Kind::Super(a, b, c) => {
@@ -347,7 +350,7 @@ pub fn clear(o: &Object) {
         Kind::Exception(e) => {
             let old = e.try_borrow_mut().ok().map(|mut e| {
                 let args = std::mem::replace(&mut e.args, Value::tuple(Vec::new()));
-                (args, e.cause.take(), e.context.take(), std::mem::take(&mut e.tb))
+                (args, e.cause.take(), e.context.take(), std::mem::take(&mut e.tb), e.tb_cache.take())
             });
             drop(old);
         }

@@ -343,7 +343,7 @@ impl Interp {
 
     /// `write(2)` through the platform; descriptors 1 and 2 go to the output sink when one is
     /// set, after the buffered print output.
-    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> crate::platform::PResult<usize> {
+    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> R<crate::platform::PResult<usize>> {
         if fd == 1 || fd == 2 {
             self.flush_out();
             if let Some(s) = &mut self.sink {
@@ -353,13 +353,16 @@ impl Interp {
                 } else {
                     s.write_stderr(data);
                 }
-                return Ok(data.len());
+                return Ok(Ok(data.len()));
             }
         }
         if fd > 2 {
-            self.wait_fd_quiet(fd, lumen_os::poll::POLLOUT);
+            self.wait_fd(fd, lumen_os::poll::POLLOUT)?;
+            // a write to a full pipe or socket can block for as long as its reader takes
+            let fs = self.platform.borrow().filesystem();
+            return Ok(self.unlocked(move || fs.write(fd, data, None)).map_err(Into::into));
         }
-        self.platform.borrow_mut().fd_write(fd, data, None)
+        Ok(self.platform.borrow_mut().fd_write(fd, data, None))
     }
 
     pub fn write_stderr(&mut self, s: &str) {
@@ -528,29 +531,46 @@ impl Interp {
     }
 
     fn link_context(&mut self, exc: &Obj) {
-        if let Kind::Exception(d) = &exc.kind {
+        let Kind::Exception(d) = &exc.kind else { return };
+        {
             let mut d = d.borrow_mut();
             if d.ctx_set {
                 return;
             }
             d.ctx_set = true;
-            if let Some(h) = &self.handled {
-                if Rc::ptr_eq(h, exc) {
-                    return;
-                }
-                let mut cur = Some(h.clone());
-                while let Some(c) = cur {
-                    if Rc::ptr_eq(&c, exc) {
-                        return;
-                    }
-                    cur = match &c.kind {
-                        Kind::Exception(cd) => cd.borrow().context.clone(),
-                        _ => None,
-                    };
-                }
-                d.context = Some(h.clone());
-            }
         }
+        let Some(h) = self.handled.clone() else { return };
+        if Rc::ptr_eq(&h, exc) {
+            return;
+        }
+        let context_of = |e: &Obj| match &e.kind {
+            Kind::Exception(cd) => cd.borrow().context.clone(),
+            _ => None,
+        };
+        // cut a chain that leads back to `exc`, and stop at a cycle (Floyd's algorithm)
+        let mut o = h.clone();
+        let mut slow = h.clone();
+        let mut toggle = false;
+        while let Some(context) = context_of(&o) {
+            if Rc::ptr_eq(&context, exc) {
+                if let Kind::Exception(od) = &o.kind {
+                    od.borrow_mut().context = None;
+                }
+                break;
+            }
+            o = context;
+            if Rc::ptr_eq(&o, &slow) {
+                break;
+            }
+            if toggle {
+                match context_of(&slow) {
+                    Some(next) => slow = next,
+                    None => break,
+                }
+            }
+            toggle = !toggle;
+        }
+        d.borrow_mut().context = Some(h);
     }
 
     fn name_err(&mut self, name: &Obj) -> Obj {
@@ -1431,7 +1451,7 @@ impl Interp {
                     let prev = self.handled.replace(exc.as_obj().cloned().unwrap());
                     let tb = match &exc {
                         Value::Obj(e) => match &e.kind {
-                            Kind::Exception(d) => self.make_tb(&d.borrow().tb),
+                            Kind::Exception(d) => self.exc_tb(d),
                             _ => Value::None,
                         },
                         _ => Value::None,

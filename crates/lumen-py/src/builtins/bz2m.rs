@@ -121,6 +121,7 @@ pub mod _bz2 {
     #[class(name = "BZ2Decompressor", module = "_bz2", hint(py(final)))]
     pub struct BZ2Decompressor {
         core: Decompressor<Bz2>,
+        failed: bool,
     }
 
     struct Bz2(Bz2Decoder);
@@ -161,7 +162,7 @@ pub mod _bz2 {
         #[constructor]
         fn new(cls: This<Value>, _it: &mut Interp) -> R<Value> {
             let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            Ok(opaque_instance(cls, BZ2Decompressor { core: Decompressor::new(Bz2(Bz2Decoder::new())) }))
+            Ok(opaque_instance(cls, BZ2Decompressor { core: Decompressor::new(Bz2(Bz2Decoder::new())), failed: false }))
         }
 
         /// Decompress *data*, returning uncompressed data as bytes.
@@ -181,7 +182,17 @@ pub mod _bz2 {
         fn decompress(slf: This<Py<Self>>, it: &mut Interp, #[kw] data: &Value, #[kw] #[default(-1)] max_length: i64) -> R<Vec<u8>> {
             let data = it.buffer_bytes(data)?;
             let max = (max_length >= 0).then_some(max_length as usize);
-            let result = slf.0.borrow_mut(it)?.core.decompress(&data, max);
+            let mut guard = slf.0.borrow_mut(it)?;
+            if guard.failed && !guard.core.eof {
+                // libbzip2 can write out of bounds when re-entered after an error
+                drop(guard);
+                return Err(it.value_error("Decompressor is unusable after a previous error"));
+            }
+            let result = guard.core.decompress(&data, max);
+            if matches!(result, Err(Failure::Codec(_))) {
+                guard.failed = true;
+            }
+            drop(guard);
             result.map_err(|e| match e {
                 Failure::AtEof => it.new_exc_str("EOFError", "End of stream already reached"),
                 Failure::Codec(e) => bz2_error(it, e),

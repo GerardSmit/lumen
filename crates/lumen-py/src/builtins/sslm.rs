@@ -1279,11 +1279,14 @@ pub mod _ssl {
         deadline: Option<f64>,
         msg: &str,
     ) -> R<Fill> {
-        let mut buf = vec![0u8; READ_CHUNK];
         loop {
             if timeout != Some(0.0) && !wait_ready(it, fd, false, deadline)? {
                 return Err(timeout_error(it, msg));
             }
+            // Only up to the end of the current record: bytes of a later one taken here would
+            // be invisible to a `select` on the socket although the connection can read them.
+            let wanted = slf.with(it, |s| s.session.wanted_input())?.min(READ_CHUNK);
+            let mut buf = vec![0u8; wanted];
             match net::recv(fd, &mut buf, 0) {
                 Ok(0) => {
                     slf.with(it, |s| s.session.feed_eof())?;

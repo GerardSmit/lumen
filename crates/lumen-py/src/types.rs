@@ -259,6 +259,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
         )
     }
@@ -857,15 +858,15 @@ impl Interp {
         };
         match &o.kind {
             Kind::Exception(d) => {
+                if nm == "__traceback__" {
+                    return Ok(Some(self.exc_tb(d)));
+                }
                 let d = d.borrow();
                 match nm {
                     "args" => return Ok(Some(d.args.clone())),
                     "__cause__" => return Ok(Some(d.cause.clone().map(Value::Obj).unwrap_or(Value::None))),
                     "__context__" => return Ok(Some(d.context.clone().map(Value::Obj).unwrap_or(Value::None))),
                     "__suppress_context__" => return Ok(Some(Value::Bool(d.suppress_context))),
-                    "__traceback__" => {
-                        return Ok(Some(self.make_tb(&d.tb)));
-                    }
                     _ => {}
                 }
             }
@@ -1203,6 +1204,19 @@ impl Interp {
         Ok(())
     }
 
+    pub fn set_function_code(&mut self, o: &Obj, v: &Value) -> R<()> {
+        let Kind::Function(f) = &o.kind else { return Err(self.type_error("__code__ is only settable on functions")) };
+        let Value::Obj(c) = v else { return Err(self.type_error("__code__ must be set to a code object")) };
+        let Kind::Code(code) = &c.kind else { return Err(self.type_error("__code__ must be set to a code object")) };
+        if code.freevars.len() != f.closure.len() {
+            let msg = format!("{}() requires a code object with {} free vars, not {}", f.name.borrow(), f.closure.len(), code.freevars.len());
+            return Err(self.value_error(&msg));
+        }
+        *f.code.borrow_mut() = code.clone();
+        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(v));
+        Ok(())
+    }
+
     pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
         self.check_mutable_type(obj, &nm)?;
@@ -1255,7 +1269,9 @@ impl Interp {
                     "__suppress_context__" => d.borrow_mut().suppress_context = self.truthy(&v)?,
                     "__traceback__" => {
                         if v.is_none() {
-                            d.borrow_mut().tb.clear();
+                            let mut dm = d.borrow_mut();
+                            dm.tb.clear();
+                            dm.tb_cache = None;
                         }
                     }
                     _ => {
@@ -1285,16 +1301,7 @@ impl Interp {
                         *f.kwdefaults.borrow_mut() = pairs;
                         self.func_event(crate::watch::FuncEvent::ModifyKwDefaults, o, Some(&v));
                     }
-                    "__code__" => {
-                        let Value::Obj(c) = &v else { return Err(self.type_error("__code__ must be set to a code object")) };
-                        let Kind::Code(code) = &c.kind else { return Err(self.type_error("__code__ must be set to a code object")) };
-                        if code.freevars.len() != f.closure.len() {
-                            let msg = format!("{}() requires a code object with {} free vars, not {}", f.name.borrow(), f.closure.len(), code.freevars.len());
-                            return Err(self.value_error(&msg));
-                        }
-                        *f.code.borrow_mut() = code.clone();
-                        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(&v));
-                    }
+                    "__code__" => self.set_function_code(o, &v)?,
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
                     "__type_params__" => {
                         if v.tuple_items().is_none() {
@@ -1346,9 +1353,26 @@ impl Interp {
         }
     }
 
+    /// The traceback chain of an exception; the chain built earlier is reused and only entries
+    /// added since are put on top of it.
+    pub fn exc_tb(&self, d: &RefCell<ExcData>) -> Value {
+        let mut d = d.borrow_mut();
+        let n = d.tb.len();
+        let (done, head) = match d.tb_cache.take() {
+            Some((k, head)) if k <= n => (k, head),
+            _ => (0, Value::None),
+        };
+        let head = self.make_tb_onto(head, &d.tb[done..]);
+        d.tb_cache = Some((n, head.clone()));
+        head
+    }
+
     /// Builds a traceback chain; entries are stored innermost first.
     pub fn make_tb(&self, entries: &[TbEntry]) -> Value {
-        let mut next = Value::None;
+        self.make_tb_onto(Value::None, entries)
+    }
+
+    fn make_tb_onto(&self, mut next: Value, entries: &[TbEntry]) -> Value {
         for e in entries {
             let o = Object::with_cls(self.types.traceback.clone(), Kind::Instance);
             let d = self.instance_dict(&o);
@@ -1575,6 +1599,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
             Layout::Int => Kind::Int(crate::pyint::BigInt::zero()),
             Layout::Float => Kind::Float(0.0),

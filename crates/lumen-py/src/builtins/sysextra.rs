@@ -793,6 +793,105 @@ impl CodeType {
         it.get_iter(&Value::list(items))
     }
 
+    /// Return a copy of the code object with new values for the specified fields.
+    ///
+    /// The instruction stream is Lumen's own, so `co_code`, `co_linetable`, `co_exceptiontable`,
+    /// `co_nlocals` and `co_stacksize` are accepted and ignored.
+    #[method(hint(py(text_signature = "($self, /, **changes)")))]
+    fn replace(
+        slf: This<CodeRef>,
+        it: &mut Interp,
+        #[kwonly] co_argcount: Option<i64>,
+        #[kwonly] co_posonlyargcount: Option<i64>,
+        #[kwonly] co_kwonlyargcount: Option<i64>,
+        #[kwonly] co_nlocals: Option<i64>,
+        #[kwonly] co_stacksize: Option<i64>,
+        #[kwonly] co_flags: Option<i64>,
+        #[kwonly] co_firstlineno: Option<i64>,
+        #[kwonly] co_code: Option<&Value>,
+        #[kwonly] co_consts: Option<&Value>,
+        #[kwonly] co_names: Option<&Value>,
+        #[kwonly] co_varnames: Option<&Value>,
+        #[kwonly] co_freevars: Option<&Value>,
+        #[kwonly] co_cellvars: Option<&Value>,
+        #[kwonly] co_filename: Option<&str>,
+        #[kwonly] co_name: Option<&str>,
+        #[kwonly] co_qualname: Option<&str>,
+        #[kwonly] co_linetable: Option<&Value>,
+        #[kwonly] co_exceptiontable: Option<&Value>,
+    ) -> R<Value> {
+        let _ = (co_nlocals, co_stacksize, co_code, co_linetable, co_exceptiontable);
+        let c = &slf.0 .0;
+        let count = |it: &mut Interp, v: Option<i64>, old: u32, what: &str| -> R<u32> {
+            match v {
+                None => Ok(old),
+                Some(n) if (0..=i64::from(i32::MAX)).contains(&n) => Ok(n as u32),
+                Some(_) => Err(it.value_error(&format!("{what} must be a non-negative int"))),
+            }
+        };
+        let tuple = |it: &mut Interp, v: Option<&Value>, what: &str| -> R<Option<Vec<Value>>> {
+            match v {
+                None => Ok(None),
+                Some(v) => match v.tuple_items() {
+                    Some(items) => Ok(Some(items.to_vec())),
+                    None => {
+                        let t = it.type_name_of(v);
+                        Err(it.type_error(&format!("replace() argument '{what}' must be tuple, not {t}")))
+                    }
+                },
+            }
+        };
+        let str_obj = |it: &mut Interp, x: &Value, what: &str| -> R<Obj> {
+            match x {
+                Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => Ok(o.clone()),
+                _ => Err(it.type_error(&format!("{what} must be a tuple of strings"))),
+            }
+        };
+        let strings = |it: &mut Interp, v: Option<Vec<Value>>, old: &[Rc<str>], what: &str| -> R<Vec<Rc<str>>> {
+            let Some(items) = v else { return Ok(old.to_vec()) };
+            items
+                .iter()
+                .map(|x| match &str_obj(it, x, what)?.kind {
+                    Kind::Str(s) => Ok(Rc::from(&*s.s)),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let consts = tuple(it, co_consts, "co_consts")?;
+        let names = tuple(it, co_names, "co_names")?;
+        let varnames = tuple(it, co_varnames, "co_varnames")?;
+        let freevars = tuple(it, co_freevars, "co_freevars")?;
+        let cellvars = tuple(it, co_cellvars, "co_cellvars")?;
+        let names = match names {
+            None => c.names.clone(),
+            Some(items) => items.iter().map(|x| str_obj(it, x, "co_names")).collect::<R<Vec<_>>>()?,
+        };
+        let code = Code {
+            name: co_name.map_or_else(|| c.name.clone(), Rc::from),
+            qualname: co_qualname.map_or_else(|| c.qualname.clone(), Rc::from),
+            filename: co_filename.map_or_else(|| c.filename.clone(), Rc::from),
+            first_line: count(it, co_firstlineno, c.first_line, "co_firstlineno")?,
+            ops: c.ops.clone(),
+            lines: c.lines.clone(),
+            consts: consts.unwrap_or_else(|| c.consts.clone()),
+            names,
+            varnames: strings(it, varnames, &c.varnames, "co_varnames")?,
+            cellvars: strings(it, cellvars, &c.cellvars, "co_cellvars")?,
+            freevars: strings(it, freevars, &c.freevars, "co_freevars")?,
+            argcount: count(it, co_argcount, c.argcount, "co_argcount")?,
+            posonly: count(it, co_posonlyargcount, c.posonly, "co_posonlyargcount")?,
+            kwonly: count(it, co_kwonlyargcount, c.kwonly, "co_kwonlyargcount")?,
+            flags: count(it, co_flags, c.flags, "co_flags")?,
+            cell_args: c.cell_args.clone(),
+            doc: c.doc.clone(),
+            pyobj: Default::default(),
+            info: Default::default(),
+        };
+        let obj = Object::new(Kind::Code(Rc::new(code)));
+        it.code_created(&obj);
+        Ok(Value::Obj(obj))
+    }
+
     // `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
     #[method(hint(py(text_signature = "")))]
     fn co_lines(slf: This<CodeRef>, it: &mut Interp) -> R<Value> {

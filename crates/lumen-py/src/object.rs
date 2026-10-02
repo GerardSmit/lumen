@@ -311,6 +311,9 @@ pub struct ExcData {
     pub suppress_context: bool,
     pub ctx_set: bool,
     pub tb: Vec<TbEntry>,
+    /// The traceback chain built from the first `n` entries of `tb`, extended as the exception
+    /// unwinds further so reading `__traceback__` stays cheap in deep recursion.
+    pub tb_cache: Option<(usize, Value)>,
 }
 
 pub struct PropData {
