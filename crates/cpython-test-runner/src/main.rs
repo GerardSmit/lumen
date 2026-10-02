@@ -93,13 +93,22 @@ fn read_names(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Test modules the way regrtest finds them: `test_*.py` files and `test_*` packages (directories
+/// with an `__init__.py`, such as `test_capi/`).
 fn discover(test_dir: &Path, filters: &[String]) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(test_dir)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| n.starts_with("test_") && n.ends_with(".py"))
-                .map(|n| n.trim_end_matches(".py").to_string())
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    if !name.starts_with("test_") {
+                        return None;
+                    }
+                    if let Some(stem) = name.strip_suffix(".py") {
+                        return Some(stem.to_string());
+                    }
+                    e.path().join("__init__.py").is_file().then_some(name)
+                })
                 .collect()
         })
         .unwrap_or_default();
