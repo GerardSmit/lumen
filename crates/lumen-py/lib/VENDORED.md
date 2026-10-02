@@ -117,6 +117,7 @@ Regenerate with `scripts/cpython-fetch.sh && scripts/cpython-vendor.sh`; the lis
 - `selectors.py`
 - `socket.py`
 - `socketserver.py`
+- `ssl.py`
 - `subprocess.py`
 - `queue.py`
 - `concurrent/__init__.py`
