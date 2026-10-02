@@ -915,29 +915,7 @@ impl Str {
     /// If tabsize is not given, a tab size of 8 characters is assumed.
     #[method]
     fn expandtabs(slf: This<StrRef<'_>>, it: &mut Interp, #[kw] #[default(8)] tabsize: i32) -> R<Value> {
-        let ts = tabsize as i64;
-        let mut out = String::new();
-        let mut col = 0i64;
-        for c in slf.0 .1.s.chars() {
-            match c {
-                '\t' => {
-                    if ts > 0 {
-                        let n = ts - (col % ts);
-                        it.check_str_len(out.len() + n as usize)?;
-                        out.extend(std::iter::repeat_n(' ', n as usize));
-                        col += n;
-                    }
-                }
-                '\n' | '\r' => {
-                    out.push(c);
-                    col = 0;
-                }
-                c => {
-                    out.push(c);
-                    col += 1;
-                }
-            }
-        }
+        let out = lumen_common::text::expand_tabs(&slf.0 .1.s, tabsize as i64, |n| it.check_str_len(n))?;
         Ok(Value::string(out))
     }
 

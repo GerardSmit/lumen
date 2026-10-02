@@ -160,9 +160,38 @@ fn has_annassign(body: &[Stmt]) -> bool {
 
 fn docstring(body: &[Stmt]) -> Option<Rc<str>> {
     match body.first() {
-        Some(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Constant(Constant::Str(s)), .. }), .. }) => Some(s.clone()),
+        Some(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Constant(Constant::Str(s)), .. }), .. }) => {
+            Some(clean_doc(s).into())
+        }
         _ => None,
     }
+}
+
+/// `_PyCompile_CleanDoc`: tabs expanded, leading spaces of the first line dropped and the
+/// common indentation of the later non-blank lines removed from every later line.
+fn clean_doc(doc: &str) -> String {
+    let doc = lumen_common::text::expand_tabs(doc, 8, |_| Ok::<(), ()>(())).unwrap_or_default();
+    let b = doc.as_bytes();
+    let mut lines = doc.split_inclusive('\n');
+    let first = lines.next().unwrap_or("");
+    let margin = lines
+        .filter_map(|l| {
+            let n = l.bytes().take_while(|&c| c == b' ').count();
+            (n < l.len() && l.as_bytes()[n] != b'\n').then_some(n)
+        })
+        .min()
+        .unwrap_or(0);
+    let lead = b.iter().take_while(|&&c| c == b' ').count();
+    if lead == 0 && margin == 0 {
+        return doc;
+    }
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&first[lead.min(first.len())..]);
+    for l in doc[first.len()..].split_inclusive('\n') {
+        let n = l.bytes().take(margin).take_while(|&c| c == b' ').count();
+        out.push_str(&l[n..]);
+    }
+    out
 }
 
 impl<'a> Compiler<'a> {
