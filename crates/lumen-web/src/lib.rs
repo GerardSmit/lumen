@@ -13,18 +13,17 @@
 //! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
-//!   `lumen_host::fill_random`, no crates), `crypto.subtle.digest` (SHA-256 only)
+//!   `lumen_os::proc::entropy`, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
 //!   through lumen-tls (system OpenSSL on Unix, rustls on Windows)
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
 //!   `serve((request) => Response)` convention of Deno/Bun/Workers). v1 is single-accept,
 //!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
-//! - [~] Streams: `ReadableStream` (default reader, async iteration, `getReader`/`cancel`/
-//!   `values`) backing Request/Response `.body` over the buffered bytes; no BYOB/byte streams,
-//!   `tee()`, piping, `WritableStream`, or `TransformStream` yet. Bodies remain buffered, so a
-//!   stream used as a body must produce its data synchronously.
-//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `TextEncoderStream`/`TextDecoderStream`,
-//!   `crypto.subtle` beyond digest, `WebSocket`, compression streams
+//! - [x] Streams (`ReadableStream`, `WritableStream`, `TransformStream`, the text and compression
+//!   streams, queuing strategies) come from lumen-node's `webstreams.js` (Node's own WHATWG
+//!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
+//!   Bodies remain buffered, so a stream used as a body must produce its data synchronously.
+//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
 
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
@@ -139,17 +138,6 @@ pub fn extension() -> Extension {
                 ],
             ),
             (
-                "__compress",
-                ops![
-                    "deflate" (1) => op_deflate,
-                    "inflate" (1) => op_inflate,
-                    "deflateRaw" (1) => op_deflate_raw,
-                    "inflateRaw" (1) => op_inflate_raw,
-                    "gzip" (1) => op_gzip,
-                    "gunzip" (1) => op_gunzip,
-                ],
-            ),
-            (
                 "__wasm",
                 ops![
                     "validate" (1) => wasm_ops::op_validate,
@@ -241,46 +229,10 @@ fn op_btoa(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
 /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
 fn op_atob(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
     let s = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?;
-    let mut data: Vec<u8> = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        if matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ') {
-            continue;
-        }
-        if !c.is_ascii() {
-            return Ok(Value::Null);
-        }
-        data.push(c as u8);
-    }
-    if data.len() % 4 == 0 {
-        for _ in 0..2 {
-            if data.last() == Some(&b'=') {
-                data.pop();
-            }
-        }
-    }
-    if data.len() % 4 == 1 {
-        return Ok(Value::Null);
-    }
-    let mut out = String::with_capacity(data.len() * 3 / 4);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &b in &data {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return Ok(Value::Null),
-        };
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(char::from((acc >> bits) as u8));
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Ok(Value::from_string(out))
+    Ok(match lumen_common::codec::base64_decode_forgiving(s.as_bytes()) {
+        Some(bytes) => Value::from_string(bytes.into_iter().map(char::from).collect::<String>()),
+        None => Value::Null,
+    })
 }
 
 // ---- url ----
@@ -401,7 +353,7 @@ pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value
 
 fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
     let mut buf = vec![0u8; n];
-    lumen_host::fill_random(&mut buf)
+    lumen_os::proc::entropy(&mut buf)
         .map_err(|e| ctx.make_error("Error", format!("no randomness source: {e}")))?;
     Ok(buf)
 }
@@ -448,50 +400,6 @@ fn op_digest(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value
         _ => return Err(ctx.make_error("TypeError", format!("unsupported digest {name}"))),
     };
     ctx.make_uint8array(&digest)
-}
-
-// ---- compression (DEFLATE/zlib/gzip, backing CompressionStream/DecompressionStream) ----
-
-fn compress_op(ctx: &mut Ctx, args: &[Value], codec: fn(&[u8]) -> Vec<u8>) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "compression expects a BufferSource"));
-    };
-    ctx.make_uint8array(&codec(&bytes))
-}
-
-fn decompress_op(
-    ctx: &mut Ctx,
-    args: &[Value],
-    codec: fn(&[u8]) -> Result<Vec<u8>, String>,
-) -> Result<Value, Value> {
-    let v = args.first().unwrap_or(&Value::Undefined);
-    let Some(bytes) = ctx.typed_array_bytes(v) else {
-        return Err(ctx.make_error("TypeError", "decompression expects a BufferSource"));
-    };
-    match codec(&bytes) {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("TypeError", e)),
-    }
-}
-
-fn op_deflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::zlib_compress)
-}
-fn op_inflate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::zlib_decompress)
-}
-fn op_deflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::deflate)
-}
-fn op_inflate_raw(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::inflate)
-}
-fn op_gzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    compress_op(ctx, a, lumen_host::codec::gzip_compress)
-}
-fn op_gunzip(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    decompress_op(ctx, a, lumen_host::codec::gzip_decompress)
 }
 
 // ---- fetch ----

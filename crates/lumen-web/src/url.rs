@@ -108,42 +108,7 @@ fn userinfo_set(c: u8) -> bool {
         )
 }
 
-const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
-
-fn percent_encode(input: &[u8], set: EncodeSet) -> String {
-    let mut out = String::with_capacity(input.len());
-    for &b in input {
-        if set(b) {
-            out.push('%');
-            out.push(HEX_UPPER[(b >> 4) as usize] as char);
-            out.push(HEX_UPPER[(b & 15) as usize] as char);
-        } else {
-            out.push(b as char);
-        }
-    }
-    out
-}
-
-fn percent_decode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
-    while i < input.len() {
-        let c = input[i];
-        if c == b'%'
-            && i + 2 < input.len()
-            && input[i + 1].is_ascii_hexdigit()
-            && input[i + 2].is_ascii_hexdigit()
-        {
-            let hex = |x: u8| (x as char).to_digit(16).unwrap_or(0) as u8;
-            out.push(hex(input[i + 1]) * 16 + hex(input[i + 2]));
-            i += 3;
-        } else {
-            out.push(c);
-            i += 1;
-        }
-    }
-    out
-}
+use lumen_common::codec::{percent_decode, percent_encode};
 
 fn is_forbidden_host(c: u8) -> bool {
     matches!(

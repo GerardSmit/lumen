@@ -1603,14 +1603,7 @@ fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
 /// surrogate, or > U+10FFFF is a URIError -> None). An escape whose decoded octet is an ASCII
 /// character in `preserve` (decodeURI's reservedSet) keeps its original `%XX` text instead.
 fn uri_decode(s: &str, preserve: &str) -> Option<String> {
-    fn hex_at(bytes: &[u8], i: usize) -> Option<u8> {
-        if i + 2 >= bytes.len() || bytes[i] != b'%' {
-            return None;
-        }
-        let h = (bytes[i + 1] as char).to_digit(16)?;
-        let l = (bytes[i + 2] as char).to_digit(16)?;
-        Some((h * 16 + l) as u8)
-    }
+    use lumen_common::codec::percent_escape_at as hex_at;
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0;
@@ -1771,7 +1764,7 @@ fn uri_encode(s: &str, keep: &str) -> Option<String> {
         } else {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{b:02X}"));
+                lumen_common::codec::push_percent_escape(&mut out, b);
             }
         }
     }
@@ -3976,45 +3969,6 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
         enumerable,
         configurable,
     })
-}
-
-/// `Number.prototype.toPrecision(p)`: `p` significant digits, fixed or exponential per the exponent.
-fn to_precision(n: f64, p: usize) -> String {
-    if n == 0.0 {
-        return if p == 1 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(p - 1))
-        };
-    }
-    let neg = n < 0.0;
-    // `p` significant digits via scientific notation (`d.ddde±E`, the mantissa has exactly `p` digits).
-    let sci = format!("{:.*e}", p - 1, n.abs());
-    let (mantissa, exp_str) = sci.split_once('e').unwrap();
-    let e: i32 = exp_str.parse().unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let body = if e < -6 || e >= p as i32 {
-        let sign = if e >= 0 { "+" } else { "-" };
-        if p == 1 {
-            format!("{}e{}{}", digits, sign, e.abs())
-        } else {
-            format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign, e.abs())
-        }
-    } else if e >= 0 {
-        let ip = (e + 1) as usize;
-        if ip >= p {
-            digits
-        } else {
-            format!("{}.{}", &digits[..ip], &digits[ip..])
-        }
-    } else {
-        format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
 }
 
 /// Intrinsic Object.defineProperty, also used by native host property definitions.
@@ -9089,63 +9043,3 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     }
 }
 
-/// Number.prototype.toExponential's digit selection: the exact decimal expansion of the binary
-/// value, rounded to `f` fraction digits with ties away from zero (the spec's "larger n").
-/// `shortest` (fractionDigits undefined) picks the minimal digits that round-trip.
-fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
-    // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
-    let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
-    let fmt_exp = |exp: i32| format!("e{}{}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    if shortest {
-        let s = format!("{x:e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let exp: i32 = e.parse().unwrap();
-        return format!("{sign}{m}{}", fmt_exp(exp));
-    }
-    if x == 0.0 {
-        let m = if f == 0 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(f))
-        };
-        return format!("{sign}{m}e+0");
-    }
-    // 780 fraction digits is past the longest exact decimal expansion of any f64 mantissa, so the
-    // digits (including everything after the rounding point) are exact.
-    let s = format!("{x:.780e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let mut exp: i32 = e.parse().unwrap();
-    let mut digits: Vec<u8> = m
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    if digits.len() > f + 1 && digits[f + 1] >= 5 {
-        let mut k = f + 1;
-        loop {
-            if k == 0 {
-                digits.insert(0, 1);
-                exp += 1;
-                break;
-            }
-            k -= 1;
-            if digits[k] == 9 {
-                digits[k] = 0;
-            } else {
-                digits[k] += 1;
-                break;
-            }
-        }
-    }
-    digits.truncate(f + 1);
-    while digits.len() < f + 1 {
-        digits.push(0);
-    }
-    let ds: String = digits.iter().map(|d| (d + b'0') as char).collect();
-    let m = if f == 0 {
-        ds
-    } else {
-        format!("{}.{}", &ds[..1], &ds[1..])
-    };
-    format!("{sign}{m}{}", fmt_exp(exp))
-}

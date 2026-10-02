@@ -1,7 +1,6 @@
 //! JSON Web Key import and export for asymmetric keys (RFC 7517 / 7518 / 8037). Fields travel as
 //! flat `[name, value, ...]` string lists; the JS binding builds and reads the objects.
 
-use base64ct::{Base64UrlUnpadded, Encoding};
 use num_bigint_dig::BigUint;
 
 use super::asn1;
@@ -10,49 +9,16 @@ use super::model::{okp_public, AsymKey, EcKey, OkpKey, RsaKey, RsaPrivateParts};
 use super::{KResult, SendError};
 
 fn b64(b: &[u8]) -> String {
-    Base64UrlUnpadded::encode_string(b)
+    lumen_common::codec::base64_encode(b, true, false)
 }
 
 fn b64_uint(n: &BigUint) -> String {
     b64(&n.to_bytes_be())
 }
 
-/// Decodes base64 or base64url, padded or not (as Node's `ByteSource::FromEncodedString`).
-pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            c => c,
-        })
-        .collect();
-    lenient_decode(&cleaned)
-}
-
-fn lenient_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut bits = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        } as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
+/// Decodes base64 or base64url, padded or not, as Node's `ByteSource::FromEncodedString` does.
+fn b64_decode(s: &str) -> Vec<u8> {
+    lumen_common::codec::base64_decode_lenient(s.as_bytes())
 }
 
 fn unsupported_key_type() -> SendError {
@@ -141,7 +107,7 @@ fn import_rsa(fields: &[String]) -> KResult<AsymKey> {
     let bad = || invalid_jwk("RSA key");
     let uint = |name: &str| -> KResult<BigUint> {
         let s = field(fields, name).ok_or_else(bad)?;
-        Ok(BigUint::from_bytes_be(&b64_decode(s).ok_or_else(bad)?))
+        Ok(BigUint::from_bytes_be(&b64_decode(s)))
     };
     let n = uint("n")?;
     let e = uint("e")?;
@@ -158,7 +124,7 @@ fn import_ec(fields: &[String], curve: Option<&str>) -> KResult<AsymKey> {
     let curve = curve.or_else(|| field(fields, "crv")).and_then(EcCurve::from_name).ok_or_else(bad)?;
     let len = curve.field_len();
     let coord = |name: &str| -> KResult<Vec<u8>> {
-        let raw = b64_decode(field(fields, name).ok_or_else(bad)?).ok_or_else(bad)?;
+        let raw = b64_decode(field(fields, name).ok_or_else(bad)?);
         if raw.len() > len {
             return Err(bad());
         }

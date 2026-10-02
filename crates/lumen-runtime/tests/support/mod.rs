@@ -44,17 +44,9 @@ impl ChildGuard {
 
     /// Wait for the child to exit, failing the test if it has not within `limit`.
     pub fn wait(&mut self, limit: Duration) -> ExitStatus {
-        let started = Instant::now();
-        loop {
-            if let Some(status) = self.0.try_wait().expect("poll child") {
-                return status;
-            }
-            assert!(
-                started.elapsed() < limit,
-                "the child process did not exit within {limit:?}"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        lumen_os::child::wait_timeout(&mut self.0, limit, Duration::from_millis(10))
+            .expect("poll child")
+            .unwrap_or_else(|| panic!("the child process did not exit within {limit:?}"))
     }
 }
 

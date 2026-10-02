@@ -64,21 +64,9 @@ impl Errno {
         }
     }
 
+    /// libuv's description of the error.
     pub fn message(self) -> &'static str {
-        match self {
-            Errno::NoEnt => "no such file or directory",
-            Errno::Exist => "file already exists",
-            Errno::NotDir => "not a directory",
-            Errno::IsDir => "illegal operation on a directory",
-            Errno::NotEmpty => "directory not empty",
-            Errno::Inval => "invalid argument",
-            Errno::BadF => "bad file descriptor",
-            Errno::Acces => "permission denied",
-            Errno::Loop => "too many symbolic links encountered",
-            Errno::Perm => "operation not permitted",
-            Errno::NoSys => "function not implemented",
-            Errno::Io => "i/o error",
-        }
+        lumen_os::uv::message(self.code()).unwrap_or("unknown error")
     }
 
     pub fn to_io(self) -> std::io::Error {

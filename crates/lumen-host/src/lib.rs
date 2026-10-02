@@ -878,36 +878,3 @@ fn std_handles_not_inheritable() {
     });
 }
 
-/// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself
-/// uses), `/dev/urandom` elsewhere.
-pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        getrandom::getrandom(buf).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-    #[cfg(all(windows, not(target_arch = "wasm32")))]
-    {
-        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
-        extern "system" {
-            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
-        }
-        // Documented to always succeed (it returns TRUE); checked anyway.
-        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
-            return Err(std::io::Error::other("ProcessPrng failed"));
-        }
-        Ok(())
-    }
-    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
-    {
-        use std::io::Read;
-        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
-        let file = match URANDOM.get() {
-            Some(file) => file,
-            None => {
-                let opened = std::fs::File::open("/dev/urandom")?;
-                URANDOM.get_or_init(|| opened)
-            }
-        };
-        (&*file).read_exact(buf)
-    }
-}

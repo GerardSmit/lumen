@@ -127,8 +127,7 @@ fn ipc_failure(ctx: &mut Ctx) -> Value {
 fn op_ipc_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let fd=ipc_fd(ctx,args)?;
     #[cfg(unix)] {
-        let flags=unsafe {libc::fcntl(fd,libc::F_GETFL)};
-        if flags<0 || unsafe {libc::fcntl(fd,libc::F_SETFL,flags|libc::O_NONBLOCK)}<0 { return Err(ipc_failure(ctx)); }
+        if lumen_os::fdctl::set_blocking(fd,false).is_err() { return Err(ipc_failure(ctx)); }
         Ok(Value::Undefined)
     }
     #[cfg(not(unix))] {let _=fd;Err(ctx.make_error("Error","Dedicated subprocess IPC is currently supported on Unix only"))}
@@ -289,12 +288,6 @@ fn build_command(
     Ok((command, stdio))
 }
 
-#[cfg(unix)]
-extern "C" {
-    fn dup2(src: std::os::raw::c_int, dst: std::os::raw::c_int) -> std::os::raw::c_int;
-    fn kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
 /// Wire `stdio[3..]` slots marked `"pipe"` (a browser's `--remote-debugging-pipe` talks on fds
 /// 3 and 4): each gets a socketpair whose child end is `dup2`'d onto its fd number after the
 /// fork. Both ends are CLOEXEC, so the child sees only the numbered fd and the parent's end is
@@ -348,21 +341,20 @@ fn wire_extra_stdio(command: &mut Command, stdio: &[String], ipc_fd: &mut Option
         child_ends.push((child, fd as std::os::raw::c_int));
     }
     if !child_ends.is_empty() || !inherited.is_empty() {
+        use lumen_os::fdctl;
+        let os_err = |e: lumen_os::FsError| std::io::Error::from_raw_os_error(e.errno());
         // SAFETY: runs in the forked child before exec; dup2/fcntl are async-signal-safe and the
         // sockets it renumbers are kept alive by the closure until exec replaces the image.
         unsafe {
             command.pre_exec(move || {
                 for (sock, fd) in &child_ends {
-                    if dup2(sock.as_raw_fd(), *fd) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                    fdctl::dup2(sock.as_raw_fd(), *fd, true).map_err(os_err)?;
                 }
                 for (src, fd) in &inherited {
                     if src == fd {
-                        let flags = libc::fcntl(*fd, libc::F_GETFD);
-                        libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
-                    } else if dup2(*src, *fd) < 0 {
-                        return Err(std::io::Error::last_os_error());
+                        let _ = fdctl::set_inheritable(*fd, true);
+                    } else {
+                        fdctl::dup2(*src, *fd, true).map_err(os_err)?;
                     }
                 }
                 Ok(())
@@ -923,8 +915,7 @@ fn send_signal(child: &Arc<Mutex<ProcHandle>>, signal: i32) -> bool {
         return false;
     }
     let sig = signal;
-    // SAFETY: plain syscall on a pid this process spawned and has not reaped.
-    unsafe { kill(child.id() as std::os::raw::c_int, sig) == 0 }
+    lumen_os::proc::kill(child.id() as i32, sig).is_ok()
 }
 
 #[cfg(not(unix))]
@@ -955,10 +946,7 @@ fn op_close_stdin(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: i32) {
-    // SAFETY: plain syscall on a child this call spawned and has not yet reaped.
-    unsafe {
-        kill(pid as std::os::raw::c_int, signal);
-    }
+    let _ = lumen_os::proc::kill(pid as i32, signal);
 }
 
 /// `(cmd, argsArray, inputBytesOrNull, cwd, envPairsOrNull, verbatim, timeoutMs, opts)` with

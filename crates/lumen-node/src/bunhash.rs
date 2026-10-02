@@ -1200,6 +1200,15 @@ pub fn op_city_hash32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
     let bytes = arg_bytes(ctx, a, "Bun.hash.cityHash32")?;
     Ok(Value::Num(city_hash32(&bytes) as f64))
 }
+/// crc32 and adler32 ignore the seed too.
+pub fn op_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let bytes = arg_bytes(ctx, a, "Bun.hash.crc32")?;
+    Ok(Value::Num(lumen_host::codec::crc32_from(0, &bytes) as f64))
+}
+pub fn op_adler32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let bytes = arg_bytes(ctx, a, "Bun.hash.adler32")?;
+    Ok(Value::Num(lumen_host::codec::adler32_from(1, &bytes) as f64))
+}
 /// xxHash3 uses only the low 32 bits of the seed (Bun's wrapper narrows to u32).
 pub fn op_xx_hash3(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let bytes = arg_bytes(ctx, a, "Bun.hash.xxHash3")?;
@@ -1239,15 +1248,6 @@ mod tests {
         }
     }
 
-    fn adler32(data: &[u8]) -> u32 {
-        let (mut a, mut s) = (1u32, 0u32);
-        for &b in data {
-            a = (a + b as u32) % 65521;
-            s = (s + a) % 65521;
-        }
-        (s << 16) | a
-    }
-
     #[test]
     fn oracle_matrix() {
         let mut checked = 0usize;
@@ -1274,7 +1274,7 @@ mod tests {
                 "murmur64v2" => murmur64v2(seed, &input),
                 "rapidhash" => rapidhash(seed, &input),
                 "crc32" => lumen_host::codec::crc32_from(0, &input) as u64,
-                "adler32" => adler32(&input) as u64,
+                "adler32" => lumen_host::codec::adler32_from(1, &input) as u64,
                 other => panic!("unknown oracle family {other}"),
             };
             let expect = u64::from_str_radix(expect_hex, 16).unwrap();

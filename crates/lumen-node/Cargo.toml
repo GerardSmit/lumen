@@ -20,10 +20,6 @@ lumen-bind = { path = "../lumen-bind" }
 
 # node:crypto and crypto.subtle: RustCrypto on every platform (native and wasm32). lumen carries
 # no cryptography of its own.
-getrandom = "0.2"
-md-5 = "0.10"
-sha1 = "0.10"
-sha2 = "0.10"
 scrypt = { version = "0.11", default-features = false }
 argon2 = "0.5"
 bcrypt = { version = "0.17", default-features = false }
@@ -53,7 +49,6 @@ p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 k256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 ed448-goldilocks-plus = { version = "0.16", default-features = false, features = ["signing", "pkcs8", "zeroize"] }
 pkcs5 = { version = "0.7", features = ["pbes2", "3des", "des-insecure", "sha1-insecure", "alloc"] }
-base64ct = { version = "1", features = ["alloc"] }
 ecdsa = { version = "0.16", features = ["der", "signing", "verifying", "pkcs8", "pem", "digest"] }
 elliptic-curve = { version = "0.13", features = ["sec1", "pkcs8", "pem", "jwk", "ecdh"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
