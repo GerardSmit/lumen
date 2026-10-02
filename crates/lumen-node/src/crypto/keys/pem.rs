@@ -5,9 +5,9 @@
 use lumen_common::codec::{self, Padding};
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use der::{Decode, Encode};
-use md5::Digest;
 
 use super::asn1::{self, Reader};
+use crate::crypto::cipher::bindings::bytes_to_key;
 use super::model::{self, AsymKey, EcKey};
 use super::{bad_decrypt, decoder_unsupported, interrupted, missing_passphrase, unknown_cipher, KResult, SendError};
 
@@ -168,25 +168,9 @@ impl KeyCipher {
     }
 }
 
-/// OpenSSL's `EVP_BytesToKey(cipher, md5, salt, pass, count = 1)` key (the IV is the header's).
-fn bytes_to_key(pass: &[u8], salt: &[u8], len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len + 16);
-    let mut prev: Vec<u8> = Vec::new();
-    while out.len() < len {
-        let mut h = md5::Md5::new();
-        h.update(&prev);
-        h.update(pass);
-        h.update(salt);
-        prev = h.finalize().to_vec();
-        out.extend_from_slice(&prev);
-    }
-    out.truncate(len);
-    out
-}
-
 fn random(len: usize) -> Vec<u8> {
     let mut v = vec![0u8; len];
-    let _ = getrandom::getrandom(&mut v);
+    let _ = lumen_os::proc::entropy(&mut v);
     v
 }
 

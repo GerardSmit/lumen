@@ -241,22 +241,43 @@ pub fn terminal_size(fd: i32) -> R<(u32, u32)> {
     }
 }
 
-/// Fills `buf` from the operating system's entropy source.
+/// Fills `buf` from the operating system's CSPRNG: `/dev/urandom` on Unix (opened once),
+/// `ProcessPrng` on Windows (what std itself uses), `crypto.getRandomValues` on wasm32.
 pub fn entropy(buf: &mut [u8]) -> R<()> {
     #[cfg(unix)]
     {
         use std::io::Read;
-        std::fs::File::open("/dev/urandom")?.read_exact(buf)?;
+        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+        let file = match URANDOM.get() {
+            Some(file) => file,
+            None => {
+                let opened = std::fs::File::open("/dev/urandom")?;
+                URANDOM.get_or_init(|| opened)
+            }
+        };
+        (&*file).read_exact(buf)?;
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        use std::hash::{BuildHasher, Hasher};
-        for chunk in buf.chunks_mut(8) {
-            let h = std::collections::hash_map::RandomState::new().build_hasher();
-            chunk.copy_from_slice(&h.finish().to_le_bytes()[..chunk.len()]);
+        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
+        extern "system" {
+            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
+        }
+        // SAFETY: `buf` is a live, writable slice of `len` bytes. Documented to always succeed.
+        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
+            return Err(FsError("EIO"));
         }
         Ok(())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        getrandom::getrandom(buf).map_err(|_| FsError("EIO"))
+    }
+    #[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+    {
+        let _ = buf;
+        Err(FsError("ENOSYS"))
     }
 }
 

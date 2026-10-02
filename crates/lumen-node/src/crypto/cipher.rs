@@ -18,7 +18,7 @@ use cipher::{
 use ghash::universal_hash::UniversalHash;
 use ghash::GHash;
 use lumen::embed::OpError;
-use md5::{Digest, Md5};
+use crate::hash::{self, Algo};
 use poly1305::Poly1305;
 
 
@@ -730,11 +730,11 @@ fn des3_wrap(enc: bool, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
         let mut iv = [0u8; 8];
-        getrandom::getrandom(&mut iv).ok()?;
+        lumen_os::proc::entropy(&mut iv).ok()?;
         let mut out = Vec::with_capacity(data.len() + 16);
         out.extend_from_slice(&iv);
         out.extend_from_slice(data);
-        out.extend_from_slice(&sha1::Sha1::digest(data)[..8]);
+        out.extend_from_slice(&hash::digest(Algo::Sha1, data)[..8]);
         tdes_cbc(true, key, &iv, &mut out[8..])?;
         out.reverse();
         tdes_cbc(true, key, &DES3_WRAP_IV, &mut out)?;
@@ -750,7 +750,7 @@ fn des3_wrap(enc: bool, key: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     let iv = iv.to_vec();
     tdes_cbc(false, key, &iv, rest)?;
     let (p, icv) = rest.split_at(rest.len() - 8);
-    let sum = sha1::Sha1::digest(p);
+    let sum = hash::digest(Algo::Sha1, p);
     if !ct_eq(&sum[..8], icv) {
         return None;
     }
@@ -1175,16 +1175,24 @@ fn cipher_new(name: &str, enc: bool, key: &[u8], iv: Option<&[u8]>, tag_len: f64
 fn cipher_init(name: &str, enc: bool, password: &[u8], tag_len: f64) -> Result<CryptoCipher, OpError> {
     let spec = lookup(name).ok_or_else(unknown_cipher)?;
     let need = spec.key + spec.iv;
-    let mut out = Vec::with_capacity(need + 16);
+    let out = bytes_to_key(password, &[], need);
+    common_init(spec, name, enc, &out[..spec.key], &out[spec.key..need], tag_len)
+}
+
+/// OpenSSL's `EVP_BytesToKey(cipher, md5, salt, pass, count = 1)`: `len` bytes of chained MD5.
+pub(crate) fn bytes_to_key(pass: &[u8], salt: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 16);
     let mut prev: Vec<u8> = Vec::new();
-    while out.len() < need {
-        let mut h = Md5::new();
+    while out.len() < len {
+        let mut h = hash::Hasher::new(Algo::Md5);
         h.update(&prev);
-        h.update(password);
-        prev = h.finalize().to_vec();
+        h.update(pass);
+        h.update(salt);
+        prev = h.finish();
         out.extend_from_slice(&prev);
     }
-    common_init(spec, name, enc, &out[..spec.key], &out[spec.key..need], tag_len)
+    out.truncate(len);
+    out
 }
 
 /// The mode label of a known cipher name (`null` when unknown).

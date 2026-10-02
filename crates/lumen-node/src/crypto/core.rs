@@ -240,7 +240,7 @@ fn argon2_async(
 /// Fill a view with CSPRNG bytes.
 #[op(name = "randomFill")]
 fn random_fill(buf: &mut [u8]) -> Result<(), OpError> {
-    getrandom::getrandom(buf).map_err(|e| OpError::error(format!("random source failed: {e}")))
+    lumen_os::proc::entropy(buf).map_err(|e| OpError::error(format!("random source failed: {e}")))
 }
 
 #[op(name = "timingSafeEqual")]

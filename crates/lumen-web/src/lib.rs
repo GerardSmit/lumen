@@ -13,7 +13,7 @@
 //! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
-//!   `lumen_host::fill_random`, no crates), `crypto.subtle.digest` (SHA-256 only)
+//!   `lumen_os::proc::entropy`, no crates), `crypto.subtle.digest` (SHA-256 only)
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
 //!   through lumen-tls (system OpenSSL on Unix, rustls on Windows)
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
@@ -353,7 +353,7 @@ pub(crate) fn web_random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value
 
 fn random_bytes(ctx: &mut Ctx, n: usize) -> Result<Vec<u8>, Value> {
     let mut buf = vec![0u8; n];
-    lumen_host::fill_random(&mut buf)
+    lumen_os::proc::entropy(&mut buf)
         .map_err(|e| ctx.make_error("Error", format!("no randomness source: {e}")))?;
     Ok(buf)
 }

@@ -868,7 +868,6 @@ dependencies = [
 name = "lumen-host"
 version = "0.1.3"
 dependencies = [
- "getrandom 0.2.17",
  "js-sys",
  "lumen",
  "lumen-bind",
@@ -915,7 +914,6 @@ dependencies = [
  "lumen-host",
  "lumen-os",
  "lumen-tls",
- "md-5",
  "num-bigint-dig",
  "ocb3",
  "ofb",
@@ -930,8 +928,6 @@ dependencies = [
  "rsa",
  "scrypt",
  "sec1",
- "sha1",
- "sha2",
  "signature",
  "spki",
  "subtle",
@@ -943,6 +939,7 @@ dependencies = [
 name = "lumen-os"
 version = "0.1.3"
 dependencies = [
+ "getrandom 0.2.17",
  "libc",
 ]
 
@@ -1018,6 +1015,7 @@ dependencies = [
  "lumen-codegen",
  "lumen-common",
  "lumen-host",
+ "lumen-os",
  "lumen-tls",
  "wasm-bindgen",
 ]

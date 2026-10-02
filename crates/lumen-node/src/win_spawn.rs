@@ -301,7 +301,7 @@ impl Write for PipeWriter {
 fn duplex_pipe() -> io::Result<(PipeReader, PipeWriter, Owned)> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let mut nonce = [0u8; 8];
-    let _ = lumen_host::fill_random(&mut nonce);
+    let _ = lumen_os::proc::entropy(&mut nonce);
     let name = format!(
         r"\\.\pipe\lumen-{}-{}-{:016x}",
         // SAFETY: plain Win32 call with no arguments.

@@ -912,25 +912,14 @@ fn verify_signature(alg: &Tlv, spki_raw: &[u8], data: &[u8], signature: &[u8]) -
                 return false;
             }
             let Some((n, e)) = rsa_public(spki.key) else { return false };
-            let key = rsa::RsaPublicKey::new_unchecked(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e));
-            let hashed = hash::digest(h, data);
             match scheme {
                 SigScheme::Pkcs1(_) => {
+                    let key = rsa::RsaPublicKey::new_unchecked(rsa::BigUint::from_bytes_be(&n), rsa::BigUint::from_bytes_be(&e));
                     let Some(prefix) = digest_info_prefix(h) else { return false };
                     let padding = rsa::Pkcs1v15Sign { hash_len: Some(h.out_len()), prefix: prefix.into() };
-                    key.verify(padding, &hashed, signature).is_ok()
+                    key.verify(padding, &hash::digest(h, data), signature).is_ok()
                 }
-                SigScheme::Pss(_, salt) => {
-                    let padding = match h {
-                        Algo::Sha1 => rsa::Pss::new_with_salt::<sha1::Sha1>(salt),
-                        Algo::Sha224 => rsa::Pss::new_with_salt::<sha2::Sha224>(salt),
-                        Algo::Sha256 => rsa::Pss::new_with_salt::<sha2::Sha256>(salt),
-                        Algo::Sha384 => rsa::Pss::new_with_salt::<sha2::Sha384>(salt),
-                        Algo::Sha512 => rsa::Pss::new_with_salt::<sha2::Sha512>(salt),
-                        _ => return false,
-                    };
-                    key.verify(padding, &hashed, signature).is_ok()
-                }
+                SigScheme::Pss(_, salt) => crate::crypto::sign::bindings::rsa_pss_verify(&n, &e, h, salt, data, signature),
                 _ => false,
             }
         }
