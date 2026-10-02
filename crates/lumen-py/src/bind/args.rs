@@ -441,7 +441,85 @@ fn slot_text_sig(name: &str, nargs: usize) -> String {
     format!("({})", parts.join(", "))
 }
 
-/// `__text_signature__` (`($module, x, /)`), or `None` (`hint(py(text_signature = ""))`).
+/// The docstring CPython's slot wrappers carry (`slotdefs` in `typeobject.c`), by dunder name.
+fn slot_doc(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__repr__" => "Return repr(self).",
+        "__str__" => "Return str(self).",
+        "__hash__" => "Return hash(self).",
+        "__call__" => "Call self as a function.",
+        "__lt__" => "Return self<value.",
+        "__le__" => "Return self<=value.",
+        "__eq__" => "Return self==value.",
+        "__ne__" => "Return self!=value.",
+        "__gt__" => "Return self>value.",
+        "__ge__" => "Return self>=value.",
+        "__iter__" => "Implement iter(self).",
+        "__next__" => "Implement next(self).",
+        "__init__" => "Initialize self.  See help(type(self)) for accurate signature.",
+        "__await__" => "Return an iterator to be used in await expression.",
+        "__aiter__" => "Return an awaitable, that resolves in asynchronous iterator.",
+        "__anext__" => "Return a value or raise StopAsyncIteration.",
+        "__add__" => "Return self+value.",
+        "__radd__" => "Return value+self.",
+        "__iadd__" => "Implement self+=value.",
+        "__sub__" => "Return self-value.",
+        "__rsub__" => "Return value-self.",
+        "__isub__" => "Return self-=value.",
+        "__mul__" => "Return self*value.",
+        "__rmul__" => "Return value*self.",
+        "__imul__" => "Implement self*=value.",
+        "__and__" => "Return self&value.",
+        "__rand__" => "Return value&self.",
+        "__iand__" => "Return self&=value.",
+        "__or__" => "Return self|value.",
+        "__ror__" => "Return value|self.",
+        "__ior__" => "Return self|=value.",
+        "__xor__" => "Return self^value.",
+        "__rxor__" => "Return value^self.",
+        "__ixor__" => "Return self^=value.",
+        "__neg__" => "-self",
+        "__pos__" => "+self",
+        "__abs__" => "abs(self)",
+        "__invert__" => "~self",
+        "__bool__" => "True if self else False",
+        "__int__" => "int(self)",
+        "__float__" => "float(self)",
+        "__index__" => "Return self converted to an integer, if self is suitable for use as an index into a list.",
+        "__len__" => "Return len(self).",
+        "__getitem__" => "Return self[key].",
+        "__setitem__" => "Set self[key] to value.",
+        "__delitem__" => "Delete self[key].",
+        "__contains__" => "Return bool(key in self).",
+        _ => return None,
+    })
+}
+
+/// `__doc__` of the native bound as `name`: its own doc, else the one CPython gives every
+/// `__new__` and slot wrapper.
+pub fn py_doc(d: &'static FnDesc, name: &str) -> Option<&'static str> {
+    if d.doc.is_some() {
+        return d.doc;
+    }
+    match d.role {
+        Role::Constructor => Some("Create and return a new object.  See help(type) for accurate signature."),
+        _ if is_slot_wrapper(d) => slot_doc(name),
+        _ => None,
+    }
+}
+
+/// `__text_signature__` of the native object: every `__new__` and `__init__` shows the generic
+/// signature of its slot, as in CPython.
+pub fn native_text_signature(d: &'static FnDesc) -> Option<String> {
+    match d.role {
+        Role::Constructor => Some("($type, *args, **kwargs)".into()),
+        Role::Proto("init") => Some("($self, /, *args, **kwargs)".into()),
+        _ => text_signature(d),
+    }
+}
+
+/// `__text_signature__` (`($module, x, /)`), or `None` (`hint(py(text_signature = ""))`); a
+/// constructor's is its class's.
 pub fn text_signature(d: &'static FnDesc) -> Option<String> {
     match d.hint(HOST, "text_signature") {
         Some("") => return None,

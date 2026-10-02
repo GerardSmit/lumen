@@ -900,10 +900,10 @@ impl Interp {
                     }
                 }
                 ("__qualname__", _) => return Ok(Some(Value::str(n.name))),
-                ("__doc__", Some(d)) => return Ok(Some(d.doc.map(Value::str).unwrap_or(Value::None))),
+                ("__doc__", Some(d)) => return Ok(Some(crate::bind::args::py_doc(d, n.name).map(Value::str).unwrap_or(Value::None))),
                 ("__doc__", None) => return Ok(Some(Value::None)),
                 ("__text_signature__", d) => {
-                    return Ok(Some(d.and_then(crate::bind::args::text_signature).map(Value::string).unwrap_or(Value::None)))
+                    return Ok(Some(d.and_then(crate::bind::args::native_text_signature).map(Value::string).unwrap_or(Value::None)))
                 }
                 ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
                     return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
