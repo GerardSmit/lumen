@@ -65,6 +65,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let mut members = Vec::new();
     T::members(&mut members);
     install_members(&ty, &members, None);
+    set_text_signature(it, &ty, &members);
     if let Some(d) = ty.dict.borrow().as_ref() {
         if c.hint(HOST, "unhashable").is_some() {
             dict_set_str(d, "__hash__", Value::None);
@@ -72,7 +73,6 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         if dict_get_str(d, "__doc__").is_none() {
             dict_set_str(d, "__doc__", c.doc.map_or(Value::None, Value::str));
         }
-        set_text_signature(d, &members);
         if !members.iter().any(|m| m.desc.role == Role::Constructor) {
             let f = Value::Obj(Object::new(Kind::Native(NativeData { name: "__new__", f: no_new, method: false, desc: None, owner: None })));
             dict_set_str(d, "__new__", f);
@@ -101,9 +101,25 @@ pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
     install_members(ty, &members, None);
 }
 
-fn set_text_signature(d: &Obj, members: &[FnItem<PyHost>]) {
+/// The `__text_signature__` of the native types that have one, by type object address (CPython
+/// derives it from the type's docstring; native types live as long as the interpreter).
+#[derive(Default)]
+struct TextSigs(std::collections::HashMap<usize, Value>);
+
+fn set_text_signature(it: &mut Interp, ty: &Obj, members: &[FnItem<PyHost>]) {
     let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
-    dict_set_str(d, "__text_signature__", sig.map_or(Value::None, Value::string));
+    if let Some(sig) = sig {
+        set_type_text_signature(it, ty, Value::string(sig));
+    }
+}
+
+pub fn set_type_text_signature(it: &mut Interp, ty: &Obj, sig: Value) {
+    it.native_state::<TextSigs>().0.insert(std::rc::Rc::as_ptr(ty) as usize, sig);
+}
+
+/// `type.__text_signature__`: the signature of a native type, else `None`.
+pub fn type_text_signature(it: &mut Interp, ty: &Obj) -> Value {
+    it.native_state::<TextSigs>().0.get(&(std::rc::Rc::as_ptr(ty) as usize)).cloned().unwrap_or(Value::None)
 }
 
 /// [`extend_type`], plus the class docstring and `__text_signature__` of `T`: a core type whose
@@ -115,8 +131,8 @@ pub fn extend_type_documented<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
     install_members(ty, &members, None);
     if let Some(d) = ty.dict.borrow().as_ref() {
         dict_set_str(d, "__doc__", T::DESC.doc.map_or(Value::None, Value::str));
-        set_text_signature(d, &members);
     }
+    set_text_signature(it, ty, &members);
 }
 
 /// The class `module.name` of a `base` hint, imported on first use of the native class.

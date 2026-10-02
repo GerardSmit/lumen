@@ -121,9 +121,6 @@ fn register_names(it: &mut Interp) {
         ("filter", t.filter.clone()),
         ("reversed", t.reversed.clone()),
     ];
-    if let Some(d) = it.types.object.dict.borrow().as_ref() {
-        dict_set_str(d, "__doc__", Value::str("The base class of the class hierarchy."));
-    }
     for (n, o) in named {
         dict_set_str(&b, n, Value::Obj(o));
     }

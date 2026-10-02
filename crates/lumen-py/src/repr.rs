@@ -316,9 +316,14 @@ impl Interp {
             }
             Kind::Code(c) => Ok(format!("<code object {} at {:#x}, file \"{}\", line {}>", c.name, self.id_of(v), c.filename, c.first_line)),
             Kind::Super(t, _, ot) => {
-                let t = self.repr_of(t)?;
-                let ot = self.repr_of(ot)?;
-                Ok(format!("<super: {}, <{} object>>", t, ot))
+                let t = match t {
+                    Value::Obj(c) if matches!(c.kind, Kind::Type(_)) => format!("<class '{}'>", self.type_name(c)),
+                    _ => self.repr_of(t)?,
+                };
+                match ot {
+                    Value::Obj(c) => Ok(format!("<super: {}, <{} object>>", t, self.type_name(c))),
+                    _ => Ok(format!("<super: {}, NULL>", t)),
+                }
             }
             Kind::Cell(c) => {
                 let inner = c.borrow().clone();

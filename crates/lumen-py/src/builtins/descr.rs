@@ -351,17 +351,13 @@ pub fn init(it: &mut Interp) {
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
     let member = new_type(it, "builtins", "member_descriptor", None, Layout::Other);
     for ty in [&getset, &member] {
-        it.reg(ty, "__get__", super::objectm::prop_get);
-        it.reg(ty, "__set__", super::objectm::prop_set);
+        super::objectm::install_descr_methods(ty);
         install_into::<DescriptorRepr>(ty, &["__repr__"]);
     }
     *it.native_state::<DescrTypes>() = DescrTypes { getset: Some(getset), member: Some(member) };
     let func = it.types.function.clone();
     install_getsets::<FunctionType>(it, &func, &["__globals__", "__closure__"]);
-    let type_ = it.types.type_.clone();
-    for (name, get, set) in super::objectm::TYPE_GETSETS {
-        add_getset(it, &type_, name, *get, *set, false);
-    }
+    super::objectm::install_getset_descriptors(it);
 }
 
 #[derive(Default)]
@@ -370,28 +366,24 @@ struct DescrTypes {
     member: Option<Obj>,
 }
 
-/// Installs the getters `T` declares into the builtin class `owner` as CPython's
-/// `getset_descriptor`s (`member_descriptor`s for the names in `members`).
+/// Installs the getters (with their setters) `T` declares into the builtin class `owner` as
+/// CPython's `getset_descriptor`s (`member_descriptor`s for the names in `members`).
 pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(it: &mut Interp, owner: &Obj, members: &[&str]) {
+    use crate::bind::args::py_name;
+    use lumen_bind::Role;
     let mut items = Vec::new();
     T::members(&mut items);
     for item in &items {
-        if item.desc.role != lumen_bind::Role::Getter {
+        if item.desc.role != Role::Getter {
             continue;
         }
-        let name = crate::bind::args::py_name(item.desc);
+        let name = py_name(item.desc);
         let fget = crate::bind::native_value(item);
+        let setter = items.iter().find(|s| s.desc.role == Role::Setter && py_name(s.desc) == name);
+        let fset = setter.map_or(Value::None, crate::bind::native_value);
         let doc = item.desc.doc.map_or(Value::None, Value::str);
-        put_descriptor(it, owner, name, fget, Value::None, doc, members.contains(&name));
+        put_descriptor(it, owner, name, fget, fset, doc, members.contains(&name));
     }
-}
-
-/// Puts a native attribute on a builtin class as CPython's `getset_descriptor` (or
-/// `member_descriptor`) that names its owner.
-pub fn add_getset(it: &mut Interp, owner: &Obj, name: &'static str, get: NativeFn, set: Option<NativeFn>, member: bool) {
-    let fget = it.new_native(name, get, false);
-    let fset = set.map_or(Value::None, |f| it.new_native(name, f, false));
-    put_descriptor(it, owner, name, fget, fset, Value::None, member);
 }
 
 fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, doc: Value, member: bool) {

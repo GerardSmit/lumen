@@ -751,6 +751,12 @@ impl Interp {
         if nm == "__class__" {
             return Ok(Value::Obj(self.types.super_.clone()));
         }
+        if matches!(nm.as_str(), "__thisclass__" | "__self__" | "__self_class__") {
+            let super_ = self.types.super_.clone();
+            if let Some(v) = self.lookup_mro_name(&super_, name) {
+                return self.bind_descr(&v, obj, &super_);
+            }
+        }
         let start_cls = match &objtype {
             Value::Obj(c) => c.clone(),
             _ => return Err(self.attr_error(obj, &nm)),
@@ -777,8 +783,10 @@ impl Interp {
                 return self.bind_descr(&v, &inst, &start_cls);
             }
         }
-        let t = self.type_name(&typ_obj);
-        let _ = t;
+        let super_ = self.types.super_.clone();
+        if let Some(v) = self.lookup_mro_name(&super_, name) {
+            return self.bind_descr(&v, obj, &super_);
+        }
         Err(self.new_exc_str("AttributeError", &format!("'super' object has no attribute '{}'", nm)))
     }
 
@@ -914,6 +922,11 @@ impl Interp {
                     }
                 }
                 ("__module__", _) => return Ok(Some(Value::str("builtins"))),
+                ("__self__", Some(d)) if d.role == lumen_bind::Role::Constructor => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::Obj(c.clone())));
+                    }
+                }
                 ("__self__", d) if d.is_none_or(|d| d.class().is_none()) => {
                     let own = match &n.owner {
                         Some(NativeOwner::Module(m)) => Some(&**m),
@@ -994,7 +1007,7 @@ impl Interp {
                 _ => {}
             },
             Kind::StaticMethod(f) | Kind::ClassMethod(f) => {
-                if nm == "__func__" {
+                if nm == "__func__" || nm == "__wrapped__" {
                     return Ok(Some(f.clone()));
                 }
                 if nm == "__isabstractmethod__" {
@@ -1522,7 +1535,10 @@ impl Interp {
     pub fn type_new_from_args(&mut self, meta: Obj, args: &[Value], kw: Vec<(Obj, Value)>) -> R<Value> {
         let name = match args[0].as_str() {
             Some(s) => s.to_string(),
-            None => return Err(self.type_error("type.__new__() argument 1 must be str")),
+            None => {
+                let t = self.type_name_of(&args[0]);
+                return Err(self.type_error(&format!("type.__new__() argument 1 must be str, not {t}")));
+            }
         };
         let bases: Vec<Obj> = match args[1].tuple_items() {
             Some(t) => {
@@ -1897,37 +1913,6 @@ impl Interp {
     pub fn new_module_native(&self, module: &str, name: &'static str, f: NativeFn) -> Value {
         let owner = Some(NativeOwner::Module(module.into()));
         Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: false, desc: None, owner })))
-    }
-
-    pub fn reg(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let owner = Some(NativeOwner::Class(ty.clone()));
-        let v = Value::Obj(Object::new(Kind::Native(NativeData { name, f, method: true, desc: None, owner })));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_static(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let n = self.new_native(name, f, false);
-        let v = Value::Obj(Object::new(Kind::StaticMethod(n)));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_class(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let n = self.new_native(name, f, false);
-        let v = Value::Obj(Object::new(Kind::ClassMethod(n)));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_new(&mut self, ty: &Obj, f: NativeFn) {
-        let n = self.new_native("__new__", f, false);
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, "__new__", n);
-        }
     }
 
     pub fn reg_prop(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
