@@ -1,94 +1,231 @@
 //! Exception classes: construction, `args`, notes and the attributes of the specialised types.
 
+use crate::bind::{Exc, KwArgs, This};
 use crate::object::*;
 use crate::vm::*;
 
-type Kw<'a> = &'a [(Obj, Value)];
-
-fn exc_args_cell<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a Obj> {
-    match a.first() {
-        Some(Value::Obj(o)) if matches!(o.kind, Kind::Exception(_)) => Ok(o),
-        _ => Err(it.type_error("descriptor requires a 'BaseException' object")),
+fn set_args(e: &Obj, args: &[Value]) {
+    if let Kind::Exception(d) = &e.kind {
+        d.borrow_mut().args = Value::tuple(args.to_vec());
     }
 }
 
-fn exc_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let cls = match a.first() {
-        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => c.clone(),
-        _ => return Err(it.type_error("BaseException.__new__(X): X is not a type object")),
-    };
-    let o = it.alloc_instance(&cls)?;
-    if let Value::Obj(e) = &o {
-        if let Kind::Exception(d) = &e.kind {
-            d.borrow_mut().args = Value::tuple(a[1..].to_vec());
+/// Keyword arguments `allowed` become attributes of `e` (`ImportError(name=..)`); any other is
+/// an error naming `cls`.
+fn keyword_fields(it: &mut Interp, d: &Obj, kw: KwArgs, allowed: &[&str], cls: &str) -> R<()> {
+    for (k, v) in kw.iter() {
+        if !allowed.contains(&k) {
+            return Err(it.type_error(&format!("'{}' is an invalid keyword argument for {}()", k, cls)));
+        }
+        dict_set_str(d, k, v.clone());
+    }
+    Ok(())
+}
+
+/// `BaseException`'s members.
+#[lumen_bind::class(name = "BaseException")]
+pub struct BaseException;
+
+#[lumen_bind::methods]
+impl BaseException {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        let _ = kwargs;
+        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let o = it.alloc_instance(cls)?;
+        if let Value::Obj(e) = &o {
+            set_args(e, args);
+        }
+        Ok(o)
+    }
+
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let e = slf.0 .0;
+        if !kwargs.is_empty() {
+            let n = it.type_name(&it.type_of_obj(e));
+            return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
+        }
+        set_args(e, args);
+        Ok(())
+    }
+
+    /// Return str(self).
+    #[proto(str)]
+    fn str(slf: This<&Value>, it: &mut Interp) -> R<String> {
+        it.native_str(&slf)
+    }
+
+    /// Return repr(self).
+    #[proto(repr)]
+    fn repr(slf: This<&Value>, it: &mut Interp) -> R<String> {
+        it.native_repr(&slf)
+    }
+
+    /// Exception.with_traceback(tb) --
+    ///     set self.__traceback__ to tb and return self.
+    #[method(hint(py(text_signature = "")))]
+    fn with_traceback(slf: This<Exc<'_>>, tb: &Value) -> Value {
+        let _ = tb;
+        Value::Obj(slf.0 .0.clone())
+    }
+
+    /// Exception.add_note(note) --
+    ///     add a note to the exception
+    #[method(hint(py(text_signature = "")))]
+    fn add_note(slf: This<Exc<'_>>, it: &mut Interp, note: &Value) -> R<()> {
+        if note.as_str().is_none() {
+            let t = it.type_name_of(note);
+            return Err(it.type_error(&format!("note must be a str, not '{t}'")));
+        }
+        let d = it.instance_dict(slf.0 .0);
+        match dict_get_str(&d, "__notes__") {
+            Some(Value::Obj(l)) => {
+                if let Kind::List(l) = &l.kind {
+                    l.borrow_mut().push(note.clone());
+                }
+            }
+            _ => dict_set_str(&d, "__notes__", Value::list(vec![note.clone()])),
+        }
+        Ok(())
+    }
+
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<Exc<'_>>, it: &mut Interp) -> Value {
+        let e = slf.0 .0;
+        let args = match &e.kind {
+            Kind::Exception(d) => d.borrow().args.clone(),
+            _ => Value::tuple(Vec::new()),
+        };
+        let mut out = vec![Value::Obj(it.type_of_obj(e)), args];
+        if let Some(d) = e.dict.borrow().as_ref() {
+            if matches!(&d.kind, Kind::Dict(m) if !m.borrow().is_empty()) {
+                out.push(Value::Obj(d.clone()));
+            }
+        }
+        Value::tuple(out)
+    }
+
+    #[method(name = "__setstate__", hint(py(text_signature = "")))]
+    fn setstate(slf: This<&Value>, it: &mut Interp, state: &Value) -> R<()> {
+        if state.is_none() {
+            return Ok(());
+        }
+        let Some(state) = dict_of(state) else {
+            return Err(it.type_error("state is not a dictionary"));
+        };
+        let entries: Vec<(Value, Value)> = state.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect();
+        for (k, v) in entries {
+            let Value::Obj(name) = &k else { return Err(it.type_error("attribute name must be string")) };
+            it.set_attr(&slf, name, v)?;
+        }
+        Ok(())
+    }
+}
+
+/// `StopIteration.value`.
+#[lumen_bind::class(name = "StopIteration")]
+pub struct StopIteration;
+
+#[lumen_bind::methods]
+impl StopIteration {
+    /// generator return value
+    #[getter]
+    fn value(slf: This<Exc<'_>>, it: &mut Interp) -> Value {
+        let e = slf.0 .0;
+        if let Some(v) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "value")) {
+            return v;
+        }
+        it.stop_value(e)
+    }
+}
+
+/// `SystemExit.code`.
+#[lumen_bind::class(name = "SystemExit")]
+pub struct SystemExit;
+
+#[lumen_bind::methods]
+impl SystemExit {
+    /// exception code
+    #[getter]
+    fn code(slf: This<Exc<'_>>) -> Value {
+        let e = slf.0 .0;
+        if let Some(v) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "code")) {
+            return v;
+        }
+        match &e.kind {
+            Kind::Exception(d) => match d.borrow().args.tuple_items() {
+                Some([]) | None => Value::None,
+                Some([x]) => x.clone(),
+                Some(_) => d.borrow().args.clone(),
+            },
+            _ => Value::None,
         }
     }
-    Ok(o)
 }
 
-fn exc_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?;
-    if !kw.is_empty() {
-        let n = it.type_name_of(&a[0]);
-        return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
+/// `ImportError(*args, name=None, path=None)`.
+#[lumen_bind::class(name = "ImportError")]
+pub struct ImportError;
+
+#[lumen_bind::methods]
+impl ImportError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let e = slf.0 .0;
+        set_args(e, args);
+        let d = it.instance_dict(e);
+        dict_set_str(&d, "name", Value::None);
+        dict_set_str(&d, "path", Value::None);
+        dict_set_str(&d, "msg", args.first().cloned().unwrap_or(Value::None));
+        keyword_fields(it, &d, kwargs, &["name", "path"], "ImportError")
     }
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(a[1..].to_vec());
-    }
-    Ok(Value::None)
 }
 
-fn exc_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__str__", a, 1, 1)?;
-    Ok(Value::string(it.native_str(&a[0])?))
+/// `AttributeError(*args, name=None, obj=None)`.
+#[lumen_bind::class(name = "AttributeError")]
+pub struct AttributeError;
+
+#[lumen_bind::methods]
+impl AttributeError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let e = slf.0 .0;
+        set_args(e, args);
+        let d = it.instance_dict(e);
+        for n in ["name", "obj"] {
+            if dict_get_str(&d, n).is_none() {
+                dict_set_str(&d, n, Value::None);
+            }
+        }
+        keyword_fields(it, &d, kwargs, &["name", "obj"], "AttributeError")
+    }
+}
+
+/// `NameError(*args, name=None)`.
+#[lumen_bind::class(name = "NameError")]
+pub struct NameError;
+
+#[lumen_bind::methods]
+impl NameError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let e = slf.0 .0;
+        set_args(e, args);
+        let d = it.instance_dict(e);
+        if dict_get_str(&d, "name").is_none() {
+            dict_set_str(&d, "name", Value::None);
+        }
+        keyword_fields(it, &d, kwargs, &["name"], "NameError")
+    }
 }
 
 fn unicode_field(e: &Obj, name: &str) -> Option<Value> {
     e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name))
-}
-
-/// `UnicodeEncodeError.__init__` and friends: `(encoding, object, start, end, reason)`, without
-/// `encoding` for `UnicodeTranslateError`.
-fn unicode_exc_init(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    let args = &a[1..];
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(args.to_vec());
-    }
-    let translate = it.exc_is(&e, "UnicodeTranslateError");
-    let decode = it.exc_is(&e, "UnicodeDecodeError");
-    let want = if translate { 4 } else { 5 };
-    if args.len() != want {
-        return Err(it.type_error(&format!("function takes exactly {} arguments ({} given)", want, args.len())));
-    }
-    let (encoding, rest) = if translate { (Value::None, args) } else { (args[0].clone(), &args[1..]) };
-    let check_str = |it: &mut Interp, v: &Value, n: usize| -> R<()> {
-        if v.as_str().is_some() {
-            return Ok(());
-        }
-        let t = it.type_name_of(v);
-        Err(it.type_error(&format!("argument {} must be str, not {}", n, t)))
-    };
-    let off = if translate { 0 } else { 1 };
-    if !translate {
-        check_str(it, &encoding, 1)?;
-    }
-    let object = if decode {
-        Value::bytes(it.bytes_of(&rest[0])?)
-    } else {
-        check_str(it, &rest[0], off + 1)?;
-        rest[0].clone()
-    };
-    let start = it.index_of(&rest[1])?;
-    let end = it.index_of(&rest[2])?;
-    check_str(it, &rest[3], off + 4)?;
-    let d = it.instance_dict(&e);
-    dict_set_str(&d, "encoding", encoding);
-    dict_set_str(&d, "object", object);
-    dict_set_str(&d, "start", Value::Int(start));
-    dict_set_str(&d, "end", Value::Int(end));
-    dict_set_str(&d, "reason", rest[3].clone());
-    Ok(Value::None)
 }
 
 impl Interp {
@@ -126,183 +263,45 @@ impl Interp {
     }
 }
 
-fn exc_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__repr__", a, 1, 1)?;
-    Ok(Value::string(it.native_repr(&a[0])?))
-}
-
-fn with_traceback(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("with_traceback", a, 2, 2)?;
-    Ok(a[0].clone())
-}
-
-fn add_note(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("add_note", a, 2, 2)?;
-    if a[1].as_str().is_none() {
-        return Err(it.type_error("note must be a str"));
-    }
-    let e = exc_args_cell(it, a)?.clone();
-    let d = it.instance_dict(&e);
-    match dict_get_str(&d, "__notes__") {
-        Some(Value::Obj(l)) => {
-            if let Kind::List(l) = &l.kind {
-                l.borrow_mut().push(a[1].clone());
-            }
-        }
-        _ => dict_set_str(&d, "__notes__", Value::list(vec![a[1].clone()])),
-    }
-    Ok(Value::None)
-}
-
-fn exc_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__reduce__", a, 1, 1)?;
-    let e = exc_args_cell(it, a)?.clone();
-    let args = match &e.kind {
-        Kind::Exception(d) => d.borrow().args.clone(),
-        _ => Value::tuple(Vec::new()),
-    };
-    let mut out = vec![Value::Obj(it.type_of_obj(&e)), args];
-    if let Some(d) = e.dict.borrow().as_ref() {
-        if matches!(&d.kind, Kind::Dict(m) if !m.borrow().is_empty()) {
-            out.push(Value::Obj(d.clone()));
-        }
-    }
-    Ok(Value::tuple(out))
-}
-
-fn exc_setstate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setstate__", a, 2, 2)?;
-    if a[1].is_none() {
-        return Ok(Value::None);
-    }
-    let Some(state) = dict_of(&a[1]) else {
-        return Err(it.type_error("state is not a dictionary"));
-    };
-    let entries: Vec<(Value, Value)> = state.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect();
-    for (k, v) in entries {
-        let Value::Obj(name) = &k else { return Err(it.type_error("attribute name must be string")) };
-        it.set_attr(&a[0], name, v)?;
-    }
-    Ok(Value::None)
-}
-
-fn stop_value_prop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    if let Some(d) = e.dict.borrow().as_ref() {
-        if let Some(v) = dict_get_str(d, "value") {
-            return Ok(v);
-        }
-    }
-    Ok(it.stop_value(&e))
-}
-
-fn exit_code_prop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    if let Some(d) = e.dict.borrow().as_ref() {
-        if let Some(v) = dict_get_str(d, "code") {
-            return Ok(v);
-        }
-    }
-    Ok(match &e.kind {
-        Kind::Exception(d) => match d.borrow().args.tuple_items() {
-            Some([]) | None => Value::None,
-            Some([x]) => x.clone(),
-            Some(_) => d.borrow().args.clone(),
-        },
-        _ => Value::None,
-    })
-}
-
-fn import_error_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(a[1..].to_vec());
-    }
-    let d = it.instance_dict(&e);
-    dict_set_str(&d, "name", Value::None);
-    dict_set_str(&d, "path", Value::None);
-    dict_set_str(&d, "msg", a.get(1).cloned().unwrap_or(Value::None));
-    for (k, v) in kw {
-        match k.as_str_kind().unwrap_or("") {
-            "name" | "path" => dict_set_name(&d, k, v.clone()),
-            other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for ImportError()", other))),
-        }
-    }
-    Ok(Value::None)
-}
-
-fn attr_error_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(a[1..].to_vec());
-    }
-    let d = it.instance_dict(&e);
-    if dict_get_str(&d, "name").is_none() {
-        dict_set_str(&d, "name", Value::None);
-    }
-    if dict_get_str(&d, "obj").is_none() {
-        dict_set_str(&d, "obj", Value::None);
-    }
-    for (k, v) in kw {
-        match k.as_str_kind().unwrap_or("") {
-            "name" | "obj" => dict_set_name(&d, k, v.clone()),
-            other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for AttributeError()", other))),
-        }
-    }
-    Ok(Value::None)
-}
-
-fn name_error_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(a[1..].to_vec());
-    }
-    let d = it.instance_dict(&e);
-    if dict_get_str(&d, "name").is_none() {
-        dict_set_str(&d, "name", Value::None);
-    }
-    for (k, v) in kw {
-        match k.as_str_kind().unwrap_or("") {
-            "name" => dict_set_name(&d, k, v.clone()),
-            other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for NameError()", other))),
-        }
-    }
-    Ok(Value::None)
-}
-
 const SYNTAX_FIELDS: [&str; 7] = ["filename", "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line"];
 
 /// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
-fn syntax_error_init(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let e = exc_args_cell(it, a)?.clone();
-    let args = &a[1..];
-    if let Kind::Exception(d) = &e.kind {
-        d.borrow_mut().args = Value::tuple(args.to_vec());
-    }
-    let d = it.instance_dict(&e);
-    for n in ["msg"].iter().chain(SYNTAX_FIELDS.iter()) {
-        if dict_get_str(&d, n).is_none() {
-            dict_set_str(&d, n, Value::None);
+#[lumen_bind::class(name = "SyntaxError")]
+pub struct SyntaxError;
+
+#[lumen_bind::methods]
+impl SyntaxError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let _ = kwargs;
+        let e = slf.0 .0;
+        set_args(e, args);
+        let d = it.instance_dict(e);
+        for n in ["msg"].iter().chain(SYNTAX_FIELDS.iter()) {
+            if dict_get_str(&d, n).is_none() {
+                dict_set_str(&d, n, Value::None);
+            }
         }
-    }
-    if let Some(m) = args.first() {
-        dict_set_str(&d, "msg", m.clone());
-    }
-    if args.len() == 2 {
-        let info = it.iterate_to_vec(&args[1])?;
-        if !(4..=6).contains(&info.len()) {
-            let msg = if info.len() < 4 {
-                format!("function takes at least 4 arguments ({} given)", info.len())
-            } else {
-                format!("function takes at most 6 arguments ({} given)", info.len())
-            };
-            return Err(it.type_error(&msg));
+        if let Some(m) = args.first() {
+            dict_set_str(&d, "msg", m.clone());
         }
-        for (n, v) in SYNTAX_FIELDS.iter().zip(info.iter()) {
-            dict_set_str(&d, n, v.clone());
+        if args.len() == 2 {
+            let info = it.iterate_to_vec(&args[1])?;
+            if !(4..=6).contains(&info.len()) {
+                let msg = if info.len() < 4 {
+                    format!("function takes at least 4 arguments ({} given)", info.len())
+                } else {
+                    format!("function takes at most 6 arguments ({} given)", info.len())
+                };
+                return Err(it.type_error(&msg));
+            }
+            for (n, v) in SYNTAX_FIELDS.iter().zip(info.iter()) {
+                dict_set_str(&d, n, v.clone());
+            }
         }
+        Ok(())
     }
-    Ok(Value::None)
 }
 
 /// `msg (file, line N)` with the file's base name, as CPython's `SyntaxError_str`.
@@ -325,30 +324,20 @@ pub fn syntax_error_str(it: &mut Interp, e: &Obj) -> R<String> {
 }
 
 pub fn init(it: &mut Interp) {
+    use crate::bind::extend_type;
     let base = it.exc_type("BaseException");
-    it.reg_new(&base, exc_new);
-    it.reg(&base, "__init__", exc_init);
-    it.reg(&base, "__str__", exc_str);
-    it.reg(&base, "__repr__", exc_repr);
-    it.reg(&base, "with_traceback", with_traceback);
-    it.reg(&base, "add_note", add_note);
-    it.reg(&base, "__reduce__", exc_reduce);
-    it.reg(&base, "__setstate__", exc_setstate);
+    extend_type::<BaseException>(it, &base);
     let si = it.exc_type("StopIteration");
-    it.reg_prop(&si, "value", stop_value_prop);
+    extend_type::<StopIteration>(it, &si);
     let se = it.exc_type("SystemExit");
-    it.reg_prop(&se, "code", exit_code_prop);
+    extend_type::<SystemExit>(it, &se);
     crate::builtins::oserror::init(it);
     let ie = it.exc_type("ImportError");
-    it.reg(&ie, "__init__", import_error_init);
+    extend_type::<ImportError>(it, &ie);
     let ae = it.exc_type("AttributeError");
-    it.reg(&ae, "__init__", attr_error_init);
+    extend_type::<AttributeError>(it, &ae);
     let ne = it.exc_type("NameError");
-    it.reg(&ne, "__init__", name_error_init);
-    for name in ["UnicodeEncodeError", "UnicodeDecodeError", "UnicodeTranslateError"] {
-        let t = it.exc_type(name);
-        it.reg(&t, "__init__", unicode_exc_init);
-    }
+    extend_type::<NameError>(it, &ne);
     let sy = it.exc_type("SyntaxError");
-    it.reg(&sy, "__init__", syntax_error_init);
+    extend_type::<SyntaxError>(it, &sy);
 }

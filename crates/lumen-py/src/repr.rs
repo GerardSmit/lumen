@@ -265,6 +265,8 @@ impl Interp {
                         }
                         _ => Ok(format!("<method '{}' of object>", n.name)),
                     }
+                } else if let (Some(NativeOwner::Class(c)), Some(lumen_bind::Role::Constructor)) = (&n.owner, n.desc.map(|d| d.role)) {
+                    Ok(format!("<built-in method __new__ of type object at {:#x}>", self.id_of(&Value::Obj(c.clone()))))
                 } else {
                     Ok(format!("<built-in function {}>", n.name))
                 }
