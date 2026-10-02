@@ -1376,6 +1376,50 @@ pub struct Session {
     wbio: Ptr,
     state: Box<State>,
     is_server: bool,
+    framing: RecordFraming,
+}
+
+/// Where the bytes fed so far end within the TLS record stream, so an owner reading from a
+/// socket can take exactly what completes the next record (as OpenSSL's own socket BIO does)
+/// and never pull bytes that belong to a later record out of the socket, where `select` could
+/// no longer see them.
+#[derive(Default)]
+struct RecordFraming {
+    header: [u8; 5],
+    header_len: usize,
+    body_left: usize,
+}
+
+impl RecordFraming {
+    fn advance(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.header_len < 5 {
+                let take = (5 - self.header_len).min(bytes.len());
+                self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
+                self.header_len += take;
+                bytes = &bytes[take..];
+                if self.header_len == 5 {
+                    self.body_left = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                }
+            }
+            if self.header_len == 5 {
+                let take = self.body_left.min(bytes.len());
+                self.body_left -= take;
+                bytes = &bytes[take..];
+                if self.body_left == 0 {
+                    self.header_len = 0;
+                }
+            }
+        }
+    }
+
+    fn wanted(&self) -> usize {
+        if self.header_len < 5 {
+            5 - self.header_len
+        } else {
+            self.body_left.max(1)
+        }
+    }
 }
 
 unsafe impl Send for Session {}
@@ -1664,6 +1708,7 @@ impl Session {
             wbio,
             state,
             is_server,
+            framing: RecordFraming::default(),
         })
     }
 
@@ -1671,7 +1716,14 @@ impl Session {
         self.is_server
     }
 
+    /// How many bytes complete the record the fed input ends in the middle of (the 5-byte
+    /// header of the next one when it ends on a record boundary).
+    pub fn wanted_input(&self) -> usize {
+        self.framing.wanted()
+    }
+
     pub fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.framing.advance(bytes);
         let mut offset = 0;
         while offset < bytes.len() {
             let chunk = (bytes.len() - offset).min(c_int::MAX as usize);
