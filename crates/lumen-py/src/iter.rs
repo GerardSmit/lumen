@@ -64,7 +64,6 @@ impl Interp {
                     let t = self.type_name_of(v);
                     return Err(self.type_error(&format!("'{}' object is not iterable", t)));
                 }
-                Kind::File(_) => return Ok(v.clone()),
                 _ => {}
             }
         }
@@ -130,14 +129,6 @@ impl Interp {
                         self.ret_val = v;
                         Ok(None)
                     }
-                }
-            }
-            Kind::File(_) => {
-                let line = self.file_readline(o, -1)?;
-                if line.as_str().map(|s| s.is_empty()).unwrap_or(line.as_bytes_empty()) {
-                    Ok(None)
-                } else {
-                    Ok(Some(line))
                 }
             }
             _ => {

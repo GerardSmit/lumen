@@ -266,22 +266,6 @@ pub enum IterState {
     Empty,
 }
 
-pub enum FileMode {
-    Stdout,
-    Stderr,
-    Stdin,
-    Read { data: Vec<u8>, pos: usize },
-    Write { handle: crate::platform::FileHandle, buf: Vec<u8>, append: bool },
-    Closed,
-}
-
-pub struct FileData {
-    pub mode: FileMode,
-    pub text: bool,
-    pub name: String,
-    pub platform: Option<crate::platform::PlatformRef>,
-}
-
 pub struct RangeData {
     pub start: i64,
     pub stop: i64,
@@ -320,7 +304,6 @@ pub enum Kind {
     ClassMethod(Value),
     Super(Value, Value, Value),
     DictView(Obj, ViewKind),
-    File(RefCell<FileData>),
     Frame,
     AsyncGenValue(Value),
     /// Native state owned by a builtin extension type (deque, partial, weakref, ...).

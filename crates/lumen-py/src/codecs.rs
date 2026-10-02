@@ -1569,7 +1569,7 @@ pub fn forget_codec(it: &mut Interp, encoding: &str) {
 
 /// `lookup()` that refuses codecs marked `_is_text_encoding = False` (CPython's
 /// `_PyCodec_LookupTextEncoding`).
-fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value> {
+pub fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value> {
     let codec = lookup(it, encoding)?;
     let exact_tuple = std::rc::Rc::ptr_eq(&it.type_of(&codec), &it.types.tuple);
     if !exact_tuple {

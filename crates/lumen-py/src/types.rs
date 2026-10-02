@@ -139,7 +139,6 @@ impl Interp {
             (t.zip.clone(), obj.clone()),
             (t.map.clone(), obj.clone()),
             (t.filter.clone(), obj.clone()),
-            (t.file.clone(), obj.clone()),
             (t.frame.clone(), obj.clone()),
         ];
         self.set_bases(&obj, vec![]);
@@ -351,7 +350,6 @@ impl Interp {
                 ViewKind::Values => t.dict_values.clone(),
                 ViewKind::Items => t.dict_items.clone(),
             },
-            Kind::File(_) => t.file.clone(),
             Kind::Frame => t.frame.clone(),
             Kind::AsyncGenValue(_) | Kind::Opaque(_) => t.object.clone(),
         }
@@ -957,11 +955,6 @@ impl Interp {
             Kind::Super(t, _, ot) => match nm {
                 "__thisclass__" => return Ok(Some(t.clone())),
                 "__self_class__" => return Ok(Some(ot.clone())),
-                _ => {}
-            },
-            Kind::File(f) => match nm {
-                "name" => return Ok(Some(Value::str(&f.borrow().name))),
-                "closed" => return Ok(Some(Value::Bool(matches!(f.borrow().mode, FileMode::Closed)))),
                 _ => {}
             },
             Kind::Cell(c) if nm == "cell_contents" => {

@@ -333,16 +333,6 @@ impl Interp {
                 let ot = self.repr_of(ot)?;
                 Ok(format!("<super: {}, <{} object>>", t, ot))
             }
-            Kind::File(f) => {
-                let f = f.borrow();
-                let mode = match &f.mode {
-                    FileMode::Read { .. } | FileMode::Stdin => "r",
-                    FileMode::Write { append: true, .. } => "a",
-                    FileMode::Write { .. } | FileMode::Stdout | FileMode::Stderr => "w",
-                    FileMode::Closed => "r",
-                };
-                Ok(format!("<_io.TextIOWrapper name={} mode='{}' encoding='UTF-8'>", str_repr(&f.name), mode))
-            }
             Kind::Cell(c) => {
                 let inner = c.borrow().clone();
                 match inner {

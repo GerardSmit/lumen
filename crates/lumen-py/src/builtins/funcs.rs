@@ -45,30 +45,43 @@ fn print(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for print()", other))),
         }
     }
-    let mut out = String::new();
-    for (i, v) in a.iter().enumerate() {
-        if i > 0 {
-            out.push_str(&sep);
-        }
-        match v.as_str() {
-            Some(s) => out.push_str(s),
-            None => out.push_str(&it.str_of(v)?),
+    if file.is_none() {
+        match it.sys_attr("stdout") {
+            Some(f) if !f.is_none() => file = f,
+            _ => return Ok(Value::None),
         }
     }
-    out.push_str(&end);
-    if file.is_none() {
-        let sys_out = it.sys_attr("stdout");
-        match sys_out {
-            Some(f) if !matches!(&f, Value::Obj(o) if matches!(&o.kind, Kind::File(fd) if matches!(fd.borrow().mode, FileMode::Stdout))) => {
-                it.write_to(&f, &out)?;
+    let native = super::iom::textio::is_native_textio(it, &file);
+    if native {
+        let mut out = String::new();
+        for (i, v) in a.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&sep);
             }
-            _ => it.write_stdout(&out),
+            match v.as_str() {
+                Some(s) => out.push_str(s),
+                None => out.push_str(&it.str_of(v)?),
+            }
         }
-    } else {
+        out.push_str(&end);
         it.write_to(&file, &out)?;
+    } else {
+        for (i, v) in a.iter().enumerate() {
+            if i > 0 {
+                it.write_to(&file, &sep)?;
+            }
+            match v.as_str() {
+                Some(s) => it.write_to(&file, s)?,
+                None => {
+                    let s = it.str_of(v)?;
+                    it.write_to(&file, &s)?;
+                }
+            }
+        }
+        it.write_to(&file, &end)?;
     }
     if flush {
-        it.flush_out();
+        it.call_method(&file, "flush", Vec::new())?;
     }
     Ok(Value::None)
 }
@@ -80,13 +93,10 @@ impl Interp {
         dict_get_str(&d, name)
     }
 
+    /// `f.write(s)`, directly for a native `TextIOWrapper`.
     pub fn write_to(&mut self, f: &Value, s: &str) -> R<()> {
-        if let Value::Obj(o) = f {
-            if let Kind::File(_) = &o.kind {
-                if o.cls.is_none() {
-                    return self.file_write(o, s);
-                }
-            }
+        if let Some(r) = super::iom::textio::write_native(self, f, s) {
+            return r.map(|_| ());
         }
         self.call_method(f, "write", vec![Value::str(s)])?;
         Ok(())
@@ -418,23 +428,28 @@ fn id(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn input(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("input", a, 0, 1)?;
-    if let Some(p) = a.first() {
-        let s = it.str_of(p)?;
-        it.write_stdout(&s);
-    }
-    it.flush_out();
-    let raw = it.platform.borrow_mut().read_stdin_line();
-    if raw.is_empty() {
-        return Err(it.new_exc_str("EOFError", "EOF when reading a line"));
-    }
-    let mut line = lumen_common::smuggle::escape_text_owned(String::from_utf8_lossy(&raw).into_owned());
-    if line.ends_with('\n') {
-        line.pop();
-        if line.ends_with('\r') {
-            line.pop();
+    let mut streams = Vec::new();
+    for name in ["stdin", "stdout", "stderr"] {
+        match it.sys_attr(name) {
+            Some(f) if !f.is_none() => streams.push(f),
+            _ => return Err(it.new_exc_str("RuntimeError", &format!("input(): lost sys.{}", name))),
         }
     }
-    Ok(Value::string(line))
+    let (fin, fout, ferr) = (&streams[0], &streams[1], &streams[2]);
+    let _ = it.call_method(ferr, "flush", Vec::new());
+    if let Some(p) = a.first() {
+        let s = it.str_of(p)?;
+        it.write_to(fout, &s)?;
+    }
+    it.call_method(fout, "flush", Vec::new())?;
+    let line = it.call_method(fin, "readline", Vec::new())?;
+    let Some(s) = line.as_str() else {
+        return Err(it.type_error("object.readline() returned non-string"));
+    };
+    if s.is_empty() {
+        return Err(it.new_exc_str("EOFError", "EOF when reading a line"));
+    }
+    Ok(Value::str(s.strip_suffix('\n').unwrap_or(s)))
 }
 
 fn isinstance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {

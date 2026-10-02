@@ -7,9 +7,9 @@ pub mod descr;
 pub mod dictm;
 pub mod excgroup;
 pub mod excm;
-pub mod file;
 pub mod format;
 pub mod funcs;
+pub mod iom;
 pub mod genm;
 pub mod iterm;
 pub mod itertools;
@@ -53,7 +53,6 @@ pub fn init(it: &mut Interp) {
     excm::init(it);
     codecsm::init(it);
     excgroup::init(it);
-    file::init(it);
     funcs::init(it);
     sysextra::init_frame_type(it);
     descr::init(it);

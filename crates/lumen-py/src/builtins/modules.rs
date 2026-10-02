@@ -1,6 +1,5 @@
 //! Native modules: `sys` and `time`.
 
-use super::file::new_file;
 use crate::object::*;
 use crate::vm::*;
 
@@ -16,6 +15,7 @@ fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<
 const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_codecs", |it| Some(super::codecsm::make(it))),
     ("_collections", |it| Some(super::collectionsm::make(it))),
+    ("_io", bound::<super::iom::_io::Module>),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_sha2", |it| Some(super::sha2m::make(it))),
     ("_sre", |it| Some(super::sre::make(it))),
@@ -44,6 +44,7 @@ pub fn builtin_module(it: &mut Interp, name: &str) -> Option<Obj> {
 pub fn init(it: &mut Interp) {
     let sys = make_sys(it);
     it.register_module("sys", &sys);
+    super::iom::init_std_streams(it, &sys);
 }
 
 fn set_fn(it: &mut Interp, d: &Obj, name: &'static str, f: NativeFn) {
@@ -77,9 +78,6 @@ fn make_sys(it: &mut Interp) -> Obj {
         it.argv = argv;
     }
     dict_set_str(&d, "builtin_module_names", Value::tuple(BUILTIN_MODULES.iter().map(|(n, _)| Value::str(n)).collect()));
-    dict_set_str(&d, "stdout", new_file(it, FileMode::Stdout, true, "<stdout>"));
-    dict_set_str(&d, "stderr", new_file(it, FileMode::Stderr, true, "<stderr>"));
-    dict_set_str(&d, "stdin", new_file(it, FileMode::Stdin, true, "<stdin>"));
     set_fn(it, &d, "exit", sys_exit);
     set_fn(it, &d, "getrecursionlimit", sys_getrecursionlimit);
     set_fn(it, &d, "setrecursionlimit", sys_setrecursionlimit);

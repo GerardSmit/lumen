@@ -533,10 +533,12 @@ fn sys_getattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             ];
             let ty = new_structseq_type(it, "sys", "flags", &names);
             let digits = it.int_max_str_digits() as i64;
+            let utf8 = crate::builtins::iom::utf8_mode(it) as i64;
             let vals = names
                 .iter()
                 .map(|n| match *n {
-                    "hash_randomization" | "dont_write_bytecode" | "utf8_mode" => Value::Int(1),
+                    "hash_randomization" | "dont_write_bytecode" => Value::Int(1),
+                    "utf8_mode" => Value::Int(utf8),
                     "int_max_str_digits" => Value::Int(digits),
                     "dev_mode" => Value::Bool(false),
                     "safe_path" => Value::Bool(false),

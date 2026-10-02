@@ -134,6 +134,7 @@ impl Interp {
 
     fn run_exit_hooks(&mut self) {
         self.run_atexit();
+        crate::builtins::iom::flush_std_streams(self);
         self.flush_out();
     }
 

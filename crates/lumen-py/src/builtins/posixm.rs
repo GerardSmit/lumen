@@ -747,7 +747,7 @@ pub mod posix {
     /// Write a bytes object to a file descriptor.
     #[op]
     fn write(it: &mut Interp, fd: i32, data: &[u8]) -> R<usize> {
-        let r = it.platform.borrow_mut().fd_write(fd, data, None);
+        let r = it.fd_write(fd, data);
         r.map_err(|e| os_err(it, e))
     }
 

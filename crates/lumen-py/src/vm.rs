@@ -110,7 +110,6 @@ types! {
     zip: "zip", Layout::Other;
     map: "map", Layout::Other;
     filter: "filter", Layout::Other;
-    file: "TextIOWrapper", Layout::Other;
     frame: "frame", Layout::Other;
 }
 
@@ -272,6 +271,24 @@ impl Interp {
         if self.out.len() > 1 << 16 {
             self.flush_out();
         }
+    }
+
+    /// `write(2)` through the platform; descriptors 1 and 2 go to the output sink when one is
+    /// set, after the buffered print output.
+    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> crate::platform::PResult<usize> {
+        if fd == 1 || fd == 2 {
+            self.flush_out();
+            if let Some(s) = &mut self.sink {
+                if fd == 1 {
+                    s.write_stdout(data);
+                    s.flush();
+                } else {
+                    s.write_stderr(data);
+                }
+                return Ok(data.len());
+            }
+        }
+        self.platform.borrow_mut().fd_write(fd, data, None)
     }
 
     pub fn write_stderr(&mut self, s: &str) {
