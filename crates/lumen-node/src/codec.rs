@@ -19,7 +19,10 @@ pub const BASE64: u32 = 4;
 pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
-use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, SMUGGLE_BASE};
+use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, Spelling};
+use lumen_common::utf;
+use std::borrow::Cow;
+use std::convert::Infallible;
 
 /// Call `f` with each UTF-16 code unit of `s` (smuggled scalars decode to their surrogates).
 #[inline]
@@ -125,11 +128,15 @@ pub(crate) fn canonical(s: String) -> String {
 }
 
 pub fn utf8_decode(bytes: &[u8]) -> String {
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-    };
-    canonical(s)
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return canonical(s.to_owned());
+    }
+    let mut out = String::with_capacity(bytes.len() + 8);
+    let _ = utf::decode_utf8::<Infallible>(&mut Cow::Borrowed(bytes), true, Spelling::Utf16, &mut out, |_, m, out| {
+        out.push('\u{FFFD}');
+        Ok(m.end)
+    });
+    out
 }
 
 // ---- latin1 / ascii / utf16le -------------------------------------------------------------------
@@ -171,45 +178,17 @@ pub fn utf16le_encode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Units -> string: valid pairs combine, lone surrogates are smuggled.
-pub fn from_units(units: impl Iterator<Item = u16>) -> String {
-    let mut out = String::new();
-    let mut pending: Option<u16> = None;
-    let push_lone = |out: &mut String, u: u16| {
-        out.push(smuggle(u));
-    };
-    for u in units {
-        if let Some(hi) = pending.take() {
-            if (0xDC00..0xE000).contains(&u) {
-                let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + (u as u32 - 0xDC00);
-                if cp >= SMUGGLE_BASE {
-                    push_lone(&mut out, hi);
-                    push_lone(&mut out, u);
-                } else {
-                    out.push(char::from_u32(cp).unwrap());
-                }
-                continue;
-            }
-            push_lone(&mut out, hi);
-        }
-        match u {
-            0xD800..=0xDBFF => pending = Some(u),
-            0xDC00..=0xDFFF => push_lone(&mut out, u),
-            _ => out.push(char::from_u32(u as u32).unwrap()),
-        }
-    }
-    if let Some(hi) = pending {
-        push_lone(&mut out, hi);
-    }
-    out
-}
-
+/// Node's utf16le: lone surrogates are kept and an odd last byte is dropped.
 pub fn utf16le_decode(bytes: &[u8]) -> String {
-    from_units(
-        bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]])),
-    )
+    let mut out = String::with_capacity(bytes.len());
+    let _ = utf::decode_utf16::<Infallible>(&mut Cow::Borrowed(bytes), 0, false, true, Spelling::Utf16, &mut out, |data, m, out| {
+        if m.end - m.start < 2 {
+            return Ok(m.end);
+        }
+        out.push(smuggle(u16::from_le_bytes([data[m.start], data[m.start + 1]])));
+        Ok(m.start + 2)
+    });
+    out
 }
 
 // ---- hex / base64 (shared byte codecs; Node's lenient decoders) --------------------------------
@@ -391,6 +370,7 @@ pub fn is_utf8(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_common::smuggle::SMUGGLE_BASE;
 
     #[test]
     fn base64_node_semantics() {

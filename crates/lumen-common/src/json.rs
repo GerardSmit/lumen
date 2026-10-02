@@ -11,16 +11,7 @@ use crate::smuggle;
 use std::borrow::Cow;
 use std::fmt;
 
-/// How the strings being quoted or parsed carry characters a Rust `str` cannot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Spelling {
-    /// Plain text: a `\u` escape of a lone surrogate reads as U+FFFD.
-    Plain,
-    /// JavaScript strings: lone surrogates smuggled as UTF-16 code units.
-    Utf16,
-    /// Python strings: every code point, with the escape spelling of the reserved block.
-    CodePoints,
-}
+pub use crate::smuggle::Spelling;
 
 // ---- quoting ----------------------------------------------------------------------------------
 
@@ -678,7 +669,7 @@ impl<'a> Parser<'a> {
                     i += 6;
                 }
             }
-            lone |= push_code_point(&mut out, cp, self.opts.spelling);
+            lone |= self.opts.spelling.push(&mut out, cp);
         }
         self.pos = i;
         Ok(Str { text: Cow::Owned(out), start: begin, end: i, lone_surrogate: lone })
@@ -688,22 +679,6 @@ impl<'a> Parser<'a> {
 #[inline]
 fn hex4(h: &[u8]) -> Option<u32> {
     h.iter().try_fold(0u32, |n, &c| Some(n * 16 + (c as char).to_digit(16)?))
-}
-
-/// Append `cp` in `spelling`; whether it was a lone surrogate.
-fn push_code_point(out: &mut String, cp: u32, spelling: Spelling) -> bool {
-    let lone = (0xD800..0xE000).contains(&cp);
-    match spelling {
-        Spelling::Plain => out.push(char::from_u32(cp).unwrap_or('\u{FFFD}')),
-        Spelling::CodePoints => {
-            smuggle::push_code_point(out, cp);
-        }
-        Spelling::Utf16 => match char::from_u32(cp) {
-            Some(c) => smuggle::push_char_utf16(out, c),
-            None => out.push(smuggle::smuggle(cp as u16)),
-        },
-    }
-    lone
 }
 
 // ---- a plain value tree -------------------------------------------------------------------------
