@@ -187,21 +187,6 @@ fn status_detail(s: &Status) -> String {
     }
 }
 
-fn json_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std::io::Result<String> {
     let mut totals = Counts::default();
     let mut by_status: BTreeMap<&'static str, u32> = BTreeMap::new();
@@ -224,14 +209,14 @@ fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std:
         tsv.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\n", r.name, r.status.label(), r.counts.pass, r.counts.fail, r.counts.error, r.counts.skip, r.secs, status_detail(&r.status)));
         json_files.push(format!(
             "    {}: {{ \"status\": {}, \"pass\": {}, \"fail\": {}, \"error\": {}, \"skip\": {}, \"seconds\": {:.2}, \"detail\": {} }}",
-            json_string(&r.name),
-            json_string(r.status.label()),
+            lumen_common::json::json_string(&r.name),
+            lumen_common::json::json_string(r.status.label()),
             r.counts.pass,
             r.counts.fail,
             r.counts.error,
             r.counts.skip,
             r.secs,
-            json_string(&status_detail(&r.status)),
+            lumen_common::json::json_string(&status_detail(&r.status)),
         ));
     }
     fs::write(o.report.join("files.tsv"), tsv)?;

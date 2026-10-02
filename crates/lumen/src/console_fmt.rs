@@ -77,56 +77,23 @@ fn str_escape(s: &str) -> R<String> {
     if has_lone_surrogate(s) {
         return Err(Bail);
     }
-    let mut quote = '\'';
+    let mut quote = b'\'';
     if s.contains('\'') {
         if !s.contains('"') {
-            quote = '"';
+            quote = b'"';
         } else if !s.contains('`') && !s.contains("${") {
-            quote = '`';
+            quote = b'`';
         }
     }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push(quote);
-    for c in s.chars() {
-        match c {
-            '\'' if quote == '\'' => out.push_str("\\'"),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\u{c}' => out.push_str("\\f"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
-                out.push_str(&format!("\\x{:02X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    Ok(out)
+    use lumen_common::json::{quote as quoted, Escapes, Quote};
+    Ok(quoted(s, &Quote { quote, escapes: Escapes::Inspect, ..Quote::JSON }))
 }
 
 fn json_quote(s: &str) -> R<String> {
     if has_lone_surrogate(s) {
         return Err(Bail);
     }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    Ok(out)
+    Ok(lumen_common::json::json_string(s))
 }
 
 fn is_identifier_key(k: &str) -> bool {

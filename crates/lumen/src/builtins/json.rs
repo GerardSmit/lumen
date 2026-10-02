@@ -1,6 +1,8 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use lumen_common::json;
+use std::borrow::Cow;
 
 pub(super) fn install_json(it: &mut Interp) {
     let j = it.new_object();
@@ -95,54 +97,33 @@ pub(super) fn install_json(it: &mut Interp) {
         crate::bytecode::reflect::caller_transparent(i);
         let text = ab(i.to_string(&arg(args, 0)))?;
         let reviver = arg(args, 1);
+        let mut parser = json::Parser::new(&text, PARSE);
         if !reviver.is_callable() {
-            return JsonBytes::new(&text).document(i);
+            return parser.document(&mut JsSink::new(i, &text));
         }
-        let chars: Vec<char> = text.chars().collect();
-        let mut pos = 0;
         // A callable reviver walks the result via InternalizeJSONProperty from a `{ "": v }` root,
         // recording primitive source spans for its `context` argument.
-        if reviver.is_callable() {
-            let (v, record) = json_parse_recorded(i, &chars, &mut pos)?;
-            json_skip_ws(&chars, &mut pos);
-            if pos != chars.len() {
-                return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
-            }
-            let root = i.new_object();
-            set_data(&root, "", v);
-            let mut reviver = crate::bytecode::PreparedCall::new(i, reviver, Value::Undefined);
-            let r =
-                internalize_json_property(i, &Value::Obj(root), "", &mut reviver, Some(&record));
-            reviver.finish(i);
-            return r;
-        }
-        let v = json_parse_value(i, &chars, &mut pos)?;
-        json_skip_ws(&chars, &mut pos);
-        if pos != chars.len() {
-            return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
-        }
-        Ok(v)
+        let (v, record) = parser.document(&mut RecordSink { i, src: &text })?;
+        let root = i.new_object();
+        set_data(&root, "", v);
+        let mut reviver = crate::bytecode::PreparedCall::new(i, reviver, Value::Undefined);
+        let r = internalize_json_property(i, &Value::Obj(root), "", &mut reviver, Some(&record));
+        reviver.finish(i);
+        r
     });
     it.def_method(&j, "rawJSON", 1, |i, _t, args| {
         let text = ab(i.to_string(&arg(args, 0)))?.to_string();
-        let bytes: Vec<char> = text.chars().collect();
-        if bytes.is_empty() {
+        let (Some(first), Some(last)) = (text.bytes().next(), text.bytes().last()) else {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON: empty string"));
-        }
-        let is_ws = |c: char| matches!(c, '\t' | '\n' | '\r' | ' ');
-        if is_ws(bytes[0]) || is_ws(*bytes.last().unwrap()) {
+        };
+        let is_ws = |c: u8| matches!(c, b'\t' | b'\n' | b'\r' | b' ');
+        if is_ws(first) || is_ws(last) {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON: leading/trailing whitespace"));
         }
-        if bytes[0] == '{' || bytes[0] == '[' {
+        if first == b'{' || first == b'[' {
             return Err(i.make_error("SyntaxError", "JSON.rawJSON value must be a primitive"));
         }
-        // Validate it is exactly one JSON value.
-        let mut pos = 0;
-        json_parse_value(i, &bytes, &mut pos)?;
-        json_skip_ws(&bytes, &mut pos);
-        if pos != bytes.len() {
-            return Err(i.make_error("SyntaxError", "JSON.rawJSON: invalid JSON text"));
-        }
+        json::Parser::new(&text, PARSE).document(&mut JsSink::new(i, &text))?;
         let o = i.new_object();
         o.borrow_mut().proto = None;
         set_data(&o, "rawJSON", Value::from_string(text.clone()));
@@ -159,83 +140,12 @@ pub(super) fn install_json(it: &mut Interp) {
     set_builtin(&it.global, "JSON", Value::Obj(j));
 }
 
-/// Append the JSON quoting of `s` (QuoteJSONString) to `out`.
-fn json_quote_into(out: &mut String, s: &str) {
-    out.push('"');
-    let bytes = s.as_bytes();
-    // Plain-ASCII runs need no escaping and are copied as slices.
-    let mut run = 0usize;
-    let mut k = 0usize;
-    while k < bytes.len() {
-        let b = bytes[k];
-        if b >= 0x20 && b != b'"' && b != b'\\' && b < 0x80 {
-            k += 1;
-            continue;
-        }
-        out.push_str(&s[run..k]);
-        if b >= 0x80 {
-            // Non-ASCII tail: the character-level loop (smuggled surrogates).
-            json_quote_chars(out, &s[k..]);
-            out.push('"');
-            return;
-        }
-        match b {
-            b'"' => out.push_str("\\\""),
-            b'\\' => out.push_str("\\\\"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x08 => out.push_str("\\b"),
-            0x0C => out.push_str("\\f"),
-            c => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c);
-            }
-        }
-        k += 1;
-        run = k;
-    }
-    out.push_str(&s[run..]);
-    out.push('"');
-}
-
-fn json_quote_chars(out: &mut String, s: &str) {
-    use std::fmt::Write as _;
-    let mut chars = s.chars().peekable();
-    while let Some(mut c) = chars.next() {
-        // A smuggled pair round-trips as its real character. If that character itself falls in
-        // the smuggle range (a real plane-16 PUA code point), keep the smuggled representation so
-        // it isn't re-read as a lone surrogate below.
-        if let Some(real) = chars.peek().and_then(|&n| crate::jstr::paired_char(c, n)) {
-            if crate::jstr::smuggled(real).is_some() {
-                out.push(c);
-                out.push(chars.next().unwrap());
-                continue;
-            }
-            chars.next();
-            c = real;
-        }
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{0008}' => out.push_str("\\b"),
-            '\u{000C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => match crate::jstr::smuggled(c) {
-                // Well-formed JSON.stringify: a lone surrogate is written as its \u escape.
-                Some(u) => {
-                    let _ = write!(out, "\\u{u:04x}");
-                }
-                None => out.push(c),
-            },
-        }
-    }
-}
+/// QuoteJSONString: well-formed, so lone surrogates are written as `\u` escapes.
+const STRINGIFY: json::Quote = json::Quote {
+    lone_surrogates: true,
+    spelling: json::Spelling::Utf16,
+    ..json::Quote::JSON
+};
 
 /// JSON.stringify options: an optional function replacer and/or an array PropertyList of keys.
 struct JsonOpts {
@@ -389,7 +299,7 @@ impl JsonSer<'_> {
                 Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"))
             }
             Value::Str(s) => {
-                json_quote_into(&mut self.out, &s);
+                json::quote_into(&mut self.out, &s, &STRINGIFY);
                 Ok(true)
             }
             Value::Obj(ref o) => {
@@ -478,7 +388,7 @@ impl JsonSer<'_> {
                             self.out.push(',');
                         }
                         self.newline();
-                        json_quote_into(&mut self.out, k);
+                        json::quote_into(&mut self.out, k, &STRINGIFY);
                         self.out.push(':');
                         if !self.gap.is_empty() {
                             self.out.push(' ');
@@ -636,455 +546,6 @@ fn internalize_json_property(
     ))
 }
 
-/// JSON.parse without a reviver, over the source's UTF-8 bytes. Every structural character is
-/// ASCII, so string contents are copied as byte runs; object keys that repeat within one parse
-/// share one key allocation.
-struct JsonBytes<'a> {
-    b: &'a [u8],
-    src: &'a str,
-    pos: usize,
-    keys: crate::fasthash::FastMap<&'a str, Rc<str>>,
-}
-
-impl<'a> JsonBytes<'a> {
-    fn new(src: &'a str) -> Self {
-        JsonBytes {
-            b: src.as_bytes(),
-            src,
-            pos: 0,
-            keys: Default::default(),
-        }
-    }
-
-    #[inline]
-    fn ws(&mut self) {
-        while let Some(&c) = self.b.get(self.pos) {
-            if matches!(c, b' ' | b'\t' | b'\n' | b'\r') {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-    }
-
-    #[inline]
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-
-    fn document(&mut self, i: &mut Interp) -> Result<Value, Value> {
-        let v = self.value(i)?;
-        self.ws();
-        if self.pos != self.b.len() {
-            return Err(i.make_error("SyntaxError", "Unexpected non-whitespace after JSON"));
-        }
-        Ok(v)
-    }
-
-    fn value(&mut self, i: &mut Interp) -> Result<Value, Value> {
-        self.ws();
-        let Some(c) = self.peek() else {
-            return Err(i.make_error("SyntaxError", "Unexpected end of JSON input"));
-        };
-        match c {
-            b'{' => {
-                self.pos += 1;
-                ab(i.check_native_stack())?;
-                let obj = i.new_object();
-                self.ws();
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                    return Ok(Value::Obj(obj));
-                }
-                loop {
-                    self.ws();
-                    if self.peek() != Some(b'"') {
-                        return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
-                    }
-                    let key = self.key(i)?;
-                    self.ws();
-                    if self.peek() != Some(b':') {
-                        return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
-                    }
-                    self.pos += 1;
-                    let v = self.value(i)?;
-                    obj.borrow_mut().props.insert(key, Property::plain(v));
-                    self.ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => {
-                            self.pos += 1;
-                            break;
-                        }
-                        _ => {
-                            return Err(
-                                i.make_error("SyntaxError", "Expected ',' or '}' in JSON object")
-                            );
-                        }
-                    }
-                }
-                Ok(Value::Obj(obj))
-            }
-            b'[' => {
-                self.pos += 1;
-                ab(i.check_native_stack())?;
-                let mut items = Vec::new();
-                self.ws();
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                    return Ok(i.make_array(items));
-                }
-                loop {
-                    items.push(self.value(i)?);
-                    self.ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {
-                            self.pos += 1;
-                            break;
-                        }
-                        _ => {
-                            return Err(
-                                i.make_error("SyntaxError", "Expected ',' or ']' in JSON array")
-                            );
-                        }
-                    }
-                }
-                Ok(i.make_array(items))
-            }
-            b'"' => {
-                let s = self.string(i)?;
-                Ok(match s {
-                    Ok(raw) => Value::str(raw),
-                    Err(owned) => Value::from_string(owned),
-                })
-            }
-            b't' => self.lit(i, b"true", Value::Bool(true)),
-            b'f' => self.lit(i, b"false", Value::Bool(false)),
-            b'n' => self.lit(i, b"null", Value::Null),
-            b'-' | b'0'..=b'9' => self.number(i),
-            _ => Err(i.make_error("SyntaxError", "Unexpected token in JSON")),
-        }
-    }
-
-    fn lit(&mut self, i: &mut Interp, lit: &[u8], v: Value) -> Result<Value, Value> {
-        if self.b[self.pos..].starts_with(lit) {
-            self.pos += lit.len();
-            Ok(v)
-        } else {
-            Err(i.make_error("SyntaxError", "Invalid literal in JSON"))
-        }
-    }
-
-    fn number(&mut self, i: &mut Interp) -> Result<Value, Value> {
-        // Strict JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no leading zeros, a
-        // mandatory integer part, and at least one digit after `.` / exponent.
-        let start = self.pos;
-        let digits = |p: &mut usize, b: &[u8]| {
-            let s = *p;
-            while b.get(*p).is_some_and(|c| c.is_ascii_digit()) {
-                *p += 1;
-            }
-            *p - s
-        };
-        let neg = self.peek() == Some(b'-');
-        if neg {
-            self.pos += 1;
-        }
-        let int_start = self.pos;
-        match self.peek() {
-            Some(b'0') => self.pos += 1,
-            Some(b'1'..=b'9') => {
-                digits(&mut self.pos, self.b);
-            }
-            _ => return Err(i.make_error("SyntaxError", "Invalid number in JSON")),
-        }
-        let int_end = self.pos;
-        let mut simple = true;
-        if self.peek() == Some(b'.') {
-            simple = false;
-            self.pos += 1;
-            if digits(&mut self.pos, self.b) == 0 {
-                return Err(i.make_error("SyntaxError", "Invalid number in JSON"));
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            simple = false;
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            if digits(&mut self.pos, self.b) == 0 {
-                return Err(i.make_error("SyntaxError", "Invalid number in JSON"));
-            }
-        }
-        if simple && int_end - int_start <= 15 {
-            let mut n = 0u64;
-            for &c in &self.b[int_start..int_end] {
-                n = n * 10 + (c - b'0') as u64;
-            }
-            let n = n as f64;
-            return Ok(Value::Num(if neg { -n } else { n }));
-        }
-        self.src[start..self.pos]
-            .parse::<f64>()
-            .map(Value::Num)
-            .map_err(|_| i.make_error("SyntaxError", "Invalid number in JSON"))
-    }
-
-    /// An object key, shared across the parse when it has no escapes.
-    fn key(&mut self, i: &mut Interp) -> Result<Rc<str>, Value> {
-        match self.string(i)? {
-            Ok(raw) => {
-                if let Some(k) = self.keys.get(raw) {
-                    return Ok(k.clone());
-                }
-                let k: Rc<str> = Rc::from(raw);
-                self.keys.insert(raw, k.clone());
-                Ok(k)
-            }
-            Err(owned) => Ok(Rc::from(owned)),
-        }
-    }
-
-    /// A string literal at `pos` (on its opening quote): `Ok(slice)` when it is a verbatim span
-    /// of the source (no escapes), else `Err(decoded)`.
-    fn string(&mut self, i: &mut Interp) -> Result<Result<&'a str, String>, Value> {
-        self.pos += 1; // opening quote
-        let start = self.pos;
-        // Fast scan: the common escape-free literal is a slice of the (canonical) source.
-        loop {
-            match self.b.get(self.pos) {
-                None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),
-                Some(b'"') => {
-                    let s = &self.src[start..self.pos];
-                    self.pos += 1;
-                    return Ok(Ok(s));
-                }
-                Some(b'\\') => break,
-                Some(&c) if c < 0x20 => {
-                    return Err(
-                        i.make_error("SyntaxError", "Unescaped control character in JSON string")
-                    );
-                }
-                Some(_) => self.pos += 1,
-            }
-        }
-        let mut s = String::from(&self.src[start..self.pos]);
-        let mut surrogate = false;
-        loop {
-            let run = self.pos;
-            loop {
-                match self.b.get(self.pos) {
-                    None => return Err(i.make_error("SyntaxError", "Unterminated JSON string")),
-                    Some(b'"' | b'\\') => break,
-                    Some(&c) if c < 0x20 => {
-                        return Err(i.make_error(
-                            "SyntaxError",
-                            "Unescaped control character in JSON string",
-                        ));
-                    }
-                    Some(_) => self.pos += 1,
-                }
-            }
-            s.push_str(&self.src[run..self.pos]);
-            if self.b[self.pos] == b'"' {
-                self.pos += 1;
-                break;
-            }
-            self.pos += 1; // backslash
-            let Some(e) = self.peek() else {
-                return Err(i.make_error("SyntaxError", "Bad escape in JSON"));
-            };
-            self.pos += 1;
-            match e {
-                b'"' => s.push('"'),
-                b'\\' => s.push('\\'),
-                b'/' => s.push('/'),
-                b'n' => s.push('\n'),
-                b't' => s.push('\t'),
-                b'r' => s.push('\r'),
-                b'b' => s.push('\u{0008}'),
-                b'f' => s.push('\u{000C}'),
-                b'u' => {
-                    let n = self
-                        .hex4(self.pos)
-                        .ok_or_else(|| i.make_error("SyntaxError", "Bad \\u escape in JSON"))?;
-                    self.pos += 4;
-                    if (0xD800..0xDC00).contains(&n)
-                        && self.b.get(self.pos) == Some(&b'\\')
-                        && self.b.get(self.pos + 1) == Some(&b'u')
-                    {
-                        // A high surrogate followed by \uDCxx forms a pair.
-                        if let Some(n2) = self.hex4(self.pos + 2) {
-                            if (0xDC00..0xE000).contains(&n2) {
-                                self.pos += 6;
-                                let c = 0x10000 + ((n - 0xD800) << 10) + (n2 - 0xDC00);
-                                s.push(char::from_u32(c).unwrap());
-                                continue;
-                            }
-                        }
-                    }
-                    if (0xD800..0xE000).contains(&n) {
-                        surrogate = true;
-                        s.push(crate::jstr::smuggle(n as u16));
-                    } else {
-                        s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
-                    }
-                }
-                _ => return Err(i.make_error("SyntaxError", "Bad escape in JSON")),
-            }
-        }
-        if surrogate {
-            // An escaped lone half next to a (literal or escaped) partner recombines.
-            if let Some(c) = crate::jstr::canonicalize(&s) {
-                s = c;
-            }
-        }
-        Ok(Err(s))
-    }
-
-    fn hex4(&self, at: usize) -> Option<u32> {
-        let h = self.b.get(at..at + 4)?;
-        let mut n = 0u32;
-        for &c in h {
-            n = n * 16 + (c as char).to_digit(16)?;
-        }
-        Some(n)
-    }
-}
-
-fn json_skip_ws(chars: &[char], pos: &mut usize) {
-    while *pos < chars.len() && matches!(chars[*pos], ' ' | '\t' | '\n' | '\r') {
-        *pos += 1;
-    }
-}
-
-fn json_parse_value(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<Value, Value> {
-    json_skip_ws(chars, pos);
-    let c = *chars
-        .get(*pos)
-        .ok_or_else(|| i.make_error("SyntaxError", "Unexpected end of JSON input"))?;
-    match c {
-        '{' => {
-            *pos += 1;
-            ab(i.check_native_stack())?;
-            let obj = i.new_object();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&'}') {
-                *pos += 1;
-                return Ok(Value::Obj(obj));
-            }
-            loop {
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'"') {
-                    return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
-                }
-                let key = json_parse_string(i, chars, pos)?;
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&':') {
-                    return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
-                }
-                *pos += 1;
-                let v = json_parse_value(i, chars, pos)?;
-                set_data(&obj, &key, v);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
-                    Some(',') => {
-                        *pos += 1;
-                    }
-                    Some('}') => {
-                        *pos += 1;
-                        break;
-                    }
-                    _ => {
-                        return Err(
-                            i.make_error("SyntaxError", "Expected ',' or '}' in JSON object")
-                        );
-                    }
-                }
-            }
-            Ok(Value::Obj(obj))
-        }
-        '[' => {
-            *pos += 1;
-            ab(i.check_native_stack())?;
-            let mut items = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&']') {
-                *pos += 1;
-                return Ok(i.make_array(items));
-            }
-            loop {
-                items.push(json_parse_value(i, chars, pos)?);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
-                    Some(',') => {
-                        *pos += 1;
-                    }
-                    Some(']') => {
-                        *pos += 1;
-                        break;
-                    }
-                    _ => {
-                        return Err(
-                            i.make_error("SyntaxError", "Expected ',' or ']' in JSON array")
-                        );
-                    }
-                }
-            }
-            Ok(i.make_array(items))
-        }
-        '"' => Ok(Value::from_string(json_parse_string(i, chars, pos)?)),
-        't' => json_parse_lit(i, chars, pos, "true", Value::Bool(true)),
-        'f' => json_parse_lit(i, chars, pos, "false", Value::Bool(false)),
-        'n' => json_parse_lit(i, chars, pos, "null", Value::Null),
-        '-' | '0'..='9' => {
-            let start = *pos;
-            // Strict JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)? — no leading
-            // zeros, a mandatory integer part, and at least one digit after `.` / exponent.
-            let err = || i.make_error("SyntaxError", "Invalid number in JSON");
-            let at = |p: usize| chars.get(p).copied();
-            if at(*pos) == Some('-') {
-                *pos += 1;
-            }
-            match at(*pos) {
-                Some('0') => *pos += 1,
-                Some('1'..='9') => {
-                    while matches!(at(*pos), Some('0'..='9')) {
-                        *pos += 1;
-                    }
-                }
-                _ => return Err(err()),
-            }
-            if at(*pos) == Some('.') {
-                *pos += 1;
-                if !matches!(at(*pos), Some('0'..='9')) {
-                    return Err(err());
-                }
-                while matches!(at(*pos), Some('0'..='9')) {
-                    *pos += 1;
-                }
-            }
-            if matches!(at(*pos), Some('e' | 'E')) {
-                *pos += 1;
-                if matches!(at(*pos), Some('+' | '-')) {
-                    *pos += 1;
-                }
-                if !matches!(at(*pos), Some('0'..='9')) {
-                    return Err(err());
-                }
-                while matches!(at(*pos), Some('0'..='9')) {
-                    *pos += 1;
-                }
-            }
-            let s: String = chars[start..*pos].iter().collect();
-            s.parse::<f64>().map(Value::Num).map_err(|_| err())
-        }
-        _ => Err(i.make_error("SyntaxError", "Unexpected token in JSON")),
-    }
-}
-
 /// A parallel parse tree recording the source text of every primitive leaf, so the JSON.parse
 /// reviver can receive a `context` argument with a `source` property (ES2025 source-text access).
 enum JsonRecord {
@@ -1093,177 +554,201 @@ enum JsonRecord {
     Obj(Vec<(String, JsonRecord)>),
 }
 
-/// Mirror of `json_parse_value` that also returns a `JsonRecord`. Containers are framed inline;
-/// primitive leaves delegate to `json_parse_value` and capture their exact source span.
-fn json_parse_recorded(
-    i: &mut Interp,
-    chars: &[char],
-    pos: &mut usize,
-) -> Result<(Value, JsonRecord), Value> {
-    json_skip_ws(chars, pos);
-    let c = *chars
-        .get(*pos)
-        .ok_or_else(|| i.make_error("SyntaxError", "Unexpected end of JSON input"))?;
-    match c {
-        '{' => {
-            *pos += 1;
-            ab(i.check_native_stack())?;
-            let obj = i.new_object();
-            let mut rec: Vec<(String, JsonRecord)> = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&'}') {
-                *pos += 1;
-                return Ok((Value::Obj(obj), JsonRecord::Obj(rec)));
-            }
-            loop {
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&'"') {
-                    return Err(i.make_error("SyntaxError", "Expected string key in JSON object"));
-                }
-                let key = json_parse_string(i, chars, pos)?;
-                json_skip_ws(chars, pos);
-                if chars.get(*pos) != Some(&':') {
-                    return Err(i.make_error("SyntaxError", "Expected ':' in JSON object"));
-                }
-                *pos += 1;
-                let (v, vr) = json_parse_recorded(i, chars, pos)?;
-                set_data(&obj, &key, v);
-                rec.retain(|(k, _)| k != &key);
-                rec.push((key, vr));
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
-                    Some(',') => *pos += 1,
-                    Some('}') => {
-                        *pos += 1;
-                        break;
-                    }
-                    _ => {
-                        return Err(
-                            i.make_error("SyntaxError", "Expected ',' or '}' in JSON object")
-                        );
-                    }
-                }
-            }
-            Ok((Value::Obj(obj), JsonRecord::Obj(rec)))
-        }
-        '[' => {
-            *pos += 1;
-            ab(i.check_native_stack())?;
-            let mut items = Vec::new();
-            let mut rec = Vec::new();
-            json_skip_ws(chars, pos);
-            if chars.get(*pos) == Some(&']') {
-                *pos += 1;
-                return Ok((i.make_array(items), JsonRecord::Arr(rec)));
-            }
-            loop {
-                let (v, vr) = json_parse_recorded(i, chars, pos)?;
-                items.push(v);
-                rec.push(vr);
-                json_skip_ws(chars, pos);
-                match chars.get(*pos) {
-                    Some(',') => *pos += 1,
-                    Some(']') => {
-                        *pos += 1;
-                        break;
-                    }
-                    _ => {
-                        return Err(
-                            i.make_error("SyntaxError", "Expected ',' or ']' in JSON array")
-                        );
-                    }
-                }
-            }
-            Ok((i.make_array(items), JsonRecord::Arr(rec)))
-        }
-        _ => {
-            let start = *pos;
-            let v = json_parse_value(i, chars, pos)?;
-            let src: String = chars[start..*pos].iter().collect();
-            Ok((v.clone(), JsonRecord::Prim(src, v)))
-        }
+const PARSE: json::Options = json::Options {
+    strict: true,
+    constants: false,
+    jsonc: false,
+    spelling: json::Spelling::Utf16,
+};
+
+fn parse_error(i: &mut Interp, src: &str, e: json::Error) -> Value {
+    use json::ErrorKind as K;
+    if e.kind == K::ExpectingValue && e.pos >= src.len() {
+        return i.make_error("SyntaxError", "Unexpected end of JSON input");
+    }
+    let what = match e.kind {
+        K::ExpectingValue => "Unexpected token",
+        K::ExpectingKey => "Expected property name",
+        K::ExpectingColon => "Expected ':' after property name",
+        K::ExpectingComma => "Expected ',' or closing bracket",
+        K::ExtraData => "Unexpected non-whitespace character after JSON",
+        K::UnterminatedString => "Unterminated string",
+        K::ControlCharacter => "Bad control character in string literal",
+        K::BadEscape => "Bad escaped character",
+        K::BadUnicodeEscape => "Bad Unicode escape",
+        K::UnterminatedComment | K::TooDeep => e.kind.message(),
+    };
+    let at = crate::jstr::unit_len(&src[..e.pos.min(src.len())]);
+    i.make_error("SyntaxError", format!("{what} in JSON at position {at}"))
+}
+
+/// A decoded string in canonical UTF-16 spelling: an escaped lone half next to a (literal or
+/// escaped) partner recombines.
+fn js_text(s: json::Str<'_>) -> Cow<'_, str> {
+    match s.text {
+        Cow::Owned(o) if s.lone_surrogate => Cow::Owned(crate::jstr::canonicalize(&o).unwrap_or(o)),
+        text => text,
     }
 }
 
-fn json_parse_lit(
-    i: &mut Interp,
-    chars: &[char],
-    pos: &mut usize,
-    lit: &str,
-    val: Value,
-) -> Result<Value, Value> {
-    for expect in lit.chars() {
-        if chars.get(*pos) != Some(&expect) {
-            return Err(i.make_error("SyntaxError", "Invalid literal in JSON"));
-        }
-        *pos += 1;
+fn js_string(s: json::Str<'_>) -> Value {
+    match js_text(s) {
+        Cow::Borrowed(b) => Value::str(b),
+        Cow::Owned(o) => Value::from_string(o),
     }
-    Ok(val)
 }
 
-fn json_parse_string(i: &mut Interp, chars: &[char], pos: &mut usize) -> Result<String, Value> {
-    *pos += 1; // opening quote
-    let mut s = String::new();
-    loop {
-        let c = *chars
-            .get(*pos)
-            .ok_or_else(|| i.make_error("SyntaxError", "Unterminated JSON string"))?;
-        *pos += 1;
-        match c {
-            '"' => return Ok(s),
-            '\\' => {
-                let e = *chars
-                    .get(*pos)
-                    .ok_or_else(|| i.make_error("SyntaxError", "Bad escape in JSON"))?;
-                *pos += 1;
-                match e {
-                    '"' => s.push('"'),
-                    '\\' => s.push('\\'),
-                    '/' => s.push('/'),
-                    'n' => s.push('\n'),
-                    't' => s.push('\t'),
-                    'r' => s.push('\r'),
-                    'b' => s.push('\u{0008}'),
-                    'f' => s.push('\u{000C}'),
-                    'u' => {
-                        let hex: String = chars[*pos..(*pos + 4).min(chars.len())].iter().collect();
-                        *pos += 4;
-                        let n = u32::from_str_radix(&hex, 16)
-                            .map_err(|_| i.make_error("SyntaxError", "Bad \\u escape in JSON"))?;
-                        if (0xD800..0xDC00).contains(&n)
-                            && chars.get(*pos) == Some(&'\\')
-                            && chars.get(*pos + 1) == Some(&'u')
-                        {
-                            // A high surrogate followed by \uDCxx forms a pair.
-                            let hex2: String = chars
-                                [(*pos + 2).min(chars.len())..(*pos + 6).min(chars.len())]
-                                .iter()
-                                .collect();
-                            if let Ok(n2) = u32::from_str_radix(&hex2, 16) {
-                                if (0xDC00..0xE000).contains(&n2) {
-                                    *pos += 6;
-                                    let c = 0x10000 + ((n - 0xD800) << 10) + (n2 - 0xDC00);
-                                    s.push(char::from_u32(c).unwrap());
-                                    continue;
-                                }
-                            }
-                        }
-                        if (0xD800..0xE000).contains(&n) {
-                            s.push(crate::jstr::smuggle(n as u16));
-                        } else {
-                            s.push(char::from_u32(n).unwrap_or('\u{FFFD}'));
-                        }
-                    }
-                    _ => return Err(i.make_error("SyntaxError", "Bad escape in JSON")),
+fn js_constant(c: json::Constant) -> Value {
+    Value::Num(match c {
+        json::Constant::NaN => f64::NAN,
+        json::Constant::Infinity => f64::INFINITY,
+        json::Constant::NegInfinity => f64::NEG_INFINITY,
+    })
+}
+
+/// JSON.parse without a reviver. Object keys that repeat within one parse share one key
+/// allocation.
+struct JsSink<'i, 'a> {
+    i: &'i mut Interp,
+    src: &'a str,
+    keys: crate::fasthash::FastMap<&'a str, Rc<str>>,
+}
+
+impl<'i, 'a> JsSink<'i, 'a> {
+    fn new(i: &'i mut Interp, src: &'a str) -> Self {
+        JsSink { i, src, keys: Default::default() }
+    }
+}
+
+impl<'a> json::Sink<'a> for JsSink<'_, 'a> {
+    type Value = Value;
+    type Key = Rc<str>;
+    type Object = Gc;
+    type Array = Vec<Value>;
+    type Error = Value;
+
+    fn error(&mut self, e: json::Error) -> Value {
+        parse_error(self.i, self.src, e)
+    }
+    fn enter(&mut self) -> Result<(), Value> {
+        ab(self.i.check_native_stack())
+    }
+    fn null(&mut self) -> Result<Value, Value> {
+        Ok(Value::Null)
+    }
+    fn bool(&mut self, b: bool) -> Result<Value, Value> {
+        Ok(Value::Bool(b))
+    }
+    fn number(&mut self, n: json::Number<'a>) -> Result<Value, Value> {
+        Ok(Value::Num(n.to_f64()))
+    }
+    fn string(&mut self, s: json::Str<'a>) -> Result<Value, Value> {
+        Ok(js_string(s))
+    }
+    fn constant(&mut self, c: json::Constant) -> Result<Value, Value> {
+        Ok(js_constant(c))
+    }
+    fn object(&mut self) -> Result<Gc, Value> {
+        Ok(self.i.new_object())
+    }
+    #[inline]
+    fn key(&mut self, s: json::Str<'a>) -> Result<Rc<str>, Value> {
+        Ok(match js_text(s) {
+            Cow::Borrowed(raw) => {
+                if let Some(k) = self.keys.get(raw) {
+                    return Ok(k.clone());
                 }
+                let k: Rc<str> = Rc::from(raw);
+                self.keys.insert(raw, k.clone());
+                k
             }
-            // Unescaped control characters (U+0000–U+001F) are not allowed in JSON strings.
-            c if (c as u32) < 0x20 => {
-                return Err(
-                    i.make_error("SyntaxError", "Unescaped control character in JSON string")
-                );
-            }
-            c => s.push(c),
-        }
+            Cow::Owned(o) => Rc::from(o),
+        })
+    }
+    fn member(&mut self, obj: &mut Gc, key: Rc<str>, v: Value) -> Result<(), Value> {
+        obj.borrow_mut().props.insert(key, Property::plain(v));
+        Ok(())
+    }
+    fn end_object(&mut self, obj: Gc) -> Result<Value, Value> {
+        Ok(Value::Obj(obj))
+    }
+    fn array(&mut self) -> Result<Vec<Value>, Value> {
+        Ok(Vec::new())
+    }
+    fn element(&mut self, arr: &mut Vec<Value>, v: Value) -> Result<(), Value> {
+        arr.push(v);
+        Ok(())
+    }
+    fn end_array(&mut self, arr: Vec<Value>) -> Result<Value, Value> {
+        Ok(self.i.make_array(arr))
+    }
+}
+
+/// JSON.parse with a reviver: each value paired with its [`JsonRecord`].
+struct RecordSink<'i, 'a> {
+    i: &'i mut Interp,
+    src: &'a str,
+}
+
+impl RecordSink<'_, '_> {
+    fn prim(v: Value, src: &str) -> Result<(Value, JsonRecord), Value> {
+        Ok((v.clone(), JsonRecord::Prim(src.to_string(), v)))
+    }
+}
+
+impl<'a> json::Sink<'a> for RecordSink<'_, 'a> {
+    type Value = (Value, JsonRecord);
+    type Key = String;
+    type Object = (Gc, Vec<(String, JsonRecord)>);
+    type Array = (Vec<Value>, Vec<JsonRecord>);
+    type Error = Value;
+
+    fn error(&mut self, e: json::Error) -> Value {
+        parse_error(self.i, self.src, e)
+    }
+    fn enter(&mut self) -> Result<(), Value> {
+        ab(self.i.check_native_stack())
+    }
+    fn null(&mut self) -> Result<Self::Value, Value> {
+        Self::prim(Value::Null, "null")
+    }
+    fn bool(&mut self, b: bool) -> Result<Self::Value, Value> {
+        Self::prim(Value::Bool(b), if b { "true" } else { "false" })
+    }
+    fn number(&mut self, n: json::Number<'a>) -> Result<Self::Value, Value> {
+        Self::prim(Value::Num(n.to_f64()), n.text)
+    }
+    fn string(&mut self, s: json::Str<'a>) -> Result<Self::Value, Value> {
+        let raw = &self.src[s.start..s.end];
+        Self::prim(js_string(s), raw)
+    }
+    fn constant(&mut self, c: json::Constant) -> Result<Self::Value, Value> {
+        Self::prim(js_constant(c), c.text())
+    }
+    fn object(&mut self) -> Result<Self::Object, Value> {
+        Ok((self.i.new_object(), Vec::new()))
+    }
+    fn key(&mut self, s: json::Str<'a>) -> Result<String, Value> {
+        Ok(js_text(s).into_owned())
+    }
+    fn member(&mut self, obj: &mut Self::Object, key: String, v: Self::Value) -> Result<(), Value> {
+        set_data(&obj.0, &key, v.0);
+        obj.1.retain(|(k, _)| k != &key);
+        obj.1.push((key, v.1));
+        Ok(())
+    }
+    fn end_object(&mut self, obj: Self::Object) -> Result<Self::Value, Value> {
+        Ok((Value::Obj(obj.0), JsonRecord::Obj(obj.1)))
+    }
+    fn array(&mut self) -> Result<Self::Array, Value> {
+        Ok((Vec::new(), Vec::new()))
+    }
+    fn element(&mut self, arr: &mut Self::Array, v: Self::Value) -> Result<(), Value> {
+        arr.0.push(v.0);
+        arr.1.push(v.1);
+        Ok(())
+    }
+    fn end_array(&mut self, arr: Self::Array) -> Result<Self::Value, Value> {
+        Ok((self.i.make_array(arr.0), JsonRecord::Arr(arr.1)))
     }
 }

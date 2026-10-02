@@ -323,6 +323,7 @@ dependencies = [
 name = "cpython-test-runner"
 version = "0.1.3"
 dependencies = [
+ "lumen-common",
  "lumen-os",
 ]
 
@@ -790,6 +791,7 @@ version = "0.1.3"
 dependencies = [
  "lumen",
  "lumen-aot-macros",
+ "lumen-common",
  "lumen-runtime",
 ]
 
@@ -798,6 +800,7 @@ name = "lumen-aot-macros"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-common",
 ]
 
 [[package]]
@@ -817,6 +820,7 @@ name = "lumen-cli"
 version = "0.1.3"
 dependencies = [
  "lumen",
+ "lumen-common",
  "lumen-host",
  "lumen-repl",
  "lumen-runtime",

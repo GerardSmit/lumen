@@ -1043,7 +1043,7 @@ impl Runtime {
                if (globalThis.WebAssembly) {{ delete WebAssembly.compileStreaming; delete WebAssembly.instantiateStreaming; }}\
              }} \
              const apply = globalThis.__lumenApplyOptions; delete globalThis.__lumenApplyOptions; if (apply) apply();",
-            js_quote(json)
+            js_source_string(json)
         );
         let _ = self.engine.eval(&src, false);
     }
@@ -1645,25 +1645,6 @@ fn report_load_stats(what: &str, t0: Instant) {
     );
 }
 
-fn js_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\u{2028}' => out.push_str("\\u2028"),
-            '\u{2029}' => out.push_str("\\u2029"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 static TRACE_ATOMICS_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Print each `Atomics.wait` step of `engine` the way Node's `--trace-atomics-wait` does; the
@@ -1694,4 +1675,8 @@ pub(crate) fn install_atomics_wait_trace(engine: &mut Engine, thread_id: u64) {
 
 pub(crate) fn atomics_wait_trace_enabled() -> bool {
     TRACE_ATOMICS_WAIT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn js_source_string(s: &str) -> String {
+    lumen_common::json::quote(s, &lumen_common::json::Quote::JS_SOURCE)
 }
