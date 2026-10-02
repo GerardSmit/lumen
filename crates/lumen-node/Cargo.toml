@@ -42,7 +42,7 @@ chacha20poly1305 = "0.10"
 ghash = "0.5"
 poly1305 = "0.8"
 ocb3 = "0.1"
-rsa = { version = "0.9", features = ["sha2", "sha1", "pem"] }
+rsa = { version = "0.9", features = ["sha2", "sha1", "pem", "hazmat"] }
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p384 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
@@ -63,6 +63,12 @@ der = { version = "0.7", features = ["alloc", "oid", "pem"] }
 x509-cert = "0.2"
 num-bigint-dig = { version = "0.8", features = ["prime", "rand"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Constant-time bignum arithmetic and prime generation for finite-field DH and `generatePrime`.
+# They speak rand_core 0.10; `crypto::rng::SysRng` serves both rand_core generations.
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc", "rand_core"] }
+crypto-primes = "0.7"
+rand_core10 = { package = "rand_core", version = "0.10", default-features = false }
+digest = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libsqlite3-sys = { version = "0.37", optional = true, features = ["bundled", "column_metadata"] }

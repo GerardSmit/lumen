@@ -453,7 +453,7 @@ impl OkpKey {
     }
 
     pub fn ed448_verifying(&self) -> KResult<ed448_goldilocks_plus::VerifyingKey> {
-        ed448_goldilocks_plus::VerifyingKey::from_bytes(&self.public_array::<57>()?.into()).map_err(|_| decoder_unsupported())
+        ed448_goldilocks_plus::VerifyingKey::from_bytes(&self.public_array::<57>()?).map_err(|_| decoder_unsupported())
     }
 
     pub fn x25519_secret(&self) -> KResult<x25519_dalek::StaticSecret> {
@@ -738,7 +738,7 @@ fn parse_spki(der: &[u8]) -> Option<KResult<AsymKey>> {
                 ed25519_dalek::VerifyingKey::from_bytes(key.try_into().ok()?).is_ok()
             } else {
                 let arr: [u8; 57] = key.try_into().ok()?;
-                ed448_goldilocks_plus::VerifyingKey::from_bytes(&arr.into()).is_ok()
+                ed448_goldilocks_plus::VerifyingKey::from_bytes(&arr).is_ok()
             };
             if !ok {
                 return None;
@@ -775,7 +775,7 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
     if oid == asn1::OID_DSA {
         let (p, q, g) = three_ints(&params?.1)?;
         let x = Reader::new(key).biguint()?;
-        let y = g.modpow(&x, &p);
+        let y = crate::crypto::bignum::modpow(&g, &x, &p)?;
         return Some(Ok(AsymKey::Dsa(DsaKey { p, q, g, y, x: Some(x) })));
     }
     if oid == asn1::OID_EC {
@@ -795,7 +795,7 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
     if oid == asn1::OID_DH || oid == asn1::OID_DHX {
         let (p, g, q) = dh_params(&oid, &params)?;
         let x = Reader::new(key).biguint()?;
-        let y = g.modpow(&x, &p);
+        let y = crate::crypto::bignum::modpow(&g, &x, &p)?;
         return Some(Ok(AsymKey::Dh(DhKey { p, g, q, y, x: Some(x) })));
     }
     None

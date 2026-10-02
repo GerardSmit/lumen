@@ -9,11 +9,13 @@
 
 use lumen::embed::{Ctx, Value};
 
+mod bignum;
 mod cipher;
 mod core;
 mod dh;
 mod keys;
 mod prime;
+mod rng;
 mod sign;
 mod x509;
 

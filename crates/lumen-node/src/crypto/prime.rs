@@ -1,11 +1,9 @@
 //! Prime generation and testing (`generatePrime`, `checkPrime`).
 
 use lumen::embed::{OpError, SendError};
-use num_bigint_dig::prime::probably_prime;
-use num_bigint_dig::{BigUint, RandBigInt, RandPrime};
-use rand_core::OsRng;
+use num_bigint_dig::BigUint;
 
-use super::keys::safe_prime;
+use super::bignum::{generate_prime, is_prime, random_range};
 
 
 #[lumen_bind::module(name = "crypto")]
@@ -34,8 +32,7 @@ fn generate(bits: u32, safe: bool, add: Option<&[u8]>, rem: Option<&[u8]>) -> Re
     }
     let bits = bits as usize;
     let Some(add) = add.map(BigUint::from_bytes_be) else {
-        let p = if safe { safe_prime(bits as u32)? } else { OsRng.gen_prime(bits) };
-        return Ok(p.to_bytes_be());
+        return Ok(generate_prime(bits as u32, safe).to_bytes_be());
     };
     let zero = BigUint::from(0u8);
     let one = BigUint::from(1u8);
@@ -53,12 +50,9 @@ fn generate(bits: u32, safe: bool, add: Option<&[u8]>, rem: Option<&[u8]>) -> Re
     }
     let top = &one << (bits - 1);
     for _ in 0..MAX_ATTEMPTS {
-        let c = OsRng.gen_biguint(bits) | &top;
+        let c = random_range(&top, &(&top << 1usize)).expect("non-empty range");
         let c = &c - (&c % &add) + &rem;
-        if c.bits() != bits || !probably_prime(&c, 20) {
-            continue;
-        }
-        if safe && !probably_prime(&((&c - &one) >> 1usize), 20) {
+        if c.bits() != bits || !is_prime(&c, safe) {
             continue;
         }
         return Ok(c.to_bytes_be());
@@ -77,18 +71,17 @@ fn prime_generate_async(bits: u32, safe: bool, add: Option<Vec<u8>>, rem: Option
     generate(bits, safe, add.as_deref(), rem.as_deref())
 }
 
-fn check(candidate: &[u8], checks: u32) -> bool {
-    let rounds = if checks == 0 { 20 } else { checks as usize };
-    probably_prime(&BigUint::from_bytes_be(candidate), rounds)
+fn check(candidate: &[u8]) -> bool {
+    is_prime(&BigUint::from_bytes_be(candidate), false)
 }
 
 #[op(name = "primeCheck")]
-fn prime_check(candidate: &[u8], checks: u32) -> bool {
-    check(candidate, checks)
+fn prime_check(candidate: &[u8], _checks: u32) -> bool {
+    check(candidate)
 }
 
 #[op(async, name = "primeCheckAsync")]
-fn prime_check_async(candidate: Vec<u8>, checks: u32) -> Result<bool, SendError> {
-    Ok(check(&candidate, checks))
+fn prime_check_async(candidate: Vec<u8>, _checks: u32) -> Result<bool, SendError> {
+    Ok(check(&candidate))
 }
 }
