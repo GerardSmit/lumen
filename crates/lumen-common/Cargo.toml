@@ -14,9 +14,9 @@ mem-stats = []
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
 # `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
 compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2"]
-# `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) over liblzma.
-# Needs a C toolchain, so it is unavailable on wasm32; enable it next to `compress`.
-lzma = ["compress", "dep:liblzma-sys"]
+# `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) in pure Rust:
+# the decoder is written in `compress::xz`, the encoders come from `lzma-rust2`.
+lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
 # `crypt`: MD5/SHA-crypt and bcrypt password hashes (`crypt(3)` formats), on `hash`.
 crypt = ["hash", "dep:bcrypt"]
 
@@ -40,17 +40,19 @@ libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "r
 brotli = { version = "8", optional = true }
 # bzip2 over the pure-Rust libbz2-rs-sys backend (the crate's default), so it also builds for wasm.
 bzip2 = { version = "0.6", optional = true }
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder"], optional = true }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
 # the browser build uses the pure-Rust ruzstd.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = { version = "0.13", optional = true }
-# xz / lzma: liblzma's exact behaviour (filters, checks, memory limits) is the contract of Python's
-# `lzma`; a pure-Rust codec offers no raw / alone / xz stream API with those semantics.
-liblzma-sys = { version = "0.4", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 ruzstd = { version = "0.8", optional = true }
+
+# The xz container writer, as an independent encoder for the decoder tests.
+[dev-dependencies]
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder", "xz"] }
 
 [lints]
 workspace = true

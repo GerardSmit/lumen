@@ -178,6 +178,9 @@ pub mod _lzma {
 
     /// `parse_filter_chain_spec`.
     fn parse_chain(it: &mut Interp, specs: &Value) -> R<Vec<Filter>> {
+        if matches!(specs, Value::Obj(o) if matches!(o.kind, Kind::Dict(_))) {
+            return Err(it.type_error("object of type 'dict' has no len()"));
+        }
         let n = it.len_of(specs)?;
         if n > FILTERS_MAX {
             return Err(it.value_error(&format!("Too many filters - liblzma supports a maximum of {FILTERS_MAX}")));
