@@ -21,6 +21,7 @@ pub mod signal;
 pub mod spawn;
 pub mod syslog;
 pub mod sysinfo;
+pub mod thread;
 pub mod time;
 pub mod tty;
 pub mod uv;

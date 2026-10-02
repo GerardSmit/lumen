@@ -557,6 +557,20 @@ impl Interp {
         }
     }
 
+    /// The innermost of `frames` (a suspended thread's stack, outermost first) as a snapshot
+    /// chained to its callers through `f_back`.
+    pub fn frame_chain_snapshot(&self, frames: &[Frame]) -> Value {
+        let mut back = None;
+        for f in frames {
+            let mut data = FrameObj::of(f);
+            data.serial = 0;
+            data.gen = None;
+            data.back = back;
+            back = Some(new_opaque(&self.types.frame, data));
+        }
+        back.unwrap_or(Value::None)
+    }
+
     pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32, lasti: u32) -> Value {
         let data = FrameObj { serial: 0, gen: None, dead: None, back: None, code, globals, line, lasti, trace: None, trace_lines: true, trace_opcodes: false };
         new_opaque(&self.types.frame, data)

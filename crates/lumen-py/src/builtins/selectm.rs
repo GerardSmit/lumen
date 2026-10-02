@@ -21,7 +21,7 @@ pub(crate) fn wait<T>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_once: i
             None => SLICE_MS,
         };
         let slice = left.min(SLICE_MS) as i32;
-        match wait_once(slice) {
+        match it.unlocked(|| wait_once(slice)) {
             Ok((false, _)) if left > i64::from(slice) => {}
             Ok((_, r)) => return Ok(r),
             Err(e) if e.errno() == 4 => {}

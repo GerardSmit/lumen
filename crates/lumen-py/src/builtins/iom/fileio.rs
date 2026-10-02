@@ -269,6 +269,7 @@ fn read_some(it: &mut Interp, fd: i32, buf: &mut [u8]) -> Result<usize, IoError>
     if fd == 0 {
         it.flush_out();
     }
+    it.wait_fd_quiet(fd, lumen_os::poll::POLLIN);
     it.platform.borrow_mut().fd_read(fd, buf, None)
 }
 

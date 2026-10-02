@@ -50,3 +50,4 @@ pub mod unicode_props;
 pub mod utf;
 pub mod xml;
 pub mod x509;
+pub mod wait;

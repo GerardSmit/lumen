@@ -743,6 +743,7 @@ pub mod posix {
         if length < 0 {
             return Err(it.os_error_errno(einval(), None, None));
         }
+        it.wait_fd(fd, lumen_os::poll::POLLIN)?;
         let mut buf = vec![0u8; length as usize];
         let r = it.platform.borrow_mut().fd_read(fd, &mut buf, None);
         let n = r.map_err(|e| os_err(it, e))?;
@@ -1050,14 +1051,14 @@ pub mod posix {
     /// Wait for completion of a given child process.
     #[op]
     fn waitpid(it: &mut Interp, pid: i32, options: i32) -> R<(i32, i32)> {
-        let r = it.platform.borrow_mut().waitpid(pid, options);
+        let r = it.waitpid_blocking(pid, options)?;
         r.map_err(|e| os_err(it, e))
     }
 
     /// Wait for completion of a child process.
     #[op]
     fn wait(it: &mut Interp) -> R<(i32, i32)> {
-        let r = it.platform.borrow_mut().waitpid(-1, 0);
+        let r = it.waitpid_blocking(-1, 0)?;
         r.map_err(|e| os_err(it, e))
     }
 

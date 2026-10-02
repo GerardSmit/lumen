@@ -230,6 +230,8 @@ pub struct Interp {
     /// `sys.settrace` / `sys.setprofile` / `sys.monitoring` state.
     pub mon: crate::trace::Monitor,
     pub frame_serial: std::cell::Cell<u64>,
+    /// The GIL and the bookkeeping of the interpreter's Python threads (see `threads`).
+    pub threads: crate::threads::Threads,
 }
 
 pub enum GenResult {
@@ -299,6 +301,7 @@ impl Interp {
             context: None,
             mon: crate::trace::Monitor::new(),
             frame_serial: std::cell::Cell::new(0),
+            threads: Default::default(),
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -349,6 +352,9 @@ impl Interp {
                 return Ok(data.len());
             }
         }
+        if fd > 2 {
+            self.wait_fd_quiet(fd, lumen_os::poll::POLLOUT);
+        }
         self.platform.borrow_mut().fd_write(fd, data, None)
     }
 
@@ -397,6 +403,7 @@ impl Interp {
         if self.frames.len() >= self.recursion_limit || lumen_common::stack::exhausted() {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
+        self.preempt();
         self.poll()?;
         if let Some(list) = &self.eval_record {
             if frame.func.is_some() {
@@ -881,6 +888,7 @@ impl Interp {
                         self.jump_event(crate::trace::ev::JUMP, src, t as usize)?;
                     }
                     if back {
+                        self.preempt();
                         self.poll()?;
                     }
                 }

@@ -27,6 +27,33 @@ thread_local! {
     static PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
+/// The weak-reference bookkeeping of the interpreter, which follows it from thread to thread as
+/// the GIL changes hands (see `threads`).
+pub(crate) struct WeakState {
+    registry: HashMap<u32, Vec<Weak<Object>>>,
+    active: bool,
+    dead: Vec<Obj>,
+    pending: bool,
+}
+
+pub(crate) fn state_take() -> WeakState {
+    WeakState {
+        registry: REGISTRY.with(|r| std::mem::take(&mut *r.borrow_mut())),
+        active: ACTIVE.with(|a| a.replace(false)),
+        dead: DEAD.with(|d| std::mem::take(&mut *d.borrow_mut())),
+        pending: PENDING.with(|p| p.replace(false)),
+    }
+}
+
+pub(crate) fn state_put(state: WeakState) {
+    let old = REGISTRY.with(|r| std::mem::replace(&mut *r.borrow_mut(), state.registry));
+    ACTIVE.with(|a| a.set(state.active));
+    let dead = DEAD.with(|d| std::mem::replace(&mut *d.borrow_mut(), state.dead));
+    PENDING.with(|p| p.set(state.pending));
+    drop(old);
+    drop(dead);
+}
+
 pub fn register(target: &Obj, weakref: &Obj) {
     ACTIVE.with(|a| a.set(true));
     let id = target.identity();

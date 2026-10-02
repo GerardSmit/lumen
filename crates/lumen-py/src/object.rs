@@ -63,6 +63,23 @@ thread_local! {
     static NEXT_ID: Cell<u32> = const { Cell::new(1) };
 }
 
+/// The identity numbers this thread has recycled and its next fresh one; they follow the
+/// interpreter from thread to thread as the GIL changes hands, so ids stay unique among its
+/// live objects.
+pub(crate) struct IdState {
+    free: Vec<u32>,
+    next: u32,
+}
+
+pub(crate) fn id_state_take() -> IdState {
+    IdState { free: FREE_IDS.with(|f| std::mem::take(&mut *f.borrow_mut())), next: NEXT_ID.with(|n| n.replace(1)) }
+}
+
+pub(crate) fn id_state_put(state: IdState) {
+    FREE_IDS.with(|f| *f.borrow_mut() = state.free);
+    NEXT_ID.with(|n| n.set(state.next));
+}
+
 impl Object {
     pub fn identity(&self) -> u32 {
         let cur = self.id.get();
