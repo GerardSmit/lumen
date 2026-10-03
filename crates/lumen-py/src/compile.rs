@@ -54,6 +54,9 @@ struct Unit<'a> {
     labels: Vec<u32>,
     consts: Vec<Value>,
     const_keys: BTreeMap<ConstKey, u32>,
+    /// `LoadConst` placeholders (op index, value) whose constants are appended after all others,
+    /// the order CPython's folding of constant tuples leaves them in.
+    deferred_consts: Vec<(usize, Value)>,
     names: Vec<Obj>,
     name_idx: BTreeMap<Rc<str>, u32>,
     varnames: Vec<Rc<str>>,
@@ -105,19 +108,7 @@ pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
 }
 
 fn label_of(op: &Op) -> Option<u32> {
-    match op {
-        Op::Jump(t)
-        | Op::JumpIfFalse(t)
-        | Op::JumpIfTrue(t)
-        | Op::JumpIfFalseKeep(t)
-        | Op::JumpIfTrueKeep(t)
-        | Op::ForIter(t)
-        | Op::SetupBlock(t)
-        | Op::SetupWith(t)
-        | Op::WithExceptEnd(t)
-        | Op::EndAsyncFor(t) => Some(*t),
-        _ => None,
-    }
+    op.jump_target()
 }
 
 fn with_label(op: Op, t: u32) -> Op {
@@ -239,6 +230,7 @@ impl<'a> Compiler<'a> {
             labels: Vec::new(),
             consts: Vec::new(),
             const_keys: BTreeMap::new(),
+            deferred_consts: Vec::new(),
             names: Vec::new(),
             name_idx: BTreeMap::new(),
             varnames,
@@ -256,6 +248,10 @@ impl<'a> Compiler<'a> {
 
     fn pop_unit(&mut self, args: &Arguments, first_line: u32) -> Rc<Code> {
         let mut u = self.units.pop().unwrap();
+        for (at, v) in std::mem::take(&mut u.deferred_consts) {
+            u.consts.push(v);
+            u.ops[at] = Op::LoadConst((u.consts.len() - 1) as u32);
+        }
         let labels = std::mem::take(&mut u.labels);
         for op in u.ops.iter_mut() {
             if let Some(l) = label_of(op) {
@@ -312,6 +308,8 @@ impl<'a> Compiler<'a> {
             flags,
             cell_args,
             doc,
+            pyobj: Default::default(),
+            info: Default::default(),
         })
     }
 
@@ -1612,6 +1610,9 @@ impl<'a> Compiler<'a> {
         if self.st.scopes[p.scope].ann == Some(AnnKind::TypeParams) && self.units.len() >= 2 {
             p = &self.units[self.units.len() - 2];
         }
+        if p.kind != UnitKind::Module && self.st.scopes[p.scope].sym_scope(&mangle(&p.private, name)) == Sc::GlobalExplicit {
+            return name.into();
+        }
         match p.kind {
             UnitKind::Module => name.into(),
             UnitKind::Class => format!("{}.{}", p.qualname, name).into(),
@@ -1632,7 +1633,7 @@ impl<'a> Compiler<'a> {
             self.emit(Op::BuildTuple(code.freevars.len() as u32));
             flags |= MF_CLOSURE;
         }
-        let ci = self.const_idx(Value::Obj(Object::new(Kind::Code(code))));
+        let ci = self.const_idx(Value::Obj(Code::object(&code)));
         self.emit(Op::LoadConst(ci));
         self.emit(Op::MakeFunction(flags));
         Ok(())
@@ -1751,9 +1752,15 @@ impl<'a> Compiler<'a> {
         }
         match body {
             FnBody::Stmts(stmts) => {
-                if let Some(d) = docstring(stmts) {
-                    doc = Some(Value::str(&d));
-                }
+                let first_const = match docstring(stmts) {
+                    Some(d) => {
+                        let v = Value::str(&d);
+                        doc = Some(v.clone());
+                        v
+                    }
+                    None => Value::None,
+                };
+                self.const_idx(first_const);
                 self.stmts(stmts)?;
                 self.load_const(Value::None);
                 self.emit(Op::ReturnValue);
@@ -1782,10 +1789,23 @@ impl<'a> Compiler<'a> {
     fn function_defaults(&mut self, args: &'a Arguments) -> CResult<u32> {
         let mut flags = 0;
         if !args.defaults.is_empty() {
-            for d in &args.defaults {
-                self.expr(d)?;
+            let folded: Option<Vec<Value>> = args
+                .defaults
+                .iter()
+                .map(|d| match &d.kind {
+                    ExprKind::Constant(c) => Some(const_value(c)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(items) = folded {
+                let at = self.emit(Op::LoadConst(0));
+                self.u().deferred_consts.push((at, Value::tuple(items)));
+            } else {
+                for d in &args.defaults {
+                    self.expr(d)?;
+                }
+                self.emit(Op::BuildTuple(args.defaults.len() as u32));
             }
-            self.emit(Op::BuildTuple(args.defaults.len() as u32));
             flags |= MF_DEFAULTS;
         }
         let kwd: Vec<(&Arg, &Expr)> =

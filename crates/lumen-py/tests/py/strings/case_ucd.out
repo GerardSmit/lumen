@@ -1,0 +1,33 @@
+isalnum 1f0ff2ac95e9d2ff9e866773fa7d9baaaea92025
+isalpha c627bcc1b3a2fb33877a7f4ec169ef060b059507
+isdecimal 1d89b59a1225f8fee59d483cb43cdf7a1a38fce0
+isdigit 95d18afb43000a1a6189c6fd487b9ca210b72e4e
+islower 5bd82e7122e748cb6a70ba150755d5b50d72ba86
+isnumeric 422a010e542ae6468b8af8b90046c4bf0eb6f256
+isspace cc94fef22fd72f33277ecec1652cb26a02c52899
+istitle cfe9ee03fee5ca5d397bfee916e64331a3f9e11f
+isupper 5944fc6d68611cee9417dd9097137022b9fd00ac
+isprintable f21b127a2be55e622aa9d3bf0b2d794df0741d3e
+isidentifier 8e81259397a9c0d675d1476e1ede85e1033bde4e
+lower 8a88b71fe3047fba6e86dcf4b0a42e6486af534f
+upper d13c3c715078653fe86818f009284d0f61a74157
+title 030a4da5d12faa2384f9f7fb49f5c91279cde2e5
+casefold 2faf043d8ca60f37bb1c1df4b9c622704adb2968
+swapcase 65f2280d01bf997ea358fba721ebcb7d41a8e88a
+'ΑΣ' ['ας', 'ΑΣ', 'Ας', 'ασ', 'Ας', 'ας', False, True, False]
+"ΑΣ'" ["ας'", "ΑΣ'", "Ας'", "ασ'", "Ας'", "ας'", False, True, False]
+"ΑΣ'Β" ["ασ'β", "ΑΣ'Β", "Ασ'Β", "ασ'β", "Ασ'β", "ασ'β", False, True, False]
+'Σ' ['σ', 'Σ', 'Σ', 'σ', 'Σ', 'σ', True, True, False]
+'aΣ.' ['aς.', 'AΣ.', 'Aς.', 'aσ.', 'Aς.', 'Aς.', False, False, False]
+'ǆungla ǅ' ['ǆungla ǆ', 'ǄUNGLA Ǆ', 'ǅungla ǅ', 'ǆungla ǆ', 'ǅungla ǆ', 'ǄUNGLA ǅ', False, False, False]
+'ﬃ straße İstanbul' ['ﬃ straße i̇stanbul', 'FFI STRASSE İSTANBUL', 'Ffi Straße İstanbul', 'ffi strasse i̇stanbul', 'Ffi straße i̇stanbul', 'FFI STRASSE i̇STANBUL', False, False, False]
+"hello world's" ["hello world's", "HELLO WORLD'S", "Hello World'S", "hello world's", "Hello world's", "HELLO WORLD'S", False, False, True]
+'ΣΑΣ ΣΑ' ['σας σα', 'ΣΑΣ ΣΑ', 'Σας Σα', 'σασ σα', 'Σας σα', 'σας σα', False, True, False]
+'ʰΣ' ['ʰσ', 'ʰΣ', 'ʰσ', 'ʰσ', 'ʰσ', 'ʰσ', False, False, False]
+'ß' ['ß', 'SS', 'Ss', 'ss', 'Ss', 'SS', False, False, True]
+'xͅΣ' ['xͅς', 'XΙΣ', 'Xͅς', 'xισ', 'Xͅς', 'XΙς', False, False, False]
+'\ud800a' ['\ud800a', '\ud800A', '\ud800A', '\ud800a', '\ud800a', '\ud800A', False, False, True]
+'ǅ' ['ǆ', 'Ǆ', 'ǅ', 'ǆ', 'ǅ', 'ǅ', True, False, False]
+'Ǆa' ['ǆa', 'ǄA', 'ǅa', 'ǆa', 'ǅa', 'ǆA', True, False, False]
+['a', 'b', 'c'] 'x' False True
+True True False True False True

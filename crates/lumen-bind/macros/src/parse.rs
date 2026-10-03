@@ -292,7 +292,10 @@ pub fn doc_of(toks: &[TokenTree]) -> Option<String> {
     if lines.is_empty() {
         None
     } else {
-        Some(lines.join("\n").trim().to_string())
+        // A trailing empty `///` line keeps one final newline (CPython docstrings that end in one).
+        let keep_newline = lines.len() > 1 && lines.last().is_some_and(|l| l.trim().is_empty());
+        let text = lines.join("\n").trim().to_string();
+        Some(if keep_newline { text + "\n" } else { text })
     }
 }
 
@@ -480,7 +483,8 @@ pub struct Sig {
 }
 
 /// Parameter attributes the macros consume.
-pub const PARAM_ATTRS: &[&str] = &["kw", "kwonly", "varargs", "varkw", "default"];
+/// `#[name("..")]` gives the parameter a name its Rust identifier cannot spell (`_feature_version`).
+pub const PARAM_ATTRS: &[&str] = &["kw", "kwonly", "varargs", "varkw", "default", "name"];
 
 /// Parse a fn item (`attrs vis qualifiers fn name <lifetimes> (params) -> ret where .. { body }`).
 pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {

@@ -1,0 +1,53 @@
+memoryview[int]
+<class 'memoryview'>
+(<class 'int'>,)
+TypeError NotImplemented should not be used in a boolean context
+TypeError NotImplemented should not be used in a boolean context
+TypeError NotImplemented should not be used in a boolean context
+TypeError NotImplemented should not be used in a boolean context
+TypeError NotImplemented should not be used in a boolean context
+TypeError NotImplemented should not be used in a boolean context
+True
+'NotImplemented'
+(<class 'PythonFinalizationError'>, <class 'RuntimeError'>, <class 'Exception'>, <class 'BaseException'>, <class 'object'>)
+True
+'bba'
+'baa'
+'aaa'
+'bbb'
+TypeError replace() takes at least 2 positional arguments (0 given)
+TypeError bytes.replace() takes no keyword arguments
+2
+6
+6
+TypeError eval() takes at least 1 positional argument (0 given)
+None
+3
+None
+{'w': 4}
+None
+5
+TypeError globals must be a dict
+TypeError int() argument must be a string, a bytes-like object or a real number, not 'Tr'
+6
+7
+TypeError int() argument must be a string, a bytes-like object or a real number, not 'NoneType'
+TypeError int() argument must be a string, a bytes-like object or a real number, not 'object'
+5
+3
+('rpow', 2, 5)
+('rpow', 2, None)
+('pow', 3, 5)
+('rpow2', 5)
+('pow', 5)
+('rpow', 5)
+TypeError unsupported operand type(s) for ** or pow(): 'NI', 'NI', 'int'
+TypeError unsupported operand type(s) for ** or pow(): 'int', 'int', 'R'
+TypeError unsupported operand type(s) for ** or pow(): 'int', 'int', 'str'
+TypeError pow() 3rd argument not allowed unless all arguments are integers
+TypeError pow() 3rd argument not allowed unless all arguments are integers
+TypeError pow() 3rd argument not allowed unless all arguments are integers
+ValueError complex modulo
+ValueError complex modulo
+TypeError unsupported operand type(s) for ** or pow(): 'str', 'int', 'int'
+8

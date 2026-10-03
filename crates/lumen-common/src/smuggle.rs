@@ -32,6 +32,45 @@ const TAIL_BASE: u32 = 0x10F400;
 /// The UTF-16 high unit of `RESERVED_BASE`.
 const RESERVED_HIGH: u32 = 0xDBFC;
 
+/// How a string type carries characters a Rust `str` cannot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spelling {
+    /// Plain text: a lone surrogate becomes U+FFFD.
+    Plain,
+    /// JavaScript strings: UTF-16 strings, lone surrogates smuggled.
+    Utf16,
+    /// Python strings: code-point strings.
+    CodePoints,
+}
+
+impl Spelling {
+    /// Append code point `cp` (a scalar or a lone surrogate); whether it was a lone surrogate.
+    #[inline]
+    pub fn push(self, out: &mut String, cp: u32) -> bool {
+        let lone = (0xD800..0xE000).contains(&cp);
+        match self {
+            Spelling::Plain => out.push(char::from_u32(cp).unwrap_or('\u{FFFD}')),
+            Spelling::CodePoints => {
+                push_code_point(out, cp);
+            }
+            Spelling::Utf16 => match char::from_u32(cp) {
+                Some(c) => push_char_utf16(out, c),
+                None => out.push(smuggle(cp as u16)),
+            },
+        }
+        lone
+    }
+
+    /// Decoded text `s` (no lone surrogates) in this spelling.
+    pub fn text(self, s: &str) -> Cow<'_, str> {
+        match self {
+            Spelling::Plain => Cow::Borrowed(s),
+            Spelling::Utf16 => utf16_text(s),
+            Spelling::CodePoints => escape_text(s),
+        }
+    }
+}
+
 /// If `c` is a smuggled lone surrogate, the surrogate code unit it encodes.
 #[inline]
 pub fn smuggled(c: char) -> Option<u16> {

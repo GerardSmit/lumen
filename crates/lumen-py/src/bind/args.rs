@@ -5,10 +5,11 @@
 //! The message family depends on the calling convention CPython would use for the same
 //! signature: `METH_NOARGS`, `METH_O`, positional-only Argument Clinic
 //! (`_PyArg_CheckPositional`), keyword Argument Clinic (`_PyArg_UnpackKeywords`), a slot wrapper,
-//! or `PyArg_ParseTuple` (`hint(py(arg_style = "parse"))`).
+//! `PyArg_ParseTuple` (`hint(py(arg_style = "parse"))`) or `PyArg_UnpackTuple`
+//! (`hint(py(arg_style = "unpack"))`, worded as the positional-only Clinic).
 //!
 //! Python hints (`hint(py(..))` on an `#[op]` / member): `text_signature = ".."` (`""`: none),
-//! `arg_style = "parse"`, `arg_name = ".."` (the name in argument errors), `aliases = "a, b"`.
+//! `arg_style = "parse" | "unpack"`, `arg_name = ".."` (the name in argument errors), `aliases = "a, b"`.
 
 use crate::object::*;
 use crate::vm::Interp;
@@ -38,8 +39,17 @@ pub enum Conv {
 const SLOT_PROTOS: &[&str] = &[
     "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash", "bool", "eq", "ne", "lt",
     "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or",
-    "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert",
+    "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext",
+    "call", "truediv", "rtruediv", "itruediv", "floordiv", "rfloordiv", "ifloordiv", "mod", "rmod", "imod", "pow",
+    "rpow", "ipow", "lshift", "rlshift", "ilshift", "rshift", "rrshift", "irshift", "matmul", "rmatmul", "imatmul",
+    "divmod", "rdivmod", "getattribute", "setattr", "delattr",
 ];
+
+/// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
+/// receiver errors read `descriptor '__init__' requires a 'X' object but received a 'Y'`.
+pub fn is_slot_wrapper(d: &FnDesc) -> bool {
+    matches!(d.role, Role::Proto(p) if p == "init" || SLOT_PROTOS.contains(&p))
+}
 
 /// `__len__` for `len`, ... (every neutral protocol is a dunder of the same name).
 fn dunder(p: &'static str) -> &'static str {
@@ -51,7 +61,10 @@ fn dunder(p: &'static str) -> &'static str {
     table!("init" "len" "getitem" "setitem" "delitem" "contains" "iter" "next" "reversed" "repr" "str" "hash"
         "bool" "eq" "ne" "lt" "le" "gt" "ge" "add" "radd" "iadd" "sub" "rsub" "isub" "mul" "rmul" "imul"
         "and" "rand" "iand" "or" "ror" "ior" "xor" "rxor" "ixor" "neg" "pos" "abs" "invert" "index" "int"
-        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit")
+        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext"
+        "truediv" "rtruediv" "itruediv" "floordiv" "rfloordiv" "ifloordiv" "mod" "rmod" "imod" "pow" "rpow" "ipow"
+        "lshift" "rlshift" "ilshift" "rshift" "rrshift" "irshift" "matmul" "rmatmul" "imatmul" "divmod" "rdivmod"
+        "getattribute" "setattr" "delattr")
 }
 
 /// The attribute name a fn gets in Python.
@@ -142,6 +155,7 @@ impl PySig {
         let all_pos = posonly == n;
         let conv = match d.role {
             _ if d.hint(HOST, "arg_style") == Some("parse") => Conv::Parse,
+            _ if d.hint(HOST, "arg_style") == Some("unpack") => Conv::Positional,
             Role::Getter => Conv::NoArgs,
             Role::Setter => Conv::O,
             Role::Constructor if all_pos && !varkw => Conv::Positional,
@@ -285,18 +299,20 @@ fn missing_error(it: &mut Interp, sig: &PySig, i: usize) -> Obj {
 pub fn bind_slow<'a>(
     it: &mut Interp,
     d: &'static FnDesc,
+    recv: &Value,
     args: &'a [Value],
     kw: &'a [(Obj, Value)],
     slots: &mut [Option<&'a Value>],
 ) -> R<()> {
     let sig = PySig::cached(d);
     if sig.conv != Conv::Keywords {
-        if !kw.is_empty() {
-            return Err(no_kwargs_error(it, sig));
+        // A `#[varkw]` collector receives the keywords and judges them itself.
+        if !kw.is_empty() && !sig.varkw {
+            return Err(no_kwargs_error(it, &for_receiver(it, sig, d, recv)));
         }
         let n = args.len();
         if n < sig.minpos || (!sig.varargs && n > sig.maxpos) {
-            return Err(arity_error(it, sig, n));
+            return Err(arity_error(it, &for_receiver(it, sig, d, recv), n));
         }
         for (slot, a) in slots.iter_mut().zip(args) {
             *slot = Some(a);
@@ -304,6 +320,18 @@ pub fn bind_slow<'a>(
         return Ok(());
     }
     bind_keywords(it, sig, args, kw, slots)
+}
+
+/// The signature errors name the receiver's type for members of a class declared
+/// `hint(py(shared))`, whose members are installed into several types ([`super::install_into`]).
+#[cold]
+#[inline(never)]
+fn for_receiver(it: &Interp, sig: &PySig, d: &FnDesc, recv: &Value) -> PySig {
+    let mut s = PySig { name: sig.name.clone(), owner: sig.owner.clone(), names: sig.names.clone(), ..*sig };
+    if d.class().is_some_and(|c| c.hint(HOST, "shared").is_some()) {
+        s.owner = it.type_name_of(recv);
+    }
+    s
 }
 
 /// `_PyArg_UnpackKeywords`: positional and keyword arguments into `slots`. Keywords not
@@ -377,7 +405,8 @@ pub fn bad_argument(it: &mut Interp, d: &'static FnDesc, i: usize, what: &str, v
             None => "argument".to_string(),
         }
     };
-    let t = it.type_name_of(v);
+    // `_PyArg_BadArgument` names `None` itself rather than its type.
+    let t = if v.is_none() { "None".to_string() } else { it.type_name_of(v) };
     it.type_error(&format!("{}() {} must be {}, not {}", sig.name, display, what, t))
 }
 
@@ -411,6 +440,9 @@ fn slot_text_sig(name: &str, nargs: usize) -> String {
     let names: &[&str] = match name {
         "__getitem__" | "__delitem__" | "__contains__" => &["key"],
         "__setitem__" => &["key", "value"],
+        "__getattribute__" | "__delattr__" => &["name"],
+        "__setattr__" => &["name", "value"],
+        "__pow__" | "__rpow__" => &["value", "mod=None"],
         _ => &["value"],
     };
     let mut parts = vec!["$self"];
@@ -419,7 +451,114 @@ fn slot_text_sig(name: &str, nargs: usize) -> String {
     format!("({})", parts.join(", "))
 }
 
-/// `__text_signature__` (`($module, x, /)`), or `None` (`hint(py(text_signature = ""))`).
+/// The docstring CPython's slot wrappers carry (`slotdefs` in `typeobject.c`), by dunder name.
+fn slot_doc(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__repr__" => "Return repr(self).",
+        "__str__" => "Return str(self).",
+        "__hash__" => "Return hash(self).",
+        "__call__" => "Call self as a function.",
+        "__lt__" => "Return self<value.",
+        "__le__" => "Return self<=value.",
+        "__eq__" => "Return self==value.",
+        "__ne__" => "Return self!=value.",
+        "__gt__" => "Return self>value.",
+        "__ge__" => "Return self>=value.",
+        "__iter__" => "Implement iter(self).",
+        "__next__" => "Implement next(self).",
+        "__init__" => "Initialize self.  See help(type(self)) for accurate signature.",
+        "__await__" => "Return an iterator to be used in await expression.",
+        "__aiter__" => "Return an awaitable, that resolves in asynchronous iterator.",
+        "__anext__" => "Return a value or raise StopAsyncIteration.",
+        "__add__" => "Return self+value.",
+        "__radd__" => "Return value+self.",
+        "__iadd__" => "Implement self+=value.",
+        "__sub__" => "Return self-value.",
+        "__rsub__" => "Return value-self.",
+        "__isub__" => "Return self-=value.",
+        "__mul__" => "Return self*value.",
+        "__rmul__" => "Return value*self.",
+        "__imul__" => "Implement self*=value.",
+        "__and__" => "Return self&value.",
+        "__rand__" => "Return value&self.",
+        "__iand__" => "Return self&=value.",
+        "__or__" => "Return self|value.",
+        "__ror__" => "Return value|self.",
+        "__ior__" => "Return self|=value.",
+        "__xor__" => "Return self^value.",
+        "__rxor__" => "Return value^self.",
+        "__ixor__" => "Return self^=value.",
+        "__neg__" => "-self",
+        "__pos__" => "+self",
+        "__abs__" => "abs(self)",
+        "__invert__" => "~self",
+        "__bool__" => "True if self else False",
+        "__int__" => "int(self)",
+        "__float__" => "float(self)",
+        "__index__" => "Return self converted to an integer, if self is suitable for use as an index into a list.",
+        "__len__" => "Return len(self).",
+        "__getitem__" => "Return self[key].",
+        "__setitem__" => "Set self[key] to value.",
+        "__delitem__" => "Delete self[key].",
+        "__contains__" => "Return bool(key in self).",
+        "__truediv__" => "Return self/value.",
+        "__rtruediv__" => "Return value/self.",
+        "__itruediv__" => "Return self/=value.",
+        "__floordiv__" => "Return self//value.",
+        "__rfloordiv__" => "Return value//self.",
+        "__ifloordiv__" => "Return self//=value.",
+        "__mod__" => "Return self%value.",
+        "__rmod__" => "Return value%self.",
+        "__imod__" => "Return self%=value.",
+        "__pow__" => "Return pow(self, value, mod).",
+        "__rpow__" => "Return pow(value, self, mod).",
+        "__ipow__" => "Return self**=value.",
+        "__lshift__" => "Return self<<value.",
+        "__rlshift__" => "Return value<<self.",
+        "__ilshift__" => "Return self<<=value.",
+        "__rshift__" => "Return self>>value.",
+        "__rrshift__" => "Return value>>self.",
+        "__irshift__" => "Return self>>=value.",
+        "__matmul__" => "Return self@value.",
+        "__rmatmul__" => "Return value@self.",
+        "__imatmul__" => "Return self@=value.",
+        "__divmod__" => "Return divmod(self, value).",
+        "__rdivmod__" => "Return divmod(value, self).",
+        "__getattribute__" => "Return getattr(self, name).",
+        "__setattr__" => "Implement setattr(self, name, value).",
+        "__delattr__" => "Implement delattr(self, name).",
+        _ => return None,
+    })
+}
+
+/// `__doc__` of the native bound as `name`: its own doc, else the one CPython gives every
+/// `__new__` and slot wrapper.
+pub fn py_doc(d: &'static FnDesc, name: &str) -> Option<&'static str> {
+    if let Some(doc) = d.hint(HOST, "doc") {
+        return Some(doc);
+    }
+    if d.doc.is_some() {
+        return d.doc;
+    }
+    match d.role {
+        Role::Constructor => Some("Create and return a new object.  See help(type) for accurate signature."),
+        _ if is_slot_wrapper(d) => slot_doc(name),
+        _ => None,
+    }
+}
+
+/// `__text_signature__` of the native object: every `__new__` and `__init__` shows the generic
+/// signature of its slot, as in CPython.
+pub fn native_text_signature(d: &'static FnDesc) -> Option<String> {
+    match d.role {
+        Role::Constructor => Some("($type, *args, **kwargs)".into()),
+        Role::Proto("init") => Some("($self, /, *args, **kwargs)".into()),
+        _ => text_signature(d),
+    }
+}
+
+/// `__text_signature__` (`($module, x, /)`), or `None` (`hint(py(text_signature = ""))`); a
+/// constructor's is its class's.
 pub fn text_signature(d: &'static FnDesc) -> Option<String> {
     match d.hint(HOST, "text_signature") {
         Some("") => return None,

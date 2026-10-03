@@ -21,8 +21,6 @@ pub fn extension() -> Extension {
     Extension {
         name: "timers",
         modules: &[lumen_host::globals::<globals::Module>],
-        globals: &[],
-        namespaces: &[],
         state_init: Some(|state| state.put(Timers::default())),
         js_init: None,
         js_init_snapshot: None,

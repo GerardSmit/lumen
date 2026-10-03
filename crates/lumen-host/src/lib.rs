@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
-pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
+pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpError, OpState, ResourceId, ResourceTable, Value};
 use lumen::embed::JsHost;
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
@@ -34,29 +34,17 @@ pub mod sysfs;
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 
-/// The in-memory virtual file system behind `node:fs` on targets without an OS file system, and
-/// the mount table that lets a path be served by the embedder (OPFS, a remote origin).
-pub mod vfs;
-
 /// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
 /// JSPI) and the completion queue the embedder pushes settled Promises into.
 pub mod browser;
 
-/// One native op: a named native function with its JS arity.
-#[derive(Clone, Copy)]
-pub struct OpDecl {
-    pub name: &'static str,
-    pub len: usize,
-    pub f: NativeFn,
-}
-
-/// Declarative op-declaration table: `ops!["add" (2) => add_impl, ...]`. Uniform by design so
-/// op registration stays a table, never hand-written glue (deno's `#[op2]` lesson).
-#[macro_export]
-macro_rules! ops {
-    ($($name:literal ($len:expr) => $f:expr),* $(,)?) => {
-        &[$($crate::OpDecl { name: $name, len: $len, f: $f }),*]
-    };
+/// Checkpoint hook of a glue built with `LUMEN_GLUE_MEM_MARKS=1`.
+#[lumen_bind::module(name = "memMark")]
+mod mem_mark {
+    #[op(coerce, name = "__lumenMemMark")]
+    pub fn mem_mark(label: String) {
+        lumen::memstats::phase(&format!("    glue {label}"));
+    }
 }
 
 /// Installs a `lumen_bind` module into a realm (see [`Extension::modules`]).
@@ -78,14 +66,8 @@ pub fn namespace<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Val
 /// is `install(&mut engine, &[timers::extension(), fs::extension(), ...])`.
 pub struct Extension {
     pub name: &'static str,
-    /// `lumen_bind` modules to install ([`globals`] / [`namespace`]), before `globals` and
-    /// `namespaces`.
+    /// `lumen_bind` modules to install ([`globals`] / [`namespace`]).
     pub modules: &'static [ModuleInit],
-    /// Installed as `globalThis.<name>` functions (e.g. `setTimeout`).
-    pub globals: &'static [OpDecl],
-    /// Installed as `globalThis.<ns>.<name>` namespace methods (e.g. a `__lumen_fs` ops
-    /// object that a JS shim wraps into the public API).
-    pub namespaces: &'static [(&'static str, &'static [OpDecl])],
     /// Installs this extension's state (timer heap, fd table, ...) into [`OpState`].
     pub state_init: Option<fn(&mut OpState)>,
     /// JS glue evaluated after this extension's ops are installed — the promise-returning
@@ -110,8 +92,6 @@ impl Extension {
         Extension {
             name,
             modules: &[],
-            globals: &[],
-            namespaces: &[],
             state_init: None,
             js_init: None,
             js_init_snapshot: None,
@@ -127,14 +107,9 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
     if lumen::memstats::enabled() {
         // Per-file checkpoints of a glue built with LUMEN_GLUE_MEM_MARKS=1 (see lumen-node's
         // build.rs).
-        engine.define_global("__lumenMemMark", 1, |ctx, _this, args| {
-            let label = match args.first() {
-                Some(v) => ctx.coerce_string(v).map(|s| s.to_string()).unwrap_or_default(),
-                None => String::new(),
-            };
-            lumen::memstats::phase(&format!("    glue {label}"));
-            Ok(lumen::embed::Value::Undefined)
-        });
+        if globals::<mem_mark::Module>(engine.ctx()).is_err() {
+            panic!("installing the glue memory marks threw");
+        }
     }
     for ext in extensions {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Glue);
@@ -146,14 +121,6 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             if m(engine.ctx()).is_err() {
                 panic!("extension {}: installing a module threw", ext.name);
             }
-        }
-        for op in ext.globals {
-            engine.define_global(op.name, op.len, op.f);
-        }
-        for (ns, ops) in ext.namespaces {
-            let table: Vec<(&str, usize, NativeFn)> =
-                ops.iter().map(|o| (o.name, o.len, o.f)).collect();
-            engine.define_namespace(ns, &table);
         }
         let aot = ext
             .js_init_snapshot
@@ -815,7 +782,9 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::p
 
 #[cfg(target_arch = "wasm32")]
 pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
-    vfs::realpath(&path.as_ref().to_string_lossy())
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem()
+        .realpath(&path.as_ref().to_string_lossy())
         .map(std::path::PathBuf::from)
         .map_err(std::io::Error::from)
 }

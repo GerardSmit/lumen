@@ -7,7 +7,7 @@ use crate::platform::IoError;
 use crate::vm::*;
 use std::rc::Rc;
 
-type Kw<'a> = &'a [(Obj, Value)];
+use crate::bind::{Exc, KwArgs, This};
 
 const FIELDS: [&str; 5] = ["errno", "strerror", "filename", "filename2", "characters_written"];
 
@@ -32,14 +32,17 @@ pub fn errno_exception(errno: i32) -> Option<&'static str> {
     })
 }
 
-fn is_native(v: Option<Value>, f: NativeFn) -> bool {
-    matches!(v, Some(Value::Obj(o)) if matches!(&o.kind, Kind::Native(n) if n.f as usize == f as usize))
+/// Whether `cls` inherits `OSError`'s own `name` member.
+fn inherits(it: &Interp, cls: &Obj, name: &str) -> bool {
+    use lumen_bind::Class;
+    matches!(it.lookup_mro(cls, name), Some(Value::Obj(o))
+        if matches!(&o.kind, Kind::Native(n) if n.desc.and_then(|d| d.class()).is_some_and(|c| c.name == OSErrorType::DESC.name)))
 }
 
 /// CPython's `oserror_use_init`: a subclass that overrides `__init__` but not `__new__` parses its
 /// arguments in `__init__`; everything else parses them in `__new__`.
 fn uses_init(it: &Interp, cls: &Obj) -> bool {
-    !is_native(it.lookup_mro(cls, "__init__"), oserror_init) && is_native(it.lookup_mro(cls, "__new__"), oserror_new)
+    !inherits(it, cls, "__init__") && inherits(it, cls, "__new__")
 }
 
 fn set_args(e: &Obj, args: Vec<Value>) {
@@ -86,56 +89,86 @@ fn init_fields(it: &mut Interp, e: &Obj, args: &[Value]) -> R<()> {
     Ok(())
 }
 
-fn oserror_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let cls = match a.first() {
-        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => c.clone(),
-        _ => return Err(it.type_error("OSError.__new__(X): X is not a type object")),
-    };
-    let args = &a[1..];
-    let use_init = uses_init(it, &cls);
-    let mut ty = cls.clone();
-    if !use_init {
-        if !kw.is_empty() {
-            let n = it.type_name(&cls);
-            return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
-        }
-        if Rc::ptr_eq(&cls, &it.exc_type("OSError")) && (2..=5).contains(&args.len()) {
-            let mapped = args[0].as_bigint().and_then(|b| b.to_i64()).and_then(|n| i32::try_from(n).ok()).and_then(errno_exception);
-            if let Some(name) = mapped {
-                ty = it.exc_type(name);
+// `OSError`'s constructor, initializer and pickling (installed into the core type).
+#[lumen_bind::class(name = "OSError")]
+pub struct OSErrorType;
+
+#[lumen_bind::methods]
+impl OSErrorType {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let use_init = uses_init(it, cls);
+        let mut ty = cls.clone();
+        if !use_init {
+            if !kw.is_empty() {
+                let n = it.type_name(cls);
+                return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
+            }
+            if Rc::ptr_eq(cls, &it.exc_type("OSError")) && (2..=5).contains(&args.len()) {
+                let mapped = args[0].as_bigint().and_then(|b| b.to_i64()).and_then(|n| i32::try_from(n).ok()).and_then(errno_exception);
+                if let Some(name) = mapped {
+                    ty = it.exc_type(name);
+                }
             }
         }
-    }
-    let o = it.alloc_instance(&ty)?;
-    if let Value::Obj(e) = &o {
-        if use_init {
-            set_args(e, Vec::new());
-        } else {
-            init_fields(it, e, args)?;
+        let o = it.alloc_instance(&ty)?;
+        if let Value::Obj(e) = &o {
+            if use_init {
+                set_args(e, Vec::new());
+            } else {
+                init_fields(it, e, args)?;
+            }
         }
+        Ok(o)
     }
-    Ok(o)
-}
 
-fn self_exc(it: &mut Interp, a: &[Value]) -> R<Obj> {
-    match a.first() {
-        Some(Value::Obj(o)) if matches!(o.kind, Kind::Exception(_)) => Ok(o.clone()),
-        _ => Err(it.type_error("descriptor requires an 'OSError' object")),
+    #[proto(init)]
+    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<()> {
+        let e = slf.0 .0;
+        let ty = it.type_of_obj(e);
+        if !uses_init(it, &ty) {
+            return Ok(());
+        }
+        if !kw.is_empty() {
+            let n = it.type_name(&ty);
+            return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
+        }
+        init_fields(it, e, args)
     }
-}
 
-fn oserror_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let e = self_exc(it, a)?;
-    let ty = it.type_of_obj(&e);
-    if !uses_init(it, &ty) {
-        return Ok(Value::None);
+    #[proto(reduce)]
+    fn reduce(slf: This<Exc<'_>>, it: &mut Interp) -> R<Value> {
+        let e = slf.0 .0;
+        let mut args = match &e.kind {
+            Kind::Exception(d) => d.borrow().args.tuple_items().map(|t| t.to_vec()).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if let (2, Some(f)) = (args.len(), field(e, "filename")) {
+            args.push(f);
+            if let Some(f2) = field(e, "filename2") {
+                args.push(Value::None);
+                args.push(f2);
+            }
+        }
+        let cls = Value::Obj(it.type_of_obj(e));
+        let state = it.new_dict();
+        let entries: Vec<(Value, Value)> = match e.dict.borrow().as_ref().map(|d| &d.kind) {
+            Some(Kind::Dict(src)) => src.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect(),
+            _ => Vec::new(),
+        };
+        for (k, v) in entries {
+            if !k.as_str().is_some_and(|s| FIELDS.contains(&s)) {
+                it.dict_set(&state, k, v)?;
+            }
+        }
+        let empty = matches!(&state.kind, Kind::Dict(d) if d.borrow().is_empty());
+        let mut out = vec![cls, Value::tuple(args)];
+        if !empty {
+            out.push(Value::Obj(state));
+        }
+        Ok(Value::tuple(out))
     }
-    if !kw.is_empty() {
-        let n = it.type_name(&ty);
-        return Err(it.type_error(&format!("{}() takes no keyword arguments", n)));
-    }
-    init_fields(it, &e, &a[1..])?;
-    Ok(Value::None)
 }
 
 fn field(e: &Obj, name: &str) -> Option<Value> {
@@ -144,39 +177,6 @@ fn field(e: &Obj, name: &str) -> Option<Value> {
 
 fn or_none(v: Option<Value>) -> Value {
     v.unwrap_or(Value::None)
-}
-
-fn oserror_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__reduce__", a, 1, 1)?;
-    let e = self_exc(it, a)?;
-    let mut args = match &e.kind {
-        Kind::Exception(d) => d.borrow().args.tuple_items().map(|t| t.to_vec()).unwrap_or_default(),
-        _ => Vec::new(),
-    };
-    if let (2, Some(f)) = (args.len(), field(&e, "filename")) {
-        args.push(f);
-        if let Some(f2) = field(&e, "filename2") {
-            args.push(Value::None);
-            args.push(f2);
-        }
-    }
-    let cls = Value::Obj(it.type_of_obj(&e));
-    let state = it.new_dict();
-    let entries: Vec<(Value, Value)> = match e.dict.borrow().as_ref().map(|d| &d.kind) {
-        Some(Kind::Dict(src)) => src.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect(),
-        _ => Vec::new(),
-    };
-    for (k, v) in entries {
-        if !k.as_str().is_some_and(|s| FIELDS.contains(&s)) {
-            it.dict_set(&state, k, v)?;
-        }
-    }
-    let empty = matches!(&state.kind, Kind::Dict(d) if d.borrow().is_empty());
-    let mut out = vec![cls, Value::tuple(args)];
-    if !empty {
-        out.push(Value::Obj(state));
-    }
-    Ok(Value::tuple(out))
 }
 
 impl Interp {
@@ -239,9 +239,7 @@ impl Interp {
 
 pub fn init(it: &mut Interp) {
     let oe = it.exc_type("OSError");
-    it.reg_new(&oe, oserror_new);
-    it.reg(&oe, "__init__", oserror_init);
-    it.reg(&oe, "__reduce__", oserror_reduce);
+    crate::bind::extend_type::<OSErrorType>(it, &oe);
     let d = oe.dict.borrow().clone();
     if let Some(d) = d {
         for n in ["errno", "strerror", "filename", "filename2"] {

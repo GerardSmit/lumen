@@ -1,0 +1,93 @@
+TypeError must be real number, not SS
+TypeError must be real number, not SS
+TypeError must be real number, not SS
+TypeError must be real number, not SS
+TypeError must be real number, not bytes
+TypeError must be real number, not bytes
+TypeError must be real number, not bytes
+TypeError must be real number, not bytes
+TypeError must be real number, not bytearray
+TypeError must be real number, not bytearray
+TypeError must be real number, not bytearray
+TypeError must be real number, not bytearray
+2.5
+(2.5+0j)
+new 2.5
+2.5
+new ((2.5+0j),)
+(2.5+0j)
+TypeError Fl2.__float__ returned non-float (type str)
+TypeError Fl2.__float__ returned non-float (type str)
+TypeError Fl2.__float__ returned non-float (type str)
+TypeError Fl2.__float__ returned non-float (type str)
+7.0
+(7+0j)
+new 7.0
+7.0
+new ((7+0j),)
+(7+0j)
+TypeError must be real number, not Cx
+(1+2j)
+TypeError must be real number, not Cx
+new ((1+2j),)
+(1+2j)
+TypeError must be real number, not Cx2
+TypeError __complex__ returned non-complex (type int)
+TypeError must be real number, not Cx2
+TypeError __complex__ returned non-complex (type int)
+TypeError must be real number, not CxF
+(1+2j)
+TypeError must be real number, not CxF
+new ((1+2j),)
+(1+2j)
+TypeError must be real number, not complex
+1j
+TypeError must be real number, not complex
+new (1j,)
+1j
+1.0
+(1+0j)
+new 1.0
+1.0
+new ((1+0j),)
+(1+0j)
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+OverflowError int too large to convert to float
+9007199254740992.0
+(9007199254740992+0j)
+new 9007199254740992.0
+9007199254740992.0
+new ((9007199254740992+0j),)
+(9007199254740992+0j)
+TypeError must be real number, not memoryview
+TypeError must be real number, not memoryview
+TypeError must be real number, not memoryview
+TypeError must be real number, not memoryview
+TypeError must be real number, not list
+TypeError must be real number, not list
+TypeError must be real number, not list
+TypeError must be real number, not list
+nan
+(nan+0j)
+new nan
+nan
+new ((nan+0j),)
+(nan+0j)
+-0.0
+(-0+0j)
+new -0.0
+-0.0
+new ((-0+0j),)
+(-0+0j)
+TypeError float.from_number() takes exactly one argument (0 given)
+TypeError float.from_number() takes exactly one argument (2 given)
+TypeError float.from_number() takes no keyword arguments
+TypeError complex.from_number() takes no keyword arguments
+<class 'complex'>
+True
+'Convert real number to a floating-point number.'
+'Convert number to a complex floating-point number.'
+'($type, number, /)'
+2.0

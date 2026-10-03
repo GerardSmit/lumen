@@ -12,17 +12,18 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-lumen-common = { path = "../lumen-common", features = ["hash"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "crypt"] }
 lumen-os = { path = "../lumen-os" }
+# RSA, DSA, finite-field DH, primes and their key generation: OpenSSL first, RustCrypto as fallback.
+lumen-crypto = { path = "../lumen-crypto", default-features = false }
 # Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
 lumen = { path = "../lumen", features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 
-# node:crypto and crypto.subtle: RustCrypto on every platform (native and wasm32). lumen carries
+# node:crypto and crypto.subtle: RustCrypto for ciphers, EC and EdDSA on every platform (native and wasm32); lumen carries
 # no cryptography of its own.
 scrypt = { version = "0.11", default-features = false }
 argon2 = "0.5"
-bcrypt = { version = "0.17", default-features = false }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 subtle = { version = "2.4", default-features = false }
 cipher = { version = "0.4", features = ["alloc", "block-padding"] }
@@ -42,7 +43,6 @@ chacha20poly1305 = "0.10"
 ghash = "0.5"
 poly1305 = "0.8"
 ocb3 = "0.1"
-rsa = { version = "0.9", features = ["sha2", "sha1", "pem"] }
 p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p384 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
 p521 = { version = "0.13", features = ["ecdsa", "ecdh", "pkcs8", "pem", "jwk"] }
@@ -53,7 +53,6 @@ ecdsa = { version = "0.16", features = ["der", "signing", "verifying", "pkcs8", 
 elliptic-curve = { version = "0.13", features = ["sec1", "pkcs8", "pem", "jwk", "ecdh"] }
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-dsa = "0.6"
 signature = "2"
 pkcs1 = { version = "0.7", features = ["pem", "alloc"] }
 pkcs8 = { version = "0.10", features = ["pem", "alloc", "encryption"] }
@@ -62,7 +61,7 @@ sec1 = { version = "0.7", features = ["pem", "alloc", "der"] }
 der = { version = "0.7", features = ["alloc", "oid", "pem"] }
 x509-cert = "0.2"
 num-bigint-dig = { version = "0.8", features = ["prime", "rand"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+digest = "0.10"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libsqlite3-sys = { version = "0.37", optional = true, features = ["bundled", "column_metadata"] }
@@ -81,7 +80,12 @@ lumen = { path = "../lumen" }
 # Optional builtins (all on by default). Embedders and mobile builds can turn them off with
 # `default-features = false` (through lumen-runtime's features of the same names).
 [features]
-default = ["bun", "http2", "cluster", "dgram", "wasi"]
+default = ["bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+# Asymmetric crypto backends (see lumen-crypto): each is a no-op on targets that cannot host it.
+crypto-openssl = ["lumen-crypto/openssl"]
+crypto-apple = ["lumen-crypto/apple"]
+crypto-cng = ["lumen-crypto/cng"]
+crypto-rustcrypto = ["lumen-crypto/rustcrypto"]
 # Bun APIs: `bun`, `bun:ffi` (the native-call trampolines), `bun:sqlite`, `bun:jsc`, Bun.hash, …
 bun = []
 # Pin a portable SQLite implementation rather than the device OS library.

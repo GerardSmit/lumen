@@ -1,0 +1,10 @@
+int int True
+True
+struct_rusage 16 True True
+16
+True
+True
+ValueError invalid resource specified
+ValueError invalid who parameter
+ValueError expected a tuple of 2 integers
+True

@@ -37,6 +37,8 @@ pub mod time {
 
     struct StructTime;
 
+    const STRUCT_TIME_DOC: &str = "The time value as returned by gmtime(), localtime(), and strptime(), and\n accepted by asctime(), mktime() and strftime().  May be considered as a\n sequence of 9 integers.\n\n Note that several fields' values are not the same as those defined by\n the C language standard for struct tm.  For example, the value of the\n field tm_year is the actual year, not year - 1900.  See individual\n fields' descriptions for details.";
+
     const FIELDS: [&str; 11] = [
         "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday", "tm_isdst", "tm_zone",
         "tm_gmtoff",
@@ -45,7 +47,13 @@ pub mod time {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
     fn struct_time_type(it: &mut Interp) -> Obj {
-        structseq_type::<StructTime>(it, "time", "struct_time", &FIELDS, 9)
+        let ty = structseq_type::<StructTime>(it, "time", "struct_time", &FIELDS, 9);
+        if let Some(d) = ty.dict.borrow().as_ref() {
+            if crate::vm::dict_get_str(d, "__doc__").map_or(true, |v| v.is_none()) {
+                dict_set_str(d, "__doc__", Value::str(STRUCT_TIME_DOC));
+            }
+        }
+        ty
     }
 
     fn struct_time(it: &mut Interp, tm: Tm) -> Value {
@@ -453,6 +461,9 @@ pub mod time {
             return Err(it.value_error("sleep length must be non-negative"));
         }
         it.flush_out();
+        if s == 0.0 {
+            it.yield_gil();
+        }
         let deadline = it.platform.borrow().monotonic_ns().saturating_add((s.min(1e9) * 1e9) as u64);
         loop {
             it.poll()?;
@@ -461,7 +472,7 @@ pub mod time {
                 return Ok(());
             }
             // Sleep in slices so an interrupt is noticed promptly.
-            it.platform.borrow_mut().sleep(left.min(20_000_000) as f64 / 1e9);
+            it.sleep_slice(left.min(20_000_000) as f64 / 1e9);
         }
     }
 

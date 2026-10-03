@@ -64,11 +64,12 @@
 //!
 //! The macros validate only the shape of a hint (`flag` or `key = "value"`); the keys are the
 //! host's. The Python host reads, on an op / member: `text_signature = ".."` (`""`: no
-//! `__text_signature__`), `arg_style = "parse"` (`PyArg_ParseTuple` error wording), `arg_name =
-//! ".."` (the name in argument errors), `aliases = "a, b"` (extra names for the same native);
+//! `__text_signature__`), `arg_style = "parse"` / `"unpack"` (`PyArg_ParseTuple` /
+//! `PyArg_UnpackTuple` error wording), `arg_name = ".."` (the name in argument errors),
+//! `aliases = "a, b"` (extra names for the same native);
 //! on a class: `unhashable` (`__hash__ = None`), `native_iter` (the constructor returns a step
-//! closure the VM drives), `final` (no subclasses) and `base = "module.Class"` (a Python base
-//! class). See `lumen_py::bind::args` and `lumen_py::bind::class`. The JS host reads no hints.
+//! closure the VM drives), `final` (no subclasses), `base = "module.Class"` (a Python base
+//! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`. The JS host reads no hints.
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.
@@ -130,8 +131,9 @@
 mod convert;
 mod desc;
 mod host;
+mod trace;
 
-pub use convert::{CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed};
+pub use convert::{CtorRet, Elem, Flag, FromArg, FromRest, FromVarKw, IntoError, IntoRet, Lenient, NextRet, Passed};
 pub use desc::{
     camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner, Param, ParamKind, Role, Scalar,
     ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,
@@ -141,14 +143,51 @@ pub use host::{
     StateHost, This,
 };
 pub use lumen_bind_macros::{class, methods, module, op};
+pub use trace::{Trace, Visit};
 pub use lumen_common::bigint::BigInt;
-pub use lumen_common::native::{ErrorKind, NativeError, NativeResult};
+pub use lumen_common::native::{Data, ErrorKind, NativeError, NativeResult};
 
 /// Support for generated code. Not a stable API.
 #[doc(hidden)]
 pub mod __private {
     use super::*;
     pub use crate::host::__this as this;
+
+    /// Autoref probes behind the `gc_trace` / `gc_clear` a `#[class]` generates: a field whose
+    /// type implements [`Trace`] is reported, any other field is skipped (no trait bound on the
+    /// struct's field types).
+    pub struct Probe<'a, T: ?Sized>(pub &'a T);
+    pub struct ProbeMut<'a, T: ?Sized>(pub &'a mut T);
+
+    pub trait ViaTrace {
+        fn __lumen_trace(&self, v: &mut dyn Visit);
+    }
+    impl<T: Trace + ?Sized> ViaTrace for Probe<'_, T> {
+        #[inline]
+        fn __lumen_trace(&self, v: &mut dyn Visit) {
+            self.0.trace(v)
+        }
+    }
+    pub trait ViaNone {
+        #[inline]
+        fn __lumen_trace(&self, _v: &mut dyn Visit) {}
+    }
+    impl<T: ?Sized> ViaNone for &Probe<'_, T> {}
+
+    pub trait ViaTraceMut {
+        fn __lumen_clear(&mut self);
+    }
+    impl<T: Trace + ?Sized> ViaTraceMut for ProbeMut<'_, T> {
+        #[inline]
+        fn __lumen_clear(&mut self) {
+            self.0.clear()
+        }
+    }
+    pub trait ViaNoneMut {
+        #[inline]
+        fn __lumen_clear(&mut self) {}
+    }
+    impl<T: ?Sized> ViaNoneMut for &mut ProbeMut<'_, T> {}
 
     #[inline(always)]
     pub fn arg<'a, H: Host, T: FromArg<'a, H>>(cx: &'a H::Cx<'_>, v: Option<&'a H::Value>, at: Slot) -> Result<T, H::Error> {

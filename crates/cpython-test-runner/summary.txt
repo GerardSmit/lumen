@@ -1,31 +1,35 @@
-files run: 406  skipped (skip.txt): 0
-  import-error  406
-file-level errors: 406
-tests: pass 0  fail 0  error 0  skip 0
+files run: 436  skipped (skip.txt): 2
+  crash         2
+  failed        222
+  import-error  33
+  ok            160
+  timeout       19
+file-level errors: 54
+tests: pass 25885  fail 1543  error 2340  skip 2533
 
 top file-level failure reasons:
-   169  ModuleNotFoundError: No module named '_io'
-   151  ImportError: no os specific module found
-    29  ModuleNotFoundError: No module named '_ast'
-    15  ModuleNotFoundError: No module named 'errno'
-     7  ModuleNotFoundError: No module named 'array'
-     5  ModuleNotFoundError: No module named '_imp'
-     5  ModuleNotFoundError: No module named 'binascii'
-     3  ModuleNotFoundError: No module named '_contextvars'
-     3  ModuleNotFoundError: No module named '_socket'
-     2  AttributeError: module 'calendar' has no attribute '__dict__'
-     2  ModuleNotFoundError: No module named 'unicodedata'
-     1  AttributeError: 'function' object has no attribute '__func__'
-     1  ModuleNotFoundError: No module named '_locale'
-     1  ModuleNotFoundError: No module named '_multibytecodec'
-     1  ModuleNotFoundError: No module named '_symtable'
-     1  ModuleNotFoundError: No module named 'cmath'
-     1  ModuleNotFoundError: No module named 'faulthandler'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CEDILLA'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CHEROKEE LETTER A'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'CYRILLIC SMALL LETTER ZHE'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'LATIN SMALL LETTER Y WITH CIRCUMFLEX'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'LONG RIGHTWARDS SQUIGGLE ARROW'
-     1  SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name 'RS'
-     1  SyntaxError: no binding for nonlocal 'GLOBAL_VAR' found
-     1  TypeError: Template.__init_subclass__() missing 1 required positional argument: 'cls'
+     7  unittest.case.SkipTest: No module named '_tkinter'
+     2  unittest.case.SkipTest: No module named '_ctypes'
+     1  AttributeError: 'code' object has no attribute 'replace'
+     1  AttributeError: module 'sys' has no attribute 'thread_info'
+     1  FAILED (failures=1)
+     1  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+     1  test_fsize_enforced (test.test_resource.ResourceTest.test_fsize_enforced) ...
+     1  unittest.case.SkipTest: Linux only
+     1  unittest.case.SkipTest: No module named '_curses'
+     1  unittest.case.SkipTest: No module named '_dbm'
+     1  unittest.case.SkipTest: No module named '_gdbm'
+     1  unittest.case.SkipTest: No module named '_msi'
+     1  unittest.case.SkipTest: No module named '_sqlite3'
+     1  unittest.case.SkipTest: No module named '_winapi'
+     1  unittest.case.SkipTest: No module named '_wmi'
+     1  unittest.case.SkipTest: No module named 'nis'
+     1  unittest.case.SkipTest: No module named 'ossaudiodev'
+     1  unittest.case.SkipTest: No module named 'spwd'
+     1  unittest.case.SkipTest: No module named 'winreg'
+     1  unittest.case.SkipTest: No module named 'winsound'
+     1  unittest.case.SkipTest: Unable to open /dev/tty
+     1  unittest.case.SkipTest: object <module 'os' from '/Users/gerard/code/lumen/.claude/worktrees/agent-a4e7d3f2d5436a9df/cpython/Lib/os.py'> has no attribute 'startfile'
+     1  unittest.case.SkipTest: test irrelevant for an installed Python
+     1  unittest.case.SkipTest: test may crash on macOS (bpo-33725)
+     1  unittest.case.SkipTest: test only relevant on win32

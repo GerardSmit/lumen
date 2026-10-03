@@ -1,0 +1,70 @@
+3.305
+0.1428571428571428571428571429
+-0.00001234 1E+3 1.23456E-8
+0.1000000000000000055511151231257827021181583404541015625
+1180591620717411303424 -5
+-1.23
+1000.5 7
+NaN123 -sNaN -Infinity
+2.5 1E+2
+2 4
+2.68
+-3 -1 (Decimal('-3'), Decimal('1'))
+1.414213562373095048801688724 7.389056098930650227230427461 0.6931471805599453094172321215 0.3010299956639811952137388947
+1.414213562373095048801688724 1024 4
+DecimalTuple(sign=0, digits=(1, 5), exponent=-1) DecimalTuple(sign=1, digits=(0,), exponent='F') DecimalTuple(sign=0, digits=(7,), exponent='n')
+(3, 4) (-120, 1)
+0 -4
+True True
+True
+True True True
+True True True
+TypeError '<' not supported between instances of 'decimal.Decimal' and 'str'
+InvalidOperation [<class 'decimal.ConversionSyntax'>]
+TypeError unsupported operand type(s) for +: 'decimal.Decimal' and 'float'
+DivisionByZero [<class 'decimal.DivisionByZero'>]
+InvalidOperation [<class 'decimal.DivisionUndefined'>]
+InvalidOperation [<class 'decimal.InvalidOperation'>]
+ValueError coefficient must be a tuple of digits
+ValueError valid range for prec is [1, MAX_PREC]
+TypeError valid values for rounding are:
+  [ROUND_CEILING, ROUND_FLOOR, ROUND_UP, ROUND_DOWN,
+   ROUND_HALF_UP, ROUND_HALF_DOWN, ROUND_HALF_EVEN,
+   ROUND_05UP]
+TypeError conversion from NoneType to Decimal is not supported
+TypeError function missing required argument 'exp' (pos 1)
+1,234,567.89 1.23e-3 1e-7
+-00012.500 50%      NaN
+1,234.5    42    | 3
+28 ROUND_HALF_EVEN 999999 -999999
+0.14286 True
+0.66666
+0.1428571428571428571428571429
+0.667 3
+0.3333 True True
+Overflow [<class 'decimal.Overflow'>]
+1.235 -1000002 999996
+Context(prec=5, rounding=ROUND_HALF_EVEN, Emin=-100, Emax=100, capitals=1, clamp=0, flags=[], traps=[InvalidOperation, DivisionByZero, Overflow])
+DivisionByZero [<class 'decimal.DivisionByZero'>]
+Decimal('Infinity')
+Decimal('NaN')
+InvalidOperation [<class 'decimal.InvalidOperation'>]
+[True, True, True, True, True, True]
+(<class 'decimal.Inexact'>, <class 'decimal.Rounded'>) (<class 'decimal.DecimalException'>, <class 'ArithmeticError'>, <class 'TypeError'>)
+True True
+999999999999999999 -999999999999999999 999999999999999999 -1999999999999999997
+True True 1.70
+2 -2
+2 2.57 -3
+1.25 (2+0j) False
+0.5 10000000000000000159028911097599180468360808563945281389781327557747838772170381060813469985856815104
+6.0 -1 1
+0 4 3
+1.000000000000000000000000001 0.9999999999999999999999999999
+1 1.5E+3 10
+1234500 123 +Normal
+True True True False
+1.0 1.2
+3.14 False
+1.5 2.5
+True False

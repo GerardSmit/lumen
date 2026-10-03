@@ -24,6 +24,49 @@ pub enum Disposition {
     Foreign,
 }
 
+/// The signals of this platform by name (Windows: the C runtime's numbers libuv emulates).
+pub fn names() -> &'static [(&'static str, i32)] {
+    SIGNALS
+}
+
+/// The number of signal `name` (`"SIGTERM"`) on this platform.
+pub fn number(name: &str) -> Option<i32> {
+    SIGNALS.iter().find(|(n, _)| *n == name).map(|e| e.1)
+}
+
+#[cfg(unix)]
+macro_rules! signal_table {
+    ($($(#[$m:meta])* $name:ident),* $(,)?) => {
+        static SIGNALS: &[(&str, i32)] = &[$($(#[$m])* (stringify!($name), libc::$name),)*];
+    };
+}
+
+#[cfg(unix)]
+signal_table!(
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGIOT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1,
+    SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN,
+    SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGSYS,
+    #[cfg(any(target_os = "linux", target_os = "android"))] SIGSTKFLT,
+    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPOLL,
+    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPWR,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGEMT,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGINFO,
+);
+
+#[cfg(not(unix))]
+static SIGNALS: &[(&str, i32)] = &[
+    ("SIGHUP", 1),
+    ("SIGINT", 2),
+    ("SIGILL", 4),
+    ("SIGABRT", 22),
+    ("SIGFPE", 8),
+    ("SIGKILL", 9),
+    ("SIGSEGV", 11),
+    ("SIGTERM", 15),
+    ("SIGBREAK", 21),
+    ("SIGWINCH", 28),
+];
+
 /// The wake-up descriptor slots: one per runtime, so each keeps its own.
 pub const WAKE_NODE: usize = 0;
 pub const WAKE_PYTHON: usize = 1;
@@ -97,6 +140,16 @@ pub fn block_on_this_thread() {
         let sync = [libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL, libc::SIGTRAP, libc::SIGABRT];
         let sigs: Vec<i32> = valid_signals().into_iter().filter(|s| !sync.contains(s)).collect();
         let _ = sigmask(libc::SIG_BLOCK, &sigs);
+    }
+}
+
+/// Ignores `SIGXFSZ`, so a write past `RLIMIT_FSIZE` fails with `EFBIG` instead of killing the
+/// process (`SIGPIPE` is already ignored by Rust's runtime).
+pub fn ignore_file_size_limit_signal() {
+    #[cfg(unix)]
+    // SAFETY: signal(3) with SIG_IGN.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
     }
 }
 

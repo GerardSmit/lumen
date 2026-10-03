@@ -28,7 +28,7 @@ mod convert;
 pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
-pub use class::{is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
+pub use class::{extend_type, extend_type_documented, function_values, install_all, install_functions, install_into, install_module, is_instance, module_object, native_value, opaque_instance, owner_of, set_type_text_signature, type_object, type_text_signature, NativeIter, Py};
 pub use convert::{buffer_error, index, native_error};
 pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
@@ -208,12 +208,16 @@ impl<'s> PyCx<'s> {
     /// `f() argument 'x' must be str, not int` (or the receiver / element variant).
     #[cold]
     #[inline(never)]
-    fn arg_error(&self, at: Slot, what: &str, v: &Value) -> Obj {
+    pub fn arg_error(&self, at: Slot, what: &str, v: &Value) -> Obj {
         let it = self.it();
         let d = self.desc;
         if at.is_this() {
             let t = it.type_name_of(v);
             let owner = d.class().map(args::class_qualname).unwrap_or_default();
+            if args::is_slot_wrapper(d) {
+                let msg = format!("descriptor '{}' requires a '{}' object but received a '{}'", args::py_name(d), owner, t);
+                return it.type_error(&msg);
+            }
             let msg = format!("descriptor '{}' for '{}' objects doesn't apply to a '{}' object", args::py_name(d), owner, t);
             return it.type_error(&msg);
         }
@@ -285,7 +289,7 @@ impl Host for PyHost {
             }
             return Ok(slots);
         }
-        args::bind_slow(cx.it(), d, a, cx.kw, &mut slots)?;
+        args::bind_slow(cx.it(), d, cx.recv, a, cx.kw, &mut slots)?;
         Ok(slots)
     }
 
@@ -376,6 +380,11 @@ impl Host for PyHost {
     }
 
     #[inline]
+    fn is_true(v: &Value) -> bool {
+        matches!(v, Value::Bool(true))
+    }
+
+    #[inline]
     fn to_bool(cx: &PyCx<'_>, v: &Value, _: Slot) -> Result<bool, Obj> {
         match v {
             Value::Bool(b) => Ok(*b),
@@ -452,6 +461,13 @@ impl Host for PyHost {
                 // SAFETY: the store lives in `Scratch::stores` until after the guard, and the lent
                 // range is unaliased until the guard drops with `cx`.
                 return cx.lend(unsafe { &*store }, None, true).map(|p| unsafe { &mut *p });
+            }
+            if let Some((store, range)) = crate::builtins::memview::writable_part(cx.it(), v)? {
+                let s = cx.scratch();
+                s.stores.push(store);
+                let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
+                // SAFETY: as for arrays above.
+                return cx.lend(unsafe { &*store }, Some(range), true).map(|p| unsafe { &mut *p });
             }
         }
         Err(cx.arg_error(at, "read-write bytes-like object", v))
@@ -626,6 +642,39 @@ impl<'a> FromArg<'a, PyHost> for &'a Value {
     }
 }
 
+/// An exception instance (`BaseException` or a subclass), e.g. the receiver of a core
+/// exception type's method.
+#[derive(Clone, Copy)]
+pub struct Exc<'a>(pub &'a Obj);
+
+impl<'a> FromArg<'a, PyHost> for Exc<'a> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Ok(Exc(o)),
+            _ => Err(cx.arg_error(at, "BaseException", v)),
+        }
+    }
+}
+
+/// An instance of the core type `T` was installed into ([`extend_type`]), or of a subclass:
+/// the receiver of a core type's method when its instances share a kind with other types
+/// (`BaseExceptionGroup` among the exceptions).
+pub struct Inst<'a, T>(pub &'a Obj, PhantomData<fn() -> T>);
+
+impl<'a, T: Class> FromArg<'a, PyHost> for Inst<'a, T> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        let it = cx.it();
+        if let (Value::Obj(o), Some(t)) = (v, it.native_types.get(&TypeId::of::<T>())) {
+            if it.is_subtype(&it.type_of_obj(o), t) {
+                return Ok(Inst(o, PhantomData));
+            }
+        }
+        Err(cx.arg_error(at, &args::class_qualname(T::DESC), v))
+    }
+}
+
 impl<'a, T: Class> FromArg<'a, PyHost> for Py<T> {
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
         if is_instance::<T>(cx.it(), v) {
@@ -680,6 +729,15 @@ impl IntoRet<PyHost> for Value {
     const MAY_RUN: bool = false;
     #[inline(always)]
     fn into_ret(self, _: &mut Interp) -> Result<Value, Obj> {
+        Ok(self)
+    }
+}
+
+/// A `__next__` returning a plain `Value` raises `StopIteration` itself (e.g. with the
+/// generator's return value).
+impl NextRet<PyHost> for Value {
+    #[inline(always)]
+    fn into_next(self, _: &mut Interp) -> Result<Value, Obj> {
         Ok(self)
     }
 }

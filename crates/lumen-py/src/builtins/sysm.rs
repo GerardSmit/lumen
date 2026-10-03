@@ -5,7 +5,7 @@
 #[lumen_bind::module(name = "sys")]
 pub mod sys {
     use crate::builtins::genm::AsyncGenHooks;
-    use crate::builtins::sysextra::{new_structseq_type, structseq};
+    use crate::builtins::sysextra::{new_structseq_type, new_structseq_type_ext, structseq, structseq_full};
     use crate::object::*;
     use crate::vm::*;
     use std::rc::Rc;
@@ -57,7 +57,7 @@ pub mod sys {
             Some(e) => {
                 let t = Value::Obj(it.type_of_obj(&e));
                 let tb = match &e.kind {
-                    Kind::Exception(d) => it.make_tb(&d.borrow().tb),
+                    Kind::Exception(d) => it.exc_tb(d),
                     _ => Value::None,
                 };
                 Value::tuple(vec![t, Value::Obj(e), tb])
@@ -172,15 +172,67 @@ pub mod sys {
     /// Return True if Python is exiting.
     #[op]
     fn is_finalizing() -> bool {
+        crate::gc::is_finalizing()
+    }
+
+    /// Return True if the GIL is enabled and False if it is disabled.
+    #[op]
+    fn _is_gil_enabled() -> bool {
+        true
+    }
+
+    /// Return True if the given object is "interned".
+    #[op]
+    fn _is_interned(string: &Value) -> bool {
+        string.as_str().is_some()
+    }
+
+    /// Return True if the given object is "immortal" per PEP 683.
+    #[op]
+    fn _is_immortal(op: &Value) -> bool {
+        !matches!(op, Value::Obj(_))
+    }
+
+    /// Clear all internal performance-related caches.
+    #[op]
+    fn _clear_internal_caches() {
+        crate::watch::clear_type_cache();
+    }
+
+    /// Return the name of the module of the frame `depth` calls below the top of the stack,
+    /// or None if the frame has no `__name__` global.
+    #[op]
+    fn _getframemodulename(it: &mut Interp, #[kw] #[default(0)] depth: i64) -> R<Value> {
+        let n = it.frames.len() as i64;
+        if depth < 0 || depth >= n {
+            return Ok(Value::None);
+        }
+        let frame = it.frame_object((n - 1 - depth) as usize);
+        let globals = it.get_attr_str(&frame, "f_globals")?;
+        match &globals {
+            Value::Obj(d) => Ok(dict_get_str(d, "__name__").unwrap_or(Value::None)),
+            _ => Ok(Value::None),
+        }
+    }
+
+    /// Return True if remote debugging is enabled, False otherwise.
+    #[op]
+    fn is_remote_debug_enabled() -> bool {
         false
+    }
+
+    /// Return the directory where the standard library lives.
+    #[op]
+    fn _stdlib_dir() -> &'static str {
+        crate::frozen::FROZEN_DIR
     }
 
     /// Return the global debug tracing function set with sys.settrace.
     ///
     /// See the debugger chapter in the library manual.
     #[op]
-    fn gettrace() -> Value {
-        Value::None
+    fn gettrace(it: &mut Interp) -> Value {
+        it.mon.trace_func.clone()
     }
 
     /// settrace(function)
@@ -188,16 +240,32 @@ pub mod sys {
     /// Set the global debug tracing function.  It will be called on each
     /// function call.  See the debugger chapter in the library manual.
     #[op(hint(py(text_signature = "")))]
-    fn settrace(function: &Value) {
-        let _ = function;
+    fn settrace(it: &mut Interp, function: &Value) {
+        it.set_trace_func(function.clone());
+    }
+
+    /// _settraceallthreads(function)
+    ///
+    /// Set the global debug tracing function in all running threads, and for future threads.
+    #[op(hint(py(text_signature = "")))]
+    fn _settraceallthreads(it: &mut Interp, function: &Value) {
+        it.set_trace_func(function.clone());
+    }
+
+    /// _setprofileallthreads(function)
+    ///
+    /// Set the profiling function in all running threads belonging to the current interpreter.
+    #[op(hint(py(text_signature = "")))]
+    fn _setprofileallthreads(it: &mut Interp, function: &Value) {
+        it.set_profile_func(function.clone());
     }
 
     /// Return the profiling function set with sys.setprofile.
     ///
     /// See the profiler chapter in the library manual.
     #[op]
-    fn getprofile() -> Value {
-        Value::None
+    fn getprofile(it: &mut Interp) -> Value {
+        it.mon.profile_func.clone()
     }
 
     /// setprofile(function)
@@ -205,8 +273,21 @@ pub mod sys {
     /// Set the profiling function.  It will be called on each function call
     /// and return.  See the profiler chapter in the library manual.
     #[op(hint(py(text_signature = "")))]
-    fn setprofile(function: &Value) {
-        let _ = function;
+    fn setprofile(it: &mut Interp, function: &Value) {
+        it.set_profile_func(function.clone());
+    }
+
+    /// call_tracing(func, args)
+    ///
+    /// Call func(*args), while tracing is enabled.  The tracing state is
+    /// saved, and restored afterwards.  This is intended to be called from
+    /// a debugger from a checkpoint, to recursively debug some other code.
+    #[op(hint(py(text_signature = "")))]
+    fn call_tracing(it: &mut Interp, func: &Value, args: &Value) -> R<Value> {
+        let Some(items) = args.tuple_items() else {
+            return Err(it.type_error("call_tracing(): argument 'args' must be tuple"));
+        };
+        it.call_tracing(func, items.to_vec())
     }
 
     /// audit(event, *args)
@@ -264,8 +345,8 @@ pub mod sys {
 
     /// Return the current thread switch interval; see sys.setswitchinterval().
     #[op]
-    fn getswitchinterval() -> f64 {
-        0.005
+    fn getswitchinterval(it: &mut Interp) -> f64 {
+        it.threads.switch_interval_us as f64 / 1e6
     }
 
     /// Set the ideal thread switching delay inside the Python interpreter.
@@ -278,10 +359,34 @@ pub mod sys {
     /// A typical value is 0.005 (5 milliseconds).
     #[op]
     fn setswitchinterval(it: &mut Interp, interval: f64) -> R<()> {
-        if interval <= 0.0 {
+        if interval <= 0.0 || interval.is_nan() {
             return Err(it.value_error("switch interval must be strictly positive"));
         }
+        it.set_switch_interval(interval);
         Ok(())
+    }
+
+    /// Return a dictionary mapping each thread's identifier to the topmost stack frame
+    /// currently active in that thread at the time the function is called.
+    #[op]
+    fn _current_frames(it: &mut Interp) -> R<Value> {
+        let frames = it.current_frames();
+        let d = it.new_dict();
+        for (ident, frame) in frames {
+            it.dict_set(&d, Value::Int(ident as i64), frame)?;
+        }
+        Ok(Value::Obj(d))
+    }
+
+    /// Return a dict mapping each thread's identifier to its currently handled exception.
+    #[op]
+    fn _current_exceptions(it: &mut Interp) -> R<Value> {
+        let excs = it.current_exceptions();
+        let d = it.new_dict();
+        for (ident, exc) in excs {
+            it.dict_set(&d, Value::Int(ident as i64), exc)?;
+        }
+        Ok(Value::Obj(d))
     }
 
     /// Handle an exception by displaying it with a traceback on sys.stderr.
@@ -297,6 +402,27 @@ pub mod sys {
         };
         it.write_stderr(&text);
         Ok(())
+    }
+
+    /// Handle an unraisable exception.
+    ///
+    /// Called when an exception has occurred but there is no way for Python to handle it.
+    /// For example, when a destructor raises an exception.
+    #[op]
+    fn unraisablehook(it: &mut Interp, unraisable: &Value) -> R<()> {
+        let get = |it: &mut Interp, name: &str| it.get_attr_str(unraisable, name);
+        let exc = get(it, "exc_value")?;
+        let msg = get(it, "err_msg")?;
+        let obj = get(it, "object")?;
+        let Value::Obj(exc) = exc else { return Ok(()) };
+        it.default_unraisable(&exc, Some(&msg), Some(&obj));
+        Ok(())
+    }
+
+    /// Clear the internal type lookup cache.
+    #[op]
+    fn _clear_type_cache() {
+        crate::watch::clear_type_cache();
     }
 
     /// Print an object to sys.stdout and also save it in builtins._
@@ -317,7 +443,7 @@ pub mod sys {
         Ok(())
     }
 
-    /// The attributes computed on first use (`flags`, `version_info`, ...).
+    // The attributes computed on first use (`flags`, `version_info`, ...).
     #[op]
     fn __getattr__(it: &mut Interp, name: &str) -> R<Value> {
         lazy_attr(it, name)
@@ -354,7 +480,7 @@ pub mod sys {
         let v = match name.as_str() {
             "version_info" => {
                 let ty = new_structseq_type(it, "sys", "version_info", &["major", "minor", "micro", "releaselevel", "serial"]);
-                structseq(&ty, vec![Value::Int(3), Value::Int(12), Value::Int(15), Value::str("final"), Value::Int(0)])
+                structseq(&ty, vec![Value::Int(3), Value::Int(14), Value::Int(8), Value::str("final"), Value::Int(0)])
             }
             "flags" => {
                 let names = [
@@ -376,14 +502,17 @@ pub mod sys {
                     "warn_default_encoding",
                     "safe_path",
                     "int_max_str_digits",
+                    "gil",
+                    "thread_inherit_context",
+                    "context_aware_warnings",
                 ];
-                let ty = new_structseq_type(it, "sys", "flags", &names);
+                let ty = new_structseq_type_ext(it, "sys", "flags", &names, 18);
                 let digits = it.int_max_str_digits() as i64;
                 let utf8 = crate::builtins::iom::utf8_mode(it) as i64;
                 let vals = names
                     .iter()
                     .map(|n| match *n {
-                        "hash_randomization" | "dont_write_bytecode" => Value::Int(1),
+                        "hash_randomization" | "dont_write_bytecode" | "gil" => Value::Int(1),
                         "utf8_mode" => Value::Int(utf8),
                         "int_max_str_digits" => Value::Int(digits),
                         "dev_mode" => Value::Bool(false),
@@ -391,7 +520,7 @@ pub mod sys {
                         _ => Value::Int(0),
                     })
                     .collect();
-                structseq(&ty, vals)
+                structseq_full(&ty, vals)
             }
             "float_info" => {
                 let names = ["max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig", "epsilon", "radix", "rounds"];
@@ -433,6 +562,7 @@ pub mod sys {
                     vec![Value::Int(64), Value::Int((1 << 61) - 1), Value::Int(314159), Value::Int(0), Value::Int(1000003), Value::str("siphash13"), Value::Int(64), Value::Int(128), Value::Int(0)],
                 )
             }
+            "monitoring" => Value::Obj(it.import_module("sys.monitoring")?),
             "implementation" => {
                 let sys = it.sys_module.clone();
                 let vi = match &sys {
@@ -447,10 +577,11 @@ pub mod sys {
                 };
                 it.new_namespace(vec![
                     ("name", Value::str("lumen-py")),
-                    ("cache_tag", Value::str("lumen-312")),
+                    ("cache_tag", Value::str("lumen-314")),
                     ("version", vi),
-                    ("hexversion", Value::Int(0x030c0ff0)),
+                    ("hexversion", Value::Int(0x030e08f0)),
                     ("_multiarch", Value::str("")),
+                    ("supports_isolated_interpreters", Value::Bool(true)),
                 ])
             }
             _ => {
@@ -476,8 +607,8 @@ pub mod sys {
         dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
         dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
         dict_set_str(&d, "byteorder", Value::str("little"));
-        dict_set_str(&d, "version", Value::str("3.12.15 (lumen-py)"));
-        dict_set_str(&d, "hexversion", Value::Int(0x030c0ff0));
+        dict_set_str(&d, "version", Value::str("3.14.8 (main, Jan  1 2026, 00:00:00) [lumen-py]"));
+        dict_set_str(&d, "hexversion", Value::Int(0x030e08f0));
         let (platform, executable, argv) = {
             let p = it.platform.borrow();
             (p.platform_name(), p.executable(), p.argv())
@@ -499,7 +630,7 @@ pub mod sys {
         if let Ok(std_names) = it.new_frozenset_from(std_names) {
             dict_set_str(&d, "stdlib_module_names", std_names);
         }
-        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook")] {
+        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook"), ("__unraisablehook__", "unraisablehook")] {
             if let Some(f) = dict_get_str(&d, name) {
                 dict_set_str(&d, alias, f);
             }

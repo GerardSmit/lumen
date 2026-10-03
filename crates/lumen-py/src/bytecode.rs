@@ -1,8 +1,9 @@
 //! Bytecode: the instruction set and code objects.
 
 use crate::ast::{BinOp, CmpOp};
-use crate::object::{Obj, Value};
-use std::rc::Rc;
+use crate::object::{Kind, Obj, Object, Value};
+use std::cell::{OnceCell, RefCell};
+use std::rc::{Rc, Weak};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UnOp {
@@ -147,6 +148,26 @@ pub enum Op {
     MatchRest(u32),
 }
 
+impl Op {
+    /// The instruction index this op can transfer control to besides falling through (jumps,
+    /// loop exits, exception-handler entries).
+    pub fn jump_target(&self) -> Option<u32> {
+        match self {
+            Op::Jump(t)
+            | Op::JumpIfFalse(t)
+            | Op::JumpIfTrue(t)
+            | Op::JumpIfFalseKeep(t)
+            | Op::JumpIfTrueKeep(t)
+            | Op::ForIter(t)
+            | Op::SetupBlock(t)
+            | Op::SetupWith(t)
+            | Op::WithExceptEnd(t)
+            | Op::EndAsyncFor(t) => Some(*t),
+            _ => None,
+        }
+    }
+}
+
 pub const CO_VARARGS: u32 = 1;
 pub const CO_VARKEYWORDS: u32 = 2;
 pub const CO_GENERATOR: u32 = 4;
@@ -190,9 +211,53 @@ pub struct Code {
     /// (cell index, local index) pairs for arguments captured by closures.
     pub cell_args: Vec<(u32, u32)>,
     pub doc: Option<Value>,
+    /// The code object that wraps this code, while one is alive (`f.__code__` twice yields one
+    /// object, so code objects compare and hash by identity like CPython's compare by value).
+    pub pyobj: RefCell<Weak<Object>>,
+    /// Facts about the instruction stream computed on first use (tracing).
+    pub info: OnceCell<CodeInfo>,
+}
+
+/// Per-instruction facts the tracer needs, derived once from `ops` and `lines`.
+pub struct CodeInfo {
+    /// Instructions a line event can fire on ([`lumen_common::lineno::line_starts`]).
+    pub line_starts: Vec<bool>,
+    /// Instructions some jump or handler entry lands on.
+    pub targets: Vec<bool>,
+}
+
+impl Drop for Code {
+    fn drop(&mut self) {
+        crate::watch::code_dropped(self as *const Code as usize);
+    }
 }
 
 impl Code {
+    pub fn info(&self) -> &CodeInfo {
+        self.info.get_or_init(|| {
+            let mut targets = vec![false; self.ops.len() + 1];
+            for op in &self.ops {
+                if let Some(t) = op.jump_target() {
+                    if let Some(slot) = targets.get_mut(t as usize) {
+                        *slot = true;
+                    }
+                }
+            }
+            let line_starts = lumen_common::lineno::line_starts(&self.lines, &targets);
+            CodeInfo { line_starts, targets }
+        })
+    }
+
+    /// The code object of `code`, the same one for as long as it is alive.
+    pub fn object(code: &Rc<Code>) -> Obj {
+        if let Some(o) = code.pyobj.borrow().upgrade() {
+            return o;
+        }
+        let o = Object::new(Kind::Code(code.clone()));
+        *code.pyobj.borrow_mut() = Rc::downgrade(&o);
+        o
+    }
+
     pub fn has(&self, flag: u32) -> bool {
         self.flags & flag != 0
     }

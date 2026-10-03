@@ -1,0 +1,24 @@
+library [{'id': '1', 'lang': 'en'}, {'id': '2'}]
+['Dune', 'Emma']
+Emma
+1965
+<library><book id="1" lang="en"><title>Dune</title><year>1965</year></book><book id="2"><title>Emma</title></book><book id="3"><title>Ulysses &amp; more</title></book></library>
+b'<?xml version=\'1.0\' encoding=\'utf-8\'?>\n<library><book id="1"'
+  <book id="1" lang="en">
+{urn:x}r {urn:x}c
+<ns0:r xmlns:ns0="urn:x"><ns0:c /></ns0:r>
+[('start', 'library'), ('start', 'book'), ('start', 'title'), ('end', 'title')] 12
+<r><a>x</a></r>
+ParseError 7 (1, 8) mismatched tag: line 1, column 8
+['1', '2']
+Dune
+<library><book id="1" lang="en"><title>Dune</title
+<?xml version="1.0" ?>
+<a>
+ <b>1</b>
+ <b>2</b>
+</a>
+
+<?xml version="1.0" ?><root k="v&lt;&gt;">a &amp; b</root>
+[('start', 'library', []), ('start', 'book', [('id', '1'), ('lang', 'en')]), ('start', 'title', []), ('chars', 'Dune'), ('end', 'title')] 15
+[('START_DOCUMENT', None), ('START_ELEMENT', 'a'), ('START_ELEMENT', 'b'), ('END_ELEMENT', 'b'), ('CHARACTERS', None), ('END_ELEMENT', 'a')]

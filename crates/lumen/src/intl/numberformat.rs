@@ -6,6 +6,8 @@ use super::service::{
 use super::{ab, arg, canonicalize_locale_list, coerce_options, make_service};
 use crate::interpreter::Interp;
 use crate::value::{set_builtin, set_data, Gc, Value};
+use lumen_common::rounding::{round_ascii, round_up, Mode, Tail};
+use std::cmp::Ordering;
 
 pub fn install(it: &mut Interp, ns: &Gc) {
     let (ctor, proto) = make_service(it, ns, "NumberFormat", 0, construct);
@@ -742,6 +744,39 @@ fn decimal_digits(x: f64) -> (String, String) {
     }
 }
 
+/// The ECMA-402 rounding mode named `mode` (`halfExpand` for anything unrecognised).
+fn rounding_mode(mode: &str) -> Mode {
+    match mode {
+        "trunc" => Mode::Down,
+        "expand" => Mode::Up,
+        "ceil" => Mode::Ceiling,
+        "floor" => Mode::Floor,
+        "halfTrunc" => Mode::HalfDown,
+        "halfCeil" => Mode::HalfCeil,
+        "halfFloor" => Mode::HalfFloor,
+        "halfEven" => Mode::HalfEven,
+        _ => Mode::HalfUp,
+    }
+}
+
+/// The tail `rem + frac` (in units of `inc`, `rem < inc` an integer remainder and `frac` the
+/// discarded fraction) against half an increment.
+fn increment_tail(rem: u128, inc: u128, frac: Tail) -> Tail {
+    let half_inc = inc / 2;
+    let half = match rem.cmp(&half_inc) {
+        Ordering::Equal if inc % 2 == 0 => {
+            if frac.nonzero {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        Ordering::Equal => frac.half,
+        o => o,
+    };
+    Tail { nonzero: rem != 0 || frac.nonzero, half }
+}
+
 /// Round the decimal `int_str.frac_str` to `keep` fraction digits (may be negative, rounding integer
 /// places), snapping to a multiple of `inc` at that scale, per the ECMA-402 `mode`. Returns the exact
 /// decimal string (unsigned, `keep` fraction digits when `keep > 0`, no min-frac padding).
@@ -753,49 +788,29 @@ fn round_decimal(
     mode: &str,
     negative: bool,
 ) -> String {
-    let mut digits: Vec<u8> = int_str
-        .bytes()
-        .chain(frac_str.bytes())
-        .map(|b| b - b'0')
-        .collect();
-    let point = int_str.len() as i32;
-    let cut = point + keep; // number of leading digits retained as the coefficient
-    if cut <= 0 {
-        // Everything is discarded; the only possible non-zero result is a single rounded-up unit.
-        let any = digits.iter().any(|&d| d != 0);
-        let up = round_up_decision(
-            mode,
-            negative,
-            /*rem*/ 0.0,
-            /*frac*/ if any { 0.5001 } else { 0.0 },
-            inc,
-            0,
-        );
-        let val = if up { inc as u128 } else { 0 };
-        return place_decimal(&val.to_string(), keep);
-    }
-    let cut = cut as usize;
-    if digits.len() < cut {
-        digits.resize(cut, 0);
-    }
-    let retained: String = digits[..cut].iter().map(|d| (d + b'0') as char).collect();
-    let discarded = &digits[cut..];
-    // The discarded tail as a fraction of one retained unit (short string → exact enough to compare).
-    let frac = if discarded.is_empty() {
-        0.0
+    let mode = rounding_mode(mode);
+    let inc = inc.max(1) as u128;
+    let digits: Vec<u8> = int_str.bytes().chain(frac_str.bytes()).collect();
+    let cut = int_str.len() as i32 + keep;
+    let (retained, frac) = if cut <= 0 {
+        // Every digit is discarded; with leading implicit zeros the tail is below half a unit.
+        let tail = Tail::of_digits(&digits);
+        (String::new(), if cut < 0 { Tail { half: Ordering::Less, ..tail } } else { tail })
     } else {
-        let s: String = discarded.iter().map(|d| (d + b'0') as char).collect();
-        format!("0.{s}").parse::<f64>().unwrap_or(0.0)
+        let cut = cut as usize;
+        let mut kept = digits;
+        let tail = Tail::of_digits(kept.get(cut..).unwrap_or(&[]));
+        kept.resize(cut, b'0');
+        (String::from_utf8(kept).unwrap_or_default(), tail)
     };
-    let Ok(c) = retained.parse::<u128>() else {
+    let c = if retained.is_empty() { Some(0) } else { retained.parse::<u128>().ok() };
+    let Some(c) = c else {
         // Coefficient too large for exact arithmetic; emit unrounded (huge integers seldom round).
         return place_decimal(&retained, keep);
     };
-    let rem = (c % inc.max(1) as u128) as f64;
-    let quotient = c / inc.max(1) as u128;
-    let up = round_up_decision(mode, negative, rem, frac, inc, quotient);
-    let base = c - (c % inc.max(1) as u128);
-    let result = if up { base + inc as u128 } else { base };
+    let (quotient, rem) = (c / inc, c % inc);
+    let up = round_up(mode, negative, increment_tail(rem, inc, frac), quotient % 2 == 1, false);
+    let result = (quotient + u128::from(up)) * inc;
     place_decimal(&result.to_string(), keep)
 }
 
@@ -812,36 +827,6 @@ fn place_decimal(coeff: &str, keep: i32) -> String {
     };
     let split = padded.len() - keep;
     format!("{}.{}", &padded[..split], &padded[split..])
-}
-
-/// Whether to round the coefficient up by one increment, given the discarded position `rem + frac`
-/// (in increment units, `rem` an integer remainder and `frac` in [0,1)) under ECMA-402 `mode`.
-fn round_up_decision(
-    mode: &str,
-    negative: bool,
-    rem: f64,
-    frac: f64,
-    inc: u32,
-    quotient: u128,
-) -> bool {
-    let position = rem + frac;
-    let half = inc as f64 / 2.0;
-    let some = position > 0.0;
-    match mode {
-        "trunc" => false,
-        "expand" => some,
-        "ceil" => some && !negative,
-        "floor" => some && negative,
-        "halfTrunc" => position > half,
-        "halfExpand" => position >= half,
-        "halfCeil" => position > half || (position == half && !negative),
-        "halfFloor" => position > half || (position == half && negative),
-        "halfEven" => {
-            // Tie → round toward the multiple whose quotient is even (parity of the retained value).
-            position > half || (position == half && quotient % 2 == 1)
-        }
-        _ => position >= half, // halfExpand default
-    }
 }
 
 /// Round `x` to at most `max_frac` fraction digits, snapping to `increment`, per `mode`; pad to
@@ -1023,24 +1008,6 @@ pub(crate) fn exact_of(i: &mut Interp, x: &Value) -> Option<ExactDec> {
     }
 }
 
-/// Round-half-away-from-zero increment of a digit string (carries; may grow by one digit).
-fn digits_increment(head: &mut Vec<u8>) {
-    let mut k = head.len();
-    loop {
-        if k == 0 {
-            head.insert(0, b'1');
-            break;
-        }
-        k -= 1;
-        if head[k] == b'9' {
-            head[k] = b'0';
-        } else {
-            head[k] += 1;
-            break;
-        }
-    }
-}
-
 /// The unsigned digit string for an exact decimal magnitude in standard notation:
 /// significant-digit rounding (halfExpand, integer-only), fraction rounding (trunc/halfExpand),
 /// and minimum-fraction zero padding directly on the decimal digits. None falls back to the f64
@@ -1071,13 +1038,9 @@ fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
             if get_str(o, "__nf_roundingmode") != "halfExpand" {
                 return None;
             }
-            let bytes = digits.as_bytes();
             let total = digits.len();
-            let round_up = bytes[ms] >= b'5';
-            let mut head: Vec<u8> = bytes[..ms].to_vec();
-            if round_up {
-                digits_increment(&mut head);
-            }
+            let mut head = digits.clone().into_bytes();
+            round_ascii(&mut head, ms, Mode::HalfUp, false);
             digits = String::from_utf8(head).unwrap();
             for _ in 0..(total - ms) {
                 digits.push('0');
@@ -1110,19 +1073,15 @@ fn exact_magnitude(ed: &ExactDec, o: &Gc) -> Option<String> {
             get_num(o, "__nf_maxfrac").unwrap_or(if frac.is_empty() { 0 } else { 21 }) as usize;
         if frac.len() > max_frac {
             let mode = get_str(o, "__nf_roundingmode");
-            let round_up = match mode.as_str() {
-                "trunc" => false,
-                "halfExpand" | "" => frac.as_bytes()[max_frac] >= b'5',
-                _ => return None,
-            };
-            frac.truncate(max_frac);
-            if round_up {
-                let mut all: Vec<u8> = format!("{digits}{frac}").into_bytes();
-                digits_increment(&mut all);
-                let split = all.len() - max_frac;
-                frac = String::from_utf8(all.split_off(split)).unwrap();
-                digits = String::from_utf8(all).unwrap();
+            if !matches!(mode.as_str(), "trunc" | "halfExpand" | "") {
+                return None;
             }
+            let mut all: Vec<u8> = format!("{digits}{frac}").into_bytes();
+            let keep = digits.len() + max_frac;
+            round_ascii(&mut all, keep, rounding_mode(&mode), false);
+            let split = all.len() - max_frac;
+            frac = String::from_utf8(all.split_off(split)).unwrap();
+            digits = String::from_utf8(all).unwrap();
         }
     }
     // Trailing fraction zeros only survive up to minimumFractionDigits.

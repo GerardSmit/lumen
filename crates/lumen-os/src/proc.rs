@@ -101,144 +101,10 @@ pub fn times() -> R<[f64; 5]> {
     Err(FsError("ENOSYS"))
 }
 
-/// The password-database entry of the real user id (`getpwuid(getuid())`). Without an entry (or
-/// off Unix) the ids are still set (-1 off Unix) and the strings are absent.
-pub struct PasswdEntry {
-    pub uid: i64,
-    pub gid: i64,
-    pub name: Option<String>,
-    pub dir: Option<String>,
-    pub shell: Option<String>,
-}
-
-pub fn current_user() -> PasswdEntry {
-    #[cfg(unix)]
-    {
-        use std::ffi::CStr;
-        let text = |p: *const libc::c_char| {
-            // SAFETY: a non-null passwd string field is a NUL-terminated C string.
-            (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
-        };
-        // SAFETY: no arguments, cannot fail.
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        // SAFETY: getpwuid returns null or a pointer to static storage valid until the next call.
-        let entry = unsafe { libc::getpwuid(uid) };
-        let (name, dir, shell) = if entry.is_null() {
-            (None, None, None)
-        } else {
-            unsafe { (text((*entry).pw_name), text((*entry).pw_dir), text((*entry).pw_shell)) }
-        };
-        PasswdEntry { uid: uid as i64, gid: gid as i64, name, dir, shell }
-    }
-    #[cfg(not(unix))]
-    PasswdEntry { uid: -1, gid: -1, name: None, dir: None, shell: None }
-}
-
-/// The 1, 5 and 15 minute load averages (zeros where the OS has none).
-pub fn loadavg() -> [f64; 3] {
-    #[cfg(all(unix, not(target_os = "android")))]
-    {
-        let mut out = [0f64; 3];
-        // SAFETY: `out` has room for the three samples requested.
-        if unsafe { libc::getloadavg(out.as_mut_ptr(), 3) } == 3 {
-            return out;
-        }
-    }
-    [0.0; 3]
-}
-
-/// Seconds since boot (0 where unknown).
-pub fn uptime() -> f64 {
-    #[cfg(target_os = "macos")]
-    {
-        sysctl::<libc::timeval>("kern.boottime")
-            .map(|boot| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                (now - boot.tv_sec as f64 - boot.tv_usec as f64 / 1e6).max(0.0)
-            })
-            .unwrap_or(0.0)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/uptime")
-            .ok()
-            .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
-            .unwrap_or(0.0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    0.0
-}
-
-/// Bytes of memory available to new allocations (0 where unknown).
-pub fn free_memory() -> f64 {
-    #[cfg(target_os = "macos")]
-    {
-        let free_pages = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as f64;
-        // SAFETY: sysconf has no failure mode beyond returning -1.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as f64;
-        free_pages * page
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|t| {
-                t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| {
-                    l.split_whitespace().nth(1).and_then(|n| n.parse::<f64>().ok())
-                })
-            })
-            .map(|kb| kb * 1024.0)
-            .unwrap_or(0.0)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    0.0
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn sysctl<T: Default>(name: &str) -> Option<T> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut value = T::default();
-    let mut len = std::mem::size_of::<T>();
-    // SAFETY: `value` is a writable `T` of `len` bytes.
-    let rc = unsafe {
-        libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
-    };
-    (rc == 0).then_some(value)
-}
-
-/// A `sysctlbyname` value of up to `buf.len()` bytes; the length written.
-#[cfg(target_os = "macos")]
-pub(crate) fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
-    let cname = std::ffi::CString::new(name).ok()?;
-    let mut len = buf.len();
-    // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
-    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
-    (rc == 0).then_some(len)
-}
-
-pub fn cpu_count() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
-}
-
 /// `(columns, lines)` of the terminal behind `fd`.
 pub fn terminal_size(fd: i32) -> R<(u32, u32)> {
-    #[cfg(unix)]
-    {
-        // SAFETY: a zeroed winsize is a valid out-parameter for TIOCGWINSZ.
-        let mut w: libc::winsize = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut w) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok((w.ws_col as u32, w.ws_row as u32))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = fd;
-        Err(FsError("ENOSYS"))
-    }
+    let (rows, cols) = crate::tty::get_winsize(fd)?;
+    Ok((cols as u32, rows as u32))
 }
 
 /// Fills `buf` from the operating system's CSPRNG: `/dev/urandom` on Unix (opened once),
@@ -414,6 +280,93 @@ pub fn waitpid(pid: i32, options: i32) -> R<(i32, i32)> {
     }
 }
 
+/// `fork(2)`: the child's pid in the parent, 0 in the child.
+pub fn fork() -> R<i32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: the caller runs the fork hooks and keeps the child single-threaded.
+        check(unsafe { libc::fork() })
+    }
+    #[cfg(not(unix))]
+    Err(FsError("ENOSYS"))
+}
+
+/// `wait4(2)` (`pid` -1 for any child; `wait3` is the same call): `(pid, status, usage)`; `pid`
+/// is 0 when `WNOHANG` found no child. Retries on `EINTR`.
+pub fn wait4(pid: i32, options: i32) -> R<(i32, i32, crate::rlimit::Rusage)> {
+    #[cfg(unix)]
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: a zeroed rusage is a valid out-parameter; `status` is live.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::wait4(pid, &mut status, options, &mut usage) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        return Ok((r, status, crate::rlimit::rusage_of(&usage)));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, options);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// The `siginfo_t` fields `waitid(2)` fills in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitInfo {
+    pub pid: i32,
+    pub uid: u32,
+    pub signo: i32,
+    pub status: i32,
+    pub code: i32,
+}
+
+/// `waitid(2)`; `None` when `WNOHANG` found no child. Retries on `EINTR`.
+pub fn waitid(idtype: i32, id: u32, options: i32) -> R<Option<WaitInfo>> {
+    #[cfg(unix)]
+    loop {
+        // SAFETY: a zeroed siginfo_t is a valid out-parameter for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(idtype as _, id as _, &mut info, options) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: waitid filled the union members read here.
+        let (pid, uid, status) = unsafe { (info.si_pid(), info.si_uid(), info.si_status()) };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let (pid, uid, status) = (info.si_pid, info.si_uid, info.si_status);
+        if pid == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(WaitInfo { pid, uid: uid as u32, signo: info.si_signo, status, code: info.si_code }));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (idtype, id, options);
+        Err(FsError("ENOSYS"))
+    }
+}
+
+/// The `CLD_*` codes of a `waitid` result.
+pub const CLD_CONSTANTS: [(&str, i64); 6] = [
+    ("CLD_EXITED", 1),
+    ("CLD_KILLED", 2),
+    ("CLD_DUMPED", 3),
+    ("CLD_TRAPPED", 4),
+    ("CLD_STOPPED", 5),
+    ("CLD_CONTINUED", 6),
+];
+
 /// `system(3)`: the raw wait status of `/bin/sh -c command`.
 pub fn system(command: &str) -> R<i32> {
     #[cfg(unix)]
@@ -509,20 +462,4 @@ pub fn getlogin() -> R<String> {
     }
     #[cfg(not(unix))]
     Err(FsError("ENOSYS"))
-}
-
-/// The supplementary group ids of the process (`getgroups(2)`).
-pub fn getgroups() -> R<Vec<u32>> {
-    #[cfg(unix)]
-    {
-        // SAFETY: a zero-length query returns the count.
-        let n = check(unsafe { libc::getgroups(0, std::ptr::null_mut()) })?;
-        let mut v: Vec<libc::gid_t> = vec![0; n as usize];
-        // SAFETY: `v` has room for `n` ids.
-        let n = check(unsafe { libc::getgroups(n, v.as_mut_ptr()) })?;
-        v.truncate(n as usize);
-        Ok(v)
-    }
-    #[cfg(not(unix))]
-    Ok(Vec::new())
 }

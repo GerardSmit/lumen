@@ -214,163 +214,10 @@ fn glob_match(glob: &str, rel: &str) -> bool {
     (0..path.len()).any(|i| segs_match(&pat, &path[i..]))
 }
 
-// ---- a minimal JSON reader (package.json) -----------------------------------------------------
-
-#[derive(Clone, Debug)]
-enum Json {
-    Null,
-    Bool,
-    Num,
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Json::Obj(kv) => kv.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-    fn str(&self) -> Option<&str> {
-        match self {
-            Json::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-}
+use lumen_common::json::Value as Json;
 
 fn parse_json(text: &str) -> Option<Json> {
-    struct P<'a> {
-        b: &'a [u8],
-        i: usize,
-    }
-    impl P<'_> {
-        fn ws(&mut self) {
-            while self.i < self.b.len() && self.b[self.i].is_ascii_whitespace() {
-                self.i += 1;
-            }
-        }
-        fn value(&mut self) -> Option<Json> {
-            self.ws();
-            match *self.b.get(self.i)? {
-                b'{' => {
-                    self.i += 1;
-                    let mut kv = Vec::new();
-                    self.ws();
-                    if self.b.get(self.i) == Some(&b'}') {
-                        self.i += 1;
-                        return Some(Json::Obj(kv));
-                    }
-                    loop {
-                        self.ws();
-                        let k = self.string()?;
-                        self.ws();
-                        if self.b.get(self.i) != Some(&b':') {
-                            return None;
-                        }
-                        self.i += 1;
-                        let v = self.value()?;
-                        kv.push((k, v));
-                        self.ws();
-                        match self.b.get(self.i)? {
-                            b',' => self.i += 1,
-                            b'}' => {
-                                self.i += 1;
-                                return Some(Json::Obj(kv));
-                            }
-                            _ => return None,
-                        }
-                    }
-                }
-                b'[' => {
-                    self.i += 1;
-                    let mut items = Vec::new();
-                    self.ws();
-                    if self.b.get(self.i) == Some(&b']') {
-                        self.i += 1;
-                        return Some(Json::Arr(items));
-                    }
-                    loop {
-                        items.push(self.value()?);
-                        self.ws();
-                        match self.b.get(self.i)? {
-                            b',' => self.i += 1,
-                            b']' => {
-                                self.i += 1;
-                                return Some(Json::Arr(items));
-                            }
-                            _ => return None,
-                        }
-                    }
-                }
-                b'"' => self.string().map(Json::Str),
-                b't' if self.b[self.i..].starts_with(b"true") => {
-                    self.i += 4;
-                    Some(Json::Bool)
-                }
-                b'f' if self.b[self.i..].starts_with(b"false") => {
-                    self.i += 5;
-                    Some(Json::Bool)
-                }
-                b'n' if self.b[self.i..].starts_with(b"null") => {
-                    self.i += 4;
-                    Some(Json::Null)
-                }
-                b'-' | b'0'..=b'9' => {
-                    while self.i < self.b.len()
-                        && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
-                    {
-                        self.i += 1;
-                    }
-                    Some(Json::Num)
-                }
-                _ => None,
-            }
-        }
-        fn string(&mut self) -> Option<String> {
-            if self.b.get(self.i) != Some(&b'"') {
-                return None;
-            }
-            self.i += 1;
-            let mut out: Vec<u8> = Vec::new();
-            loop {
-                let c = *self.b.get(self.i)?;
-                self.i += 1;
-                match c {
-                    b'"' => return String::from_utf8(out).ok(),
-                    b'\\' => {
-                        let e = *self.b.get(self.i)?;
-                        self.i += 1;
-                        match e {
-                            b'n' => out.push(b'\n'),
-                            b't' => out.push(b'\t'),
-                            b'r' => out.push(b'\r'),
-                            b'b' => out.push(8),
-                            b'f' => out.push(12),
-                            b'u' => {
-                                let hex = std::str::from_utf8(self.b.get(self.i..self.i + 4)?)
-                                    .ok()?;
-                                self.i += 4;
-                                let cp = u32::from_str_radix(hex, 16).ok()?;
-                                let ch = char::from_u32(cp).unwrap_or('\u{fffd}');
-                                let mut buf = [0u8; 4];
-                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                            }
-                            other => out.push(other),
-                        }
-                    }
-                    c => out.push(c),
-                }
-            }
-        }
-    }
-    let mut p = P {
-        b: text.as_bytes(),
-        i: 0,
-    };
-    p.value()
+    lumen_common::json::parse(text).ok()
 }
 
 // ---- resolution -------------------------------------------------------------------------------
@@ -421,7 +268,7 @@ impl Resolver {
             if d.join("package.json").is_file() {
                 return self
                     .package_json(d)
-                    .and_then(|j| j.get("type").and_then(Json::str).map(str::to_string));
+                    .and_then(|j| j.get("type").and_then(Json::as_str).map(str::to_string));
             }
             dir = d.parent();
         }
@@ -457,7 +304,7 @@ impl Resolver {
         }
         if let Some(main) = self
             .package_json(dir)
-            .and_then(|j| j.get("main").and_then(Json::str).map(str::to_string))
+            .and_then(|j| j.get("main").and_then(Json::as_str).map(str::to_string))
         {
             let target = clean(&dir.join(main));
             if let Some(f) = self

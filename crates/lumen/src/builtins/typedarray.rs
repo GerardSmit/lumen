@@ -306,7 +306,7 @@ pub(crate) fn array_buffer_from_store(i: &mut Interp, store: StoreSlot) -> (Valu
     i.gc_pin(&obj);
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
     // behind NUL-prefixed keys and surfaced through prototype accessor getters.
-    let max = store.max_len().min(9007199254740991);
+    let max = (store.max_len() as u64).min(9007199254740991);
     set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max as f64));
     set_internal(&obj, "\u{0}ab_resizable", Value::Bool(store.is_resizable()));
     i.array_buffers.insert(p, store);

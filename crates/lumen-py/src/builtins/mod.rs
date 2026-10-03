@@ -5,8 +5,18 @@ pub mod args;
 pub mod bytesm;
 pub mod contextvarsm;
 pub mod csvm;
+pub mod decimalm;
+pub mod jsonm;
 pub mod posixsubprocessm;
 pub mod selectm;
+pub mod fcntlm;
+pub mod mmapm;
+pub mod multiprocessingm;
+pub mod pwdm;
+pub mod readlinem;
+pub mod resourcem;
+pub mod syslogm;
+pub mod termiosm;
 pub mod scproxym;
 pub mod signalm;
 pub mod socketm;
@@ -22,8 +32,16 @@ pub mod astconv;
 pub mod binasciim;
 pub mod bisectm;
 pub mod unicodedatam;
+pub mod unraisable;
+pub mod functoolsm;
 pub mod genm;
+pub mod bz2m;
+pub mod decompressor;
+pub mod lzmam;
+pub mod pyexpatm;
 pub mod zlibm;
+#[cfg(all(unix, not(target_os = "android")))]
+pub mod sslm;
 pub mod hashlibm;
 pub mod heapqm;
 pub mod impm;
@@ -34,12 +52,14 @@ pub mod marshalm;
 pub mod cmathm;
 pub mod mathm;
 pub mod operatorm;
+pub mod picklem;
 pub mod memview;
 pub mod modules;
 pub mod native;
 pub mod numeric;
 pub mod objectm;
 pub mod slots;
+pub mod statisticsm;
 pub mod strm;
 pub mod sysextra;
 pub mod sysm;
@@ -62,6 +82,17 @@ pub mod errnom;
 pub mod posixm;
 pub mod typingm;
 pub mod zoneinfom;
+pub mod xid;
+pub mod testcapi;
+pub mod interpchanm;
+pub mod subinterpm;
+pub mod singlephasem;
+pub mod testbufferm;
+pub mod testextm;
+pub mod xxlimitedm;
+pub mod lsprofm;
+pub mod monitoringm;
+pub mod opcodem;
 
 use crate::object::*;
 use crate::vm::*;
@@ -76,12 +107,14 @@ pub fn init(it: &mut Interp) {
     iterm::init(it);
     genm::init(it);
     excm::init(it);
-    codecsm::init(it);
     excgroup::init(it);
     funcs::init(it);
     sysextra::init_frame_type(it);
     sysextra::init_code_type(it);
     descr::init(it);
+    numeric::init_descriptors(it);
+    dictm::init_descriptors(it);
+    alias::init(it);
     modules::init(it);
     register_names(it);
 }
@@ -116,9 +149,6 @@ fn register_names(it: &mut Interp) {
         ("filter", t.filter.clone()),
         ("reversed", t.reversed.clone()),
     ];
-    if let Some(d) = it.types.object.dict.borrow().as_ref() {
-        dict_set_str(d, "__doc__", Value::str("The base class of the class hierarchy."));
-    }
     for (n, o) in named {
         dict_set_str(&b, n, Value::Obj(o));
     }

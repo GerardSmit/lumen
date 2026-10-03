@@ -1,0 +1,25 @@
+[3, 1, 0, 1] 5 9 4
+[5, 1, 2]
+True False False
+7.0
+ValueError invalid operation in fma
+OverflowError overflow in fma
+Placeholder _PlaceholderType True
+TypeError PlaceholderType takes no arguments
+25 (Placeholder, 2) functools.partial(<built-in function pow>, Placeholder, 2)
+TypeError missing positional arguments in 'partial' call; expected at least 1, got 0
+TypeError trailing Placeholders are not allowed
+TypeError Placeholder cannot be passed as a keyword argument
+49 (7, 2)
+((Placeholder, 2), {})
+array('w', 'héllo') héllo 4
+array('w') 0
+TypeError array item must be a unicode character, not int
+ValueError bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)
+array.array[int]
+ValueError cannot un-register built-in error handler 'strict'
+False
+3 True
+None
+<class 'list'>
+0

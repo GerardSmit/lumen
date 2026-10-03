@@ -9,6 +9,7 @@ license.workspace = true
 # comes from lumen-os.
 
 [dependencies]
+lumen-common = { path = "../lumen-common" }
 lumen-os = { path = "../lumen-os" }
 
 [[bin]]

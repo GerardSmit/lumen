@@ -188,9 +188,12 @@ pub mod _imp {
     /// (-1: "never", 1: "always", 0: no override)
     #[op(hint(py(text_signature = "($module, override, /)")))]
     fn _override_multi_interp_extensions_check(flag: i64) -> i64 {
-        let _ = flag;
-        0
+        crate::builtins::subinterpm::override_extensions_check(flag)
     }
+
+    /// The pyc magic number (3627 for CPython 3.14) with `\r\n`, as a little-endian 32-bit integer.
+    #[constant(name = "pyc_magic_number_token")]
+    const PYC_MAGIC_NUMBER_TOKEN: i64 = 3627 | (13 << 16) | (10 << 24);
 
     #[init]
     fn init(it: &mut Interp, m: &Value) {

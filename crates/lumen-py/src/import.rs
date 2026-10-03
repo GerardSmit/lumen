@@ -81,6 +81,7 @@ impl Interp {
             false => format!("{l}\n"),
         });
         let text = text.map_or(Value::None, Value::string);
+        let col = col.or((line > 0).then_some(0));
         let offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 1));
         let end_offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 2));
         let detail = Value::tuple(vec![Value::str(file), Value::Int(line as i64), offset, text, Value::Int(line as i64), end_offset]);
@@ -244,6 +245,7 @@ impl Interp {
     }
 
     fn run_exit_hooks(&mut self) {
+        self.wait_for_thread_shutdown();
         self.run_atexit();
         crate::builtins::iom::flush_std_streams(self);
         self.flush_out();
@@ -285,6 +287,11 @@ impl Interp {
         let (dirs, parent_mod) = match parent_name {
             Some(p) => {
                 let pm = self.import_module(p)?;
+                // Importing the parent may itself register the child (`collections.abc` is
+                // `_collections_abc` since 3.14).
+                if let Some(Value::Obj(m)) = dict_get_str(&self.modules, full) {
+                    return Ok(m);
+                }
                 let pd = self.module_dict(&pm);
                 let path = match dict_get_str(&pd, "__path__") {
                     Some(v) => v,

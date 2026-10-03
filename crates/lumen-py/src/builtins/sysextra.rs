@@ -2,23 +2,16 @@
 //! `sys._getframe` and tracebacks.
 
 use super::native::*;
+use crate::bind::{Inst, KwArgs, PyCx, PyHost, This};
 use crate::bytecode::Code;
 use crate::object::*;
 use crate::vm::*;
+use lumen_bind::{FromArg, Slot};
 use std::rc::Rc;
 
 // ---- struct sequences ---------------------------------------------------------------------------
 
 const HIDDEN: &str = "_structseq_hidden";
-
-fn field<const N: usize>(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some(v) = a.first() else { return Err(it.type_error("descriptor requires a struct sequence")) };
-    match v.tuple_items() {
-        Some(items) if N < items.len() => Ok(items[N].clone()),
-        Some(items) => Ok(structseq_hidden(v).get(N - items.len()).cloned().unwrap_or(Value::None)),
-        None => Err(it.type_error("descriptor requires a struct sequence")),
-    }
-}
 
 /// The fields of a struct sequence past `n_sequence_fields` (reachable by name only).
 pub fn structseq_hidden(v: &Value) -> Vec<Value> {
@@ -27,46 +20,210 @@ pub fn structseq_hidden(v: &Value) -> Vec<Value> {
     d.and_then(|d| dict_get_str(&d, HIDDEN)).and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default()
 }
 
-const GETTERS: [NativeFn; 24] = [
-    field::<0>,
-    field::<1>,
-    field::<2>,
-    field::<3>,
-    field::<4>,
-    field::<5>,
-    field::<6>,
-    field::<7>,
-    field::<8>,
-    field::<9>,
-    field::<10>,
-    field::<11>,
-    field::<12>,
-    field::<13>,
-    field::<14>,
-    field::<15>,
-    field::<16>,
-    field::<17>,
-    field::<18>,
-    field::<19>,
-    field::<20>,
-    field::<21>,
-    field::<22>,
-    field::<23>,
-];
+fn field(it: &mut Interp, seq: &Value, index: usize) -> R<Value> {
+    match seq.tuple_items() {
+        Some(items) if index < items.len() => Ok(items[index].clone()),
+        Some(items) => Ok(structseq_hidden(seq).get(index - items.len()).cloned().unwrap_or(Value::None)),
+        None => Err(it.type_error("descriptor requires a struct sequence")),
+    }
+}
 
-fn structseq_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let ty = it.type_of(&a[0]);
-    let names = it.lookup_mro(&ty, "_fields");
-    let items = a[0].tuple_items().map(|t| t.to_vec()).unwrap_or_default();
-    let mut parts = Vec::new();
-    if let Some(Value::Obj(n)) = names {
-        if let Kind::Tuple(names) = &n.kind {
-            for (name, v) in names.iter().zip(items.iter()) {
-                parts.push(format!("{}={}", name.as_str().unwrap_or("?"), it.repr_of(v)?));
-            }
+/// The getters of the struct sequence fields by index, installed under the field names.
+#[lumen_bind::class(name = "structseq_fields", hint(py(shared)))]
+struct Fields;
+
+#[lumen_bind::methods]
+impl Fields {
+    #[getter(name = "0")]
+    fn f0(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 0)
+    }
+    #[getter(name = "1")]
+    fn f1(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 1)
+    }
+    #[getter(name = "2")]
+    fn f2(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 2)
+    }
+    #[getter(name = "3")]
+    fn f3(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 3)
+    }
+    #[getter(name = "4")]
+    fn f4(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 4)
+    }
+    #[getter(name = "5")]
+    fn f5(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 5)
+    }
+    #[getter(name = "6")]
+    fn f6(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 6)
+    }
+    #[getter(name = "7")]
+    fn f7(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 7)
+    }
+    #[getter(name = "8")]
+    fn f8(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 8)
+    }
+    #[getter(name = "9")]
+    fn f9(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 9)
+    }
+    #[getter(name = "10")]
+    fn f10(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 10)
+    }
+    #[getter(name = "11")]
+    fn f11(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 11)
+    }
+    #[getter(name = "12")]
+    fn f12(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 12)
+    }
+    #[getter(name = "13")]
+    fn f13(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 13)
+    }
+    #[getter(name = "14")]
+    fn f14(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 14)
+    }
+    #[getter(name = "15")]
+    fn f15(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 15)
+    }
+    #[getter(name = "16")]
+    fn f16(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 16)
+    }
+    #[getter(name = "17")]
+    fn f17(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 17)
+    }
+    #[getter(name = "18")]
+    fn f18(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 18)
+    }
+    #[getter(name = "19")]
+    fn f19(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 19)
+    }
+    #[getter(name = "20")]
+    fn f20(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 20)
+    }
+    #[getter(name = "21")]
+    fn f21(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 21)
+    }
+    #[getter(name = "22")]
+    fn f22(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 22)
+    }
+    #[getter(name = "23")]
+    fn f23(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        field(it, &slf, 23)
+    }
+}
+
+/// Installs field `index` of the struct sequence type `ty` as a `member_descriptor` named `name`.
+fn install_field(it: &mut Interp, ty: &Obj, name: &'static str, index: usize) {
+    let mut items = Vec::new();
+    <Fields as lumen_bind::Methods<PyHost>>::members(&mut items);
+    let Some(item) = items.get(index) else { return };
+    let fget = crate::bind::native_value(item);
+    super::descr::install_member(it, ty, name, fget);
+}
+
+/// An instance of a struct sequence type (a tuple subclass instance).
+#[derive(Clone, Copy)]
+pub struct SeqRef<'a>(pub &'a Value, pub &'a [Value]);
+
+impl<'a> FromArg<'a, PyHost> for SeqRef<'a> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match (v, v.tuple_items()) {
+            (Value::Obj(o), Some(items)) if o.cls.is_some() => Ok(SeqRef(v, items)),
+            _ => Err(cx.arg_error(at, "structseq", v)),
         }
     }
-    Ok(Value::string(format!("{}({})", it.type_display(&ty), parts.join(", "))))
+}
+
+/// The members of the struct sequence types, installed into each one.
+#[lumen_bind::class(name = "structseq", hint(py(shared)))]
+pub struct StructSeq;
+
+#[lumen_bind::methods]
+impl StructSeq {
+    // `T(sequence, dict=None)`.
+    #[constructor]
+    fn new(cls: This<Value>, it: &mut Interp, #[kw] sequence: &Value, #[kw] dict: Option<&Value>) -> R<Value> {
+        let Value::Obj(ty) = &*cls else { unreachable!("checked by the entry") };
+        let seq = it.iterate_to_vec(sequence)?;
+        let (min, max) = (type_int(ty, "n_sequence_fields"), type_int(ty, "n_fields"));
+        let tname = it.type_display(ty);
+        if seq.len() < min || seq.len() > max {
+            let msg = if min == max {
+                format!("{}() takes a {}-sequence ({}-sequence given)", tname, min, seq.len())
+            } else if seq.len() < min {
+                format!("{}() takes an at least {}-sequence ({}-sequence given)", tname, min, seq.len())
+            } else {
+                format!("{}() takes an at most {}-sequence ({}-sequence given)", tname, max, seq.len())
+            };
+            return Err(it.type_error(&msg));
+        }
+        let dict = match dict {
+            None => None,
+            Some(Value::Obj(d)) if dict_of(&Value::Obj(d.clone())).is_some() => Some(d.clone()),
+            Some(_) => return Err(it.type_error(&format!("{}() takes a dict as second arg, if any", tname))),
+        };
+        let mut vals = seq[..min].to_vec();
+        for (i, name) in hidden_names(ty).iter().enumerate() {
+            let v = match seq.get(min + i) {
+                Some(v) => v.clone(),
+                None => match &dict {
+                    Some(d) => it.dict_get(d, name)?.unwrap_or(Value::None),
+                    None => Value::None,
+                },
+            };
+            vals.push(v);
+        }
+        Ok(structseq_full(ty, vals))
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<SeqRef<'_>>, it: &mut Interp) -> R<String> {
+        let ty = it.type_of(slf.0 .0);
+        let names = it.lookup_mro(&ty, "_fields");
+        let mut parts = Vec::new();
+        if let Some(Value::Obj(n)) = names {
+            if let Kind::Tuple(names) = &n.kind {
+                for (name, v) in names.iter().zip(slf.0 .1.iter()) {
+                    parts.push(format!("{}={}", name.as_str().unwrap_or("?"), it.repr_of(v)?));
+                }
+            }
+        }
+        Ok(format!("{}({})", it.type_display(&ty), parts.join(", ")))
+    }
+
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<SeqRef<'_>>, it: &mut Interp) -> R<Value> {
+        let SeqRef(v, visible) = slf.0;
+        let ty = it.type_of(v);
+        let d = it.new_dict();
+        for (name, x) in hidden_names(&ty).into_iter().zip(structseq_hidden(v)) {
+            if name.as_str().is_some_and(|n| !n.is_empty()) {
+                it.dict_set(&d, name, x)?;
+            }
+        }
+        Ok(Value::tuple(vec![Value::Obj(ty), Value::tuple(vec![Value::tuple(visible.to_vec()), Value::Obj(d)])]))
+    }
 }
 
 /// A tuple subclass with named read-only fields, like CPython's `sys.version_info`.
@@ -74,9 +231,9 @@ pub fn new_structseq_type(it: &mut Interp, module: &str, name: &str, fields: &[&
     let tuple = it.types.tuple.clone();
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
-        it.reg_prop(&ty, f, GETTERS[i]);
+        install_field(it, &ty, f, i);
     }
-    it.reg(&ty, "__repr__", structseq_repr);
+    crate::bind::install_into::<StructSeq>(&ty, &["__repr__"]);
     if let Some(d) = ty.dict.borrow().as_ref() {
         dict_set_str(d, "_fields", Value::tuple(fields.iter().map(|f| Value::str(f)).collect()));
         dict_set_str(d, "n_fields", Value::Int(fields.len() as i64));
@@ -107,12 +264,10 @@ pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields:
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
         if !f.is_empty() {
-            it.reg_prop(&ty, f, GETTERS[i]);
+            install_field(it, &ty, f, i);
         }
     }
-    it.reg(&ty, "__repr__", structseq_repr);
-    it.reg_new(&ty, structseq_new);
-    it.reg(&ty, "__reduce__", structseq_reduce);
+    crate::bind::install_into::<StructSeq>(&ty, &["__new__", "__repr__", "__reduce__"]);
     let named: Vec<Value> = fields.iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
     let match_args: Vec<Value> = fields[..n_seq].iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
     if let Some(d) = ty.dict.borrow().as_ref() {
@@ -158,119 +313,80 @@ pub fn set_structseq_hidden(v: &Value, hidden: Vec<Value>) {
     }
 }
 
-/// `T(sequence, dict=None)` for a struct sequence type.
-pub fn structseq_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("structseq", a, kw, &["cls", "sequence", "dict"], 2)?;
-    let Some(Value::Obj(ty)) = b[0].clone() else { return Err(it.type_error("structseq.__new__(X): X is not a type object")) };
-    let seq = it.iterate_to_vec(b[1].as_ref().unwrap_or(&Value::None))?;
-    let (min, max) = (type_int(&ty, "n_sequence_fields"), type_int(&ty, "n_fields"));
-    let tname = it.type_display(&ty);
-    if seq.len() < min || seq.len() > max {
-        let msg = if min == max {
-            format!("{}() takes a {}-sequence ({}-sequence given)", tname, min, seq.len())
-        } else if seq.len() < min {
-            format!("{}() takes an at least {}-sequence ({}-sequence given)", tname, min, seq.len())
-        } else {
-            format!("{}() takes an at most {}-sequence ({}-sequence given)", tname, max, seq.len())
-        };
-        return Err(it.type_error(&msg));
-    }
-    let dict = match &b[2] {
-        None | Some(Value::None) => None,
-        Some(d) if dict_of(d).is_some() => Some(d.clone()),
-        Some(_) => return Err(it.type_error(&format!("{}() takes a dict as second arg, if any", tname))),
-    };
-    let mut vals = seq[..min].to_vec();
-    for (i, name) in hidden_names(&ty).iter().enumerate() {
-        let v = match seq.get(min + i) {
-            Some(v) => v.clone(),
-            None => match &dict {
-                Some(Value::Obj(d)) => it.dict_get(d, name)?.unwrap_or(Value::None),
-                _ => Value::None,
-            },
-        };
-        vals.push(v);
-    }
-    Ok(structseq_full(&ty, vals))
-}
-
-fn structseq_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__reduce__", a, 1, 1)?;
-    let ty = it.type_of(&a[0]);
-    let visible = a[0].tuple_items().map(|t| t.to_vec()).unwrap_or_default();
-    let d = it.new_dict();
-    for (name, v) in hidden_names(&ty).into_iter().zip(structseq_hidden(&a[0])) {
-        if name.as_str().is_some_and(|n| !n.is_empty()) {
-            it.dict_set(&d, name, v)?;
-        }
-    }
-    Ok(Value::tuple(vec![Value::Obj(ty), Value::tuple(vec![Value::tuple(visible), Value::Obj(d)])]))
-}
-
 // ---- SimpleNamespace ----------------------------------------------------------------------------
 
-fn ns_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    if a.len() > 1 {
-        return Err(it.type_error("no positional arguments expected"));
-    }
-    if let Value::Obj(o) = &a[0] {
-        let d = it.instance_dict(o);
-        for (k, v) in kw {
-            it.dict_set(&d, Value::Obj(k.clone()), v.clone())?;
-        }
-    }
-    Ok(Value::None)
-}
+/// A simple attribute-based namespace.
+///
+/// SimpleNamespace(**kwargs)
+#[lumen_bind::class(name = "SimpleNamespace", module = "types")]
+pub struct SimpleNamespace;
 
-fn ns_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Value::Obj(o) = &a[0] else { return Ok(Value::str("namespace()")) };
-    if it.repr_enter(o) {
-        return Ok(Value::str("namespace(...)"));
+type Ns<'a> = Inst<'a, SimpleNamespace>;
+
+#[lumen_bind::methods]
+impl SimpleNamespace {
+    #[proto(init)]
+    fn init(slf: This<Ns<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        if !args.is_empty() {
+            return Err(it.type_error("no positional arguments expected"));
+        }
+        let d = it.instance_dict(slf.0 .0);
+        for (k, v) in kwargs.iter() {
+            dict_set_str(&d, k, v.clone());
+        }
+        Ok(())
     }
-    let items: Vec<(Value, Value)> = match o.dict.borrow().as_ref().map(|d| &d.kind) {
-        Some(Kind::Dict(d)) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
-        _ => Vec::new(),
-    };
-    let mut parts = Vec::new();
-    let mut err = None;
-    for (k, v) in items {
-        match it.repr_of(&v) {
-            Ok(r) => parts.push(format!("{}={}", k.as_str().unwrap_or("?"), r)),
-            Err(e) => {
-                err = Some(e);
-                break;
+
+    #[proto(repr)]
+    fn repr(slf: This<Ns<'_>>, it: &mut Interp) -> R<String> {
+        let o = slf.0 .0;
+        if it.repr_enter(o) {
+            return Ok("namespace(...)".into());
+        }
+        let items: Vec<(Value, Value)> = match o.dict.borrow().as_ref().map(|d| &d.kind) {
+            Some(Kind::Dict(d)) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
+            _ => Vec::new(),
+        };
+        let mut parts = Vec::new();
+        let mut err = None;
+        for (k, v) in items {
+            match it.repr_of(&v) {
+                Ok(r) => parts.push(format!("{}={}", k.as_str().unwrap_or("?"), r)),
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
             }
         }
+        it.repr_leave();
+        if let Some(e) = err {
+            return Err(e);
+        }
+        let ty = it.type_of_obj(o);
+        let exact = it.simple_namespace_type().is_some_and(|t| Rc::ptr_eq(&t, &ty));
+        let name = if exact { "namespace".to_string() } else { it.type_name(&ty) };
+        Ok(format!("{}({})", name, parts.join(", ")))
     }
-    it.repr_leave();
-    if let Some(e) = err {
-        return Err(e);
-    }
-    let ty = it.type_of(&a[0]);
-    let name = if Rc::ptr_eq(&ty, &it.simple_namespace_type().unwrap_or_else(|| ty.clone())) { "namespace".to_string() } else { it.type_name(&ty) };
-    Ok(Value::string(format!("{}({})", name, parts.join(", "))))
-}
 
-fn ns_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__eq__", a, 2, 2)?;
-    let (Value::Obj(x), Value::Obj(y)) = (&a[0], &a[1]) else { return Ok(Value::NotImplemented) };
-    let nt = it.simple_namespace_type();
-    let is_ns = |it: &Interp, o: &Obj| nt.as_ref().is_some_and(|t| it.is_subtype(&it.type_of_obj(o), t));
-    if !is_ns(it, x) || !is_ns(it, y) {
-        return Ok(Value::NotImplemented);
+    #[proto(eq)]
+    fn eq(slf: This<Ns<'_>>, it: &mut Interp, value: &Value) -> R<Value> {
+        let Value::Obj(y) = value else { return Ok(Value::NotImplemented) };
+        let nt = it.simple_namespace_type();
+        if !nt.is_some_and(|t| it.is_subtype(&it.type_of_obj(y), &t)) {
+            return Ok(Value::NotImplemented);
+        }
+        let (dx, dy) = (Value::Obj(it.instance_dict(slf.0 .0)), Value::Obj(it.instance_dict(y)));
+        it.compare_op(crate::ast::CmpOp::Eq, &dx, &dy)
     }
-    let (dx, dy) = (Value::Obj(it.instance_dict(x)), Value::Obj(it.instance_dict(y)));
-    let r = it.compare_op(crate::ast::CmpOp::Eq, &dx, &dy)?;
-    Ok(r)
-}
 
-fn ns_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let ty = it.type_of(&a[0]);
-    let d = match &a[0] {
-        Value::Obj(o) => Value::Obj(it.instance_dict(o)),
-        _ => Value::None,
-    };
-    Ok(Value::tuple(vec![Value::Obj(ty), Value::tuple(Vec::new()), d]))
+    /// Return state information for pickling
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<Ns<'_>>, it: &mut Interp) -> Value {
+        let o = slf.0 .0;
+        let ty = it.type_of_obj(o);
+        let d = Value::Obj(it.instance_dict(o));
+        Value::tuple(vec![Value::Obj(ty), Value::tuple(Vec::new()), d])
+    }
 }
 
 impl Interp {
@@ -283,10 +399,7 @@ impl Interp {
             return t.clone();
         }
         let ty = new_type(self, "types", "SimpleNamespace", None, Layout::Object);
-        self.reg(&ty, "__init__", ns_init);
-        self.reg(&ty, "__repr__", ns_repr);
-        self.reg(&ty, "__eq__", ns_eq);
-        self.reg(&ty, "__reduce__", ns_reduce);
+        crate::bind::extend_type::<SimpleNamespace>(self, &ty);
         if let Some(d) = ty.dict.borrow().as_ref() {
             dict_set_str(d, "__hash__", Value::None);
         }
@@ -307,106 +420,192 @@ impl Interp {
 
 // ---- frames -------------------------------------------------------------------------------------
 
+// A frame object. While its frame runs it finds the frame on the interpreter stack by `serial`
+// (or inside its suspended generator); a frame that finished moves into `dead`, so `f_locals`,
+// `f_trace` and tracebacks keep working. Frames only known from a traceback entry keep the
+// snapshot fields alone.
+#[lumen_bind::class(name = "frame")]
 pub struct FrameObj {
-    depth: Option<usize>,
+    serial: u64,
+    gen: Option<std::rc::Weak<Object>>,
+    dead: Option<Box<Frame>>,
+    back: Option<Value>,
     code: Rc<Code>,
     globals: Obj,
     line: u32,
     lasti: u32,
+    trace: Option<Value>,
+    trace_lines: bool,
+    trace_opcodes: bool,
+}
+
+fn frame_line(fr: &Frame) -> i64 {
+    if fr.pc == 0 {
+        fr.code.first_line as i64
+    } else {
+        fr.code.line_at(fr.pc - 1) as i64
+    }
+}
+
+fn frame_lasti(fr: &Frame) -> i64 {
+    if fr.pc == 0 {
+        -1
+    } else {
+        2 * (fr.pc as i64 - 1)
+    }
+}
+
+/// The generator or coroutine whose body is the executing frame `v`, else `None`.
+pub fn frame_generator(it: &Interp, v: &Value) -> Option<Value> {
+    let live = crate::builtins::native::with_opaque::<FrameObj, _>(v, |f| f.running_at(it))?;
+    let owner = it.frames.get(live?)?.generator.as_ref()?.upgrade()?;
+    Some(Value::Obj(owner))
+}
+
+impl FrameObj {
+    fn of(f: &Frame) -> FrameObj {
+        FrameObj {
+            serial: f.serial,
+            gen: f.generator.clone(),
+            dead: None,
+            back: None,
+            code: f.code.clone(),
+            globals: f.globals.clone(),
+            line: frame_line(f) as u32,
+            lasti: f.pc.saturating_sub(1) as u32,
+            trace: f.trace.clone(),
+            trace_lines: f.trace_lines,
+            trace_opcodes: f.trace_opcodes,
+        }
+    }
+
+    /// Reads the frame this object stands for, wherever it currently lives.
+    fn peek<X>(&self, it: &Interp, f: impl FnOnce(&Frame) -> X) -> Option<X> {
+        if let Some(fr) = it.frames.iter().rev().find(|fr| fr.serial == self.serial) {
+            return Some(f(fr));
+        }
+        if let Some(g) = self.gen.as_ref().and_then(|g| g.upgrade()) {
+            if let Kind::Generator(gd) = &g.kind {
+                if let Ok(st) = gd.state.try_borrow() {
+                    if let GenState::Created(fr) | GenState::Suspended(fr) = &*st {
+                        if fr.serial == self.serial {
+                            return Some(f(&**fr));
+                        }
+                    }
+                }
+            }
+        }
+        self.dead.as_deref().map(f)
+    }
+
+    fn poke<X>(&mut self, it: &mut Interp, f: impl FnOnce(&mut Frame) -> X) -> Option<X> {
+        let serial = self.serial;
+        if let Some(fr) = it.frames.iter_mut().rev().find(|fr| fr.serial == serial) {
+            return Some(f(fr));
+        }
+        if let Some(g) = self.gen.as_ref().and_then(|g| g.upgrade()) {
+            if let Kind::Generator(gd) = &g.kind {
+                if let Ok(mut st) = gd.state.try_borrow_mut() {
+                    if let GenState::Created(fr) | GenState::Suspended(fr) = &mut *st {
+                        if fr.serial == serial {
+                            return Some(f(&mut **fr));
+                        }
+                    }
+                }
+            }
+        }
+        self.dead.as_deref_mut().map(f)
+    }
+
+    /// The position on the interpreter stack of the frame while it is running.
+    fn running_at(&self, it: &Interp) -> Option<usize> {
+        it.frames.iter().rposition(|fr| fr.serial == self.serial)
+    }
 }
 
 impl Interp {
+    /// The frame object of the frame at `depth` on the stack, the same one every time.
     pub fn frame_object(&mut self, depth: usize) -> Value {
-        let f = &self.frames[depth];
-        let lasti = f.pc.saturating_sub(1);
-        let data = FrameObj { depth: Some(depth), code: f.code.clone(), globals: f.globals.clone(), line: f.code.line_at(lasti), lasti: lasti as u32 };
-        new_opaque(&self.types.frame.clone(), data)
+        if let Some(o) = &self.frames[depth].fobj {
+            return Value::Obj(o.clone());
+        }
+        let data = FrameObj::of(&self.frames[depth]);
+        let v = new_opaque(&self.types.frame.clone(), data);
+        if let Value::Obj(o) = &v {
+            self.frames[depth].fobj = Some(o.clone());
+        }
+        v
+    }
+
+    /// `gi_frame` / `cr_frame` / `ag_frame` of a generator that is not finished.
+    pub fn gen_frame_object(&mut self, g: &Obj) -> Value {
+        let Kind::Generator(gd) = &g.kind else { return Value::None };
+        if let Ok(mut st) = gd.state.try_borrow_mut() {
+            if let GenState::Created(f) | GenState::Suspended(f) = &mut *st {
+                if let Some(o) = &f.fobj {
+                    return Value::Obj(o.clone());
+                }
+                f.generator = Some(Rc::downgrade(g));
+                let v = new_opaque(&self.types.frame, FrameObj::of(f));
+                if let Value::Obj(o) = &v {
+                    f.fobj = Some(o.clone());
+                }
+                return v;
+            }
+        }
+        let running = self.frames.iter().rposition(|f| f.generator.as_ref().and_then(|w| w.upgrade()).is_some_and(|x| Rc::ptr_eq(&x, g)));
+        match running {
+            Some(d) => self.frame_object(d),
+            None => Value::None,
+        }
+    }
+
+    /// The innermost of `frames` (a suspended thread's stack, outermost first) as a snapshot
+    /// chained to its callers through `f_back`.
+    pub fn frame_chain_snapshot(&self, frames: &[Frame]) -> Value {
+        let mut back = None;
+        for f in frames {
+            let mut data = FrameObj::of(f);
+            data.serial = 0;
+            data.gen = None;
+            data.back = back;
+            back = Some(new_opaque(&self.types.frame, data));
+        }
+        back.unwrap_or(Value::None)
     }
 
     pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32, lasti: u32) -> Value {
-        new_opaque(&self.types.frame, FrameObj { depth: None, code, globals, line, lasti })
+        let data = FrameObj { serial: 0, gen: None, dead: None, back: None, code, globals, line, lasti, trace: None, trace_lines: true, trace_opcodes: false };
+        new_opaque(&self.types.frame, data)
     }
 }
 
-fn frame_data<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&FrameObj) -> X) -> R<X> {
-    match with_opaque::<FrameObj, _>(v, |d| f(d)) {
-        Some(x) => Ok(x),
-        None => Err(it.self_state_err("frame")),
-    }
+/// Moves a frame that left the stack into its frame object (`back` is the frame below it).
+pub fn bury_frame(mut frame: Frame, back: Option<Value>) {
+    let Some(fo) = frame.fobj.take() else { return };
+    with_opaque::<FrameObj, _>(&Value::Obj(fo), move |d| {
+        d.line = frame_line(&frame) as u32;
+        d.lasti = frame.pc.saturating_sub(1) as u32;
+        d.back = back;
+        d.dead = Some(Box::new(frame));
+    });
 }
 
-fn f_code(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let c = frame_data(it, &a[0], |d| d.code.clone())?;
-    Ok(Value::Obj(Object::new(Kind::Code(c))))
+/// The code object a frame object runs.
+pub fn frame_code(frame: &Value) -> Option<Rc<Code>> {
+    with_opaque::<FrameObj, _>(frame, |d| d.code.clone())
 }
 
-fn f_globals(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Obj(frame_data(it, &a[0], |d| d.globals.clone())?))
+enum Locals {
+    Namespace(Obj),
+    Entries(Vec<(String, Value)>),
 }
 
-fn f_builtins(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Obj(it.builtins.clone()))
-}
-
-fn f_lineno(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (live, line) = frame_data(it, &a[0], |d| (d.depth.map(|x| (x, d.code.clone())), d.line))?;
-    if let Some((depth, code)) = live {
-        if let Some(f) = it.frames.get(depth) {
-            if Rc::ptr_eq(&f.code, &code) {
-                return Ok(Value::Int(f.code.line_at(f.pc.saturating_sub(1)) as i64));
-            }
-        }
-    }
-    Ok(Value::Int(line as i64))
-}
-
-fn f_lasti(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (live, lasti) = frame_data(it, &a[0], |d| (d.depth.map(|x| (x, d.code.clone())), d.lasti))?;
-    if let Some((depth, code)) = live {
-        if let Some(f) = it.frames.get(depth) {
-            if Rc::ptr_eq(&f.code, &code) {
-                return Ok(Value::Int(2 * f.pc.saturating_sub(1) as i64));
-            }
-        }
-    }
-    Ok(Value::Int(2 * lasti as i64))
-}
-
-/// `frame.clear()`: an executing frame refuses; a finished one keeps no locals here to drop.
-fn f_clear(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let live = frame_data(it, &a[0], |d| d.depth.map(|x| (x, d.code.clone())))?;
-    if let Some((depth, code)) = live {
-        if it.frames.get(depth).is_some_and(|f| Rc::ptr_eq(&f.code, &code)) {
-            return Err(it.new_exc_str("RuntimeError", "cannot clear an executing frame"));
-        }
-    }
-    Ok(Value::None)
-}
-
-fn f_none(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::None)
-}
-
-fn f_back(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (depth, code) = frame_data(it, &a[0], |d| (d.depth, d.code.clone()))?;
-    if let Some(depth) = depth {
-        let live = it.frames.get(depth).is_some_and(|f| Rc::ptr_eq(&f.code, &code));
-        if live && depth > 0 {
-            return Ok(it.frame_object(depth - 1));
-        }
-    }
-    Ok(Value::None)
-}
-
-fn f_locals(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (live, code, globals) = frame_data(it, &a[0], |d| (d.depth, d.code.clone(), d.globals.clone()))?;
-    let depth = live.filter(|&d| it.frames.get(d).is_some_and(|f| Rc::ptr_eq(&f.code, &code)));
-    let Some(depth) = depth else { return Ok(Value::Obj(it.new_dict())) };
-    let f = &it.frames[depth];
+fn collect_locals(f: &Frame) -> Locals {
     if let Some(names) = &f.names {
-        return Ok(Value::Obj(names.clone()));
+        return Locals::Namespace(names.clone());
     }
-    let _ = globals;
+    let code = &f.code;
     let mut entries: Vec<(String, Value)> = Vec::new();
     for (i, n) in code.varnames.iter().enumerate() {
         if let Some(Some(v)) = f.locals.get(i) {
@@ -422,76 +621,297 @@ fn f_locals(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             }
         }
     }
-    let d = it.new_dict();
-    for (k, v) in entries {
-        dict_set_str(&d, &k, v);
-    }
-    Ok(Value::Obj(d))
+    Locals::Entries(entries)
 }
 
-fn f_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (code, line) = frame_data(it, &a[0], |d| (d.code.clone(), d.line))?;
-    Ok(Value::string(format!("<frame at {:#x}, file '{}', line {}, code {}>", it.id_of(&a[0]), code.filename, line, code.name)))
+#[lumen_bind::methods]
+impl FrameObj {
+    #[getter]
+    fn f_code(&self) -> Value {
+        Value::Obj(Code::object(&self.code))
+    }
+
+    #[getter]
+    fn f_globals(&self) -> Value {
+        Value::Obj(self.globals.clone())
+    }
+
+    #[getter]
+    fn f_builtins(&self, it: &mut Interp) -> Value {
+        Value::Obj(it.builtins.clone())
+    }
+
+    #[getter]
+    fn f_lineno(&self, it: &mut Interp) -> i64 {
+        self.peek(it, frame_line).unwrap_or(self.line as i64)
+    }
+
+    #[setter]
+    fn set_f_lineno(&mut self, it: &mut Interp, value: &Value) -> R<()> {
+        let Value::Int(line) = value else { return Err(it.value_error("lineno must be an integer")) };
+        let at = self.running_at(it);
+        crate::jump::set_lineno(it, at, *line)
+    }
+
+    #[getter]
+    fn f_lasti(&self, it: &mut Interp) -> i64 {
+        self.peek(it, frame_lasti).unwrap_or(2 * self.lasti as i64)
+    }
+
+    #[getter]
+    fn f_back(&self, it: &mut Interp) -> Value {
+        if let Some(d) = self.running_at(it) {
+            return if d > 0 { it.frame_object(d - 1) } else { Value::None };
+        }
+        self.back.clone().unwrap_or(Value::None)
+    }
+
+    #[getter]
+    fn f_locals(&self, it: &mut Interp) -> Value {
+        match self.peek(it, collect_locals) {
+            Some(Locals::Namespace(n)) => Value::Obj(n),
+            Some(Locals::Entries(entries)) => {
+                let d = it.new_dict();
+                for (k, v) in entries {
+                    dict_set_str(&d, &k, v);
+                }
+                Value::Obj(d)
+            }
+            None => Value::Obj(it.new_dict()),
+        }
+    }
+
+    #[getter]
+    fn f_trace(&self, it: &mut Interp) -> Value {
+        self.peek(it, |fr| fr.trace.clone()).unwrap_or_else(|| self.trace.clone()).unwrap_or(Value::None)
+    }
+
+    #[setter]
+    fn set_f_trace(&mut self, it: &mut Interp, value: &Value) {
+        let v = if value.is_none() { None } else { Some(value.clone()) };
+        let mine = v.clone();
+        if self.poke(it, |fr| fr.trace = v).is_none() {
+            self.trace = mine;
+        }
+    }
+
+    #[getter]
+    fn f_trace_lines(&self, it: &mut Interp) -> bool {
+        self.peek(it, |fr| fr.trace_lines).unwrap_or(self.trace_lines)
+    }
+
+    #[setter]
+    fn set_f_trace_lines(&mut self, it: &mut Interp, value: &Value) -> R<()> {
+        let Value::Bool(b) = value else { return Err(it.type_error("attribute value type must be bool")) };
+        let b = *b;
+        if self.poke(it, |fr| fr.trace_lines = b).is_none() {
+            self.trace_lines = b;
+        }
+        Ok(())
+    }
+
+    #[getter]
+    fn f_trace_opcodes(&self, it: &mut Interp) -> bool {
+        self.peek(it, |fr| fr.trace_opcodes).unwrap_or(self.trace_opcodes)
+    }
+
+    #[setter]
+    fn set_f_trace_opcodes(&mut self, it: &mut Interp, value: &Value) -> R<()> {
+        let Value::Bool(b) = value else { return Err(it.type_error("attribute value type must be bool")) };
+        let b = *b;
+        if self.poke(it, |fr| fr.trace_opcodes = b).is_none() {
+            self.trace_opcodes = b;
+        }
+        if b {
+            it.want_opcode_events();
+        }
+        Ok(())
+    }
+
+    /// F.clear(): clear most references held by the frame
+    #[method(hint(py(text_signature = "")))]
+    fn clear(&mut self, it: &mut Interp) -> R<()> {
+        if self.running_at(it).is_some() {
+            return Err(it.new_exc_str("RuntimeError", "cannot clear an executing frame"));
+        }
+        if let Some(g) = self.gen.as_ref().and_then(|g| g.upgrade()) {
+            it.gen_close(&g)?;
+        }
+        self.poke(it, |fr| {
+            fr.stack.clear();
+            fr.blocks.clear();
+            fr.locals.iter_mut().for_each(|l| *l = None);
+            fr.trace = None;
+        });
+        Ok(())
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<&Value>, it: &mut Interp) -> R<String> {
+        let Some((code, line)) = with_opaque::<FrameObj, _>(&slf, |d| (d.code.clone(), d.peek(it, frame_line).unwrap_or(d.line as i64))) else {
+            return Err(it.self_state_err("frame"));
+        };
+        Ok(format!("<frame at {:#x}, file '{}', line {}, code {}>", it.id_of(&slf), code.filename, line, code.name))
+    }
 }
 
 // ---- code objects ---------------------------------------------------------------------------------
 
-fn code_of(it: &mut Interp, v: &Value) -> R<Rc<Code>> {
-    match v {
-        Value::Obj(o) => match &o.kind {
-            Kind::Code(c) => Ok(c.clone()),
-            _ => Err(it.self_state_err("code")),
-        },
-        _ => Err(it.self_state_err("code")),
-    }
-}
+/// A code object: the receiver of the code type's methods.
+pub struct CodeRef(pub Rc<Code>);
 
-/// `code.co_positions()`: (lineno, end_lineno, col, end_col) per instruction; columns are not
-/// tracked, so they are None (tracebacks then print no carets).
-fn co_positions(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let code = code_of(it, &a[0])?;
-    let items = (0..code.ops.len())
-        .map(|i| {
-            let line = Value::Int(code.line_at(i) as i64);
-            Value::tuple(vec![line.clone(), line, Value::None, Value::None])
-        })
-        .collect();
-    it.get_iter(&Value::list(items))
-}
-
-/// `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
-fn co_lines(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let code = code_of(it, &a[0])?;
-    let mut items = Vec::new();
-    let mut start = 0;
-    for i in 1..=code.ops.len() {
-        if i == code.ops.len() || code.line_at(i) != code.line_at(start) {
-            let line = Value::Int(code.line_at(start) as i64);
-            items.push(Value::tuple(vec![Value::Int(2 * start as i64), Value::Int(2 * i as i64), line]));
-            start = i;
+impl<'a> FromArg<'a, PyHost> for CodeRef {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) => match &o.kind {
+                Kind::Code(c) => Ok(CodeRef(c.clone())),
+                _ => Err(cx.arg_error(at, "code", v)),
+            },
+            _ => Err(cx.arg_error(at, "code", v)),
         }
     }
-    it.get_iter(&Value::list(items))
+}
+
+/// Create a code object.  Not for the faint of heart.
+#[lumen_bind::class(name = "code")]
+pub struct CodeType;
+
+#[lumen_bind::methods]
+impl CodeType {
+    // `code.co_positions()`: (lineno, end_lineno, col, end_col) per instruction; columns are not
+    // tracked, so they are None (tracebacks then print no carets).
+    #[method(hint(py(text_signature = "")))]
+    fn co_positions(slf: This<CodeRef>, it: &mut Interp) -> R<Value> {
+        let code = &slf.0 .0;
+        let items = (0..code.ops.len())
+            .map(|i| {
+                let line = Value::Int(code.line_at(i) as i64);
+                Value::tuple(vec![line.clone(), line, Value::None, Value::None])
+            })
+            .collect();
+        it.get_iter(&Value::list(items))
+    }
+
+    /// Return a copy of the code object with new values for the specified fields.
+    ///
+    /// The instruction stream is Lumen's own, so `co_code`, `co_linetable`, `co_exceptiontable`,
+    /// `co_nlocals` and `co_stacksize` are accepted and ignored.
+    #[method(hint(py(text_signature = "($self, /, **changes)")))]
+    fn replace(
+        slf: This<CodeRef>,
+        it: &mut Interp,
+        #[kwonly] co_argcount: Option<i64>,
+        #[kwonly] co_posonlyargcount: Option<i64>,
+        #[kwonly] co_kwonlyargcount: Option<i64>,
+        #[kwonly] co_nlocals: Option<i64>,
+        #[kwonly] co_stacksize: Option<i64>,
+        #[kwonly] co_flags: Option<i64>,
+        #[kwonly] co_firstlineno: Option<i64>,
+        #[kwonly] co_code: Option<&Value>,
+        #[kwonly] co_consts: Option<&Value>,
+        #[kwonly] co_names: Option<&Value>,
+        #[kwonly] co_varnames: Option<&Value>,
+        #[kwonly] co_freevars: Option<&Value>,
+        #[kwonly] co_cellvars: Option<&Value>,
+        #[kwonly] co_filename: Option<&str>,
+        #[kwonly] co_name: Option<&str>,
+        #[kwonly] co_qualname: Option<&str>,
+        #[kwonly] co_linetable: Option<&Value>,
+        #[kwonly] co_exceptiontable: Option<&Value>,
+    ) -> R<Value> {
+        let _ = (co_nlocals, co_stacksize, co_code, co_linetable, co_exceptiontable);
+        let c = &slf.0 .0;
+        let count = |it: &mut Interp, v: Option<i64>, old: u32, what: &str| -> R<u32> {
+            match v {
+                None => Ok(old),
+                Some(n) if (0..=i64::from(i32::MAX)).contains(&n) => Ok(n as u32),
+                Some(_) => Err(it.value_error(&format!("{what} must be a non-negative int"))),
+            }
+        };
+        let tuple = |it: &mut Interp, v: Option<&Value>, what: &str| -> R<Option<Vec<Value>>> {
+            match v {
+                None => Ok(None),
+                Some(v) => match v.tuple_items() {
+                    Some(items) => Ok(Some(items.to_vec())),
+                    None => {
+                        let t = it.type_name_of(v);
+                        Err(it.type_error(&format!("replace() argument '{what}' must be tuple, not {t}")))
+                    }
+                },
+            }
+        };
+        let str_obj = |it: &mut Interp, x: &Value, what: &str| -> R<Obj> {
+            match x {
+                Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => Ok(o.clone()),
+                _ => Err(it.type_error(&format!("{what} must be a tuple of strings"))),
+            }
+        };
+        let strings = |it: &mut Interp, v: Option<Vec<Value>>, old: &[Rc<str>], what: &str| -> R<Vec<Rc<str>>> {
+            let Some(items) = v else { return Ok(old.to_vec()) };
+            items
+                .iter()
+                .map(|x| match &str_obj(it, x, what)?.kind {
+                    Kind::Str(s) => Ok(Rc::from(&*s.s)),
+                    _ => unreachable!(),
+                })
+                .collect()
+        };
+        let consts = tuple(it, co_consts, "co_consts")?;
+        let names = tuple(it, co_names, "co_names")?;
+        let varnames = tuple(it, co_varnames, "co_varnames")?;
+        let freevars = tuple(it, co_freevars, "co_freevars")?;
+        let cellvars = tuple(it, co_cellvars, "co_cellvars")?;
+        let names = match names {
+            None => c.names.clone(),
+            Some(items) => items.iter().map(|x| str_obj(it, x, "co_names")).collect::<R<Vec<_>>>()?,
+        };
+        let code = Code {
+            name: co_name.map_or_else(|| c.name.clone(), Rc::from),
+            qualname: co_qualname.map_or_else(|| c.qualname.clone(), Rc::from),
+            filename: co_filename.map_or_else(|| c.filename.clone(), Rc::from),
+            first_line: count(it, co_firstlineno, c.first_line, "co_firstlineno")?,
+            ops: c.ops.clone(),
+            lines: c.lines.clone(),
+            consts: consts.unwrap_or_else(|| c.consts.clone()),
+            names,
+            varnames: strings(it, varnames, &c.varnames, "co_varnames")?,
+            cellvars: strings(it, cellvars, &c.cellvars, "co_cellvars")?,
+            freevars: strings(it, freevars, &c.freevars, "co_freevars")?,
+            argcount: count(it, co_argcount, c.argcount, "co_argcount")?,
+            posonly: count(it, co_posonlyargcount, c.posonly, "co_posonlyargcount")?,
+            kwonly: count(it, co_kwonlyargcount, c.kwonly, "co_kwonlyargcount")?,
+            flags: count(it, co_flags, c.flags, "co_flags")?,
+            cell_args: c.cell_args.clone(),
+            doc: c.doc.clone(),
+            pyobj: Default::default(),
+            info: Default::default(),
+        };
+        let obj = Object::new(Kind::Code(Rc::new(code)));
+        it.code_created(&obj);
+        Ok(Value::Obj(obj))
+    }
+
+    // `code.co_lines()`: (start, end, lineno) byte ranges of consecutive instructions on one line.
+    #[method(hint(py(text_signature = "")))]
+    fn co_lines(slf: This<CodeRef>, it: &mut Interp) -> R<Value> {
+        let code = &slf.0 .0;
+        let items = lumen_common::lineno::line_ranges(&code.lines)
+            .into_iter()
+            .map(|(start, end, line)| Value::tuple(vec![Value::Int(2 * start as i64), Value::Int(2 * end as i64), Value::Int(line as i64)]))
+            .collect();
+        it.get_iter(&Value::list(items))
+    }
 }
 
 pub fn init_code_type(it: &mut Interp) {
     let ty = it.types.code.clone();
-    it.reg(&ty, "co_positions", co_positions);
-    it.reg(&ty, "co_lines", co_lines);
+    crate::bind::extend_type::<CodeType>(it, &ty);
 }
 
 pub fn init_frame_type(it: &mut Interp) {
     let ty = it.types.frame.clone();
-    it.reg_prop(&ty, "f_code", f_code);
-    it.reg_prop(&ty, "f_globals", f_globals);
-    it.reg_prop(&ty, "f_builtins", f_builtins);
-    it.reg_prop(&ty, "f_lineno", f_lineno);
-    it.reg_prop(&ty, "f_lasti", f_lasti);
-    it.reg_prop(&ty, "f_back", f_back);
-    it.reg_prop(&ty, "f_locals", f_locals);
-    it.reg_prop(&ty, "f_trace", f_none);
-    it.reg(&ty, "__repr__", f_repr);
-    it.reg(&ty, "clear", f_clear);
+    crate::bind::extend_type::<FrameObj>(it, &ty);
     if let Kind::Type(td) = &ty.kind {
         td.flags.set(td.flags.get() | TF_DISPATCH);
     }

@@ -1,0 +1,5 @@
+PythonFinalizationError <class 'PythonFinalizationError'> (<class 'PythonFinalizationError'>, <class 'RuntimeError'>, <class 'Exception'>, <class 'BaseException'>, <class 'object'>) builtins
+_IncompleteInputError <class '_IncompleteInputError'> (<class '_IncompleteInputError'>, <class 'SyntaxError'>, <class 'Exception'>, <class 'BaseException'>, <class 'object'>) builtins
+('x',) x None _IncompleteInputError('x')
+('y',)
+['_IncompleteInputError']

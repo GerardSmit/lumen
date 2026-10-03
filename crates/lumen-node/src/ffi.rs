@@ -35,9 +35,13 @@ use std::os::raw::c_void;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lumen::embed::OpError;
+use lumen_bind::NativeError;
 use lumen_host::{Ctx, Value};
 
 use crate::dylib::DynLib;
+
+pub(crate) use bindings::Module;
 
 /// One floating-point argument, carrying its declared width so the trampoline can place the right
 /// bit pattern in the SIMD register.
@@ -181,41 +185,28 @@ thread_local! {
 
 // ---- small arg helpers ------------------------------------------------------------------------
 
-fn ptr_num_arg(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<u64, Value> {
-    value_to_pointer(ctx, args.get(i).unwrap_or(&Value::Undefined))
+fn type_error(msg: impl Into<String>) -> NativeError {
+    NativeError::type_error(msg.into())
 }
 
-fn type_error(ctx: &mut Ctx, msg: impl Into<String>) -> Value {
-    ctx.make_error("TypeError", msg.into())
-}
-
-fn plain_error(ctx: &mut Ctx, msg: impl Into<String>) -> Value {
-    ctx.make_error("Error", msg.into())
+fn plain_error(msg: impl Into<String>) -> NativeError {
+    NativeError::runtime(msg.into())
 }
 
 /// Convert a JS value used as a pointer/cstring/function argument into a raw address, matching
 /// Bun's acceptance rules: numbers are addresses, typed arrays contribute their backing pointer,
 /// null/undefined are 0, and strings/bigints are refused with Bun's exact messages.
-fn value_to_pointer(ctx: &mut Ctx, v: &Value) -> Result<u64, Value> {
+fn value_to_pointer(ctx: &mut Ctx, v: &Value) -> Result<u64, NativeError> {
     match v {
         Value::Num(n) => Ok(*n as i64 as u64),
         Value::Null | Value::Undefined => Ok(0),
-        Value::Str(_) => Err(type_error(
-            ctx,
-            "To convert a string to a pointer, encode it as a buffer",
-        )),
-        Value::BigInt(b) => Err(type_error(
-            ctx,
-            format!("Unable to convert {} to a pointer", b.to_i128_wrapping()),
-        )),
+        Value::Str(_) => Err(type_error("To convert a string to a pointer, encode it as a buffer")),
+        Value::BigInt(b) => Err(type_error(format!("Unable to convert {} to a pointer", b.to_i128_wrapping()))),
         Value::Obj(_) => {
             if let Some((_, _, p)) = ctx.typed_array_raw(v) {
                 Ok(p as u64)
             } else {
-                Err(type_error(
-                    ctx,
-                    "To convert a value to a pointer, it must be a TypedArray, number, or null",
-                ))
+                Err(type_error("To convert a value to a pointer, it must be a TypedArray, number, or null"))
             }
         }
         _ => Ok(0),
@@ -229,7 +220,7 @@ fn marshal_arg(
     v: &Value,
     ints: &mut Vec<u64>,
     floats: &mut Vec<FArg>,
-) -> Result<(), Value> {
+) -> Result<(), OpError> {
     if is_float(code) {
         let n = ctx.coerce_number(v)?;
         floats.push(if code == T_F32 {
@@ -250,7 +241,7 @@ fn marshal_arg(
             _ => {
                 let n = ctx.coerce_number(v)?;
                 if n.fract() != 0.0 || !n.is_finite() {
-                    return Err(type_error(ctx, "Not an integer"));
+                    return Err(type_error("Not an integer").into());
                 }
                 n as i64 as u64
             }
@@ -341,316 +332,254 @@ fn arr_len(ctx: &mut Ctx, v: &Value) -> usize {
     }
 }
 
-/// `__ffi.dlopen(path)` → an opaque library id (kept mapped for the process lifetime).
-pub fn op_dlopen(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let path = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let lib = DynLib::open(&path)
-        .map_err(|e| plain_error(ctx, format!("cannot open library '{path}': {e}")))?;
-    let st = ffi_state(ctx);
-    st.libs.push(Some(lib));
-    Ok(Value::Num((st.libs.len() - 1) as f64))
-}
+#[lumen_bind::module(name = "__ffi")]
+mod bindings {
+    use super::*;
+    use lumen::embed::JsArrayBuffer;
 
-/// `__ffi.dlsym(libId, name)` → the symbol's raw address as a number, or a Bun-style throw.
-pub fn op_dlsym(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
-    let name = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let addr = {
+    /// `__ffi.dlopen(path)` -> an opaque library id (kept mapped for the process lifetime).
+    #[op(coerce, name = "dlopen")]
+    fn op_dlopen(ctx: &mut Ctx, path: String) -> Result<f64, NativeError> {
+        let lib = DynLib::open(&path).map_err(|e| plain_error(format!("cannot open library '{path}': {e}")))?;
         let st = ffi_state(ctx);
-        st.libs
-            .get(id)
-            .and_then(|l| l.as_ref())
-            .and_then(|l| l.symbol(&name))
-    };
-    match addr {
-        Some(p) => Ok(Value::Num(p as usize as f64)),
-        None => Err(plain_error(ctx, format!("symbol \"{name}\" not found"))),
+        st.libs.push(Some(lib));
+        Ok((st.libs.len() - 1) as f64)
     }
-}
 
-/// `__ffi.dlclose(libId)` — unmap a library (its symbols dangle afterward).
-pub fn op_dlclose(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
-    let st = ffi_state(ctx);
-    if let Some(slot) = st.libs.get_mut(id) {
-        *slot = None;
-    }
-    Ok(Value::Undefined)
-}
-
-/// Compile one C translation unit into a temporary shared library using the host toolchain.
-/// Arguments are already tokenized by the JS layer and NUL-separated, so no shell is involved.
-pub fn op_cc(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let source = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    if !std::path::Path::new(&source).is_file() {
-        return Err(ctx.make_error("Error", format!("bun:ffi cc source not found: {source}")));
-    }
-    let extra = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let extra: Vec<&str> = extra.split('\0').filter(|arg| !arg.is_empty()).collect();
-    let extension = if cfg!(target_os = "macos") {
-        "dylib"
-    } else if cfg!(windows) {
-        "dll"
-    } else {
-        "so"
-    };
-    let output = std::env::temp_dir().join(format!(
-        "lumen-ffi-cc-{}-{}.{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed),
-        extension
-    ));
-    let mut candidates = Vec::new();
-    if let Ok(cc) = std::env::var("CC") {
-        if !cc.is_empty() {
-            candidates.push(cc);
+    /// `__ffi.dlsym(libId, name)` -> the symbol's raw address as a number, or a Bun-style throw.
+    #[op(coerce, name = "dlsym")]
+    fn op_dlsym(ctx: &mut Ctx, id: f64, name: String) -> Result<f64, NativeError> {
+        let addr = ffi_state(ctx).libs.get(id as usize).and_then(|l| l.as_ref()).and_then(|l| l.symbol(&name));
+        match addr {
+            Some(p) => Ok(p as usize as f64),
+            None => Err(plain_error(format!("symbol \"{name}\" not found"))),
         }
     }
-    candidates.extend(["cc".to_string(), "clang".to_string()]);
-    let mut failures = Vec::new();
-    for compiler in candidates {
-        let mut command = Command::new(&compiler);
-        #[cfg(target_os = "macos")]
-        command.args(["-dynamiclib", "-fPIC", "-undefined", "dynamic_lookup"]);
-        #[cfg(all(unix, not(target_os = "macos")))]
-        command.args(["-shared", "-fPIC"]);
-        #[cfg(windows)]
-        command.arg("-shared");
-        command
-            .arg("-O2")
-            .arg(&source)
-            .args(&extra)
-            .arg("-o")
-            .arg(&output);
-        match command.output() {
-            Ok(result) if result.status.success() => {
-                return Ok(Value::from_string(output.to_string_lossy().into_owned()));
-            }
-            Ok(result) => failures.push(format!(
-                "{compiler}: {}",
-                String::from_utf8_lossy(&result.stderr).trim()
-            )),
-            Err(error) => failures.push(format!("{compiler}: {error}")),
-        }
-    }
-    let _ = std::fs::remove_file(&output);
-    Err(ctx.make_error(
-        "Error",
-        format!("bun:ffi cc failed: {}", failures.join("; ")),
-    ))
-}
 
-/// `__ffi.call(fnPtr, retCode, [argCodes], [args])` — marshal, trampoline, and marshal back.
-pub fn op_call(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fnptr = ptr_num_arg(ctx, args, 0)? as *const c_void;
-    let ret_code = ctx.coerce_number(args.get(1).unwrap_or(&Value::Undefined))? as u8;
-    let codes_v = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let vals_v = args.get(3).cloned().unwrap_or(Value::Undefined);
-
-    let n = arr_len(ctx, &codes_v);
-    if n > MAX_ARGS {
-        return Err(plain_error(
-            ctx,
-            format!("bun:ffi call with {n} arguments is not supported in lumen (max {MAX_ARGS}; struct-by-value and varargs are unsupported)"),
-        ));
-    }
-
-    let mut ints: Vec<u64> = Vec::with_capacity(n);
-    let mut floats: Vec<FArg> = Vec::with_capacity(n);
-    let mut fpos = 0u32;
-    for i in 0..n {
-        let code = ctx
-            .member_get(&codes_v, &i.to_string())?
-            .as_num_opt()
-            .unwrap_or(0.0) as u8;
-        if is_float(code) {
-            fpos |= 1 << i;
-        }
-        let v = ctx.member_get(&vals_v, &i.to_string())?;
-        marshal_arg(ctx, code, &v, &mut ints, &mut floats)?;
-    }
-
-    // Publish the engine pointer so a JSCallback fired *during* this call can re-enter JS.
-    let prev = CURRENT_CTX.with(|c| c.replace(ctx as *mut Ctx));
-    let raw = unsafe { invoke_native(fnptr, &ints, &floats, fpos, ret_code) };
-    CURRENT_CTX.with(|c| c.set(prev));
-
-    Ok(marshal_return(raw, ret_code))
-}
-
-/// `__ffi.ptr(typedArray, byteOffset?)` → the backing address as a number.
-pub fn op_ptr(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let v = args.first().cloned().unwrap_or(Value::Undefined);
-    let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
-    match ctx.typed_array_raw(&v) {
-        Some((_, _, p)) => Ok(Value::Num((p as usize + off) as f64)),
-        None => Err(type_error(
-            ctx,
-            "bun:ffi ptr expects a TypedArray (ArrayBuffer views are not supported in lumen)",
-        )),
-    }
-}
-
-/// `__ffi.read(ptr, offset, kind)` — a DataView-style read from a raw address (little-endian, as
-/// on both supported targets). `kind`: 0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=u64 7=i64 8=f32 9=f64
-/// 10=ptr 11=intptr.
-pub fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let base = ptr_num_arg(ctx, args, 0)?;
-    let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
-    let kind = ctx.coerce_number(args.get(2).unwrap_or(&Value::Undefined))? as u8;
-    let p = (base as usize + off) as *const u8;
-    unsafe {
-        let v = match kind {
-            0 => Value::Num(p.read_unaligned() as f64),
-            1 => Value::Num((p.read_unaligned() as i8) as f64),
-            2 => Value::Num((p as *const u16).read_unaligned() as f64),
-            3 => Value::Num((p as *const i16).read_unaligned() as f64),
-            4 => Value::Num((p as *const u32).read_unaligned() as f64),
-            5 => Value::Num((p as *const i32).read_unaligned() as f64),
-            6 => Value::bigint_from_u64((p as *const u64).read_unaligned()),
-            7 => Value::bigint_from_i128((p as *const i64).read_unaligned() as i128),
-            8 => Value::Num((p as *const f32).read_unaligned() as f64),
-            9 => Value::Num((p as *const f64).read_unaligned()),
-            10 | 11 => Value::Num((p as *const usize).read_unaligned() as f64),
-            _ => Value::Undefined,
-        };
-        Ok(v)
-    }
-}
-
-/// `__ffi.readCString(ptr, byteOffset, byteLength)` — decode UTF-8 (`byteLength < 0` ⇒ NUL-scan).
-pub fn op_read_cstring(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let base = ptr_num_arg(ctx, args, 0)?;
-    let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
-    let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(-1.0)))?;
-    if base == 0 {
-        return Ok(Value::str(""));
-    }
-    let p = (base as usize + off) as *const u8;
-    let bytes: &[u8] = unsafe {
-        if len < 0.0 {
-            let mut n = 0usize;
-            while *p.add(n) != 0 {
-                n += 1;
-            }
-            std::slice::from_raw_parts(p, n)
-        } else {
-            std::slice::from_raw_parts(p, len as usize)
-        }
-    };
-    Ok(Value::from_string(
-        String::from_utf8_lossy(bytes).into_owned(),
-    ))
-}
-
-/// `__ffi.toArrayBuffer(ptr, byteOffset, byteLength)` — a *copy* of native memory as an
-/// ArrayBuffer. (Bun returns a zero-copy view; lumen's ArrayBuffers own their storage, so this
-/// snapshots the bytes — reads match, writes do not propagate back to native memory.)
-pub fn op_to_array_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let base = ptr_num_arg(ctx, args, 0)?;
-    let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
-    let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(0.0)))? as usize;
-    let bytes: Vec<u8> = if base == 0 || len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts((base as usize + off) as *const u8, len).to_vec() }
-    };
-    let ta = ctx.make_uint8array(&bytes)?;
-    ctx.member_get(&ta, "buffer")
-}
-
-/// `__ffi.toBuffer(ptr, byteOffset, byteLength)` — like [`op_to_array_buffer`] but a Uint8Array
-/// copy (the JS glue rewraps it as a Node `Buffer`).
-pub fn op_to_buffer(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let base = ptr_num_arg(ctx, args, 0)?;
-    let off = ctx.coerce_number(args.get(1).unwrap_or(&Value::Num(0.0)))? as usize;
-    let len = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(0.0)))? as usize;
-    let bytes: Vec<u8> = if base == 0 || len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts((base as usize + off) as *const u8, len).to_vec() }
-    };
-    ctx.make_uint8array(&bytes)
-}
-
-/// `__ffi.registerCallback(fn, [argCodes], retCode)` → `[thunkPtr, id]`, or an honest throw for
-/// signatures the pooled integer-only thunks can't serve.
-pub fn op_register_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let func = args.first().cloned().unwrap_or(Value::Undefined);
-    if !func.is_callable() {
-        return Err(type_error(ctx, "bun:ffi JSCallback expects a function"));
-    }
-    let codes_v = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let ret_code = ctx.coerce_number(args.get(2).unwrap_or(&Value::Num(f64::from(T_VOID))))? as u8;
-
-    let n = arr_len(ctx, &codes_v);
-    if n > MAX_ARGS {
-        return Err(plain_error(
-            ctx,
-            format!(
-                "bun:ffi JSCallback with {n} arguments is not supported in lumen (max {MAX_ARGS})"
-            ),
-        ));
-    }
-    let mut arg_codes = Vec::with_capacity(n);
-    for i in 0..n {
-        let code = ctx
-            .member_get(&codes_v, &i.to_string())?
-            .as_num_opt()
-            .unwrap_or(0.0) as u8;
-        if is_float(code) {
-            return Err(plain_error(
-                ctx,
-                "bun:ffi JSCallback with floating-point arguments is not supported in lumen",
-            ));
-        }
-        arg_codes.push(code);
-    }
-    if is_float(ret_code) {
-        return Err(plain_error(
-            ctx,
-            "bun:ffi JSCallback with a floating-point return is not supported in lumen",
-        ));
-    }
-
-    let st = ffi_state(ctx);
-    let slot = st.callbacks[n].iter().position(|c| c.is_none());
-    let Some(k) = slot else {
-        return Err(plain_error(
-            ctx,
-            format!("bun:ffi JSCallback pool exhausted ({JSCB_POOL} live callbacks of arity {n})"),
-        ));
-    };
-    st.callbacks[n][k] = Some(CbEntry {
-        func,
-        arg_codes,
-        ret_code,
-    });
-    let ptr = jscb_thunk_ptr(n, k) as usize as f64;
-    let id = (n * JSCB_POOL + k) as f64;
-    Ok(ctx.make_array(vec![Value::Num(ptr), Value::Num(id)]))
-}
-
-/// `__ffi.unregisterCallback(id)` — free a JSCallback slot.
-pub fn op_unregister_callback(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = ctx.coerce_number(args.first().unwrap_or(&Value::Undefined))? as usize;
-    let (n, k) = (id / JSCB_POOL, id % JSCB_POOL);
-    let st = ffi_state(ctx);
-    if let Some(row) = st.callbacks.get_mut(n) {
-        if let Some(slot) = row.get_mut(k) {
+    /// `__ffi.dlclose(libId)` - unmap a library (its symbols dangle afterward).
+    #[op(coerce, name = "dlclose")]
+    fn op_dlclose(ctx: &mut Ctx, id: f64) {
+        if let Some(slot) = ffi_state(ctx).libs.get_mut(id as usize) {
             *slot = None;
         }
     }
-    Ok(Value::Undefined)
+
+    /// Compile one C translation unit into a temporary shared library using the host toolchain.
+    /// Arguments are already tokenized by the JS layer and NUL-separated, so no shell is involved.
+    #[op(coerce, name = "cc")]
+    fn op_cc(source: String, extra: Option<String>) -> Result<String, NativeError> {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        if !std::path::Path::new(&source).is_file() {
+            return Err(plain_error(format!("bun:ffi cc source not found: {source}")));
+        }
+        let extra = extra.unwrap_or_default();
+        let extra: Vec<&str> = extra.split('\0').filter(|arg| !arg.is_empty()).collect();
+        let extension = if cfg!(target_os = "macos") {
+            "dylib"
+        } else if cfg!(windows) {
+            "dll"
+        } else {
+            "so"
+        };
+        let output = std::env::temp_dir().join(format!(
+            "lumen-ffi-cc-{}-{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            extension
+        ));
+        let mut candidates = Vec::new();
+        if let Ok(cc) = std::env::var("CC") {
+            if !cc.is_empty() {
+                candidates.push(cc);
+            }
+        }
+        candidates.extend(["cc".to_string(), "clang".to_string()]);
+        let mut failures = Vec::new();
+        for compiler in candidates {
+            let mut command = Command::new(&compiler);
+            #[cfg(target_os = "macos")]
+            command.args(["-dynamiclib", "-fPIC", "-undefined", "dynamic_lookup"]);
+            #[cfg(all(unix, not(target_os = "macos")))]
+            command.args(["-shared", "-fPIC"]);
+            #[cfg(windows)]
+            command.arg("-shared");
+            command
+                .arg("-O2")
+                .arg(&source)
+                .args(&extra)
+                .arg("-o")
+                .arg(&output);
+            match command.output() {
+                Ok(result) if result.status.success() => {
+                    return Ok(output.to_string_lossy().into_owned());
+                }
+                Ok(result) => failures.push(format!(
+                    "{compiler}: {}",
+                    String::from_utf8_lossy(&result.stderr).trim()
+                )),
+                Err(error) => failures.push(format!("{compiler}: {error}")),
+            }
+        }
+        let _ = std::fs::remove_file(&output);
+        Err(plain_error(format!("bun:ffi cc failed: {}", failures.join("; "))))
+    }
+
+    /// `__ffi.call(fnPtr, retCode, [argCodes], [args])` - marshal, trampoline, and marshal back.
+    #[op(coerce, name = "call")]
+    fn op_call(ctx: &mut Ctx, fnptr: Value, ret_code: f64, codes: Value, vals: Value) -> Result<Value, OpError> {
+        let fnptr = value_to_pointer(ctx, &fnptr)? as *const c_void;
+        let ret_code = ret_code as u8;
+        let n = arr_len(ctx, &codes);
+        if n > MAX_ARGS {
+            return Err(plain_error(format!(
+                "bun:ffi call with {n} arguments is not supported in lumen (max {MAX_ARGS}; struct-by-value and varargs are unsupported)"
+            ))
+            .into());
+        }
+
+        let mut ints: Vec<u64> = Vec::with_capacity(n);
+        let mut floats: Vec<FArg> = Vec::with_capacity(n);
+        let mut fpos = 0u32;
+        for i in 0..n {
+            let code = ctx.member_get(&codes, &i.to_string())?.as_num_opt().unwrap_or(0.0) as u8;
+            if is_float(code) {
+                fpos |= 1 << i;
+            }
+            let v = ctx.member_get(&vals, &i.to_string())?;
+            marshal_arg(ctx, code, &v, &mut ints, &mut floats)?;
+        }
+
+        // Publish the engine pointer so a JSCallback fired *during* this call can re-enter JS.
+        let prev = CURRENT_CTX.with(|c| c.replace(ctx as *mut Ctx));
+        let raw = unsafe { invoke_native(fnptr, &ints, &floats, fpos, ret_code) };
+        CURRENT_CTX.with(|c| c.set(prev));
+
+        Ok(marshal_return(raw, ret_code))
+    }
+
+    /// `__ffi.ptr(typedArray, byteOffset?)` -> the backing address as a number.
+    #[op(coerce, name = "ptr")]
+    fn op_ptr(ctx: &mut Ctx, view: Value, off: Option<f64>) -> Result<f64, NativeError> {
+        match ctx.typed_array_raw(&view) {
+            Some((_, _, p)) => Ok((p as usize + off.unwrap_or(0.0) as usize) as f64),
+            None => Err(type_error("bun:ffi ptr expects a TypedArray (ArrayBuffer views are not supported in lumen)")),
+        }
+    }
+
+    /// `__ffi.read(ptr, offset, kind)` - a DataView-style read from a raw address (little-endian,
+    /// as on both supported targets). `kind`: 0=u8 1=i8 2=u16 3=i16 4=u32 5=i32 6=u64 7=i64 8=f32
+    /// 9=f64 10=ptr 11=intptr.
+    #[op(coerce, name = "read")]
+    fn op_read(ctx: &mut Ctx, base: Value, off: Option<f64>, kind: f64) -> Result<Value, NativeError> {
+        let base = value_to_pointer(ctx, &base)?;
+        let p = (base as usize + off.unwrap_or(0.0) as usize) as *const u8;
+        unsafe {
+            Ok(match kind as u8 {
+                0 => Value::Num(p.read_unaligned() as f64),
+                1 => Value::Num((p.read_unaligned() as i8) as f64),
+                2 => Value::Num((p as *const u16).read_unaligned() as f64),
+                3 => Value::Num((p as *const i16).read_unaligned() as f64),
+                4 => Value::Num((p as *const u32).read_unaligned() as f64),
+                5 => Value::Num((p as *const i32).read_unaligned() as f64),
+                6 => Value::bigint_from_u64((p as *const u64).read_unaligned()),
+                7 => Value::bigint_from_i128((p as *const i64).read_unaligned() as i128),
+                8 => Value::Num((p as *const f32).read_unaligned() as f64),
+                9 => Value::Num((p as *const f64).read_unaligned()),
+                10 | 11 => Value::Num((p as *const usize).read_unaligned() as f64),
+                _ => Value::Undefined,
+            })
+        }
+    }
+
+    /// `__ffi.readCString(ptr, byteOffset, byteLength)` - decode UTF-8 (`byteLength < 0` = NUL-scan).
+    #[op(coerce, name = "readCString")]
+    fn op_read_cstring(ctx: &mut Ctx, base: Value, off: Option<f64>, len: Option<f64>) -> Result<String, NativeError> {
+        let base = value_to_pointer(ctx, &base)?;
+        if base == 0 {
+            return Ok(String::new());
+        }
+        let len = len.unwrap_or(-1.0);
+        let p = (base as usize + off.unwrap_or(0.0) as usize) as *const u8;
+        let bytes: &[u8] = unsafe {
+            if len < 0.0 {
+                let mut n = 0usize;
+                while *p.add(n) != 0 {
+                    n += 1;
+                }
+                std::slice::from_raw_parts(p, n)
+            } else {
+                std::slice::from_raw_parts(p, len as usize)
+            }
+        };
+        Ok(String::from_utf8_lossy(bytes).into_owned())
+    }
+
+    fn copy_native(ctx: &mut Ctx, base: Value, off: Option<f64>, len: Option<f64>) -> Result<Vec<u8>, NativeError> {
+        let base = value_to_pointer(ctx, &base)?;
+        let len = len.unwrap_or(0.0) as usize;
+        Ok(if base == 0 || len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts((base as usize + off.unwrap_or(0.0) as usize) as *const u8, len).to_vec() }
+        })
+    }
+
+    /// `__ffi.toArrayBuffer(ptr, byteOffset, byteLength)` - a *copy* of native memory as an
+    /// ArrayBuffer. (Bun returns a zero-copy view; lumen's ArrayBuffers own their storage, so this
+    /// snapshots the bytes: reads match, writes do not propagate back to native memory.)
+    #[op(coerce, name = "toArrayBuffer")]
+    fn op_to_array_buffer(ctx: &mut Ctx, base: Value, off: Option<f64>, len: Option<f64>) -> Result<JsArrayBuffer, NativeError> {
+        copy_native(ctx, base, off, len).map(JsArrayBuffer)
+    }
+
+    /// `__ffi.toBuffer(ptr, byteOffset, byteLength)` - like `toArrayBuffer` but a Uint8Array copy
+    /// (the JS glue rewraps it as a Node `Buffer`).
+    #[op(coerce, name = "toBuffer")]
+    fn op_to_buffer(ctx: &mut Ctx, base: Value, off: Option<f64>, len: Option<f64>) -> Result<Vec<u8>, NativeError> {
+        copy_native(ctx, base, off, len)
+    }
+
+    /// `__ffi.registerCallback(fn, [argCodes], retCode)` -> `[thunkPtr, id]`, or an honest throw
+    /// for signatures the pooled integer-only thunks can't serve.
+    #[op(coerce, name = "registerCallback")]
+    fn op_register_callback(ctx: &mut Ctx, func: Value, codes: Value, ret_code: Option<f64>) -> Result<Vec<f64>, OpError> {
+        if !func.is_callable() {
+            return Err(type_error("bun:ffi JSCallback expects a function").into());
+        }
+        let ret_code = ret_code.unwrap_or(f64::from(T_VOID)) as u8;
+
+        let n = arr_len(ctx, &codes);
+        if n > MAX_ARGS {
+            return Err(plain_error(format!("bun:ffi JSCallback with {n} arguments is not supported in lumen (max {MAX_ARGS})")).into());
+        }
+        let mut arg_codes = Vec::with_capacity(n);
+        for i in 0..n {
+            let code = ctx.member_get(&codes, &i.to_string())?.as_num_opt().unwrap_or(0.0) as u8;
+            if is_float(code) {
+                return Err(plain_error("bun:ffi JSCallback with floating-point arguments is not supported in lumen").into());
+            }
+            arg_codes.push(code);
+        }
+        if is_float(ret_code) {
+            return Err(plain_error("bun:ffi JSCallback with a floating-point return is not supported in lumen").into());
+        }
+
+        let st = ffi_state(ctx);
+        let Some(k) = st.callbacks[n].iter().position(|c| c.is_none()) else {
+            return Err(plain_error(format!("bun:ffi JSCallback pool exhausted ({JSCB_POOL} live callbacks of arity {n})")).into());
+        };
+        st.callbacks[n][k] = Some(CbEntry { func, arg_codes, ret_code });
+        Ok(vec![jscb_thunk_ptr(n, k) as usize as f64, (n * JSCB_POOL + k) as f64])
+    }
+
+    /// `__ffi.unregisterCallback(id)` - free a JSCallback slot.
+    #[op(coerce, name = "unregisterCallback")]
+    fn op_unregister_callback(ctx: &mut Ctx, id: f64) {
+        let (n, k) = (id as usize / JSCB_POOL, id as usize % JSCB_POOL);
+        if let Some(slot) = ffi_state(ctx).callbacks.get_mut(n).and_then(|row| row.get_mut(k)) {
+            *slot = None;
+        }
+    }
 }
 
 /// Forward a native invocation of thunk `(n, k)` into its registered JS function. Called from the

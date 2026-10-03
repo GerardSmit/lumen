@@ -13,6 +13,20 @@ verbatim when delegating.
 - Language-neutral algorithms go in `lumen-common` (keep it free of OS calls so it can become
   `no_std + alloc`); OS-facing code goes in `lumen-os`.
 - Only write new code when nothing in Lumen covers it.
+- Never hand-write a codec, compression format, cryptographic primitive, certificate/ASN.1 parser or
+  similar well-specified format when a maintained crate exists. Check crates.io first; prefer pure
+  Rust (so wasm, Android and `no_std` builds keep working) and wrap the crate in a thin adapter in
+  the shared crate. If the crate lacks something, extend or patch the crate rather than writing a
+  second implementation.
+- Data types that exist in more than one language (buffers, floats, JSON, codecs, time zones, ...)
+  use the shared cores in `lumen-common`/`lumen-os`.
+
+## Builds and tests
+
+- Disk is limited. Worktree agents build with `CARGO_TARGET_DIR` pointing at one shared target dir
+  when they can, and `cargo clean` their own target dir when done.
+- Never build whole test suites with the fat-LTO release profile; use the debug or `fast` profile.
+- Run tests with a timeout (`timeout`/`--timeout`) so a hung test cannot run for hours.
 
 ## Duplication review before every merge
 
@@ -34,7 +48,7 @@ Report the findings and resolve them (or schedule a pass to resolve them) as par
 
 ## Python (`crates/lumen-py`)
 
-- Target semantics: CPython 3.12. Vendored CPython modules live unmodified in
+- Target semantics: CPython 3.14 (moving from 3.12; Home Assistant and Hermes need 3.14). Vendored CPython modules live unmodified in
   `crates/lumen-py/lib/` (see `VENDORED.md`); fix the engine, never patch vendored files.
 - Native modules that are C in CPython are written in Rust on top of Lumen's shared code.
 - Correctness is checked against CPython: the corpus (`cargo test -p lumen-py --test corpus`),

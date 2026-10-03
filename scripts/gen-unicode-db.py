@@ -5,6 +5,10 @@ Every property is read back from the reference interpreter, so the tables reprod
 answers exactly: per-code-point records (category, bidirectional class, combining class,
 mirrored, East Asian width, decimal/digit/numeric values), decomposition mappings, the
 canonical composition pairs NFC uses, character names, and the `ucd_3_2_0` deltas.
+The character types behind `str` methods (CPython's `_PyUnicode_TypeRecord`: the predicate flags
+and the full case mappings) are read back from the interpreter's own `str` methods; the
+`Cased`, `Case_Ignorable`, `XID_Start` and `XID_Continue` flags come from the UCD's
+DerivedCoreProperties.txt and are checked against them.
 Name aliases and named sequences are not enumerable through `unicodedata`; they come from the
 UCD's NameAliases.txt and NamedSequences.txt and are checked against `unicodedata.lookup`.
 
@@ -61,6 +65,60 @@ def two_level(values, default):
         index1.append(seen[block])
     index2 = [v for b in blocks for v in b]
     return index1, index2
+
+
+TYPE_FLAGS = ["ALPHA", "DECIMAL", "DIGIT", "NUMERIC", "SPACE", "PRINTABLE", "LOWER", "UPPER",
+              "TITLE", "CASED", "CASE_IGNORABLE", "XID_START", "XID_CONTINUE"]
+# A case mapping is a code point delta, or EXTENDED + the offset of `[count, cps...]` in
+# TYPE_EXT (deltas never reach it).
+EXTENDED = 0x200000
+
+
+def derived_sets(names):
+    sets = {n: set() for n in names}
+    for fields in ucd_lines("DerivedCoreProperties.txt"):
+        if fields[1] in sets:
+            lo, _, hi = fields[0].partition("..")
+            sets[fields[1]].update(range(int(lo, 16), int(hi or lo, 16) + 1))
+    return sets
+
+
+def char_types():
+    """Per code point: (flags, upper, lower, title, fold) records and the extended mappings."""
+    derived = derived_sets(["Cased", "Case_Ignorable", "XID_Start", "XID_Continue"])
+    records, rec_ix, of = [], {}, []
+    ext, ext_ix = [0], {}
+
+    def mapping(cp, m):
+        if len(m) == 1:
+            return ord(m) - cp
+        key = tuple(map(ord, m))
+        if key not in ext_ix:
+            ext_ix[key] = len(ext)
+            ext.append(len(key))
+            ext.extend(key)
+        return EXTENDED + ext_ix[key]
+
+    for cp in range(0x110000):
+        c = chr(cp)
+        lower, upper, title = c.islower(), c.isupper(), U.category(c) == "Lt"
+        cased = cp in derived["Cased"]
+        ignorable = cp in derived["Case_Ignorable"]
+        xid_start, xid_continue = cp in derived["XID_Start"], cp in derived["XID_Continue"]
+        assert cased == (lower or upper or title), hex(cp)
+        # The final-sigma rule of str.lower() skips case-ignorable characters.
+        probe = (" " + c + "\u03a3").lower().endswith("\u03c3") if cased else ("A\u03a3" + c + "B").lower()[1] == "\u03c3"
+        assert ignorable == probe, hex(cp)
+        assert c.isidentifier() == (xid_start or c == "_"), hex(cp)
+        assert ("a" + c).isidentifier() == xid_continue, hex(cp)
+        bits = [c.isalpha(), c.isdecimal(), c.isdigit(), c.isnumeric(), c.isspace(), c.isprintable(),
+                lower, upper, title, cased, ignorable, xid_start, xid_continue]
+        flags = sum(1 << i for i, b in enumerate(bits) if b)
+        rec = (flags, mapping(cp, c.upper()), mapping(cp, c.lower()), mapping(cp, c.title()),
+               mapping(cp, c.casefold()))
+        of.append(interned(records, rec_ix, rec))
+    assert len(records) < 0x10000 and len(ext) < 0x10000
+    return records, of, ext
 
 
 def rust_list(items, per_line=16):
@@ -235,6 +293,8 @@ def main():
         sequences.append((name, seq))
     sequences.sort()
 
+    types, type_of, type_ext = char_types()
+    tidx1, tidx2 = two_level(type_of, 0)
     idx1, idx2 = two_level(rec_of, 0)
     didx1, didx2 = two_level(decomp_of, 0)
     lexicon = "".join(words)
@@ -346,13 +406,27 @@ def main():
     w(f"pub static OLD_CHANGES: &[(u32, u16)] = &[\n{rust_list((f'({c:#x}, {r})' for c, r in old_changes), 8)}\n];")
     w("/// UCD 3.2.0: singleton decompositions that differ, applied before the current mappings.")
     w(f"pub static OLD_NORMALIZATION: &[(u32, u32)] = &[\n{rust_list((f'({a:#x}, {b:#x})' for a, b in old_norm), 6)}\n];")
+    w("")
+    w("/// The character types of `str` methods: flag bits, in this order.")
+    w(f"pub static TYPE_FLAGS: &[&str] = &[{', '.join(map(rust_str, TYPE_FLAGS))}];")
+    w(f"/// A case mapping at least this is `EXTENDED` + the offset of `[count, cps...]` in `TYPE_EXT`;")
+    w(f"/// below it, it is the delta to the one code point it maps to.")
+    w(f"pub const EXTENDED: i32 = {EXTENDED:#x};")
+    w("/// (flags, upper, lower, title, casefold).")
+    w("pub static TYPE_RECORDS: &[(u16, i32, i32, i32, i32)] = &[")
+    w(rust_list((f"({', '.join(map(str, r))})" for r in types), 4))
+    w("];")
+    section("TYPE_INDEX1", "U16s", tidx1, "Type record index, first level.")
+    section("TYPE_INDEX2", "U16s", tidx2, "Type record index, second level.")
+    section("TYPE_EXT", "U32s", type_ext, "Case mappings to more than one code point: count, then the code points.")
     assert len(records) < 0x10000
     with open(OUT, "w") as f:
         f.write("\n".join(out) + "\n")
     with open(BLOB, "wb") as f:
         f.write(blob)
     print(f"{OUT}: {len(records)} records, {len(explicit)} names, {len(words)} words, "
-          f"{len(ranges)} name ranges, {len(compose)} compositions, {len(old_changes)} 3.2.0 changes")
+          f"{len(ranges)} name ranges, {len(compose)} compositions, {len(old_changes)} 3.2.0 changes, "
+          f"{len(types)} type records")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,19 @@
+0
+None
+corpus
+in use
+bad id
+tool not in use
+0
+True
+None
+True
+True
+['other', 'target']
+[('target', 42), ('other', 42)]
+True
+['target', 'target']
+['target']
+['target', 'target']
+[1]
+None

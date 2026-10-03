@@ -23,7 +23,7 @@ pub mod _ast {
     const PY_CF_TYPE_COMMENTS: i64 = 0x1000;
     const PY_CF_ALLOW_TOP_LEVEL_AWAIT: i64 = 0x2000;
 
-    #[class(name = "AST", module = "ast")]
+    #[class(name = "AST", module = "ast", hint(py(mutable)))]
     pub struct AST;
 
     #[methods]
@@ -35,8 +35,8 @@ pub mod _ast {
             Ok(opaque_instance(&cls, AST))
         }
 
-        /// `ast_type_init`: positional arguments fill `_fields` in order, keywords set any
-        /// attribute.
+        // `ast_type_init`: positional arguments fill `_fields` in order, keywords set any
+        // attribute.
         #[proto(init)]
         fn __init__(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
             let cls = it.type_of(&slf.0);

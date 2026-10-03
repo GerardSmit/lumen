@@ -8,7 +8,8 @@
 
 use crate::object::*;
 use crate::vm::*;
-use lumen_common::smuggle::{code_points, escape_text, may_contain, push_code_point};
+use lumen_common::smuggle::{code_points, escape_text, may_contain, push_code_point, Spelling};
+use lumen_common::utf;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -409,6 +410,13 @@ impl<'a> ErrCtx<'a> {
         Ok((r, end))
     }
 
+    /// [`Self::on_decode`] for a [`utf::Malformed`] sequence, appending the replacement.
+    fn on_malformed(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, m: utf::Malformed, out: &mut String, sp: SurrogateForm) -> R<usize> {
+        let (rep, pos) = self.on_decode(it, data, m.start, m.end, m.reason, Some(sp))?;
+        out.push_str(&rep);
+        Ok(pos)
+    }
+
     fn on_decode(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, start: usize, end: usize, reason: &str, sp: Option<SurrogateForm>) -> R<(String, usize)> {
         let r = match &self.mode {
             ErrorMode::Strict => return Err(self.decode_exc(it, data, start, end, reason)),
@@ -439,11 +447,17 @@ impl<'a> ErrCtx<'a> {
                     Some([rep, pos]) if rep.as_str().is_some() && pos.is_int_like() => (rep.as_str().unwrap_or("").to_string(), pos.clone()),
                     _ => return Err(it.type_error("decoding error handler must return (str, int) tuple")),
                 };
-                if let Some(Value::Obj(o)) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "object")) {
-                    if let Kind::Bytes(b) = &o.kind {
-                        if b[..] != data[..] {
-                            *data = Cow::Owned(b.clone());
+                let object = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "object"));
+                if let Some(object) = object {
+                    match &object {
+                        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => {
+                            if let Kind::Bytes(b) = &o.kind {
+                                if b[..] != data[..] {
+                                    *data = Cow::Owned(b.clone());
+                                }
+                            }
                         }
+                        _ => return Err(it.type_error("exception attribute object must be bytes")),
                     }
                 }
                 let newpos = handler_pos(it, &pos, data.len())?;
@@ -910,38 +924,11 @@ pub fn utf8_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) ->
     if let Ok(s) = std::str::from_utf8(input) {
         return Ok((escape_text(s).into_owned(), input.len()));
     }
-    let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len());
     let mut ctx = ErrCtx::new(errors, "utf-8");
-    let mut pos = 0;
-    while pos < data.len() {
-        let (good, err_len) = match std::str::from_utf8(&data[pos..]) {
-            Ok(s) => {
-                out.push_str(&escape_text(s));
-                pos = data.len();
-                break;
-            }
-            Err(e) => (e.valid_up_to(), e.error_len()),
-        };
-        out.push_str(&escape_text(std::str::from_utf8(&data[pos..pos + good]).unwrap_or("")));
-        let start = pos + good;
-        let (end, reason) = match err_len {
-            Some(n) => {
-                let b = data[start];
-                (start + n, if (0x80..0xc2).contains(&b) || b >= 0xf5 { "invalid start byte" } else { "invalid continuation byte" })
-            }
-            None => {
-                if !final_ {
-                    pos = start;
-                    return Ok((out, pos));
-                }
-                (data.len(), "unexpected end of data")
-            }
-        };
-        let (rep, newpos) = ctx.on_decode(it, &mut data, start, end, reason, Some(SurrogateForm::Utf8))?;
-        out.push_str(&rep);
-        pos = newpos;
-    }
+    let pos = utf::decode_utf8(&mut Cow::Borrowed(input), final_, Spelling::CodePoints, &mut out, |data, m, out| {
+        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf8)
+    })?;
     Ok((out, pos))
 }
 
@@ -962,52 +949,11 @@ pub fn utf16_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, f
         }
     }
     let be = *bo > 0;
-    let name = if be { "utf-16-be" } else { "utf-16-le" };
-    let rd = |d: &[u8], i: usize| -> u32 {
-        if be {
-            u16::from_be_bytes([d[i], d[i + 1]]) as u32
-        } else {
-            u16::from_le_bytes([d[i], d[i + 1]]) as u32
-        }
-    };
-    let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len() / 2);
-    let mut ctx = ErrCtx::new(errors, name);
-    let sp = Some(SurrogateForm::Utf16(be));
-    while pos < data.len() {
-        let (start, end, reason) = if pos + 1 >= data.len() {
-            if !final_ {
-                break;
-            }
-            (pos, data.len(), "truncated data")
-        } else {
-            let u = rd(&data, pos);
-            if !is_surrogate(u) {
-                push_cp(&mut out, u);
-                pos += 2;
-                continue;
-            }
-            if u >= 0xDC00 {
-                (pos, pos + 2, "illegal encoding")
-            } else if pos + 3 >= data.len() {
-                if !final_ {
-                    break;
-                }
-                (pos, data.len(), "unexpected end of data")
-            } else {
-                let u2 = rd(&data, pos + 2);
-                if (0xDC00..0xE000).contains(&u2) {
-                    push_cp(&mut out, 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00));
-                    pos += 4;
-                    continue;
-                }
-                (pos, pos + 2, "illegal UTF-16 surrogate")
-            }
-        };
-        let (rep, newpos) = ctx.on_decode(it, &mut data, start, end, reason, sp)?;
-        out.push_str(&rep);
-        pos = newpos;
-    }
+    let mut ctx = ErrCtx::new(errors, if be { "utf-16-be" } else { "utf-16-le" });
+    let pos = utf::decode_utf16(&mut Cow::Borrowed(input), pos, be, final_, Spelling::CodePoints, &mut out, |data, m, out| {
+        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf16(be))
+    })?;
     Ok((out, pos))
 }
 
@@ -1562,11 +1508,6 @@ pub fn unregister(it: &mut Interp, f: &Value) {
     }
 }
 
-pub fn forget_codec(it: &mut Interp, encoding: &str) {
-    let norm = normalize_encoding(encoding);
-    it.codecs.cache.remove(&norm);
-}
-
 /// `lookup()` that refuses codecs marked `_is_text_encoding = False` (CPython's
 /// `_PyCodec_LookupTextEncoding`).
 pub fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value> {
@@ -1680,10 +1621,10 @@ fn ensure_errors(it: &mut Interp) {
         return;
     }
     it.codecs.builtin_errors_ready = true;
-    let fns: [NativeFn; 8] = [strict_errors, ignore_errors, replace_errors, xmlcharrefreplace_errors, backslashreplace_errors, namereplace_errors, surrogateescape_errors, surrogatepass_errors];
-    for ((name, fname), f) in BUILTIN_ERRORS.iter().zip(fns) {
-        let v = it.new_native(fname, f, false);
-        it.codecs.errors.insert(name.to_string(), v);
+    for (fname, v) in crate::bind::function_values::<error_handlers::Module>() {
+        if let Some((name, _)) = BUILTIN_ERRORS.iter().find(|(_, f)| *f == fname) {
+            it.codecs.errors.insert(name.to_string(), v);
+        }
     }
 }
 
@@ -1704,12 +1645,11 @@ pub fn register_error(it: &mut Interp, name: &str, handler: Value) -> R<()> {
     Ok(())
 }
 
-/// `_codecs._unregister_error`: whether a handler was removed; built-in ones cannot be.
 pub fn unregister_error(it: &mut Interp, name: &str) -> R<bool> {
-    if BUILTIN_ERRORS.iter().any(|(n, _)| *n == name) {
-        return Err(it.value_error(&format!("cannot un-register built-in error handler '{}'", name)));
-    }
     ensure_errors(it);
+    if BUILTIN_ERRORS.iter().any(|(n, _)| *n == name) {
+        return Err(it.value_error(&format!("cannot un-register built-in error handler '{name}'")));
+    }
     Ok(it.codecs.errors.remove(name).is_some())
 }
 
@@ -1731,13 +1671,11 @@ fn exc_kind_of(it: &mut Interp, v: &Value) -> Option<ExcKind> {
     })
 }
 
-fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
-    it.check_args(name, a, 1, 1)?;
-    let Some(kind) = exc_kind_of(it, &a[0]) else {
-        let t = it.type_name_of(&a[0]);
-        return Err(it.type_error(&format!("don't know how to handle {} in error callback", t)));
+fn exc_view(it: &mut Interp, exc: &Value) -> R<ExcView> {
+    let Some(kind) = exc_kind_of(it, exc) else {
+        return Err(unhandled(it, exc));
     };
-    let object = it.get_attr_str(&a[0], "object")?;
+    let object = it.get_attr_str(exc, "object")?;
     let len = match kind {
         ExcKind::Decode => it.bytes_of(&object)?.len(),
         _ => match object.as_pystr() {
@@ -1745,8 +1683,8 @@ fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
             None => return Err(it.type_error("object attribute must be unicode")),
         },
     };
-    let sv = it.get_attr_str(&a[0], "start")?;
-    let ev = it.get_attr_str(&a[0], "end")?;
+    let sv = it.get_attr_str(exc, "start")?;
+    let ev = it.get_attr_str(exc, "end")?;
     let start = it.index_of(&sv)?;
     let end = it.index_of(&ev)?;
     let start = if start < 0 { 0 } else if start as usize >= len { len.saturating_sub(1) } else { start as usize };
@@ -1759,8 +1697,8 @@ fn view_chars(v: &ExcView) -> Vec<u32> {
     code_points(s).skip(v.start).take(v.end.saturating_sub(v.start)).collect()
 }
 
-fn unhandled(it: &mut Interp, a: &[Value]) -> Obj {
-    let t = it.type_name_of(&a[0]);
+fn unhandled(it: &mut Interp, exc: &Value) -> Obj {
+    let t = it.type_name_of(exc);
     it.type_error(&format!("don't know how to handle {} in error callback", t))
 }
 
@@ -1771,98 +1709,117 @@ fn raise_exc(it: &mut Interp, v: &Value) -> Obj {
     }
 }
 
-fn strict_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    it.check_args("strict_errors", a, 1, 1)?;
-    match &a[0] {
-        Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Err(o.clone()),
-        _ => Err(it.type_error("codec must pass exception instance")),
-    }
-}
+// The built-in error handlers (`codecs.lookup_error("strict")`, ...).
+#[lumen_bind::module(name = "builtins")]
+mod error_handlers {
+    use super::*;
 
-fn ignore_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "ignore_errors")?;
-    Ok(Value::tuple(vec![Value::str(""), Value::Int(v.end as i64)]))
-}
-
-fn replace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "replace_errors")?;
-    let n = v.end.saturating_sub(v.start);
-    let r = match v.kind {
-        ExcKind::Encode => "?".repeat(n),
-        ExcKind::Decode => "\u{fffd}".to_string(),
-        ExcKind::Translate => "\u{fffd}".repeat(n),
-    };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
-}
-
-fn xmlcharrefreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "xmlcharrefreplace_errors")?;
-    if v.kind != ExcKind::Encode {
-        return Err(unhandled(it, a));
-    }
-    Ok(Value::tuple(vec![Value::string(xmlcharref_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
-}
-
-fn backslashreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "backslashreplace_errors")?;
-    let r = match v.kind {
-        ExcKind::Decode => {
-            let b = it.bytes_of(&v.object)?;
-            backslash_bytes(&b[v.start..v.end.max(v.start)])
+    /// Implements the 'strict' error handling, which raises a UnicodeError on coding errors.
+    #[op(hint(py(text_signature = "")))]
+    fn strict_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        match exception {
+            Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Err(o.clone()),
+            _ => Err(it.type_error("codec must pass exception instance")),
         }
-        _ => backslash_chars(&view_chars(&v)),
-    };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
-}
-
-fn namereplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "namereplace_errors")?;
-    if v.kind != ExcKind::Encode {
-        return Err(unhandled(it, a));
     }
-    Ok(Value::tuple(vec![Value::string(namereplace_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
-}
 
-fn surrogateescape_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "surrogateescape")?;
-    match v.kind {
-        ExcKind::Encode => match surrogateescape_encode(&view_chars(&v)) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
-            None => Err(raise_exc(it, &a[0])),
-        },
-        ExcKind::Decode => {
-            let b = it.bytes_of(&v.object)?;
-            match surrogateescape_decode(&b, v.start, v.end) {
-                Some((s, end)) => Ok(Value::tuple(vec![Value::string(s), Value::Int(end as i64)])),
-                None => Err(raise_exc(it, &a[0])),
+    /// Implements the 'ignore' error handling, which ignores malformed data and continues.
+    #[op(hint(py(text_signature = "")))]
+    fn ignore_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        Ok(Value::tuple(vec![Value::str(""), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'replace' error handling, which replaces malformed data with a replacement marker.
+    #[op(hint(py(text_signature = "")))]
+    fn replace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        let n = v.end.saturating_sub(v.start);
+        let r = match v.kind {
+            ExcKind::Encode => "?".repeat(n),
+            ExcKind::Decode => "\u{fffd}".to_string(),
+            ExcKind::Translate => "\u{fffd}".repeat(n),
+        };
+        Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'xmlcharrefreplace' error handling, which replaces an unencodable character with the appropriate XML character reference.
+    #[op(hint(py(text_signature = "")))]
+    fn xmlcharrefreplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind != ExcKind::Encode {
+            return Err(unhandled(it, exception));
+        }
+        Ok(Value::tuple(vec![Value::string(xmlcharref_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
+    }
+
+    /// Implements the 'backslashreplace' error handling, which replaces malformed data with a backslashed escape sequence.
+    #[op(hint(py(text_signature = "")))]
+    fn backslashreplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        let r = match v.kind {
+            ExcKind::Decode => {
+                let b = it.bytes_of(&v.object)?;
+                backslash_bytes(&b[v.start..v.end.max(v.start)])
             }
-        }
-        ExcKind::Translate => Err(unhandled(it, a)),
+            _ => backslash_chars(&view_chars(&v)),
+        };
+        Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
     }
-}
 
-fn surrogatepass_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
-    let v = exc_view(it, a, "surrogatepass")?;
-    if v.kind == ExcKind::Translate {
-        return Err(unhandled(it, a));
+    /// Implements the 'namereplace' error handling, which replaces an unencodable character with a \\N{...} escape sequence.
+    #[op(hint(py(text_signature = "")))]
+    fn namereplace_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind != ExcKind::Encode {
+            return Err(unhandled(it, exception));
+        }
+        Ok(Value::tuple(vec![Value::string(namereplace_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
     }
-    let enc = it.get_attr_str(&a[0], "encoding")?;
-    let form = enc.as_str().and_then(SurrogateForm::from_name);
-    let Some(form) = form else { return Err(raise_exc(it, &a[0])) };
-    match v.kind {
-        ExcKind::Encode => match surrogatepass_encode(&view_chars(&v), form) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
-            None => Err(raise_exc(it, &a[0])),
-        },
-        _ => {
-            let b = it.bytes_of(&v.object)?;
-            match form.read(&b[v.start.min(b.len())..]) {
-                Some(cp) => {
-                    let mut s = String::new();
-                    push_cp(&mut s, cp);
-                    Ok(Value::tuple(vec![Value::string(s), Value::Int((v.start + form.len()) as i64)]))
+
+    #[op(name = "surrogateescape", hint(py(text_signature = "")))]
+    fn surrogateescape_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        match v.kind {
+            ExcKind::Encode => match surrogateescape_encode(&view_chars(&v)) {
+                Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+                None => Err(raise_exc(it, exception)),
+            },
+            ExcKind::Decode => {
+                let b = it.bytes_of(&v.object)?;
+                match surrogateescape_decode(&b, v.start, v.end) {
+                    Some((s, end)) => Ok(Value::tuple(vec![Value::string(s), Value::Int(end as i64)])),
+                    None => Err(raise_exc(it, exception)),
                 }
-                None => Err(raise_exc(it, &a[0])),
+            }
+            ExcKind::Translate => Err(unhandled(it, exception)),
+        }
+    }
+
+    #[op(name = "surrogatepass", hint(py(text_signature = "")))]
+    fn surrogatepass_errors(it: &mut Interp, exception: &Value) -> R<Value> {
+        let v = exc_view(it, exception)?;
+        if v.kind == ExcKind::Translate {
+            return Err(unhandled(it, exception));
+        }
+        let enc = it.get_attr_str(exception, "encoding")?;
+        let form = enc.as_str().and_then(SurrogateForm::from_name);
+        let Some(form) = form else { return Err(raise_exc(it, exception)) };
+        match v.kind {
+            ExcKind::Encode => match surrogatepass_encode(&view_chars(&v), form) {
+                Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+                None => Err(raise_exc(it, exception)),
+            },
+            _ => {
+                let b = it.bytes_of(&v.object)?;
+                match form.read(&b[v.start.min(b.len())..]) {
+                    Some(cp) => {
+                        let mut s = String::new();
+                        push_cp(&mut s, cp);
+                        Ok(Value::tuple(vec![Value::string(s), Value::Int((v.start + form.len()) as i64)]))
+                    }
+                    None => Err(raise_exc(it, exception)),
+                }
             }
         }
     }

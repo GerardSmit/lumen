@@ -300,6 +300,7 @@ pub mod _zoneinfo {
         }
 
         // CPython's clinic classmethods carry no docstring.
+        /// Create a ZoneInfo file from a file object.
         #[classmethod(hint(py(text_signature = "($type, file_obj, /, key=None)")))]
         fn from_file(cls: This<Value>, it: &mut Interp, file_obj: &Value, #[kw] key: Option<&Value>) -> R<Value> {
             let Value::Obj(cls) = cls.0 else { return Err(it.type_error("from_file() needs a class")) };
@@ -309,12 +310,14 @@ pub mod _zoneinfo {
             Ok(opaque_instance(&cls, zone))
         }
 
+        /// Get a new instance of ZoneInfo, bypassing the cache.
         #[classmethod(hint(py(text_signature = "($type, /, key)")))]
         fn no_cache(cls: This<Value>, it: &mut Interp, #[kw] key: &Value) -> R<Value> {
             let Value::Obj(cls) = cls.0 else { return Err(it.type_error("no_cache() needs a class")) };
             new_instance(it, &cls, key)
         }
 
+        /// Clear the ZoneInfo cache.
         #[classmethod(hint(py(text_signature = "($type, /, *, only_keys=None)")))]
         fn clear_cache(cls: This<Value>, it: &mut Interp, #[kwonly] only_keys: Option<&Value>) -> R<()> {
             let Value::Obj(cls) = cls.0 else { return Err(it.type_error("clear_cache() needs a class")) };
@@ -407,6 +410,7 @@ pub mod _zoneinfo {
             Ok(Value::tuple(vec![ctor, args]))
         }
 
+        /// Private method used in unpickling.
         #[classmethod(hint(py(text_signature = "($type, key, from_cache, /)")))]
         fn _unpickle(cls: This<Value>, it: &mut Interp, key: &Value, from_cache: &Value) -> R<Value> {
             let Value::Obj(c) = &cls.0 else { return Err(it.type_error("_unpickle() needs a class")) };

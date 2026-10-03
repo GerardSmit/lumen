@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use lumen_host::{Ctx, Value};
+use lumen_bind::{Flag, NativeError};
+use lumen_host::{Ctx, OpError, Value};
 
 use crate::wasm;
 use crate::wasm::exec::{Host, Imports, MemEntity, Store, Val};
@@ -121,10 +122,6 @@ fn valtype_of(s: &str) -> ValType {
     }
 }
 
-fn num(a: &[Value], i: usize) -> f64 {
-    a.get(i).and_then(Value::as_num_opt).unwrap_or(0.0)
-}
-
 // ---- host bridge ------------------------------------------------------------------------------
 
 struct CtxHost<'a> {
@@ -213,299 +210,23 @@ fn run_func(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>,
 
 // ---- ops --------------------------------------------------------------------------------------
 
-fn arg_bytes(ctx: &mut Ctx, args: &[Value]) -> Result<Vec<u8>, Value> {
-    ctx.typed_array_bytes(args.first().unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "WebAssembly: expected a BufferSource"))
-}
-
-pub(crate) fn op_validate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a)?;
-    Ok(Value::Bool(wasm::validate(&bytes)))
-}
-
-pub(crate) fn op_compile(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a)?;
-    match wasm::decode(&bytes) {
-        Ok(module) => {
-            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-            let id = ws.next_module;
-            ws.next_module += 1;
-            ws.modules.insert(id, module);
-            Ok(Value::Num(id as f64))
-        }
-        Err(e) => Err(ctx.make_error("Error", format!("CompileError: {e}"))),
-    }
-}
-
-fn module_of(ctx: &mut Ctx, id: u32) -> Result<Rc<Module>, Value> {
+fn module_of(ctx: &mut Ctx, id: f64) -> Result<Rc<Module>, NativeError> {
     ctx.host_mut::<WasmStore>()
-        .and_then(|s| s.modules.get(&id).cloned())
-        .ok_or_else(|| ctx.make_error("Error", "wasm: unknown module"))
-}
-
-pub(crate) fn op_module_exports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let module = module_of(ctx, num(a, 0) as u32)?;
-    let items: Vec<Value> = wasm::export_descriptors(&module)
-        .into_iter()
-        .map(|(name, kind)| {
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            o
-        })
-        .collect();
-    Ok(ctx.make_array(items))
-}
-
-pub(crate) fn op_module_imports(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let module = module_of(ctx, num(a, 0) as u32)?;
-    let items: Vec<Value> = wasm::import_descriptors(&module)
-        .into_iter()
-        .map(|(m, name, kind)| {
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "module", Value::from_string(m));
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            o
-        })
-        .collect();
-    Ok(ctx.make_array(items))
+        .and_then(|s| s.modules.get(&(id as u32)).cloned())
+        .ok_or_else(|| NativeError::runtime("wasm: unknown module"))
 }
 
 // Standalone entity allocation (for `new WebAssembly.Memory/Table/Global`).
 /// A `{initial, maximum}` descriptor's limits: whole numbers in `0..=limit` with `maximum` (when
 /// given) at least `initial`, else a `RangeError`.
-fn alloc_limits(ctx: &mut Ctx, a: &[Value], limit: u32) -> Result<(usize, Option<u32>), Value> {
+fn alloc_limits(min: Option<f64>, max: Option<f64>, limit: u32) -> Result<(usize, Option<u32>), NativeError> {
     let ok = |n: f64| n >= 0.0 && n <= limit as f64;
-    let min = num(a, 0).trunc();
-    let max = a.get(1).and_then(Value::as_num_opt).map(f64::trunc);
+    let min = min.unwrap_or(0.0).trunc();
+    let max = max.map(f64::trunc);
     if !ok(min) || max.is_some_and(|m| !ok(m) || m < min) {
-        return Err(ctx.make_error("RangeError", "WebAssembly: invalid initial or maximum size"));
+        return Err(NativeError::value_error("WebAssembly: invalid initial or maximum size"));
     }
     Ok((min as usize, max.map(|m| m as u32)))
-}
-
-pub(crate) fn op_alloc_memory(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let (min, max) = alloc_limits(ctx, a, wasm::parse::MAX_MEMORY_PAGES)?;
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    match ws.store.alloc_memory(min, max) {
-        Ok(addr) => Ok(Value::Num(addr as f64)),
-        Err(e) => Err(ctx.make_error("RangeError", e)),
-    }
-}
-pub(crate) fn op_alloc_table(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let (min, max) = alloc_limits(ctx, a, u32::MAX)?;
-    if min > wasm::parse::MAX_TABLE_SIZE as usize {
-        return Err(ctx.make_error("RangeError", "WebAssembly.Table: initial size too large"));
-    }
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    match ws.store.alloc_table(min, max) {
-        Ok(addr) => Ok(Value::Num(addr as f64)),
-        Err(e) => Err(ctx.make_error("RangeError", e)),
-    }
-}
-pub(crate) fn op_alloc_global(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let ty = valtype_of(&ctx.coerce_string(a.get(2).unwrap_or(&Value::Undefined))?);
-    let val = js_to_val(ctx, a.first().unwrap_or(&Value::Undefined), ty);
-    let mutable = matches!(a.get(1), Some(Value::Bool(true)));
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    Ok(Value::Num(ws.store.alloc_global(val, mutable) as f64))
-}
-
-/// `(moduleId, resolvedImports) -> { inst, exports: [{name, kind, addr}] }`. `resolvedImports` is a
-/// flat array in module-import order: `{fn}` | `{memAddr}` | `{tableAddr}` | `{globalAddr}`.
-pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let module = module_of(ctx, num(a, 0) as u32)?;
-    let resolved = a.get(1).cloned().unwrap_or(Value::Undefined);
-
-    // Read the JS import descriptors first (borrows ctx only).
-    enum Parsed {
-        Func(Value, wasm::parse::FuncType),
-        Mem(usize),
-        Table(usize),
-        Global(usize),
-    }
-    let mut parsed = Vec::new();
-    for (i, imp) in module.imports.iter().enumerate() {
-        let entry = ctx
-            .get_member(&resolved, &i.to_string())
-            .unwrap_or(Value::Undefined);
-        match &imp.kind {
-            wasm::ImportKind::Func(tyidx) => {
-                let f = ctx.get_member(&entry, "fn").unwrap_or(Value::Undefined);
-                if !f.is_callable() {
-                    return Err(ctx.make_error(
-                        "Error",
-                        format!(
-                            "LinkError: import {}.{} is not a function",
-                            imp.module, imp.name
-                        ),
-                    ));
-                }
-                parsed.push(Parsed::Func(f, module.types[*tyidx as usize].clone()));
-            }
-            wasm::ImportKind::Memory(_) => {
-                parsed.push(Parsed::Mem(
-                    ctx.get_member(&entry, "memAddr")
-                        .ok()
-                        .and_then(|v| v.as_num_opt())
-                        .unwrap_or(0.0) as usize,
-                ));
-            }
-            wasm::ImportKind::Table(_) => {
-                parsed.push(Parsed::Table(
-                    ctx.get_member(&entry, "tableAddr")
-                        .ok()
-                        .and_then(|v| v.as_num_opt())
-                        .unwrap_or(0.0) as usize,
-                ));
-            }
-            wasm::ImportKind::Global(_) => {
-                parsed.push(Parsed::Global(
-                    ctx.get_member(&entry, "globalAddr")
-                        .ok()
-                        .and_then(|v| v.as_num_opt())
-                        .unwrap_or(0.0) as usize,
-                ));
-            }
-        }
-    }
-
-    // Build Imports + register host callbacks, then link.
-    let imports = {
-        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-        let mut imports = Imports::default();
-        for p in parsed {
-            match p {
-                Parsed::Func(f, ty) => {
-                    let id = ws.host_funcs.len();
-                    ws.host_funcs.push(f);
-                    imports.funcs.push((id, ty));
-                }
-                Parsed::Mem(addr) => imports.mem_addr = Some(addr),
-                Parsed::Table(addr) => imports.table_addr = Some(addr),
-                Parsed::Global(addr) => imports.global_addrs.push(addr),
-            }
-        }
-        imports
-    };
-    // Data segments may write into an imported memory, which lives in its JS buffer.
-    let inst_result = with_store(ctx, |_, store| {
-        store.instantiate(Rc::clone(&module), imports)
-    });
-    let inst_idx = inst_result.map_err(|e| ctx.make_error("Error", format!("LinkError: {e}")))?;
-
-    // Run the start function, if any.
-    if let Some(start) = module.start {
-        let start_addr = {
-            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-            ws.store.instances[inst_idx].func_addrs[start as usize]
-        };
-        run_func(ctx, start_addr, Vec::new())?;
-    }
-
-    // Export metadata: name, kind, and store address.
-    let names: Vec<(String, wasm::ExportKind, usize)> = {
-        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-        module
-            .exports
-            .iter()
-            .filter_map(|e| {
-                ws.store
-                    .export_addr(inst_idx, &e.name)
-                    .map(|(k, addr)| (e.name.clone(), k, addr))
-            })
-            .collect()
-    };
-    let exports: Vec<Value> = names
-        .into_iter()
-        .map(|(name, kind, addr)| {
-            let kind = match kind {
-                wasm::ExportKind::Func => "function",
-                wasm::ExportKind::Memory => "memory",
-                wasm::ExportKind::Global => "global",
-                wasm::ExportKind::Table => "table",
-            };
-            let o = Value::Obj(ctx.new_object());
-            let _ = ctx.set_member(&o, "name", Value::from_string(name));
-            let _ = ctx.set_member(&o, "kind", Value::str(kind));
-            let _ = ctx.set_member(&o, "addr", Value::Num(addr as f64));
-            o
-        })
-        .collect();
-    let exports = ctx.make_array(exports);
-
-    let result = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&result, "inst", Value::Num(inst_idx as f64));
-    let _ = ctx.set_member(&result, "exports", exports);
-    Ok(result)
-}
-
-/// `(funcAddr, argsArray) -> resultsArray`.
-pub(crate) fn op_call(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let func_addr = num(a, 0) as usize;
-    let args_arr = a.get(1).cloned().unwrap_or(Value::Undefined);
-
-    let params = {
-        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-        match ws.store.funcs.get(func_addr) {
-            Some(f) => f.ty().params.clone(),
-            None => return Err(ctx.make_error("Error", "wasm: bad function address")),
-        }
-    };
-    let mut args = Vec::with_capacity(params.len());
-    for (i, &ty) in params.iter().enumerate() {
-        let v = ctx
-            .get_member(&args_arr, &i.to_string())
-            .unwrap_or(Value::Undefined);
-        args.push(js_to_val(ctx, &v, ty));
-    }
-
-    let results = run_func(ctx, func_addr, args)?;
-    let js: Vec<Value> = results.into_iter().map(val_to_js).collect();
-    Ok(ctx.make_array(js))
-}
-
-/// `(RuntimeError)`: register the constructor wasm traps are thrown as.
-pub(crate) fn op_set_errors(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let ctor = a.first().cloned().unwrap_or(Value::Undefined);
-    ctx.host_mut::<WasmStore>()
-        .expect("wasm store")
-        .runtime_error = ctor;
-    Ok(Value::Undefined)
-}
-
-/// `(funcAddr) -> function`: the store function as a native JS function — arguments convert
-/// straight from the call, a single result comes back as a value (none: `undefined`, several:
-/// an array), and traps throw `WebAssembly.RuntimeError`.
-pub(crate) fn op_func(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let func_addr = num(a, 0) as usize;
-    let ty = {
-        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-        match ws.store.funcs.get(func_addr) {
-            Some(f) => f.ty().clone(),
-            None => return Err(ctx.make_error("Error", "wasm: bad function address")),
-        }
-    };
-    let arity = ty.params.len();
-    let f = move |ctx: &mut Ctx, _this: Value, args: &[Value]| -> Result<Value, Value> {
-        let vals = ty
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| js_to_val(ctx, args.get(i).unwrap_or(&Value::Undefined), t))
-            .collect();
-        let results = run_func_js(ctx, func_addr, vals)?;
-        Ok(match results.len() {
-            0 => Value::Undefined,
-            1 => val_to_js(results[0]),
-            _ => {
-                let js = results.into_iter().map(val_to_js).collect();
-                ctx.make_array(js)
-            }
-        })
-    };
-    Ok(ctx.new_native_fn(&func_addr.to_string(), arity, std::rc::Rc::new(f)))
 }
 
 /// [`run_func`], with a trap thrown as a `WebAssembly.RuntimeError`.
@@ -535,156 +256,425 @@ fn run_func_js(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Va
     })
 }
 
-// ---- memory / table / global accessors (by store address) -------------------------------------
+pub(crate) use bindings::Module as WasmModule;
 
-/// `(memAddr) -> ArrayBuffer`: a view of the memory's bytes (no copy), stable until it grows.
-pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    if let Some(b) = ws.bufs.iter().find(|b| b.addr == addr) {
-        return Ok(b.buf.clone());
+#[lumen_bind::module(name = "__wasm")]
+mod bindings {
+    use super::*;
+
+    #[op]
+    fn validate(bytes: &[u8]) -> bool {
+        wasm::validate(bytes)
     }
-    let store = std::mem::take(&mut ws.store);
-    let r = match store.memories.get(addr) {
-        Some(m) => {
-            let buf = view(ctx, m);
-            let len = m.bytes.len();
-            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-            ws.bufs.push(MemBuf {
-                addr,
-                buf: buf.clone(),
-                len,
-            });
-            Ok(buf)
+
+    #[op]
+    fn compile(ctx: &mut Ctx, bytes: &[u8]) -> Result<f64, NativeError> {
+        match wasm::decode(bytes) {
+            Ok(module) => {
+                let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+                let id = ws.next_module;
+                ws.next_module += 1;
+                ws.modules.insert(id, module);
+                Ok(id as f64)
+            }
+            Err(e) => Err(NativeError::runtime(format!("CompileError: {e}"))),
         }
-        None => Err(ctx.make_error("Error", "wasm: bad memory address")),
-    };
-    ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
-    r
-}
-
-/// `(memAddr, delta) -> previous pages | -1`. Works from inside an import too (the memories are
-/// reached through `active_mems` while the store is moved out).
-pub(crate) fn op_mem_grow(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let delta = num(a, 1);
-    let delta = if (0.0..=65536.0).contains(&delta) {
-        delta as i32
-    } else {
-        -1
-    };
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    let active = ws.active_mems;
-    // SAFETY: `active_mems` is set only while an import runs, and points at the running store's
-    // memories, which no one else borrows until the import returns.
-    let mems: &mut [MemEntity] = if active.is_null() || ws.store.memories.len() > addr {
-        &mut ws.store.memories
-    } else {
-        unsafe { &mut *active }
-    };
-    let Some(m) = mems.get_mut(addr) else {
-        return Err(ctx.make_error("Error", "wasm: bad memory address"));
-    };
-    let r = m.grow(delta);
-    let mems: &[MemEntity] = if active.is_null() {
-        &[]
-    } else {
-        unsafe { &*active }
-    };
-    let store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
-    refresh(
-        ctx,
-        if mems.is_empty() {
-            &store.memories
-        } else {
-            mems
-        },
-    );
-    ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
-    Ok(Value::Num(r as f64))
-}
-
-pub(crate) fn op_table_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let i = num(a, 1) as usize;
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    let slot = ws
-        .store
-        .tables
-        .get(addr)
-        .and_then(|t| t.elems.get(i))
-        .copied();
-    match slot {
-        Some(Some(faddr)) => Ok(Value::Num(faddr as f64)),
-        Some(None) => Ok(Value::Num(-1.0)),
-        None => Err(ctx.make_error("RangeError", "table index out of bounds")),
     }
-}
 
-pub(crate) fn op_table_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let i = num(a, 1) as usize;
-    let faddr = a.get(2).and_then(Value::as_num_opt);
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    match ws
-        .store
-        .tables
-        .get_mut(addr)
-        .and_then(|t| t.elems.get_mut(i))
-    {
-        Some(slot) => {
-            *slot = faddr.filter(|n| *n >= 0.0).map(|n| n as usize);
-            Ok(Value::Undefined)
-        }
-        None => Err(ctx.make_error("RangeError", "table index out of bounds")),
+    #[op(name = "moduleExports")]
+    fn module_exports(ctx: &mut Ctx, id: f64) -> Result<Value, NativeError> {
+        let module = module_of(ctx, id)?;
+        let items: Vec<Value> = wasm::export_descriptors(&module)
+            .into_iter()
+            .map(|(name, kind)| {
+                let o = Value::Obj(ctx.new_object());
+                let _ = ctx.set_member(&o, "name", Value::from_string(name));
+                let _ = ctx.set_member(&o, "kind", Value::str(kind));
+                o
+            })
+            .collect();
+        Ok(ctx.make_array(items))
     }
-}
 
-pub(crate) fn op_table_size(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    Ok(Value::Num(
-        ws.store
-            .tables
-            .get(addr)
-            .map(|t| t.elems.len())
-            .unwrap_or(0) as f64,
-    ))
-}
+    #[op(name = "moduleImports")]
+    fn module_imports(ctx: &mut Ctx, id: f64) -> Result<Value, NativeError> {
+        let module = module_of(ctx, id)?;
+        let items: Vec<Value> = wasm::import_descriptors(&module)
+            .into_iter()
+            .map(|(m, name, kind)| {
+                let o = Value::Obj(ctx.new_object());
+                let _ = ctx.set_member(&o, "module", Value::from_string(m));
+                let _ = ctx.set_member(&o, "name", Value::from_string(name));
+                let _ = ctx.set_member(&o, "kind", Value::str(kind));
+                o
+            })
+            .collect();
+        Ok(ctx.make_array(items))
+    }
 
-pub(crate) fn op_global_get(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let v = ctx
-        .host_mut::<WasmStore>()
-        .and_then(|ws| ws.store.globals.get(addr))
-        .map(|g| g.get())
-        .ok_or_else(|| ctx.make_error("Error", "wasm: bad global address"))?;
-    Ok(val_to_js(v))
-}
-
-pub(crate) fn op_global_set(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let addr = num(a, 0) as usize;
-    let raw = a.get(1).cloned().unwrap_or(Value::Undefined);
-    // Coerce to the global's existing value type.
-    let ty = {
+    #[op(name = "allocMemory")]
+    fn alloc_memory(ctx: &mut Ctx, initial: Option<f64>, maximum: Option<f64>) -> Result<f64, NativeError> {
+        let (min, max) = alloc_limits(initial, maximum, wasm::parse::MAX_MEMORY_PAGES)?;
         let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-        match ws.store.globals.get(addr) {
-            Some(g) => match g.ty() {
-                ValType::I64 => ValType::I64,
-                ValType::F32 => ValType::F32,
-                ValType::F64 => ValType::F64,
-                _ => ValType::I32,
-            },
-            None => return Err(ctx.make_error("Error", "wasm: bad global address")),
+        match ws.store.alloc_memory(min, max) {
+            Ok(addr) => Ok(addr as f64),
+            Err(e) => Err(NativeError::value_error(e)),
         }
-    };
-    let val = js_to_val(ctx, &raw, ty);
-    let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
-    if let Some(g) = ws.store.globals.get_mut(addr) {
-        if !g.mutable {
-            return Err(ctx.make_error("TypeError", "cannot set an immutable global"));
-        }
-        g.set(val);
     }
-    Ok(Value::Undefined)
+
+    #[op(name = "allocTable")]
+    fn alloc_table(ctx: &mut Ctx, initial: Option<f64>, maximum: Option<f64>) -> Result<f64, NativeError> {
+        let (min, max) = alloc_limits(initial, maximum, u32::MAX)?;
+        if min > wasm::parse::MAX_TABLE_SIZE as usize {
+            return Err(NativeError::value_error("WebAssembly.Table: initial size too large"));
+        }
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        match ws.store.alloc_table(min, max) {
+            Ok(addr) => Ok(addr as f64),
+            Err(e) => Err(NativeError::value_error(e)),
+        }
+    }
+
+    #[op(coerce, name = "allocGlobal")]
+    fn alloc_global(ctx: &mut Ctx, value: Value, mutable: Flag, ty: String) -> f64 {
+        let ty = valtype_of(&ty);
+        let val = js_to_val(ctx, &value, ty);
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        ws.store.alloc_global(val, mutable.0) as f64
+    }
+
+    /// `(moduleId, resolvedImports) -> { inst, exports: [{name, kind, addr}] }`. `resolvedImports` is a
+    /// flat array in module-import order: `{fn}` | `{memAddr}` | `{tableAddr}` | `{globalAddr}`.
+    #[op]
+    fn instantiate(ctx: &mut Ctx, module_id: f64, resolved: Value) -> Result<Value, OpError> {
+        let module = module_of(ctx, module_id)?;
+
+        // Read the JS import descriptors first (borrows ctx only).
+        enum Parsed {
+            Func(Value, wasm::parse::FuncType),
+            Mem(usize),
+            Table(usize),
+            Global(usize),
+        }
+        let mut parsed = Vec::new();
+        for (i, imp) in module.imports.iter().enumerate() {
+            let entry = ctx
+                .get_member(&resolved, &i.to_string())
+                .unwrap_or(Value::Undefined);
+            match &imp.kind {
+                wasm::ImportKind::Func(tyidx) => {
+                    let f = ctx.get_member(&entry, "fn").unwrap_or(Value::Undefined);
+                    if !f.is_callable() {
+                        return Err(NativeError::runtime(format!(
+                            "LinkError: import {}.{} is not a function",
+                            imp.module, imp.name
+                        ))
+                        .into());
+                    }
+                    parsed.push(Parsed::Func(f, module.types[*tyidx as usize].clone()));
+                }
+                wasm::ImportKind::Memory(_) => {
+                    parsed.push(Parsed::Mem(
+                        ctx.get_member(&entry, "memAddr")
+                            .ok()
+                            .and_then(|v| v.as_num_opt())
+                            .unwrap_or(0.0) as usize,
+                    ));
+                }
+                wasm::ImportKind::Table(_) => {
+                    parsed.push(Parsed::Table(
+                        ctx.get_member(&entry, "tableAddr")
+                            .ok()
+                            .and_then(|v| v.as_num_opt())
+                            .unwrap_or(0.0) as usize,
+                    ));
+                }
+                wasm::ImportKind::Global(_) => {
+                    parsed.push(Parsed::Global(
+                        ctx.get_member(&entry, "globalAddr")
+                            .ok()
+                            .and_then(|v| v.as_num_opt())
+                            .unwrap_or(0.0) as usize,
+                    ));
+                }
+            }
+        }
+
+        // Build Imports + register host callbacks, then link.
+        let imports = {
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            let mut imports = Imports::default();
+            for p in parsed {
+                match p {
+                    Parsed::Func(f, ty) => {
+                        let id = ws.host_funcs.len();
+                        ws.host_funcs.push(f);
+                        imports.funcs.push((id, ty));
+                    }
+                    Parsed::Mem(addr) => imports.mem_addr = Some(addr),
+                    Parsed::Table(addr) => imports.table_addr = Some(addr),
+                    Parsed::Global(addr) => imports.global_addrs.push(addr),
+                }
+            }
+            imports
+        };
+        // Data segments may write into an imported memory, which lives in its JS buffer.
+        let inst_result = with_store(ctx, |_, store| {
+            store.instantiate(Rc::clone(&module), imports)
+        });
+        let inst_idx = inst_result.map_err(|e| NativeError::runtime(format!("LinkError: {e}")))?;
+
+        // Run the start function, if any.
+        if let Some(start) = module.start {
+            let start_addr = {
+                let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+                ws.store.instances[inst_idx].func_addrs[start as usize]
+            };
+            run_func(ctx, start_addr, Vec::new())?;
+        }
+
+        // Export metadata: name, kind, and store address.
+        let names: Vec<(String, wasm::ExportKind, usize)> = {
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            module
+                .exports
+                .iter()
+                .filter_map(|e| {
+                    ws.store
+                        .export_addr(inst_idx, &e.name)
+                        .map(|(k, addr)| (e.name.clone(), k, addr))
+                })
+                .collect()
+        };
+        let exports: Vec<Value> = names
+            .into_iter()
+            .map(|(name, kind, addr)| {
+                let kind = match kind {
+                    wasm::ExportKind::Func => "function",
+                    wasm::ExportKind::Memory => "memory",
+                    wasm::ExportKind::Global => "global",
+                    wasm::ExportKind::Table => "table",
+                };
+                let o = Value::Obj(ctx.new_object());
+                let _ = ctx.set_member(&o, "name", Value::from_string(name));
+                let _ = ctx.set_member(&o, "kind", Value::str(kind));
+                let _ = ctx.set_member(&o, "addr", Value::Num(addr as f64));
+                o
+            })
+            .collect();
+        let exports = ctx.make_array(exports);
+
+        let result = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&result, "inst", Value::Num(inst_idx as f64));
+        let _ = ctx.set_member(&result, "exports", exports);
+        Ok(result)
+    }
+
+    /// `(funcAddr, argsArray) -> resultsArray`.
+    #[op]
+    fn call(ctx: &mut Ctx, func_addr: f64, args_arr: Value) -> Result<Value, OpError> {
+        let func_addr = func_addr as usize;
+        let params = {
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            match ws.store.funcs.get(func_addr) {
+                Some(f) => f.ty().params.clone(),
+                None => return Err(NativeError::runtime("wasm: bad function address").into()),
+            }
+        };
+        let mut args = Vec::with_capacity(params.len());
+        for (i, &ty) in params.iter().enumerate() {
+            let v = ctx
+                .get_member(&args_arr, &i.to_string())
+                .unwrap_or(Value::Undefined);
+            args.push(js_to_val(ctx, &v, ty));
+        }
+
+        let results = run_func(ctx, func_addr, args)?;
+        let js: Vec<Value> = results.into_iter().map(val_to_js).collect();
+        Ok(ctx.make_array(js))
+    }
+
+    /// `(RuntimeError)`: register the constructor wasm traps are thrown as.
+    #[op(name = "setErrors")]
+    fn set_errors(ctx: &mut Ctx, ctor: Value) {
+        ctx.host_mut::<WasmStore>().expect("wasm store").runtime_error = ctor;
+    }
+
+    /// `(funcAddr) -> function`: the store function as a native JS function - arguments convert
+    /// straight from the call, a single result comes back as a value (none: `undefined`, several:
+    /// an array), and traps throw `WebAssembly.RuntimeError`.
+    #[op]
+    fn func(ctx: &mut Ctx, func_addr: f64) -> Result<Value, NativeError> {
+        let func_addr = func_addr as usize;
+        let ty = {
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            match ws.store.funcs.get(func_addr) {
+                Some(f) => f.ty().clone(),
+                None => return Err(NativeError::runtime("wasm: bad function address")),
+            }
+        };
+        let arity = ty.params.len();
+        let f = move |ctx: &mut Ctx, _this: Value, args: &[Value]| -> Result<Value, Value> {
+            let vals = ty
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, &t)| js_to_val(ctx, args.get(i).unwrap_or(&Value::Undefined), t))
+                .collect();
+            let results = run_func_js(ctx, func_addr, vals)?;
+            Ok(match results.len() {
+                0 => Value::Undefined,
+                1 => val_to_js(results[0]),
+                _ => {
+                    let js = results.into_iter().map(val_to_js).collect();
+                    ctx.make_array(js)
+                }
+            })
+        };
+        Ok(ctx.new_native_fn(&func_addr.to_string(), arity, std::rc::Rc::new(f)))
+    }
+
+    /// `(memAddr) -> ArrayBuffer`: a view of the memory's bytes (no copy), stable until it grows.
+    #[op(name = "memBuffer")]
+    fn mem_buffer(ctx: &mut Ctx, addr: f64) -> Result<Value, NativeError> {
+        let addr = addr as usize;
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        if let Some(b) = ws.bufs.iter().find(|b| b.addr == addr) {
+            return Ok(b.buf.clone());
+        }
+        let store = std::mem::take(&mut ws.store);
+        let r = match store.memories.get(addr) {
+            Some(m) => {
+                let buf = view(ctx, m);
+                let len = m.bytes.len();
+                let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+                ws.bufs.push(MemBuf {
+                    addr,
+                    buf: buf.clone(),
+                    len,
+                });
+                Ok(buf)
+            }
+            None => Err(NativeError::runtime("wasm: bad memory address")),
+        };
+        ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
+        r
+    }
+
+    /// `(memAddr, delta) -> previous pages | -1`. Works from inside an import too (the memories
+    /// are reached through `active_mems` while the store is moved out).
+    #[op(name = "memGrow")]
+    fn mem_grow(ctx: &mut Ctx, addr: f64, delta: f64) -> Result<f64, NativeError> {
+        let addr = addr as usize;
+        let delta = if (0.0..=65536.0).contains(&delta) {
+            delta as i32
+        } else {
+            -1
+        };
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        let active = ws.active_mems;
+        // SAFETY: `active_mems` is set only while an import runs, and points at the running
+        // store's memories, which no one else borrows until the import returns.
+        let mems: &mut [MemEntity] = if active.is_null() || ws.store.memories.len() > addr {
+            &mut ws.store.memories
+        } else {
+            unsafe { &mut *active }
+        };
+        let Some(m) = mems.get_mut(addr) else {
+            return Err(NativeError::runtime("wasm: bad memory address"));
+        };
+        let r = m.grow(delta);
+        let mems: &[MemEntity] = if active.is_null() {
+            &[]
+        } else {
+            unsafe { &*active }
+        };
+        let store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
+        refresh(
+            ctx,
+            if mems.is_empty() {
+                &store.memories
+            } else {
+                mems
+            },
+        );
+        ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
+        Ok(r as f64)
+    }
+
+    #[op(name = "tableGet")]
+    fn table_get(ctx: &mut Ctx, addr: f64, index: f64) -> Result<f64, NativeError> {
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        let slot = ws
+            .store
+            .tables
+            .get(addr as usize)
+            .and_then(|t| t.elems.get(index as usize))
+            .copied();
+        match slot {
+            Some(Some(faddr)) => Ok(faddr as f64),
+            Some(None) => Ok(-1.0),
+            None => Err(NativeError::value_error("table index out of bounds")),
+        }
+    }
+
+    #[op(name = "tableSet")]
+    fn table_set(ctx: &mut Ctx, addr: f64, index: f64, faddr: Option<f64>) -> Result<(), NativeError> {
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        match ws
+            .store
+            .tables
+            .get_mut(addr as usize)
+            .and_then(|t| t.elems.get_mut(index as usize))
+        {
+            Some(slot) => {
+                *slot = faddr.filter(|n| *n >= 0.0).map(|n| n as usize);
+                Ok(())
+            }
+            None => Err(NativeError::value_error("table index out of bounds")),
+        }
+    }
+
+    #[op(name = "tableSize")]
+    fn table_size(ctx: &mut Ctx, addr: f64) -> f64 {
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        ws.store.tables.get(addr as usize).map(|t| t.elems.len()).unwrap_or(0) as f64
+    }
+
+    #[op(name = "globalGet")]
+    fn global_get(ctx: &mut Ctx, addr: f64) -> Result<Value, NativeError> {
+        let v = ctx
+            .host_mut::<WasmStore>()
+            .and_then(|ws| ws.store.globals.get(addr as usize))
+            .map(|g| g.get())
+            .ok_or_else(|| NativeError::runtime("wasm: bad global address"))?;
+        Ok(val_to_js(v))
+    }
+
+    #[op(name = "globalSet")]
+    fn global_set(ctx: &mut Ctx, addr: f64, raw: Value) -> Result<(), NativeError> {
+        let addr = addr as usize;
+        // Coerce to the global's existing value type.
+        let ty = {
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            match ws.store.globals.get(addr) {
+                Some(g) => match g.ty() {
+                    ValType::I64 => ValType::I64,
+                    ValType::F32 => ValType::F32,
+                    ValType::F64 => ValType::F64,
+                    _ => ValType::I32,
+                },
+                None => return Err(NativeError::runtime("wasm: bad global address")),
+            }
+        };
+        let val = js_to_val(ctx, &raw, ty);
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        if let Some(g) = ws.store.globals.get_mut(addr) {
+            if !g.mutable {
+                return Err(NativeError::type_error("cannot set an immutable global"));
+            }
+            g.set(val);
+        }
+        Ok(())
+    }
 }

@@ -75,7 +75,7 @@ fn st<X>(it: &mut Interp, slf: &Py<BytesIO>, f: impl FnOnce(&mut BytesIO) -> X) 
 
 #[lumen_bind::methods]
 impl BytesIO {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(initial_bytes=b'')")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BytesIO {
         let _ = (args, kwargs);
         BytesIO { buf: new_store(), pos: 0, closed: false }
@@ -99,28 +99,46 @@ impl BytesIO {
     /// Get a read-write view over the contents of the BytesIO object.
     fn getbuffer(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let store = st(it, &slf.0, |s| s.buf.clone())?;
-        crate::builtins::memview::view_of_store(it, slf.0.value().clone(), &store)
+        let exporter = Py::new(it, BytesIOBuffer { _source: slf.0.value().clone() });
+        crate::builtins::memview::view_of_store(it, exporter.into_value(), &store)
     }
 
     /// Read at most size bytes, returned as a bytes object.
+    ///
+    /// If the size argument is negative, read until EOF is reached.
+    /// Return an empty bytes object at EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Vec<u8>> {
         let n = size_arg(it, size)?;
         st(it, &slf.0, |s| s.take(n))
     }
 
     /// Read at most size bytes, returned as a bytes object.
+    ///
+    /// If the size argument is negative or omitted, read until EOF is reached.
+    /// Return an empty bytes object at EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read1(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Vec<u8>> {
         let n = size_arg(it, size)?;
         st(it, &slf.0, |s| s.take(n))
     }
 
     /// Next line from the file, as a bytes object.
+    ///
+    /// Retain newline.  A non-negative size argument limits the maximum
+    /// number of bytes to return (an incomplete line may be returned then).
+    /// Return an empty bytes object at EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn readline(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Vec<u8>> {
         let n = size_arg(it, size)?;
         st(it, &slf.0, |s| s.line(n))
     }
 
     /// List of bytes objects, each a line from the file.
+    ///
+    /// Call readline() repeatedly and return a list of the lines so read.
+    /// The optional size argument, if given, is an approximate bound on the
+    /// total number of bytes in the lines returned.
     fn readlines(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         let hint = size_arg(it, size)?;
         let out = st(it, &slf.0, |s| {
@@ -143,6 +161,9 @@ impl BytesIO {
     }
 
     /// Read bytes into buffer.
+    ///
+    /// Returns number of bytes read (0 for EOF), or None if the object
+    /// is set not to block and has no data to read.
     fn readinto(slf: This<Py<Self>>, it: &mut Interp, buffer: &mut [u8]) -> R<usize> {
         let data = st(it, &slf.0, |s| s.take(buffer.len() as i64))?;
         buffer[..data.len()].copy_from_slice(&data);
@@ -150,6 +171,8 @@ impl BytesIO {
     }
 
     /// Write bytes to file.
+    ///
+    /// Return the number of bytes written.
     fn write(slf: This<Py<Self>>, it: &mut Interp, b: &[u8]) -> R<usize> {
         st(it, &slf.0, |_| ())?;
         check_exports(it, &slf.0)?;
@@ -157,6 +180,10 @@ impl BytesIO {
     }
 
     /// Write lines to the file.
+    ///
+    /// Note that newlines are not added.  lines can be any iterable object
+    /// producing bytes-like objects. This is equivalent to calling write() for
+    /// each element.
     fn writelines(slf: This<Py<Self>>, it: &mut Interp, lines: &Value) -> R<()> {
         st(it, &slf.0, |_| ())?;
         check_exports(it, &slf.0)?;
@@ -168,6 +195,12 @@ impl BytesIO {
     }
 
     /// Change stream position.
+    ///
+    /// Seek to byte offset pos relative to position indicated by whence:
+    ///      0  Start of stream (the default).  pos should be >= 0;
+    ///      1  Current position - pos may be negative;
+    ///      2  End of stream - pos usually negative.
+    /// Returns the new absolute position.
     fn seek(slf: This<Py<Self>>, it: &mut Interp, pos: i64, #[default(0)] whence: i32) -> R<i64> {
         let (cur, len) = st(it, &slf.0, |s| (s.pos as i64, s.buf.len() as i64))?;
         let target = match whence {
@@ -189,6 +222,9 @@ impl BytesIO {
     }
 
     /// Truncate the file to at most size bytes.
+    ///
+    /// Size defaults to the current file position, as returned by tell().
+    /// The current file position is unchanged.  Returns the new size.
     fn truncate(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<i64> {
         let cur = st(it, &slf.0, |s| s.pos as i64)?;
         check_exports(it, &slf.0)?;
@@ -205,16 +241,19 @@ impl BytesIO {
         Ok(size)
     }
 
+    /// Returns True if the IO object can be read.
     fn readable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
     }
 
+    /// Returns True if the IO object can be written.
     fn writable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
     }
 
+    /// Returns True if the IO object can be seeked.
     fn seekable(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(true)
@@ -227,6 +266,8 @@ impl BytesIO {
     }
 
     /// Always returns False.
+    ///
+    /// BytesIO objects are not connected to a TTY-like device.
     fn isatty(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         st(it, &slf.0, |_| ())?;
         Ok(false)
@@ -259,6 +300,7 @@ impl BytesIO {
         Ok((!l.is_empty()).then(|| Value::bytes(l)))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (buf, pos) = st(it, &slf.0, |s| (s.buf.to_vec(), s.pos))?;
         let Value::Obj(o) = slf.0.value() else { unreachable!() };
@@ -266,6 +308,7 @@ impl BytesIO {
         Ok(Value::tuple(vec![Value::bytes(buf), Value::Int(pos as i64), d]))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
         let items = match state.tuple_items() {
             Some(t) if t.len() >= 3 => t.to_vec(),
@@ -290,5 +333,20 @@ impl BytesIO {
             it.call_method(&Value::Obj(dd), "update", vec![Value::Obj(d.clone())])?;
         }
         Ok(())
+    }
+}
+
+/// The exporter behind `BytesIO.getbuffer()`: the `obj` of the memoryview it returns.
+#[lumen_bind::class(module = "_io", name = "_BytesIOBuffer", hint(py(final)))]
+pub struct BytesIOBuffer {
+    _source: Value,
+}
+
+#[lumen_bind::methods]
+impl BytesIOBuffer {
+    #[constructor]
+    fn new(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<BytesIOBuffer> {
+        let _ = (args, kwargs);
+        Err(it.type_error("cannot create '_io._BytesIOBuffer' instances"))
     }
 }

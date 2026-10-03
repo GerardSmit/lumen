@@ -1,0 +1,27 @@
+b'BZh' True
+True True b''
+True
+OSError Invalid data stream
+b'\xfd7zXZ\x00' True
+True
+True
+LZMAError Input format not supported by decoder
+ValueError Must specify filters for FORMAT_RAW
+['hello', 'world']
+True
+0 ['dir/one.txt', 'two.txt'] True None
+8 ['dir/one.txt', 'two.txt'] True None
+12 ['dir/one.txt', 'two.txt'] True None
+14 ['dir/one.txt', 'two.txt'] True None
+w: ['hello.txt'] True
+w:gz ['hello.txt'] True
+w:bz2 ['hello.txt'] True
+w:xz ['hello.txt'] True
+[b'a', b'b'] b'1' 2
+[b'b'] True
+b'v'
+True
+True
+6
+(1, 'two', [3.5], {'k': True}) method
+Fault 4 oops

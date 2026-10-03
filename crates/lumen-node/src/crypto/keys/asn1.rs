@@ -3,25 +3,28 @@
 //! the RustCrypto crates.
 
 use der::asn1::ObjectIdentifier;
+use lumen_common::x509;
 use num_bigint_dig::BigUint;
 
-pub const TAG_INTEGER: u8 = 0x02;
-pub const TAG_BIT_STRING: u8 = 0x03;
-pub const TAG_OCTET_STRING: u8 = 0x04;
-pub const TAG_NULL: u8 = 0x05;
-pub const TAG_OID: u8 = 0x06;
-pub const TAG_SEQUENCE: u8 = 0x30;
+pub use lumen_crypto::pad_be;
 
-pub const OID_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-pub const OID_RSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+pub const TAG_INTEGER: u8 = x509::INTEGER;
+pub const TAG_BIT_STRING: u8 = x509::BIT_STRING;
+pub const TAG_OCTET_STRING: u8 = x509::OCTET_STRING;
+pub const TAG_NULL: u8 = 0x05;
+pub const TAG_OID: u8 = x509::OID;
+pub const TAG_SEQUENCE: u8 = x509::SEQ;
+
+pub const OID_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_RSA);
+pub const OID_RSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_RSA_PSS);
 pub const OID_MGF1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8");
-pub const OID_DSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10040.4.1");
-pub const OID_EC: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+pub const OID_DSA: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_DSA);
+pub const OID_EC: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_EC);
 pub const OID_PRIME_FIELD: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.1.1");
-pub const OID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.112");
-pub const OID_ED448: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.113");
-pub const OID_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.110");
-pub const OID_X448: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.101.111");
+pub const OID_ED25519: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_ED25519);
+pub const OID_ED448: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_ED448);
+pub const OID_X25519: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_X25519);
+pub const OID_X448: ObjectIdentifier = ObjectIdentifier::new_unwrap(x509::OID_X448);
 pub const OID_DH: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.3.1");
 pub const OID_DHX: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10046.2.1");
 
@@ -124,25 +127,9 @@ impl<'a> Reader<'a> {
 }
 
 fn split_tlv(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
-    let tag = *data.first()?;
-    if tag & 0x1f == 0x1f {
-        return None;
-    }
-    let first = *data.get(1)? as usize;
-    let (len, header) = if first < 0x80 {
-        (first, 2)
-    } else {
-        let n = first & 0x7f;
-        if n == 0 || n > 4 {
-            return None;
-        }
-        let bytes = data.get(2..2 + n)?;
-        let len = bytes.iter().fold(0usize, |acc, b| (acc << 8) | *b as usize);
-        (len, 2 + n)
-    };
-    let end = header.checked_add(len)?;
-    let content = data.get(header..end)?;
-    Some((tag, content, &data[end..]))
+    let mut rest = data;
+    let t = x509::read_tlv(&mut rest)?;
+    Some((t.tag, t.value, rest))
 }
 
 /// The element starting at `data`'s first byte, whole, if `data` holds exactly one element.
@@ -220,14 +207,3 @@ pub fn explicit(n: u8, content: &[u8]) -> Vec<u8> {
     tlv(0xa0 | n, content)
 }
 
-/// Big-endian bytes of `n`, left-padded with zeros to `len`.
-pub fn pad_be(n: &[u8], len: usize) -> Vec<u8> {
-    let start = n.iter().position(|b| *b != 0).unwrap_or(n.len());
-    let n = &n[start..];
-    if n.len() >= len {
-        return n.to_vec();
-    }
-    let mut out = vec![0; len - n.len()];
-    out.extend_from_slice(n);
-    out
-}

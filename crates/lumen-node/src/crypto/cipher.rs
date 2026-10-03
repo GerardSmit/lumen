@@ -646,7 +646,7 @@ where
     C: BlockCipher + BlockEncrypt + BlockDecrypt + BlockSizeUser<BlockSize = U16> + KeyInit,
 {
     let c = C::new_from_slice(key).ok()?;
-    let default_iv = iv.map_or(true, |v| if pad { v == KWP_PREFIX } else { v == KW_IV });
+    let default_iv = iv.is_none_or(|v| if pad { v == KWP_PREFIX } else { v == KW_IV });
     if default_iv {
         let kek = aes_kw::Kek::<C>::try_from(key).ok()?;
         return match (pad, enc) {
@@ -841,7 +841,7 @@ impl CryptoCipher {
                 if data.is_empty() && !*used {
                     return Ok(Vec::new());
                 }
-                let fits = !*used && msg_len.map_or(true, |m| m == data.len());
+                let fits = !*used && msg_len.is_none_or(|m| m == data.len());
                 *used = true;
                 if !enc && (self.tag_state != TagState::Known || !fits) {
                     self.pending_auth_failed = true;
@@ -979,7 +979,7 @@ impl CryptoCipher {
         }
         let n = tag.len();
         let valid = if self.spec.mode == Mode::Gcm {
-            self.tag_len.map_or(true, |l| l == n) && valid_gcm_tag(n)
+            self.tag_len.is_none_or(|l| l == n) && valid_gcm_tag(n)
         } else {
             self.tag_len == Some(n)
         };
@@ -1240,5 +1240,253 @@ fn aes_ctr(key: &[u8], counter: &[u8], length: u32, data: &[u8]) -> Result<Vec<u
     f(key, counter, a)?;
     f(key, &(ctr & !mask).to_be_bytes(), b)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// Encrypts `pt` in `chunk`-sized `update`s with the AAD fed in `aad_chunk`-sized pieces;
+    /// returns the ciphertext and the tag.
+    fn seal(name: &str, key: &[u8], iv: &[u8], aad: &[u8], pt: &[u8], tag_len: f64, chunk: usize, aad_chunk: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut c = cipher_new(name, true, key, Some(iv), tag_len).unwrap();
+        for piece in aad.chunks(aad_chunk.max(1)) {
+            assert!(c.set_aad(piece, -1.0).unwrap());
+        }
+        let mut ct = Vec::new();
+        for piece in pt.chunks(chunk.max(1)) {
+            ct.extend(c.update(piece).unwrap());
+        }
+        ct.extend(c.finish().unwrap());
+        (ct, c.auth_tag().unwrap())
+    }
+
+    fn open(name: &str, key: &[u8], iv: &[u8], aad: &[u8], ct: &[u8], tag: &[u8], tag_len: f64) -> Result<Vec<u8>, OpError> {
+        let mut c = cipher_new(name, false, key, Some(iv), tag_len)?;
+        if !tag.is_empty() {
+            c.set_auth_tag(tag)?;
+        }
+        if !aad.is_empty() {
+            c.set_aad(aad, -1.0)?;
+        }
+        let mut pt = c.update(ct)?;
+        pt.extend(c.finish()?);
+        Ok(pt)
+    }
+
+    struct Gcm {
+        name: &'static str,
+        key: &'static str,
+        iv: &'static str,
+        aad: &'static str,
+        pt: &'static str,
+        ct: &'static str,
+        tag: &'static str,
+    }
+
+    const PT64: &str = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255";
+    const PT60: &str = "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39";
+    const AAD: &str = "feedfacedeadbeeffeedfacedeadbeefabaddad2";
+    const K128: &str = "feffe9928665731c6d6a8f9467308308";
+
+    // The test cases of "The Galois/Counter Mode of Operation" (McGrew & Viega), as used by NIST SP 800-38D.
+    fn vectors() -> Vec<Gcm> {
+        vec![
+            Gcm { name: "aes-128-gcm", key: "00000000000000000000000000000000", iv: "000000000000000000000000", aad: "", pt: "", ct: "", tag: "58e2fccefa7e3061367f1d57a4e7455a" },
+            Gcm {
+                name: "aes-128-gcm",
+                key: "00000000000000000000000000000000",
+                iv: "000000000000000000000000",
+                aad: "",
+                pt: "00000000000000000000000000000000",
+                ct: "0388dace60b6a392f328c2b971b2fe78",
+                tag: "ab6e47d42cec13bdf53a67b21257bddf",
+            },
+            Gcm {
+                name: "aes-128-gcm",
+                key: K128,
+                iv: "cafebabefacedbaddecaf888",
+                aad: "",
+                pt: PT64,
+                ct: "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985",
+                tag: "4d5c2af327cd64a62cf35abd2ba6fab4",
+            },
+            Gcm {
+                name: "aes-128-gcm",
+                key: K128,
+                iv: "cafebabefacedbaddecaf888",
+                aad: AAD,
+                pt: PT60,
+                ct: "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091",
+                tag: "5bc94fbc3221a5db94fae95ae7121a47",
+            },
+            Gcm {
+                name: "aes-128-gcm",
+                key: K128,
+                iv: "cafebabefacedbad",
+                aad: AAD,
+                pt: PT60,
+                ct: "61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c742373806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598",
+                tag: "3612d2e79e3b0785561be14aaca2fccb",
+            },
+            Gcm {
+                name: "aes-128-gcm",
+                key: K128,
+                iv: "9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b",
+                aad: AAD,
+                pt: PT60,
+                ct: "8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca701e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5",
+                tag: "619cc5aefffe0bfa462af43c1699d050",
+            },
+            Gcm {
+                name: "aes-256-gcm",
+                key: "0000000000000000000000000000000000000000000000000000000000000000",
+                iv: "000000000000000000000000",
+                aad: "",
+                pt: "",
+                ct: "",
+                tag: "530f8afbc74536b9a963b4f1c4cb738b",
+            },
+            Gcm {
+                name: "aes-256-gcm",
+                key: "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308",
+                iv: "cafebabefacedbaddecaf888",
+                aad: "",
+                pt: PT64,
+                ct: "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad",
+                tag: "b094dac5d93471bdec1a502270e3cc6c",
+            },
+        ]
+    }
+
+    #[test]
+    fn gcm_matches_nist_vectors() {
+        for (i, v) in vectors().iter().enumerate() {
+            let (key, iv, aad, pt) = (hex(v.key), hex(v.iv), hex(v.aad), hex(v.pt));
+            let (ct, tag) = seal(v.name, &key, &iv, &aad, &pt, -1.0, usize::MAX, usize::MAX);
+            assert_eq!(ct, hex(v.ct), "ciphertext {i}");
+            assert_eq!(tag, hex(v.tag), "tag {i}");
+            assert_eq!(open(v.name, &key, &iv, &aad, &ct, &tag, -1.0).unwrap(), pt, "decrypt {i}");
+        }
+    }
+
+    #[test]
+    fn gcm_streaming_is_independent_of_chunking() {
+        for v in vectors().iter().filter(|v| !v.aad.is_empty()) {
+            let (key, iv, aad, pt) = (hex(v.key), hex(v.iv), hex(v.aad), hex(v.pt));
+            for (chunk, aad_chunk) in [(1, 1), (3, 5), (15, 16), (16, 17), (17, 4), (64, 64)] {
+                let (ct, tag) = seal(v.name, &key, &iv, &aad, &pt, -1.0, chunk, aad_chunk);
+                assert_eq!(ct, hex(v.ct), "chunk {chunk}/{aad_chunk}");
+                assert_eq!(tag, hex(v.tag), "chunk {chunk}/{aad_chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn gcm_truncated_tags() {
+        let v = &vectors()[3];
+        let (key, iv, aad, pt) = (hex(v.key), hex(v.iv), hex(v.aad), hex(v.pt));
+        let full = hex(v.tag);
+        for n in [4usize, 8, 12, 13, 14, 15, 16] {
+            let (ct, tag) = seal(v.name, &key, &iv, &aad, &pt, n as f64, usize::MAX, usize::MAX);
+            assert_eq!(tag, full[..n], "length {n}");
+            assert_eq!(open(v.name, &key, &iv, &aad, &ct, &tag, n as f64).unwrap(), pt);
+            assert_eq!(open(v.name, &key, &iv, &aad, &ct, &tag, -1.0).unwrap(), pt);
+        }
+        for n in [0usize, 1, 2, 3, 5, 6, 7, 9, 10, 11, 17] {
+            assert!(cipher_new(v.name, true, &key, Some(&iv), n as f64).is_err(), "authTagLength {n}");
+            let mut c = cipher_new(v.name, false, &key, Some(&iv), -1.0).unwrap();
+            assert!(c.set_auth_tag(&vec![0u8; n]).is_err(), "setAuthTag length {n}");
+        }
+        let mut c = cipher_new(v.name, false, &key, Some(&iv), 8.0).unwrap();
+        assert!(c.set_auth_tag(&full[..12]).is_err());
+    }
+
+    #[test]
+    fn gcm_rejects_any_tampering() {
+        let v = &vectors()[3];
+        let (key, iv, aad, pt) = (hex(v.key), hex(v.iv), hex(v.aad), hex(v.pt));
+        let (ct, tag) = seal(v.name, &key, &iv, &aad, &pt, -1.0, usize::MAX, usize::MAX);
+        for i in 0..tag.len() {
+            let mut bad = tag.clone();
+            bad[i] ^= 1;
+            let e = open(v.name, &key, &iv, &aad, &ct, &bad, -1.0).unwrap_err().to_string();
+            assert!(e.contains("authenticate"), "{e}");
+        }
+        for n in [4usize, 12] {
+            let mut bad = tag[..n].to_vec();
+            bad[n - 1] ^= 0x80;
+            assert!(open(v.name, &key, &iv, &aad, &ct, &bad, n as f64).is_err());
+        }
+        let mut bad_ct = ct.clone();
+        bad_ct[10] ^= 1;
+        assert!(open(v.name, &key, &iv, &aad, &bad_ct, &tag, -1.0).is_err());
+        let mut bad_aad = aad.clone();
+        bad_aad[0] ^= 1;
+        assert!(open(v.name, &key, &iv, &bad_aad, &ct, &tag, -1.0).is_err());
+        assert!(open(v.name, &key, &iv, &aad, &ct, &[], -1.0).is_err());
+    }
+
+    const CHAPOLY_KEY: &str = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f";
+    const CHAPOLY_IV: &str = "070000004041424344454647";
+    const CHAPOLY_AAD: &str = "50515253c0c1c2c3c4c5c6c7";
+    const CHAPOLY_PT: &[u8] = b"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+    const CHAPOLY_CT: &str = "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116";
+    const CHAPOLY_TAG: &str = "1ae10b594f09e26a7e902ecbd0600691";
+
+    #[test]
+    fn chacha20_poly1305_matches_rfc_8439() {
+        let (key, iv, aad) = (hex(CHAPOLY_KEY), hex(CHAPOLY_IV), hex(CHAPOLY_AAD));
+        let (ct, tag) = seal("chacha20-poly1305", &key, &iv, &aad, CHAPOLY_PT, 16.0, usize::MAX, usize::MAX);
+        assert_eq!(ct, hex(CHAPOLY_CT));
+        assert_eq!(tag, hex(CHAPOLY_TAG));
+        assert_eq!(open("chacha20-poly1305", &key, &iv, &aad, &ct, &tag, 16.0).unwrap(), CHAPOLY_PT);
+    }
+
+    #[test]
+    fn chacha20_poly1305_streaming_and_truncation() {
+        let (key, iv, aad) = (hex(CHAPOLY_KEY), hex(CHAPOLY_IV), hex(CHAPOLY_AAD));
+        for (chunk, aad_chunk) in [(1, 1), (7, 3), (16, 16), (63, 13), (64, 64)] {
+            let (ct, tag) = seal("chacha20-poly1305", &key, &iv, &aad, CHAPOLY_PT, 16.0, chunk, aad_chunk);
+            assert_eq!(ct, hex(CHAPOLY_CT), "chunk {chunk}/{aad_chunk}");
+            assert_eq!(tag, hex(CHAPOLY_TAG), "chunk {chunk}/{aad_chunk}");
+        }
+        let full = hex(CHAPOLY_TAG);
+        for n in 1..=16usize {
+            let (ct, tag) = seal("chacha20-poly1305", &key, &iv, &aad, CHAPOLY_PT, n as f64, usize::MAX, usize::MAX);
+            assert_eq!(tag, full[..n]);
+            assert_eq!(open("chacha20-poly1305", &key, &iv, &aad, &ct, &tag, n as f64).unwrap(), CHAPOLY_PT);
+        }
+    }
+
+    #[test]
+    fn chacha20_poly1305_rejects_any_tampering() {
+        let (key, iv, aad, ct, tag) = (hex(CHAPOLY_KEY), hex(CHAPOLY_IV), hex(CHAPOLY_AAD), hex(CHAPOLY_CT), hex(CHAPOLY_TAG));
+        for i in 0..tag.len() {
+            let mut bad = tag.clone();
+            bad[i] ^= 1;
+            let e = open("chacha20-poly1305", &key, &iv, &aad, &ct, &bad, 16.0).unwrap_err().to_string();
+            assert!(e.contains("authenticate"), "{e}");
+        }
+        let mut bad_ct = ct.clone();
+        bad_ct[0] ^= 1;
+        assert!(open("chacha20-poly1305", &key, &iv, &aad, &bad_ct, &tag, 16.0).is_err());
+        let mut bad_aad = aad.clone();
+        bad_aad[11] ^= 1;
+        assert!(open("chacha20-poly1305", &key, &iv, &bad_aad, &ct, &tag, 16.0).is_err());
+        assert!(open("chacha20-poly1305", &key, &iv, &aad, &ct, &[], 16.0).is_err());
+    }
+
+    #[test]
+    fn tag_comparison_is_length_and_content_exact() {
+        assert!(ct_eq(b"abcd", b"abcd"));
+        assert!(!ct_eq(b"abcd", b"abce"));
+        assert!(!ct_eq(b"abcd", b"abc"));
+        assert!(ct_eq(b"", b""));
+    }
 }
 }

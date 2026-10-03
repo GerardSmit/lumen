@@ -2,40 +2,18 @@
 //! console. `log`/`info`/`debug` go to the out sink, `warn`/`error` to the err sink; the
 //! sinks live in `OpState` so tests (and later, embedders) can capture them.
 
+use lumen_host::OpError;
 use std::io::Write;
 
-use lumen_host::{ops, Ctx, Extension, OpState, Value};
+use lumen_host::{Ctx, Extension, OpState, Value};
 
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "console",
-        modules: &[],
-        globals: &[],
-        namespaces: &[(
-            "console",
-            ops![
-                "log" (0) => op_log,
-                "info" (0) => op_log,
-                "debug" (0) => op_log,
-                "warn" (0) => op_warn,
-                "error" (0) => op_error,
-                "__reportUncaught" (1) => op_report_uncaught,
-            ],
-        ),
-        // Glue-facing primitives; process.js moves them to `process._console` and deletes this.
-        (
-            "__console",
-            ops![
-                "write" (2) => op_write,
-                "format" (0) => op_format,
-                "live" (1) => op_live,
-                "setLive" (1) => op_set_live,
-                "indent" (1) => op_indent,
-                "slow" (1) => op_slow,
-                "watch" (3) => op_watch,
-                "disableNative" (0) => op_disable_native,
-            ],
-        )],
+        modules: &[
+            lumen_host::namespace::<console_ns::Module>,
+            lumen_host::namespace::<console_internal::Module>,
+        ],
         state_init: Some(|state: &mut OpState| {
             state.put(ConsoleOut::default());
             state.put(ConsoleFlags::default());
@@ -98,8 +76,8 @@ fn is_live(ctx: &mut Ctx, fd: usize) -> bool {
     !ctx.own_getter_is(&process, STREAM_KEYS[fd], &getter)
 }
 
-fn fd_arg(args: &[Value]) -> usize {
-    matches!(args.first(), Some(Value::Num(n)) if *n == 2.0) as usize
+fn fd_index(fd: f64) -> usize {
+    (fd == 2.0) as usize
 }
 
 /// Render one argument roughly the way Node does for the common cases: strings bare, symbols
@@ -137,7 +115,7 @@ fn write_text(ctx: &mut Ctx, to_err: bool, text: &str) {
 }
 
 /// Space-joined arguments, one line, to the chosen sink.
-fn write_line(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value> {
+fn write_line(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, OpError> {
     let fd = to_err as usize;
     let f = flags(ctx);
     let native = !f.indented && !f.native_off;
@@ -150,88 +128,105 @@ fn write_line(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Valu
     }
     if let Some(slow) = slow {
         let list = ctx.make_array(args.to_vec());
-        return ctx.invoke(slow, Value::Undefined, &[Value::Num(fd as f64 + 1.0), list]);
+        return Ok(ctx.invoke(slow, Value::Undefined, &[Value::Num(fd as f64 + 1.0), list])?);
     }
     let parts: Vec<String> = args.iter().map(|a| render(ctx, a)).collect();
     write_text(ctx, to_err, &parts.join(" "));
     Ok(Value::Undefined)
 }
 
-/// `(fd, text)` — `text` and a newline to fd 1 or 2.
-fn op_write(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let text = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    write_text(ctx, fd_arg(args) == 1, &text);
-    Ok(Value::Undefined)
-}
+#[lumen_bind::module(name = "console")]
+mod console_ns {
+    use super::*;
 
-/// `(...args)` — `util.format(...args)` when the native formatter covers it, else `undefined`.
-fn op_format(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if flags(ctx).native_off {
-        return Ok(Value::Undefined);
+    #[op(name = "log")]
+    fn op_log(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Result<Value, OpError> {
+        write_line(ctx, args, false)
     }
-    Ok(match ctx.console_format(args) {
-        Some(text) => Value::from_string(text),
-        None => Value::Undefined,
-    })
+
+    #[op(name = "info")]
+    fn op_info(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Result<Value, OpError> {
+        write_line(ctx, args, false)
+    }
+
+    #[op(name = "debug")]
+    fn op_debug(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Result<Value, OpError> {
+        write_line(ctx, args, false)
+    }
+
+    #[op(name = "warn")]
+    fn op_warn(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Result<Value, OpError> {
+        write_line(ctx, args, true)
+    }
+
+    #[op(name = "error")]
+    fn op_error(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Result<Value, OpError> {
+        write_line(ctx, args, true)
+    }
+
+    /// `reportError`'s default report (after the global `onerror` declined to suppress): the same
+    /// `Uncaught <error>` line on the error sink that an uncaught loop-callback error produces.
+    #[op(name = "__reportUncaught")]
+    fn op_report_uncaught(ctx: &mut Ctx, error: &Value) {
+        let text = describe_error(ctx, error);
+        write_err_line(ctx, format!("Uncaught {text}"));
+    }
 }
 
-fn op_live(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Bool(is_live(ctx, fd_arg(args))))
-}
+/// Glue-facing primitives; process.js moves them to `process._console` and deletes this.
+#[lumen_bind::module(name = "__console")]
+mod console_internal {
+    use super::*;
 
-fn op_set_live(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    flags(ctx).live[fd_arg(args)] = true;
-    Ok(Value::Undefined)
-}
+    /// `(fd, text)` — `text` and a newline to fd 1 or 2.
+    #[op(name = "write", coerce)]
+    fn op_write(ctx: &mut Ctx, fd: f64, text: String) {
+        write_text(ctx, fd_index(fd) == 1, &text);
+    }
 
-fn op_indent(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    flags(ctx).indented = matches!(args.first(), Some(Value::Bool(true)));
-    Ok(Value::Undefined)
-}
+    /// `(...args)` — `util.format(...args)` when the native formatter covers it, else `undefined`.
+    #[op(name = "format")]
+    fn op_format(ctx: &mut Ctx, #[varargs] args: &[Value]) -> Option<String> {
+        if flags(ctx).native_off {
+            return None;
+        }
+        ctx.console_format(args)
+    }
 
-/// `(fn)` — the JS fallback `fn(fd, args)` for calls the native path declines.
-fn op_slow(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    flags(ctx).slow = args.first().filter(|v| v.is_callable()).cloned();
-    Ok(Value::Undefined)
-}
+    #[op(name = "live", coerce)]
+    fn op_live(ctx: &mut Ctx, fd: f64) -> bool {
+        is_live(ctx, fd_index(fd))
+    }
 
-/// `(process, stdoutGetter, stderrGetter)` — the accessors that materialise the streams.
-fn op_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    if let [process, out, err] = args {
+    #[op(name = "setLive", coerce)]
+    fn op_set_live(ctx: &mut Ctx, fd: f64) {
+        flags(ctx).live[fd_index(fd)] = true;
+    }
+
+    #[op(name = "indent", coerce)]
+    fn op_indent(ctx: &mut Ctx, on: Option<bool>) {
+        flags(ctx).indented = on.unwrap_or(false);
+    }
+
+    /// `(fn)` — the JS fallback `fn(fd, args)` for calls the native path declines.
+    #[op(name = "slow")]
+    fn op_slow(ctx: &mut Ctx, callback: Option<&Value>) {
+        flags(ctx).slow = callback.filter(|v| v.is_callable()).cloned();
+    }
+
+    /// `(process, stdoutGetter, stderrGetter)` — the accessors that materialise the streams.
+    #[op(name = "watch")]
+    fn op_watch(ctx: &mut Ctx, process: &Value, out: &Value, err: &Value) {
         flags(ctx).watch = Some(Watch {
             process: process.clone(),
             getters: [out.clone(), err.clone()],
         });
     }
-    Ok(Value::Undefined)
-}
 
-fn op_disable_native(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    flags(ctx).native_off = true;
-    Ok(Value::Undefined)
-}
-
-fn op_log(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    write_line(ctx, args, false)
-}
-
-fn op_warn(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    write_line(ctx, args, true)
-}
-
-fn op_error(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    write_line(ctx, args, true)
-}
-
-/// `reportError`'s default report (after the global `onerror` declined to suppress): the same
-/// `Uncaught <error>` line on the error sink that an uncaught loop-callback error produces.
-fn op_report_uncaught(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let e = args.first().cloned().unwrap_or(Value::Undefined);
-    let text = describe_error(ctx, &e);
-    write_err_line(ctx, format!("Uncaught {text}"));
-    Ok(Value::Undefined)
+    #[op(name = "disableNative")]
+    fn op_disable_native(ctx: &mut Ctx) {
+        flags(ctx).native_off = true;
+    }
 }
 
 /// [`render`] for hosts above the runtime (the REPL prints results with it).

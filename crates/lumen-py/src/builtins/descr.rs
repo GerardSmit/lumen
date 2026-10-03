@@ -2,49 +2,24 @@
 //! standard library probes through `types.py`.
 
 use super::native::*;
-use crate::ast::CmpOp;
+use crate::ast::{BinOp, CmpOp};
+use crate::bind::{type_object, KwArgs, Py, This};
 use crate::object::*;
 use crate::vm::*;
 use std::rc::Rc;
 
+#[lumen_bind::class(name = "mappingproxy")]
 pub struct ProxyOf {
     mapping: Value,
 }
 
 impl Interp {
     pub fn mappingproxy_type(&mut self) -> Obj {
-        if let Some(t) = &self.mappingproxy_type {
-            return t.clone();
-        }
-        let ty = new_type(self, "builtins", "mappingproxy", None, Layout::Other);
-        self.reg_new(&ty, mp_new);
-        self.reg(&ty, "__getitem__", mp_getitem);
-        self.reg(&ty, "__iter__", mp_iter);
-        self.reg(&ty, "__len__", mp_len);
-        self.reg(&ty, "__contains__", mp_contains);
-        self.reg(&ty, "__reversed__", mp_reversed);
-        self.reg(&ty, "__repr__", mp_repr);
-        self.reg(&ty, "__str__", mp_str);
-        self.reg(&ty, "__eq__", mp_eq);
-        self.reg(&ty, "__ne__", mp_ne);
-        self.reg(&ty, "__or__", mp_or);
-        self.reg(&ty, "__ror__", mp_ror);
-        self.reg(&ty, "get", mp_get);
-        self.reg(&ty, "keys", mp_keys);
-        self.reg(&ty, "values", mp_values);
-        self.reg(&ty, "items", mp_items);
-        self.reg(&ty, "copy", mp_copy);
-        self.reg_class(&ty, "__class_getitem__", mp_class_getitem);
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, "__hash__", Value::None);
-        }
-        self.mappingproxy_type = Some(ty.clone());
-        ty
+        type_object::<ProxyOf>(self)
     }
 
     pub fn new_mappingproxy(&mut self, mapping: Value) -> Value {
-        let ty = self.mappingproxy_type();
-        new_opaque(&ty, ProxyOf { mapping })
+        Py::new(self, ProxyOf { mapping }).into_value()
     }
 
     fn is_mapping_value(&mut self, v: &Value) -> bool {
@@ -61,247 +36,374 @@ impl Interp {
     }
 }
 
-fn target(it: &mut Interp, v: &Value) -> R<Value> {
-    match with_opaque::<ProxyOf, _>(v, |p| p.mapping.clone()) {
-        Some(m) => Ok(m),
-        None => Err(it.self_state_err("mappingproxy")),
+/// The mapping a proxy wraps, or `v` itself.
+fn unwrap_proxy(v: &Value) -> Value {
+    with_opaque::<ProxyOf, _>(v, |p| p.mapping.clone()).unwrap_or_else(|| v.clone())
+}
+
+#[lumen_bind::methods]
+impl ProxyOf {
+    #[constructor]
+    fn new(it: &mut Interp, #[kw] mapping: &Value) -> R<Value> {
+        if !it.is_mapping_value(mapping) {
+            let t = it.type_name_of(mapping);
+            return Err(it.type_error(&format!("mappingproxy() argument must be a mapping, not {}", t)));
+        }
+        Ok(it.new_mappingproxy(mapping.clone()))
+    }
+
+    #[proto(getitem)]
+    fn getitem(&self, it: &mut Interp, key: &Value) -> R<Value> {
+        it.getitem(&self.mapping, key)
+    }
+
+    #[proto(iter)]
+    fn iter(&self, it: &mut Interp) -> R<Value> {
+        it.get_iter(&self.mapping)
+    }
+
+    #[proto(len)]
+    fn len(&self, it: &mut Interp) -> R<usize> {
+        it.len_of(&self.mapping)
+    }
+
+    #[proto(contains)]
+    fn contains(&self, it: &mut Interp, key: &Value) -> R<bool> {
+        it.contains(&self.mapping, key)
+    }
+
+    #[proto(hash)]
+    fn hash(&self, it: &mut Interp) -> R<i64> {
+        it.hash_value(&self.mapping)
+    }
+
+    /// D.__reversed__() -> reverse iterator
+    #[method(name = "__reversed__", hint(py(text_signature = "")))]
+    fn reversed(&self, it: &mut Interp) -> R<Value> {
+        let f = it.builtins_fn("reversed");
+        it.call(&f, vec![self.mapping.clone()], Vec::new())
+    }
+
+    #[proto(repr)]
+    fn repr(&self, it: &mut Interp) -> R<String> {
+        Ok(format!("mappingproxy({})", it.repr_of(&self.mapping)?))
+    }
+
+    #[proto(str)]
+    fn str(&self, it: &mut Interp) -> R<Value> {
+        it.str_value(&self.mapping)
+    }
+
+    #[proto(eq)]
+    fn eq(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::Eq, &self.mapping, value)
+    }
+
+    #[proto(ne)]
+    fn ne(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::NotEq, &self.mapping, value)
+    }
+
+    #[proto(lt)]
+    fn lt(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::Lt, &self.mapping, value)
+    }
+
+    #[proto(le)]
+    fn le(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::LtE, &self.mapping, value)
+    }
+
+    #[proto(gt)]
+    fn gt(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::Gt, &self.mapping, value)
+    }
+
+    #[proto(ge)]
+    fn ge(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.compare_op(CmpOp::GtE, &self.mapping, value)
+    }
+
+    #[proto(or)]
+    fn or(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.binary_op(BinOp::BitOr, &self.mapping, &unwrap_proxy(value))
+    }
+
+    #[proto(ror)]
+    fn ror(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        it.binary_op(BinOp::BitOr, &unwrap_proxy(value), &self.mapping)
+    }
+
+    #[proto(ior)]
+    fn ior(&self, it: &mut Interp, value: &Value) -> R<Value> {
+        let _ = value;
+        Err(it.type_error("'|=' is not supported by mappingproxy; use '|' instead"))
+    }
+
+    /// D.get(k[,d]) -> D[k] if k in D, else d.  d defaults to None.
+    #[method(hint(py(text_signature = "")))]
+    fn get(&self, it: &mut Interp, key: &Value, default: lumen_bind::Passed<&Value>) -> R<Value> {
+        let mut args = vec![key.clone()];
+        args.extend(default.0.cloned());
+        let m = it.get_attr_str(&self.mapping, "get")?;
+        it.call(&m, args, Vec::new())
+    }
+
+    /// D.keys() -> a set-like object providing a view on D's keys
+    #[method(hint(py(text_signature = "")))]
+    fn keys(&self, it: &mut Interp) -> R<Value> {
+        it.call_method(&self.mapping, "keys", Vec::new())
+    }
+
+    /// D.values() -> an object providing a view on D's values
+    #[method(hint(py(text_signature = "")))]
+    fn values(&self, it: &mut Interp) -> R<Value> {
+        it.call_method(&self.mapping, "values", Vec::new())
+    }
+
+    /// D.items() -> a set-like object providing a view on D's items
+    #[method(hint(py(text_signature = "")))]
+    fn items(&self, it: &mut Interp) -> R<Value> {
+        it.call_method(&self.mapping, "items", Vec::new())
+    }
+
+    /// D.copy() -> a shallow copy of D
+    #[method(hint(py(text_signature = "")))]
+    fn copy(&self, it: &mut Interp) -> R<Value> {
+        it.call_method(&self.mapping, "copy", Vec::new())
+    }
+
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
     }
 }
 
-fn mp_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("mappingproxy", &a[1.min(a.len())..], kw, &["mapping"], 1)?;
-    let m = b[0].clone().unwrap();
-    if !it.is_mapping_value(&m) {
-        let t = it.type_name_of(&m);
-        return Err(it.type_error(&format!("mappingproxy() argument must be a mapping, not {}", t)));
+// `__class_getitem__` of the core types PEP 585 makes subscriptable.
+#[lumen_bind::class(name = "generic", hint(py(shared)))]
+pub struct ClassGetitem;
+
+#[lumen_bind::methods]
+impl ClassGetitem {
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
     }
-    Ok(it.new_mappingproxy(m))
 }
 
-fn mp_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getitem__", a, 2, 2)?;
-    let t = target(it, &a[0])?;
-    it.getitem(&t, &a[1])
+// ---- function, method, builtin_function_or_method and module ------------------------------------
+
+// `__call__` of the callable core types.
+#[lumen_bind::class(name = "callable", hint(py(shared)))]
+pub struct CallSlot;
+
+#[lumen_bind::methods]
+impl CallSlot {
+    #[proto(call)]
+    fn call(slf: This<&Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        it.call(&slf, args.to_vec(), kwargs.to_vec())
+    }
+
+    // `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
+    // `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as
+    // its name.
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        let bound_to = match &*slf {
+            Value::Obj(o) => match &o.kind {
+                Kind::Method(_, this) => Some(this.clone()),
+                Kind::Native(NativeData { owner: Some(NativeOwner::Class(c)), .. }) => Some(Value::Obj(c.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        let name = it.get_attr_str(&slf, "__name__")?;
+        match bound_to {
+            Some(this) if !matches!(&this, Value::Obj(o) if matches!(o.kind, Kind::Module)) => {
+                let getattr = dict_get_str(&it.builtins, "getattr").unwrap_or(Value::None);
+                Ok(Value::tuple(vec![getattr, Value::tuple(vec![this, name])]))
+            }
+            _ => Ok(name),
+        }
+    }
 }
 
-fn mp_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = target(it, &a[0])?;
-    it.get_iter(&t)
+/// Create a bound instance method object.
+#[lumen_bind::class(name = "method")]
+pub struct MethodType;
+
+#[lumen_bind::methods]
+impl MethodType {
+    #[constructor(hint(py(text_signature = "(function, instance, /)")))]
+    fn new(it: &mut Interp, function: &Value, instance: &Value) -> R<Value> {
+        if !it.is_callable(function) {
+            return Err(it.type_error("first argument must be callable"));
+        }
+        if instance.is_none() {
+            return Err(it.type_error("instance must not be None"));
+        }
+        Ok(Value::Obj(Object::new(Kind::Method(function.clone(), instance.clone()))))
+    }
 }
 
-fn mp_len(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = target(it, &a[0])?;
-    Ok(Value::Int(it.len_of(&t)? as i64))
+/// A module object (or subclass instance).
+pub struct ModuleRef<'a>(pub &'a Obj);
+
+impl<'a> lumen_bind::FromArg<'a, crate::bind::PyHost> for ModuleRef<'a> {
+    #[inline]
+    fn from_arg(cx: &'a crate::bind::PyCx<'_>, v: &'a Value, at: lumen_bind::Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) if matches!(o.kind, Kind::Module) => Ok(ModuleRef(o)),
+            _ => Err(cx.arg_error(at, "module", v)),
+        }
+    }
 }
 
-fn mp_contains(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__contains__", a, 2, 2)?;
-    let t = target(it, &a[0])?;
-    Ok(Value::Bool(it.contains(&t, &a[1])?))
-}
+/// Create a module object.
+///
+/// The name must be a string; the optional doc argument can have any type.
+#[lumen_bind::class(name = "module")]
+pub struct ModuleType;
 
-fn mp_reversed(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = target(it, &a[0])?;
-    let items = it.iterate_to_vec(&t)?;
-    let rev: Vec<Value> = items.into_iter().rev().collect();
-    it.native_get_iter(&Value::list(rev))
-}
+#[lumen_bind::methods]
+impl ModuleType {
+    #[constructor(hint(py(text_signature = "(name, doc=None)")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Value {
+        let _ = (args, kwargs);
+        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let m = it.new_module("");
+        if Rc::ptr_eq(cls, &it.types.module) {
+            return Value::Obj(m);
+        }
+        let d = it.module_dict(&m);
+        let o = Object::with_cls(cls.clone(), Kind::Module);
+        *o.dict.borrow_mut() = Some(d);
+        Value::Obj(o)
+    }
 
-fn mp_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = target(it, &a[0])?;
-    Ok(Value::string(format!("mappingproxy({})", it.repr_of(&t)?)))
-}
+    #[proto(init)]
+    fn init(slf: This<ModuleRef<'_>>, it: &mut Interp, #[kw] name: &Value, #[kw] doc: Option<&Value>) {
+        let d = it.module_dict(slf.0 .0);
+        dict_set_str(&d, "__name__", name.clone());
+        dict_set_str(&d, "__doc__", doc.cloned().unwrap_or(Value::None));
+    }
 
-fn mp_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let t = target(it, &a[0])?;
-    it.str_value(&t)
-}
-
-fn mp_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__eq__", a, 2, 2)?;
-    let t = target(it, &a[0])?;
-    let other = match with_opaque::<ProxyOf, _>(&a[1], |p| p.mapping.clone()) {
-        Some(m) => m,
-        None => a[1].clone(),
-    };
-    it.compare_op(CmpOp::Eq, &t, &other)
-}
-
-fn mp_ne(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let r = mp_eq(it, a, kw)?;
-    Ok(Value::Bool(!it.truthy(&r)?))
-}
-
-fn mp_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__or__", a, 2, 2)?;
-    let t = target(it, &a[0])?;
-    let other = with_opaque::<ProxyOf, _>(&a[1], |p| p.mapping.clone()).unwrap_or_else(|| a[1].clone());
-    it.binary_op(crate::ast::BinOp::BitOr, &t, &other)
-}
-
-fn mp_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__ror__", a, 2, 2)?;
-    let t = target(it, &a[0])?;
-    it.binary_op(crate::ast::BinOp::BitOr, &a[1], &t)
-}
-
-fn mp_get(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("get", a, 2, 3)?;
-    let t = target(it, &a[0])?;
-    let m = it.get_attr_str(&t, "get")?;
-    it.call(&m, a[1..].to_vec(), Vec::new())
-}
-
-fn forward(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
-    let t = target(it, &a[0])?;
-    let m = it.get_attr_str(&t, name)?;
-    it.call(&m, Vec::new(), Vec::new())
-}
-
-fn mp_keys(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    forward(it, a, "keys")
-}
-
-fn mp_values(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    forward(it, a, "values")
-}
-
-fn mp_items(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    forward(it, a, "items")
-}
-
-fn mp_copy(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    forward(it, a, "copy")
-}
-
-fn mp_class_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__class_getitem__", a, 2, 2)?;
-    Ok(it.make_alias(a[0].clone(), &a[1]))
+    /// __dir__() -> list
+    /// specialized dir() implementation
+    #[method(name = "__dir__", hint(py(text_signature = "")))]
+    fn dir(slf: This<ModuleRef<'_>>, it: &mut Interp) -> R<Value> {
+        let d = it.get_attr_str(&Value::Obj(slf.0 .0.clone()), "__dict__")?;
+        let Value::Obj(dobj) = &d else { return Err(it.type_error("<module>.__dict__ is not a dictionary")) };
+        if !matches!(dobj.kind, Kind::Dict(_)) {
+            return Err(it.type_error("<module>.__dict__ is not a dictionary"));
+        }
+        if let Some(f) = dict_get_str(dobj, "__dir__") {
+            return it.call(&f, Vec::new(), Vec::new());
+        }
+        let keys = it.call_method(&d, "keys", Vec::new())?;
+        Ok(Value::list(it.iterate_to_vec(&keys)?))
+    }
 }
 
 // ---- getset / member descriptors ----------------------------------------------------------------
 
-fn function_code(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(it.special_attr(&a[0], "__code__")?.unwrap_or(Value::None))
-}
+// The data descriptors of `function` that CPython exposes as getset/member descriptors.
+#[lumen_bind::class(name = "function")]
+pub struct FunctionType;
 
-fn function_globals(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(it.special_attr(&a[0], "__globals__")?.unwrap_or(Value::None))
-}
-
-fn function_closure(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(it.special_attr(&a[0], "__closure__")?.unwrap_or(Value::None))
-}
-
-fn call_forward(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    if a.is_empty() {
-        return Err(it.type_error("descriptor '__call__' needs an argument"));
+#[lumen_bind::methods]
+impl FunctionType {
+    #[getter(name = "__code__")]
+    fn code(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        Ok(it.special_attr(&slf, "__code__")?.unwrap_or(Value::None))
     }
-    it.call(&a[0], a[1..].to_vec(), kw.to_vec())
-}
 
-/// `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
-/// `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as its
-/// name.
-fn method_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__reduce__", a, 1, 1)?;
-    let bound_to = match &a[0] {
-        Value::Obj(o) => match &o.kind {
-            Kind::Method(_, this) => Some(this.clone()),
-            Kind::Native(NativeData { method: true, owner: Some(NativeOwner::Class(c)), .. }) => Some(Value::Obj(c.clone())),
-            _ => None,
-        },
-        _ => None,
-    };
-    let name = it.get_attr_str(&a[0], "__name__")?;
-    match bound_to {
-        Some(this) if !matches!(&this, Value::Obj(o) if matches!(o.kind, Kind::Module)) => {
-            let getattr = dict_get_str(&it.builtins, "getattr").unwrap_or(Value::None);
-            Ok(Value::tuple(vec![getattr, Value::tuple(vec![this, name])]))
+    #[setter(name = "__code__")]
+    fn set_code(slf: This<&Value>, it: &mut Interp, v: &Value) -> R<()> {
+        match &*slf {
+            Value::Obj(o) => it.set_function_code(o, v),
+            _ => Err(it.type_error("__code__ is only settable on functions")),
         }
-        _ => Ok(name),
+    }
+
+    #[getter(name = "__globals__")]
+    fn globals(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        Ok(it.special_attr(&slf, "__globals__")?.unwrap_or(Value::None))
+    }
+
+    #[getter(name = "__closure__")]
+    fn closure(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        Ok(it.special_attr(&slf, "__closure__")?.unwrap_or(Value::None))
     }
 }
 
-fn module_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some(Value::Obj(cls)) = a.first() else { return Err(it.type_error("module.__new__(X): X is not a type object")) };
-    let m = it.new_module("");
-    if Rc::ptr_eq(cls, &it.types.module) {
-        return Ok(Value::Obj(m));
-    }
-    let d = it.module_dict(&m);
-    let o = Object::with_cls(cls.clone(), Kind::Module);
-    *o.dict.borrow_mut() = Some(d);
-    Ok(Value::Obj(o))
-}
+// `__repr__` of `getset_descriptor` and `member_descriptor`.
+#[lumen_bind::class(name = "descriptor", hint(py(shared)))]
+pub struct DescriptorRepr;
 
-fn module_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("module", &a[1.min(a.len())..], kw, &["name", "doc"], 1)?;
-    if let Value::Obj(m) = &a[0] {
-        let d = it.module_dict(m);
-        dict_set_str(&d, "__name__", b[0].clone().unwrap_or(Value::None));
-        dict_set_str(&d, "__doc__", b[1].clone().unwrap_or(Value::None));
+#[lumen_bind::methods]
+impl DescriptorRepr {
+    #[proto(repr)]
+    fn repr(slf: This<&Value>, it: &mut Interp) -> R<String> {
+        let name = it.get_attr_str(&slf, "__name__")?;
+        let name = it.str_of(&name)?;
+        let owner = it.get_attr_str(&slf, "__objclass__")?;
+        let owner = match &owner {
+            Value::Obj(o) => it.type_display(o),
+            _ => String::new(),
+        };
+        let is_member = matches!(&*slf, Value::Obj(o) if o.cls.as_ref().is_some_and(|c| it.type_name(c) == "member_descriptor"));
+        let kind = if is_member { "member" } else { "attribute" };
+        Ok(format!("<{kind} '{name}' of '{owner}' objects>"))
     }
-    Ok(Value::None)
-}
-
-fn method_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("method", &a[1.min(a.len())..], 2, 2)?;
-    if !it.is_callable(&a[1]) {
-        return Err(it.type_error("first argument must be callable"));
-    }
-    if a[2].is_none() {
-        return Err(it.type_error("instance must not be None"));
-    }
-    Ok(Value::Obj(Object::new(Kind::Method(a[1].clone(), a[2].clone()))))
-}
-
-/// `module_dir`: the module's `__dict__` keys, or what its own `__dir__` returns.
-fn module_dir(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__dir__", a, 1, 1)?;
-    let d = it.get_attr_str(&a[0], "__dict__")?;
-    let Value::Obj(dobj) = &d else { return Err(it.type_error("<module>.__dict__ is not a dictionary")) };
-    if !matches!(dobj.kind, Kind::Dict(_)) {
-        return Err(it.type_error("<module>.__dict__ is not a dictionary"));
-    }
-    if let Some(f) = dict_get_str(dobj, "__dir__") {
-        return it.call(&f, Vec::new(), Vec::new());
-    }
-    let keys = it.call_method(&d, "keys", Vec::new())?;
-    Ok(Value::list(it.iterate_to_vec(&keys)?))
 }
 
 pub fn init(it: &mut Interp) {
+    use crate::bind::{extend_type, install_into};
     let module_ty = it.types.module.clone();
-    it.reg_new(&module_ty, module_new);
-    it.reg(&module_ty, "__init__", module_init);
-    it.reg(&module_ty, "__dir__", module_dir);
+    extend_type::<ModuleType>(it, &module_ty);
     let method_ty = it.types.method.clone();
-    it.reg_new(&method_ty, method_new);
-    for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()] {
-        it.reg(&ty, "__call__", call_forward);
+    extend_type::<MethodType>(it, &method_ty);
+    for ty in [
+        it.types.list.clone(),
+        it.types.tuple.clone(),
+        it.types.dict.clone(),
+        it.types.set.clone(),
+        it.types.frozenset.clone(),
+        it.types.generator.clone(),
+        it.types.coroutine.clone(),
+        it.types.async_generator.clone(),
+    ] {
+        install_into::<ClassGetitem>(&ty, &["__class_getitem__"]);
     }
-    for ty in [it.types.method.clone(), it.types.builtin_function.clone()] {
-        it.reg(&ty, "__reduce__", method_reduce);
+    let native_descr = [
+        it.types.method_descriptor.clone(),
+        it.types.wrapper_descriptor.clone(),
+        it.types.classmethod_descriptor.clone(),
+        it.types.method_wrapper.clone(),
+    ];
+    for ty in [it.types.function.clone(), it.types.method.clone(), it.types.builtin_function.clone()].iter().chain(&native_descr) {
+        install_into::<CallSlot>(ty, &["__call__"]);
+    }
+    for ty in [it.types.method.clone(), it.types.builtin_function.clone()].iter().chain(&native_descr) {
+        install_into::<CallSlot>(ty, &["__reduce__"]);
+    }
+    for ty in &native_descr[..3] {
+        super::objectm::install_descr_methods_get(ty);
     }
     super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
     let member = new_type(it, "builtins", "member_descriptor", None, Layout::Other);
     for ty in [&getset, &member] {
-        it.reg(ty, "__get__", super::objectm::prop_get);
-        it.reg(ty, "__set__", super::objectm::prop_set);
-        it.reg(ty, "__repr__", descriptor_repr);
+        super::objectm::install_descr_methods(ty);
+        install_into::<DescriptorRepr>(ty, &["__repr__"]);
     }
     *it.native_state::<DescrTypes>() = DescrTypes { getset: Some(getset), member: Some(member) };
     let func = it.types.function.clone();
-    let entries: [(&'static str, NativeFn, bool); 3] = [("__code__", function_code, false), ("__globals__", function_globals, true), ("__closure__", function_closure, true)];
-    for (name, f, is_member) in entries {
-        add_getset(it, &func, name, f, None, is_member);
-    }
-    let type_ = it.types.type_.clone();
-    for (name, get, set) in super::objectm::TYPE_GETSETS {
-        add_getset(it, &type_, name, *get, *set, false);
-    }
+    install_getsets::<FunctionType>(it, &func, &["__globals__", "__closure__"]);
+    super::objectm::install_getset_descriptors(it);
 }
 
 #[derive(Default)]
@@ -310,14 +412,59 @@ struct DescrTypes {
     member: Option<Obj>,
 }
 
-/// Puts a native attribute on a builtin class as CPython's `getset_descriptor` (or
-/// `member_descriptor`) that names its owner.
-pub fn add_getset(it: &mut Interp, owner: &Obj, name: &'static str, get: NativeFn, set: Option<NativeFn>, member: bool) {
+/// Installs the getters (with their setters) `T` declares into the builtin class `owner` as
+/// CPython's `getset_descriptor`s (`member_descriptor`s for the names in `members`).
+pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(it: &mut Interp, owner: &Obj, members: &[&str]) {
+    use crate::bind::args::py_name;
+    use lumen_bind::Role;
+    let mut items = Vec::new();
+    T::members(&mut items);
+    for item in &items {
+        if item.desc.role != Role::Getter {
+            continue;
+        }
+        let name = py_name(item.desc);
+        let fget = crate::bind::native_value(item);
+        let setter = items.iter().find(|s| s.desc.role == Role::Setter && py_name(s.desc) == name);
+        let fset = setter.map_or(Value::None, crate::bind::native_value);
+        let doc = item.desc.doc.map_or(Value::None, Value::str);
+        put_descriptor(it, owner, name, fget, fset, doc, members.contains(&name));
+    }
+}
+
+/// Installs `fget` into the builtin class `owner` as the read-only `member_descriptor` `name` (a
+/// plain property while the descriptor types do not exist yet).
+pub fn install_member(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value) {
+    if it.native_state::<DescrTypes>().member.is_none() {
+        let p = Value::Obj(Object::new(Kind::Property(PropData { fget, fset: Value::None, fdel: Value::None, doc: Value::None, name: Default::default() })));
+        if let Some(d) = owner.dict.borrow().as_ref() {
+            dict_set_str(d, name, p);
+        }
+        return;
+    }
+    put_descriptor(it, owner, name, fget, Value::None, Value::None, true);
+}
+
+/// Gives the getset descriptors `name` of the builtin class `owner` the deleter `f` (CPython's
+/// setters double as deleters; ours are separate natives).
+pub fn install_deleters(it: &mut Interp, owner: &Obj, deleters: &[(&'static str, NativeFn)]) {
+    let Some(od) = owner.dict.borrow().clone() else { return };
+    for &(name, f) in deleters {
+        let Some(Value::Obj(old)) = dict_get_str(&od, name) else { continue };
+        let Kind::Property(p) = &old.kind else { continue };
+        let fdel = it.new_native(name, f, false);
+        let cls = old.cls.clone().unwrap_or_else(|| it.types.property.clone());
+        let new = Object::with_cls(cls, Kind::Property(PropData { fget: p.fget.clone(), fset: p.fset.clone(), fdel, doc: p.doc.clone(), name: p.name.clone() }));
+        let dict = old.dict.borrow().clone();
+        *new.dict.borrow_mut() = dict;
+        dict_set_str(&od, name, Value::Obj(new));
+    }
+}
+
+fn put_descriptor(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value, fset: Value, doc: Value, member: bool) {
     let types = it.native_state::<DescrTypes>();
     let Some(ty) = (if member { types.member.clone() } else { types.getset.clone() }) else { return };
-    let fget = it.new_native(name, get, false);
-    let fset = set.map_or(Value::None, |f| it.new_native(name, f, false));
-    let p = Object::with_cls(ty, Kind::Property(PropData { fget, fset, fdel: Value::None, doc: Value::None }));
+    let p = Object::with_cls(ty, Kind::Property(PropData { fget, fset, fdel: Value::None, doc, name: Default::default() }));
     let d = it.instance_dict(&p);
     let owner_name = it.type_name(owner);
     dict_set_str(&d, "__name__", Value::str(name));
@@ -326,18 +473,4 @@ pub fn add_getset(it: &mut Interp, owner: &Obj, name: &'static str, get: NativeF
     if let Some(od) = owner.dict.borrow().as_ref() {
         dict_set_str(od, name, Value::Obj(p));
     }
-}
-
-fn descriptor_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__repr__", a, 1, 1)?;
-    let name = it.get_attr_str(&a[0], "__name__")?;
-    let name = it.str_of(&name)?;
-    let owner = it.get_attr_str(&a[0], "__objclass__")?;
-    let owner = match &owner {
-        Value::Obj(o) => it.type_name(o),
-        _ => String::new(),
-    };
-    let is_member = matches!(&a[0], Value::Obj(o) if o.cls.as_ref().is_some_and(|c| it.type_name(c) == "member_descriptor"));
-    let kind = if is_member { "member" } else { "attribute" };
-    Ok(Value::string(format!("<{kind} '{name}' of '{owner}' objects>")))
 }

@@ -116,7 +116,7 @@ fn main() {
     check(&mut e, "const f = ext.this_is_object; return f()", "false");
     check(&mut e, "const o = {}; return ext.identity(o) === o", "true");
     check(&mut e, "ext.counter_add(2); return ext.counter_add(3)", "5");
-    check(&mut e, "return ext.maybe() + ' ' + ext.maybe(null) + ' ' + ext.maybe(4)", "null null 8");
+    check(&mut e, "return ext.maybe() + ' ' + ext.maybe(null) + ' ' + ext.maybe(4)", "undefined undefined 8");
     check(&mut e, "return ext.parse_int(' 12 ')", "12");
     check(&mut e, "return ext.parse_int('x')", "THROW SyntaxError: invalid digit found in string");
 

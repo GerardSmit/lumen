@@ -7,27 +7,7 @@ use crate::vm::*;
 use std::rc::Rc;
 
 pub fn is_printable(c: char) -> bool {
-    if c == ' ' {
-        return true;
-    }
-    if (c as u32) < 0x7f {
-        return c as u32 >= 0x20;
-    }
-    use std::sync::OnceLock;
-    static NON_PRINT: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
-    let r = NON_PRINT.get_or_init(|| {
-        let mut v: Vec<(u32, u32)> = Vec::new();
-        for k in ["gc=c", "gc=z"] {
-            if let Some(rs) = lumen_common::unicode_props::lookup(k, None) {
-                v.extend_from_slice(rs);
-            }
-        }
-        v.sort();
-        v
-    });
-    let u = c as u32;
-    let i = r.partition_point(|&(lo, _)| lo <= u);
-    !(i > 0 && r[i - 1].1 >= u)
+    crate::unicode::is_printable(c as u32)
 }
 
 pub fn str_repr(s: &str) -> String {
@@ -265,6 +245,9 @@ impl Interp {
                 if let Value::Obj(fo) = f {
                     if let Kind::Native(n) = &fo.kind {
                         let t = self.type_of(this);
+                        if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) {
+                            return Ok(format!("<method-wrapper '{}' of {} object at {:#x}>", n.name, self.type_display(&t), self.id_of(this)));
+                        }
                         return Ok(format!("<built-in method {} of {} object at {:#x}>", n.name, self.type_display(&t), self.id_of(this)));
                     }
                 }
@@ -276,13 +259,17 @@ impl Interp {
                 Ok(format!("<bound method {} of {}>", name, r))
             }
             Kind::Native(n) => {
-                if let Some(d) = n.desc.filter(|d| n.method && d.class().is_some()) {
-                    Ok(format!("<method '{}' of '{}' objects>", n.name, crate::bind::owner_of(d)))
-                } else if n.method {
+                if n.method {
+                    let kind = if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) { "slot wrapper" } else { "method" };
                     match &n.owner {
-                        Some(NativeOwner::Class(c)) => Ok(format!("<method '{}' of '{}' objects>", n.name, self.type_name(c))),
+                        Some(NativeOwner::Class(c)) => Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, self.type_display(c))),
+                        _ if n.desc.is_some_and(|d| d.class().is_some()) => {
+                            Ok(format!("<{} '{}' of '{}' objects>", kind, n.name, crate::bind::owner_of(n.desc.unwrap())))
+                        }
                         _ => Ok(format!("<method '{}' of object>", n.name)),
                     }
+                } else if let (Some(NativeOwner::Class(c)), Some(lumen_bind::Role::Constructor)) = (&n.owner, n.desc.map(|d| d.role)) {
+                    Ok(format!("<built-in method __new__ of type object at {:#x}>", self.id_of(&Value::Obj(c.clone()))))
                 } else {
                     Ok(format!("<built-in function {}>", n.name))
                 }
@@ -332,9 +319,14 @@ impl Interp {
             }
             Kind::Code(c) => Ok(format!("<code object {} at {:#x}, file \"{}\", line {}>", c.name, self.id_of(v), c.filename, c.first_line)),
             Kind::Super(t, _, ot) => {
-                let t = self.repr_of(t)?;
-                let ot = self.repr_of(ot)?;
-                Ok(format!("<super: {}, <{} object>>", t, ot))
+                let t = match t {
+                    Value::Obj(c) if matches!(c.kind, Kind::Type(_)) => format!("<class '{}'>", self.type_name(c)),
+                    _ => self.repr_of(t)?,
+                };
+                match ot {
+                    Value::Obj(c) => Ok(format!("<super: {}, <{} object>>", t, self.type_name(c))),
+                    _ => Ok(format!("<super: {}, NULL>", t)),
+                }
             }
             Kind::Cell(c) => {
                 let inner = c.borrow().clone();

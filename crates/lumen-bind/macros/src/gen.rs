@@ -284,9 +284,11 @@ pub fn gen(s: &Spec) -> Res<String> {
             Use::Kw => ("VarKw", None),
             _ => continue,
         };
+        let explicit = p.attrs.iter().find(|a| a.path == "name").map(|a| a.args_ts().to_string().trim_matches('"').to_string());
+        let pname = explicit.unwrap_or_else(|| p.name.trim_start_matches("r#").trim_start_matches('_').to_string());
         params_src.push(format!(
             "{B}::Param {{ name: {:?}, kind: {B}::ParamKind::{kind}, default: {} }}",
-            p.name.trim_start_matches("r#").trim_start_matches('_'),
+            pname,
             opt_str(default.as_deref())
         ));
     }

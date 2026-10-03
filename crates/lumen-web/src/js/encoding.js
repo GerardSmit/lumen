@@ -290,14 +290,14 @@ function incompleteUtf8Tail(bytes) {
 function btoa(data) {
   if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "input" argument must be specified');
   const out = __encoding.btoa(data);
-  if (out === null) throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
+  if (out === undefined) throw new DOMException("btoa: character beyond latin1 range", "InvalidCharacterError");
   return out;
 }
 
 function atob(data) {
   if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "input" argument must be specified');
   const out = __encoding.atob(data);
-  if (out === null) throw new DOMException("atob: invalid base64", "InvalidCharacterError");
+  if (out === undefined) throw new DOMException("atob: invalid base64", "InvalidCharacterError");
   return out;
 }
 

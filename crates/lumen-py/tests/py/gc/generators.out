@@ -1,0 +1,12 @@
+closed on refcount death: ['finally']
+unstarted generator has no finally: []
+rebinding: ['finally']
+cyclic generator pending: [] True
+cyclic generator closed: ['cycle finally'] True
+['GeneratorExit']
+yield from: ['inner finally', 'outer finally']
+unraisable from close: [('ValueError', 'in finally')]
+never awaited: [('RuntimeWarning', "coroutine 'coro' was never awaited")]
+coroutine result: 1
+awaited coroutine does not warn: []
+generator owned by a cycle: ['holder generator finally'] True

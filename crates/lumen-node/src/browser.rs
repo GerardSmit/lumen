@@ -2,23 +2,11 @@
 //! threads (`wasm32-unknown-unknown`). The tables keep the names the JS glue reads; calling one
 //! throws `ERR_NOT_SUPPORTED_IN_BROWSER`, so `require('node:net')` loads and only use fails.
 
-use lumen_host::{ops, Ctx, OpDecl, Value};
+use lumen::embed::OpError;
+use lumen_host::{Ctx, Value};
 
-fn unsupported(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let err = ctx.make_error(
-        "Error",
-        "this API is not available in the browser runtime".to_string(),
-    );
-    let _ = ctx.set_member(&err, "code", Value::str("ERR_NOT_SUPPORTED_IN_BROWSER"));
-    Err(err)
-}
-
-fn empty_list(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(ctx.make_array(Vec::new()))
-}
-
-fn no(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Bool(false))
+fn unsupported_error() -> OpError {
+    lumen_host::browser::unsupported("this API").into()
 }
 
 pub mod child {
@@ -27,23 +15,89 @@ pub mod child {
     #[derive(Default)]
     pub struct ChildRegistry;
 
-    pub const CHILD_OPS: &[OpDecl] = ops![
-    "spawn" (7) => unsupported,
-    "read" (4) => unsupported,
-    "write" (4) => unsupported,
-    "wait" (3) => unsupported,
-    "unref" (1) => unsupported,
-    "ref" (1) => unsupported,
-    "kill" (2) => unsupported,
-    "closeStdin" (1) => unsupported,
-    "writeFd" (5) => unsupported,
-    "closeFd" (2) => unsupported,
-    "execSync" (8) => unsupported,
-    "ipcOpen" (1) => unsupported,
-    "ipcRead" (1) => unsupported,
-    "ipcWrite" (2) => unsupported,
-    "ipcClose" (1) => unsupported,
-    ];
+    pub fn close_child_pipes(_ctx: &mut Ctx) {}
+
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__child")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op]
+        pub fn spawn(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value, _a6: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn read(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn write(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn wait(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn unref(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ref")]
+        pub fn ref_(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn kill(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "closeStdin")]
+        pub fn close_stdin(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "writeFd")]
+        pub fn write_fd(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "closeFd")]
+        pub fn close_fd(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "execSync")]
+        pub fn exec_sync(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value, _a6: Value, _a7: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ipcOpen")]
+        pub fn ipc_open(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ipcRead")]
+        pub fn ipc_read(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ipcWrite")]
+        pub fn ipc_write(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ipcClose")]
+        pub fn ipc_close(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 }
 
 pub mod net {
@@ -55,48 +109,203 @@ pub mod net {
     #[derive(Default)]
     pub struct DgramRegistry;
 
-    pub const NET_OPS: &[OpDecl] = ops![
-    "connect" (6) => unsupported,
-    "connectPath" (3) => unsupported,
-    "read" (3) => unsupported,
-    "write" (4) => unsupported,
-    "tryWrite" (2) => unsupported,
-    "endWritable" (1) => unsupported,
-    "close" (1) => unsupported,
-    "setNoDelay" (2) => unsupported,
-    "setKeepAlive" (3) => unsupported,
-    "address" (1) => unsupported,
-    "socketRef" (2) => unsupported,
-    "listen" (4) => unsupported,
-    "listenPath" (2) => unsupported,
-    "accept" (3) => unsupported,
-    "closeServer" (1) => unsupported,
-    "serverAddress" (1) => unsupported,
-    "serverRef" (2) => unsupported,
-    ];
+    pub(crate) use bindings::Module;
+    pub(crate) use udp_bindings::Module as UdpModule;
 
-    pub const UDP_OPS: &[OpDecl] = ops![
-    "bind" (4) => unsupported,
-    "recv" (3) => unsupported,
-    "send" (4) => unsupported,
-    "connect" (3) => unsupported,
-    "disconnect" (1) => unsupported,
-    "peer" (1) => unsupported,
-    "close" (1) => unsupported,
-    "address" (1) => unsupported,
-    "setBroadcast" (2) => unsupported,
-    "setTTL" (2) => unsupported,
-    "setMulticastTTL" (2) => unsupported,
-    "setMulticastLoopback" (2) => unsupported,
-    "setMulticastInterface" (2) => unsupported,
-    "addMembership" (3) => unsupported,
-    "dropMembership" (3) => unsupported,
-    "addSourceMembership" (4) => unsupported,
-    "dropSourceMembership" (4) => unsupported,
-    "getBufferSize" (2) => unsupported,
-    "setBufferSize" (3) => unsupported,
-    "udpRef" (2) => unsupported,
-    ];
+    #[lumen_bind::module(name = "__net")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op]
+        pub fn connect(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "connectPath")]
+        pub fn connect_path(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn read(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn write(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "tryWrite")]
+        pub fn try_write(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "endWritable")]
+        pub fn end_writable(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn close(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setNoDelay")]
+        pub fn set_no_delay(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setKeepAlive")]
+        pub fn set_keep_alive(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn address(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "socketRef")]
+        pub fn socket_ref(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn listen(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "listenPath")]
+        pub fn listen_path(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn accept(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "closeServer")]
+        pub fn close_server(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "serverAddress")]
+        pub fn server_address(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "serverRef")]
+        pub fn server_ref(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
+
+    #[lumen_bind::module(name = "__udp")]
+    pub(crate) mod udp_bindings {
+        use super::*;
+
+        #[op(name = "bind")]
+        pub fn bind_(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn recv(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn send(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn connect(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn disconnect(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn peer(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn close(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn address(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setBroadcast")]
+        pub fn set_broadcast(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setTTL")]
+        pub fn set_ttl(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setMulticastTTL")]
+        pub fn set_multicast_ttl(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setMulticastLoopback")]
+        pub fn set_multicast_loopback(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setMulticastInterface")]
+        pub fn set_multicast_interface(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "addMembership")]
+        pub fn add_membership(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "dropMembership")]
+        pub fn drop_membership(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "addSourceMembership")]
+        pub fn add_source_membership(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "dropSourceMembership")]
+        pub fn drop_source_membership(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "getBufferSize")]
+        pub fn get_buffer_size(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setBufferSize")]
+        pub fn set_buffer_size(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "udpRef")]
+        pub fn udp_ref(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 }
 
 pub mod tls {
@@ -105,101 +314,372 @@ pub mod tls {
     #[derive(Default)]
     pub struct TlsRegistry;
 
-    pub const TLS_OPS: &[OpDecl] = ops![
-        "available" (0) => no,
-        "rootCertificates" (0) => empty_list,
-        "ciphers" (0) => empty_list,
-    "ctxOp" (4) => unsupported,
-    "sessNew" (2) => unsupported,
-    "sessFree" (1) => unsupported,
-    "sessOp" (4) => unsupported,
-    "feed" (2) => unsupported,
-    "output" (1) => unsupported,
-    "read" (2) => unsupported,
-    "write" (2) => unsupported,
-    "events" (1) => unsupported,
-    "lastError" (1) => unsupported,
-    ];
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__tls")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op]
+        pub fn available() -> bool {
+            false
+        }
+
+        #[op(name = "rootCertificates")]
+        pub fn root_certificates() -> Vec<String> {
+            Vec::new()
+        }
+
+        #[op]
+        pub fn ciphers() -> Vec<String> {
+            Vec::new()
+        }
+
+        #[op(name = "ctxOp")]
+        pub fn ctx_op(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "sessNew")]
+        pub fn sess_new(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "sessFree")]
+        pub fn sess_free(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "sessOp")]
+        pub fn sess_op(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn feed(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn output(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn read(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn write(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn events(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "lastError")]
+        pub fn last_error(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 }
 
 pub mod dns {
-    pub use super::unsupported as op_lookup;
-    pub use super::unsupported as op_resolve;
-    pub use super::unsupported as op_getaddrinfo;
-    pub use super::unsupported as op_getnameinfo;
-    pub use super::empty_list as op_get_servers;
+    use super::*;
+
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__dns")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op(name = "getaddrinfo")]
+        pub fn getaddrinfo(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "getnameinfo")]
+        pub fn getnameinfo(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "getServers")]
+        pub fn get_servers() -> Vec<String> {
+            Vec::new()
+        }
+    }
 }
 
 pub mod napi {
     use super::*;
 
-    pub use super::unsupported as op_load_addon;
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__node")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op(name = "loadNativeAddon")]
+        pub fn load_native_addon(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 
     pub fn shutdown(_ctx: &mut Ctx) {}
 }
 
 pub mod ffi {
-    pub use super::unsupported as op_dlopen;
-    pub use super::unsupported as op_dlsym;
-    pub use super::unsupported as op_dlclose;
-    pub use super::unsupported as op_call;
-    pub use super::unsupported as op_ptr;
-    pub use super::unsupported as op_read;
-    pub use super::unsupported as op_read_cstring;
-    pub use super::unsupported as op_to_array_buffer;
-    pub use super::unsupported as op_to_buffer;
-    pub use super::unsupported as op_register_callback;
-    pub use super::unsupported as op_unregister_callback;
-    pub use super::unsupported as op_cc;
+    use super::*;
+
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__ffi")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op(name = "dlopen")]
+        pub fn dlopen(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "dlsym")]
+        pub fn dlsym(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "dlclose")]
+        pub fn dlclose(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "call")]
+        pub fn call(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "ptr")]
+        pub fn ptr(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "read")]
+        pub fn read(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "readCString")]
+        pub fn read_cstring(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "toArrayBuffer")]
+        pub fn to_array_buffer(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "toBuffer")]
+        pub fn to_buffer(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "registerCallback")]
+        pub fn register_callback(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "unregisterCallback")]
+        pub fn unregister_callback(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "cc")]
+        pub fn cc(#[varargs] _args: &[Value]) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 }
 
 pub mod sqlite {
     use super::*;
 
-    pub const SQLITE_OPS: &[OpDecl] = ops![
-    "open" (2) => unsupported,
-    "function" (6) => unsupported,
-    "close" (1) => unsupported,
-    "prepare" (2) => unsupported,
-    "finalize" (1) => unsupported,
-    "reset" (2) => unsupported,
-    "bind" (3) => unsupported,
-    "step" (1) => unsupported,
-    "columnCount" (1) => unsupported,
-    "columnNames" (1) => unsupported,
-    "columns" (1) => unsupported,
-    "row" (2) => unsupported,
-    "bindParameterCount" (1) => unsupported,
-    "bindParameterName" (2) => unsupported,
-    "bindParameterIndex" (2) => unsupported,
-    "exec" (2) => unsupported,
-    "changes" (1) => unsupported,
-    "totalChanges" (1) => unsupported,
-    "isTransaction" (1) => unsupported,
-    "location" (2) => unsupported,
-    "doubleQuotedStringLiterals" (2) => unsupported,
-    "defensive" (2) => unsupported,
-    "lastInsertRowid" (2) => unsupported,
-    "expandedSql" (1) => unsupported,
-    "libversion" (0) => unsupported,
-    "serialize" (1) => unsupported,
-    "deserialize" (1) => unsupported,
-    "setCustomSQLite" (1) => unsupported,
-    "enableLoadExtension" (2) => unsupported,
-    "loadExtension" (2) => unsupported,
-    "fileControl" (3) => unsupported,
-    ];
+    pub(crate) use bindings::Module;
+
+    #[lumen_bind::module(name = "__sqlite")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op]
+        pub fn open(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn function(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn close(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn prepare(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn finalize(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn reset(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "bind")]
+        pub fn bind_(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn step(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "columnCount")]
+        pub fn column_count(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "columnNames")]
+        pub fn column_names(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn columns(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn row(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "bindParameterCount")]
+        pub fn bind_parameter_count(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "bindParameterName")]
+        pub fn bind_parameter_name(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "bindParameterIndex")]
+        pub fn bind_parameter_index(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn exec(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn changes(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "totalChanges")]
+        pub fn total_changes(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "isTransaction")]
+        pub fn is_transaction(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn location(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "doubleQuotedStringLiterals")]
+        pub fn double_quoted_string_literals(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn defensive(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "lastInsertRowid")]
+        pub fn last_insert_rowid(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "expandedSql")]
+        pub fn expanded_sql(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn libversion() -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn serialize(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op]
+        pub fn deserialize(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "setCustomSQLite")]
+        pub fn set_custom_sq_lite(_a0: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "enableLoadExtension")]
+        pub fn enable_load_extension(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "loadExtension")]
+        pub fn load_extension(_a0: Value, _a1: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+
+        #[op(name = "fileControl")]
+        pub fn file_control(_a0: Value, _a1: Value, _a2: Value) -> Result<(), OpError> {
+            Err(unsupported_error())
+        }
+    }
 }
 
 pub mod vm_timeout {
     use super::*;
 
-    pub const VM_OPS: &[OpDecl] = ops![
-        "runWithTimeout" (2) => run_with_timeout,
-    ];
+    pub(crate) use bindings::Module;
 
-    fn run_with_timeout(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-        let callee = args.get(1).cloned().unwrap_or(Value::Undefined);
-        ctx.invoke(callee, Value::Undefined, &[])
+    #[lumen_bind::module(name = "__vm")]
+    pub(crate) mod bindings {
+        use super::*;
+
+        #[op(name = "runWithTimeout")]
+        pub fn run_with_timeout(ctx: &mut Ctx, _timeout_ms: Value, callee: Value) -> Result<Value, OpError> {
+            ctx.invoke(callee, Value::Undefined, &[]).map_err(OpError::thrown)
+        }
     }
 }

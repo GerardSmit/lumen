@@ -32,7 +32,6 @@ mod pem;
 
 pub use curves::{with_ec_curve, EcCurve};
 pub use dh_groups::dh_group;
-pub use gen::{safe_prime, safe_prime_congruent};
 pub use model::{pss_hash, x448_mul, AsymKey, DsaKey, EcKey, PssParams, RsaKey};
 pub use pem::KeyCipher;
 
@@ -304,7 +303,7 @@ fn dh_keygen(group: Option<String>, prime: Option<Vec<u8>>, prime_len: Option<u3
     let (p, g) = match (group, prime, prime_len) {
         (Some(name), _, _) => dh_group(&name).ok_or_else(|| SendError::new("Error", "Unknown DH group").with_code("ERR_CRYPTO_UNKNOWN_DH_GROUP"))?,
         (None, Some(p), _) => (num_bigint_dig::BigUint::from_bytes_be(&p), num_bigint_dig::BigUint::from(g)),
-        (None, None, Some(bits)) => (gen::safe_prime(bits)?, num_bigint_dig::BigUint::from(g)),
+        (None, None, Some(bits)) => (gen::safe_prime(bits, g)?, num_bigint_dig::BigUint::from(g)),
         _ => return Err(SendError::new("Error", "Invalid DH parameters")),
     };
     gen::dh(p, g).map(pair)

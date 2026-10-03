@@ -1,5 +1,7 @@
 //! The `math` module.
 
+/// This module provides access to the mathematical functions
+/// defined by the C standard.
 #[lumen_bind::module(name = "math")]
 pub mod math {
     use crate::ast::BinOp;
@@ -48,111 +50,141 @@ pub mod math {
     #[constant(name = "nan")]
     const NAN: f64 = f64::NAN;
 
+    /// Return the sine of x (measured in radians).
     #[op]
     fn sin(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::sin(x), false)
     }
 
+    /// Return the cosine of x (measured in radians).
     #[op]
     fn cos(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::cos(x), false)
     }
 
+    /// Return the tangent of x (measured in radians).
     #[op]
     fn tan(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::tan(x), false)
     }
 
+    /// Return the arc sine (measured in radians) of x.
+    ///
+    /// The result is between -pi/2 and pi/2.
     #[op]
     fn asin(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::asin(x), false)
     }
 
+    /// Return the arc cosine (measured in radians) of x.
+    ///
+    /// The result is between 0 and pi.
     #[op]
     fn acos(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::acos(x), false)
     }
 
+    /// Return the arc tangent (measured in radians) of x.
+    ///
+    /// The result is between -pi/2 and pi/2.
     #[op]
     fn atan(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::atan(x), false)
     }
 
+    /// Return the hyperbolic sine of x.
     #[op]
     fn sinh(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::sinh(x), true)
     }
 
+    /// Return the hyperbolic cosine of x.
     #[op]
     fn cosh(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::cosh(x), true)
     }
 
+    /// Return the hyperbolic tangent of x.
     #[op]
     fn tanh(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::tanh(x), false)
     }
 
+    /// Return the inverse hyperbolic sine of x.
     #[op]
     fn asinh(x: f64) -> NativeResult<f64> {
         math_1(x, lf::asinh(x), false)
     }
 
+    /// Return the inverse hyperbolic cosine of x.
     #[op]
     fn acosh(x: f64) -> NativeResult<f64> {
         math_1(x, lf::acosh(x), false)
     }
 
+    /// Return the inverse hyperbolic tangent of x.
     #[op]
     fn atanh(x: f64) -> NativeResult<f64> {
         math_1(x, lf::atanh(x), false)
     }
 
+    /// Return e raised to the power of x.
     #[op]
     fn exp(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::exp(x), true)
     }
 
+    /// Return exp(x)-1.
+    ///
+    /// This function avoids the loss of precision involved in the direct evaluation of exp(x)-1 for small x.
     #[op]
     fn expm1(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::exp_m1(x), true)
     }
 
+    /// Return 2 raised to the power of x.
     #[op]
     fn exp2(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::exp2(x), true)
     }
 
+    /// Return the absolute value of the float x.
     #[op]
     fn fabs(x: f64) -> f64 {
         f64::abs(x)
     }
 
+    /// Convert angle x from radians to degrees.
     #[op]
     fn degrees(x: f64) -> f64 {
         f64::to_degrees(x)
     }
 
+    /// Convert angle x from degrees to radians.
     #[op]
     fn radians(x: f64) -> f64 {
         f64::to_radians(x)
     }
 
+    /// Error function at x.
     #[op]
     fn erf(x: f64) -> NativeResult<f64> {
         math_1(x, lf::erf(x), false)
     }
 
+    /// Complementary error function at x.
     #[op]
     fn erfc(x: f64) -> NativeResult<f64> {
         math_1(x, lf::erfc(x), false)
     }
 
+    /// Return the square root of x.
     #[op]
     fn sqrt(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::sqrt(x), false)
     }
 
+    /// Return the cube root of x.
     #[op]
     fn cbrt(x: f64) -> f64 {
         fmath::cbrt(x)
@@ -187,6 +219,10 @@ pub mod math {
         Ok(r)
     }
 
+    /// log(x, [base=math.e])
+    /// Return the logarithm of x to the given base.
+    ///
+    /// If the base is not specified, returns the natural logarithm (base e) of x.
     #[op(hint(py(text_signature = "")))]
     fn log(it: &mut Interp, x: &Value, base: Option<&Value>) -> R<f64> {
         let num = loghelper(it, x, fmath::ln)?;
@@ -202,21 +238,27 @@ pub mod math {
         }
     }
 
+    /// Return the base 2 logarithm of x.
     #[op]
     fn log2(it: &mut Interp, x: &Value) -> R<f64> {
         loghelper(it, x, fmath::log2)
     }
 
+    /// Return the base 10 logarithm of x.
     #[op]
     fn log10(it: &mut Interp, x: &Value) -> R<f64> {
         loghelper(it, x, fmath::log10)
     }
 
+    /// Return the natural logarithm of 1+x (base e).
+    ///
+    /// The result is computed in a way which is accurate for x near zero.
     #[op]
     fn log1p(x: f64) -> NativeResult<f64> {
         math_1(x, fmath::ln_1p(x), false)
     }
 
+    /// Return x**y (x to the power of y).
     #[op]
     fn pow(x: f64, y: f64) -> NativeResult<f64> {
         let r = fmath::powf(x, y);
@@ -229,11 +271,26 @@ pub mod math {
         Ok(r)
     }
 
+    /// Return the arc tangent (measured in radians) of y/x.
+    ///
+    /// Unlike atan(y/x), the signs of both x and y are considered.
     #[op]
     fn atan2(y: f64, x: f64) -> f64 {
         fmath::atan2(y, x)
     }
 
+    /// Multidimensional Euclidean distance from the origin to a point.
+    ///
+    /// Roughly equivalent to:
+    ///     sqrt(sum(x**2 for x in coordinates))
+    ///
+    /// For a two dimensional point (x, y), gives the hypotenuse
+    /// using the Pythagorean theorem:  sqrt(x*x + y*y).
+    ///
+    /// For example, the hypotenuse of a 3/4/5 right triangle is:
+    ///
+    ///     >>> hypot(3.0, 4.0)
+    ///     5.0
     #[op(hint(py(text_signature = "")))]
     fn hypot(it: &mut Interp, #[varargs] coordinates: &[Value]) -> R<f64> {
         let mut vals = Vec::with_capacity(coordinates.len());
@@ -243,11 +300,36 @@ pub mod math {
         Ok(lf::hypot(&mut vals))
     }
 
+    /// Return a float with the magnitude (absolute value) of x but the sign of y.
+    ///
+    /// On platforms that support signed zeros, copysign(1.0, -0.0)
+    /// returns -1.0.
     #[op]
     fn copysign(x: f64, y: f64) -> f64 {
         x.copysign(y)
     }
 
+    /// Fused multiply-add operation.
+    ///
+    /// Compute (x * y) + z with a single round.
+    #[op]
+    fn fma(x: f64, y: f64, z: f64) -> NativeResult<f64> {
+        let r = x.mul_add(y, z);
+        if r.is_nan() && !x.is_nan() && !y.is_nan() && !z.is_nan() {
+            return Err(NativeError::value_error("invalid operation in fma"));
+        }
+        if r.is_infinite() && x.is_finite() && y.is_finite() && z.is_finite() {
+            return Err(NativeError::overflow("overflow in fma"));
+        }
+        Ok(r)
+    }
+
+    /// Return the floating-point value the given number of steps after x towards y.
+    ///
+    /// If steps is not specified or is None, it defaults to 1.
+    ///
+    /// Raises a TypeError, if x or y is not a double, or if steps is not an integer.
+    /// Raises ValueError if steps is negative.
     #[op]
     fn nextafter(x: f64, y: f64, #[kwonly] steps: Option<i64>) -> NativeResult<f64> {
         let Some(steps) = steps else { return Ok(next_toward(x, y)) };
@@ -265,6 +347,7 @@ pub mod math {
         Ok(x)
     }
 
+    /// Return the value of the least significant bit of the float x.
     #[op]
     fn ulp(x: f64) -> f64 {
         if x.is_nan() {
@@ -281,6 +364,14 @@ pub mod math {
         next - x
     }
 
+    /// Return the sum of products of values from two iterables p and q.
+    ///
+    /// Roughly equivalent to:
+    ///
+    ///     sum(map(operator.mul, p, q, strict=True))
+    ///
+    /// For float and mixed int/float inputs, the intermediate products
+    /// and sums are computed with extended precision.
     #[op]
     fn sumprod(it: &mut Interp, p: &Value, q: &Value) -> R<Value> {
         let p = it.iterate_to_vec(p)?;
@@ -320,6 +411,9 @@ pub mod math {
         Ok(r)
     }
 
+    /// Return fmod(x, y), according to platform C.
+    ///
+    /// x % y may differ.
     #[op]
     fn fmod(x: f64, y: f64) -> NativeResult<f64> {
         if y.is_infinite() && x.is_finite() {
@@ -328,11 +422,19 @@ pub mod math {
         math_2(x, y, x % y)
     }
 
+    /// Difference between x and the closest integer multiple of y.
+    ///
+    /// Return x - n*y where n*y is the closest integer multiple of y.
+    /// In the case where x is exactly halfway between two multiples of
+    /// y, the nearest even value of n is used. The result is always exact.
     #[op]
     fn remainder(x: f64, y: f64) -> NativeResult<f64> {
         math_2(x, y, lf::remainder(x, y))
     }
 
+    /// Return the fractional and integer parts of x.
+    ///
+    /// Both results carry the sign of x and are floats.
     #[op]
     fn modf(x: f64) -> (f64, f64) {
         if x.is_infinite() {
@@ -342,12 +444,19 @@ pub mod math {
         ((x - i).copysign(x), i)
     }
 
+    /// Return the mantissa and exponent of x, as pair (m, e).
+    ///
+    /// m is a float and e is an int, such that x = m * 2.**e.
+    /// If x is 0, m and e are both 0.  Else 0.5 <= abs(m) < 1.0.
     #[op]
     fn frexp(x: f64) -> (f64, i64) {
         let (m, e) = lf::frexp(x);
         (m, e as i64)
     }
 
+    /// Return x * (2**i).
+    ///
+    /// This is essentially the inverse of frexp().
     #[op]
     fn ldexp(it: &mut Interp, x: f64, i: &Value) -> R<f64> {
         if !i.is_int_like() {
@@ -386,7 +495,6 @@ pub mod math {
             }
             Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => return Ok(x.clone()),
             Value::Float(v) => return f_to_int(it, f(*v)),
-            Value::Obj(o) if matches!(o.kind, Kind::Float(_)) => {}
             v => {
                 let cls = it.type_of(v);
                 if it.lookup_mro(&cls, dunder).is_some() {
@@ -402,36 +510,65 @@ pub mod math {
         f_to_int(it, f(v))
     }
 
+    /// Return the floor of x as an Integral.
+    ///
+    /// This is the largest integer <= x.
     #[op]
     fn floor(it: &mut Interp, x: &Value) -> R<Value> {
         round_op(it, x, "__floor__", fmath::floor)
     }
 
+    /// Return the ceiling of x as an Integral.
+    ///
+    /// This is the smallest integer >= x.
     #[op]
     fn ceil(it: &mut Interp, x: &Value) -> R<Value> {
         round_op(it, x, "__ceil__", fmath::ceil)
     }
 
+    /// Truncates the Real x to the nearest Integral toward 0.
+    ///
+    /// Uses the __trunc__ magic method.
     #[op]
     fn trunc(it: &mut Interp, x: &Value) -> R<Value> {
         round_op(it, x, "__trunc__", fmath::trunc)
     }
 
+    /// Return True if x is a NaN (not a number), and False otherwise.
     #[op]
     fn isnan(x: f64) -> bool {
         x.is_nan()
     }
 
+    /// Return True if x is a positive or negative infinity, and False otherwise.
     #[op]
     fn isinf(x: f64) -> bool {
         x.is_infinite()
     }
 
+    /// Return True if x is neither an infinity nor a NaN, and False otherwise.
     #[op]
     fn isfinite(x: f64) -> bool {
         x.is_finite()
     }
 
+    /// Determine whether two floating-point numbers are close in value.
+    ///
+    ///   rel_tol
+    ///     maximum difference for being considered "close", relative to the
+    ///     magnitude of the input values
+    ///   abs_tol
+    ///     maximum difference for being considered "close", regardless of the
+    ///     magnitude of the input values
+    ///
+    /// Return True if a is close in value to b, and False otherwise.
+    ///
+    /// For the values to be considered close, the difference between them
+    /// must be smaller than at least one of the tolerances.
+    ///
+    /// -inf, inf and NaN behave similarly to the IEEE 754 Standard.  That
+    /// is, NaN is not close to anything, even itself.  inf and -inf are
+    /// only close to themselves.
     #[op]
     fn isclose(#[kw] a: f64, #[kw] b: f64, #[kwonly] #[default(1e-09)] rel_tol: f64, #[kwonly] #[default(0.0)] abs_tol: f64) -> NativeResult<bool> {
         if rel_tol < 0.0 || abs_tol < 0.0 {
@@ -447,6 +584,7 @@ pub mod math {
         Ok(diff <= (rel_tol * b).abs() || diff <= (rel_tol * a).abs() || diff <= abs_tol)
     }
 
+    /// Greatest Common Divisor.
     #[op]
     fn gcd(it: &mut Interp, #[varargs] integers: &[Value]) -> R<BigInt> {
         let mut acc = BigInt::from_i64(0);
@@ -457,14 +595,16 @@ pub mod math {
         Ok(acc)
     }
 
+    /// Least Common Multiple.
     #[op]
     fn lcm(it: &mut Interp, #[varargs] integers: &[Value]) -> R<BigInt> {
         let mut acc = BigInt::from_i64(1);
         for v in integers {
             let b = crate::bind::index(it, v)?;
             let b = int_value(&b).abs();
-            if b.is_zero() {
-                return Ok(BigInt::from_i64(0));
+            if b.is_zero() || acc.is_zero() {
+                acc = BigInt::from_i64(0);
+                continue;
             }
             let g = acc.gcd(&b);
             acc = acc.mul(&b).floor_div(&g);
@@ -483,6 +623,57 @@ pub mod math {
         }
     }
 
+    /// Product of `lo..=hi`, split in halves so the big multiplications stay balanced.
+    fn range_product(it: &mut Interp, lo: i64, hi: i64) -> R<BigInt> {
+        if lo > hi {
+            return Ok(BigInt::from_i64(1));
+        }
+        if hi - lo < 24 {
+            let mut acc = BigInt::from_i64(1);
+            let mut small: i64 = 1;
+            for i in lo..=hi {
+                match small.checked_mul(i) {
+                    Some(v) => small = v,
+                    None => {
+                        acc = acc.mul(&BigInt::from_i64(small));
+                        small = i;
+                    }
+                }
+            }
+            return Ok(acc.mul(&BigInt::from_i64(small)));
+        }
+        it.poll()?;
+        let mid = lo + (hi - lo) / 2;
+        let a = range_product(it, lo, mid)?;
+        let b = range_product(it, mid + 1, hi)?;
+        Ok(a.mul(&b))
+    }
+
+    /// `n * (n-1) * ... * (n-k+1)`, divided by `k!` for combinations; divide and conquer as
+    /// `P(n, k) = P(n, j) P(n-j, k-j)` and `C(n, k) = C(n, j) C(n-j, k-j) / C(k, j)`.
+    fn perm_comb(it: &mut Interp, n: &BigInt, k: i64, comb: bool) -> R<BigInt> {
+        if k == 0 {
+            return Ok(BigInt::from_i64(1));
+        }
+        if k == 1 {
+            return Ok(n.clone());
+        }
+        if k > 64 {
+            it.poll()?;
+        }
+        let j = k / 2;
+        let a = perm_comb(it, n, j, comb)?;
+        let nj = n.sub(&BigInt::from_i64(j));
+        let b = perm_comb(it, &nj, k - j, comb)?;
+        let r = a.mul(&b);
+        if comb {
+            let c = perm_comb(it, &BigInt::from_i64(k), j, true)?;
+            return Ok(r.floor_div(&c));
+        }
+        Ok(r)
+    }
+
+    /// Find n!.
     #[op]
     fn factorial(it: &mut Interp, n: &Value) -> R<BigInt> {
         if matches!(n, Value::Float(_)) {
@@ -498,83 +689,83 @@ pub mod math {
         }
         let nf = n as f64;
         it.check_int_bits((nf * (nf / std::f64::consts::E).log2().max(0.0)) as u128)?;
-        let mut acc = BigInt::from_i64(1);
-        let mut small: i64 = 1;
-        for i in 2..=n {
-            if i & 0xfff == 0 {
-                it.poll()?;
-            }
-            match small.checked_mul(i) {
-                Some(v) => small = v,
-                None => {
-                    acc = acc.mul(&BigInt::from_i64(small));
-                    small = i;
-                }
-            }
-        }
-        Ok(acc.mul(&BigInt::from_i64(small)))
+        range_product(it, 2, n)
     }
 
+    /// Return the integer part of the square root of the input.
     #[op]
     fn isqrt(n: BigInt) -> NativeResult<BigInt> {
         if n.is_negative() {
             return Err(NativeError::value_error("isqrt() argument must be nonnegative"));
         }
-        if n.is_zero() {
-            return Ok(n);
-        }
-        let mut x = BigInt::from_i64(1).shl(n.bit_len().div_ceil(2) as u64);
-        loop {
-            let y = x.add(&n.floor_div(&x)).shr(1);
-            if y.cmp(&x) != std::cmp::Ordering::Less {
-                return Ok(x);
-            }
-            x = y;
-        }
+        Ok(n.isqrt().expect("checked non-negative"))
     }
 
     fn comb_perm(it: &mut Interp, n: &Value, k: Option<&Value>, perm: bool) -> R<BigInt> {
-        let n = it.index_of(n)?;
+        let n = int_value(&crate::bind::index(it, n)?);
         let k = match k {
-            Some(Value::None) | None => n,
-            Some(v) => it.index_of(v)?,
+            Some(Value::None) | None => n.clone(),
+            Some(v) => int_value(&crate::bind::index(it, v)?),
         };
-        if n < 0 {
+        if n.is_negative() {
             return Err(it.value_error("n must be a non-negative integer"));
         }
-        if k < 0 {
+        if k.is_negative() {
             return Err(it.value_error("k must be a non-negative integer"));
         }
-        if k > n {
+        if k.cmp(&n) == std::cmp::Ordering::Greater {
             return Ok(BigInt::from_i64(0));
         }
-        let k = if perm { k } else { k.min(n - k) };
-        let (nf, kf) = (n as f64, k as f64);
-        let bits = if perm { kf * nf.log2() } else { kf * ((nf / kf.max(1.0)).log2() + std::f64::consts::LOG2_E) };
-        it.check_int_bits(bits as u128)?;
-        let mut acc = BigInt::from_i64(1);
-        for i in 0..k {
-            if i & 0xff == 0 {
-                it.poll()?;
-            }
-            acc = acc.mul(&BigInt::from_i64(n - i));
-            if !perm {
-                acc = acc.floor_div(&BigInt::from_i64(i + 1));
-            }
-        }
-        Ok(acc)
+        let k = if perm {
+            k
+        } else {
+            let rest = n.sub(&k);
+            if rest.cmp(&k) == std::cmp::Ordering::Less { rest } else { k }
+        };
+        let Some(k) = k.to_i64() else {
+            let msg = if perm { "k must not exceed 9223372036854775807" } else { "min(n - k, k) must not exceed 9223372036854775807" };
+            return Err(it.overflow_err(msg));
+        };
+        let (nbits, kf) = (n.bit_len() as f64, k as f64);
+        let bits = if perm { kf * nbits } else { kf * (nbits - kf.max(1.0).log2() + std::f64::consts::LOG2_E) };
+        it.check_int_bits(bits.max(0.0) as u128)?;
+        perm_comb(it, &n, k, !perm)
     }
 
+    /// Number of ways to choose k items from n items without repetition and without order.
+    ///
+    /// Evaluates to n! / (k! * (n - k)!) when k <= n and evaluates
+    /// to zero when k > n.
+    ///
+    /// Also called the binomial coefficient because it is equivalent
+    /// to the coefficient of k-th term in polynomial expansion of the
+    /// expression (1 + x)**n.
+    ///
+    /// Raises TypeError if either of the arguments are not integers.
+    /// Raises ValueError if either of the arguments are negative.
     #[op]
     fn comb(it: &mut Interp, n: &Value, k: &Value) -> R<BigInt> {
         comb_perm(it, n, Some(k), false)
     }
 
+    /// Number of ways to choose k items from n items without repetition and with order.
+    ///
+    /// Evaluates to n! / (n - k)! when k <= n and evaluates
+    /// to zero when k > n.
+    ///
+    /// If k is not specified or is None, then k defaults to n
+    /// and the function returns n!.
+    ///
+    /// Raises TypeError if either of the arguments are not integers.
+    /// Raises ValueError if either of the arguments are negative.
     #[op]
     fn perm(it: &mut Interp, n: &Value, k: Option<&Value>) -> R<BigInt> {
         comb_perm(it, n, k, true)
     }
 
+    /// Return an accurate floating-point sum of values in the iterable seq.
+    ///
+    /// Assumes IEEE-754 floating-point arithmetic.
     #[op]
     fn fsum(it: &mut Interp, seq: &Value) -> R<f64> {
         let iter = it.get_iter(seq)?;
@@ -588,6 +779,13 @@ pub mod math {
         })
     }
 
+    /// Calculate the product of all the elements in the input iterable.
+    ///
+    /// The default start value for the product is 1.
+    ///
+    /// When the iterable is empty, return the start value.  This function is
+    /// intended specifically for use with numeric values and may reject
+    /// non-numeric types.
     #[op]
     fn prod(it: &mut Interp, iterable: &Value, #[kwonly] #[default(1)] start: Value) -> R<Value> {
         let items = it.iterate_to_vec(iterable)?;
@@ -598,6 +796,13 @@ pub mod math {
         Ok(acc)
     }
 
+    /// Return the Euclidean distance between two points p and q.
+    ///
+    /// The points should be specified as sequences (or iterables) of
+    /// coordinates.  Both inputs must have the same dimension.
+    ///
+    /// Roughly equivalent to:
+    ///     sqrt(sum((px - qx) ** 2.0 for px, qx in zip(p, q)))
     #[op]
     fn dist(it: &mut Interp, p: &Value, q: &Value) -> R<f64> {
         let p = it.iterate_to_vec(p)?;
@@ -618,11 +823,13 @@ pub mod math {
         Ok(lf::vector_norm(&mut diffs, max, nan))
     }
 
+    /// Gamma function at x.
     #[op]
     fn gamma(x: f64) -> NativeResult<f64> {
         lf::tgamma(x).map_err(math_err)
     }
 
+    /// Natural logarithm of absolute value of Gamma function at x.
     #[op]
     fn lgamma(x: f64) -> NativeResult<f64> {
         lf::lgamma(x).map_err(math_err)

@@ -2,26 +2,15 @@
 
 use crate::pyint::{BigInt, PyInt};
 use crate::fmath;
+use lumen_common::float::format::{fixed, significant};
+use lumen_common::rounding::Mode;
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
 use crate::vm::*;
 
 pub use crate::repr::ascii_escape;
 
-#[derive(Default, Clone)]
-pub struct Spec {
-    /// A code point: the fill may be a lone surrogate or a reserved-block character.
-    pub fill: Option<u32>,
-    pub align: Option<char>,
-    pub sign: Option<char>,
-    pub alt: bool,
-    pub zero: bool,
-    pub z: bool,
-    pub width: Option<usize>,
-    pub grouping: Option<char>,
-    pub precision: Option<usize>,
-    pub ty: Option<char>,
-}
+pub use lumen_common::fmtspec::Spec;
 
 fn pad(s: &str, width: usize, fill: u32, align: char) -> String {
     let n = lumen_common::smuggle::count_code_points(s);
@@ -60,71 +49,22 @@ fn group_digits(digits: &str, sep: char, size: usize) -> String {
 
 impl Interp {
     pub fn parse_spec(&mut self, spec: &str, tname: &str) -> R<Spec> {
-        let cps: Vec<u32> = lumen_common::smuggle::code_points(spec).collect();
-        let chars: Vec<char> = cps.iter().map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}')).collect();
-        let mut i = 0;
-        let mut s = Spec::default();
-        let bad = |it: &mut Interp| it.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname));
-        if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
-            s.fill = Some(cps[0]);
-            s.align = Some(chars[1]);
-            i = 2;
-        } else if !chars.is_empty() && matches!(chars[0], '<' | '>' | '^' | '=') {
-            s.align = Some(chars[0]);
-            i = 1;
+        let s = lumen_common::fmtspec::parse(spec).map_err(|e| match e.message() {
+            Some(m) => self.value_error(m),
+            None => self.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname)),
+        })?;
+        let bad_type = match (s.grouping, s.ty) {
+            (Some(g), Some(ty)) if !matches!(ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F') && !(g == '_' && matches!(ty, 'b' | 'o' | 'x' | 'X')) => {
+                Some((g, ty))
+            }
+            _ => s.frac_grouping.zip(s.ty.filter(|&t| t == 'n')),
+        };
+        if let Some((g, ty)) = bad_type {
+            let ty = if ty.is_ascii_graphic() { ty.to_string() } else { format!("\\x{:x}", ty as u32) };
+            return Err(self.value_error(&format!("Cannot specify '{g}' with '{ty}'.")));
         }
-        if i < chars.len() && matches!(chars[i], '+' | '-' | ' ') {
-            s.sign = Some(chars[i]);
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == 'z' {
-            s.z = true;
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '#' {
-            s.alt = true;
-            i += 1;
-        }
-        if i < chars.len() && chars[i] == '0' {
-            s.zero = true;
-            i += 1;
-        }
-        let start = i;
-        while i < chars.len() && chars[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i > start {
-            let w: String = chars[start..i].iter().collect();
-            let w: usize = w.parse().ok().filter(|&w| w <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
+        if let Some(w) = s.width {
             self.check_str_len(w)?;
-            s.width = Some(w);
-        }
-        if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
-            s.grouping = Some(chars[i]);
-            i += 1;
-            if i < chars.len() && (chars[i] == ',' || chars[i] == '_') {
-                return Err(self.value_error("Cannot specify both ',' and '_'."));
-            }
-        }
-        if i < chars.len() && chars[i] == '.' {
-            i += 1;
-            let start = i;
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i == start {
-                return Err(self.value_error("Format specifier missing precision"));
-            }
-            let p: String = chars[start..i].iter().collect();
-            let p: usize = p.parse().ok().filter(|&p| p <= i64::MAX as usize).ok_or_else(|| self.value_error("Too many decimal digits in format string"))?;
-            s.precision = Some(p);
-        }
-        if i < chars.len() {
-            s.ty = Some(chars[i]);
-            i += 1;
-        }
-        if i < chars.len() {
-            return Err(bad(self));
         }
         Ok(s)
     }
@@ -179,8 +119,11 @@ impl Interp {
                 if matches!(sp.align, Some('=')) {
                     return Err(self.value_error("'=' alignment flag is not allowed in complex format specifier"));
                 }
+                if let Some(c) = sp.ty.filter(|c| !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n')) {
+                    return Err(self.value_error(&format!("Unknown format code '{c}' for object of type 'complex'")));
+                }
                 let body = match sp.ty {
-                    None if sp.precision.is_none() && sp.grouping.is_none() => crate::repr::complex_repr(*re, *im),
+                    None if sp.precision.is_none() && sp.grouping.is_none() && sp.frac_grouping.is_none() => crate::repr::complex_repr(*re, *im),
                     ty => {
                         let ty = ty.unwrap_or('r');
                         let part_spec = |plus: bool| {
@@ -199,8 +142,14 @@ impl Interp {
                             if let Some(g) = sp.grouping {
                                 s.push(g);
                             }
+                            if sp.precision.is_some() || sp.frac_grouping.is_some() {
+                                s.push('.');
+                            }
                             if let Some(p) = sp.precision {
-                                s.push_str(&format!(".{}", p));
+                                s.push_str(&p.to_string());
+                            }
+                            if let Some(g) = sp.frac_grouping {
+                                s.push(g);
                             }
                             if ty != 'r' {
                                 s.push(ty);
@@ -407,14 +356,14 @@ impl Interp {
             "inf".to_string()
         } else {
             match ty {
-                Some('f') | Some('F') => format!("{:.*}", sp.precision.unwrap_or(6), a),
+                Some('f') | Some('F') => fixed(a, sp.precision.unwrap_or(6), Mode::HalfEven),
                 Some('e') | Some('E') => fmt_exp(a, sp.precision.unwrap_or(6), sp.alt),
-                Some('%') => format!("{:.*}", sp.precision.unwrap_or(6), a * 100.0),
+                Some('%') => fixed(a * 100.0, sp.precision.unwrap_or(6), Mode::HalfEven),
                 Some('g') | Some('G') | Some('n') => fmt_general(a, sp.precision.unwrap_or(6), sp.alt),
                 _ => match sp.precision {
                     None => float_repr(a),
                     Some(p) => {
-                        let g = fmt_general(a, p, sp.alt);
+                        let g = fmt_general_with(a, p, sp.alt, 1);
                         if g.contains('.') || g.contains('e') || g.contains("inf") || g.contains("nan") {
                             g
                         } else {
@@ -433,6 +382,13 @@ impl Interp {
         if upper {
             body = body.to_uppercase();
         }
+        if let Some(g) = sp.frac_grouping {
+            if let Some(dot) = body.find('.') {
+                let frac_len = body[dot + 1..].find(|c: char| !c.is_ascii_digit()).unwrap_or(body.len() - dot - 1);
+                let grouped = lumen_common::fmtspec::group_fraction(&body[dot + 1..dot + 1 + frac_len], g);
+                body = format!("{}.{}{}", &body[..dot], grouped, &body[dot + 1 + frac_len..]);
+            }
+        }
         if let Some(g) = sp.grouping {
             let (int_part, rest) = match body.find(|c: char| !c.is_ascii_digit()) {
                 Some(i) => (body[..i].to_string(), body[i..].to_string()),
@@ -440,7 +396,7 @@ impl Interp {
             };
             body = format!("{}{}", group_digits(&int_part, g, 3), rest);
         }
-        let neg = neg && !(sp.z && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
+        let neg = neg && !(sp.z && a.is_finite() && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
         let sign = if neg {
             "-"
         } else {
@@ -450,6 +406,10 @@ impl Interp {
                 _ => "",
             }
         };
+        if !a.is_finite() && sp.grouping.is_some() {
+            let plain = Spec { grouping: None, ..sp.clone() };
+            return Ok(self.apply_number_layout(&plain, sign, "", &body, '>'));
+        }
         Ok(self.apply_number_layout(&sp, sign, "", &body, '>'))
     }
 
@@ -618,24 +578,30 @@ impl Interp {
 }
 
 fn fmt_exp(a: f64, prec: usize, alt: bool) -> String {
-    let s = format!("{:.*e}", prec, a);
-    let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
-    let ev: i32 = e.parse().unwrap_or(0);
-    let m = if alt && prec == 0 { format!("{}.", m) } else { m.to_string() };
+    let (digits, ev) = significant(a, prec + 1, Mode::HalfEven);
+    let mut m = digits[..1].to_string();
+    if prec > 0 || alt {
+        m.push('.');
+    }
+    m.push_str(&digits[1..]);
     format!("{}e{}{:02}", m, if ev < 0 { '-' } else { '+' }, ev.abs())
 }
 
 fn fmt_general(a: f64, prec: usize, alt: bool) -> String {
+    fmt_general_with(a, prec, alt, 0)
+}
+
+/// `'g'` formatting; the exponential form is used from exponent `p - shorten` up (the format with
+/// no type letter switches one digit earlier than `'g'`).
+fn fmt_general_with(a: f64, prec: usize, alt: bool, shorten: i32) -> String {
     let p = if prec == 0 { 1 } else { prec };
-    if a == 0.0 {
+    let (_, x) = significant(a, p, Mode::HalfEven);
+    if a == 0.0 && shorten == 0 {
         return if alt { format!("0.{}", "0".repeat(p - 1)) } else { "0".into() };
     }
-    let es = format!("{:.*e}", p - 1, a);
-    let (_, e) = es.split_once('e').unwrap_or(("", "0"));
-    let x: i32 = e.parse().unwrap_or(0);
-    if x >= -4 && x < p as i32 {
+    if x >= -4 && x < p as i32 - shorten {
         let decimals = (p as i32 - 1 - x).max(0) as usize;
-        let s = format!("{:.*}", decimals, a);
+        let s = fixed(a, decimals, Mode::HalfEven);
         if alt {
             if s.contains('.') {
                 s

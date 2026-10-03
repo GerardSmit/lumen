@@ -2,7 +2,7 @@
 
 use super::native::*;
 use crate::ast::{BinOp, CmpOp};
-use crate::bind::{opaque_instance, type_object, KwArgs, NativeError, NativeResult, Py, This};
+use crate::bind::{opaque_instance, type_object, Inst, KwArgs, NativeError, NativeResult, Py, This};
 use crate::object::*;
 use crate::vm::*;
 use std::collections::VecDeque;
@@ -54,7 +54,7 @@ impl TupleGetter {
         self.doc = v.clone();
     }
 
-    #[method(name = "__reduce__")]
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
     fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
         let Some((index, doc)) = with_opaque::<TupleGetter, _>(&slf.0, |g| (g.index, g.doc.clone())) else { return Err(it.self_state_err("_tuplegetter")) };
         let t = it.type_of(&slf.0);
@@ -64,6 +64,9 @@ impl TupleGetter {
 
 const MUTATED: &str = "deque mutated during iteration";
 
+/// deque([iterable[, maxlen]]) --> deque object
+///
+/// A list-like sequence optimized for data accesses near its endpoints.
 #[lumen_bind::class(name = "deque", module = "collections", generic, hint(py(unhashable)))]
 pub struct Deque {
     items: VecDeque<Value>,
@@ -221,40 +224,47 @@ impl Deque {
         Ok(())
     }
 
+    /// Add an element to the right side of the deque.
     #[method(hint(py(text_signature = "")))]
     fn append(&mut self, item: Value) {
         self.push_back(item);
     }
 
+    /// Add an element to the left side of the deque.
     #[method(hint(py(text_signature = "")))]
     fn appendleft(&mut self, item: Value) {
         self.push_front(item);
     }
 
+    /// Remove and return the rightmost element.
     #[method(hint(py(text_signature = "")))]
     fn pop(&mut self) -> NativeResult<Value> {
         self.state += 1;
         self.items.pop_back().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
+    /// Remove and return the leftmost element.
     #[method(hint(py(text_signature = "")))]
     fn popleft(&mut self) -> NativeResult<Value> {
         self.state += 1;
         self.items.pop_front().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
+    /// Extend the right side of the deque with elements from the iterable
     #[method(hint(py(text_signature = "")))]
     fn extend(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
         let slf = slf.0;
         Self::extend_with(&slf, it, iterable, false)
     }
 
+    /// Extend the left side of the deque with elements from the iterable
     #[method(hint(py(text_signature = "")))]
     fn extendleft(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
         let slf = slf.0;
         Self::extend_with(&slf, it, iterable, true)
     }
 
+    /// Remove all elements from the deque.
     #[method(hint(py(text_signature = "")))]
     fn clear(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         let slf = slf.0;
@@ -267,6 +277,7 @@ impl Deque {
         Ok(())
     }
 
+    /// Return a shallow copy of a deque.
     #[method(hint(py(aliases = "__copy__", text_signature = "")))]
     fn copy(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let slf = slf.0;
@@ -281,6 +292,7 @@ impl Deque {
         it.call(&Value::Obj(ty), args, Vec::new())
     }
 
+    /// D.count(value) -- return number of occurrences of value
     #[method(hint(py(text_signature = "")))]
     fn count(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<i64> {
         let slf = slf.0;
@@ -301,6 +313,8 @@ impl Deque {
         Ok(count)
     }
 
+    /// D.index(value, [start, [stop]]) -- return first index of value.
+    /// Raises ValueError if the value is not present.
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
     fn index(slf: This<Py<Self>>, it: &mut Interp, value: &Value, start: Option<&Value>, stop: Option<&Value>) -> R<usize> {
         let slf = slf.0;
@@ -320,6 +334,7 @@ impl Deque {
         Err(it.value_error(&format!("{} is not in deque", r)))
     }
 
+    /// D.insert(index, object) -- insert object before index
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
     fn insert(&mut self, index: isize, value: Value) -> NativeResult<()> {
         if self.maxlen.is_some_and(|m| self.items.len() >= m) {
@@ -332,6 +347,7 @@ impl Deque {
         Ok(())
     }
 
+    /// D.remove(value) -- remove first occurrence of value.
     #[method(hint(py(text_signature = "")))]
     fn remove(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<()> {
         let slf = slf.0;
@@ -349,12 +365,14 @@ impl Deque {
         Err(it.value_error(&format!("{} is not in deque", r)))
     }
 
+    /// D.reverse() -- reverse *IN PLACE*
     #[method(hint(py(text_signature = "")))]
     fn reverse(&mut self) {
         self.items.make_contiguous().reverse();
         self.state += 1;
     }
 
+    /// Rotate the deque n steps to the right (default n=1).  If n is negative, rotates left.
     #[method(hint(py(text_signature = "", arg_name = "deque.rotate")))]
     fn rotate(&mut self, #[default(1)] n: isize) {
         let len = self.items.len() as isize;
@@ -364,6 +382,7 @@ impl Deque {
         self.state += 1;
     }
 
+    /// maximum size of a deque or None if unbounded
     #[getter]
     fn maxlen(&self) -> Option<usize> {
         self.maxlen
@@ -420,6 +439,7 @@ impl Deque {
         DequeIter::over(slf, it)
     }
 
+    /// D.__reversed__() -- return a reverse iterator over the deque
     #[proto(reversed)]
     #[method(hint(py(text_signature = "")))]
     fn __reversed__(slf: This<Py<Self>>, it: &mut Interp) -> R<DequeRevIter> {
@@ -549,6 +569,7 @@ impl Deque {
         Ok(slf.into_value())
     }
 
+    /// Return state information for pickling.
     #[proto(reduce)]
     #[method(hint(py(text_signature = "")))]
     fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
@@ -563,6 +584,7 @@ impl Deque {
         Ok(Value::tuple(vec![ty, args, Value::None, items]))
     }
 
+    /// D.__sizeof__() -- size of D in memory, in bytes
     #[proto(sizeof)]
     #[method(hint(py(text_signature = "")))]
     fn __sizeof__(&self) -> usize {
@@ -628,6 +650,8 @@ impl DequeIter {
         self.step(it, false)
     }
 
+    /// Private method returning an estimate of len(list(it)).
+    #[method(hint(py(text_signature = "")))]
     fn __length_hint__(&self) -> usize {
         self.remaining
     }
@@ -648,118 +672,166 @@ impl DequeRevIter {
         self.0.step(it, true)
     }
 
+    /// Private method returning an estimate of len(list(it)).
+    #[method(hint(py(text_signature = "")))]
     fn __length_hint__(&self) -> usize {
         self.0.remaining
     }
 }
 
-fn class_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__class_getitem__", a, 2, 2)?;
-    Ok(it.make_alias(a[0].clone(), &a[1]))
-}
-
 // ---- defaultdict --------------------------------------------------------------------------------
 
-fn factory_of(it: &mut Interp, v: &Value) -> Value {
-    match v {
-        Value::Obj(o) => {
-            let d = it.instance_dict(o);
-            dict_get_str(&d, "default_factory").unwrap_or(Value::None)
-        }
-        _ => Value::None,
-    }
+fn factory_of(it: &mut Interp, o: &Obj) -> Value {
+    let d = it.instance_dict(o);
+    dict_get_str(&d, "default_factory").unwrap_or(Value::None)
 }
 
-fn dd_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let factory = match a.get(1) {
-        Some(f) => {
-            if !f.is_none() && !it.is_callable(f) {
-                return Err(it.type_error("first argument must be callable or None"));
+fn is_dict(v: &Value) -> bool {
+    matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Dict(_)))
+}
+
+fn dd_copy(it: &mut Interp, o: &Obj) -> R<Value> {
+    let f = factory_of(it, o);
+    let ty = Value::Obj(it.type_of_obj(o));
+    it.call(&ty, vec![f, Value::Obj(o.clone())], Vec::new())
+}
+
+type Dd<'a> = Inst<'a, DefaultDict>;
+
+/// defaultdict(default_factory=None, /, [...]) --> dict with default factory
+///
+/// The default factory is called without arguments to produce
+/// a new value when a key is not present, in __getitem__ only.
+/// A defaultdict compares equal to a dict with the same items.
+/// All remaining arguments are treated the same as if they were
+/// passed to the dict constructor, including keyword arguments.
+#[lumen_bind::class(name = "defaultdict", module = "collections")]
+pub struct DefaultDict;
+
+#[lumen_bind::methods]
+impl DefaultDict {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(slf: This<Dd<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        let factory = match args.first() {
+            Some(f) => {
+                if !f.is_none() && !it.is_callable(f) {
+                    return Err(it.type_error("first argument must be callable or None"));
+                }
+                f.clone()
             }
-            f.clone()
-        }
-        None => Value::None,
-    };
-    if let Value::Obj(o) = &a[0] {
+            None => Value::None,
+        };
+        let o = slf.0 .0;
         let d = it.instance_dict(o);
         dict_set_str(&d, "default_factory", factory);
+        let dict_ty = it.types.dict.clone();
+        let init = it.lookup_mro(&dict_ty, "__init__").ok_or_else(|| it.type_error("dict has no __init__"))?;
+        let mut rest = vec![Value::Obj(o.clone())];
+        rest.extend(args.iter().skip(1).cloned());
+        it.call(&init, rest, kwargs.to_vec())?;
+        Ok(())
     }
-    let dict_ty = it.types.dict.clone();
-    let init = it.lookup_mro(&dict_ty, "__init__").ok_or_else(|| it.type_error("dict has no __init__"))?;
-    let mut args = vec![a[0].clone()];
-    args.extend(a.iter().skip(2).cloned());
-    it.call(&init, args, kw.to_vec())?;
-    Ok(Value::None)
-}
 
-fn dd_missing(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__missing__", a, 2, 2)?;
-    let f = factory_of(it, &a[0]);
-    if f.is_none() {
-        return Err(it.new_exc_val("KeyError", a[1].clone()));
+    /// Factory called by `__missing__` to make the default value.
+    #[getter]
+    fn default_factory(slf: This<Dd<'_>>, it: &mut Interp) -> Value {
+        factory_of(it, slf.0 .0)
     }
-    let v = it.call(&f, Vec::new(), Vec::new())?;
-    it.setitem(&a[0], a[1].clone(), v.clone())?;
-    Ok(v)
-}
 
-fn dd_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let ty = it.type_of(&a[0]);
-    let name = it.type_name(&ty);
-    let f = factory_of(it, &a[0]);
-    let d = it.native_repr(&a[0])?;
-    let fr = match &a[0] {
-        _ if f.is_none() => "None".to_string(),
-        Value::Obj(o) if it.repr_enter(o) => "...".to_string(),
-        _ => {
+    #[setter]
+    fn set_default_factory(slf: This<Dd<'_>>, it: &mut Interp, value: &Value) {
+        let d = it.instance_dict(slf.0 .0);
+        dict_set_str(&d, "default_factory", value.clone());
+    }
+
+    /// __missing__(key) # Called by __getitem__ for missing key; pseudo-code:
+    ///   if self.default_factory is None: raise KeyError((key,))
+    ///   self[key] = value = self.default_factory()
+    ///   return value
+    ///
+    #[method(name = "__missing__", hint(py(text_signature = "")))]
+    fn missing(slf: This<Dd<'_>>, it: &mut Interp, key: &Value) -> R<Value> {
+        let o = slf.0 .0;
+        let f = factory_of(it, o);
+        if f.is_none() {
+            return Err(it.new_exc_val("KeyError", key.clone()));
+        }
+        let v = it.call(&f, Vec::new(), Vec::new())?;
+        it.setitem(&Value::Obj(o.clone()), key.clone(), v.clone())?;
+        Ok(v)
+    }
+
+    /// Return repr(self).
+    #[proto(repr)]
+    fn repr(slf: This<Dd<'_>>, it: &mut Interp) -> R<String> {
+        let o = slf.0 .0;
+        let ty = it.type_of_obj(o);
+        let name = it.type_name(&ty);
+        let f = factory_of(it, o);
+        let d = it.native_repr(&Value::Obj(o.clone()))?;
+        let fr = if f.is_none() {
+            "None".to_string()
+        } else if it.repr_enter(o) {
+            "...".to_string()
+        } else {
             let r = it.repr_of(&f);
             it.repr_leave();
             r?
+        };
+        Ok(format!("{}({}, {})", name, fr, d))
+    }
+
+    /// D.copy() -> a shallow copy of D.
+    #[method(hint(py(text_signature = "", aliases = "__copy__")))]
+    fn copy(slf: This<Dd<'_>>, it: &mut Interp) -> R<Value> {
+        dd_copy(it, slf.0 .0)
+    }
+
+    /// Return state information for pickling.
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<Dd<'_>>, it: &mut Interp) -> R<Value> {
+        let o = slf.0 .0;
+        let f = factory_of(it, o);
+        let ty = Value::Obj(it.type_of_obj(o));
+        let args = if f.is_none() { Value::tuple(Vec::new()) } else { Value::tuple(vec![f]) };
+        let items = it.call_method(&Value::Obj(o.clone()), "items", Vec::new())?;
+        let items = it.get_iter(&items)?;
+        Ok(Value::tuple(vec![ty, args, Value::None, Value::None, items]))
+    }
+
+    /// Return self|value.
+    #[proto(or)]
+    fn or(slf: This<Dd<'_>>, it: &mut Interp, other: &Value) -> R<Value> {
+        if !is_dict(other) {
+            return Ok(Value::NotImplemented);
         }
-    };
-    Ok(Value::string(format!("{}({}, {})", name, fr, d)))
-}
-
-fn dd_copy(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("copy", a, 1, 1)?;
-    let f = factory_of(it, &a[0]);
-    let ty = Value::Obj(it.type_of(&a[0]));
-    it.call(&ty, vec![f, a[0].clone()], Vec::new())
-}
-
-fn dd_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let f = factory_of(it, &a[0]);
-    let ty = Value::Obj(it.type_of(&a[0]));
-    let args = if f.is_none() { Value::tuple(Vec::new()) } else { Value::tuple(vec![f]) };
-    let items = it.call_method(&a[0], "items", Vec::new())?;
-    let items = it.get_iter(&items)?;
-    Ok(Value::tuple(vec![ty, args, Value::None, Value::None, items]))
-}
-
-fn dd_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__or__", a, 2, 2)?;
-    let is_dict = matches!(&a[1], Value::Obj(o) if matches!(o.kind, Kind::Dict(_)));
-    if !is_dict {
-        return Ok(Value::NotImplemented);
+        let new = dd_copy(it, slf.0 .0)?;
+        let upd = it.get_attr_str(&new, "update")?;
+        it.call(&upd, vec![other.clone()], Vec::new())?;
+        Ok(new)
     }
-    let new = dd_copy(it, &a[..1], &[])?;
-    let upd = it.get_attr_str(&new, "update")?;
-    it.call(&upd, vec![a[1].clone()], Vec::new())?;
-    Ok(new)
-}
 
-fn dd_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__ror__", a, 2, 2)?;
-    let is_dict = matches!(&a[1], Value::Obj(o) if matches!(o.kind, Kind::Dict(_)));
-    if !is_dict {
-        return Ok(Value::NotImplemented);
+    /// Return value|self.
+    #[proto(ror)]
+    fn ror(slf: This<Dd<'_>>, it: &mut Interp, other: &Value) -> R<Value> {
+        if !is_dict(other) {
+            return Ok(Value::NotImplemented);
+        }
+        let o = slf.0 .0;
+        let f = factory_of(it, o);
+        let ty = Value::Obj(it.type_of_obj(o));
+        let new = it.call(&ty, vec![f, other.clone()], Vec::new())?;
+        let upd = it.get_attr_str(&new, "update")?;
+        it.call(&upd, vec![Value::Obj(o.clone())], Vec::new())?;
+        Ok(new)
     }
-    let f = factory_of(it, &a[0]);
-    let ty = Value::Obj(it.type_of(&a[0]));
-    let new = it.call(&ty, vec![f, a[1].clone()], Vec::new())?;
-    let upd = it.get_attr_str(&new, "update")?;
-    it.call(&upd, vec![a[0].clone()], Vec::new())?;
-    Ok(new)
+
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
+    }
 }
 
 // ---- helpers ------------------------------------------------------------------------------------
@@ -778,52 +850,51 @@ fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
     }
 }
 
-fn count_elements(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("_count_elements", a, 2, 2)?;
-    let get = it.get_attr_str(&a[0], "get")?;
-    let src = it.get_iter(&a[1])?;
-    while let Some(elem) = it.iter_next(&src)? {
-        let old = it.call(&get, vec![elem.clone(), Value::Int(0)], Vec::new())?;
-        let new = match &old {
-            Value::Int(n) => match n.checked_add(1) {
-                Some(s) => Value::Int(s),
-                None => it.binary_op(BinOp::Add, &old, &Value::Int(1))?,
-            },
-            _ => it.binary_op(BinOp::Add, &old, &Value::Int(1))?,
-        };
-        it.setitem(&a[0], elem, new)?;
+/// High performance data structures.
+/// - deque:        ordered collection accessible from endpoints only
+/// - defaultdict:  dict subclass with a default value factory
+///
+#[lumen_bind::module(name = "_collections")]
+pub mod _collections {
+    use super::*;
+
+    /// Count elements in the iterable, updating the mapping
+    #[op]
+    fn _count_elements(it: &mut Interp, mapping: &Value, iterable: &Value) -> R<()> {
+        let get = it.get_attr_str(mapping, "get")?;
+        let src = it.get_iter(iterable)?;
+        while let Some(elem) = it.iter_next(&src)? {
+            let old = it.call(&get, vec![elem.clone(), Value::Int(0)], Vec::new())?;
+            let new = match &old {
+                Value::Int(n) => match n.checked_add(1) {
+                    Some(s) => Value::Int(s),
+                    None => it.binary_op(BinOp::Add, &old, &Value::Int(1))?,
+                },
+                _ => it.binary_op(BinOp::Add, &old, &Value::Int(1))?,
+            };
+            it.setitem(mapping, elem, new)?;
+        }
+        Ok(())
     }
-    Ok(Value::None)
-}
 
-pub fn make(it: &mut Interp) -> Obj {
-    let m = it.new_module("_collections");
-    let d = it.module_dict(&m);
-    it.register_module("_collections", &m);
-
-    let deque = type_object::<Deque>(it);
-    set_type(&d, "deque", &deque);
-    let ty = type_object::<DequeIter>(it);
-    set_type(&d, "_deque_iterator", &ty);
-    let ty = type_object::<DequeRevIter>(it);
-    set_type(&d, "_deque_reverse_iterator", &ty);
-
-    let dict_ty = it.types.dict.clone();
-    let dd = new_type(it, "collections", "defaultdict", Some(&dict_ty), Layout::Dict);
-    it.reg(&dd, "__init__", dd_init);
-    it.reg(&dd, "__missing__", dd_missing);
-    it.reg(&dd, "__repr__", dd_repr);
-    it.reg(&dd, "copy", dd_copy);
-    it.reg(&dd, "__copy__", dd_copy);
-    it.reg(&dd, "__reduce__", dd_reduce);
-    it.reg(&dd, "__or__", dd_or);
-    it.reg(&dd, "__ror__", dd_ror);
-    it.reg_class(&dd, "__class_getitem__", class_getitem);
-    set_type(&d, "defaultdict", &dd);
-
-    let tg = type_object::<TupleGetter>(it);
-    set_type(&d, "_tuplegetter", &tg);
-
-    set_fn(it, &d, "_count_elements", count_elements);
-    m
+    #[init]
+    fn init(it: &mut Interp, m: &Value) {
+        let Value::Obj(m) = m else { return };
+        let d = it.module_dict(m);
+        let deque = type_object::<Deque>(it);
+        set_type(&d, "deque", &deque);
+        let ty = type_object::<DequeIter>(it);
+        set_type(&d, "_deque_iterator", &ty);
+        let ty = type_object::<DequeRevIter>(it);
+        set_type(&d, "_deque_reverse_iterator", &ty);
+        let dict_ty = it.types.dict.clone();
+        let dd = new_type(it, "collections", "defaultdict", Some(&dict_ty), Layout::Dict);
+        crate::bind::extend_type::<DefaultDict>(it, &dd);
+        if let Some(td) = dd.dict.borrow().as_ref() {
+            dict_set_str(td, "__doc__", <DefaultDict as lumen_bind::Class>::DESC.doc.map_or(Value::None, Value::str));
+        }
+        set_type(&d, "defaultdict", &dd);
+        let tg = type_object::<TupleGetter>(it);
+        set_type(&d, "_tuplegetter", &tg);
+    }
 }

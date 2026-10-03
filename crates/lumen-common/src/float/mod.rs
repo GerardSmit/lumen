@@ -8,12 +8,14 @@ pub mod format;
 mod fsum;
 mod gamma;
 mod norm;
+mod normal;
 mod shortest;
 
 pub use erf::{erf, erfc};
 pub use fsum::{fsum, Fsum, FsumError};
 pub use gamma::{lgamma, sinpi, tgamma};
 pub use norm::{frexp, frexp_exp, hypot, ldexp, vector_norm};
+pub use normal::normal_inv_cdf;
 pub use shortest::{shortest, Digits};
 
 /// Why a math function has no finite result (C's `EDOM` / `ERANGE`).

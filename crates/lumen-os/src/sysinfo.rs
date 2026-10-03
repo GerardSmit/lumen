@@ -1,6 +1,6 @@
 //! Process and machine facts a runtime reports: resource usage (`getrusage` and its Windows
-//! equivalents, as libuv gathers them), resident and available memory, CPU model and memory size,
-//! scheduling priority and the temporary directory.
+//! equivalents, as libuv gathers them), resident, free and available memory, CPU count, model and
+//! memory size, load averages and uptime, scheduling priority and the temporary directory.
 
 use crate::errno::FsError;
 
@@ -26,32 +26,24 @@ pub struct ResourceUsage {
 
 #[cfg(unix)]
 pub fn resource_usage() -> R<ResourceUsage> {
-    // SAFETY: a zeroed rusage is a valid out-parameter for getrusage.
-    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
-    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let micros = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+    let u = crate::rlimit::getrusage(crate::rlimit::RUSAGE_SELF)?;
+    let [maxrss, _, _, _, minflt, majflt, nswap, inblock, oublock, msgsnd, msgrcv, nsignals, nvcsw, nivcsw] = u.counters;
     // macOS reports ru_maxrss in bytes, everyone else in KiB.
-    let max_rss_kib = if cfg!(any(target_os = "macos", target_os = "ios")) {
-        u.ru_maxrss as u64 / 1024
-    } else {
-        u.ru_maxrss as u64
-    };
+    let max_rss_kib = if cfg!(any(target_os = "macos", target_os = "ios")) { maxrss as u64 / 1024 } else { maxrss as u64 };
     Ok(ResourceUsage {
-        user_us: micros(u.ru_utime),
-        system_us: micros(u.ru_stime),
+        user_us: (u.utime * 1_000_000.0).round() as u64,
+        system_us: (u.stime * 1_000_000.0).round() as u64,
         max_rss_kib,
-        minor_faults: u.ru_minflt as u64,
-        major_faults: u.ru_majflt as u64,
-        swaps: u.ru_nswap as u64,
-        block_in: u.ru_inblock as u64,
-        block_out: u.ru_oublock as u64,
-        msgs_sent: u.ru_msgsnd as u64,
-        msgs_received: u.ru_msgrcv as u64,
-        signals: u.ru_nsignals as u64,
-        voluntary_switches: u.ru_nvcsw as u64,
-        involuntary_switches: u.ru_nivcsw as u64,
+        minor_faults: minflt as u64,
+        major_faults: majflt as u64,
+        swaps: nswap as u64,
+        block_in: inblock as u64,
+        block_out: oublock as u64,
+        msgs_sent: msgsnd as u64,
+        msgs_received: msgrcv as u64,
+        signals: nsignals as u64,
+        voluntary_switches: nvcsw as u64,
+        involuntary_switches: nivcsw as u64,
     })
 }
 
@@ -133,18 +125,7 @@ pub fn resident_set_bytes_of(pid: u32) -> Option<u64> {
 pub fn available_memory(rss: u64) -> (u64, u64) {
     #[cfg(target_os = "linux")]
     {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let value = |name: &str| {
-            meminfo
-                .lines()
-                .find(|line| line.starts_with(name))
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0)
-                * 1024
-        };
-        let total = value("MemTotal:");
-        let host_available = value("MemAvailable:");
+        let [total, host_available] = meminfo(&["MemTotal:", "MemAvailable:"]);
         let limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
             .ok()
             .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok())
@@ -155,10 +136,10 @@ pub fn available_memory(rss: u64) -> (u64, u64) {
     }
     #[cfg(target_os = "macos")]
     {
-        let n = |name| crate::proc::sysctl::<u64>(name).unwrap_or(0);
+        let n = |name| sysctl::<u64>(name).unwrap_or(0);
         let total = n("hw.memsize");
         let pages = n("vm.page_free_count") + n("vm.page_inactive_count") + n("vm.page_purgeable_count");
-        let page_size = crate::proc::sysctl::<u64>("hw.pagesize").unwrap_or(4096);
+        let page_size = sysctl::<u64>("hw.pagesize").unwrap_or(4096);
         (pages.saturating_mul(page_size).min(total.saturating_sub(rss)), 0)
     }
     #[cfg(windows)]
@@ -178,11 +159,11 @@ pub fn cpu_and_memory() -> (String, u64, u64) {
     #[cfg(target_os = "macos")]
     {
         let mut model = [0u8; 256];
-        let model = crate::proc::sysctl_bytes("machdep.cpu.brand_string", &mut model)
+        let model = sysctl_bytes("machdep.cpu.brand_string", &mut model)
             .map(|n| String::from_utf8_lossy(&model[..n]).trim_end_matches('\0').to_string())
             .unwrap_or_default();
-        let hz = crate::proc::sysctl::<u64>("hw.cpufrequency").unwrap_or(0);
-        (model, hz / 1_000_000, crate::proc::sysctl::<u64>("hw.memsize").unwrap_or(0))
+        let hz = sysctl::<u64>("hw.cpufrequency").unwrap_or(0);
+        (model, hz / 1_000_000, sysctl::<u64>("hw.memsize").unwrap_or(0))
     }
     #[cfg(target_os = "linux")]
     {
@@ -196,36 +177,111 @@ pub fn cpu_and_memory() -> (String, u64, u64) {
         };
         let model = field("model name").unwrap_or_default();
         let mhz = field("cpu MHz").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
-        let total = std::fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|m| {
-                m.lines()
-                    .find(|l| l.starts_with("MemTotal:"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|kb| kb.parse::<u64>().ok())
-            })
-            .map(|kb| kb * 1024)
-            .unwrap_or(0);
-        (model, mhz, total)
+        (model, mhz, meminfo(&["MemTotal:"])[0])
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     (String::new(), 0, 0)
+}
+
+/// The 1, 5 and 15 minute load averages (zeros where the OS has none).
+pub fn loadavg() -> [f64; 3] {
+    #[cfg(all(unix, not(target_os = "android")))]
+    {
+        let mut out = [0f64; 3];
+        // SAFETY: `out` has room for the three samples requested.
+        if unsafe { libc::getloadavg(out.as_mut_ptr(), 3) } == 3 {
+            return out;
+        }
+    }
+    [0.0; 3]
+}
+
+/// Seconds since boot (0 where unknown).
+pub fn uptime() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        sysctl::<libc::timeval>("kern.boottime")
+            .map(|boot| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                (now - boot.tv_sec as f64 - boot.tv_usec as f64 / 1e6).max(0.0)
+            })
+            .unwrap_or(0.0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    0.0
+}
+
+/// Bytes of memory available to new allocations (0 where unknown).
+pub fn free_memory() -> f64 {
+    #[cfg(target_os = "macos")]
+    {
+        let free_pages = sysctl::<u32>("vm.page_free_count").unwrap_or(0) as f64;
+        // SAFETY: sysconf has no failure mode beyond returning -1.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(0) as f64;
+        free_pages * page
+    }
+    #[cfg(target_os = "linux")]
+    {
+        meminfo(&["MemAvailable:"])[0] as f64
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    0.0
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl<T: Default>(name: &str) -> Option<T> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut value = T::default();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: `value` is a writable `T` of `len` bytes.
+    let rc = unsafe {
+        libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    (rc == 0).then_some(value)
+}
+
+/// A `sysctlbyname` value of up to `buf.len()` bytes; the length written.
+#[cfg(target_os = "macos")]
+fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut len = buf.len();
+    // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
+    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    (rc == 0).then_some(len)
+}
+
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// Byte values of `/proc/meminfo` fields (`"MemTotal:"`), 0 for a missing one.
+#[cfg(target_os = "linux")]
+fn meminfo<const N: usize>(fields: &[&str; N]) -> [u64; N] {
+    let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    fields.map(|name| {
+        text.lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024)
+    })
 }
 
 /// `getpriority(PRIO_PROCESS, pid)`.
 pub fn get_priority(pid: i32) -> R<i32> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        // getpriority legitimately returns -1, so errno is cleared first and consulted after.
-        // SAFETY: the errno cell is this thread's; getpriority takes plain integers.
-        unsafe {
-            *errno_location() = 0;
-            let rc = libc::getpriority(libc::PRIO_PROCESS as _, pid as libc::id_t);
-            if rc == -1 && *errno_location() != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(rc)
-        }
+        crate::posix::getpriority(libc::PRIO_PROCESS as i32, pid as u32)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

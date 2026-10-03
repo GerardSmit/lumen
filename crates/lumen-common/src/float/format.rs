@@ -3,33 +3,26 @@
 //! `toPrecision` round exact ties away from zero, CPython's `format()` rounds them to even. Ties
 //! are judged on the exact binary value (`0.15` is really `0.1499…`).
 
-/// How an exact tie between two candidates is broken.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rounding {
-    /// The larger magnitude (ECMAScript's "pick the larger n").
-    HalfAwayFromZero,
-    /// The even last digit (IEEE 754 / CPython).
-    HalfEven,
-}
+use crate::rounding::{round_ascii, Mode};
 
 /// Every f64's exact decimal expansion has at most 767 significant digits.
 const EXACT_DIGITS: usize = 780;
 
 /// `|v|` to `n` significant digits: `(digits, exp)` with `digits.len() == n` and
 /// `|v| ≈ d.ddd × 10^exp`. `v` must be finite; zero gives `n` zeros and exponent 0. `n ≥ 1`.
-pub fn significant(v: f64, n: usize, mode: Rounding) -> (String, i32) {
+pub fn significant(v: f64, n: usize, mode: Mode) -> (String, i32) {
     let n = n.max(1);
     let v = v.abs();
     if v == 0.0 {
         return ("0".repeat(n), 0);
     }
-    if mode == Rounding::HalfEven {
+    if mode == Mode::HalfEven {
         // core's exact mode rounds ties to even.
         return split_sci(&format!("{:.*e}", n - 1, v));
     }
     let (mut digits, mut exp) = split_sci(&format!("{v:.EXACT_DIGITS$e}"));
     let mut bytes = std::mem::take(&mut digits).into_bytes();
-    if round_at(&mut bytes, n, mode) {
+    if round_ascii(&mut bytes, n, mode, false) {
         bytes.truncate(n);
         exp += 1;
     }
@@ -38,15 +31,15 @@ pub fn significant(v: f64, n: usize, mode: Rounding) -> (String, i32) {
 
 /// `|v|` to exactly `n` fraction digits as a plain decimal (`"0.050"`, `"12"`), no sign. `v` must
 /// be finite and below 1e21 for the result to stay short.
-pub fn fixed(v: f64, n: usize, mode: Rounding) -> String {
+pub fn fixed(v: f64, n: usize, mode: Mode) -> String {
     let v = v.abs();
-    if mode == Rounding::HalfEven {
+    if mode == Mode::HalfEven {
         return format!("{v:.n$}");
     }
     // Fast path: when v·10^n is small enough that the product's rounding error (< 2^-13 below
     // 2^40) cannot move it across a rounding boundary, the nearest integer is decided from the
     // product directly.
-    if n <= 22 {
+    if mode == Mode::HalfUp && n <= 22 {
         let scaled = v * 10f64.powi(n as i32);
         if scaled < (1u64 << 40) as f64 {
             let floor = scaled.floor();
@@ -69,7 +62,7 @@ pub fn fixed(v: f64, n: usize, mode: Rounding) -> String {
     let (int, frac) = exact.split_once('.').unwrap_or((&exact, ""));
     let mut bytes: Vec<u8> = int.bytes().chain(frac.bytes()).collect();
     let keep = int.len() + n;
-    let carried = round_at(&mut bytes, keep, mode);
+    let carried = round_ascii(&mut bytes, keep, mode, false);
     let int_len = int.len() + usize::from(carried);
     let mut out = String::with_capacity(bytes.len() + 1);
     out.push_str(std::str::from_utf8(&bytes[..int_len]).unwrap_or_default());
@@ -103,46 +96,12 @@ fn split_sci(s: &str) -> (String, i32) {
     (m.chars().filter(|c| *c != '.').collect(), e.parse().unwrap_or(0))
 }
 
-/// Rounds the ASCII digit string `digits` (exact, so everything past `keep` is the true tail) to
-/// `keep` digits, padding with zeros when shorter. Returns whether a carry added a leading digit
-/// (the string is then `keep + 1` long).
-fn round_at(digits: &mut Vec<u8>, keep: usize, mode: Rounding) -> bool {
-    if digits.len() <= keep {
-        digits.resize(keep, b'0');
-        return false;
-    }
-    let next = digits[keep];
-    let up = match mode {
-        Rounding::HalfAwayFromZero => next >= b'5',
-        Rounding::HalfEven => {
-            next > b'5'
-                || (next == b'5'
-                    && (digits[keep + 1..].iter().any(|&d| d != b'0')
-                        || keep.checked_sub(1).is_some_and(|k| (digits[k] - b'0') % 2 == 1)))
-        }
-    };
-    digits.truncate(keep);
-    if !up {
-        return false;
-    }
-    for d in digits.iter_mut().rev() {
-        if *d == b'9' {
-            *d = b'0';
-        } else {
-            *d += 1;
-            return false;
-        }
-    }
-    digits.insert(0, b'1');
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const AWAY: Rounding = Rounding::HalfAwayFromZero;
-    const EVEN: Rounding = Rounding::HalfEven;
+    const AWAY: Mode = Mode::HalfUp;
+    const EVEN: Mode = Mode::HalfEven;
 
     #[test]
     fn fixed_ties() {

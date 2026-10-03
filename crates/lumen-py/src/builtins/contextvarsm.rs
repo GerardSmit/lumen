@@ -326,6 +326,19 @@ pub mod _contextvars {
             self.var.clone()
         }
 
+        #[proto(enter)]
+        fn enter(slf: This<Py<Self>>) -> Value {
+            slf.0.value().clone()
+        }
+
+        #[proto(exit)]
+        fn exit(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value]) -> R<()> {
+            let _ = args;
+            let var = slf.0.borrow(it)?.var.clone();
+            it.call_method(&var, "reset", vec![slf.0.value().clone()])?;
+            Ok(())
+        }
+
         #[getter]
         fn old_value(&self, it: &mut Interp) -> R<Value> {
             match &self.old {
@@ -417,7 +430,7 @@ impl Values {
     }
 }
 
-/// The `(variable, value)` pairs of a context; its own iterator.
+// The `(variable, value)` pairs of a context; its own iterator.
 #[lumen_bind::class(name = "items", hint(py(final)))]
 pub struct Items {
     items: Vec<Value>,
@@ -444,7 +457,7 @@ impl Items {
     }
 }
 
-/// The `Token.MISSING` marker.
+// The `Token.MISSING` marker.
 #[lumen_bind::class(name = "Token.MISSING", hint(py(final)))]
 pub struct Missing;
 

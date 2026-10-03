@@ -8,6 +8,8 @@
 //! [`tokenize_extra`] is the `tokenize` module's view of the same scan: every token with its
 //! source text and end position, plus comments, `NL` and the PEP 701 f-string tokens.
 
+// The path keeps the module resolvable when `build.rs` includes this file from the crate root.
+#[path = "lexer/string.rs"]
 pub(crate) mod string;
 
 use std::rc::Rc;
@@ -416,6 +418,13 @@ impl<'a> Lexer<'a> {
         Ok(self.toks)
     }
 
+    fn eof_in_continuation(&self, line: u32, col: u32) -> Result<(), SyntaxError> {
+        if self.extra {
+            return self.err("unexpected EOF in multi-line statement", line, col + 1);
+        }
+        self.err("unexpected EOF while parsing", line, col)
+    }
+
     fn continuation(&mut self) -> Result<(), SyntaxError> {
         let (line, col) = (self.line, self.col);
         match self.peek(1) {
@@ -423,11 +432,11 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 self.bump();
                 if self.i >= self.src.len() {
-                    return self.err("unexpected EOF while parsing", line, col);
+                    return self.eof_in_continuation(line, col);
                 }
                 Ok(())
             }
-            None => self.err("unexpected EOF while parsing", line, col),
+            None => self.eof_in_continuation(line, col),
             Some(_) => self.err(
                 "unexpected character after line continuation character",
                 line,
@@ -502,6 +511,10 @@ impl<'a> Lexer<'a> {
             self.indents.push((col, alt));
             self.push(Tok::Indent, line, pos);
         } else {
+            if self.extra && !self.indents.iter().any(|&(c, _)| c == col) {
+                let eol = self.src[self.i..].iter().position(|&c| c == '\n').unwrap_or(self.src.len() - self.i);
+                return self.err("unindent does not match any outer indentation level", line, pos + eol as u32);
+            }
             while self.indents.last().is_some_and(|&(c, _)| c > col) {
                 self.indents.pop();
                 self.push(Tok::Dedent, line, pos);
@@ -591,6 +604,10 @@ impl<'a> Lexer<'a> {
             }
             ")" | "]" | "}" => {
                 let Some((open, oline, _)) = self.brackets.pop() else {
+                    if self.extra {
+                        self.push(Tok::Op(op), line, col);
+                        return Ok(());
+                    }
                     return self.err(format!("unmatched '{c}'"), line, col);
                 };
                 let want = match open {
@@ -750,7 +767,7 @@ impl<'a> Lexer<'a> {
                     chunk = (self.line, self.col, self.i);
                 }
                 '{' => {
-                    self.fstring_middle(chunk, spec && after_field);
+                    self.fstring_middle(chunk, false);
                     self.fstring_field(q, raw)?;
                     after_field = true;
                     chunk = (self.line, self.col, self.i);
@@ -759,7 +776,10 @@ impl<'a> Lexer<'a> {
                     self.fstring_middle(chunk, after_field);
                     return Ok(());
                 }
-                '}' => return self.err("f-string: single '}' is not allowed", self.line, self.col),
+                '}' => {
+                    self.fstring_middle(chunk, true);
+                    return self.err("f-string: single '}' is not allowed", self.line, self.col);
+                }
                 _ => self.bump(),
             }
         }
@@ -853,7 +873,8 @@ impl<'a> Lexer<'a> {
                 return self.err(format!("invalid {name} literal"), line, col);
             }
             if let Some(&d) = self.src.get(j).filter(|c| c.is_ascii_digit()) {
-                return self.err(format!("invalid digit '{d}' in {name} literal"), line, col);
+                let at = if self.extra { col + (j - start) as u32 } else { col };
+                return self.err(format!("invalid digit '{d}' in {name} literal"), line, at);
             }
             tok = Tok::Int(Rc::from(radix_to_decimal(&digits, radix as u64).as_str()));
         } else {
@@ -922,7 +943,7 @@ impl<'a> Lexer<'a> {
                 k += 1;
             }
             let word: String = self.src[j..k].iter().collect();
-            if keyword(&word).is_none() {
+            if !self.extra && keyword(&word).is_none() {
                 return self.err("invalid decimal literal", line, col);
             }
         }
