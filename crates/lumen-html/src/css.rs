@@ -1,10 +1,10 @@
 //! Parsed author rules and a compact computed style for the initial block renderer.
 use crate::{
-    paint::{
-        Affine, BorderPattern, BoxShadow, GradientPosition, GradientStop, LinearGradient, Rect,
-        Rgba,
-    },
     Document, NodeId, NodeKind,
+    paint::{
+        Affine, BorderPattern, BoxShadow, Gradient, GradientKind, GradientPosition, GradientStop,
+        LengthPercentage, RadialShape, RadialSize, Rect, Rgba,
+    },
 };
 use alloc::{
     boxed::Box,
@@ -36,6 +36,7 @@ pub enum FlexDirection {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum JustifyContent {
+    Stretch,
     Start,
     End,
     Center,
@@ -130,6 +131,393 @@ pub enum GridTrack {
     Auto,
     Pixels(f32),
     Fraction(f32),
+    Percentage(f32),
+    Length(f32, f32),
+    MinContent,
+    MaxContent,
+    MinMax(GridBreadth, GridBreadth),
+    FitContent(f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GridBreadth {
+    Auto,
+    MinContent,
+    MaxContent,
+    Pixels(f32),
+    Percentage(f32),
+    Length(f32, f32),
+    Fraction(f32),
+}
+
+impl GridTrack {
+    pub fn minimum(self) -> GridBreadth {
+        match self {
+            Self::MinMax(min, _) => min,
+            Self::Pixels(v) => GridBreadth::Pixels(v),
+            Self::Percentage(v) => GridBreadth::Percentage(v),
+            Self::Length(px, pct) => GridBreadth::Length(px, pct),
+            Self::MinContent => GridBreadth::MinContent,
+            Self::MaxContent => GridBreadth::MaxContent,
+            _ => GridBreadth::Auto,
+        }
+    }
+    pub fn maximum(self) -> GridBreadth {
+        match self {
+            Self::MinMax(_, max) => max,
+            Self::Fraction(v) => GridBreadth::Fraction(v),
+            Self::Pixels(v) => GridBreadth::Pixels(v),
+            Self::Percentage(v) => GridBreadth::Percentage(v),
+            Self::Length(px, pct) => GridBreadth::Length(px, pct),
+            Self::MinContent => GridBreadth::MinContent,
+            Self::MaxContent => GridBreadth::MaxContent,
+            _ => GridBreadth::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridAutoFlow {
+    pub column: bool,
+    pub dense: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridArea {
+    pub name: Arc<str>,
+    pub column: usize,
+    pub row: usize,
+    pub columns: usize,
+    pub rows: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridNamedLine {
+    pub name: Arc<str>,
+    pub line: usize,
+}
+
+fn grid_identifier(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 128
+        && !matches!(raw, "auto" | "span")
+        && raw
+            .bytes()
+            .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+        && !raw.as_bytes()[0].is_ascii_digit()
+}
+
+fn grid_template(
+    raw: &str,
+    context: LengthContext,
+) -> Option<(Arc<[GridTrack]>, Option<Arc<[GridNamedLine]>>, bool)> {
+    if raw == "subgrid" {
+        return Some((Arc::from([]), None, true));
+    }
+    let mut tracks = Vec::new();
+    let mut names = Vec::new();
+    let mut rest = raw.trim();
+    if rest == "none" {
+        return Some((tracks.into(), None, false));
+    }
+    while !rest.is_empty() {
+        if rest.starts_with('[') {
+            let end = rest.find(']')?;
+            for name in rest[1..end].split_ascii_whitespace() {
+                if !grid_identifier(name) || names.len() == 256 {
+                    return None;
+                }
+                names.push(GridNamedLine {
+                    name: Arc::from(name),
+                    line: tracks.len(),
+                });
+            }
+            rest = rest[end + 1..].trim_start();
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = rest.len();
+        for (i, ch) in rest.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.checked_sub(1)?,
+                '[' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ if ch.is_ascii_whitespace() && depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+            if depth > 8 {
+                return None;
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        let part = &rest[..end];
+        if let Some(args) = part
+            .strip_prefix("repeat(")
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            let args = comma_components(args, 2)?;
+            if args.len() != 2 || args[1].contains("repeat(") {
+                return None;
+            }
+            let count = args[0]
+                .parse::<usize>()
+                .ok()
+                .filter(|v| *v > 0 && *v <= MAX_GRID_TRACKS)?;
+            let (repeat, lines, subgrid) = grid_template(args[1], context)?;
+            if subgrid || repeat.is_empty() || tracks.len() + repeat.len() * count > MAX_GRID_TRACKS
+            {
+                return None;
+            }
+            for _ in 0..count {
+                let offset = tracks.len();
+                if let Some(lines) = &lines {
+                    for line in lines.iter() {
+                        if names.len() == 256 {
+                            return None;
+                        }
+                        names.push(GridNamedLine {
+                            name: line.name.clone(),
+                            line: offset + line.line,
+                        });
+                    }
+                }
+                tracks.extend_from_slice(&repeat);
+            }
+        } else {
+            let parsed = grid_tracks(part, context)?;
+            if tracks.len() + parsed.len() > MAX_GRID_TRACKS {
+                return None;
+            }
+            tracks.extend_from_slice(&parsed);
+        }
+        rest = rest[end..].trim_start();
+    }
+    if tracks.is_empty() {
+        return None;
+    }
+    Some((
+        tracks.into(),
+        (!names.is_empty()).then(|| names.into()),
+        false,
+    ))
+}
+
+fn grid_line_spec(raw: &str) -> bool {
+    let mut segments = 0;
+    for segment in raw.split('/') {
+        segments += 1;
+        if segments > 2 {
+            return false;
+        }
+        if segment.trim() == "auto" {
+            continue;
+        }
+        let mut integer = false;
+        let mut name = false;
+        let mut span = false;
+        let mut words = 0;
+        for word in segment.split_ascii_whitespace() {
+            words += 1;
+            if word == "span" {
+                if span {
+                    return false;
+                }
+                span = true;
+            } else if let Ok(value) = word.parse::<i16>() {
+                if integer
+                    || value == 0
+                    || value.unsigned_abs() as usize > MAX_GRID_TRACKS + 1
+                    || span && value < 0
+                {
+                    return false;
+                }
+                integer = true;
+            } else if grid_identifier(word) {
+                if name {
+                    return false;
+                }
+                name = true;
+            } else {
+                return false;
+            }
+        }
+        if words == 0 || (!integer && !name) || span && name {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn resolve_grid_placement(
+    fallback: GridPlacement,
+    raw: Option<&str>,
+    names: &[GridNamedLine],
+    explicit: usize,
+    areas: &[GridArea],
+    horizontal: bool,
+) -> Option<GridPlacement> {
+    let Some(raw) = raw else {
+        return Some(fallback);
+    };
+    let mut parts = raw.split('/');
+    let first = parts.next()?;
+    let second = parts.next().unwrap_or("auto");
+    let parse = |raw: &str, end: bool| -> Option<(Option<usize>, usize, bool)> {
+        if raw.trim() == "auto" {
+            return Some((None, 1, false));
+        }
+        let mut count = None;
+        let mut name = None;
+        let mut span = false;
+        for word in raw.split_ascii_whitespace() {
+            if word == "span" {
+                span = true;
+            } else if let Ok(value) = word.parse::<i16>() {
+                count = Some(value);
+            } else {
+                name = Some(word);
+            }
+        }
+        if span {
+            return Some((None, count.unwrap_or(1) as usize, true));
+        }
+        let count = count.unwrap_or(1);
+        let line = if let Some(name) = name {
+            let candidates: Vec<_> = names
+                .iter()
+                .filter(|line| line.name.as_ref() == name)
+                .map(|line| line.line)
+                .collect();
+            if !candidates.is_empty() {
+                if count > 0 {
+                    *candidates.get(count as usize - 1)?
+                } else {
+                    *candidates.get(candidates.len().checked_sub((-count) as usize)?)?
+                }
+            } else if let Some(area) = areas.iter().find(|area| area.name.as_ref() == name) {
+                let start = if horizontal { area.column } else { area.row };
+                start
+                    + if end {
+                        if horizontal { area.columns } else { area.rows }
+                    } else {
+                        0
+                    }
+            } else {
+                explicit.checked_add(count.max(1) as usize)?
+            }
+        } else if count > 0 {
+            count as usize - 1
+        } else {
+            (explicit + 1).checked_sub((-count) as usize)?
+        };
+        (line <= MAX_GRID_TRACKS).then_some((Some(line), 1, false))
+    };
+    let (start, start_span, start_is_span) = parse(first, false)?;
+    let (end, end_span, end_is_span) = parse(second, true)?;
+    let placement = match (start, end) {
+        (Some(start), Some(end)) => GridPlacement {
+            start: Some(start.min(end)),
+            span: start.abs_diff(end).max(1),
+        },
+        (Some(start), None) => GridPlacement {
+            start: Some(start),
+            span: if end_is_span { end_span } else { 1 },
+        },
+        (None, Some(end)) => {
+            let span = if start_is_span { start_span } else { 1 };
+            GridPlacement {
+                start: Some(end.checked_sub(span)?),
+                span,
+            }
+        }
+        (None, None) => GridPlacement {
+            start: None,
+            span: if start_is_span {
+                start_span
+            } else if end_is_span {
+                end_span
+            } else {
+                1
+            },
+        },
+    };
+    (placement.span > 0 && placement.start.unwrap_or(0) + placement.span <= MAX_GRID_TRACKS)
+        .then_some(placement)
+}
+
+fn grid_areas(raw: &str) -> Option<Arc<[GridArea]>> {
+    if raw == "none" {
+        return Some(Arc::from([]));
+    }
+    let mut rest = raw.trim();
+    let mut rows = Vec::new();
+    while !rest.is_empty() {
+        let quote = *rest.as_bytes().first()?;
+        if !matches!(quote, b'\'' | b'"') || rows.len() == MAX_GRID_TRACKS {
+            return None;
+        }
+        let end = rest[1..].find(quote as char)? + 1;
+        let row: Vec<_> = rest[1..end].split_ascii_whitespace().collect();
+        if row.is_empty()
+            || row.len() > MAX_GRID_TRACKS
+            || rows
+                .first()
+                .is_some_and(|previous: &Vec<&str>| previous.len() != row.len())
+        {
+            return None;
+        }
+        rows.push(row);
+        rest = rest[end + 1..].trim_start();
+    }
+    let mut areas: Vec<GridArea> = Vec::new();
+    for (y, row) in rows.iter().enumerate() {
+        for (x, name) in row.iter().enumerate() {
+            if name.bytes().all(|v| v == b'.') {
+                continue;
+            }
+            if name.len() > 128
+                || !name
+                    .bytes()
+                    .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+            {
+                return None;
+            }
+            if let Some(area) = areas.iter_mut().find(|area| area.name.as_ref() == *name) {
+                area.columns = area.columns.max(x + 1 - area.column);
+                area.rows = area.rows.max(y + 1 - area.row);
+            } else {
+                if areas.len() == MAX_GRID_TRACKS {
+                    return None;
+                }
+                areas.push(GridArea {
+                    name: Arc::from(*name),
+                    column: x,
+                    row: y,
+                    columns: 1,
+                    rows: 1,
+                });
+            }
+        }
+    }
+    for area in &areas {
+        for row in &rows[area.row..area.row + area.rows] {
+            if row[area.column..area.column + area.columns]
+                .iter()
+                .any(|name| *name != area.name.as_ref())
+            {
+                return None;
+            }
+        }
+    }
+    Some(areas.into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -138,24 +526,101 @@ pub struct GridPlacement {
     pub span: usize,
 }
 
-fn grid_tracks(raw: &str) -> Option<Arc<[GridTrack]>> {
+fn grid_breadth(raw: &str, context: LengthContext) -> Option<GridBreadth> {
+    Some(match raw {
+        "auto" => GridBreadth::Auto,
+        "min-content" => GridBreadth::MinContent,
+        "max-content" => GridBreadth::MaxContent,
+        _ if raw.ends_with("fr") => GridBreadth::Fraction(
+            raw.strip_suffix("fr")?
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)?,
+        ),
+        _ if raw.ends_with('%') => GridBreadth::Percentage(
+            raw.strip_suffix('%')?
+                .parse::<f32>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)?,
+        ),
+        _ => {
+            let length = transform_length(raw, context)?;
+            if length.pixels < 0.0 || length.percent < 0.0 {
+                return None;
+            }
+            if length.percent == 0.0 {
+                GridBreadth::Pixels(length.pixels)
+            } else {
+                GridBreadth::Length(length.pixels, length.percent)
+            }
+        }
+    })
+}
+
+fn grid_tracks(raw: &str, context: LengthContext) -> Option<Arc<[GridTrack]>> {
     let mut tracks = Vec::new();
-    for part in raw.split_ascii_whitespace() {
+    if raw == "none" {
+        return Some(tracks.into());
+    }
+    for part in components(raw)? {
         if tracks.len() == MAX_GRID_TRACKS {
             return None;
         }
-        tracks.push(if part == "auto" {
-            GridTrack::Auto
-        } else if let Some(value) = part.strip_suffix("fr") {
-            GridTrack::Fraction(
-                value
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|v| v.is_finite() && *v > 0.0)?,
-            )
-        } else {
-            GridTrack::Pixels(nonnegative_length(part)?)
-        });
+        if let Some(args) = part
+            .strip_prefix("repeat(")
+            .and_then(|v| v.strip_suffix(')'))
+        {
+            let args = comma_components(args, 2)?;
+            if args.len() != 2 {
+                return None;
+            }
+            let count = args[0]
+                .parse::<usize>()
+                .ok()
+                .filter(|v| *v > 0 && *v <= MAX_GRID_TRACKS)?;
+            if args[1].contains("repeat(") {
+                return None;
+            }
+            let repeated = grid_tracks(args[1], context)?;
+            if repeated.is_empty() || tracks.len() + count * repeated.len() > MAX_GRID_TRACKS {
+                return None;
+            }
+            for _ in 0..count {
+                tracks.extend_from_slice(&repeated);
+            }
+            continue;
+        }
+        tracks.push(
+            if let Some(args) = part
+                .strip_prefix("minmax(")
+                .and_then(|v| v.strip_suffix(')'))
+            {
+                let args = comma_components(args, 2)?;
+                if args.len() != 2 {
+                    return None;
+                }
+                let min = grid_breadth(args[0], context)?;
+                if matches!(min, GridBreadth::Fraction(_)) {
+                    return None;
+                }
+                GridTrack::MinMax(min, grid_breadth(args[1], context)?)
+            } else if let Some(args) = part
+                .strip_prefix("fit-content(")
+                .and_then(|v| v.strip_suffix(')'))
+            {
+                GridTrack::FitContent(contextual_length(args, Some(context))?.max(0.0))
+            } else {
+                match grid_breadth(part, context)? {
+                    GridBreadth::Auto => GridTrack::Auto,
+                    GridBreadth::Pixels(v) => GridTrack::Pixels(v),
+                    GridBreadth::Percentage(v) => GridTrack::Percentage(v),
+                    GridBreadth::Length(px, pct) => GridTrack::Length(px, pct),
+                    GridBreadth::Fraction(v) => GridTrack::Fraction(v),
+                    GridBreadth::MinContent => GridTrack::MinContent,
+                    GridBreadth::MaxContent => GridTrack::MaxContent,
+                }
+            },
+        );
     }
     if tracks.is_empty() {
         None
@@ -220,11 +685,25 @@ struct LengthContext {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StyleExtras {
+    pub gap_specified: bool,
+    pub grid_auto_columns: Option<Arc<[GridTrack]>>,
+    pub grid_auto_rows: Option<Arc<[GridTrack]>>,
+    pub grid_auto_flow: GridAutoFlow,
+    pub justify_items: AlignItems,
+    pub justify_self: Option<AlignItems>,
+    pub grid_areas: Option<Arc<[GridArea]>>,
+    pub grid_area: Option<Arc<str>>,
+    pub grid_column_names: Option<Arc<[GridNamedLine]>>,
+    pub grid_row_names: Option<Arc<[GridNamedLine]>>,
+    pub grid_column_spec: Option<Arc<str>>,
+    pub grid_row_spec: Option<Arc<str>>,
+    pub grid_columns_subgrid: bool,
+    pub grid_rows_subgrid: bool,
     pub transforms: Option<Arc<[Transform]>>,
     pub transform_origin: [TransformLength; 2],
     pub border_pattern: Option<BorderPattern>,
     pub shadows: Option<Arc<[BoxShadow]>>,
-    pub gradients: Option<Arc<[Arc<LinearGradient>]>>,
+    pub gradients: Option<Arc<[Arc<Gradient>]>>,
     pub white_space: WhiteSpace,
     pub text_align: TextAlign,
     pub direction: Direction,
@@ -251,6 +730,23 @@ pub struct StyleExtras {
 }
 
 static INITIAL_EXTRAS: StyleExtras = StyleExtras {
+    gap_specified: false,
+    grid_auto_columns: None,
+    grid_auto_rows: None,
+    grid_auto_flow: GridAutoFlow {
+        column: false,
+        dense: false,
+    },
+    justify_items: AlignItems::Stretch,
+    justify_self: None,
+    grid_areas: None,
+    grid_area: None,
+    grid_column_names: None,
+    grid_row_names: None,
+    grid_column_spec: None,
+    grid_row_spec: None,
+    grid_columns_subgrid: false,
+    grid_rows_subgrid: false,
     transforms: None,
     transform_origin: [TransformLength {
         pixels: 0.0,
@@ -472,7 +968,7 @@ impl Style {
             line_height: LineHeight::Normal,
             flex_direction: FlexDirection::Row,
             flex_wrap: false,
-            justify_content: JustifyContent::Start,
+            justify_content: JustifyContent::Stretch,
             align_items: AlignItems::Stretch,
             gap: 0.0,
             flex_grow: 0.0,
@@ -616,6 +1112,7 @@ enum Value {
     TextDecoration(u8),
     GradientNone,
     GradientRaw(String),
+
     ContextLength(usize, String, bool),
     MinHeight(f32),
     MaxHeight(Option<f32>),
@@ -663,15 +1160,33 @@ enum Value {
     BoxSizing(BoxSizing),
     TableFixed(bool),
     BorderSpacing(f32),
-    GridColumns(Arc<[GridTrack]>),
-    GridRows(Arc<[GridTrack]>),
+    GridColumns(Arc<[GridTrack]>, Option<Arc<[GridNamedLine]>>, bool),
+    GridRows(Arc<[GridTrack]>, Option<Arc<[GridNamedLine]>>, bool),
+    GridRaw(usize, Arc<str>),
+    GridColumnSpec(Arc<str>),
+    GridRowSpec(Arc<str>),
     GridColumn(GridPlacement),
     GridRow(GridPlacement),
+    GridAutoColumns(Arc<[GridTrack]>),
+    GridAutoRows(Arc<[GridTrack]>),
+    GridAutoFlow(GridAutoFlow),
+    JustifyItems(AlignItems),
+    JustifySelf(Option<AlignItems>),
+    GridAreas(Arc<[GridArea]>),
+    GridArea(Option<Arc<str>>),
 }
 
 impl Value {
     fn slot(&self) -> usize {
         match self {
+            Self::GridRaw(slot, _) => *slot,
+            Self::GridAutoColumns(_) => 61,
+            Self::GridAutoRows(_) => 62,
+            Self::GridAutoFlow(_) => 63,
+            Self::JustifyItems(_) => 64,
+            Self::JustifySelf(_) => 65,
+            Self::GridAreas(_) => 66,
+            Self::GridArea(_) => 67,
             Self::Transforms(_) | Self::TransformRaw(_) => 59,
             Self::TransformOrigin(_) | Self::TransformOriginRaw(_) => 60,
             Self::BorderPattern(_) => 11,
@@ -682,6 +1197,7 @@ impl Value {
             Self::Direction(_) => 56,
             Self::TextDecoration(_) => 57,
             Self::GradientNone | Self::GradientRaw(_) => 53,
+
             Self::ContextLength(slot, _, _) => *slot,
             Self::MinHeight(_) => 51,
             Self::MaxHeight(_) => 52,
@@ -728,10 +1244,10 @@ impl Value {
             Self::BoxSizing(_) => 21,
             Self::TableFixed(_) => 25,
             Self::BorderSpacing(_) => 26,
-            Self::GridColumns(_) => 27,
-            Self::GridRows(_) => 28,
-            Self::GridColumn(_) => 29,
-            Self::GridRow(_) => 30,
+            Self::GridColumns(..) => 27,
+            Self::GridRows(..) => 28,
+            Self::GridColumn(_) | Self::GridColumnSpec(_) => 29,
+            Self::GridRow(_) | Self::GridRowSpec(_) => 30,
         }
     }
     fn apply(&self, style: &mut Style) {
@@ -784,6 +1300,7 @@ impl Value {
                 }
             }
             Self::GradientRaw(_) => unreachable!(),
+
             Self::ContextLength(_, _, _) => unreachable!(),
             Self::MinHeight(v) => style.min_height = *v,
             Self::MaxHeight(v) => style.max_height = *v,
@@ -840,17 +1357,56 @@ impl Value {
             Self::FlexWrap(v) => style.flex_wrap = *v,
             Self::JustifyContent(v) => style.justify_content = *v,
             Self::AlignItems(v) => style.align_items = *v,
-            Self::Gap(v) => style.gap = *v,
+            Self::Gap(v) => {
+                style.gap = *v;
+                style.gap_specified = true;
+            }
             Self::FlexGrow(v) => style.flex_grow = *v,
             Self::FlexShrink(v) => style.flex_shrink = *v,
             Self::FlexBasis(v) => style.flex_basis = *v,
             Self::BoxSizing(v) => style.box_sizing = *v,
             Self::TableFixed(v) => style.table_fixed = *v,
             Self::BorderSpacing(v) => style.border_spacing = *v,
-            Self::GridColumns(v) => style.grid_columns = Some(v.clone()),
-            Self::GridRows(v) => style.grid_rows = Some(v.clone()),
-            Self::GridColumn(v) => style.grid_column = *v,
-            Self::GridRow(v) => style.grid_row = *v,
+            Self::GridRaw(..) => unreachable!(),
+            Self::GridAutoColumns(v) => style.grid_auto_columns = Some(v.clone()),
+            Self::GridAutoRows(v) => style.grid_auto_rows = Some(v.clone()),
+            Self::GridAutoFlow(v) => style.grid_auto_flow = *v,
+            Self::JustifyItems(v) => style.justify_items = *v,
+            Self::JustifySelf(v) => style.justify_self = *v,
+            Self::GridAreas(v) => style.grid_areas = Some(v.clone()),
+            Self::GridArea(v) => style.grid_area = v.clone(),
+            Self::GridColumns(v, names, subgrid) => {
+                style.grid_columns = Some(v.clone());
+                style.grid_column_names = names.clone();
+                style.grid_columns_subgrid = *subgrid;
+            }
+            Self::GridRows(v, names, subgrid) => {
+                style.grid_rows = Some(v.clone());
+                style.grid_row_names = names.clone();
+                style.grid_rows_subgrid = *subgrid;
+            }
+            Self::GridColumn(v) => {
+                style.grid_column = *v;
+                style.grid_column_spec = None;
+            }
+            Self::GridRow(v) => {
+                style.grid_row = *v;
+                style.grid_row_spec = None;
+            }
+            Self::GridColumnSpec(v) => {
+                style.grid_column = GridPlacement {
+                    start: None,
+                    span: 1,
+                };
+                style.grid_column_spec = Some(v.clone());
+            }
+            Self::GridRowSpec(v) => {
+                style.grid_row = GridPlacement {
+                    start: None,
+                    span: 1,
+                };
+                style.grid_row_spec = Some(v.clone());
+            }
         }
     }
 }
@@ -1932,7 +2488,7 @@ struct PropertyRegistration {
     in_all: bool,
 }
 
-const PROPERTY_COUNT: usize = 61;
+const PROPERTY_COUNT: usize = 68;
 
 const fn same_property_name(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
@@ -2075,7 +2631,7 @@ property_registry! {
     "align-self" => [47], false, true;
     "display" => [0], false, true;
     "color" => [1], true, true;
-    "background" => [2, 53], false, true;
+    "background" => [2,53], false, true;
     "background-color" => [2], false, true;
     "background-image" => [53], false, true;
     "box-shadow" => [58], false, true;
@@ -2113,6 +2669,13 @@ property_registry! {
     "table-layout" => [25], false, true;
     "border-spacing" => [26], true, true;
     "grid-template-columns" => [27], false, true;
+    "grid-auto-columns" => [61], false, true;
+    "grid-auto-rows" => [62], false, true;
+    "grid-auto-flow" => [63], false, true;
+    "justify-items" => [64], false, true;
+    "justify-self" => [65], false, true;
+    "grid-template-areas" => [66], false, true;
+    "grid-area" => [67], false, true;
     "grid-template-rows" => [28], false, true;
     "grid-column" => [29], false, true;
     "grid-row" => [30], false, true;
@@ -2161,7 +2724,10 @@ fn copy_slot(slot: usize, from: &Style, to: &mut Style) {
         14 => to.flex_direction = from.flex_direction,
         15 => to.justify_content = from.justify_content,
         16 => to.align_items = from.align_items,
-        17 => to.gap = from.gap,
+        17 => {
+            to.gap = from.gap;
+            to.gap_specified = from.gap_specified;
+        }
         18 => to.flex_grow = from.flex_grow,
         19 => to.flex_shrink = from.flex_shrink,
         20 => to.flex_basis = from.flex_basis,
@@ -2171,10 +2737,31 @@ fn copy_slot(slot: usize, from: &Style, to: &mut Style) {
         24 => to.max_width = from.max_width,
         25 => to.table_fixed = from.table_fixed,
         26 => to.border_spacing = from.border_spacing,
-        27 => to.grid_columns = from.grid_columns.clone(),
-        28 => to.grid_rows = from.grid_rows.clone(),
-        29 => to.grid_column = from.grid_column,
-        30 => to.grid_row = from.grid_row,
+        27 => {
+            to.grid_columns = from.grid_columns.clone();
+            to.grid_column_names = from.grid_column_names.clone();
+            to.grid_columns_subgrid = from.grid_columns_subgrid;
+        }
+        61 => to.grid_auto_columns = from.grid_auto_columns.clone(),
+        62 => to.grid_auto_rows = from.grid_auto_rows.clone(),
+        63 => to.grid_auto_flow = from.grid_auto_flow,
+        64 => to.justify_items = from.justify_items,
+        65 => to.justify_self = from.justify_self,
+        66 => to.grid_areas = from.grid_areas.clone(),
+        67 => to.grid_area = from.grid_area.clone(),
+        28 => {
+            to.grid_rows = from.grid_rows.clone();
+            to.grid_row_names = from.grid_row_names.clone();
+            to.grid_rows_subgrid = from.grid_rows_subgrid;
+        }
+        29 => {
+            to.grid_column = from.grid_column;
+            to.grid_column_spec = from.grid_column_spec.clone();
+        }
+        30 => {
+            to.grid_row = from.grid_row;
+            to.grid_row_spec = from.grid_row_spec.clone();
+        }
         31 => to.opacity = from.opacity,
         32 => to.position = from.position,
         33 => to.float = from.float,
@@ -2389,11 +2976,20 @@ fn gradient_layers(
     raw: &str,
     current_color: Rgba,
     context: Option<LengthContext>,
-) -> Option<Arc<[Arc<LinearGradient>]>> {
+) -> Option<Arc<[Arc<Gradient>]>> {
     let mut layers = Vec::new();
     for layer in comma_components(raw, 8)? {
         if layer != "none" {
-            layers.push(linear_gradient(layer, current_color, context)?);
+            let function = layer.split_once('(')?.0;
+            layers.push(
+                if function.eq_ignore_ascii_case("radial-gradient")
+                    || function.eq_ignore_ascii_case("repeating-radial-gradient")
+                {
+                    radial_gradient(layer, current_color, context)?
+                } else {
+                    linear_gradient(layer, current_color, context)?
+                },
+            );
         }
     }
     Some(layers.into())
@@ -2490,8 +3086,16 @@ fn linear_gradient(
     raw: &str,
     current_color: Rgba,
     context: Option<LengthContext>,
-) -> Option<Arc<LinearGradient>> {
+) -> Option<Arc<Gradient>> {
     let raw = raw.trim();
+    let (repeating, raw) = if raw
+        .get(..10)
+        .is_some_and(|v| v.eq_ignore_ascii_case("repeating-"))
+    {
+        (true, &raw[10..])
+    } else {
+        (false, raw)
+    };
     if raw.len() > MAX_VARIABLE_BYTES || !raw.get(..16)?.eq_ignore_ascii_case("linear-gradient(") {
         return None;
     }
@@ -2572,8 +3176,20 @@ fn linear_gradient(
             }
         }
     }
+    Some(Arc::new(Gradient {
+        kind: GradientKind::Linear { angle, corner },
+        repeating,
+        stops: gradient_stops(&parts[first_stop..], current_color, context)?,
+    }))
+}
+
+fn gradient_stops(
+    parts: &[&str],
+    current_color: Rgba,
+    context: Option<LengthContext>,
+) -> Option<Arc<[GradientStop]>> {
     let mut stops = Vec::new();
-    for part in &parts[first_stop..] {
+    for part in parts {
         let tokens = components(part)?;
         if tokens.is_empty() || tokens.len() > 3 {
             return None;
@@ -2596,6 +3212,11 @@ fn linear_gradient(
                         return None;
                     }
                     GradientPosition::Fraction(value / 100.0)
+                } else if token
+                    .get(..5)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("calc("))
+                {
+                    GradientPosition::Mixed(background_length(token, context?)?)
                 } else {
                     GradientPosition::Pixels(contextual_length(token, context)?)
                 };
@@ -2612,11 +3233,189 @@ fn linear_gradient(
     if stops.len() < 2 {
         return None;
     }
-    Some(Arc::new(LinearGradient {
-        angle,
-        corner,
-        stops: stops.into(),
+    Some(stops.into())
+}
+
+fn background_length(raw: &str, context: LengthContext) -> Option<LengthPercentage> {
+    let value = transform_length(raw, context)?;
+    Some(LengthPercentage {
+        pixels: value.pixels,
+        fraction: value.percent * 0.01,
+    })
+}
+
+fn radial_gradient(
+    raw: &str,
+    current_color: Rgba,
+    context: Option<LengthContext>,
+) -> Option<Arc<Gradient>> {
+    let context = context.unwrap_or(LengthContext {
+        font: 16.0,
+        root_font: 16.0,
+        viewport: MediaEnvironment::default(),
+        percent: None,
+    });
+    let raw = raw.trim();
+    let (repeating, raw) = if raw
+        .get(..10)
+        .is_some_and(|v| v.eq_ignore_ascii_case("repeating-"))
+    {
+        (true, &raw[10..])
+    } else {
+        (false, raw)
+    };
+    if !raw.get(..16)?.eq_ignore_ascii_case("radial-gradient(") {
+        return None;
+    }
+    let parts = comma_components(raw[16..].strip_suffix(')')?, 33)?;
+    let tokens = components(parts[0])?;
+    let (mut shape, mut size, mut radii, mut center) = (
+        None,
+        None,
+        Vec::new(),
+        [LengthPercentage {
+            pixels: 0.0,
+            fraction: 0.5,
+        }; 2],
+    );
+    let first_stop = if color(tokens.first()?).is_some()
+        || tokens.first()?.eq_ignore_ascii_case("currentcolor")
+    {
+        0
+    } else {
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index];
+            if token.eq_ignore_ascii_case("at") {
+                center = background_position(&tokens[index + 1..], context)?;
+                break;
+            }
+            if token.eq_ignore_ascii_case("circle") || token.eq_ignore_ascii_case("ellipse") {
+                if shape.is_some() {
+                    return None;
+                }
+                shape = Some(if token.eq_ignore_ascii_case("circle") {
+                    RadialShape::Circle
+                } else {
+                    RadialShape::Ellipse
+                });
+            } else if let Some(keyword) = match token.to_ascii_lowercase().as_str() {
+                "closest-side" => Some(RadialSize::ClosestSide),
+                "farthest-side" => Some(RadialSize::FarthestSide),
+                "closest-corner" => Some(RadialSize::ClosestCorner),
+                "farthest-corner" => Some(RadialSize::FarthestCorner),
+                _ => None,
+            } {
+                if size.is_some() || !radii.is_empty() {
+                    return None;
+                }
+                size = Some(keyword);
+            } else {
+                if size.is_some() || radii.len() == 2 {
+                    return None;
+                }
+                let value = background_length(token, context)?;
+                if !token.to_ascii_lowercase().starts_with("calc(")
+                    && (value.pixels < 0.0 || value.fraction < 0.0)
+                {
+                    return None;
+                }
+                radii.push(value);
+            }
+            index += 1;
+        }
+        1
+    };
+    let shape = shape.unwrap_or(if radii.len() == 1 {
+        RadialShape::Circle
+    } else {
+        RadialShape::Ellipse
+    });
+    let size = if radii.is_empty() {
+        size.unwrap_or(RadialSize::FarthestCorner)
+    } else if shape == RadialShape::Circle {
+        if radii.len() != 1 || radii[0].fraction != 0.0 {
+            return None;
+        }
+        RadialSize::Radii([radii[0]; 2])
+    } else {
+        if radii.len() != 2 {
+            return None;
+        }
+        RadialSize::Radii([radii[0], radii[1]])
+    };
+    Some(Arc::new(Gradient {
+        kind: GradientKind::Radial {
+            shape,
+            size,
+            center,
+        },
+        repeating,
+        stops: gradient_stops(&parts[first_stop..], current_color, Some(context))?,
     }))
+}
+
+fn background_position(tokens: &[&str], context: LengthContext) -> Option<[LengthPercentage; 2]> {
+    if tokens.is_empty() || tokens.len() > 4 {
+        return None;
+    }
+    let center = LengthPercentage {
+        pixels: 0.0,
+        fraction: 0.5,
+    };
+    if tokens.len() <= 2 {
+        let joined = tokens.join(" ");
+        let values = transform_origin(&joined, context)?;
+        return Some(values.map(|v| LengthPercentage {
+            pixels: v.pixels,
+            fraction: v.percent * 0.01,
+        }));
+    }
+    let mut result = [None, None];
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].to_ascii_lowercase();
+        let (axis, far) = match token.as_str() {
+            "left" => (0, false),
+            "right" => (0, true),
+            "top" => (1, false),
+            "bottom" => (1, true),
+            "center" => {
+                let axis = if result[0].is_none() { 0 } else { 1 };
+                if result[axis].is_some() {
+                    return None;
+                }
+                result[axis] = Some(center);
+                index += 1;
+                continue;
+            }
+            _ => return None,
+        };
+        if result[axis].is_some() {
+            return None;
+        }
+        index += 1;
+        let offset = if index < tokens.len()
+            && !matches!(
+                tokens[index].to_ascii_lowercase().as_str(),
+                "left" | "right" | "top" | "bottom" | "center"
+            ) {
+            let value = background_length(tokens[index], context)?;
+            index += 1;
+            value
+        } else {
+            LengthPercentage::default()
+        };
+        result[axis] = Some(if far {
+            LengthPercentage {
+                pixels: -offset.pixels,
+                fraction: 1.0 - offset.fraction,
+            }
+        } else {
+            offset
+        });
+    }
+    Some([result[0]?, result[1]?])
 }
 
 fn components(raw: &str) -> Option<Vec<&str>> {
@@ -3143,6 +3942,29 @@ fn typed_declarations(input: &str, offset: usize) -> Result<Vec<Declaration>, Cs
             }
             continue;
         }
+        if matches!(
+            name.as_str(),
+            "grid-template-columns" | "grid-template-rows" | "grid-auto-columns" | "grid-auto-rows"
+        ) {
+            let context = LengthContext {
+                font: 16.0,
+                root_font: 16.0,
+                viewport: MediaEnvironment::default(),
+                percent: None,
+            };
+            let valid = if name.starts_with("grid-auto-") {
+                grid_tracks(raw, context).is_some_and(|v| !v.is_empty())
+            } else {
+                grid_template(raw, context).is_some()
+            };
+            if valid {
+                out.push(Declaration {
+                    value: Value::GridRaw(slots(&name)[0], Arc::from(raw)),
+                    important,
+                });
+            }
+            continue;
+        }
         let value = match name.as_str() {
             "white-space" => match raw {
                 "normal" => Some(Value::WhiteSpace(WhiteSpace::Normal)),
@@ -3353,9 +4175,8 @@ fn typed_declarations(input: &str, offset: usize) -> Result<Vec<Declaration>, Cs
                 _ => None,
             },
             "justify-content" => match raw {
-                "normal" | "start" | "flex-start" => {
-                    Some(Value::JustifyContent(JustifyContent::Start))
-                }
+                "normal" | "stretch" => Some(Value::JustifyContent(JustifyContent::Stretch)),
+                "start" | "flex-start" => Some(Value::JustifyContent(JustifyContent::Start)),
                 "end" | "flex-end" => Some(Value::JustifyContent(JustifyContent::End)),
                 "center" => Some(Value::JustifyContent(JustifyContent::Center)),
                 "space-between" => Some(Value::JustifyContent(JustifyContent::SpaceBetween)),
@@ -3371,10 +4192,63 @@ fn typed_declarations(input: &str, offset: usize) -> Result<Vec<Declaration>, Cs
                 _ => None,
             },
             "gap" => nonnegative_length(raw).map(Value::Gap),
-            "grid-template-columns" => grid_tracks(raw).map(Value::GridColumns),
-            "grid-template-rows" => grid_tracks(raw).map(Value::GridRows),
-            "grid-column" => grid_placement(raw).map(Value::GridColumn),
-            "grid-row" => grid_placement(raw).map(Value::GridRow),
+            "grid-auto-flow" => {
+                let parts: Vec<_> = raw.split_ascii_whitespace().collect();
+                if parts.is_empty()
+                    || parts.len() > 2
+                    || parts
+                        .iter()
+                        .any(|v| !matches!(*v, "row" | "column" | "dense"))
+                    || (parts.contains(&"row") && parts.contains(&"column"))
+                {
+                    None
+                } else {
+                    Some(Value::GridAutoFlow(GridAutoFlow {
+                        column: parts.contains(&"column"),
+                        dense: parts.contains(&"dense"),
+                    }))
+                }
+            }
+            "justify-items" | "justify-self" => {
+                let alignment = match raw {
+                    "normal" | "stretch" => Some(AlignItems::Stretch),
+                    "start" | "flex-start" => Some(AlignItems::Start),
+                    "end" | "flex-end" => Some(AlignItems::End),
+                    "center" => Some(AlignItems::Center),
+                    _ => None,
+                };
+                if name == "justify-self" && raw == "auto" {
+                    Some(Value::JustifySelf(None))
+                } else {
+                    alignment.map(|v| {
+                        if name == "justify-items" {
+                            Value::JustifyItems(v)
+                        } else {
+                            Value::JustifySelf(Some(v))
+                        }
+                    })
+                }
+            }
+            "grid-template-areas" => grid_areas(raw).map(Value::GridAreas),
+            "grid-area" => {
+                if raw == "auto" {
+                    Some(Value::GridArea(None))
+                } else if raw.len() <= 128
+                    && raw
+                        .bytes()
+                        .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'-' | b'_'))
+                {
+                    Some(Value::GridArea(Some(Arc::from(raw))))
+                } else {
+                    None
+                }
+            }
+            "grid-column" => grid_placement(raw)
+                .map(Value::GridColumn)
+                .or_else(|| grid_line_spec(raw).then(|| Value::GridColumnSpec(Arc::from(raw)))),
+            "grid-row" => grid_placement(raw)
+                .map(Value::GridRow)
+                .or_else(|| grid_line_spec(raw).then(|| Value::GridRowSpec(Arc::from(raw)))),
             "opacity" => raw
                 .parse::<f32>()
                 .ok()
@@ -4343,6 +5217,33 @@ fn compute_for(
                     if slot == 10 && !inherit {
                         style.border_color = style.color;
                     }
+                } else if let Value::GridRaw(slot, raw) = &declaration.value {
+                    let context = LengthContext {
+                        font: style.font_size,
+                        root_font: style.root_font_size,
+                        viewport: index.environment,
+                        percent: None,
+                    };
+                    let value = match slot {
+                        27 | 28 => grid_template(raw, context).map(|(tracks, names, subgrid)| {
+                            if *slot == 27 {
+                                Value::GridColumns(tracks, names, subgrid)
+                            } else {
+                                Value::GridRows(tracks, names, subgrid)
+                            }
+                        }),
+                        61 | 62 => grid_tracks(raw, context).map(|tracks| {
+                            if *slot == 61 {
+                                Value::GridAutoColumns(tracks)
+                            } else {
+                                Value::GridAutoRows(tracks)
+                            }
+                        }),
+                        _ => None,
+                    };
+                    if let Some(value) = value {
+                        value.apply(&mut style);
+                    }
                 } else if matches!(
                     declaration.value,
                     Value::TransformRaw(_) | Value::TransformOriginRaw(_)
@@ -4517,14 +5418,16 @@ mod tests {
                 "{invalid}"
             );
         }
-        assert!(compute(
-            &element("transform:none;transform-origin:50% 50%"),
-            None,
-            &index
-        )
-        .unwrap()
-        .extras
-        .is_none());
+        assert!(
+            compute(
+                &element("transform:none;transform-origin:50% 50%"),
+                None,
+                &index
+            )
+            .unwrap()
+            .extras
+            .is_none()
+        );
         assert_eq!(core::mem::size_of::<Style>(), 200);
     }
 
@@ -4663,10 +5566,12 @@ mod tests {
     #[test]
     fn optional_style_state_is_lazy_and_flex_controls_cascade() {
         let index = StyleIndex::new(Vec::new());
-        assert!(compute(&element("color:red;width:5px"), None, &index)
-            .unwrap()
-            .extras
-            .is_none());
+        assert!(
+            compute(&element("color:red;width:5px"), None, &index)
+                .unwrap()
+                .extras
+                .is_none()
+        );
         let style = compute(&element("align-self:center;order:-2;align-content:space-around;flex-wrap:wrap-reverse;margin:1px auto;margin-left:3px"),None,&index).unwrap();
         assert_eq!(style.align_self, Some(AlignItems::Center));
         assert_eq!(style.order, -2);
@@ -4721,10 +5626,12 @@ mod tests {
                 .width,
             Some(24.0)
         );
-        assert!(compute(&element("color:red;width:5px"), None, &index)
-            .unwrap()
-            .extras
-            .is_none());
+        assert!(
+            compute(&element("color:red;width:5px"), None, &index)
+                .unwrap()
+                .extras
+                .is_none()
+        );
     }
 
     #[test]
@@ -4752,7 +5659,13 @@ mod tests {
         let index = StyleIndex::new(Vec::new());
         let style = compute(&element("background-image:linear-gradient(to right bottom, currentColor 1em 25%, rgba(0, 0, 255, 0.5), red 120%);font-size:10px;color:green"),None,&index).unwrap();
         let gradient = &style.gradients.as_ref().unwrap()[0];
-        assert_eq!(gradient.corner, Some((1, -1)));
+        assert_eq!(
+            gradient.kind,
+            GradientKind::Linear {
+                angle: 180.0,
+                corner: Some((1, -1))
+            }
+        );
         assert_eq!(gradient.stops.len(), 4);
         assert_eq!(gradient.stops[0].color, color("green").unwrap());
         assert_eq!(
@@ -4776,21 +5689,28 @@ mod tests {
             .unwrap()
             .first()
             .unwrap()
-            .angle,
-            90.0
+            .kind,
+            GradientKind::Linear {
+                angle: 90.0,
+                corner: None
+            }
         );
-        assert!(compute(
-            &element("background:linear-gradient(red,blue);background:red"),
-            None,
-            &index
-        )
-        .unwrap()
-        .gradients
-        .is_none());
-        assert!(compute(&element("background:red;width:5px"), None, &index)
+        assert!(
+            compute(
+                &element("background:linear-gradient(red,blue);background:red"),
+                None,
+                &index
+            )
             .unwrap()
-            .extras
-            .is_none());
+            .gradients
+            .is_none()
+        );
+        assert!(
+            compute(&element("background:red;width:5px"), None, &index)
+                .unwrap()
+                .extras
+                .is_none()
+        );
         for raw in [
             "linear-gradient(to left right,red,blue)",
             "linear-gradient(red)",
@@ -4816,7 +5736,13 @@ mod tests {
         let layers = style.gradients.as_ref().unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[0].stops[0].color, color("green").unwrap());
-        assert_eq!(layers[1].angle, 90.0);
+        assert_eq!(
+            layers[1].kind,
+            GradientKind::Linear {
+                angle: 90.0,
+                corner: None
+            }
+        );
         let raw = ["linear-gradient(red,blue)"; 9].join(",");
         assert!(gradient_layers(&raw, Style::initial().color, None).is_none());
         assert_eq!(
@@ -4889,14 +5815,16 @@ mod tests {
             );
         }
         assert!(box_shadows(&["1px 2px"; 17].join(","), Style::initial().color, None).is_none());
-        assert!(compute(
-            &element("box-shadow:none;background:red;width:5px"),
-            None,
-            &index
-        )
-        .unwrap()
-        .extras
-        .is_none());
+        assert!(
+            compute(
+                &element("box-shadow:none;background:red;width:5px"),
+                None,
+                &index
+            )
+            .unwrap()
+            .extras
+            .is_none()
+        );
         assert_eq!(core::mem::size_of::<Style>(), 200);
     }
 
@@ -5065,10 +5993,12 @@ mod tests {
             .border_color,
             color("red").unwrap()
         );
-        assert!(compute(&element("border:1px solid red"), None, &index)
-            .unwrap()
-            .extras
-            .is_none());
+        assert!(
+            compute(&element("border:1px solid red"), None, &index)
+                .unwrap()
+                .extras
+                .is_none()
+        );
     }
 
     #[test]
@@ -5269,9 +6199,11 @@ mod tests {
     #[test]
     fn selector_lists_invalidate_the_whole_rule() {
         for selector in ["p, :unknown", "p,", ",p", "p, .1bad"] {
-            assert!(parse(&alloc::format!("{selector} {{ color:red }}"))
-                .unwrap()
-                .is_empty());
+            assert!(
+                parse(&alloc::format!("{selector} {{ color:red }}"))
+                    .unwrap()
+                    .is_empty()
+            );
         }
         assert_eq!(parse("[title='a,b'], p {color:red}").unwrap().len(), 2);
         assert_eq!(parse(r".a\,b, p {color:red}").unwrap().len(), 2);

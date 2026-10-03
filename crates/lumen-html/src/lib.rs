@@ -11,6 +11,8 @@ pub mod paint;
 pub mod selector;
 pub mod session;
 pub mod observe;
+pub mod shadow;
+pub use shadow::ShadowMode;
 
 use alloc::{rc::Rc, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -139,6 +141,7 @@ pub struct Document {
     max_nodes: usize,
     journal: Vec<Mutation>,
     mutation_sink: Option<Rc<dyn Fn(&Document, &observe::ObservedMutation)>>,
+    shadow_trees: Vec<shadow::ShadowTree>,
 }
 
 impl Document {
@@ -163,6 +166,7 @@ impl Document {
             max_nodes: max_nodes.max(1),
             journal: Vec::new(),
             mutation_sink: None,
+            shadow_trees: Vec::new(),
         }
     }
 
@@ -274,6 +278,7 @@ impl Document {
     }
 
     fn host_including_parent(&self, id: NodeId) -> Result<Option<NodeId>, Error> {
+        if let Some(host) = self.shadow_host(id)? { return Ok(Some(host)); }
         if matches!(self.kind(id)?, NodeKind::DocumentFragment) {
             let index = self.nodes[id.index()].template_content;
             if index != NO_LINK { return Ok(Some(NodeId { document: self.id, index, generation: self.nodes[index as usize].generation })); }
@@ -283,11 +288,12 @@ impl Document {
 
     /// Reclaim a detached subtree; its old IDs become invalid.
     pub fn destroy_subtree(&mut self, root: NodeId) -> Result<(), Error> {
-        if root == self.root() || self.parent(root)?.is_some() {
+        if root == self.root() || self.parent(root)?.is_some() || self.shadow_host(root)?.is_some() {
             return Err(Error::Hierarchy);
         }
         let mut pending = alloc::vec![root];
         while let Some(id) = pending.pop() {
+            if let Some(index) = self.shadow_trees.iter().position(|tree| tree.host == id) { pending.push(self.shadow_trees.remove(index).root); }
             if let Some(content) = self.template_content(id)? { pending.push(content); }
             let mut child = self.first_child(id)?;
             while let Some(next) = child {
@@ -318,7 +324,7 @@ impl Document {
 
     /// Clone a detached subtree. Only attaching the result invalidates the document.
     pub fn clone_subtree(&mut self, source: NodeId) -> Result<NodeId, Error> {
-        if matches!(self.kind(source)?, NodeKind::Document) {
+        if matches!(self.kind(source)?, NodeKind::Document) || self.shadow_host(source)?.is_some() {
             return Err(Error::Hierarchy);
         }
         let mut pending = alloc::vec![source];
@@ -461,7 +467,7 @@ impl Document {
                 node.dirty.0 |= level.0;
                 node.parent
             };
-            if let Some(parent) = self.link_id(parent_index) {
+            if let Some(parent) = self.link_id(parent_index).or_else(|| self.shadow_trees.iter().find(|tree| tree.root == id).map(|tree| tree.host)) {
                 id = parent;
             } else {
                 break;

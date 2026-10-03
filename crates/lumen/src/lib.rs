@@ -340,6 +340,13 @@ pub fn collect_disposed_realms() {
     collect_quiescent_realms();
 }
 
+/// Executable memory is short (an embedder's arena shared by several realms): ask every engine
+/// to release the JIT code it has not run recently at its next safe point. Callable from any
+/// thread; each engine frees only its own code, so no engine's running code is ever released.
+pub fn request_jit_trim() {
+    lumen_os::jitmem::request_exec_trim();
+}
+
 /// Evict native code while retaining bytecode and realm state.
 ///
 /// # Safety

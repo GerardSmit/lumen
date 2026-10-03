@@ -728,6 +728,13 @@ fn load_program_impl(
         target.builtin_modules_hash = [
             crate::target::EMPTY_BUILTIN_MODULES_HASH,
             crate::target::PARALLEL_BUILTIN_MODULES_HASH,
+            lumen_common::aot::builtin_catalog::hash(
+                lumen_common::aot::builtin_catalog::Features {
+                    parallel: true,
+                    bitnest_process: true,
+                    ..Default::default()
+                },
+            ),
         ]
         .into_iter()
         .find(|hash| {

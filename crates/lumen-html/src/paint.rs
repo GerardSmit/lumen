@@ -34,6 +34,9 @@ impl ImageData {
 
 pub trait TextShaper {
     fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()>;
+    fn shape_directional(&self, text: &str, size: f32, _rtl: bool) -> Result<ShapedRun, ()> {
+        self.shape(text, size)
+    }
     fn measure(&self, text: &str, size: f32) -> Result<f32, ()> {
         self.shape(text, size).map(|run| run.width)
     }
@@ -91,18 +94,104 @@ pub struct Rgba {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LinearGradient {
-    /// CSS degrees: zero points up, 90 points right.
-    pub angle: f32,
-    /// `to <horizontal> <vertical>` uses box-dependent magic corners.
-    pub corner: Option<(i8, i8)>,
+pub struct Gradient {
+    pub kind: GradientKind,
+    pub repeating: bool,
     pub stops: Arc<[GradientStop]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientKind {
+    /// CSS degrees: zero points up; corner directions use box-dependent angles.
+    Linear {
+        angle: f32,
+        corner: Option<(i8, i8)>,
+    },
+    Radial {
+        shape: RadialShape,
+        size: RadialSize,
+        center: [LengthPercentage; 2],
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RadialShape {
+    Circle,
+    Ellipse,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadialSize {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+    Radii([LengthPercentage; 2]),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LengthPercentage {
+    pub pixels: f32,
+    pub fraction: f32,
+}
+impl LengthPercentage {
+    pub fn resolve(self, basis: f32) -> f32 {
+        self.pixels + self.fraction * basis
+    }
+    fn is_finite(self) -> bool {
+        self.pixels.is_finite() && self.fraction.is_finite()
+    }
+}
+impl Gradient {
+    pub fn is_valid(&self) -> bool {
+        let valid_kind = match self.kind {
+            GradientKind::Linear { angle, corner } => {
+                angle.is_finite()
+                    && !corner.is_some_and(|(x, y)| !matches!(x, -1 | 1) || !matches!(y, -1 | 1))
+            }
+            GradientKind::Radial {
+                shape,
+                size,
+                center,
+            } => {
+                center.iter().all(|v| v.is_finite())
+                    && match size {
+                        RadialSize::Radii(radii) => {
+                            radii
+                                .iter()
+                                .all(|v| v.is_finite() && (v.fraction != 0.0 || v.pixels >= 0.0))
+                                && (shape != RadialShape::Circle
+                                    || radii[0] == radii[1] && radii[0].fraction == 0.0)
+                        }
+                        _ => true,
+                    }
+            }
+        };
+        valid_kind
+            && (2..=32).contains(&self.stops.len())
+            && self.stops.iter().all(|stop| match stop.position {
+                Some(GradientPosition::Fraction(v) | GradientPosition::Pixels(v)) => v.is_finite(),
+                Some(GradientPosition::Mixed(v)) => v.is_finite(),
+                None => true,
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+    Space,
+    Round,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackgroundPaint {
+    Gradient(Arc<Gradient>),
+    Image(Arc<ImageData>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GradientPosition {
     Fraction(f32),
     Pixels(f32),
+    Mixed(LengthPercentage),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -325,10 +414,18 @@ pub enum Command {
         radius: f32,
         color: Rgba,
     },
-    FillLinearGradient {
+    FillGradient {
         rect: Rect,
         radius: f32,
-        gradient: Arc<LinearGradient>,
+        gradient: Arc<Gradient>,
+    },
+    FillBackground {
+        rect: Rect,
+        radius: f32,
+        positioning_rect: Rect,
+        image_rect: Rect,
+        repeat: [BackgroundRepeat; 2],
+        image: BackgroundPaint,
     },
     BoxShadow {
         rect: Rect,
@@ -378,7 +475,16 @@ pub trait ReplaySink {
     fn pop_clip(&mut self);
     fn fill_rect(&mut self, rect: Rect, color: Rgba);
     fn fill_rounded_rect(&mut self, rect: Rect, radius: f32, color: Rgba);
-    fn fill_linear_gradient(&mut self, rect: Rect, radius: f32, gradient: &LinearGradient);
+    fn fill_gradient(&mut self, rect: Rect, radius: f32, gradient: &Gradient);
+    fn fill_background(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        positioning_rect: Rect,
+        image_rect: Rect,
+        repeat: [BackgroundRepeat; 2],
+        image: &BackgroundPaint,
+    );
     fn draw_shadow(&mut self, rect: Rect, radius: f32, shadow: BoxShadow);
     fn stroke_border(&mut self, rect: Rect, radius: f32, width: f32, color: Rgba);
     fn stroke_pattern_border(
@@ -421,7 +527,8 @@ impl DisplayList {
                 | Command::PushLayer { rect, .. }
                 | Command::FillRect { rect, .. }
                 | Command::FillRoundedRect { rect, .. }
-                | Command::FillLinearGradient { rect, .. }
+                | Command::FillGradient { rect, .. }
+                | Command::FillBackground { rect, .. }
                 | Command::BoxShadow { rect, .. }
                 | Command::StrokeBorder { rect, .. }
                 | Command::StrokePatternBorder { rect, .. }
@@ -466,27 +573,40 @@ impl DisplayList {
                             return Err(ReplayError::InvalidGeometry);
                         }
                     }
-                    if let Command::FillLinearGradient {
+                    if let Command::FillGradient {
                         radius, gradient, ..
+                    } = command
+                    {
+                        if !radius.is_finite() || *radius < 0.0 || !gradient.is_valid() {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::FillBackground {
+                        radius,
+                        positioning_rect,
+                        image_rect,
+                        image,
+                        ..
                     } = command
                     {
                         if !radius.is_finite()
                             || *radius < 0.0
-                            || !gradient.angle.is_finite()
-                            || gradient.stops.len() < 2
-                            || gradient.stops.len() > 32
-                            || gradient
-                                .corner
-                                .is_some_and(|(x, y)| !matches!(x, -1 | 1) || !matches!(y, -1 | 1))
-                            || gradient.stops.iter().any(|stop| match stop.position {
-                                Some(
-                                    GradientPosition::Fraction(value)
-                                    | GradientPosition::Pixels(value),
-                                ) => !value.is_finite(),
-                                None => false,
+                            || [positioning_rect, image_rect].iter().any(|r| {
+                                ![r.x, r.y, r.width, r.height].iter().all(|v| v.is_finite())
+                                    || r.width < 0.0
+                                    || r.height < 0.0
                             })
                         {
                             return Err(ReplayError::InvalidGeometry);
+                        }
+                        match image {
+                            BackgroundPaint::Gradient(gradient) if !gradient.is_valid() => {
+                                return Err(ReplayError::InvalidGeometry);
+                            }
+                            BackgroundPaint::Image(image) if !image.is_valid() => {
+                                return Err(ReplayError::InvalidImage);
+                            }
+                            _ => {}
                         }
                     }
                     if let Command::StrokeBorder { radius, width, .. }
@@ -584,11 +704,21 @@ impl DisplayList {
                     sink.fill_rounded_rect(rect, radius, color)
                 }
                 Command::FillRoundedRect { .. } => {}
-                Command::FillLinearGradient {
+                Command::FillGradient {
                     rect,
                     radius,
                     ref gradient,
-                } => sink.fill_linear_gradient(rect, radius, gradient),
+                } => sink.fill_gradient(rect, radius, gradient),
+                Command::FillBackground {
+                    rect,
+                    radius,
+                    positioning_rect,
+                    image_rect,
+                    repeat,
+                    ref image,
+                } => {
+                    sink.fill_background(rect, radius, positioning_rect, image_rect, repeat, image)
+                }
                 Command::BoxShadow {
                     rect,
                     radius,

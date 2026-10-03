@@ -73,9 +73,13 @@ std::thread_local! {
     static LAST_FAILED: Cell<usize> = const { Cell::new(0) };
 }
 
-fn exhausted(len: usize) -> String {
+/// A failed allocation asks the other engines to trim, unless only a thread budget (a stand-in
+/// for an arena no one else shares) ran out.
+fn exhausted(len: usize, shared: bool) -> String {
     LAST_FAILED.with(|l| l.set(len));
-    request_exec_trim();
+    if shared {
+        request_exec_trim();
+    }
     EXEC_EXHAUSTED.into()
 }
 
@@ -100,7 +104,7 @@ impl ExecMemory {
         if let Some(b) = &budget {
             if b.used.fetch_add(len, Ordering::Relaxed) + len > b.limit {
                 b.used.fetch_sub(len, Ordering::Relaxed);
-                return Err(exhausted(len));
+                return Err(exhausted(len, false));
             }
         }
         let release = |budget: &Option<Arc<Budget>>| {
@@ -111,7 +115,7 @@ impl ExecMemory {
         let ptr = unsafe { sys::alloc(len) };
         if ptr.is_null() {
             release(&budget);
-            return Err(exhausted(len));
+            return Err(exhausted(len, true));
         }
         fill(
             unsafe { std::slice::from_raw_parts_mut(ptr, len) },
@@ -481,4 +485,33 @@ mod sys {
         false
     }
     pub unsafe fn free_exec(_mem: *mut u8, _len: usize) {}
+}
+
+#[cfg(all(test, any(windows, unix)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_limit_fails_allocation_past_the_budget_and_counts_frees() {
+        set_thread_exec_limit(Some(300));
+        let trim = exec_trim_generation();
+        let a = ExecMemory::new(&[0xc3; 200]).unwrap();
+        let freed = exec_freed_generation();
+        assert_eq!(ExecMemory::new(&[0xc3; 200]).err().as_deref(), Some(EXEC_EXHAUSTED));
+        assert_eq!(last_failed_len(), 200);
+        assert_eq!(exec_trim_generation(), trim, "a thread budget is not arena pressure");
+        drop(a);
+        assert!(exec_freed_generation() > freed);
+        let b = ExecMemory::new(&[0xc3; 200]).unwrap();
+        set_thread_exec_limit(None);
+        drop(b);
+        assert!(ExecMemory::new(&[0xc3; 4096]).is_ok());
+    }
+
+    #[test]
+    fn requesting_a_trim_moves_the_generation() {
+        let before = exec_trim_generation();
+        request_exec_trim();
+        assert!(exec_trim_generation() > before);
+    }
 }

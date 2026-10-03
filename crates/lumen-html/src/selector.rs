@@ -89,7 +89,7 @@ pub fn query_selector_all(
     Ok(result)
 }
 
-fn next_descendant(document: &Document, root: NodeId, id: NodeId) -> Result<Option<NodeId>, Error> {
+pub(crate) fn next_descendant(document: &Document, root: NodeId, id: NodeId) -> Result<Option<NodeId>, Error> {
     if let Some(child) = document.first_child(id)? {
         return Ok(Some(child));
     }

@@ -97,7 +97,7 @@ pub(crate) fn install_data_props(
 
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (startup_args().to_vec(), std::env::vars().collect()),
+        None => (startup_args().to_vec(), std::env::vars().filter(|(key, _)| public_environment_key(key)).collect()),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -118,7 +118,7 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
 
-    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
+    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("invalid startup environment (invalid key/value or realm limit exceeded)"));
 
     #[cfg(target_arch = "wasm32")]
     let (os_name, arch_name) = ("linux", "wasm32");
@@ -149,6 +149,22 @@ pub(crate) fn install_data_props(
 
 /// js/env_proxy.js, precompiled by build.rs.
 const ENV_PROXY_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/env_proxy.aot"));
+
+fn public_environment_key(key: &str) -> bool {
+    // Windows stores per-drive working directories under hidden names such as
+    // `=C:`. These are OS bookkeeping, not process.env keys.
+    !cfg!(windows) || !key.starts_with('=')
+}
+
+#[cfg(test)]
+mod startup_environment_tests {
+    #[test]
+    fn windows_drive_state_is_not_a_public_environment_variable() {
+        assert!(super::public_environment_key("PATH"));
+        assert!(super::public_environment_key("LUMEN_TEST"));
+        assert_eq!(super::public_environment_key("=C:"), !cfg!(windows));
+    }
+}
 
 /// `(chunk)` — write raw bytes to stdout (no trailing newline, unlike `console.log`). A typed
 /// array is written as-is; anything else is coerced to a string. Backs `process.stdout.write`.

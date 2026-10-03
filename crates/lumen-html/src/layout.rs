@@ -1,11 +1,11 @@
 //! Block formatting into a typed display list in CSS pixels.
 use crate::{
+    Document, Namespace, NodeId, NodeKind,
     css::{
         self, AlignItems, BoxSizing, Clear, Direction, Display, FlexDirection, Float,
         JustifyContent, LineHeight, Position, Style, StyleIndex, TextAlign, WhiteSpace,
     },
     paint::{Command, DisplayList, ImageData, Rect, Rgba, TextShaper},
-    Document, Namespace, NodeId, NodeKind,
 };
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
@@ -328,6 +328,181 @@ fn background_bleed_inset(style: &Style) -> f32 {
     }
 }
 
+fn grid_track_sizes(
+    definitions: &[css::GridTrack],
+    count: usize,
+    available: Option<f32>,
+    gap: f32,
+    stretch: bool,
+    contributions: impl Iterator<Item = (usize, usize, f32, f32)>,
+) -> [f32; css::MAX_GRID_TRACKS] {
+    use css::{GridBreadth as B, GridTrack as T, MAX_GRID_TRACKS};
+    let mut sizes = [0.0f32; MAX_GRID_TRACKS];
+    let mut limits = [f32::INFINITY; MAX_GRID_TRACKS];
+    let fixed = |breadth| match breadth {
+        B::Pixels(v) => Some(v),
+        B::Percentage(v) => available.map(|size| size * v / 100.0),
+        B::Length(px, pct) => available.map(|size| px + size * pct / 100.0),
+        _ => None,
+    };
+    for i in 0..count {
+        let track = definitions.get(i).copied().unwrap_or(T::Auto);
+        sizes[i] = fixed(track.minimum()).unwrap_or(0.0);
+        limits[i] = fixed(track.maximum())
+            .unwrap_or(f32::INFINITY)
+            .max(sizes[i]);
+    }
+    for (start, span, min, max) in contributions {
+        for maximum in [false, true] {
+            let eligible = |i: usize| {
+                let track = definitions.get(i).copied().unwrap_or(T::Auto);
+                let breadth = if maximum {
+                    track.maximum()
+                } else {
+                    track.minimum()
+                };
+                if maximum {
+                    matches!(breadth, B::MaxContent | B::Auto | B::MinContent)
+                        && !matches!(track, T::MinMax(_, B::Fraction(_)))
+                } else {
+                    matches!(breadth, B::Auto | B::MinContent | B::MaxContent)
+                        || matches!(breadth, B::Percentage(_)) && available.is_none()
+                }
+            };
+            let current = sizes[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+            let breadth = if maximum {
+                definitions.get(start).copied().unwrap_or(T::Auto).maximum()
+            } else {
+                definitions.get(start).copied().unwrap_or(T::Auto).minimum()
+            };
+            let target = if span == 1 && matches!(breadth, B::MinContent) {
+                min
+            } else if maximum || span == 1 && matches!(breadth, B::MaxContent) {
+                max
+            } else {
+                min
+            };
+            let mut extra = (target - current).max(0.0);
+            for _ in 0..span {
+                let eligible_count = (start..start + span)
+                    .filter(|i| eligible(*i) && sizes[*i] < limits[*i])
+                    .count();
+                if eligible_count == 0 || extra <= 0.0 {
+                    break;
+                }
+                let share = extra / eligible_count as f32;
+                for i in start..start + span {
+                    if eligible(i) && sizes[i] < limits[i] {
+                        let added = share.min(limits[i] - sizes[i]);
+                        sizes[i] += added;
+                        extra -= added;
+                    }
+                }
+            }
+        }
+        for i in start..start + span {
+            if let Some(T::FitContent(limit)) = definitions.get(i) {
+                sizes[i] = sizes[i].min(limit.max(min / span as f32));
+            }
+        }
+    }
+    if let Some(available) = available {
+        let mut extra =
+            (available - sizes[..count].iter().sum::<f32>() - gap * count.saturating_sub(1) as f32)
+                .max(0.0);
+        for _ in 0..count {
+            let growing = (0..count)
+                .filter(|i| limits[*i].is_finite() && sizes[*i] < limits[*i])
+                .count();
+            if growing == 0 || extra <= 0.0 {
+                break;
+            }
+            let share = extra / growing as f32;
+            for i in 0..count {
+                if limits[i].is_finite() && sizes[i] < limits[i] {
+                    let added = share.min(limits[i] - sizes[i]);
+                    sizes[i] += added;
+                    extra -= added;
+                }
+            }
+        }
+        let mut frozen = [false; MAX_GRID_TRACKS];
+        for _ in 0..=count {
+            let mut used = gap * count.saturating_sub(1) as f32;
+            let mut fractions = 0.0;
+            for i in 0..count {
+                match definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
+                    B::Fraction(v) if !frozen[i] => fractions += v,
+                    _ => used += sizes[i],
+                }
+            }
+            if fractions == 0.0 {
+                break;
+            }
+            let unit = ((available - used).max(0.0) / fractions.max(1.0)).max(0.0);
+            let mut changed = false;
+            for i in 0..count {
+                if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
+                    if !frozen[i] && sizes[i] > unit * v {
+                        frozen[i] = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                for i in 0..count {
+                    if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum()
+                    {
+                        if !frozen[i] {
+                            sizes[i] = unit * v;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if stretch {
+            let extra = (available
+                - sizes[..count].iter().sum::<f32>()
+                - gap * count.saturating_sub(1) as f32)
+                .max(0.0);
+            let autos = (0..count)
+                .filter(|i| {
+                    matches!(
+                        definitions.get(*i).copied().unwrap_or(T::Auto),
+                        T::Auto | T::MinMax(_, B::Auto)
+                    )
+                })
+                .count();
+            if autos > 0 {
+                for i in 0..count {
+                    if matches!(
+                        definitions.get(i).copied().unwrap_or(T::Auto),
+                        T::Auto | T::MinMax(_, B::Auto)
+                    ) {
+                        sizes[i] += extra / autos as f32;
+                    }
+                }
+            }
+        }
+    } else {
+        let unit = (0..count)
+            .filter_map(
+                |i| match definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
+                    B::Fraction(v) if v > 0.0 => Some(sizes[i] / v.max(1.0)),
+                    _ => None,
+                },
+            )
+            .fold(0.0f32, f32::max);
+        for i in 0..count {
+            if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
+                sizes[i] = sizes[i].max(unit * v);
+            }
+        }
+    }
+    sizes
+}
+
 fn has_background(style: &Style) -> bool {
     style.background.a != 0 || style.gradients.is_some() || style.shadows.is_some()
 }
@@ -451,11 +626,22 @@ fn constrained_height(style: &Style, content: f32) -> f32 {
 fn move_command(command: &mut Command, dx: f32, dy: f32) {
     match command {
         Command::PushTransform(matrix) => *matrix = matrix.translated_space(dx, dy),
+        Command::FillBackground {
+            rect,
+            positioning_rect,
+            image_rect,
+            ..
+        } => {
+            for rect in [rect, positioning_rect, image_rect] {
+                rect.x += dx;
+                rect.y += dy;
+            }
+        }
         Command::PushClip(rect)
         | Command::PushLayer { rect, .. }
         | Command::FillRect { rect, .. }
         | Command::FillRoundedRect { rect, .. }
-        | Command::FillLinearGradient { rect, .. }
+        | Command::FillGradient { rect, .. }
         | Command::BoxShadow { rect, .. }
         | Command::StrokeBorder { rect, .. }
         | Command::StrokePatternBorder { rect, .. }
@@ -580,7 +766,7 @@ impl Layout<'_> {
                 height: (rect.height - 2.0 * border).max(0.0),
             };
             for gradient in gradients.iter().rev() {
-                self.push_command(Command::FillLinearGradient {
+                self.push_command(Command::FillGradient {
                     rect,
                     radius: (style.border_radius - border).max(0.0),
                     gradient: gradient.clone(),
@@ -625,7 +811,7 @@ impl Layout<'_> {
         let first = index + 1 - background_paints(style);
         for command in &mut self.commands[first..=index] {
             match command {
-                Command::FillLinearGradient { rect, .. } => *rect = padding_rect,
+                Command::FillGradient { rect, .. } => *rect = padding_rect,
                 Command::BoxShadow {
                     rect: target,
                     shadow,
@@ -850,9 +1036,15 @@ impl Layout<'_> {
             }
         }
         for cell in cells {
-            let cx = ox + inset + spacing + xs[cell.col];
             let cy = oy + inset + spacing + ys[cell.row];
             let cw = xs[cell.col + cell.cols] - xs[cell.col] - spacing;
+            let cx = ox
+                + inset
+                + if style.direction == Direction::Rtl {
+                    width - spacing - xs[cell.col] - cw
+                } else {
+                    spacing + xs[cell.col]
+                };
             let ch = ys[cell.row + cell.rows] - ys[cell.row] - spacing;
             let mut computed = cell.style;
             computed.display = Display::Block;
@@ -871,6 +1063,16 @@ impl Layout<'_> {
         style: &Style,
         depth: usize,
     ) -> Result<(f32, f32), LayoutError> {
+        self.intrinsic_size_mode(id, style, depth, false)
+    }
+
+    fn intrinsic_size_mode(
+        &self,
+        id: NodeId,
+        style: &Style,
+        depth: usize,
+        minimum: bool,
+    ) -> Result<(f32, f32), LayoutError> {
         if depth > 512 {
             return Err(LayoutError::DepthLimit);
         }
@@ -880,6 +1082,22 @@ impl Layout<'_> {
             .map_err(|_| LayoutError::InvalidTree)?;
         if let NodeKind::Text(value) = kind {
             let text = collapsed_text(value);
+            if minimum
+                && !matches!(
+                    style.white_space,
+                    css::WhiteSpace::NoWrap | css::WhiteSpace::Pre
+                )
+            {
+                let mut width = 0.0f32;
+                for word in text.split_ascii_whitespace() {
+                    width = width.max(
+                        self.text
+                            .measure(word, style.font_size)
+                            .map_err(|_| LayoutError::Text)?,
+                    );
+                }
+                return Ok((width, self.line_height(style)));
+            }
             return Ok((
                 self.text
                     .measure(text.trim_matches(' '), style.font_size)
@@ -970,7 +1188,7 @@ impl Layout<'_> {
             } else {
                 style.clone()
             };
-            let (w, h) = self.intrinsic_size(node, &child_style, depth + 1)?;
+            let (w, h) = self.intrinsic_size_mode(node, &child_style, depth + 1, minimum)?;
             if matches!(child_kind, NodeKind::Text(_)) || child_style.display == Display::Inline {
                 inline_width += w;
                 inline_height = inline_height.max(h);
@@ -1019,6 +1237,7 @@ impl Layout<'_> {
             cols: usize,
             rows: usize,
             natural: (f32, f32),
+            minimum: f32,
             commands: core::ops::Range<usize>,
             hits: core::ops::Range<usize>,
         }
@@ -1026,6 +1245,13 @@ impl Layout<'_> {
         let column_tracks = style.grid_columns.as_deref().unwrap_or(&[]);
         let row_tracks = style.grid_rows.as_deref().unwrap_or(&[]);
         let mut columns = column_tracks.len().max(1);
+        let mut rows = row_tracks.len().max(1);
+        if let Some(areas) = &style.grid_areas {
+            for area in areas.iter() {
+                columns = columns.max(area.column + area.columns);
+                rows = rows.max(area.row + area.rows);
+            }
+        }
         let mut child = self
             .document
             .first_child(parent)
@@ -1036,19 +1262,65 @@ impl Layout<'_> {
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
             if matches!(kind, NodeKind::Element { .. }) {
-                let computed = css::compute_node(self.document, node, Some(style), self.rules)
-                    .map_err(LayoutError::Css)?
-                    .resolve_percentages(width, self.parent_height);
+                let mut computed = css::compute_node(self.document, node, Some(style), self.rules)
+                    .map_err(LayoutError::Css)?;
                 if computed.display != Display::None {
+                    if matches!(computed.position, Position::Absolute | Position::Fixed) {
+                        self.box_for(node, style, Some(computed), x, y, width, depth + 1)?;
+                        child = self
+                            .document
+                            .next_sibling(node)
+                            .map_err(|_| LayoutError::InvalidTree)?;
+                        continue;
+                    }
+                    if let Some(area) = computed.grid_area.as_ref().and_then(|name| {
+                        style
+                            .grid_areas
+                            .as_ref()?
+                            .iter()
+                            .find(|area| area.name == *name)
+                    }) {
+                        computed.grid_column = css::GridPlacement {
+                            start: Some(area.column),
+                            span: area.columns,
+                        };
+                        computed.grid_row = css::GridPlacement {
+                            start: Some(area.row),
+                            span: area.rows,
+                        };
+                    }
+                    computed.grid_column = css::resolve_grid_placement(
+                        computed.grid_column,
+                        computed.grid_column_spec.as_deref(),
+                        style.grid_column_names.as_deref().unwrap_or(&[]),
+                        column_tracks.len(),
+                        style.grid_areas.as_deref().unwrap_or(&[]),
+                        true,
+                    )
+                    .ok_or(LayoutError::GridLimit)?;
+                    computed.grid_row = css::resolve_grid_placement(
+                        computed.grid_row,
+                        computed.grid_row_spec.as_deref(),
+                        style.grid_row_names.as_deref().unwrap_or(&[]),
+                        row_tracks.len(),
+                        style.grid_areas.as_deref().unwrap_or(&[]),
+                        false,
+                    )
+                    .ok_or(LayoutError::GridLimit)?;
                     if items.len() == MAX_GRID_TRACKS * MAX_GRID_TRACKS {
                         return Err(LayoutError::GridLimit);
                     }
                     columns = columns
                         .max(computed.grid_column.start.unwrap_or(0) + computed.grid_column.span);
-                    if columns > MAX_GRID_TRACKS {
+                    rows = rows.max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span);
+                    if columns > MAX_GRID_TRACKS || rows > MAX_GRID_TRACKS {
                         return Err(LayoutError::GridLimit);
                     }
-                    let natural = self.intrinsic_size(node, &computed, depth + 1)?;
+                    let sizing_style = computed.resolve_percentages(width, self.parent_height);
+                    let natural = self.intrinsic_size(node, &sizing_style, depth + 1)?;
+                    let minimum = self
+                        .intrinsic_size_mode(node, &sizing_style, depth + 1, true)?
+                        .0;
                     items.push(Item {
                         node,
                         style: computed,
@@ -1057,6 +1329,7 @@ impl Layout<'_> {
                         cols: 1,
                         rows: 1,
                         natural,
+                        minimum,
                         commands: 0..0,
                         hits: 0..0,
                     });
@@ -1067,29 +1340,76 @@ impl Layout<'_> {
                 .next_sibling(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
         }
+        items.sort_by_key(|item| item.style.order);
         let mut occupied = [0u64; MAX_GRID_TRACKS];
-        let mut rows = row_tracks.len();
         let mut cursor = 0;
-        // Definite positions reserve cells before the sparse row-major auto pass.
-        for definite in [true, false] {
+        let column_flow = style.grid_auto_flow.column;
+        let flow_rows = rows;
+        let flow_columns = columns;
+        // Reserve definite areas, then major-axis locked items, then remaining auto items.
+        for phase in 0..3 {
             for item in &mut items {
                 let cp = item.style.grid_column;
                 let rp = item.style.grid_row;
-                if (cp.start.is_some() && rp.start.is_some()) != definite {
+                let definite = cp.start.is_some() && rp.start.is_some();
+                let locked = if column_flow {
+                    cp.start.is_some()
+                } else {
+                    rp.start.is_some()
+                };
+                if (if definite {
+                    0
+                } else if locked {
+                    1
+                } else {
+                    2
+                }) != phase
+                {
                     continue;
                 }
                 item.cols = cp.span;
                 item.rows = rp.span;
                 let mut found = None;
-                for index in if definite || rp.start.is_some() {
+                for index in if phase < 2 || style.grid_auto_flow.dense {
                     0
                 } else {
                     cursor
-                }..MAX_GRID_TRACKS * columns
+                }
+                    ..MAX_GRID_TRACKS * if column_flow { flow_rows } else { flow_columns }
                 {
-                    let col = cp.start.unwrap_or(index % columns);
-                    let row = rp.start.unwrap_or(index / columns);
-                    if col + item.cols > columns || row + item.rows > MAX_GRID_TRACKS {
+                    let mut col = cp.start.unwrap_or(if column_flow {
+                        index / flow_rows
+                    } else {
+                        index % flow_columns
+                    });
+                    let mut row = rp.start.unwrap_or(if column_flow {
+                        index % flow_rows
+                    } else {
+                        index / flow_columns
+                    });
+                    if phase == 2 && !style.grid_auto_flow.dense {
+                        if !column_flow
+                            && cp.start.is_some_and(|start| start < index % flow_columns)
+                        {
+                            row += 1;
+                        }
+                        if column_flow && rp.start.is_some_and(|start| start < index % flow_rows) {
+                            col += 1;
+                        }
+                    }
+                    if col + item.cols
+                        > if column_flow {
+                            MAX_GRID_TRACKS
+                        } else {
+                            flow_columns
+                        }
+                        || row + item.rows
+                            > if column_flow {
+                                flow_rows
+                            } else {
+                                MAX_GRID_TRACKS
+                            }
+                    {
                         continue;
                     }
                     let mask = (u64::MAX >> (64 - item.cols)) << col;
@@ -1105,9 +1425,40 @@ impl Layout<'_> {
                 item.col = col;
                 item.row = row;
                 rows = rows.max(row + item.rows);
-                if !definite && rp.start.is_none() {
-                    cursor = row * columns + col + item.cols;
+                columns = columns.max(col + item.cols);
+                if phase == 2 {
+                    cursor = if column_flow {
+                        col * flow_rows + row + item.rows
+                    } else {
+                        row * flow_columns + col + item.cols
+                    };
                 }
+            }
+        }
+        let mut column_definitions = [GridTrack::Auto; MAX_GRID_TRACKS];
+        let mut row_definitions = [GridTrack::Auto; MAX_GRID_TRACKS];
+        for (definitions, explicit, implicit, count) in [
+            (
+                &mut column_definitions,
+                column_tracks,
+                style.grid_auto_columns.as_deref().unwrap_or(&[]),
+                columns,
+            ),
+            (
+                &mut row_definitions,
+                row_tracks,
+                style.grid_auto_rows.as_deref().unwrap_or(&[]),
+                rows,
+            ),
+        ] {
+            for i in 0..count {
+                definitions[i] = explicit.get(i).copied().unwrap_or_else(|| {
+                    if implicit.is_empty() {
+                        GridTrack::Auto
+                    } else {
+                        implicit[(i - explicit.len()) % implicit.len()]
+                    }
+                });
             }
         }
         let gap = style.gap;
@@ -1116,118 +1467,220 @@ impl Layout<'_> {
                       count: usize,
                       available: Option<f32>,
                       horizontal: bool| {
-            let mut sizes = [0f32; MAX_GRID_TRACKS];
-            for (i, value) in sizes[..count].iter_mut().enumerate() {
-                if let Some(GridTrack::Pixels(v)) = definitions.get(i) {
-                    *value = *v;
-                }
-            }
-            for item in items {
-                let (start, span, natural) = if horizontal {
-                    (item.col, item.cols, item.natural.0)
+            grid_track_sizes(
+                definitions,
+                count,
+                available,
+                gap,
+                if horizontal {
+                    style.justify_content == JustifyContent::Stretch
                 } else {
-                    (item.row, item.rows, item.natural.1)
-                };
-                let present =
-                    sizes[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
-                let flexible = (start..start + span)
-                    .filter(|i| !matches!(definitions.get(*i), Some(GridTrack::Pixels(_))))
-                    .count();
-                if flexible > 0 {
-                    let extra = (natural - present).max(0.0) / flexible as f32;
-                    for i in start..start + span {
-                        if !matches!(definitions.get(i), Some(GridTrack::Pixels(_))) {
-                            sizes[i] += extra;
-                        }
+                    style.align_content.is_none()
+                },
+                items.iter().map(|item| {
+                    if horizontal {
+                        (item.col, item.cols, item.minimum, item.natural.0)
+                    } else {
+                        (item.row, item.rows, item.natural.1, item.natural.1)
                     }
-                }
-            }
-            if let Some(available) = available {
-                let fractions: f32 = definitions
-                    .iter()
-                    .filter_map(|v| {
-                        if let GridTrack::Fraction(v) = v {
-                            Some(*v)
-                        } else {
-                            None
-                        }
-                    })
-                    .sum();
-                let fixed: f32 = sizes[..count]
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !matches!(definitions.get(*i), Some(GridTrack::Fraction(_))))
-                    .map(|(_, v)| *v)
-                    .sum();
-                let free = (available - fixed - gap * count.saturating_sub(1) as f32).max(0.0);
-                if fractions > 0.0 {
-                    for i in 0..count {
-                        if let Some(GridTrack::Fraction(v)) = definitions.get(i) {
-                            sizes[i] = sizes[i].max(free * v / fractions.max(1.0));
-                        }
-                    }
-                } else {
-                    let autos = (0..count)
-                        .filter(|i| matches!(definitions.get(*i), None | Some(GridTrack::Auto)))
-                        .count();
-                    let extra = (free
-                        - sizes[..count]
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| {
-                                matches!(definitions.get(*i), None | Some(GridTrack::Auto))
-                            })
-                            .map(|(_, v)| *v)
-                            .sum::<f32>())
-                    .max(0.0);
-                    if autos > 0 {
-                        for i in 0..count {
-                            if matches!(definitions.get(i), None | Some(GridTrack::Auto)) {
-                                sizes[i] += extra / autos as f32;
-                            }
-                        }
-                    }
-                }
-            } else {
-                let fraction = (0..count)
-                    .filter_map(|i| match definitions.get(i) {
-                        Some(GridTrack::Fraction(v)) => Some(sizes[i] / v),
-                        _ => None,
-                    })
-                    .fold(0.0f32, f32::max);
-                for i in 0..count {
-                    if let Some(GridTrack::Fraction(v)) = definitions.get(i) {
-                        sizes[i] = fraction * v;
-                    }
-                }
-            }
-            sizes
+                }),
+            )
         };
-        let widths = tracks(&items, column_tracks, columns, Some(width), true);
+        let widths = tracks(&items, &column_definitions, columns, Some(width), true);
+        let distribute = |count: usize, free: f32, alignment: JustifyContent| match alignment {
+            JustifyContent::End => (free, 0.0),
+            JustifyContent::Center => (free * 0.5, 0.0),
+            JustifyContent::SpaceBetween if count > 1 => (0.0, free / (count - 1) as f32),
+            JustifyContent::SpaceAround if count > 0 => {
+                (free / count as f32 * 0.5, free / count as f32)
+            }
+            JustifyContent::SpaceEvenly => (free / (count + 1) as f32, free / (count + 1) as f32),
+            _ => (0.0, 0.0),
+        };
+        let (column_offset, column_extra) = distribute(
+            columns,
+            (width
+                - widths[..columns].iter().sum::<f32>()
+                - gap * columns.saturating_sub(1) as f32)
+                .max(0.0),
+            style.justify_content,
+        );
+        let preliminary_rows = tracks(
+            &items,
+            &row_definitions,
+            rows,
+            style.height.map(|v| content_height_dimension(style, v)),
+            false,
+        );
         // Lay out once at the final column width; retain commands and move them after row sizing.
         for item in &mut items {
-            let cx = x + widths[..item.col].iter().sum::<f32>() + gap * item.col as f32;
+            let mut cx = x
+                + column_offset
+                + widths[..item.col].iter().sum::<f32>()
+                + (gap + column_extra) * item.col as f32;
             let cw = widths[item.col..item.col + item.cols].iter().sum::<f32>()
-                + gap * (item.cols - 1) as f32;
-            let mut computed = item.style.clone();
+                + (gap + column_extra) * (item.cols - 1) as f32;
+            if style.direction == css::Direction::Rtl {
+                cx = x + width - (cx - x) - cw;
+            }
+            let definite_height = style.height.is_some()
+                || row_definitions[item.row..item.row + item.rows]
+                    .iter()
+                    .all(|track| matches!(track, GridTrack::Pixels(_)));
+            let area_height = preliminary_rows[item.row..item.row + item.rows]
+                .iter()
+                .sum::<f32>()
+                + gap * (item.rows - 1) as f32;
+            let mut computed = item
+                .style
+                .resolve_percentages(cw, definite_height.then_some(area_height));
+            if computed.grid_columns_subgrid || computed.grid_rows_subgrid {
+                let subgap = if computed.gap_specified {
+                    computed.gap
+                } else {
+                    gap
+                };
+                let difference = subgap - gap;
+                let border = if computed.border_solid {
+                    computed.border_width
+                } else {
+                    0.0
+                };
+                if computed.grid_columns_subgrid {
+                    let mut shared: Vec<_> = widths[item.col..item.col + item.cols]
+                        .iter()
+                        .copied()
+                        .collect();
+                    for (index, size) in shared.iter_mut().enumerate() {
+                        let start = if index == 0 {
+                            computed.padding_sides[3] + border
+                        } else {
+                            difference * 0.5
+                        };
+                        let end = if index + 1 == item.cols {
+                            computed.padding_sides[1] + border
+                        } else {
+                            difference * 0.5
+                        };
+                        *size = (*size - start - end).max(0.0);
+                    }
+                    computed.grid_columns = Some(
+                        shared
+                            .into_iter()
+                            .map(GridTrack::Pixels)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                    computed.grid_column_names = style.grid_column_names.as_ref().map(|names| {
+                        names
+                            .iter()
+                            .filter(|line| {
+                                line.line >= item.col && line.line <= item.col + item.cols
+                            })
+                            .map(|line| css::GridNamedLine {
+                                name: line.name.clone(),
+                                line: line.line - item.col,
+                            })
+                            .collect::<Vec<_>>()
+                            .into()
+                    });
+                }
+                if computed.grid_rows_subgrid {
+                    let mut shared: Vec<_> = preliminary_rows[item.row..item.row + item.rows]
+                        .iter()
+                        .copied()
+                        .collect();
+                    for (index, size) in shared.iter_mut().enumerate() {
+                        let start = if index == 0 {
+                            computed.padding_sides[0] + border
+                        } else {
+                            difference * 0.5
+                        };
+                        let end = if index + 1 == item.rows {
+                            computed.padding_sides[2] + border
+                        } else {
+                            difference * 0.5
+                        };
+                        *size = (*size - start - end).max(0.0);
+                    }
+                    computed.grid_rows = Some(
+                        shared
+                            .into_iter()
+                            .map(GridTrack::Pixels)
+                            .collect::<Vec<_>>()
+                            .into(),
+                    );
+                    computed.grid_row_names = style.grid_row_names.as_ref().map(|names| {
+                        names
+                            .iter()
+                            .filter(|line| {
+                                line.line >= item.row && line.line <= item.row + item.rows
+                            })
+                            .map(|line| css::GridNamedLine {
+                                name: line.name.clone(),
+                                line: line.line - item.row,
+                            })
+                            .collect::<Vec<_>>()
+                            .into()
+                    });
+                    if computed.height.is_none() {
+                        computed.height = Some(specified_height(
+                            &computed,
+                            (area_height - box_edges(&computed, false)).max(0.0),
+                        ));
+                    }
+                }
+                computed.gap = subgap;
+            }
             if computed.display == Display::Inline {
                 computed.display = Display::Block;
             }
-            let margin = computed.margin * 2.0;
+            let margin = computed.margin_sides[1] + computed.margin_sides[3];
+            let alignment = computed.justify_self.unwrap_or(style.justify_items);
             if computed.width.is_none() {
                 computed.width = Some(specified_dimension(
                     &computed,
-                    (cw - margin
-                        - 2.0
-                            * (computed.padding
-                                + if computed.border_solid {
-                                    computed.border_width
-                                } else {
-                                    0.0
-                                }))
+                    ((if alignment == AlignItems::Stretch {
+                        cw
+                    } else {
+                        item.natural.0.min(cw).max(item.minimum)
+                    }) - margin
+                        - box_edges(&computed, true))
                     .max(0.0),
                 ));
             }
+            let free = (cw
+                - margin
+                - content_dimension(&computed, computed.width.unwrap_or(0.0))
+                - box_edges(&computed, true))
+            .max(0.0);
+            cx += if computed.margin_auto[3] {
+                if computed.margin_auto[1] {
+                    free * 0.5
+                } else {
+                    free
+                }
+            } else if computed.margin_auto[1] {
+                0.0
+            } else {
+                match alignment {
+                    AlignItems::End => {
+                        if style.direction == css::Direction::Rtl {
+                            0.0
+                        } else {
+                            free
+                        }
+                    }
+                    AlignItems::Start | AlignItems::Stretch => {
+                        if style.direction == css::Direction::Rtl {
+                            free
+                        } else {
+                            0.0
+                        }
+                    }
+                    AlignItems::Center => free * 0.5,
+                }
+            };
             item.commands.start = self.commands.len();
             item.hits.start = self.geometry.as_ref().map_or(0, |g| g.hits.len());
             item.natural.1 =
@@ -1237,23 +1690,50 @@ impl Layout<'_> {
         }
         let heights = tracks(
             &items,
-            row_tracks,
+            &row_definitions,
             rows,
-            style.height.map(|v| content_dimension(style, v)),
+            style.height.map(|v| content_height_dimension(style, v)),
             false,
+        );
+        let used_height = heights[..rows].iter().sum::<f32>() + gap * rows.saturating_sub(1) as f32;
+        let (row_offset, row_extra) = distribute(
+            rows,
+            (style
+                .height
+                .map_or(used_height, |v| content_height_dimension(style, v))
+                - used_height)
+                .max(0.0),
+            style.align_content.unwrap_or(JustifyContent::Stretch),
         );
         for item in &items {
             let ch = heights[item.row..item.row + item.rows].iter().sum::<f32>()
-                + gap * (item.rows - 1) as f32;
+                + (gap + row_extra) * (item.rows - 1) as f32;
             let free = (ch - item.natural.1).max(0.0);
             let alignment = item.style.align_self.unwrap_or(style.align_items);
-            let align = match alignment {
-                AlignItems::End => free,
-                AlignItems::Center => free * 0.5,
-                _ => 0.0,
+            let align = if item.style.margin_auto[0] {
+                if item.style.margin_auto[2] {
+                    free * 0.5
+                } else {
+                    free
+                }
+            } else if item.style.margin_auto[2] {
+                0.0
+            } else {
+                match alignment {
+                    AlignItems::End => free,
+                    AlignItems::Center => free * 0.5,
+                    _ => 0.0,
+                }
             };
-            let dy = heights[..item.row].iter().sum::<f32>() + gap * item.row as f32 + align;
-            if item.style.height.is_none() && alignment == AlignItems::Stretch {
+            let dy = row_offset
+                + heights[..item.row].iter().sum::<f32>()
+                + (gap + row_extra) * item.row as f32
+                + align;
+            if item.style.height.is_none()
+                && alignment == AlignItems::Stretch
+                && !item.style.margin_auto[0]
+                && !item.style.margin_auto[2]
+            {
                 let height =
                     (ch - item.style.margin_sides[0] - item.style.margin_sides[2]).max(0.0);
                 let paints = if has_background(&item.style) {
@@ -1292,7 +1772,7 @@ impl Layout<'_> {
                             *command = background_color(outer, &item.style);
                             remaining -= 1;
                         }
-                        Command::FillLinearGradient { rect, .. } if remaining > 0 => {
+                        Command::FillGradient { rect, .. } if remaining > 0 => {
                             rect.height = (height
                                 - if item.style.border_solid {
                                     2.0 * item.style.border_width
@@ -1367,7 +1847,8 @@ impl Layout<'_> {
         let reverse = matches!(
             style.flex_direction,
             FlexDirection::RowReverse | FlexDirection::ColumnReverse
-        );
+        ) ^ (row && style.direction == Direction::Rtl);
+        let cross_reverse = style.flex_wrap_reverse ^ (!row && style.direction == Direction::Rtl);
         let mut items = Vec::new();
         let mut positioned = Vec::new();
         let mut child = self
@@ -1573,7 +2054,7 @@ impl Layout<'_> {
         let mut total_main = 0.0f32;
         for (line_start, line_end, line_cross) in lines {
             let items = &mut items[line_start..line_end];
-            let line_offset = if style.flex_wrap_reverse {
+            let line_offset = if cross_reverse {
                 cross_limit.unwrap_or(natural_cross) - cross_offset - line_cross - line_stretch
             } else {
                 cross_offset
@@ -1660,7 +2141,7 @@ impl Layout<'_> {
             let remaining = if auto_count == 0 { remaining } else { 0.0 };
             let count = items.len() as f32;
             let (start, extra_gap) = match style.justify_content {
-                JustifyContent::Start => (0.0, 0.0),
+                JustifyContent::Start | JustifyContent::Stretch => (0.0, 0.0),
                 JustifyContent::End => (remaining, 0.0),
                 JustifyContent::Center => (remaining * 0.5, 0.0),
                 JustifyContent::SpaceBetween if items.len() > 1 => (0.0, remaining / (count - 1.0)),
@@ -1871,7 +2352,7 @@ impl Layout<'_> {
                                 };
                                 *command = background_color(outer, &item.style);
                             }
-                            Command::FillLinearGradient { rect, .. } => {
+                            Command::FillGradient { rect, .. } => {
                                 rect.height = (root_height
                                     - if item.style.border_solid {
                                         2.0 * item.style.border_width
@@ -1922,7 +2403,7 @@ impl Layout<'_> {
                         _ => 0.0,
                     }
                 };
-                let offset = if style.flex_wrap_reverse
+                let offset = if cross_reverse
                     && !item.style.margin_auto[cross_start]
                     && !item.style.margin_auto[cross_end]
                 {
@@ -2043,7 +2524,7 @@ impl Layout<'_> {
         {
             let shaped = self
                 .text
-                .shape(value, size)
+                .shape_directional(value, size, style.direction == Direction::Rtl)
                 .map_err(|_| LayoutError::Text)?;
             if !wrap || *advance + shaped.width <= width {
                 let tail = if collapse {
@@ -2093,7 +2574,10 @@ impl Layout<'_> {
             let newline = part.ends_with('\n');
             let tab = part.ends_with('\t');
             let part = part.trim_end_matches(['\n', '\t']);
-            let shaped = self.text.shape(part, size).map_err(|_| LayoutError::Text)?;
+            let shaped = self
+                .text
+                .shape_directional(part, size, style.direction == Direction::Rtl)
+                .map_err(|_| LayoutError::Text)?;
             let (_, space) = float_edges(floats, left, width, *cursor, height);
             let hang = collapse || style.white_space == WhiteSpace::PreWrap;
             let visible_width = if hang && part.ends_with(' ') {
@@ -2389,7 +2873,7 @@ impl Layout<'_> {
             }
             let shaped = self
                 .text
-                .shape(value, size)
+                .shape_directional(value, size, parent_style.direction == Direction::Rtl)
                 .map_err(|_| LayoutError::Text)?;
             let width = shaped.width;
             self.push_command(Command::GlyphRun {
@@ -2586,7 +3070,7 @@ impl Layout<'_> {
                                 height: rect.height + 2.0 * inset,
                             })
                         }
-                        Command::FillLinearGradient { rect, .. } => {
+                        Command::FillGradient { rect, .. } => {
                             let border = if style.border_solid {
                                 style.border_width
                             } else {
@@ -2674,6 +3158,60 @@ impl Layout<'_> {
         if let Some(style) = computed.as_mut() {
             self.begin_decoration(style)?;
             out_of_flow = matches!(style.position, Position::Absolute | Position::Fixed);
+            if !out_of_flow
+                && style.float == Float::None
+                && !matches!(parent_style.display, Display::Flex | Display::Grid)
+                && matches!(
+                    style.display,
+                    Display::Block | Display::Flex | Display::Grid
+                )
+            {
+                let left_auto = style.margin_auto[3];
+                let right_auto = style.margin_auto[1];
+                let left = if left_auto {
+                    0.0
+                } else {
+                    style.margin_sides[3]
+                };
+                let right = if right_auto {
+                    0.0
+                } else {
+                    style.margin_sides[1]
+                };
+                let edges = style.padding_sides[1]
+                    + style.padding_sides[3]
+                    + if style.border_solid {
+                        2.0 * style.border_width
+                    } else {
+                        0.0
+                    };
+                let content = constrained_width(
+                    style,
+                    style
+                        .width
+                        .map_or((available - left - right - edges).max(0.0), |width| {
+                            content_dimension(style, width)
+                        }),
+                );
+                let free = available - edges - content - left - right;
+                let (used_left, used_right) = if free >= 0.0 && (left_auto || right_auto) {
+                    match (left_auto, right_auto) {
+                        (true, true) => (free * 0.5, free * 0.5),
+                        (true, false) => (free, right),
+                        _ => (left, free),
+                    }
+                } else if parent_style.direction == Direction::Rtl {
+                    (left + free, right)
+                } else {
+                    (left, right)
+                };
+                if style.margin_sides[3] != used_left {
+                    style.margin_sides[3] = used_left;
+                }
+                if style.margin_sides[1] != used_right {
+                    style.margin_sides[1] = used_right;
+                }
+            }
             if out_of_flow {
                 let containing = if style.position == Position::Fixed {
                     saved_fixed.unwrap_or(self.viewport)
@@ -2898,7 +3436,7 @@ impl Layout<'_> {
             }
             let shaped = self
                 .text
-                .shape(value, size)
+                .shape_directional(value, size, parent_style.direction == Direction::Rtl)
                 .map_err(|_| LayoutError::Text)?;
             self.push_command(Command::GlyphRun {
                 origin_x: x,
@@ -3699,10 +4237,12 @@ mod tests {
             crate::html::parse("<div style='height:100px'></div><p>below viewport</p>", 64)
                 .unwrap();
         let list = display_list(&document, 20, 10, &NoShape).unwrap();
-        assert!(!list
-            .0
-            .iter()
-            .any(|command| matches!(command, Command::GlyphRun { .. })));
+        assert!(
+            !list
+                .0
+                .iter()
+                .any(|command| matches!(command, Command::GlyphRun { .. }))
+        );
     }
 
     #[test]
@@ -3775,6 +4315,47 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn rtl_blocks_resolve_overflow_and_physical_auto_margins() {
+        let boxes = colored_boxes(
+            "<style>body{margin:0}main{direction:rtl;width:80px}div{height:5px;background:red}</style><main><div style='width:30px;margin-left:20px'></div><div style='width:120px'></div><div style='width:30px;margin:auto'></div><div style='width:30px;margin-right:auto'></div></main>",
+        );
+        assert_eq!(
+            boxes.iter().map(|rect| rect.x).collect::<Vec<_>>(),
+            [50.0, -40.0, 25.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn rtl_flex_row_reverse_and_column_start_follow_inline_direction() {
+        for (direction, expected) in [
+            ("row", [60.0, 40.0]),
+            ("row-reverse", [0.0, 20.0]),
+            ("column", [60.0, 60.0]),
+        ] {
+            let markup = alloc::format!(
+                "<style>body{{margin:0}}main{{display:flex;width:80px;direction:rtl;flex-direction:{direction};align-items:start}}div{{width:20px;height:5px;background:red}}</style><main><div></div><div></div></main>"
+            );
+            let boxes = colored_boxes(&markup);
+            assert_eq!(
+                boxes.iter().map(|rect| rect.x).collect::<Vec<_>>(),
+                expected,
+                "{direction}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtl_table_columns_and_cell_block_content_start_on_the_right() {
+        let boxes = colored_boxes(
+            "<style>body{margin:0}table{direction:rtl;width:80px;border-spacing:0}td{padding:0}div{width:20px;height:5px;background:red}</style><table><tr><td><div></div></td><td><div></div></td></tr></table>",
+        );
+        assert_eq!(
+            boxes.iter().map(|rect| rect.x).collect::<Vec<_>>(),
+            [60.0, 20.0]
+        );
     }
 
     #[test]
@@ -4263,7 +4844,9 @@ mod tests {
             ("2px dashed #0080ff", 0.0),
             ("2px dotted #0080ff", 0.0),
         ] {
-            let html = alloc::format!("<div style='width:20px;border:{border};border-radius:6px;background:#ff8000'><div style='height:16px'></div></div>");
+            let html = alloc::format!(
+                "<div style='width:20px;border:{border};border-radius:6px;background:#ff8000'><div style='height:16px'></div></div>"
+            );
             let document = crate::html::parse(&html, 16).unwrap();
             let list = display_list(&document, 40, 40, &FixedText).unwrap();
             let (rect, radius) = list
@@ -4289,10 +4872,82 @@ mod tests {
                 "{border}"
             );
             assert_eq!(radius, 6.0 - inset, "{border}");
-            assert!(!list
-                .0
-                .iter()
-                .any(|command| matches!(command, Command::PushLayer { .. })));
+            assert!(
+                !list
+                    .0
+                    .iter()
+                    .any(|command| matches!(command, Command::PushLayer { .. }))
+            );
         }
+    }
+
+    #[test]
+    fn grid_repeat_minmax_percent_implicit_flow_and_alignment() {
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;grid-template-columns:repeat(2,minmax(0,1fr));grid-auto-rows:10px;gap:4px'><div style='background:red'></div><div style='background:green'></div><div style='background:#ff8000'></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [
+                (0.0, 0.0, 48.0, 10.0),
+                (52.0, 0.0, 48.0, 10.0),
+                (0.0, 14.0, 48.0, 10.0)
+            ]
+        );
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;grid-template-columns:25% 1fr;grid-template-rows:10px 10px;grid-auto-flow:column'><div style='background:red'></div><div style='background:green'></div><div style='background:#ff8000'></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0, 25.0), (0.0, 10.0, 25.0), (25.0, 0.0, 75.0)]
+        );
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;height:40px;grid-template-columns:20px 20px;grid-template-rows:10px;justify-content:center;align-content:end;justify-items:center;align-items:center'><div style='width:10px;height:4px;background:red'></div></div>",
+        );
+        assert_eq!(
+            (boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height),
+            (35.0, 33.0, 10.0, 4.0)
+        );
+    }
+
+    #[test]
+    fn grid_named_lines_areas_rtl_and_subgrid_inherit_tracks() {
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;grid-template-columns:[a] 30px [b] 70px [c];grid-template-rows:10px'><div style='grid-column:b / c;background:red'></div></div>",
+        );
+        assert_eq!((boxes[0].x, boxes[0].width), (30.0, 70.0));
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;grid-template-columns:30px 70px;grid-template-rows:10px 20px;grid-template-areas:\"top top\" \"left right\"'><div style='grid-area:right;background:red'></div></div>",
+        );
+        assert_eq!(
+            (boxes[0].x, boxes[0].y, boxes[0].width, boxes[0].height),
+            (30.0, 10.0, 70.0, 20.0)
+        );
+        let boxes = colored_boxes(
+            "<div style='display:grid;direction:rtl;width:100px;grid-template-columns:30px 70px;grid-template-rows:10px'><div style='background:red'></div><div style='background:green'></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.width))
+                .collect::<Vec<_>>(),
+            [(70.0, 30.0), (0.0, 70.0)]
+        );
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:100px;grid-template-columns:30px 70px;grid-template-rows:10px'><div style='display:grid;grid-column:1 / 3;grid-template-columns:subgrid;grid-template-rows:subgrid'><div style='background:red'></div><div style='background:green'></div></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(0.0, 30.0, 10.0), (30.0, 70.0, 10.0)]
+        );
     }
 }

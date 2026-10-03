@@ -6,6 +6,7 @@ use lumen_html::{
 use lumen_html_text::{FontFace, GlyphCoverage};
 use std::collections::HashMap;
 use std::{cell::RefCell, io::Read, path::PathBuf, sync::Arc};
+mod background;
 mod border;
 mod coverage;
 mod gradient;
@@ -339,13 +340,28 @@ impl ReplaySink for Raster<'_> {
         }
     }
 
-    fn fill_linear_gradient(
+    fn fill_gradient(&mut self, rect: Rect, radius: f32, gradient: &lumen_html::paint::Gradient) {
+        gradient::fill(self, rect, radius, gradient);
+    }
+
+    fn fill_background(
         &mut self,
         rect: Rect,
         radius: f32,
-        gradient: &lumen_html::paint::LinearGradient,
+        positioning_rect: Rect,
+        image_rect: Rect,
+        repeat: [lumen_html::paint::BackgroundRepeat; 2],
+        image: &lumen_html::paint::BackgroundPaint,
     ) {
-        gradient::fill(self, rect, radius, gradient);
+        background::fill(
+            self,
+            rect,
+            radius,
+            positioning_rect,
+            image_rect,
+            repeat,
+            image,
+        );
     }
 
     fn draw_shadow(&mut self, rect: Rect, radius: f32, shadow: lumen_html::paint::BoxShadow) {
@@ -624,7 +640,7 @@ pub fn rasterize_layers(
     let mut resolved = resolve_layers(list, scale, Some(font), cache, &mut bytes)?;
     for command in &mut resolved.0 {
         let rect = match command {
-            Command::FillLinearGradient { rect, .. } => *rect,
+            Command::FillGradient { rect, .. } | Command::FillBackground { rect, .. } => *rect,
             Command::BoxShadow { rect, shadow, .. } => shadow.bounds(*rect),
             Command::StrokePatternBorder { rect, .. } => *rect,
             _ => continue,
@@ -931,9 +947,9 @@ fn paint_bounds(
             {
                 include(*rect)
             }
-            Command::Image { rect, .. } | Command::FillLinearGradient { rect, .. } => {
-                include(*rect)
-            }
+            Command::Image { rect, .. }
+            | Command::FillGradient { rect, .. }
+            | Command::FillBackground { rect, .. } => include(*rect),
             Command::BoxShadow { rect, shadow, .. } if shadow.color.a != 0 => {
                 include(shadow.bounds(*rect))
             }
@@ -982,12 +998,23 @@ fn paint_bounds(
 
 fn translate_command(command: &mut Command, x: f32, y: f32) {
     match command {
+        Command::FillBackground {
+            rect,
+            positioning_rect,
+            image_rect,
+            ..
+        } => {
+            for rect in [rect, positioning_rect, image_rect] {
+                rect.x += x;
+                rect.y += y;
+            }
+        }
         Command::PushTransform(matrix) => *matrix = matrix.translated_space(x, y),
         Command::PushClip(rect)
         | Command::PushLayer { rect, .. }
         | Command::FillRect { rect, .. }
         | Command::FillRoundedRect { rect, .. }
-        | Command::FillLinearGradient { rect, .. }
+        | Command::FillGradient { rect, .. }
         | Command::BoxShadow { rect, .. }
         | Command::StrokePatternBorder { rect, .. }
         | Command::StrokeBorder { rect, .. }

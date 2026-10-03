@@ -101,40 +101,89 @@ impl DomEventTarget {
         event.immediate.set(false);
         *event.target.borrow_mut() = this.0.clone();
         let result = (|| {
-        let mut path = vec![(this.0.clone(), self.data.clone())];
+        let related = event.related_original.borrow().clone();
+        let related_node = ctx.with_instance::<DomNode, _>(&related, |node| (node.realm.clone(), node.id)).ok();
+        let mut path = vec![(this.0.clone(), self.data.clone(), this.0.clone(), Vec::new(), related.clone())];
         if let (Some(realm), Some(mut node)) = (self.data.realm.upgrade(), self.data.node) {
+            let original = node;
+            let origin_root = realm.session.borrow().document().root_node(node, false).map_err(dom_error)?;
+            path[0].3 = closed_roots(realm.session.borrow().document(), node)?;
             loop {
-                let parent = realm.session.borrow().document().parent(node).map_err(|_| OpError::new("InvalidStateError", "event target was removed"))?;
+                let parent = realm.session.borrow().document().event_parent(node, event.composed, origin_root).map_err(|_| OpError::new("InvalidStateError", "event target was removed"))?;
                 let Some(parent) = parent else { break; };
+                if path.len() >= 1024 { return Err(OpError::new("RangeError", "event path limit exceeded")); }
+                let adjusted = realm.session.borrow().document().retarget(original, Some(parent)).map_err(dom_error)?;
+                let adjusted = realm.wrap(ctx, adjusted);
+                let related_adjusted = if let Some((related_realm, id)) = &related_node {
+                    if Rc::ptr_eq(related_realm, &realm) { let id = realm.session.borrow().document().retarget(*id, Some(parent)).map_err(dom_error)?; realm.wrap(ctx, id) } else { related.clone() }
+                } else { related.clone() };
+                if same(&adjusted, &related_adjusted) { break; }
+                let closed = closed_roots(realm.session.borrow().document(), parent)?;
                 let value = realm.wrap(ctx, parent);
-                if let Some(target) = realm.targets.borrow().get(&parent).and_then(Weak::upgrade) { path.push((value, target)); }
+                if let Some(target) = realm.targets.borrow().get(&parent).and_then(Weak::upgrade) { path.push((value, target, adjusted, closed, related_adjusted)); }
                 node = parent;
             }
             if node == realm.session.borrow().document().root() {
-                if let (Some(value), Some(target)) = (realm.window_wrapper.borrow().as_ref().and_then(WeakValue::upgrade), realm.window_target.borrow().as_ref()) { path.push((value, target.clone())); }
+                let adjusted = realm.session.borrow().document().retarget(original, None).map_err(dom_error)?;
+                let adjusted = realm.wrap(ctx, adjusted);
+                let related_adjusted = if let Some((related_realm, id)) = &related_node {
+                    if Rc::ptr_eq(related_realm, &realm) { let id = realm.session.borrow().document().retarget(*id, None).map_err(dom_error)?; realm.wrap(ctx, id) } else { related.clone() }
+                } else { related.clone() };
+                if let (Some(value), Some(target)) = (realm.window_wrapper.borrow().as_ref().and_then(WeakValue::upgrade), realm.window_target.borrow().as_ref()) { path.push((value, target.clone(), adjusted, Vec::new(), related_adjusted)); }
             }
         }
-            for (value, target) in path.iter().skip(1).rev() {
-                invoke(ctx, &event, &event_value, value, target, true, 1)?;
+            if path.iter().map(|entry| entry.3.len()).sum::<usize>() > 4096 { return Err(OpError::new("RangeError", "event shadow path limit exceeded")); }
+            let clear_target = if let (Some(realm), Some(original)) = (self.data.realm.upgrade(), self.data.node) {
+                let session = realm.session.borrow(); let document = session.document();
+                let target = document.retarget(original, path.last().unwrap().1.node).map_err(dom_error)?;
+                document.shadow_host(document.root_node(target, false).map_err(dom_error)?).map_err(dom_error)?.is_some()
+            } else { false };
+            *event.path.borrow_mut() = path.iter().map(|entry| (entry.0.clone(), entry.3.clone())).collect();
+            for (value, target, adjusted, closed, related) in path.iter().skip(1).rev() {
+                *event.target.borrow_mut() = adjusted.clone();
+                *event.related.borrow_mut() = related.clone();
+                *event.visibility.borrow_mut() = closed.clone();
+                invoke(ctx, &event, &event_value, value, target, true, if same(value, adjusted) { 2 } else { 1 })?;
                 if event.stopped.get() { break; }
             }
             if !event.stopped.get() {
+                *event.target.borrow_mut() = this.0.clone();
+                *event.related.borrow_mut() = related.clone();
+                *event.visibility.borrow_mut() = path[0].3.clone();
                 invoke(ctx, &event, &event_value, &this.0, &self.data, true, 2)?;
                 if !event.immediate.get() { invoke(ctx, &event, &event_value, &this.0, &self.data, false, 2)?; }
             }
-            if event.bubbles && !event.stopped.get() {
-                for (value, target) in path.iter().skip(1) {
-                    invoke(ctx, &event, &event_value, value, target, false, 3)?;
+            if !event.stopped.get() {
+                for (value, target, adjusted, closed, related) in path.iter().skip(1) {
+                    if !event.bubbles && !same(value, adjusted) { continue; }
+                    *event.target.borrow_mut() = adjusted.clone();
+                    *event.related.borrow_mut() = related.clone();
+                    *event.visibility.borrow_mut() = closed.clone();
+                    invoke(ctx, &event, &event_value, value, target, false, if same(value, adjusted) { 2 } else { 3 })?;
                     if event.stopped.get() { break; }
                 }
             }
+            *event.target.borrow_mut() = if clear_target { Value::Null } else { path.last().unwrap().2.clone() };
+            *event.related.borrow_mut() = if clear_target { Value::Null } else { path.last().unwrap().4.clone() };
             Ok(!event.canceled.get())
         })();
         event.dispatching.set(false);
         event.phase.set(0);
         *event.current.borrow_mut() = Value::Null;
+        event.path.borrow_mut().clear();
+        event.visibility.borrow_mut().clear();
         result
     }
+}
+
+fn closed_roots(document: &lumen_html::Document, node: NodeId) -> OpResult<Vec<NodeId>> {
+    let mut root = document.root_node(node, false).map_err(dom_error)?;
+    let mut closed = Vec::new();
+    while let Some(host) = document.shadow_host(root).map_err(dom_error)? {
+        if document.shadow_mode(root).map_err(dom_error)? == Some(lumen_html::ShadowMode::Closed) { if closed.len() >= 64 { return Err(OpError::new("RangeError", "event shadow nesting limit exceeded")); } closed.push(root); }
+        root = document.root_node(host, false).map_err(dom_error)?;
+    }
+    Ok(closed)
 }
 
 fn invoke(ctx: &mut Ctx, event: &DomEvent, event_value: &Value, value: &Value, target: &TargetData, capture: bool, phase: u8) -> OpResult<()> {
@@ -163,6 +212,11 @@ pub struct DomEvent {
     kind: String,
     bubbles: bool,
     cancelable: bool,
+    composed: bool,
+    path: RefCell<Vec<(Value, Vec<NodeId>)>>,
+    visibility: RefCell<Vec<NodeId>>,
+    related_original: RefCell<Value>,
+    related: RefCell<Value>,
     target: RefCell<Value>,
     current: RefCell<Value>,
     phase: Cell<u8>,
@@ -177,7 +231,7 @@ pub struct DomEvent {
 impl DomEvent {
     #[constructor]
     pub(crate) fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
-        Ok(Self { kind: kind.into(), bubbles: flag(ctx, &options, "bubbles")?, cancelable: flag(ctx, &options, "cancelable")?, target: RefCell::new(Value::Null), current: RefCell::new(Value::Null), phase: Cell::new(0), dispatching: Cell::new(false), stopped: Cell::new(false), immediate: Cell::new(false), canceled: Cell::new(false), passive: Cell::new(false) })
+        Ok(Self { kind: kind.into(), bubbles: flag(ctx, &options, "bubbles")?, cancelable: flag(ctx, &options, "cancelable")?, composed: flag(ctx, &options, "composed")?, path: RefCell::new(Vec::new()), visibility: RefCell::new(Vec::new()), related_original: RefCell::new(Value::Null), related: RefCell::new(Value::Null), target: RefCell::new(Value::Null), current: RefCell::new(Value::Null), phase: Cell::new(0), dispatching: Cell::new(false), stopped: Cell::new(false), immediate: Cell::new(false), canceled: Cell::new(false), passive: Cell::new(false) })
     }
     #[getter(name = "type")]
     fn kind(&self) -> String { self.kind.clone() }
@@ -186,9 +240,17 @@ impl DomEvent {
     #[getter]
     fn cancelable(&self) -> bool { self.cancelable }
     #[getter]
+    fn composed(&self) -> bool { self.composed }
+    fn composed_path(&self, ctx: &mut Ctx) -> Value {
+        let visible = self.visibility.borrow();
+        ctx.make_array(self.path.borrow().iter().filter(|(_, closed)| closed.iter().all(|root| visible.contains(root))).map(|(value, _)| value.clone()).collect())
+    }
+    #[getter]
     fn target(&self) -> Value { self.target.borrow().clone() }
     #[getter]
     fn current_target(&self) -> Value { self.current.borrow().clone() }
+    #[getter]
+    fn related_target(&self) -> Value { self.related.borrow().clone() }
     #[getter]
     fn event_phase(&self) -> u8 { self.phase.get() }
     #[getter]
@@ -196,4 +258,8 @@ impl DomEvent {
     fn prevent_default(&self) { if self.cancelable && !self.passive.get() { self.canceled.set(true); } }
     fn stop_propagation(&self) { self.stopped.set(true); }
     fn stop_immediate_propagation(&self) { self.stopped.set(true); self.immediate.set(true); }
+}
+
+impl DomEvent {
+    pub(crate) fn set_related_target(&self, value: Value) { *self.related_original.borrow_mut() = value.clone(); *self.related.borrow_mut() = value; }
 }

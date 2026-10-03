@@ -25,7 +25,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
-use super::{composite, rounded_contains, Raster};
+use super::{Raster, composite, rounded_contains};
 use lumen_html::paint::{BorderPattern, Rect, Rgba};
 pub(super) fn draw(
     raster: &mut Raster<'_>,
@@ -483,7 +483,9 @@ mod tests {
             .collect();
         assert_eq!(
             dashed,
-            [0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 18, 19, 20, 21, 22, 23]
+            [
+                0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 18, 19, 20, 21, 22, 23
+            ]
         );
     }
 

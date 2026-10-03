@@ -715,6 +715,8 @@ fn new_shadow(bytes: usize) -> Box<Shadow> {
 mod shadow_tests;
 #[cfg(test)]
 mod int32_tests;
+#[cfg(test)]
+mod evict_tests;
 
 /// A direct call site's callee cache (see `build::call`): the callee last seen there — its
 /// payload word, `fn_frames` identity and the address of the environment it closes over (inside

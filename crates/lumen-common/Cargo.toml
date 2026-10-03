@@ -22,6 +22,8 @@ compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
 memchr = { version = "2", default-features = false }
 unicode-linebreak = { version = "=0.1.5", default-features = false }
 unicode-segmentation = { version = "=1.12.0", default-features = false }
+unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"] }
+unicode-script = "=0.5.8"
 ed25519-dalek = { version = "2", default-features = false, optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }

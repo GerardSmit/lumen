@@ -1,4 +1,14 @@
 /target/
+/target-*/
+*.rlib
+*.rmeta
+*.pdb
+*.obj
+*.o
+*.profraw
+*.profdata
+*.rs.bk
+*.dSYM/
 # tc39/test262 conformance suite (cloned on demand by scripts/test262-clone.sh) + its score report.
 /test262/
 /test262-report/

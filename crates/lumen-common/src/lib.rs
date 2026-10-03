@@ -5,6 +5,7 @@
 
 pub mod aot;
 pub mod bigint;
+pub mod bidi;
 pub mod buffer;
 pub mod bytes;
 pub mod scan;

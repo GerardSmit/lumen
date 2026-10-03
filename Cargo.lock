@@ -1061,7 +1061,9 @@ dependencies = [
  "sha2",
  "sha3",
  "sm3",
+ "unicode-bidi",
  "unicode-linebreak",
+ "unicode-script",
  "unicode-segmentation",
  "zstd",
 ]
@@ -2289,6 +2291,12 @@ checksum = "7285e83a80ce76f5e7bce79fa41f68d78ba62d1003cf27bf748ab24413808cf4"
 dependencies = [
  "thiserror",
 ]
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-bidi-mirroring"

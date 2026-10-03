@@ -17,6 +17,8 @@ mod templates;
 mod jsx;
 mod observers;
 mod editing;
+mod shadow;
+use shadow::{DomShadowRoot, DomSlotElement};
 
 /// Source facades to bundle with an app; their implementation is installed natively.
 pub fn module_source(specifier: &str) -> Option<&'static str> {
@@ -55,7 +57,7 @@ impl DomRealm {
         let mut ancestor = node;
         loop {
             if ancestor == document.root() { return Some(node); }
-            ancestor = document.parent(ancestor).ok().flatten()?;
+            ancestor = document.shadow_including_parent(ancestor).ok().flatten()?;
         }
     }
 
@@ -68,7 +70,7 @@ impl DomRealm {
             let focusable = matches!(name.as_str(), "input" | "button" | "textarea" | "select" | "summary") || attributes.iter().any(|(attribute, _)| attribute == "tabindex" || attribute == "contenteditable" || (attribute == "href" && matches!(name.as_str(), "a" | "area")));
             if !focusable { return Ok(()); }
             let mut ancestor = node;
-            while ancestor != document.root() { let Some(parent) = document.parent(ancestor).map_err(dom_error)? else { return Ok(()); }; ancestor = parent; }
+            while ancestor != document.root() { let Some(parent) = document.shadow_including_parent(ancestor).map_err(dom_error)? else { return Ok(()); }; ancestor = parent; }
         }
         let old = self.focused_node();
         if old == node { return Ok(()); }
@@ -95,9 +97,12 @@ impl DomRealm {
         let options = Value::Obj(ctx.new_object());
         ctx.set_member(&options, "bubbles", Value::Bool(bubbles)).map_err(|_| lumen::embed::OpError::new("TypeError", "event initialization failed"))?;
         ctx.set_member(&options, "cancelable", Value::Bool(cancelable)).map_err(|_| lumen::embed::OpError::new("TypeError", "event initialization failed"))?;
+        let composed = matches!(kind, "click"|"keydown"|"keyup"|"input"|"beforeinput"|"focus"|"blur"|"focusin"|"focusout") || kind.starts_with("pointer") || kind.starts_with("mouse");
+        ctx.set_member(&options, "composed", Value::Bool(composed)).map_err(|_| lumen::embed::OpError::new("TypeError", "event initialization failed"))?;
         let event = DomEvent::new(ctx, kind, Some(options))?;
+        if let Some((_, related)) = properties.iter().find(|(name, _)| *name == "relatedTarget") { event.set_related_target(related.clone()); }
         let event = ctx.new_instance(event);
-        for (name, property) in properties { ctx.set_member(&event, name, property.clone()).map_err(|_| lumen::embed::OpError::new("TypeError", "event property initialization failed"))?; }
+        for (name, property) in properties { if *name != "relatedTarget" { ctx.set_member(&event, name, property.clone()).map_err(|_| lumen::embed::OpError::new("TypeError", "event property initialization failed"))?; } }
         let data = self.targets.borrow().get(&node).and_then(std::rc::Weak::upgrade).ok_or_else(|| lumen::embed::OpError::new("InvalidStateError", "event target no longer exists"))?;
         let allowed = DomEventTarget::from_data(data).dispatch_event(ctx, lumen_bind::This(value), lumen::embed::JsObject::from_value(event).expect("event object"))?;
         if allowed && kind == "keydown" && self.focused_node() == Some(node) { self.edit_control_key(ctx, node, properties)?; }
@@ -142,6 +147,7 @@ impl DomRealm {
                     break;
                 }
                 if let Ok(Some(content)) = document.template_content(id) { contents.push(content); }
+                if let Ok(Some(content)) = document.shadow_root(id) { contents.push(content); }
                 cursor = next_descendant(document, tree_root, id).ok().flatten();
                 if cursor.is_none() { if let Some(content) = contents.pop() { tree_root = content; cursor = Some(content); } }
             }
@@ -180,10 +186,12 @@ impl DomRealm {
             Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "template" => ctx.cached_instance(id, || DomTemplateElement { base: DomHtmlElement { base: DomElement { base: node } } }),
             Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "iframe" => ctx.cached_instance(id, || DomIFrameElement { base: DomHtmlElement { base: DomElement { base: node } } }),
             Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "input" => ctx.cached_instance(id, || DomInputElement { base: DomHtmlElement { base: DomElement { base: node } } }),
+            Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == "slot" => ctx.cached_instance(id, || DomSlotElement { base: DomHtmlElement { base: DomElement { base: node } } }),
             Ok(NodeKind::Element { namespace: Namespace::Html, .. }) => ctx.cached_instance(id, || DomHtmlElement { base: DomElement { base: node } }),
             Ok(NodeKind::Element { .. }) => ctx.cached_instance(id, || DomElement { base: node }),
             Ok(NodeKind::Text(_)) => ctx.cached_instance(id, || DomText { base: DomCharacterData { base: node } }),
             Ok(NodeKind::Comment(_)) => ctx.cached_instance(id, || DomComment { base: DomCharacterData { base: node } }),
+            Ok(NodeKind::DocumentFragment) if self.session.borrow().document().shadow_host(id).ok().flatten().is_some() => ctx.cached_instance(id, || DomShadowRoot { base: DomDocumentFragment { base: node } }),
             Ok(NodeKind::DocumentFragment) => ctx.cached_instance(id, || DomDocumentFragment { base: node }),
             _ => ctx.cached_instance(id, || node),
         };
@@ -229,6 +237,9 @@ fn named_child(
 
 fn element_by_id(document: &lumen_html::Document, wanted: &str) -> Result<Option<NodeId>, Error> {
     let root = document.root();
+    element_by_id_in(document, root, wanted)
+}
+fn element_by_id_in(document: &lumen_html::Document, root: NodeId, wanted: &str) -> Result<Option<NodeId>, Error> {
     let mut cursor = next_descendant(document, root, root)?;
     while let Some(id) = cursor {
         if let NodeKind::Element { attributes, .. } = document.kind(id)? {
@@ -291,7 +302,26 @@ fn children(document: &lumen_html::Document, parent: NodeId) -> Result<Vec<NodeI
 #[lumen_bind::class(name = "Element", extends = DomNode)]
 pub struct DomElement { base: DomNode }
 #[lumen_bind::methods]
-impl DomElement {}
+impl DomElement {
+    fn attach_shadow(&self, ctx: &mut Ctx, options: Value) -> OpResult<Value> {
+        let mode = match ctx.get_member(&options, "mode").map_err(|_| OpError::new("TypeError", "shadow mode is required"))? {
+            Value::Str(value) if value.as_str() == "open" => lumen_html::ShadowMode::Open,
+            Value::Str(value) if value.as_str() == "closed" => lumen_html::ShadowMode::Closed,
+            _ => return Err(OpError::new("TypeError", "shadow mode must be open or closed")),
+        };
+        let root = self.base.realm.session.borrow_mut().document_mut().attach_shadow(self.base.id, mode).map_err(|error| if error == Error::Hierarchy { OpError::new("NotSupportedError", "host already has a shadow root") } else { dom_error(error) })?;
+        Ok(self.base.realm.wrap(ctx, root))
+    }
+    #[getter]
+    fn shadow_root(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let root = { let session = self.base.realm.session.borrow(); let document = session.document(); document.shadow_root(self.base.id).map_err(dom_error)?.filter(|root| document.shadow_mode(*root).ok().flatten() == Some(lumen_html::ShadowMode::Open)) };
+        Ok(self.base.realm.wrap_option(ctx, root))
+    }
+    #[getter]
+    fn slot(&self) -> OpResult<String> { Ok(self.base.get_attribute("slot")?.unwrap_or_default()) }
+    #[setter]
+    fn set_slot(&self, value: &str) -> OpResult<()> { self.base.set_attribute("slot", value) }
+}
 
 #[lumen_bind::class(name = "HTMLElement", extends = DomElement)]
 pub struct DomHtmlElement { base: DomElement }
@@ -420,7 +450,7 @@ impl DomDocument {
     fn set_oninput(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, callback: Option<lumen::embed::JsFunction>) { self.base.base.set_handler(ctx, &this.0, "input", callback); }
     #[getter]
     fn active_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        if let Some(node) = self.realm.focused_node() { return Ok(self.realm.wrap(ctx, node)); }
+        if let Some(node) = self.realm.focused_node() { let target = self.realm.session.borrow().document().retarget(node, Some(self.base.id)).map_err(dom_error)?; return Ok(self.realm.wrap(ctx, target)); }
         self.body(ctx)
     }
     #[getter]
@@ -561,6 +591,16 @@ pub struct DomNode {
 
 #[lumen_bind::methods]
 impl DomNode {
+    fn get_root_node(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
+        let composed = match options { Some(value) => matches!(ctx.get_member(&value, "composed").map_err(|_| OpError::new("TypeError", "root options getter failed"))?, Value::Bool(true)), None => false };
+        let root = self.realm.session.borrow().document().root_node(self.id, composed).map_err(dom_error)?;
+        Ok(self.realm.wrap(ctx, root))
+    }
+    #[getter]
+    fn assigned_slot(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let slot = { let session = self.realm.session.borrow(); let document = session.document(); document.assigned_slot(self.id).map_err(dom_error)?.filter(|slot| document.root_node(*slot, false).ok().and_then(|root| document.shadow_mode(root).ok().flatten()) == Some(lumen_html::ShadowMode::Open)) };
+        Ok(self.realm.wrap_option(ctx, slot))
+    }
     fn append(&self, #[varargs] nodes: Vec<&DomNode>) -> OpResult<()> {
         if nodes.iter().any(|node| !Rc::ptr_eq(&self.realm, &node.realm)) { return Err(OpError::new("WrongDocumentError", "nodes belong to different documents")); }
         let ids: Vec<NodeId> = nodes.iter().map(|node| node.id).collect();
@@ -595,7 +635,7 @@ impl DomNode {
         let session = self.realm.session.borrow();
         let document = session.document();
         let mut current = Some(self.id);
-        while let Some(node) = current { if node == document.root() { return Ok(true); } current = document.parent(node).map_err(dom_error)?; }
+        while let Some(node) = current { if node == document.root() { return Ok(true); } current = document.shadow_including_parent(node).map_err(dom_error)?; }
         Ok(false)
     }
     fn contains(&self, other: Option<&DomNode>) -> OpResult<bool> {
@@ -965,7 +1005,8 @@ impl DomNode {
     fn set_inner_html(&self, value: &str) -> OpResult<()> {
         let mut session = self.realm.session.borrow_mut();
         let document = session.document_mut();
-        let fragment = html::parse_fragment_in(document, self.id, value).map_err(|error| {
+        let context = document.shadow_host(self.id).map_err(dom_error)?.unwrap_or(self.id);
+        let fragment = html::parse_fragment_in(document, context, value).map_err(|error| {
             OpError::new("InvalidStateError", format!(
                 "HTML parse error at {}: {}",
                 error.offset, error.message
@@ -1055,6 +1096,8 @@ pub fn install(
         ("HTMLElement", ctx.class_constructor::<DomHtmlElement>()),
         ("HTMLIFrameElement", ctx.class_constructor::<DomIFrameElement>()),
         ("HTMLInputElement", ctx.class_constructor::<DomInputElement>()),
+        ("HTMLSlotElement", ctx.class_constructor::<DomSlotElement>()),
+        ("ShadowRoot", ctx.class_constructor::<DomShadowRoot>()),
         ("HTMLTemplateElement", ctx.class_constructor::<DomTemplateElement>()),
         ("CharacterData", ctx.class_constructor::<DomCharacterData>()),
         ("Text", ctx.class_constructor::<DomText>()),
