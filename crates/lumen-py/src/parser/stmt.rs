@@ -488,6 +488,9 @@ impl Parser {
                         }
                         elts.push(self.expression()?);
                     }
+                    if self.at_kw("as") {
+                        return self.error_at(tpos, "multiple exception types must be parenthesized when using 'as'");
+                    }
                     typ = Some(mk(
                         tpos,
                         ExprKind::Tuple {

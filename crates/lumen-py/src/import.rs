@@ -141,10 +141,30 @@ impl Interp {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), src)),
         };
-        match crate::compile::compile_module(&module, filename, interactive) {
+        let mut warnings = Vec::new();
+        let compiled = crate::compile::compile_module(&module, filename, interactive, &mut warnings);
+        self.emit_syntax_warnings(&warnings, filename, src)?;
+        match compiled {
             Ok(c) => Ok(c),
             Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, src)),
         }
+    }
+
+    /// `_PyErr_EmitSyntaxWarning` for each warning; one that the filters turn into an error is
+    /// raised as a `SyntaxError` at its location.
+    pub fn emit_syntax_warnings(&mut self, warnings: &[crate::compile::CompileWarning], filename: &str, src: &str) -> R<()> {
+        for w in warnings {
+            match crate::builtins::warningsm::warn_explicit_category(self, "SyntaxWarning", &w.msg, filename, w.line) {
+                Ok(()) => {}
+                Err(e) if self.exc_is(&e, "SyntaxWarning") => {
+                    // CPython reads the line back from the file, so code compiled from a string has no text.
+                    let text = if filename.starts_with('<') { "" } else { src };
+                    return Err(self.syntax_error(&w.msg, filename, w.line, Some(w.col), text));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     fn sys_dict(&self) -> Option<Obj> {

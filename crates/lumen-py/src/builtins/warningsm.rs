@@ -3,7 +3,7 @@
 //! their arguments to it, so one implementation serves both the accelerated and the pure
 //! `warnings` module.
 
-pub use _warnings::warn_category;
+pub use _warnings::{warn_category, warn_explicit_category};
 
 /// _warnings provides basic warning filtering support.
 /// It is a helper module to speed up interpreter start-up.
@@ -23,6 +23,19 @@ pub mod _warnings {
         let f = it.get_attr_str(&Value::Obj(m), "warn")?;
         let cat = Value::Obj(it.exc_type(category));
         it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
+        Ok(())
+    }
+
+    /// `PyErr_WarnExplicit(category, msg, filename, lineno, NULL, NULL)` for a builtin category:
+    /// the module is the filename without `.py`, and there is no registry.
+    pub fn warn_explicit_category(it: &mut Interp, category: &str, msg: &str, filename: &str, lineno: u32) -> R<()> {
+        // Through `warnings`, not `_py_warnings`: importing it binds `_py_warnings._wm`, which compile-time
+        // warnings can need before user code ever imports `warnings`.
+        let w = Value::Obj(it.import_module("warnings")?);
+        let f = it.get_attr_str(&w, "warn_explicit")?;
+        let cat = Value::Obj(it.exc_type(category));
+        let module = Value::str(filename.strip_suffix(".py").unwrap_or(filename));
+        it.call(&f, vec![Value::str(msg), cat, Value::str(filename), Value::Int(lineno as i64), module], Vec::new())?;
         Ok(())
     }
 

@@ -43,6 +43,7 @@ pub mod search;
 pub mod siphash;
 pub mod smuggle;
 pub mod strftime;
+pub mod text;
 pub mod tz;
 #[rustfmt::skip]
 pub mod tzdata;

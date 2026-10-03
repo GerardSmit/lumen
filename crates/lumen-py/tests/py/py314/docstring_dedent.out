@@ -1,0 +1,7 @@
+'\nModule docstring\n  with indent.\n'
+'\nThis is a docstring with\n  leading whitespace.\n\nIt even has multiple paragraphs!\n'
+'First line after a tab.\nSecond line indented by a tab.\n        Third by two.'
+'leading spaces on the only line   '
+'First.\n\n\nLast.\n'
+'a\nb\n  c'
+None
