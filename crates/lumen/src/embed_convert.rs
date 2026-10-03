@@ -1415,7 +1415,11 @@ impl OpError {
                     let global = ctx.global_object();
                     match ctx.get_member(&global, "DOMException") {
                         Ok(constructor) if constructor.is_callable() => ctx.construct_value(constructor, &[Value::str(&message), Value::str(class)]).unwrap_or_else(|error| error),
-                        _ => ctx.make_error(class, message),
+                        _ => {
+                            let error = ctx.make_error(class, message);
+                            if let Value::Obj(object) = &error { object.borrow_mut().props.insert("name", Property::builtin(Value::str(class))); }
+                            error
+                        },
                     }
                 } else { ctx.make_error(class, message) };
                 if let (Some(code), Value::Obj(o)) = (code, &e) {
