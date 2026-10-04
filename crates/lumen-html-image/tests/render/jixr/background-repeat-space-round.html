@@ -1,0 +1,20 @@
+<!doctype html>
+<style>
+  html,body{margin:0;background:#fff}
+  .stage{width:296px;height:176px;padding:12px;background:#fafafa}
+  .tile{
+    width:62px;height:8px;margin-bottom:16px;background-color:#e8eef8;
+    background-image:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAIUlEQVR42mMQ91v2H4R/72EFY3Q+A0EFuCRgfMIKBoEbAJHKmKFnaCjvAAAAAElFTkSuQmCC");
+    background-repeat:space no-repeat;
+  }
+  .round{
+    width:50px;height:8px;
+    background-repeat:round no-repeat;
+  }
+</style>
+<div class=stage><div class=tile></div><div class="tile round"></div></div>
+<!-- jixr-compare: threshold=189 max-diff-ratio=0.03
+     The `space` row has seven native 8px tiles separated by 1px gaps. The `round` row scales
+     six tiles to exactly fill 50px. PDF image sampling has the repository's established edge
+     tolerance; the scaled `round` image has the same independent sampler-edge variance on the
+     Window and ImageSharp raster paths (maximum observed channel delta 189). -->

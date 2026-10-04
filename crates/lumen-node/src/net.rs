@@ -47,27 +47,52 @@ use lumen_host::{ops, CallbackQueue, CompletionSender, Ctx, OpDecl, TaskId, Task
 const UDP_POLL: Duration = Duration::from_millis(200);
 
 #[cfg(unix)]
-mod wake;
-#[cfg(unix)]
 mod fdpass;
+#[cfg(unix)]
+mod wake;
 /// Descriptor passing is unix-only (Windows IPC rides the child's stdio instead).
 #[cfg(not(unix))]
 mod fdpass {
     use lumen_host::{Ctx, Value};
     fn unsupported(ctx: &mut Ctx) -> Result<Value, Value> {
-        Err(ctx.make_error("Error", "socket descriptor passing is not supported on this platform"))
+        Err(ctx.make_error(
+            "Error",
+            "socket descriptor passing is not supported on this platform",
+        ))
     }
-    pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_socket_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_server_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_udp_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_release(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_guess_handle(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::str("UNKNOWN")) }
-    pub(super) fn op_dup_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_close_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Undefined) }
+    pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_socket_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_server_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_udp_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_release(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_guess_handle(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::str("UNKNOWN"))
+    }
+    pub(super) fn op_dup_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_close_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Undefined)
+    }
 }
 
 // ---- op tables --------------------------------------------------------------------------------
@@ -350,67 +375,11 @@ struct NetErr {
     errno: Option<i32>,
 }
 
+/// libuv's name for a socket error; `UNKNOWN` for one that carries no OS error of its own.
 fn io_code(e: &std::io::Error) -> &'static str {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        ConnectionRefused => "ECONNREFUSED",
-        ConnectionReset => "ECONNRESET",
-        ConnectionAborted => "ECONNABORTED",
-        NotConnected => "ENOTCONN",
-        AddrInUse => "EADDRINUSE",
-        AddrNotAvailable => "EADDRNOTAVAIL",
-        BrokenPipe => "EPIPE",
-        TimedOut => "ETIMEDOUT",
-        PermissionDenied => "EACCES",
-        NotFound => "ENOENT",
-        _ => errno_name(e.raw_os_error()).unwrap_or("UNKNOWN"),
-    }
-}
-
-#[cfg(unix)]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    use libc::*;
-    let raw = raw?;
-    Some(match raw {
-        EPIPE => "EPIPE",
-        ECONNRESET => "ECONNRESET",
-        EINVAL => "EINVAL",
-        EAFNOSUPPORT => "EAFNOSUPPORT",
-        EMSGSIZE => "EMSGSIZE",
-        ENOBUFS => "ENOBUFS",
-        ENOTSOCK => "ENOTSOCK",
-        ENETUNREACH => "ENETUNREACH",
-        EHOSTUNREACH => "EHOSTUNREACH",
-        EISCONN => "EISCONN",
-        EDESTADDRREQ => "EDESTADDRREQ",
-        EBADF => "EBADF",
-        ENOPROTOOPT => "ENOPROTOOPT",
-        EPROTONOSUPPORT => "EPROTONOSUPPORT",
-        ENODEV => "ENODEV",
-        ENOMEM => "ENOMEM",
-        EMFILE => "EMFILE",
-        EPERM => "EPERM",
-        EAGAIN => "EAGAIN",
-        EADDRINUSE => "EADDRINUSE",
-        EADDRNOTAVAIL => "EADDRNOTAVAIL",
-        ENOTCONN => "ENOTCONN",
-        ECONNREFUSED => "ECONNREFUSED",
-        ENOENT => "ENOENT",
-        EACCES => "EACCES",
-        ENOTDIR => "ENOTDIR",
-        ENAMETOOLONG => "ENAMETOOLONG",
-        _ => return None,
-    })
-}
-
-#[cfg(not(unix))]
-fn errno_name(raw: Option<i32>) -> Option<&'static str> {
-    match raw? {
-        10040 => Some("EMSGSIZE"),
-        10022 => Some("EINVAL"),
-        10047 => Some("EAFNOSUPPORT"),
-        10038 => Some("ENOTSOCK"),
-        _ => None,
+    match lumen_os::errno::uv_code(e) {
+        "EIO" if e.raw_os_error().is_none() => "UNKNOWN",
+        code => code,
     }
 }
 
@@ -596,12 +565,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     let local_port = arg_u64(args, 3) as u16;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(4), args.get(5))?;
 
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_connect,
-    );
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
     completions(ctx).run_blocking(id, move || {
         let result: Result<NetStream, NetErr> = (|| {
             let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
@@ -622,8 +586,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
             } else {
                 local_host.parse().ok()
             };
-            let local = (local_ip.is_some() || local_port != 0)
-                .then_some((local_ip, local_port));
+            let local = (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
             let mut last = None;
             for addr in addrs {
                 match connect_tcp(addr, local) {
@@ -673,17 +636,8 @@ fn connect_tcp_from(
     local_ip: Option<IpAddr>,
     local_port: u16,
 ) -> std::io::Result<TcpStream> {
+    use lumen_os::net::{self as os, SockAddr};
     use std::os::fd::FromRawFd;
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
-    let stream = unsafe { TcpStream::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     let ip = local_ip.unwrap_or(if addr.is_ipv6() {
         IpAddr::V6(Ipv6Addr::UNSPECIFIED)
     } else {
@@ -692,24 +646,28 @@ fn connect_tcp_from(
     if ip.is_ipv6() != addr.is_ipv6() {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let (storage, len) = sockaddr_of(&SocketAddr::new(ip, local_port));
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    let rc = unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let (storage, len) = sockaddr_of(&addr);
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
+    // SAFETY: `fd` is a fresh descriptor owned by nothing else.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+    os::bind(fd, &SockAddr::from(SocketAddr::new(ip, local_port))).map_err(os_error)?;
     loop {
-        // SAFETY: as above.
-        let rc = unsafe { libc::connect(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-        if rc == 0 {
-            return Ok(stream);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
+        match os::connect(fd, &SockAddr::from(addr)) {
+            Ok(()) => return Ok(stream),
+            Err(e) if e.errno() == libc::EINTR => {}
+            Err(e) => return Err(os_error(e)),
         }
     }
+}
+
+/// The `io::Error` of a `lumen_os` error, keeping its errno.
+#[cfg(unix)]
+pub(crate) fn os_error(e: lumen_os::FsError) -> std::io::Error {
+    std::io::Error::from_raw_os_error(e.errno())
 }
 
 #[cfg(windows)]
@@ -879,12 +837,7 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
     #[cfg(unix)]
     {
-        let id = lumen_host::register_task(
-        ctx,
-            resolve,
-            Some(reject),
-            decode_connect,
-        );
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
         completions(ctx).run_blocking(id, move || {
             let result = UnixStream::connect(&path)
                 .map(NetStream::Unix)
@@ -895,12 +848,7 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     }
     #[cfg(windows)]
     {
-        let id = lumen_host::register_task(
-        ctx,
-            resolve,
-            Some(reject),
-            decode_connect,
-        );
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
         completions(ctx).run_blocking(id, move || {
             let result = crate::win_pipe::PipeStream::connect(&path)
                 .map(NetStream::Pipe)
@@ -959,14 +907,10 @@ fn op_read(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                 Ok(false) => break Ok(0),
                 Err(e) => break Err(e),
             }
-            // SAFETY: the descriptor is kept open by `stream`; `buf` is a live buffer.
-            let n = unsafe { libc::recv(stream.raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-            if n >= 0 {
-                break Ok(n as usize);
-            }
-            let e = std::io::Error::last_os_error();
-            if !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
-                break Err(e);
+            match lumen_os::net::recv(stream.raw_fd(), &mut buf, libc::MSG_DONTWAIT) {
+                Ok(n) => break Ok(n),
+                Err(e) if lumen_os::net::would_block(e.errno()) || e.errno() == libc::EINTR => {}
+                Err(e) => break Err(os_error(e)),
             }
         };
         #[cfg(not(unix))]
@@ -1024,12 +968,7 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         return Ok(Value::Undefined);
     };
 
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_write,
-    );
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
     completions(ctx).run_blocking(id, move || {
         let mut s: &NetStream = &stream;
         let result: Result<(), NetErr> = s
@@ -1096,7 +1035,8 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
             let mut v: i32 = 0;
             let mut len = 4u32;
             // SAFETY: `v` is a live i32 and `len` its size, for an open socket.
-            let rc = unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
+            let rc =
+                unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
             (rc == 0 && v >= 0).then_some(v as usize)
         };
         let space = match (query(SO_SNDBUF), query(SO_NWRITE)) {
@@ -1110,7 +1050,11 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
     }
     // SAFETY: `fd` is an open socket owned by `stream`, and `data` is a live buffer of `len` bytes.
     let n = unsafe { send(fd, data.as_ptr().cast(), data.len(), MSG_DONTWAIT) };
-    if n > 0 { n as usize } else { 0 }
+    if n > 0 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 /// Windows has no per-call non-blocking send; the socket stays blocking (its reader thread
@@ -1287,6 +1231,7 @@ fn op_socket_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Valu
 /// IPv6 address (so `::` is dual-stack unless asked otherwise), the real backlog.
 #[cfg(unix)]
 fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Result<TcpListener> {
+    use lumen_os::net as os;
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     let addr = match host.parse::<IpAddr>() {
@@ -1296,42 +1241,26 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
             .next()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL))?,
     };
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
-        // SAFETY: `on` is a live c_int of the size passed.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&on as *const i32).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-    };
-    set(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+    os::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).map_err(os_error)?;
     if addr.is_ipv6() {
-        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (flags & IPV6ONLY != 0) as i32)?;
+        os::setsockopt_int(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (flags & IPV6ONLY != 0) as i32,
+        )
+        .map_err(os_error)?;
     }
-    let (storage, len) = sockaddr_of(&addr);
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    if unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a bound stream socket.
-    if unsafe { libc::listen(fd, backlog) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    os::bind(fd, &addr.into()).map_err(os_error)?;
+    os::listen(fd, backlog).map_err(os_error)?;
     Ok(listener)
 }
 
@@ -1517,7 +1446,13 @@ fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                     };
                     break Ok(stream);
                 }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(e) => break Err(e),
             }
         };
@@ -1701,11 +1636,21 @@ fn op_udp_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 
     let addr = match parse_udp_addr(&host, port, kind6) {
         Ok(a) => a,
-        Err(e) => return Err(net_error_value(ctx, &net_err("bind", &e, Some((host, port))))),
+        Err(e) => {
+            return Err(net_error_value(
+                ctx,
+                &net_err("bind", &e, Some((host, port))),
+            ))
+        }
     };
     let socket = match bind_udp(addr, flags) {
         Ok(s) => s,
-        Err(e) => return Err(net_error_value(ctx, &net_err("bind", &e, Some((host, port))))),
+        Err(e) => {
+            return Err(net_error_value(
+                ctx,
+                &net_err("bind", &e, Some((host, port))),
+            ))
+        }
     };
     // Bounded read timeout so the recv thread can notice close() and exit.
     let _ = socket.set_read_timeout(Some(UDP_POLL));
@@ -1768,91 +1713,32 @@ fn invalid_argument_errno() -> i32 {
     10022
 }
 
-#[cfg(unix)]
-pub(crate) fn sockaddr_of(addr: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
-    // SAFETY: an all-zero sockaddr_storage is a valid value; the family-specific struct written
-    // into it below is no larger than the storage.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let len = match addr {
-        SocketAddr::V4(a) => {
-            let sin = libc::sockaddr_in {
-                #[cfg(target_vendor = "apple")]
-                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
-                sin_family: libc::AF_INET as libc::sa_family_t,
-                sin_port: a.port().to_be(),
-                sin_addr: libc::in_addr {
-                    s_addr: u32::from_ne_bytes(a.ip().octets()),
-                },
-                sin_zero: [0; 8],
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin) };
-            std::mem::size_of::<libc::sockaddr_in>()
-        }
-        SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                #[cfg(target_vendor = "apple")]
-                sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
-            };
-            // SAFETY: see above.
-            unsafe { std::ptr::write((&mut storage as *mut libc::sockaddr_storage).cast(), sin6) };
-            std::mem::size_of::<libc::sockaddr_in6>()
-        }
-    };
-    (storage, len as libc::socklen_t)
-}
-
 /// Bind a UDP socket with the libuv bind flags std cannot express (`UV_UDP_IPV6ONLY` = 1,
 /// `UV_UDP_REUSEADDR` = 4).
 #[cfg(unix)]
 fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
+    use lumen_os::net as os;
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     const REUSEADDR: u32 = 4;
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
-    // SAFETY: plain socket(2); the descriptor is wrapped (and so closed on error) right away.
-    let fd = unsafe { libc::socket(domain, libc::SOCK_DGRAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
+    let fd = os::socket(domain, libc::SOCK_DGRAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
-    // SAFETY: fcntl on the descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-    let set = |level: i32, name: i32, on: i32| -> std::io::Result<()> {
-        // SAFETY: `on` is a live c_int of the size passed.
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&on as *const i32).cast(),
-                std::mem::size_of::<i32>() as libc::socklen_t,
-            )
-        };
-        if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
-    };
+    let set = |level: i32, name: i32| os::setsockopt_int(fd, level, name, 1).map_err(os_error);
     if addr.is_ipv6() && flags & IPV6ONLY != 0 {
-        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, 1)?;
+        set(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY)?;
     }
     if flags & REUSEADDR != 0 {
-        set(libc::SOL_SOCKET, libc::SO_REUSEADDR, 1)?;
+        set(libc::SOL_SOCKET, libc::SO_REUSEADDR)?;
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        set(libc::SOL_SOCKET, libc::SO_REUSEPORT, 1)?;
+        set(libc::SOL_SOCKET, libc::SO_REUSEPORT)?;
     }
-    let (storage, len) = sockaddr_of(&addr);
-    // SAFETY: `storage` holds a valid sockaddr of `len` bytes.
-    let rc = unsafe { libc::bind(fd, (&storage as *const libc::sockaddr_storage).cast(), len) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    os::bind(fd, &addr.into()).map_err(os_error)?;
     Ok(socket)
 }
 
@@ -1876,9 +1762,9 @@ fn op_udp_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
         return Err(ctx.make_error("Error", "dgram: unknown socket"));
     };
     let result = parse_udp_addr(&host, port, kind6).and_then(|addr| socket.connect(addr));
-    result.map(|()| Value::Undefined).map_err(|e| {
-        net_error_value(ctx, &net_err("connect", &e, Some((host, port))))
-    })
+    result
+        .map(|()| Value::Undefined)
+        .map_err(|e| net_error_value(ctx, &net_err("connect", &e, Some((host, port)))))
 }
 
 /// `(socketId)` — dissolve the association made by `connect`.
@@ -1890,33 +1776,7 @@ fn op_udp_disconnect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, 
 #[cfg(unix)]
 fn disconnect_udp(socket: &UdpSocket) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    let fd = socket.as_raw_fd();
-    // SAFETY: an all-zero sockaddr_storage with family AF_UNSPEC is the documented way to
-    // dissolve a datagram socket's peer.
-    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    storage.ss_family = libc::AF_UNSPEC as libc::sa_family_t;
-    #[cfg(target_vendor = "apple")]
-    {
-        storage.ss_len = std::mem::size_of::<libc::sockaddr>() as u8;
-    }
-    // SAFETY: `storage` is a live sockaddr of the length passed.
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&storage as *const libc::sockaddr_storage).cast(),
-            std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-        )
-    };
-    if rc == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    // Darwin reports the dissolved association as EAFNOSUPPORT on some releases while still
-    // having applied it.
-    if error.raw_os_error() == Some(libc::EAFNOSUPPORT) && socket.peer_addr().is_err() {
-        return Ok(());
-    }
-    Err(error)
+    lumen_os::net::disconnect(socket.as_raw_fd()).map_err(os_error)
 }
 
 #[cfg(not(unix))]
@@ -2143,17 +2003,13 @@ fn op_udp_set_multicast_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
 #[cfg(unix)]
 fn set_ipv6_multicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    // SAFETY: the fd is a live socket and `hops` a c_int of the size passed.
-    let rc = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MULTICAST_HOPS,
-            (&hops as *const i32).cast(),
-            std::mem::size_of::<i32>() as libc::socklen_t,
-        )
-    };
-    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+    lumen_os::net::setsockopt_int(
+        socket.as_raw_fd(),
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MULTICAST_HOPS,
+        hops,
+    )
+    .map_err(os_error)
 }
 
 #[cfg(not(unix))]
@@ -2508,7 +2364,9 @@ fn win_setsockopt<T>(socket: &UdpSocket, level: i32, name: i32, value: &T) -> st
         Ok(())
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
@@ -2724,12 +2582,22 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
     use std::os::windows::io::AsRawSocket;
     #[link(name = "ws2_32")]
     extern "system" {
-        fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, length: *mut i32) -> i32;
+        fn getsockopt(
+            socket: usize,
+            level: i32,
+            name: i32,
+            value: *mut u8,
+            length: *mut i32,
+        ) -> i32;
         fn WSAGetLastError() -> i32;
     }
     let mut value = 0i32;
     let mut length = std::mem::size_of::<i32>() as i32;
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     // SAFETY: the socket is live for the borrow; value/length describe a valid i32 buffer.
     let rc = unsafe {
         getsockopt(
@@ -2744,13 +2612,19 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
         Ok(value)
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
 #[cfg(windows)]
 fn set_socket_buffer_size(socket: &UdpSocket, receive: bool, size: i32) -> std::io::Result<()> {
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     win_setsockopt(socket, WIN_SOL_SOCKET, name, &size)
 }
 

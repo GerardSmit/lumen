@@ -1,5 +1,5 @@
-use super::shapes::{INDEX_THRESHOLD, OWNED_THRESHOLD};
 use super::Props;
+use super::shapes::{INDEX_THRESHOLD, OWNED_THRESHOLD};
 use crate::value::{Property, Value};
 
 fn num(n: f64) -> Property {
@@ -282,7 +282,11 @@ fn shared_shapes_store_one_key_each_and_materialise_lists_on_demand() {
     );
     assert_eq!(keys(&p), names);
     let listed: Vec<usize> = (INDEX_THRESHOLD + 1..=OWNED_THRESHOLD).rev().collect();
-    assert_eq!(flat_lists(&p), listed, "iterating materialises the leaf's list");
+    assert_eq!(
+        flat_lists(&p),
+        listed,
+        "iterating materialises the leaf's list"
+    );
     // The materialised list answers the same lookups.
     for (i, k) in names.iter().enumerate() {
         assert_eq!(p.slot_of(k), Some(i));
@@ -352,7 +356,7 @@ fn dictionary_sized_objects_index_every_key_through_growth_and_deletes() {
 
 #[test]
 fn keys_colliding_under_the_old_hash_keep_order_and_insert_in_linear_time() {
-    use crate::fasthash::tests::{old_colliding_keys, OldFx};
+    use crate::fasthash::tests::{OldFx, old_colliding_keys};
     use std::time::{Duration, Instant};
     let hostile = old_colliding_keys(&OldFx::default(), 20_000);
     let benign: Vec<String> = (0..hostile.len())

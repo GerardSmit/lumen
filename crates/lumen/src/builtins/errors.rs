@@ -181,9 +181,10 @@ pub(super) fn install_errors(it: &mut Interp) {
                 i.capture_stack_trace(&arg(a, 0), &arg(a, 1))?;
                 Ok(Value::Undefined)
             });
-            ctor.borrow_mut()
-                .props
-                .insert("stackTraceLimit", Property::data(Value::Num(10.0), true, true, true));
+            ctor.borrow_mut().props.insert(
+                "stackTraceLimit",
+                Property::data(Value::Num(10.0), true, true, true),
+            );
             it.extra_protos.insert("%Error%", ctor.clone());
             error_ctor = Some(ctor.clone());
         } else if let Some(ec) = &error_ctor {

@@ -4,17 +4,18 @@
 
 use crate::interpreter::{Abrupt, Interp, MAX_ARRAY_OP_LEN, MAX_BUFFER_BYTES, MAX_STR_LEN};
 use crate::value::*;
+use lumen_common::limits::size;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
 // Per-object modules split out of this file (behavior-preserving). Shared helpers remain here and
 // are reachable from each submodule via `use super::*`.
 mod array_fast;
-mod num_fmt;
 mod array_iterator;
 mod atomics;
 pub(crate) mod collection_data;
 pub(crate) mod collections;
+mod num_fmt;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 pub(crate) mod dataview;
 mod date;
@@ -31,15 +32,15 @@ pub(crate) use math::jit_math_fns;
 mod primitives;
 mod promise;
 pub(crate) use promise::{make_aggregate_error_value, promise_then_is_silent};
-mod proxy;
-mod reflect;
+pub(crate) mod proxy;
+pub(crate) mod reflect;
 mod regexp;
 mod shadowrealm;
-pub(crate) mod vm_context;
 mod string_code_point;
 mod string_substring;
-pub(crate) use string_code_point::nf_code_point_at;
+pub(crate) mod vm_context;
 pub(crate) use collections::make_collection_iterator;
+pub(crate) use string_code_point::nf_code_point_at;
 pub(crate) mod typedarray;
 pub(crate) mod weakrefs;
 
@@ -340,21 +341,7 @@ pub(crate) fn proxy_own_keys(
 ) -> Result<Vec<Value>, Value> {
     let trap = ab(i.proxy_trap(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        // Forward to the target's [[OwnPropertyKeys]] (recursing for a proxy target).
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_own_keys(i, &t2, &h2);
-        }
-        return Ok(match target {
-            Value::Obj(t) => {
-                // OrdinaryOwnPropertyKeys order: array-index keys ascending, then other string keys in
-                // insertion order, then symbol keys (as their Symbol values) in insertion order.
-                ordinary_own_keys_ordered(i, t)
-                    .into_iter()
-                    .map(|k| i.sym_from_key(&k).unwrap_or_else(|| Value::from_string(k)))
-                    .collect()
-            }
-            _ => Vec::new(),
-        });
+        return proxy_target_own_keys(i, target);
     }
     if !trap.is_callable() {
         return Err(i.make_error("TypeError", "proxy 'ownKeys' trap is not callable"));
@@ -379,49 +366,54 @@ pub(crate) fn proxy_own_keys(
         let result_set: std::collections::HashSet<&str> =
             key_strs.iter().map(|s| s.as_str()).collect();
         if result_set.len() != key_strs.len() {
-            return Err(i.make_error("TypeError", "'ownKeys' on proxy: trap returned duplicate entries"));
+            return Err(i.make_error(
+                "TypeError",
+                "'ownKeys' on proxy: trap returned duplicate entries",
+            ));
         }
-        // Invariants relative to the target's own keys / extensibility.
-        if let Value::Obj(t) = target {
-            let extensible = t.borrow().extensible;
-            let target_keys: Vec<(String, bool)> = t
-                .borrow()
-                .props
-                .keys()
-                .into_iter()
-                .map(|k| {
-                    let conf = t
-                        .borrow()
-                        .props
-                        .get(&k)
-                        .map(|p| p.configurable())
-                        .unwrap_or(true);
-                    (k.to_string(), conf)
-                })
-                .collect();
-            for (tk, conf) in &target_keys {
-                if !conf && !result_set.contains(tk.as_str()) {
+        // Invariants relative to the target's own [[OwnPropertyKeys]], [[GetOwnProperty]], and
+        // [[IsExtensible]] methods. In particular, a wrapped WindowProxy is always extensible and
+        // contributes its child-window index descriptors here.
+        let extensible = proxy_target_is_extensible(i, target)?;
+        let mut target_keys = Vec::new();
+        for target_key in proxy_target_own_keys(i, target)? {
+            let target_key = ab(i.to_property_key(&target_key))?;
+            let descriptor = proxy_target_own_property(i, target, &target_key)?;
+            let Value::Obj(descriptor) = descriptor else {
+                continue;
+            };
+            let configurable = matches!(
+                descriptor
+                    .borrow()
+                    .props
+                    .get("configurable")
+                    .map(|property| property.value()),
+                Some(Value::Bool(true))
+            );
+            target_keys.push((target_key, configurable));
+        }
+        for (target_key, configurable) in &target_keys {
+            if !configurable && !result_set.contains(target_key.as_str()) {
+                return Err(i.make_error(
+                    "TypeError",
+                    &format!("'ownKeys' on proxy: trap result did not include '{target_key}'"),
+                ));
+            }
+        }
+        if !extensible {
+            for (target_key, _) in &target_keys {
+                if !result_set.contains(target_key.as_str()) {
                     return Err(i.make_error(
                         "TypeError",
-                        &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
+                        &format!("'ownKeys' on proxy: trap result did not include '{target_key}'"),
                     ));
                 }
             }
-            if !extensible {
-                for (tk, _) in &target_keys {
-                    if !result_set.contains(tk.as_str()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
-                        ));
-                    }
-                }
-                if key_strs.len() != target_keys.len() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
-                    ));
-                }
+            if key_strs.len() != target_keys.len() {
+                return Err(i.make_error(
+                    "TypeError",
+                    "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
+                ));
             }
         }
         Ok(keys)
@@ -440,6 +432,10 @@ pub(crate) fn proxy_own_keys(
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
 /// `[[IsExtensible]]`, proxy-aware (recurses into a proxy target, enforcing the trap invariant).
 fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(obj, Value::Obj(o) if i.is_window_proxy(o)) {
+        return Ok(true);
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -467,6 +463,39 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         Value::Obj(o) => o.clone(),
         _ => return Ok(true),
     };
+    #[cfg(feature = "embed")]
+    if i.is_window_proxy(&o) {
+        let Some(decision) = ab(i.window_proxy_decision(
+            &o,
+            crate::embed_realms::WindowProxyOperation::SetPrototypeOf {
+                prototype: proto.clone(),
+            },
+        ))?
+        else {
+            unreachable!("WindowProxy registry entry disappeared during operation")
+        };
+        return match decision {
+            crate::embed_realms::WindowProxyDecision::Handled(
+                crate::embed_realms::WindowProxyResult::SetPrototypeOf(success),
+            ) => Ok(success),
+            crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            )),
+            crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                let target = forward.target.as_obj().ok_or_else(|| {
+                    i.make_error("TypeError", "WindowProxy target is not an object")
+                })?;
+                let current = target
+                    .borrow()
+                    .proto
+                    .clone()
+                    .map(Value::Obj)
+                    .unwrap_or(Value::Null);
+                Ok(i.strict_equals(proto, &current))
+            }
+        };
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -569,6 +598,10 @@ pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Ve
 
 /// `[[PreventExtensions]]`, proxy-aware. Returns whether it succeeded.
 fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(obj, Value::Obj(o) if i.is_window_proxy(o)) {
+        return Ok(false);
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -682,6 +715,232 @@ pub(crate) fn proxy_pair(i: &Interp, v: &Value) -> Option<(Value, Value)> {
     }
 }
 
+/// WindowProxy `[[GetOwnProperty]]`, returning `None` only when `object` is not a WindowProxy.
+/// `Undefined` is the (authorized) absent-property result.
+#[cfg(feature = "embed")]
+pub(crate) fn window_proxy_get_own_property(
+    i: &mut Interp,
+    object: &Value,
+    key: &str,
+) -> Result<Option<Value>, Value> {
+    let Some(window_proxy) = object.as_obj() else {
+        return Ok(None);
+    };
+    if !i.is_window_proxy(window_proxy) {
+        return Ok(None);
+    }
+    let key_value = i
+        .sym_from_key(key)
+        .unwrap_or_else(|| Value::from_string(key.to_owned()));
+    let Some(decision) = ab(i.window_proxy_decision(
+        window_proxy,
+        crate::embed_realms::WindowProxyOperation::GetOwnProperty { key: key_value },
+    ))?
+    else {
+        unreachable!("WindowProxy registry entry disappeared during operation")
+    };
+    let descriptor = match decision {
+        crate::embed_realms::WindowProxyDecision::Handled(
+            crate::embed_realms::WindowProxyResult::GetOwnProperty(descriptor),
+        ) => descriptor.unwrap_or(Value::Undefined),
+        crate::embed_realms::WindowProxyDecision::Handled(_) => {
+            return Err(i.make_error(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            ));
+        }
+        crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+            if let Some(index) = crate::value::canonical_index(key) {
+                return Ok(Some(match ab(i.window_proxy_child_at(&forward, index))? {
+                    Some(child) => {
+                        descriptor_from_prop(i, Property::data(child, false, true, true))
+                    }
+                    None => Value::Undefined,
+                }));
+            }
+            let target = forward
+                .target
+                .as_obj()
+                .ok_or_else(|| i.make_error("TypeError", "WindowProxy target is not an object"))?;
+            let property = target
+                .borrow()
+                .props
+                .get(key)
+                .map(|property| property.clone());
+            property
+                .map(|property| descriptor_from_prop(i, property))
+                .unwrap_or(Value::Undefined)
+        }
+    };
+    Ok(Some(descriptor))
+}
+
+/// WindowProxy `[[OwnPropertyKeys]]`, returning `None` only for non-WindowProxy values.
+#[cfg(feature = "embed")]
+pub(crate) fn window_proxy_own_property_keys(
+    i: &mut Interp,
+    object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    let Some(window_proxy) = object.as_obj() else {
+        return Ok(None);
+    };
+    if !i.is_window_proxy(window_proxy) {
+        return Ok(None);
+    }
+    let Some(decision) = ab(i.window_proxy_decision(
+        window_proxy,
+        crate::embed_realms::WindowProxyOperation::OwnPropertyKeys,
+    ))?
+    else {
+        unreachable!("WindowProxy registry entry disappeared during operation")
+    };
+    match decision {
+        crate::embed_realms::WindowProxyDecision::Handled(
+            crate::embed_realms::WindowProxyResult::OwnPropertyKeys(keys),
+        ) => Ok(Some(keys)),
+        crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+            "TypeError",
+            "WindowProxy policy returned a result for the wrong operation",
+        )),
+        crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+            let count = i.window_proxy_child_count(&forward);
+            let target = forward
+                .target
+                .as_obj()
+                .ok_or_else(|| i.make_error("TypeError", "WindowProxy target is not an object"))?;
+            let ordinary_keys = ordinary_own_keys_ordered(i, target);
+            let mut keys = Vec::with_capacity(count.saturating_add(ordinary_keys.len()));
+            for index in 0..count {
+                keys.push(Value::from_string(index.to_string()));
+            }
+            for key in ordinary_keys {
+                if Interp::is_private_key(&key) {
+                    continue;
+                }
+                if let Some(symbol) = i.sym_from_key(&key) {
+                    keys.push(symbol);
+                } else {
+                    keys.push(Value::from_string(key));
+                }
+            }
+            Ok(Some(keys))
+        }
+    }
+}
+
+// WindowProxy identities can only be installed by the embed realm API. With
+// that feature disabled these helpers leave ordinary object behavior intact.
+#[cfg(not(feature = "embed"))]
+pub(crate) fn window_proxy_get_own_property(
+    _i: &mut Interp,
+    _object: &Value,
+    _key: &str,
+) -> Result<Option<Value>, Value> {
+    Ok(None)
+}
+
+#[cfg(not(feature = "embed"))]
+pub(crate) fn window_proxy_own_property_keys(
+    _i: &mut Interp,
+    _object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    Ok(None)
+}
+
+/// Own enumerable string keys of a WindowProxy, preserving internal-method authorization and
+/// child-index descriptors.
+pub(crate) fn window_proxy_enum_string_keys(
+    i: &mut Interp,
+    object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    let Some(keys) = window_proxy_own_property_keys(i, object)? else {
+        return Ok(None);
+    };
+    let mut enumerable = Vec::new();
+    for key in keys {
+        let Value::Str(_) = key else {
+            continue;
+        };
+        let property = ab(i.to_property_key(&key))?;
+        let Some(descriptor) = window_proxy_get_own_property(i, object, &property)? else {
+            unreachable!("WindowProxy disappeared during key enumeration")
+        };
+        let Value::Obj(descriptor) = descriptor else {
+            continue;
+        };
+        if matches!(
+            descriptor
+                .borrow()
+                .props
+                .get("enumerable")
+                .map(|property| property.value()),
+            Some(Value::Bool(true))
+        ) {
+            enumerable.push(key);
+        }
+    }
+    Ok(Some(enumerable))
+}
+
+/// The target side of an ordinary Proxy internal-method operation. A Proxy whose target is a
+/// WindowProxy still invokes the target's exotic methods; it must never see the holder's empty
+/// ordinary property table.
+fn proxy_target_own_property(i: &mut Interp, target: &Value, key: &str) -> Result<Value, Value> {
+    if let Some(descriptor) = window_proxy_get_own_property(i, target, key)? {
+        return Ok(descriptor);
+    }
+    if let Some((nested_target, nested_handler)) = proxy_pair(i, target) {
+        return proxy_gopd_value(i, &nested_target, &nested_handler, key);
+    }
+    if let Value::Obj(object) = target {
+        let property = object
+            .borrow()
+            .props
+            .get(key)
+            .map(|property| property.clone());
+        return Ok(property
+            .map(|property| descriptor_from_prop(i, property))
+            .unwrap_or(Value::Undefined));
+    }
+    Ok(Value::Undefined)
+}
+
+pub(crate) fn proxy_target_property(
+    i: &mut Interp,
+    target: &Value,
+    key: &str,
+) -> Result<Option<Property>, Value> {
+    let descriptor = proxy_target_own_property(i, target, key)?;
+    if matches!(descriptor, Value::Undefined) {
+        return Ok(None);
+    }
+    let partial = ab(build_partial(i, &descriptor))?;
+    Ok(Some(complete_descriptor(partial)))
+}
+
+fn proxy_target_own_keys(i: &mut Interp, target: &Value) -> Result<Vec<Value>, Value> {
+    if let Some(keys) = window_proxy_own_property_keys(i, target)? {
+        return Ok(keys);
+    }
+    if let Some((nested_target, nested_handler)) = proxy_pair(i, target) {
+        return proxy_own_keys(i, &nested_target, &nested_handler);
+    }
+    Ok(match target {
+        Value::Obj(object) => ordinary_own_keys_ordered(i, object)
+            .into_iter()
+            .map(|key| {
+                i.sym_from_key(&key)
+                    .unwrap_or_else(|| Value::from_string(key))
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn proxy_target_is_extensible(i: &mut Interp, target: &Value) -> Result<bool, Value> {
+    js_is_extensible(i, target)
+}
+
 fn ta_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let (info, _) = ta_receiver(i, &this)?;
     Ok(Value::Num(
@@ -699,6 +958,38 @@ const TA_META_KEYS: [&str; 5] = [
 
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
+    #[cfg(feature = "embed")]
+    if let Value::Obj(window_proxy) = obj {
+        if i.is_window_proxy(window_proxy) {
+            let Some(decision) = ab(i.window_proxy_decision(
+                window_proxy,
+                crate::embed_realms::WindowProxyOperation::GetPrototypeOf,
+            ))?
+            else {
+                unreachable!("WindowProxy registry entry disappeared during operation")
+            };
+            return match decision {
+                crate::embed_realms::WindowProxyDecision::Handled(
+                    crate::embed_realms::WindowProxyResult::GetPrototypeOf(prototype),
+                ) => Ok(prototype),
+                crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+                    "TypeError",
+                    "WindowProxy policy returned a result for the wrong operation",
+                )),
+                crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                    let target = forward.target.as_obj().ok_or_else(|| {
+                        i.make_error("TypeError", "WindowProxy target is not an object")
+                    })?;
+                    Ok(target
+                        .borrow()
+                        .proto
+                        .clone()
+                        .map(Value::Obj)
+                        .unwrap_or(Value::Null))
+                }
+            };
+        }
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -725,6 +1016,9 @@ pub(crate) fn has_own_property_trapped(
     v: &Value,
     key: &str,
 ) -> Result<bool, Value> {
+    if let Some(descriptor) = window_proxy_get_own_property(i, v, key)? {
+        return Ok(!matches!(descriptor, Value::Undefined));
+    }
     if let Some((t, h)) = proxy_pair(i, v) {
         return Ok(!matches!(
             proxy_gopd_value(i, &t, &h, key)?,
@@ -749,16 +1043,7 @@ pub(crate) fn proxy_gopd_value(
     }
     let trap = ab(i.proxy_trap(handler, "getOwnPropertyDescriptor"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_gopd_value(i, &t2, &h2, key);
-        }
-        if let Value::Obj(t) = target {
-            let prop = t.borrow().props.get(key).map(|p| p.clone());
-            return Ok(prop
-                .map(|p| descriptor_from_prop(i, p))
-                .unwrap_or(Value::Undefined));
-        }
-        return Ok(Value::Undefined);
+        return proxy_target_own_property(i, target, key);
     }
     if !trap.is_callable() {
         return Err(i.make_error(
@@ -770,23 +1055,24 @@ pub(crate) fn proxy_gopd_value(
         .sym_from_key(key)
         .unwrap_or_else(|| Value::from_string(key.to_string()));
     let res = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
+    let target_descriptor = proxy_target_own_property(i, target, key)?;
+    let target_exists = !matches!(target_descriptor, Value::Undefined);
+    let target_extensible = proxy_target_is_extensible(i, target)?;
     if matches!(res, Value::Undefined) {
         // The trap may report a property absent only if the target permits it.
-        if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).map(|p| p.clone());
-            if let Some(p) = tprop {
-                if !p.configurable() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-configurable property",
-                    ));
-                }
-                if !t.borrow().extensible {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-extensible target's property",
-                    ));
-                }
+        if target_exists {
+            let target_pd = ab(build_partial(i, &target_descriptor))?;
+            if !target_pd.configurable.unwrap_or(false) {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported undefined for a non-configurable property",
+                ));
+            }
+            if !target_extensible {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported undefined for a non-extensible target's property",
+                ));
             }
         }
         return Ok(Value::Undefined);
@@ -803,103 +1089,112 @@ pub(crate) fn proxy_gopd_value(
         return Ok(descriptor_from_prop(i, complete_descriptor(pd)));
     }
     // A descriptor may be reported for a property the target lacks only on an extensible target.
-    if let Value::Obj(t) = target {
-        if !t.borrow().props.contains(key) && !t.borrow().extensible {
-            return Err(i.make_error(
-                "TypeError",
-                "gOPD trap reported a property missing from a non-extensible target",
-            ));
-        }
+    if !target_exists && !target_extensible {
+        return Err(i.make_error(
+            "TypeError",
+            "gOPD trap reported a property missing from a non-extensible target",
+        ));
     }
     // A non-configurable target property pins the reported descriptor: configurability,
     // enumerability and the data/accessor shape must all match (IsCompatiblePropertyDescriptor).
-    if let Value::Obj(t) = target {
-        if let Some(p) = t.borrow().props.get(key) {
-            if !p.configurable() {
-                if !matches!(pd.configurable, Some(false)) {
+    let target_pd = if target_exists {
+        Some(ab(build_partial(i, &target_descriptor))?)
+    } else {
+        None
+    };
+    if let Some(target_pd) = &target_pd {
+        if !target_pd.configurable.unwrap_or(false) {
+            if !matches!(pd.configurable, Some(false)) {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report an existing non-configurable property '{key}' as configurable"),
+                ));
+            }
+            if let Some(enumerable) = pd.enumerable {
+                if enumerable != target_pd.enumerable.unwrap_or(false) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report an existing non-configurable property '{key}' as configurable"),
+                        format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
                     ));
                 }
-                if let Some(e) = pd.enumerable {
-                    if e != p.enumerable() {
+            }
+            let target_accessor = target_pd.is_accessor();
+            let reported_accessor = pd.is_accessor();
+            let reported_data = pd.is_data();
+            if (reported_accessor && !target_accessor) || (reported_data && target_accessor) {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report a differently-shaped descriptor for the non-configurable property '{key}'"),
+                ));
+            }
+            if !target_accessor
+                && !target_pd.writable.unwrap_or(false)
+                && matches!(pd.writable, Some(true))
+            {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report a non-configurable, non-writable property '{key}' as writable"),
+                ));
+            }
+            if !target_accessor && !target_pd.writable.unwrap_or(false) {
+                if let Some(value) = &pd.value {
+                    if !target_pd
+                        .value
+                        .as_ref()
+                        .is_some_and(|target_value| same_value(value, target_value))
+                    {
                         return Err(i.make_error(
                             "TypeError",
-                            format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
+                            format!("proxy must report the same value for the non-writable, non-configurable property '{key}'"),
                         ));
                     }
                 }
-                let reported_accessor = pd.get.is_some() || pd.set.is_some();
-                let reported_data = pd.value.is_some() || pd.writable.is_some();
-                if (reported_accessor && !p.accessor()) || (reported_data && p.accessor()) {
+            }
+            let same_fn = |left: &Option<Value>, right: &Option<Value>| match (left, right) {
+                (Some(x), Some(y)) => same_value(x, y),
+                (None, None) => true,
+                (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
+            };
+            if target_accessor {
+                if pd.get.is_some() && !same_fn(&pd.get, &target_pd.get) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report a differently-shaped descriptor for the non-configurable property '{key}'"),
+                        format!("proxy must report the same getter for the non-configurable property '{key}'"),
                     ));
                 }
-                if !p.accessor() && !p.writable() && matches!(pd.writable, Some(true)) {
+                if pd.set.is_some() && !same_fn(&pd.set, &target_pd.set) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report a non-configurable, non-writable property '{key}' as writable"),
+                        format!("proxy must report the same setter for the non-configurable property '{key}'"),
                     ));
-                }
-                if !p.accessor() && !p.writable() {
-                    if let Some(v) = &pd.value {
-                        if !same_value(v, &p.value()) {
-                            return Err(i.make_error(
-                                "TypeError",
-                                format!("proxy must report the same value for the non-writable, non-configurable property '{key}'"),
-                            ));
-                        }
-                    }
-                }
-                if p.accessor() {
-                    let same_fn = |a: &Option<Value>, b: &Option<Value>| match (a, b) {
-                        (Some(x), Some(y)) => same_value(x, y),
-                        (None, None) => true,
-                        (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
-                    };
-                    if pd.get.is_some() && !same_fn(&pd.get, &p.getter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same getter for the non-configurable property '{key}'"),
-                        ));
-                    }
-                    if pd.set.is_some() && !same_fn(&pd.set, &p.setter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same setter for the non-configurable property '{key}'"),
-                        ));
-                    }
                 }
             }
         }
     }
     // A reported non-configurable descriptor must be backed by the target.
     if matches!(pd.configurable, Some(false)) {
-        if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).map(|p| p.clone());
-            match tprop {
-                None => {
+        match target_pd.as_ref() {
+            None => {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported a non-configurable descriptor the target lacks",
+                ));
+            }
+            Some(target_pd) => {
+                if target_pd.configurable.unwrap_or(false) {
                     return Err(i.make_error(
                         "TypeError",
-                        "gOPD trap reported a non-configurable descriptor the target lacks",
+                        "gOPD trap reported non-configurable for a configurable target property",
                     ));
                 }
-                Some(p) => {
-                    if p.configurable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-configurable for a configurable target property",
-                        ));
-                    }
-                    if matches!(pd.writable, Some(false)) && !p.accessor() && p.writable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-writable for a writable target property",
-                        ));
-                    }
+                if matches!(pd.writable, Some(false))
+                    && !target_pd.is_accessor()
+                    && target_pd.writable.unwrap_or(false)
+                {
+                    return Err(i.make_error(
+                        "TypeError",
+                        "gOPD trap reported non-writable for a writable target property",
+                    ));
                 }
             }
         }
@@ -924,17 +1219,8 @@ fn proxy_key_enumerable(
         }
         let enum_v = ab(i.get_member(&res, "enumerable"))?;
         Ok(i.to_boolean(&enum_v))
-    } else if let Some((t2, h2)) = proxy_pair(i, target) {
-        // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
-        proxy_key_enumerable(i, &t2, &h2, key)
-    } else if let Value::Obj(t) = target {
-        Ok(t.borrow()
-            .props
-            .get(key)
-            .map(|p| p.enumerable())
-            .unwrap_or(false))
     } else {
-        Ok(false)
+        Ok(proxy_target_property(i, target, key)?.is_some_and(|property| property.enumerable()))
     }
 }
 
@@ -947,11 +1233,10 @@ fn proxy_define_property(
 ) -> Result<bool, Abrupt> {
     let trap = i.proxy_trap(handler, "defineProperty")?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_define_property(i, &t2, &h2, key, desc);
-        }
-        return if let Value::Obj(t) = target {
-            define_own_property(i, t, key, desc)
+        return if let Some((t2, h2)) = proxy_pair(i, target) {
+            proxy_define_property(i, &t2, &h2, key, desc)
+        } else if let Value::Obj(target) = target {
+            define_own_property(i, target, key, desc)
         } else {
             Ok(false)
         };
@@ -997,9 +1282,12 @@ fn proxy_define_property(
     }
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
-    if let Value::Obj(t) = target {
-        let tprop = t.borrow().props.get(key).map(|p| p.clone());
-        let extensible = t.borrow().extensible;
+    if matches!(target, Value::Obj(_)) {
+        // A Proxy's target can itself be exotic. In particular, querying the ordinary property
+        // table here would miss WindowProxy's child-index properties and policy-controlled
+        // descriptors, so use its actual [[GetOwnProperty]] and [[IsExtensible]] operations.
+        let tprop = proxy_target_property(i, target, key).map_err(Abrupt::Throw)?;
+        let extensible = proxy_target_is_extensible(i, target).map_err(Abrupt::Throw)?;
         match tprop {
             None => {
                 if !extensible {
@@ -1188,6 +1476,18 @@ pub(crate) fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 /// observable trap order on proxies). `entries` controls value vs `[key, value]` output.
 fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result<Value, Value> {
     let mut out = Vec::new();
+    if let Some(keys) = window_proxy_enum_string_keys(i, o)? {
+        for key in keys {
+            let property = ab(i.to_property_key(&key))?;
+            let value = ab(i.get_member(o, &property))?;
+            out.push(if entries {
+                i.make_array(vec![key, value])
+            } else {
+                value
+            });
+        }
+        return Ok(i.make_array(out));
+    }
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let Value::Str(ks) = &k {
@@ -1291,6 +1591,10 @@ fn reflect_ordinary_set(
     value: Value,
     receiver: &Value,
 ) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(target, Value::Obj(o) if i.is_window_proxy(o)) {
+        return ab(i.set_member_recv(target, key, value, receiver.clone()));
+    }
     // Integer-indexed exotic [[Set]]: a canonical numeric index on a TypedArray is handled by
     // TypedArraySetElement (which coerces the value unconditionally, writing only when the index is
     // in range) and never falls back to creating an ordinary shadowing property.
@@ -1378,6 +1682,38 @@ pub(crate) fn reflect_define_on_receiver(
     key: &str,
     value: Value,
 ) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(receiver, Value::Obj(o) if i.is_window_proxy(o)) {
+        let existing = window_proxy_get_own_property(i, receiver, key)?
+            .expect("WindowProxy receiver was recognized");
+        let desc = i.new_object();
+        if let Value::Obj(existing) = &existing {
+            let (is_accessor, writable) = {
+                let properties = existing.borrow();
+                (
+                    properties.props.contains("get") || properties.props.contains("set"),
+                    matches!(
+                        properties
+                            .props
+                            .get("writable")
+                            .map(|property| property.value()),
+                        Some(Value::Bool(true))
+                    ),
+                )
+            };
+            if is_accessor || !writable {
+                return Ok(false);
+            }
+            set_data(&desc, "value", value);
+        } else {
+            set_data(&desc, "value", value);
+            set_data(&desc, "writable", Value::Bool(true));
+            set_data(&desc, "enumerable", Value::Bool(true));
+            set_data(&desc, "configurable", Value::Bool(true));
+        }
+        let object = receiver.as_obj().expect("WindowProxy object");
+        return ab(define_own_property(i, object, key, &Value::Obj(desc)));
+    }
     if proxy_pair(i, receiver).is_some() {
         let (target, handler) = proxy_pair(i, receiver).unwrap();
         // OrdinarySetWithOwnDescriptor: the receiver's [[GetOwnProperty]] runs first (its trap is
@@ -1469,6 +1805,10 @@ pub(crate) fn reflect_ordinary_get(
     key: &str,
     receiver: &Value,
 ) -> Result<Value, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(target, Value::Obj(o) if i.is_window_proxy(o)) {
+        return ab(i.get_member_recv(target, key, receiver.clone()));
+    }
     let mut current = target.clone();
     loop {
         if proxy_pair(i, &current).is_some() {
@@ -1602,14 +1942,7 @@ fn can_be_held_weakly(i: &Interp, v: &Value) -> bool {
 /// surrogate, or > U+10FFFF is a URIError -> None). An escape whose decoded octet is an ASCII
 /// character in `preserve` (decodeURI's reservedSet) keeps its original `%XX` text instead.
 fn uri_decode(s: &str, preserve: &str) -> Option<String> {
-    fn hex_at(bytes: &[u8], i: usize) -> Option<u8> {
-        if i + 2 >= bytes.len() || bytes[i] != b'%' {
-            return None;
-        }
-        let h = (bytes[i + 1] as char).to_digit(16)?;
-        let l = (bytes[i + 2] as char).to_digit(16)?;
-        Some((h * 16 + l) as u8)
-    }
+    use lumen_common::codec::percent_escape_at as hex_at;
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0;
@@ -1649,14 +1982,7 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
         }
         let decoded = std::str::from_utf8(&buf[..cont + 1]).ok()?;
         for c in decoded.chars() {
-            let cp = c as u32;
-            if cp >= crate::jstr::SMUGGLE_BASE {
-                // A real code point in the lone-surrogate smuggle range must take the
-                // engine's smuggled-pair representation (see jstr).
-                out.push_str(&crate::jstr::from_code_points(&[cp]));
-            } else {
-                out.push(c);
-            }
+            crate::jstr::push_char_utf16(&mut out, c);
         }
     }
     Some(out)
@@ -1777,7 +2103,7 @@ fn uri_encode(s: &str, keep: &str) -> Option<String> {
         } else {
             let mut buf = [0u8; 4];
             for b in c.encode_utf8(&mut buf).bytes() {
-                out.push_str(&format!("%{b:02X}"));
+                lumen_common::codec::push_percent_escape(&mut out, b);
             }
         }
     }
@@ -1942,7 +2268,8 @@ fn advance_string_index(index: usize, s: &str, unicode: bool) -> usize {
     let mut it = crate::jstr::UnitIter::new(&s[b..]);
     match (it.next(), it.next()) {
         (Some(hi), Some(lo))
-            if (0xD800..0xDC00).contains(&(hi as u32)) && (0xDC00..0xE000).contains(&(lo as u32)) =>
+            if (0xD800..0xDC00).contains(&(hi as u32))
+                && (0xDC00..0xE000).contains(&(lo as u32)) =>
         {
             index + 2
         }
@@ -2405,7 +2732,10 @@ pub fn install(it: &mut Interp) {
             .props
             .insert(name, Property::data(val, false, false, false));
     }
-    set_builtin(&g, "globalThis", Value::Obj(g.clone()));
+    g.borrow_mut().props.insert(
+        "globalThis",
+        Property::data(Value::Obj(g.clone()), true, false, true),
+    );
 
     function_proto::install_function_proto(it);
     install_object(it);
@@ -3233,6 +3563,19 @@ fn install_object(it: &mut Interp) {
             };
             return Ok(Value::Bool(e));
         }
+        if let Some(desc) = window_proxy_get_own_property(i, &Value::Obj(o.clone()), &key)? {
+            let enumerable = match desc {
+                Value::Obj(desc) => matches!(
+                    desc.borrow()
+                        .props
+                        .get("enumerable")
+                        .map(|property| property.value()),
+                    Some(Value::Bool(true))
+                ),
+                _ => false,
+            };
+            return Ok(Value::Bool(enumerable));
+        }
         let e = o
             .borrow()
             .props
@@ -3376,6 +3719,9 @@ fn install_object(it: &mut Interp) {
             return Ok(i.make_array(keys));
         }
         ab(i.defer_trigger(&o, None))?;
+        if let Some(keys) = window_proxy_enum_string_keys(i, &Value::Obj(o.clone()))? {
+            return Ok(i.make_array(keys));
+        }
         if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
             return Ok(i.make_array(keys));
@@ -3416,6 +3762,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(strs));
         }
+        if let Some(keys) = window_proxy_own_property_keys(i, &Value::Obj(o.clone()))? {
+            return Ok(i.make_array(
+                keys.into_iter()
+                    .filter(|key| matches!(key, Value::Str(_)))
+                    .collect(),
+            ));
+        }
         // A TypedArray's own keys are its integer indices, then any string expandos (the
         // length/buffer/... metadata are inherited, not own).
         if let Some(info) = ta_info(i, &o) {
@@ -3455,6 +3808,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(syms));
         }
+        if let Some(keys) = window_proxy_own_property_keys(i, &ov)? {
+            return Ok(i.make_array(
+                keys.into_iter()
+                    .filter(|key| matches!(key, Value::Sym(_)))
+                    .collect(),
+            ));
+        }
         let syms: Vec<Value> = o
             .borrow()
             .props
@@ -3467,16 +3827,7 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "getPrototypeOf", 1, |i, _this, args| {
         match arg(args, 0) {
-            Value::Obj(o) => {
-                if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-                    return proxy_get_prototype(i, &target, &handler);
-                }
-                Ok(o.borrow()
-                    .proto
-                    .clone()
-                    .map(Value::Obj)
-                    .unwrap_or(Value::Null))
-            }
+            Value::Obj(o) => js_get_prototype_of(i, &Value::Obj(o)),
             // ToObject coerces a primitive (Object.getPrototypeOf('') → String.prototype).
             Value::Undefined | Value::Empty | Value::Null => {
                 Err(i.make_error("TypeError", "Cannot convert undefined or null to object"))
@@ -3567,6 +3918,9 @@ fn install_object(it: &mut Interp) {
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
         }
+        if let Some(descriptor) = window_proxy_get_own_property(i, &Value::Obj(o.clone()), &key)? {
+            return Ok(descriptor);
+        }
         let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
@@ -3594,6 +3948,20 @@ fn install_object(it: &mut Interp) {
                         .borrow_mut()
                         .props
                         .insert(key.as_str(), Property::plain(desc));
+                }
+            }
+            return Ok(Value::Obj(result));
+        }
+        if let Some(keys) = window_proxy_own_property_keys(i, &ov)? {
+            for key_value in keys {
+                let key = ab(i.to_property_key(&key_value))?;
+                let descriptor = window_proxy_get_own_property(i, &ov, &key)?
+                    .expect("WindowProxy descriptor operation remains registered");
+                if !matches!(descriptor, Value::Undefined) {
+                    result
+                        .borrow_mut()
+                        .props
+                        .insert(key, Property::plain(descriptor));
                 }
             }
             return Ok(Value::Obj(result));
@@ -3660,6 +4028,29 @@ fn install_object(it: &mut Interp) {
                     if proxy_key_enumerable(i, &t, &h, &pk)? {
                         let v = ab(i.get_member(&from, &pk))?;
                         assign_set(i, &to_val, &pk, v)?;
+                    }
+                }
+                continue;
+            }
+            if let Some(keys) = window_proxy_own_property_keys(i, &from)? {
+                for key_value in keys {
+                    let key = ab(i.to_property_key(&key_value))?;
+                    let descriptor = window_proxy_get_own_property(i, &from, &key)?
+                        .expect("WindowProxy descriptor operation remains registered");
+                    let enumerable = match &descriptor {
+                        Value::Obj(descriptor) => matches!(
+                            descriptor
+                                .borrow()
+                                .props
+                                .get("enumerable")
+                                .map(|property| property.value()),
+                            Some(Value::Bool(true))
+                        ),
+                        _ => false,
+                    };
+                    if enumerable {
+                        let value = ab(i.get_member(&from, &key))?;
+                        assign_set(i, &to_val, &key, value)?;
                     }
                 }
                 continue;
@@ -3764,52 +4155,64 @@ pub(crate) fn nf_has_own_property(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
-        // A string key on an ordinary object or array (no proxy, namespace or typed array —
-        // those clear `ic_plain`): the own entries decide, with no key copy.
-        if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
-            if let Ok(b) = o.try_borrow() {
-                if matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array)
-                    && b.ic_plain.get()
-                    && !Interp::is_private_key(k)
-                {
-                    return Ok(Value::Bool(b.props.contains(k)));
-                }
-            }
-        }
+    #[cfg(feature = "embed")]
+    if matches!(&this, Value::Obj(object) if i.is_window_proxy(object)) {
         let key = ab(i.to_property_key(&arg(args, 0)))?;
-        // A private-name slot (`#x`) is never an observable own property.
         if Interp::is_private_key(&key) {
             return Ok(Value::Bool(false));
         }
-        let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
-        i.materialize_fn(&o);
-        if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+        let descriptor = window_proxy_get_own_property(i, &this, &key)?
+            .expect("WindowProxy descriptor operation remains registered");
+        return Ok(Value::Bool(!matches!(descriptor, Value::Undefined)));
+    }
+    // A string key on an ordinary object or array (no proxy, namespace or typed array —
+    // those clear `ic_plain`): the own entries decide, with no key copy.
+    if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
+        if let Ok(b) = o.try_borrow() {
+            if matches!(
+                b.exotic,
+                crate::value::Exotic::None | crate::value::Exotic::Array
+            ) && b.ic_plain.get()
+                && !Interp::is_private_key(k)
+            {
+                return Ok(Value::Bool(b.props.contains(k)));
+            }
+        }
+    }
+    let key = ab(i.to_property_key(&arg(args, 0)))?;
+    // A private-name slot (`#x`) is never an observable own property.
+    if Interp::is_private_key(&key) {
+        return Ok(Value::Bool(false));
+    }
+    let o = to_object_arg_lazy(i, this, "Object.prototype.hasOwnProperty")?;
+    i.materialize_fn(&o);
+    if crate::split_view::has_own_elem_obj(&o.borrow(), &key) {
+        return Ok(Value::Bool(true));
+    }
+    // A TypedArray index in range is an own property even though it isn't in the property map;
+    // a canonical-numeric non-index is never an own property.
+    if let Some(info) = ta_info(i, &o) {
+        match i.ta_index_kind(&info, &key) {
+            crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
+            crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
+            crate::value::TaIndex::Ordinary => {}
+        }
+    }
+    // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
+    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
+        let desc = proxy_gopd_value(i, &target, &handler, &key)?;
+        return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
+    }
+    // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
+    let ptr = Gc::as_ptr(&o) as usize;
+    if i.is_namespace(ptr) {
+        if let Some(res) = i.namespace_own_property(ptr, &key) {
+            ab(res)?;
             return Ok(Value::Bool(true));
         }
-        // A TypedArray index in range is an own property even though it isn't in the property map;
-        // a canonical-numeric non-index is never an own property.
-        if let Some(info) = ta_info(i, &o) {
-            match i.ta_index_kind(&info, &key) {
-                crate::value::TaIndex::Element(_) => return Ok(Value::Bool(true)),
-                crate::value::TaIndex::Exotic => return Ok(Value::Bool(false)),
-                crate::value::TaIndex::Ordinary => {}
-            }
-        }
-        // A proxy's [[GetOwnProperty]] goes through its trap (recursing for a proxy target).
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-            let desc = proxy_gopd_value(i, &target, &handler, &key)?;
-            return Ok(Value::Bool(!matches!(desc, Value::Undefined)));
-        }
-        // A module namespace's [[GetOwnProperty]] reads live and throws for an uninitialized export.
-        let ptr = Gc::as_ptr(&o) as usize;
-        if i.is_namespace(ptr) {
-            if let Some(res) = i.namespace_own_property(ptr, &key) {
-                ab(res)?;
-                return Ok(Value::Bool(true));
-            }
-        }
-        let has = o.borrow().props.contains(&key);
-        Ok(Value::Bool(has))
+    }
+    let has = o.borrow().props.contains(&key);
+    Ok(Value::Bool(has))
 }
 
 pub(crate) fn nf_object_has_own(
@@ -3871,7 +4274,7 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
 
 /// Build a property descriptor from a JS descriptor object.
 /// Build a descriptor object (`{value, writable, enumerable, configurable}` or `{get, set, ...}`).
-fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
+pub(crate) fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
     let d = i.new_object();
     if p.accessor() {
         set_data(&d, "get", p.getter().cloned().unwrap_or(Value::Undefined));
@@ -3984,45 +4387,6 @@ fn build_partial(i: &mut Interp, desc: &Value) -> Result<PartialDesc, Abrupt> {
     })
 }
 
-/// `Number.prototype.toPrecision(p)`: `p` significant digits, fixed or exponential per the exponent.
-fn to_precision(n: f64, p: usize) -> String {
-    if n == 0.0 {
-        return if p == 1 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(p - 1))
-        };
-    }
-    let neg = n < 0.0;
-    // `p` significant digits via scientific notation (`d.ddde±E`, the mantissa has exactly `p` digits).
-    let sci = format!("{:.*e}", p - 1, n.abs());
-    let (mantissa, exp_str) = sci.split_once('e').unwrap();
-    let e: i32 = exp_str.parse().unwrap();
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let body = if e < -6 || e >= p as i32 {
-        let sign = if e >= 0 { "+" } else { "-" };
-        if p == 1 {
-            format!("{}e{}{}", digits, sign, e.abs())
-        } else {
-            format!("{}.{}e{}{}", &digits[..1], &digits[1..], sign, e.abs())
-        }
-    } else if e >= 0 {
-        let ip = (e + 1) as usize;
-        if ip >= p {
-            digits
-        } else {
-            format!("{}.{}", &digits[..ip], &digits[ip..])
-        }
-    } else {
-        format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
-    };
-    if neg {
-        format!("-{body}")
-    } else {
-        body
-    }
-}
-
 /// Intrinsic Object.defineProperty, also used by native host property definitions.
 pub(crate) fn object_define_property(
     i: &mut Interp,
@@ -4046,7 +4410,13 @@ pub(crate) fn object_define_property(
             &descriptor,
         ))? {
             if vm_context::is_vm_handler(&handler) {
-                return Err(i.make_error("TypeError", format!("Cannot redefine property: {}", vm_context::key_display(i, &key))));
+                return Err(i.make_error(
+                    "TypeError",
+                    format!(
+                        "Cannot redefine property: {}",
+                        vm_context::key_display(i, &key)
+                    ),
+                ));
             }
             return Err(i.make_error("TypeError", "proxy defineProperty returned a falsish value"));
         }
@@ -4074,6 +4444,38 @@ fn defer_trigger_v(i: &mut Interp, v: &Value, key: Option<&str>) -> Result<(), V
 }
 
 fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Result<bool, Abrupt> {
+    #[cfg(feature = "embed")]
+    if i.is_window_proxy(o) {
+        let key_value = i
+            .sym_from_key(key)
+            .unwrap_or_else(|| Value::from_string(key.to_owned()));
+        let operation = crate::embed_realms::WindowProxyOperation::DefineOwnProperty {
+            key: key_value,
+            descriptor: desc.clone(),
+        };
+        let Some(decision) = i.window_proxy_decision(o, operation)? else {
+            unreachable!("WindowProxy registry entry disappeared during operation")
+        };
+        return match decision {
+            crate::embed_realms::WindowProxyDecision::Handled(
+                crate::embed_realms::WindowProxyResult::DefineOwnProperty(success),
+            ) => Ok(success),
+            crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.throw(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            )),
+            crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                if crate::value::canonical_index(key).is_some() {
+                    return Ok(false);
+                }
+                let target = forward
+                    .target
+                    .as_obj()
+                    .ok_or_else(|| i.throw("TypeError", "WindowProxy target is not an object"))?;
+                define_own_property(i, target, key, desc)
+            }
+        };
+    }
     i.defer_trigger(o, Some(key))?;
     let d = build_partial(i, desc)?;
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the
@@ -4112,6 +4514,8 @@ fn define_own_property_ordinary(
     key: &str,
     d: &PartialDesc,
 ) -> Result<bool, Abrupt> {
+    #[cfg(feature = "embed")]
+    crate::embed_convert::retain_identity_receiver(i, &Value::Obj(o.clone()));
     // A defineProperty can rewrite attributes (data → accessor, writable → false) without a
     // structural change: conservatively invalidate the property-creation inline caches, whose
     // fill-time chain walks assumed no such shadow could appear (the op is rare).
@@ -4490,11 +4894,16 @@ fn install_array(it: &mut Interp) {
 /// ordinary Array with a writable whole-number `length` at its dense frontier and no elements
 /// on the array prototypes. Returns the new length, or hands `v` back (nothing changed).
 pub(crate) fn array_push_one(i: &Interp, o: &Gc, v: Value) -> Result<f64, Value> {
-    let Ok(mut b) = o.try_borrow_mut() else { return Err(v) };
+    let Ok(mut b) = o.try_borrow_mut() else {
+        return Err(v);
+    };
     if !matches!(b.exotic, Exotic::Array)
         || !b.extensible
         || !b.ic_plain.get()
-        || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
+        || !b
+            .proto
+            .as_ref()
+            .is_some_and(|p| Gc::ptr_eq(p, &i.array_proto))
         || !i.array_prototypes_unshadowed()
     {
         return Err(v);
@@ -5867,7 +6276,10 @@ fn array_from_async(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, V
         }
     };
     i.park_async_coro(&promise, coro);
-    i.drive_async(promise.clone(), crate::coroutine::Resume::Next(Value::Undefined));
+    i.drive_async(
+        promise.clone(),
+        crate::coroutine::Resume::Next(Value::Undefined),
+    );
     Ok(promise)
 }
 
@@ -7249,7 +7661,6 @@ fn drive_generator(
     }
 }
 
-
 pub(crate) fn generator_next(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
     drive_generator(i, &this, crate::coroutine::Resume::Next(arg(args, 0)))
 }
@@ -7657,7 +8068,9 @@ pub(crate) fn nf_str_index_of(i: &mut Interp, this: Value, args: &[Value]) -> Re
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
-    Ok(Value::Num(str_find(i, &s, &needle, pos).map_or(-1.0, |k| k as f64)))
+    Ok(Value::Num(
+        str_find(i, &s, &needle, pos).map_or(-1.0, |k| k as f64),
+    ))
 }
 
 /// Whether byte matches of `needle` are exactly its UTF-16 matches: it doesn't begin with a
@@ -7675,7 +8088,7 @@ fn str_find(i: &mut Interp, s: &crate::lstr::LStr, needle: &str, pos: usize) -> 
     }
     if !needle_bytewise(needle) {
         let (h, n) = (crate::jstr::units(s), crate::jstr::units(needle));
-        return (pos..=h.len()).find(|&k| k + n.len() <= h.len() && h[k..k + n.len()] == n[..]);
+        return lumen_common::scan::utf16_find(&h[pos..], &n).map(|k| pos + k);
     }
     let (mut b, mid) = i.unit_pos(s, pos);
     if mid {
@@ -7710,7 +8123,9 @@ pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Re
     let needle = ab(i.to_string(&arg(args, 0)))?;
     if s.ascii_hint() {
         let pos = str_clamp_pos(i, args.get(1), s.len() as i64)?;
-        return Ok(Value::Bool(needle.is_ascii() && s[pos..].contains(&*needle)));
+        return Ok(Value::Bool(
+            needle.is_ascii() && s[pos..].contains(&*needle),
+        ));
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -7718,7 +8133,11 @@ pub(crate) fn nf_str_includes(i: &mut Interp, this: Value, args: &[Value]) -> Re
 }
 
 /// `String.prototype.startsWith`.
-pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_starts_with(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::StartsWith, &this, args) {
         return Ok(v);
     }
@@ -7732,7 +8151,9 @@ pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) ->
             None | Some(Value::Undefined) => 0,
             v => str_clamp_pos(i, v, s.len() as i64)?,
         };
-        return Ok(Value::Bool(s.as_bytes()[pos..].starts_with(needle.as_bytes())));
+        return Ok(Value::Bool(
+            s.as_bytes()[pos..].starts_with(needle.as_bytes()),
+        ));
     }
     let len = i.str_len(&s) as i64;
     let pos = str_clamp_pos(i, args.get(1), len)?;
@@ -7740,7 +8161,11 @@ pub(crate) fn nf_str_starts_with(i: &mut Interp, this: Value, args: &[Value]) ->
 }
 
 /// `String.prototype.endsWith`.
-pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_ends_with(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::EndsWith, &this, args) {
         return Ok(v);
     }
@@ -7751,12 +8176,12 @@ pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> R
     let needle = ab(i.to_string(&arg(args, 0)))?;
     if s.ascii_hint() {
         let end = match args.get(1) {
-            Some(v) if !matches!(v, Value::Undefined) => {
-                str_clamp_pos(i, Some(v), s.len() as i64)?
-            }
+            Some(v) if !matches!(v, Value::Undefined) => str_clamp_pos(i, Some(v), s.len() as i64)?,
             _ => s.len(),
         };
-        return Ok(Value::Bool(s.as_bytes()[..end].ends_with(needle.as_bytes())));
+        return Ok(Value::Bool(
+            s.as_bytes()[..end].ends_with(needle.as_bytes()),
+        ));
     }
     let len = i.str_len(&s) as i64;
     // endsWith's optional argument is the END position (default = length).
@@ -7765,11 +8190,17 @@ pub(crate) fn nf_str_ends_with(i: &mut Interp, this: Value, args: &[Value]) -> R
         _ => len as usize,
     };
     let n = crate::str_index::unit_len(&needle);
-    Ok(Value::Bool(end >= n && str_match_at(i, &s, end - n, &needle)))
+    Ok(Value::Bool(
+        end >= n && str_match_at(i, &s, end - n, &needle),
+    ))
 }
 
 /// `String.prototype.toUpperCase`.
-pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_to_upper_case(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::ToUpperCase, &this, args) {
         return Ok(v);
     }
@@ -7778,13 +8209,17 @@ pub(crate) fn nf_str_to_upper_case(i: &mut Interp, this: Value, args: &[Value]) 
         if !s.bytes().any(|b| b.is_ascii_lowercase()) {
             return Ok(Value::Str(s));
         }
-        return Ok(Value::from_string(s.to_ascii_uppercase()));
+        return Ok(Value::from_string(lumen_common::scan::ascii_case(&s, true)));
     }
     Ok(Value::from_string(s.to_uppercase()))
 }
 
 /// `String.prototype.toLowerCase`.
-pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_to_lower_case(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::ToLowerCase, &this, args) {
         return Ok(v);
     }
@@ -7793,7 +8228,9 @@ pub(crate) fn nf_str_to_lower_case(i: &mut Interp, this: Value, args: &[Value]) 
         if !s.bytes().any(|b| b.is_ascii_uppercase()) {
             return Ok(Value::Str(s));
         }
-        return Ok(Value::from_string(s.to_ascii_lowercase()));
+        return Ok(Value::from_string(lumen_common::scan::ascii_case(
+            &s, false,
+        )));
     }
     Ok(Value::from_string(s.to_lowercase()))
 }
@@ -7816,7 +8253,11 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
     if s.ascii_hint() {
         let len = s.len() as i64;
         let n = ab(i.to_number(&arg(args, 0)))?;
-        let mut idx = if n.is_nan() { 0 } else { n.trunc().clamp(-1e18, 1e18) as i64 };
+        let mut idx = if n.is_nan() {
+            0
+        } else {
+            n.trunc().clamp(-1e18, 1e18) as i64
+        };
         if idx < 0 {
             idx += len;
         }
@@ -7842,7 +8283,11 @@ pub(crate) fn nf_str_at(i: &mut Interp, this: Value, args: &[Value]) -> Result<V
 }
 
 /// `String.prototype.trimStart`.
-pub(crate) fn nf_str_trim_start(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn nf_str_trim_start(
+    i: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if let Some(v) = str_fast_this(StrFast::TrimStart, &this, args) {
         return Ok(v);
     }
@@ -7895,7 +8340,10 @@ pub(crate) fn str_fast_of(f: crate::value::NativeFn) -> Option<StrFast> {
         (nf_str_to_upper_case, StrFast::ToUpperCase),
         (nf_str_to_lower_case, StrFast::ToLowerCase),
     ];
-    table.iter().find(|(g, _)| *g as usize == f as usize).map(|&(_, k)| k)
+    table
+        .iter()
+        .find(|(g, _)| *g as usize == f as usize)
+        .map(|&(_, k)| k)
 }
 
 /// The first index of `n` in `h`: a plain scan for a short search (`str::find`'s two-way
@@ -7905,7 +8353,9 @@ fn find_str(h: &str, n: &str) -> Option<usize> {
         return h.find(n);
     }
     let (h, n) = (h.as_bytes(), n.as_bytes());
-    let Some((&first, rest)) = n.split_first() else { return Some(0) };
+    let Some((&first, rest)) = n.split_first() else {
+        return Some(0);
+    };
     let last = h.len().checked_sub(n.len())?;
     (0..=last).find(|&k| h[k] == first && &h[k + 1..k + n.len()] == rest)
 }
@@ -8004,14 +8454,14 @@ pub(crate) fn str_fast(k: StrFast, s: &crate::lstr::LStr, args: &[Value]) -> Opt
         }
         StrFast::ToUpperCase => {
             if s.bytes().any(|b| b.is_ascii_lowercase()) {
-                Value::from_string(s.to_ascii_uppercase())
+                Value::from_string(lumen_common::scan::ascii_case(s, true))
             } else {
                 Value::Str(s.clone())
             }
         }
         StrFast::ToLowerCase => {
             if s.bytes().any(|b| b.is_ascii_uppercase()) {
-                Value::from_string(s.to_ascii_lowercase())
+                Value::from_string(lumen_common::scan::ascii_case(s, false))
             } else {
                 Value::Str(s.clone())
             }
@@ -8542,7 +8992,7 @@ fn install_string(it: &mut Interp) {
             return Err(i.make_error("RangeError", "invalid count value"));
         }
         let count = n as usize;
-        if s.len().saturating_mul(count) > MAX_STR_LEN {
+        if size::repeat(s.len(), count, MAX_STR_LEN).is_err() {
             return Err(i.make_error("RangeError", "Invalid string length"));
         }
         let out = s.repeat(count);
@@ -8808,11 +9258,7 @@ fn install_string(it: &mut Interp) {
                 // A lone surrogate is a valid argument: smuggle it (see `jstr`).
                 s.push(crate::jstr::smuggle(cp as u16));
             } else if cp >= crate::jstr::SMUGGLE_BASE {
-                // A smuggle-range character is canonically its smuggled pair.
-                let hi = 0xD800 + ((cp - 0x10000) >> 10);
-                let lo = 0xDC00 + ((cp - 0x10000) & 0x3FF);
-                s.push(crate::jstr::smuggle(hi as u16));
-                s.push(crate::jstr::smuggle(lo as u16));
+                crate::jstr::push_char_utf16(&mut s, char::from_u32(cp).unwrap_or('\u{FFFD}'));
             } else {
                 s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
             }
@@ -9097,65 +9543,4 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
         },
         _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
     }
-}
-
-/// Number.prototype.toExponential's digit selection: the exact decimal expansion of the binary
-/// value, rounded to `f` fraction digits with ties away from zero (the spec's "larger n").
-/// `shortest` (fractionDigits undefined) picks the minimal digits that round-trip.
-fn to_exponential(x: f64, f: usize, shortest: bool) -> String {
-    // The sign follows x < 0 exclusively; `+ 0.0` then clears a negative zero so it formats as "0".
-    let (sign, x) = if x < 0.0 { ("-", -x) } else { ("", x + 0.0) };
-    let fmt_exp = |exp: i32| format!("e{}{}", if exp < 0 { '-' } else { '+' }, exp.abs());
-    if shortest {
-        let s = format!("{x:e}");
-        let (m, e) = s.split_once('e').unwrap();
-        let exp: i32 = e.parse().unwrap();
-        return format!("{sign}{m}{}", fmt_exp(exp));
-    }
-    if x == 0.0 {
-        let m = if f == 0 {
-            "0".to_string()
-        } else {
-            format!("0.{}", "0".repeat(f))
-        };
-        return format!("{sign}{m}e+0");
-    }
-    // 780 fraction digits is past the longest exact decimal expansion of any f64 mantissa, so the
-    // digits (including everything after the rounding point) are exact.
-    let s = format!("{x:.780e}");
-    let (m, e) = s.split_once('e').unwrap();
-    let mut exp: i32 = e.parse().unwrap();
-    let mut digits: Vec<u8> = m
-        .bytes()
-        .filter(|b| b.is_ascii_digit())
-        .map(|b| b - b'0')
-        .collect();
-    if digits.len() > f + 1 && digits[f + 1] >= 5 {
-        let mut k = f + 1;
-        loop {
-            if k == 0 {
-                digits.insert(0, 1);
-                exp += 1;
-                break;
-            }
-            k -= 1;
-            if digits[k] == 9 {
-                digits[k] = 0;
-            } else {
-                digits[k] += 1;
-                break;
-            }
-        }
-    }
-    digits.truncate(f + 1);
-    while digits.len() < f + 1 {
-        digits.push(0);
-    }
-    let ds: String = digits.iter().map(|d| (d + b'0') as char).collect();
-    let m = if f == 0 {
-        ds
-    } else {
-        format!("{}.{}", &ds[..1], &ds[1..])
-    };
-    format!("{sign}{m}{}", fmt_exp(exp))
 }

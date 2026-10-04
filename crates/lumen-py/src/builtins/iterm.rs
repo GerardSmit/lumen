@@ -1,288 +1,648 @@
 //! `range`, `slice`, `enumerate`, `zip`, `map`, `filter`, `reversed` and the iterator types.
 
-use super::numeric::{reg_binops, reg_compare};
+use super::numeric::reg_compare;
 use super::slots::{reg_iterator, reg_slots};
+use crate::bind::{Inst, PyCx, PyHost, This};
 use crate::object::*;
 use crate::ops::slice_len;
 use crate::vm::*;
+use lumen_bind::{FromArg, Passed, Slot};
+use std::cell::RefCell;
 
-type Kw<'a> = &'a [(Obj, Value)];
+/// A builtin iterator's state (the receiver of the iterator types' members).
+#[derive(Clone, Copy)]
+pub struct IterRef<'a>(pub &'a Obj, pub &'a RefCell<IterState>);
 
-fn range_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("range", kw)?;
-    let args = &a[1.min(a.len())..];
-    if args.is_empty() || args.len() > 3 {
-        return Err(if args.is_empty() {
-            it.type_error("range expected at least 1 argument, got 0")
-        } else {
-            it.type_error(&format!("range expected at most 3 arguments, got {}", args.len()))
-        });
-    }
-    let mut ints = Vec::with_capacity(3);
-    let mut bigs: Vec<crate::pyint::BigInt> = Vec::with_capacity(3);
-    let mut overflow = false;
-    for v in args {
-        if !it.has_index(v) {
-            let t = it.type_name_of(v);
-            return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+impl<'a> FromArg<'a, PyHost> for IterRef<'a> {
+    #[inline]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v {
+            Value::Obj(o) => match &o.kind {
+                Kind::Iter(st) => Ok(IterRef(o, st)),
+                _ => Err(cx.arg_error(at, "iterator", v)),
+            },
+            _ => Err(cx.arg_error(at, "iterator", v)),
         }
-        match v.as_bigint() {
-            Some(b) => {
-                match b.to_i64() {
-                    Some(i) => ints.push(i),
-                    None => {
-                        overflow = true;
-                        ints.push(0);
+    }
+}
+
+/// A new iterator of type `cls`: the builtin type `base` itself, or a subclass of it.
+fn new_iter(it: &Interp, cls: &Value, base: &Obj, st: IterState) -> Value {
+    match cls {
+        Value::Obj(c) if !std::rc::Rc::ptr_eq(c, base) => {
+            Value::Obj(Object::with_cls(c.clone(), Kind::Iter(RefCell::new(st))))
+        }
+        _ => it.mk_iter(st),
+    }
+}
+
+#[lumen_bind::class(name = "range")]
+pub struct Range;
+
+#[lumen_bind::methods]
+impl Range {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(it: &mut Interp, a: &Value, b: Passed<&Value>, c: Passed<&Value>) -> R<Value> {
+        let args: Vec<&Value> = [Some(a), b.0, c.0].into_iter().flatten().collect();
+        let mut ints = Vec::with_capacity(3);
+        let mut bigs: Vec<crate::pyint::BigInt> = Vec::with_capacity(3);
+        let mut overflow = false;
+        for v in args {
+            if !it.has_index(v) {
+                let t = it.type_name_of(v);
+                return Err(it.type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    t
+                )));
+            }
+            match v.as_bigint() {
+                Some(b) => {
+                    match b.to_i64() {
+                        Some(i) => ints.push(i),
+                        None => {
+                            overflow = true;
+                            ints.push(0);
+                        }
                     }
+                    bigs.push(b);
                 }
-                bigs.push(b);
-            }
-            None => {
-                let i = it.index_of(v)?;
-                ints.push(i);
-                bigs.push(crate::pyint::BigInt::from_i64(i));
+                None => {
+                    let i = it.index_of(v)?;
+                    ints.push(i);
+                    bigs.push(crate::pyint::BigInt::from_i64(i));
+                }
             }
         }
-    }
-    if overflow {
-        let one = crate::pyint::BigInt::from_i64(1);
-        let mut it3 = bigs.into_iter();
-        let (a0, a1, a2) = (it3.next(), it3.next(), it3.next());
-        let (start, stop, step) = match (a0, a1, a2) {
-            (Some(x), None, None) => (crate::pyint::BigInt::zero(), x, one),
-            (Some(x), Some(y), None) => (x, y, one),
-            (Some(x), Some(y), Some(z)) => (x, y, z),
-            _ => return Err(it.type_error("range expected at least 1 argument, got 0")),
+        if overflow {
+            let one = crate::pyint::BigInt::from_i64(1);
+            let mut it3 = bigs.into_iter();
+            let (start, stop, step) = match (it3.next(), it3.next(), it3.next()) {
+                (Some(x), None, None) => (crate::pyint::BigInt::zero(), x, one),
+                (Some(x), Some(y), None) => (x, y, one),
+                (Some(x), Some(y), Some(z)) => (x, y, z),
+                _ => unreachable!("one to three arguments"),
+            };
+            if step.is_zero() {
+                return Err(it.value_error("range() arg 3 must not be zero"));
+            }
+            return Ok(Value::Obj(Object::new(Kind::BigRange(Box::new([
+                start, stop, step,
+            ])))));
+        }
+        let (start, stop, step) = match ints.len() {
+            1 => (0, ints[0], 1),
+            2 => (ints[0], ints[1], 1),
+            _ => (ints[0], ints[1], ints[2]),
         };
-        if step.is_zero() {
+        if step == 0 {
             return Err(it.value_error("range() arg 3 must not be zero"));
         }
-        return Ok(Value::Obj(Object::new(Kind::BigRange(Box::new([start, stop, step])))));
+        Ok(Value::Obj(Object::new(Kind::Range(RangeData {
+            start,
+            stop,
+            step,
+        }))))
     }
-    let (start, stop, step) = match ints.len() {
-        1 => (0, ints[0], 1),
-        2 => (ints[0], ints[1], 1),
-        _ => (ints[0], ints[1], ints[2]),
-    };
-    if step == 0 {
-        return Err(it.value_error("range() arg 3 must not be zero"));
-    }
-    Ok(Value::Obj(Object::new(Kind::Range(RangeData { start, stop, step }))))
-}
 
-fn range_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a RangeData> {
-    match a.first() {
-        Some(Value::Obj(o)) => match &o.kind {
-            Kind::Range(r) => Ok(r),
-            _ => Err(it.type_error("descriptor requires a 'range' object")),
-        },
-        _ => Err(it.type_error("descriptor requires a 'range' object")),
-    }
-}
-
-fn range_index(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("range.index", a, 2, 2)?;
-    let r = range_of(it, a)?;
-    let (start, stop, step) = (r.start, r.stop, r.step);
-    if let Value::Int(i) = &a[1] {
-        let len = slice_len(start, stop, step) as i64;
-        let d = i - start;
-        if d % step == 0 {
-            let k = d / step;
-            if k >= 0 && k < len {
-                return Ok(Value::Int(k));
+    /// rangeobject.index(value) -> integer -- return index of value.
+    /// Raise ValueError if the value is not present.
+    #[method(hint(py(text_signature = "")))]
+    fn index(slf: This<Inst<'_, Range>>, it: &mut Interp, value: &Value) -> R<i64> {
+        if let (Kind::Range(r), Value::Int(i)) = (&slf.0 .0.kind, value) {
+            let len = slice_len(r.start, r.stop, r.step) as i64;
+            let d = i - r.start;
+            if d % r.step == 0 {
+                let k = d / r.step;
+                if k >= 0 && k < len {
+                    return Ok(k);
+                }
             }
         }
+        let s = it.repr_of(value)?;
+        Err(it.value_error(&format!("{} is not in range", s)))
     }
-    let s = it.repr_of(&a[1])?;
-    Err(it.value_error(&format!("{} is not in range", s)))
-}
 
-fn range_count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("range.count", a, 2, 2)?;
-    Ok(Value::Int(if it.native_contains(&a[0], &a[1])? { 1 } else { 0 }))
-}
-
-fn range_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(it.native_hash(&a[0])?))
-}
-
-fn range_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::string(it.native_repr(&a[0])?))
-}
-
-fn slice_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("slice", kw)?;
-    let args = &a[1.min(a.len())..];
-    let (s, e, st) = match args.len() {
-        1 => (Value::None, args[0].clone(), Value::None),
-        2 => (args[0].clone(), args[1].clone(), Value::None),
-        3 => (args[0].clone(), args[1].clone(), args[2].clone()),
-        0 => return Err(it.type_error("slice expected at least 1 argument, got 0")),
-        n => return Err(it.type_error(&format!("slice expected at most 3 arguments, got {}", n))),
-    };
-    Ok(Value::Obj(Object::new(Kind::Slice(s, e, st))))
-}
-
-fn slice_indices(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("slice.indices", a, 2, 2)?;
-    let len = it.index_of(&a[1])?;
-    if len < 0 {
-        return Err(it.value_error("length should not be negative"));
+    /// rangeobject.count(value) -> integer -- return number of occurrences of value
+    #[method(hint(py(text_signature = "")))]
+    fn count(slf: This<Inst<'_, Range>>, it: &mut Interp, value: &Value) -> R<i64> {
+        let r = Value::Obj(slf.0 .0.clone());
+        Ok(if it.native_contains(&r, value)? { 1 } else { 0 })
     }
-    let (s, e, st) = it.slice_bounds(&a[0], len as usize)?;
-    Ok(Value::tuple(vec![Value::Int(s), Value::Int(e), Value::Int(st)]))
+
+    #[proto(hash)]
+    fn hash(slf: This<Inst<'_, Range>>, it: &mut Interp) -> R<i64> {
+        it.native_hash(&Value::Obj(slf.0 .0.clone()))
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<Inst<'_, Range>>, it: &mut Interp) -> R<String> {
+        it.native_repr(&Value::Obj(slf.0 .0.clone()))
+    }
+
+    // CPython's range_reduce is METH_VARARGS and ignores its arguments.
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<Inst<'_, Range>>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
+        let _ = args;
+        start_stop_step_reduce(it, &Value::Obj(slf.0 .0.clone()))
+    }
 }
 
-fn slice_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::string(it.native_repr(&a[0])?))
-}
+#[lumen_bind::class(name = "slice")]
+pub struct Slice;
 
-fn enumerate_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("enumerate", &a[1.min(a.len())..], kw, &["iterable", "start"], 1)?;
-    let src = it.get_iter(&b[0].clone().unwrap_or(Value::None))?;
-    let start = match &b[1] {
-        Some(v) => it.index_of(v)?,
-        None => 0,
-    };
-    Ok(it.mk_iter(IterState::Enumerate { it: src, idx: start }))
-}
+#[lumen_bind::methods]
+impl Slice {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(a: &Value, b: Passed<&Value>, c: Passed<&Value>) -> Value {
+        let (s, e, st) = match (b.0, c.0) {
+            (None, _) => (Value::None, a.clone(), Value::None),
+            (Some(b), None) => (a.clone(), b.clone(), Value::None),
+            (Some(b), Some(c)) => (a.clone(), b.clone(), c.clone()),
+        };
+        Value::Obj(Object::new(Kind::Slice(s, e, st)))
+    }
 
-fn zip_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let mut strict = false;
-    for (k, v) in kw {
-        match k.as_str_kind().unwrap_or("") {
-            "strict" => strict = it.truthy(v)?,
-            other => return Err(it.type_error(&format!("zip() got an unexpected keyword argument '{}'", other))),
+    /// S.indices(len) -> (start, stop, stride)
+    ///
+    /// Assuming a sequence of length len, calculate the start and stop
+    /// indices, and the stride length of the extended slice described by
+    /// S. Out of bounds indices are clipped in a manner consistent with the
+    /// handling of normal slices.
+    #[method(hint(py(text_signature = "")))]
+    fn indices(slf: This<Inst<'_, Slice>>, it: &mut Interp, len: &Value) -> R<(i64, i64, i64)> {
+        let len = it.index_of(len)?;
+        if len < 0 {
+            return Err(it.value_error("length should not be negative"));
         }
+        it.slice_bounds(&Value::Obj(slf.0 .0.clone()), len as usize)
     }
-    let mut its = Vec::new();
-    for v in &a[1.min(a.len())..] {
-        its.push(it.get_iter(v)?);
+
+    #[proto(repr)]
+    fn repr(slf: This<Inst<'_, Slice>>, it: &mut Interp) -> R<String> {
+        it.native_repr(&Value::Obj(slf.0 .0.clone()))
     }
-    Ok(it.mk_iter(IterState::Zip { its, strict }))
+
+    /// Return state information for pickling.
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<Inst<'_, Slice>>, it: &mut Interp) -> R<Value> {
+        start_stop_step_reduce(it, &Value::Obj(slf.0 .0.clone()))
+    }
 }
 
-fn map_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("map", kw)?;
-    let args = &a[1.min(a.len())..];
-    if args.len() < 2 {
-        return Err(it.type_error("map() must have at least two arguments."));
+/// `range.__reduce__` and `slice.__reduce__`: `(type, (start, stop, step))`.
+fn start_stop_step_reduce(it: &mut Interp, v: &Value) -> R<Value> {
+    let mut parts = Vec::with_capacity(3);
+    for name in ["start", "stop", "step"] {
+        parts.push(it.get_attr_str(v, name)?);
     }
-    let mut its = Vec::new();
-    for v in &args[1..] {
-        its.push(it.get_iter(v)?);
-    }
-    Ok(it.mk_iter(IterState::Map { f: args[0].clone(), its }))
+    let t = it.type_of(v);
+    Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(parts)]))
 }
 
-fn filter_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("filter", kw)?;
-    let args = &a[1.min(a.len())..];
-    if args.len() != 2 {
-        return Err(it.type_error(&format!("filter expected 2 arguments, got {}", args.len())));
+#[lumen_bind::class(name = "enumerate")]
+pub struct Enumerate;
+
+#[lumen_bind::methods]
+impl Enumerate {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] iterable: &Value,
+        #[kw] start: Passed<&Value>,
+    ) -> R<Value> {
+        let src = it.get_iter(iterable)?;
+        let idx = match start.0 {
+            Some(v) => it.index_of(v)?,
+            None => 0,
+        };
+        let base = it.types.enumerate.clone();
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Enumerate { it: src, idx },
+        ))
     }
-    let src = it.get_iter(&args[1])?;
-    Ok(it.mk_iter(IterState::Filter { f: args[0].clone(), it: src }))
+
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
+    }
 }
 
-fn reversed_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("reversed", kw)?;
-    let args = &a[1.min(a.len())..];
-    if args.len() != 1 {
-        return Err(it.type_error(&format!("reversed expected 1 argument, got {}", args.len())));
+#[lumen_bind::class(name = "zip")]
+pub struct Zip;
+
+#[lumen_bind::methods]
+impl Zip {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] iterables: &[Value],
+        #[kwonly] strict: Option<&Value>,
+    ) -> R<Value> {
+        let strict = match strict {
+            Some(v) => it.truthy(v)?,
+            None => false,
+        };
+        let mut its = Vec::with_capacity(iterables.len());
+        for v in iterables {
+            its.push(it.get_iter(v)?);
+        }
+        let base = it.types.zip.clone();
+        Ok(new_iter(it, &cls, &base, IterState::Zip { its, strict }))
     }
-    let seq = &args[0];
-    if let Value::Obj(o) = seq {
-        if o.cls.is_some() {
-            if let Some(m) = it.user_special(seq, "__reversed__") {
-                return it.call_user_special(seq, &m, Vec::new());
+
+    /// Set state information for unpickling.
+    #[method(name = "__setstate__", hint(py(text_signature = "")))]
+    fn setstate(slf: This<IterRef<'_>>, it: &mut Interp, state: &Value) -> R<()> {
+        let flag = it.truthy(state)?;
+        if let IterState::Zip { strict, .. } = &mut *slf.0 .1.borrow_mut() {
+            *strict = flag;
+        }
+        Ok(())
+    }
+}
+
+#[lumen_bind::class(name = "map")]
+pub struct Map;
+
+#[lumen_bind::methods]
+impl Map {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
+        if args.len() < 2 {
+            return Err(it.type_error("map() must have at least two arguments."));
+        }
+        let mut its = Vec::with_capacity(args.len() - 1);
+        for v in &args[1..] {
+            its.push(it.get_iter(v)?);
+        }
+        let base = it.types.map.clone();
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Map {
+                f: args[0].clone(),
+                its,
+            },
+        ))
+    }
+}
+
+#[lumen_bind::class(name = "filter")]
+pub struct Filter;
+
+#[lumen_bind::methods]
+impl Filter {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, function: &Value, iterable: &Value) -> R<Value> {
+        let src = it.get_iter(iterable)?;
+        let base = it.types.filter.clone();
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Filter {
+                f: function.clone(),
+                it: src,
+            },
+        ))
+    }
+}
+
+#[lumen_bind::class(name = "reversed")]
+pub struct Reversed;
+
+#[lumen_bind::methods]
+impl Reversed {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(cls: This<Value>, it: &mut Interp, sequence: &Value) -> R<Value> {
+        let seq = sequence;
+        let base = it.types.reversed.clone();
+        if let Value::Obj(o) = seq {
+            if o.cls.is_some() {
+                if let Some(m) = it.user_special(seq, "__reversed__") {
+                    return it.call_user_special(seq, &m, Vec::new());
+                }
             }
         }
-    }
-    let cls = it.type_of(seq);
-    if let Some(m) = it.lookup_mro(&cls, "__reversed__") {
-        if !m.is_none() {
-            let b = it.bind_descr(&m, seq, &cls)?;
-            return it.call(&b, Vec::new(), Vec::new());
+        let t = it.type_of(seq);
+        if let Some(m) = it.lookup_mro(&t, "__reversed__") {
+            if !m.is_none() {
+                let b = it.bind_descr(&m, seq, &t)?;
+                return it.call(&b, Vec::new(), Vec::new());
+            }
         }
+        if it.lookup_mro(&t, "__getitem__").is_none() || it.lookup_mro(&t, "__len__").is_none() {
+            let t = it.type_name_of(seq);
+            return Err(it.type_error(&format!("'{}' object is not reversible", t)));
+        }
+        let n = it.len_of(seq)? as i64;
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Reversed {
+                seq: seq.clone(),
+                idx: n - 1,
+            },
+        ))
     }
-    if it.lookup_mro(&cls, "__getitem__").is_none() || it.lookup_mro(&cls, "__len__").is_none() {
-        let t = it.type_name_of(seq);
-        return Err(it.type_error(&format!("'{}' object is not reversible", t)));
-    }
-    let n = it.len_of(seq)? as i64;
-    Ok(it.mk_iter(IterState::Reversed { seq: seq.clone(), idx: n - 1 }))
 }
 
-fn iter_length_hint(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let _ = it;
-    if let Value::Obj(o) = &a[0] {
-        if let Kind::Iter(st) = &o.kind {
-            let n = match &*st.borrow() {
-                IterState::List { list, idx } => match &list.kind {
-                    Kind::List(l) => l.borrow().len().saturating_sub(*idx),
-                    _ => 0,
-                },
-                IterState::Tuple { tup, idx } => match &tup.kind {
-                    Kind::Tuple(t) => t.len().saturating_sub(*idx),
-                    _ => 0,
-                },
-                IterState::Range { cur, stop, step } => slice_len(*cur, *stop, *step),
+/// The pickling and length-hint members of the builtin iterator types, installed into each type
+/// that has them in CPython.
+#[lumen_bind::class(name = "iterator", hint(py(shared)))]
+pub struct IterMethods;
+
+#[lumen_bind::methods]
+impl IterMethods {
+    /// Private method returning an estimate of len(list(it)).
+    #[method(name = "__length_hint__", hint(py(text_signature = "")))]
+    fn length_hint(slf: This<IterRef<'_>>) -> usize {
+        match &*slf.0 .1.borrow() {
+            IterState::List { list, idx } => match &list.kind {
+                Kind::List(l) => l.borrow().len().saturating_sub(*idx),
+                _ => 0,
+            },
+            IterState::Tuple { tup, idx } => match &tup.kind {
+                Kind::Tuple(t) => t.len().saturating_sub(*idx),
+                _ => 0,
+            },
+            IterState::Range { cur, stop, step } => slice_len(*cur, *stop, *step),
+            _ => 0,
+        }
+    }
+
+    /// Return state information for pickling.
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
+    fn reduce(slf: This<IterRef<'_>>, it: &mut Interp) -> R<Value> {
+        iter_reduce(it, slf.0)
+    }
+
+    /// Set state information for unpickling.
+    #[method(name = "__setstate__", hint(py(text_signature = "")))]
+    fn setstate(slf: This<IterRef<'_>>, it: &mut Interp, state: &Value) -> R<()> {
+        iter_setstate(it, slf.0 .1, state)
+    }
+}
+
+fn builtin_fn(it: &mut Interp, name: &str) -> R<Value> {
+    let b = Value::Obj(it.import_module("builtins")?);
+    it.get_attr_str(&b, name)
+}
+
+/// The keys, values or items a dict or set iterator has left, from entry `pos`.
+fn remaining_entries(d: &Obj, pos: usize, kind: Option<ViewKind>) -> Vec<Value> {
+    let Some(pd) = crate::containers::pydict_of(d) else {
+        return Vec::new();
+    };
+    let pd = pd.borrow();
+    let mut out = Vec::new();
+    let mut i = pos;
+    while let Some(j) = pd.next_live(i) {
+        let Some(e) = pd.get(j) else { break };
+        out.push(match kind {
+            None | Some(ViewKind::Keys) => e.key.clone(),
+            Some(ViewKind::Values) => e.val.clone(),
+            Some(ViewKind::Items) => Value::tuple(vec![e.key.clone(), e.val.clone()]),
+        });
+        i = j + 1;
+    }
+    out
+}
+
+/// `__reduce__` of the builtin iterators: CPython's `(callable, args[, index])` forms.
+fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
+    enum Plan {
+        Indexed(&'static str, Value, i64),
+        Done(&'static str, Value),
+        Range(i64, i64, i64),
+        Args(&'static str, Vec<Value>),
+        Zip(Vec<Value>, bool),
+        Unpicklable,
+    }
+    let plan = match &*st.borrow() {
+        IterState::List { list, idx } => {
+            Plan::Indexed("iter", Value::Obj(list.clone()), *idx as i64)
+        }
+        IterState::Tuple { tup, idx } => {
+            Plan::Indexed("iter", Value::Obj(tup.clone()), *idx as i64)
+        }
+        IterState::Str { s, pos } => {
+            let n = match &s.kind {
+                Kind::Str(ps) => lumen_common::smuggle::code_points(&ps.s[..*pos]).count(),
                 _ => 0,
             };
-            return Ok(Value::Int(n as i64));
+            Plan::Indexed("iter", Value::Obj(s.clone()), n as i64)
         }
+        IterState::Bytes { b, idx } => Plan::Indexed("iter", Value::Obj(b.clone()), *idx as i64),
+        IterState::Range { cur, stop, step } => Plan::Range(*cur, *stop, *step),
+        IterState::Dict {
+            dict, pos, kind, ..
+        } => Plan::Done(
+            "iter",
+            Value::list(remaining_entries(dict, *pos, Some(*kind))),
+        ),
+        IterState::Set { set, pos, .. } => {
+            Plan::Done("iter", Value::list(remaining_entries(set, *pos, None)))
+        }
+        IterState::Seq { idx, .. } if *idx == i64::MIN => {
+            Plan::Done("iter", Value::tuple(Vec::new()))
+        }
+        IterState::Seq { obj, idx } => Plan::Indexed("iter", obj.clone(), *idx),
+        IterState::CallIter { done: true, .. } => Plan::Done("iter", Value::tuple(Vec::new())),
+        IterState::CallIter { f, sentinel, .. } => {
+            Plan::Args("iter", vec![f.clone(), sentinel.clone()])
+        }
+        IterState::Reversed { seq, idx } if *idx < 0 => {
+            let is_list = matches!(seq, Value::Obj(so) if matches!(so.kind, Kind::List(_)) && so.cls.is_none());
+            Plan::Done(
+                "reversed",
+                if is_list {
+                    Value::list(Vec::new())
+                } else {
+                    Value::tuple(Vec::new())
+                },
+            )
+        }
+        IterState::Reversed { seq, idx } => Plan::Indexed("reversed", seq.clone(), *idx),
+        IterState::Enumerate { it: inner, idx } => {
+            Plan::Args("enumerate", vec![inner.clone(), Value::Int(*idx)])
+        }
+        IterState::Zip { its, strict } => Plan::Zip(its.clone(), *strict),
+        IterState::Map { f, its } => {
+            let mut args = vec![f.clone()];
+            args.extend(its.iter().cloned());
+            Plan::Args("map", args)
+        }
+        IterState::Filter { f, it: inner } => Plan::Args("filter", vec![f.clone(), inner.clone()]),
+        IterState::Empty => Plan::Done("iter", Value::tuple(Vec::new())),
+        IterState::Native(_) | IterState::Running => Plan::Unpicklable,
+    };
+    Ok(match plan {
+        Plan::Indexed(f, seq, i) => {
+            let f = builtin_fn(it, f)?;
+            Value::tuple(vec![f, Value::tuple(vec![seq]), Value::Int(i)])
+        }
+        Plan::Done(f, seq) => {
+            let f = builtin_fn(it, f)?;
+            Value::tuple(vec![f, Value::tuple(vec![seq])])
+        }
+        Plan::Range(cur, stop, step) => {
+            let n = slice_len(cur, stop, step) as i64;
+            let end = cur.saturating_add(n.saturating_mul(step));
+            let r = Value::Obj(Object::new(Kind::Range(RangeData {
+                start: cur,
+                stop: end,
+                step,
+            })));
+            let f = builtin_fn(it, "iter")?;
+            Value::tuple(vec![f, Value::tuple(vec![r]), Value::None])
+        }
+        Plan::Args(f, args) => {
+            let f = builtin_fn(it, f)?;
+            Value::tuple(vec![f, Value::tuple(args)])
+        }
+        Plan::Zip(its, strict) => {
+            let zip = Value::Obj(it.types.zip.clone());
+            let mut out = vec![zip, Value::tuple(its)];
+            if strict {
+                out.push(Value::Bool(true));
+            }
+            Value::tuple(out)
+        }
+        Plan::Unpicklable => {
+            let t = it.type_name(&it.type_of_obj(o));
+            return Err(it.type_error(&format!("cannot pickle '{}' object", t)));
+        }
+    })
+}
+
+/// `__setstate__` of the indexed builtin iterators: the position, clamped as CPython does.
+fn iter_setstate(it: &mut Interp, st: &RefCell<IterState>, state: &Value) -> R<()> {
+    let i = it.index_of(state)?;
+    let reversed_seq = match &*st.borrow() {
+        IterState::Reversed { seq, idx } if *idx >= 0 => Some(seq.clone()),
+        _ => None,
+    };
+    if let Some(seq) = reversed_seq {
+        let n = it.len_of(&seq)? as i64;
+        if let IterState::Reversed { idx, .. } = &mut *st.borrow_mut() {
+            *idx = i.clamp(-1, n - 1);
+        }
+        return Ok(());
     }
-    Ok(Value::Int(0))
+    match &mut *st.borrow_mut() {
+        IterState::List { list, idx } => {
+            let n = match &list.kind {
+                Kind::List(l) => l.borrow().len() as i64,
+                _ => 0,
+            };
+            *idx = i.clamp(0, n) as usize;
+        }
+        IterState::Tuple { tup, idx } => {
+            let n = match &tup.kind {
+                Kind::Tuple(t) => t.len() as i64,
+                _ => 0,
+            };
+            *idx = i.clamp(0, n) as usize;
+        }
+        IterState::Bytes { b, idx } => {
+            let n = match &b.kind {
+                Kind::Bytes(x) => x.len() as i64,
+                Kind::ByteArray(x) => x.len() as i64,
+                _ => 0,
+            };
+            *idx = i.clamp(0, n) as usize;
+        }
+        IterState::Str { s: so, pos } => {
+            if let Kind::Str(ps) = &so.kind {
+                let mut p = 0;
+                for _ in 0..i.max(0) {
+                    if p >= ps.s.len() {
+                        break;
+                    }
+                    p += lumen_common::smuggle::decode_at(&ps.s, p).1;
+                }
+                *pos = p;
+            }
+        }
+        IterState::Range { cur, stop, step } => {
+            let n = slice_len(*cur, *stop, *step) as i64;
+            *cur = cur.saturating_add(i.clamp(0, n).saturating_mul(*step));
+        }
+        IterState::Seq { idx, .. } if *idx != i64::MIN => *idx = i.max(0),
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn init(it: &mut Interp) {
+    use crate::bind::{extend_type, install_into};
     let range = it.types.range.clone();
-    it.reg_new(&range, range_new);
-    it.reg(&range, "index", range_index);
-    it.reg(&range, "count", range_count);
-    it.reg(&range, "__hash__", range_hash);
-    it.reg(&range, "__repr__", range_repr);
-    reg_slots(it, &range, &["__getitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
+    extend_type::<Range>(it, &range);
+    reg_slots(
+        it,
+        &range,
+        &[
+            "__getitem__",
+            "__len__",
+            "__contains__",
+            "__iter__",
+            "__reversed__",
+        ],
+    );
     reg_compare(it, &range, false);
 
     let slice = it.types.slice.clone();
-    it.reg_new(&slice, slice_new);
-    it.reg(&slice, "indices", slice_indices);
-    it.reg(&slice, "__repr__", slice_repr);
+    extend_type::<Slice>(it, &slice);
     reg_compare(it, &slice, true);
 
-    let (enumerate, zip, map, filter, reversed) =
-        (it.types.enumerate.clone(), it.types.zip.clone(), it.types.map.clone(), it.types.filter.clone(), it.types.reversed.clone());
-    it.reg_new(&enumerate, enumerate_new);
-    it.reg_new(&zip, zip_new);
-    it.reg_new(&map, map_new);
-    it.reg_new(&filter, filter_new);
-    it.reg_new(&reversed, reversed_new);
+    let types = &it.types;
+    let (enumerate, zip, map, filter, reversed) = (
+        types.enumerate.clone(),
+        types.zip.clone(),
+        types.map.clone(),
+        types.filter.clone(),
+        types.reversed.clone(),
+    );
+    extend_type::<Enumerate>(it, &enumerate);
+    extend_type::<Zip>(it, &zip);
+    extend_type::<Map>(it, &map);
+    extend_type::<Filter>(it, &filter);
+    extend_type::<Reversed>(it, &reversed);
 
-    let iter_types = [
-        enumerate,
-        zip,
-        map,
-        filter,
-        reversed,
-        it.types.list_iterator.clone(),
-        it.types.list_reverseiterator.clone(),
-        it.types.tuple_iterator.clone(),
-        it.types.str_iterator.clone(),
-        it.types.bytes_iterator.clone(),
-        it.types.range_iterator.clone(),
-        it.types.dict_keyiterator.clone(),
-        it.types.dict_valueiterator.clone(),
-        it.types.dict_itemiterator.clone(),
-        it.types.set_iterator.clone(),
-        it.types.iterator.clone(),
-        it.types.callable_iterator.clone(),
+    let types = &it.types;
+    let all = ["__length_hint__", "__reduce__", "__setstate__"];
+    let reduce_only = ["__reduce__"];
+    let hint_reduce = ["__length_hint__", "__reduce__"];
+    let iter_types: [(Obj, &[&str]); 17] = [
+        (enumerate, &reduce_only),
+        (zip, &reduce_only),
+        (map, &reduce_only),
+        (filter, &reduce_only),
+        (reversed, &all),
+        (types.list_iterator.clone(), &all),
+        (types.list_reverseiterator.clone(), &all),
+        (types.tuple_iterator.clone(), &all),
+        (types.str_iterator.clone(), &all),
+        (types.bytes_iterator.clone(), &all),
+        (types.range_iterator.clone(), &all),
+        (types.dict_keyiterator.clone(), &hint_reduce),
+        (types.dict_valueiterator.clone(), &hint_reduce),
+        (types.dict_itemiterator.clone(), &hint_reduce),
+        (types.set_iterator.clone(), &hint_reduce),
+        (types.iterator.clone(), &all),
+        (types.callable_iterator.clone(), &reduce_only),
     ];
-    for t in &iter_types {
+    for (t, members) in &iter_types {
         reg_iterator(it, t);
-        it.reg(t, "__length_hint__", iter_length_hint);
+        install_into::<IterMethods>(t, members);
     }
-    let _ = reg_binops;
 }

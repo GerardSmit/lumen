@@ -45,7 +45,12 @@ mod unsupported {
 }
 
 #[cfg(not(all(unix, not(target_os = "android"))))]
-use unsupported::{any as op_ciphers, any as op_ctx_new, any as op_ctx_op, any as op_events, any as op_feed, any as op_last_error, any as op_output, any as op_read, any as op_root_certificates, any as op_sess_free, any as op_sess_new, any as op_sess_op, any as op_write, available as op_available};
+use unsupported::{
+    any as op_ciphers, any as op_ctx_new, any as op_ctx_op, any as op_events, any as op_feed,
+    any as op_last_error, any as op_output, any as op_read, any as op_root_certificates,
+    any as op_sess_free, any as op_sess_new, any as op_sess_op, any as op_write,
+    available as op_available,
+};
 
 #[cfg(all(unix, not(target_os = "android")))]
 use imp::{
@@ -121,7 +126,8 @@ mod imp {
     }
 
     fn registry(ctx: &mut Ctx) -> &mut TlsRegistry {
-        ctx.host_mut::<TlsRegistry>().expect("runtime installs the TLS registry")
+        ctx.host_mut::<TlsRegistry>()
+            .expect("runtime installs the TLS registry")
     }
 
     fn id_arg(args: &[Value]) -> u64 {
@@ -133,7 +139,8 @@ mod imp {
     }
 
     fn bytes_arg(ctx: &mut Ctx, args: &[Value], index: usize) -> Option<Vec<u8>> {
-        args.get(index).and_then(|value| ctx.typed_array_bytes(value))
+        args.get(index)
+            .and_then(|value| ctx.typed_array_bytes(value))
     }
 
     fn string_arg(ctx: &mut Ctx, args: &[Value], index: usize) -> Result<Option<String>, Value> {
@@ -147,7 +154,11 @@ mod imp {
         Ok(Value::Bool(lumen_tls::engine::openssl_available()))
     }
 
-    pub fn op_root_certificates(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    pub fn op_root_certificates(
+        ctx: &mut Ctx,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
         let out = Out::Array(
             lumen_tls::engine::root_certificate_pems()
                 .into_iter()
@@ -187,7 +198,9 @@ mod imp {
         let name = string_arg(ctx, args, 1)?.unwrap_or_default();
         let bytes = bytes_arg(ctx, args, 2);
         let text = match name.as_str() {
-            "setCiphers" | "setCipherSuites" | "setSigalgs" | "setECDHCurve" => string_arg(ctx, args, 2)?,
+            "setCiphers" | "setCipherSuites" | "setSigalgs" | "setECDHCurve" => {
+                string_arg(ctx, args, 2)?
+            }
             _ => None,
         };
         let number = num_arg(args, 2);
@@ -195,8 +208,9 @@ mod imp {
         let out = match registry(ctx).contexts.get_mut(&id) {
             None => Out::Error(EngineError::plain("SecureContext is closed")),
             Some(context) => match name.as_str() {
-                "setKey" => bytes
-                    .map_or(Out::Undefined, |pem| context.set_key(&pem, passphrase.as_deref()).into()),
+                "setKey" => bytes.map_or(Out::Undefined, |pem| {
+                    context.set_key(&pem, passphrase.as_deref()).into()
+                }),
                 "setCert" => bytes.map_or(Out::Undefined, |pem| context.set_cert(&pem).into()),
                 "addCACert" => bytes.map_or(Out::Undefined, |pem| context.add_ca_cert(&pem).into()),
                 "addCRL" => bytes.map_or(Out::Undefined, |pem| context.add_crl(&pem).into()),
@@ -215,20 +229,26 @@ mod imp {
                 "getMinProto" => Out::Num(context.min_proto() as f64),
                 "getMaxProto" => Out::Num(context.max_proto() as f64),
                 "setOptions" => context.set_options(number as u64).into(),
-                "setSessionIdContext" => bytes
-                    .map_or(Out::Undefined, |context_id| context.set_session_id_context(&context_id).into()),
+                "setSessionIdContext" => bytes.map_or(Out::Undefined, |context_id| {
+                    context.set_session_id_context(&context_id).into()
+                }),
                 "setSessionTimeout" => context.set_session_timeout(number as i32).into(),
-                "setTicketKeys" => bytes.map_or(Out::Undefined, |keys| context.set_ticket_keys(&keys).into()),
+                "setTicketKeys" => {
+                    bytes.map_or(Out::Undefined, |keys| context.set_ticket_keys(&keys).into())
+                }
                 "getTicketKeys" => Out::Bytes(context.ticket_keys()),
-                "loadPKCS12" => bytes
-                    .map_or(Out::Undefined, |data| context.load_pkcs12(&data, passphrase.as_deref()).into()),
+                "loadPKCS12" => bytes.map_or(Out::Undefined, |data| {
+                    context.load_pkcs12(&data, passphrase.as_deref()).into()
+                }),
                 "getCertificate" => Out::Bytes(context.certificate().to_vec()),
                 "getIssuer" => Out::Bytes(context.issuer().to_vec()),
                 "close" => {
                     context.close();
                     Out::Undefined
                 }
-                other => Out::Error(EngineError::plain(format!("unknown context operation {other}"))),
+                other => Out::Error(EngineError::plain(format!(
+                    "unknown context operation {other}"
+                ))),
             },
         };
         if name == "close" {
@@ -303,7 +323,12 @@ mod imp {
             None
         };
         let registry = registry(ctx);
-        let sni = sni_context.and_then(|id| registry.contexts.get(&id).map(|context| context as *const Context));
+        let sni = sni_context.and_then(|id| {
+            registry
+                .contexts
+                .get(&id)
+                .map(|context| context as *const Context)
+        });
         let Some(session) = registry.sessions.get_mut(&id) else {
             return to_value(ctx, Out::Error(EngineError::plain("TLS session is closed")));
         };
@@ -324,7 +349,9 @@ mod imp {
                 None => Out::Null,
             },
             "alpnSelected" => session.alpn_selected().map_or(Out::Bool(false), Out::Bytes),
-            "setAlpn" => Out::Bool(bytes.is_some_and(|protocols| session.set_alpn_protocols(&protocols))),
+            "setAlpn" => {
+                Out::Bool(bytes.is_some_and(|protocols| session.set_alpn_protocols(&protocols)))
+            }
             "servername" => session.servername().map_or(Out::Bool(false), Out::Str),
             "setServername" => Out::Bool(text.is_some_and(|name| session.set_servername(&name))),
             "getSession" => session.session_bytes().map_or(Out::Undefined, Out::Bytes),
@@ -388,7 +415,11 @@ mod imp {
                 Out::Undefined
             }
             "setAlpnChoice" => {
-                session.set_alpn_choice(if number < 0.0 { None } else { Some(number as usize) });
+                session.set_alpn_choice(if number < 0.0 {
+                    None
+                } else {
+                    Some(number as usize)
+                });
                 Out::Undefined
             }
             "certRequest" => match session.take_cert_request() {
@@ -400,10 +431,14 @@ mod imp {
                 Out::Undefined
             }
             "ephemeralKey" => match session.ephemeral_key() {
-                Some((kind, bits)) => Out::Array(vec![Out::Num(kind as f64), Out::Num(bits as f64)]),
+                Some((kind, bits)) => {
+                    Out::Array(vec![Out::Num(kind as f64), Out::Num(bits as f64)])
+                }
                 None => Out::Undefined,
             },
-            "sharedSigalgs" => Out::Array(session.shared_sigalgs().into_iter().map(Out::Str).collect()),
+            "sharedSigalgs" => {
+                Out::Array(session.shared_sigalgs().into_iter().map(Out::Str).collect())
+            }
             "shutdown" => {
                 session.shutdown();
                 Out::Undefined
@@ -414,7 +449,9 @@ mod imp {
                 Out::Undefined
             }
             "handshakeFinished" => Out::Bool(session.handshake_finished()),
-            other => Out::Error(EngineError::plain(format!("unknown session operation {other}"))),
+            other => Out::Error(EngineError::plain(format!(
+                "unknown session operation {other}"
+            ))),
         };
         to_value(ctx, out)
     }
@@ -476,10 +513,14 @@ mod imp {
                 .map(|event| match event {
                     Event::HandshakeStart => Out::Array(vec![Out::Str("hs-start".into())]),
                     Event::HandshakeDone => Out::Array(vec![Out::Str("hs-done".into())]),
-                    Event::NewSession { id, session } => {
-                        Out::Array(vec![Out::Str("session".into()), Out::Bytes(id), Out::Bytes(session)])
+                    Event::NewSession { id, session } => Out::Array(vec![
+                        Out::Str("session".into()),
+                        Out::Bytes(id),
+                        Out::Bytes(session),
+                    ]),
+                    Event::Keylog(line) => {
+                        Out::Array(vec![Out::Str("keylog".into()), Out::Bytes(line)])
                     }
-                    Event::Keylog(line) => Out::Array(vec![Out::Str("keylog".into()), Out::Bytes(line)]),
                     Event::OcspResponse(response) => Out::Array(vec![
                         Out::Str("ocsp".into()),
                         response.map_or(Out::Undefined, Out::Bytes),

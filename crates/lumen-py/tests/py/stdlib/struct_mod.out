@@ -1,0 +1,152 @@
+error struct Exception True
+Struct ['calcsize', 'pack', 'pack_into', 'unpack', 'unpack_from', 'iter_unpack', 'Struct', 'error']
+None
+TypeError Struct() argument 1 must be a str or bytes object, not int
+TypeError Struct() argument 1 must be a str or bytes object, not int
+TypeError Struct() missing required argument 'format' (pos 1)
+TypeError Struct() takes at most 1 argument (2 given)
+error bad char in struct format
+error repeat count given without format specifier
+error bad char in struct format
+error bad char in struct format
+error bad char in struct format
+error bad char in struct format
+error total struct size too long
+error total struct size too long
+error total struct size too long
+error embedded null character
+error embedded null character
+UnicodeEncodeError 'ascii' codec can't encode character '\xff' in position 0: ordinal not in range(128)
+h error 'h' format requires -32768 <= number <= 32767
+H error 'H' format requires 0 <= number <= 65535
+b error 'b' format requires -128 <= number <= 127
+B error 'B' format requires 0 <= number <= 255
+i error 'i' format requires -2147483648 <= number <= 2147483647
+I error 'I' format requires 0 <= number <= 4294967295
+q error 'q' format requires -9223372036854775808 <= number <= 9223372036854775807
+Q error 'Q' format requires 0 <= number <= 18446744073709551615
+<q error 'q' format requires -9223372036854775808 <= number <= 9223372036854775807
+<Q error 'Q' format requires 0 <= number <= 18446744073709551615
+<i error 'i' format requires -2147483648 <= number <= 2147483647
+<Q error 'Q' format requires 0 <= number <= 18446744073709551615
+<q error 'q' format requires -9223372036854775808 <= number <= 9223372036854775807
+<I error 'I' format requires 0 <= number <= 4294967295
+n error 'n' format requires -9223372036854775808 <= number <= 9223372036854775807
+N error 'N' format requires 0 <= number <= 18446744073709551615
+@l error 'l' format requires -9223372036854775808 <= number <= 9223372036854775807
+<l error 'l' format requires -2147483648 <= number <= 2147483647
+<L error 'L' format requires 0 <= number <= 4294967295
+>h error 'h' format requires -32768 <= number <= 32767
+error required argument is not an integer
+error required argument is not an integer
+error required argument is not an integer
+error required argument is not an integer
+error required argument is not a float
+error required argument is not a float
+error required argument is not a float
+error required argument is not a float
+OverflowError float too large to pack with e format
+b'\x00|'
+OverflowError float too large to pack with e format
+error char format requires a bytes object of length 1
+error char format requires a bytes object of length 1
+error char format requires a bytes object of length 1
+error argument for 's' must be a bytes object
+error argument for 's' must be a bytes object
+error argument for 'p' must be a bytes object
+error pack expected 2 items for packing (got 1)
+error pack expected 1 items for packing (got 2)
+error pack expected 3 items for packing (got 2)
+error pack expected 0 items for packing (got 1)
+TypeError missing format argument
+ZeroDivisionError division by zero
+TypeError __index__ returned non-int (type str)
+ZeroDivisionError division by zero
+None bytearray(b'\x00\x01\x00\x02\x00\x00\x00\x00\x00\x00')
+error pack_into requires a buffer of at least 11 bytes for packing 4 bytes at offset 7 (actual buffer size is 10)
+None
+bytearray(b'\x00\x01\x00\x02\x00\x00\x03\x00\x00\x00')
+None
+bytearray(b'\x00\x01\x00\x02\x00\x00\x05\x00\x00\x00')
+error no space to pack 4 bytes at offset -3
+error offset -11 out of range for 10-byte buffer
+IndexError cannot fit 'int' into an index-sized integer
+TypeError 'str' object cannot be interpreted as an integer
+TypeError 'float' object cannot be interpreted as an integer
+TypeError argument must be read-write bytes-like object, not bytes
+TypeError argument must be read-write bytes-like object, not list
+error pack_into expected offset argument
+error pack_into expected buffer argument
+error pack_into expected 1 items for packing (got 0)
+error pack_into expected 1 items for packing (got 2)
+bytearray(b'\xff\x01\x00\x02\x00\x00\x00\xff')
+bytearray(b'\x00\x00\x00\x00\x01\x00\x00\x00')
+error unpack requires a buffer of 4 bytes
+error unpack requires a buffer of 4 bytes
+TypeError a bytes-like object is required, not 'str'
+TypeError a bytes-like object is required, not 'list'
+TypeError unpack expected 2 arguments, got 1
+(1,)
+(50462976,) (117835012,) (252579084,) (50462976,)
+(252579084,) (50462976,) (b'\x0e\x0f',)
+error unpack_from requires a buffer of at least 17 bytes for unpacking 4 bytes at offset 13 (actual buffer size is 16)
+error unpack_from requires a buffer of at least 20 bytes for unpacking 4 bytes at offset 16 (actual buffer size is 16)
+error not enough data to unpack 4 bytes at offset -3
+error offset -17 out of range for 16-byte buffer
+OverflowError Python int too large to convert to C ssize_t
+OverflowError Python int too large to convert to C ssize_t
+TypeError 'float' object cannot be interpreted as an integer
+TypeError 'str' object cannot be interpreted as an integer
+TypeError unpack_from() missing required argument 'buffer' (pos 2)
+TypeError unpack_from() takes at most 3 arguments (4 given)
+error unpack_from requires a buffer of at least 4 bytes for unpacking 4 bytes at offset 0 (actual buffer size is 3)
+() ()
+error unpack_from requires a buffer of at least 1 bytes for unpacking 0 bytes at offset 1 (actual buffer size is 0)
+error iterative unpacking requires a buffer of a multiple of 4 bytes
+error cannot iteratively unpack with a struct of length 0
+error cannot iteratively unpack with a struct of length 0
+TypeError a bytes-like object is required, not 'int'
+[(1, 2), (1, 2), (1, 2)] []
+unpack_iterator 3 (1,) 2 True [(2,), (3,)] 0
+StopIteration 
+TypeError cannot create '_struct.unpack_iterator' instances
+[(16909060, 5), (101124105, 10)]
+8 <2i b'\x01\x00\x00\x00\x02\x00\x00\x00' (1, 2) True
+<2i str
+TypeError Struct.unpack() takes exactly one argument (2 given)
+TypeError Struct.unpack() takes exactly one argument (0 given)
+error unpack requires a buffer of 8 bytes
+TypeError Struct.unpack() takes no keyword arguments
+None bytearray(b'\x05\x00\x00\x00\xfb\xff\xff\xff')
+error pack_into requires a buffer of at least 9 bytes for packing 8 bytes at offset 1 (actual buffer size is 8)
+error pack expected 2 items for packing (got 1)
+(5, -5) (5, -5) (5, -5) (5, -5)
+error unpack_from requires a buffer of at least 9 bytes for unpacking 8 bytes at offset 1 (actual buffer size is 8)
+TypeError unpack_from() missing required argument 'buffer' (pos 1)
+[(5, -5), (5, -5)]
+error iterative unpacking requires a buffer of a multiple of 8 bytes
+AttributeError attribute 'size' of '_struct.Struct' objects is not writable
+AttributeError attribute 'format' of '_struct.Struct' objects is not writable
+error cannot iteratively unpack with a struct of length 0
+0 b'' ()
+<2h 4 b'\x01\x00\x02\x00'
+TypeError Struct() argument 1 must be a str or bytes object, not int
+TypeError Struct() missing required argument 'format' (pos 1)
+<2h
+b'\x05\x00' sub 2 True
+b'\xff\xff' b'09' (12345,)
+error unpack requires a buffer of -1 bytes
+error pack expected -1 items for packing (got 0)
+<e 2 2
+<f 4 4
+<d 8 8
+<h 2 2
+<I 4 4
+<q 8 8
+<? 1 1
+<c 1 1
+<5s 5 5
+<4p 4 4
+<3x 3 3
+600 True
+(True,) (1,)

@@ -1,6 +1,6 @@
 //! Realm-owned environment data. SHARE_ENV passes this backing only to admitted child workers;
 //! writes never mutate the embedding process's OS environment.
-use lumen_host::{Ctx, Extension, OpState, Value, ops};
+use lumen_host::{ops, Ctx, Extension, OpState, Value};
 use std::sync::{Arc, Mutex};
 
 const MAX_KEYS: usize = 16_384;
@@ -88,27 +88,8 @@ pub(crate) fn own_time_zone(ctx: &mut Ctx) {
 fn apply_time_zone(tz: Option<&str>) {
     match tz {
         Some(tz) => lumen::set_local_time_zone(Some(tz)),
-        None => lumen::set_local_time_zone(system_time_zone().as_deref()),
+        None => lumen::set_local_time_zone(lumen_os::time::system_zone().as_deref()),
     };
-}
-
-/// The system's IANA zone: the `/etc/localtime` link's `.../zoneinfo/<name>` target, else
-/// `/etc/timezone` (Debian).
-#[cfg(all(unix, not(target_arch = "wasm32")))]
-fn system_time_zone() -> Option<String> {
-    if let Ok(target) = std::fs::read_link("/etc/localtime") {
-        let target = target.to_string_lossy();
-        if let Some(pos) = target.rfind("zoneinfo/") {
-            return Some(target[pos + "zoneinfo/".len()..].to_string());
-        }
-    }
-    let name = std::fs::read_to_string("/etc/timezone").ok()?;
-    Some(name.trim().to_string()).filter(|n| !n.is_empty())
-}
-
-#[cfg(not(all(unix, not(target_arch = "wasm32"))))]
-fn system_time_zone() -> Option<String> {
-    None
 }
 
 fn time_zone_changed(ctx: &mut Ctx, key: &str, value: Option<&str>) {
@@ -208,6 +189,7 @@ fn reset(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "realm-environment",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__env",

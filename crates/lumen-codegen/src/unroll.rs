@@ -100,7 +100,11 @@ fn analyze(func: &Function, cfg: &Cfg, h: Block) -> Option<Plan> {
             if c.block != h {
                 continue;
             }
-            let e = if cfg.dominates(h, p) { &mut back } else { &mut enter };
+            let e = if cfg.dominates(h, p) {
+                &mut back
+            } else {
+                &mut enter
+            };
             if e.is_some() {
                 return None;
             }
@@ -125,11 +129,12 @@ fn analyze(func: &Function, cfg: &Cfg, h: Block) -> Option<Plan> {
     let InstData::Brif { cond, then, else_ } = func.inst(term) else {
         return None;
     };
-    let (body, exit, cont_on_true) = match (in_loop[then.block.index()], in_loop[else_.block.index()]) {
-        (true, false) => (then.block, else_.block, true),
-        (false, true) => (else_.block, then.block, false),
-        _ => return None,
-    };
+    let (body, exit, cont_on_true) =
+        match (in_loop[then.block.index()], in_loop[else_.block.index()]) {
+            (true, false) => (then.block, else_.block, true),
+            (false, true) => (else_.block, then.block, false),
+            _ => return None,
+        };
     if cfg.preds[exit.index()].len() != 1 || !cfg.dominates(h, exit) {
         return None;
     }
@@ -180,13 +185,17 @@ fn analyze(func: &Function, cfg: &Cfg, h: Block) -> Option<Plan> {
     let mut v = start;
     let mut trips = 0u64;
     loop {
-        let c = eval::pure_inst(func, cmp_data, |a| {
-            if func.resolve(a) == p {
-                v
-            } else {
-                limit
-            }
-        })?;
+        let c = eval::pure_inst(
+            func,
+            cmp_data,
+            |a| {
+                if func.resolve(a) == p {
+                    v
+                } else {
+                    limit
+                }
+            },
+        )?;
         if (c as u32 != 0) != cont_on_true {
             break;
         }
@@ -289,7 +298,10 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
         }
         // Resolve the copy's test: into the body for the first n, to the exit for the last.
         let nh = copies[k].0[&h];
-        let t = *func.blocks[nh.index()].insts.last().expect("header terminator");
+        let t = *func.blocks[nh.index()]
+            .insts
+            .last()
+            .expect("header terminator");
         let target = if k == n {
             plan.exit
         } else if plan.body == h {
@@ -344,7 +356,11 @@ fn apply(func: &mut Function, cfg: &Cfg, plan: &Plan) {
         }
     }
     // Layout: the copies where the loop was.
-    let at = func.layout.iter().position(|&b| b == h).unwrap_or(func.layout.len());
+    let at = func
+        .layout
+        .iter()
+        .position(|&b| b == h)
+        .unwrap_or(func.layout.len());
     let mut new_blocks = Vec::new();
     for (bmap, _) in &copies {
         for b in &plan.region {

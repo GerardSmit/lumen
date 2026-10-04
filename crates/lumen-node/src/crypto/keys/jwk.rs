@@ -1,7 +1,6 @@
 //! JSON Web Key import and export for asymmetric keys (RFC 7517 / 7518 / 8037). Fields travel as
 //! flat `[name, value, ...]` string lists; the JS binding builds and reads the objects.
 
-use base64ct::{Base64UrlUnpadded, Encoding};
 use num_bigint_dig::BigUint;
 
 use super::asn1;
@@ -10,53 +9,21 @@ use super::model::{okp_public, AsymKey, EcKey, OkpKey, RsaKey, RsaPrivateParts};
 use super::{KResult, SendError};
 
 fn b64(b: &[u8]) -> String {
-    Base64UrlUnpadded::encode_string(b)
+    lumen_common::codec::base64_encode(b, true, false)
 }
 
 fn b64_uint(n: &BigUint) -> String {
     b64(&n.to_bytes_be())
 }
 
-/// Decodes base64 or base64url, padded or not (as Node's `ByteSource::FromEncodedString`).
-pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .map(|c| match c {
-            '+' => '-',
-            '/' => '_',
-            c => c,
-        })
-        .collect();
-    lenient_decode(&cleaned)
-}
-
-fn lenient_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut bits = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        } as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
+/// Decodes base64 or base64url, padded or not, as Node's `ByteSource::FromEncodedString` does.
+fn b64_decode(s: &str) -> Vec<u8> {
+    lumen_common::codec::base64_decode_lenient(s.as_bytes())
 }
 
 fn unsupported_key_type() -> SendError {
-    SendError::new("TypeError", "Unsupported JWK Key Type.").with_code("ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE")
+    SendError::new("TypeError", "Unsupported JWK Key Type.")
+        .with_code("ERR_CRYPTO_JWK_UNSUPPORTED_KEY_TYPE")
 }
 
 fn invalid_jwk(detail: &str) -> SendError {
@@ -90,8 +57,11 @@ pub fn export(key: &AsymKey, handle_rsa_pss: bool) -> KResult<Vec<String>> {
         }
         AsymKey::Ec(k) => {
             let crv = k.curve.jwk_name().ok_or_else(|| {
-                SendError::new("Error", format!("Unsupported JWK EC curve: {}.", k.curve.name()))
-                    .with_code("ERR_CRYPTO_JWK_UNSUPPORTED_CURVE")
+                SendError::new(
+                    "Error",
+                    format!("Unsupported JWK EC curve: {}.", k.curve.name()),
+                )
+                .with_code("ERR_CRYPTO_JWK_UNSUPPORTED_CURVE")
             })?;
             let len = k.curve.field_len();
             put("kty", "EC".into());
@@ -122,7 +92,10 @@ pub fn export(key: &AsymKey, handle_rsa_pss: bool) -> KResult<Vec<String>> {
 }
 
 fn field<'a>(fields: &'a [String], name: &str) -> Option<&'a str> {
-    fields.chunks(2).find(|c| c.len() == 2 && c[0] == name).map(|c| c[1].as_str())
+    fields
+        .chunks(2)
+        .find(|c| c.len() == 2 && c[0] == name)
+        .map(|c| c[1].as_str())
 }
 
 /// `ImportJWKRsaKey` / `ImportJWKEcKey`: `fields` are the JWK's string members, `curve` the
@@ -131,9 +104,14 @@ pub fn import(fields: &[String], curve: Option<&str>) -> KResult<AsymKey> {
     match field(fields, "kty") {
         Some("RSA") => import_rsa(fields),
         Some("EC") => import_ec(fields, curve),
-        Some(other) => Err(SendError::new("TypeError", format!("Invalid JWK data: {other} is not a supported JWK key type"))
-            .with_code("ERR_CRYPTO_INVALID_JWK")),
-        None => Err(SendError::new("TypeError", "Invalid JWK data").with_code("ERR_CRYPTO_INVALID_JWK")),
+        Some(other) => Err(SendError::new(
+            "TypeError",
+            format!("Invalid JWK data: {other} is not a supported JWK key type"),
+        )
+        .with_code("ERR_CRYPTO_INVALID_JWK")),
+        None => {
+            Err(SendError::new("TypeError", "Invalid JWK data").with_code("ERR_CRYPTO_INVALID_JWK"))
+        }
     }
 }
 
@@ -141,24 +119,39 @@ fn import_rsa(fields: &[String]) -> KResult<AsymKey> {
     let bad = || invalid_jwk("RSA key");
     let uint = |name: &str| -> KResult<BigUint> {
         let s = field(fields, name).ok_or_else(bad)?;
-        Ok(BigUint::from_bytes_be(&b64_decode(s).ok_or_else(bad)?))
+        Ok(BigUint::from_bytes_be(&b64_decode(s)))
     };
     let n = uint("n")?;
     let e = uint("e")?;
     let private = if field(fields, "d").is_some() {
-        Some(RsaPrivateParts { d: uint("d")?, p: uint("p")?, q: uint("q")?, dp: uint("dp")?, dq: uint("dq")?, qi: uint("qi")? })
+        Some(RsaPrivateParts {
+            d: uint("d")?,
+            p: uint("p")?,
+            q: uint("q")?,
+            dp: uint("dp")?,
+            dq: uint("dq")?,
+            qi: uint("qi")?,
+        })
     } else {
         None
     };
-    Ok(AsymKey::Rsa(RsaKey { n, e, private, pss: None }))
+    Ok(AsymKey::Rsa(RsaKey {
+        n,
+        e,
+        private,
+        pss: None,
+    }))
 }
 
 fn import_ec(fields: &[String], curve: Option<&str>) -> KResult<AsymKey> {
     let bad = || invalid_jwk("EC key");
-    let curve = curve.or_else(|| field(fields, "crv")).and_then(EcCurve::from_name).ok_or_else(bad)?;
+    let curve = curve
+        .or_else(|| field(fields, "crv"))
+        .and_then(EcCurve::from_name)
+        .ok_or_else(bad)?;
     let len = curve.field_len();
     let coord = |name: &str| -> KResult<Vec<u8>> {
-        let raw = b64_decode(field(fields, name).ok_or_else(bad)?).ok_or_else(bad)?;
+        let raw = b64_decode(field(fields, name).ok_or_else(bad)?);
         if raw.len() > len {
             return Err(bad());
         }
@@ -178,7 +171,12 @@ fn import_ec(fields: &[String], curve: Option<&str>) -> KResult<AsymKey> {
         }
         None => None,
     };
-    Ok(AsymKey::Ec(EcKey { curve, point, d, explicit: false }))
+    Ok(AsymKey::Ec(EcKey {
+        curve,
+        point,
+        d,
+        explicit: false,
+    }))
 }
 
 /// `InitEDRaw`: an OKP key from its raw public or private value. `None` when the bytes are not a
@@ -196,8 +194,14 @@ pub fn import_okp_raw(name: &str, data: &[u8], private: bool) -> Option<AsymKey>
     }
     if private {
         let public = okp_public(kind, data).ok()?;
-        Some(ctor(OkpKey { public, private: Some(data.to_vec()) }))
+        Some(ctor(OkpKey {
+            public,
+            private: Some(data.to_vec()),
+        }))
     } else {
-        Some(ctor(OkpKey { public: data.to_vec(), private: None }))
+        Some(ctor(OkpKey {
+            public: data.to_vec(),
+            private: None,
+        }))
     }
 }

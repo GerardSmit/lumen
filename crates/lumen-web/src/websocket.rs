@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use lumen_host::{Ctx, SpawnHandle, Value};
 
-use sha1::{Digest, Sha1};
 use crate::url;
+use lumen_common::hash::{digest, Algo};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Bound reads/writes so a dead peer can't pin a pool worker (reads) or the loop (writes).
@@ -36,33 +36,8 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Message size cap (mirrors the HTTP body cap); exceeding it fails the connection with 1009.
 const MAX_MESSAGE: usize = 32 << 20;
 
-// ---- base64 (encode only — the handshake key/accept values) -----------------------------------
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 pub(crate) fn base64(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = u32::from_be_bytes([0, b[0], b[1], b[2]]);
-        out.push(B64[(n >> 18) as usize & 63] as char);
-        out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            B64[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            B64[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    lumen_common::codec::base64_encode(data, false, true)
 }
 
 /// The `Sec-WebSocket-Accept` value for a handshake `Sec-WebSocket-Key` (RFC 6455 §4.2.2 step
@@ -70,7 +45,7 @@ pub(crate) fn base64(data: &[u8]) -> String {
 pub fn websocket_accept(key: &str) -> String {
     let mut input = key.trim().to_string();
     input.push_str(GUID);
-    base64(&Sha1::digest(input.as_bytes()))
+    base64(&digest(Algo::Sha1, input.as_bytes()))
 }
 
 // ---- frame codec -------------------------------------------------------------------------------

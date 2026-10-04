@@ -407,19 +407,9 @@ fn wait_with_timeout(
     })
     .collect();
 
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
-            Err(_) => break None,
-        }
-    };
+    let status = lumen_os::child::wait_timeout(&mut child, timeout, Duration::from_millis(5))
+        .ok()
+        .flatten();
     // Kill whatever the test spawned and left behind (servers, `fork`ed children, a timed-out
     // test's whole tree): stragglers would hold the pipes open and eat CPU for later tests.
     drop(tree);
@@ -520,7 +510,11 @@ fn option_entry(flag: &str) -> Option<(&'static str, bool)> {
         }
         let takes_value = fields.next()? == "v";
         fields.next()?;
-        let source = if fields.next() == Some("v8") { "v8" } else { "node" };
+        let source = if fields.next() == Some("v8") {
+            "v8"
+        } else {
+            "node"
+        };
         Some((source, takes_value))
     })
 }
@@ -531,8 +525,20 @@ fn option_takes_value(flag: &str) -> bool {
 
 fn node_table_flag(flag: &str) -> bool {
     const SKIPPED: &[&str] = &[
-        "--check", "--eval", "--print", "--interactive", "--help", "--version", "--test", "--watch",
-        "--watch-path", "--build-snapshot", "--prof", "--prof-process", "--cpu-prof", "--heap-prof",
+        "--check",
+        "--eval",
+        "--print",
+        "--interactive",
+        "--help",
+        "--version",
+        "--test",
+        "--watch",
+        "--watch-path",
+        "--build-snapshot",
+        "--prof",
+        "--prof-process",
+        "--cpu-prof",
+        "--heap-prof",
     ];
     let name = flag.split('=').next().unwrap_or(flag);
     if name.starts_with("--inspect") || SKIPPED.contains(&name) {
@@ -839,7 +845,11 @@ mod leaks {
     }
 
     pub fn begin(serial: usize) {
-        ACTIVE.lock().unwrap().get_or_insert_with(HashSet::new).insert(serial);
+        ACTIVE
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashSet::new)
+            .insert(serial);
     }
 
     pub fn end(serial: usize) {
@@ -865,25 +875,33 @@ mod leaks {
     /// every tagged process, or with `only`, just that test's).
     #[cfg(unix)]
     pub fn sweep(only: Option<usize>, all: bool) {
-        extern "C" {
-            fn kill(pid: i32, signal: i32) -> i32;
-        }
         let needle = format!("{VAR}={}.", std::process::id());
         let me = std::process::id() as i32;
         let active = ACTIVE.lock().unwrap().clone().unwrap_or_default();
         for line in listing().lines() {
             let line = line.trim_start();
-            let Some((pid, rest)) = line.split_once(' ') else { continue };
-            let Ok(pid) = pid.parse::<i32>() else { continue };
-            let Some(at) = rest.find(&needle) else { continue };
-            let digits: String = rest[at + needle.len()..].chars().take_while(|c| c.is_ascii_digit()).collect();
-            let Ok(serial) = digits.parse::<usize>() else { continue };
+            let Some((pid, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<i32>() else {
+                continue;
+            };
+            let Some(at) = rest.find(&needle) else {
+                continue;
+            };
+            let digits: String = rest[at + needle.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            let Ok(serial) = digits.parse::<usize>() else {
+                continue;
+            };
             let doomed = match only {
                 Some(only) => serial == only,
                 None => all || !active.contains(&serial),
             };
             if doomed && pid != me && pid > 1 {
-                unsafe { kill(pid, 9) };
+                let _ = lumen_os::proc::kill(pid, lumen_os::signal::number("SIGKILL").unwrap_or(9));
             }
         }
     }
@@ -916,14 +934,8 @@ mod tree {
     #[cfg(unix)]
     impl Drop for ProcessTree {
         fn drop(&mut self) {
-            extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            const SIGKILL: i32 = 9;
             // The group id is the child's pid (`process_group(0)`); a negative pid targets it.
-            unsafe {
-                kill(-self.0, SIGKILL);
-            }
+            let _ = lumen_os::proc::kill(-self.0, lumen_os::signal::number("SIGKILL").unwrap_or(9));
         }
     }
 

@@ -1,4 +1,12 @@
+> [!IMPORTANT]
+> Remove this line to confirm you've reviewed this PR before submitting.
+
 # lumen
+
+Bitnest embedding changes in this checkout include the native ARM64 JIT memory
+backend, soft-float helper ABI, collection API and a timer-only installation
+without the hosted filesystem/thread substrate. Review these changes manually
+before committing or updating the parent submodule pin.
 
 A from-scratch JavaScript **engine** in Rust — std only, zero dependencies — and a
 **runtime** being built on top of it, the way Node/Deno/Bun wrap a JS engine with an event
@@ -65,10 +73,9 @@ On top of that:
   `setImmediate`, plus `queueMicrotask`.
 - **`console` and `process`** — streaming `console.*`; `process.argv`/`env`/`platform`/
   `cwd()`/`exit()`/`nextTick()`.
-- **Filesystem** (`lumen-fs`) — synchronous ops (`readFileSync`, `writeFileSync`,
-  `existsSync`, `mkdirSync`, `readdirSync`, …), file handles via a resource table
-  (`openSync`/`readSync`/`writeSync`/`closeSync`), and async `fs.promises.readFile`/
-  `writeFile` on the thread pool.
+- **Filesystem** — `node:fs` (sync, callback and promise APIs, the async forms on the thread
+  pool) over `lumen_os::vfs`, the file-system interface the Python runtime shares: the OS
+  natively, an in-memory tree on wasm.
 - **Web platform** (`lumen-web`) — a growing slice of the WinterTC Minimum Common API:
   `Event`/`EventTarget`/`CustomEvent`/`AbortController`/`AbortSignal`/`DOMException`,
   `TextEncoder`/`TextDecoder` (UTF-8 and WHATWG Windows-1252 labels), `atob`/`btoa`, `structuredClone`, `URL`/`URLSearchParams`,
@@ -219,9 +226,10 @@ On top of that:
 
 ```
 lumen          engine (std-only, zero-dep; `embed` feature gates the runtime API)
+lumen-common   engine-neutral code shared with lumen-py: bigint, Unicode, byte codecs, civil dates, tz tables; optional `hash` / `compress` features
+lumen-os       engine-neutral OS services: file-system primitives, the `vfs` backends (OS, in-memory, overlay), errno
 lumen-host     substrate: OpState, ResourceTable, Extension, the thread-pool/callback primitives
 lumen-timers   setTimeout/setInterval/queueMicrotask/setImmediate
-lumen-fs       filesystem (sync + async)
 lumen-web      WinterTC Minimum Common API (Event, URL, crypto, fetch, …)
 lumen-node     node: compatibility (require, node:path/os/fs, Buffer)
 lumen-runtime  the event loop; assembles the op crates; console + process

@@ -9,6 +9,7 @@ use crate::ast::*;
 use crate::interpreter::name_cache::NameRes;
 use crate::interpreter::*;
 use crate::value::*;
+use lumen_common::limits::size;
 use std::rc::Rc;
 
 impl Interp {
@@ -2185,7 +2186,12 @@ impl Interp {
     /// PrivateSet: write a private field (or invoke a private setter) after a brand check. A
     /// private *method* (non-writable) or a getter-only private accessor is a TypeError — never a
     /// silent sloppy-mode no-op.
-    pub(crate) fn set_private_member(&mut self, base: &Value, name: &str, value: Value) -> Result<(), Abrupt> {
+    pub(crate) fn set_private_member(
+        &mut self,
+        base: &Value,
+        name: &str,
+        value: Value,
+    ) -> Result<(), Abrupt> {
         let shown = private_display(name).to_string();
         let (o, prop) = match base {
             Value::Obj(o) => (o.clone(), o.borrow().props.get(name).map(|p| p.clone())),
@@ -2318,14 +2324,55 @@ impl Interp {
             Value::Obj(o) => o,
             _ => return Ok(false),
         };
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            let key_value = self
+                .sym_from_key(key)
+                .unwrap_or_else(|| Value::from_string(key.to_owned()));
+            let operation = crate::embed_realms::WindowProxyOperation::Has { key: key_value };
+            if let Some(decision) = self.window_proxy_decision(o, operation)? {
+                return match decision {
+                    crate::embed_realms::WindowProxyDecision::Handled(
+                        crate::embed_realms::WindowProxyResult::Has(present),
+                    ) => Ok(present),
+                    crate::embed_realms::WindowProxyDecision::Handled(_) => Err(self.throw(
+                        "TypeError",
+                        "WindowProxy policy returned a result for the wrong operation",
+                    )),
+                    crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                        if let Some(index) = crate::value::canonical_index(key) {
+                            if self.window_proxy_child_at(&forward, index)?.is_some() {
+                                return Ok(true);
+                            }
+                            let target = forward.target.as_obj().ok_or_else(|| {
+                                self.throw("TypeError", "WindowProxy target is not an object")
+                            })?;
+                            return match target.borrow().proto.clone() {
+                                Some(prototype) => {
+                                    self.js_has_property(&Value::Obj(prototype), key)
+                                }
+                                None => Ok(false),
+                            };
+                        }
+                        self.js_has_property(&forward.target, key)
+                    }
+                };
+            }
+        }
         // Ordinary objects and arrays all the way (no proxy, namespace, typed array, wrapper —
         // those clear `ic_plain` or are exotic): [[HasProperty]] is the entries walk alone.
         // Walked by raw pointer: every level is kept alive by `o` for the duration.
         {
             let mut cur: *const crate::value::ObjCell = Gc::as_ptr(o);
             loop {
-                let Ok(b) = (unsafe { (*cur).try_borrow() }) else { break };
-                if !(matches!(b.exotic, crate::value::Exotic::None | crate::value::Exotic::Array) && b.ic_plain.get()) {
+                let Ok(b) = (unsafe { (*cur).try_borrow() }) else {
+                    break;
+                };
+                if !(matches!(
+                    b.exotic,
+                    crate::value::Exotic::None | crate::value::Exotic::Array
+                ) && b.ic_plain.get())
+                {
                     break;
                 }
                 if b.props.contains(key) {
@@ -2545,7 +2592,8 @@ impl Interp {
             Expr::Null => Ok(Value::Null),
             Expr::Undefined => Ok(Value::Undefined),
             Expr::Ident(name) => {
-                if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, name, env) {
+                if let Some((_, bd)) = self.cached_binding(expr as *const Expr as usize, name, env)
+                {
                     // SAFETY: the epoch was current at the lookup and nothing ran since.
                     let bd = unsafe { &*bd };
                     if bd.initialized && !bd.import {
@@ -2951,7 +2999,13 @@ impl Interp {
         Ok(Value::Obj(obj))
     }
 
-    pub(crate) fn define_accessor(&self, obj: &Gc, key: &str, get: Option<Value>, set: Option<Value>) {
+    pub(crate) fn define_accessor(
+        &self,
+        obj: &Gc,
+        key: &str,
+        get: Option<Value>,
+        set: Option<Value>,
+    ) {
         let mut b = obj.borrow_mut();
         if let Some(p) = b.props.get_mut(key) {
             if p.accessor() {
@@ -3578,7 +3632,9 @@ impl Interp {
 
     pub(crate) fn resolve_promise(&mut self, promise: &Value, value: Value) {
         // Only a pending promise is affected (a subclass graft forwards to its target).
-        let Some(target) = Self::pending_promise_target(promise) else { return };
+        let Some(target) = Self::pending_promise_target(promise) else {
+            return;
+        };
         if self.promise_hooks.is_some() {
             self.run_promise_hook(
                 crate::eval::promise_fast::HOOK_RESOLVE,
@@ -3637,7 +3693,9 @@ impl Interp {
     fn settle(&mut self, promise: &Gc, value: Value, fulfilled: bool) {
         let (first, rest) = {
             let mut b = promise.borrow_mut();
-            let Callable::Promise(s) = &mut b.call else { return };
+            let Callable::Promise(s) = &mut b.call else {
+                return;
+            };
             if s.status != crate::eval::promise_fast::PENDING {
                 return;
             }
@@ -3692,7 +3750,10 @@ impl Interp {
     ) {
         let Value::Obj(o) = promise else { return };
         let context = self.async_context.clone();
-        self.perform_then(o, crate::eval::promise_fast::Reaction::then(on_f, on_r, result, context));
+        self.perform_then(
+            o,
+            crate::eval::promise_fast::Reaction::then(on_f, on_r, result, context),
+        );
     }
 
     /// Drain the microtask queue (called after the main script). Bounded to avoid an unbounded loop.
@@ -3748,6 +3809,8 @@ impl Interp {
     /// is awaiting. A genuinely infinite microtask loop spins here, as it does in Node.
     pub(crate) fn drain_microtasks(&mut self) {
         loop {
+            #[cfg(feature = "embed")]
+            crate::embed_convert::flush_deferred_microtasks(self);
             while let Some(job) = self.microtasks.pop_front() {
                 // A terminated realm runs no more reactions; the queue dies with it.
                 if self.terminating {
@@ -3756,7 +3819,8 @@ impl Interp {
                 }
                 self.lang.promise.drain_job.set(true);
                 self.run_job(job);
-
+                #[cfg(feature = "embed")]
+                crate::embed_convert::flush_deferred_microtasks(self);
             }
             // The checkpoint is quiescent: ClearKeptObjects, and queue any FinalizationRegistry
             // cleanup jobs a collection made due.
@@ -3932,6 +3996,9 @@ impl Interp {
 
     /// Direct eval: a non-string argument is returned unchanged; a string is parsed and executed.
     fn direct_eval(&mut self, arg: Option<&Value>, env: &Env) -> Result<Value, Abrupt> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(self.throw("EvalError", "dynamic code is not available in an AOT build"));
+        }
         let code = match arg {
             Some(Value::Str(s)) => s.clone(),
             Some(other) => return Ok(other.clone()),
@@ -3953,6 +4020,9 @@ impl Interp {
         caller_env: &Env,
         direct: bool,
     ) -> Result<Value, Abrupt> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(self.throw("EvalError", "dynamic code is not available in an AOT build"));
+        }
         let base_strict = direct && self.strict;
         // `new.target` is valid at the top level of a direct eval whose caller is in function code.
         let allow_new_target = direct && self.in_function_code(caller_env);
@@ -4840,7 +4910,7 @@ impl Interp {
 
     /// Build an auto-accessor's getter (`is_get`) or setter as a function object backed by the
     /// private `backing` field, with a spec-shaped `name` (`get x`/`set x`) and `length`.
-    fn make_accessor_fn(&self, name: &str, backing: &Rc<str>, is_get: bool) -> Value {
+    pub(crate) fn make_accessor_fn(&self, name: &str, backing: &Rc<str>, is_get: bool) -> Value {
         let o = Object::new(Some(self.function_proto.clone()));
         {
             let mut b = o.borrow_mut();
@@ -4872,7 +4942,7 @@ impl Interp {
         Value::Obj(o)
     }
 
-    fn define_class_accessor(
+    pub(crate) fn define_class_accessor(
         &self,
         target: &Gc,
         key: &str,
@@ -4966,15 +5036,38 @@ impl Interp {
         &mut self,
         decorators: &[Expr],
         env: &Env,
-        mut value: Value,
+        value: Value,
         kind: &str,
         key: &str,
         is_static: bool,
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Value, Abrupt> {
+        self.decorate_callable_with(
+            decorators,
+            value,
+            kind,
+            key,
+            is_static,
+            is_private,
+            inits,
+            |i, d| i.eval(d, env),
+        )
+    }
+
+    pub(crate) fn decorate_callable_with<T>(
+        &mut self,
+        decorators: &[T],
+        mut value: Value,
+        kind: &str,
+        key: &str,
+        is_static: bool,
+        is_private: bool,
+        inits: &mut Vec<Value>,
+        mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
+    ) -> Result<Value, Abrupt> {
         for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
+            let dec = evaluate(self, d)?;
             if !dec.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
@@ -5004,9 +5097,23 @@ impl Interp {
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Vec<Value>, Abrupt> {
+        self.decorate_field_with(decorators, key, is_static, is_private, inits, |i, d| {
+            i.eval(d, env)
+        })
+    }
+
+    pub(crate) fn decorate_field_with<T>(
+        &mut self,
+        decorators: &[T],
+        key: &str,
+        is_static: bool,
+        is_private: bool,
+        inits: &mut Vec<Value>,
+        mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
+    ) -> Result<Vec<Value>, Abrupt> {
         let mut transforms = Vec::new();
         for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
+            let dec = evaluate(self, d)?;
             if !dec.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
@@ -5035,14 +5142,29 @@ impl Interp {
         env: &Env,
         key: &str,
         is_static: bool,
+        get: Value,
+        set: Value,
+        inits: &mut Vec<Value>,
+    ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
+        self.decorate_accessor_with(decorators, key, is_static, get, set, inits, |i, d| {
+            i.eval(d, env)
+        })
+    }
+
+    pub(crate) fn decorate_accessor_with<T>(
+        &mut self,
+        decorators: &[T],
+        key: &str,
+        is_static: bool,
         mut get: Value,
         mut set: Value,
         inits: &mut Vec<Value>,
+        mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
         let is_private = Interp::is_private_key(key);
         let mut transforms = Vec::new();
         for d in decorators.iter().rev() {
-            let dec = self.eval(d, env)?;
+            let dec = evaluate(self, d)?;
             if !dec.is_callable() {
                 return Err(self.throw("TypeError", "decorator is not callable"));
             }
@@ -5106,6 +5228,29 @@ impl Interp {
             let nt = self.new_target.clone();
             return self.construct_nt(ctor.clone(), args, nt);
         }
+        #[cfg(feature = "aot-native")]
+        if self.native_classes.contains_key(&ptr) || matches!(obj.borrow().call, Callable::Aot(_)) {
+            let target = std::mem::replace(&mut self.pending_new_target, Value::Undefined);
+            let saved_target = std::mem::replace(
+                &mut self.new_target,
+                if matches!(target, Value::Undefined) {
+                    ctor.clone()
+                } else {
+                    target
+                },
+            );
+            let saved_constructing = std::mem::replace(&mut self.constructing, true);
+            let saved_super = self.super_call_ok;
+            self.super_call_ok = self
+                .native_classes
+                .get(&ptr)
+                .is_some_and(|class| class.derived);
+            let result = crate::native_aot::classes::constructor_on(self, ctor, this, args);
+            self.new_target = saved_target;
+            self.constructing = saved_constructing;
+            self.super_call_ok = saved_super;
+            return result;
+        }
         let is_class = self.class_info.contains_key(&ptr);
         let derived = self
             .class_info
@@ -5154,11 +5299,21 @@ impl Interp {
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
                 self.constructing = true;
+                self.native_super_return_overrides.push(None);
                 let made = self
                     .dispatch_native(&call, this.clone(), args)
                     .map_err(Abrupt::Throw);
+                // Always pop this frame before propagating a constructor throw. A nested native
+                // super() has its own slot, so its opt-in replacement cannot leak into this call.
+                let replacement = self
+                    .native_super_return_overrides
+                    .pop()
+                    .expect("native super result frame");
                 self.constructing = saved;
                 let made = made?;
+                if let Some(replacement) = replacement {
+                    return Ok(replacement);
+                }
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
                     if !Gc::ptr_eq(src, dst) {
                         self.materialize_fn(src);
@@ -5319,7 +5474,19 @@ impl Interp {
         Ok(())
     }
 
-    pub(crate) fn init_instance_fields(&mut self, ctor: &Value, this: &Value) -> Result<(), Abrupt> {
+    pub(crate) fn init_instance_fields(
+        &mut self,
+        ctor: &Value,
+        this: &Value,
+    ) -> Result<(), Abrupt> {
+        #[cfg(feature = "aot-native")]
+        if let Some(class) = ctor
+            .as_obj()
+            .and_then(|object| self.native_classes.get(&(Gc::as_ptr(object) as usize)))
+            .cloned()
+        {
+            return crate::native_aot::classes::init_instance_fields(self, &class, this);
+        }
         if let Some(r) = self.init_instance_fields_compiled(ctor, this) {
             return r;
         }
@@ -5693,11 +5860,20 @@ impl Interp {
             let Some(obj) = cur else { break };
             let (ctor, proto) = {
                 let b = obj.borrow();
-                let ctor = b.props.get("constructor").filter(|p| !p.accessor()).map(|p| p.value());
+                let ctor = b
+                    .props
+                    .get("constructor")
+                    .filter(|p| !p.accessor())
+                    .map(|p| p.value());
                 (ctor, b.proto.clone())
             };
             if let Some(Value::Obj(f)) = ctor {
-                let name = f.borrow().props.get("name").filter(|p| !p.accessor()).map(|p| p.value());
+                let name = f
+                    .borrow()
+                    .props
+                    .get("name")
+                    .filter(|p| !p.accessor())
+                    .map(|p| p.value());
                 if let Some(Value::Str(name)) = name {
                     let name = name.to_string();
                     if !name.is_empty() {
@@ -5730,6 +5906,49 @@ impl Interp {
                     self.defer_trigger(o, Some(prop))?;
                     self.materialize(o);
                     let ptr = Gc::as_ptr(o) as usize;
+                    #[cfg(feature = "embed")]
+                    if self.is_window_proxy(o) {
+                        let key_value = self
+                            .sym_from_key(prop)
+                            .unwrap_or_else(|| Value::from_string(prop.to_owned()));
+                        let operation = crate::embed_realms::WindowProxyOperation::Delete {
+                            key: key_value,
+                        };
+                        if let Some(decision) = self.window_proxy_decision(o, operation)? {
+                            let success = match decision {
+                                crate::embed_realms::WindowProxyDecision::Handled(
+                                    crate::embed_realms::WindowProxyResult::Delete(success),
+                                ) => success,
+                                crate::embed_realms::WindowProxyDecision::Handled(_) => {
+                                    return Err(self.throw(
+                                        "TypeError",
+                                        "WindowProxy policy returned a result for the wrong operation",
+                                    ));
+                                }
+                                crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                                    if let Some(index) = crate::value::canonical_index(prop) {
+                                        !self.window_proxy_child_at(&forward, index)?.is_some()
+                                    } else {
+                                        matches!(
+                                            self.delete_prop_with(
+                                                forward.target,
+                                                prop,
+                                                strict,
+                                            )?,
+                                            Value::Bool(true)
+                                        )
+                                    }
+                                }
+                            };
+                            if !success && strict {
+                                return Err(self.throw(
+                                    "TypeError",
+                                    format!("cannot delete property '{prop}'"),
+                                ));
+                            }
+                            return Ok(Value::Bool(success));
+                        }
+                    }
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {
@@ -6550,7 +6769,7 @@ impl Interp {
             if op == "+" && (matches!(lp, Value::Str(_)) || matches!(rp, Value::Str(_))) {
                 let ls = self.to_string(&lp)?;
                 let rs = self.to_string(&rp)?;
-                if ls.len() + rs.len() > MAX_STR_LEN {
+                if size::sum(ls.len(), rs.len(), MAX_STR_LEN).is_err() {
                     return Err(self.throw("RangeError", "Invalid string length"));
                 }
                 return Ok(Value::Str(if crate::jstr::needs_join_fixup(&ls, &rs) {
@@ -6655,7 +6874,9 @@ impl Interp {
             bigint_arith(op, x, y)
         };
         match v {
-            Some(v) => v.map(Value::BigInt).map_err(|e| self.throw("RangeError", e.message())),
+            Some(v) => v
+                .map(Value::BigInt)
+                .map_err(|e| self.throw("RangeError", e.message())),
             None => Err(self.throw("TypeError", "unsupported BigInt operator")),
         }
     }
@@ -7163,15 +7384,10 @@ impl Interp {
             };
         }
         let neg = n < 0.0;
-        // Rust's `{:e}` yields the shortest round-tripping mantissa + exponent (`d[.ddd]e±E`).
-        let sci = format!("{:e}", n.abs());
-        let (mantissa, exp_str) = sci.split_once('e').unwrap();
-        let exp: i32 = exp_str.parse().unwrap();
-        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-        let digits = digits.trim_end_matches('0');
-        let digits = if digits.is_empty() { "0" } else { digits };
+        let d = lumen_common::float::shortest(n);
+        let digits = d.as_str();
         let k = digits.len() as i32;
-        let np = exp + 1; // the spec's `n`: value = digits × 10^(n-k)
+        let np = d.decpt; // the spec's `n`: value = digits × 10^(n-k)
         let body = if k <= np && np <= 21 {
             format!("{}{}", digits, "0".repeat((np - k) as usize))
         } else if 0 < np && np <= 21 {
@@ -7237,6 +7453,8 @@ impl Interp {
                         .map(|p| !p.accessor())
                         .unwrap_or(false)
             }
+            #[cfg(feature = "aot-native")]
+            Callable::Aot(_) => b.is_constructor,
             // A bound function constructs exactly when its target does.
             Callable::Bound(_) => b.is_constructor,
             _ => false,
@@ -7256,7 +7474,9 @@ impl Interp {
             (Value::BigInt(x), Value::Num(y)) | (Value::Num(y), Value::BigInt(x)) => x.eq_f64(*y),
             (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => {
                 // StringToBigInt: an unparsable string compares unequal.
-                self.string_to_bigint_g(s)?.map(|n| n == *x).unwrap_or(false)
+                self.string_to_bigint_g(s)?
+                    .map(|n| n == *x)
+                    .unwrap_or(false)
             }
             (Value::BigInt(_), Value::Obj(_)) => {
                 let bp = self.to_primitive(b, Hint::Default)?;
@@ -7348,7 +7568,9 @@ fn default_constructor(derived: bool) -> Function {
     let body = if derived {
         vec![Stmt::Expr(Expr::Call {
             callee: Box::new(Expr::Super),
-            args: vec![ArrayElem::Spread(Expr::Ident(DEFAULT_CTOR_ARGS.to_string()))],
+            args: vec![ArrayElem::Spread(Expr::Ident(
+                DEFAULT_CTOR_ARGS.to_string(),
+            ))],
             optional: false,
             pos: crate::ast::NO_POS,
         })]
@@ -7493,7 +7715,9 @@ pub(crate) fn expr_contains(x: &Expr, pred: fn(&Expr) -> bool) -> bool {
         }),
         // `Contains` descends into arrow functions; an ordinary function/class does not.
         Expr::Func(f) if f.is_arrow => {
-            f.params.iter().any(|p| p.default.as_deref().is_some_and(&e))
+            f.params
+                .iter()
+                .any(|p| p.default.as_deref().is_some_and(&e))
                 || f.parsed_body().is_some_and(|b| stmts_contain(&b, pred))
         }
         _ => false,
@@ -7578,7 +7802,9 @@ fn fi_expr(e: &Expr, args: bool) -> Option<&'static str> {
             }
             fi_expr(callee, args).or_else(|| fi_arr(a, args))
         }
-        Expr::New { callee, args: a, .. } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
+        Expr::New {
+            callee, args: a, ..
+        } => fi_expr(callee, args).or_else(|| fi_arr(a, args)),
         Expr::Unary { arg, .. } | Expr::Update { arg, .. } | Expr::Await(arg) => fi_expr(arg, args),
         Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
             fi_expr(left, args).or_else(|| fi_expr(right, args))
@@ -7703,8 +7929,6 @@ fn dec_add_initializer(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     i.decorator_initializers.push(f);
     Ok(Value::Undefined)
 }
-
-
 
 fn describe_callee(callee: &Expr) -> String {
     match callee {

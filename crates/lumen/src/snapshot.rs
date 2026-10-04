@@ -120,6 +120,8 @@ impl Writer {
 #[derive(Default, Debug, Clone)]
 pub struct Deps {
     pub dynamic_imports: Vec<String>,
+    pub computed_dynamic_imports: usize,
+    pub dynamic_code_sites: Vec<(u32, &'static str)>,
     pub requires: Vec<String>,
 }
 
@@ -161,7 +163,10 @@ impl KeepMap {
 
     /// `start..end` in kept-text coordinates (`None`: not inside one kept span).
     fn map(&self, start: u32, end: u32) -> Option<(u32, u32)> {
-        let i = self.spans.partition_point(|s| s.0 <= start).checked_sub(1)?;
+        let i = self
+            .spans
+            .partition_point(|s| s.0 <= start)
+            .checked_sub(1)?;
         let (s, e, off) = self.spans[i];
         (end <= e).then(|| (off + (start - s), off + (end - s)))
     }
@@ -229,19 +234,11 @@ impl Reader<'_> {
         Ok(b)
     }
     fn uv(&mut self) -> R<u64> {
-        let mut result = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            result |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(result);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err("snapshot: varint overflow".into());
-            }
-        }
+        lumen_common::aot::read_varint(self.buf, &mut self.pos)
+            .map_err(|e| format!("snapshot: {e}"))
+    }
+    fn usize(&mut self) -> R<usize> {
+        usize::try_from(self.uv()?).map_err(|_| "snapshot: value exceeds pointer width".into())
     }
     fn f64(&mut self) -> R<f64> {
         let end = self.pos.checked_add(8).ok_or("snapshot: truncated f64")?;
@@ -256,7 +253,7 @@ impl Reader<'_> {
         Ok(self.u8()? != 0)
     }
     fn str(&mut self) -> R<String> {
-        let len = self.uv()? as usize;
+        let len = self.usize()?;
         let end = self.pos.checked_add(len).ok_or("snapshot: truncated str")?;
         let bytes = self
             .buf
@@ -516,6 +513,15 @@ pub(crate) fn encode_split(
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
+    decode_shared(bytes, Rc::from(src))
+}
+
+/// Decode a snapshot while reusing an embedder-owned source allocation across realms.
+///
+/// The decoded AST and lazy function bodies are still created separately for each realm, but
+/// all of them retain this same `Rc<str>` instead of copying a large generated glue source for
+/// every child realm.
+pub(crate) fn decode_shared(bytes: &[u8], src: Rc<str>) -> R<Vec<Stmt>> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
     decode_inner(bytes, src, false).map(|(body, _)| body)
 }
@@ -524,7 +530,7 @@ pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
 /// [`encode_stripped_with_functions`]).
 #[allow(dead_code)] // the non-split form; blobs use `SplitUnit`
 pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Vec<Rc<Function>>)> {
-    let (body, funcs) = decode_inner(bytes, src, true)?;
+    let (body, funcs) = decode_inner(bytes, Rc::from(src), true)?;
     let funcs = funcs
         .unwrap_or_default()
         .into_iter()
@@ -535,7 +541,7 @@ pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Ve
 
 type Decoded = (Vec<Stmt>, Option<Vec<Option<Rc<Function>>>>);
 
-fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
+fn decode_inner(bytes: &[u8], src: Rc<str>, collect: bool) -> R<Decoded> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
@@ -550,10 +556,10 @@ fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
     if r.uv()? != VERSION as u64 {
         return Err("snapshot: version mismatch".into());
     }
-    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(src) {
+    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(&src) {
         return Err("snapshot: source mismatch".into());
     }
-    r.src = Rc::from(src);
+    r.src = src;
     let body = dec_stmts(&mut r)?;
     crate::interpreter::stack_trace::note_parsed_source(r.src.clone(), None);
     Ok((body, r.funcs))
@@ -572,7 +578,7 @@ pub(crate) type FunctionHook = Box<dyn Fn(usize, &Rc<Function>)>;
 /// when it first needs one (see [`crate::precompiled::decode_body`]). A program that never
 /// reaches most of a large bundle never pays for most of its function nodes.
 pub(crate) struct SplitUnit {
-    ast: &'static [u8],
+    ast: lumen_common::bytes::Bytes,
     n: usize,
     /// Byte offsets within `ast`: the per-function table, the headers, the top-level
     /// statements.
@@ -597,13 +603,14 @@ pub(crate) struct SplitUnit {
 impl SplitUnit {
     /// Read a split unit's framing. `src` is the unit's (empty) source marker.
     pub(crate) fn new(
-        ast: &'static [u8],
+        ast: impl Into<lumen_common::bytes::Bytes>,
         src: Rc<str>,
         kept: Option<Rc<crate::precompiled::KeptRef>>,
         bodies: BodyBytes,
     ) -> R<Rc<SplitUnit>> {
+        let ast = ast.into();
         let mut r = Reader {
-            buf: ast,
+            buf: &ast,
             pos: 0,
             src: src.clone(),
             scopes: Vec::new(),
@@ -616,7 +623,7 @@ impl SplitUnit {
         if r.uv()? != VERSION as u64 {
             return Err("snapshot: version mismatch".into());
         }
-        let n = r.uv()? as usize;
+        let n = r.usize()?;
         let table = r.pos;
         let headers = n
             .checked_mul(16)
@@ -628,13 +635,14 @@ impl SplitUnit {
             .checked_add(u32_at(headers - 8))
             .filter(|&t| t <= ast.len())
             .ok_or("snapshot: bad header length")?;
+        let bodies_len = u32_at(headers - 4);
         Ok(Rc::new(SplitUnit {
             ast,
             n,
             table,
             headers,
             top,
-            bodies_len: u32_at(headers - 4),
+            bodies_len,
             bodies,
             src,
             kept,
@@ -652,9 +660,7 @@ impl SplitUnit {
     /// Row `i` of the function table: (owner stream, descendants' end, header offset, body
     /// offset); row `n` holds the totals in the offset columns.
     fn row(&self, i: usize) -> (u64, usize, usize, usize) {
-        let u = |at: usize| {
-            u32::from_le_bytes(self.ast[at..at + 4].try_into().unwrap()) as usize
-        };
+        let u = |at: usize| u32::from_le_bytes(self.ast[at..at + 4].try_into().unwrap()) as usize;
         if i == self.n {
             return (0, self.n, u(self.headers - 8), self.bodies_len);
         }
@@ -743,7 +749,7 @@ impl SplitUnit {
         let params_of = self.stream(i + 1, end, 2 * i as u64 + 2)?;
         let mut r = self.reader(&self.ast[start..stop], params_of);
         let name = dec_opt_str(&mut r)?;
-        let np = r.uv()? as usize;
+        let np = r.usize()?;
         let mut params = Vec::with_capacity(r.cap(np));
         for _ in 0..np {
             params.push(Param {
@@ -852,7 +858,7 @@ fn enc_stmts(w: &mut Writer, v: &[Stmt]) {
     }
 }
 fn dec_stmts(r: &mut Reader) -> R<Vec<Stmt>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_stmt(r)?);
@@ -867,7 +873,7 @@ fn enc_exprs(w: &mut Writer, v: &[Expr]) {
     }
 }
 fn dec_exprs(r: &mut Reader) -> R<Vec<Expr>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(dec_expr(r)?);
@@ -1126,7 +1132,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         0 => Stmt::Expr(dec_expr(r)?),
         1 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
@@ -1210,7 +1216,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         }
         14 => {
             let disc = dec_expr(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut cases = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 cases.push(SwitchCase {
@@ -1236,7 +1242,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
         19 => Stmt::Debugger,
         20 => {
             let source = r.rcstr()?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(dec_importspec(r)?);
@@ -1248,7 +1254,7 @@ fn dec_stmt(r: &mut Reader) -> R<Stmt> {
             })
         }
         21 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut specs = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 specs.push(ExportSpec {
@@ -1387,6 +1393,22 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             optional,
             pos,
         } => {
+            if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
+                if matches!(
+                    name.as_str(),
+                    "eval" | "Function" | "AsyncFunction" | "GeneratorFunction"
+                ) {
+                    deps.dynamic_code_sites.push((
+                        *pos,
+                        match name.as_str() {
+                            "eval" => "eval",
+                            "Function" => "Function",
+                            "AsyncFunction" => "AsyncFunction",
+                            _ => "GeneratorFunction",
+                        },
+                    ));
+                }
+            }
             if let (Some(deps), Expr::Ident(name), [ArrayElem::Item(Expr::Str(spec))]) =
                 (&mut w.deps, &**callee, args.as_slice())
             {
@@ -1401,6 +1423,21 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             enc_pos(w, *pos);
         }
         Expr::New { callee, args, pos } => {
+            if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
+                if matches!(
+                    name.as_str(),
+                    "Function" | "AsyncFunction" | "GeneratorFunction"
+                ) {
+                    deps.dynamic_code_sites.push((
+                        *pos,
+                        match name.as_str() {
+                            "Function" => "Function",
+                            "AsyncFunction" => "AsyncFunction",
+                            _ => "GeneratorFunction",
+                        },
+                    ));
+                }
+            }
             w.u8(25);
             enc_expr(w, callee);
             enc_array_elems(w, args);
@@ -1456,11 +1493,13 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             phase,
             options,
         } => {
-            if let (Some(deps), Expr::Str(s), ImportPhase::Evaluation, None) =
-                (&mut w.deps, &**spec, phase, options)
-            {
-                if !deps.dynamic_imports.iter().any(|d| **d == **s) {
-                    deps.dynamic_imports.push(s.to_string());
+            if let Some(deps) = &mut w.deps {
+                if let (Expr::Str(s), ImportPhase::Evaluation, None) = (&**spec, phase, options) {
+                    if !deps.dynamic_imports.iter().any(|d| **d == **s) {
+                        deps.dynamic_imports.push(s.to_string());
+                    }
+                } else {
+                    deps.computed_dynamic_imports += 1;
                 }
             }
             w.u8(32);
@@ -1502,7 +1541,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         },
         11 => Expr::Array(dec_array_elems(r)?),
         12 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(dec_propdef(r)?);
@@ -1575,7 +1614,7 @@ fn dec_expr(r: &mut Reader) -> R<Expr> {
         28 => Expr::Seq(dec_exprs(r)?),
         29 => {
             let tag = Box::new(dec_expr(r)?);
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut quasis = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 quasis.push((dec_opt_str(r)?, r.str()?));
@@ -1631,7 +1670,7 @@ fn enc_array_elems(w: &mut Writer, elems: &[ArrayElem]) {
     }
 }
 fn dec_array_elems(r: &mut Reader) -> R<Vec<ArrayElem>> {
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut out = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         out.push(match r.u8()? {
@@ -1784,7 +1823,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
     Ok(match r.u8()? {
         0 => Pattern::Ident(r.str()?),
         1 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut elems = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 elems.push(match r.u8()? {
@@ -1800,7 +1839,7 @@ fn dec_pattern(r: &mut Reader) -> R<Pattern> {
             Pattern::Array(elems)
         }
         2 => {
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut props = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 props.push(ObjPatProp {
@@ -1925,7 +1964,7 @@ fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
     Ok(match r.u8()? {
         0 => None,
         1 => {
-            let id = r.uv()? as usize;
+            let id = r.usize()?;
             Some(
                 r.scopes
                     .get(id)
@@ -1935,7 +1974,7 @@ fn dec_scope(r: &mut Reader) -> R<Option<Rc<PrivateScope>>> {
         }
         2 => {
             let parent = dec_scope(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut names = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 names.push(r.str()?);
@@ -2103,7 +2142,7 @@ fn fn_flags(f: &Function) -> u8 {
 
 fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
     if r.split.is_some() {
-        let local = r.uv()? as usize;
+        let local = r.usize()?;
         let sp = r.split.as_ref().expect("split mode");
         let i = *sp
             .children
@@ -2116,7 +2155,7 @@ fn dec_function(r: &mut Reader) -> R<Rc<Function>> {
         funcs.len() - 1
     });
     let name = dec_opt_str(r)?;
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut params = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         params.push(Param {
@@ -2207,7 +2246,7 @@ fn dec_class(r: &mut Reader) -> R<Class> {
     } else {
         None
     };
-    let n = r.uv()? as usize;
+    let n = r.usize()?;
     let mut members = Vec::with_capacity(r.cap(n));
     for _ in 0..n {
         let key = dec_propkey(r)?;
@@ -2266,7 +2305,7 @@ fn dec_forinit(r: &mut Reader) -> R<ForInit> {
     Ok(match r.u8()? {
         0 => {
             let kind = dec_declkind(r)?;
-            let n = r.uv()? as usize;
+            let n = r.usize()?;
             let mut decls = Vec::with_capacity(r.cap(n));
             for _ in 0..n {
                 decls.push((dec_pattern(r)?, dec_opt_expr(r)?));
@@ -2339,9 +2378,10 @@ fn dec_declkind(r: &mut Reader) -> R<DeclKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, decode_shared, encode};
     use crate::ast::{Expr, Stmt};
     use crate::{Completion, Engine};
+    use std::rc::Rc;
 
     /// `encode` and `decode` must be exact inverses: re-encoding a decoded tree reproduces the
     /// bytes. This catches every tag/field-order asymmetry (a *dropped* field is caught instead
@@ -2375,7 +2415,8 @@ mod tests {
     #[test]
     fn expression_arrow_reload_metadata_roundtrips_and_executes() {
         assert_roundtrips("const arrow = value => ({text: 'é', value: value + 3});");
-        check_snapshot(r#"
+        check_snapshot(
+            r#"
             const tag = strings => strings;
             const template = () => tag`é`;
             const first = template();
@@ -2383,7 +2424,8 @@ mod tests {
             assert(read() === 41);
             $262.gc(); $262.gc();
             assert(read() === 42 && template() === first);
-        "#);
+        "#,
+        );
     }
 
     #[test]
@@ -2424,7 +2466,6 @@ mod tests {
             "events.js",
             "encoding.js",
             "url.js",
-            "streams.js",
             "fetch.js",
             "server.js",
             "crypto.js",
@@ -2457,7 +2498,10 @@ mod tests {
                         },
                         e => panic!("unexpected callee {e:?}"),
                     };
-                    assert!(f.parsed_body().is_none(), "an IIFE decodes with reload metadata");
+                    assert!(
+                        f.parsed_body().is_none(),
+                        "an IIFE decodes with reload metadata"
+                    );
                     assert!(f.lazy.borrow().is_some());
                     assert_eq!(f.source.as_str(), Some("function iife() { return 3; }"));
                 }
@@ -2602,6 +2646,30 @@ function fine() { return 'ok'; }";
         assert_eq!(crate::value::flush_cold_lazy_bodies(), 1);
         assert!(f.parsed_body().is_none());
         assert_eq!(f.body().len(), 2);
+    }
+
+    #[test]
+    fn child_snapshot_decodes_reuse_the_shared_source_allocation() {
+        let src: Rc<str> = Rc::from("function f(a) { return a + 1; }");
+        let blob = crate::compile_snapshot(&src).unwrap();
+        let first = decode_shared(&blob, src.clone()).unwrap();
+        let second = decode_shared(&blob, src.clone()).unwrap();
+        let Stmt::FuncDecl(first_fn) = &first[0] else {
+            panic!("snapshot preserves the function declaration");
+        };
+        let Stmt::FuncDecl(second_fn) = &second[0] else {
+            panic!("snapshot preserves the function declaration");
+        };
+        let first_source = first_fn.lazy.borrow();
+        let second_source = second_fn.lazy.borrow();
+        assert!(Rc::ptr_eq(
+            &first_source.as_ref().expect("lazy source is retained").src,
+            &src
+        ));
+        assert!(Rc::ptr_eq(
+            &second_source.as_ref().expect("lazy source is retained").src,
+            &src
+        ));
     }
 
     #[test]

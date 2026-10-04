@@ -1,9 +1,10 @@
 // Channel messaging (HTML §9.4) + the web event classes beyond the DOM core: MessageEvent,
-// CloseEvent, ErrorEvent, PromiseRejectionEvent, MessageChannel/MessagePort (in-process
+// CloseEvent, PromiseRejectionEvent, MessageChannel/MessagePort (in-process
 // entangled pair), BroadcastChannel (same-realm), and AbortSignal.any. Message data is
 // serialized SYNCHRONOUSLY at postMessage time via structuredClone and delivered as a task;
 // each BroadcastChannel receiver gets its own clone (mutation isolation, like the spec's
-// per-destination deserialize).
+// per-destination deserialize). This unit is intentionally separate from events.js so its
+// subclasses use the realm's final Event and EventTarget constructors.
 
 function isMessagePortLike(value) {
   if (value === null || typeof value !== "object") return false;
@@ -17,7 +18,7 @@ function invalidPortArg(name, value) {
   return err;
 }
 
-class MessageEvent extends Event {
+class MessageEvent extends globalThis.Event {
   constructor(type, init = {}) {
     super(type, init);
     init = init && typeof init === "object" ? init : {};
@@ -39,7 +40,7 @@ class MessageEvent extends Event {
   }
 }
 
-class CloseEvent extends Event {
+class CloseEvent extends globalThis.Event {
   constructor(type, init = {}) {
     super(type, init);
     init = init && typeof init === "object" ? init : {};
@@ -50,20 +51,7 @@ class CloseEvent extends Event {
   }
 }
 
-class ErrorEvent extends Event {
-  constructor(type, init = {}) {
-    super(type, init);
-    init = init && typeof init === "object" ? init : {};
-    const num = (v) => (Number.isFinite(Number(v)) ? Number(v) >>> 0 : 0);
-    this.message = "message" in init ? String(init.message) : "";
-    this.filename = "filename" in init ? String(init.filename) : "";
-    this.lineno = "lineno" in init ? num(init.lineno) : 0;
-    this.colno = "colno" in init ? num(init.colno) : 0;
-    this.error = "error" in init ? init.error : undefined;
-  }
-}
-
-class PromiseRejectionEvent extends Event {
+class PromiseRejectionEvent extends globalThis.Event {
   constructor(type, init) {
     if (!init || typeof init !== "object" || !("promise" in init)) {
       throw new TypeError("PromiseRejectionEvent requires an init with a promise");
@@ -103,7 +91,7 @@ function defineEventHandler(proto, name, afterSet) {
 
 const kPortCreate = Symbol("MessagePort-create");
 
-class MessagePort extends EventTarget {
+class MessagePort extends globalThis.EventTarget {
   constructor(token) {
     if (token !== kPortCreate) throw new TypeError("Illegal constructor");
     super();
@@ -111,9 +99,21 @@ class MessagePort extends EventTarget {
     this._queue = [];
     this._started = false;
     this._closed = false;
+    this._nativeId = null;
+    this._onNativeClose = null;
   }
   postMessage(message, options) {
     if (this._closed) return;
+    if (this._nativeId !== null) {
+      const transfer = Array.isArray(options)
+        ? options
+        : options && typeof options === "object" && options.transfer
+          ? options.transfer
+          : [];
+      const bytes = withWebPortClone(() => globalThis.__serializeForClone(message, transfer, true));
+      globalThis.__lumenPorts.post(this._nativeId, bytes);
+      return;
+    }
     const transfer = Array.isArray(options)
       ? options
       : options && typeof options === "object" && options.transfer
@@ -130,11 +130,24 @@ class MessagePort extends EventTarget {
   start() {
     if (this._started || this._closed) return;
     this._started = true;
+    if (this._nativeId !== null) {
+      globalThis.__lumenPorts.listen(this._nativeId, () => this._flushNative());
+      return;
+    }
     this._schedule();
   }
   close() {
     this._closed = true;
     this._queue.length = 0;
+    if (this._nativeId !== null) {
+      const id = this._nativeId;
+      this._nativeId = null;
+      globalThis.__lumenPorts.close(id);
+      globalThis.__lumenPorts.detach(id);
+      this._onNativeClose?.();
+      this._onNativeClose = null;
+      return;
+    }
     if (this._other) this._other._other = null;
     this._other = null;
   }
@@ -143,6 +156,28 @@ class MessagePort extends EventTarget {
     if (this._closed || !this._started || !this._queue.length) return;
     this._dispatch(this._queue.shift());
     if (this._queue.length && !this._closed) this._schedule();
+  }
+  _flushNative() {
+    if (this._closed || !this._started || this._nativeId === null) return;
+    const id = this._nativeId;
+    const bytes = globalThis.__lumenPorts.poll(id);
+    if (bytes === false) {
+      this._closed = true;
+      this._nativeId = null;
+      globalThis.__lumenPorts.detach(id);
+      this._onNativeClose?.();
+      this._onNativeClose = null;
+      this.dispatchEvent(new globalThis.Event("close"));
+      return;
+    }
+    if (bytes === undefined) return;
+    globalThis.__lumenPorts.wake(id);
+    try {
+      const data = withWebPortClone(() => globalThis.__deserializeClone(bytes));
+      this.dispatchEvent(new MessageEvent("message", { data }));
+    } catch (error) {
+      this.dispatchEvent(new MessageEvent("messageerror", { data: error }));
+    }
   }
   _dispatch(data) {
     if (this._closed) return;
@@ -154,19 +189,93 @@ defineEventHandler(MessagePort.prototype, "messageerror");
 
 class MessageChannel {
   constructor() {
-    const port1 = new MessagePort(kPortCreate);
-    const port2 = new MessagePort(kPortCreate);
-    port1._other = port2;
-    port2._other = port1;
+    let port1;
+    let port2;
+    if (globalThis.__lumenPorts?.pair) {
+      const pair = globalThis.__lumenPorts.pair();
+      port1 = globalThis.__lumenSharedPorts.create(pair.a);
+      port2 = globalThis.__lumenSharedPorts.create(pair.b);
+    } else {
+      port1 = new MessagePort(kPortCreate);
+      port2 = new MessagePort(kPortCreate);
+      port1._other = port2;
+      port2._other = port1;
+    }
     this.port1 = port1;
     this.port2 = port2;
+  }
+}
+
+Object.defineProperty(globalThis, "__lumenSharedPorts", {
+  configurable: true,
+  enumerable: false,
+  value: {
+    create(id, onClose = null) {
+      const port = new MessagePort(kPortCreate);
+      port._nativeId = Number(id);
+      port._onNativeClose = onClose;
+      return port;
+    },
+  },
+});
+
+// Node may have installed its own MessagePort bridge before this web module is loaded. For a
+// browser MessagePort operation, temporarily present a bridge that recognizes web ports and
+// delegates Node ports to the active bridge. Deserialization then creates the web wrapper in a
+// web MessagePort's receive path, while Node serialization remains unchanged everywhere else.
+let webPortClone;
+const otherPortClone = () => globalThis.__lumenPortClone === webPortClone ? null : globalThis.__lumenPortClone;
+const isWebPort = (value) => value instanceof MessagePort && value._nativeId !== null;
+webPortClone = {
+  isPort(value) { return isWebPort(value) || !!otherPortClone()?.isPort(value); },
+  isUntransferable(value) { return !!otherPortClone()?.isUntransferable?.(value); },
+  isUncloneable(value) { return !!otherPortClone()?.isUncloneable?.(value); },
+  validate(port) {
+    if (!isWebPort(port)) return otherPortClone()?.validate(port);
+    if (port._closed || globalThis.__lumenPorts.isClosed(port._nativeId)) {
+      throw new globalThis.DOMException("MessagePort in transfer list is already detached", "DataCloneError");
+    }
+  },
+  export(port) { return isWebPort(port) ? globalThis.__lumenPorts.export(port._nativeId) : otherPortClone()?.export(port); },
+  detach(port) {
+    if (!isWebPort(port)) return otherPortClone()?.detach(port);
+    const id = port._nativeId;
+    port._nativeId = null;
+    port._closed = true;
+    port._queue.length = 0;
+    port._onNativeClose = null;
+    globalThis.__lumenPorts.detach(id);
+  },
+  import(index) { return globalThis.__lumenSharedPorts.create(globalThis.__lumenPorts.import(index)); },
+};
+if (!Object.getOwnPropertyDescriptor(globalThis, "__lumenPortClone")) {
+  Object.defineProperty(globalThis, "__lumenPortClone", {
+    configurable: true,
+    enumerable: false,
+    value: webPortClone,
+  });
+}
+function withWebPortClone(callback) {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "__lumenPortClone");
+  if (previous?.value === webPortClone) return callback();
+  Object.defineProperty(globalThis, "__lumenPortClone", {
+    configurable: true,
+    enumerable: false,
+    writable: true,
+    value: webPortClone,
+  });
+  try {
+    return callback();
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "__lumenPortClone", previous);
+    else delete globalThis.__lumenPortClone;
   }
 }
 
 // Same-realm broadcast registry: name -> Set of live channels.
 const broadcastChannels = new Map();
 
-class BroadcastChannel extends EventTarget {
+class BroadcastChannel extends globalThis.EventTarget {
   constructor(name) {
     if (arguments.length === 0) {
       throw new TypeError("BroadcastChannel requires a name");
@@ -183,7 +292,7 @@ class BroadcastChannel extends EventTarget {
   }
   postMessage(message) {
     if (this._closed) {
-      throw new DOMException("BroadcastChannel is closed", "InvalidStateError");
+      throw new globalThis.DOMException("BroadcastChannel is closed", "InvalidStateError");
     }
     const data = structuredClone(message); // serialize now, once
     const peers = [...(broadcastChannels.get(this.name) ?? [])].filter(
@@ -210,7 +319,6 @@ defineEventHandler(BroadcastChannel.prototype, "messageerror");
 
 globalThis.MessageEvent = MessageEvent;
 globalThis.CloseEvent = CloseEvent;
-globalThis.ErrorEvent = ErrorEvent;
 globalThis.PromiseRejectionEvent = PromiseRejectionEvent;
 globalThis.MessagePort = MessagePort;
 globalThis.MessageChannel = MessageChannel;

@@ -1,4 +1,23 @@
-use crate::{Completion, Engine, Value, collect_disposed_realms};
+use crate::{collect_disposed_realms, Completion, Engine, Value};
+
+#[test]
+fn quiescent_worker_cleanup_preserves_a_live_parent_realm() {
+    std::thread::spawn(|| {
+        let mut parent = Engine::new();
+        parent.eval("var retained={value:42};retained.self=retained;", false).unwrap();
+        parent.collect_garbage();
+        let baseline = crate::value::live_objects();
+        for _ in 0..3 {
+            let mut worker = Engine::new();
+            worker.eval("function hot(x){return x*3+1;} hot.self=hot;var sum=0;for(var i=0;i<2048;i++)sum+=hot(i);", false).unwrap();
+            assert!(worker.jit_stats().executed_entries > 0);
+            drop(worker);
+            crate::collect_quiescent_realms();
+            assert_eq!(crate::value::live_objects(), baseline);
+            assert!(matches!(parent.eval("retained.value", false).unwrap(), Completion::Value(value) if value == "42"));
+        }
+    }).join().unwrap();
+}
 
 #[test]
 fn disposed_realms_reclaim_closure_scope_and_prototype_cycles() {
@@ -75,7 +94,10 @@ fn function_constructor_loop_keeps_the_lazy_registry_bounded() {
             s === 30000 + 29999 * 30000 / 2;
         "#, false).unwrap(), Completion::Value(value) if value == "true"));
         let after = crate::value::lazy_function_registry_len();
-        assert!(after < before + 16384, "registry grew from {before} to {after}");
+        assert!(
+            after < before + 16384,
+            "registry grew from {before} to {after}"
+        );
     })
     .join()
     .unwrap();
@@ -99,7 +121,10 @@ fn throwaway_computed_key_objects_keep_the_shape_table_bounded() {
             s;
         "#, false).unwrap(), Completion::Value(value) if value == "180000"));
         let after = crate::value::shape_table_census().shapes;
-        assert!(after < before + 16384, "shape table grew from {before} to {after}");
+        assert!(
+            after < before + 16384,
+            "shape table grew from {before} to {after}"
+        );
     })
     .join()
     .unwrap();

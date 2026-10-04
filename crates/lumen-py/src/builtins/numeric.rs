@@ -2,10 +2,11 @@
 
 use super::funcs::{float_to_int, round_half_even};
 use crate::ast::{BinOp, CmpOp};
-use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::UnOp;
+use crate::fmath;
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
+use crate::pyint::{BigInt, PyInt};
 use crate::vm::*;
 use std::rc::Rc;
 
@@ -26,7 +27,9 @@ pub enum IntParseError {
 
 /// Parses `s` as `int(s, base)` would; `max_digits` of 0 means no limit.
 pub fn parse_int_str(s: &str, base: u32, max_digits: usize) -> Result<BigInt, IntParseError> {
-    parse_int_inner(s, base, max_digits).ok_or(IntParseError::Invalid).and_then(|r| r)
+    parse_int_inner(s, base, max_digits)
+        .ok_or(IntParseError::Invalid)
+        .and_then(|r| r)
 }
 
 fn parse_int_inner(s: &str, base: u32, max_digits: usize) -> Option<Result<BigInt, IntParseError>> {
@@ -51,27 +54,37 @@ fn parse_int_inner(s: &str, base: u32, max_digits: usize) -> Option<Result<BigIn
             digits = &digits[2..];
         } else {
             base = 10;
-            if digits.len() > 1 && digits.starts_with('0') && digits.chars().any(|c| c != '0' && c != '_') {
+            if digits.len() > 1
+                && digits.starts_with('0')
+                && digits.chars().any(|c| c != '0' && c != '_')
+            {
                 return None;
             }
         }
         if digits.starts_with('_') {
             digits = &digits[1..];
         }
-    } else if (base == 16 && prefix("0x")) || (base == 8 && prefix("0o")) || (base == 2 && prefix("0b")) {
+    } else if (base == 16 && prefix("0x"))
+        || (base == 8 && prefix("0o"))
+        || (base == 2 && prefix("0b"))
+    {
         digits = &digits[2..];
         if digits.starts_with('_') {
             digits = &digits[1..];
         }
     }
-    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') || digits.contains("__") {
+    if digits.is_empty()
+        || digits.starts_with('_')
+        || digits.ends_with('_')
+        || digits.contains("__")
+    {
         return None;
     }
     let clean: String = digits.chars().filter(|c| *c != '_').collect();
     if !clean.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    if max_digits != 0 && !base.is_power_of_two() && clean.len() > max_digits {
+    if !base.is_power_of_two() && lumen_common::bigint::digits_exceed(max_digits, clean.len()) {
         return Some(Err(IntParseError::TooManyDigits(clean.len())));
     }
     let v = BigInt::parse_signed(&clean, base)?;
@@ -109,7 +122,7 @@ pub fn parse_float_str(s: &str) -> Option<f64> {
                 c.set(v + 1);
                 v
             });
-            return Some(f64::from_bits(0x7ff8_0000_0000_0000 | (n << 3)));
+            return Some(sgn(f64::from_bits(0x7ff8_0000_0000_0000 | (n << 3))));
         }
         _ => {}
     }
@@ -123,7 +136,9 @@ pub fn parse_float_str(s: &str) -> Option<f64> {
         if c == '_' {
             let prev = i.checked_sub(1).map(|j| chars[j]);
             let next = chars.get(i + 1).copied();
-            if !(prev.is_some_and(|p| p.is_ascii_digit()) && next.is_some_and(|n| n.is_ascii_digit())) {
+            if !(prev.is_some_and(|p| p.is_ascii_digit())
+                && next.is_some_and(|n| n.is_ascii_digit()))
+            {
                 return None;
             }
         } else if c.is_ascii_digit() || matches!(c, '.' | 'e' | '+' | '-') {
@@ -152,7 +167,7 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
             Value::Obj(o) => match &o.kind {
                 Kind::Str(s) => s.s.to_string(),
                 Kind::Bytes(bs) => String::from_utf8_lossy(bs).into_owned(),
-                Kind::ByteArray(bs) => String::from_utf8_lossy(&bs.borrow()).into_owned(),
+                Kind::ByteArray(bs) => String::from_utf8_lossy(&bs.bytes()).into_owned(),
                 _ => return Err(it.type_error("int() can't convert non-string with explicit base")),
             },
             _ => return Err(it.type_error("int() can't convert non-string with explicit base")),
@@ -180,14 +195,15 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
                     Some(v) => Ok(Value::big(v)),
                     None => {
                         let r = it.repr_of(x)?;
-                        Err(it.value_error(&format!("invalid literal for int() with base 10: {}", r)))
+                        Err(it
+                            .value_error(&format!("invalid literal for int() with base 10: {}", r)))
                     }
                 }
             }
             Kind::Bytes(_) | Kind::ByteArray(_) => {
                 let raw = match &o.kind {
                     Kind::Bytes(bs) => bs.clone(),
-                    Kind::ByteArray(bs) => bs.borrow().clone(),
+                    Kind::ByteArray(bs) => bs.to_vec(),
                     _ => Vec::new(),
                 };
                 let text = String::from_utf8_lossy(&raw).into_owned();
@@ -195,7 +211,8 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
                     Some(v) => Ok(Value::big(v)),
                     None => {
                         let r = it.repr_of(x)?;
-                        Err(it.value_error(&format!("invalid literal for int() with base 10: {}", r)))
+                        Err(it
+                            .value_error(&format!("invalid literal for int() with base 10: {}", r)))
                     }
                 };
             }
@@ -222,7 +239,10 @@ fn int_from_value(it: &mut Interp, x: &Value, base: Option<i64>) -> R<Value> {
         }
     }
     let t = it.type_name_of(x);
-    Err(it.type_error(&format!("int() argument must be a string, a bytes-like object or a real number, not '{}'", t)))
+    Err(it.type_error(&format!(
+        "int() argument must be a string, a bytes-like object or a real number, not '{}'",
+        t
+    )))
 }
 
 fn float_to_int_checked(it: &mut Interp, f: f64) -> R<Value> {
@@ -232,7 +252,7 @@ fn float_to_int_checked(it: &mut Interp, f: f64) -> R<Value> {
     if f.is_infinite() {
         return Err(it.overflow_err("cannot convert float infinity to integer"));
     }
-    Ok(float_to_int(f.trunc()))
+    Ok(float_to_int(fmath::trunc(f)))
 }
 
 fn int_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -278,7 +298,9 @@ fn float_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     Some(f) => f,
                     None => {
                         let r = it.repr_of(x)?;
-                        return Err(it.value_error(&format!("could not convert string to float: {}", r)));
+                        return Err(
+                            it.value_error(&format!("could not convert string to float: {}", r))
+                        );
                     }
                 }
             }
@@ -291,7 +313,9 @@ fn float_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     Some(f) => f,
                     None => {
                         let r = it.repr_of(x)?;
-                        return Err(it.value_error(&format!("could not convert string to float: {}", r)));
+                        return Err(
+                            it.value_error(&format!("could not convert string to float: {}", r))
+                        );
                     }
                 }
             }
@@ -300,7 +324,10 @@ fn float_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                 Err(e) => {
                     if it.exc_is(&e, "TypeError") {
                         let t = it.type_name_of(x);
-                        return Err(it.type_error(&format!("float() argument must be a string or a real number, not '{}'", t)));
+                        return Err(it.type_error(&format!(
+                            "float() argument must be a string or a real number, not '{}'",
+                            t
+                        )));
                     }
                     return Err(e);
                 }
@@ -316,7 +343,11 @@ fn float_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 
 fn parse_complex(s: &str) -> Option<(f64, f64)> {
     let t = s.trim();
-    let t = t.strip_prefix('(').and_then(|x| x.strip_suffix(')')).unwrap_or(t).trim();
+    let t = t
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(t)
+        .trim();
     if t.is_empty() {
         return None;
     }
@@ -333,11 +364,25 @@ fn parse_complex(s: &str) -> Option<(f64, f64)> {
             Some(i) => {
                 let re: String = bytes[..i].iter().collect();
                 let im: String = bytes[i..].iter().collect();
-                let imv = if im == "+" || im == "-" { if im == "-" { -1.0 } else { 1.0 } } else { parse_float_str(&im)? };
+                let imv = if im == "+" || im == "-" {
+                    if im == "-" {
+                        -1.0
+                    } else {
+                        1.0
+                    }
+                } else {
+                    parse_float_str(&im)?
+                };
                 Some((parse_float_str(&re)?, imv))
             }
             None => {
-                let imv = if body.is_empty() || body == "+" { 1.0 } else if body == "-" { -1.0 } else { parse_float_str(body)? };
+                let imv = if body.is_empty() || body == "+" {
+                    1.0
+                } else if body == "-" {
+                    -1.0
+                } else {
+                    parse_float_str(body)?
+                };
                 Some((0.0, imv))
             }
         }
@@ -349,13 +394,27 @@ fn parse_complex(s: &str) -> Option<(f64, f64)> {
 fn complex_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let cls = cls_of(it, a, "complex")?;
     let b = it.bind_args("complex", &a[1..], kw, &["real", "imag"], 0)?;
+    if let (Some(v @ Value::Obj(o)), None) = (&b[0], &b[1]) {
+        if o.cls.is_none()
+            && matches!(o.kind, Kind::Complex(..))
+            && Rc::ptr_eq(&cls, &it.types.complex)
+        {
+            return Ok(v.clone());
+        }
+    }
     let (mut re, mut im) = (0.0, 0.0);
-    let parts = |it: &mut Interp, v: &Value| -> R<(f64, f64)> {
+    let parts = |it: &mut Interp, v: &Value, first: bool| -> R<(f64, f64)> {
         if let Value::Obj(o) = v {
-            if let Kind::Complex(r, i) = &o.kind {
-                return Ok((*r, *i));
+            if let Kind::Complex(..) = &o.kind {
+                return it.complex_arg(v);
+            }
+            if first && o.cls.is_some() && it.user_special(v, "__complex__").is_some() {
+                return it.complex_arg(v);
             }
             if let Kind::Str(s) = &o.kind {
+                if !first {
+                    return Err(it.type_error("complex() second arg can't be a string"));
+                }
                 return match parse_complex(&s.s) {
                     Some(p) => Ok(p),
                     None => Err(it.value_error("complex() arg is a malformed string")),
@@ -364,21 +423,31 @@ fn complex_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         }
         match it.float_arg(v) {
             Ok(f) => Ok((f, 0.0)),
+            Err(e) if !it.exc_is(&e, "TypeError") => Err(e),
             Err(_) => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("complex() first argument must be a string or a number, not '{}'", t)))
+                Err(it.type_error(&if first {
+                    format!("complex() first argument must be a string or a number, not '{t}'")
+                } else {
+                    format!("complex() second argument must be a number, not '{t}'")
+                }))
             }
         }
     };
+    if let (Some(Value::Obj(o)), Some(_)) = (&b[0], &b[1]) {
+        if matches!(o.kind, Kind::Str(_)) {
+            return Err(it.type_error("complex() can't take second arg if first is a string"));
+        }
+    }
     let mut first_complex = false;
     if let Some(r) = &b[0] {
-        let (x, y) = parts(it, r)?;
-        first_complex = matches!(r, Value::Obj(o) if matches!(o.kind, Kind::Complex(..) | Kind::Str(_)));
+        let (x, y) = parts(it, r, true)?;
+        first_complex = matches!(r, Value::Obj(o) if matches!(o.kind, Kind::Complex(..) | Kind::Str(_)) || (o.cls.is_some() && it.user_special(r, "__complex__").is_some()));
         re = x;
         im = y;
     }
     if let Some(i) = &b[1] {
-        let (x, y) = parts(it, i)?;
+        let (x, y) = parts(it, i, false)?;
         if matches!(i, Value::Obj(o) if matches!(o.kind, Kind::Complex(..))) {
             re -= y;
             im += x;
@@ -389,7 +458,11 @@ fn complex_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         }
     }
     let kind = Kind::Complex(re, im);
-    Ok(Value::Obj(if Rc::ptr_eq(&cls, &it.types.complex) { Object::new(kind) } else { Object::with_cls(cls, kind) }))
+    Ok(Value::Obj(if Rc::ptr_eq(&cls, &it.types.complex) {
+        Object::new(kind)
+    } else {
+        Object::with_cls(cls, kind)
+    }))
 }
 
 // ---- int methods -----------------------------------------------------------------------------
@@ -399,7 +472,10 @@ fn big_of(it: &mut Interp, v: &Value) -> R<BigInt> {
         Some(b) => Ok(b),
         None => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("descriptor requires an 'int' object but received a '{}'", t)))
+            Err(it.type_error(&format!(
+                "descriptor requires an 'int' object but received a '{}'",
+                t
+            )))
         }
     }
 }
@@ -417,7 +493,13 @@ fn int_bit_count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn int_to_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("to_bytes", &a[1..], kw, &["length", "byteorder", "signed"], 0)?;
+    let b = it.bind_args(
+        "to_bytes",
+        &a[1..],
+        kw,
+        &["length", "byteorder", "signed"],
+        0,
+    )?;
     let n = big_of(it, &a[0])?;
     let len = match &b[0] {
         Some(l) => it.index_of(l)?.max(0) as usize,
@@ -447,8 +529,14 @@ fn int_to_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 
 fn int_from_bytes(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let cls = cls_of(it, a, "int")?;
-    let b = it.bind_args("from_bytes", &a[1..], kw, &["bytes", "byteorder", "signed"], 1)?;
-    let data = it.bytes_of(&b[0].clone().unwrap_or(Value::None))?;
+    let b = it.bind_args(
+        "from_bytes",
+        &a[1..],
+        kw,
+        &["bytes", "byteorder", "signed"],
+        1,
+    )?;
+    let data = it.bytes_from_object(&b[0].clone().unwrap_or(Value::None))?;
     let big_endian = match &b[1] {
         Some(o) => match o.as_str() {
             Some("big") => true,
@@ -507,7 +595,7 @@ impl Interp {
 
 fn float_is_integer(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    Ok(Value::Bool(f.is_finite() && f == f.trunc()))
+    Ok(Value::Bool(f.is_finite() && f == fmath::trunc(f)))
 }
 
 fn float_trunc(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -517,12 +605,12 @@ fn float_trunc(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn float_floor(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    float_to_int_checked(it, f.floor())
+    float_to_int_checked(it, fmath::floor(f))
 }
 
 fn float_ceil(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let f = it.float_arg(&a[0])?;
-    float_to_int_checked(it, f.ceil())
+    float_to_int_checked(it, fmath::ceil(f))
 }
 
 fn float_as_ratio(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -540,7 +628,11 @@ fn float_as_ratio(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let neg = (bits >> 63) != 0;
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let frac = bits & ((1u64 << 52) - 1);
-    let (mant, e) = if exp == 0 { (frac, -1074) } else { (frac | (1u64 << 52), exp - 1075) };
+    let (mant, e) = if exp == 0 {
+        (frac, -1074)
+    } else {
+        (frac | (1u64 << 52), exp - 1075)
+    };
     let mut num = BigInt::from_u64(mant);
     let mut den = BigInt::from_i64(1);
     if e >= 0 {
@@ -563,15 +655,30 @@ fn float_hex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Ok(Value::string(float_repr(f)));
     }
     if f == 0.0 {
-        return Ok(Value::str(if f.is_sign_negative() { "-0x0.0p+0" } else { "0x0.0p+0" }));
+        return Ok(Value::str(if f.is_sign_negative() {
+            "-0x0.0p+0"
+        } else {
+            "0x0.0p+0"
+        }));
     }
     let bits = f.to_bits();
     let neg = (bits >> 63) != 0;
     let exp = ((bits >> 52) & 0x7ff) as i64;
     let frac = bits & ((1u64 << 52) - 1);
-    let (lead, e) = if exp == 0 { (0, -1022) } else { (1, exp - 1023) };
+    let (lead, e) = if exp == 0 {
+        (0, -1022)
+    } else {
+        (1, exp - 1023)
+    };
     let hex = format!("{:013x}", frac);
-    Ok(Value::string(format!("{}0x{}.{}p{}{}", if neg { "-" } else { "" }, lead, hex, if e < 0 { '-' } else { '+' }, e.abs())))
+    Ok(Value::string(format!(
+        "{}0x{}.{}p{}{}",
+        if neg { "-" } else { "" },
+        lead,
+        hex,
+        if e < 0 { '-' } else { '+' },
+        e.abs()
+    )))
 }
 
 pub fn parse_hex_float(s: &str) -> Option<f64> {
@@ -582,7 +689,13 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
     };
     let low = s.to_ascii_lowercase();
     match low.as_str() {
-        "inf" | "infinity" => return Some(if neg { f64::NEG_INFINITY } else { f64::INFINITY }),
+        "inf" | "infinity" => {
+            return Some(if neg {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            })
+        }
         "nan" => return Some(f64::NAN),
         _ => {}
     }
@@ -605,7 +718,9 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
         scale /= 16.0;
     }
     let e = exp.clamp(-3000, 3000) as i32;
-    let r = v * 2f64.powi(e.clamp(-1000, 1000)) * 2f64.powi((e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
+    let r = v
+        * fmath::powi(2.0, e.clamp(-1000, 1000))
+        * fmath::powi(2.0, (e - e.clamp(-1000, 1000)).clamp(-1000, 1000));
     Some(if neg { -r } else { r })
 }
 
@@ -616,6 +731,46 @@ fn float_fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         Some(f) => Ok(Value::Float(f)),
         None => Err(it.value_error("invalid hexadecimal floating-point string")),
     }
+}
+
+/// `float.__getformat__(typestr)`: the storage format of C doubles and floats.
+fn float_getformat(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    it.check_args("__getformat__", a, 2, 2)?;
+    let Some(t) = a[1].as_str() else {
+        let n = it.type_name_of(&a[1]);
+        return Err(it.type_error(&format!(
+            "float.__getformat__() argument must be str, not {n}"
+        )));
+    };
+    if t != "double" && t != "float" {
+        return Err(it.value_error("__getformat__() argument 1 must be 'double' or 'float'"));
+    }
+    let order = if cfg!(target_endian = "little") {
+        "little"
+    } else {
+        "big"
+    };
+    Ok(Value::string(format!("IEEE, {order}-endian")))
+}
+
+fn complex_self(it: &mut Interp, v: &Value, meth: &str) -> R<(f64, f64)> {
+    match v {
+        Value::Obj(o) => match &o.kind {
+            Kind::Complex(re, im) => Ok((*re, *im)),
+            _ => Err(it.type_error(&format!("descriptor '{meth}' requires a 'complex' object"))),
+        },
+        _ => Err(it.type_error(&format!("descriptor '{meth}' requires a 'complex' object"))),
+    }
+}
+
+fn complex_complex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let (re, im) = complex_self(it, &a[0], "__complex__")?;
+    Ok(Value::Obj(Object::new(Kind::Complex(re, im))))
+}
+
+fn complex_getnewargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+    let (re, im) = complex_self(it, &a[0], "__getnewargs__")?;
+    Ok(Value::tuple(vec![Value::Float(re), Value::Float(im)]))
 }
 
 fn complex_conjugate(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -759,11 +914,18 @@ fn pow3(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         let f = it.builtins_fn("pow");
         return it.call(&f, a.to_vec(), Vec::new());
     }
-    Ok(it.native_binop(BinOp::Pow, &a[0], &a[1])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .native_binop(BinOp::Pow, &a[0], &a[1])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 pub fn init(it: &mut Interp) {
-    let (int, bool_, float, complex) = (it.types.int.clone(), it.types.bool_.clone(), it.types.float.clone(), it.types.complex.clone());
+    let (int, bool_, float, complex) = (
+        it.types.int.clone(),
+        it.types.bool_.clone(),
+        it.types.float.clone(),
+        it.types.complex.clone(),
+    );
     it.reg_new(&int, int_new);
     it.reg(&int, "bit_length", int_bit_length);
     it.reg(&int, "bit_count", int_bit_count);
@@ -790,8 +952,28 @@ pub fn init(it: &mut Interp) {
     it.reg(&int, "__divmod__", w_divmod);
     it.reg(&int, "__pow__", pow3);
     let all_ops = [
-        "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__truediv__", "__rtruediv__", "__mod__", "__rmod__", "__lshift__",
-        "__rlshift__", "__rshift__", "__rrshift__", "__or__", "__ror__", "__xor__", "__rxor__", "__and__", "__rand__", "__floordiv__", "__rfloordiv__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__mod__",
+        "__rmod__",
+        "__lshift__",
+        "__rlshift__",
+        "__rshift__",
+        "__rrshift__",
+        "__or__",
+        "__ror__",
+        "__xor__",
+        "__rxor__",
+        "__and__",
+        "__rand__",
+        "__floordiv__",
+        "__rfloordiv__",
         "__rpow__",
     ];
     reg_binops(it, &int, &all_ops);
@@ -805,6 +987,7 @@ pub fn init(it: &mut Interp) {
     it.reg(&float, "as_integer_ratio", float_as_ratio);
     it.reg(&float, "hex", float_hex);
     it.reg_class(&float, "fromhex", float_fromhex);
+    it.reg_class(&float, "__getformat__", float_getformat);
     it.reg(&float, "conjugate", int_conjugate);
     it.reg(&float, "__trunc__", float_trunc);
     it.reg(&float, "__int__", float_trunc);
@@ -822,14 +1005,27 @@ pub fn init(it: &mut Interp) {
     it.reg(&float, "__divmod__", w_divmod);
     it.reg(&float, "__pow__", pow3);
     let float_ops = [
-        "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__truediv__", "__rtruediv__", "__mod__", "__rmod__", "__floordiv__",
-        "__rfloordiv__", "__rpow__",
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__mod__",
+        "__rmod__",
+        "__floordiv__",
+        "__rfloordiv__",
+        "__rpow__",
     ];
     reg_binops(it, &float, &float_ops);
     reg_compare(it, &float, true);
 
     it.reg_new(&complex, complex_new);
     it.reg(&complex, "conjugate", complex_conjugate);
+    it.reg(&complex, "__complex__", complex_complex);
+    it.reg(&complex, "__getnewargs__", complex_getnewargs);
     it.reg(&complex, "__neg__", u_neg);
     it.reg(&complex, "__pos__", u_pos);
     it.reg(&complex, "__abs__", u_abs);
@@ -837,8 +1033,21 @@ pub fn init(it: &mut Interp) {
     it.reg(&complex, "__repr__", w_repr);
     it.reg(&complex, "__format__", w_format);
     it.reg(&complex, "__pow__", pow3);
-    let complex_ops = ["__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__", "__truediv__", "__rtruediv__", "__rpow__"];
+    let complex_ops = [
+        "__add__",
+        "__radd__",
+        "__sub__",
+        "__rsub__",
+        "__mul__",
+        "__rmul__",
+        "__truediv__",
+        "__rtruediv__",
+        "__rpow__",
+    ];
     reg_binops(it, &complex, &complex_ops);
     reg_compare(it, &complex, false);
-    let _ = (to_num as fn(&Value) -> Option<Num>, round_half_even as fn(f64) -> f64);
+    let _ = (
+        to_num as fn(&Value) -> Option<Num>,
+        round_half_even as fn(f64) -> f64,
+    );
 }

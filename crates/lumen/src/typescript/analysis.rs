@@ -221,26 +221,8 @@ pub fn report_text(table: &TypeTable, src: &str, file: &str) -> String {
     out
 }
 
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn kind_json(k: &TKind) -> String {
-    json_str(&k.to_string())
+    lumen_common::json::json_string(&k.to_string())
 }
 
 fn site_json(s: &Site) -> String {
@@ -271,7 +253,7 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
             .map(|n| {
                 format!(
                     ",\"reason\":{},\"reasonAt\":{{\"offset\":{},{}}}",
-                    json_str(&n.reason),
+                    lumen_common::json::json_string(&n.reason),
                     n.at,
                     loc(n.at)
                 )
@@ -281,7 +263,13 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
             .param_names
             .iter()
             .zip(&f.params)
-            .map(|(n, k)| format!("{{\"name\":{},\"type\":{}}}", json_str(n), kind_json(k)))
+            .map(|(n, k)| {
+                format!(
+                    "{{\"name\":{},\"type\":{}}}",
+                    lumen_common::json::json_string(n),
+                    kind_json(k)
+                )
+            })
             .collect();
         let locals: Vec<String> = f
             .locals
@@ -291,8 +279,8 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
         let sites: Vec<String> = f.sites.iter().map(site_json).collect();
         fns.push(format!(
             "{{\"name\":{},\"kind\":{},\"start\":{},\"end\":{},{},\"sound\":{}{note},\"params\":[{}],\"this\":{},\"ret\":{},\"sig\":{},\"locals\":[{}],\"sites\":[{}]}}",
-            json_str(&f.name),
-            json_str(&format!("{:?}", f.kind).to_ascii_lowercase()),
+            lumen_common::json::json_string(&f.name),
+            lumen_common::json::json_string(&format!("{:?}", f.kind).to_ascii_lowercase()),
             f.start,
             f.end,
             loc(f.start),
@@ -313,7 +301,7 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
             .map(|n| {
                 format!(
                     ",\"reason\":{},\"reasonAt\":{{\"offset\":{},{}}}",
-                    json_str(&n.reason),
+                    lumen_common::json::json_string(&n.reason),
                     n.at,
                     loc(n.at)
                 )
@@ -325,7 +313,7 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
             .map(|(n, k, ro)| {
                 format!(
                     "{{\"name\":{},\"type\":{},\"readonly\":{ro}}}",
-                    json_str(n),
+                    lumen_common::json::json_string(n),
                     kind_json(k)
                 )
             })
@@ -333,11 +321,16 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
         let methods: Vec<String> = c
             .methods
             .iter()
-            .map(|(n, o)| format!("{{\"name\":{},\"fn\":{o}}}", json_str(n)))
+            .map(|(n, o)| {
+                format!(
+                    "{{\"name\":{},\"fn\":{o}}}",
+                    lumen_common::json::json_string(n)
+                )
+            })
             .collect();
         classes.push(format!(
             "{{\"id\":{i},\"name\":{},\"start\":{},\"end\":{},{},\"parent\":{},\"sound\":{}{note},\"fields\":[{}],\"methods\":[{}]}}",
-            json_str(&c.name),
+            lumen_common::json::json_string(&c.name),
             c.start,
             c.end,
             loc(c.start),
@@ -362,7 +355,7 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
     let (sound, total) = table.sound_count();
     format!(
         "{{\"file\":{},\"sound\":{sound},\"total\":{total},\"functions\":[{}],\"classes\":[{}],\"signatures\":[{}]}}\n",
-        json_str(file),
+        lumen_common::json::json_string(file),
         fns.join(","),
         classes.join(","),
         sigs.join(",")

@@ -1,7 +1,7 @@
 //! `dict`, dict views, `set` and `frozenset`.
 
 use super::numeric::{reg_binops, reg_compare};
-use super::slots::reg_slots;
+use super::slots::{reg_method_forms, reg_slots};
 use crate::containers::pydict_of;
 use crate::dict::PyDict;
 use crate::object::*;
@@ -16,7 +16,10 @@ fn dict_this<'a>(it: &mut Interp, a: &'a [Value], name: &str) -> R<&'a Obj> {
         Some(Value::Obj(o)) if matches!(o.kind, Kind::Dict(_)) => Ok(o),
         _ => {
             let t = a.first().map(|v| it.type_name_of(v)).unwrap_or_default();
-            Err(it.type_error(&format!("descriptor '{}' for 'dict' objects doesn't apply to a '{}' object", name, t)))
+            Err(it.type_error(&format!(
+                "descriptor '{}' for 'dict' objects doesn't apply to a '{}' object",
+                name, t
+            )))
         }
     }
 }
@@ -31,7 +34,10 @@ fn dict_new(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn dict_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let d = dict_this(it, a, "__init__")?.clone();
     if a.len() > 2 {
-        return Err(it.type_error(&format!("dict expected at most 1 argument, got {}", a.len() - 1)));
+        return Err(it.type_error(&format!(
+            "dict expected at most 1 argument, got {}",
+            a.len() - 1
+        )));
     }
     if let Some(src) = a.get(1) {
         it.dict_update_from(&d, src)?;
@@ -45,7 +51,9 @@ fn dict_init(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn dict_get(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("dict.get", a, 2, 3)?;
     let d = dict_this(it, a, "get")?;
-    Ok(it.dict_get(d, &a[1])?.unwrap_or_else(|| a.get(2).cloned().unwrap_or(Value::None)))
+    Ok(it
+        .dict_get(d, &a[1])?
+        .unwrap_or_else(|| a.get(2).cloned().unwrap_or(Value::None)))
 }
 
 fn setdefault(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -107,7 +115,10 @@ fn items(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn update(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let d = dict_this(it, a, "update")?.clone();
     if a.len() > 2 {
-        return Err(it.type_error(&format!("update expected at most 1 argument, got {}", a.len() - 1)));
+        return Err(it.type_error(&format!(
+            "update expected at most 1 argument, got {}",
+            a.len() - 1
+        )));
     }
     if let Some(src) = a.get(1) {
         it.dict_update_from(&d, src)?;
@@ -195,7 +206,10 @@ fn set_this<'a>(it: &mut Interp, a: &'a [Value], name: &str) -> R<&'a Obj> {
         Some(Value::Obj(o)) if matches!(o.kind, Kind::Set(_) | Kind::FrozenSet(_)) => Ok(o),
         _ => {
             let t = a.first().map(|v| it.type_name_of(v)).unwrap_or_default();
-            Err(it.type_error(&format!("descriptor '{}' for 'set' objects doesn't apply to a '{}' object", name, t)))
+            Err(it.type_error(&format!(
+                "descriptor '{}' for 'set' objects doesn't apply to a '{}' object",
+                name, t
+            )))
         }
     }
 }
@@ -244,7 +258,10 @@ fn frozenset_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         Kind::FrozenSet(d) => d.borrow().clone(),
         _ => PyDict::new(),
     };
-    Ok(Value::Obj(Object::with_cls(cls, Kind::FrozenSet(RefCell::new(d)))))
+    Ok(Value::Obj(Object::with_cls(
+        cls,
+        Kind::FrozenSet(RefCell::new(d)),
+    )))
 }
 
 fn set_add(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -379,21 +396,32 @@ fn difference_update(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 fn symmetric_difference_update(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("symmetric_difference_update", a, 2, 2)?;
-    set_update_with(it, a, crate::ast::BinOp::BitXor, "symmetric_difference_update")
+    set_update_with(
+        it,
+        a,
+        crate::ast::BinOp::BitXor,
+        "symmetric_difference_update",
+    )
 }
 
 fn issubset(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("issubset", a, 2, 2)?;
     set_this(it, a, "issubset")?;
     let o = as_set_value(it, &a[1])?;
-    Ok(Value::Bool(it.native_compare(crate::ast::CmpOp::LtE, &a[0], &o)?.unwrap_or(false)))
+    Ok(Value::Bool(
+        it.native_compare(crate::ast::CmpOp::LtE, &a[0], &o)?
+            .unwrap_or(false),
+    ))
 }
 
 fn issuperset(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("issuperset", a, 2, 2)?;
     set_this(it, a, "issuperset")?;
     let o = as_set_value(it, &a[1])?;
-    Ok(Value::Bool(it.native_compare(crate::ast::CmpOp::GtE, &a[0], &o)?.unwrap_or(false)))
+    Ok(Value::Bool(
+        it.native_compare(crate::ast::CmpOp::GtE, &a[0], &o)?
+            .unwrap_or(false),
+    ))
 }
 
 fn set_isdisjoint(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -422,7 +450,11 @@ fn set_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 pub fn init(it: &mut Interp) {
-    let (dict, set, frozenset) = (it.types.dict.clone(), it.types.set.clone(), it.types.frozenset.clone());
+    let (dict, set, frozenset) = (
+        it.types.dict.clone(),
+        it.types.set.clone(),
+        it.types.frozenset.clone(),
+    );
     it.reg_new(&dict, dict_new);
     it.reg(&dict, "__init__", dict_init);
     let dm: &[(&'static str, NativeFn)] = &[
@@ -447,16 +479,32 @@ pub fn init(it: &mut Interp) {
     if let Some(d) = dict.dict.borrow().as_ref() {
         dict_set_str(d, "__hash__", Value::None);
     }
-    reg_slots(it, &dict, &["__getitem__", "__setitem__", "__delitem__", "__len__", "__contains__", "__iter__"]);
+    reg_slots(
+        it,
+        &dict,
+        &["__setitem__", "__delitem__", "__len__", "__iter__"],
+    );
+    reg_method_forms(&dict, &["__getitem__", "__contains__"]);
     reg_binops(it, &dict, &["__or__", "__ror__"]);
     reg_compare(it, &dict, false);
 
-    for vt in [it.types.dict_keys.clone(), it.types.dict_values.clone(), it.types.dict_items.clone()] {
+    for vt in [
+        it.types.dict_keys.clone(),
+        it.types.dict_values.clone(),
+        it.types.dict_items.clone(),
+    ] {
         it.reg(&vt, "isdisjoint", view_isdisjoint);
         it.reg(&vt, "__reversed__", view_reversed);
         it.reg(&vt, "__repr__", view_repr);
         reg_slots(it, &vt, &["__len__", "__contains__", "__iter__"]);
-        reg_binops(it, &vt, &["__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__", "__rxor__"]);
+        reg_binops(
+            it,
+            &vt,
+            &[
+                "__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__",
+                "__rxor__",
+            ],
+        );
         reg_compare(it, &vt, true);
     }
 
@@ -498,8 +546,16 @@ pub fn init(it: &mut Interp) {
         dict_set_str(d, "__hash__", Value::None);
     }
     for t in [&set, &frozenset] {
-        reg_slots(it, t, &["__len__", "__contains__", "__iter__"]);
-        reg_binops(it, t, &["__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__", "__rxor__"]);
+        reg_slots(it, t, &["__len__", "__iter__"]);
+        reg_method_forms(t, &["__contains__"]);
+        reg_binops(
+            it,
+            t,
+            &[
+                "__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__",
+                "__rxor__",
+            ],
+        );
         reg_compare(it, t, true);
     }
 }

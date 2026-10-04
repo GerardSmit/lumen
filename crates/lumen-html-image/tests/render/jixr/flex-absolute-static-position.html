@@ -1,0 +1,13 @@
+<!doctype html>
+<style>
+  html, body { margin: 0; width: 320px; height: 200px; }
+  .stage { position: absolute; left: 10px; width: 240px; height: 80px; background: #dbeafe; }
+  .center { display: flex; justify-content: center; align-items: center; }
+  .center { top: 10px; }
+  .reverse { top: 100px; display: flex; flex-direction: row-reverse; align-items: flex-end; }
+  .item { position: absolute; width: 40px; height: 20px; background: #dc2626; }
+  .reverse .item { background: #16a34a; }
+  .inset { left: 12px; background: #7c3aed; }
+</style>
+<div class="stage center"><div class="item"></div><div class="item inset"></div></div>
+<div class="stage reverse"><div class="item"></div></div>

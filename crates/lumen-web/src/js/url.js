@@ -709,6 +709,7 @@
       ctx.search_start = record[7];
       ctx.hash_start = record[8];
       ctx.scheme_type = record[9];
+      ctx.origin = record[10];
       if (this.#searchParams) {
         if (ctx.hasSearch) setURLSearchParams(this.#searchParams, this.search);
         else setURLSearchParams(this.#searchParams, undefined);
@@ -735,25 +736,7 @@
     }
 
     get origin() {
-      const protocol = this.#context.href.slice(0, this.#context.protocol_end);
-      if (this.#context.scheme_type !== 1) {
-        if (this.#context.scheme_type === 6) return "null";
-        return `${protocol}//${this.host}`;
-      }
-      if (protocol === "blob:") {
-        const path = this.pathname;
-        if (path.length > 0) {
-          try {
-            const out = new URL(path);
-            if (out.#context.scheme_type === 0 || out.#context.scheme_type === 2) {
-              return `${out.protocol}//${out.host}`;
-            }
-          } catch {
-            // Opaque origin.
-          }
-        }
-      }
-      return "null";
+      return this.#context.origin;
     }
 
     get protocol() {
@@ -911,7 +894,15 @@
         `The "obj" argument must be an instance of Blob.${describeReceived(obj)}`,
       );
     }
-    const id = crypto.randomUUID();
+    let id;
+    if (typeof globalThis.__lumenCreateObjectURL === "function") {
+      const snapshot = Blob[Symbol.for("lumen.blob.internals")].snapshot(obj);
+      id = globalThis.__lumenCreateObjectURL(snapshot.bytes, snapshot.type);
+    } else if (typeof globalThis.crypto?.randomUUID === "function") {
+      id = globalThis.crypto.randomUUID();
+    } else {
+      throw new Error("secure object URL identifier source is unavailable");
+    }
     objectURLs.set(id, obj);
     return `blob:nodedata:${id}`;
   }
@@ -927,7 +918,11 @@
     if (parsed.protocol !== "blob:") return;
     const path = parsed.pathname;
     if (!path.startsWith("nodedata:")) return;
-    objectURLs.delete(path.slice("nodedata:".length));
+    const id = path.slice("nodedata:".length);
+    objectURLs.delete(id);
+    if (typeof globalThis.__lumenRevokeObjectURL === "function") {
+      globalThis.__lumenRevokeObjectURL(id);
+    }
   }
   Object.defineProperties(URL, {
     createObjectURL: { __proto__: null, configurable: true, writable: true, enumerable: true, value: createObjectURL },

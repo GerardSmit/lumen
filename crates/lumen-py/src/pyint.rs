@@ -1,5 +1,6 @@
 //! Python `int` semantics on top of the shared arbitrary-precision integer.
 
+use crate::fmath;
 pub use lumen_common::bigint::BigInt;
 
 const HASH_MODULUS: u64 = (1 << 61) - 1;
@@ -51,7 +52,7 @@ impl PyInt for BigInt {
     }
 
     fn from_f64_trunc(f: f64) -> Self {
-        BigInt::from_f64(f.trunc()).unwrap_or_else(BigInt::zero)
+        BigInt::from_f64(fmath::trunc(f)).unwrap_or_else(BigInt::zero)
     }
 
     fn parse_signed(s: &str, radix: u32) -> Option<Self> {
@@ -66,7 +67,10 @@ impl PyInt for BigInt {
     fn py_hash(&self) -> i64 {
         let (neg, mag) = self.words();
         let m = HASH_MODULUS as u128;
-        let acc = mag.iter().rev().fold(0u128, |acc, &l| ((acc << 64) | l as u128) % m);
+        let acc = mag
+            .iter()
+            .rev()
+            .fold(0u128, |acc, &l| ((acc << 64) | l as u128) % m);
         let h = if neg { -(acc as i64) } else { acc as i64 };
         if h == -1 {
             -2
@@ -92,7 +96,12 @@ impl PyInt for BigInt {
         if bits.div_ceil(8) > len {
             return None;
         }
-        let mut bytes: Vec<u8> = mag.iter().flat_map(|l| l.to_le_bytes()).chain(std::iter::repeat(0)).take(len).collect();
+        let mut bytes: Vec<u8> = mag
+            .iter()
+            .flat_map(|l| l.to_le_bytes())
+            .chain(std::iter::repeat(0))
+            .take(len)
+            .collect();
         if neg {
             negate_le(&mut bytes);
         }
@@ -162,16 +171,31 @@ mod tests {
         let wide = p("-340282366920938463463374607431768211457");
         let bytes = wide.to_py_bytes(17, false, true).unwrap();
         assert_eq!(BigInt::from_py_bytes(&bytes, false, true), wide);
-        assert_eq!(BigInt::from_py_bytes(&[0xFF, 0xFF], false, false).to_i64(), Some(65535));
+        assert_eq!(
+            BigInt::from_py_bytes(&[0xFF, 0xFF], false, false).to_i64(),
+            Some(65535)
+        );
         assert_eq!(BigInt::from_py_bytes(&[], false, true).to_i64(), Some(0));
     }
 
     #[test]
     fn float_conversions() {
-        assert_eq!(BigInt::from_i64(1).shl(100).to_float(), Some(2f64.powi(100)));
+        assert_eq!(
+            BigInt::from_i64(1).shl(100).to_float(),
+            Some(2f64.powi(100))
+        );
         assert_eq!(BigInt::from_i64(1).shl(1024).to_float(), None);
-        assert_eq!(BigInt::from_i64(1).shl(1024).sub(&BigInt::from_i64(1)).to_float(), None);
-        assert_eq!(BigInt::from_f64_trunc(-1e20).to_string_radix(10), "-100000000000000000000");
+        assert_eq!(
+            BigInt::from_i64(1)
+                .shl(1024)
+                .sub(&BigInt::from_i64(1))
+                .to_float(),
+            None
+        );
+        assert_eq!(
+            BigInt::from_f64_trunc(-1e20).to_string_radix(10),
+            "-100000000000000000000"
+        );
         assert_eq!(BigInt::from_f64_trunc(2.9).to_i64(), Some(2));
         assert_eq!(BigInt::from_f64_trunc(-2.9).to_i64(), Some(-2));
     }

@@ -1,0 +1,237 @@
+prefix '<' 38 3
+prefix '>' 38 3
+prefix '=' 38 3
+prefix '!' 38 3
+prefix '@' 48 3
+prefix '' 48 3
+8 8 5 16
+16 4 4 8
+8 8 8 8 4
+7 4 0 4
+8 8 7 0
+@b -128 80 True
+@b 127 7f True
+@B 0 00 True
+@B 255 ff True
+@h -32768 0080 True
+@h 32767 ff7f True
+@H 65535 ffff True
+@i -2147483648 00000080 True
+@i 2147483647 ffffff7f True
+@I 4294967295 ffffffff True
+@l -9223372036854775808 0000000000000080 True
+@L 18446744073709551615 ffffffffffffffff True
+@q -9223372036854775808 0000000000000080 True
+@q 9223372036854775807 ffffffffffffff7f True
+@Q 18446744073709551615 ffffffffffffffff True
+@Q 0 0000000000000000 True
+@n -9223372036854775808 0000000000000080 True
+@N 18446744073709551615 ffffffffffffffff True
+@P 18446744073709551615 ffffffffffffffff True
+<b -128 80 True
+<b 127 7f True
+<B 0 00 True
+<B 255 ff True
+<h -32768 0080 True
+<h 32767 ff7f True
+<H 65535 ffff True
+<i -2147483648 00000080 True
+<i 2147483647 ffffff7f True
+<I 4294967295 ffffffff True
+<l -9223372036854775808 error 'l' format requires -2147483648 <= number <= 2147483647
+<L 18446744073709551615 error 'L' format requires 0 <= number <= 4294967295
+<q -9223372036854775808 0000000000000080 True
+<q 9223372036854775807 ffffffffffffff7f True
+<Q 18446744073709551615 ffffffffffffffff True
+<Q 0 0000000000000000 True
+<n -9223372036854775808 error bad char in struct format
+<N 18446744073709551615 error bad char in struct format
+<P 18446744073709551615 error bad char in struct format
+>b -128 80 True
+>b 127 7f True
+>B 0 00 True
+>B 255 ff True
+>h -32768 8000 True
+>h 32767 7fff True
+>H 65535 ffff True
+>i -2147483648 80000000 True
+>i 2147483647 7fffffff True
+>I 4294967295 ffffffff True
+>l -9223372036854775808 error 'l' format requires -2147483648 <= number <= 2147483647
+>L 18446744073709551615 error 'L' format requires 0 <= number <= 4294967295
+>q -9223372036854775808 8000000000000000 True
+>q 9223372036854775807 7fffffffffffffff True
+>Q 18446744073709551615 ffffffffffffffff True
+>Q 0 0000000000000000 True
+>n -9223372036854775808 error bad char in struct format
+>N 18446744073709551615 error bad char in struct format
+>P 18446744073709551615 error bad char in struct format
+=b -128 80 True
+=b 127 7f True
+=B 0 00 True
+=B 255 ff True
+=h -32768 0080 True
+=h 32767 ff7f True
+=H 65535 ffff True
+=i -2147483648 00000080 True
+=i 2147483647 ffffff7f True
+=I 4294967295 ffffffff True
+=l -9223372036854775808 error 'l' format requires -2147483648 <= number <= 2147483647
+=L 18446744073709551615 error 'L' format requires 0 <= number <= 4294967295
+=q -9223372036854775808 0000000000000080 True
+=q 9223372036854775807 ffffffffffffff7f True
+=Q 18446744073709551615 ffffffffffffffff True
+=Q 0 0000000000000000 True
+=n -9223372036854775808 error bad char in struct format
+=N 18446744073709551615 error bad char in struct format
+=P 18446744073709551615 error bad char in struct format
+!b -128 80 True
+!b 127 7f True
+!B 0 00 True
+!B 255 ff True
+!h -32768 8000 True
+!h 32767 7fff True
+!H 65535 ffff True
+!i -2147483648 80000000 True
+!i 2147483647 7fffffff True
+!I 4294967295 ffffffff True
+!l -9223372036854775808 error 'l' format requires -2147483648 <= number <= 2147483647
+!L 18446744073709551615 error 'L' format requires 0 <= number <= 4294967295
+!q -9223372036854775808 8000000000000000 True
+!q 9223372036854775807 7fffffffffffffff True
+!Q 18446744073709551615 ffffffffffffffff True
+!Q 0 0000000000000000 True
+!n -9223372036854775808 error bad char in struct format
+!N 18446744073709551615 error bad char in struct format
+!P 18446744073709551615 error bad char in struct format
+0100 0001 ffffffff fffffffffffffffe
+(-1,) (18446744073709551615,) (4294967295,)
+(-1,) (18446744073709551615,) (18446744073709551615,)
+(-1, 255, -1, 65535)
+b'\x01' b'\x00' b'\x01' b'\x00' b'\x01'
+(True,) (False,)
+b'a' (b'z',)
+b'\x01\x00' b'\x00\x00\x00\x00'
+b'\x07\x00\x00\x00' b'\x00\x00\x00\x00\x00\x00\x04@' b'\x00\x00\x00\x00\x00\x00\x1c@' b'\x00\x00\x00\x00\x00\x00\x08@'
+<e 0.0 0000 0.0
+<e -0.0 0080 -0.0
+<e 1.0 003c 1.0
+<e -1.5 00be -1.5
+<e 0.1 662e 0.0999755859375
+<e 65504.0 ff7b 65504.0
+<e 5.960464477539063e-08 0100 5.960464477539063e-08
+<e 1e-08 0000 0.0
+<e inf 007c inf
+<e -inf 00fc -inf
+>e 0.0 0000 0.0
+>e -0.0 8000 -0.0
+>e 1.0 3c00 1.0
+>e -1.5 be00 -1.5
+>e 0.1 2e66 0.0999755859375
+>e 65504.0 7bff 65504.0
+>e 5.960464477539063e-08 0001 5.960464477539063e-08
+>e 1e-08 0000 0.0
+>e inf 7c00 inf
+>e -inf fc00 -inf
+<f 0.0 00000000 0.0
+<f -0.0 00000080 -0.0
+<f 1.0 0000803f 1.0
+<f -1.5 0000c0bf -1.5
+<f 0.1 cdcccc3d 0.10000000149011612
+<f 65504.0 00e07f47 65504.0
+<f 5.960464477539063e-08 00008033 5.960464477539063e-08
+<f 1e-08 77cc2b32 9.99999993922529e-09
+<f inf 0000807f inf
+<f -inf 000080ff -inf
+>f 0.0 00000000 0.0
+>f -0.0 80000000 -0.0
+>f 1.0 3f800000 1.0
+>f -1.5 bfc00000 -1.5
+>f 0.1 3dcccccd 0.10000000149011612
+>f 65504.0 477fe000 65504.0
+>f 5.960464477539063e-08 33800000 5.960464477539063e-08
+>f 1e-08 322bcc77 9.99999993922529e-09
+>f inf 7f800000 inf
+>f -inf ff800000 -inf
+<d 0.0 0000000000000000 0.0
+<d -0.0 0000000000000080 -0.0
+<d 1.0 000000000000f03f 1.0
+<d -1.5 000000000000f8bf -1.5
+<d 0.1 9a9999999999b93f 0.1
+<d 65504.0 0000000000fcef40 65504.0
+<d 5.960464477539063e-08 000000000000703e 5.960464477539063e-08
+<d 1e-08 3a8c30e28e79453e 1e-08
+<d inf 000000000000f07f inf
+<d -inf 000000000000f0ff -inf
+>d 0.0 0000000000000000 0.0
+>d -0.0 8000000000000000 -0.0
+>d 1.0 3ff0000000000000 1.0
+>d -1.5 bff8000000000000 -1.5
+>d 0.1 3fb999999999999a 0.1
+>d 65504.0 40effc0000000000 65504.0
+>d 5.960464477539063e-08 3e70000000000000 5.960464477539063e-08
+>d 1e-08 3e45798ee2308c3a 1e-08
+>d inf 7ff0000000000000 inf
+>d -inf fff0000000000000 -inf
+@f 0.0 00000000 0.0
+@f -0.0 00000080 -0.0
+@f 1.0 0000803f 1.0
+@f -1.5 0000c0bf -1.5
+@f 0.1 cdcccc3d 0.10000000149011612
+@f 65504.0 00e07f47 65504.0
+@f 5.960464477539063e-08 00008033 5.960464477539063e-08
+@f 1e-08 77cc2b32 9.99999993922529e-09
+@f inf 0000807f inf
+@f -inf 000080ff -inf
+@d 0.0 0000000000000000 0.0
+@d -0.0 0000000000000080 -0.0
+@d 1.0 000000000000f03f 1.0
+@d -1.5 000000000000f8bf -1.5
+@d 0.1 9a9999999999b93f 0.1
+@d 65504.0 0000000000fcef40 65504.0
+@d 5.960464477539063e-08 000000000000703e 5.960464477539063e-08
+@d 1e-08 3a8c30e28e79453e 1e-08
+@d inf 000000000000f07f inf
+@d -inf 000000000000f0ff -inf
+@e 0.0 0000 0.0
+@e -0.0 0080 -0.0
+@e 1.0 003c 1.0
+@e -1.5 00be -1.5
+@e 0.1 662e 0.0999755859375
+@e 65504.0 ff7b 65504.0
+@e 5.960464477539063e-08 0100 5.960464477539063e-08
+@e 1e-08 0000 0.0
+@e inf 007c inf
+@e -inf 00fc -inf
+e 65504.0 ff7b
+e 65519.9 ff7b
+e 65520.0 OverflowError float too large to pack with e format
+e 65536.0 OverflowError float too large to pack with e format
+e 1e+300 OverflowError float too large to pack with e format
+e -65520.0 OverflowError float too large to pack with e format
+e -1e+300 OverflowError float too large to pack with e format
+e 5.960464477539063e-08 0100
+e 2.9802322387695312e-08 0000
+e 8.940696716308594e-08 0200
+e 1.4901161193847656e-08 0000
+e 1.0009765625 013c
+e 1.00048828125 003c
+e 1.0014648437500002 023c
+007e 00fe
+(5.960464477539063e-08,) (nan,) (nan,) (-inf,)
+True
+(1.100000023841858,) (1.1,)
+True
+OverflowError float too large to pack with f format
+0000807f 000080ff
+ffff7f7f
+OverflowError float too large to pack with f format
+b'ab\x00\x00\x00' b'ab' b'' b'x' b'hel'
+b'\x02ab' b'\x03abc\x00\x00\x00\x00\x00\x00' b'' b'\x00' 300 255
+(b'abc',) (b'ab',) (b'',) (b'',)
+(b'ab\x00cd',) (b'',) (b'ab', b'cde')
+b'\x00\x00' b'\x00\x00\x00' () () b''
+b'\x01\x00\x02\x00\x00\x00' b'\x01\x00\x00\x00\x02\x00\x00\x00' b'\x01\x00\x02\x00' b'\x01\x00\x01'
+b'\x01\x00\x00\x00\x02\x00\x00\x00' b'\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00' b'\x01\x00\x02\x00\x03\x00\x00\x00\x04\x00\x00\x00' b'a\x00\x00\x00\x01\x00\x00\x00'
+(1, 2, 3, 4) (256, 770, 4, 5, 6)
+(b'ab', 1, 2) (1, -1)

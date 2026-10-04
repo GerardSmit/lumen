@@ -15,7 +15,9 @@
 //! - [`node_error_text`]: Node's code-frame `stack` for a rejected source.
 //! - With `typed`: the analyzer ([`analyze`], [`TypeTable`], the checker behind `lumen typed`).
 
-pub use crate::parser::{error_code, side_table_for, ParamTy, SideFn, SideTable, TsSpan};
+pub use crate::parser::error_code;
+#[cfg(feature = "compiler")]
+pub use crate::parser::{side_table_for, ParamTy, SideFn, SideTable, TsSpan};
 
 pub mod options;
 pub use options::CompilerOptions;

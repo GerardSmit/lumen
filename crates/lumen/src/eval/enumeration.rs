@@ -47,6 +47,27 @@ impl Interp {
             // Key enumeration reads the property map: a split view becomes an Array first.
             self.materialize(&o);
             let ov = Value::Obj(o.clone());
+            #[cfg(feature = "embed")]
+            if self.is_window_proxy(&o) {
+                let keys = crate::builtins::window_proxy_enum_string_keys(self, &ov)
+                    .map_err(Abrupt::Throw)?
+                    .expect("WindowProxy key enumeration remains registered");
+                for key in keys {
+                    if let Value::Str(key) = key {
+                        let key = key.to_string();
+                        if seen.insert(key.clone()) {
+                            out.push(key);
+                        }
+                    }
+                }
+                let parent = crate::builtins::js_get_prototype_of(self, &ov)
+                    .map_err(Abrupt::Throw)?;
+                cur = match parent {
+                    Value::Obj(parent) => Some(parent),
+                    _ => None,
+                };
+                continue;
+            }
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].
             if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {

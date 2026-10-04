@@ -1,9 +1,10 @@
 //! Object model: values, heap objects and their payloads.
 
-use crate::pyint::BigInt;
 use crate::bytecode::Code;
 use crate::dict::PyDict;
+use crate::pyint::BigInt;
 use crate::vm::{Frame, Interp};
+pub use lumen_common::buffer::ByteStore;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -60,6 +61,7 @@ impl Drop for Object {
     fn drop(&mut self) {
         let id = self.id.get();
         if id != 0 {
+            crate::weak::on_object_drop(id);
             let _ = FREE_IDS.try_with(|f| f.borrow_mut().push(id));
         }
     }
@@ -91,8 +93,18 @@ impl PyStr {
 
     pub fn from_box(s: Box<str>) -> PyStr {
         let ascii = s.is_ascii();
-        let nchars = if ascii { s.len() } else { s.chars().count() };
-        PyStr { s, ascii, nchars, hash: Cell::new(0), hashed: Cell::new(false) }
+        let nchars = if ascii {
+            s.len()
+        } else {
+            lumen_common::smuggle::count_code_points(&s)
+        };
+        PyStr {
+            s,
+            ascii,
+            nchars,
+            hash: Cell::new(0),
+            hashed: Cell::new(false),
+        }
     }
 
     pub fn hash(&self) -> i64 {
@@ -107,15 +119,16 @@ impl PyStr {
         if self.ascii {
             char_idx
         } else {
-            self.s.char_indices().nth(char_idx).map_or(self.s.len(), |(i, _)| i)
+            lumen_common::smuggle::code_point_offset(&self.s, char_idx)
         }
     }
 
-    pub fn char_at(&self, i: usize) -> Option<char> {
+    /// The code point at index `i`.
+    pub fn char_at(&self, i: usize) -> Option<u32> {
         if self.ascii {
-            self.s.as_bytes().get(i).map(|&b| b as char)
+            self.s.as_bytes().get(i).map(|&b| b as u32)
         } else {
-            self.s.chars().nth(i)
+            lumen_common::smuggle::code_points(&self.s).nth(i)
         }
     }
 
@@ -153,14 +166,24 @@ pub enum Layout {
 pub const TF_HEAP: u32 = 1;
 pub const TF_NO_INSTANCE_DICT: u32 = 2;
 pub const TF_ABSTRACT: u32 = 4;
+/// Special methods defined in the type's own dict are dispatched like those of a heap class.
+pub const TF_DISPATCH: u32 = 8;
+/// The type cannot be subclassed (no `Py_TPFLAGS_BASETYPE`).
+pub const TF_FINAL: u32 = 16;
+/// A core builtin type: setting or deleting its attributes is a TypeError.
+pub const TF_IMMUTABLE: u32 = 32;
 
 pub struct TypeData {
     pub name: RefCell<Rc<str>>,
+    /// `__qualname__`, when it differs from `name` (taken out of the class namespace).
+    pub qualname: RefCell<Option<Rc<str>>>,
     pub bases: RefCell<Vec<Obj>>,
     pub mro: RefCell<Vec<Obj>>,
     pub layout: Cell<Layout>,
     pub flags: Cell<u32>,
     pub hooks: Cell<(u64, u8)>,
+    /// The (mangled) names a class statement's `__slots__` declares; `None` without `__slots__`.
+    pub slots: RefCell<Option<Rc<[Rc<str>]>>>,
 }
 
 pub struct Function {
@@ -172,12 +195,23 @@ pub struct Function {
     pub name: RefCell<Rc<str>>,
     pub qualname: RefCell<Rc<str>>,
     pub annotations: RefCell<Option<Obj>>,
+    /// `__type_params__`; `None` means the empty tuple.
+    pub type_params: RefCell<Option<Value>>,
 }
 
 pub struct NativeData {
     pub name: &'static str,
     pub f: NativeFn,
     pub method: bool,
+    /// Set for natives bound with `lumen_bind` (`__text_signature__`, `__module__`, ...).
+    pub desc: Option<&'static lumen_bind::FnDesc>,
+    /// The module or class a hand-registered native belongs to (`desc` gives it for bound ones).
+    pub owner: Option<NativeOwner>,
+}
+
+pub enum NativeOwner {
+    Module(Rc<str>),
+    Class(Obj),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -200,13 +234,19 @@ pub struct GenData {
     pub name: RefCell<Rc<str>>,
     pub qualname: RefCell<Rc<str>>,
     pub running_async: Cell<bool>,
+    pub hooks_inited: Cell<bool>,
 }
 
 #[derive(Clone)]
 pub struct TbEntry {
     pub file: Rc<str>,
     pub line: u32,
+    /// Index of the instruction that raised (`tb_lasti` is twice this, as in CPython's
+    /// 2-byte code units).
+    pub lasti: u32,
     pub name: Rc<str>,
+    pub code: Rc<Code>,
+    pub globals: Obj,
 }
 
 pub struct ExcData {
@@ -233,37 +273,71 @@ pub enum ViewKind {
 }
 
 pub enum IterState {
-    List { list: Obj, idx: usize },
-    Tuple { tup: Obj, idx: usize },
-    Str { s: Obj, pos: usize },
-    Bytes { b: Obj, idx: usize },
-    Range { cur: i64, stop: i64, step: i64 },
-    Dict { dict: Obj, pos: usize, len: usize, kind: ViewKind },
-    Set { set: Obj, pos: usize, len: usize },
-    Seq { obj: Value, idx: i64 },
-    CallIter { f: Value, sentinel: Value, done: bool },
-    Reversed { seq: Value, idx: i64 },
-    Enumerate { it: Value, idx: i64 },
-    Zip { its: Vec<Value>, strict: bool },
-    Map { f: Value, its: Vec<Value> },
-    Filter { f: Value, it: Value },
+    List {
+        list: Obj,
+        idx: usize,
+    },
+    Tuple {
+        tup: Obj,
+        idx: usize,
+    },
+    Str {
+        s: Obj,
+        pos: usize,
+    },
+    Bytes {
+        b: Obj,
+        idx: usize,
+    },
+    Range {
+        cur: i64,
+        stop: i64,
+        step: i64,
+    },
+    Dict {
+        dict: Obj,
+        pos: usize,
+        len: usize,
+        kind: ViewKind,
+    },
+    Set {
+        set: Obj,
+        pos: usize,
+        len: usize,
+    },
+    Seq {
+        obj: Value,
+        idx: i64,
+    },
+    CallIter {
+        f: Value,
+        sentinel: Value,
+        done: bool,
+    },
+    Reversed {
+        seq: Value,
+        idx: i64,
+    },
+    Enumerate {
+        it: Value,
+        idx: i64,
+    },
+    Zip {
+        its: Vec<Value>,
+        strict: bool,
+    },
+    Map {
+        f: Value,
+        its: Vec<Value>,
+    },
+    Filter {
+        f: Value,
+        it: Value,
+    },
     Native(Box<dyn FnMut(&mut Interp) -> R<Option<Value>>>),
+    /// A `Native` iterator whose step is running (its closure is out of the cell).
+    Running,
     Empty,
-}
-
-pub enum FileMode {
-    Stdout,
-    Stderr,
-    Stdin,
-    Read { data: Vec<u8>, pos: usize },
-    Write { path: String, buf: Vec<u8>, append: bool },
-    Closed,
-}
-
-pub struct FileData {
-    pub mode: FileMode,
-    pub text: bool,
-    pub name: String,
 }
 
 pub struct RangeData {
@@ -284,7 +358,8 @@ pub enum Kind {
     Set(RefCell<PyDict>),
     FrozenSet(RefCell<PyDict>),
     Bytes(Vec<u8>),
-    ByteArray(RefCell<Vec<u8>>),
+    /// A growable store, shared with the memoryviews that export it.
+    ByteArray(Rc<ByteStore>),
     Type(TypeData),
     Function(Box<Function>),
     Method(Value, Value),
@@ -303,22 +378,38 @@ pub enum Kind {
     ClassMethod(Value),
     Super(Value, Value, Value),
     DictView(Obj, ViewKind),
-    File(RefCell<FileData>),
     Frame,
     AsyncGenValue(Value),
+    /// Native state owned by a builtin extension type (deque, partial, weakref, ...).
+    Opaque(RefCell<Box<dyn std::any::Any>>),
 }
 
 impl Object {
     pub fn new(kind: Kind) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(None), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: None,
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn with_cls(cls: Obj, kind: Kind) -> Obj {
-        Rc::new(Object { cls: Some(cls), dict: RefCell::new(None), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: Some(cls),
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn with_dict(kind: Kind, dict: Obj) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(Some(dict)), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: None,
+            dict: RefCell::new(Some(dict)),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn type_data(&self) -> Option<&TypeData> {
@@ -326,6 +417,37 @@ impl Object {
             Kind::Type(t) => Some(t),
             _ => None,
         }
+    }
+}
+
+/// Literal conversions (binding defaults: `#[default(0)] start: Value`).
+impl From<i32> for Value {
+    fn from(i: i32) -> Value {
+        Value::Int(i as i64)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(i: i64) -> Value {
+        Value::Int(i)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(x: f64) -> Value {
+        Value::Float(x)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Value {
+        Value::Bool(b)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Value {
+        Value::str(s)
     }
 }
 
@@ -352,6 +474,10 @@ impl Value {
 
     pub fn bytes(v: Vec<u8>) -> Value {
         Value::Obj(Object::new(Kind::Bytes(v)))
+    }
+
+    pub fn bytearray(v: Vec<u8>) -> Value {
+        Value::Obj(Object::new(Kind::ByteArray(ba_store(v))))
     }
 
     pub fn big(b: BigInt) -> Value {
@@ -382,6 +508,14 @@ impl Value {
         }
     }
 
+    /// The text of an exact `str` (not a subclass instance, whose `__str__` may differ).
+    pub fn as_exact_str(&self) -> Option<&str> {
+        match self {
+            Value::Obj(o) if o.cls.is_none() => self.as_str(),
+            _ => None,
+        }
+    }
+
     pub fn as_pystr(&self) -> Option<&PyStr> {
         match self {
             Value::Obj(o) => match &o.kind {
@@ -398,7 +532,9 @@ impl Value {
 
     pub fn is(&self, o: &Value) -> bool {
         match (self, o) {
-            (Value::None, Value::None) | (Value::NotImplemented, Value::NotImplemented) | (Value::Ellipsis, Value::Ellipsis) => true,
+            (Value::None, Value::None)
+            | (Value::NotImplemented, Value::NotImplemented)
+            | (Value::Ellipsis, Value::Ellipsis) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
@@ -479,4 +615,9 @@ pub fn set_of(v: &Value) -> Option<&RefCell<PyDict>> {
         },
         _ => None,
     }
+}
+
+/// The store of a new `bytearray` holding `v`.
+pub fn ba_store(v: Vec<u8>) -> Rc<ByteStore> {
+    Rc::new(ByteStore::new(v).growable())
 }

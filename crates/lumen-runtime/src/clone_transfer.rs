@@ -4,7 +4,7 @@
 //! A getter may post another message without overwriting the outer frame. Delivery replaces the incoming
 //! frame; deserialization's `finish` releases it, and realm teardown drops both frames.
 use lumen::embed::SharedBufferHandle;
-use lumen_host::{Ctx, Extension, Value, ops};
+use lumen_host::{ops, Ctx, Extension, Value};
 
 const MAX_ATTACHMENTS: usize = 1024;
 const MAX_NESTED_FRAMES: usize = 32;
@@ -158,6 +158,7 @@ fn import_shared(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "clone-transfer",
+        modules: &[],
         globals: &[],
         namespaces: &[(
             "__cloneTransfer",

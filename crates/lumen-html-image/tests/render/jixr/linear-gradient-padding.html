@@ -1,0 +1,12 @@
+<!doctype html>
+<!--
+  jixr-compare: threshold=4 max-diff-ratio=0.07
+  The gradient spans the padding box (background-origin default) in both engines; the Window and
+  Image backends differ from Chromium by at most 1 channel unit across the gradient's rounding
+  boundary (~6% of pixels), the recorded gradient antialiasing class.
+-->
+<style>
+html,body{margin:0;background:#fff}
+.stage{width:220px;height:120px;background:#e8eef8;padding:10px}
+.a{width:100px;height:50px;padding:10px;border:6px solid #34a853;background-image:linear-gradient(to bottom,#ff0000,#0000ff);background-color:#e8eef8}
+</style><div class=stage><div class=a></div></div>

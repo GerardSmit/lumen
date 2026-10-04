@@ -23,7 +23,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         ) {
             return Err(i.make_error("TypeError", "Atomics requires an integer TypedArray"));
         }
-        if write && i.immutable_buffers.contains(&info.buffer) {
+        if write && i.buffer_immutable(info.buffer) {
             return Err(i.make_error(
                 "TypeError",
                 "Atomics: cannot write into a view over an immutable ArrayBuffer",
@@ -94,7 +94,11 @@ pub(super) fn install_atomics(it: &mut Interp) {
         })
     }
 
-    it.def_method(&atomics, "add", 3, |i, _t, a| rmw(i, a, |o, v| o + v));
+    fn add(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+        rmw(i, a, |o, v| o + v)
+    }
+    it.atomic_intrinsics[0] = add as *const () as usize;
+    it.def_method(&atomics, "add", 3, add);
     it.def_method(&atomics, "sub", 3, |i, _t, a| rmw(i, a, |o, v| o - v));
     it.def_method(&atomics, "and", 3, |i, _t, a| rmw(i, a, |o, v| o & v));
     it.def_method(&atomics, "or", 3, |i, _t, a| rmw(i, a, |o, v| o | v));
@@ -117,7 +121,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             Value::Num(val as f64)
         })
     });
-    it.def_method(&atomics, "compareExchange", 4, |i, _t, a| {
+    fn compare_exchange(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
         let (info, idx) = target_rw(i, a, true)?;
         let expected = operand(i, &info, &arg(a, 2))?;
         let replacement = operand(i, &info, &arg(a, 3))?;
@@ -139,7 +143,9 @@ pub(super) fn install_atomics(it: &mut Interp) {
         } else {
             Value::Num(old as f64)
         })
-    });
+    }
+    it.atomic_intrinsics[1] = compare_exchange as *const () as usize;
+    it.def_method(&atomics, "compareExchange", 4, compare_exchange);
     it.def_method(&atomics, "isLockFree", 1, |i, _t, a| {
         let n = ab(i.to_number(&arg(a, 0)))?;
         Ok(Value::Bool(matches!(n as i64, 1 | 2 | 4 | 8)))
@@ -196,7 +202,11 @@ pub(super) fn install_atomics(it: &mut Interp) {
             ));
         }
         let byte_index = info.offset + idx * info.kind.elsize();
-        let timeout_ms = if q.is_nan() { f64::INFINITY } else { q.max(0.0) };
+        let timeout_ms = if q.is_nan() {
+            f64::INFINITY
+        } else {
+            q.max(0.0)
+        };
         let report = |i: &Interp, phase| {
             if let Some(hook) = &i.atomics_wait_hook {
                 hook(&crate::interpreter::AtomicsWaitEvent {
@@ -216,7 +226,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             report(i, crate::interpreter::AtomicsWaitPhase::NotEqual);
             return Ok(Value::str("not-equal"));
         };
-        let interrupt = i.interrupt.clone();
+        let interrupt = i.stop.interrupt_flag().cloned();
         let woken =
             crate::interpreter::futex_block(&waiter, id, byte_index, timeout, interrupt.as_deref());
         if !woken {

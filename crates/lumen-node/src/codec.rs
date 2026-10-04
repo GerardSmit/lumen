@@ -1,5 +1,5 @@
-//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url) and byte
-//! search, with Node's exact semantics — including its lenient decoders: base64 skips characters
+//! Buffer's string codecs (utf8, utf16le, latin1, ascii, hex, base64, base64url),
+//! with Node's exact semantics — including its lenient decoders: base64 skips characters
 //! outside the alphabet and stops at `=`, hex stops at the first invalid pair, utf8 decodes with
 //! U+FFFD replacement of maximal subparts (WHATWG / V8).
 //!
@@ -19,24 +19,10 @@ pub const BASE64: u32 = 4;
 pub const BASE64URL: u32 = 5;
 pub const UTF16LE: u32 = 6;
 
-const SMUGGLE_BASE: u32 = 0x10F800;
-
-/// The UTF-16 unit a smuggled scalar stands for.
-#[inline]
-fn smuggled(c: char) -> Option<u16> {
-    let v = c as u32;
-    if (SMUGGLE_BASE..SMUGGLE_BASE + 0x800).contains(&v) {
-        Some((v - SMUGGLE_BASE + 0xD800) as u16)
-    } else {
-        None
-    }
-}
-
-/// Every smuggled scalar starts `F4 8F`; a string without an `F4` byte has none.
-#[inline]
-fn may_smuggle(s: &str) -> bool {
-    s.as_bytes().contains(&0xF4)
-}
+use lumen_common::smuggle::{may_contain as may_smuggle, smuggle, smuggled, Spelling};
+use lumen_common::utf;
+use std::borrow::Cow;
+use std::convert::Infallible;
 
 /// Call `f` with each UTF-16 code unit of `s` (smuggled scalars decode to their surrogates).
 #[inline]
@@ -138,31 +124,25 @@ pub fn utf8_len(s: &str) -> usize {
 /// Rewrite characters >= U+10F800 (which a decoder may produce from valid input) as their
 /// smuggled surrogate pairs, the only form lumen strings hold them in.
 pub(crate) fn canonical(s: String) -> String {
-    if !may_smuggle(&s) {
-        return s;
-    }
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        let v = c as u32;
-        if v >= SMUGGLE_BASE {
-            let w = v - 0x10000;
-            let hi = 0xD800 + (w >> 10);
-            let lo = 0xDC00 + (w & 0x3FF);
-            out.push(char::from_u32(SMUGGLE_BASE + hi - 0xD800).unwrap());
-            out.push(char::from_u32(SMUGGLE_BASE + lo - 0xD800).unwrap());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    lumen_common::smuggle::utf16_text_owned(s)
 }
 
 pub fn utf8_decode(bytes: &[u8]) -> String {
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_owned(),
-        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-    };
-    canonical(s)
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return canonical(s.to_owned());
+    }
+    let mut out = String::with_capacity(bytes.len() + 8);
+    let _ = utf::decode_utf8::<Infallible>(
+        &mut Cow::Borrowed(bytes),
+        true,
+        Spelling::Utf16,
+        &mut out,
+        |_, m, out| {
+            out.push('\u{FFFD}');
+            Ok(m.end)
+        },
+    );
+    out
 }
 
 // ---- latin1 / ascii / utf16le -------------------------------------------------------------------
@@ -204,223 +184,47 @@ pub fn utf16le_encode(s: &str) -> Vec<u8> {
     out
 }
 
-/// Units -> string: valid pairs combine, lone surrogates are smuggled.
-pub fn from_units(units: impl Iterator<Item = u16>) -> String {
-    let mut out = String::new();
-    let mut pending: Option<u16> = None;
-    let push_lone = |out: &mut String, u: u16| {
-        out.push(char::from_u32(SMUGGLE_BASE + (u as u32 - 0xD800)).unwrap());
-    };
-    for u in units {
-        if let Some(hi) = pending.take() {
-            if (0xDC00..0xE000).contains(&u) {
-                let cp = 0x10000 + (((hi as u32) - 0xD800) << 10) + (u as u32 - 0xDC00);
-                if cp >= SMUGGLE_BASE {
-                    push_lone(&mut out, hi);
-                    push_lone(&mut out, u);
-                } else {
-                    out.push(char::from_u32(cp).unwrap());
-                }
-                continue;
+/// Node's utf16le: lone surrogates are kept and an odd last byte is dropped.
+pub fn utf16le_decode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    let _ = utf::decode_utf16::<Infallible>(
+        &mut Cow::Borrowed(bytes),
+        0,
+        false,
+        true,
+        Spelling::Utf16,
+        &mut out,
+        |data, m, out| {
+            if m.end - m.start < 2 {
+                return Ok(m.end);
             }
-            push_lone(&mut out, hi);
-        }
-        match u {
-            0xD800..=0xDBFF => pending = Some(u),
-            0xDC00..=0xDFFF => push_lone(&mut out, u),
-            _ => out.push(char::from_u32(u as u32).unwrap()),
-        }
-    }
-    if let Some(hi) = pending {
-        push_lone(&mut out, hi);
-    }
+            out.push(smuggle(u16::from_le_bytes([
+                data[m.start],
+                data[m.start + 1],
+            ])));
+            Ok(m.start + 2)
+        },
+    );
     out
 }
 
-pub fn utf16le_decode(bytes: &[u8]) -> String {
-    from_units(
-        bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]])),
-    )
-}
+// ---- hex / base64 (shared byte codecs; Node's lenient decoders) --------------------------------
 
-// ---- hex ----------------------------------------------------------------------------------------
+pub use lumen_common::codec::hex_encode;
 
-const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-pub fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = vec![0u8; bytes.len() * 2];
-    for (o, &b) in out.chunks_exact_mut(2).zip(bytes) {
-        o[0] = HEX_DIGITS[(b >> 4) as usize];
-        o[1] = HEX_DIGITS[(b & 15) as usize];
-    }
-    // SAFETY: hex digits are ASCII.
-    unsafe { String::from_utf8_unchecked(out) }
+#[inline]
+pub fn hex_decode(s: &str) -> Vec<u8> {
+    lumen_common::codec::hex_decode_lenient(s.as_bytes())
 }
 
 #[inline]
-fn unhex(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => 0xff,
-    }
-}
-
-/// Node's hex decode: pairs until the first invalid one (an odd trailing digit is dropped).
-pub fn hex_decode(s: &str) -> Vec<u8> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len() / 2);
-    for pair in b.chunks_exact(2) {
-        let (hi, lo) = (unhex(pair[0]), unhex(pair[1]));
-        if hi == 0xff || lo == 0xff {
-            break;
-        }
-        out.push(hi << 4 | lo);
-    }
-    out
-}
-
-// ---- base64 -------------------------------------------------------------------------------------
-
-const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
 pub fn base64_encode(bytes: &[u8], url: bool) -> String {
-    let alpha = if url { B64URL } else { B64 };
-    let mut out = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut chunks = bytes.chunks_exact(3);
-    for c in &mut chunks {
-        let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
-        out.extend_from_slice(&[
-            alpha[(n >> 18) as usize & 63],
-            alpha[(n >> 12) as usize & 63],
-            alpha[(n >> 6) as usize & 63],
-            alpha[n as usize & 63],
-        ]);
-    }
-    let rest = chunks.remainder();
-    match rest.len() {
-        1 => {
-            let n = (rest[0] as u32) << 16;
-            out.push(alpha[(n >> 18) as usize & 63]);
-            out.push(alpha[(n >> 12) as usize & 63]);
-            if !url {
-                out.extend_from_slice(b"==");
-            }
-        }
-        2 => {
-            let n = (rest[0] as u32) << 16 | (rest[1] as u32) << 8;
-            out.push(alpha[(n >> 18) as usize & 63]);
-            out.push(alpha[(n >> 12) as usize & 63]);
-            out.push(alpha[(n >> 6) as usize & 63]);
-            if !url {
-                out.push(b'=');
-            }
-        }
-        _ => {}
-    }
-    // SAFETY: the alphabet is ASCII.
-    unsafe { String::from_utf8_unchecked(out) }
+    lumen_common::codec::base64_encode(bytes, url, !url)
 }
 
-/// Both alphabets decode in both encodings, as in Node. 0xff = not in the alphabet.
-const UNB64: [u8; 256] = {
-    let mut t = [0xffu8; 256];
-    let mut i = 0;
-    while i < 64 {
-        t[B64[i] as usize] = i as u8;
-        t[B64URL[i] as usize] = i as u8;
-        i += 1;
-    }
-    t
-};
-
-/// Node's `base64_decoded_size`: the buffer it allocates (decoding never writes past it).
-fn base64_decoded_size(src: &[u8]) -> usize {
-    let mut size = src.len();
-    if size < 2 {
-        return 0;
-    }
-    if src[size - 1] == b'=' {
-        size -= 1;
-        if src[size - 1] == b'=' {
-            size -= 1;
-        }
-    }
-    let rem = size % 4;
-    let mut n = size / 4 * 3;
-    if rem != 0 {
-        if n == 0 && rem == 1 {
-            n = 0;
-        } else {
-            n += 1 + (rem == 3) as usize;
-        }
-    }
-    n
-}
-
-/// Node's lenient base64 decode (either alphabet): characters outside the alphabet are skipped,
-/// `=` ends the input, and a trailing partial group yields the bytes it completes.
+#[inline]
 pub fn base64_decode(s: &str) -> Vec<u8> {
-    let src = s.as_bytes();
-    let cap = base64_decoded_size(src);
-    let mut out = Vec::with_capacity(cap);
-    // Fast path: whole groups of clean alphabet characters.
-    let mut i = 0;
-    while i + 4 <= src.len() && out.len() + 3 <= cap {
-        let a = UNB64[src[i] as usize];
-        let b = UNB64[src[i + 1] as usize];
-        let c = UNB64[src[i + 2] as usize];
-        let d = UNB64[src[i + 3] as usize];
-        if (a | b | c | d) & 0x80 != 0 {
-            break;
-        }
-        let n = (a as u32) << 18 | (b as u32) << 12 | (c as u32) << 6 | d as u32;
-        out.extend_from_slice(&[(n >> 16) as u8, (n >> 8) as u8, n as u8]);
-        i += 4;
-    }
-    // Slow path (Node's base64_decode_group_slow), from wherever the fast path stopped.
-    let mut quad = [0u8; 4];
-    let mut q = 0;
-    while i < src.len() {
-        let c = src[i];
-        i += 1;
-        let v = UNB64[c as usize];
-        if v == 0xff {
-            if c == b'=' {
-                break;
-            }
-            continue;
-        }
-        quad[q] = v;
-        q += 1;
-        if q == 4 {
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[0] << 2 | quad[1] >> 4);
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[1] << 4 | quad[2] >> 2);
-            if out.len() >= cap {
-                break;
-            }
-            out.push(quad[2] << 6 | quad[3]);
-            q = 0;
-        }
-    }
-    // A partial final group: 2 characters make 1 byte, 3 make 2.
-    if q >= 2 && out.len() < cap {
-        out.push(quad[0] << 2 | quad[1] >> 4);
-        if q == 3 && out.len() < cap {
-            out.push(quad[1] << 4 | quad[2] >> 2);
-        }
-    }
-    out
+    lumen_common::codec::base64_decode_lenient(s.as_bytes())
 }
 
 /// `Buffer.byteLength(s, 'base64')`, Node's formula (no decoding).
@@ -515,65 +319,6 @@ pub fn write(dst: &mut [u8], s: &str, enc: u32) -> usize {
     }
 }
 
-// ---- search -------------------------------------------------------------------------------------
-
-/// Index of the first `b` in `hay` (word-at-a-time: 8 bytes per step on the long runs between
-/// candidates, which is what a byte search spends its time on).
-pub fn memchr(b: u8, hay: &[u8]) -> Option<usize> {
-    const LO: u64 = 0x0101_0101_0101_0101;
-    const HI: u64 = 0x8080_8080_8080_8080;
-    let pat = LO.wrapping_mul(b as u64);
-    let mut i = 0;
-    while i + 8 <= hay.len() {
-        let w = u64::from_le_bytes(hay[i..i + 8].try_into().unwrap()) ^ pat;
-        if (w.wrapping_sub(LO) & !w & HI) != 0 {
-            break; // a match in this word: finish bytewise
-        }
-        i += 8;
-    }
-    hay[i..].iter().position(|&x| x == b).map(|p| p + i)
-}
-
-/// First index >= `from` where `needle` occurs in `hay`.
-pub fn index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if from > hay.len() {
-        return None;
-    }
-    if needle.is_empty() {
-        return Some(from);
-    }
-    let first = needle[0];
-    let last_start = hay.len().checked_sub(needle.len())?;
-    let mut i = from;
-    while i <= last_start {
-        match memchr(first, &hay[i..=last_start]) {
-            None => return None,
-            Some(p) => {
-                i += p;
-                if &hay[i..i + needle.len()] == needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-        }
-    }
-    None
-}
-
-/// Last index <= `from` where `needle` occurs in `hay`.
-pub fn last_index_of(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.len() > hay.len() {
-        return None;
-    }
-    let start = from.min(hay.len() - needle.len());
-    if needle.is_empty() {
-        return Some(start);
-    }
-    (0..=start)
-        .rev()
-        .find(|&i| hay[i] == needle[0] && &hay[i..i + needle.len()] == needle)
-}
-
 // ---- validation ---------------------------------------------------------------------------------
 
 pub fn is_utf8(bytes: &[u8]) -> bool {
@@ -583,6 +328,7 @@ pub fn is_utf8(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen_common::smuggle::SMUGGLE_BASE;
 
     #[test]
     fn base64_node_semantics() {
@@ -641,21 +387,5 @@ mod tests {
         assert_eq!(write(&mut d, "ab\u{e9}", UTF8), 2);
         let mut d = [0u8; 3];
         assert_eq!(write(&mut d, "ab", UTF16LE), 2);
-    }
-
-    #[test]
-    fn search() {
-        assert_eq!(index_of(b"abcabc", b"ca", 0), Some(2));
-        assert_eq!(index_of(b"abcabc", b"abc", 1), Some(3));
-        assert_eq!(index_of(b"abc", b"", 2), Some(2));
-        assert_eq!(index_of(b"abc", b"d", 0), None);
-        assert_eq!(last_index_of(b"abcabc", b"abc", 6), Some(3));
-        assert_eq!(last_index_of(b"abcabc", b"abc", 2), Some(0));
-        let hay: Vec<u8> = (0..1000u32).map(|i| (i * 31 + 7) as u8).collect();
-        for b in 0..=255u8 {
-            assert_eq!(memchr(b, &hay), hay.iter().position(|&x| x == b), "byte {b}");
-            assert_eq!(memchr(b, &hay[3..17]), hay[3..17].iter().position(|&x| x == b));
-        }
-        assert_eq!(index_of(&hay, &hay[500..505], 0), Some(500 % 256));
     }
 }

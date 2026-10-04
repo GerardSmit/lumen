@@ -214,177 +214,16 @@ pub(crate) fn scan_field_expr(
     msg("f-string: expecting '}'")
 }
 
-const NAMES: &[(&str, char)] = &[
-    ("NULL", '\0'),
-    ("SPACE", ' '),
-    ("NO-BREAK SPACE", '\u{a0}'),
-    ("EM SPACE", '\u{2003}'),
-    ("EN SPACE", '\u{2002}'),
-    ("THIN SPACE", '\u{2009}'),
-    ("ZERO WIDTH SPACE", '\u{200b}'),
-    ("ZERO WIDTH JOINER", '\u{200d}'),
-    ("ZERO WIDTH NON-JOINER", '\u{200c}'),
-    ("LINE FEED", '\n'),
-    ("CARRIAGE RETURN", '\r'),
-    ("CHARACTER TABULATION", '\t'),
-    ("BULLET", '\u{2022}'),
-    ("EM DASH", '\u{2014}'),
-    ("EN DASH", '\u{2013}'),
-    ("HYPHEN", '\u{2010}'),
-    ("MINUS SIGN", '\u{2212}'),
-    ("HORIZONTAL ELLIPSIS", '\u{2026}'),
-    ("MIDDLE DOT", '\u{b7}'),
-    ("DEGREE SIGN", '\u{b0}'),
-    ("COPYRIGHT SIGN", '\u{a9}'),
-    ("REGISTERED SIGN", '\u{ae}'),
-    ("TRADE MARK SIGN", '\u{2122}'),
-    ("EURO SIGN", '\u{20ac}'),
-    ("POUND SIGN", '\u{a3}'),
-    ("YEN SIGN", '\u{a5}'),
-    ("CENT SIGN", '\u{a2}'),
-    ("SECTION SIGN", '\u{a7}'),
-    ("PILCROW SIGN", '\u{b6}'),
-    ("MICRO SIGN", '\u{b5}'),
-    ("PLUS-MINUS SIGN", '\u{b1}'),
-    ("MULTIPLICATION SIGN", '\u{d7}'),
-    ("DIVISION SIGN", '\u{f7}'),
-    ("LEFT DOUBLE QUOTATION MARK", '\u{201c}'),
-    ("RIGHT DOUBLE QUOTATION MARK", '\u{201d}'),
-    ("LEFT SINGLE QUOTATION MARK", '\u{2018}'),
-    ("RIGHT SINGLE QUOTATION MARK", '\u{2019}'),
-    ("LEFT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{ab}'),
-    ("RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK", '\u{bb}'),
-    ("RIGHTWARDS ARROW", '\u{2192}'),
-    ("LEFTWARDS ARROW", '\u{2190}'),
-    ("UPWARDS ARROW", '\u{2191}'),
-    ("DOWNWARDS ARROW", '\u{2193}'),
-    ("CHECK MARK", '\u{2713}'),
-    ("BALLOT X", '\u{2717}'),
-    ("BLACK STAR", '\u{2605}'),
-    ("WHITE STAR", '\u{2606}'),
-    ("SNOWMAN", '\u{2603}'),
-    ("INFINITY", '\u{221e}'),
-    ("NOT EQUAL TO", '\u{2260}'),
-    ("LESS-THAN OR EQUAL TO", '\u{2264}'),
-    ("GREATER-THAN OR EQUAL TO", '\u{2265}'),
-    ("GREEK SMALL LETTER ALPHA", '\u{3b1}'),
-    ("GREEK SMALL LETTER BETA", '\u{3b2}'),
-    ("GREEK SMALL LETTER GAMMA", '\u{3b3}'),
-    ("GREEK SMALL LETTER DELTA", '\u{3b4}'),
-    ("GREEK SMALL LETTER MU", '\u{3bc}'),
-    ("GREEK SMALL LETTER PI", '\u{3c0}'),
-    ("GREEK SMALL LETTER SIGMA", '\u{3c3}'),
-    ("GREEK SMALL LETTER OMEGA", '\u{3c9}'),
-    ("GREEK CAPITAL LETTER OMEGA", '\u{3a9}'),
-    ("GREEK CAPITAL LETTER SIGMA", '\u{3a3}'),
-    ("GREEK CAPITAL LETTER DELTA", '\u{394}'),
-    ("LATIN SMALL LETTER E WITH ACUTE", '\u{e9}'),
-    ("LATIN SMALL LETTER A WITH GRAVE", '\u{e0}'),
-    ("LATIN SMALL LETTER U WITH DIAERESIS", '\u{fc}'),
-    ("LATIN SMALL LETTER SHARP S", '\u{df}'),
-    ("LATIN CAPITAL LETTER A WITH GRAVE", '\u{c0}'),
-    ("REPLACEMENT CHARACTER", '\u{fffd}'),
-    ("BYTE ORDER MARK", '\u{feff}'),
-    ("ZERO WIDTH NO-BREAK SPACE", '\u{feff}'),
-    ("SNAKE", '\u{1f40d}'),
-    ("GRINNING FACE", '\u{1f600}'),
-    ("PILE OF POO", '\u{1f4a9}'),
-    ("DIGIT ZERO", '0'),
-    ("DIGIT ONE", '1'),
-    ("LATIN SMALL LETTER A", 'a'),
-    ("LATIN CAPITAL LETTER A", 'A'),
-    ("LATIN SMALL LETTER Z", 'z'),
-    ("LATIN CAPITAL LETTER Z", 'Z'),
-    ("LEFT CURLY BRACKET", '{'),
-    ("RIGHT CURLY BRACKET", '}'),
-    ("QUOTATION MARK", '"'),
-    ("APOSTROPHE", '\''),
-    ("REVERSE SOLIDUS", '\\'),
-    ("DOLLAR SIGN", '$'),
-    ("COMMERCIAL AT", '@'),
-    ("NUMBER SIGN", '#'),
-];
-
-const DIGITS: [&str; 10] = [
-    "ZERO", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "SEVEN", "EIGHT", "NINE",
-];
-
-const GREEK: [&str; 24] = [
-    "ALPHA", "BETA", "GAMMA", "DELTA", "EPSILON", "ZETA", "ETA", "THETA", "IOTA", "KAPPA", "LAMDA",
-    "MU", "NU", "XI", "OMICRON", "PI", "RHO", "SIGMA", "TAU", "UPSILON", "PHI", "CHI", "PSI",
-    "OMEGA",
-];
-
-const ASCII_PUNCT: [(&str, char); 31] = [
-    ("EXCLAMATION MARK", '!'),
-    ("PERCENT SIGN", '%'),
-    ("AMPERSAND", '&'),
-    ("LEFT PARENTHESIS", '('),
-    ("RIGHT PARENTHESIS", ')'),
-    ("ASTERISK", '*'),
-    ("PLUS SIGN", '+'),
-    ("COMMA", ','),
-    ("HYPHEN-MINUS", '-'),
-    ("FULL STOP", '.'),
-    ("SOLIDUS", '/'),
-    ("COLON", ':'),
-    ("SEMICOLON", ';'),
-    ("LESS-THAN SIGN", '<'),
-    ("EQUALS SIGN", '='),
-    ("GREATER-THAN SIGN", '>'),
-    ("QUESTION MARK", '?'),
-    ("LEFT SQUARE BRACKET", '['),
-    ("RIGHT SQUARE BRACKET", ']'),
-    ("CIRCUMFLEX ACCENT", '^'),
-    ("LOW LINE", '_'),
-    ("GRAVE ACCENT", '`'),
-    ("VERTICAL LINE", '|'),
-    ("TILDE", '~'),
-    ("SOFT HYPHEN", '\u{ad}'),
-    ("NARROW NO-BREAK SPACE", '\u{202f}'),
-    ("EMPTY SET", '\u{2205}'),
-    ("LATIN CAPITAL LETTER AE", '\u{c6}'),
-    ("LATIN SMALL LETTER AE", '\u{e6}'),
-    ("LATIN SMALL LETTER A WITH DIAERESIS", '\u{e4}'),
-    ("LATIN CAPITAL LETTER A WITH DIAERESIS", '\u{c4}'),
-];
-
-fn lookup_name(name: &str) -> Option<char> {
-    let up = name.to_ascii_uppercase();
-    if let Some((_, c)) = NAMES
-        .iter()
-        .chain(ASCII_PUNCT.iter())
-        .find(|(n, _)| *n == up)
-    {
-        return Some(*c);
-    }
-    if let Some(letter) = up.strip_prefix("LATIN SMALL LETTER ") {
-        return single_letter(letter).map(|c| c.to_ascii_lowercase());
-    }
-    if let Some(letter) = up.strip_prefix("LATIN CAPITAL LETTER ") {
-        return single_letter(letter);
-    }
-    if let Some(d) = up.strip_prefix("DIGIT ") {
-        let n = DIGITS.iter().position(|x| *x == d)?;
-        return char::from_digit(n as u32, 10);
-    }
-    let (small, rest) = match (
-        up.strip_prefix("GREEK SMALL LETTER "),
-        up.strip_prefix("GREEK CAPITAL LETTER "),
-    ) {
-        (Some(r), _) => (true, r),
-        (_, Some(r)) => (false, r),
-        _ => return None,
-    };
-    let idx = GREEK.iter().position(|x| *x == rest)? as u32;
-    let idx = if idx >= 17 { idx + 1 } else { idx };
-    char::from_u32(if small { 0x3b1 + idx } else { 0x391 + idx })
+/// The Unicode name of `c` (never an alias); None for unnamed characters such as controls.
+pub(crate) fn char_name(c: char) -> Option<String> {
+    lumen_common::ucd::name(c as u32, lumen_common::ucd::Version::Current)
 }
 
-fn single_letter(s: &str) -> Option<char> {
-    let mut it = s.chars();
-    match (it.next(), it.next()) {
-        (Some(c), None) if c.is_ascii_uppercase() => Some(c),
+/// The character `\N{name}` denotes: a name or alias in any case (named sequences are not
+/// characters).
+pub(crate) fn lookup_name(name: &str) -> Option<char> {
+    match lumen_common::ucd::lookup(name, lumen_common::ucd::Version::Current, false)?.as_slice() {
+        [c] => char::from_u32(*c),
         _ => None,
     }
 }
@@ -460,7 +299,7 @@ pub(crate) fn decode_str(s: &[char], raw: bool) -> Result<String, String> {
                             .into(),
                     );
                 }
-                out.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                lumen_common::smuggle::push_code_point(&mut out, v);
             }
             'N' => {
                 let close = (s.get(i) == Some(&'{'))

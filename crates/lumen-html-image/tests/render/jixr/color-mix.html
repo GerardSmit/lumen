@@ -1,0 +1,25 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+div{position:absolute;width:40px;height:40px}
+</style>
+<!-- jixr-compare: threshold=2 max-diff-ratio=0.005
+  Polar-space mixes (oklch/lch) round the interpolated hue/chroma within one or two channel
+  units of Chromium; everything else matches exactly.
+--><main style="width:220px;height:140px">
+<div style="left:0;top:0;background:color-mix(in srgb, red, blue)"></div>
+<div style="left:40px;top:0;background:color-mix(in srgb, rgb(255 0 0) 25%, rgb(0 0 255))"></div>
+<div style="left:80px;top:0;background:color-mix(in oklab, white, black)"></div>
+<div style="left:120px;top:0;background:color-mix(in hsl shorter hue, hsl(120 100% 50%), hsl(240 100% 50%))"></div>
+<div style="left:160px;top:0;background:color-mix(in hsl longer hue, hsl(120 100% 50%), hsl(240 100% 50%))"></div>
+<div style="left:200px;top:0;width:20px;background:color-mix(in xyz, rgb(255 0 0), rgb(0 255 0))"></div>
+<div style="left:0;top:40px;background:color-mix(in srgb, rgba(255,0,0,.5), blue)"></div>
+<div style="left:40px;top:40px;background:color-mix(in srgb, red 75%, blue 75%)"></div>
+<div style="left:80px;top:40px;background:color-mix(in srgb, red 0%, blue 0%)"></div>
+<div style="left:120px;top:40px;background:color-mix(in oklch, oklch(70% .1 30), oklch(70% .1 330))"></div>
+<div style="left:160px;top:40px;background:color-mix(in lch longer hue, lch(50 60 40), lch(50 60 280))"></div>
+<div style="left:200px;top:40px;width:20px;background:color-mix(in lab, white, black)"></div>
+<div style="left:0;top:80px;background:color-mix(in srgb-linear, black, white)"></div>
+<div style="left:40px;top:80px;background:color-mix(in hwb, red, yellow)"></div>
+<div style="left:80px;top:80px;background:color-mix(in oklab, red 25%, blue)"></div>
+<div style="left:120px;top:80px;background:color-mix(in srgb, red 150%, blue 150%)"></div>
+</main>

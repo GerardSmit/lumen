@@ -11,7 +11,10 @@ impl Interp {
         if !items.is_empty() {
             note_compact();
         }
-        Value::Obj(Object::new_array_from_vec(Some(self.array_proto.clone()), items))
+        Value::Obj(Object::new_array_from_vec(
+            Some(self.array_proto.clone()),
+            items,
+        ))
     }
 
     /// [`Interp::make_array`] from an exact-size run of owned values (an array literal's operand
@@ -24,7 +27,10 @@ impl Interp {
         if len != 0 {
             note_compact();
         }
-        Value::Obj(Object::new_array_from_iter(Some(self.array_proto.clone()), items))
+        Value::Obj(Object::new_array_from_iter(
+            Some(self.array_proto.clone()),
+            items,
+        ))
     }
 
     /// [`Interp::make_array_iter`] of the `n` values at `vals`, *moved* out (the caller must
@@ -251,7 +257,13 @@ mod tests {
         let before = crate::value::live_objects();
         eval(&mut engine, "for(var k=0;k<20000;k++)f('ab');");
         let grown = crate::value::live_objects() - before;
-        assert!(grown < 1000, "regex objects outlived their last reference: {grown}");
-        assert!(engine.interp.regexps.len() < 5000, "stale regexps entries were not pruned");
+        assert!(
+            grown < 1000,
+            "regex objects outlived their last reference: {grown}"
+        );
+        assert!(
+            engine.interp.regexps.len() < 5000,
+            "stale regexps entries were not pruned"
+        );
     }
 }

@@ -283,7 +283,12 @@ fn is_collation_ignorable(cp: u32) -> bool {
 fn collate(a: &str, b: &str, opts: &CollateOpts) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if !opts.numeric && !opts.ignore_punct && a.is_ascii() && b.is_ascii() {
-        return collate_ascii(a.as_bytes(), b.as_bytes(), &opts.sensitivity, opts.upper_first);
+        return collate_ascii(
+            a.as_bytes(),
+            b.as_bytes(),
+            &opts.sensitivity,
+            opts.upper_first,
+        );
     }
     let ea = elements(a, opts);
     let eb = elements(b, opts);

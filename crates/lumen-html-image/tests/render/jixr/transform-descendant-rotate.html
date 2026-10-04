@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- jixr-compare: threshold=28 max-diff-ratio=0.0013 -->
+<style>
+  html, body { margin: 0; width: 320px; height: 200px; overflow: hidden; background: #fff; }
+  #stage { position: relative; width: 320px; height: 200px; background: #e8f0fe; }
+  #parent {
+    position: absolute;
+    left: 100px;
+    top: 60px;
+    width: 60px;
+    height: 60px;
+    transform-origin: 0 0;
+    transform: rotate(90deg);
+  }
+  #child { width: 60px; height: 20px; background: #d93025; }
+  #control { position: absolute; left: 190px; top: 60px; width: 20px; height: 60px; background: #188038; }
+</style>
+<div id="stage">
+  <div id="parent"><div id="child"></div></div>
+  <div id="control"></div>
+</div>

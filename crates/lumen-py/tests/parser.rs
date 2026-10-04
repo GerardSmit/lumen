@@ -266,6 +266,32 @@ impl Dumper {
         )
     }
 
+    fn type_params(&self, ps: &[TypeParam]) -> Option<String> {
+        lst(ps
+            .iter()
+            .map(|p| match &p.kind {
+                TypeParamKind::TypeVar { name, bound } => node(
+                    "TypeVar",
+                    self.p(p.pos),
+                    vec![
+                        ("name", some(py_str_repr(name))),
+                        ("bound", self.opt_expr(bound)),
+                    ],
+                ),
+                TypeParamKind::ParamSpec { name } => node(
+                    "ParamSpec",
+                    self.p(p.pos),
+                    vec![("name", some(py_str_repr(name)))],
+                ),
+                TypeParamKind::TypeVarTuple { name } => node(
+                    "TypeVarTuple",
+                    self.p(p.pos),
+                    vec![("name", some(py_str_repr(name)))],
+                ),
+            })
+            .collect())
+    }
+
     fn keywords(&self, ks: &[Keyword]) -> Option<String> {
         lst(ks
             .iter()
@@ -597,6 +623,7 @@ impl Dumper {
                     ("body", self.stmts(&f.body)),
                     ("decorator_list", self.exprs(&f.decorators)),
                     ("returns", self.opt_expr(&f.returns)),
+                    ("type_params", self.type_params(&f.type_params)),
                 ],
             ),
             StmtKind::ClassDef(c) => node(
@@ -608,6 +635,7 @@ impl Dumper {
                     ("keywords", self.keywords(&c.keywords)),
                     ("body", self.stmts(&c.body)),
                     ("decorator_list", self.exprs(&c.decorators)),
+                    ("type_params", self.type_params(&c.type_params)),
                 ],
             ),
             StmtKind::Return(v) => node("Return", pos, vec![("value", self.opt_expr(v))]),
@@ -787,6 +815,19 @@ impl Dumper {
             ),
             StmtKind::Global(n) => node("Global", pos, vec![("names", Self::names(n))]),
             StmtKind::Nonlocal(n) => node("Nonlocal", pos, vec![("names", Self::names(n))]),
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                value,
+            } => node(
+                "TypeAlias",
+                pos,
+                vec![
+                    ("name", some(self.expr(name))),
+                    ("type_params", self.type_params(type_params)),
+                    ("value", some(self.expr(value))),
+                ],
+            ),
             StmtKind::Expr(e) => node("Expr", pos, vec![("value", some(self.expr(e)))]),
             StmtKind::Pass => node("Pass", pos, vec![]),
             StmtKind::Break => node("Break", pos, vec![]),
@@ -833,22 +874,36 @@ fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/parser_corpus")
 }
 
+/// The local `python3` may be newer than 3.12. `parse312` makes its parser answer like 3.12's:
+/// type parameter defaults (PEP 696, new in 3.13) are a syntax error. Its `ast.dump` output is
+/// otherwise the same shape for every node lumen-py produces.
+const PY_312: &str = r#"
+def parse312(s):
+    t = ast.parse(s)
+    for n in ast.walk(t):
+        if isinstance(n, ast.type_param) and getattr(n, "default_value", None) is not None:
+            raise SyntaxError("type parameter defaults need Python 3.13")
+    return t
+"#;
+
 const PY_DUMP: &str = r#"
-import ast, sys
+import ast, os, sys
 sep = "\n#---\n"
+exec(os.environ["PY_312"])
 srcs = sys.stdin.read().split(sep)
 out = []
 for s in srcs:
     try:
-        out.append(ast.dump(ast.parse(s)))
+        out.append(ast.dump(parse312(s)))
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         out.append("SyntaxError")
 sys.stdout.write(sep.join(out))
 "#;
 
 const PY_DUMP_POS: &str = r#"
-import ast, sys
+import ast, os, sys
 sep = "\n#---\n"
+exec(os.environ["PY_312"])
 
 LINES = []
 
@@ -866,7 +921,7 @@ def dump(n):
             continue
         parts.append(f + "=" + dump(v))
     at = ""
-    if isinstance(n, (ast.stmt, ast.expr, ast.excepthandler, ast.arg, ast.keyword)):
+    if isinstance(n, (ast.stmt, ast.expr, ast.excepthandler, ast.arg, ast.keyword, ast.type_param)):
         col = len(LINES[n.lineno - 1].encode()[:n.col_offset].decode(errors="replace"))
         at = "@%d:%d" % (n.lineno, col)
     return type(n).__name__ + at + "(" + ", ".join(parts) + ")"
@@ -876,7 +931,7 @@ out = []
 for s in srcs:
     try:
         LINES[:] = s.split("\n")
-        out.append(dump(ast.parse(s)))
+        out.append(dump(parse312(s)))
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         out.append("SyntaxError")
 sys.stdout.write(sep.join(out))
@@ -895,6 +950,8 @@ fn run_python(script: &str, srcs: &[String]) -> Vec<String> {
     use std::io::Write;
     let mut child = Command::new("python3")
         .args(["-c", script])
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PY_312", PY_312)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1128,7 +1185,7 @@ fn stdlib_parse() {
             let want = run_python(if with_pos { PY_DUMP_POS } else { PY_DUMP }, chunk_src);
             for ((name, src), want) in chunk_names.iter().zip(chunk_src).zip(want) {
                 let want = normalize_unicode(&want).replace(", kind='u'", "");
-                let known_gap = want.contains("type_params=") || has_surrogate_escape(&want);
+                let known_gap = has_surrogate_escape(&want);
                 let got = match parse(src, "<stdlib>") {
                     Ok(m) if with_pos => dump_pos(&m),
                     Ok(m) => dump(&m),
@@ -1167,7 +1224,7 @@ fn stdlib_parse() {
                 }
             }
         }
-        println!("{known} known-gap dump mismatches (type params, lone surrogates)");
+        println!("{known} known-gap dump mismatches (lone surrogates)");
         println!("{} other dump mismatches", mismatched.len());
         for m in mismatched.iter().take(40) {
             println!("MISMATCH {m}");
@@ -1290,7 +1347,9 @@ fn error_positions_and_messages() {
     assert!(err("try:\n    pass\n").contains("expected 'except' or 'finally'"));
     assert!(!err("x = yield = 1").is_empty());
     assert!(err("for x in y:\n    pass\n  z\n").contains("unindent"));
-    assert!(err("type X = int").contains("type statements"));
+    assert!(err("def f[](): pass").contains("invalid syntax"));
+    assert!(err("def f[*Ts: int](): pass").contains("cannot use bound with TypeVarTuple"));
+    assert!(err("class C[**P: int]: pass").contains("cannot use bound with ParamSpec"));
     assert!(err("x = t'a'").contains("t-strings"));
 }
 
@@ -1330,6 +1389,8 @@ fn soft_keywords_as_identifiers() {
         "match.x = 1\n",
         "match x:\n    case _:\n        pass\n",
         "type = 1\nprint(type(x))\n",
+        "type.x = 1\ntype[x] = 2\ntype(x)\ntype: int = 3\n",
+        "type X = int\ntype Y[T, *Ts, **P] = dict[T, P]\ntype type = type\n",
     ] {
         assert!(parse(src, "<t>").is_ok(), "{src}");
     }

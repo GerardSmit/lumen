@@ -7,53 +7,37 @@ use crate::vm::*;
 use std::rc::Rc;
 
 pub fn is_printable(c: char) -> bool {
-    if c == ' ' {
-        return true;
-    }
-    if (c as u32) < 0x7f {
-        return c as u32 >= 0x20;
-    }
-    use std::sync::OnceLock;
-    static NON_PRINT: OnceLock<Vec<(u32, u32)>> = OnceLock::new();
-    let r = NON_PRINT.get_or_init(|| {
-        let mut v: Vec<(u32, u32)> = Vec::new();
-        for k in ["gc=c", "gc=z"] {
-            if let Some(rs) = lumen_common::unicode_props::lookup(k, None) {
-                v.extend_from_slice(rs);
-            }
-        }
-        v.sort();
-        v
-    });
-    let u = c as u32;
-    let i = r.partition_point(|&(lo, _)| lo <= u);
-    !(i > 0 && r[i - 1].1 >= u)
+    crate::unicode::is_printable(c as u32)
 }
 
 pub fn str_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
     let mut out = String::with_capacity(s.len() + 2);
     out.push(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c == quote => {
+    for cp in lumen_common::smuggle::code_points(s) {
+        // `from_u32` is `None` exactly for the lone surrogates.
+        match char::from_u32(cp) {
+            Some('\\') => out.push_str("\\\\"),
+            Some('\n') => out.push_str("\\n"),
+            Some('\r') => out.push_str("\\r"),
+            Some('\t') => out.push_str("\\t"),
+            Some(c) if c == quote => {
                 out.push('\\');
                 out.push(c);
             }
-            c if is_printable(c) => out.push(c),
-            c => push_escape(&mut out, c),
+            Some(c) if is_printable(c) => out.push(c),
+            _ => push_escape(&mut out, cp),
         }
     }
     out.push(quote);
     out
 }
 
-fn push_escape(out: &mut String, c: char) {
-    let u = c as u32;
+fn push_escape(out: &mut String, u: u32) {
     if u < 0x100 {
         out.push_str(&format!("\\x{:02x}", u));
     } else if u < 0x10000 {
@@ -65,18 +49,22 @@ fn push_escape(out: &mut String, c: char) {
 
 pub fn ascii_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        if c.is_ascii() {
-            out.push(c);
+    for cp in lumen_common::smuggle::code_points(s) {
+        if cp < 0x80 {
+            out.push(cp as u8 as char);
         } else {
-            push_escape(&mut out, c);
+            push_escape(&mut out, cp);
         }
     }
     out
 }
 
 pub fn bytes_repr(b: &[u8]) -> String {
-    let quote = if b.contains(&b'\'') && !b.contains(&b'"') { '"' } else { '\'' };
+    let quote = if b.contains(&b'\'') && !b.contains(&b'"') {
+        '"'
+    } else {
+        '\''
+    };
     let mut out = String::with_capacity(b.len() + 3);
     out.push('b');
     out.push(quote);
@@ -106,7 +94,11 @@ pub fn complex_repr(re: f64, im: f64) -> String {
     if re == 0.0 && re.is_sign_positive() {
         return format!("{}j", fmt(im));
     }
-    let sign = if im.is_sign_negative() && !im.is_nan() { "" } else { "+" };
+    let sign = if im.is_sign_negative() && !im.is_nan() {
+        ""
+    } else {
+        "+"
+    };
     format!("({}{}{}j)", fmt(re), sign, fmt(im))
 }
 
@@ -130,6 +122,11 @@ impl Interp {
     }
 
     pub fn type_qualname(&self, t: &Obj) -> String {
+        if let Kind::Type(td) = &t.kind {
+            if let Some(q) = &*td.qualname.borrow() {
+                return q.to_string();
+            }
+        }
         if let Some(d) = t.dict.borrow().as_ref() {
             if let Some(q) = dict_get_str(d, "__qualname__") {
                 if let Some(s) = q.as_str() {
@@ -164,7 +161,10 @@ impl Interp {
                             Some(s) => Ok(s.to_string()),
                             None => {
                                 let t = self.type_name_of(&r);
-                                Err(self.type_error(&format!("__repr__ returned non-string (type {})", t)))
+                                Err(self.type_error(&format!(
+                                    "__repr__ returned non-string (type {})",
+                                    t
+                                )))
                             }
                         };
                     }
@@ -186,7 +186,7 @@ impl Interp {
             Kind::Complex(r, i) => Ok(complex_repr(*r, *i)),
             Kind::Bytes(b) => Ok(bytes_repr(b)),
             Kind::ByteArray(b) => {
-                let r = bytes_repr(&b.borrow());
+                let r = bytes_repr(&b.bytes());
                 Ok(self.wrap_cls_repr(o, "bytearray", &r))
             }
             Kind::Tuple(items) => {
@@ -197,7 +197,11 @@ impl Interp {
                 let r = self.repr_seq(&items);
                 self.repr_leave();
                 let parts = r?;
-                let body = if parts.len() == 1 { format!("({},)", parts[0]) } else { format!("({})", parts.join(", ")) };
+                let body = if parts.len() == 1 {
+                    format!("({},)", parts[0])
+                } else {
+                    format!("({})", parts.join(", "))
+                };
                 Ok(body)
             }
             Kind::List(l) => {
@@ -213,14 +217,24 @@ impl Interp {
                 if self.repr_enter(o) {
                     return Ok("{...}".into());
                 }
-                let entries: Vec<(Value, Value)> = d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect();
+                let entries: Vec<(Value, Value)> = d
+                    .borrow()
+                    .iter()
+                    .map(|e| (e.key.clone(), e.val.clone()))
+                    .collect();
                 let r = self.repr_pairs(&entries);
                 self.repr_leave();
                 Ok(format!("{{{}}}", r?))
             }
             Kind::Set(d) | Kind::FrozenSet(d) => {
                 let frozen = matches!(o.kind, Kind::FrozenSet(_));
-                let tname = if o.cls.is_some() { self.type_name_of(v) } else if frozen { "frozenset".into() } else { "set".into() };
+                let tname = if o.cls.is_some() {
+                    self.type_name_of(v)
+                } else if frozen {
+                    "frozenset".into()
+                } else {
+                    "set".into()
+                };
                 if self.repr_enter(o) {
                     return Ok(format!("{}(...)", tname));
                 }
@@ -242,7 +256,11 @@ impl Interp {
                     Some(p) => match vk {
                         ViewKind::Keys => p.borrow().keys(),
                         ViewKind::Values => p.borrow().values(),
-                        ViewKind::Items => p.borrow().iter().map(|e| Value::tuple(vec![e.key.clone(), e.val.clone()])).collect(),
+                        ViewKind::Items => p
+                            .borrow()
+                            .iter()
+                            .map(|e| Value::tuple(vec![e.key.clone(), e.val.clone()]))
+                            .collect(),
                     },
                     None => Vec::new(),
                 };
@@ -255,8 +273,23 @@ impl Interp {
                 Ok(format!("{}([{}])", name, parts.join(", ")))
             }
             Kind::Type(_) => Ok(format!("<class '{}'>", self.type_display(o))),
-            Kind::Function(f) => Ok(format!("<function {} at {:#x}>", f.qualname.borrow(), self.id_of(v))),
+            Kind::Function(f) => Ok(format!(
+                "<function {} at {:#x}>",
+                f.qualname.borrow(),
+                self.id_of(v)
+            )),
             Kind::Method(f, this) => {
+                if let Value::Obj(fo) = f {
+                    if let Kind::Native(n) = &fo.kind {
+                        let t = self.type_of(this);
+                        return Ok(format!(
+                            "<built-in method {} of {} object at {:#x}>",
+                            n.name,
+                            self.type_display(&t),
+                            self.id_of(this)
+                        ));
+                    }
+                }
                 let name = match self.get_attr_str(f, "__qualname__") {
                     Ok(q) => q.as_str().unwrap_or("?").to_string(),
                     Err(_) => "?".into(),
@@ -266,15 +299,48 @@ impl Interp {
             }
             Kind::Native(n) => {
                 if n.method {
-                    Ok(format!("<method '{}' of object>", n.name))
+                    let kind = if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) {
+                        "slot wrapper"
+                    } else {
+                        "method"
+                    };
+                    match &n.owner {
+                        Some(NativeOwner::Class(c)) => Ok(format!(
+                            "<{} '{}' of '{}' objects>",
+                            kind,
+                            n.name,
+                            self.type_display(c)
+                        )),
+                        _ if n.desc.is_some_and(|d| d.class().is_some()) => Ok(format!(
+                            "<{} '{}' of '{}' objects>",
+                            kind,
+                            n.name,
+                            crate::bind::owner_of(n.desc.unwrap())
+                        )),
+                        _ => Ok(format!("<method '{}' of object>", n.name)),
+                    }
+                } else if let (Some(NativeOwner::Class(c)), Some(lumen_bind::Role::Constructor)) =
+                    (&n.owner, n.desc.map(|d| d.role))
+                {
+                    Ok(format!(
+                        "<built-in method __new__ of type object at {:#x}>",
+                        self.id_of(&Value::Obj(c.clone()))
+                    ))
                 } else {
                     Ok(format!("<built-in function {}>", n.name))
                 }
             }
             Kind::Module => {
                 let d = o.dict.borrow().clone();
-                let name = d.as_ref().and_then(|d| dict_get_str(d, "__name__")).and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_else(|| "?".into());
-                let file = d.as_ref().and_then(|d| dict_get_str(d, "__file__")).and_then(|v| v.as_str().map(|s| s.to_string()));
+                let name = d
+                    .as_ref()
+                    .and_then(|d| dict_get_str(d, "__name__"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "?".into());
+                let file = d
+                    .as_ref()
+                    .and_then(|d| dict_get_str(d, "__file__"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()));
                 Ok(match file {
                     Some(f) => format!("<module '{}' from '{}'>", name, f),
                     None => format!("<module '{}'>", name),
@@ -286,7 +352,12 @@ impl Interp {
                     GenKind::Coroutine => "coroutine",
                     GenKind::AsyncGen => "async_generator",
                 };
-                Ok(format!("<{} object {} at {:#x}>", kind, g.qualname.borrow(), self.id_of(v)))
+                Ok(format!(
+                    "<{} object {} at {:#x}>",
+                    kind,
+                    g.qualname.borrow(),
+                    self.id_of(v)
+                ))
             }
             Kind::Exception(d) => {
                 let args = d.borrow().args.clone();
@@ -300,7 +371,11 @@ impl Interp {
                 Ok(format!("slice({}, {}, {})", a, b, c))
             }
             Kind::BigRange(r) => {
-                let (a, b, c) = (self.int_to_decimal(&r[0])?, self.int_to_decimal(&r[1])?, self.int_to_decimal(&r[2])?);
+                let (a, b, c) = (
+                    self.int_to_decimal(&r[0])?,
+                    self.int_to_decimal(&r[1])?,
+                    self.int_to_decimal(&r[2])?,
+                );
                 if r[2].cmp(&crate::pyint::BigInt::from_i64(1)) == std::cmp::Ordering::Equal {
                     Ok(format!("range({}, {})", a, b))
                 } else {
@@ -314,35 +389,40 @@ impl Interp {
                     Ok(format!("range({}, {}, {})", r.start, r.stop, r.step))
                 }
             }
-            Kind::Code(c) => Ok(format!("<code object {} at {:#x}, file \"{}\", line {}>", c.name, self.id_of(v), c.filename, c.first_line)),
+            Kind::Code(c) => Ok(format!(
+                "<code object {} at {:#x}, file \"{}\", line {}>",
+                c.name,
+                self.id_of(v),
+                c.filename,
+                c.first_line
+            )),
             Kind::Super(t, _, ot) => {
                 let t = self.repr_of(t)?;
                 let ot = self.repr_of(ot)?;
                 Ok(format!("<super: {}, <{} object>>", t, ot))
-            }
-            Kind::File(f) => {
-                let f = f.borrow();
-                let mode = match &f.mode {
-                    FileMode::Read { .. } | FileMode::Stdin => "r",
-                    FileMode::Write { append: true, .. } => "a",
-                    FileMode::Write { .. } | FileMode::Stdout | FileMode::Stderr => "w",
-                    FileMode::Closed => "r",
-                };
-                Ok(format!("<_io.TextIOWrapper name={} mode='{}' encoding='UTF-8'>", str_repr(&f.name), mode))
             }
             Kind::Cell(c) => {
                 let inner = c.borrow().clone();
                 match inner {
                     Some(x) => {
                         let t = self.type_name_of(&x);
-                        Ok(format!("<cell at {:#x}: {} object at {:#x}>", self.id_of(v), t, self.id_of(&x)))
+                        Ok(format!(
+                            "<cell at {:#x}: {} object at {:#x}>",
+                            self.id_of(v),
+                            t,
+                            self.id_of(&x)
+                        ))
                     }
                     None => Ok(format!("<cell at {:#x}: empty>", self.id_of(v))),
                 }
             }
             _ => {
                 let cls = self.type_of_obj(o);
-                Ok(format!("<{} object at {:#x}>", self.type_display(&cls), self.id_of(v)))
+                Ok(format!(
+                    "<{} object at {:#x}>",
+                    self.type_display(&cls),
+                    self.id_of(v)
+                ))
             }
         }
     }
@@ -356,7 +436,7 @@ impl Interp {
         }
     }
 
-    fn repr_enter(&mut self, o: &Obj) -> bool {
+    pub fn repr_enter(&mut self, o: &Obj) -> bool {
         let id = Rc::as_ptr(o) as *const u8 as usize;
         if self.repr_stack.contains(&id) {
             return true;
@@ -365,7 +445,7 @@ impl Interp {
         false
     }
 
-    fn repr_leave(&mut self) {
+    pub fn repr_leave(&mut self) {
         self.repr_stack.pop();
     }
 
@@ -399,7 +479,8 @@ impl Interp {
                         Some(s) => Ok(s.to_string()),
                         None => {
                             let t = self.type_name_of(&r);
-                            Err(self.type_error(&format!("__str__ returned non-string (type {})", t)))
+                            Err(self
+                                .type_error(&format!("__str__ returned non-string (type {})", t)))
                         }
                     };
                 }
@@ -418,17 +499,15 @@ impl Interp {
                     }
                     let args = d.borrow().args.clone();
                     if self.exc_is(o, "OSError") {
-                        let dict = o.dict.borrow().clone();
-                        let get = |n: &str| dict.as_ref().and_then(|d| dict_get_str(d, n)).filter(|v| !v.is_none());
-                        if let (Some(errno), Some(msg)) = (get("errno"), get("strerror")) {
-                            let (errno, msg) = (self.str_of(&errno)?, self.str_of(&msg)?);
-                            let mut s = format!("[Errno {}] {}", errno, msg);
-                            if let Some(f) = get("filename") {
-                                s.push_str(&format!(": {}", self.repr_of(&f)?));
-                                if let Some(f2) = get("filename2") {
-                                    s.push_str(&format!(" -> {}", self.repr_of(&f2)?));
-                                }
-                            }
+                        if let Some(s) = self.oserror_str(o)? {
+                            return Ok(s);
+                        }
+                    }
+                    if self.exc_is(o, "SyntaxError") {
+                        return crate::builtins::excm::syntax_error_str(self, o);
+                    }
+                    if self.exc_is(o, "UnicodeError") {
+                        if let Some(s) = self.unicode_exc_str(o)? {
                             return Ok(s);
                         }
                     }

@@ -47,13 +47,18 @@ pub(super) fn pattern_exprs_safe(
             (match &prop.key {
                 PropKey::Computed(k) => default_expr_safe(k, banned),
                 _ => true,
-            }) && prop.default.as_ref().is_none_or(|d| default_expr_safe(d, banned))
+            }) && prop
+                .default
+                .as_ref()
+                .is_none_or(|d| default_expr_safe(d, banned))
                 && pattern_exprs_safe(&prop.value, banned)
         }),
         Pattern::Array(elems) => elems.iter().all(|e| match e {
             ArrayPatElem::Hole => true,
             ArrayPatElem::Elem { pattern, default } => {
-                default.as_ref().is_none_or(|d| default_expr_safe(d, banned))
+                default
+                    .as_ref()
+                    .is_none_or(|d| default_expr_safe(d, banned))
                     && pattern_exprs_safe(pattern, banned)
             }
             ArrayPatElem::Rest(p) => pattern_exprs_safe(p, banned),

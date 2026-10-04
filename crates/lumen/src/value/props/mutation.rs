@@ -1,13 +1,43 @@
 //! Property insertion, removal, and shape maintenance.
 use super::shapes::{
-    fresh_owned_id, shape_by_id, shape_owned_from, shape_transition, Shape, OWNED_THRESHOLD,
-    SHAPE_EMPTY,
+    OWNED_THRESHOLD, SHAPE_EMPTY, Shape, fresh_owned_id, shape_by_id, shape_owned_from,
+    shape_transition,
 };
-use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
-use crate::value::{canonical_index, PackedValue, Property, Value};
+use super::{MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT, Props};
+use crate::value::{PackedValue, Property, Value, canonical_index};
 use std::rc::Rc;
 
 impl Props {
+    /// Replay named keys in the current heap's shape table.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(in crate::value) fn remap_shape(
+        &mut self,
+        memo: &mut std::collections::HashMap<u32, Rc<Shape>>,
+    ) {
+        let Some(old) = self.shape_rc.as_ref() else {
+            return;
+        };
+        let shape = if old.owned() {
+            // Owned shapes must never become shared between objects.
+            shape_owned_from(Some(old))
+        } else if let Some(shape) = memo.get(&old.id) {
+            shape.clone()
+        } else {
+            let mut next = None;
+            for key in old.keys() {
+                next = shape_transition(next.as_ref(), &Rc::from(&**key));
+                if next.is_none() {
+                    self.set_shape(shape_owned_from(Some(old)));
+                    return;
+                }
+            }
+            let shape = next.expect("nonempty shape");
+            memo.insert(old.id, shape.clone());
+            shape
+        };
+        self.set_shape(shape);
+    }
+
     /// Drop every property (used by the GC to break a garbage object's reference cycles).
     pub(crate) fn clear(&mut self) {
         self.note_structural();

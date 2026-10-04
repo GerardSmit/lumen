@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 lumen = { path = "../lumen" }
 lumen-host = { path = "../lumen-host", optional = true }
+lumen-os = { path = "../lumen-os", optional = true }
 lumen-runtime = { path = "../lumen-runtime", optional = true }
 wasm-bindgen = "=0.2.127"
 js-sys = "0.3"
@@ -22,7 +23,7 @@ js-sys = "0.3"
 # embedder-driven event loop. The bare-engine `Session` the playground uses is always present.
 [features]
 default = []
-runtime = ["dep:lumen-host", "dep:lumen-runtime"]
+runtime = ["dep:lumen-host", "dep:lumen-os", "dep:lumen-runtime"]
 
 [lints]
 workspace = true

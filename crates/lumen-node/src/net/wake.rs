@@ -8,7 +8,7 @@
 //! wake a thread, which matters once a descriptor is shared with other processes: shutting it down
 //! or connecting to it would act on everyone's copy.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -20,26 +20,12 @@ struct Epoch {
 static CURRENT: Mutex<Option<Arc<Epoch>>> = Mutex::new(None);
 
 fn new_epoch() -> std::io::Result<Epoch> {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a valid two-element array for pipe(2).
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(std::io::Error::last_os_error());
+    let os_err = |e: lumen_os::FsError| std::io::Error::other(e.code());
+    let (read, write) = lumen_os::fdctl::os_pipe().map_err(os_err)?;
+    for fd in [&read, &write] {
+        lumen_os::fdctl::set_blocking(fd.as_raw_fd(), false).map_err(os_err)?;
     }
-    for fd in fds {
-        // SAFETY: both descriptors were just created by pipe(2).
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-    // SAFETY: the descriptors are fresh and owned by nobody else.
-    Ok(unsafe {
-        Epoch {
-            read: OwnedFd::from_raw_fd(fds[0]),
-            write: OwnedFd::from_raw_fd(fds[1]),
-        }
-    })
+    Ok(Epoch { read, write })
 }
 
 fn current() -> std::io::Result<Arc<Epoch>> {
@@ -64,7 +50,11 @@ pub(super) fn wake_all() {
 
 /// Park until `fd` reports one of `events` (or an error/hangup): `Ok(true)`. `Ok(false)` once
 /// `cancelled` is set and [`wake_all`] has run.
-pub(super) fn wait(fd: RawFd, events: libc::c_short, cancelled: &AtomicBool) -> std::io::Result<bool> {
+pub(super) fn wait(
+    fd: RawFd,
+    events: libc::c_short,
+    cancelled: &AtomicBool,
+) -> std::io::Result<bool> {
     loop {
         if cancelled.load(Ordering::SeqCst) {
             return Ok(false);
@@ -73,18 +63,16 @@ pub(super) fn wait(fd: RawFd, events: libc::c_short, cancelled: &AtomicBool) -> 
         if cancelled.load(Ordering::SeqCst) {
             return Ok(false);
         }
+        use lumen_os::poll::{poll, PollFd, POLLIN};
         let mut fds = [
-            libc::pollfd { fd, events, revents: 0 },
-            libc::pollfd { fd: epoch.read.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            PollFd::new(fd, events),
+            PollFd::new(epoch.read.as_raw_fd(), POLLIN),
         ];
-        // SAFETY: `fds` is a valid array of two pollfd entries.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if n < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
+        if let Err(e) = poll(&mut fds, -1) {
+            if e.errno() == libc::EINTR {
                 continue;
             }
-            return Err(error);
+            return Err(std::io::Error::from_raw_os_error(e.errno()));
         }
         if fds[0].revents != 0 {
             return Ok(true);

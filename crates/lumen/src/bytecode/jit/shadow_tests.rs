@@ -1,4 +1,4 @@
-use super::{SHADOW_BYTES, shadow};
+use super::{shadow, SHADOW_BYTES};
 use crate::interpreter::Interp;
 
 #[test]
@@ -38,4 +38,46 @@ fn shadow_owner_survives_interpreter_moves_and_other_engine_teardown() {
         // The frame descriptor remains live until its own interpreter drops.
         assert_eq!((*pointer).end - (*pointer).top, SHADOW_BYTES);
     }
+}
+
+#[test]
+fn small_shadow_budget_falls_back_when_a_frame_would_cross_its_end() {
+    let mut interpreter = Interp::new();
+    interpreter.jit_shadow = Some(super::new_shadow(64 << 10));
+    let pointer = shadow(&mut interpreter);
+    let initial_top = unsafe { (*pointer).top };
+    assert_eq!(initial_top % 16, 0);
+    assert_eq!(unsafe { (*pointer).end - initial_top }, 64 << 10);
+    let program = crate::parser::parse_script("function answer() { return 42; }", false).unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &program[0] else {
+        panic!("function declaration");
+    };
+    let chunk = crate::bytecode::compile(function).unwrap();
+    chunk.jit.dentry.set(1); // The capacity check never executes this sentinel.
+    chunk.jit.dsize.set(4096);
+    unsafe {
+        (*pointer).top = (*pointer).end - 4096;
+    }
+    assert!(super::direct_ready(&mut interpreter, &chunk));
+    unsafe {
+        (*pointer).top += 16;
+    }
+    assert!(!super::direct_ready(&mut interpreter, &chunk));
+    unsafe {
+        (*pointer).top = initial_top;
+    }
+    assert!(super::direct_ready(&mut interpreter, &chunk));
+}
+
+#[test]
+fn cold_interpreter_scripts_do_not_allocate_shadow_storage() {
+    let mut engine = crate::Engine::new();
+    assert!(engine.interp.jit_shadow.is_none());
+    engine
+        .eval(
+            "console.log('ready'); JSON.stringify({runtime:'Lumen'})",
+            false,
+        )
+        .unwrap();
+    assert!(engine.interp.jit_shadow.is_none());
 }

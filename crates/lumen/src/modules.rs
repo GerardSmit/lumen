@@ -83,6 +83,16 @@ pub(crate) struct ModuleRec {
     cycle_root: Option<String>,
 }
 
+#[cfg(feature = "compiler")]
+impl ModuleRec {
+    pub(crate) fn snapshot_ready(&self) -> bool {
+        self.evaluated && !self.evaluating && self.eval_error.is_none() && self.pending_async == 0
+    }
+    pub(crate) fn snapshot_env(&self) -> Env {
+        self.env.clone()
+    }
+}
+
 /// The origin of a local name that is an import binding (so re-exports resolve to the source).
 enum ImportOrigin {
     /// `import * as x from 'dep'` — resolves to `dep`'s namespace object.
@@ -118,10 +128,51 @@ impl Interp {
     /// Load, link, and evaluate the module identified by canonical `key` (with initial `src`),
     /// returning its namespace object.
     pub(crate) fn load_module(&mut self, key: &str, src: &str) -> Result<Value, Abrupt> {
+        let (namespace, top) = self.start_module(key, src, key, false)?;
+        self.run_agent_event_loop();
+        if let Some((crate::eval::promise_fast::REJECTED, reason)) =
+            crate::eval::promise_fast::promise_state(&top)
+        {
+            return Err(Abrupt::Throw(reason));
+        }
+        Ok(namespace)
+    }
+
+    /// Start loading and evaluating a module graph, returning the root namespace and its real
+    /// evaluation promise without running the agent event loop. `record_key` identifies the
+    /// module in the engine's module map; `module_url` is the URL used for import resolution and
+    /// `import.meta.url`. They differ for inline HTML module scripts, which have distinct module
+    /// records while sharing their document URL.
+    pub(crate) fn start_module(
+        &mut self,
+        record_key: &str,
+        src: &str,
+        module_url: &str,
+        observe_for_host: bool,
+    ) -> Result<(Value, Value), Abrupt> {
+        self.start_module_with_base(record_key, src, module_url, module_url, observe_for_host)
+    }
+
+    /// Start a module whose import-resolution base differs from its observable `import.meta.url`.
+    /// HTML inline modules use the document base URL for static imports while exposing the
+    /// document URL as `import.meta.url`.
+    pub(crate) fn start_module_with_base(
+        &mut self,
+        record_key: &str,
+        src: &str,
+        module_url: &str,
+        resolution_url: &str,
+        observe_for_host: bool,
+    ) -> Result<(Value, Value), Abrupt> {
         // Phase 1: parse the whole graph (so every module's export tables exist before any linking).
         // Phase 2: link (hoist bindings, wire live imports, build namespaces) depth-first. A graph
         // that fails to parse or link registers nothing, so importing it again fails again.
-        self.parse_and_link(key, Some(src.to_string()))?;
+        self.parse_and_link_at_with_base(
+            record_key,
+            Some(src.to_string()),
+            module_url,
+            resolution_url,
+        )?;
         // Phase 3: evaluate module bodies depth-first. A graph containing top-level await
         // evaluates through the async machinery (awaits interleave with the job queue, an async
         // module doesn't block siblings, ancestors run in [[AsyncEvaluationOrder]]); a fully
@@ -129,23 +180,20 @@ impl Interp {
         // Pre-create every graph member's evaluation promise, so a dynamic import of a
         // not-yet-executed batch member waits for the batch instead of executing it early.
         let mut graph = Vec::new();
-        self.collect_eager_graph(key, &mut graph);
+        self.collect_eager_graph(record_key, &mut graph);
         for m in &graph {
             if !self.module_recs[m].evaluated && self.module_recs[m].top_promise.is_none() {
                 let p = self.new_promise();
                 self.module_recs.get_mut(m).unwrap().top_promise = Some(p);
             }
         }
-        let top = self.module_recs[key].top_promise.clone().unwrap();
-        let mut stack = Vec::new();
-        self.inner_module_evaluation_async(key, &mut stack, &mut 0);
-        self.run_agent_event_loop();
-        if let Some((crate::eval::promise_fast::REJECTED, reason)) =
-            crate::eval::promise_fast::promise_state(&top)
-        {
-            return Err(Abrupt::Throw(reason));
+        let top = self.module_recs[record_key].top_promise.clone().unwrap();
+        if observe_for_host {
+            self.observe_promise_for_host(&top);
         }
-        Ok(self.module_recs[key].ns.clone())
+        let mut stack = Vec::new();
+        self.inner_module_evaluation_async(record_key, &mut stack, &mut 0);
+        Ok((self.module_recs[record_key].ns.clone(), top))
     }
 
     /// Every module in `key`'s dependency graph (including itself), depth-first.
@@ -228,7 +276,7 @@ impl Interp {
     /// ResolveExport can see the whole graph. Idempotent per key.
     fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
         let mut added = Vec::new();
-        let result = self.parse_and_register_graph(key, src, &mut added);
+        let result = self.parse_and_register_graph(key, key, key, src, &mut added);
         if result.is_err() {
             self.discard_modules(added);
         }
@@ -238,9 +286,28 @@ impl Interp {
     /// Parse and link as one unit: a failure in either phase discards every record the call
     /// registered, so none stays marked linked with imports that were never wired.
     fn parse_and_link(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
+        self.parse_and_link_at(key, src, key)
+    }
+
+    fn parse_and_link_at(
+        &mut self,
+        key: &str,
+        src: Option<String>,
+        module_url: &str,
+    ) -> Result<(), Abrupt> {
+        self.parse_and_link_at_with_base(key, src, module_url, module_url)
+    }
+
+    fn parse_and_link_at_with_base(
+        &mut self,
+        key: &str,
+        src: Option<String>,
+        module_url: &str,
+        resolution_url: &str,
+    ) -> Result<(), Abrupt> {
         let mut added = Vec::new();
         let result = self
-            .parse_and_register_graph(key, src, &mut added)
+            .parse_and_register_graph(key, module_url, resolution_url, src, &mut added)
             .and_then(|()| self.link_module(key));
         if result.is_err() {
             self.discard_modules(added);
@@ -261,6 +328,8 @@ impl Interp {
     fn parse_and_register_graph(
         &mut self,
         key: &str,
+        module_url: &str,
+        resolution_url: &str,
         src: Option<String>,
         added: &mut Vec<String>,
     ) -> Result<(), Abrupt> {
@@ -275,6 +344,38 @@ impl Interp {
         let t_parse = std::time::Instant::now();
         let body = match crate::precompiled::module_body(self, key) {
             Some(decoded) => decoded.map_err(|e| self.throw("SyntaxError", e))?,
+            None if crate::parser::jsx_path(key).is_some()
+                || self.jsx_module_keys.contains_key(key) =>
+            {
+                let ts = self
+                    .jsx_module_keys
+                    .get(key)
+                    .copied()
+                    .or_else(|| crate::parser::jsx_path(key))
+                    .unwrap_or(false);
+                let mut options = self.jsx_options.clone();
+                if let Some(loader) = self.jsx_options_loader.clone() {
+                    options = loader(key, &options)
+                        .map_err(|message| self.throw("SyntaxError", message))?;
+                }
+                options.filename = key.to_string();
+                crate::parser::parse_module_jsx(&src, ts, &options).map_err(|e| {
+                    let (start, _) = crate::parser::last_error_span();
+                    let column = src
+                        .get(..start as usize)
+                        .unwrap_or("")
+                        .rsplit('\n')
+                        .next()
+                        .unwrap_or("")
+                        .encode_utf16()
+                        .count()
+                        + 1;
+                    self.throw(
+                        "SyntaxError",
+                        format!("{key}:{}:{column}: {}", e.line, e.message),
+                    )
+                })?
+            }
             // A `.ts`/`.mts`/`.cts` module is TypeScript (the parser's strip-only mode).
             None if crate::typescript::is_ts_path(key) => crate::parser::parse_module_ts(&src)
                 .map_err(|e| self.throw_ts_syntax(e, &file_url(key), &src))?,
@@ -283,7 +384,9 @@ impl Interp {
         };
         load_stats::add(&load_stats::PARSE, t_parse, src.len());
         let module_src = self.adopt_parsed_source(
-            Some(&crate::interpreter::stack_trace::module_display_name(key)),
+            Some(&crate::interpreter::stack_trace::module_display_name(
+                module_url,
+            )),
             0,
         );
         let body = Rc::new(body);
@@ -327,7 +430,7 @@ impl Interp {
                 resolved.insert(map_key, spec);
                 continue;
             }
-            let (canon, dsrc) = self.fetch_module(&spec, key, attr_type.as_deref())?;
+            let (canon, dsrc) = self.fetch_module(&spec, resolution_url, attr_type.as_deref())?;
             // A `with { type: ... }` dependency synthesizes a wrapper module (JSON/text/bytes) —
             // keyed separately from any ordinary module of the same file.
             let canon = match attr_type.as_deref() {
@@ -355,7 +458,7 @@ impl Interp {
         let ns_obj = Object::new(None);
         let ns = Value::Obj(ns_obj.clone());
         self.modules.insert(key.to_string(), ns.clone());
-        let meta = self.build_import_meta(key);
+        let meta = self.build_import_meta(module_url);
         // `import.meta` resolves lexically: a function exported from this module keeps seeing
         // this module's object no matter who calls it.
         crate::eval::bind(&env, "%importmeta%", meta.clone());
@@ -405,7 +508,7 @@ impl Interp {
 
         // Recurse: parse each dependency (fetched during specifier resolution above).
         for (canon, dsrc) in dep_srcs {
-            self.parse_and_register_graph(&canon, Some(dsrc), added)?;
+            self.parse_and_register_graph(&canon, &canon, &canon, Some(dsrc), added)?;
         }
         Ok(())
     }
@@ -481,6 +584,23 @@ impl Interp {
         referrer: &str,
         attr_type: Option<&str>,
     ) -> Result<(String, String), Abrupt> {
+        #[cfg(feature = "parallel")]
+        if specifier == "lumen:parallel" {
+            if !self.host_state.has::<crate::parallel::api::Realm>() {
+                return Err(self.throw("TypeError", "parallel host is not installed"));
+            }
+            if attr_type.is_some() {
+                return Err(self.throw(
+                    "TypeError",
+                    "lumen:parallel does not accept import attributes",
+                ));
+            }
+            return Ok((
+                specifier.into(),
+                "export const run = Lumen.parallel.run; export const spawn = Lumen.parallel.spawn;"
+                    .into(),
+            ));
+        }
         // A specifier naming a module of a loaded precompiled bundle resolves inside the bundle
         // (its AST is decoded in `parse_and_register`); no host loader is consulted.
         if let Some(key) = crate::precompiled::resolve(self, specifier, referrer, attr_type) {
@@ -553,7 +673,7 @@ impl Interp {
     /// prototype). For a file-backed module the `url` is a `file://` URL (as Node's is, so
     /// `new URL(rel, import.meta.url)` resolves), and `filename`/`dirname` (Node 20.11+) are the
     /// plain paths.
-    fn build_import_meta(&mut self, key: &str) -> Value {
+    pub(crate) fn build_import_meta(&mut self, key: &str) -> Value {
         let meta = Object::new(None);
         let is_path = key.starts_with('/');
         let url = if is_path {
@@ -1053,7 +1173,12 @@ impl Interp {
 
         let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.src.clone(),
+            )
         };
         let saved_meta = self.import_meta.take();
         let saved_strict = self.strict;
@@ -1085,7 +1210,9 @@ impl Interp {
     /// initialization statements cannot execute again, but graph metadata is still needed
     /// by subsequent imports, including deferred imports through an evaluated module.
     fn retire_module_body(&mut self, key: &str) {
-        let Some(rec) = self.module_recs.get(key) else { return };
+        let Some(rec) = self.module_recs.get(key) else {
+            return;
+        };
         if !rec.evaluated || rec.retired_eager_order.is_some() {
             return;
         }
@@ -1379,7 +1506,12 @@ impl Interp {
         let top = self.module_recs[key].top_promise.clone();
         let (body, env, meta, src) = {
             let rec = &self.module_recs[key];
-            (rec.body.clone(), rec.env.clone(), rec.meta.clone(), rec.src.clone())
+            (
+                rec.body.clone(),
+                rec.env.clone(),
+                rec.meta.clone(),
+                rec.src.clone(),
+            )
         };
         if body_has_tla(&body) {
             self.module_recs.get_mut(key).unwrap().evaluating = true;
@@ -1423,10 +1555,7 @@ impl Interp {
             // Every step of the body, the first included, runs under the module's frame.
             coro.set_frame(Interp::resume_frame_script(src));
             self.park_async_coro(&top, coro);
-            self.drive_async(
-                top,
-                crate::coroutine::Resume::Next(Value::Undefined),
-            );
+            self.drive_async(top, crate::coroutine::Resume::Next(Value::Undefined));
             return;
         }
         let saved_meta = self.import_meta.take();
@@ -1603,6 +1732,21 @@ impl Interp {
             },
             None => self.import_base.clone(),
         };
+        if let Some(handler) = self.async_module_import_handler.clone() {
+            let id = self.next_async_module_import_id;
+            self.next_async_module_import_id = id.wrapping_add(1).max(1);
+            let request = crate::AsyncModuleImportRequest {
+                id,
+                specifier: specifier.to_owned(),
+                referrer,
+                attribute_type: attr_type.map(str::to_owned),
+                defer,
+            };
+            self.pending_async_module_imports
+                .insert(id, (request.clone(), promise.clone()));
+            handler(request);
+            return promise;
+        }
         let result = (|| {
             let (canon, src) = self.fetch_module(specifier, &referrer, attr_type)?;
             let canon = match attr_type {
@@ -1645,6 +1789,76 @@ impl Interp {
             }
         }
         promise
+    }
+
+    /// Finish a dynamic import whose host fetch was completed asynchronously.
+    /// The host loader is a prepared, in-memory graph reader, so linking still
+    /// runs through the canonical module parser and graph cache here.
+    pub(crate) fn complete_async_module_import(
+        &mut self,
+        id: u64,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<(Value, Value), String> {
+        let Some((request, import_promise)) = self.pending_async_module_imports.remove(&id) else {
+            return Err("unknown or already completed async module import".into());
+        };
+        self.module_loader = Some(Rc::new(loader));
+        let result = (|| -> Result<(Value, Value), Abrupt> {
+            let (canon, source) = self.fetch_module(
+                &request.specifier,
+                &request.referrer,
+                request.attribute_type.as_deref(),
+            )?;
+            let canon = match request.attribute_type.as_deref() {
+                Some(t @ ("json" | "text" | "bytes")) => format!("{canon}#{t}"),
+                _ => canon,
+            };
+            let source = typed_module_source(source, request.attribute_type.as_deref());
+            self.parse_and_link(&canon, Some(source))?;
+            if request.defer {
+                self.evaluate_async_subgraph(&canon, &mut Vec::new())?;
+                let namespace = self.make_deferred_ns(&canon);
+                self.resolve_promise(&import_promise, namespace.clone());
+                return Ok((namespace, import_promise.clone()));
+            }
+            let evaluation = self.evaluate_module_dynamic(&canon);
+            let namespace = self.module_recs[&canon].ns.clone();
+            let on_f = make_bound_len(
+                self,
+                dynamic_import_fulfil,
+                vec![import_promise.clone(), namespace.clone()],
+                1.0,
+            );
+            let on_r = make_bound_len(
+                self,
+                dynamic_import_reject,
+                vec![import_promise.clone()],
+                1.0,
+            );
+            self.promise_then(&evaluation, on_f, on_r);
+            Ok((namespace, evaluation))
+        })();
+        match result {
+            Ok(pair) => Ok(pair),
+            Err(error) => {
+                let reason = crate::interpreter::abrupt_value(error);
+                self.reject_promise(&import_promise, reason);
+                Err("async dynamic module import failed to link".into())
+            }
+        }
+    }
+
+    pub(crate) fn reject_async_module_import(
+        &mut self,
+        id: u64,
+        message: &str,
+    ) -> Result<(), String> {
+        let Some((_request, promise)) = self.pending_async_module_imports.remove(&id) else {
+            return Err("unknown or already completed async module import".into());
+        };
+        let reason = crate::interpreter::abrupt_value(self.throw("TypeError", message));
+        self.reject_promise(&promise, reason);
+        Ok(())
     }
 
     /// Evaluate a dynamically-imported module, returning a promise that settles when its body
@@ -1753,7 +1967,7 @@ pub(crate) fn dep_map_key(spec: &str, attr: Option<&str>) -> String {
 }
 
 /// Every module specifier this body imports/re-exports from (with duplicates).
-fn module_dependency_specifiers(body: &[Stmt]) -> Vec<(String, Option<String>)> {
+pub(crate) fn module_dependency_specifiers(body: &[Stmt]) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
     for stmt in body {
         match stmt {
@@ -1883,7 +2097,8 @@ pub(crate) fn body_has_tla(body: &[Stmt]) -> bool {
                 block.iter().any(stmt)
                     || handler
                         .as_ref()
-                        .map(|h| &h.1).map(|h| h.iter().any(stmt))
+                        .map(|h| &h.1)
+                        .map(|h| h.iter().any(stmt))
                         .unwrap_or(false)
                     || finalizer
                         .as_ref()
@@ -2087,7 +2302,11 @@ pub mod load_stats {
         c.2.fetch_add(bytes as u64, Relaxed);
     }
     pub fn get(c: &Counter) -> (f64, u64, u64) {
-        (c.0.load(Relaxed) as f64 / 1e6, c.1.load(Relaxed), c.2.load(Relaxed))
+        (
+            c.0.load(Relaxed) as f64 / 1e6,
+            c.1.load(Relaxed),
+            c.2.load(Relaxed),
+        )
     }
 }
 
@@ -2100,10 +2319,7 @@ fn file_url(key: &str) -> String {
     if has_scheme {
         return key.to_string();
     }
-    let path = key
-        .strip_prefix(r"\\?\")
-        .unwrap_or(key)
-        .replace('\\', "/");
+    let path = key.strip_prefix(r"\\?\").unwrap_or(key).replace('\\', "/");
     if path.starts_with('/') {
         format!("file://{path}")
     } else {
@@ -2284,11 +2500,9 @@ mod namespace_lifetime_tests {
         assert!(!interp.gc_pins.contains_key(&ptr));
         let ordinary = Value::Obj(Object::new(None));
         interp.strict = true;
-        assert!(
-            interp
-                .set_member(&ordinary, "PATH", Value::str("fixture"))
-                .is_ok()
-        );
+        assert!(interp
+            .set_member(&ordinary, "PATH", Value::str("fixture"))
+            .is_ok());
     }
 
     fn live_scopes() -> usize {

@@ -17,8 +17,8 @@
 
 use super::*;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
-use lumen_codegen::ir::{BinaryOp, FloatCC, IntCC, Type, UnaryOp, Value as V};
 use lumen_codegen::builder::Variable;
+use lumen_codegen::ir::{BinaryOp, FloatCC, IntCC, Type, UnaryOp, Value as V};
 
 /// Ops beyond which a callee is not inlined.
 const MAX_INLINE_OPS: usize = 48;
@@ -415,7 +415,11 @@ fn shape(chunk: &Chunk, args: &[bool], env: &crate::interpreter::Env) -> Option<
         }
     }
     // A leader's stack kinds are the merged ones (checked equal on every edge).
-    let gen = if caps.is_empty() { 0 } else { env.try_borrow().ok()?.vars.generation() };
+    let gen = if caps.is_empty() {
+        0
+    } else {
+        env.try_borrow().ok()?.vars.generation()
+    };
     Some(Shape {
         locals: kind,
         leaders,
@@ -440,7 +444,9 @@ impl Tr<'_, '_> {
                 Entry::Num(x) => args.push((x, true)),
                 Entry::Bool(b) => args.push((b, false)),
                 other => {
-                    return Err(format!("inline call argument {other:?} at {pc} is not unboxed"))
+                    return Err(format!(
+                        "inline call argument {other:?} at {pc} is not unboxed"
+                    ))
                 }
             }
         }
@@ -580,11 +586,9 @@ impl Tr<'_, '_> {
                     let old = self.fb.use_var(var(s));
                     let one = self.fb.f64const(1.0);
                     let inc = matches!(u, UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard);
-                    let new = self.fb.binary(
-                        if inc { BinaryOp::Fadd } else { BinaryOp::Fsub },
-                        old,
-                        one,
-                    );
+                    let new =
+                        self.fb
+                            .binary(if inc { BinaryOp::Fadd } else { BinaryOp::Fsub }, old, one);
                     self.fb.def_var(var(s), new);
                     match u {
                         UpdKind::PreInc | UpdKind::PreDec => st.push((new, true)),
@@ -627,7 +631,8 @@ impl Tr<'_, '_> {
                 }
                 Op::Jump(t) => {
                     let vals: Vec<V> = st.iter().map(|x| x.0).collect();
-                    self.fb.jump(blocks[t as usize].expect("shaped leader"), &vals);
+                    self.fb
+                        .jump(blocks[t as usize].expect("shaped leader"), &vals);
                     open = false;
                 }
                 Op::JumpIfFalse(t) => {
@@ -683,7 +688,8 @@ impl Tr<'_, '_> {
             if let Some((cond, t)) = branch {
                 let vals: Vec<V> = st.iter().map(|x| x.0).collect();
                 let next = self.fb.create_block();
-                self.fb.brif(cond, blocks[t].expect("shaped leader"), &vals, next, &[]);
+                self.fb
+                    .brif(cond, blocks[t].expect("shaped leader"), &vals, next, &[]);
                 self.fb.seal_block(next);
                 self.fb.switch_to_block(next);
             }

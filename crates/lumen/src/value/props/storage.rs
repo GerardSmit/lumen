@@ -68,7 +68,8 @@ pub(in crate::value) const DENSE_BOXED: usize = 1;
 
 const _: () = assert!(std::mem::align_of::<DenseBuffers>() > DENSE_BOXED);
 // In-box element slots follow the buffers directly.
-const _: () = assert!(std::mem::size_of::<DenseBuffers>() % std::mem::align_of::<PackedValue>() == 0);
+const _: () =
+    assert!(std::mem::size_of::<DenseBuffers>() % std::mem::align_of::<PackedValue>() == 0);
 
 /// The nullable sidecar pointer. Usually an array's buffers live in the tail of its object's
 /// own heap box, followed by a few element slots its packed storage starts out in
@@ -185,7 +186,11 @@ impl DenseStorage {
     /// # Safety
     /// As [`adopt_in_box`](DenseStorage::adopt_in_box).
     #[inline]
-    pub(in crate::value) unsafe fn install_in_box(&mut self, slot: *mut DenseBuffers, packed: PackedVec) {
+    pub(in crate::value) unsafe fn install_in_box(
+        &mut self,
+        slot: *mut DenseBuffers,
+        packed: PackedVec,
+    ) {
         self.release();
         slot.write(DenseBuffers {
             packed,

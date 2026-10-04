@@ -19,6 +19,8 @@ pub struct Legal {
     /// `srem` defined for `MIN % -1` (x64 `idiv` faults on it).
     pub srem_min_neg1: bool,
     pub fcopysign: bool,
+    pub js_to_i32: bool,
+    pub checked_i32: bool,
 }
 
 pub fn legalize(func: &mut Function, legal: Legal) {
@@ -47,6 +49,63 @@ pub fn legalize(func: &mut Function, legal: Legal) {
             continue;
         };
         match data {
+            InstData::CheckedBinary { op, args: [a, b] } => {
+                let results = func.results(inst).to_vec();
+                let mut p = pos;
+                let mut ins = |func: &mut Function, data| {
+                    let value = insert(func, block, p, data);
+                    p += 1;
+                    value
+                };
+                let a = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Sext,
+                        to: Type::I64,
+                        arg: a,
+                    },
+                );
+                let b = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Sext,
+                        to: Type::I64,
+                        arg: b,
+                    },
+                );
+                let op = match op {
+                    CheckedOp::IaddOv => BinaryOp::Iadd,
+                    CheckedOp::IsubOv => BinaryOp::Isub,
+                    CheckedOp::ImulOv => BinaryOp::Imul,
+                };
+                let wide = ins(func, InstData::Binary { op, args: [a, b] });
+                let value = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Wrap,
+                        to: Type::I32,
+                        arg: wide,
+                    },
+                );
+                let back = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Sext,
+                        to: Type::I64,
+                        arg: value,
+                    },
+                );
+                let overflow = ins(
+                    func,
+                    InstData::IntCmp {
+                        cc: IntCC::Ne,
+                        args: [wide, back],
+                    },
+                );
+                func.replace_uses(results[0], value);
+                func.replace_uses(results[1], overflow);
+                func.blocks[block.index()].insts.retain(|&i| i != inst);
+            }
             InstData::Unary {
                 op: UnaryOp::Eqz,
                 arg,
@@ -95,21 +154,67 @@ pub fn legalize(func: &mut Function, legal: Legal) {
                 args: [a, b],
             } if !legal.fcopysign => {
                 let fty = func.value_type(a);
-                let ity = if fty == Type::F32 { Type::I32 } else { Type::I64 };
-                let sign: i64 = if fty == Type::F32 { 0x8000_0000u32 as i32 as i64 } else { i64::MIN };
+                let ity = if fty == Type::F32 {
+                    Type::I32
+                } else {
+                    Type::I64
+                };
+                let sign: i64 = if fty == Type::F32 {
+                    0x8000_0000u32 as i32 as i64
+                } else {
+                    i64::MIN
+                };
                 let mut p = pos;
                 let mut ins = |func: &mut Function, d: InstData| {
                     let v = insert(func, block, p, d);
                     p += 1;
                     v
                 };
-                let ai = ins(func, InstData::Convert { op: ConvOp::Bitcast, to: ity, arg: a });
-                let bi = ins(func, InstData::Convert { op: ConvOp::Bitcast, to: ity, arg: b });
+                let ai = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Bitcast,
+                        to: ity,
+                        arg: a,
+                    },
+                );
+                let bi = ins(
+                    func,
+                    InstData::Convert {
+                        op: ConvOp::Bitcast,
+                        to: ity,
+                        arg: b,
+                    },
+                );
                 let s = ins(func, InstData::Iconst { ty: ity, imm: sign });
-                let ns = ins(func, InstData::Iconst { ty: ity, imm: !sign });
-                let am = ins(func, InstData::Binary { op: BinaryOp::Band, args: [ai, ns] });
-                let bm = ins(func, InstData::Binary { op: BinaryOp::Band, args: [bi, s] });
-                let r = ins(func, InstData::Binary { op: BinaryOp::Bor, args: [am, bm] });
+                let ns = ins(
+                    func,
+                    InstData::Iconst {
+                        ty: ity,
+                        imm: !sign,
+                    },
+                );
+                let am = ins(
+                    func,
+                    InstData::Binary {
+                        op: BinaryOp::Band,
+                        args: [ai, ns],
+                    },
+                );
+                let bm = ins(
+                    func,
+                    InstData::Binary {
+                        op: BinaryOp::Band,
+                        args: [bi, s],
+                    },
+                );
+                let r = ins(
+                    func,
+                    InstData::Binary {
+                        op: BinaryOp::Bor,
+                        args: [am, bm],
+                    },
+                );
                 func.insts[inst.index()] = InstData::Convert {
                     op: ConvOp::Bitcast,
                     to: fty,
@@ -167,6 +272,71 @@ pub fn legalize(func: &mut Function, legal: Legal) {
                 }
             }
             InstData::Convert {
+                op: ConvOp::ToJsInt32,
+                arg,
+                ..
+            } if !legal.js_to_i32 => {
+                let x = insert(
+                    func,
+                    block,
+                    pos,
+                    InstData::Unary {
+                        op: UnaryOp::Trunc,
+                        arg,
+                    },
+                );
+                let scale = insert(
+                    func,
+                    block,
+                    pos + 1,
+                    InstData::F64const {
+                        bits: 4294967296.0f64.to_bits(),
+                    },
+                );
+                let quotient = insert(
+                    func,
+                    block,
+                    pos + 2,
+                    InstData::Binary {
+                        op: BinaryOp::Fdiv,
+                        args: [x, scale],
+                    },
+                );
+                let quotient = insert(
+                    func,
+                    block,
+                    pos + 3,
+                    InstData::Unary {
+                        op: UnaryOp::Floor,
+                        arg: quotient,
+                    },
+                );
+                let multiple = insert(
+                    func,
+                    block,
+                    pos + 4,
+                    InstData::Binary {
+                        op: BinaryOp::Fmul,
+                        args: [quotient, scale],
+                    },
+                );
+                let reduced = insert(
+                    func,
+                    block,
+                    pos + 5,
+                    InstData::Binary {
+                        op: BinaryOp::Fsub,
+                        args: [x, multiple],
+                    },
+                );
+                func.insts[inst.index()] = InstData::Convert {
+                    op: ConvOp::ToUintSat,
+                    to: Type::I32,
+                    arg: reduced,
+                };
+                work.push(inst);
+            }
+            InstData::Convert {
                 op: op @ (ConvOp::ToSintSat | ConvOp::ToUintSat),
                 to,
                 arg,
@@ -183,12 +353,32 @@ pub fn legalize(func: &mut Function, legal: Legal) {
 /// Whether `legalize` rewrites an instruction of this shape (its match arms' patterns).
 fn needs_rewrite(data: &InstData, legal: Legal) -> bool {
     match data {
-        InstData::Unary { op: UnaryOp::Eqz, .. } => true,
-        InstData::Binary { op: BinaryOp::Srem, .. } => !legal.srem_min_neg1,
-        InstData::Binary { op: BinaryOp::Fcopysign, .. } => !legal.fcopysign,
-        InstData::Convert { op: ConvOp::FromUint, .. } => !legal.from_u64,
-        InstData::Convert { op: ConvOp::ToUint, .. } => !legal.to_uint,
-        InstData::Convert { op: ConvOp::ToSintSat | ConvOp::ToUintSat, .. } => !legal.to_int_sat,
+        InstData::CheckedBinary { .. } => !legal.checked_i32,
+        InstData::Unary {
+            op: UnaryOp::Eqz, ..
+        } => true,
+        InstData::Binary {
+            op: BinaryOp::Srem, ..
+        } => !legal.srem_min_neg1,
+        InstData::Binary {
+            op: BinaryOp::Fcopysign,
+            ..
+        } => !legal.fcopysign,
+        InstData::Convert {
+            op: ConvOp::FromUint,
+            ..
+        } => !legal.from_u64,
+        InstData::Convert {
+            op: ConvOp::ToUint, ..
+        } => !legal.to_uint,
+        InstData::Convert {
+            op: ConvOp::ToSintSat | ConvOp::ToUintSat,
+            ..
+        } => !legal.to_int_sat,
+        InstData::Convert {
+            op: ConvOp::ToJsInt32,
+            ..
+        } => !legal.js_to_i32,
         _ => false,
     }
 }
@@ -285,19 +475,93 @@ fn expand_from_u64(func: &mut Function, block: Block, pos: usize, inst: Inst, to
     let (join, _) = split_at(func, block, pos, inst, to);
     let small = new_block_after(func, block);
     let big = new_block_after(func, small);
-    let zero = append(func, block, InstData::Iconst { ty: Type::I64, imm: 0 }).unwrap();
-    let neg = append(func, block, InstData::IntCmp { cc: IntCC::Slt, args: [x, zero] }).unwrap();
+    let zero = append(
+        func,
+        block,
+        InstData::Iconst {
+            ty: Type::I64,
+            imm: 0,
+        },
+    )
+    .unwrap();
+    let neg = append(
+        func,
+        block,
+        InstData::IntCmp {
+            cc: IntCC::Slt,
+            args: [x, zero],
+        },
+    )
+    .unwrap();
     brif(func, block, neg, big, small);
 
-    let r1 = append(func, small, InstData::Convert { op: ConvOp::FromSint, to, arg: x }).unwrap();
+    let r1 = append(
+        func,
+        small,
+        InstData::Convert {
+            op: ConvOp::FromSint,
+            to,
+            arg: x,
+        },
+    )
+    .unwrap();
     jump(func, small, join, vec![r1]);
 
-    let one = append(func, big, InstData::Iconst { ty: Type::I64, imm: 1 }).unwrap();
-    let h = append(func, big, InstData::Binary { op: BinaryOp::Ushr, args: [x, one] }).unwrap();
-    let l = append(func, big, InstData::Binary { op: BinaryOp::Band, args: [x, one] }).unwrap();
-    let t = append(func, big, InstData::Binary { op: BinaryOp::Bor, args: [h, l] }).unwrap();
-    let f = append(func, big, InstData::Convert { op: ConvOp::FromSint, to, arg: t }).unwrap();
-    let r2 = append(func, big, InstData::Binary { op: BinaryOp::Fadd, args: [f, f] }).unwrap();
+    let one = append(
+        func,
+        big,
+        InstData::Iconst {
+            ty: Type::I64,
+            imm: 1,
+        },
+    )
+    .unwrap();
+    let h = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Ushr,
+            args: [x, one],
+        },
+    )
+    .unwrap();
+    let l = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Band,
+            args: [x, one],
+        },
+    )
+    .unwrap();
+    let t = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Bor,
+            args: [h, l],
+        },
+    )
+    .unwrap();
+    let f = append(
+        func,
+        big,
+        InstData::Convert {
+            op: ConvOp::FromSint,
+            to,
+            arg: t,
+        },
+    )
+    .unwrap();
+    let r2 = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Fadd,
+            args: [f, f],
+        },
+    )
+    .unwrap();
     jump(func, big, join, vec![r2]);
 }
 
@@ -308,16 +572,66 @@ fn expand_to_u64(func: &mut Function, block: Block, pos: usize, inst: Inst, x: V
     let small = new_block_after(func, block);
     let big = new_block_after(func, small);
     let c = append(func, block, fconst(fty, 9223372036854775808.0)).unwrap();
-    let ge = append(func, block, InstData::FloatCmp { cc: FloatCC::Ge, args: [x, c] }).unwrap();
+    let ge = append(
+        func,
+        block,
+        InstData::FloatCmp {
+            cc: FloatCC::Ge,
+            args: [x, c],
+        },
+    )
+    .unwrap();
     brif(func, block, ge, big, small);
 
-    let r1 = append(func, small, InstData::Convert { op: ConvOp::ToSint, to: Type::I64, arg: x }).unwrap();
+    let r1 = append(
+        func,
+        small,
+        InstData::Convert {
+            op: ConvOp::ToSint,
+            to: Type::I64,
+            arg: x,
+        },
+    )
+    .unwrap();
     jump(func, small, join, vec![r1]);
 
-    let d = append(func, big, InstData::Binary { op: BinaryOp::Fsub, args: [x, c] }).unwrap();
-    let t = append(func, big, InstData::Convert { op: ConvOp::ToSint, to: Type::I64, arg: d }).unwrap();
-    let m = append(func, big, InstData::Iconst { ty: Type::I64, imm: i64::MIN }).unwrap();
-    let r2 = append(func, big, InstData::Binary { op: BinaryOp::Bxor, args: [t, m] }).unwrap();
+    let d = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Fsub,
+            args: [x, c],
+        },
+    )
+    .unwrap();
+    let t = append(
+        func,
+        big,
+        InstData::Convert {
+            op: ConvOp::ToSint,
+            to: Type::I64,
+            arg: d,
+        },
+    )
+    .unwrap();
+    let m = append(
+        func,
+        big,
+        InstData::Iconst {
+            ty: Type::I64,
+            imm: i64::MIN,
+        },
+    )
+    .unwrap();
+    let r2 = append(
+        func,
+        big,
+        InstData::Binary {
+            op: BinaryOp::Bxor,
+            args: [t, m],
+        },
+    )
+    .unwrap();
     jump(func, big, join, vec![r2]);
 }
 
@@ -358,24 +672,52 @@ fn expand_sat(
     let max_b = new_block_after(func, hi_b);
     let conv_b = new_block_after(func, max_b);
 
-    let nan = append(func, block, InstData::FloatCmp { cc: FloatCC::Ne, args: [x, x] }).unwrap();
+    let nan = append(
+        func,
+        block,
+        InstData::FloatCmp {
+            cc: FloatCC::Ne,
+            args: [x, x],
+        },
+    )
+    .unwrap();
     brif(func, block, nan, nan_b, lo_b);
     let z = append(func, nan_b, InstData::Iconst { ty: to, imm: 0 }).unwrap();
     jump(func, nan_b, join, vec![z]);
 
     let lc = append(func, lo_b, fconst(fty, lo)).unwrap();
-    let below = append(func, lo_b, InstData::FloatCmp { cc: FloatCC::Le, args: [x, lc] }).unwrap();
+    let below = append(
+        func,
+        lo_b,
+        InstData::FloatCmp {
+            cc: FloatCC::Le,
+            args: [x, lc],
+        },
+    )
+    .unwrap();
     brif(func, lo_b, below, min_b, hi_b);
     let mv = append(func, min_b, InstData::Iconst { ty: to, imm: min }).unwrap();
     jump(func, min_b, join, vec![mv]);
 
     let hc = append(func, hi_b, fconst(fty, hi)).unwrap();
-    let above = append(func, hi_b, InstData::FloatCmp { cc: FloatCC::Ge, args: [x, hc] }).unwrap();
+    let above = append(
+        func,
+        hi_b,
+        InstData::FloatCmp {
+            cc: FloatCC::Ge,
+            args: [x, hc],
+        },
+    )
+    .unwrap();
     brif(func, hi_b, above, max_b, conv_b);
     let xv = append(func, max_b, InstData::Iconst { ty: to, imm: max }).unwrap();
     jump(func, max_b, join, vec![xv]);
 
-    let op = if signed { ConvOp::ToSint } else { ConvOp::ToUint };
+    let op = if signed {
+        ConvOp::ToSint
+    } else {
+        ConvOp::ToUint
+    };
     let conv = func.make_inst(InstData::Convert { op, to, arg: x });
     func.blocks[conv_b.index()].insts.push(conv);
     let r = func.results(conv)[0];

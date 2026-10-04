@@ -1,0 +1,18 @@
+<!doctype html>
+<style>
+  html, body { margin: 0; width: 40px; height: 20px; background: white; }
+  .masked {
+    width: 40px;
+    height: 20px;
+    background: #e53935;
+    mask-image: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADElEQVR4nGNggID/AAEIAQBNGY85AAAAAElFTkSuQmCC');
+    /* A no-repeat alpha tile placed outside the element masks every source pixel. The focused
+       renderer tests cover the alternating repeated tile; this visual case proves the shared
+       group/compositing path without Poppler antialiasing thousands of one-pixel clip edges. */
+    mask-size: 2px 1px;
+    mask-repeat: no-repeat;
+    mask-position: 100px 100px;
+    mask-mode: alpha;
+  }
+</style>
+<div class="masked"></div>

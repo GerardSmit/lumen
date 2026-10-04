@@ -26,20 +26,82 @@ struct Unit {
 }
 
 const UNITS: &[Unit] = &[
-    Unit { files: &["preamble.js"], lazy: false, defined: &[] },
-    Unit { files: &["events.js", "messaging.js"], lazy: true, defined: &[("__cloneTransferableSignal", false), ("__eventTargetInternals", false)] },
-    Unit { files: &["encoding.js", "serialize.js"], lazy: true, defined: &[] },
-    Unit { files: &["url.js"], lazy: true, defined: &[("URL", false), ("URLSearchParams", false)] },
-    Unit { files: &["urlpattern.js"], lazy: true, defined: &[] },
-    Unit { files: &["streams.js"], lazy: true, defined: &[] },
-    Unit { files: &["writable.js"], lazy: true, defined: &[] },
-    Unit { files: &["compression.js"], lazy: true, defined: &[] },
-    Unit { files: &["blob.js", "fetch.js"], lazy: true, defined: &[] },
-    Unit { files: &["websocket.js", "eventsource.js"], lazy: true, defined: &[] },
-    Unit { files: &["server.js"], lazy: false, defined: &[] },
-    Unit { files: &["crypto.js"], lazy: false, defined: &[] },
-    Unit { files: &["platform.js"], lazy: false, defined: &[] },
-    Unit { files: &["wasm.js"], lazy: true, defined: &[] },
+    Unit {
+        files: &["preamble.js"],
+        lazy: false,
+        defined: &[],
+    },
+    Unit {
+        files: &["events.js"],
+        lazy: true,
+        defined: &[
+            ("__cloneTransferableSignal", false),
+            ("__eventTargetInternals", false),
+        ],
+    },
+    Unit {
+        files: &["custom-event.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["error-events.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["messaging.js"],
+        lazy: true,
+        // This helper is installed with Object.defineProperty rather than an assignment, so
+        // publish it explicitly as a lazy trigger for realms whose MessagePort global is already
+        // occupied by Node's implementation.
+        defined: &[("__lumenSharedPorts", false)],
+    },
+    Unit {
+        files: &["encoding.js", "serialize.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["url.js"],
+        lazy: true,
+        defined: &[("URL", false), ("URLSearchParams", false)],
+    },
+    Unit {
+        files: &["urlpattern.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["blob.js", "fetch.js", "xhr.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["websocket.js", "eventsource.js"],
+        lazy: true,
+        defined: &[],
+    },
+    Unit {
+        files: &["server.js"],
+        lazy: false,
+        defined: &[],
+    },
+    Unit {
+        files: &["crypto.js"],
+        lazy: false,
+        defined: &[],
+    },
+    Unit {
+        files: &["platform.js"],
+        lazy: false,
+        defined: &[],
+    },
+    Unit {
+        files: &["wasm.js"],
+        lazy: true,
+        defined: &[],
+    },
 ];
 
 /// The globals a lazy unit publishes: its column-0 `globalThis.X = …` statements, then `defined`.
@@ -65,7 +127,10 @@ fn published(body: &str, defined: &[(&str, bool)]) -> Vec<(String, bool)> {
             names.push((name.to_string(), *enumerable));
         }
     }
-    assert!(!names.is_empty(), "a lazy web glue unit must publish a global");
+    assert!(
+        !names.is_empty(),
+        "a lazy web glue unit must publish a global"
+    );
     names
 }
 
@@ -97,13 +162,20 @@ fn main() {
             ));
         } else {
             glue.push_str(&body);
+            if unit.files == ["preamble.js"] && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("wasm32") {
+                glue.push_str("__http.policyHandledByHost = true;\n");
+            }
         }
     }
     glue.push_str("\n})();");
 
     // An ahead-of-time blob: AST, bytecode and the compressed function text (for `toString`).
-    let blob = lumen::precompiled::precompile_glue(&glue, "web-glue")
-        .unwrap_or_else(|e| panic!("web glue failed to precompile: {e}"));
+    let blob = if std::env::var_os("CARGO_FEATURE_COMPILER").is_some() {
+        lumen::precompiled::precompile_glue(&glue, "web-glue")
+    } else {
+        lumen_aot::native::precompile_glue_for_build(&glue, "web-glue")
+    }
+    .unwrap_or_else(|e| panic!("web glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // web_glue.js is for reference only (not linked).

@@ -7,8 +7,10 @@
 
 use super::*;
 use crate::bytecode::ctor_plan::{CtorPlan, PlanSrc};
-use crate::value::{Property, PACK_BIGINT, PACK_BOOL, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_STR,
-    PACK_SYM, PACK_UNDEFINED};
+use crate::value::{
+    Property, PACK_BIGINT, PACK_BOOL, PACK_EMPTY, PACK_NULL, PACK_OBJ, PACK_STR, PACK_SYM,
+    PACK_UNDEFINED,
+};
 use lumen_codegen::{BinaryOp, IntCC, MemKind, Type, Value as V};
 use std::rc::Rc;
 
@@ -107,7 +109,9 @@ pub(crate) unsafe extern "C" fn new_plan_helper(
         // (Never 0: an instance without entries has no stores.)
         b.props
             .entry_at_mut(0)
-            .map_or(std::mem::align_of::<Property>(), |p| p as *mut Property as usize)
+            .map_or(std::mem::align_of::<Property>(), |p| {
+                p as *mut Property as usize
+            })
     };
     if consume != 0 {
         std::ptr::drop_in_place(out);

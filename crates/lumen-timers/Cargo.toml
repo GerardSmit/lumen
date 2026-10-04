@@ -1,6 +1,6 @@
 # Timer op crate: setTimeout/setInterval/clearTimeout/clearInterval/setImmediate. The timer
 # heap lives in OpState; the runtime's loop asks it for the next deadline and the due batch
-# each turn (the ops themselves never sleep or spawn). Std-only.
+# each turn (the ops themselves never sleep or spawn). The ops are `lumen_bind` ops.
 [package]
 name = "lumen-timers"
 version.workspace = true
@@ -10,7 +10,15 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-host = { path = "../lumen-host" }
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
+lumen-bind = { path = "../lumen-bind" }
+lumen-host = { path = "../lumen-host", default-features = false, optional = true }
+
+[features]
+default = ["hosted"]
+# The lumen-host event loop (`extension()`, `setImmediate`, hosted clocks). Bare-metal
+# embedders disable it and call `install`.
+hosted = ["dep:lumen-host"]
 
 [lints]
 workspace = true

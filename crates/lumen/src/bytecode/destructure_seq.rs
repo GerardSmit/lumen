@@ -7,7 +7,9 @@
 //! step (a step's own throw leaves the iterator unclosed) and cleared when the step yields.
 //! The element code runs under a handler whose pad closes the iterator in throw mode unless it
 //! is done; a normal completion closes a not-done iterator in normal mode.
-use super::{Bail, CResult, Compiler, Op};
+use super::Op;
+#[cfg(feature = "compiler")]
+use super::{Bail, CResult, Compiler};
 use crate::ast::{ArrayPatElem, DeclKind, Pattern};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
@@ -41,9 +43,14 @@ struct Walk {
     k_true: u32,
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// Sequential array destructuring of the value on the stack (see the module docs).
-    pub(super) fn destructure_array_seq(&mut self, elems: &[ArrayPatElem], kind: DeclKind) -> CResult {
+    pub(super) fn destructure_array_seq(
+        &mut self,
+        elems: &[ArrayPatElem],
+        kind: DeclKind,
+    ) -> CResult {
         // A destructuring *assignment* evaluates a member target's reference before the step;
         // this lowering binds after it — leave those to the tree-walker.
         if self.assign_mode
@@ -59,9 +66,15 @@ impl Compiler {
         // A generator's `return()` resumption at a `yield` inside a default would leave this
         // region without the iterator close the spec performs.
         if self.generator
-            && elems
-                .iter()
-                .any(|e| matches!(e, ArrayPatElem::Elem { default: Some(_), .. }))
+            && elems.iter().any(|e| {
+                matches!(
+                    e,
+                    ArrayPatElem::Elem {
+                        default: Some(_),
+                        ..
+                    }
+                )
+            })
         {
             return Err(Bail);
         }
@@ -105,7 +118,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn destructure_array_elems(&mut self, elems: &[ArrayPatElem], kind: DeclKind, w: &Walk) -> CResult {
+    fn destructure_array_elems(
+        &mut self,
+        elems: &[ArrayPatElem],
+        kind: DeclKind,
+        w: &Walk,
+    ) -> CResult {
         for e in elems {
             match e {
                 ArrayPatElem::Hole | ArrayPatElem::Elem { .. } => {

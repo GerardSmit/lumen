@@ -1,0 +1,14 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+.grid{display:grid;grid-template-columns:100px 150px 60px;grid-template-rows:40px 30px;gap:10px;width:400px;background:#e8eef8}
+.sub{display:grid;grid-column:1 / 4;grid-row:1 / 3;grid-template-columns:subgrid;grid-template-rows:subgrid;border:5px solid #202124;padding:3px;background:#fce8e6}
+.sub>div:nth-child(1){background:#174ea6}
+.sub>div:nth-child(2){background:#fbbc04}
+.sub>div:nth-child(3){background:#34a853}
+.sub>div:nth-child(4){background:#a142f4}
+.wide{display:grid;grid-template-columns:100px 100px 100px;grid-template-rows:50px 50px;gap:10px;width:400px;background:#e6f4ea;margin-top:12px}
+.gapped{display:grid;grid-column:1 / 4;grid-row:1 / 3;grid-template-columns:subgrid;grid-template-rows:subgrid;gap:40px}
+.gapped>div{background:#0b8043}
+</style>
+<div class=grid><div class=sub><div></div><div></div><div></div><div></div></div></div>
+<div class=wide><div class=gapped><div></div><div></div><div></div><div></div></div></div>

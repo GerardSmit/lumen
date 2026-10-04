@@ -98,6 +98,7 @@
 pub use lumen::precompiled::Precompiled;
 pub use lumen_aot_macros::include_js;
 
+mod assets;
 #[path = "walk.rs"]
 mod walk;
 
@@ -114,10 +115,100 @@ mod walk;
 /// // main.rs
 /// static APP: lumen::Precompiled = lumen_aot::include_precompiled!("app.aot");
 /// ```
+#[cfg(feature = "native")]
+pub mod native;
+
 pub mod build {
     use std::path::{Path, PathBuf};
 
+    pub use crate::walk::Bundle;
     pub use crate::walk::Spec;
+
+    /// Compile a bundle without writing an output file.
+    pub fn compile(base: impl AsRef<Path>, spec: &Spec) -> Result<Bundle, String> {
+        crate::walk::bundle(base.as_ref(), spec)
+    }
+
+    /// Return every source and package manifest read by the bundle walker.
+    /// Relative paths in `spec` resolve against `base`.
+    pub fn collect_inputs(base: impl AsRef<Path>, spec: &Spec) -> Result<Vec<PathBuf>, String> {
+        let bundle = crate::walk::bundle(base.as_ref(), spec)?;
+        for warning in &bundle.warnings {
+            eprintln!("warning: {warning}");
+        }
+        Ok(bundle.inputs)
+    }
+
+    /// Write a host-tool bundle, rejecting outputs that alias any bundled source.
+    /// Relative input paths resolve against `base`, not the caller's environment.
+    pub fn compile_to(
+        base: impl AsRef<Path>,
+        spec: &Spec,
+        out: impl AsRef<Path>,
+    ) -> Result<usize, String> {
+        let bundle = crate::walk::bundle(base.as_ref(), spec)?;
+        for warning in &bundle.warnings {
+            eprintln!("warning: {warning}");
+        }
+        let out = out.as_ref();
+        let report = out.with_extension("trim.txt");
+        if spec.trim_modules && report == out {
+            return Err("output and trim report paths must differ".into());
+        }
+        for path in std::iter::once(out).chain(spec.trim_modules.then_some(report.as_path())) {
+            if let Ok(output) = path.canonicalize() {
+                if bundle
+                    .inputs
+                    .iter()
+                    .any(|p| p.canonicalize().is_ok_and(|p| p == output))
+                {
+                    return Err("output would overwrite a bundled source".into());
+                }
+            }
+        }
+        if spec.trim_modules {
+            let paths = bundle
+                .inputs
+                .iter()
+                .map(|p| {
+                    p.canonicalize()
+                        .map_err(|e| format!("{}: {e}", p.display()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut root = paths
+                .first()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            while paths.iter().any(|path| !path.starts_with(&root)) {
+                if !root.pop() {
+                    return Err("bundle sources have no common root".into());
+                }
+            }
+            let mut lines = vec!["trim: modules".to_owned(),
+                format!("output bytes: {}", bundle.blob.len()),
+                "Module roots and their transitive imports are kept; no member analysis is applied.".into()];
+            for path in &paths {
+                lines.push(format!(
+                    "kept input: {}",
+                    path.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                ));
+            }
+            for name in &bundle.required_modules {
+                lines.push(format!("required native: {name}"));
+            }
+            for warning in &bundle.warnings {
+                lines.push(format!("warning: {warning}"));
+            }
+            std::fs::write(&report, format!("{}\n", lines.join("\n")))
+                .map_err(|e| format!("{}: {e}", report.display()))?;
+        }
+        std::fs::write(out, &bundle.blob).map_err(|e| format!("{}: {e}", out.display()))?;
+        Ok(bundle.blob.len())
+    }
 
     /// Bundle the ES module graph rooted at `entry` (see [`precompile_spec`]).
     pub fn precompile_to(out: impl AsRef<Path>, entry: impl AsRef<Path>) -> Result<(), String> {
@@ -138,6 +229,9 @@ pub mod build {
             .map(PathBuf::from)
             .unwrap_or_default();
         let bundle = crate::walk::bundle(&base, spec)?;
+        for warning in &bundle.warnings {
+            println!("cargo:warning={warning}");
+        }
         for input in &bundle.inputs {
             println!("cargo:rerun-if-changed={}", input.display());
         }

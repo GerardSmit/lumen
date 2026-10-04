@@ -32,6 +32,9 @@ pub struct Abi {
     /// Windows on ARM64. Same register and stack-argument rules as AAPCS64 for the signatures
     /// the IR can express; kept so the caller can tell (e.g. unwind data, `x18`).
     pub windows: bool,
+    /// Imported C functions use integer registers for floating-point bits.
+    /// Generated function entries keep the backend's internal floating ABI.
+    pub softfloat_calls: bool,
     pub callee_saved: RegSet,
     /// Caller-saved registers a call overwrites.
     pub call_clobbers: RegSet,
@@ -58,7 +61,10 @@ pub fn host_abi() -> Abi {
     } else if cfg!(windows) {
         windows()
     } else {
-        aapcs64()
+        Abi {
+            softfloat_calls: cfg!(target_abi = "softfloat"),
+            ..aapcs64()
+        }
     }
 }
 
@@ -93,6 +99,7 @@ pub fn aapcs64() -> Abi {
     Abi {
         apple: false,
         windows: false,
+        softfloat_calls: false,
         callee_saved: callee_saved(),
         call_clobbers: clobbers(),
     }

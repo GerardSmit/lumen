@@ -106,6 +106,7 @@
 //! An ES module importing a CommonJS file is linked to a synthesized module unit with the same
 //! key that re-exports `require(key)` (default export plus the statically detected names).
 
+use lumen_common::bytes::Bytes;
 use std::collections::HashMap;
 
 use crate::ast::{Expr, Stmt};
@@ -113,14 +114,16 @@ use crate::interpreter::Interp;
 use crate::snapshot;
 use crate::value::Value;
 
+#[cfg(feature = "jit")]
+#[path = "precompiled/native_host.rs"]
+mod native_host;
+#[cfg(feature = "jit")]
+pub use native_host::{NativeSnapshotBaseline, NativeSnapshotFunctions, NativeUnit};
+
 /// The container format version (header + section table + manifest). Bump on any change.
-pub const FORMAT_VERSION: u32 = 6;
+pub use lumen_common::aot::FORMAT_VERSION;
 /// The AST codec version units are encoded with.
 pub const AST_VERSION: u32 = snapshot::VERSION;
-
-const MAGIC: &[u8; 8] = b"LUMENAOT";
-const HEADER_LEN: usize = 48;
-const SECTION_ENTRY_LEN: usize = 24;
 
 /// The unit list (kind, key, AST section of every unit, and the entry).
 pub const SEC_MANIFEST: u32 = 1;
@@ -135,6 +138,8 @@ pub const SEC_STORE: u32 = 6;
 /// in the blob (format 5): per unit in manifest order, `len` (LEB128) + the table
 /// (`stack_trace::LineTable::encode`; empty = none).
 pub const SEC_LINES: u32 = 7;
+/// Optional execution requirements; omitted for portable bytecode bundles.
+pub const SEC_TARGET: u32 = 8;
 
 /// The uncompressed size of a store block: the unit of decompression.
 pub const STORE_BLOCK: usize = 16 * 1024;
@@ -155,20 +160,46 @@ pub const CJS_WRAPPER_HEAD: &str = "(function (exports, require, module, __filen
 
 /// A precompiled blob linked into the binary, as `include_js!` expands to:
 /// `static APP: lumen::Precompiled = lumen_aot::include_js!("app.js");`
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Precompiled {
-    bytes: &'static [u8],
+    bytes: Bytes,
 }
 
 impl Precompiled {
     /// Wrap blob bytes (from `include_js!`, or `include_bytes!` of a blob a build script wrote
     /// with `lumen_aot::build`). Validated when loaded.
     pub const fn from_static(bytes: &'static [u8]) -> Precompiled {
-        Precompiled { bytes }
+        Precompiled {
+            bytes: Bytes::Static(bytes),
+        }
     }
 
-    pub fn as_bytes(&self) -> &'static [u8] {
-        self.bytes
+    /// Own an uploaded or file-backed blob. Deferred functions retain shared ownership.
+    pub fn from_bytes(bytes: std::sync::Arc<[u8]>) -> Precompiled {
+        Precompiled {
+            bytes: Bytes::owned(bytes),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Decode and validate every AST body and bytecode chunk without running JavaScript.
+    /// Unlike lazy loading's AST fallback, this rejects a corrupt cached chunk.
+    pub fn validate(&self) -> Result<(), String> {
+        for u in parse_blob(self)?.units {
+            let ast = u.data.split_ast()?;
+            if let Some(bc) = u.data.bytecode()? {
+                crate::bytecode::serialize::attach_unit(bc, &ast)?;
+            }
+            ast.decode_top()?;
+            for f in ast.all_functions()? {
+                f.ensure_body().map_err(|e| e.message)?;
+            }
+            crate::bytecode::serialize::validate_unit(&ast)?;
+        }
+        Ok(())
     }
 }
 
@@ -212,6 +243,7 @@ impl Default for CompileOptions {
 
 /// One unit compiled on its own, before it is named in a bundle (a module's AST does not
 /// depend on its key, so a bundler can compile first and choose the bundle root afterwards).
+#[derive(Clone)]
 pub struct CompiledUnit {
     kind: SourceKind,
     ast: Vec<u8>,
@@ -223,6 +255,12 @@ pub struct CompiledUnit {
     deps: snapshot::Deps,
     /// The source's line table (stack-trace positions; see [`SEC_LINES`]).
     lines: Vec<u8>,
+    #[cfg(feature = "jit")]
+    native_funcs: Vec<std::rc::Rc<crate::ast::Function>>,
+    #[cfg(feature = "jit")]
+    native_body: Vec<Stmt>,
+    #[cfg(feature = "jit")]
+    native_source: std::rc::Rc<str>,
 }
 
 impl CompiledUnit {
@@ -258,6 +296,16 @@ impl CompiledUnit {
         kind: SourceKind,
         opts: CompileOptions,
     ) -> Result<CompiledUnit, String> {
+        Self::compile_with_jsx_options(src, kind, opts, None)
+    }
+
+    /// Compile native JSX/TSX using the ordinary JavaScript AST and bytecode format.
+    pub fn compile_with_jsx_options(
+        src: &str,
+        kind: SourceKind,
+        opts: CompileOptions,
+        jsx: Option<(bool, &crate::JsxOptions)>,
+    ) -> Result<CompiledUnit, String> {
         let fmt =
             |e: crate::parser::ParseError| format!("SyntaxError: {} (line {})", e.message, e.line);
         let wrapped;
@@ -275,7 +323,10 @@ impl CompiledUnit {
         };
         let body = crate::parser::with_eager_bodies(|| match kind {
             SourceKind::Script | SourceKind::CommonJs => crate::parser::parse_script(text, false),
-            SourceKind::Module => crate::parser::parse_module(text),
+            SourceKind::Module => match jsx {
+                Some((ts, options)) => crate::parser::parse_module_jsx(text, ts, options),
+                None => crate::parser::parse_module(text),
+            },
         })
         .map_err(fmt)?;
         let mut imports = Vec::new();
@@ -309,6 +360,12 @@ impl CompiledUnit {
             (None, SectionStats::default())
         };
         Ok(CompiledUnit {
+            #[cfg(feature = "jit")]
+            native_funcs: unit.funcs,
+            #[cfg(feature = "jit")]
+            native_body: body,
+            #[cfg(feature = "jit")]
+            native_source: text.into(),
             kind,
             ast: unit.ast,
             bodies: unit.bodies,
@@ -324,6 +381,66 @@ impl CompiledUnit {
     /// What the bytecode precompile did (all zero when built without bytecode).
     pub fn bytecode_stats(&self) -> SectionStats {
         self.stats
+    }
+
+    /// Host-side native IR inputs, in the snapshot's stable function-table order.
+    /// A refused bytecode function is a build error, never a runtime fallback.
+    #[cfg(feature = "jit")]
+    pub fn native_chunks(&self) -> Result<Vec<std::rc::Rc<crate::bytecode::Chunk>>, String> {
+        self.native_funcs
+            .iter()
+            .enumerate()
+            .map(|(index, function)| {
+                if let Some(cached) = function.code.get() {
+                    return cached.clone().ok_or_else(|| {
+                        format!(
+                            "native compilation refused function {index}: {}",
+                            function.name.as_deref().unwrap_or("<anonymous>")
+                        )
+                    });
+                }
+                let chunk = crate::bytecode::compile(function);
+                let _ = function.code.set(chunk.clone());
+                chunk.ok_or_else(|| {
+                    let offset = match &function.source {
+                        crate::ast::FnSource::Range { start, .. } => *start,
+                        _ => 0,
+                    };
+                    format!(
+                        "native compilation refused function {index} {} at source offset {offset}",
+                        function.name.as_deref().unwrap_or("<anonymous>")
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Compile the unit's top-level statements as host IR. Module binding and script
+    /// global semantics must be supplied by the native runtime before this may launch.
+    #[cfg(feature = "jit")]
+    pub fn native_entry_chunk(&self) -> Result<std::rc::Rc<crate::bytecode::Chunk>, String> {
+        crate::bytecode::compile(self.snapshot_cjs_function()?.as_ref())
+            .ok_or_else(|| "native compilation refused top-level statements".into())
+    }
+
+    #[cfg(feature = "jit")]
+    pub(crate) fn snapshot_cjs_function(
+        &self,
+    ) -> Result<std::rc::Rc<crate::ast::Function>, String> {
+        let mut function = native_host::synthetic(
+            native_host::entry_body(&self.native_body, &self.native_source)?,
+            "<entry>",
+            false,
+            self.kind == SourceKind::Module,
+            false,
+        );
+        std::rc::Rc::get_mut(&mut function).unwrap().is_async = self.native_entry_async();
+        Ok(function)
+    }
+
+    #[cfg(feature = "jit")]
+    pub fn native_entry_async(&self) -> bool {
+        self.kind == SourceKind::Module && crate::modules::body_has_tla(&self.native_body)
     }
 
     /// The encoded bytecode section's size in bytes (0 without one).
@@ -355,6 +472,14 @@ impl CompiledUnit {
     /// attributes), deduplicated.
     pub fn dynamic_imports(&self) -> &[String] {
         &self.deps.dynamic_imports
+    }
+
+    pub fn computed_dynamic_imports(&self) -> usize {
+        self.deps.computed_dynamic_imports
+    }
+
+    pub fn dynamic_code_sites(&self) -> &[(u32, &'static str)] {
+        &self.deps.dynamic_code_sites
     }
 
     /// The string-literal specifiers of the unit's `require("x")` calls, deduplicated.
@@ -396,6 +521,7 @@ pub struct PrecompileBundle {
     entry: Option<usize>,
     no_bytecode: bool,
     compress: bool,
+    target: Option<crate::target::TargetSpec>,
 }
 
 impl Default for PrecompileBundle {
@@ -405,6 +531,7 @@ impl Default for PrecompileBundle {
             entry: None,
             no_bytecode: false,
             compress: true,
+            target: None,
         }
     }
 }
@@ -434,6 +561,13 @@ impl PrecompileBundle {
     /// Whether kept function text is compressed in the blob (default on).
     pub fn set_compress_source(&mut self, on: bool) {
         self.compress = on;
+    }
+
+    /// Bind a bundle to an explicit execution target. Portable bytecode needs no binding.
+    pub fn set_target(&mut self, target: crate::target::TargetSpec) -> Result<(), &'static str> {
+        target.validate()?;
+        self.target = Some(target);
+        Ok(())
     }
 
     /// Compile and add one unit (see [`PrecompileBundle::add_compiled`]); returns the module's
@@ -603,30 +737,25 @@ impl PrecompileBundle {
         if self.units.iter().any(|u| !u.lines.is_empty()) {
             sections.push((SEC_LINES, 0, &lines));
         }
-        let mut out = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&AST_VERSION.to_le_bytes());
-        out.extend_from_slice(&(sections.len() as u32).to_le_bytes());
+        let target = self
+            .target
+            .map(|target| target.encode().expect("validated target"));
+        if let Some(target) = &target {
+            sections.push((SEC_TARGET, 0, target));
+        }
         let layout_fp = if has_bytecode { LAYOUT_FINGERPRINT } else { 0 };
-        out.extend_from_slice(&layout_fp.to_le_bytes());
-        let mut ver = [0u8; 16];
-        let v = env!("CARGO_PKG_VERSION").as_bytes();
-        ver[..v.len().min(16)].copy_from_slice(&v[..v.len().min(16)]);
-        out.extend_from_slice(&ver);
-        let mut offset = (HEADER_LEN + sections.len() * SECTION_ENTRY_LEN) as u64;
-        for (kind, flags, data) in &sections {
-            out.extend_from_slice(&kind.to_le_bytes());
-            out.extend_from_slice(&flags.to_le_bytes());
-            out.extend_from_slice(&offset.to_le_bytes());
-            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-            offset += data.len() as u64;
-        }
-        for (_, _, data) in &sections {
-            out.extend_from_slice(data);
-        }
-        out
+        lumen_common::aot::encode(
+            lumen_common::aot::Header {
+                codec_version: AST_VERSION,
+                layout_fp,
+                lumen_version: lumen_common::aot::version_bytes(LUMEN_VERSION),
+            },
+            &sections
+                .iter()
+                .map(|&(kind, flags, data)| lumen_common::aot::Section { kind, flags, data })
+                .collect::<Vec<_>>(),
+        )
+        .expect("precompiled container too large")
     }
 }
 
@@ -752,28 +881,21 @@ pub(crate) mod store {
     }
 
     fn uv(b: &[u8], pos: &mut usize) -> Result<usize, String> {
-        let mut v = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = *b.get(*pos).ok_or("precompiled: truncated store")?;
-            *pos += 1;
-            v |= ((byte & 0x7f) as u64) << shift;
-            if byte & 0x80 == 0 {
-                return usize::try_from(v).map_err(|_| "precompiled: bad store".to_string());
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err("precompiled: bad store".into());
-            }
-        }
+        let v = lumen_common::aot::read_varint(b, pos)
+            .map_err(|e| format!("precompiled store: {e}"))?;
+        usize::try_from(v).map_err(|_| "precompiled: bad store".into())
     }
 
-    fn index(section: &'static [u8]) -> Result<Index, String> {
+    fn index(section: &[u8]) -> Result<Index, String> {
         let mut pos = 0;
         let block_size = uv(section, &mut pos)?;
         let raw_len = uv(section, &mut pos)?;
         let count = uv(section, &mut pos)?;
-        if block_size == 0 || count != raw_len.div_ceil(block_size) {
+        if block_size == 0
+            || block_size > super::STORE_BLOCK
+            || count != raw_len.div_ceil(block_size)
+            || count > section.len().saturating_sub(pos)
+        {
             return Err("precompiled: bad store header".into());
         }
         let mut lens = Vec::with_capacity(count);
@@ -797,7 +919,7 @@ pub(crate) mod store {
     }
 
     /// A raw store's bytes (see `raw_store_section`), or `None` for a compressed store.
-    fn raw(section: &'static [u8]) -> Result<Option<&'static [u8]>, String> {
+    fn raw(section: &[u8]) -> Result<Option<&[u8]>, String> {
         if section.first() != Some(&0) {
             return Ok(None);
         }
@@ -813,6 +935,64 @@ pub(crate) mod store {
     /// Recently decompressed blocks for [`bytes`], most recent last: `(section, block, data)`.
     const RECENT: usize = 2;
     static RECENT_BLOCKS: Mutex<Vec<(usize, usize, Box<[u8]>)>> = Mutex::new(Vec::new());
+
+    /// Owned stores use bounded temporary decoding; process-wide address-keyed caches
+    /// are reserved for static blobs so reused allocation addresses cannot alias old data.
+    pub(crate) fn owned_range(
+        section: &super::Bytes,
+        off: usize,
+        len: usize,
+    ) -> Result<super::Bytes, String> {
+        if let Some(section) = section.as_static() {
+            return range(section, off, len).map(super::Bytes::Static);
+        }
+        if let Some(raw) = raw(section)? {
+            let base = raw.as_ptr() as usize - section.as_ptr() as usize;
+            let end = off
+                .checked_add(len)
+                .filter(|&end| end <= raw.len())
+                .ok_or("precompiled: store slice out of bounds")?;
+            return section
+                .slice(base + off..base + end)
+                .ok_or_else(|| "precompiled: bad raw store".into());
+        }
+        let idx = index(section)?;
+        let end = off
+            .checked_add(len)
+            .filter(|&end| end <= idx.raw_len)
+            .ok_or("precompiled: store slice out of bounds")?;
+        if len == 0 {
+            return Ok(super::Bytes::Static(&[]));
+        }
+        let first = off / idx.block_size;
+        let last = (end - 1) / idx.block_size;
+        let mut out = Vec::with_capacity(len);
+        for b in first..=last {
+            let data =
+                crate::lzh::decompress_bounded(&section[idx.frames[b].clone()], idx.block_size)?;
+            if data.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
+                return Err("precompiled: bad store block".into());
+            }
+            let lo = if b == first {
+                off - first * idx.block_size
+            } else {
+                0
+            };
+            out.extend_from_slice(&data[lo..(lo + len - out.len()).min(data.len())]);
+        }
+        Ok(super::Bytes::owned(out.into()))
+    }
+
+    pub(crate) fn body_bytes(
+        section: &super::Bytes,
+        off: usize,
+        len: usize,
+    ) -> Result<std::borrow::Cow<'static, [u8]>, String> {
+        if let Some(section) = section.as_static() {
+            return bytes(section, off, len);
+        }
+        owned_range(section, off, len).map(|data| std::borrow::Cow::Owned(data.to_vec()))
+    }
 
     /// `len` bytes at `off` of the store `section`, for a reader that only needs them for a
     /// moment (a function body being decoded): a block that is not already held is
@@ -859,7 +1039,10 @@ pub(crate) mod store {
             let at = match recent.iter().position(|(k, n, _)| *k == key && *n == b) {
                 Some(at) => at,
                 None => {
-                    let d = crate::lzh::decompress(&section[idx.frames[b].clone()])?;
+                    let d = crate::lzh::decompress_bounded(
+                        &section[idx.frames[b].clone()],
+                        idx.block_size,
+                    )?;
                     if d.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                         return Err("precompiled: bad store block".into());
                     }
@@ -871,7 +1054,11 @@ pub(crate) mod store {
                 }
             };
             let entry = recent.remove(at);
-            let lo = if b == first { off - first * idx.block_size } else { 0 };
+            let lo = if b == first {
+                off - first * idx.block_size
+            } else {
+                0
+            };
             let hi = (lo + (len - out.len())).min(entry.2.len());
             out.extend_from_slice(&entry.2[lo..hi]);
             recent.push(entry);
@@ -923,7 +1110,8 @@ pub(crate) mod store {
             .ok_or("precompiled: store slice out of bounds")?;
         let (first, last) = (off / idx.block_size, (end - 1) / idx.block_size);
         let decode = |b: usize| -> Result<Vec<u8>, String> {
-            let d = crate::lzh::decompress(&section[idx.frames[b].clone()])?;
+            let d =
+                crate::lzh::decompress_bounded(&section[idx.frames[b].clone()], idx.block_size)?;
             if d.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                 return Err("precompiled: bad store block".into());
             }
@@ -965,26 +1153,36 @@ pub(crate) mod store {
 /// point into it). Nothing is decompressed until a `toString` reads a function's text, and then
 /// only the store blocks that function's text spans.
 pub struct KeptRef {
-    store: &'static [u8],
+    store: Bytes,
     off: usize,
     len: usize,
+    decoded: std::cell::OnceCell<Option<String>>,
 }
 
 impl KeptRef {
     /// The whole text (`None`: the store is corrupt).
-    pub fn text(&self) -> Option<&'static str> {
+    pub fn text(&self) -> Option<&str> {
         self.slice(0, self.len as u32)
     }
 
     /// The text at `start..end` (`None`: out of range or corrupt — `toString` then renders the
     /// native form).
-    pub fn slice(&self, start: u32, end: u32) -> Option<&'static str> {
+    pub fn slice(&self, start: u32, end: u32) -> Option<&str> {
         let (start, end) = (start as usize, end as usize);
         if start > end || end > self.len {
             return None;
         }
-        let bytes = store::range(self.store, self.off + start, end - start).ok()?;
-        std::str::from_utf8(bytes).ok()
+        if let Some(store) = self.store.as_static() {
+            let bytes = store::range(store, self.off + start, end - start).ok()?;
+            return std::str::from_utf8(bytes).ok();
+        }
+        self.decoded
+            .get_or_init(|| {
+                let data = store::owned_range(&self.store, self.off, self.len).ok()?;
+                String::from_utf8(data.to_vec()).ok()
+            })
+            .as_ref()?
+            .get(start..end)
     }
 }
 
@@ -1003,46 +1201,60 @@ pub(crate) fn decode_body(aot: &AotBody) -> Result<Vec<Stmt>, String> {
 // ---- reading ----------------------------------------------------------------------------------
 
 /// Where one unit's parts are: its load-time AST section and its slices of the stores.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct UnitData {
-    pub ast: &'static [u8],
-    bodies: (&'static [u8], usize),
-    bytecode: Option<(&'static [u8], usize, usize)>,
-    kept: Option<(&'static [u8], usize, usize)>,
+    pub ast: Bytes,
+    bodies: (Bytes, usize),
+    bytecode: Option<(Bytes, usize, usize)>,
+    kept: Option<(Bytes, usize, usize)>,
     /// The unit's line table (see [`SEC_LINES`]).
-    lines: Option<&'static [u8]>,
+    lines: Option<Bytes>,
 }
 
 impl UnitData {
     fn kept_ref(&self) -> Option<std::rc::Rc<KeptRef>> {
-        self.kept.map(|(store, off, len)| {
-            std::rc::Rc::new(KeptRef { store, off, len })
+        self.kept.clone().map(|(store, off, len)| {
+            std::rc::Rc::new(KeptRef {
+                store,
+                off,
+                len,
+                decoded: Default::default(),
+            })
         })
     }
 
-    fn bytecode(&self) -> Result<Option<&'static [u8]>, String> {
+    fn bytecode(&self) -> Result<Option<Bytes>, String> {
         self.bytecode
-            .map(|(store, off, len)| store::range(store, off, len))
+            .as_ref()
+            .map(|(store, off, len)| store::owned_range(store, *off, *len))
             .transpose()
     }
 
-    /// The unit's AST, decoded on demand (see [`snapshot::SplitUnit`]). The unit's source
-    /// marker and line table are noted for the caller that runs it
-    /// (`stack_trace::take_parsed_source`).
-    fn split_unit(&self) -> Result<std::rc::Rc<snapshot::SplitUnit>, String> {
+    fn split_ast(&self) -> Result<std::rc::Rc<snapshot::SplitUnit>, String> {
         let kept = self.kept_ref();
         let src: std::rc::Rc<str> = std::rc::Rc::from("");
-        let (store, base) = self.bodies;
-        let unit = snapshot::SplitUnit::new(
-            self.ast,
+        let (store, base) = self.bodies.clone();
+        snapshot::SplitUnit::new(
+            self.ast.clone(),
             src.clone(),
             kept,
-            Box::new(move |start, len| store::bytes(store, base + start, len)),
-        )?;
+            Box::new(move |start, len| {
+                let off = base
+                    .checked_add(start)
+                    .ok_or("precompiled: body offset overflow")?;
+                store::body_bytes(&store, off, len)
+            }),
+        )
+    }
+
+    /// Decode the AST and note its source/line table for the caller running it.
+    fn split_unit(&self) -> Result<std::rc::Rc<snapshot::SplitUnit>, String> {
+        let unit = self.split_ast()?;
         let table = self
             .lines
+            .clone()
             .map(|b| std::rc::Rc::new(crate::interpreter::stack_trace::LineTable::lazy(b)));
-        crate::interpreter::stack_trace::note_parsed_source(src, table);
+        crate::interpreter::stack_trace::note_parsed_source(unit.src.clone(), table);
         Ok(unit)
     }
 }
@@ -1067,109 +1279,113 @@ pub(crate) struct Parsed {
     pub entry: Option<usize>,
 }
 
-fn read_u32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-fn read_u64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
 /// Validate a blob's header and read its manifest. Section payloads are not decoded here.
 pub(crate) fn parse(bytes: &'static [u8]) -> Result<Parsed, String> {
+    parse_bytes(Bytes::Static(bytes))
+}
+
+pub(crate) fn parse_blob(blob: &Precompiled) -> Result<Parsed, String> {
+    if !cfg!(feature = "compiler") {
+        return Err(
+            "AOT bytecode is unavailable in the Aot profile; load an AOT native image".into(),
+        );
+    }
+    parse_bytes(blob.bytes.clone())
+}
+
+fn parse_bytes(bytes: Bytes) -> Result<Parsed, String> {
     let err = |m: &str| Err(format!("precompiled: {m}"));
-    if bytes.len() < HEADER_LEN || &bytes[..8] != MAGIC {
-        return err("not a lumen precompiled blob");
-    }
-    if read_u32(bytes, 8) != FORMAT_VERSION {
-        return err("container format version mismatch (rebuild with this lumen)");
-    }
-    if read_u32(bytes, 16) != AST_VERSION {
+    let container =
+        lumen_common::aot::Container::parse(&bytes).map_err(|m| format!("precompiled: {m}"))?;
+    if container.header.codec_version != AST_VERSION {
         return err("AST version mismatch (rebuild with this lumen)");
     }
-    let built = &bytes[32..48];
+    let built = &container.header.lumen_version;
     let built = &built[..built.iter().position(|&b| b == 0).unwrap_or(16)];
-    if built != env!("CARGO_PKG_VERSION").as_bytes() {
+    if container.header.lumen_version != lumen_common::aot::version_bytes(LUMEN_VERSION) {
         return Err(format!(
             "precompiled: built by lumen {} but loaded by {}",
             String::from_utf8_lossy(built),
             env!("CARGO_PKG_VERSION")
         ));
     }
-    let layout_fp = read_u64(bytes, 24);
+    let layout_fp = container.header.layout_fp;
     if layout_fp != 0 && layout_fp != LAYOUT_FINGERPRINT {
         return err("bytecode layout fingerprint mismatch (rebuild with this lumen)");
     }
-    let count = read_u32(bytes, 20) as usize;
-    let table_end = HEADER_LEN + count * SECTION_ENTRY_LEN;
-    if bytes.len() < table_end {
-        return err("truncated section table");
+    let sections: Vec<_> = container
+        .sections
+        .iter()
+        .map(|s| {
+            let off = s.data.as_ptr() as usize - bytes.as_ptr() as usize;
+            (
+                s.kind,
+                s.flags,
+                bytes.slice(off..off + s.data.len()).unwrap(),
+            )
+        })
+        .collect();
+    if sections.iter().filter(|s| s.0 == SEC_MANIFEST).count() != 1 {
+        return err("expected exactly one manifest");
     }
-    let mut sections = Vec::with_capacity(count);
-    for i in 0..count {
-        let at = HEADER_LEN + i * SECTION_ENTRY_LEN;
-        let (kind, flags, off, len) = (
-            read_u32(bytes, at),
-            read_u32(bytes, at + 4),
-            read_u64(bytes, at + 8),
-            read_u64(bytes, at + 16),
-        );
-        let end = off.checked_add(len).filter(|&e| e <= bytes.len() as u64);
-        let Some(end) = end else {
-            return err("section out of bounds");
-        };
-        sections.push((kind, flags, &bytes[off as usize..end as usize]));
+    if sections.iter().filter(|s| s.0 == SEC_LINES).count() > 1 {
+        return err("duplicate line tables");
+    }
+    if sections.iter().filter(|s| s.0 == SEC_TARGET).count() > 1 {
+        return err("duplicate target requirements");
+    }
+    if let Some((_, _, target)) = sections.iter().find(|s| s.0 == SEC_TARGET) {
+        crate::target::TargetSpec::decode(target)
+            .and_then(|target| target.supported_by(&crate::target::host()))
+            .map_err(|e| format!("precompiled: {e}"))?;
+    }
+    if sections.iter().any(|s| {
+        matches!(
+            s.0,
+            SEC_MANIFEST | SEC_AST | SEC_STORE | SEC_LINES | SEC_TARGET
+        ) && s.1 != 0
+    }) {
+        return err("unsupported section flags");
     }
     let manifest = sections
         .iter()
         .find(|(k, _, _)| *k == SEC_MANIFEST)
-        .map(|(_, _, d)| *d)
+        .map(|(_, _, d)| d)
         .ok_or("precompiled: no manifest")?;
     let mut parsed = read_manifest(manifest, &sections)?;
-    if let Some((_, _, mut d)) = sections.iter().find(|(k, _, _)| *k == SEC_LINES).copied() {
+    if parsed.units.iter().any(|u| u.data.bytecode.is_some()) && layout_fp != LAYOUT_FINGERPRINT {
+        return err("bytecode requires its layout fingerprint");
+    }
+    if let Some((_, _, data)) = sections.iter().find(|(k, _, _)| *k == SEC_LINES) {
+        let mut d = &data[..];
         for u in &mut parsed.units {
-            let (mut at, mut len, mut shift) = (0usize, 0usize, 0);
-            while let Some(&b) = d.get(at) {
-                at += 1;
-                len |= ((b & 0x7f) as usize) << shift;
-                shift += 7;
-                if b & 0x80 == 0 || shift > 56 {
-                    break;
-                }
-            }
+            let mut at = 0;
+            let len = lumen_common::aot::read_varint(d, &mut at)
+                .map_err(|e| format!("precompiled line tables: {e}"))?;
+            let len = usize::try_from(len).map_err(|_| "precompiled: bad line table length")?;
             let Some(table) = at.checked_add(len).and_then(|end| d.get(at..end)) else {
                 return err("truncated line tables");
             };
-            u.data.lines = (!table.is_empty()).then_some(table);
+            let off = table.as_ptr() as usize - data.as_ptr() as usize;
+            u.data.lines = (!table.is_empty()).then(|| data.slice(off..off + table.len()).unwrap());
             d = &d[at + len..];
+        }
+        if !d.is_empty() {
+            return err("trailing line table data");
         }
     }
     Ok(parsed)
 }
 
-fn read_manifest(m: &[u8], sections: &[(u32, u32, &'static [u8])]) -> Result<Parsed, String> {
+fn read_manifest(m: &[u8], sections: &[(u32, u32, Bytes)]) -> Result<Parsed, String> {
     struct Cur<'a> {
         b: &'a [u8],
         pos: usize,
     }
     impl Cur<'_> {
         fn uv(&mut self) -> Result<u64, String> {
-            let mut v = 0u64;
-            let mut shift = 0;
-            loop {
-                let b = *self
-                    .b
-                    .get(self.pos)
-                    .ok_or("precompiled: truncated manifest")?;
-                self.pos += 1;
-                v |= ((b & 0x7f) as u64) << shift;
-                if b & 0x80 == 0 {
-                    return Ok(v);
-                }
-                shift += 7;
-                if shift >= 64 {
-                    return Err("precompiled: bad manifest varint".into());
-                }
-            }
+            lumen_common::aot::read_varint(self.b, &mut self.pos)
+                .map_err(|e| format!("precompiled manifest: {e}"))
         }
         fn u8(&mut self) -> Result<u8, String> {
             let b = *self
@@ -1180,7 +1396,7 @@ fn read_manifest(m: &[u8], sections: &[(u32, u32, &'static [u8])]) -> Result<Par
             Ok(b)
         }
         fn str(&mut self) -> Result<String, String> {
-            let len = self.uv()? as usize;
+            let len = self.usize()?;
             let end = self.pos.checked_add(len).ok_or("precompiled: bad length")?;
             let s = self
                 .b
@@ -1194,18 +1410,18 @@ fn read_manifest(m: &[u8], sections: &[(u32, u32, &'static [u8])]) -> Result<Par
         }
     }
     let mut c = Cur { b: m, pos: 0 };
-    let mut stores: [Option<&'static [u8]>; 3] = [None; 3];
+    let mut stores: [Option<Bytes>; 3] = [None, None, None];
     for s in &mut stores {
         *s = match c.usize()? {
             0 => None,
             i => match sections.get(i) {
-                Some((SEC_STORE, _, d)) => Some(*d),
+                Some((SEC_STORE, _, d)) => Some(d.clone()),
                 _ => return Err(format!("precompiled: bad store section {i}")),
             },
         };
     }
     let [body_store, bc_store, kept_store] = stores;
-    let n = c.uv()? as usize;
+    let n = c.usize()?;
     let mut units = Vec::with_capacity(n.min(1 << 16));
     for _ in 0..n {
         let kind = match c.u8()? {
@@ -1217,32 +1433,31 @@ fn read_manifest(m: &[u8], sections: &[(u32, u32, &'static [u8])]) -> Result<Par
         let key = c.str()?;
         let sec = c.usize()?;
         let ast = match sections.get(sec) {
-            Some((SEC_AST, _, d)) => *d,
+            Some((SEC_AST, _, d)) => d.clone(),
             _ => return Err(format!("precompiled: {key}: bad AST section {sec}")),
         };
         let bodies_off = c.usize()?;
         let bodies_len = c.usize()?;
-        let bodies = match body_store {
+        let bodies = match body_store.clone() {
             Some(store) => (store, bodies_off),
-            None if bodies_len == 0 => (&[][..], 0),
+            None if bodies_len == 0 => (Bytes::Static(&[]), 0),
             None => return Err(format!("precompiled: {key}: no body store")),
         };
-        let mut span = |store: Option<&'static [u8]>, what: &str| match c.usize()? {
+        let mut span = |store: Option<Bytes>, what: &str| match c.usize()? {
             0 => Ok(None),
             len => {
                 let off = c.usize()?;
-                let store =
-                    store.ok_or_else(|| format!("precompiled: {key}: no {what} store"))?;
+                let store = store.ok_or_else(|| format!("precompiled: {key}: no {what} store"))?;
                 Ok::<_, String>(Some((store, off, len - 1)))
             }
         };
-        let bytecode = span(bc_store, "bytecode")?;
-        let kept = span(kept_store, "kept-text")?;
-        let n_links = c.uv()? as usize;
+        let bytecode = span(bc_store.clone(), "bytecode")?;
+        let kept = span(kept_store.clone(), "kept-text")?;
+        let n_links = c.usize()?;
         let mut links = Vec::with_capacity(n_links.min(1 << 12));
         for _ in 0..n_links {
             let spec = c.str()?;
-            let to = c.uv()? as usize;
+            let to = c.usize()?;
             if to >= n {
                 return Err(format!("precompiled: {key}: bad link target {to}"));
             }
@@ -1261,16 +1476,19 @@ fn read_manifest(m: &[u8], sections: &[(u32, u32, &'static [u8])]) -> Result<Par
             links,
         });
     }
-    let entry = match c.uv()? {
+    let entry = match c.usize()? {
         0 => None,
         e => {
-            let i = e as usize - 1;
+            let i = e - 1;
             if units.get(i).is_none_or(|u| u.kind != SourceKind::Module) {
                 return Err("precompiled: bad entry".into());
             }
             Some(i)
         }
     };
+    if c.pos != m.len() {
+        return Err("precompiled: trailing manifest data".into());
+    }
     Ok(Parsed { units, entry })
 }
 
@@ -1388,7 +1606,8 @@ pub fn verify_bytecode(blob: &'static [u8]) -> Result<VerifyReport, String> {
             continue;
         };
         let t = Instant::now();
-        crate::bytecode::serialize::attach_unit(bc, &unit).map_err(|e| format!("{}: {e}", u.key))?;
+        crate::bytecode::serialize::attach_unit(bc, &unit)
+            .map_err(|e| format!("{}: {e}", u.key))?;
         for f in &funcs {
             crate::bytecode::serialize::attach_now(f);
         }
@@ -1456,11 +1675,7 @@ impl PrecompiledModules {
         let table = |k: &str| -> Option<usize> {
             match want {
                 SourceKind::Module => self.modules.get(k).copied(),
-                _ => self
-                    .cjs
-                    .get(k)
-                    .or_else(|| self.modules.get(k))
-                    .copied(),
+                _ => self.cjs.get(k).or_else(|| self.modules.get(k)).copied(),
             }
         };
         let path = if let Some(path) = specifier.strip_prefix(KEY_PREFIX) {
@@ -1539,7 +1754,7 @@ pub(crate) fn register_modules(interp: &mut Interp, parsed: &Parsed) {
         table.units.push(RegUnit {
             kind: u.kind,
             key: u.key.clone(),
-            data: u.data,
+            data: u.data.clone(),
             links,
         });
     }
@@ -1609,12 +1824,10 @@ fn aot_resolve(interp: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
     let Some(table) = interp.host_state.get::<PrecompiledModules>() else {
         return Ok(Value::Undefined);
     };
-    Ok(
-        match table.lookup(&spec, &referrer, SourceKind::CommonJs) {
-            Some(id) => Value::from_string(table.units[id].key.clone()),
-            None => Value::Undefined,
-        },
-    )
+    Ok(match table.lookup(&spec, &referrer, SourceKind::CommonJs) {
+        Some(id) => Value::from_string(table.units[id].key.clone()),
+        None => Value::Undefined,
+    })
 }
 
 /// `__lumenAot.kind(key)`: `"commonjs"` when `key` is a CommonJS unit (what `require` loads —
@@ -1640,13 +1853,13 @@ fn aot_load(interp: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
         .host_state
         .get::<PrecompiledModules>()
         .and_then(|t| t.cjs.get(&key).map(|&id| &t.units[id]))
-        .map(|u| u.data);
+        .map(|u| u.data.clone());
     let Some(data) = unit else {
         return Err(interp.make_error("Error", format!("precompiled: no CommonJS unit {key}")));
     };
     let t_decode = std::time::Instant::now();
-    let body = decode_unit(&data)
-        .map_err(|e| interp.make_error("SyntaxError", format!("{key}: {e}")))?;
+    let body =
+        decode_unit(&data).map_err(|e| interp.make_error("SyntaxError", format!("{key}: {e}")))?;
     crate::modules::load_stats::add(&crate::modules::load_stats::PARSE, t_decode, data.ast.len());
     // The unit's own text starts after the wrapper header, on its first line.
     let src = interp.adopt_parsed_source(Some(&key), CJS_WRAPPER_HEAD.len() as u32);
@@ -1681,6 +1894,89 @@ fn normalize(path: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn owned_backing_lives_with_deferred_units_and_is_released() {
+        let bytes: std::sync::Arc<[u8]> =
+            precompile("function f(x) { return x + 1; }", SourceKind::Script)
+                .unwrap()
+                .into();
+        let weak = std::sync::Arc::downgrade(&bytes);
+        let blob = Precompiled::from_bytes(bytes);
+        let parsed = parse_blob(&blob).unwrap();
+        let unit = parsed.units[0].data.split_unit().unwrap();
+        drop(parsed);
+        drop(blob);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(unit.all_functions().unwrap().len(), 1);
+        drop(crate::interpreter::stack_trace::take_parsed_source());
+        drop(unit);
+        assert!(weak.upgrade().is_none(), "owned blob was leaked");
+    }
+
+    #[test]
+    fn owned_blob_supports_lazy_code_bodies_kept_text_and_lines() {
+        let src = "function add(x) { return x + 1; }\nfunction* gen() { yield add(4); }\nfunction trace() { return new Error('owned').stack; }";
+        for tier in [
+            crate::bytecode::Tier::Interp,
+            crate::bytecode::Tier::Bytecode,
+        ] {
+            let compiled = CompiledUnit::compile_with_options(
+                src,
+                SourceKind::Script,
+                CompileOptions {
+                    bytecode: true,
+                    keep_source: true,
+                },
+            )
+            .unwrap();
+            let mut bundle = PrecompileBundle::new();
+            bundle.add_compiled("owned.js", compiled).unwrap();
+            let mut e = crate::Engine::new();
+            e.set_tier(tier);
+            assert!(matches!(
+                e.load_precompiled_owned(bundle.finish().into()),
+                Ok(crate::Completion::Value(_))
+            ));
+            for (code, want) in [
+                ("add(41)", "42"),
+                ("[...gen()].join()", "5"),
+                ("add.toString()", "function add(x) { return x + 1; }"),
+                ("trace().includes('owned.js:3:27')", "true"),
+            ] {
+                match e.eval(code, false) {
+                    Ok(crate::Completion::Value(got)) => assert_eq!(got, want, "{tier:?}: {code}"),
+                    _ => panic!("owned eval failed: {code}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn strict_validation_decodes_payloads_without_running_or_retaining_them() {
+        let src = "throw new Error('must not execute'); function* f(a) { yield* a; }";
+        let bytes: std::sync::Arc<[u8]> = precompile(src, SourceKind::Script).unwrap().into();
+        let weak = std::sync::Arc::downgrade(&bytes);
+        let blob = Precompiled::from_bytes(bytes);
+        blob.validate().unwrap();
+        let mut altered = blob.as_bytes().to_vec();
+        altered[24..32].fill(0);
+        assert!(Precompiled::from_bytes(altered.into()).validate().is_err());
+        drop(blob);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn mutated_owned_blobs_validate_without_panicking() {
+        let bytes = precompile("function* g(x) { yield x + 1; }", SourceKind::Script).unwrap();
+        for at in 0..bytes.len() {
+            for value in [0, 0x80, 0xff] {
+                let mut changed = bytes.clone();
+                changed[at] = value;
+                let _ = Precompiled::from_bytes(changed.into()).validate();
+            }
+        }
+    }
+
     /// Bodies stay in the blob until used: a precompiled function that runs on its chunk never
     /// decodes its body, one that runs on the tree-walker decodes it on its first call.
     #[test]
@@ -1689,8 +1985,11 @@ mod tests {
                    function* gen() { yield 1; yield 2; }\n\
                    class A { static { globalThis.__sb = 7; } m(x = () => 3) { return x(); } }\n\
                    globalThis.__r = [hot(10), [...gen()].join(), new A().m(), __sb].join('|');\n";
-        let blob: &'static [u8] =
-            Box::leak(precompile(src, SourceKind::Script).unwrap().into_boxed_slice());
+        let blob: &'static [u8] = Box::leak(
+            precompile(src, SourceKind::Script)
+                .unwrap()
+                .into_boxed_slice(),
+        );
         let mut e = crate::Engine::new();
         match e.load_precompiled(&Precompiled::from_static(blob)) {
             Ok(crate::Completion::Value(_)) => {}
@@ -1703,7 +2002,12 @@ mod tests {
         };
         assert_eq!(got, "45|1,2|3|7");
         let parsed = parse(blob).unwrap();
-        let funcs = parsed.units[0].data.split_unit().unwrap().all_functions().unwrap();
+        let funcs = parsed.units[0]
+            .data
+            .split_unit()
+            .unwrap()
+            .all_functions()
+            .unwrap();
         assert!(funcs.iter().all(|f| f.parsed_body().is_none()));
         assert!(funcs[0].body().len() == 3, "hot's body decodes on demand");
     }
@@ -1720,7 +2024,10 @@ mod tests {
         let mut b = PrecompileBundle::new();
         b.add("main.js", src, SourceKind::Script).unwrap();
         let blob: &'static [u8] = Box::leak(b.finish().into_boxed_slice());
-        for tier in [crate::bytecode::Tier::Interp, crate::bytecode::Tier::Bytecode] {
+        for tier in [
+            crate::bytecode::Tier::Interp,
+            crate::bytecode::Tier::Bytecode,
+        ] {
             let mut e = crate::Engine::new();
             e.set_tier(tier);
             e.set_tier_threshold(0);

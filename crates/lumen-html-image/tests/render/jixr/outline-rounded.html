@@ -1,0 +1,20 @@
+<!-- jixr-compare: threshold=236 max-diff-ratio=0
+     The geometry is exact; PDF and ImageSharp use different curved-stroke coverage than Blink
+     at the antialiased edge pixels (maximum observed channel delta 236). -->
+<!doctype html>
+<style>
+  html, body { margin: 0; background: white; }
+  .stage { position: relative; width: 320px; height: 180px; }
+  .card {
+    position: absolute;
+    width: 80px;
+    height: 48px;
+    background: #d2e3fc;
+    border-radius: 18px;
+    outline: 6px solid #a50e0e;
+    outline-offset: 4px;
+  }
+  .one { left: 30px; top: 30px; }
+  .two { left: 160px; top: 90px; border-radius: 30px 8px; outline-color: #137333; }
+</style>
+<div class="stage"><div class="card one"></div><div class="card two"></div></div>

@@ -1,0 +1,31 @@
+# The host-independent WHATWG Streams globals. Algorithms are generated from lumen-node's
+# upstream Node 20.11 web-stream sources, but this crate has no Node, OS, crypto, TLS, or transport
+# runtime dependency.
+[package]
+name = "lumen-webstreams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+lumen-host = { path = "../lumen-host", default-features = false }
+
+[build-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
+
+[dev-dependencies]
+lumen-host = { path = "../lumen-host", default-features = false, features = ["compiler"] }
+lumen-runtime = { path = "../lumen-runtime" }
+
+[features]
+default = ["compiler", "jit", "aot-native", "typed"]
+compiler = ["lumen-host/compiler"]
+jit = ["compiler", "lumen-host/jit"]
+aot-native = ["lumen-host/aot-native"]
+typed = ["compiler", "lumen-host/typed"]
+
+[lints]
+workspace = true

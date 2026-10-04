@@ -88,7 +88,9 @@ pub(super) fn install_promise(it: &mut Interp) {
         // %Promise% itself that is its non-writable, non-configurable `prototype`: the realm's
         // %Promise.prototype%, which `new_promise` already used.
         let nt_is_ctor = is_intrinsic_promise_ctor(i, &i.new_target);
-        if let (Value::Obj(p), nt @ Value::Obj(_), false) = (&promise, &i.new_target.clone(), nt_is_ctor) {
+        if let (Value::Obj(p), nt @ Value::Obj(_), false) =
+            (&promise, &i.new_target.clone(), nt_is_ctor)
+        {
             match ab(i.get_member(nt, "prototype"))? {
                 Value::Obj(proto) => p.borrow_mut().proto = Some(proto),
                 _ => {
@@ -334,7 +336,12 @@ pub(super) fn install_promise(it: &mut Interp) {
     });
     it.def_method(&ctor, "allSettled", 1, |i, t, a| {
         if combinator_gate(i, &t)? {
-            return combinator_fast(i, &t, arg(a, 0), crate::eval::promise_fast::REACT_ALL_SETTLED);
+            return combinator_fast(
+                i,
+                &t,
+                arg(a, 0),
+                crate::eval::promise_fast::REACT_ALL_SETTLED,
+            );
         }
         let (result, resolve_fn, reject_fn) = match new_promise_capability_full(i, &t) {
             Ok(c) => c,
@@ -635,8 +642,12 @@ fn species_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr
     let cb = intr.ctor.borrow();
     let shape = cb.props.shape();
     if c.ctor_shape != Some(shape) {
-        let Some(key) = well_known_key(i, "species") else { return false };
-        let Some(slot) = cb.props.slot_of(&key) else { return false };
+        let Some(key) = well_known_key(i, "species") else {
+            return false;
+        };
+        let Some(slot) = cb.props.slot_of(&key) else {
+            return false;
+        };
         c.species_slot = slot as u32;
         c.ctor_shape = Some(shape);
         intr.slots.set(c);
@@ -654,7 +665,9 @@ fn species_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr
 /// properties and %Promise% the original species getter: `Invoke(p, "then", ...)` on a plain
 /// native promise `p` then runs exactly PerformPromiseThen with an unobservable derived promise.
 fn proto_then_is_pristine(i: &Interp, intr: &crate::eval::promise_fast::PromiseIntr) -> bool {
-    let Some((ctor, then)) = proto_slots(intr) else { return false };
+    let Some((ctor, then)) = proto_slots(intr) else {
+        return false;
+    };
     let pb = intr.proto.borrow();
     let holds = |slot: u32, want: &Gc| {
         matches!(pb.props.entry_at(slot as usize),
@@ -686,7 +699,9 @@ fn proto_slots(intr: &crate::eval::promise_fast::PromiseIntr) -> Option<(u32, u3
 /// property holding %Promise%), whose `@@species` is still the original getter.
 pub(crate) fn promise_then_is_silent(i: &Interp, this: &Value) -> bool {
     let Value::Obj(o) = this else { return false };
-    let Some(intr) = i.promise_intr() else { return false };
+    let Some(intr) = i.promise_intr() else {
+        return false;
+    };
     {
         let b = o.borrow();
         if !matches!(&b.proto, Some(p) if Gc::ptr_eq(p, &intr.proto))
@@ -695,7 +710,9 @@ pub(crate) fn promise_then_is_silent(i: &Interp, this: &Value) -> bool {
             return false;
         }
     }
-    let Some((ctor, _)) = proto_slots(&intr) else { return false };
+    let Some((ctor, _)) = proto_slots(&intr) else {
+        return false;
+    };
     let ctor_ok = matches!(intr.proto.borrow().props.entry_at(ctor as usize),
         Some(p) if !p.accessor() && matches!(p.value(), Value::Obj(c) if Gc::ptr_eq(&c, &intr.ctor)));
     ctor_ok && species_is_pristine(i, &intr)
@@ -727,7 +744,10 @@ fn combinator_fast(i: &mut Interp, t: &Value, iterable: Value, mode: u8) -> Resu
     let result = i.new_promise();
     if let Value::Obj(ro) = &result {
         if let Callable::Promise(s) = &mut ro.borrow_mut().call {
-            s.comb = Some(Box::new(Combinator { remaining: 1, ..Default::default() }));
+            s.comb = Some(Box::new(Combinator {
+                remaining: 1,
+                ..Default::default()
+            }));
         }
     }
     let (iter, next) = match i.get_iterator(&iterable) {
@@ -874,9 +894,13 @@ fn combinator_gate(i: &mut Interp, t: &Value) -> Result<bool, Value> {
     if !is_intrinsic_promise_ctor(i, t) {
         return Ok(false);
     }
-    let Some(intr) = i.promise_intr() else { return Ok(false) };
+    let Some(intr) = i.promise_intr() else {
+        return Ok(false);
+    };
     // A data property holding the original: reading it is unobservable, and the general path
     // would read it again (the read happens after NewPromiseCapability there, which is
     // unobservable for %Promise%).
-    Ok(matches!(proto_data(&intr.ctor, "resolve"), Some(Value::Obj(r)) if Gc::ptr_eq(&r, &intr.resolve)))
+    Ok(
+        matches!(proto_data(&intr.ctor, "resolve"), Some(Value::Obj(r)) if Gc::ptr_eq(&r, &intr.resolve)),
+    )
 }

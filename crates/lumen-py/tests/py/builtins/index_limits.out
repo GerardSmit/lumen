@@ -1,0 +1,35 @@
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError index out of bounds on dimension 1
+b''
+b'xxx'
+IndexError cannot fit 'int' into an index-sized integer
+ValueError memoryview.cast(): product(shape) > SSIZE_MAX
+OverflowError Python int too large to convert to C ssize_t
+ValueError memoryview.cast(): product(shape) > SSIZE_MAX
+ValueError memoryview.cast(): elements of shape must be integers > 0
+(4, 2)
+ValueError memoryview.cast(): product(shape) > SSIZE_MAX
+ValueError memoryview: number of dimensions must not exceed 64
+TypeError memoryview: product(shape) * itemsize != buffer size
+ValueError memoryview.cast(): elements of shape must be integers > 0
+TypeError memoryview.cast(): elements of shape must be integers
+(4, 2)
+()
+TypeError memoryview: cannot cast view with zeros in shape or strides
+TypeError memoryview: length is not a multiple of itemsize
+TypeError memoryview: product(shape) * itemsize != buffer size
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError cannot fit 'int' into an index-sized integer
+IndexError range object index out of range
+OverflowError cannot fit 'int' into an index-sized integer
+OverflowError Python int too large to convert to C ssize_t
+OverflowError Python int too large to convert to C ssize_t
+-1
+-1
+OverflowError Python int too large to convert to C ssize_t

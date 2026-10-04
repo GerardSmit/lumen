@@ -399,6 +399,7 @@ fn zero(b: &mut FunctionBuilder, t: Type) -> Value {
         Type::I32 | Type::I64 => b.iconst(t, 0),
         Type::F32 => b.f32const_bits(0),
         Type::F64 => b.f64const_bits(0),
+        Type::V128 => unreachable!("the scalar wasm translator has no vector values"),
     }
 }
 
@@ -1216,5 +1217,6 @@ fn mem_kind(t: Type) -> MemKind {
         Type::I64 => MemKind::I64,
         Type::F32 => MemKind::F32,
         Type::F64 => MemKind::F64,
+        Type::V128 => MemKind::V128,
     }
 }

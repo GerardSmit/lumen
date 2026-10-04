@@ -1,0 +1,91 @@
+TypeError math.sqrt() takes exactly one argument (0 given)
+TypeError math.sqrt() takes exactly one argument (2 given)
+TypeError math.sqrt() takes no keyword arguments
+TypeError must be real number, not str
+TypeError must be real number, not NoneType
+TypeError 'float' object cannot be interpreted as an integer
+ValueError factorial() not defined for negative values
+TypeError 'str' object cannot be interpreted as an integer
+TypeError copysign expected 2 arguments, got 1
+TypeError copysign expected 2 arguments, got 3
+TypeError math.atan2() takes no keyword arguments
+TypeError must be real number, not str
+TypeError isclose() missing required argument 'b' (pos 2)
+TypeError isclose() takes exactly 2 positional arguments (3 given)
+TypeError 'bogus' is an invalid keyword argument for isclose()
+TypeError isclose() missing required argument 'b' (pos 2)
+ValueError tolerances must be non-negative
+TypeError must be real number, not str
+TypeError prod() takes exactly 1 positional argument (2 given)
+ok 6
+TypeError prod() takes exactly 1 positional argument (0 given)
+TypeError nextafter() takes exactly 2 positional arguments (3 given)
+ValueError steps must be a non-negative integer
+TypeError 'str' object cannot be interpreted as an integer
+TypeError log expected at least 1 argument, got 0
+TypeError log expected at most 2 arguments, got 3
+TypeError 'str' object cannot be interpreted as an integer
+TypeError must be real number, not str
+TypeError math.gcd() takes no keyword arguments
+TypeError math.hypot() takes no keyword arguments
+sqrt ($module, x, /)
+isclose ($module, /, a, b, *, rel_tol=1e-09, abs_tol=0.0)
+prod ($module, iterable, /, *, start=1)
+nextafter ($module, x, y, /, *, steps=None)
+gcd ($module, *integers)
+hypot None
+log None
+copysign ($module, x, y, /)
+TypeError deque.append() takes exactly one argument (0 given)
+TypeError deque.append() takes exactly one argument (2 given)
+TypeError deque.append() takes no keyword arguments
+TypeError 'str' object cannot be interpreted as an integer
+TypeError deque.rotate expected at most 1 argument, got 2
+TypeError insert() takes exactly 2 arguments (1 given)
+TypeError 'str' object cannot be interpreted as an integer
+TypeError index() takes at least 1 argument (0 given)
+TypeError slice indices must be integers or have an __index__ method
+TypeError deque.pop() takes no arguments (1 given)
+TypeError descriptor 'append' for 'collections.deque' objects doesn't apply to a 'int' object
+TypeError unbound method deque.append() needs an argument
+TypeError deque() takes at most 2 arguments (3 given)
+TypeError an integer is required
+ValueError maxlen must be non-negative
+TypeError 'bogus' is an invalid keyword argument for deque()
+IndexError deque index out of range
+TypeError sequence index must be integer, not 'str'
+append None
+rotate None
+insert None
+index None
+__reversed__ None
+__len__ ($self, /)
+__getitem__ ($self, key, /)
+__init__ ($self, /, *args, **kwargs)
+None
+TypeError a number is required
+TypeError repeat() missing required argument 'object' (pos 1)
+TypeError repeat() takes at most 2 arguments (3 given)
+TypeError islice expected at least 2 arguments, got 0
+ValueError Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.
+TypeError combinations() missing required argument 'r' (pos 2)
+ValueError r must be non-negative
+TypeError Expected int as r
+TypeError accumulate() missing required argument 'iterable' (pos 1)
+TypeError accumulate() takes at most 2 positional arguments (3 given)
+TypeError zip_longest() got an unexpected keyword argument
+ValueError repeat argument cannot be negative
+TypeError 'bogus' is an invalid keyword argument for product()
+TypeError chain.from_iterable() takes exactly one argument (0 given)
+ValueError n must be at least one
+TypeError batched() missing required argument 'n' (pos 2)
+TypeError starmap expected 2 arguments, got 1
+TypeError compress() missing required argument 'selectors' (pos 2)
+ValueError n must be >= 0
+TypeError groupby() missing required argument 'iterable' (pos 1)
+count (start=0, step=1)
+repeat None
+islice None
+accumulate (iterable, func=None, *, initial=None)
+chain None
+combinations (iterable, r)

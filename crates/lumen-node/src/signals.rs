@@ -1,82 +1,26 @@
-//! Process signals as Node's `process.on('SIGUSR2', ...)` sees them: a listener installs an
-//! OS handler that writes the signal number to a self-pipe; one watcher thread (started on the
-//! first listener) reads it and wakes every realm listening for that signal through its event
-//! loop. Nothing is installed until a program listens for a signal.
+//! Process signals as Node's `process.on('SIGUSR2', ...)` sees them: a listener installs the
+//! shared `lumen_os::signal` handler, which writes the signal number to this runtime's
+//! self-pipe; one watcher thread (started on the first listener) reads it and wakes every realm
+//! listening for that signal through its event loop. Nothing is installed until a program
+//! listens for a signal.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use lumen_host::{CompletionSender, Ctx, TaskId, TaskRegistry, Value};
 
-/// The signal number for a Node signal name (`"SIGTERM"`), on this platform.
-pub(crate) fn number(name: &str) -> Option<i32> {
-    #[cfg(unix)]
-    {
-        let n = match name {
-            "SIGHUP" => libc::SIGHUP,
-            "SIGINT" => libc::SIGINT,
-            "SIGQUIT" => libc::SIGQUIT,
-            "SIGILL" => libc::SIGILL,
-            "SIGTRAP" => libc::SIGTRAP,
-            "SIGABRT" => libc::SIGABRT,
-            "SIGIOT" => libc::SIGIOT,
-            "SIGBUS" => libc::SIGBUS,
-            "SIGFPE" => libc::SIGFPE,
-            "SIGKILL" => libc::SIGKILL,
-            "SIGUSR1" => libc::SIGUSR1,
-            "SIGSEGV" => libc::SIGSEGV,
-            "SIGUSR2" => libc::SIGUSR2,
-            "SIGPIPE" => libc::SIGPIPE,
-            "SIGALRM" => libc::SIGALRM,
-            "SIGTERM" => libc::SIGTERM,
-            "SIGCHLD" => libc::SIGCHLD,
-            "SIGCONT" => libc::SIGCONT,
-            "SIGSTOP" => libc::SIGSTOP,
-            "SIGTSTP" => libc::SIGTSTP,
-            "SIGTTIN" => libc::SIGTTIN,
-            "SIGTTOU" => libc::SIGTTOU,
-            "SIGURG" => libc::SIGURG,
-            "SIGXCPU" => libc::SIGXCPU,
-            "SIGXFSZ" => libc::SIGXFSZ,
-            "SIGVTALRM" => libc::SIGVTALRM,
-            "SIGPROF" => libc::SIGPROF,
-            "SIGWINCH" => libc::SIGWINCH,
-            "SIGIO" => libc::SIGIO,
-            "SIGSYS" => libc::SIGSYS,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            "SIGSTKFLT" => libc::SIGSTKFLT,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            "SIGPOLL" => libc::SIGPOLL,
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            "SIGPWR" => libc::SIGPWR,
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-            "SIGINFO" => libc::SIGINFO,
-            _ => return None,
-        };
-        Some(n)
-    }
-    #[cfg(not(unix))]
-    {
-        Some(match name {
-            "SIGHUP" => 1,
-            "SIGINT" => 2,
-            "SIGILL" => 4,
-            "SIGABRT" => 22,
-            "SIGFPE" => 8,
-            "SIGKILL" => 9,
-            "SIGSEGV" => 11,
-            "SIGTERM" => 15,
-            "SIGBREAK" => 21,
-            "SIGWINCH" => 28,
-            _ => return None,
-        })
-    }
-}
+pub(crate) use lumen_os::signal::number;
 
 /// `(name)` — the platform's number for signal `name`, or `undefined` if it is not one.
-pub(crate) fn op_signal_number(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_number(
+    _ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     Ok(match args.first() {
-        Some(Value::Str(s)) => number(&s.to_string()).map_or(Value::Undefined, |n| Value::Num(n as f64)),
+        Some(Value::Str(s)) => {
+            number(&s.to_string()).map_or(Value::Undefined, |n| Value::Num(n as f64))
+        }
         _ => Value::Undefined,
     })
 }
@@ -115,49 +59,22 @@ mod imp {
         targets: Vec<Target>,
     }
 
-    static WATCH: Mutex<Watch> = Mutex::new(Watch { depth: 0, pending: false, targets: Vec::new() });
+    static WATCH: Mutex<Watch> = Mutex::new(Watch {
+        depth: 0,
+        pending: false,
+        targets: Vec::new(),
+    });
     static WATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
-
-    extern "C" fn on_signal(sig: libc::c_int) {
-        let fd = WRITE_FD.load(Ordering::Relaxed);
-        if fd >= 0 {
-            // SAFETY: write(2) and errno access are async-signal-safe; errno is restored so the
-            // interrupted code does not observe the handler's.
-            unsafe {
-                let errno = errno_ptr();
-                let saved = *errno;
-                let byte = sig as u8;
-                libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
-                *errno = saved;
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    unsafe fn errno_ptr() -> *mut libc::c_int {
-        libc::__error()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
-    unsafe fn errno_ptr() -> *mut libc::c_int {
-        libc::__errno_location()
-    }
 
     fn start_watcher() -> bool {
         START.call_once(|| {
-            let mut fds = [0 as libc::c_int; 2];
-            // SAFETY: `fds` is a valid two-int buffer.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            use std::os::fd::IntoRawFd;
+            let Ok((read, write)) = lumen_os::fdctl::os_pipe() else {
                 return;
-            }
-            // SAFETY: plain fcntl on descriptors this call owns.
-            unsafe {
-                for fd in fds {
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-                let flags = libc::fcntl(fds[1], libc::F_GETFL);
-                libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
-            let read_fd = fds[0];
+            };
+            // The handler's write end must never block; both ends live for the process.
+            let (read_fd, write_fd) = (read.into_raw_fd(), write.into_raw_fd());
+            let _ = lumen_os::fdctl::set_blocking(write_fd, false);
             let spawned = std::thread::Builder::new()
                 .name("lumen-signals".into())
                 .stack_size(64 * 1024)
@@ -169,7 +86,9 @@ mod imp {
                             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                         };
                         if n < 0 {
-                            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
                                 continue;
                             }
                             return;
@@ -189,7 +108,8 @@ mod imp {
                     }
                 });
             if spawned.is_ok() {
-                WRITE_FD.store(fds[1], Ordering::Relaxed);
+                WRITE_FD.store(write_fd, Ordering::Relaxed);
+                lumen_os::signal::set_wakeup_fd(lumen_os::signal::WAKE_NODE, write_fd);
             }
         });
         WRITE_FD.load(Ordering::Relaxed) >= 0
@@ -210,19 +130,21 @@ mod imp {
     }
 
     fn set_handler(sig: i32, install: bool) -> bool {
-        // SAFETY: a zeroed sigaction with a valid handler and an empty mask.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            let handler: extern "C" fn(libc::c_int) = on_signal;
-            action.sa_sigaction = if install { handler as usize } else { libc::SIG_DFL };
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigemptyset(&mut action.sa_mask);
-            libc::sigaction(sig, &action, std::ptr::null_mut()) == 0
-        }
+        use lumen_os::signal::{set_disposition, Disposition};
+        set_disposition(
+            sig,
+            if install {
+                Disposition::Catch
+            } else {
+                Disposition::Default
+            },
+            true,
+        )
+        .is_ok()
     }
 
     pub(super) fn catchable(sig: i32) -> bool {
-        sig != libc::SIGKILL && sig != libc::SIGSTOP
+        lumen_os::signal::catchable(sig)
     }
 
     /// Start delivering `sig` to `task` on `sender`'s loop; the key identifies the watch.
@@ -235,7 +157,12 @@ mod imp {
             return None;
         }
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        listeners.push(Listener { sig, key, sender, task });
+        listeners.push(Listener {
+            sig,
+            key,
+            sender,
+            task,
+        });
         Some(key)
     }
 
@@ -260,7 +187,13 @@ mod imp {
         if watch.depth > 0 {
             watch.depth -= 1;
             WATCH_DEPTH.store(watch.depth, Ordering::SeqCst);
-            if watch.depth == 0 && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == libc::SIGINT) {
+            if watch.depth == 0
+                && !LISTENERS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.sig == libc::SIGINT)
+            {
                 set_handler(libc::SIGINT, false);
             }
         }
@@ -273,7 +206,11 @@ mod imp {
 
     pub(super) fn break_register(raised: Arc<AtomicBool>, fired: Arc<AtomicBool>) -> u64 {
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        WATCH.lock().unwrap().targets.push(Target { key, raised, fired });
+        WATCH
+            .lock()
+            .unwrap()
+            .targets
+            .push(Target { key, raised, fired });
         key
     }
 
@@ -290,8 +227,7 @@ mod imp {
         if !watchdog && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == sig) {
             return false;
         }
-        // SAFETY: raise(3) takes no pointers.
-        unsafe { libc::raise(sig) == 0 }
+        lumen_os::signal::raise(sig).is_ok()
     }
 
     /// Stop a watch, restoring the default disposition once nothing listens for its signal.
@@ -308,7 +244,10 @@ mod imp {
     }
 }
 
-fn decode_signal(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_signal(
+    _ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
     let sig = payload.downcast::<i32>().map(|b| *b).unwrap_or(0);
     Ok(vec![Value::Num(sig as f64)])
 }
@@ -333,7 +272,9 @@ pub(crate) fn op_signal_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             return Ok(Value::Undefined);
         };
         if imp::catchable(sig) {
-            let registry = ctx.host_mut::<TaskRegistry>().expect("runtime task registry");
+            let registry = ctx
+                .host_mut::<TaskRegistry>()
+                .expect("runtime task registry");
             let task = registry.register_stream(callback, decode_signal);
             registry.set_unref(task);
             if let Some(key) = imp::watch(sig, sender, task) {
@@ -355,7 +296,11 @@ pub(crate) fn op_signal_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
 }
 
 /// `(key)` — stop a `signalWatch`.
-pub(crate) fn op_signal_unwatch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_unwatch(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     if let Some(Value::Num(key)) = args.first() {
         if let Some(task) = imp::unwatch(*key as u64) {
@@ -370,7 +315,11 @@ pub(crate) fn op_signal_unwatch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> 
 
 /// `(signum)` — deliver `signum` to this process synchronously if it has a listener for it
 /// (see `imp::raise_watched`); `false` when it has none and the caller should `kill(2)`.
-pub(crate) fn op_signal_raise(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_raise(
+    _ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     if let Some(Value::Num(sig)) = args.first() {
         return Ok(Value::Bool(imp::raise_watched(*sig as i32)));
@@ -393,7 +342,8 @@ impl SigintBreak {
         let fired = Arc::new(AtomicBool::new(false));
         #[cfg(all(unix, not(target_arch = "wasm32")))]
         {
-            let key = imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
+            let key =
+                imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
             SigintBreak { fired, key }
         }
         #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
@@ -423,14 +373,22 @@ impl Drop for SigintBreak {
 }
 
 /// `()` — Node's `startSigintWatchdog`.
-pub(crate) fn op_sigint_watchdog_start(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_start(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     imp::watchdog_start();
     Ok(Value::Undefined)
 }
 
 /// `()` — Node's `stopSigintWatchdog`: whether a SIGINT arrived while it was watching.
-pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_stop(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     return Ok(Value::Bool(imp::watchdog_stop()));
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
@@ -438,7 +396,11 @@ pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Val
 }
 
 /// `()` — Node's `watchdogHasPendingSigint`.
-pub(crate) fn op_sigint_watchdog_pending(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_pending(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     return Ok(Value::Bool(imp::watchdog_pending()));
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]

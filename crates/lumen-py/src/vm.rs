@@ -4,11 +4,11 @@ use crate::ast::{BinOp, CmpOp};
 use crate::bytecode::*;
 use crate::dict::PyDict;
 use crate::object::*;
+use crate::platform::{Platform, PlatformRef, StdPlatform};
+use lumen_common::limits::{HeapBudget, InterruptHandle};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 pub struct Block {
     pub handler: u32,
@@ -45,11 +45,13 @@ pub fn new_type_raw(name: &str, layout: Layout) -> Obj {
         dict: RefCell::new(Some(Object::new(Kind::Dict(RefCell::new(PyDict::new()))))),
         kind: Kind::Type(TypeData {
             name: RefCell::new(name.into()),
+            qualname: RefCell::new(None),
             bases: RefCell::new(Vec::new()),
             mro: RefCell::new(Vec::new()),
             layout: std::cell::Cell::new(layout),
-            flags: std::cell::Cell::new(0),
+            flags: std::cell::Cell::new(TF_IMMUTABLE),
             hooks: std::cell::Cell::new((u64::MAX, 0)),
+            slots: RefCell::new(None),
         }),
     })
 }
@@ -109,7 +111,6 @@ types! {
     zip: "zip", Layout::Other;
     map: "map", Layout::Other;
     filter: "filter", Layout::Other;
-    file: "TextIOWrapper", Layout::Other;
     frame: "frame", Layout::Other;
 }
 
@@ -143,7 +144,7 @@ impl Output for ProcessOutput {
 pub struct Interp {
     pub frames: Vec<Frame>,
     pub types: Types,
-    pub exc_types: HashMap<&'static str, Obj>,
+    pub exc_types: BTreeMap<&'static str, Obj>,
     pub builtins: Obj,
     pub modules: Obj,
     pub sys_module: Option<Obj>,
@@ -153,26 +154,38 @@ pub struct Interp {
     pub no_tb: bool,
     pub repr_stack: Vec<usize>,
     pub out: Vec<u8>,
-    pub sink: Box<dyn Output>,
+    pub sink: Option<Box<dyn Output>>,
+    pub platform: PlatformRef,
     pub path_set: bool,
     pub script_dir: String,
     pub argv: Vec<String>,
-    pub sources: HashMap<String, Vec<String>>,
+    pub sources: BTreeMap<String, Vec<String>>,
     pub type_epoch: u64,
     pub main_globals: Option<Obj>,
     pub exit_code: Option<i32>,
-    pub start: std::time::Instant,
+    pub start_ns: u64,
     pub next_id: usize,
     pub obj_new: Option<Obj>,
     pub obj_init: Option<Obj>,
-    pub native_depth: usize,
     pub subclass_registry: Vec<std::rc::Weak<Object>>,
     pub ret_val: Value,
-    pub interrupt: Arc<AtomicBool>,
+    pub atexit: Vec<(Value, Vec<Value>, Vec<(Obj, Value)>)>,
+    pub gc_enabled: bool,
+    pub simple_namespace: Option<Obj>,
+    pub alias_types: Option<Rc<crate::builtins::alias::AliasTypes>>,
+    pub interrupt: InterruptHandle,
     pub interrupted: bool,
-    pub heap_limit: usize,
-    pub heap_base: isize,
+    /// Runs Python signal handlers at `poll` (the interpreter of the thread that owns signals).
+    pub handles_signals: bool,
+    pub heap: HeapBudget,
     pub int_max_str_digits: usize,
+    pub codecs: crate::codecs::CodecState,
+    /// Type objects of the native classes bound with `#[class]` (see `bind::type_object`).
+    pub native_types: std::collections::HashMap<std::any::TypeId, Obj>,
+    /// Per-interpreter state of native modules (CPython's module state), keyed by its type.
+    pub native_state: std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any>>,
+    /// The current `contextvars.Context`, created on first use.
+    pub context: Option<Value>,
 }
 
 pub enum GenResult {
@@ -181,15 +194,34 @@ pub enum GenResult {
 }
 
 impl Interp {
+    /// The native-module state `T`, created on first use.
+    pub fn native_state<T: Default + 'static>(&mut self) -> &mut T {
+        let slot = self
+            .native_state
+            .entry(std::any::TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()));
+        slot.downcast_mut::<T>()
+            .expect("native state keyed by its own type")
+    }
+
     #[allow(clippy::new_without_default)]
     pub fn new() -> Interp {
+        Interp::with_platform(Box::new(StdPlatform::new()))
+    }
+
+    pub fn with_platform(platform: Box<dyn Platform>) -> Interp {
+        let platform: Box<dyn Platform> = Box::new(crate::platform::MemPlatform::new(
+            platform,
+            crate::frozen::fs(),
+        ));
+        let start_ns = platform.monotonic_ns();
         let types = Types::create();
         let builtins = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
         let modules = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
         let mut it = Interp {
             frames: Vec::new(),
             types,
-            exc_types: HashMap::new(),
+            exc_types: BTreeMap::new(),
             builtins,
             modules,
             sys_module: None,
@@ -199,26 +231,34 @@ impl Interp {
             no_tb: false,
             repr_stack: Vec::new(),
             out: Vec::new(),
-            sink: Box::new(ProcessOutput),
+            sink: None,
+            platform: Rc::new(RefCell::new(platform)),
             path_set: false,
             script_dir: ".".into(),
             argv: Vec::new(),
-            sources: HashMap::new(),
+            sources: BTreeMap::new(),
             type_epoch: 0,
             main_globals: None,
             exit_code: None,
-            start: std::time::Instant::now(),
+            start_ns,
             next_id: 1,
             obj_new: None,
             obj_init: None,
-            native_depth: 0,
             subclass_registry: Vec::new(),
             ret_val: Value::None,
-            interrupt: Arc::new(AtomicBool::new(false)),
+            atexit: Vec::new(),
+            gc_enabled: true,
+            simple_namespace: None,
+            alias_types: None,
+            interrupt: InterruptHandle::new(),
             interrupted: false,
-            heap_limit: usize::MAX,
-            heap_base: 0,
+            handles_signals: false,
+            heap: HeapBudget::NONE,
             int_max_str_digits: crate::limits::DEFAULT_INT_MAX_STR_DIGITS,
+            codecs: Default::default(),
+            native_types: std::collections::HashMap::new(),
+            native_state: std::collections::HashMap::new(),
+            context: None,
         };
         it.bootstrap_types();
         crate::builtins::init(&mut it);
@@ -227,32 +267,71 @@ impl Interp {
 
     pub fn set_output(&mut self, sink: Box<dyn Output>) {
         self.flush_out();
-        self.sink = sink;
+        self.sink = Some(sink);
     }
 
     pub fn flush_out(&mut self) {
         if !self.out.is_empty() {
-            self.sink.write_stdout(&self.out);
-            self.sink.flush();
+            match &mut self.sink {
+                Some(s) => {
+                    s.write_stdout(&self.out);
+                    s.flush();
+                }
+                None => {
+                    let mut p = self.platform.borrow_mut();
+                    p.write_stdout(&self.out);
+                    p.flush_stdout();
+                }
+            }
             self.out.clear();
         }
     }
 
     pub fn write_stdout(&mut self, s: &str) {
-        self.out.extend_from_slice(s.as_bytes());
+        self.out
+            .extend_from_slice(lumen_common::smuggle::unescape_text(s).as_bytes());
         if self.out.len() > 1 << 16 {
             self.flush_out();
         }
     }
 
+    /// `write(2)` through the platform; descriptors 1 and 2 go to the output sink when one is
+    /// set, after the buffered print output.
+    pub fn fd_write(&mut self, fd: i32, data: &[u8]) -> crate::platform::PResult<usize> {
+        if fd == 1 || fd == 2 {
+            self.flush_out();
+            if let Some(s) = &mut self.sink {
+                if fd == 1 {
+                    s.write_stdout(data);
+                    s.flush();
+                } else {
+                    s.write_stderr(data);
+                }
+                return Ok(data.len());
+            }
+        }
+        self.platform.borrow_mut().fd_write(fd, data, None)
+    }
+
     pub fn write_stderr(&mut self, s: &str) {
         self.flush_out();
-        self.sink.write_stderr(s.as_bytes());
+        let s = lumen_common::smuggle::unescape_text(s);
+        match &mut self.sink {
+            Some(k) => k.write_stderr(s.as_bytes()),
+            None => self.platform.borrow_mut().write_stderr(s.as_bytes()),
+        }
     }
 
     // ---- frames ----------------------------------------------------------------------------
 
-    pub fn new_frame(&self, code: Rc<Code>, globals: Obj, names: Option<Obj>, func: Option<Obj>, closure: &[Obj]) -> Frame {
+    pub fn new_frame(
+        &self,
+        code: Rc<Code>,
+        globals: Obj,
+        names: Option<Obj>,
+        func: Option<Obj>,
+        closure: &[Obj],
+    ) -> Frame {
         let mut cells: Vec<Obj> = Vec::with_capacity(code.cellvars.len() + closure.len());
         for _ in 0..code.cellvars.len() {
             cells.push(Object::new(Kind::Cell(RefCell::new(None))));
@@ -272,7 +351,7 @@ impl Interp {
     }
 
     pub fn push_frame(&mut self, frame: Frame) -> R<()> {
-        if self.frames.len() >= self.recursion_limit {
+        if self.frames.len() >= self.recursion_limit || lumen_common::stack::exhausted() {
             return Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"));
         }
         self.poll()?;
@@ -307,7 +386,7 @@ impl Interp {
     /// consequence of an aborted big-integer operation) is replaced by `KeyboardInterrupt`, so
     /// handlers for ordinary exceptions never see it.
     pub(crate) fn supersede_by_interrupt(&mut self, e: Obj) -> Obj {
-        if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) && !self.exc_is(&e, "KeyboardInterrupt") {
+        if self.interrupt.is_interrupted() && !self.exc_is(&e, "KeyboardInterrupt") {
             return self.interrupt_exc();
         }
         e
@@ -318,8 +397,16 @@ impl Interp {
         loop {
             let fr = self.frames.last_mut().unwrap();
             if add_tb {
-                let line = fr.code.line_at(fr.pc.saturating_sub(1));
-                let entry_tb = TbEntry { file: fr.code.filename.clone(), line, name: fr.code.name.clone() };
+                let lasti = fr.pc.saturating_sub(1);
+                let line = fr.code.line_at(lasti);
+                let entry_tb = TbEntry {
+                    file: fr.code.filename.clone(),
+                    line,
+                    lasti: lasti as u32,
+                    name: fr.code.name.clone(),
+                    code: fr.code.clone(),
+                    globals: fr.globals.clone(),
+                };
                 if let Kind::Exception(d) = &exc.kind {
                     d.borrow_mut().tb.push(entry_tb);
                 }
@@ -467,6 +554,9 @@ impl Interp {
                             &format!("cannot access local variable '{}' where it is not associated with a value", n),
                         ));
                     }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                 }
                 Op::LoadName(i) => {
                     let fr = fr!();
@@ -491,7 +581,11 @@ impl Interp {
                     let name = fr.code.names[i as usize].clone();
                     let v = fr.stack.pop().unwrap();
                     let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
-                    dict_set_name(&ns, &name, v);
+                    if ns.cls.is_some() {
+                        self.setitem(&Value::Obj(ns), Value::Obj(name), v)?;
+                    } else {
+                        dict_set_name(&ns, &name, v);
+                    }
                 }
                 Op::DelName(i) => {
                     let fr = fr!();
@@ -499,6 +593,9 @@ impl Interp {
                     let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
                     if dict_del_name(&ns, &name).is_none() {
                         return Err(self.name_err(&name));
+                    }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
                     }
                 }
                 Op::LoadGlobal(i) => {
@@ -527,6 +624,9 @@ impl Interp {
                     if dict_del_name(&g, &name).is_none() {
                         return Err(self.name_err(&name));
                     }
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                 }
                 Op::LoadDeref(i) => {
                     let fr = fr!();
@@ -544,7 +644,14 @@ impl Interp {
                             } else {
                                 format!("cannot access local variable '{}' where it is not associated with a value", n)
                             };
-                            return Err(self.new_exc_str(if free { "NameError" } else { "UnboundLocalError" }, &msg));
+                            return Err(self.new_exc_str(
+                                if free {
+                                    "NameError"
+                                } else {
+                                    "UnboundLocalError"
+                                },
+                                &msg,
+                            ));
                         }
                     }
                 }
@@ -756,10 +863,15 @@ impl Interp {
                 }
                 Op::BuildSlice(n) => {
                     let fr = fr!();
-                    let step = if n == 3 { fr.stack.pop().unwrap() } else { Value::None };
+                    let step = if n == 3 {
+                        fr.stack.pop().unwrap()
+                    } else {
+                        Value::None
+                    };
                     let stop = fr.stack.pop().unwrap();
                     let start = fr.stack.pop().unwrap();
-                    fr.stack.push(Value::Obj(Object::new(Kind::Slice(start, stop, step))));
+                    fr.stack
+                        .push(Value::Obj(Object::new(Kind::Slice(start, stop, step))));
                 }
                 Op::BuildString(n) => {
                     let at = fr!().stack.len() - n as usize;
@@ -868,7 +980,10 @@ impl Interp {
                         Some(s) => s.as_str().unwrap_or("").to_string(),
                         None => String::new(),
                     };
-                    let out = if spec_s.is_empty() && v.as_str().is_some() && matches!(&v, Value::Obj(o) if o.cls.is_none()) {
+                    let out = if spec_s.is_empty()
+                        && v.as_str().is_some()
+                        && matches!(&v, Value::Obj(o) if o.cls.is_none())
+                    {
                         v
                     } else {
                         Value::string(self.format_value(&v, &spec_s)?)
@@ -877,14 +992,33 @@ impl Interp {
                 }
                 Op::MakeFunction(flags) => {
                     let code = pop!();
-                    let closure = if flags & MF_CLOSURE != 0 { Some(pop!()) } else { None };
-                    let ann = if flags & MF_ANNOTATIONS != 0 { Some(pop!()) } else { None };
-                    let kwd = if flags & MF_KWDEFAULTS != 0 { Some(pop!()) } else { None };
-                    let defaults = if flags & MF_DEFAULTS != 0 { Some(pop!()) } else { None };
+                    let closure = if flags & MF_CLOSURE != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let ann = if flags & MF_ANNOTATIONS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let kwd = if flags & MF_KWDEFAULTS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let defaults = if flags & MF_DEFAULTS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
                     let f = self.make_function(code, closure, ann, kwd, defaults)?;
                     push!(f);
                 }
                 Op::Call(argc) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let fr = fr!();
                     let at = fr.stack.len() - argc as usize;
                     let args: Vec<Value> = fr.stack.drain(at..).collect();
@@ -894,6 +1028,9 @@ impl Interp {
                     }
                 }
                 Op::CallKw(argc) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let names = pop!();
                     let fr = fr!();
                     let at = fr.stack.len() - argc as usize;
@@ -912,6 +1049,9 @@ impl Interp {
                     }
                 }
                 Op::CallEx(flags) => {
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     let kwd = if flags & 1 != 0 { Some(pop!()) } else { None };
                     let args = pop!();
                     let f = pop!();
@@ -930,6 +1070,9 @@ impl Interp {
                 Op::ReturnValue => {
                     let v = pop!();
                     self.frames.pop();
+                    if crate::weak::has_pending() {
+                        self.run_weak_callbacks();
+                    }
                     if self.frames.len() == entry {
                         return Ok(v);
                     }
@@ -956,7 +1099,9 @@ impl Interp {
                             if self.frames.len() == entry {
                                 return Ok(y);
                             }
-                            return Err(self.new_exc_str("RuntimeError", "yield outside generator context"));
+                            return Err(
+                                self.new_exc_str("RuntimeError", "yield outside generator context")
+                            );
                         }
                         GenResult::Return(r) => {
                             let fr = fr!();
@@ -972,7 +1117,8 @@ impl Interp {
                 }
                 Op::GetYieldFromIter => {
                     let v = pop!();
-                    let is_gen = matches!(&v, Value::Obj(o) if matches!(o.kind, Kind::Generator(_)));
+                    let is_gen =
+                        matches!(&v, Value::Obj(o) if matches!(o.kind, Kind::Generator(_)));
                     let it = if is_gen { v } else { self.get_iter(&v)? };
                     push!(it);
                 }
@@ -1062,7 +1208,11 @@ impl Interp {
                 }
                 Op::ExcStarEnd => {
                     let rest = pop!();
-                    let rest = if rest.is_none() { rest } else { crate::builtins::excgroup::star_unwrap(rest) };
+                    let rest = if rest.is_none() {
+                        rest
+                    } else {
+                        crate::builtins::excgroup::star_unwrap(rest)
+                    };
                     push!(rest);
                 }
                 Op::Reraise => {
@@ -1110,7 +1260,11 @@ impl Interp {
                 }
                 Op::WithCallExit => {
                     let exit = pop!();
-                    let r = self.call(&exit, vec![Value::None, Value::None, Value::None], Vec::new())?;
+                    let r = self.call(
+                        &exit,
+                        vec![Value::None, Value::None, Value::None],
+                        Vec::new(),
+                    )?;
                     push!(r);
                 }
                 Op::WithExceptStart => {
@@ -1150,8 +1304,12 @@ impl Interp {
                 Op::ImportName(i) => {
                     let fromlist = pop!();
                     let level = pop!();
-                    let name = fr!().code.names[i as usize].as_str_kind().unwrap_or("").to_string();
-                    let m = self.import_name(&name, level.as_i64().unwrap_or(0) as usize, &fromlist)?;
+                    let name = fr!().code.names[i as usize]
+                        .as_str_kind()
+                        .unwrap_or("")
+                        .to_string();
+                    let m =
+                        self.import_name(&name, level.as_i64().unwrap_or(0) as usize, &fromlist)?;
                     push!(m);
                 }
                 Op::ImportFrom(i) => {
@@ -1173,6 +1331,62 @@ impl Interp {
                     let c = self.exc_type("AssertionError");
                     push!(Value::Obj(c));
                 }
+                Op::LoadLocals => {
+                    let fr = fr!();
+                    let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
+                    push!(Value::Obj(ns));
+                }
+                Op::LoadFromDictOrDeref(i) => {
+                    let mapping = pop!();
+                    let n = cell_name(&fr!().code, i as usize);
+                    let key = self.str_obj(&n);
+                    let found = match self.mapping_lookup(&mapping, &key)? {
+                        Some(v) => Some(v),
+                        None => match &fr!().cells[i as usize].kind {
+                            Kind::Cell(c) => c.borrow().clone(),
+                            _ => None,
+                        },
+                    };
+                    match found {
+                        Some(v) => push!(v),
+                        None => {
+                            return Err(self.new_exc_str(
+                                "NameError",
+                                &format!("cannot access free variable '{}' where it is not associated with a value in enclosing scope", n),
+                            ))
+                        }
+                    }
+                }
+                Op::LoadFromDictOrGlobals(i) => {
+                    let mapping = pop!();
+                    let name = fr!().code.names[i as usize].clone();
+                    let mut found = self.mapping_lookup(&mapping, &name)?;
+                    if found.is_none() {
+                        found = dict_get_name(&fr!().globals, &name);
+                    }
+                    if found.is_none() {
+                        found = dict_get_name(&self.builtins, &name);
+                    }
+                    match found {
+                        Some(v) => push!(v),
+                        None => return Err(self.name_err(&name)),
+                    }
+                }
+                Op::CallIntrinsic1(k) => {
+                    let v = pop!();
+                    let r = if k == crate::bytecode::INTRINSIC1_PRINT {
+                        self.display_hook(v)?
+                    } else {
+                        crate::builtins::typingm::intrinsic1(self, k, v)?
+                    };
+                    push!(r);
+                }
+                Op::CallIntrinsic2(k) => {
+                    let b = pop!();
+                    let a = pop!();
+                    let r = crate::builtins::typingm::intrinsic2(self, k, a, b)?;
+                    push!(r);
+                }
                 Op::SetupAnnotations => {
                     let fr = fr!();
                     let ns = fr.names.clone().unwrap_or_else(|| fr.globals.clone());
@@ -1188,13 +1402,21 @@ impl Interp {
                 Op::MatchLen(n, star) => {
                     let v = fr!().stack.last().unwrap().clone();
                     let l = self.len_of(&v)?;
-                    let ok = if star { l >= n as usize } else { l == n as usize };
+                    let ok = if star {
+                        l >= n as usize
+                    } else {
+                        l == n as usize
+                    };
                     push!(Value::Bool(ok));
                 }
                 Op::MatchSeqItem(i) => {
                     let v = pop!();
                     let items = self.iterate_to_vec(&v)?;
-                    let idx = if i < 0 { (items.len() as i32 + i) as usize } else { i as usize };
+                    let idx = if i < 0 {
+                        (items.len() as i32 + i) as usize
+                    } else {
+                        i as usize
+                    };
                     push!(items.get(idx).cloned().unwrap_or(Value::None));
                 }
                 Op::MatchStarSlice(before, after) => {
@@ -1246,7 +1468,10 @@ impl Interp {
         match ty {
             Value::Obj(c) if matches!(c.kind, Kind::Type(_)) => {
                 if !self.is_subtype(c, &self.exc_type("BaseException")) {
-                    return Err(self.new_exc_str("TypeError", "catching classes that do not inherit from BaseException is not allowed"));
+                    return Err(self.new_exc_str(
+                        "TypeError",
+                        "catching classes that do not inherit from BaseException is not allowed",
+                    ));
                 }
                 match exc {
                     Value::Obj(e) => {
@@ -1256,7 +1481,10 @@ impl Interp {
                     _ => Ok(false),
                 }
             }
-            _ => Err(self.new_exc_str("TypeError", "catching classes that do not inherit from BaseException is not allowed")),
+            _ => Err(self.new_exc_str(
+                "TypeError",
+                "catching classes that do not inherit from BaseException is not allowed",
+            )),
         }
     }
 
@@ -1273,7 +1501,9 @@ impl Interp {
                     self.no_tb = true;
                     return Ok(h.clone());
                 }
-                None => return Err(self.new_exc_str("RuntimeError", "No active exception to reraise")),
+                None => {
+                    return Err(self.new_exc_str("RuntimeError", "No active exception to reraise"))
+                }
             },
             Some(e) => e,
         };
@@ -1295,11 +1525,17 @@ impl Interp {
     fn exc_from_value(&mut self, v: Value) -> R<Obj> {
         match &v {
             Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Ok(o.clone()),
-            Value::Obj(o) if matches!(o.kind, Kind::Type(_)) && self.is_subtype(o, &self.exc_type("BaseException")) => {
+            Value::Obj(o)
+                if matches!(o.kind, Kind::Type(_))
+                    && self.is_subtype(o, &self.exc_type("BaseException")) =>
+            {
                 let r = self.call(&v, Vec::new(), Vec::new())?;
                 match r {
                     Value::Obj(e) if matches!(e.kind, Kind::Exception(_)) => Ok(e),
-                    _ => Err(self.new_exc_str("TypeError", "calling exception class did not return an exception instance")),
+                    _ => Err(self.new_exc_str(
+                        "TypeError",
+                        "calling exception class did not return an exception instance",
+                    )),
                 }
             }
             _ => Err(self.new_exc_str("TypeError", "exceptions must derive from BaseException")),
@@ -1332,14 +1568,19 @@ fn cell_name(code: &Code, i: usize) -> String {
     if i < code.cellvars.len() {
         code.cellvars[i].to_string()
     } else {
-        code.freevars.get(i - code.cellvars.len()).map(|s| s.to_string()).unwrap_or_default()
+        code.freevars
+            .get(i - code.cellvars.len())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 }
 
 pub fn dict_get_name(d: &Obj, name: &Obj) -> Option<Value> {
     if let (Kind::Dict(dd), Kind::Str(s)) = (&d.kind, &name.kind) {
         let dd = dd.borrow();
-        return dd.find_str(s.hash(), &s.s).and_then(|i| dd.get(i).map(|e| e.val.clone()));
+        return dd
+            .find_str(s.hash(), &s.s)
+            .and_then(|i| dd.get(i).map(|e| e.val.clone()));
     }
     None
 }
@@ -1368,7 +1609,9 @@ pub fn dict_del_name(d: &Obj, name: &Obj) -> Option<Value> {
 pub fn dict_get_str(d: &Obj, name: &str) -> Option<Value> {
     if let Kind::Dict(dd) = &d.kind {
         let dd = dd.borrow();
-        return dd.find_str(hash_str(name), name).and_then(|i| dd.get(i).map(|e| e.val.clone()));
+        return dd
+            .find_str(hash_str(name), name)
+            .and_then(|i| dd.get(i).map(|e| e.val.clone()));
     }
     None
 }

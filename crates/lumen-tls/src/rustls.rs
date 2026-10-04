@@ -1,4 +1,4 @@
-//! TLS over rustls (ring provider) for Android and Windows.
+//! TLS over rustls (ring provider).
 //!
 //! Same surface and I/O semantics as `openssl`: the handshake completes inside `connect`/`accept`,
 //! reads block on the socket, a socket read timeout surfaces as `ErrorKind::Interrupted` (the
@@ -7,7 +7,7 @@
 //! falling back to the bundled Mozilla roots when that store yields nothing.
 
 use std::collections::HashMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Cursor, ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,10 +16,278 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{self, CryptoProvider};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::time_provider::TimeProvider;
 use rustls::{
     CipherSuite, ClientConfig, ClientConnection, Connection, DigitallySignedStruct,
     ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
 };
+
+pub type RuntimeRandomFill = fn(&mut [u8]) -> Result<(), String>;
+pub type RuntimeUnixTimeSource = fn() -> Option<u64>;
+
+#[derive(Clone, Copy)]
+struct RuntimeCrypto {
+    random_fill: RuntimeRandomFill,
+    unix_time: RuntimeUnixTimeSource,
+}
+
+static RUNTIME_CRYPTO: OnceLock<RuntimeCrypto> = OnceLock::new();
+
+/// Install strong entropy and synchronized wall-clock providers for transport-free TLS clients.
+/// The entropy callback must fill the entire slice from a CSPRNG or return an error. The clock
+/// must return Unix seconds only when certificate validity can be checked against real time.
+pub fn install_runtime_crypto(
+    random_fill: RuntimeRandomFill,
+    unix_time: RuntimeUnixTimeSource,
+) -> Result<(), String> {
+    RUNTIME_CRYPTO
+        .set(RuntimeCrypto {
+            random_fill,
+            unix_time,
+        })
+        .map_err(|_| String::from("TLS runtime crypto providers are already installed"))
+}
+
+#[derive(Debug)]
+struct RuntimeSecureRandom;
+
+impl rustls::crypto::SecureRandom for RuntimeSecureRandom {
+    fn fill(&self, bytes: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
+        let runtime = RUNTIME_CRYPTO
+            .get()
+            .ok_or(rustls::crypto::GetRandomFailed)?;
+        (runtime.random_fill)(bytes).map_err(|_| rustls::crypto::GetRandomFailed)
+    }
+}
+
+static RUNTIME_SECURE_RANDOM: RuntimeSecureRandom = RuntimeSecureRandom;
+
+#[derive(Debug)]
+struct RuntimeTimeProvider;
+
+impl TimeProvider for RuntimeTimeProvider {
+    fn current_time(&self) -> Option<UnixTime> {
+        let seconds = (RUNTIME_CRYPTO.get()?.unix_time)()?;
+        Some(UnixTime::since_unix_epoch(Duration::from_secs(seconds)))
+    }
+}
+
+static RUNTIME_TIME_PROVIDER: RuntimeTimeProvider = RuntimeTimeProvider;
+
+fn runtime_provider() -> Result<Arc<CryptoProvider>, String> {
+    if RUNTIME_CRYPTO.get().is_none() {
+        return Err(String::from(
+            "TLS runtime entropy and clock providers are unavailable",
+        ));
+    }
+    static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
+    Ok(PROVIDER
+        .get_or_init(|| {
+            let mut provider = crypto::ring::default_provider();
+            provider.secure_random = &RUNTIME_SECURE_RANDOM;
+            Arc::new(provider)
+        })
+        .clone())
+}
+
+/// Construct a verified Rustls client config from the bundled Mozilla roots plus caller roots.
+/// Certificate verification uses the clock installed by [`install_runtime_crypto`].
+pub fn client_config_with_roots(
+    protocols: &[String],
+    extra_roots: &[Vec<u8>],
+) -> Result<Arc<ClientConfig>, String> {
+    validate_alpn(protocols)?;
+    let provider = runtime_provider()?;
+    let runtime = RUNTIME_CRYPTO
+        .get()
+        .ok_or_else(|| String::from("TLS runtime entropy and clock providers are unavailable"))?;
+    if (runtime.unix_time)().is_none() {
+        return Err(String::from("TLS requires a synchronized wall clock"));
+    }
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for root in extra_roots {
+        roots
+            .add(CertificateDer::from(root.clone()))
+            .map_err(|error| format!("invalid TLS trust anchor: {error}"))?;
+    }
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|error| error.to_string())?;
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = protocols
+        .iter()
+        .map(|protocol| protocol.as_bytes().to_vec())
+        .collect();
+    config.time_provider = Arc::new(RuntimeTimeProvider);
+    Ok(Arc::new(config))
+}
+
+/// A nonblocking Rustls client session driven by an external transport.
+///
+/// `connect` queues its initial ClientHello. The owner exchanges bytes with its transport by
+/// passing received TLS records to [`feed_encrypted`](Self::feed_encrypted) and sending the bytes
+/// returned by [`take_encrypted`](Self::take_encrypted). Plaintext I/O never touches a socket.
+pub struct ClientSession {
+    connection: ClientConnection,
+    transport_eof: bool,
+}
+
+/// Result of attempting a nonblocking plaintext read from [`ClientSession`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaintextRead {
+    /// `length` bytes were decrypted and copied into the supplied buffer.
+    Data(usize),
+    /// No plaintext is buffered yet; the transport should wait for more encrypted bytes.
+    Pending,
+    /// The peer sent an authenticated TLS `close_notify` alert.
+    Closed,
+}
+
+impl ClientSession {
+    /// Start a verified client using bundled Mozilla roots and the installed runtime providers.
+    pub fn connect(hostname: &str, protocols: &[String]) -> Result<Self, String> {
+        let config = client_config_with_roots(protocols, &[])?;
+        Self::with_config(config, hostname)
+    }
+
+    /// Start a verified client using the shared runtime crypto/time providers and extra roots.
+    pub fn connect_with_roots(
+        hostname: &str,
+        protocols: &[String],
+        extra_roots: &[Vec<u8>],
+    ) -> Result<Self, String> {
+        let config = client_config_with_roots(protocols, extra_roots)?;
+        Self::with_config(config, hostname)
+    }
+
+    fn with_config(config: Arc<ClientConfig>, hostname: &str) -> Result<Self, String> {
+        let server_name = ServerName::try_from(hostname.to_owned())
+            .map_err(|error| format!("invalid TLS hostname {hostname:?}: {error}"))?;
+        let connection = ClientConnection::new(config, server_name)
+            .map_err(|error| format!("TLS client setup failed: {error}"))?;
+        Ok(Self {
+            connection,
+            transport_eof: false,
+        })
+    }
+
+    /// Whether the peer handshake has completed.
+    pub fn is_handshaking(&self) -> bool {
+        self.connection.is_handshaking()
+    }
+
+    /// Feed encrypted peer bytes, processing every complete TLS record they contain.
+    pub fn feed_encrypted(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        if self.transport_eof {
+            return Err(String::from(
+                "TLS encrypted input arrived after transport EOF",
+            ));
+        }
+        let mut input = Cursor::new(bytes);
+        while (input.position() as usize) < bytes.len() {
+            let consumed = self
+                .connection
+                .read_tls(&mut input)
+                .map_err(|error| format!("TLS encrypted input failed: {error}"))?;
+            if consumed == 0 {
+                break;
+            }
+            self.connection
+                .process_new_packets()
+                .map_err(|error| format!("TLS peer data rejected: {error}"))?;
+        }
+        Ok(input.position() as usize)
+    }
+
+    /// Signal that the underlying byte transport reached EOF.
+    ///
+    /// Rustls treats this as an unauthenticated transport close. Any subsequent plaintext read
+    /// without a previously received `close_notify` fails with an unexpected-EOF error, allowing
+    /// close-delimited protocols to reject truncation instead of treating it as a clean TLS EOF.
+    pub fn feed_eof(&mut self) -> Result<(), String> {
+        if self.transport_eof {
+            return Ok(());
+        }
+        self.transport_eof = true;
+        let mut empty = Cursor::new(&[]);
+        self.connection
+            .read_tls(&mut empty)
+            .map_err(|error| format!("TLS transport EOF failed: {error}"))?;
+        self.connection
+            .process_new_packets()
+            .map_err(|error| format!("TLS peer data rejected at transport EOF: {error}"))?;
+        Ok(())
+    }
+
+    /// Drain encrypted TLS records queued for the peer.
+    pub fn take_encrypted(&mut self) -> Result<Vec<u8>, String> {
+        let mut output = Vec::new();
+        while self.connection.wants_write() {
+            let written = self
+                .connection
+                .write_tls(&mut output)
+                .map_err(|error| format!("TLS encrypted output failed: {error}"))?;
+            if written == 0 {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
+    /// Queue plaintext for encryption. Returns the number of bytes accepted by Rustls.
+    pub fn write_plaintext(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        self.connection
+            .writer()
+            .write(bytes)
+            .map_err(|error| format!("TLS plaintext write failed: {error}"))
+    }
+
+    /// Read currently available decrypted bytes without waiting for more transport input.
+    ///
+    /// A transport must call [`feed_eof`](Self::feed_eof) when its TCP-like stream closes. Rustls
+    /// then distinguishes an authenticated `close_notify` (`Closed`) from abrupt truncation
+    /// (an error).
+    pub fn read_plaintext(&mut self, bytes: &mut [u8]) -> Result<PlaintextRead, String> {
+        if bytes.is_empty() {
+            return Ok(PlaintextRead::Data(0));
+        }
+        match self.connection.reader().read(bytes) {
+            Ok(0) => Ok(PlaintextRead::Closed),
+            Ok(length) => Ok(PlaintextRead::Data(length)),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(PlaintextRead::Pending),
+            Err(error) => Err(format!("TLS plaintext read failed: {error}")),
+        }
+    }
+
+    /// Queue TLS close_notify. The owner must then send bytes from `take_encrypted`.
+    pub fn close_notify(&mut self) {
+        self.connection.send_close_notify();
+    }
+
+    pub fn protocol(&self) -> String {
+        match self.connection.protocol_version() {
+            Some(ProtocolVersion::TLSv1_3) => "TLSv1.3".into(),
+            Some(ProtocolVersion::TLSv1_2) => "TLSv1.2".into(),
+            Some(other) => format!("{other:?}"),
+            None => String::new(),
+        }
+    }
+
+    pub fn cipher(&self) -> String {
+        self.connection
+            .negotiated_cipher_suite()
+            .map(|suite| format!("{:?}", suite.suite()))
+            .unwrap_or_default()
+    }
+
+    pub fn alpn_protocol(&self) -> String {
+        self.connection
+            .alpn_protocol()
+            .map(|protocol| String::from_utf8_lossy(protocol).into_owned())
+            .unwrap_or_default()
+    }
+}
 
 /// How long a handshake may keep retrying reads that time out. The runtime's sockets carry short
 /// poll-style read timeouts (100 ms), so a single timeout is not a failure.
@@ -43,6 +311,19 @@ impl TlsStream {
         Self::connect_with_options(stream, hostname, protocols, true)
     }
 
+    /// Connect with the platform's normal roots plus certificate authorities supplied for this
+    /// connection only. The hostname still controls both SNI and certificate name verification.
+    pub fn connect_with_extra_roots(
+        stream: TcpStream,
+        hostname: &str,
+        pem: &[u8],
+    ) -> Result<Self, String> {
+        let config = client_config_with_extra_pem(&[], pem)?;
+        let server_name = ServerName::try_from(hostname.to_owned())
+            .map_err(|error| format!("invalid TLS hostname {hostname:?}: {error}"))?;
+        Self::connect_configured(stream, server_name, config)
+    }
+
     pub fn connect_with_options(
         stream: TcpStream,
         hostname: &str,
@@ -64,6 +345,14 @@ impl TlsStream {
             Err(error) => return Err(format!("invalid TLS hostname {hostname:?}: {error}")),
         };
         let config = client_config(verify_peer, protocols)?;
+        Self::connect_configured(stream, server_name, config)
+    }
+
+    fn connect_configured(
+        stream: TcpStream,
+        server_name: ServerName<'static>,
+        config: Arc<ClientConfig>,
+    ) -> Result<Self, String> {
         let connection = ClientConnection::new(config, server_name)
             .map_err(|error| format!("TLS client setup failed: {error}"))?;
         let mut tls = Self {
@@ -301,6 +590,7 @@ fn root_store() -> &'static Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS.get_or_init(|| {
         let mut roots = RootCertStore::empty();
+        #[cfg(all(any(not(unix), target_os = "android"), not(target_os = "none")))]
         roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         if roots.is_empty() {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -335,6 +625,33 @@ fn client_config(verify_peer: bool, protocols: &[String]) -> Result<Arc<ClientCo
     let config = Arc::new(config);
     configs.lock().unwrap().insert(key, config.clone());
     Ok(config)
+}
+
+/// Build a verified socket client using the normal root set plus connection-local PEM roots.
+/// Configurations containing caller roots are deliberately not entered in the shared cache.
+fn client_config_with_extra_pem(
+    protocols: &[String],
+    pem: &[u8],
+) -> Result<Arc<ClientConfig>, String> {
+    validate_alpn(protocols)?;
+    let certificates = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid TLS CA PEM: {error}"))?;
+    if certificates.is_empty() {
+        return Err("invalid TLS CA PEM: no certificate found".into());
+    }
+    let mut roots = root_store().as_ref().clone();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| format!("invalid TLS CA certificate: {error}"))?;
+    }
+    let builder = ClientConfig::builder_with_provider(provider().clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|error| error.to_string())?;
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = protocols.iter().map(|p| p.as_bytes().to_vec()).collect();
+    Ok(Arc::new(config))
 }
 
 /// `rejectUnauthorized: false`: any certificate chain and name is accepted, but the handshake
@@ -391,6 +708,29 @@ impl ServerCertVerifier for AcceptAnyCertificate {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::sync::Once;
+
+    static INSTALL_RUNTIME: Once = Once::new();
+
+    fn install_runtime() {
+        INSTALL_RUNTIME.call_once(|| {
+            fn random(bytes: &mut [u8]) -> Result<(), String> {
+                crypto::ring::default_provider()
+                    .secure_random
+                    .fill(bytes)
+                    .map_err(|_| String::from("test entropy unavailable"))
+            }
+            fn now() -> Option<u64> {
+                Some(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_secs(),
+                )
+            }
+            install_runtime_crypto(random, now).unwrap();
+        });
+    }
 
     fn self_signed() -> (Vec<u8>, Vec<u8>) {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
@@ -398,6 +738,170 @@ mod tests {
             certified.cert.pem().into_bytes(),
             certified.key_pair.serialize_pem().into_bytes(),
         )
+    }
+
+    fn der_pair(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let certs = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(key_pem).unwrap();
+        (certs, key)
+    }
+
+    fn local_server(cert_pem: &[u8], key_pem: &[u8], alpn: &[String]) -> ServerConnection {
+        let (certs, key) = der_pair(cert_pem, key_pem);
+        let config = ServerConfig::builder_with_provider(crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let mut config = config;
+        config.alpn_protocols = alpn.iter().map(|value| value.as_bytes().to_vec()).collect();
+        ServerConnection::new(Arc::new(config)).unwrap()
+    }
+
+    fn pump(client: &mut ClientSession, server: &mut ServerConnection) -> Result<(), String> {
+        let client_bytes = client.take_encrypted()?;
+        if !client_bytes.is_empty() {
+            server
+                .read_tls(&mut Cursor::new(client_bytes))
+                .map_err(|error| error.to_string())?;
+            server
+                .process_new_packets()
+                .map_err(|error| error.to_string())?;
+        }
+        let mut server_bytes = Vec::new();
+        while server.wants_write() {
+            let written = server
+                .write_tls(&mut server_bytes)
+                .map_err(|error| error.to_string())?;
+            if written == 0 {
+                break;
+            }
+        }
+        if !server_bytes.is_empty() {
+            client.feed_encrypted(&server_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn finish_handshake(
+        client: &mut ClientSession,
+        server: &mut ServerConnection,
+    ) -> Result<(), String> {
+        for _ in 0..16 {
+            pump(client, server)?;
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return Ok(());
+            }
+        }
+        Err(String::from("in-memory TLS handshake did not complete"))
+    }
+
+    #[test]
+    fn transport_free_session_verifies_and_reads_authenticated_eof() {
+        install_runtime();
+        let (cert_pem, key_pem) = self_signed();
+        let (certs, _) = der_pair(&cert_pem, &key_pem);
+        let roots = certs
+            .iter()
+            .map(|cert| cert.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        let alpn = [String::from("http/1.1")];
+        let mut client = ClientSession::connect_with_roots("localhost", &alpn, &roots).unwrap();
+        let mut pending = [0u8; 1];
+        assert_eq!(
+            client.read_plaintext(&mut pending).unwrap(),
+            PlaintextRead::Pending
+        );
+        let mut server = local_server(&cert_pem, &key_pem, &alpn);
+        finish_handshake(&mut client, &mut server).unwrap();
+        assert_eq!(client.protocol(), "TLSv1.3");
+        assert_eq!(client.alpn_protocol(), "http/1.1");
+
+        assert_eq!(client.write_plaintext(b"request").unwrap(), 7);
+        pump(&mut client, &mut server).unwrap();
+        let mut request = [0u8; 7];
+        server.reader().read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"request");
+        server.writer().write_all(b"response").unwrap();
+        server.send_close_notify();
+        let mut server_bytes = Vec::new();
+        while server.wants_write() {
+            let written = server.write_tls(&mut server_bytes).unwrap();
+            assert_ne!(written, 0);
+        }
+        client.feed_encrypted(&server_bytes).unwrap();
+        let mut response = [0u8; 16];
+        assert_eq!(
+            client.read_plaintext(&mut response).unwrap(),
+            PlaintextRead::Data(8)
+        );
+        assert_eq!(&response[..8], b"response");
+        assert_eq!(
+            client.read_plaintext(&mut response).unwrap(),
+            PlaintextRead::Closed
+        );
+    }
+
+    #[test]
+    fn transport_free_session_rejects_wrong_hostname_and_truncated_tls() {
+        install_runtime();
+        let (cert_pem, key_pem) = self_signed();
+        let (certs, _) = der_pair(&cert_pem, &key_pem);
+        let roots = certs
+            .iter()
+            .map(|cert| cert.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        let mut wrong_name =
+            ClientSession::connect_with_roots("not-localhost", &[], &roots).unwrap();
+        let mut server = local_server(&cert_pem, &key_pem, &[]);
+        let mut rejected = false;
+        for _ in 0..8 {
+            let bytes = wrong_name.take_encrypted().unwrap();
+            if !bytes.is_empty() {
+                server.read_tls(&mut Cursor::new(bytes)).unwrap();
+                if server.process_new_packets().is_err() {
+                    break;
+                }
+            }
+            let mut response = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut response).unwrap();
+            }
+            if !response.is_empty() && wrong_name.feed_encrypted(&response).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(
+            rejected,
+            "a trusted certificate with the wrong hostname must fail verification"
+        );
+
+        let mut client = ClientSession::connect_with_roots("localhost", &[], &roots).unwrap();
+        let mut server = local_server(&cert_pem, &key_pem, &[]);
+        finish_handshake(&mut client, &mut server).unwrap();
+        server.writer().write_all(b"partial response").unwrap();
+        let mut encrypted = Vec::new();
+        while server.wants_write() {
+            server.write_tls(&mut encrypted).unwrap();
+        }
+        client.feed_encrypted(&encrypted).unwrap();
+        client.feed_eof().unwrap();
+        let mut plaintext = [0u8; 32];
+        assert_eq!(
+            client.read_plaintext(&mut plaintext).unwrap(),
+            PlaintextRead::Data(16)
+        );
+        assert!(
+            client.read_plaintext(&mut plaintext).is_err(),
+            "abrupt TCP EOF must not be clean TLS EOF"
+        );
     }
 
     fn round_trip(alpn_server: &[String], alpn_client: &[String]) -> (String, String, String) {
@@ -476,6 +980,57 @@ mod tests {
             .expect("must fail");
         assert!(error.contains("certificate"), "{error}");
         assert!(server.join().unwrap().is_some());
+    }
+
+    #[test]
+    fn socket_client_extra_roots_are_connection_scoped() {
+        let (cert, key) = self_signed();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_cert = cert.clone();
+        let server_key = key.clone();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut tls = TlsStream::accept(tcp, &server_cert, &server_key).unwrap();
+            let mut request = [0u8; 4];
+            tls.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            tls.write_all(b"pong").unwrap();
+        });
+
+        let tcp = TcpStream::connect(address).unwrap();
+        let mut client = TlsStream::connect_with_extra_roots(tcp, "localhost", &cert).unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut response = [0u8; 4];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        server.join().unwrap();
+
+        // The additional CA must not enter the shared platform root store or later configs.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            TlsStream::accept(tcp, &cert, &key).err()
+        });
+        let tcp = TcpStream::connect(address).unwrap();
+        let error = TlsStream::connect(tcp, "localhost")
+            .err()
+            .expect("the ordinary client must not inherit a connection-local root");
+        assert!(error.contains("certificate"), "{error}");
+        assert!(server.join().unwrap().is_some());
+    }
+
+    #[test]
+    fn socket_client_rejects_invalid_extra_root_pem() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = TcpStream::connect(address).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let error = TlsStream::connect_with_extra_roots(tcp, "localhost", b"not a certificate")
+            .err()
+            .expect("invalid extra-root PEM must be rejected");
+        assert!(error.contains("PEM"), "{error}");
     }
 
     #[test]

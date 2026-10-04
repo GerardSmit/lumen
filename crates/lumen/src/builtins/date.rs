@@ -12,7 +12,12 @@ fn now_ms() -> f64 {
         .unwrap_or(0.0)
 }
 
-use crate::local_tz::{civil_from_days, days_from_civil};
+use lumen_common::civil::days_from_civil;
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let (y, m, d) = lumen_common::civil::civil_from_days(z);
+    (y, m as i64, d as i64)
+}
 
 /// (year, month0, day, hour, minute, second, millisecond, weekday[0=Sun]).
 const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

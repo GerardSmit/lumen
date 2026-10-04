@@ -1,0 +1,39 @@
+True True
+Scanner Encoder True
+{'a': [1, 2.5, 0, 12345678901234567890, True, None, 'xé𝄠'], 'b': {}}
+[nan, inf, -inf, -0.0, inf]
+OrderedDict({'a': 2})
+['x']
+('f', '1.5') ('i', '7')
+True
+'' Expecting value 0
+'[' Expecting value 1
+'[1,' Expecting value 3
+'{"a"' Expecting ':' delimiter 4
+'{"a":}' Expecting value 5
+'"abc' Unterminated string starting at 0
+'"\\x"' Invalid \escape 1
+'[1 2]' Expecting ',' delimiter 3
+'{1:2}' Expecting property name enclosed in double quotes 1
+'"\x01"' Invalid control character at 1
+'1 2' Extra data 2
+'é[' Expecting value 0
+'"é\\u12"' Invalid \uXXXX escape 3
+{"a": [1, 2.5, null, true, "\u00e9\ud834", [1, 2]], "3": "x", "1.5": "y", "null": 0, "false": 1}
+{"a": "é𝄠"} "\u00e9\ud834\udd20\u007f\u001f"
+{"a":2,"b":1}
+{"z": 1, "y": 2}
+[NaN, Infinity, -Infinity, 1180591620717411303424]
+ValueError Out of range float values are not JSON compliant: nan
+TypeError keys must be str, int, float, bool or None, not tuple
+TypeError Object of type object is not JSON serializable
+{"a": 1}
+Circular reference detected
+[0.0, 1.0]
+True
+[]
+('abc', 5) "a\"\n\u1234" "a\"\nሴ"
+make_encoder() argument 1 must be dict or None, not int
+overflow Python int too large to convert to C ssize_t
+True <class 'float'> ([1], 5)
+stop 0

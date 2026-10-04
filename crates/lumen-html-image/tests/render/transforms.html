@@ -1,0 +1,8 @@
+<!doctype html><html><head><style>
+html,body{margin:0;background:white}div{position:absolute;width:12px;height:8px;background:red}
+#translate{left:2px;top:2px;transform:translate(4px,6px)}
+#rotate{left:34px;top:8px;transform:rotate(90deg);background:blue}
+#scale{left:4px;top:36px;transform:scale(2,1.5);transform-origin:0 0;background:green}
+#nested{left:40px;top:36px;transform:translate(2px,2px);background:transparent}
+#nested div{left:0;top:0;transform:rotate(90deg);transform-origin:0 0;background:purple}
+</style></head><body><div id="translate"></div><div id="rotate"></div><div id="scale"></div><div id="nested"><div></div></div></body></html>

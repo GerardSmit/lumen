@@ -1,0 +1,26 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+div{position:absolute;width:40px;height:40px}
+</style>
+<!-- jixr-compare: threshold=2 max-diff-ratio=0.01
+  Channel substitution round-trips through each space's conversion chain; oklch/lab cases
+  land within one or two channel units of Chromium, matching the recorded polar-space
+  rounding from the color-mix case.
+--><main style="width:220px;height:140px">
+<div style="left:0;top:0;background:rgb(from red r g b)"></div>
+<div style="left:40px;top:0;background:rgb(from red 255 g b)"></div>
+<div style="left:80px;top:0;background:rgb(from rgb(255 128 0) calc(r/2) g b)"></div>
+<div style="left:120px;top:0;background:hsl(from hsl(120 100% 50%) h s l)"></div>
+<div style="left:160px;top:0;background:oklch(from oklch(70% .1 180) l c h)"></div>
+<div style="left:200px;top:0;width:20px;background:rgb(from red r g b / 0.5)"></div>
+<div style="left:0;top:40px;background:rgb(from red none g b)"></div>
+<div style="left:40px;top:40px;background:lab(from lab(50% 40 -30) l a b)"></div>
+<div style="left:80px;top:40px;background:rgb(from red 100% 0% 0%)"></div>
+<div style="left:120px;top:40px;background:oklch(from oklch(.7 .1 90deg) calc(l*0.5) c h)"></div>
+<div style="left:160px;top:40px;background:rgb(from #34c9eb 12% g b)"></div>
+<div style="left:200px;top:40px;width:20px;background:rgb(from blue r g 255)"></div>
+<div style="left:0;top:80px;background:xyz(from xyz(0.4 0.5 0.6) x y z)"></div>
+<div style="left:40px;top:80px;background:hsl(from green h 50% 25%)"></div>
+<div style="left:80px;top:80px;background:rgb(from red r g b / none)"></div>
+<div style="left:120px;top:80px;background:rgb(from rebeccapurple r 20% b)"></div>
+</main>

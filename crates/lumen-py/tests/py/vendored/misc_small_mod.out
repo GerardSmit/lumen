@@ -1,0 +1,12 @@
+None ['nested_scopes', 'generators', 'division']
+True False True
+35 True
+True True False
+True True
+True Real
+True True True
+True True True
+True True
+['a', 'b'] 1 0 True [('a', 1), ('b', 2)] True
+[1, 2, 3] 3 1 True [2, 1]
+copyreg True

@@ -1,6 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
+use lumen_common::buffer::{BufferError, ByteStore, StoreSlot};
 
 pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     // Modeled as a plain ArrayBuffer (no real sharing) — enough for tests that just need the type.
@@ -37,7 +38,12 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     sab_getter(it, &proto, "maxByteLength", |i, this, _| {
         require_shared_buffer(i, &this)?;
         this.as_obj()
-            .and_then(|o| o.borrow().props.get("\u{0}ab_max_byte_length").map(|p| p.value()))
+            .and_then(|o| {
+                o.borrow()
+                    .props
+                    .get("\u{0}ab_max_byte_length")
+                    .map(|p| p.value())
+            })
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))
     });
     sab_getter(it, &proto, "growable", |i, this, _| {
@@ -64,8 +70,9 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&ptr) {
-            buf.resize(new_len as usize, 0);
+        if let Some(buf) = i.array_buffers.get(&ptr) {
+            buf.resize(new_len as usize)
+                .map_err(|e| buffer_error(i, e))?;
         }
         Ok(Value::Undefined)
     });
@@ -181,8 +188,13 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, vec![0u8; len].into());
-        set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max.unwrap_or(n)));
+        i.array_buffers
+            .insert(bp, new_store(len, max.map(|m| m as usize)).into());
+        set_internal(
+            &obj,
+            "\u{0}ab_max_byte_length",
+            Value::Num(max.unwrap_or(n)),
+        );
         set_internal(&obj, "\u{0}ab_resizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
         i.shared_buffers.insert(bp, id);
@@ -209,9 +221,9 @@ fn ab_transfer(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value>
 fn ab_transfer_fixed(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
     ab_transfer_impl(i, this, a, true)
 }
-/// ArrayBuffer.prototype.transfer / transferToFixedLength: copy into a new buffer of `newLength` and
-/// detach the source. `transfer` preserves the source's resizability (its maxByteLength);
-/// `transferToFixedLength` always produces a fixed-length buffer.
+/// ArrayBuffer.prototype.transfer / transferToFixedLength: move the source's bytes into a new
+/// buffer of `newLength` and detach the source. `transfer` preserves the source's resizability
+/// (its maxByteLength); `transferToFixedLength` always produces a fixed-length buffer.
 fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Result<Value, Value> {
     let o = this
         .as_obj()
@@ -234,60 +246,86 @@ fn ab_transfer_impl(i: &mut Interp, this: Value, a: &[Value], fixed: bool) -> Re
             Some(n as usize)
         }
     };
-    if i.immutable_buffers.contains(&ptr) {
+    if i.buffer_immutable(ptr) {
         return Err(i.make_error("TypeError", "an immutable ArrayBuffer is not detachable"));
     }
-    if !i.array_buffers.contains_key(&ptr) {
+    let Some(src_len) = i.array_buffers.get(&ptr).map(|s| s.len()) else {
         return Err(i.make_error("TypeError", "ArrayBuffer is detached"));
-    }
-    let new_len = new_len.unwrap_or_else(|| i.array_buffers[&ptr].len());
+    };
+    let new_len = new_len.unwrap_or(src_len);
     // transfer() preserves the source's resizability; transferToFixedLength() is always fixed.
     let src_resizable = matches!(i.get_member(&this, "resizable"), Ok(Value::Bool(true)));
     let src_max = match i.get_member(&this, "maxByteLength") {
         Ok(Value::Num(n)) => n as usize,
         _ => new_len,
     };
-    let bytes = i.array_buffers[&ptr].clone();
-    let (bv, bp) = make_array_buffer(i, new_len);
-    if let Some(buf) = i.array_buffers.get_mut(&bp) {
-        let n = bytes.len().min(new_len);
-        buf[..n].copy_from_slice(&bytes[..n]);
-    }
-    if !fixed && src_resizable {
-        if let Value::Obj(nb) = &bv {
-            set_internal(nb, "\u{0}ab_max_byte_length", Value::Num(src_max as f64));
-            set_internal(nb, "\u{0}ab_resizable", Value::Bool(true));
-        }
-    }
-    // Detach the source (drop its backing store; detached/byteLength derive from the side table).
+    // Detach the source, taking its bytes (no copy for an owned store).
+    let detached = match i.array_buffers.get(&ptr) {
+        Some(src) => src.detach(),
+        None => Err(BufferError::Detached),
+    };
+    let mut bytes = detached.map_err(|e| buffer_error(i, e))?;
     i.array_buffers.remove(&ptr);
+    bytes.resize(new_len, 0);
+    let max = (!fixed && src_resizable).then_some(src_max);
+    let (bv, _) = array_buffer_from_store(i, store_with_max(ByteStore::new(bytes), max).into());
+    if let (Some(m), Value::Obj(nb)) = (max, &bv) {
+        set_internal(nb, "\u{0}ab_max_byte_length", Value::Num(m as f64));
+    }
     Ok(bv)
+}
+
+/// `store` made resizable up to `max` when given.
+fn store_with_max(store: ByteStore, max: Option<usize>) -> ByteStore {
+    match max {
+        Some(m) => store.with_max_len(m),
+        None => store,
+    }
+}
+
+/// `len` zero bytes, resizable up to `max` when given.
+fn new_store(len: usize, max: Option<usize>) -> ByteStore {
+    store_with_max(ByteStore::zeroed(len), max)
+}
+
+/// The JS error for a store operation the shared buffer refused.
+pub(crate) fn buffer_error(i: &Interp, e: BufferError) -> Value {
+    let msg = match e {
+        BufferError::Pinned => {
+            "ArrayBuffer has live exports and cannot be resized, transferred or detached"
+        }
+        BufferError::Detached => "ArrayBuffer is detached",
+        BufferError::ReadOnly => "ArrayBuffer is immutable",
+        e => e.message(),
+    };
+    let kind = match e {
+        BufferError::TooLarge | BufferError::OutOfBounds => "RangeError",
+        _ => "TypeError",
+    };
+    i.make_error(kind, msg)
 }
 
 /// A fixed-length ArrayBuffer owning `bytes` (no copy).
 pub(crate) fn array_buffer_from_vec(i: &mut Interp, bytes: Vec<u8>) -> Value {
-    let (v, p) = make_array_buffer(i, 0);
-    if let Value::Obj(o) = &v {
-        set_max_byte_length(o, bytes.len());
-    }
-    i.array_buffers.insert(p, bytes.into());
-    v
+    array_buffer_from_store(i, ByteStore::new(bytes).into()).0
 }
 
-pub(crate) fn set_max_byte_length(o: &Gc, len: usize) {
-    set_internal(o, "\u{0}ab_max_byte_length", Value::Num(len as f64));
-}
-
-fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
+/// A new ArrayBuffer object over `store`; its maxByteLength / resizable slots mirror the store.
+pub(crate) fn array_buffer_from_store(i: &mut Interp, store: StoreSlot) -> (Value, usize) {
     let obj = Object::new(i.extra_protos.get("ArrayBuffer").cloned());
     let p = Gc::as_ptr(&obj) as usize;
     i.gc_pin(&obj);
-    i.array_buffers.insert(p, vec![0u8; byte_len].into());
     // byteLength/detached derive from the side table; only max/resizable need stored slots, hidden
-    // behind the `__ab*` prefix and surfaced through prototype accessor getters.
-    set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(byte_len as f64));
-    set_internal(&obj, "\u{0}ab_resizable", Value::Bool(false));
+    // behind NUL-prefixed keys and surfaced through prototype accessor getters.
+    let max = (store.max_len() as u64).min(9007199254740991);
+    set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max as f64));
+    set_internal(&obj, "\u{0}ab_resizable", Value::Bool(store.is_resizable()));
+    i.array_buffers.insert(p, store);
     (Value::Obj(obj), p)
+}
+
+fn make_array_buffer(i: &mut Interp, byte_len: usize) -> (Value, usize) {
+    array_buffer_from_store(i, ByteStore::zeroed(byte_len).into())
 }
 
 /// `get ArrayBuffer.prototype.byteLength`.
@@ -352,10 +390,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     });
     ab_getter(it, &proto, "resizable", |i, this, _| {
         reject_shared_buffer(i, &this)?;
-        match this
-            .as_obj()
-            .and_then(|o| o.borrow().props.get("\u{0}ab_resizable").map(|pr| pr.value()))
-        {
+        match this.as_obj().and_then(|o| {
+            o.borrow()
+                .props
+                .get("\u{0}ab_resizable")
+                .map(|pr| pr.value())
+        }) {
             Some(v) => Ok(v),
             None => Err(i.make_error("TypeError", "not an ArrayBuffer")),
         }
@@ -376,9 +416,7 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             .as_obj()
             .filter(|o| o.borrow().props.contains("\u{0}ab_max_byte_length"))
             .ok_or_else(|| i.make_error("TypeError", "not an ArrayBuffer"))?;
-        Ok(Value::Bool(
-            i.immutable_buffers.contains(&(Gc::as_ptr(o) as usize)),
-        ))
+        Ok(Value::Bool(i.buffer_immutable(Gc::as_ptr(o) as usize)))
     });
     it.def_method(&proto, "slice", 2, |i, this, a| {
         // RequireInternalSlot([[ArrayBufferData]]), reject a shared buffer, then a detached one.
@@ -430,23 +468,21 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         if nptr == ptr {
             return Err(i.make_error("TypeError", "slice species returned the same ArrayBuffer"));
         }
-        if i.immutable_buffers.contains(&nptr) {
+        if i.buffer_immutable(nptr) {
             return Err(i.make_error("TypeError", "slice species returned an immutable buffer"));
         }
         if i.array_buffers[&nptr].len() < new_len {
             return Err(i.make_error("TypeError", "slice species buffer is too small"));
         }
         // The species constructor may have detached or shrunk the source.
-        if !i.array_buffers.contains_key(&ptr) {
+        let Some(src) = i.array_buffers.get(&ptr) else {
             return Err(i.make_error("TypeError", "source ArrayBuffer was detached during slice"));
-        }
-        let src = i.array_buffers[&ptr].clone();
+        };
         let (begin, end) = (begin.min(src.len() as i64), end.min(src.len() as i64));
         if begin < end {
-            let slice = src[begin as usize..end as usize].to_vec();
-            if let Some(buf) = i.array_buffers.get_mut(&nptr) {
-                buf[..slice.len()].copy_from_slice(&slice);
-            }
+            // Copied out first: two buffer objects may share one store.
+            let slice = src.bytes()[begin as usize..end as usize].to_vec();
+            i.array_buffers[&nptr].write_at(0, &slice);
         }
         Ok(new_buf)
     });
@@ -479,11 +515,11 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             return Err(i.make_error("RangeError", "ArrayBuffer resize out of range"));
         }
         let n = new_len as usize;
-        if i.immutable_buffers.contains(&(Gc::as_ptr(&o) as usize)) {
+        if i.buffer_immutable(Gc::as_ptr(&o) as usize) {
             return Err(i.make_error("TypeError", "ArrayBuffer is immutable"));
         }
-        if let Some(buf) = i.array_buffers.get_mut(&(Gc::as_ptr(&o) as usize)) {
-            buf.resize(n, 0);
+        if let Some(buf) = i.array_buffers.get(&(Gc::as_ptr(&o) as usize)) {
+            buf.resize(n).map_err(|e| buffer_error(i, e))?;
         }
         // byteLength derives from the backing store length, which the resize above updated.
         Ok(Value::Undefined)
@@ -495,7 +531,9 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     it.def_method(&proto, "transferToImmutable", 0, |i, this, a| {
         let bv = ab_transfer_fixed(i, this, a)?;
         if let Value::Obj(o) = &bv {
-            i.immutable_buffers.insert(Gc::as_ptr(o) as usize);
+            if let Some(store) = i.array_buffers.get(&(Gc::as_ptr(o) as usize)) {
+                store.set_readonly();
+            }
         }
         Ok(bv)
     });
@@ -529,16 +567,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
             ));
         }
         let slice = if begin < end {
-            bytes[begin as usize..end as usize].to_vec()
+            bytes.bytes()[begin as usize..end as usize].to_vec()
         } else {
             Vec::new()
         };
-        let (bv, bp) = make_array_buffer(i, slice.len());
-        if let Some(buf) = i.array_buffers.get_mut(&bp) {
-            buf.copy_from_slice(&slice);
-        }
-        i.immutable_buffers.insert(bp);
-        Ok(bv)
+        let store = ByteStore::new(slice).readonly();
+        Ok(array_buffer_from_store(i, store.into()).0)
     });
     let ctor = it.make_native("ArrayBuffer", 1, |i, _t, a| {
         if !i.constructing {
@@ -580,8 +614,13 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let len = n as usize;
         let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, vec![0u8; len].into());
-        set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max.unwrap_or(n)));
+        i.array_buffers
+            .insert(p, new_store(len, max.map(|m| m as usize)).into());
+        set_internal(
+            &obj,
+            "\u{0}ab_max_byte_length",
+            Value::Num(max.unwrap_or(n)),
+        );
         set_internal(&obj, "\u{0}ab_resizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
     });
@@ -1005,6 +1044,37 @@ fn ta_native(
                 Some(l) => l,
                 None => return Ok(Value::Num(-1.0)),
             };
+            if !last && !info.kind.is_bigint() {
+                if let Value::Num(needle) = &search {
+                    let start = if from >= 0.0 {
+                        (from as usize).min(len)
+                    } else {
+                        (len as f64 + from).max(0.0) as usize
+                    };
+                    let end = len.min(curlen);
+                    if start >= end {
+                        return Ok(Value::Num(-1.0));
+                    }
+                    let es = info.kind.elsize();
+                    let found = i
+                        .with_buffer_bytes(info.buffer, |bytes| {
+                            bytes
+                                .get(info.offset + start * es..info.offset + end * es)
+                                .and_then(|bytes| {
+                                    lumen_common::scan::numeric_find(
+                                        bytes,
+                                        info.kind.elem(),
+                                        *needle,
+                                        false,
+                                    )
+                                })
+                        })
+                        .flatten();
+                    return Ok(Value::Num(
+                        found.map(|k| (start + k) as f64).unwrap_or(-1.0),
+                    ));
+                }
+            }
             let order: Vec<i64> = if last {
                 let k = if from >= 0.0 {
                     from.min((len - 1) as f64) as i64
@@ -1055,6 +1125,30 @@ fn ta_native(
             } else {
                 (from as usize).min(len)
             };
+            if !info.kind.is_bigint() {
+                if let Value::Num(needle) = &search {
+                    let end = len.min(i.ta_len(&info).unwrap_or(0));
+                    if lo >= end {
+                        return Ok(Value::Bool(false));
+                    }
+                    let es = info.kind.elsize();
+                    let found = i
+                        .with_buffer_bytes(info.buffer, |bytes| {
+                            bytes
+                                .get(info.offset + lo * es..info.offset + end * es)
+                                .and_then(|bytes| {
+                                    lumen_common::scan::numeric_find(
+                                        bytes,
+                                        info.kind.elem(),
+                                        *needle,
+                                        true,
+                                    )
+                                })
+                        })
+                        .flatten();
+                    return Ok(Value::Bool(found.is_some()));
+                }
+            }
             for k in lo..len {
                 let v = i.ta_read(&info, k);
                 if same_value_zero(&v, &search) {
@@ -1064,7 +1158,7 @@ fn ta_native(
             Ok(Value::Bool(false))
         })()),
         "fill" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             // The fill value is coerced to the element type exactly once.
@@ -1084,13 +1178,28 @@ fn ta_native(
                 .ok_or_else(|| i.make_error("TypeError", "TypedArray is out of bounds"))?;
             let start = start.min(curlen);
             let end = end.min(curlen);
-            for k in start..end {
-                ab(i.ta_store(&info, k, &value))?;
+            if start < end {
+                let es = info.kind.elsize();
+                let mut pattern = [0u8; 8];
+                match &value {
+                    Value::BigInt(n) => info
+                        .kind
+                        .write_int(n.to_i128_wrapping(), &mut pattern[..es]),
+                    Value::Num(n) => info.kind.write(*n, &mut pattern[..es]),
+                    _ => unreachable!(),
+                }
+                let begin = info.offset + start * es;
+                let limit = info.offset + end * es;
+                i.with_buffer_bytes_mut(info.buffer, |buf| {
+                    if let Some(dst) = buf.get_mut(begin..limit) {
+                        lumen_common::scan::fill_pattern(dst, &pattern[..es]);
+                    }
+                });
             }
             Ok(this.clone())
         })()),
         "copyWithin" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             let to = rel_index(ab(i.to_number(&arg(args, 0)))?, len);
@@ -1110,11 +1219,9 @@ fn ta_native(
                 .min(curlen as i64 - to as i64)
                 .min(curlen as i64 - from as i64);
             if count > 0 {
-                let snap: Vec<Value> = (0..count as usize)
-                    .map(|j| i.ta_read(&info, from + j))
-                    .collect();
-                for (j, v) in snap.iter().enumerate() {
-                    ab(i.ta_store(&info, to + j, v))?;
+                // Snapshot bytes for overlap and preserve floating NaN payloads.
+                if let Some(bytes) = i.ta_read_bytes(&info, from, count as usize) {
+                    i.ta_write_bytes(&info, to, &bytes);
                 }
             }
             Ok(this.clone())
@@ -1125,7 +1232,7 @@ fn ta_native(
                 return Err(i.make_error("TypeError", "comparefn must be a function"));
             }
             let in_place = method == "sort";
-            if in_place && i.immutable_buffers.contains(&info.buffer) {
+            if in_place && i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             // Default (no comparator) numeric sort runs natively — the Value-boxed merge sort
@@ -1191,7 +1298,7 @@ fn ta_native(
             Ok(new_ta)
         })()),
         "reverse" => Some((|| {
-            if i.immutable_buffers.contains(&info.buffer) {
+            if i.buffer_immutable(info.buffer) {
                 return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
             }
             for k in 0..len / 2 {
@@ -1225,6 +1332,25 @@ fn ta_native(
                     // earlier writes.
                     let es = info.kind.elsize();
                     let n = count.min(curlen.saturating_sub(start));
+                    // Owned stores cannot move during this owner-thread turn. Only disjoint
+                    // ranges can use a snapshot: aliasing species retains sequential Set order.
+                    let disjoint = match (
+                        i.array_buffers.get(&info.buffer),
+                        i.array_buffers.get(&new_info.buffer),
+                    ) {
+                        (Some(src), Some(dst)) if !src.is_external() && !dst.is_external() => {
+                            let source = src.as_ptr() as usize + info.offset + start * es;
+                            let target = dst.as_ptr() as usize + new_info.offset;
+                            source + n * es <= target || target + n * es <= source
+                        }
+                        _ => false,
+                    };
+                    if disjoint {
+                        if let Some(bytes) = i.ta_read_bytes(&info, start, n) {
+                            i.ta_write_bytes(&new_info, 0, &bytes);
+                        }
+                        return Ok(new_ta);
+                    }
                     for j in 0..n {
                         if let Some(bytes) = i.ta_read_bytes(&info, start + j, 1) {
                             debug_assert_eq!(bytes.len(), es);
@@ -1326,7 +1452,7 @@ fn ta_validate_created(
             ));
         }
     };
-    if write && i.immutable_buffers.contains(&new_info.buffer) {
+    if write && i.buffer_immutable(new_info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "TypedArray destination is backed by an immutable buffer",
@@ -1460,14 +1586,18 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             let n = if n.is_nan() { 0.0 } else { n.trunc() };
             if !(0.0..=9007199254740991.0).contains(&n) {
                 let shown = i.num_to_str(n);
-                return Err(i.make_error("RangeError", format!("Invalid typed array length: {shown}")));
+                return Err(
+                    i.make_error("RangeError", format!("Invalid typed array length: {shown}"))
+                );
             }
             let len = n as usize;
             // A fresh typed array is one flat allocation, so the byte ceiling is the bound —
             // not the element cap that guards Value-per-element arrays. `Buffer.alloc(2 MiB)`
             // is ordinary Node.
             if len.saturating_mul(es) > MAX_BUFFER_BYTES {
-                return Err(i.make_error("RangeError", format!("Invalid typed array length: {len}")));
+                return Err(
+                    i.make_error("RangeError", format!("Invalid typed array length: {len}"))
+                );
             }
             let (bv, bp) = make_array_buffer(i, len * es);
             (bv, bp, 0, len, false)
@@ -1586,7 +1716,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         .get(&ptr)
         .ok_or_else(|| i.make_error("TypeError", "set on non-TypedArray"))?;
     // An immutable target buffer can't be written — verified before any argument is coerced.
-    if i.immutable_buffers.contains(&info.buffer) {
+    if i.buffer_immutable(info.buffer) {
         return Err(i.make_error("TypeError", "Cannot write to an immutable ArrayBuffer"));
     }
     // targetOffset = ToIntegerOrInfinity(offset); a negative offset is a RangeError.
@@ -1742,7 +1872,13 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         it.def_method(&ta_proto, name, len, *f);
     }
     // %TypedArray%.prototype.toString is the very same function object as %Array.prototype.toString%.
-    if let Some(p) = it.array_proto.borrow().props.get("toString").map(|p| p.clone()) {
+    if let Some(p) = it
+        .array_proto
+        .borrow()
+        .props
+        .get("toString")
+        .map(|p| p.clone())
+    {
         ta_proto.borrow_mut().props.insert("toString", p);
     }
     // %TypedArray%.prototype[@@iterator] is the same function object as its own `values`.
@@ -1889,172 +2025,18 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
 
 // --- Uint8Array base64 / hex (the Stage-3 proposal) -------------------------------------------
 
-const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-const B64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+use lumen_common::codec::{self, LastChunk, PartialDecode};
 
-fn b64_encode(bytes: &[u8], url: bool, pad: bool) -> String {
-    let alpha = if url { B64_URL } else { B64_STD };
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(alpha[(n >> 18 & 63) as usize] as char);
-        out.push(alpha[(n >> 12 & 63) as usize] as char);
-        match chunk.len() {
-            1 => {
-                if pad {
-                    out.push_str("==");
-                }
-            }
-            2 => {
-                out.push(alpha[(n >> 6 & 63) as usize] as char);
-                if pad {
-                    out.push('=');
-                }
-            }
-            _ => {
-                out.push(alpha[(n >> 6 & 63) as usize] as char);
-                out.push(alpha[(n & 63) as usize] as char);
-            }
-        }
-    }
-    out
-}
-/// FromBase64: decode at most `max_len` bytes honoring `handling` (loose / strict /
-/// stop-before-partial). Returns `(read, bytes)` where `read` is the code units consumed through
-/// the last fully decoded chunk; `Err(())` is a syntax error.
-fn b64_decode_spec(s: &str, url: bool, handling: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let is_ws = |c: char| matches!(c, '\t' | '\n' | '\x0c' | '\r' | ' ');
-    let decode_chunk = |chunk: &[u8], throw_extra: bool, bytes: &mut Vec<u8>| -> Result<(), ()> {
-        let mut n = 0u32;
-        for (idx, &v) in chunk.iter().enumerate() {
-            n |= (v as u32) << (18 - 6 * idx);
-        }
-        match chunk.len() {
-            2 => {
-                if throw_extra && n & 0xFFFF != 0 {
-                    return Err(());
-                }
-                bytes.push((n >> 16) as u8);
-            }
-            3 => {
-                if throw_extra && n & 0xFF != 0 {
-                    return Err(());
-                }
-                bytes.extend([(n >> 16) as u8, (n >> 8) as u8]);
-            }
-            _ => bytes.extend([(n >> 16) as u8, (n >> 8) as u8, n as u8]),
-        }
-        Ok(())
-    };
-    let mut bytes = Vec::new();
-    if max_len == 0 {
-        return (0, bytes, false);
-    }
-    let (mut read, mut index) = (0usize, 0usize);
-    let mut chunk: Vec<u8> = Vec::new();
-    loop {
-        while index < len && is_ws(chars[index]) {
-            index += 1;
-        }
-        if index == len {
-            if !chunk.is_empty() {
-                match handling {
-                    "stop-before-partial" => return (read, bytes, false),
-                    "loose" => {
-                        if chunk.len() == 1 {
-                            return (read, bytes, true);
-                        }
-                        if decode_chunk(&chunk, false, &mut bytes).is_err() {
-                            return (read, bytes, true);
-                        }
-                    }
-                    _ => return (read, bytes, true), // strict: a partial chunk must be padded
-                }
-            }
-            return (len, bytes, false);
-        }
-        let mut c = chars[index];
-        index += 1;
-        if c == '=' {
-            if chunk.len() < 2 {
-                return (read, bytes, true);
-            }
-            while index < len && is_ws(chars[index]) {
-                index += 1;
-            }
-            if chunk.len() == 2 {
-                if index == len {
-                    if handling == "stop-before-partial" {
-                        return (read, bytes, false);
-                    }
-                    return (read, bytes, true);
-                }
-                if chars[index] != '=' {
-                    return (read, bytes, true);
-                }
-                index += 1;
-                while index < len && is_ws(chars[index]) {
-                    index += 1;
-                }
-            }
-            if index < len {
-                return (read, bytes, true); // trailing characters after padding
-            }
-            if decode_chunk(&chunk, handling == "strict", &mut bytes).is_err() {
-                return (read, bytes, true);
-            }
-            return (len, bytes, false);
-        }
-        if url {
-            c = match c {
-                '+' | '/' => return (read, bytes, true),
-                '-' => '+',
-                '_' => '/',
-                other => other,
-            };
-        }
-        let Some(v) = B64_STD.iter().position(|&a| a as char == c) else {
-            return (read, bytes, true);
+/// FromHex: an odd UTF-16 length is an error before anything is decoded.
+fn hex_decode_spec(s: &str, max_len: usize) -> PartialDecode {
+    if !crate::jstr::unit_len(s).is_multiple_of(2) {
+        return PartialDecode {
+            read: 0,
+            bytes: Vec::new(),
+            error: true,
         };
-        let remaining = max_len - bytes.len();
-        if (remaining == 1 && chunk.len() == 2) || (remaining == 2 && chunk.len() == 3) {
-            return (read, bytes, false); // the next chunk wouldn't fit: stop before it
-        }
-        chunk.push(v as u8);
-        if chunk.len() == 4 {
-            if decode_chunk(&chunk, false, &mut bytes).is_err() {
-                return (read, bytes, true);
-            }
-            chunk.clear();
-            read = index;
-            if bytes.len() == max_len {
-                return (read, bytes, false);
-            }
-        }
     }
-}
-/// FromHex: decode at most `max_len` bytes; `read` is the number of code units consumed.
-fn hex_decode_spec(s: &str, max_len: usize) -> (usize, Vec<u8>, bool) {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = Vec::new();
-    if !chars.len().is_multiple_of(2) {
-        return (0, out, true);
-    }
-    let mut index = 0;
-    while index < chars.len() && out.len() < max_len {
-        let (Some(hi), Some(lo)) = (chars[index].to_digit(16), chars[index + 1].to_digit(16))
-        else {
-            return (index, out, true);
-        };
-        out.push((hi * 16 + lo) as u8);
-        index += 2;
-    }
-    (index, out, false)
+    codec::hex_decode_partial(s.as_bytes(), max_len)
 }
 
 /// Read a Uint8Array receiver's bytes; errors if `this` isn't a (non-detached) Uint8Array.
@@ -2071,15 +2053,15 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
         .array_buffers
         .get(&info.buffer)
         .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
-    Ok(buf[info.offset..info.offset + info.len].to_vec())
+    Ok(buf.bytes()[info.offset..info.offset + info.len].to_vec())
 }
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
     let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Uint8Array"))?;
     let ta = ab(i.construct(ctor, &[Value::Num(bytes.len() as f64)]))?;
     if let Some(ptr) = map_ptr(&ta) {
         if let Some(info) = i.typed_arrays.get(&ptr).copied() {
-            if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-                buf[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
+            if let Some(buf) = i.array_buffers.get(&info.buffer) {
+                buf.bytes_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(&bytes);
             }
         }
     }
@@ -2102,12 +2084,14 @@ fn b64_option_url(i: &mut Interp, opts: &Value) -> Result<bool, Value> {
 }
 
 /// Read `{alphabet, lastChunkHandling}` for the base64 decode methods.
-fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), Value> {
+fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, LastChunk), Value> {
     let url = b64_option_url(i, opts)?;
     let handling = if let Value::Obj(_) = opts {
         match ab(i.get_member(opts, "lastChunkHandling"))? {
-            Value::Undefined => crate::lstr::LStr::from("loose"),
-            Value::Str(s) if matches!(&*s, "loose" | "strict" | "stop-before-partial") => s,
+            Value::Undefined => LastChunk::Loose,
+            Value::Str(s) if &*s == "loose" => LastChunk::Loose,
+            Value::Str(s) if &*s == "strict" => LastChunk::Strict,
+            Value::Str(s) if &*s == "stop-before-partial" => LastChunk::StopBeforePartial,
             _ => {
                 return Err(i.make_error(
                     "TypeError",
@@ -2116,9 +2100,9 @@ fn b64_decode_options(i: &mut Interp, opts: &Value) -> Result<(bool, Rc<str>), V
             }
         }
     } else {
-        crate::lstr::LStr::from("loose")
+        LastChunk::Loose
     };
-    Ok((url, (&handling).into()))
+    Ok((url, handling))
 }
 
 pub(super) fn install_uint8_base64(it: &mut Interp) {
@@ -2135,11 +2119,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
     };
     it.def_method(&proto, "toHex", 0, |i, this, _| {
         let bytes = u8_bytes(i, &this)?;
-        let mut s = String::with_capacity(bytes.len() * 2);
-        for b in bytes {
-            s.push_str(&format!("{b:02x}"));
-        }
-        Ok(Value::from_string(s))
+        Ok(Value::from_string(codec::hex_encode(&bytes)))
     });
     it.def_method(&proto, "toBase64", 0, |i, this, a| {
         // Receiver validation, then options, then the (detachment-sensitive) byte read.
@@ -2152,15 +2132,19 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             false
         };
         let bytes = u8_bytes(i, &this)?;
-        Ok(Value::from_string(b64_encode(&bytes, url, !omit_padding)))
+        Ok(Value::from_string(codec::base64_encode(
+            &bytes,
+            url,
+            !omit_padding,
+        )))
     });
     it.def_method(&ctor, "fromHex", 1, |i, _t, a| {
         let s = match arg(a, 0) {
             Value::Str(s) => s,
             _ => return Err(i.make_error("TypeError", "fromHex requires a string")),
         };
-        let (_, bytes, err) = hex_decode_spec(&s, usize::MAX);
-        if err {
+        let PartialDecode { bytes, error, .. } = hex_decode_spec(&s, usize::MAX);
+        if error {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
         }
         make_u8array(i, bytes)
@@ -2171,8 +2155,9 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "fromBase64 requires a string")),
         };
         let (url, handling) = b64_decode_options(i, &arg(a, 1))?;
-        let (_, bytes, err) = b64_decode_spec(&s, url, &handling, usize::MAX);
-        if err {
+        let PartialDecode { bytes, error, .. } =
+            codec::base64_decode_partial(s.as_bytes(), url, handling, usize::MAX);
+        if error {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));
         }
         make_u8array(i, bytes)
@@ -2187,9 +2172,9 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = hex_decode_spec(&s, max);
+        let PartialDecode { read, bytes, error } = hex_decode_spec(&s, max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
-        if err {
+        if error {
             return Err(i.make_error("SyntaxError", "invalid hex string"));
         }
         Ok(result)
@@ -2205,9 +2190,10 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             .ta_len(&info)
             .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
         // Valid chunks decoded before an error are still written, then the SyntaxError surfaces.
-        let (read, bytes, err) = b64_decode_spec(&s, url, &handling, max);
+        let PartialDecode { read, bytes, error } =
+            codec::base64_decode_partial(s.as_bytes(), url, handling, max);
         let result = u8_set_bytes(i, &info, read, &bytes)?;
-        if err {
+        if error {
             return Err(i.make_error("SyntaxError", "invalid base64 string"));
         }
         Ok(result)
@@ -2218,7 +2204,7 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
 /// (before any argument is read).
 fn u8_validate_writable(i: &mut Interp, this: &Value) -> Result<TaInfo, Value> {
     let info = u8_validate(i, this)?;
-    if i.immutable_buffers.contains(&info.buffer) {
+    if i.buffer_immutable(info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "cannot write into a view over an immutable ArrayBuffer",
@@ -2242,14 +2228,14 @@ fn u8_validate(i: &mut Interp, this: &Value) -> Result<TaInfo, Value> {
 
 /// SetUint8ArrayBytes + result object: write decoded `bytes` into the view, report `{read, written}`.
 fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Result<Value, Value> {
-    if !bytes.is_empty() && i.immutable_buffers.contains(&info.buffer) {
+    if !bytes.is_empty() && i.buffer_immutable(info.buffer) {
         return Err(i.make_error(
             "TypeError",
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get_mut(&info.buffer) {
-        buf[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
+    if let Some(buf) = i.array_buffers.get(&info.buffer) {
+        buf.bytes_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
     }
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));

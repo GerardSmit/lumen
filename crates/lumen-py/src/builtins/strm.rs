@@ -3,7 +3,11 @@
 use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
+use crate::unicode::Case;
 use crate::vm::*;
+use lumen_common::search;
+use lumen_common::smuggle::{code_points, may_contain};
+use lumen_common::ucd::{char_type, flag};
 use std::rc::Rc;
 
 type Kw<'a> = &'a [(Obj, Value)];
@@ -13,7 +17,10 @@ fn this<'a>(it: &mut Interp, a: &'a [Value], name: &str) -> R<&'a PyStr> {
         Some(s) => Ok(s),
         None => {
             let t = a.first().map(|v| it.type_name_of(v)).unwrap_or_default();
-            Err(it.type_error(&format!("descriptor '{}' for 'str' objects doesn't apply to a '{}' object", name, t)))
+            Err(it.type_error(&format!(
+                "descriptor '{}' for 'str' objects doesn't apply to a '{}' object",
+                name, t
+            )))
         }
     }
 }
@@ -29,7 +36,7 @@ fn str_arg<'a>(it: &mut Interp, v: &'a Value, meth: &str) -> R<&'a str> {
 }
 
 fn is_py_space(c: char) -> bool {
-    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+    crate::unicode::is_space(c as u32)
 }
 
 fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -51,10 +58,15 @@ fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
                     None => "strict".into(),
                 };
                 let data = match x {
-                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(x)?,
+                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                        it.bytes_of(x)?
+                    }
                     _ => {
                         let t = it.type_name_of(x);
-                        return Err(it.type_error(&format!("decoding to str: need a bytes-like object, {} found", t)));
+                        return Err(it.type_error(&format!(
+                            "decoding to str: need a bytes-like object, {} found",
+                            t
+                        )));
                     }
                 };
                 Value::string(it.decode_bytes(&data, &enc, &errs)?)
@@ -67,196 +79,97 @@ fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         return Ok(v);
     }
     let s = v.as_str().unwrap_or("").to_string();
-    Ok(Value::Obj(Object::with_cls(cls, Kind::Str(PyStr::from_box(s.into_boxed_str())))))
+    Ok(Value::Obj(Object::with_cls(
+        cls,
+        Kind::Str(PyStr::from_box(s.into_boxed_str())),
+    )))
 }
 
 impl Interp {
     pub fn decode_bytes(&mut self, data: &[u8], enc: &str, errors: &str) -> R<String> {
-        let e = enc.to_ascii_lowercase().replace('_', "-");
-        match e.as_str() {
-            "utf-8" | "utf8" => match std::str::from_utf8(data) {
-                Ok(s) => Ok(s.to_string()),
-                Err(err) => match errors {
-                    "ignore" => Ok(String::from_utf8_lossy(data).replace('\u{FFFD}', "")),
-                    "replace" => Ok(String::from_utf8_lossy(data).into_owned()),
-                    _ => {
-                        let pos = err.valid_up_to();
-                        let byte = data[pos];
-                        let exc = self.new_exc_str(
-                            "UnicodeDecodeError",
-                            &format!("'utf-8' codec can't decode byte 0x{:02x} in position {}: invalid start byte", byte, pos),
-                        );
-                        Err(exc)
-                    }
-                },
-            },
-            "ascii" | "us-ascii" => {
-                let mut out = String::new();
-                for (i, &b) in data.iter().enumerate() {
-                    if b < 128 {
-                        out.push(b as char);
-                    } else {
-                        match errors {
-                            "ignore" => {}
-                            "replace" => out.push('\u{FFFD}'),
-                            _ => {
-                                return Err(self.new_exc_str(
-                                    "UnicodeDecodeError",
-                                    &format!("'ascii' codec can't decode byte 0x{:02x} in position {}: ordinal not in range(128)", b, i),
-                                ))
-                            }
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => Ok(data.iter().map(|&b| b as char).collect()),
-            _ => Err(self.new_exc_str("LookupError", &format!("unknown encoding: {}", enc))),
-        }
+        crate::codecs::decode(self, data, enc, errors)
     }
 
     pub fn encode_str(&mut self, s: &str, enc: &str, errors: &str) -> R<Vec<u8>> {
-        let e = enc.to_ascii_lowercase().replace('_', "-");
-        match e.as_str() {
-            "utf-8" | "utf8" => Ok(s.as_bytes().to_vec()),
-            "ascii" | "us-ascii" | "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => {
-                let limit = if e.contains("ascii") { 128 } else { 256 };
-                let name = if e.contains("ascii") { "ascii" } else { "latin-1" };
-                let mut out = Vec::new();
-                for (i, c) in s.chars().enumerate() {
-                    if (c as u32) < limit {
-                        out.push(c as u32 as u8);
-                    } else {
-                        match errors {
-                            "ignore" => {}
-                            "replace" => out.push(b'?'),
-                            "backslashreplace" => out.extend(crate::repr::ascii_escape(&c.to_string()).bytes()),
-                            "xmlcharrefreplace" => out.extend(format!("&#{};", c as u32).bytes()),
-                            _ => {
-                                let r = crate::repr::ascii_escape(&c.to_string());
-                                return Err(self.new_exc_str(
-                                    "UnicodeEncodeError",
-                                    &format!("'{}' codec can't encode character '{}' in position {}: ordinal not in range({})", name, r, i, limit),
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ok(out)
-            }
-            "utf-16" | "utf16" | "utf-16-le" => {
-                let mut out = Vec::new();
-                if e == "utf-16" || e == "utf16" {
-                    out.extend([0xff, 0xfe]);
-                }
-                for u in s.encode_utf16() {
-                    out.extend(u.to_le_bytes());
-                }
-                Ok(out)
-            }
-            "utf-16-be" => Ok(s.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()),
-            "utf-32" | "utf-32-le" => Ok(s.chars().flat_map(|c| (c as u32).to_le_bytes()).collect()),
-            _ => Err(self.new_exc_str("LookupError", &format!("unknown encoding: {}", enc))),
-        }
+        crate::codecs::encode(self, s, enc, errors)
     }
+}
+
+fn convert_case(it: &mut Interp, a: &[Value], name: &str, case: Case) -> R<Value> {
+    let s = this(it, a, name)?;
+    Ok(Value::string(crate::unicode::convert(&s.s, case)))
 }
 
 fn upper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "upper")?;
-    Ok(Value::string(s.s.to_uppercase()))
+    convert_case(it, a, "upper", Case::Upper)
 }
 
 fn lower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "lower")?;
-    Ok(Value::string(s.s.to_lowercase()))
+    convert_case(it, a, "lower", Case::Lower)
 }
 
 fn casefold(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "casefold")?;
-    Ok(Value::string(s.s.to_lowercase().replace('ß', "ss")))
-}
-
-fn push_title(out: &mut String, c: char) {
-    match c as u32 {
-        0x1C4..=0x1C6 => out.push('\u{1C5}'),
-        0x1C7..=0x1C9 => out.push('\u{1C8}'),
-        0x1CA..=0x1CC => out.push('\u{1CB}'),
-        0x1F1..=0x1F3 => out.push('\u{1F2}'),
-        _ => out.extend(c.to_uppercase()),
-    }
-}
-
-fn is_cased(c: char) -> bool {
-    c.is_lowercase() || c.is_uppercase() || crate::unicode::is_titlecase(c)
+    convert_case(it, a, "casefold", Case::Fold)
 }
 
 fn capitalize(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "capitalize")?;
-    let mut out = String::with_capacity(s.s.len());
-    let mut chars = s.s.chars();
-    if let Some(c) = chars.next() {
-        push_title(&mut out, c);
-    }
-    for c in chars {
-        out.extend(c.to_lowercase());
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "capitalize", Case::Capitalize)
 }
 
 fn title(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "title")?;
-    let mut out = String::with_capacity(s.s.len());
-    let mut prev_cased = false;
-    for c in s.s.chars() {
-        if is_cased(c) {
-            if prev_cased {
-                out.extend(c.to_lowercase());
-            } else {
-                push_title(&mut out, c);
-            }
-            prev_cased = true;
-        } else {
-            out.push(c);
-            prev_cased = false;
-        }
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "title", Case::Title)
 }
 
 fn swapcase(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let s = this(it, a, "swapcase")?;
-    let mut out = String::with_capacity(s.s.len());
-    for c in s.s.chars() {
-        if c.is_uppercase() {
-            out.extend(c.to_lowercase());
-        } else if c.is_lowercase() {
-            out.extend(c.to_uppercase());
-        } else {
-            out.push(c);
-        }
-    }
-    Ok(Value::string(out))
+    convert_case(it, a, "swapcase", Case::SwapCase)
 }
 
 fn strip_impl(it: &mut Interp, a: &[Value], name: &str, left: bool, right: bool) -> R<Value> {
     it.check_args(&format!("str.{}", name), a, 1, 2)?;
     let s = this(it, a, name)?;
-    let chars: Option<Vec<char>> = match a.get(1) {
+    let chars: Option<Vec<u32>> = match a.get(1) {
         Some(Value::None) | None => None,
-        Some(v) => Some(str_arg(it, v, name).map(|x| x.chars().collect())?),
+        Some(v) => Some(str_arg(it, v, name).map(|x| code_points(x).collect())?),
     };
-    let pred = |c: char| match &chars {
-        None => is_py_space(c),
+    let pred = |c: u32| match &chars {
+        None => char::from_u32(c).is_some_and(is_py_space),
         Some(set) => set.contains(&c),
     };
     let mut t: &str = &s.s;
-    if left {
-        t = t.trim_start_matches(pred);
+    if may_contain(t) {
+        let (mut a, mut b) = (0, t.len());
+        let mut cps = code_points(t);
+        let mut first = true;
+        while let Some(c) = cps.next() {
+            if pred(c) {
+                if first && left {
+                    a = cps.offset();
+                }
+            } else {
+                first = false;
+                b = cps.offset();
+            }
+        }
+        if first {
+            b = a;
+        }
+        if !right {
+            b = t.len();
+        }
+        t = &t[a..b];
+    } else {
+        let pred = |c: char| pred(c as u32);
+        if left {
+            t = t.trim_start_matches(pred);
+        }
+        if right {
+            t = t.trim_end_matches(pred);
+        }
     }
-    if right {
-        t = t.trim_end_matches(pred);
-    }
-    if t.len() == s.s.len() && a[0].as_str().is_some() && matches!(&a[0], Value::Obj(o) if o.cls.is_none()) {
+    if t.len() == s.s.len()
+        && a[0].as_str().is_some()
+        && matches!(&a[0], Value::Obj(o) if o.cls.is_none())
+    {
         return Ok(a[0].clone());
     }
     Ok(Value::str(t))
@@ -277,10 +190,14 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> 
     let s = this(it, a, name)?;
     let sep: Option<String> = match &b[0] {
         None | Some(Value::None) => None,
-        Some(v) => Some(str_arg(it, v, "must be str or None, not").map(|x| x.to_string()).map_err(|_| {
-            let t = it.type_name_of(v);
-            it.type_error(&format!("must be str or None, not {}", t))
-        })?),
+        Some(v) => Some(
+            str_arg(it, v, "must be str or None, not")
+                .map(|x| x.to_string())
+                .map_err(|_| {
+                    let t = it.type_name_of(v);
+                    it.type_error(&format!("must be str or None, not {}", t))
+                })?,
+        ),
     };
     let max = match &b[1] {
         Some(v) => it.index_of(v)?,
@@ -356,7 +273,10 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> 
                         tail.push(Value::str(rest));
                         break;
                     }
-                    let start = rest.rfind(is_py_space).map(|i| i + rest[i..].chars().next().map_or(1, |c| c.len_utf8())).unwrap_or(0);
+                    let start = rest
+                        .rfind(is_py_space)
+                        .map(|i| i + rest[i..].chars().next().map_or(1, |c| c.len_utf8()))
+                        .unwrap_or(0);
                     tail.push(Value::str(&rest[start..]));
                     rest = &rest[..start];
                     n += 1;
@@ -389,7 +309,18 @@ fn splitlines(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let mut i = 0;
     while i < chars.len() {
         let (bi, c) = chars[i];
-        let is_break = matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}');
+        let is_break = matches!(
+            c,
+            '\n' | '\r'
+                | '\x0b'
+                | '\x0c'
+                | '\x1c'
+                | '\x1d'
+                | '\x1e'
+                | '\u{85}'
+                | '\u{2028}'
+                | '\u{2029}'
+        );
         if is_break {
             let mut end = bi + c.len_utf8();
             if c == '\r' && i + 1 < chars.len() && chars[i + 1].1 == '\n' {
@@ -417,7 +348,11 @@ fn partition_impl(it: &mut Interp, a: &[Value], right: bool) -> R<Value> {
     }
     let pos = if right { s.s.rfind(sep) } else { s.s.find(sep) };
     Ok(match pos {
-        Some(i) => Value::tuple(vec![Value::str(&s.s[..i]), Value::str(sep), Value::str(&s.s[i + sep.len()..])]),
+        Some(i) => Value::tuple(vec![
+            Value::str(&s.s[..i]),
+            Value::str(sep),
+            Value::str(&s.s[i + sep.len()..]),
+        ]),
         None => {
             if right {
                 Value::tuple(vec![Value::str(""), Value::str(""), Value::str(&s.s)])
@@ -457,7 +392,10 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             }
             None => {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("sequence item {}: expected str instance, {} found", i, t)));
+                return Err(it.type_error(&format!(
+                    "sequence item {}: expected str instance, {} found",
+                    i, t
+                )));
             }
         }
     }
@@ -465,7 +403,13 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn replace(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("replace", &a[1.min(a.len())..], kw, &["old", "new", "count"], 2)?;
+    let b = it.bind_args(
+        "replace",
+        &a[1.min(a.len())..],
+        kw,
+        &["old", "new", "count"],
+        2,
+    )?;
     let s = this(it, a, "replace")?;
     let old = str_arg(it, b[0].as_ref().unwrap_or(&Value::None), "replace")?.to_string();
     let new = str_arg(it, b[1].as_ref().unwrap_or(&Value::None), "replace")?.to_string();
@@ -477,12 +421,24 @@ fn replace(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     if growth > 0 {
         let hits = if old.is_empty() {
             let n = s.nchars + 1;
-            if count < 0 { n } else { n.min(count as usize) }
+            if count < 0 {
+                n
+            } else {
+                n.min(count as usize)
+            }
         } else {
             let n = s.s.matches(old.as_str()).count();
-            if count < 0 { n } else { n.min(count as usize) }
+            if count < 0 {
+                n
+            } else {
+                n.min(count as usize)
+            }
         };
-        let extra = if old.is_empty() { new.len().saturating_mul(hits) } else { growth.saturating_mul(hits) };
+        let extra = if old.is_empty() {
+            new.len().saturating_mul(hits)
+        } else {
+            growth.saturating_mul(hits)
+        };
         it.check_str_len(s.s.len().saturating_add(extra))?;
     }
     if count < 0 {
@@ -519,17 +475,17 @@ fn opt_range(it: &mut Interp, a: &[Value], from: usize, nchars: usize) -> R<(usi
     let get = |it: &mut Interp, v: Option<&Value>, dflt: i64| -> R<i64> {
         match v {
             None | Some(Value::None) => Ok(dflt),
-            Some(v) => it.index_of(v),
+            Some(v) => it.slice_index(v),
         }
     };
     let n = nchars as i64;
     let mut s = get(it, a.get(from), 0)?;
     let mut e = get(it, a.get(from + 1), n)?;
     if s < 0 {
-        s = (s + n).max(0);
+        s = s.saturating_add(n).max(0);
     }
     if e < 0 {
-        e = (e + n).max(0);
+        e = e.saturating_add(n).max(0);
     }
     Ok((s.min(n + 1) as usize, e.min(n) as usize))
 }
@@ -551,8 +507,18 @@ fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool)
         let bs = s.byte_offset(st);
         let be = s.byte_offset(en);
         let hay = &s.s[bs..be];
-        let pos = if right { hay.rfind(sub) } else { hay.find(sub) };
-        pos.map(|p| if s.ascii { bs + p } else { s.s[..bs + p].chars().count() })
+        let pos = if right {
+            hay.rfind(sub)
+        } else {
+            search::find(hay.as_bytes(), sub.as_bytes())
+        };
+        pos.map(|p| {
+            if s.ascii {
+                bs + p
+            } else {
+                lumen_common::smuggle::count_code_points(&s.s[..bs + p])
+            }
+        })
     };
     match found {
         Some(i) => Ok(Value::Int(i as i64)),
@@ -595,9 +561,13 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     }
     let hay = s.slice(st, en);
     if sub.is_empty() {
-        return Ok(Value::Int(hay.chars().count() as i64 + 1));
+        return Ok(Value::Int(
+            lumen_common::smuggle::count_code_points(hay) as i64 + 1,
+        ));
     }
-    Ok(Value::Int(hay.matches(sub).count() as i64))
+    Ok(Value::Int(
+        search::count(hay.as_bytes(), sub.as_bytes(), usize::MAX) as i64,
+    ))
 }
 
 fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Value> {
@@ -608,7 +578,13 @@ fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Val
         return Ok(Value::Bool(false));
     }
     let hay = s.slice(st, en);
-    let test = |p: &str| if end { hay.ends_with(p) } else { hay.starts_with(p) };
+    let test = |p: &str| {
+        if end {
+            hay.ends_with(p)
+        } else {
+            hay.starts_with(p)
+        }
+    };
     match &a[1] {
         v if v.as_str().is_some() => Ok(Value::Bool(test(v.as_str().unwrap_or("")))),
         v => match v.tuple_items() {
@@ -622,7 +598,10 @@ fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Val
                         }
                         None => {
                             let t = it.type_name_of(x);
-                            return Err(it.type_error(&format!("tuple for {} must only contain str, not {}", name, t)));
+                            return Err(it.type_error(&format!(
+                                "tuple for {} must only contain str, not {}",
+                                name, t
+                            )));
                         }
                     }
                 }
@@ -630,7 +609,10 @@ fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Val
             }
             None => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("{} first arg must be str or a tuple of str, not {}", name, t)))
+                Err(it.type_error(&format!(
+                    "{} first arg must be str or a tuple of str, not {}",
+                    name, t
+                )))
             }
         },
     }
@@ -654,103 +636,135 @@ fn removesuffix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("removesuffix", a, 2, 2)?;
     let s = this(it, a, "removesuffix")?;
     let p = str_arg(it, &a[1], "removesuffix")?;
-    Ok(Value::str(if p.is_empty() { &s.s } else { s.s.strip_suffix(p).unwrap_or(&s.s) }))
+    Ok(Value::str(if p.is_empty() {
+        &s.s
+    } else {
+        s.s.strip_suffix(p).unwrap_or(&s.s)
+    }))
 }
 
-fn all_chars(it: &mut Interp, a: &[Value], name: &str, nonempty: bool, f: fn(char) -> bool) -> R<Value> {
+fn all_chars(
+    it: &mut Interp,
+    a: &[Value],
+    name: &str,
+    nonempty: bool,
+    f: impl Fn(u32) -> bool,
+) -> R<Value> {
     it.check_args(&format!("str.{}", name), a, 1, 1)?;
     let s = this(it, a, name)?;
-    Ok(Value::Bool((!nonempty || s.nchars > 0) && s.s.chars().all(f)))
+    Ok(Value::Bool(
+        (!nonempty || s.nchars > 0) && code_points(&s.s).all(f),
+    ))
 }
 
-fn is_decimal_char(c: char) -> bool {
-    crate::unicode::is_decimal(c)
-}
-
-fn is_digit_char(c: char) -> bool {
-    is_decimal_char(c) || matches!(c as u32, 0xB2 | 0xB3 | 0xB9 | 0x2070 | 0x2074..=0x2079 | 0x2080..=0x2089)
+fn all_have(it: &mut Interp, a: &[Value], name: &str, f: u16) -> R<Value> {
+    all_chars(it, a, name, true, |c| crate::unicode::has(c, f))
 }
 
 fn isalpha(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isalpha", true, |c| c.is_alphabetic())
+    all_have(it, a, "isalpha", flag::ALPHA)
 }
 fn isalnum(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isalnum", true, |c| c.is_alphanumeric())
+    all_have(
+        it,
+        a,
+        "isalnum",
+        flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC,
+    )
 }
 fn isdigit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isdigit", true, is_digit_char)
+    all_have(it, a, "isdigit", flag::DIGIT)
 }
 fn isdecimal(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isdecimal", true, is_decimal_char)
+    all_have(it, a, "isdecimal", flag::DECIMAL)
 }
 fn isnumeric(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isnumeric", true, |c| c.is_numeric())
+    all_have(it, a, "isnumeric", flag::NUMERIC)
 }
 fn isspace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isspace", true, is_py_space)
+    all_chars(it, a, "isspace", true, crate::unicode::is_space)
 }
 fn isascii(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isascii", false, |c| c.is_ascii())
+    all_chars(it, a, "isascii", false, |c| c < 0x80)
 }
 fn isprintable(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isprintable", false, crate::repr::is_printable)
+    all_chars(it, a, "isprintable", false, crate::unicode::is_printable)
+}
+
+/// `str.isupper` (`upper`) or `str.islower`: some cased character, and none of the other case
+/// or titlecase.
+fn is_one_case(it: &mut Interp, a: &[Value], name: &str, upper: bool) -> R<Value> {
+    it.check_args(&format!("str.{}", name), a, 1, 1)?;
+    let s = this(it, a, name)?;
+    let (want, other) = if upper {
+        (flag::UPPER, flag::LOWER)
+    } else {
+        (flag::LOWER, flag::UPPER)
+    };
+    let mut cased = false;
+    for c in code_points(&s.s) {
+        let t = char_type(c);
+        if t.is(other | flag::TITLE) {
+            return Ok(Value::Bool(false));
+        }
+        cased |= t.is(want);
+    }
+    Ok(Value::Bool(cased))
 }
 
 fn isupper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.isupper", a, 1, 1)?;
-    let s = this(it, a, "isupper")?;
-    let cased = s.s.chars().any(|c| c.is_uppercase() || c.is_lowercase());
-    Ok(Value::Bool(cased && !s.s.chars().any(|c| c.is_lowercase())))
+    is_one_case(it, a, "isupper", true)
 }
 
 fn islower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.islower", a, 1, 1)?;
-    let s = this(it, a, "islower")?;
-    let cased = s.s.chars().any(|c| c.is_uppercase() || c.is_lowercase());
-    Ok(Value::Bool(cased && !s.s.chars().any(|c| c.is_uppercase())))
+    is_one_case(it, a, "islower", false)
 }
 
 fn istitle(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("str.istitle", a, 1, 1)?;
     let s = this(it, a, "istitle")?;
     let mut prev_cased = false;
-    let mut any = false;
-    for c in s.s.chars() {
-        if c.is_uppercase() {
+    let mut cased = false;
+    for c in code_points(&s.s) {
+        let t = char_type(c);
+        if t.is(flag::UPPER | flag::TITLE) {
             if prev_cased {
                 return Ok(Value::Bool(false));
             }
             prev_cased = true;
-            any = true;
-        } else if c.is_lowercase() {
+            cased = true;
+        } else if t.is(flag::LOWER) {
             if !prev_cased {
                 return Ok(Value::Bool(false));
             }
             prev_cased = true;
-            any = true;
+            cased = true;
         } else {
             prev_cased = false;
         }
     }
-    Ok(Value::Bool(any))
+    Ok(Value::Bool(cased))
 }
 
 fn isidentifier(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("str.isidentifier", a, 1, 1)?;
     let s = this(it, a, "isidentifier")?;
-    let mut chars = s.s.chars();
-    let ok = match chars.next() {
-        Some(c) => crate::unicode::is_xid_start(c) && chars.all(crate::unicode::is_xid_continue),
+    let mut cps = code_points(&s.s);
+    let ok = match cps.next() {
+        Some(c) => {
+            (c == '_' as u32 || crate::unicode::has(c, flag::XID_START))
+                && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE))
+        }
         None => false,
     };
     Ok(Value::Bool(ok))
 }
 
-fn fill_arg(it: &mut Interp, a: &[Value], idx: usize) -> R<char> {
+fn fill_arg(it: &mut Interp, a: &[Value], idx: usize) -> R<String> {
     match a.get(idx) {
-        None => Ok(' '),
+        None => Ok(" ".into()),
         Some(v) => match v.as_str() {
-            Some(s) if s.chars().count() == 1 => Ok(s.chars().next().unwrap_or(' ')),
+            Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => Ok(s.to_string()),
             _ => Err(it.type_error("The fill character must be exactly one character long")),
         },
     }
@@ -766,7 +780,7 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
         return Ok(Value::str(&s.s));
     }
     let total = (width - n) as usize;
-    it.check_str_len(total.saturating_mul(fill.len_utf8()).saturating_add(s.s.len()))?;
+    it.check_str_len(total.saturating_mul(fill.len()).saturating_add(s.s.len()))?;
     let (l, r) = match mode {
         0 => (0, total),
         1 => (total, 0),
@@ -775,10 +789,9 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
             (left, total - left)
         }
     };
-    let mut out = String::new();
-    out.extend(std::iter::repeat_n(fill, l));
+    let mut out = fill.repeat(l);
     out.push_str(&s.s);
-    out.extend(std::iter::repeat_n(fill, r));
+    out.push_str(&fill.repeat(r));
     Ok(Value::string(out))
 }
 
@@ -845,7 +858,13 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 }
 
 fn encode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("encode", &a[1.min(a.len())..], kw, &["encoding", "errors"], 0)?;
+    let b = it.bind_args(
+        "encode",
+        &a[1.min(a.len())..],
+        kw,
+        &["encoding", "errors"],
+        0,
+    )?;
     let s = this(it, a, "encode")?.s.clone();
     let enc = match &b[0] {
         Some(v) => it.str_arg(v, "encode() argument 'encoding'")?,
@@ -887,25 +906,37 @@ fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         let items = match &a[0] {
             Value::Obj(o) if matches!(o.kind, Kind::Dict(_)) => {
                 let e: Vec<(Value, Value)> = match &o.kind {
-                    Kind::Dict(p) => p.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
+                    Kind::Dict(p) => p
+                        .borrow()
+                        .iter()
+                        .map(|e| (e.key.clone(), e.val.clone()))
+                        .collect(),
                     _ => Vec::new(),
                 };
                 e
             }
-            _ => return Err(it.type_error("if you give only one argument to maketrans it must be a dict")),
+            _ => {
+                return Err(
+                    it.type_error("if you give only one argument to maketrans it must be a dict")
+                )
+            }
         };
         for (k, v) in items {
             let key = match k.as_str() {
-                Some(s) if s.chars().count() == 1 => Value::Int(s.chars().next().map(|c| c as i64).unwrap_or(0)),
-                Some(_) => return Err(it.value_error("string keys in translate table must be of length 1")),
+                Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => {
+                    Value::Int(lumen_common::smuggle::code_points(s).next().unwrap_or(0) as i64)
+                }
+                Some(_) => {
+                    return Err(it.value_error("string keys in translate table must be of length 1"))
+                }
                 None => k,
             };
             it.dict_set(&d, key, v)?;
         }
         return Ok(Value::Obj(d));
     }
-    let x: Vec<char> = a[0].as_str().unwrap_or("").chars().collect();
-    let y: Vec<char> = a[1].as_str().unwrap_or("").chars().collect();
+    let x: Vec<u32> = lumen_common::smuggle::code_points(a[0].as_str().unwrap_or("")).collect();
+    let y: Vec<u32> = lumen_common::smuggle::code_points(a[1].as_str().unwrap_or("")).collect();
     if x.len() != y.len() {
         return Err(it.value_error("the first two maketrans arguments must have equal length"));
     }
@@ -913,7 +944,7 @@ fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         it.dict_set(&d, Value::Int(*p as i64), Value::Int(*q as i64))?;
     }
     if let Some(z) = a.get(2) {
-        for c in z.as_str().unwrap_or("").chars() {
+        for c in lumen_common::smuggle::code_points(z.as_str().unwrap_or("")) {
             it.dict_set(&d, Value::Int(c as i64), Value::None)?;
         }
     }
@@ -924,20 +955,25 @@ fn translate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("translate", a, 2, 2)?;
     let s = this(it, a, "translate")?.s.clone();
     let mut out = String::new();
-    for c in s.chars() {
+    for c in lumen_common::smuggle::code_points(&s) {
         match it.getitem(&a[1], &Value::Int(c as i64)) {
             Ok(Value::None) => {}
-            Ok(Value::Int(i)) => match char::from_u32(i as u32) {
-                Some(ch) => out.push(ch),
-                None => return Err(it.value_error("character mapping must be in range(0x110000)")),
-            },
+            Ok(Value::Int(i)) => {
+                if !u32::try_from(i)
+                    .is_ok_and(|i| lumen_common::smuggle::push_code_point(&mut out, i))
+                {
+                    return Err(it.value_error("character mapping must be in range(0x110000)"));
+                }
+            }
             Ok(v) => match v.as_str() {
                 Some(r) => out.push_str(r),
-                None => return Err(it.type_error("character mapping must return integer, None or str")),
+                None => {
+                    return Err(it.type_error("character mapping must return integer, None or str"))
+                }
             },
             Err(e) => {
                 if it.exc_is(&e, "LookupError") {
-                    out.push(c);
+                    lumen_common::smuggle::push_code_point(&mut out, c);
                 } else {
                     return Err(e);
                 }
@@ -949,7 +985,12 @@ fn translate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn str_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__str__", a, 1, 1)?;
-    it.str_value(&a[0])
+    match &a[0] {
+        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) && o.cls.is_some() => {
+            Ok(Value::str(a[0].as_str().unwrap_or("")))
+        }
+        v => it.str_value(v),
+    }
 }
 
 fn str_getnewargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -1013,10 +1054,20 @@ pub fn init(it: &mut Interp) {
         it.reg(&t, n, *f);
     }
     it.reg_static(&t, "maketrans", maketrans);
-    reg_slots(it, &t, &["__getitem__", "__len__", "__contains__", "__iter__"]);
-    reg_binops(it, &t, &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"]);
+    reg_slots(
+        it,
+        &t,
+        &["__getitem__", "__len__", "__contains__", "__iter__"],
+    );
+    reg_binops(
+        it,
+        &t,
+        &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"],
+    );
     reg_compare(it, &t, true);
-    let hash = |it: &mut Interp, a: &[Value], _kw: Kw| -> R<Value> { Ok(Value::Int(it.native_hash(&a[0])?)) };
+    let hash = |it: &mut Interp, a: &[Value], _kw: Kw| -> R<Value> {
+        Ok(Value::Int(it.native_hash(&a[0])?))
+    };
     let _ = hash;
     it.reg(&t, "__hash__", str_hash);
     it.reg(&t, "__repr__", str_repr_m);

@@ -174,7 +174,24 @@ impl Parser {
                     && matches!(self.peek(1), Tok::Name(_))
                     && matches!(self.peek(2), Tok::Op("=") | Tok::Op("[")) =>
             {
-                return self.error("type statements are not supported");
+                self.advance();
+                let npos = self.pos();
+                let id = self.ident()?;
+                let name = mk(
+                    npos,
+                    ExprKind::Name {
+                        id,
+                        ctx: Ctx::Store,
+                    },
+                );
+                let type_params = self.type_params()?;
+                self.expect_op("=")?;
+                let value = self.expression()?;
+                StmtKind::TypeAlias {
+                    name,
+                    type_params,
+                    value,
+                }
             }
             _ => return self.expr_stmt(out),
         };
@@ -629,40 +646,47 @@ impl Parser {
         }
     }
 
-    fn type_params(&mut self) -> PResult<()> {
+    fn type_params(&mut self) -> PResult<Vec<TypeParam>> {
+        let mut params = Vec::new();
         if !self.eat_op("[") {
-            return Ok(());
+            return Ok(params);
         }
         loop {
-            if self.at_op("]") {
-                break;
-            }
-            if self.eat_op("*") {
-                self.ident()?;
-                if self.eat_op("=") {
-                    self.star_expression()?;
+            let pos = self.pos();
+            let kind = if self.eat_op("*") {
+                let name = self.ident()?;
+                if self.at_op(":") {
+                    return self.error("cannot use bound with TypeVarTuple");
                 }
+                TypeParamKind::TypeVarTuple { name }
+            } else if self.eat_op("**") {
+                let name = self.ident()?;
+                if self.at_op(":") {
+                    return self.error("cannot use bound with ParamSpec");
+                }
+                TypeParamKind::ParamSpec { name }
             } else {
-                self.eat_op("**");
-                self.ident()?;
-                if self.eat_op(":") {
-                    self.expression()?;
-                }
-                if self.eat_op("=") {
-                    self.expression()?;
-                }
-            }
-            if !self.eat_op(",") {
+                let name = self.ident()?;
+                let bound = if self.eat_op(":") {
+                    Some(self.expression()?)
+                } else {
+                    None
+                };
+                TypeParamKind::TypeVar { name, bound }
+            };
+            params.push(TypeParam { pos, kind });
+            if !self.eat_op(",") || self.at_op("]") {
                 break;
             }
         }
-        self.expect_op("]")
+        self.expect_op("]")?;
+        Ok(params)
     }
 
     fn funcdef(&mut self, pos: Pos, decorators: Vec<Expr>, is_async: bool) -> PResult<Stmt> {
         self.advance();
         let name = self.ident()?;
-        self.type_params()?;
+        let type_params = self.type_params()?;
         self.expect_op("(")?;
         let args = self.parameters(false)?;
         self.expect_op(")")?;
@@ -681,6 +705,7 @@ impl Parser {
                 decorators,
                 returns,
                 is_async,
+                type_params,
             })),
         ))
     }
@@ -688,7 +713,7 @@ impl Parser {
     fn classdef(&mut self, pos: Pos, decorators: Vec<Expr>) -> PResult<Stmt> {
         self.advance();
         let name = self.ident()?;
-        self.type_params()?;
+        let type_params = self.type_params()?;
         let (mut bases, mut keywords) = (Vec::new(), Vec::new());
         let lparen = self.pos();
         if self.eat_op("(") {
@@ -704,6 +729,7 @@ impl Parser {
                 keywords,
                 body,
                 decorators,
+                type_params,
             })),
         ))
     }

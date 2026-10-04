@@ -1,0 +1,16 @@
+# The attribute macros of `lumen-bind` (re-exported there; use them as `lumen_bind::op` etc.).
+# No dependencies: signatures are parsed by hand from the token stream, and the output names
+# only `::lumen_bind` paths. The macros know no language: they emit a neutral descriptor and a
+# thunk generic over `lumen_bind::Host`.
+[package]
+name = "lumen-bind-macros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+proc-macro = true
+
+[lints]
+workspace = true

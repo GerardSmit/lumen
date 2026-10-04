@@ -5,18 +5,22 @@
 //! reference every later stage is differentially tested against. See docs/jit.md.
 
 pub mod aarch64;
+pub mod aot_image;
+pub mod atomics;
 pub mod builder;
 pub mod cfg;
 pub mod eval;
+pub mod guard;
 pub mod interp;
 pub mod ir;
 pub mod jitmem;
-pub mod guard;
 pub mod legalize;
 pub mod machinst;
 pub mod opt;
 pub mod regalloc;
+pub mod target_codegen;
 pub mod unroll;
+pub mod unwind;
 pub mod verify;
 pub mod wasm;
 pub mod x64;

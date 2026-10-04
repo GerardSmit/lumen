@@ -87,7 +87,7 @@ fn run(
         let src = src.replace("\r\n", "\n");
         for case in src.split("\n=====\n") {
             match strip_types(case) {
-                Ok(out) => println!("{}", json_string(&out)),
+                Ok(out) => println!("{}", lumen_common::json::json_string(&out)),
                 Err(e) => println!(
                     "ERR {} {} @{}:{}",
                     e.code.unwrap_or("SyntaxError"),
@@ -142,28 +142,4 @@ fn analyze_mode(
         _ => print!("{}", report_text(&a.table, src, name)),
     }
     Ok(())
-}
-
-/// A JSON string literal (the escapes `JSON.stringify` uses).
-fn json_string(s: &str) -> String {
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '"' | '\u{5c}' => {
-                out.push('\u{5c}');
-                out.push(c);
-            }
-            c if (c as u32) < 0x20 => out.push_str(&match c {
-                '\n' => "\u{5c}n".to_string(),
-                '\r' => "\u{5c}r".to_string(),
-                '\t' => "\u{5c}t".to_string(),
-                '\u{8}' => "\u{5c}b".to_string(),
-                '\u{c}' => "\u{5c}f".to_string(),
-                c => format!("\u{5c}u{:04x}", c as u32),
-            }),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

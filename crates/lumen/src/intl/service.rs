@@ -9,29 +9,30 @@ use crate::value::{Gc, Property, Value};
 /// The languages we ship formatting data for (plus common ones the conformance tests negotiate).
 /// Unknown languages resolve to `en`.
 pub fn supported_language(lang: &str) -> bool {
-    matches!(
-        lang,
-        "en" | "de"
-            | "fr"
-            | "es"
-            | "it"
-            | "pt"
-            | "nl"
-            | "ja"
-            | "zh"
-            | "ko"
-            | "ru"
-            | "ar"
-            | "sr"
-            | "th"
-            | "gv"
-            | "sl"
-            | "pl"
-            | "si"
-            | "ln"
-            | "sv"
-            | "hi"
-    )
+    super::data::locale_selected(lang)
+        && matches!(
+            lang,
+            "en" | "de"
+                | "fr"
+                | "es"
+                | "it"
+                | "pt"
+                | "nl"
+                | "ja"
+                | "zh"
+                | "ko"
+                | "ru"
+                | "ar"
+                | "sr"
+                | "th"
+                | "gv"
+                | "sl"
+                | "pl"
+                | "si"
+                | "ln"
+                | "sv"
+                | "hi"
+        )
 }
 
 /// The result of ResolveLocale: the chosen locale's base name plus the Unicode `-u-` keywords it

@@ -1,4 +1,4 @@
-//! `Bun.password` backing on the RustCrypto `argon2` and `bcrypt` crates (SHA-512 from `sha2`
+//! `Bun.password` backing on the RustCrypto `argon2` and `bcrypt` crates (SHA-512 from `lumen_common::hash`
 //! for the bcrypt long-password pre-hash). Lumen carries no cryptography of its own; this
 //! module only shapes inputs, strings and errors. Behavior is matched against Bun v1.2.21,
 //! see `tests/fixtures/bun_hash_oracle.txt`.
@@ -16,13 +16,13 @@
 //! Not preserved: the argon2 crate rejects `m < 8 * p`, where Zig (and so Bun) clamped the
 //! matrix and still recorded the requested `m`; and associated data is limited to 32 bytes.
 
+use crate::hash::{digest, Algo};
 use argon2::password_hash::{
     Error as PhError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 use base64::Engine;
 use lumen_host::{ops, Ctx, OpDecl, Value};
-use sha2::{Digest, Sha512};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,7 +110,7 @@ pub fn argon2_phc(
 fn bcrypt_raw(password: &[u8], salt: &[u8; 16], cost: u32) -> [u8; 23] {
     let mut key = Vec::with_capacity(73);
     if password.len() > 72 {
-        key.extend_from_slice(&Sha512::digest(password));
+        key.extend_from_slice(&digest(Algo::Sha512, password));
     } else {
         key.extend_from_slice(password);
     }
@@ -178,7 +178,9 @@ fn bcrypt_verify(password: &[u8], hash: &str) -> Result<bool, PasswordError> {
         .try_into()
         .map_err(|_| inv)?;
     let expect = bcrypt::BASE_64.decode(&hash[29..60]).map_err(|_| inv)?;
-    Ok(bool::from(bcrypt_raw(password, &salt, cost)[..].ct_eq(&expect)))
+    Ok(bool::from(
+        bcrypt_raw(password, &salt, cost)[..].ct_eq(&expect),
+    ))
 }
 
 /// Verify `password` against a PHC argon2 string or a `$2[abxy]$` bcrypt string,
@@ -200,7 +202,7 @@ pub fn verify_password(password: &[u8], hash: &str) -> Result<bool, PasswordErro
 }
 
 fn fill_random(buf: &mut [u8]) -> Result<(), String> {
-    lumen_host::fill_random(buf).map_err(|e| format!("randomness source: {e}"))
+    lumen_os::proc::entropy(buf).map_err(|e| format!("randomness source: {e}"))
 }
 
 /// Hash with a fresh random salt. `algorithm` is one of bcrypt/argon2id/argon2i/argon2d;
@@ -439,12 +441,12 @@ mod tests {
         let long = vec![b'A'; 100];
         assert_eq!(
             bcrypt_raw(&long, &salt, 4),
-            bcrypt_raw(&Sha512::digest(&long), &salt, 4)
+            bcrypt_raw(&digest(Algo::Sha512, &long), &salt, 4)
         );
         let pw72 = vec![b'A'; 72];
         assert_ne!(
             bcrypt_raw(&pw72, &salt, 4),
-            bcrypt_raw(&Sha512::digest(&pw72), &salt, 4)
+            bcrypt_raw(&digest(Algo::Sha512, &pw72), &salt, 4)
         );
     }
 

@@ -38,6 +38,7 @@ fn extension_installs_state_globals_and_namespaces() {
     }
     static EXT: Extension = Extension {
         name: "counter",
+        modules: &[],
         globals: ops!["bump" (0) => bump],
         namespaces: &[("counterNs", ops!["bumpToo" (0) => bump])],
         state_init: Some(|state| state.put(Counter(0))),

@@ -1,0 +1,34 @@
+files run: 406  skipped (skip.txt): 0
+  failed        228
+  import-error  66
+  ok            103
+  timeout       9
+file-level errors: 75
+tests: pass 16477  fail 2071  error 2743  skip 2555
+
+top file-level failure reasons:
+     5  unittest.case.SkipTest: No module named '_tkinter'
+     4  unittest.case.SkipTest: _testinternalcapi required
+     3  unittest.case.SkipTest: No module named '_testcapi'
+     3  unittest.case.SkipTest: No module named '_xxsubinterpreters'
+     3  unittest.case.SkipTest: No module named 'termios'
+     2  unittest.case.SkipTest: No module named '_ssl'
+     2  unittest.case.SkipTest: No module named 'fcntl'
+     2  unittest.case.SkipTest: requires working os.fork()
+     1  AttributeError: 'NoneType' object has no attribute 'MethInstance'
+     1  AttributeError: module 'sys' has no attribute 'monitoring'
+     1  AttributeError: module 'sys' has no attribute 'thread_info'
+     1  FAILED (failures=1)
+     1  SyntaxError: no binding for nonlocal 'GLOBAL_VAR' found
+     1  ValueError: failed to parse CPython sys.version: '3.12.15 (lumen-py)'
+     1  unittest.case.SkipTest: No module named '_bz2'
+     1  unittest.case.SkipTest: No module named '_curses'
+     1  unittest.case.SkipTest: No module named '_dbm'
+     1  unittest.case.SkipTest: No module named '_gdbm'
+     1  unittest.case.SkipTest: No module named '_lzma'
+     1  unittest.case.SkipTest: No module named '_msi'
+     1  unittest.case.SkipTest: No module named '_multiprocessing'
+     1  unittest.case.SkipTest: No module named '_opcode'
+     1  unittest.case.SkipTest: No module named '_testinternalcapi'
+     1  unittest.case.SkipTest: No module named '_winapi'
+     1  unittest.case.SkipTest: No module named '_wmi'

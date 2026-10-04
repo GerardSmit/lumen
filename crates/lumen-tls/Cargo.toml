@@ -6,14 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
-# Desktop Unix dlopens system OpenSSL. Android and Windows use rustls on the ring provider,
-# trusting the operating system's certificate store with bundled roots as a fallback.
-[target.'cfg(any(not(unix), target_os = "android"))'.dependencies]
+# Desktop Unix keeps its dlopen OpenSSL transport. Rustls is also built there for its
+# transport-free client state machine, which the managed kernel drives over its own sockets.
+[dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "0.8"
 webpki-roots = "1"
 
-[target.'cfg(any(not(unix), target_os = "android"))'.dev-dependencies]
+[target.'cfg(all(any(not(unix), target_os = "android"), not(target_os = "none")))'.dependencies]
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [lints]

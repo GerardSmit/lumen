@@ -1,9 +1,9 @@
 //! Named property maps and their shared dense side storage.
 use crate::value::{Property, Value};
 pub(in crate::value) use entries::EntryVec;
+pub(in crate::value) use packed_vec::PackedVec;
 use shapes::SHAPE_EMPTY;
 use std::rc::Rc;
-pub(in crate::value) use packed_vec::PackedVec;
 pub(in crate::value) use storage::{DenseBuffers, DenseStorage};
 mod access;
 mod array_builder;
@@ -16,9 +16,9 @@ mod shapes;
 mod storage;
 #[cfg(test)]
 mod tests;
+pub(in crate::value) use shapes::{Shape, ShapeTable, array_length_shape};
 pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
 pub(crate) use shapes::{jit_shared_shape, proto_epoch_addr};
-pub(in crate::value) use shapes::{array_length_shape, Shape, ShapeTable};
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
 /// named (shape-keyed), whether a dense sidecar exists, and whether the shape is owned by this
 /// object alone (its key list is then per-object memory).
@@ -438,10 +438,11 @@ impl Props {
     /// setter already live in a box every copy of the property shares, so the collector sees
     /// the same edges whether the entries are copied or shared.
     pub(crate) fn share_entries(&mut self) {
-        debug_assert!(self
-            .entries
-            .iter()
-            .all(|p| !p.writable() && !matches!(p.value(), Value::Obj(_))));
+        debug_assert!(
+            self.entries
+                .iter()
+                .all(|p| !p.writable() && !matches!(p.value(), Value::Obj(_)))
+        );
         self.entries.make_shared();
     }
 

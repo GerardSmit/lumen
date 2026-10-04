@@ -4,7 +4,7 @@ use super::numeric::{reg_binops, reg_compare};
 use super::slots::reg_slots;
 use crate::object::*;
 use crate::vm::*;
-use std::cell::RefCell;
+use lumen_common::search;
 
 type Kw<'a> = &'a [(Obj, Value)];
 
@@ -12,7 +12,7 @@ fn data(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
     match v {
         Value::Obj(o) => match &o.kind {
             Kind::Bytes(b) => Ok(b.clone()),
-            Kind::ByteArray(b) => Ok(b.borrow().clone()),
+            Kind::ByteArray(b) => Ok(b.to_vec()),
             _ => Err(it.type_error("descriptor requires a 'bytes' object")),
         },
         _ => Err(it.type_error("descriptor requires a 'bytes' object")),
@@ -25,7 +25,7 @@ fn is_array(v: &Value) -> bool {
 
 fn wrap(like: &Value, b: Vec<u8>) -> Value {
     if is_array(like) {
-        Value::Obj(Object::new(Kind::ByteArray(RefCell::new(b))))
+        Value::Obj(Object::new(Kind::ByteArray(ba_store(b))))
     } else {
         Value::bytes(b)
     }
@@ -39,10 +39,20 @@ fn zeroed(it: &mut Interp, n: usize) -> R<Vec<u8>> {
 
 fn build(it: &mut Interp, a: &[Value], kw: Kw, array: bool) -> R<Vec<u8>> {
     let name = if array { "bytearray" } else { "bytes" };
-    let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["source", "encoding", "errors"], 0)?;
-    let Some(src) = &b[0] else { return Ok(Vec::new()) };
+    let b = it.bind_args(
+        name,
+        &a[1.min(a.len())..],
+        kw,
+        &["source", "encoding", "errors"],
+        0,
+    )?;
+    let Some(src) = &b[0] else {
+        return Ok(Vec::new());
+    };
     if let Some(s) = src.as_str() {
-        let Some(enc) = &b[1] else { return Err(it.type_error("string argument without an encoding")) };
+        let Some(enc) = &b[1] else {
+            return Err(it.type_error("string argument without an encoding"));
+        };
         let enc = it.str_arg(enc, "encoding")?;
         let errs = match &b[2] {
             Some(e) => it.str_arg(e, "errors")?,
@@ -61,15 +71,19 @@ fn build(it: &mut Interp, a: &[Value], kw: Kw, array: bool) -> R<Vec<u8>> {
             zeroed(it, *n as usize)
         }
         Value::Bool(n) => zeroed(it, *n as usize),
-        Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => Err(it.overflow_err("cannot fit 'int' into an index-sized integer")),
-        _ => it.bytes_of(src),
+        Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => {
+            Err(it.overflow_err("cannot fit 'int' into an index-sized integer"))
+        }
+        _ => it.bytes_from_object(src),
     }
 }
 
 fn bytes_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let v = build(it, a, kw, false)?;
     match a.first() {
-        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytes) => Ok(Value::Obj(Object::with_cls(c.clone(), Kind::Bytes(v)))),
+        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytes) => {
+            Ok(Value::Obj(Object::with_cls(c.clone(), Kind::Bytes(v))))
+        }
         _ => Ok(Value::bytes(v)),
     }
 }
@@ -77,8 +91,13 @@ fn bytes_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn bytearray_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let v = build(it, a, kw, true)?;
     match a.first() {
-        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytearray) => Ok(Value::Obj(Object::with_cls(c.clone(), Kind::ByteArray(RefCell::new(v))))),
-        _ => Ok(wrap(&Value::Obj(Object::new(Kind::ByteArray(RefCell::new(Vec::new())))), v)),
+        Some(Value::Obj(c)) if !std::rc::Rc::ptr_eq(c, &it.types.bytearray) => Ok(Value::Obj(
+            Object::with_cls(c.clone(), Kind::ByteArray(ba_store(v))),
+        )),
+        _ => Ok(wrap(
+            &Value::Obj(Object::new(Kind::ByteArray(ba_store(Vec::new())))),
+            v,
+        )),
     }
 }
 
@@ -100,14 +119,17 @@ fn decode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(Value::string(it.decode_bytes(&d, &enc, &errs)?))
 }
 
-fn hex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
+fn hex(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let d = data(it, &a[0])?;
-    let sep = match a.get(1) {
-        Some(v) => Some(it.str_arg(v, "sep")?),
-        None => None,
+    let b = it.bind_args("hex", &a[1..], kw, &["sep", "bytes_per_sep"], 0)?;
+    let sep = super::memview::hex_sep_arg(it, b[0].as_ref())?;
+    let per = match &b[1] {
+        Some(v) => it.index_of(v)?,
+        None => 1,
     };
-    let parts: Vec<String> = d.iter().map(|b| format!("{:02x}", b)).collect();
-    Ok(Value::string(parts.join(sep.as_deref().unwrap_or(""))))
+    Ok(Value::string(lumen_common::codec::hex_encode_sep(
+        &d, sep, per,
+    )))
 }
 
 fn fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -121,12 +143,18 @@ fn fromhex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         match (hi, lo) {
             (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
             _ => {
-                return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {}", i * 2)));
+                return Err(it.value_error(&format!(
+                    "non-hexadecimal number found in fromhex() arg at position {}",
+                    i * 2
+                )));
             }
         }
     }
     Ok(match &a[0] {
-        Value::Obj(c) if std::rc::Rc::ptr_eq(c, &it.types.bytearray) => wrap(&Value::Obj(Object::new(Kind::ByteArray(RefCell::new(Vec::new())))), out),
+        Value::Obj(c) if std::rc::Rc::ptr_eq(c, &it.types.bytearray) => wrap(
+            &Value::Obj(Object::new(Kind::ByteArray(ba_store(Vec::new())))),
+            out,
+        ),
         _ => Value::bytes(out),
     })
 }
@@ -140,7 +168,7 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         if let Value::Obj(o) = v {
             total = total.saturating_add(match &o.kind {
                 Kind::Bytes(b) => b.len(),
-                Kind::ByteArray(b) => b.borrow().len(),
+                Kind::ByteArray(b) => b.len(),
                 _ => 0,
             });
         }
@@ -154,25 +182,27 @@ fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             out.extend_from_slice(&sep);
         }
         match v {
-            Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => out.extend(data(it, v)?),
+            Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                out.extend(data(it, v)?)
+            }
             _ => {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("sequence item {}: expected a bytes-like object, {} found", i, t)));
+                return Err(it.type_error(&format!(
+                    "sequence item {}: expected a bytes-like object, {} found",
+                    i, t
+                )));
             }
         }
     }
     Ok(wrap(&a[0], out))
 }
 
+/// Where `n` first (or, with `rev`, last) occurs in `h` at or after `from`.
 fn find_sub(h: &[u8], n: &[u8], from: usize, rev: bool) -> Option<usize> {
-    if n.len() > h.len() {
-        return None;
-    }
-    let range = from..=(h.len() - n.len());
     if rev {
-        range.rev().find(|&i| &h[i..i + n.len()] == n)
+        Some(search::rfind(h.get(from..)?, n)? + from)
     } else {
-        range.into_iter().find(|&i| &h[i..i + n.len()] == n)
+        search::find_from(h, n, from)
     }
 }
 
@@ -192,8 +222,12 @@ fn find_impl(it: &mut Interp, a: &[Value], rev: bool, name: &str) -> R<Option<us
         match v {
             None | Some(Value::None) => Ok(d),
             Some(v) => {
-                let i = it.index_of(v)?;
-                Ok(if i < 0 { (i + len).max(0) } else { i.min(len) })
+                let i = it.slice_index(v)?;
+                Ok(if i < 0 {
+                    i.saturating_add(len).max(0)
+                } else {
+                    i.min(len)
+                })
             }
         }
     };
@@ -206,11 +240,15 @@ fn find_impl(it: &mut Interp, a: &[Value], rev: bool, name: &str) -> R<Option<us
 }
 
 fn find(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(find_impl(it, a, false, "find")?.map_or(-1, |i| i as i64)))
+    Ok(Value::Int(
+        find_impl(it, a, false, "find")?.map_or(-1, |i| i as i64),
+    ))
 }
 
 fn rfind(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(find_impl(it, a, true, "rfind")?.map_or(-1, |i| i as i64)))
+    Ok(Value::Int(
+        find_impl(it, a, true, "rfind")?.map_or(-1, |i| i as i64),
+    ))
 }
 
 fn index(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -231,15 +269,7 @@ fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("count", a, 2, 2)?;
     let h = data(it, &a[0])?;
     let n = sub_arg(it, &a[1])?;
-    if n.is_empty() {
-        return Ok(Value::Int(h.len() as i64 + 1));
-    }
-    let (mut c, mut i) = (0, 0);
-    while let Some(p) = find_sub(&h, &n, i, false) {
-        c += 1;
-        i = p + n.len();
-    }
-    Ok(Value::Int(c))
+    Ok(Value::Int(search::count(&h, &n, usize::MAX) as i64))
 }
 
 fn affix(it: &mut Interp, a: &[Value], start: bool) -> R<Value> {
@@ -284,7 +314,9 @@ fn replace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         } else {
             let mut from = 0;
             while hits < cap {
-                let Some(p) = find_sub(&h, &old, from, false) else { break };
+                let Some(p) = find_sub(&h, &old, from, false) else {
+                    break;
+                };
                 hits += 1;
                 from = p + old.len();
             }
@@ -464,7 +496,9 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, rev: bool) -> R<Value> {
             }
         }
     }
-    Ok(Value::list(parts.into_iter().map(|p| wrap(&a[0], p)).collect()))
+    Ok(Value::list(
+        parts.into_iter().map(|p| wrap(&a[0], p)).collect(),
+    ))
 }
 
 fn split(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -511,9 +545,21 @@ fn partition_impl(it: &mut Interp, a: &[Value], rev: bool) -> R<Value> {
         return Err(it.value_error("empty separator"));
     }
     Ok(match find_sub(&h, &sep, 0, rev) {
-        Some(p) => Value::tuple(vec![wrap(&a[0], h[..p].to_vec()), wrap(&a[0], sep.clone()), wrap(&a[0], h[p + sep.len()..].to_vec())]),
-        None if rev => Value::tuple(vec![wrap(&a[0], Vec::new()), wrap(&a[0], Vec::new()), wrap(&a[0], h)]),
-        None => Value::tuple(vec![wrap(&a[0], h), wrap(&a[0], Vec::new()), wrap(&a[0], Vec::new())]),
+        Some(p) => Value::tuple(vec![
+            wrap(&a[0], h[..p].to_vec()),
+            wrap(&a[0], sep.clone()),
+            wrap(&a[0], h[p + sep.len()..].to_vec()),
+        ]),
+        None if rev => Value::tuple(vec![
+            wrap(&a[0], Vec::new()),
+            wrap(&a[0], Vec::new()),
+            wrap(&a[0], h),
+        ]),
+        None => Value::tuple(vec![
+            wrap(&a[0], h),
+            wrap(&a[0], Vec::new()),
+            wrap(&a[0], Vec::new()),
+        ]),
     })
 }
 
@@ -537,13 +583,32 @@ fn lower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn capitalize(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let d = data(it, &a[0])?;
-    let out = d.iter().enumerate().map(|(i, b)| if i == 0 { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() }).collect();
+    let out = d
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if i == 0 {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            }
+        })
+        .collect();
     Ok(wrap(&a[0], out))
 }
 
 fn swapcase(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let d = data(it, &a[0])?;
-    let out = d.iter().map(|b| if b.is_ascii_uppercase() { b.to_ascii_lowercase() } else { b.to_ascii_uppercase() }).collect();
+    let out = d
+        .iter()
+        .map(|b| {
+            if b.is_ascii_uppercase() {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            }
+        })
+        .collect();
     Ok(wrap(&a[0], out))
 }
 
@@ -553,7 +618,11 @@ fn title(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let out = d
         .iter()
         .map(|b| {
-            let r = if prev { b.to_ascii_lowercase() } else { b.to_ascii_uppercase() };
+            let r = if prev {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            };
             prev = b.is_ascii_alphabetic();
             r
         })
@@ -571,11 +640,15 @@ fn isdigit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn isalpha(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    pred(it, a, |d| !d.is_empty() && d.iter().all(u8::is_ascii_alphabetic))
+    pred(it, a, |d| {
+        !d.is_empty() && d.iter().all(u8::is_ascii_alphabetic)
+    })
 }
 
 fn isalnum(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    pred(it, a, |d| !d.is_empty() && d.iter().all(u8::is_ascii_alphanumeric))
+    pred(it, a, |d| {
+        !d.is_empty() && d.iter().all(u8::is_ascii_alphanumeric)
+    })
 }
 
 fn isspace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -583,11 +656,15 @@ fn isspace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn isupper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    pred(it, a, |d| d.iter().any(u8::is_ascii_uppercase) && !d.iter().any(u8::is_ascii_lowercase))
+    pred(it, a, |d| {
+        d.iter().any(u8::is_ascii_uppercase) && !d.iter().any(u8::is_ascii_lowercase)
+    })
 }
 
 fn islower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    pred(it, a, |d| d.iter().any(u8::is_ascii_lowercase) && !d.iter().any(u8::is_ascii_uppercase))
+    pred(it, a, |d| {
+        d.iter().any(u8::is_ascii_lowercase) && !d.iter().any(u8::is_ascii_uppercase)
+    })
 }
 
 fn isascii(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -658,14 +735,20 @@ fn removeprefix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("removeprefix", a, 2, 2)?;
     let d = data(it, &a[0])?;
     let p = it.bytes_of(&a[1])?;
-    Ok(wrap(&a[0], d.strip_prefix(p.as_slice()).unwrap_or(&d).to_vec()))
+    Ok(wrap(
+        &a[0],
+        d.strip_prefix(p.as_slice()).unwrap_or(&d).to_vec(),
+    ))
 }
 
 fn removesuffix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("removesuffix", a, 2, 2)?;
     let d = data(it, &a[0])?;
     let p = it.bytes_of(&a[1])?;
-    Ok(wrap(&a[0], d.strip_suffix(p.as_slice()).unwrap_or(&d).to_vec()))
+    Ok(wrap(
+        &a[0],
+        d.strip_suffix(p.as_slice()).unwrap_or(&d).to_vec(),
+    ))
 }
 
 fn bytes_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -700,7 +783,13 @@ fn table_arg(it: &mut Interp, v: &Value) -> R<Option<Vec<u8>>> {
 }
 
 fn translate(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("translate", &a[1.min(a.len())..], kw, &["table", "delete"], 1)?;
+    let b = it.bind_args(
+        "translate",
+        &a[1.min(a.len())..],
+        kw,
+        &["table", "delete"],
+        1,
+    )?;
     let d = data(it, &a[0])?;
     let table = match &b[0] {
         Some(t) => table_arg(it, t)?,
@@ -767,25 +856,7 @@ fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(wrap(&a[0], out))
 }
 
-fn memoryview(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("memoryview", a, 1, 1)?;
-    match &a[0] {
-        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
-            let d = data(it, &a[0])?;
-            Ok(wrap(&a[0], d))
-        }
-        v => {
-            let t = it.type_name_of(v);
-            Err(it.type_error(&format!("memoryview: a bytes-like object is required, not '{}'", t)))
-        }
-    }
-}
-
-pub fn memoryview_fn() -> NativeFn {
-    memoryview
-}
-
-fn ba_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a RefCell<Vec<u8>>> {
+fn ba_of<'a>(it: &mut Interp, a: &'a [Value]) -> R<&'a ByteStore> {
     match a.first() {
         Some(Value::Obj(o)) => match &o.kind {
             Kind::ByteArray(b) => Ok(b),
@@ -806,14 +877,16 @@ fn byte_val(it: &mut Interp, v: &Value) -> R<u8> {
 fn ba_append(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("append", a, 2, 2)?;
     let b = byte_val(it, &a[1])?;
-    ba_of(it, a)?.borrow_mut().push(b);
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.push(b))?;
     Ok(Value::None)
 }
 
 fn ba_extend(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("extend", a, 2, 2)?;
     let items = it.bytes_of(&a[1])?;
-    ba_of(it, a)?.borrow_mut().extend(items);
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.extend(items))?;
     Ok(Value::None)
 }
 
@@ -824,7 +897,7 @@ fn ba_pop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         None => -1,
     };
     let cell = ba_of(it, a)?;
-    let len = cell.borrow().len() as i64;
+    let len = cell.len() as i64;
     if len == 0 {
         return Err(it.new_exc_str("IndexError", "pop from empty bytearray"));
     }
@@ -832,11 +905,14 @@ fn ba_pop(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if k < 0 || k >= len {
         return Err(it.new_exc_str("IndexError", "pop index out of range"));
     }
-    Ok(Value::Int(cell.borrow_mut().remove(k as usize) as i64))
+    Ok(Value::Int(
+        it.ba_edit(cell, |v| v.remove(k as usize))? as i64
+    ))
 }
 
 fn ba_clear(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ba_of(it, a)?.borrow_mut().clear();
+    let cell = ba_of(it, a)?;
+    it.ba_edit(cell, |v| v.clear())?;
     Ok(Value::None)
 }
 
@@ -845,9 +921,9 @@ fn ba_insert(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let i = it.index_of(&a[1])?;
     let b = byte_val(it, &a[2])?;
     let cell = ba_of(it, a)?;
-    let len = cell.borrow().len() as i64;
+    let len = cell.len() as i64;
     let k = if i < 0 { (i + len).max(0) } else { i.min(len) };
-    cell.borrow_mut().insert(k as usize, b);
+    it.ba_edit(cell, |v| v.insert(k as usize, b))?;
     Ok(Value::None)
 }
 
@@ -855,10 +931,10 @@ fn ba_remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("remove", a, 2, 2)?;
     let b = byte_val(it, &a[1])?;
     let cell = ba_of(it, a)?;
-    let pos = cell.borrow().iter().position(|&x| x == b);
+    let pos = cell.bytes().iter().position(|&x| x == b);
     match pos {
         Some(p) => {
-            cell.borrow_mut().remove(p);
+            it.ba_edit(cell, |v| v.remove(p))?;
             Ok(Value::None)
         }
         None => Err(it.value_error("value not found in bytearray")),
@@ -866,7 +942,8 @@ fn ba_remove(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn ba_reverse(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ba_of(it, a)?.borrow_mut().reverse();
+    let cell = ba_of(it, a)?;
+    it.ba_write(cell)?.reverse();
     Ok(Value::None)
 }
 
@@ -924,7 +1001,11 @@ pub fn init(it: &mut Interp) {
         it.reg(t, "removesuffix", removesuffix);
         it.reg(t, "__repr__", bytes_repr);
         it.reg(t, "__mod__", bytes_mod);
-        reg_slots(it, t, &["__getitem__", "__len__", "__contains__", "__iter__"]);
+        reg_slots(
+            it,
+            t,
+            &["__getitem__", "__len__", "__contains__", "__iter__"],
+        );
         reg_binops(it, t, &["__add__", "__mul__", "__rmul__"]);
         reg_compare(it, t, true);
     }
@@ -942,5 +1023,18 @@ pub fn init(it: &mut Interp) {
     let d = ba.dict.borrow().clone();
     if let Some(d) = d {
         dict_set_str(&d, "__hash__", Value::None);
+    }
+}
+
+impl Interp {
+    /// A length-changing edit of a `bytearray`; refused while a memoryview exports it.
+    pub fn ba_edit<T>(&mut self, b: &ByteStore, f: impl FnOnce(&mut Vec<u8>) -> T) -> R<T> {
+        b.edit(f).map_err(|e| crate::bind::buffer_error(self, e))
+    }
+
+    /// In-place (same-length) writes to a `bytearray`; allowed while exported.
+    pub fn ba_write<'a>(&mut self, b: &'a ByteStore) -> R<lumen_common::buffer::BytesMut<'a>> {
+        b.try_bytes_mut()
+            .map_err(|e| crate::bind::buffer_error(self, e))
     }
 }

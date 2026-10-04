@@ -126,18 +126,18 @@ impl Parsed {
             if i > 0 {
                 out.push(',');
             }
-            out.push_str(&json_str(k));
+            out.push_str(&lumen_common::json::json_string(k));
             out.push(':');
             match &self.options[*k] {
                 Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-                Value::Str(s) => out.push_str(&json_str(s)),
+                Value::Str(s) => out.push_str(&lumen_common::json::json_string(s)),
                 Value::List(l) => {
                     out.push('[');
                     for (j, s) in l.iter().enumerate() {
                         if j > 0 {
                             out.push(',');
                         }
-                        out.push_str(&json_str(s));
+                        out.push_str(&lumen_common::json::json_string(s));
                     }
                     out.push(']');
                 }
@@ -146,24 +146,6 @@ impl Parsed {
         out.push('}');
         out
     }
-}
-
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Options that accumulate into a list instead of the last one winning.
@@ -242,7 +224,9 @@ fn set(parsed: &mut Parsed, name: &str, value: Value) {
             match parsed.options.get_mut(name) {
                 Some(Value::List(l)) => l.push(s),
                 _ => {
-                    parsed.options.insert(name.to_string(), Value::List(vec![s]));
+                    parsed
+                        .options
+                        .insert(name.to_string(), Value::List(vec![s]));
                 }
             }
         }
@@ -302,9 +286,7 @@ pub fn parse(
         let (resolved, spec, negated) = match lookup(&name) {
             Some((n, s)) => (n.to_string(), s, false),
             None => {
-                let base = name
-                    .strip_prefix("--no-")
-                    .map(|b| format!("--{b}"));
+                let base = name.strip_prefix("--no-").map(|b| format!("--{b}"));
                 match base.as_deref().and_then(lookup) {
                     Some((n, s)) => {
                         if s.kind != Kind::Bool {
@@ -346,7 +328,12 @@ pub fn parse(
                         if !from_env {
                             parsed.exec_argv.push(code.clone());
                         }
-                        parsed.eval = Some(code.strip_prefix('\\').filter(|r| r.starts_with('-')).unwrap_or(&code).to_string());
+                        parsed.eval = Some(
+                            code.strip_prefix('\\')
+                                .filter(|r| r.starts_with('-'))
+                                .unwrap_or(&code)
+                                .to_string(),
+                        );
                         set(parsed, "--eval", Value::Str(parsed.eval.clone().unwrap()));
                     }
                     continue;
@@ -384,7 +371,13 @@ pub fn parse(
                     }
                 };
                 if resolved == "--eval" {
-                    parsed.eval = Some(value.strip_prefix('\\').filter(|r| r.starts_with('-')).unwrap_or(&value).to_string());
+                    parsed.eval = Some(
+                        value
+                            .strip_prefix('\\')
+                            .filter(|r| r.starts_with('-'))
+                            .unwrap_or(&value)
+                            .to_string(),
+                    );
                     set(parsed, &resolved, Value::Str(parsed.eval.clone().unwrap()));
                 } else {
                     set(parsed, &resolved, Value::Str(value));

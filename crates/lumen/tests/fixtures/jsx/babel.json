@@ -1,0 +1,117 @@
+{
+  "generator": "Babel plugin-transform-react-jsx (MIT)",
+  "typescript": "5.9.3",
+  "versions": {
+    "@babel/core": "7.29.7",
+    "@babel/plugin-transform-react-jsx": "7.29.7",
+    "@babel/plugin-transform-typescript": "7.29.9",
+    "@babel/plugin-transform-modules-commonjs": "7.29.7"
+  },
+  "fixtures": [
+    {
+      "name": "automatic-basic",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<div id=\"x\" flag>{1+2}</div>;",
+      "expected": "{\"type\":\"div\",\"props\":{\"id\":\"x\",\"flag\":true,\"children\":3}}"
+    },
+    {
+      "name": "automatic-fragment",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<><a/>hello<b/></>;",
+      "expected": "{\"type\":\"fragment\",\"props\":{\"children\":[{\"type\":\"a\",\"props\":{}},\"hello\",{\"type\":\"b\",\"props\":{}}]}}"
+    },
+    {
+      "name": "automatic-key-before-spread",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "const p={key:\"spread\",a:1};globalThis.result=<a key=\"early\" {...p}/>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"key\":\"spread\",\"a\":1},\"key\":\"early\"}"
+    },
+    {
+      "name": "automatic-key-after-spread",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "const p={key:\"spread\",a:1};globalThis.result=<a {...p} key=\"late\"/>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"key\":\"late\",\"a\":1},\"children\":[],\"mode\":\"classic\"}"
+    },
+    {
+      "name": "entities",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<a title=\"&copy;&Omega;&#x1f642;\">&amp;&lt;&#65;&unknown;</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"title\":\"©Ω🙂\",\"children\":\"&<A&unknown;\"}}"
+    },
+    {
+      "name": "whitespace",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<a>\n  hello\n  world\n <b/> </a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"children\":[\"hello world\",{\"type\":\"b\",\"props\":{}},\" \"]}}"
+    },
+    {
+      "name": "attribute-newlines",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<a title=\"hello\n  world\"/>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"title\":\"hello world\"}}"
+    },
+    {
+      "name": "namespaced",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "globalThis.result=<svg:path xml:lang=\"en\"/>;",
+      "expected": "{\"type\":\"svg:path\",\"props\":{\"xml:lang\":\"en\"}}"
+    },
+    {
+      "name": "nested-expressions",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "const n=3;globalThis.result=<a>{n>2?<b/>:null}{(()=> <c>{n}</c>)()}</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"children\":[{\"type\":\"b\",\"props\":{}},{\"type\":\"c\",\"props\":{\"children\":3}}]}}"
+    },
+    {
+      "name": "comment-and-string",
+      "typescript": false,
+      "runtime": "automatic",
+      "source": "const text=\"<tag/>\";globalThis.result=<a>{/* empty */}{text}</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"children\":\"<tag/>\"}}"
+    },
+    {
+      "name": "classic-member",
+      "typescript": false,
+      "runtime": "classic",
+      "source": "const React={Fragment:\"fragment\",createElement(type,props,...children){return {type,props,children,mode:\"classic\"};}};const UI={Button:\"button\"};globalThis.result=<UI.Button {...{n:3}}>a{4}</UI.Button>;",
+      "expected": "{\"type\":\"button\",\"props\":{\"n\":3},\"children\":[\"a\",4],\"mode\":\"classic\"}"
+    },
+    {
+      "name": "classic-fragment",
+      "typescript": false,
+      "runtime": "classic",
+      "source": "const React={Fragment:\"fragment\",createElement(type,props,...children){return {type,props,children,mode:\"classic\"};}};globalThis.result=<><a/>hello</>;",
+      "expected": "{\"type\":\"fragment\",\"props\":null,\"children\":[{\"type\":\"a\",\"props\":null,\"children\":[],\"mode\":\"classic\"},\"hello\"],\"mode\":\"classic\"}"
+    },
+    {
+      "name": "tsx-generics",
+      "typescript": true,
+      "runtime": "automatic",
+      "source": "const id=<T,>(x:T):T=>x;const n:number=3;globalThis.result=<a n={id<number>(n)}>{n+1}</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"n\":3,\"children\":4}}"
+    },
+    {
+      "name": "tsx-constraint",
+      "typescript": true,
+      "runtime": "automatic",
+      "source": "const id=<T extends number>(x:T):T=>x;globalThis.result=<a>{id(4)}</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"children\":4}}"
+    },
+    {
+      "name": "tsx-default",
+      "typescript": true,
+      "runtime": "automatic",
+      "source": "const id=<T=number>(x:T):T=>x;globalThis.result=<a>{id(5)}</a>;",
+      "expected": "{\"type\":\"a\",\"props\":{\"children\":5}}"
+    }
+  ]
+}

@@ -136,7 +136,6 @@ pub(crate) struct LangCaches {
     pub(crate) array_cb: crate::bytecode::inline_callback::CbCache,
 }
 
-
 impl Interp {
     /// The property key of the realm's `Symbol.iterator`.
     fn iter_sym_key(&self) -> Option<Rc<str>> {
@@ -174,7 +173,9 @@ impl Interp {
             values,
             next,
             aip,
-            step_enabled: self.extra_protos.contains_key("%ArrayIteratorStepIntrinsic%"),
+            step_enabled: self
+                .extra_protos
+                .contains_key("%ArrayIteratorStepIntrinsic%"),
         });
         let c = c.as_ref()?;
         Some((addr(&c.values), addr(&c.next), &c.aip as *const Gc))
@@ -272,14 +273,23 @@ impl Interp {
     /// The intrinsic `%ArrayIteratorPrototype%.next`, when remembered.
     pub(crate) fn array_iter_next_intrinsic(&self) -> Option<Gc> {
         self.iter_intrinsics()?;
-        self.lang.intrinsics.borrow().as_ref().map(|c| c.next.clone())
+        self.lang
+            .intrinsics
+            .borrow()
+            .as_ref()
+            .map(|c| c.next.clone())
     }
 
     /// Whether `f` is the intrinsic `next` and the bytecode step elision is enabled.
     #[inline]
     pub(crate) fn is_elidable_array_iter_next(&self, f: &Gc) -> bool {
         self.is_array_iter_next(f)
-            && self.lang.intrinsics.borrow().as_ref().is_some_and(|c| c.step_enabled)
+            && self
+                .lang
+                .intrinsics
+                .borrow()
+                .as_ref()
+                .is_some_and(|c| c.step_enabled)
     }
 
     /// Whether `f` is the intrinsic `%ArrayIteratorPrototype%.next`.
@@ -476,6 +486,10 @@ impl Interp {
     /// non-enumerable). The result is then just the object's own enumerable string keys in
     /// [[OwnPropertyKeys]] order — no dedupe set, no prototype key lists. `None` = generic path.
     pub(crate) fn for_in_keys_fast(&self, o: &Gc) -> Option<Vec<Value>> {
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            return None;
+        }
         let b = o.borrow();
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None | Exotic::Array) {
             return None;
@@ -520,6 +534,10 @@ impl Interp {
     /// `Object.keys(o)` of a plain ordinary object without elements: its own enumerable string
     /// keys from the per-shape key list (no key strings built). `None` = generic path.
     pub(crate) fn object_keys_fast(&self, o: &Gc) -> Option<Vec<Value>> {
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            return None;
+        }
         let b = o.try_borrow().ok()?;
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) || has_elements(&b.props) {
             return None;
@@ -704,7 +722,10 @@ impl Interp {
         source: &Rc<str>,
         flags: &Rc<str>,
     ) -> Result<Rc<crate::regex::Regex>, crate::interpreter::Abrupt> {
-        let key = (Rc::as_ptr(source) as *const u8 as usize, Rc::as_ptr(flags) as *const u8 as usize);
+        let key = (
+            Rc::as_ptr(source) as *const u8 as usize,
+            Rc::as_ptr(flags) as *const u8 as usize,
+        );
         if let Some((s, f, re)) = self.lang.regexp_sites.borrow().get(&key) {
             if Rc::ptr_eq(s, source) && Rc::ptr_eq(f, flags) {
                 return Ok(re.clone());

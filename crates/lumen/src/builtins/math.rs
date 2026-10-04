@@ -55,8 +55,7 @@ pub(crate) fn nf_math_max(i: &mut Interp, _this: Value, a: &[Value]) -> Result<V
         };
         if n.is_nan() {
             nan = true;
-        } else if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative())
-        {
+        } else if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
             m = n;
         }
     }
@@ -73,8 +72,7 @@ pub(crate) fn nf_math_min(i: &mut Interp, _this: Value, a: &[Value]) -> Result<V
         };
         if n.is_nan() {
             nan = true;
-        } else if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive())
-        {
+        } else if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
             m = n;
         }
     }
@@ -145,33 +143,11 @@ pub(super) fn install_math(it: &mut Interp) {
     unary!("sinh", f64::sinh);
     unary!("cosh", f64::cosh);
     unary!("tanh", f64::tanh);
-    unary!("asinh", f64::asinh);
-    unary!("acosh", f64::acosh);
-    // fdlibm atanh — the platform libm loses ~400 ulp near |x| = 1; log1p keeps it exact.
-    unary!("atanh", |x: f64| {
-        let ax = x.abs();
-        if ax > 1.0 {
-            return f64::NAN;
-        }
-        let t = if ax < 0.5 {
-            let t = ax + ax;
-            0.5 * (t + t * ax / (1.0 - ax)).ln_1p()
-        } else {
-            0.5 * ((ax + ax) / (1.0 - ax)).ln_1p()
-        };
-        if x < 0.0 {
-            -t
-        } else if x == 0.0 {
-            x
-        } else {
-            t
-        }
-    });
+    unary!("asinh", lumen_common::float::asinh);
+    unary!("acosh", lumen_common::float::acosh);
+    unary!("atanh", lumen_common::float::atanh);
     unary!("fround", |x: f64| x as f32 as f64);
-    unary!(
-        "f16round",
-        |x: f64| crate::value::f16_to_f32(crate::value::f64_to_f16(x)) as f64
-    );
+    unary!("f16round", lumen_common::buffer::format::f16_round);
     unary!("clz32", |x: f64| (to_uint32(x)).leading_zeros() as f64);
     it.def_method(&math, "sumPrecise", 1, |i, _t, a| {
         // Iterate the argument, requiring every element to be a Number; compute the correctly
@@ -210,49 +186,33 @@ pub(super) fn install_math(it: &mut Interp) {
             f64::INFINITY
         } else if neg_inf {
             f64::NEG_INFINITY
-        } else if finite.is_empty() {
+        } else if finite.iter().all(|x| *x == 0.0 && x.is_sign_negative()) {
             -0.0
         } else {
-            let s = fsum_exact(&finite);
-            if s.is_finite() {
-                s
-            } else {
-                // The exact-summation partials transiently overflowed. Retry on values scaled by a
-                // power of two (exact, so the correctly-rounded result is unchanged) centred near
-                // 2^500, then scale back — a genuine overflow re-materialises as ±Infinity.
-                let max_abs = finite.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
-                let scale_exp = max_abs.log2().floor() as i32 - 500;
-                let down = 2f64.powi(-scale_exp);
-                let up = 2f64.powi(scale_exp);
-                let scaled: Vec<f64> = finite.iter().map(|&x| x * down).collect();
-                fsum_exact(&scaled) * up
+            match lumen_common::float::fsum(&finite) {
+                Ok(s) => s,
+                Err(_) => {
+                    // The exact-summation partials transiently overflowed. Retry on values scaled
+                    // by a power of two (exact, so the correctly rounded result is unchanged)
+                    // centred near 2^500, then scale back: a genuine overflow becomes ±Infinity.
+                    let max_abs = finite.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+                    let scale_exp = max_abs.log2().floor() as i32 - 500;
+                    let down = 2f64.powi(-scale_exp);
+                    let up = 2f64.powi(scale_exp);
+                    let scaled: Vec<f64> = finite.iter().map(|&x| x * down).collect();
+                    lumen_common::float::fsum(&scaled).unwrap_or(f64::NAN) * up
+                }
             }
         };
         Ok(Value::Num(result))
     });
     it.def_method(&math, "hypot", 2, |i, _t, a| {
-        // Coerce every argument (in order), then: any infinite operand yields +Infinity (even
-        // alongside a NaN), otherwise any NaN yields NaN, otherwise the Euclidean norm.
-        let mut sum = 0.0;
-        let mut any_inf = false;
-        let mut any_nan = false;
+        // Every argument is coerced (in order) before any is inspected.
+        let mut coords = Vec::with_capacity(a.len());
         for v in a {
-            let n = ab(i.to_number(v))?;
-            if n.is_infinite() {
-                any_inf = true;
-            } else if n.is_nan() {
-                any_nan = true;
-            } else {
-                sum += n * n;
-            }
+            coords.push(ab(i.to_number(v))?);
         }
-        Ok(Value::Num(if any_inf {
-            f64::INFINITY
-        } else if any_nan {
-            f64::NAN
-        } else {
-            sum.sqrt()
-        }))
+        Ok(Value::Num(lumen_common::float::hypot(&mut coords)))
     });
     it.def_method(&math, "imul", 2, nf_math_imul);
     it.def_method(&math, "random", 0, |_i, _t, _a| {
@@ -289,55 +249,4 @@ pub(super) fn install_math(it: &mut Interp) {
     it.def_method(&math, "min", 2, nf_math_min);
     set_to_string_tag(it, &math, "Math");
     set_builtin(&it.global, "Math", Value::Obj(math));
-}
-
-/// Correctly-rounded sum of finite f64s, via Shewchuk's nonoverlapping-partials algorithm with
-/// CPython's final round-half-to-even step (the `math.fsum` algorithm).
-fn fsum_exact(values: &[f64]) -> f64 {
-    let mut partials: Vec<f64> = Vec::new();
-    for &xi in values {
-        let mut x = xi;
-        let mut i = 0;
-        for j in 0..partials.len() {
-            let mut y = partials[j];
-            if x.abs() < y.abs() {
-                std::mem::swap(&mut x, &mut y);
-            }
-            let hi = x + y;
-            let lo = y - (hi - x);
-            if lo != 0.0 {
-                partials[i] = lo;
-                i += 1;
-            }
-            x = hi;
-        }
-        partials.truncate(i);
-        partials.push(x);
-    }
-    let n = partials.len();
-    if n == 0 {
-        return 0.0;
-    }
-    let mut hi = partials[n - 1];
-    let mut lo = 0.0;
-    let mut idx = n - 1;
-    while idx > 0 {
-        idx -= 1;
-        let x = hi;
-        let y = partials[idx];
-        hi = x + y;
-        lo = y - (hi - x);
-        if lo != 0.0 {
-            break;
-        }
-    }
-    // Round half to even: nudge when the residual and the next partial agree in sign.
-    if idx > 0 && ((lo < 0.0 && partials[idx - 1] < 0.0) || (lo > 0.0 && partials[idx - 1] > 0.0)) {
-        let y = lo * 2.0;
-        let x = hi + y;
-        if y == x - hi {
-            hi = x;
-        }
-    }
-    hi
 }

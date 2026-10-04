@@ -11,16 +11,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     it.def_method(&r, "deleteProperty", 2, reflect_delete);
     it.def_method(&r, "ownKeys", 1, reflect_own_keys);
     it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| match arg(a, 0) {
-        Value::Obj(o) => {
-            if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
-                return js_get_prototype_of(i, &Value::Obj(o.clone()));
-            }
-            Ok(o.borrow()
-                .proto
-                .clone()
-                .map(Value::Obj)
-                .unwrap_or(Value::Null))
-        }
+        Value::Obj(o) => js_get_prototype_of(i, &Value::Obj(o)),
         _ => Err(i.make_error("TypeError", "Reflect.getPrototypeOf called on non-object")),
     });
     it.def_method(&r, "setPrototypeOf", 2, |i, _t, a| {
@@ -183,6 +174,9 @@ pub(crate) fn reflect_gopd(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Val
     if Interp::is_private_key(&key) {
         return Ok(Value::Undefined); // private-name slot is not an own property
     }
+    if let Some(descriptor) = window_proxy_get_own_property(i, &Value::Obj(o.clone()), &key)? {
+        return Ok(descriptor);
+    }
     i.materialize(&o);
     // A mapped arguments index reports the live parameter value.
     if let Some(v) = i.mapped_arg_value(Gc::as_ptr(&o) as usize, &key) {
@@ -221,6 +215,10 @@ pub(crate) fn reflect_gopd(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Val
 pub(crate) fn reflect_delete(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let key = ab(i.to_property_key(&arg(a, 1)))?;
     if let Value::Obj(o) = arg(a, 0) {
+        #[cfg(feature = "embed")]
+        if i.is_window_proxy(&o) {
+            return ab(i.delete_prop_with(Value::Obj(o), &key, false));
+        }
         ab(i.defer_trigger(&o, Some(&key)))?;
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
@@ -255,6 +253,9 @@ pub(crate) fn reflect_own_keys(i: &mut Interp, _t: Value, a: &[Value]) -> Result
         _ => return Err(i.make_error("TypeError", "Reflect.ownKeys called on non-object")),
     };
     ab(i.defer_trigger(&o, None))?;
+    if let Some(keys) = window_proxy_own_property_keys(i, &Value::Obj(o.clone()))? {
+        return Ok(i.make_array(keys));
+    }
     if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
         let keys = proxy_own_keys(i, &target, &handler)?;
         return Ok(i.make_array(keys));
@@ -302,7 +303,11 @@ pub(crate) fn reflect_define(i: &mut Interp, _t: Value, a: &[Value]) -> Result<V
     Ok(Value::Bool(ok))
 }
 
-pub(crate) fn reflect_is_extensible(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+pub(crate) fn reflect_is_extensible(
+    i: &mut Interp,
+    _t: Value,
+    a: &[Value],
+) -> Result<Value, Value> {
     let obj = arg(a, 0);
     if !matches!(obj, Value::Obj(_)) {
         return Err(i.make_error("TypeError", "Reflect.isExtensible called on non-object"));

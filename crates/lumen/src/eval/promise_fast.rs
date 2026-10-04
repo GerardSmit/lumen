@@ -16,8 +16,8 @@
 //! result capability).
 use crate::interpreter::{Interp, Job};
 use crate::value::{Callable, Gc, Object, Property, Props, Value};
-use std::rc::Rc;
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 /// [[PromiseState]] values of [`PromiseSlot::status`].
 pub(crate) const PENDING: u8 = 0;
@@ -320,7 +320,11 @@ impl Interp {
     }
 
     /// Release the pin a thread-backed async body's promise holds while the body runs.
-    pub(crate) fn unpin_async_thread(&mut self, promise: &Value, coro: &crate::coroutine::Coroutine) {
+    pub(crate) fn unpin_async_thread(
+        &mut self,
+        promise: &Value,
+        coro: &crate::coroutine::Coroutine,
+    ) {
         if let (crate::coroutine::Coroutine::Thread(_), Value::Obj(o)) = (coro, promise) {
             self.gc_pins.remove(&(Gc::as_ptr(o) as usize));
         }
@@ -350,7 +354,10 @@ impl Interp {
     pub(crate) fn resolver_pair_for(&mut self, cell: Rc<ResolverCell>) -> (Value, Value) {
         if self.lang.promise.resolver.borrow().is_none() {
             let mut props = Props::new();
-            props.insert("length", Property::data(Value::Num(1.0), false, false, true));
+            props.insert(
+                "length",
+                Property::data(Value::Num(1.0), false, false, true),
+            );
             props.insert("name", Property::data(Value::str(""), false, false, true));
             *self.lang.promise.resolver.borrow_mut() = Some(props);
         }
@@ -365,7 +372,12 @@ impl Interp {
     }
 
     /// A call of a resolving function: the first call of either one of a pair settles.
-    pub(crate) fn call_promise_resolver(&mut self, cell: &ResolverCell, fulfil: bool, args: &[Value]) {
+    pub(crate) fn call_promise_resolver(
+        &mut self,
+        cell: &ResolverCell,
+        fulfil: bool,
+        args: &[Value],
+    ) {
         if cell.already.replace(true) {
             if let Some(hook) = self.multiple_resolves_hook.clone() {
                 let kind = Value::str(if fulfil { "resolve" } else { "reject" });
@@ -405,7 +417,9 @@ impl Interp {
     pub(crate) fn perform_then(&mut self, p: &Gc, reaction: Reaction) {
         let (status, value) = {
             let mut b = p.borrow_mut();
-            let Callable::Promise(s) = &mut b.call else { return };
+            let Callable::Promise(s) = &mut b.call else {
+                return;
+            };
             if s.status == PENDING {
                 s.push_reaction(reaction);
                 return;
@@ -418,7 +432,9 @@ impl Interp {
                 self.note_rejection_handled(p);
                 b = p.borrow_mut();
             }
-            let Callable::Promise(s) = &b.call else { return };
+            let Callable::Promise(s) = &b.call else {
+                return;
+            };
             (s.status, s.value.clone())
         };
         let job = Self::reaction_job(reaction, status == FULFILLED, value);
@@ -478,7 +494,9 @@ impl Interp {
         let Value::Obj(o) = result else { return };
         let done = {
             let mut b = o.borrow_mut();
-            let Callable::Promise(s) = &mut b.call else { return };
+            let Callable::Promise(s) = &mut b.call else {
+                return;
+            };
             let Some(c) = s.comb.as_mut() else { return };
             if let Some((idx, value)) = element {
                 if let Some(slot) = c.values.get_mut(idx as usize) {
@@ -510,7 +528,9 @@ impl Interp {
         let Value::Obj(o) = result else { return };
         {
             let mut b = o.borrow_mut();
-            let Callable::Promise(s) = &mut b.call else { return };
+            let Callable::Promise(s) = &mut b.call else {
+                return;
+            };
             let Some(c) = s.comb.as_mut() else { return };
             if c.already {
                 return;
@@ -533,7 +553,9 @@ impl Interp {
         let (then, thenable, promise) = (job.handler, job.value, job.result);
         let outer = std::mem::replace(&mut self.async_context, job.context.into_value());
         if let Value::Obj(t) = &thenable {
-            if self.is_intrinsic_then(&then) && crate::builtins::promise_then_is_silent(self, &thenable) {
+            if self.is_intrinsic_then(&then)
+                && crate::builtins::promise_then_is_silent(self, &thenable)
+            {
                 let reaction = Reaction {
                     on_f: Value::Undefined,
                     on_r: Value::Undefined,
@@ -587,7 +609,12 @@ impl Interp {
             return Ok(());
         }
         let px = self.promise_resolve_checked(awaited)?;
-        self.promise_then_into(&px, async_promise.clone(), async_promise.clone(), Value::Empty);
+        self.promise_then_into(
+            &px,
+            async_promise.clone(),
+            async_promise.clone(),
+            Value::Empty,
+        );
         Ok(())
     }
 
@@ -722,7 +749,11 @@ impl Interp {
     /// A tracked (unhandled) rejection of `p` got a handler: drop it from the pending report,
     /// or, when it was already reported, record it for the embedder's `rejectionHandled`.
     pub(crate) fn note_rejection_handled(&mut self, p: &Gc) {
-        if self.unhandled_rejections.remove(&(Gc::as_ptr(p) as usize)).is_none() {
+        if self
+            .unhandled_rejections
+            .remove(&(Gc::as_ptr(p) as usize))
+            .is_none()
+        {
             if let Some(list) = self.late_handled_rejections.as_mut() {
                 list.push(Value::Obj(p.clone()));
             }
@@ -734,7 +765,10 @@ impl Interp {
         // Replaced from inside a hook: the new set is just as busy.
         let running = self.promise_hooks.as_ref().is_some_and(|h| h.running.get());
         self.promise_hooks = hooks.and_then(|[init, before, after, resolve]| {
-            if [&init, &before, &after, &resolve].iter().all(|f| !f.is_callable()) {
+            if [&init, &before, &after, &resolve]
+                .iter()
+                .all(|f| !f.is_callable())
+            {
                 return None;
             }
             Some(Box::new(PromiseHooks {
@@ -751,7 +785,9 @@ impl Interp {
     /// A throwing hook is ignored here: the host's hook functions report their own errors.
     #[cold]
     pub(crate) fn run_promise_hook(&mut self, which: u8, promise: &Value, parent: &Value) {
-        let Some(h) = self.promise_hooks.as_ref() else { return };
+        let Some(h) = self.promise_hooks.as_ref() else {
+            return;
+        };
         let f = match which {
             HOOK_INIT => &h.init,
             HOOK_BEFORE => &h.before,
@@ -827,7 +863,11 @@ impl Interp {
     /// promise whose parent is the async function's promise, and the reaction gets a throwaway
     /// result promise (parent: the awaited promise) for the before/after hooks.
     #[cold]
-    fn await_subscribe_hooked(&mut self, awaited: Value, async_promise: &Value) -> Result<(), Value> {
+    fn await_subscribe_hooked(
+        &mut self,
+        awaited: Value,
+        async_promise: &Value,
+    ) -> Result<(), Value> {
         let px = if is_promise(&awaited) {
             self.promise_resolve_checked(awaited)?
         } else {

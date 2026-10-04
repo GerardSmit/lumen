@@ -48,8 +48,9 @@ pub(crate) const ARRAY_SLOTS_MAX: usize = 4;
 /// Number of slot classes.
 pub(crate) const CLASSES: usize = 7;
 /// Slot class names, by index (the `LUMEN_MEM_STATS` report).
-pub(crate) const CLASS_NAMES: [&str; CLASSES] =
-    ["plain", "inline2", "inline4", "inline8", "array0", "array2", "array4"];
+pub(crate) const CLASS_NAMES: [&str; CLASSES] = [
+    "plain", "inline2", "inline4", "inline8", "array0", "array2", "array4",
+];
 /// How long empty chunks must stay unused before [`ObjHeap::trim_if_emptied`] returns them.
 const PURGE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -57,11 +58,7 @@ const fn round_up(n: usize, align: usize) -> usize {
     n.div_ceil(align) * align
 }
 const fn max(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
+    if a > b { a } else { b }
 }
 /// Offset of the inline property area from the start of its box. Sizes and alignments differ
 /// by pointer width (on wasm32 / armv7 `Property` can be more aligned than `GcBox`'s size), so
@@ -246,12 +243,8 @@ mod os {
     pub const PAGE_READWRITE: u32 = 0x04;
     #[link(name = "kernel32")]
     extern "system" {
-        pub fn VirtualAlloc(
-            addr: *mut c_void,
-            size: usize,
-            kind: u32,
-            protect: u32,
-        ) -> *mut c_void;
+        pub fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32)
+        -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
     }
 }
@@ -416,6 +409,40 @@ pub(super) struct ObjHeap {
 }
 
 impl ObjHeap {
+    /// Move all chunks from an exclusively owned heap, preserving box addresses.
+    /// Both heaps must stay pinned, and no allocator or collector may run during
+    /// the move. The caller transfers the live count and remaps object shapes.
+    #[cfg(any(test, feature = "parallel"))]
+    pub(super) fn absorb(&self, other: &Self, live: &Cell<i64>) {
+        assert!(!std::ptr::eq(self, other), "cannot absorb the same heap");
+        for (target, source) in self.classes.iter().zip(&other.classes) {
+            let mut head = source.free.replace(std::ptr::null_mut());
+            if !head.is_null() {
+                let first = head;
+                unsafe {
+                    while !free_next(head).is_null() {
+                        head = free_next(head);
+                    }
+                    set_free_next(head, target.free.get());
+                }
+                target.free.set(first);
+            }
+            source.cur.set(std::ptr::null_mut());
+            for chunk in source.chunks().drain(..) {
+                unsafe {
+                    let header = &mut *chunk.as_ptr();
+                    header.free_head = &target.free;
+                    header.live = live;
+                    header.emptied = &self.emptied;
+                }
+                target.chunks().push(chunk);
+            }
+        }
+        self.emptied
+            .set(self.emptied.get().saturating_add(other.emptied.replace(0)));
+        other.purge_at.set(None);
+    }
+
     pub(super) const fn new() -> ObjHeap {
         ObjHeap {
             classes: [const { ClassHeap::new() }; CLASSES],

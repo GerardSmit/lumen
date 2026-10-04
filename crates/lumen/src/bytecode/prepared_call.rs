@@ -59,14 +59,16 @@ impl PreparedCall {
     #[inline]
     pub(crate) fn call(&mut self, i: &mut Interp, args: &mut [Value]) -> Result<Value, Abrupt> {
         match &mut self.kind {
-            Kind::Compiled(c) if compiled_ok(i, c) => call_compiled_prepared(i, c, &self.this, |s| {
-                for v in args.iter_mut() {
-                    if !s.wants() {
-                        break;
+            Kind::Compiled(c) if compiled_ok(i, c) => {
+                call_compiled_prepared(i, c, &self.this, |s| {
+                    for v in args.iter_mut() {
+                        if !s.wants() {
+                            break;
+                        }
+                        s.push(std::mem::take(v));
                     }
-                    s.push(std::mem::take(v));
-                }
-            }),
+                })
+            }
             Kind::Native(f) if i.depth < i.depth_limit && !i.multi_realm() => {
                 let f = *f;
                 call_native_prepared(i, f, &self.this, args)
@@ -137,7 +139,9 @@ pub(crate) fn call_once_direct(
     callee: &Value,
     arg: Value,
 ) -> Result<Result<Value, Abrupt>, Value> {
-    let Value::Obj(o) = callee else { return Err(arg) };
+    let Value::Obj(o) = callee else {
+        return Err(arg);
+    };
     if matches!(i.tier, Tier::Interp) || i.depth >= i.depth_limit || i.multi_realm() {
         return Err(arg);
     }
@@ -147,9 +151,13 @@ pub(crate) fn call_once_direct(
     }
     let (chunk, env, strict, arrow) = {
         let b = o.borrow();
-        let Callable::User(u) = &b.call else { return Err(arg) };
+        let Callable::User(u) = &b.call else {
+            return Err(arg);
+        };
         let f = &u.func;
-        let Some(Some(chunk)) = f.code.get() else { return Err(arg) };
+        let Some(Some(chunk)) = f.code.get() else {
+            return Err(arg);
+        };
         if f.is_generator
             || f.is_async
             || (!i.class_info.is_empty() && i.class_info.contains_key(&key))
@@ -169,13 +177,27 @@ pub(crate) fn call_once_direct(
         i.depth -= 1;
         return Ok(Err(e));
     }
+    // The poll may have released the function's code.
+    if !crate::bytecode::jit::direct_ready(i, &chunk) {
+        i.depth -= 1;
+        return Err(arg);
+    }
     // SAFETY: a live compiled function (the checks above are `resolve`'s).
     let r = unsafe {
-        crate::bytecode::jit::call_direct(i, &chunk, &env, key, strict, arrow, &Value::Undefined, |s| {
-            if s.wants() {
-                s.push(arg);
-            }
-        })
+        crate::bytecode::jit::call_direct(
+            i,
+            &chunk,
+            &env,
+            key,
+            strict,
+            arrow,
+            &Value::Undefined,
+            |s| {
+                if s.wants() {
+                    s.push(arg);
+                }
+            },
+        )
     };
     Ok(finish_call(i, r))
 }
@@ -251,7 +273,9 @@ fn call_compiled_prepared(
     if crate::bytecode::jit::direct_ready(i, chunk) {
         // SAFETY: `c` is a live compiled function (see `resolve`).
         let r = unsafe {
-            crate::bytecode::jit::call_direct(i, chunk, &c.env, c.fn_ptr, c.strict, c.arrow, this, seed)
+            crate::bytecode::jit::call_direct(
+                i, chunk, &c.env, c.fn_ptr, c.strict, c.arrow, this, seed,
+            )
         };
         return finish_call(i, r);
     }

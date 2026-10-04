@@ -1,0 +1,10 @@
+﻿{
+    "fixture_sha256":  "e153aa3bf9719d87d9775148edc04862ff7c0294bc3ca991af49aa15ecff4bd4",
+    "scale":  1,
+    "viewport":  [
+                     64,
+                     64
+                 ],
+    "chromium":  "154.0.8037.97",
+    "font_sha256":  "76d04c18ea243f426b7de1f3ad208e927008f961dc5945e5aad352d0dfde8ee8"
+}

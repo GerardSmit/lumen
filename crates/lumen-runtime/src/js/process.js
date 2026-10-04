@@ -115,15 +115,10 @@
     process.getgroups = proc.getgroups;
     Object.defineProperty(process, Symbol.for("lumen.identity"), { value: proc, configurable: true });
   }
-  // `process.platform` is stamped after this runs, so the table is built on first use.
+  // The signal table (lumen_os, via lumen-node's `__oscon`) is read on first use.
   let signals;
   const signalNumber = (name) => {
-    if (signals === undefined) {
-      const linux = process.platform !== "darwin";
-      signals = { SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGILL: 4, SIGABRT: 6, SIGFPE: 8,
-        SIGKILL: 9, SIGSEGV: 11, SIGPIPE: 13, SIGALRM: 14, SIGTERM: 15, SIGWINCH: 28,
-        SIGUSR1: linux ? 10 : 30, SIGUSR2: linux ? 12 : 31, SIGCONT: linux ? 18 : 19 };
-    }
+    signals ??= Object.fromEntries(globalThis.__oscon?.signals() ?? []);
     return signals[name] ?? 15;
   };
   Object.defineProperty(process, Symbol.for("lumen.signalHandler"), { value: proc.signalHandler, configurable: true });
@@ -132,5 +127,16 @@
     const n = typeof sig === "number" ? sig : signalNumber(sig);
     rawKill(pid | 0, n);
     return true;
+  };
+  globalThis.__lumenSetCliOptions = (json) => {
+    const options = JSON.parse(json);
+    Object.defineProperty(process, Symbol.for("lumen.options"), { value: options, configurable: true });
+    if (options["--experimental-fetch"] === false) {
+      for (const key of ["fetch", "FormData", "Headers", "Request", "Response"]) delete globalThis[key];
+      if (globalThis.WebAssembly) { delete WebAssembly.compileStreaming; delete WebAssembly.instantiateStreaming; }
+    }
+    const apply = globalThis.__lumenApplyOptions;
+    delete globalThis.__lumenApplyOptions;
+    if (apply) apply();
   };
 })();

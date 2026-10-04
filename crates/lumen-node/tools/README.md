@@ -9,6 +9,7 @@ generator inputs here, never the generated file, then regenerate from the reposi
     node crates/lumen-node/tools/http2gen/gen.js crates/lumen-node/src/js/http2.js
     node crates/lumen-node/tools/urlgen/gen.js crates/lumen-node/src/js/url.js
     node crates/lumen-node/tools/fsgen/gen.js  crates/lumen-node/src/js/fs.js
+    node crates/lumen-node/tools/webstreamsgen/gen.js crates/lumen-node/src/js/webstreams.js crates/lumen-node/src/js/webstreams_browser.js
 
 | generator | shell (`head.js`/`tail.js`) | vendored Node sources            |
 |-----------|-----------------------------|----------------------------------|

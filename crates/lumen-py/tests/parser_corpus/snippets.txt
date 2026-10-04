@@ -2744,3 +2744,49 @@ x = {a: b for a in c if d for b in e if f}
 x = [a for a in b if c for d in e if f]
 #---
 x = [a for a in b if c if d for e in f if g if h]
+#---
+def f[T](x: T) -> T: return x
+#---
+async def g[T: int, *Ts, **P](a: T, *b: *Ts) -> None: pass
+#---
+@dec
+class C[T, U: (int, str), **P](Base[T], metaclass=M):
+    def m[V](self, v: V) -> V: ...
+#---
+type X = int
+#---
+type Pair[A, B] = tuple[A, B]
+#---
+type Alias[T: (int, str), *Ts, **P] = Callable[P, tuple[T, *Ts]]
+#---
+type  X  [ T , ] = list [ T ]
+#---
+type = 1
+#---
+type(x)
+#---
+type.x = 1
+#---
+type[x] = 1
+#---
+type: int = 1
+#---
+type X
+#---
+type match = case
+#---
+def f[](): pass
+#---
+def f[*Ts: int](): pass
+#---
+def f[**P: int](): pass
+#---
+class C[T=int]: pass
+#---
+type X[T] = (yield)
+#---
+type X = *a
+#---
+def f[T, ](): pass
+#---
+class C[T: int = str]: pass

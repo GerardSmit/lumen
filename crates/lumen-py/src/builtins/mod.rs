@@ -1,21 +1,70 @@
 //! Builtin functions, types and native modules.
 
+pub mod alias;
 pub mod args;
+pub mod arraym;
+pub mod astconv;
+pub mod astm;
+pub mod astnodes;
+pub mod binasciim;
+pub mod bisectm;
 pub mod bytesm;
+pub mod cmathm;
+pub mod codecsm;
+pub mod collectionsm;
+pub mod contextvarsm;
+pub mod csvm;
+pub mod descr;
 pub mod dictm;
+pub mod errnom;
 pub mod excgroup;
 pub mod excm;
-pub mod file;
 pub mod format;
 pub mod funcs;
+pub mod functoolsm;
 pub mod genm;
+pub mod hashlibm;
+pub mod heapqm;
+pub mod impm;
+pub mod iom;
 pub mod iterm;
+pub mod itertools;
+pub mod jsonm;
 pub mod listm;
+pub mod marshalm;
+pub mod mathm;
+pub mod memview;
 pub mod modules;
+pub mod native;
 pub mod numeric;
 pub mod objectm;
+pub mod operatorm;
+pub mod oserror;
+pub mod posixm;
+pub mod posixsubprocessm;
+pub mod randomm;
+pub mod scproxym;
+pub mod selectm;
+pub mod signalm;
 pub mod slots;
+pub mod socketm;
+pub mod sre;
+pub mod statisticsm;
+pub mod stringm;
 pub mod strm;
+pub mod structm;
+pub mod sysextra;
+pub mod sysm;
+pub mod sysmods;
+pub mod threadm;
+pub mod timem;
+pub mod tokenizem;
+pub mod typingm;
+pub mod unicodedatam;
+pub mod warningsm;
+pub mod weakm;
+pub mod zlibm;
+pub mod zoneinfom;
 
 use crate::object::*;
 use crate::vm::*;
@@ -30,9 +79,12 @@ pub fn init(it: &mut Interp) {
     iterm::init(it);
     genm::init(it);
     excm::init(it);
+    codecsm::init(it);
     excgroup::init(it);
-    file::init(it);
     funcs::init(it);
+    sysextra::init_frame_type(it);
+    sysextra::init_code_type(it);
+    descr::init(it);
     modules::init(it);
     register_names(it);
 }
@@ -67,10 +119,18 @@ fn register_names(it: &mut Interp) {
         ("filter", t.filter.clone()),
         ("reversed", t.reversed.clone()),
     ];
+    if let Some(d) = it.types.object.dict.borrow().as_ref() {
+        dict_set_str(
+            d,
+            "__doc__",
+            Value::str("The base class of the class hierarchy."),
+        );
+    }
     for (n, o) in named {
         dict_set_str(&b, n, Value::Obj(o));
     }
-    let excs: Vec<(&'static str, Obj)> = it.exc_types.iter().map(|(k, v)| (*k, v.clone())).collect();
+    let excs: Vec<(&'static str, Obj)> =
+        it.exc_types.iter().map(|(k, v)| (*k, v.clone())).collect();
     for (n, o) in excs {
         dict_set_str(&b, n, Value::Obj(o));
     }

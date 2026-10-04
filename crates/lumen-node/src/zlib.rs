@@ -62,7 +62,11 @@ impl CodecError {
         let message = stream
             .and_then(ZStream::message)
             .unwrap_or_else(|| message.to_string());
-        CodecError { message, errno, code: zlib_code(errno) }
+        CodecError {
+            message,
+            errno,
+            code: zlib_code(errno),
+        }
     }
 }
 
@@ -87,7 +91,14 @@ fn arg_num(a: &[Value], i: usize, default: f64) -> f64 {
 }
 
 impl ZlibCtx {
-    fn new(mode: u32, window_bits: i32, level: i32, mem_level: i32, strategy: i32, dictionary: Vec<u8>) -> Self {
+    fn new(
+        mode: u32,
+        window_bits: i32,
+        level: i32,
+        mem_level: i32,
+        strategy: i32,
+        dictionary: Vec<u8>,
+    ) -> Self {
         let mut c = ZlibCtx {
             mode,
             stream: None,
@@ -138,7 +149,9 @@ impl ZlibCtx {
         if self.dictionary.is_empty() || !matches!(self.mode, DEFLATE | DEFLATERAW | INFLATERAW) {
             return;
         }
-        let Some(stream) = self.stream.as_mut() else { return };
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
         if stream.set_dictionary(&self.dictionary) != Z_OK {
             self.init_error = Some(Z_STREAM_ERROR);
         }
@@ -159,7 +172,11 @@ impl ZlibCtx {
         let stream = self.stream.as_mut()?;
         let code = stream.params(level, strategy);
         if code != Z_OK && code != Z_BUF_ERROR {
-            return Some(CodecError::zlib("Failed to set parameters", Some(stream), code));
+            return Some(CodecError::zlib(
+                "Failed to set parameters",
+                Some(stream),
+                code,
+            ));
         }
         self.level = level;
         self.strategy = strategy;
@@ -167,12 +184,21 @@ impl ZlibCtx {
     }
 
     /// One `ZlibContext::DoThreadPoolWork` + `GetErrorInfo`: returns `(availOut, availIn)`.
-    fn write(&mut self, flush: i32, input: &[u8], out: &mut [u8]) -> Result<(usize, usize), CodecError> {
+    fn write(
+        &mut self,
+        flush: i32,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> Result<(usize, usize), CodecError> {
         if let Some(code) = self.init_error {
             return Err(CodecError::zlib("Init error", None, code));
         }
         let Some(mut stream) = self.stream.take() else {
-            return Err(CodecError::zlib("zlib binding closed", None, Z_STREAM_ERROR));
+            return Err(CodecError::zlib(
+                "zlib binding closed",
+                None,
+                Z_STREAM_ERROR,
+            ));
         };
         let (code, consumed, produced) = self.process(&mut stream, flush, input, out);
         let avail_out = out.len() - produced;
@@ -181,7 +207,13 @@ impl ZlibCtx {
         result.map(|()| (avail_out, input.len() - consumed))
     }
 
-    fn process(&mut self, stream: &mut ZStream, flush: i32, input: &[u8], out: &mut [u8]) -> (i32, usize, usize) {
+    fn process(
+        &mut self,
+        stream: &mut ZStream,
+        flush: i32,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> (i32, usize, usize) {
         let first = stream.run(flush, input, out);
         if self.deflates() {
             return (first.code, first.consumed, first.produced);
@@ -203,7 +235,11 @@ impl ZlibCtx {
             }
         }
         // Further bytes after a gunzip member are another member, or padding if they are zeros.
-        while consumed < input.len() && self.mode == GUNZIP && code == Z_STREAM_END && input[consumed] != 0 {
+        while consumed < input.len()
+            && self.mode == GUNZIP
+            && code == Z_STREAM_END
+            && input[consumed] != 0
+        {
             stream.reset();
             let next = stream.run(flush, &input[consumed..], &mut out[produced..]);
             code = next.code;
@@ -241,17 +277,31 @@ impl ZlibCtx {
         }
     }
 
-    fn classify(&self, stream: &ZStream, code: i32, flush: i32, avail_out: usize) -> Result<(), CodecError> {
+    fn classify(
+        &self,
+        stream: &ZStream,
+        code: i32,
+        flush: i32,
+        avail_out: usize,
+    ) -> Result<(), CodecError> {
         match code {
             Z_OK | Z_BUF_ERROR => {
                 if avail_out != 0 && flush == Z_FINISH {
-                    return Err(CodecError::zlib("unexpected end of file", Some(stream), code));
+                    return Err(CodecError::zlib(
+                        "unexpected end of file",
+                        Some(stream),
+                        code,
+                    ));
                 }
                 Ok(())
             }
             Z_STREAM_END => Ok(()),
             Z_NEED_DICT => {
-                let message = if self.dictionary.is_empty() { "Missing dictionary" } else { "Bad dictionary" };
+                let message = if self.dictionary.is_empty() {
+                    "Missing dictionary"
+                } else {
+                    "Bad dictionary"
+                };
                 Err(CodecError::zlib(message, Some(stream), code))
             }
             _ => Err(CodecError::zlib("Zlib error", Some(stream), code)),
@@ -290,7 +340,12 @@ fn brotli_decoder_error_code(errno: i32) -> String {
     format!("ERR__ERROR_{name}")
 }
 
-fn brotli_encode_write(enc: &mut BrotliEncoder, op: u32, input: &[u8], out: &mut [u8]) -> Result<(usize, usize), CodecError> {
+fn brotli_encode_write(
+    enc: &mut BrotliEncoder,
+    op: u32,
+    input: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, usize), CodecError> {
     match enc.run(op, input, out) {
         Some((consumed, produced)) => Ok((out.len() - produced, input.len() - consumed)),
         None => Err(CodecError {
@@ -301,7 +356,12 @@ fn brotli_encode_write(enc: &mut BrotliEncoder, op: u32, input: &[u8], out: &mut
     }
 }
 
-fn brotli_decode_write(dec: &mut BrotliDecoder, op: u32, input: &[u8], out: &mut [u8]) -> Result<(usize, usize), CodecError> {
+fn brotli_decode_write(
+    dec: &mut BrotliDecoder,
+    op: u32,
+    input: &[u8],
+    out: &mut [u8],
+) -> Result<(usize, usize), CodecError> {
     let (status, consumed, produced) = dec.run(input, out);
     match status {
         BrotliStatus::Error(errno) => Err(CodecError {
@@ -333,12 +393,18 @@ pub(crate) fn op_handle_open(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
     let mode = arg_num(a, 0, 0.0) as u32;
     let handle = match mode {
         BROTLI_ENCODE => {
-            let pairs = a.get(1).and_then(|v| ctx.typed_array_bytes(v)).map(|b| u32_pairs(&b));
+            let pairs = a
+                .get(1)
+                .and_then(|v| ctx.typed_array_bytes(v))
+                .map(|b| u32_pairs(&b));
             Handle::BrotliEncode(BrotliEncoder::new(&pairs.unwrap_or_default()))
         }
         BROTLI_DECODE => Handle::BrotliDecode(BrotliDecoder::new()),
         DEFLATE..=UNZIP => {
-            let dictionary = a.get(5).and_then(|v| ctx.typed_array_bytes(v)).unwrap_or_default();
+            let dictionary = a
+                .get(5)
+                .and_then(|v| ctx.typed_array_bytes(v))
+                .unwrap_or_default();
             Handle::Zlib(ZlibCtx::new(
                 mode,
                 arg_num(a, 1, 15.0) as i32,
@@ -362,7 +428,11 @@ fn handle_id(a: &[Value]) -> u64 {
 }
 
 fn error_value(ctx: &mut Ctx, e: CodecError) -> Value {
-    ctx.make_array(vec![Value::from_string(e.message), Value::Num(e.errno as f64), Value::from_string(e.code)])
+    ctx.make_array(vec![
+        Value::from_string(e.message),
+        Value::Num(e.errno as f64),
+        Value::from_string(e.code),
+    ])
 }
 
 /// `(id, flush, in, inOff, inLen, out, outOff, outLen)` — one codec step over the given windows,
@@ -378,7 +448,10 @@ pub(crate) fn op_handle_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
     let Some((_, out_total, out_ptr)) = out_raw else {
         return Err(ctx.make_error("TypeError", "zlib expects Buffer/TypedArray windows"));
     };
-    if out_off.checked_add(out_len).is_none_or(|end| end > out_total) {
+    if out_off
+        .checked_add(out_len)
+        .is_none_or(|end| end > out_total)
+    {
         return Err(ctx.make_error("RangeError", "zlib output window out of range"));
     }
     let input: &[u8] = match in_raw {
@@ -394,8 +467,15 @@ pub(crate) fn op_handle_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
     };
     // SAFETY: as above; input and output are distinct buffers (the caller owns both).
     let out = unsafe { std::slice::from_raw_parts_mut(out_ptr.add(out_off), out_len) };
-    let Some(handle) = ctx.host_mut::<ZlibHandles>().and_then(|r| r.handles.get_mut(&id)) else {
-        let e = CodecError { message: "zlib binding closed".into(), errno: Z_STREAM_ERROR, code: zlib_code(Z_STREAM_ERROR) };
+    let Some(handle) = ctx
+        .host_mut::<ZlibHandles>()
+        .and_then(|r| r.handles.get_mut(&id))
+    else {
+        let e = CodecError {
+            message: "zlib binding closed".into(),
+            errno: Z_STREAM_ERROR,
+            code: zlib_code(Z_STREAM_ERROR),
+        };
         return Ok(error_value(ctx, e));
     };
     let op = flush as u32;
@@ -405,7 +485,10 @@ pub(crate) fn op_handle_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
         Handle::BrotliDecode(dec) => brotli_decode_write(dec, op, input, out),
     };
     match result {
-        Ok((avail_out, avail_in)) => Ok(ctx.make_array(vec![Value::Num(avail_out as f64), Value::Num(avail_in as f64)])),
+        Ok((avail_out, avail_in)) => Ok(ctx.make_array(vec![
+            Value::Num(avail_out as f64),
+            Value::Num(avail_in as f64),
+        ])),
         Err(e) => Ok(error_value(ctx, e)),
     }
 }
@@ -414,7 +497,10 @@ pub(crate) fn op_handle_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<V
 pub(crate) fn op_handle_params(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let id = handle_id(a);
     let (level, strategy) = (arg_num(a, 1, -1.0) as i32, arg_num(a, 2, 0.0) as i32);
-    let error = match ctx.host_mut::<ZlibHandles>().and_then(|r| r.handles.get_mut(&id)) {
+    let error = match ctx
+        .host_mut::<ZlibHandles>()
+        .and_then(|r| r.handles.get_mut(&id))
+    {
         Some(Handle::Zlib(c)) => c.params(level, strategy),
         _ => None,
     };
@@ -427,7 +513,10 @@ pub(crate) fn op_handle_params(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<
 /// `(id)` — `zlib.reset()`: a fresh stream with the same options.
 pub(crate) fn op_handle_reset(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let id = handle_id(a);
-    match ctx.host_mut::<ZlibHandles>().and_then(|r| r.handles.get_mut(&id)) {
+    match ctx
+        .host_mut::<ZlibHandles>()
+        .and_then(|r| r.handles.get_mut(&id))
+    {
         Some(Handle::Zlib(c)) => c.reset(),
         Some(Handle::BrotliEncode(enc)) => enc.reset(),
         Some(Handle::BrotliDecode(dec)) => dec.reset(),

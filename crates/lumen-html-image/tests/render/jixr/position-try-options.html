@@ -1,0 +1,19 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+#cb{position:relative;width:400px;height:280px;background:#f1f3f4}
+#a{position:absolute;left:150px;top:60px;width:100px;height:40px;anchor-name:--a;background:#174ea6}
+.t{position:absolute;position-anchor:--a;width:80px;height:80px}
+@position-try --wide{position-area:bottom span-all}
+@position-try --tall{position-area:span-all right}
+@position-try --inset{position-area:bottom right;width:40px;height:20px;margin-top:15px;align-self:start}
+#flip{position-area:top left;position-try-fallbacks:flip-block;background:#34a853}
+#stuck{position-area:top left;position-try-fallbacks:flip-inline;background:#fbbc04}
+#bare{position-area:top left;position-try-fallbacks:bottom right;background:#ea4335}
+#widest{position-area:bottom left;position-try-order:most-width;position-try-fallbacks:--wide,--tall;background:#a142f4}
+#named{position-area:top left;position-try-fallbacks:--inset;background:#00838f}
+#hidden{position-area:top left;position-visibility:no-overflow;background:#000}
+</style><div id=cb>
+<div id=a></div>
+<div class=t id=flip></div><div class=t id=stuck></div><div class=t id=bare></div>
+<div class=t id=widest></div><div class=t id=named></div><div class=t id=hidden></div>
+</div>

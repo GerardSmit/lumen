@@ -15,27 +15,29 @@
 //!   callback by [`TaskId`]).
 
 use std::any::Any;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::mpsc;
 
 pub use lumen::bytecode::Tier;
+#[cfg(feature = "compiler")]
+use lumen::embed::HostRealmEvalError;
 pub use lumen::embed::{Ctx, NativeClosure, NativeFn, OpState, ResourceId, ResourceTable, Value};
+use lumen::embed::{JsHost, RealmHandle};
 pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 
-/// Compression codecs (zlib, Brotli, Zstandard) over maintained crates, shared by web
-/// CompressionStream, node:zlib and the Bun APIs.
-pub mod codec;
+/// Compression codecs (zlib, Brotli, Zstandard), shared by web CompressionStream, node:zlib and
+/// the Bun APIs.
+pub use lumen_common::compress as codec;
 
-/// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
-/// `Date.now()`), where `std::time::Instant::now()` panics.
+pub mod encoding;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
 pub mod sysfs;
+/// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
+/// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
-
-/// The in-memory virtual file system behind `node:fs` on targets without an OS file system, and
-/// the mount table that lets a path be served by the embedder (OPFS, a remote origin).
-pub mod vfs;
+pub mod url;
 
 /// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
 /// JSPI) and the completion queue the embedder pushes settled Promises into.
@@ -58,10 +60,28 @@ macro_rules! ops {
     };
 }
 
+/// Installs a `lumen_bind` module into a realm (see [`Extension::modules`]).
+pub type ModuleInit = fn(&mut Ctx) -> Result<(), Value>;
+
+/// [`ModuleInit`]: everything `#[lumen_bind::module]` `M` declares, as globals.
+pub fn globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let g = ctx.global_object();
+    ctx.install_module::<M>(&g)
+}
+
+/// [`ModuleInit`]: `globalThis.<module name>` holding everything `M` declares.
+pub fn namespace<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    let ns = ctx.namespace_object(M::DESC.name_for("js"));
+    ctx.install_module::<M>(&ns)
+}
+
 /// A bundle of native ops + host-state init, exported one per op crate. Composing a runtime
 /// is `install(&mut engine, &[timers::extension(), fs::extension(), ...])`.
 pub struct Extension {
     pub name: &'static str,
+    /// `lumen_bind` modules to install ([`globals`] / [`namespace`]), before `globals` and
+    /// `namespaces`.
+    pub modules: &'static [ModuleInit],
     /// Installed as `globalThis.<name>` functions (e.g. `setTimeout`).
     pub globals: &'static [OpDecl],
     /// Installed as `globalThis.<ns>.<name>` namespace methods (e.g. a `__lumen_fs` ops
@@ -85,11 +105,64 @@ pub struct Extension {
     pub js_init_snapshot: Option<&'static [u8]>,
 }
 
+/// Records which extensions initialized their shared OpState during ordinary installation.
+/// Host-realm installation checks this marker and never invokes `state_init` a second time.
+#[derive(Default)]
+struct InitializedExtensionStates(HashSet<&'static str>);
+
+/// Exact static source/snapshot pairs shared by host realms in one engine. This retains Rust
+/// source text only, never JS values or realm handles.
+#[derive(Default)]
+struct SharedExtensionSources(HashMap<ExtensionSourceKey, Rc<str>>);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ExtensionSourceKey {
+    source_address: usize,
+    source_len: usize,
+    snapshot_address: Option<usize>,
+    snapshot_len: usize,
+}
+
+const MAX_SHARED_EXTENSION_SOURCES: usize = 64;
+
+fn shared_extension_source(
+    engine: &mut Engine,
+    extension: &Extension,
+    source: &'static str,
+) -> Rc<str> {
+    let (snapshot_address, snapshot_len) = extension
+        .js_init_snapshot
+        .map(|snapshot| (Some(snapshot.as_ptr() as usize), snapshot.len()))
+        .unwrap_or((None, 0));
+    let key = ExtensionSourceKey {
+        source_address: source.as_ptr() as usize,
+        source_len: source.len(),
+        snapshot_address,
+        snapshot_len,
+    };
+    let state = engine.ctx().op_state();
+    if !state.has::<SharedExtensionSources>() {
+        state.put(SharedExtensionSources::default());
+    }
+    let cache = state
+        .get_mut::<SharedExtensionSources>()
+        .expect("source cache was just installed");
+    if let Some(source) = cache.0.get(&key) {
+        return source.clone();
+    }
+    let shared = Rc::<str>::from(source);
+    if cache.0.len() < MAX_SHARED_EXTENSION_SOURCES {
+        cache.0.insert(key, shared.clone());
+    }
+    shared
+}
+
 impl Extension {
     /// An empty extension named `name`; fill in the fields that apply.
     pub const fn new(name: &'static str) -> Extension {
         Extension {
             name,
+            modules: &[],
             globals: &[],
             namespaces: &[],
             state_init: None,
@@ -109,7 +182,10 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         // build.rs).
         engine.define_global("__lumenMemMark", 1, |ctx, _this, args| {
             let label = match args.first() {
-                Some(v) => ctx.coerce_string(v).map(|s| s.to_string()).unwrap_or_default(),
+                Some(v) => ctx
+                    .coerce_string(v)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
                 None => String::new(),
             };
             lumen::memstats::phase(&format!("    glue {label}"));
@@ -121,6 +197,20 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         let t0 = timing.then(crate::time::Instant::now);
         if let Some(init) = ext.state_init {
             init(engine.ctx().op_state());
+            let state = engine.ctx().op_state();
+            if !state.has::<InitializedExtensionStates>() {
+                state.put(InitializedExtensionStates::default());
+            }
+            state
+                .get_mut::<InitializedExtensionStates>()
+                .expect("initialized extension state marker was just installed")
+                .0
+                .insert(ext.name);
+        }
+        for m in ext.modules {
+            if m(engine.ctx()).is_err() {
+                panic!("extension {}: installing a module threw", ext.name);
+            }
         }
         for op in ext.globals {
             engine.define_global(op.name, op.len, op.f);
@@ -130,14 +220,13 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                 ops.iter().map(|o| (o.name, o.len, o.f)).collect();
             engine.define_namespace(ns, &table);
         }
-        let aot = ext
-            .js_init_snapshot
-            .filter(|b| b.starts_with(b"LUMENAOT"));
+        let aot = ext.js_init_snapshot.filter(|b| b.starts_with(b"LUMENAOT"));
         if let Some(blob) = aot {
             let tier = engine.tier();
             engine.set_tier(lumen::bytecode::Tier::Interp);
-            let loaded = engine.load_precompiled(&lumen::Precompiled::from_static(blob));
+            let loaded = load_glue(engine, blob);
             let completion = match (loaded, ext.js_init) {
+                #[cfg(feature = "compiler")]
                 (Err(_), Some(src)) => engine.eval(src, false),
                 (r, _) => r,
             };
@@ -150,29 +239,37 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
                 Err(e) => panic!("extension '{}' js_init: {}", ext.name, e.message),
             }
         } else if let Some(src) = ext.js_init {
-            // The glue's setup path runs once, in the tree-walker: compiling it would parse the
-            // body of every function it defines (the capture scan needs them) for code that
-            // never runs again. Functions it defines tier up on their own calls as usual.
-            let tier = engine.tier();
-            engine.set_tier(lumen::bytecode::Tier::Interp);
-            // Prefer the precompiled snapshot (skips lex+parse); on a decode failure fall back to
-            // parsing the source, so the snapshot can never change behavior — only speed.
-            let completion = ext
-                .js_init_snapshot
-                .filter(|_| std::env::var_os("LUMEN_NO_SNAPSHOT").is_none())
-                .and_then(|bytes| engine.eval_snapshot(bytes, src, false).ok())
-                .map(Ok)
-                .unwrap_or_else(|| engine.eval(src, false));
-            engine.set_tier(tier);
-            match completion {
-                Ok(Completion::Value(_)) => {}
-                Ok(Completion::Throw { name, message }) => {
-                    panic!("extension '{}' js_init threw {name}: {message}", ext.name)
+            #[cfg(not(feature = "compiler"))]
+            panic!(
+                "extension '{}' requires native initialization glue",
+                ext.name
+            );
+            #[cfg(feature = "compiler")]
+            {
+                // The glue's setup path runs once, in the tree-walker: compiling it would parse the
+                // body of every function it defines (the capture scan needs them) for code that
+                // never runs again. Functions it defines tier up on their own calls as usual.
+                let tier = engine.tier();
+                engine.set_tier(lumen::bytecode::Tier::Interp);
+                // Prefer the precompiled snapshot (skips lex+parse); on a decode failure fall back to
+                // parsing the source, so the snapshot can never change behavior — only speed.
+                let completion = ext
+                    .js_init_snapshot
+                    .filter(|_| std::env::var_os("LUMEN_NO_SNAPSHOT").is_none())
+                    .and_then(|bytes| engine.eval_snapshot(bytes, src, false).ok())
+                    .map(Ok)
+                    .unwrap_or_else(|| engine.eval(src, false));
+                engine.set_tier(tier);
+                match completion {
+                    Ok(Completion::Value(_)) => {}
+                    Ok(Completion::Throw { name, message }) => {
+                        panic!("extension '{}' js_init threw {name}: {message}", ext.name)
+                    }
+                    Err(e) => panic!(
+                        "extension '{}' js_init: SyntaxError: {}",
+                        ext.name, e.message
+                    ),
                 }
-                Err(e) => panic!(
-                    "extension '{}' js_init: SyntaxError: {}",
-                    ext.name, e.message
-                ),
             }
         }
         if let Some(t0) = t0 {
@@ -181,6 +278,234 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
         if lumen::memstats::enabled() {
             lumen::memstats::phase(&format!("install {}", ext.name));
         }
+    }
+}
+
+/// Install already-initialized extensions into another registered realm of the same engine.
+/// Native state remains shared through OpState; only modules, globals, namespaces, and glue are
+/// installed in the target realm. In particular, this function never calls `state_init`.
+pub fn install_realm(
+    engine: &mut Engine,
+    realm: &RealmHandle,
+    extensions: &[Extension],
+) -> Result<(), String> {
+    if extensions
+        .iter()
+        .any(|extension| extension.state_init.is_some())
+    {
+        let state = engine.ctx().op_state();
+        let initialized = state
+            .get::<InitializedExtensionStates>()
+            .ok_or_else(|| "base extension state has not been initialized".to_string())?;
+        for extension in extensions {
+            if extension.state_init.is_some() && !initialized.0.contains(extension.name) {
+                return Err(format!(
+                    "extension '{}' has not initialized shared host state",
+                    extension.name
+                ));
+            }
+        }
+    }
+
+    for extension in extensions {
+        let installed = engine
+            .ctx()
+            .with_host_realm(realm, |ctx| {
+                for module in extension.modules {
+                    module(ctx).map_err(|_| {
+                        format!("extension '{}' module installation threw", extension.name)
+                    })?;
+                }
+
+                let Value::Obj(global) = ctx.global_object() else {
+                    return Err("host realm global is not an object".to_string());
+                };
+                for op in extension.globals {
+                    ctx.def_method(&global, op.name, op.len, op.f);
+                }
+                for (name, ops) in extension.namespaces {
+                    let Value::Obj(namespace) = ctx.namespace_object(name) else {
+                        return Err(format!(
+                            "extension '{}' namespace '{}' is not an object",
+                            extension.name, name
+                        ));
+                    };
+                    for op in *ops {
+                        ctx.def_method(&namespace, op.name, op.len, op.f);
+                    }
+                }
+                Ok(())
+            })
+            .map_err(|error| error.to_string())?;
+        installed?;
+
+        install_realm_glue(engine, realm, extension)?;
+    }
+    Ok(())
+}
+
+fn install_realm_glue(
+    engine: &mut Engine,
+    realm: &RealmHandle,
+    extension: &Extension,
+) -> Result<(), String> {
+    let snapshot = extension.js_init_snapshot;
+    let shared_source = extension
+        .js_init
+        .map(|source| shared_extension_source(engine, extension, source));
+    let native_version = lumen_common::aot::NATIVE_FORMAT_VERSION.to_le_bytes();
+    let native = snapshot.filter(|bytes| bytes.get(8..12) == Some(native_version.as_slice()));
+
+    if let Some(blob) = native {
+        #[cfg(feature = "aot-native")]
+        {
+            let tier = engine.tier();
+            engine.set_tier(lumen::bytecode::Tier::Interp);
+            let loaded = engine.load_native_glue_value_in_host_realm(realm, blob);
+            engine.set_tier(tier);
+            match loaded.map_err(|error| error.to_string())? {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    return Err(format!(
+                        "extension '{}' native glue failed: {error}",
+                        extension.name
+                    ));
+                }
+            }
+        }
+        #[cfg(not(feature = "aot-native"))]
+        {
+            #[cfg(feature = "compiler")]
+            if let Some(source) = shared_source.as_deref() {
+                return run_realm_source(engine, realm, extension.name, source);
+            }
+            return Err(format!(
+                "extension '{}' native glue is unavailable",
+                extension.name
+            ));
+        }
+    }
+
+    let Some(source) = shared_source.as_deref() else {
+        if snapshot.is_some() {
+            return Err(format!(
+                "extension '{}' has portable snapshot glue but no source for host-realm decoding",
+                extension.name
+            ));
+        }
+        return Ok(());
+    };
+
+    #[cfg(feature = "compiler")]
+    {
+        if std::env::var_os("LUMEN_NO_SNAPSHOT").is_none() {
+            if let Some(snapshot) = snapshot.filter(|bytes| bytes.starts_with(b"LUMENAOT")) {
+                let tier = engine.tier();
+                engine.set_tier(lumen::bytecode::Tier::Interp);
+                let result = engine.eval_snapshot_shared_source_in_host_realm(
+                    realm,
+                    snapshot,
+                    shared_source
+                        .as_ref()
+                        .expect("shared source was checked above")
+                        .clone(),
+                    false,
+                );
+                engine.set_tier(tier);
+                match result {
+                    Ok(Ok(_)) => return Ok(()),
+                    Ok(Err(thrown)) => {
+                        return Err(describe_realm_throw(engine, extension.name, thrown));
+                    }
+                    Err(HostRealmEvalError::Scope(error)) => return Err(error.to_string()),
+                    // A stale/corrupt snapshot follows the existing extension contract and
+                    // falls back to the source used to build it.
+                    Err(HostRealmEvalError::Parse(_)) => {}
+                }
+            }
+        }
+        run_realm_source(engine, realm, extension.name, source)
+    }
+    #[cfg(not(feature = "compiler"))]
+    {
+        let _ = (engine, realm, source);
+        Err(format!(
+            "extension '{}' requires native initialization glue",
+            extension.name
+        ))
+    }
+}
+
+#[cfg(feature = "compiler")]
+fn run_realm_source(
+    engine: &mut Engine,
+    realm: &RealmHandle,
+    extension: &str,
+    source: &str,
+) -> Result<(), String> {
+    let tier = engine.tier();
+    engine.set_tier(lumen::bytecode::Tier::Interp);
+    let result = engine.eval_value_in_host_realm(realm, source, false);
+    engine.set_tier(tier);
+    match result {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(thrown)) => Err(describe_realm_throw(engine, extension, thrown)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(feature = "compiler"))]
+fn run_realm_source(
+    _engine: &mut Engine,
+    _realm: &RealmHandle,
+    extension: &str,
+    _source: &str,
+) -> Result<(), String> {
+    Err(format!(
+        "extension '{}' requires native initialization glue",
+        extension
+    ))
+}
+
+fn describe_realm_throw(engine: &mut Engine, extension: &str, thrown: Value) -> String {
+    match engine.describe_throw(thrown) {
+        Completion::Value(_) => format!("extension '{extension}' js_init failed"),
+        Completion::Throw { name, message } => {
+            format!("extension '{extension}' js_init threw {name}: {message}")
+        }
+    }
+}
+
+/// Load build-produced extension glue in its recorded execution format.
+pub fn load_glue(engine: &mut Engine, blob: &'static [u8]) -> Result<Completion, ParseError> {
+    if blob.get(8..12) == Some(&lumen_common::aot::NATIVE_FORMAT_VERSION.to_le_bytes()[..]) {
+        #[cfg(feature = "aot-native")]
+        return engine
+            .load_native_glue_value(blob)
+            .map(|_| Completion::Value(String::new()))
+            .map_err(|message| ParseError {
+                message,
+                line: 1,
+                at_eof: false,
+            });
+        #[cfg(not(feature = "aot-native"))]
+        return Err(ParseError {
+            message: "native extension glue is unavailable in this runtime".into(),
+            line: 1,
+            at_eof: false,
+        });
+    }
+    #[cfg(feature = "compiler")]
+    {
+        engine.load_precompiled(&lumen::Precompiled::from_static(blob))
+    }
+    #[cfg(not(feature = "compiler"))]
+    {
+        Err(ParseError {
+            message: "Aot initialization requires native glue".into(),
+            line: 1,
+            at_eof: false,
+        })
     }
 }
 
@@ -663,6 +988,16 @@ pub struct ChildRealmRequest {
     /// Kept alive for as long as the realm runs and dropped after it ends (the realm's end of an
     /// IPC channel, say).
     pub resources: Vec<Box<dyn Send>>,
+    /// Optional packet transport supplied by an embedder without OS descriptors.
+    pub ipc: Option<std::sync::Arc<dyn RealmIpc>>,
+}
+
+/// An embedder's bounded, duplex child-realm packet channel.
+pub trait RealmIpc: Send + Sync {
+    fn send(&self, bytes: Vec<u8>) -> std::io::Result<()>;
+    fn receive(&self) -> std::io::Result<Option<Vec<u8>>>;
+    fn disconnect(&self);
+    fn connected(&self) -> bool;
 }
 
 /// How a child realm ended.
@@ -693,7 +1028,8 @@ pub trait ChildRealm: Send + Sync {
 /// stops and joins its children.
 pub trait RealmLauncher: Send + Sync {
     /// Fails with `WouldBlock` when the realm tree already runs as many realms as it may.
-    fn launch(&self, request: ChildRealmRequest) -> std::io::Result<std::sync::Arc<dyn ChildRealm>>;
+    fn launch(&self, request: ChildRealmRequest)
+        -> std::io::Result<std::sync::Arc<dyn ChildRealm>>;
     /// Deliver `signal` to the live child realm with stand-in pid `pid`; `false` when there is
     /// none.
     fn signal_pid(&self, pid: u32, signal: i32) -> bool;
@@ -735,20 +1071,7 @@ pub fn read_stdin_fd(ctx: &mut Ctx, buf: &mut [u8]) -> std::io::Result<usize> {
 /// nobody writes to cannot be cancelled, so it is only entered once it will not block.
 #[cfg(unix)]
 fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
-    #[cfg(target_vendor = "apple")]
-    type NFds = std::ffi::c_uint;
-    #[cfg(not(target_vendor = "apple"))]
-    type NFds = std::ffi::c_ulong;
-    extern "C" {
-        fn poll(fds: *mut PollFd, nfds: NFds, timeout: i32) -> i32;
-    }
-    const POLLIN: i16 = 1;
+    use lumen_os::poll::{poll, PollFd, POLLIN};
     if ctx.interrupt_for_host().is_none() {
         return Ok(());
     }
@@ -759,15 +1082,8 @@ fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
                 "realm terminated",
             ));
         }
-        let mut fd = PollFd {
-            fd: 0,
-            events: POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd; a negative result (EINTR, EBADF) falls through to the read,
-        // which reports it.
-        let ready = unsafe { poll(&mut fd, 1, 20) };
-        if ready != 0 {
+        // An error (EINTR, EBADF) falls through to the read, which reports it.
+        if poll(&mut [PollFd::new(0, POLLIN)], 20) != Ok(0) {
             return Ok(());
         }
     }
@@ -777,7 +1093,11 @@ fn wait_stdin_readable(ctx: &mut Ctx) -> std::io::Result<()> {
 pub fn write_std_fd(ctx: &mut Ctx, fd: u32, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let realm = ctx.op_state().get::<RealmProcess>().map(|realm| {
-        std::sync::Arc::clone(if fd == 2 { &realm.stderr } else { &realm.stdout })
+        std::sync::Arc::clone(if fd == 2 {
+            &realm.stderr
+        } else {
+            &realm.stdout
+        })
     });
     match realm {
         Some(writer) => {
@@ -810,7 +1130,9 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::p
 
 #[cfg(target_arch = "wasm32")]
 pub fn canonicalize(path: impl AsRef<std::path::Path>) -> std::io::Result<std::path::PathBuf> {
-    vfs::realpath(&path.as_ref().to_string_lossy())
+    use lumen_os::vfs::FileSystem;
+    lumen_os::vfs::mem()
+        .realpath(&path.as_ref().to_string_lossy())
         .map(std::path::PathBuf::from)
         .map_err(std::io::Error::from)
 }
@@ -871,38 +1193,4 @@ fn std_handles_not_inheritable() {
             }
         }
     });
-}
-
-/// Fill `buf` from the operating system's CSPRNG: `ProcessPrng` on Windows (what std itself
-/// uses), `/dev/urandom` elsewhere.
-pub fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        getrandom::getrandom(buf).map_err(|e| std::io::Error::other(e.to_string()))
-    }
-    #[cfg(all(windows, not(target_arch = "wasm32")))]
-    {
-        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
-        extern "system" {
-            fn ProcessPrng(data: *mut u8, len: usize) -> i32;
-        }
-        // Documented to always succeed (it returns TRUE); checked anyway.
-        if unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) } == 0 {
-            return Err(std::io::Error::other("ProcessPrng failed"));
-        }
-        Ok(())
-    }
-    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
-    {
-        use std::io::Read;
-        static URANDOM: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
-        let file = match URANDOM.get() {
-            Some(file) => file,
-            None => {
-                let opened = std::fs::File::open("/dev/urandom")?;
-                URANDOM.get_or_init(|| opened)
-            }
-        };
-        (&*file).read_exact(buf)
-    }
 }

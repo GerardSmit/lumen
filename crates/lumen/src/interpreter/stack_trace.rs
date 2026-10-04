@@ -111,14 +111,14 @@ pub(crate) struct LineTable {
     /// An ahead-of-time blob's encoded table ([`LineTable::lazy`]), decoded into `decoded` on
     /// the first lookup: a large bundle's table is sizeable and most runs
     /// never format a stack position in it.
-    encoded: Option<&'static [u8]>,
+    encoded: Option<lumen_common::bytes::Bytes>,
     decoded: std::cell::OnceCell<Option<Box<LineTable>>>,
 }
 
 impl LineTable {
     /// A table decoded from `b` ([`LineTable::encode`]'s form) on its first lookup; a malformed
     /// `b` then yields no positions.
-    pub(crate) fn lazy(b: &'static [u8]) -> LineTable {
+    pub(crate) fn lazy(b: lumen_common::bytes::Bytes) -> LineTable {
         LineTable {
             starts: Vec::new(),
             wide: Vec::new(),
@@ -174,7 +174,7 @@ impl LineTable {
 
     /// 1-based line and 0-based UTF-16 column of byte offset `p`.
     pub(crate) fn line_col(&self, p: u32) -> Option<(u32, u32)> {
-        if let Some(b) = self.encoded {
+        if let Some(b) = &self.encoded {
             return self
                 .decoded
                 .get_or_init(|| {
@@ -368,7 +368,11 @@ impl Sources {
         };
         let lc = match (lc, e.offsets) {
             (Some((l, c)), (lo, co)) if (lo, co) != (0, 0) => {
-                let c = if l == 1 { (c as i64 + co as i64).max(1) } else { c as i64 };
+                let c = if l == 1 {
+                    (c as i64 + co as i64).max(1)
+                } else {
+                    c as i64
+                };
                 Some(((l as i64 + lo as i64).max(1) as u32, c as u32))
             }
             (lc, _) => lc,
@@ -739,16 +743,27 @@ impl Interp {
         filename: &str,
         ts: bool,
     ) -> Result<Value, Value> {
-        let f = crate::parser::parse_cjs_function(src, params, ts).map_err(|e| {
-            if ts {
-                match self.throw_ts_syntax(e, filename, src) {
-                    crate::interpreter::Abrupt::Throw(v) => v,
-                    _ => Value::Undefined,
-                }
-            } else {
-                self.make_error("SyntaxError", e.message)
+        let jsx_ts = crate::parser::jsx_path(filename);
+        let ts = jsx_ts.unwrap_or(ts);
+        let mut options = self.jsx_options.clone();
+        if jsx_ts.is_some() {
+            if let Some(loader) = self.jsx_options_loader.clone() {
+                options = loader(filename, &options)
+                    .map_err(|message| self.make_error("SyntaxError", message))?;
             }
-        })?;
+        }
+        options.filename = filename.to_string();
+        let f = crate::parser::parse_cjs_function_jsx(src, params, ts, jsx_ts.map(|_| &options))
+            .map_err(|e| {
+                if ts {
+                    match self.throw_ts_syntax(e, filename, src) {
+                        crate::interpreter::Abrupt::Throw(v) => v,
+                        _ => Value::Undefined,
+                    }
+                } else {
+                    self.make_error("SyntaxError", e.message)
+                }
+            })?;
         let f = Rc::new(f);
         let env = self.global_env.clone();
         let func = self.make_function(f.clone(), env);
@@ -817,7 +832,7 @@ impl Interp {
 
     /// Pop the frame pushed at `depth` for `fn_ptr` (left alone if something unbalanced the
     /// stack meanwhile) and put its caller's site back.
-    fn pop_pushed_frame(&mut self, depth: usize, fn_ptr: usize) {
+    pub(crate) fn pop_pushed_frame(&mut self, depth: usize, fn_ptr: usize) {
         if self
             .fn_frames
             .get(depth)
@@ -842,6 +857,11 @@ impl Interp {
                 let g = f.upgrade()?;
                 let strict = match &g.borrow().call {
                     Callable::User(u) => u.func.is_strict,
+                    #[cfg(feature = "aot-native")]
+                    Callable::Aot(native) => {
+                        native.program.metadata.functions[native.function_index as usize].flags & 2
+                            != 0
+                    }
                     _ => return None,
                 };
                 crate::bytecode::jit::sync_frames(self);
@@ -1186,7 +1206,9 @@ impl Interp {
         };
         let items = self.dense_array_values(arr).unwrap_or_default();
         items
-            .as_chunks::<SLOTS>().0.iter()
+            .as_chunks::<SLOTS>()
+            .0
+            .iter()
             .map(|f| {
                 let flags = num(&f[3]) as u32;
                 if flags & F_PSEUDO != 0 {

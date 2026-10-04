@@ -10,9 +10,14 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-lumen = { path = "../lumen", default-features = false }
+lumen = { path = "../lumen", default-features = false, features = ["compiler"] }
+lumen-common = { path = "../lumen-common" }
 # `.ts`/`.mts`/`.cts` sources are type-stripped (offsets kept) before compiling.
 lumen-aot-macros = { path = "macros" }
+lumen-codegen = { path = "../lumen-codegen", optional = true }
+
+[features]
+native = ["lumen/jit", "lumen/aot-native", "lumen-common/native-sidecar", "dep:lumen-codegen", "lumen-codegen/standalone-object"]
 
 [dev-dependencies]
 # examples/aot_node.rs runs a node_modules bundle on the Node runtime.

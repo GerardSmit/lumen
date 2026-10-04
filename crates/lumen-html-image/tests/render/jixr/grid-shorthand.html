@@ -1,0 +1,19 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+.a{display:grid;grid:30px 50px / 100px 200px;gap:8px;width:400px;background:#e8eef8}
+.a>div:nth-child(1){background:#174ea6}
+.a>div:nth-child(2){background:#fbbc04}
+.a>div:nth-child(3){background:#34a853}
+.b{display:grid;grid:auto-flow dense 40px / 100px 120px 60px;gap:6px;width:400px;background:#fce8e6;margin-top:10px}
+.b>div{background:#a142f4}
+.c{display:grid;grid:100px 60px / auto-flow 70px;gap:6px;width:400px;background:#e6f4ea;margin-top:10px}
+.c>div{background:#0b8043}
+.d{display:grid;grid-template:[top] "x y" 30px [mid] "z z" 40px [bot] / 90px 1fr;gap:5px;width:400px;background:#fef7e0;margin-top:10px}
+.d>div:nth-child(1){grid-area:x;background:#d93025}
+.d>div:nth-child(2){grid-area:y;background:#1a73e8}
+.d>div:nth-child(3){grid-area:z;background:#5f6368}
+</style>
+<div class=a><div></div><div></div><div></div></div>
+<div class=b><div></div><div></div><div></div><div></div><div></div></div>
+<div class=c><div></div><div></div><div></div><div></div></div>
+<div class=d><div></div><div></div><div></div></div>

@@ -14,33 +14,37 @@ fn thread_name() -> String {
     format!("{:?}", std::thread::current().id())
 }
 
-/// Sleeps on whatever thread runs it and returns that thread's id.
-#[lumen::op(async, name = "slowThreadId")]
-fn slow_thread_id(ms: u32) -> String {
-    std::thread::sleep(Duration::from_millis(ms as u64));
-    thread_name()
-}
+#[lumen_bind::module(name = "t")]
+mod t {
+    use super::*;
 
-#[lumen::op(async, name = "failAsync")]
-fn fail_async(code: String) -> Result<u32, SendError> {
-    Err(SendError::new("RangeError", "no luck").with_code(code))
-}
+    /// Sleeps on whatever thread runs it and returns that thread's id.
+    #[op(async, name = "slowThreadId")]
+    fn slow_thread_id(ms: u32) -> String {
+        std::thread::sleep(Duration::from_millis(ms as u64));
+        thread_name()
+    }
 
-#[lumen::op(name = "loopThreadId")]
-fn loop_thread_id() -> String {
-    thread_name()
-}
+    #[op(async, name = "failAsync")]
+    fn fail_async(code: String) -> Result<u32, SendError> {
+        Err(SendError::new("RangeError", "no luck").with_code(code))
+    }
 
-#[lumen::op]
-fn report(line: String) {
-    REPORT.lock().unwrap().push(line);
+    #[op(name = "loopThreadId")]
+    fn loop_thread_id() -> String {
+        thread_name()
+    }
+
+    #[op]
+    fn report(line: String) {
+        REPORT.lock().unwrap().push(line);
+    }
 }
 
 #[test]
 fn async_ops_run_off_the_loop_thread() {
     let mut rt = Runtime::new();
-    rt.engine()
-        .define_ops("t", lumen::ops![slow_thread_id, fail_async, loop_thread_id, report]);
+    assert!(rt.engine().define_module::<t::Module>().is_ok());
     let started = Instant::now();
     rt.eval(
         r#"
@@ -63,7 +67,10 @@ fn async_ops_run_off_the_loop_thread() {
     let report = REPORT.lock().unwrap().clone();
     assert!(report.contains(&"off-loop true".to_string()), "{report:?}");
     assert!(report.contains(&"ticks true".to_string()), "{report:?}");
-    assert!(report.contains(&"rejected true E_NOPE no luck".to_string()), "{report:?}");
+    assert!(
+        report.contains(&"rejected true E_NOPE no luck".to_string()),
+        "{report:?}"
+    );
     // Three 200 ms bodies on a 4-thread pool overlap.
     assert!(elapsed < Duration::from_millis(550), "took {elapsed:?}");
 }

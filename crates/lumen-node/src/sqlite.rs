@@ -16,9 +16,9 @@
 //! first), and text/blob bindings must outlive the `bind` call — we pass `SQLITE_TRANSIENT`, so
 //! SQLite copies the bytes before `bind_*` returns and our Rust buffer can drop immediately.
 
+use std::cell::{Cell as ActiveCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::{Cell as ActiveCell, RefCell};
 mod functions;
 mod library;
 use library::Library;
@@ -261,7 +261,7 @@ impl Api {
 struct Db {
     active: Rc<ActiveCell<usize>>,
     pending: Rc<RefCell<Option<Value>>>,
-    functions: std::collections::HashSet<(String,i32)>,
+    functions: std::collections::HashSet<(String, i32)>,
     ptr: *mut c_void,
 }
 
@@ -285,9 +285,13 @@ struct SqliteState {
 
 impl Drop for SqliteState {
     fn drop(&mut self) {
-        if let Some(api)=self.api.as_ref() {
-            for (_,statement) in self.stmts.drain() {unsafe {(api.finalize)(statement.ptr)};}
-            for (_,database) in self.dbs.drain() {unsafe {(api.close_v2)(database.ptr)};}
+        if let Some(api) = self.api.as_ref() {
+            for (_, statement) in self.stmts.drain() {
+                unsafe { (api.finalize)(statement.ptr) };
+            }
+            for (_, database) in self.dbs.drain() {
+                unsafe { (api.close_v2)(database.ptr) };
+            }
         }
     }
 }
@@ -421,7 +425,7 @@ fn db_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, Value> {
 
 fn stmt_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, Value> {
     match state(ctx).stmts.get(&id) {
-        Some(s) if s.active.get()==0 => Ok(s.ptr),
+        Some(s) if s.active.get() == 0 => Ok(s.ptr),
         Some(_) => Err(functions::busy_error(ctx)),
         // Bun's exact message for a use-after-finalize.
         None => Err(ctx.make_error("Error", "Statement has finalized")),
@@ -471,7 +475,15 @@ fn op_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 
     let st = state(ctx);
     let id = st.next_id();
-    st.dbs.insert(id, Db { ptr: db, active: Rc::new(ActiveCell::new(0)), pending:Rc::new(RefCell::new(None)), functions:Default::default() });
+    st.dbs.insert(
+        id,
+        Db {
+            ptr: db,
+            active: Rc::new(ActiveCell::new(0)),
+            pending: Rc::new(RefCell::new(None)),
+            functions: Default::default(),
+        },
+    );
     Ok(Value::Num(id as f64))
 }
 
@@ -479,7 +491,13 @@ fn op_open(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 /// then closes the connection.
 fn op_close(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let id = arg_u32(args, 0);
-    if state(ctx).dbs.get(&id).is_some_and(|db|db.active.get()!=0) {return Err(functions::busy_error(ctx));}
+    if state(ctx)
+        .dbs
+        .get(&id)
+        .is_some_and(|db| db.active.get() != 0)
+    {
+        return Err(functions::busy_error(ctx));
+    }
     let st = state(ctx);
     if st.api.is_none() {
         return Ok(Value::Undefined);
@@ -548,7 +566,13 @@ fn op_prepare(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
 
 fn op_finalize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u32(args, 0);
-    if state(ctx).stmts.get(&sid).is_some_and(|s|s.active.get()!=0) {return Err(functions::busy_error(ctx));}
+    if state(ctx)
+        .stmts
+        .get(&sid)
+        .is_some_and(|s| s.active.get() != 0)
+    {
+        return Err(functions::busy_error(ctx));
+    }
     let st = state(ctx);
     if let Some(s) = st.stmts.remove(&sid) {
         if let Some(api) = st.api.as_ref() {
@@ -675,16 +699,19 @@ fn op_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
 fn op_step(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u32(args, 0);
     let stmt = stmt_ptr(ctx, sid)?;
-    let db_id=state(ctx).stmts.get(&sid).unwrap().db_id;
-    let pending=state(ctx).dbs.get(&db_id).unwrap().pending.clone();
+    let db_id = state(ctx).stmts.get(&sid).unwrap().db_id;
+    let pending = state(ctx).dbs.get(&db_id).unwrap().pending.clone();
     let rc = {
-        let _db_guard=functions::Active::new(state(ctx).dbs.get(&db_id).unwrap().active.clone());
-        let _statement_guard=functions::Active::new(state(ctx).stmts.get(&sid).unwrap().active.clone());
+        let _db_guard = functions::Active::new(state(ctx).dbs.get(&db_id).unwrap().active.clone());
+        let _statement_guard =
+            functions::Active::new(state(ctx).stmts.get(&sid).unwrap().active.clone());
         let api = state(ctx).api.as_ref().unwrap().clone();
-        let _library=functions::Enter::new(&api, ctx);
+        let _library = functions::Enter::new(&api, ctx);
         unsafe { (api.step)(stmt) }
     };
-    if let Some(error)=pending.borrow_mut().take() {return Err(error);}
+    if let Some(error) = pending.borrow_mut().take() {
+        return Err(error);
+    }
     match rc {
         SQLITE_ROW => Ok(Value::Num(1.0)),
         SQLITE_DONE => Ok(Value::Num(0.0)),
@@ -895,11 +922,11 @@ fn op_exec(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let c_sql = std::ffi::CString::new(sql)
         .map_err(|_| ctx.make_error("Error", "SQL contains a NUL byte"))?;
 
-    let pending=state(ctx).dbs.get(&id).unwrap().pending.clone();
+    let pending = state(ctx).dbs.get(&id).unwrap().pending.clone();
     let (rc, errmsg, before) = {
-        let _db_guard=functions::Active::new(state(ctx).dbs.get(&id).unwrap().active.clone());
+        let _db_guard = functions::Active::new(state(ctx).dbs.get(&id).unwrap().active.clone());
         let api = state(ctx).api.as_ref().unwrap().clone();
-        let _library=functions::Enter::new(&api, ctx);
+        let _library = functions::Enter::new(&api, ctx);
         let before = unsafe { (api.total_changes)(db) };
         let mut errmsg: *mut c_char = std::ptr::null_mut();
         // SAFETY: `db` is live; `c_sql` is NUL-terminated; no callback. `errmsg`, if set, is
@@ -915,8 +942,10 @@ fn op_exec(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         };
         (rc, errmsg, before)
     };
-    if let Some(error)=pending.borrow_mut().take() {
-        if !errmsg.is_null() {unsafe {(state(ctx).api.as_ref().unwrap().free)(errmsg.cast())};}
+    if let Some(error) = pending.borrow_mut().take() {
+        if !errmsg.is_null() {
+            unsafe { (state(ctx).api.as_ref().unwrap().free)(errmsg.cast()) };
+        }
         return Err(error);
     }
     if rc != SQLITE_OK {
@@ -1290,7 +1319,15 @@ fn op_deserialize(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
 
     let st = state(ctx);
     let id = st.next_id();
-    st.dbs.insert(id, Db { ptr: db, active: Rc::new(ActiveCell::new(0)), pending:Rc::new(RefCell::new(None)), functions:Default::default() });
+    st.dbs.insert(
+        id,
+        Db {
+            ptr: db,
+            active: Rc::new(ActiveCell::new(0)),
+            pending: Rc::new(RefCell::new(None)),
+            functions: Default::default(),
+        },
+    );
     Ok(Value::Num(id as f64))
 }
 

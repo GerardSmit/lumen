@@ -1,0 +1,12 @@
+<!doctype html>
+<!-- jixr-compare: threshold=96 max-diff-ratio=0
+     The Window and ImageSharp backends match Chromium exactly. Poppler rasterizes the final
+     partial period's axial shading with its own edge coverage, so the PDF differs by up to 77
+     color levels on the last band's boundary pixels; the threshold records that boundary. -->
+<style>
+html,body{margin:0;background:#fff}
+.a{width:200px;height:50px;background-image:repeating-linear-gradient(to right, #ff0000 0px, #0000ff 30px);margin:8px}
+.b{width:200px;height:50px;background-image:repeating-linear-gradient(to bottom, #ff8800, #0088ff 10px, #ff00ff 25px);margin:8px}
+.c{width:200px;height:50px;background-image:repeating-linear-gradient(to right, #ff0000, #00ff00 20px, #0000ff 40px);margin:8px}
+</style>
+<div class=a></div><div class=b></div><div class=c></div>

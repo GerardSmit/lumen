@@ -152,12 +152,15 @@ impl ChildRealms {
     /// Ask every child still running to end with `SIGTERM`, stop the ones that have not after a
     /// short grace, and wait for all of them.
     pub(crate) fn shutdown(&self) {
-        let children = std::mem::take(&mut *self.children.lock().unwrap_or_else(PoisonError::into_inner));
+        let children =
+            std::mem::take(&mut *self.children.lock().unwrap_or_else(PoisonError::into_inner));
         for (child, _) in children.values() {
             child.signal(SIGTERM);
         }
         let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while children.values().any(|(child, _)| child.exit().is_none()) && Instant::now() < deadline {
+        while children.values().any(|(child, _)| child.exit().is_none())
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
         for (child, _) in children.values() {
@@ -181,15 +184,22 @@ impl RealmLauncher for ChildRealms {
             interrupt,
             owned_fds,
             resources,
+            ipc: _,
         } = request;
         let script = argv
             .get(1)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no script to run"))?;
         let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
-        let live = children.values().filter(|(child, _)| child.exit().is_none()).count();
+        let live = children
+            .values()
+            .filter(|(child, _)| child.exit().is_none())
+            .count();
         let too_many = || {
-            io::Error::new(io::ErrorKind::WouldBlock, "too many child realms are running")
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many child realms are running",
+            )
         };
         if live >= MAX_CHILDREN_PER_REALM {
             return Err(too_many());
@@ -233,8 +243,10 @@ impl RealmLauncher for ChildRealms {
                 if let Some(workers) = runtime.engine().ctx().host_mut::<crate::WorkerEmbedding>() {
                     workers.owned_fds = owned_fds;
                 }
-                *state.handlers.lock().unwrap_or_else(PoisonError::into_inner) =
-                    runtime.signal_handlers();
+                *state
+                    .handlers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = runtime.signal_handlers();
                 *state
                     .terminator
                     .lock()

@@ -101,6 +101,12 @@ pub enum StmtKind {
     },
     Global(Vec<Ident>),
     Nonlocal(Vec<Ident>),
+    /// `type X[T] = value`; `name` is always a `Name` in store context.
+    TypeAlias {
+        name: Expr,
+        type_params: Vec<TypeParam>,
+        value: Expr,
+    },
     Expr(Expr),
     Pass,
     Break,
@@ -115,6 +121,7 @@ pub struct FunctionDef {
     pub decorators: Vec<Expr>,
     pub returns: Option<Expr>,
     pub is_async: bool,
+    pub type_params: Vec<TypeParam>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -124,6 +131,34 @@ pub struct ClassDef {
     pub keywords: Vec<Keyword>,
     pub body: Vec<Stmt>,
     pub decorators: Vec<Expr>,
+    pub type_params: Vec<TypeParam>,
+}
+
+/// A PEP 695 type parameter (Python 3.12 shape: no defaults).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeParam {
+    pub pos: Pos,
+    pub kind: TypeParamKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypeParamKind {
+    /// `T` or `T: bound`; a tuple bound `T: (A, B)` means constraints.
+    TypeVar { name: Ident, bound: Option<Expr> },
+    /// `**P`
+    ParamSpec { name: Ident },
+    /// `*Ts`
+    TypeVarTuple { name: Ident },
+}
+
+impl TypeParam {
+    pub fn name(&self) -> &Ident {
+        match &self.kind {
+            TypeParamKind::TypeVar { name, .. }
+            | TypeParamKind::ParamSpec { name }
+            | TypeParamKind::TypeVarTuple { name } => name,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

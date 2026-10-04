@@ -1,5 +1,5 @@
-"""Generate crates/lumen/src/tznames.rs: the en-US display names of every zone in tzdata.rs
-(rows in `ZONES` order).
+"""Generate crates/lumen/src/tznames.rs: the en-US display names of every zone in
+crates/lumen-common/src/tzdata.rs (rows in `ZONES` order).
 
 Asks a Node.js built with full ICU (`node` on PATH) for each zone's long/short specific names
 (standard and daylight) and long/short generic names. Names ICU renders as a localized GMT
@@ -19,6 +19,7 @@ from cldr_pack import emit  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(ROOT, "crates", "lumen", "src")
+TZDATA = os.path.join(ROOT, "crates", "lumen-common", "src", "tzdata.rs")
 
 NODE_SCRIPT = r"""
 const zones = JSON.parse(require('fs').readFileSync(0, 'utf8'));
@@ -69,7 +70,7 @@ GMT = re.compile(r"^GMT([+-]\d{1,2}(:\d\d)?)?$")
 
 
 def main():
-    text = open(os.path.join(SRC, "tzdata.rs"), encoding="utf-8").read()
+    text = open(TZDATA, encoding="utf-8").read()
     links = re.findall(r'^    \("([^"]+)", "([^"]+)"\),$', text, re.M)
     zones = [[z] + [a for a, c in links if c == z]
              for z in re.findall(r'Zone \{ name: "([^"]+)"', text)]

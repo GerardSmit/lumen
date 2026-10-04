@@ -11,7 +11,10 @@ pub use openssl::TlsStream;
 #[cfg(all(unix, not(target_os = "android")))]
 pub mod engine;
 
-#[cfg(any(not(unix), target_os = "android"))]
 mod rustls;
+pub use rustls::{
+    client_config_with_roots, install_runtime_crypto, ClientSession, PlaintextRead,
+    RuntimeRandomFill, RuntimeUnixTimeSource,
+};
 #[cfg(any(not(unix), target_os = "android"))]
-pub use self::rustls::TlsStream;
+pub use rustls::TlsStream;

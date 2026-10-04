@@ -558,7 +558,8 @@ thread_local! {
 fn is_native(v: &Value, f: NativeFn) -> bool {
     match v {
         Value::Obj(o) => matches!(
-            o.try_borrow().map(|b| matches!(b.call, Callable::Native(g) if g as usize == f as usize)),
+            o.try_borrow()
+                .map(|b| matches!(b.call, Callable::Native(g) if g as usize == f as usize)),
             Ok(true)
         ),
         _ => false,
@@ -578,7 +579,8 @@ fn pristine_regexp(i: &Interp, this: &Value) -> Option<Rc<crate::regex::Regex>> 
     let re = i.regexps.get(&(Gc::as_ptr(o) as usize))?;
     let proto = i.extra_protos.get("RegExp")?;
     let b = o.try_borrow().ok()?;
-    if !matches!(b.exotic, Exotic::None) || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, proto)) {
+    if !matches!(b.exotic, Exotic::None) || !b.proto.as_ref().is_some_and(|p| Gc::ptr_eq(p, proto))
+    {
         return None;
     }
     let pb = proto.try_borrow().ok()?;
@@ -593,8 +595,7 @@ fn pristine_regexp(i: &Interp, this: &Value) -> Option<Rc<crate::regex::Regex>> 
             let holds = if k == 1 {
                 !p.accessor() && is_native(&p.value(), pristine_intrinsic(k))
             } else {
-                p.accessor()
-                    && matches!(p.getter(), Some(g) if is_native(g, pristine_intrinsic(k)))
+                p.accessor() && matches!(p.getter(), Some(g) if is_native(g, pristine_intrinsic(k)))
             };
             if !holds {
                 return false;
@@ -1219,7 +1220,8 @@ fn re_replace_direct(
     let mut out = String::with_capacity(s.len());
     let mut next = 0usize;
     let mut cbargs: Vec<Value> = Vec::new();
-    let mut f = functional.then(|| crate::bytecode::PreparedCall::new(i, repl.clone(), Value::Undefined));
+    let mut f =
+        functional.then(|| crate::bytecode::PreparedCall::new(i, repl.clone(), Value::Undefined));
     for caps in &all {
         let (a, b) = caps[0].expect("whole match");
         if plain_template {
@@ -1377,15 +1379,16 @@ fn re_split_direct_run(
     // `exec`); anything but the intrinsic there — possibly installed by the limit's valueOf —
     // runs the observable loop on a real splitter object.
     let proto = i.extra_protos.get("RegExp").cloned();
-    let intrinsic_exec = proto.as_ref().is_some_and(|proto| {
-        match proto.borrow().props.get("exec") {
-            Some(p) if !p.accessor() => matches!(p.value(), Value::Obj(f) if matches!(
-                f.borrow().call,
-                Callable::Native(nf) if nf as usize == regexp_exec as *const () as usize
-            )),
-            _ => false,
-        }
-    });
+    let intrinsic_exec =
+        proto
+            .as_ref()
+            .is_some_and(|proto| match proto.borrow().props.get("exec") {
+                Some(p) if !p.accessor() => matches!(p.value(), Value::Obj(f) if matches!(
+                    f.borrow().call,
+                    Callable::Native(nf) if nf as usize == regexp_exec as *const () as usize
+                )),
+                _ => false,
+            });
     if !intrinsic_exec {
         let splitter = ab(i.make_regexp_with_proto(&re.source, &new_flags, proto))?;
         let unicode = flags.contains('u') || flags.contains('v');

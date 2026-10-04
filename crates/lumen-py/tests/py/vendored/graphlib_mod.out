@@ -1,0 +1,4 @@
+a 2
+[['a'], ['b'], ['c']]
+cycle ['a', 'a']
+ValueError prepare() must be called first

@@ -7,9 +7,10 @@
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use lumen_common::limits::Deadline;
 use lumen_host::{ops, Ctx, OpDecl, Value};
 
 use crate::signals::SigintBreak;
@@ -50,39 +51,25 @@ fn op_run_with_timeout(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value
     let sigint = break_on_sigint.then(|| SigintBreak::new(Arc::clone(&raised)));
     let fired = Arc::new(Fired {
         timeout: Arc::new(AtomicBool::new(false)),
-        sigint: sigint.as_ref().map_or_else(|| Arc::new(AtomicBool::new(false)), SigintBreak::fired_flag),
+        sigint: sigint
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), SigintBreak::fired_flag),
     });
-    let cancel = Arc::new((Mutex::new(false), Condvar::new()));
-    let watchdog = timed
-        .then(|| {
-            let (raised, fired, cancel) = (Arc::clone(&raised), Arc::clone(&fired.timeout), Arc::clone(&cancel));
-            std::thread::Builder::new()
-                .name("lumen-vm-timeout".into())
-                .spawn(move || {
-                    let (lock, wake) = &*cancel;
-                    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let (cancelled, _) = wake
-                        .wait_timeout_while(guard, Duration::from_secs_f64(ms / 1000.0), |c| !*c)
-                        .unwrap_or_else(|e| e.into_inner());
-                    if !*cancelled {
-                        // `fired` first: the unwinding side reads it after seeing the flag.
-                        fired.store(true, Ordering::SeqCst);
-                        raised.store(true, Ordering::SeqCst);
-                    }
-                })
-                .ok()
-        })
-        .flatten();
+    let watchdog = timed.then(|| {
+        let (raised, fired) = (Arc::clone(&raised), Arc::clone(&fired.timeout));
+        Deadline::start(
+            "lumen-vm-timeout",
+            Duration::from_secs_f64(ms / 1000.0),
+            move || {
+                // `fired` first: the unwinding side reads it after seeing the flag.
+                fired.store(true, Ordering::SeqCst);
+                raised.store(true, Ordering::SeqCst);
+            },
+        )
+    });
     ACTIVE.with(|a| a.borrow_mut().push(Arc::clone(&fired)));
     let result = ctx.invoke(callee, Value::Undefined, &[]);
-    {
-        let (lock, wake) = &*cancel;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        wake.notify_all();
-    }
-    if let Some(watchdog) = watchdog {
-        let _ = watchdog.join();
-    }
+    drop(watchdog);
     drop(sigint);
     ACTIVE.with(|a| a.borrow_mut().pop());
     // Lower the flag unless an enclosing run has been stopped as well (re-checked after lowering,

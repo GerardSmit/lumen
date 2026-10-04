@@ -3,6 +3,31 @@
 
 use lumen_host::{ops, Ctx, Extension, Value};
 
+#[lumen_bind::module(name = "__lumenSharedWorker")]
+pub(crate) mod shared_worker_browser_bindings {
+    use lumen::embed::{Ctx, OpError, OpResult, Value};
+
+    #[op]
+    pub fn connect(
+        ctx: &mut Ctx,
+        _url: String,
+        _origin: String,
+        _is_module: bool,
+        _name: String,
+        _dispatch: Value,
+    ) -> OpResult<Value> {
+        Err(OpError::thrown(ctx.make_error(
+            "NotSupportedError",
+            "SharedWorker requires a separate Lumen realm and transferable MessagePort bridge, which this browser runtime does not provide",
+        )))
+    }
+
+    #[op]
+    pub fn disconnect(_ctx: &mut Ctx, _id: u64) -> OpResult<Value> {
+        Ok(Value::Undefined)
+    }
+}
+
 fn spawn(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let err = ctx.make_error(
         "Error",
@@ -21,6 +46,7 @@ pub(crate) fn terminate_all(_ctx: &mut Ctx) {}
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
+        modules: &[lumen_host::namespace::<shared_worker_browser_bindings::Module>],
         globals: &[],
         namespaces: &[(
             "__worker",

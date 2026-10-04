@@ -1,0 +1,15 @@
+<!doctype html>
+<!--
+  jixr-compare: threshold=16 max-diff-ratio=0.07
+  The Window/Image backends blur the shadow with a truncated Gaussian (sigma = blur/2 per
+  css-backgrounds-3 §5.1); Chromium's Skia blur is a box-blur approximation, so the shadow's
+  soft edge differs by at most 5 channel units over ~7% of pixels. The Pdf backend paints the
+  unblurred shadow (no per-pixel filter machinery there). The ratio keeps a 1.5x margin over
+  the measured 6.8%.
+-->
+<style>
+html,body{margin:0;background:#fff}
+.stage{width:260px;height:150px;background:#e8eef8;padding:10px}
+.a{width:100px;height:50px;background:#174ea6;box-shadow:20px 12px 8px #d93025;margin-bottom:30px}
+.b{width:60px;height:30px;background:#fbbc04;box-shadow:-8px -6px 4px #34a853}
+</style><div class=stage><div class=a></div><div class=b></div></div>

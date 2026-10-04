@@ -73,7 +73,10 @@ pub(crate) fn coll_fast(
         CollectionKind::Map if is(map_has) => Some(Value::Bool(data.contains(key))),
         CollectionKind::Set if is(set_has) => Some(Value::Bool(data.contains(key))),
         CollectionKind::Map if is(super::insert::map_set) => {
-            data.insert(key.clone(), args.get(1).cloned().unwrap_or(Value::Undefined));
+            data.insert(
+                key.clone(),
+                args.get(1).cloned().unwrap_or(Value::Undefined),
+            );
             Some(this.clone())
         }
         CollectionKind::Set if is(super::insert::set_add) => {

@@ -18,6 +18,14 @@ pub const LR: u8 = 30;
 pub const X16: u8 = 16;
 pub const X17: u8 = 17;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectOp {
+    Plain = 0,
+    Inc = 0x400,
+    Inv = 0x40000000,
+    Neg = 0x40000400,
+}
+
 /// Condition codes (hardware encoding).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cond {
@@ -81,11 +89,18 @@ pub enum LdSt {
     LdrS = 0xBD40_0000,
     StrD = 0xFD00_0000,
     LdrD = 0xFD40_0000,
+    StrQ = 0x3D80_0000,
+    LdrQ = 0x3DC0_0000,
+    Prfm = 0xF980_0000,
 }
 
 impl LdSt {
     pub fn log2(self) -> u32 {
-        (self as u32) >> 30
+        if matches!(self, Self::StrQ | Self::LdrQ) {
+            4
+        } else {
+            (self as u32) >> 30
+        }
     }
     /// Whether `off` is encodable directly (scaled unsigned 12-bit, or unscaled signed 9-bit).
     pub fn offset_ok(self, off: i64) -> bool {
@@ -98,6 +113,7 @@ impl LdSt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Rrr {
+    Adds = 0x2B00_0000,
     Add = 0x0B00_0000,
     Sub = 0x4B00_0000,
     Subs = 0x6B00_0000,
@@ -105,6 +121,7 @@ pub enum Rrr {
     Orr = 0x2A00_0000,
     Eor = 0x4A00_0000,
     Mul = 0x1B00_7C00,
+    Smull = 0x9B20_7C00,
     Udiv = 0x1AC0_0800,
     Sdiv = 0x1AC0_0C00,
     Lslv = 0x1AC0_2000,
@@ -158,6 +175,7 @@ enum Kind {
     B26,
     /// `b.cond`/`cbz`/`cbnz`/`ldr` literal: imm19 at bit 5.
     B19,
+    B14,
     /// `adr`: 21-bit byte offset split immlo (29..31) / immhi (5..24).
     Adr,
     /// A jump-table entry: `label - base` as i32.
@@ -254,12 +272,13 @@ impl Asm {
                     }
                     w |= (d as u32) & 0x03ff_ffff;
                 }
-                Kind::B19 => {
+                Kind::B19 | Kind::B14 => {
                     let d = disp >> 2;
-                    if !(-(1 << 18)..(1 << 18)).contains(&d) {
+                    let bits = if matches!(f.kind, Kind::B14) { 14 } else { 19 };
+                    if !(-(1 << (bits - 1))..(1 << (bits - 1))).contains(&d) {
                         return Err("aarch64: conditional branch out of range".into());
                     }
-                    w |= ((d as u32) & 0x7_ffff) << 5;
+                    w |= ((d as u32) & ((1 << bits) - 1)) << 5;
                 }
                 Kind::Adr => {
                     if !(-(1 << 20)..(1 << 20)).contains(&disp) {
@@ -292,6 +311,16 @@ impl Asm {
     pub fn cbz(&mut self, nz: bool, w64: bool, rt: u8, l: Label) {
         self.fixup(l, Kind::B19);
         self.word(sf(w64) | 0x3400_0000 | (nz as u32) << 24 | r(rt));
+    }
+    pub fn tbz(&mut self, nz: bool, bit: u8, rt: u8, l: Label) {
+        self.fixup(l, Kind::B14);
+        self.word(
+            0x3600_0000
+                | (nz as u32) << 24
+                | ((bit as u32 & 32) << 26)
+                | ((bit as u32 & 31) << 19)
+                | r(rt),
+        );
     }
     pub fn br(&mut self, rn: u8) {
         self.word(0xD61F_0000 | r(rn) << 5);
@@ -348,6 +377,10 @@ impl Asm {
     pub fn cmp_ext(&mut self, rn: u8, rm: u8) {
         self.word(0xEB20_6000 | r(rm) << 16 | r(rn) << 5 | 31);
     }
+    /// `cmp xn, wm, sxtw`: compare a wide result with its signed low word.
+    pub fn cmp_sxtw(&mut self, rn: u8, rm: u8) {
+        self.word(0xEB20_C000 | r(rm) << 16 | r(rn) << 5 | 31);
+    }
     pub fn mov(&mut self, w64: bool, rd: u8, rm: u8) {
         self.rrr(Rrr::Orr, w64, rd, ZR, rm);
     }
@@ -358,6 +391,14 @@ impl Asm {
     /// `rd = ra - rn * rm`
     pub fn msub(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, ra: u8) {
         self.word(sf(w64) | 0x1B00_8000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd));
+    }
+    pub fn madd(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, ra: u8) {
+        self.word(sf(w64) | 0x1B00_0000 | r(rm) << 16 | r(ra) << 10 | r(rn) << 5 | r(rd));
+    }
+    pub fn ccmp(&mut self, w64: bool, rn: u8, rm: u8, cc: Cond, nzcv: u8) {
+        self.word(
+            sf(w64) | 0x7a40_0000 | r(rm) << 16 | (cc as u32) << 12 | r(rn) << 5 | nzcv as u32,
+        );
     }
     /// Logical immediate with a pre-encoded `N:immr:imms` (see [`logical_imm`]).
     pub fn log_imm(&mut self, op: LogImm, w64: bool, rd: u8, rn: u8, enc: u32) {
@@ -397,8 +438,10 @@ impl Asm {
         self.word(sf(w64) | 0x5AC0_0000 | r(rn) << 5 | r(rd));
     }
     /// `csel rd, rn, rm, c` (`rd = c ? rn : rm`).
-    pub fn csel(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, c: Cond) {
-        self.word(sf(w64) | 0x1A80_0000 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd));
+    pub fn csel(&mut self, w64: bool, rd: u8, rn: u8, rm: u8, c: Cond, op: SelectOp) {
+        self.word(
+            sf(w64) | 0x1A80_0000 | op as u32 | r(rm) << 16 | (c as u32) << 12 | r(rn) << 5 | r(rd),
+        );
     }
     /// `cset wd, c` (`csinc wd, wzr, wzr, !c`).
     pub fn cset(&mut self, rd: u8, c: Cond) {
@@ -480,11 +523,11 @@ impl Asm {
         }
     }
     /// `op rt, [rn, rm]` (register offset, no shift).
-    pub fn ldst_reg(&mut self, op: LdSt, rt: u8, rn: u8, rm: u8, shift: bool) {
+    pub fn ldst_reg(&mut self, op: LdSt, rt: u8, rn: u8, rm: u8, shift: bool, sxtw: bool) {
         let w = (op as u32 & !0x0100_0000)
             | 1 << 21
             | r(rm) << 16
-            | 0b011 << 13
+            | (if sxtw { 0b110 } else { 0b011 }) << 13
             | (shift as u32) << 12
             | 0b10 << 10;
         self.word(w | r(rn) << 5 | r(rt));
@@ -500,7 +543,7 @@ impl Asm {
             self.ldst(op, rt, rn, off);
         } else {
             self.mov_imm(tmp, off as u64);
-            self.ldst_reg(op, rt, rn, tmp, false);
+            self.ldst_reg(op, rt, rn, tmp, false, false);
         }
     }
     /// `stp`/`ldp` of 64-bit GPRs (`fp: false`) or d registers, offset a multiple of 8 in

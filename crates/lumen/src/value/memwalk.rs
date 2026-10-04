@@ -5,7 +5,7 @@
 use std::mem::size_of;
 use std::rc::Rc;
 
-use super::{with_gc_state, Callable, Property};
+use super::{Callable, Property, with_gc_state};
 
 /// Structural byte estimates for one heap.
 #[derive(Default, Debug)]

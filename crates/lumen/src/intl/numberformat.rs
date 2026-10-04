@@ -1015,7 +1015,12 @@ impl ExactDec {
 pub(crate) fn exact_of(i: &mut Interp, x: &Value) -> Option<ExactDec> {
     match x {
         Value::BigInt(b) => Some(ExactDec {
-            int: i.bigint_to_string(b, 10).ok().flatten()?.trim_start_matches('-').to_string(),
+            int: i
+                .bigint_to_string(b, 10)
+                .ok()
+                .flatten()?
+                .trim_start_matches('-')
+                .to_string(),
             frac: String::new(),
         }),
         Value::Str(s) => ExactDec::parse(s),

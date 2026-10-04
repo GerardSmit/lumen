@@ -1,0 +1,35 @@
+~T +T_co -T_contra __main__
+<class 'str'> (<class 'int'>, <class 'str'>) __main__ P.args Ts
+T T [typing.Unpack[Ts]]
+1 (~T,) __main__.Stack[int] <class '__main__.Stack'> (<class 'int'>,)
+__main__.Stack[int]
+__main__.Pair[str, int] (<class 'str'>, <class 'int'>) (~KT, ~T)
+TypeError Too few arguments for <class '__main__.Pair'>; actual 1, expected 2
+TypeError Parameters to Generic[...] must all be type variables or parameter specification variables.
+TypeError Cannot inherit from plain Generic
+True False True
+{'title': 'Blade Runner', 'year': 1982} <class 'dict'> True frozenset({'rating'})
+{'title': <class 'str'>, 'year': <class 'int'>}
+Point(x=1, y=0) ('x', 'y') {'y': 0} {'x': <class 'int'>, 'y': <class 'int'>} Point(x=1, y=5)
+Emp(name='a', id=1)
+(<class 'int'>, <class 'str'>) True
+(<class 'int'>, <class 'NoneType'>) True True
+(<class 'int'>, <class 'str'>) ([<class 'int'>, <class 'str'>], <class 'bool'>) (Ellipsis, <class 'int'>)
+(1, 'a') (<class 'int'>, 'meta') True
+(<class 'int'>, <class 'str'>) (typing.Concatenate[int, ~P], ~T)
+typing.List[int] typing.Dict[str, int] typing.Tuple[int, ...] (<class 'int'>, Ellipsis)
+list[int] dict[str, int]
+typing.Tuple[typing.Unpack[Ts]] tuple[typing.Unpack[Ts]]
+{'a': <class 'int'>, 'b': <class 'str'>, 'c': typing.Optional[typing.List[int]], 'return': typing.Dict[str, typing.Any]}
+{'x': typing.ClassVar[int], 'y': typing.Final, 'z': <class '__main__.WithVars'>}
+typing.ClassVar[int]
+3 2
+not an int [1]
+5 UserId <class 'int'>
+list[float]
+1
+False typing.Any typing.Any
+True True typing.Sized
+True ~AnyStr
+(~T,) __main__.Proto[int]
+TypeError Protocols cannot be instantiated

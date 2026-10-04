@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><body><pre id="results"></pre><script>
+const cases = [
+  '<p>1<b>2<i>3</b>4</i>5</p>',
+  '<b>1<p>2</b>3</p>',
+  '<p><b>A</p>B',
+  '<a>A<a>B</a>C',
+  '<b><i><div>x</b>y</i>z',
+  '<table><b><tr><td>aaa</td></tr>bbb</table>ccc',
+  '<div title="unfinished',
+  '<p a=>A</p></p></br>',
+  '<!bogus><!--unterminated',
+  '<select><option>A<option>B<optgroup label=x><option>C</select>',
+  '<template><tr><td>A</template>B',
+  '\x3cscript>\x3c!--\x3cscript>var a = 1;\x3c/script>after\x3c/script>\x3cp>x',
+  '<table><tr><td><b>A<td>B</table>C',
+];
+document.querySelector('#results').textContent = JSON.stringify(cases.map(source => {
+  const container = document.createElement('div');
+  container.innerHTML = source;
+  return [source, container.innerHTML];
+}));
+document.querySelector('#results').textContent += '\n' + JSON.stringify([
+  ['table', '<tr><td>A<td>B'], ['tbody', '<tr><td>A'],
+  ['tr', '<td>A<td>B'], ['textarea', '<b>&amp;</textarea><p>x'],
+  ['style', '<b>&amp;'],
+].map(([context, source]) => {
+  const container = document.createElement(context);
+  container.innerHTML = source;
+  return [context, source, container.innerHTML];
+}));
+</script>

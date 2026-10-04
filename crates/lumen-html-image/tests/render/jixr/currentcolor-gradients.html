@@ -1,0 +1,22 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+main{position:relative;width:220px;height:140px}
+.a{position:absolute;left:0;top:0;width:100px;height:60px;color:#e8710a;
+background:linear-gradient(currentcolor, #174ea6)}
+.b{position:absolute;left:110px;top:0;width:100px;height:60px;color:#188448;
+background:linear-gradient(#fbbc04, currentcolor 60%, #174ea6)}
+.c{position:absolute;left:0;top:70px;width:100px;height:60px;color:#ffffff;
+background:radial-gradient(currentcolor, #e8710a)}
+.d{position:absolute;left:110px;top:70px;width:100px;height:60px;color:#174ea6;
+background:repeating-linear-gradient(currentcolor, #ffffff 8px)}
+</style>
+<!-- jixr-compare: threshold=96 max-diff-ratio=0.13
+  Gradient interpolation rounding differs from Chromium by at most one channel unit along
+  the interpolation path (the same class linear-gradient-padding records); the radial case
+  samples its near-white outer edge where Chromium's dithering differs by ~1-4 units.
+--><main>
+<div class=a></div>
+<div class=b></div>
+<div class=c></div>
+<div class=d></div>
+</main>

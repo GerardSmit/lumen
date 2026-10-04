@@ -11,7 +11,8 @@ rust-version.workspace = true
 proc-macro = true
 
 [dependencies]
-lumen = { path = "../../lumen", default-features = false }
+lumen = { path = "../../lumen", default-features = false, features = ["compiler"] }
+lumen-common = { path = "../../lumen-common" }
 # `.ts`/`.mts`/`.cts` sources are type-stripped (offsets kept) before compiling.
 
 [lints]
