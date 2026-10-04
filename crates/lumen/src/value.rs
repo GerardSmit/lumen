@@ -1064,6 +1064,12 @@ impl Value {
             _ => None,
         }
     }
+    /// Stable identity for a live object in this realm. Native hosts can use
+    /// this to associate opaque capabilities with object handles without
+    /// reading user-visible properties.
+    pub fn object_identity(&self) -> Option<usize> {
+        self.as_obj().map(|object| Gc::as_ptr(object) as usize)
+    }
     /// The number, if this is a `Number` (an embedder convenience for reading op arguments).
     pub fn as_num_opt(&self) -> Option<f64> {
         match self {
@@ -2494,7 +2500,7 @@ pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census
 pub(crate) fn shape_count() -> usize {
     shape_table_census().shapes
 }
-pub(crate) use props::{jit_props_layout, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK};
+pub(crate) use props::{MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, jit_props_layout};
 pub(crate) use props::{jit_shared_shape, proto_epoch_addr};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).

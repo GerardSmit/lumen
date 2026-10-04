@@ -1,5 +1,5 @@
 //! Shared packed-array construction from owned values.
-use super::shapes::{array_length_shape, Shape};
+use super::shapes::{Shape, array_length_shape};
 use super::storage::{DenseBuffers, DenseStorage};
 use super::{EntryVec, PackedVec, Props};
 use crate::value::{Property, Value};

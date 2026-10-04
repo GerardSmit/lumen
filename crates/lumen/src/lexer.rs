@@ -219,9 +219,14 @@ impl Lexer<'_> {
     fn regex_allowed(&self) -> bool {
         match self.tok_back(0).map(|t| &t.kind) {
             None => !self.start_div,
-            Some(Tok::Num(_) | Tok::BigInt(_) | Tok::Str(_) | Tok::Template(_) | Tok::Jsx(_) | Tok::Regex(_)) => {
-                false
-            }
+            Some(
+                Tok::Num(_)
+                | Tok::BigInt(_)
+                | Tok::Str(_)
+                | Tok::Template(_)
+                | Tok::Jsx(_)
+                | Tok::Regex(_),
+            ) => false,
             // `await`/`yield` are contextual: when they are keywords (module top level, async or
             // generator bodies) they prefix an expression, so a following `/` starts a regex. They
             // are `Ident` tokens here since the lexer lacks that context; allow the regex form —
@@ -239,6 +244,38 @@ impl Lexer<'_> {
             },
             Some(Tok::Eof) => false,
         }
+    }
+
+    /// Certain declarations end at a line break before a JSX expression. In those cases
+    /// `<tag>` starts the next statement even though the preceding token normally makes `/`
+    /// a division operator (or `<` a relational operator).
+    fn jsx_after_asi_declaration(&self) -> bool {
+        let lexical_declaration = matches!(
+            self.tok_back(1).map(|token| &token.kind),
+            Some(Tok::Keyword("const" | "var"))
+        ) || matches!(
+            self.tok_back(1).map(|token| &token.kind),
+            Some(Tok::Ident(word)) if word == "let"
+        );
+        let import_declaration =
+            matches!(self.tok_back(0).map(|token| &token.kind), Some(Tok::Str(_)))
+                && matches!(
+                    self.tok_back(1).map(|token| &token.kind),
+                    Some(Tok::Ident(word)) if word == "from"
+                )
+                && (0..self.out.len().saturating_sub(2))
+                    .rev()
+                    .take(32)
+                    .any(|index| {
+                        self.out
+                            .get(index)
+                            .is_some_and(|token| matches!(&token.kind, Tok::Keyword("import")))
+                    });
+        let bare_binding = matches!(
+            self.tok_back(0).map(|token| &token.kind),
+            Some(Tok::Ident(_))
+        ) && lexical_declaration;
+        self.nl_pending && (bare_binding || import_declaration)
     }
 
     /// In TypeScript, whether the `!` just pushed is a non-null assertion (`x!`): it follows a
@@ -432,14 +469,20 @@ impl Lexer<'_> {
         {
             // Annex B: `-->` at the start of a line (or of the source) is a comment to EOL.
             self.skip_line_comment();
-        } else if c == '<' && self.jsx && self.regex_allowed() && self.jsx_starts() {
+        } else if c == '<'
+            && self.jsx
+            && (self.regex_allowed() || self.jsx_after_asi_declaration())
+            && self.jsx_starts()
+        {
             let (start, nl) = (self.tok_start, std::mem::take(&mut self.nl_pending));
             let element = self.read_jsx_element()?;
             self.tok_start = start;
             self.nl_pending = nl;
             self.push(Tok::Jsx(Rc::new(element)));
             if let Some(token) = self.out.last_mut() {
-                if let Tok::Jsx(element) = &token.kind { token.line = element.line; }
+                if let Tok::Jsx(element) = &token.kind {
+                    token.line = element.line;
+                }
             }
         } else if c == '/' && self.regex_allowed() {
             if self.ts {

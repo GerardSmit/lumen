@@ -56,7 +56,10 @@ impl NormData for Latest {
     }
 
     fn compose(&self, a: u32, b: u32) -> Option<u32> {
-        COMPOSE.binary_search_by(|&(x, y, _)| (x, y).cmp(&(a, b))).ok().map(|k| COMPOSE[k].2)
+        COMPOSE
+            .binary_search_by(|&(x, y, _)| (x, y).cmp(&(a, b)))
+            .ok()
+            .map(|k| COMPOSE[k].2)
     }
 }
 
@@ -79,7 +82,13 @@ fn compose_pair<D: NormData + ?Sized>(data: &D, a: u32, b: u32) -> Option<u32> {
 }
 
 /// Fully decompose `cp` onto `out`.
-fn push_decomp<D: NormData + ?Sized>(data: &D, cp: u32, compat: bool, stack: &mut Vec<u32>, out: &mut Vec<u32>) {
+fn push_decomp<D: NormData + ?Sized>(
+    data: &D,
+    cp: u32,
+    compat: bool,
+    stack: &mut Vec<u32>,
+    out: &mut Vec<u32>,
+) {
     stack.push(cp);
     while let Some(cp) = stack.pop() {
         if (S_BASE..S_BASE + S_COUNT).contains(&cp) {

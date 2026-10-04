@@ -24,6 +24,8 @@ struct Endpoint {
     closed: AtomicBool,
     waker: Mutex<Option<Waker>>,
     wake_pending: AtomicBool,
+    close_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    close_notified: AtomicBool,
     /// A BroadcastChannel endpoint: posts fan out to every other endpoint of this name.
     group: Option<String>,
 }
@@ -39,6 +41,8 @@ impl Endpoint {
             closed: AtomicBool::new(false),
             waker: Mutex::new(None),
             wake_pending: AtomicBool::new(false),
+            close_hook: Mutex::new(None),
+            close_notified: AtomicBool::new(false),
         })
     }
 
@@ -53,7 +57,9 @@ impl Endpoint {
         }
         let waker = self.waker.lock().unwrap();
         match waker.as_ref() {
-            Some(w) => w.sender.send(w.task, Box::new(PortTransfer(Arc::clone(self)))),
+            Some(w) => w
+                .sender
+                .send(w.task, Box::new(PortTransfer(Arc::clone(self)))),
             None => self.wake_pending.store(false, Ordering::SeqCst),
         }
     }
@@ -62,23 +68,58 @@ impl Endpoint {
         if let Some(name) = &self.group {
             self.closed.store(true, Ordering::SeqCst);
             self.queue.lock().unwrap().clear();
-            if let Some(members) = GROUPS.lock().unwrap().as_mut().and_then(|g| g.get_mut(name)) {
-                members.retain(|m| m.strong_count() > 0 && !std::ptr::eq(m.as_ptr(), Arc::as_ptr(self)));
+            if let Some(members) = GROUPS
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|g| g.get_mut(name))
+            {
+                members.retain(|m| {
+                    m.strong_count() > 0 && !std::ptr::eq(m.as_ptr(), Arc::as_ptr(self))
+                });
             }
             self.wake();
+            self.notify_close();
             return;
         }
         self.closed.store(true, Ordering::SeqCst);
         self.wake();
+        self.notify_close();
         if let Some(peer) = self.peer() {
             peer.closed.store(true, Ordering::SeqCst);
             peer.wake();
+            peer.notify_close();
+        }
+    }
+
+    fn notify_close(&self) {
+        // A close can race with `on_close` when a port is adopted just as its peer shuts down.
+        // Only mark the callback consumed after extracting an installed hook; otherwise the
+        // installer observes `closed` and gets a chance to deliver it itself.
+        let hook = self.close_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            if !self.close_notified.swap(true, Ordering::SeqCst) {
+                hook();
+            }
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct PortTransfer(Arc<Endpoint>);
+
+impl PortTransfer {
+    pub(crate) fn on_close(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.0.close_hook.lock().unwrap() = Some(hook);
+        if self.0.closed.load(Ordering::SeqCst) {
+            self.0.notify_close();
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.0.close_both();
+    }
+}
 
 struct Handle {
     port: PortTransfer,
@@ -262,7 +303,10 @@ fn peek(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     }))
 }
 
-fn decode_wake(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_wake(
+    _ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
     if let Ok(port) = payload.downcast::<PortTransfer>() {
         port.0.wake_pending.store(false, Ordering::SeqCst);
     }
@@ -292,7 +336,9 @@ fn listen(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
         return Ok(Value::Undefined);
     };
     let (port, old) = port;
-    let reg = ctx.host_mut::<TaskRegistry>().expect("task registry installed");
+    let reg = ctx
+        .host_mut::<TaskRegistry>()
+        .expect("task registry installed");
     if let Some(old) = old {
         reg.cancel(old);
     }

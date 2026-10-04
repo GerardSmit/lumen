@@ -14,36 +14,76 @@ use std::{
 
 impl Builder {
     #[cfg(feature = "aot-native")]
-    pub(super) fn register_native_class(&mut self, interp: &Interp, constructor: &Gc, class: &crate::native_aot::classes::NativeClass) {
+    pub(super) fn register_native_class(
+        &mut self,
+        interp: &Interp,
+        constructor: &Gc,
+        class: &crate::native_aot::classes::NativeClass,
+    ) {
         self.class_objects.insert(Gc::as_ptr(constructor) as usize);
         let mut scope = Some(class.env.clone());
         while let Some(current) = scope {
-            if Rc::ptr_eq(&current, &interp.global_env) { break; }
+            if Rc::ptr_eq(&current, &interp.global_env) {
+                break;
+            }
             self.class_scopes.insert(Rc::as_ptr(&current) as usize);
             for (name, binding) in current.borrow().vars.iter() {
                 if name.starts_with('#') {
                     if let Value::Str(key) = &binding.value {
                         static NEXT: AtomicU64 = AtomicU64::new(1);
-                        self.private_keys.entry(key.to_string()).or_insert_with(|| format!("{name}\u{1}native{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+                        self.private_keys.entry(key.to_string()).or_insert_with(|| {
+                            format!("{name}\u{1}native{}", NEXT.fetch_add(1, Ordering::Relaxed))
+                        });
                     }
                 }
             }
             scope = current.borrow().parent.clone();
         }
-        for key in class.fields.iter().map(|field| &field.key).chain(class.private_members.iter().map(|(key, _)| key)) {
+        for key in class
+            .fields
+            .iter()
+            .map(|field| &field.key)
+            .chain(class.private_members.iter().map(|(key, _)| key))
+        {
             if Interp::is_private_key(key) {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
-                self.private_keys.entry(key.clone()).or_insert_with(|| format!("{key}\u{1}native{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+                self.private_keys.entry(key.clone()).or_insert_with(|| {
+                    format!("{key}\u{1}native{}", NEXT.fetch_add(1, Ordering::Relaxed))
+                });
             }
         }
-        let prototype = constructor.borrow().props.get("prototype").and_then(|property| property.value().as_obj().cloned());
+        let prototype = constructor
+            .borrow()
+            .props
+            .get("prototype")
+            .and_then(|property| property.value().as_obj().cloned());
         for object in std::iter::once(constructor.clone()).chain(prototype) {
             self.class_objects.insert(Gc::as_ptr(&object) as usize);
-            let properties = object.borrow().props.iter().map(|(_, property)| property.clone()).collect::<Vec<_>>();
-            for property in properties.into_iter().chain(class.private_members.iter().map(|(_, property)| property.clone())) {
-                for value in [Some(property.value()), property.getter().cloned(), property.setter().cloned()].into_iter().flatten() {
+            let properties = object
+                .borrow()
+                .props
+                .iter()
+                .map(|(_, property)| property.clone())
+                .collect::<Vec<_>>();
+            for property in properties.into_iter().chain(
+                class
+                    .private_members
+                    .iter()
+                    .map(|(_, property)| property.clone()),
+            ) {
+                for value in [
+                    Some(property.value()),
+                    property.getter().cloned(),
+                    property.setter().cloned(),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     if let Value::Obj(function) = value {
-                        if matches!(function.borrow().call, Callable::Aot(_) | Callable::AccessorGet(_) | Callable::AccessorSet(_)) {
+                        if matches!(
+                            function.borrow().call,
+                            Callable::Aot(_) | Callable::AccessorGet(_) | Callable::AccessorSet(_)
+                        ) {
                             self.class_objects.insert(Gc::as_ptr(&function) as usize);
                         }
                     }
@@ -53,25 +93,54 @@ impl Builder {
     }
 
     #[cfg(feature = "aot-native")]
-    pub(super) fn copy_native_class(&mut self, interp: &mut Interp, target: &Gc, class: &crate::native_aot::classes::NativeClass, depth: usize) -> Result<(), Value> {
+    pub(super) fn copy_native_class(
+        &mut self,
+        interp: &mut Interp,
+        target: &Gc,
+        class: &crate::native_aot::classes::NativeClass,
+        depth: usize,
+    ) -> Result<(), Value> {
         let env = self.copy_environment(interp, &class.env, depth + 1)?;
         let mut fields = Vec::new();
         for field in &class.fields {
             let mut copied = field.clone();
-            copied.key = self.private_keys.get(&field.key).cloned().unwrap_or_else(|| field.key.clone());
-            copied.transforms = field.transforms.iter().map(|value| self.copy(interp, value, depth + 1)).collect::<Result<_, _>>()?;
+            copied.key = self
+                .private_keys
+                .get(&field.key)
+                .cloned()
+                .unwrap_or_else(|| field.key.clone());
+            copied.transforms = field
+                .transforms
+                .iter()
+                .map(|value| self.copy(interp, value, depth + 1))
+                .collect::<Result<_, _>>()?;
             fields.push(copied);
         }
         let mut private_members = Vec::new();
         for (key, property) in &class.private_members {
-            let key = self.private_keys.get(key).cloned().unwrap_or_else(|| key.clone());
+            let key = self
+                .private_keys
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| key.clone());
             private_members.push((key, self.copy_descriptor(interp, property, depth + 1)?));
         }
-        let initializers = class.initializers.iter().map(|value| self.copy(interp, value, depth + 1)).collect::<Result<_, _>>()?;
+        let initializers = class
+            .initializers
+            .iter()
+            .map(|value| self.copy(interp, value, depth + 1))
+            .collect::<Result<_, _>>()?;
         self.parcel.native_classes.push(super::parcel::NativeClass {
             trusted_glue: class.program.trusted_glue,
-            object: target.clone(), bytes: class.program.bytes.clone(), hash: class.program.image.blob_hash(),
-            env, derived: class.derived, body: class.body, fields, private_members, initializers,
+            object: target.clone(),
+            bytes: class.program.bytes.clone(),
+            hash: class.program.image.blob_hash(),
+            env,
+            derived: class.derived,
+            body: class.body,
+            fields,
+            private_members,
+            initializers,
         });
         Ok(())
     }

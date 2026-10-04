@@ -4,9 +4,27 @@
 
 use crate::civil::{is_leap, Tm};
 
-const DAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const DAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
 const MONTHS: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
     "December",
 ];
 
@@ -79,7 +97,11 @@ fn num(n: i64, width: usize, default_zero: bool, pad: Pad, out: &mut String) {
             return;
         }
     };
-    let s = if zero { format!("{n:0width$}") } else { format!("{n:width$}") };
+    let s = if zero {
+        format!("{n:0width$}")
+    } else {
+        format!("{n:width$}")
+    };
     out.push_str(&s);
 }
 
@@ -167,7 +189,13 @@ fn conversion(c: char, pad: Pad, tm: &Tm, zone: &ZoneFields, out: &mut String) {
         'G' => yconv(iso_week(tm).1, true, true, out),
         'g' => yconv(iso_week(tm).1, false, true, out),
         'v' => format("%e-%b-%Y", tm, zone, out),
-        'W' => num((yday0 + 7 - (sunday_wday as i64 + 6) % 7) / 7, 2, true, pad, out),
+        'W' => num(
+            (yday0 + 7 - (sunday_wday as i64 + 6) % 7) / 7,
+            2,
+            true,
+            pad,
+            out,
+        ),
         'w' => out.push_str(&sunday_wday.to_string()),
         'Y' => yconv(tm.year, true, true, out),
         'y' => yconv(tm.year, false, true, out),
@@ -189,19 +217,51 @@ mod tests {
     use super::*;
 
     fn tm(year: i64, mon: i32, mday: i32, hour: i32, wday: i32, yday: i32) -> Tm {
-        Tm { year, mon, mday, hour, min: 4, sec: 5, wday, yday, ..Tm::default() }
+        Tm {
+            year,
+            mon,
+            mday,
+            hour,
+            min: 4,
+            sec: 5,
+            wday,
+            yday,
+            ..Tm::default()
+        }
     }
 
     #[test]
     fn conversions() {
-        let z = ZoneFields { name: "CET".into(), offset: Some(3600), epoch: 0 };
+        let z = ZoneFields {
+            name: "CET".into(),
+            offset: Some(3600),
+            epoch: 0,
+        };
         let t = tm(2005, 1, 2, 3, 6, 2);
-        assert_eq!(strftime("%c|%D|%j|%U|%W|%V|%G|%g|%u|%w|%z|%Z", &t, &z), "Sun Jan  2 03:04:05 2005|01/02/05|002|01|00|53|2004|04|7|0|+0100|CET");
-        assert_eq!(strftime("%-d|%_d|%0e|%-z|%_z|%Ey|%EEd|%E_d|%0-d|%Q|%|%E", &t, &z), "2| 2|02|+100|+ 100|05|Ed| 2|-d|Q||E");
-        assert_eq!(strftime("%Y|%C|%y", &tm(-5, 1, 1, 0, 0, 1), &z), "-005|-0|05");
-        assert_eq!(strftime("%Y|%C|%y", &tm(-100, 1, 1, 0, 0, 1), &z), "-100|-1|00");
-        assert_eq!(strftime("%Y|%C|%y", &tm(12345, 1, 1, 0, 0, 1), &z), "12345|123|45");
-        assert_eq!(strftime("%I %l %p", &tm(2024, 1, 1, 0, 0, 1), &z), "12 12 AM");
+        assert_eq!(
+            strftime("%c|%D|%j|%U|%W|%V|%G|%g|%u|%w|%z|%Z", &t, &z),
+            "Sun Jan  2 03:04:05 2005|01/02/05|002|01|00|53|2004|04|7|0|+0100|CET"
+        );
+        assert_eq!(
+            strftime("%-d|%_d|%0e|%-z|%_z|%Ey|%EEd|%E_d|%0-d|%Q|%|%E", &t, &z),
+            "2| 2|02|+100|+ 100|05|Ed| 2|-d|Q||E"
+        );
+        assert_eq!(
+            strftime("%Y|%C|%y", &tm(-5, 1, 1, 0, 0, 1), &z),
+            "-005|-0|05"
+        );
+        assert_eq!(
+            strftime("%Y|%C|%y", &tm(-100, 1, 1, 0, 0, 1), &z),
+            "-100|-1|00"
+        );
+        assert_eq!(
+            strftime("%Y|%C|%y", &tm(12345, 1, 1, 0, 0, 1), &z),
+            "12345|123|45"
+        );
+        assert_eq!(
+            strftime("%I %l %p", &tm(2024, 1, 1, 0, 0, 1), &z),
+            "12 12 AM"
+        );
         assert_eq!(strftime("%%", &t, &z), "%");
     }
 }

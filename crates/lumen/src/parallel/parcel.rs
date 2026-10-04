@@ -1,4 +1,4 @@
-use crate::value::{enter_gc_state, gc_snapshot, Callable, Gc, GcState, Value};
+use crate::value::{Callable, Gc, GcState, Value, enter_gc_state, gc_snapshot};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]
@@ -108,6 +108,10 @@ pub struct Parcel {
     pub(crate) field_symbols: Vec<(usize, usize, &'static str)>,
     pub(crate) bytes: usize,
     pub(crate) objects: usize,
+    /// Host-owned transferable objects carried by structured-clone messages.
+    /// Values are opaque capability ids; the receiving host reifies them only
+    /// after it has accepted the parcel on the destination realm.
+    pub(crate) attachments: Vec<(u64, u8)>,
     pub(crate) adopted: bool,
 }
 // SAFETY: only the builder creates graphs; it never stores a sender handle.
@@ -133,6 +137,7 @@ impl Parcel {
             field_symbols: Vec::new(),
             bytes: 0,
             objects: 0,
+            attachments: Vec::new(),
             adopted: false,
         }
     }
@@ -141,6 +146,9 @@ impl Parcel {
     }
     pub fn objects(&self) -> usize {
         self.objects
+    }
+    pub fn attachments(&self) -> &[(u64, u8)] {
+        &self.attachments
     }
 }
 impl Drop for Parcel {

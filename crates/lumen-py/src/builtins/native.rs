@@ -8,7 +8,13 @@ use std::cell::RefCell;
 pub type Kw<'a> = &'a [(Obj, Value)];
 
 /// A new builtin type whose own special methods are dispatched like those of a Python class.
-pub fn new_type(it: &mut Interp, module: &str, name: &str, base: Option<&Obj>, layout: Layout) -> Obj {
+pub fn new_type(
+    it: &mut Interp,
+    module: &str,
+    name: &str,
+    base: Option<&Obj>,
+    layout: Layout,
+) -> Obj {
     let ty = new_type_raw(name, layout);
     if let Kind::Type(td) = &ty.kind {
         td.flags.set(TF_DISPATCH);
@@ -22,13 +28,18 @@ pub fn new_type(it: &mut Interp, module: &str, name: &str, base: Option<&Obj>, l
 }
 
 pub fn new_opaque(cls: &Obj, data: impl Any) -> Value {
-    Value::Obj(Object::with_cls(cls.clone(), Kind::Opaque(RefCell::new(Box::new(data)))))
+    Value::Obj(Object::with_cls(
+        cls.clone(),
+        Kind::Opaque(RefCell::new(Box::new(data))),
+    ))
 }
 
 /// Runs `f` on the native state of `v` if it is an opaque object holding a `T`.
 pub fn with_opaque<T: Any, X>(v: &Value, f: impl FnOnce(&mut T) -> X) -> Option<X> {
     let Value::Obj(o) = v else { return None };
-    let Kind::Opaque(cell) = &o.kind else { return None };
+    let Kind::Opaque(cell) = &o.kind else {
+        return None;
+    };
     let mut b = cell.try_borrow_mut().ok()?;
     b.downcast_mut::<T>().map(f)
 }

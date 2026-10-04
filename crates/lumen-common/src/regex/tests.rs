@@ -138,7 +138,11 @@ fn absolute_anchors_ignore_multiline() {
     assert_eq!(find(&re, "ab"), Some((0, 2)));
     assert_eq!(find(&re, "x\nab"), None);
     assert_eq!(find(&re, "ab\n"), None);
-    let line = build(Node::concat(vec![Node::Start, Node::literal("ab")]), 0, opts);
+    let line = build(
+        Node::concat(vec![Node::Start, Node::literal("ab")]),
+        0,
+        opts,
+    );
     assert_eq!(find(&line, "x\nab"), Some((2, 4)));
 }
 
@@ -237,7 +241,11 @@ fn python_ignore_case_in_classes_and_backrefs() {
     assert_eq!(find(&class, "D"), Some((0, 1)));
     assert_eq!(find(&class, "G"), None);
     let negated = build(
-        Node::Class(CharClass::new().negated(true).with_range('a' as u32, 'f' as u32)),
+        Node::Class(
+            CharClass::new()
+                .negated(true)
+                .with_range('a' as u32, 'f' as u32),
+        ),
         0,
         opts,
     );
@@ -259,11 +267,7 @@ fn python_ascii_ignore_case_does_not_use_unicode_folds() {
     let s = build(ch('s'), 0, opts);
     assert_eq!(find(&s, "S"), Some((0, 1)));
     assert_eq!(find(&s, "\u{17f}"), None);
-    let class = build(
-        Node::Class(CharClass::new().with_char('k' as u32)),
-        0,
-        opts,
-    );
+    let class = build(Node::Class(CharClass::new().with_char('k' as u32)), 0, opts);
     assert_eq!(find(&class, "K"), Some((0, 1)));
     assert_eq!(find(&class, "\u{212a}"), None);
 }
@@ -297,12 +301,7 @@ fn python_word_digit_space_definitions() {
 
 #[test]
 fn python_word_boundary() {
-    let b = |flavor| {
-        py(
-            Node::concat(vec![Node::WordB(true, flavor), ch('x')]),
-            0,
-        )
-    };
+    let b = |flavor| py(Node::concat(vec![Node::WordB(true, flavor), ch('x')]), 0);
     assert_eq!(find(&b(Flavor::PyUnicode), "\u{e9}x"), None);
     assert_eq!(find(&b(Flavor::PyAscii), "\u{e9}x"), Some((1, 2)));
     let not_b = py(Node::WordB(false, Flavor::PyUnicode), 0);
@@ -343,10 +342,7 @@ fn match_mode_is_anchored_at_start() {
 
 #[test]
 fn fullmatch_backtracks_to_reach_the_end() {
-    let re = py(
-        Node::alt(vec![ch('a'), Node::literal("ab")]),
-        0,
-    );
+    let re = py(Node::alt(vec![ch('a'), Node::literal("ab")]), 0);
     assert_eq!(span(&re, "ab", ExecOptions::anchored(0)), Some((0, 1)));
     assert_eq!(span(&re, "ab", ExecOptions::full(0)), Some((0, 2)));
     assert_eq!(span(&re, "abc", ExecOptions::full(0)), None);
@@ -357,10 +353,7 @@ fn fullmatch_backtracks_to_reach_the_end() {
 #[test]
 fn fullmatch_ignores_lookaround_bodies() {
     let re = py(
-        Node::concat(vec![
-            Node::lookahead(false, ch('a')),
-            ch('a'),
-        ]),
+        Node::concat(vec![Node::lookahead(false, ch('a')), ch('a')]),
         0,
     );
     assert_eq!(span(&re, "ab", ExecOptions::anchored(0)), Some((0, 1)));
@@ -436,10 +429,7 @@ fn interrupt_flag_aborts_a_match() {
     handle.interrupt();
     set_host_poll(StopFlags::from_handle(&handle), HeapBudget::NONE);
     let re = py(
-        Node::concat(vec![
-            plus(Node::capture(1, plus(ch('a')))),
-            ch('b'),
-        ]),
+        Node::concat(vec![plus(Node::capture(1, plus(ch('a')))), ch('b')]),
         1,
     );
     let subject = "a".repeat(40);
@@ -453,7 +443,8 @@ fn interrupt_flag_aborts_a_match() {
 #[test]
 fn deadline_flag_aborts_a_match() {
     let mut stop = StopFlags::new();
-    stop.deadline_flag().store(true, std::sync::atomic::Ordering::Relaxed);
+    stop.deadline_flag()
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     set_host_poll(stop, HeapBudget::NONE);
     let re = py(
         Node::concat(vec![plus(Node::capture(1, plus(ch('a')))), ch('b')]),
@@ -472,7 +463,9 @@ fn backtracking_budget_stops_catastrophic_patterns() {
         Node::concat(vec![plus(Node::capture(1, plus(ch('a')))), ch('b')]),
         1,
     );
-    assert!(re.exec_str(&"a".repeat(64), ExecOptions::search(0)).is_err());
+    assert!(re
+        .exec_str(&"a".repeat(64), ExecOptions::search(0))
+        .is_err());
     assert_eq!(take_abort(), Abort::None);
 }
 
@@ -495,13 +488,29 @@ fn js_front_end_still_parses_and_matches() {
     let elems: Vec<char> = r"(\w+)@(\w+)".chars().collect();
     let re = js::compile(elems, &flags).unwrap();
     assert_eq!(re.ngroups, 2);
-    assert_eq!(groups(&re, "mail Bob@Example.com"), vec![
-        Some((5, 16)),
-        Some((5, 8)),
-        Some((9, 16)),
-    ]);
+    assert_eq!(
+        groups(&re, "mail Bob@Example.com"),
+        vec![Some((5, 16)), Some((5, 8)), Some((9, 16)),]
+    );
     assert!(js::Flags::parse("gg").is_err());
     assert!(js::compile("(".chars().collect(), &flags).is_err());
+}
+
+#[test]
+fn js_overflowing_decimal_escape_never_panics_or_truncates() {
+    let digits = "8".repeat(64);
+    let pattern = format!("\\{digits}");
+
+    // In Unicode mode this is a decimal back-reference, whose index cannot be represented or
+    // refer to a capture in the pattern. It must be rejected, never overflow while parsing.
+    let unicode = js::Flags::parse("u").unwrap();
+    assert!(js::compile(pattern.chars().collect(), &unicode).is_err());
+
+    // Annex B legacy mode interprets an out-of-range decimal escape as an identity escape followed
+    // by the remaining literal digits, rather than truncating it into some unrelated capture.
+    let legacy = js::Flags::parse("").unwrap();
+    let re = js::compile(pattern.chars().collect(), &legacy).unwrap();
+    assert_eq!(find(&re, &digits), Some((0, digits.len())));
 }
 
 #[test]

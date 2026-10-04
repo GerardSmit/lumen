@@ -809,7 +809,12 @@ mod tests {
     }
 
     extern "C" fn mixed7(a: f64, b: i32, c: f32, d: u64, e: f64, g: f32, h: i8) -> f64 {
-        a + b as f64 * 10.0 + c as f64 * 100.0 + d as f64 * 1e3 + e * 1e4 + g as f64 * 1e5 + h as f64 * 1e6
+        a + b as f64 * 10.0
+            + c as f64 * 100.0
+            + d as f64 * 1e3
+            + e * 1e4
+            + g as f64 * 1e5
+            + h as f64 * 1e6
     }
     extern "C" fn mixed_f32(a: i32, b: f32, c: f32, d: i64, e: f32) -> f32 {
         a as f32 + b * 2.0 + c * 4.0 + d as f32 * 8.0 + e * 16.0
@@ -823,7 +828,12 @@ mod tests {
             call_f64(
                 mixed7 as *const c_void,
                 &[2, 4, (-1i64) as u64],
-                &[FArg::F64(1.0), FArg::F32(3.0), FArg::F64(5.0), FArg::F32(6.0)],
+                &[
+                    FArg::F64(1.0),
+                    FArg::F32(3.0),
+                    FArg::F64(5.0),
+                    FArg::F32(6.0),
+                ],
                 0b0110101,
             )
         };

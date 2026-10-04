@@ -408,7 +408,7 @@ impl Shape {
                     return self
                         .chain()
                         .find(|(_, k)| key_eq(k, key))
-                        .map(|(s, _)| s.len - 1)
+                        .map(|(s, _)| s.len - 1);
                 }
             },
         };

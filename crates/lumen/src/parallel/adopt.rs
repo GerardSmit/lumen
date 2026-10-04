@@ -8,23 +8,41 @@ use lumen_common::buffer::ByteStore;
 impl Interp {
     /// Consume the parcel's heap and side tables on this realm's owner thread.
     pub fn adopt(&mut self, parcel: Parcel) -> Value {
-        self.try_adopt(parcel).unwrap_or_else(|_| panic!("parcel adoption failed; use try_adopt for native parcels"))
+        self.try_adopt(parcel)
+            .unwrap_or_else(|_| panic!("parcel adoption failed; use try_adopt for native parcels"))
     }
 
     pub fn try_adopt(&mut self, mut parcel: Parcel) -> Result<Value, Value> {
         #[cfg(feature = "aot-native")]
-        let mut programs: std::collections::HashMap<[u8; 32], std::rc::Rc<crate::native_aot::NativeProgram>> = std::collections::HashMap::new();
+        let mut programs: std::collections::HashMap<
+            [u8; 32],
+            std::rc::Rc<crate::native_aot::NativeProgram>,
+        > = std::collections::HashMap::new();
         #[cfg(feature = "aot-native")]
-        for (hash, bytes, trusted_glue) in parcel.native_functions.iter().map(|function| (function.hash, function.bytes.clone(), function.trusted_glue))
-            .chain(parcel.native_classes.iter().map(|class| (class.hash, class.bytes.clone(), class.trusted_glue))) {
+        for (hash, bytes, trusted_glue) in parcel
+            .native_functions
+            .iter()
+            .map(|function| (function.hash, function.bytes.clone(), function.trusted_glue))
+            .chain(
+                parcel
+                    .native_classes
+                    .iter()
+                    .map(|class| (class.hash, class.bytes.clone(), class.trusted_glue)),
+            )
+        {
             if let Some(program) = programs.get(&hash) {
-                if program.trusted_glue != trusted_glue { return Err(self.make_error("DataCloneError", "native parcel trust provenance mismatch")); }
+                if program.trusted_glue != trusted_glue {
+                    return Err(self
+                        .make_error("DataCloneError", "native parcel trust provenance mismatch"));
+                }
                 continue;
             }
             let program = crate::native_aot::load_authenticated_program(self, bytes, trusted_glue)
                 .map_err(|message| self.make_error("DataCloneError", &message))?;
             if program.image.blob_hash() != hash {
-                return Err(self.make_error("DataCloneError", "native parcel image identity mismatch"));
+                return Err(
+                    self.make_error("DataCloneError", "native parcel image identity mismatch")
+                );
             }
             programs.insert(hash, program);
         }
@@ -153,20 +171,33 @@ impl Interp {
         }
         #[cfg(feature = "aot-native")]
         for function in parcel.native_functions.drain(..) {
-            function.object.borrow_mut().call = crate::value::Callable::Aot(Box::new(crate::value::AotCallable {
-                program: programs[&function.hash].clone(), function_index: function.index,
-                env: function.env.unwrap_or_else(|| self.global_env.clone()),
-            }));
+            function.object.borrow_mut().call =
+                crate::value::Callable::Aot(Box::new(crate::value::AotCallable {
+                    program: programs[&function.hash].clone(),
+                    function_index: function.index,
+                    env: function.env.unwrap_or_else(|| self.global_env.clone()),
+                }));
         }
         #[cfg(feature = "aot-native")]
         for class in parcel.native_classes.drain(..) {
-            if class.body.is_none() { class.object.borrow_mut().call = crate::value::Callable::Native(crate::native_aot::classes::default_constructor); }
+            if class.body.is_none() {
+                class.object.borrow_mut().call =
+                    crate::value::Callable::Native(crate::native_aot::classes::default_constructor);
+            }
             class.object.borrow_mut().is_constructor = true;
             self.gc_pin(&class.object);
-            self.native_classes.insert(crate::value::Gc::as_ptr(&class.object) as usize, std::rc::Rc::new(crate::native_aot::classes::NativeClass {
-                program: programs[&class.hash].clone(), env: class.env, derived: class.derived, body: class.body,
-                fields: class.fields, private_members: class.private_members, initializers: class.initializers,
-            }));
+            self.native_classes.insert(
+                crate::value::Gc::as_ptr(&class.object) as usize,
+                std::rc::Rc::new(crate::native_aot::classes::NativeClass {
+                    program: programs[&class.hash].clone(),
+                    env: class.env,
+                    derived: class.derived,
+                    body: class.body,
+                    fields: class.fields,
+                    private_members: class.private_members,
+                    initializers: class.initializers,
+                }),
+            );
         }
         parcel.adopted = true;
         Ok(std::mem::replace(&mut parcel.root, Value::Undefined))

@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 lumen-html = { path = "../lumen-html" }
-lumen-common = { path = "../lumen-common" }
+lumen-common = { path = "../lumen-common", features = ["compress"] }
 fontdue = "0.9"
 rustybuzz = { version = "0.20", default-features = false }
 ttf-parser = { version = "0.25", default-features = false, features = ["opentype-layout", "no-std-float"] }

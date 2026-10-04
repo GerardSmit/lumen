@@ -1,7 +1,9 @@
 //! The ECMAScript pattern parser: pattern elements to a [`Node`] tree.
 
-use super::classset::{builtin_class_set, class_set_to_node, property_of_strings, push_q_alternative, ClassSet};
-use super::{cp_of_elem, regex_ident_part, regex_ident_start, is_regex_syntax_char};
+use super::classset::{
+    builtin_class_set, class_set_to_node, property_of_strings, push_q_alternative, ClassSet,
+};
+use super::{cp_of_elem, is_regex_syntax_char, regex_ident_part, regex_ident_start};
 use crate::regex::{Builtin, CharClass, Flavor, Node, NEST_ERROR};
 
 pub(super) struct Parser {
@@ -820,15 +822,26 @@ impl Parser {
             Some(c) if c.is_ascii_digit() => {
                 let start = self.pos;
                 let mut num = c.to_digit(10).unwrap() as usize;
+                let mut overflow = false;
                 while let Some(d) = self.peek() {
                     if d.is_ascii_digit() {
-                        num = num.saturating_mul(10) + d.to_digit(10).unwrap() as usize;
+                        if !overflow {
+                            match num.checked_mul(10).and_then(|value| {
+                                value.checked_add(d.to_digit(10).unwrap() as usize)
+                            }) {
+                                Some(value) => num = value,
+                                None => overflow = true,
+                            }
+                        }
                         self.bump();
                     } else {
                         break;
                     }
                 }
-                if self.unicode || (num >= 1 && num <= self.total_groups) {
+                if overflow && self.unicode {
+                    return Err("decimal back reference is too large".into());
+                }
+                if self.unicode || (!overflow && num >= 1 && num <= self.total_groups) {
                     return Ok(Node::Backref(num));
                 }
                 // Annex B: a decimal escape naming no capture group is a LegacyOctalEscapeSequence
@@ -1130,4 +1143,3 @@ fn push_class_atom(cc: &mut CharClass, a: ClassAtom) {
         ClassAtom::Prop(p) => cc.props.push(p),
     }
 }
-

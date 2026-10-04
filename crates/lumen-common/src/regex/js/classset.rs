@@ -302,4 +302,3 @@ pub(super) fn class_set_to_node(mut set: ClassSet) -> Node {
     alts.push(class);
     Node::Group(None, Box::new(Node::Alt(alts)))
 }
-

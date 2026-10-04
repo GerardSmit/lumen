@@ -5,6 +5,8 @@ use std::cell::RefCell;
 impl JsxOptions {
     pub(super) fn with_pragmas(&self, src: &str) -> Result<Self, ParseError> {
         let mut options = self.clone();
+        let mut runtime_pragma = false;
+        let mut classic_factory_pragma = false;
         let mut rest = src.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
         if rest.starts_with("#!") {
             rest = rest.split_once('\n').map_or("", |(_, s)| s);
@@ -41,6 +43,7 @@ impl JsxOptions {
                 };
                 match word {
                     "@jsxRuntime" => {
+                        runtime_pragma = true;
                         options.runtime = match value {
                             "classic" => JsxRuntime::Classic,
                             "automatic" => JsxRuntime::Automatic,
@@ -62,11 +65,15 @@ impl JsxOptions {
                         } else {
                             options.fragment_factory = value.into();
                         }
+                        classic_factory_pragma = true;
                     }
                     _ => return Err(bad()),
                 }
             }
             rest = tail;
+        }
+        if classic_factory_pragma && !runtime_pragma {
+            options.runtime = JsxRuntime::Classic;
         }
         Ok(options)
     }
@@ -1008,7 +1015,11 @@ mod tests {
 
     #[test]
     fn native_jsx_automatic_elements_fragments_entities_and_text() {
-        let result = evaluate("const UI={Button:'button'}; globalThis.result=<><div data-x='a\\b' title='&copy; &Omega;' flag>\n hello\n world {1+2}<UI.Button />{ /* empty */ }</div></>;", false, JsxOptions::default());
+        let result = evaluate(
+            "const UI={Button:'button'}; globalThis.result=<><div data-x='a\\b' title='&copy; &Omega;' flag>\n hello\n world {1+2}<UI.Button />{ /* empty */ }</div></>;",
+            false,
+            JsxOptions::default(),
+        );
         // The component is resolved as a member expression, never a tag string.
         assert!(result.contains("fragment"), "{result}");
         assert!(result.contains("hello world "), "{result}");
@@ -1018,7 +1029,11 @@ mod tests {
 
     #[test]
     fn native_jsx_key_spread_fallback_and_significant_spaces() {
-        let result = evaluate("const props={key:'spread',a:1}; globalThis.result=[<a key='early' {...props}/>, <a {...props} key='late'/>, <a> <b/> </a>];", false, JsxOptions::default());
+        let result = evaluate(
+            "const props={key:'spread',a:1}; globalThis.result=[<a key='early' {...props}/>, <a {...props} key='late'/>, <a> <b/> </a>];",
+            false,
+            JsxOptions::default(),
+        );
         assert_eq!(
             result,
             r#"[{"type":"a","props":{"key":"spread","a":1},"key":"early"},{"type":"a","props":{"key":"late","a":1},"children":[],"mode":"classic"},{"type":"a","props":{"children":[" ",{"type":"b","props":{}}," "]}}]"#
@@ -1055,7 +1070,11 @@ mod tests {
 
     #[test]
     fn native_tsx_generic_arrows_and_annotations() {
-        let result = evaluate("const id = <T,>(x: T): T => x; const constrained = <T extends number>(x: T): T => x; const count: number = 3; globalThis.result=<div n={id<number>(count)}>{constrained(4)}</div>;", true, JsxOptions::default());
+        let result = evaluate(
+            "const id = <T,>(x: T): T => x; const constrained = <T extends number>(x: T): T => x; const count: number = 3; globalThis.result=<div n={id<number>(count)}>{constrained(4)}</div>;",
+            true,
+            JsxOptions::default(),
+        );
         assert_eq!(result, r#"{"type":"div","props":{"n":3,"children":4}}"#);
     }
 
@@ -1065,7 +1084,11 @@ mod tests {
             runtime: JsxRuntime::Classic,
             ..Default::default()
         };
-        let result = evaluate("/** @jsx make @jsxFrag Frag */ function make(type,props,...children) { return {type,props,children}; } const Frag='F'; const values=[1,2]; globalThis.result=<><x {...{a:3}}>{...values}</x></>;", false, options);
+        let result = evaluate(
+            "/** @jsx make @jsxFrag Frag */ function make(type,props,...children) { return {type,props,children}; } const Frag='F'; const values=[1,2]; globalThis.result=<><x {...{a:3}}>{...values}</x></>;",
+            false,
+            options,
+        );
         assert_eq!(
             result,
             r#"{"type":"F","props":null,"children":[{"type":"x","props":{"a":3},"children":[1,2]}]}"#
@@ -1110,7 +1133,11 @@ mod tests {
 
     #[test]
     fn native_jsx_keeps_js_less_than_and_regex_containers() {
-        let result = evaluate("const small=1<2; globalThis.result=<a yes={small}>{/x/.test('x') ? <b/> : null}{`x${1}`}</a>;", false, JsxOptions::default());
+        let result = evaluate(
+            "const small=1<2; globalThis.result=<a yes={small}>{/x/.test('x') ? <b/> : null}{`x${1}`}</a>;",
+            false,
+            JsxOptions::default(),
+        );
         assert_eq!(
             result,
             r#"{"type":"a","props":{"yes":true,"children":[{"type":"b","props":{}},"x1"]}}"#

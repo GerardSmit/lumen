@@ -377,7 +377,11 @@ fn cstr(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         None
     } else {
-        Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+        Some(
+            unsafe { CStr::from_ptr(ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 }
 
@@ -416,7 +420,13 @@ impl Api {
             let mut name = String::from("ERR_");
             if handshake {
                 name.push_str("SSL_");
-                name.extend(reason.chars().map(|c| if c == ' ' { '_' } else { c.to_ascii_uppercase() }));
+                name.extend(reason.chars().map(|c| {
+                    if c == ' ' {
+                        '_'
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                }));
                 return name;
             }
             let lib = err_lib(first);
@@ -428,7 +438,11 @@ impl Api {
                 }
             }
             for c in reason.chars() {
-                name.push(if c == ' ' { '_' } else { c.to_ascii_uppercase() });
+                name.push(if c == ' ' {
+                    '_'
+                } else {
+                    c.to_ascii_uppercase()
+                });
             }
             name
         });
@@ -448,7 +462,8 @@ impl Api {
     }
 
     fn mem_bio(&self, bytes: &[u8]) -> Result<Ptr, EngineError> {
-        let length = c_int::try_from(bytes.len()).map_err(|_| EngineError::plain("input is too large"))?;
+        let length =
+            c_int::try_from(bytes.len()).map_err(|_| EngineError::plain("input is too large"))?;
         let bio = unsafe { (self.BIO_new_mem_buf)(bytes.as_ptr() as CPtr, length) };
         if bio.is_null() {
             Err(EngineError::plain("BIO_new_mem_buf failed"))
@@ -545,7 +560,12 @@ fn load_pem_file_into(api: &Api, store: Ptr, path: &str) -> Result<(), c_ulong> 
     unsafe { (api.ERR_clear_error)() };
     loop {
         let x509 = unsafe {
-            (api.PEM_read_bio_X509)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+            (api.PEM_read_bio_X509)(
+                bio,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         if x509.is_null() {
             break;
@@ -604,7 +624,12 @@ fn load_pem_text(api: &Api, store: Ptr, bytes: &[u8]) -> Result<(), EngineError>
     unsafe { (api.ERR_clear_error)() };
     loop {
         let x509 = unsafe {
-            (api.PEM_read_bio_X509)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+            (api.PEM_read_bio_X509)(
+                bio,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         if x509.is_null() {
             break;
@@ -646,10 +671,18 @@ impl Drop for Context {
 }
 
 impl Context {
-    pub fn new(method: Option<&str>, min_version: i32, max_version: i32) -> Result<Context, EngineError> {
+    pub fn new(
+        method: Option<&str>,
+        min_version: i32,
+        max_version: i32,
+    ) -> Result<Context, EngineError> {
         let api = api()?;
         let mut min_version = min_version;
-        let mut max_version = if max_version == 0 { TLS1_3_VERSION } else { max_version };
+        let mut max_version = if max_version == 0 {
+            TLS1_3_VERSION
+        } else {
+            max_version
+        };
         if let Some(method) = method {
             let invalid = |message: String| {
                 EngineError::with_code(message, "ERR_TLS_INVALID_PROTOCOL_METHOD", "TypeError")
@@ -685,14 +718,38 @@ impl Context {
         }
         unsafe {
             (api.SSL_CTX_set_options)(ctx, SSL_OP_NO_SSLV3 | SSL_OP_ALLOW_CLIENT_RENEGOTIATION);
-            (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_CLEAR_MODE, SSL_MODE_NO_AUTO_CHAIN, std::ptr::null_mut());
+            (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_CLEAR_MODE,
+                SSL_MODE_NO_AUTO_CHAIN,
+                std::ptr::null_mut(),
+            );
             // CLIENT | SERVER | NO_INTERNAL | NO_AUTO_CLEAR
-            (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, 0x0001 | 0x0002 | 0x0300 | 0x0080, std::ptr::null_mut());
-            (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, min_version as c_long, std::ptr::null_mut());
-            (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, max_version as c_long, std::ptr::null_mut());
+            (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_SESS_CACHE_MODE,
+                0x0001 | 0x0002 | 0x0300 | 0x0080,
+                std::ptr::null_mut(),
+            );
+            (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_MIN_PROTO_VERSION,
+                min_version as c_long,
+                std::ptr::null_mut(),
+            );
+            (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_MAX_PROTO_VERSION,
+                max_version as c_long,
+                std::ptr::null_mut(),
+            );
             (api.SSL_CTX_sess_set_new_cb)(ctx, Some(new_session_callback));
             (api.SSL_CTX_sess_set_get_cb)(ctx, Some(get_session_callback));
-            (api.SSL_CTX_set_client_hello_cb)(ctx, Some(client_hello_callback), std::ptr::null_mut());
+            (api.SSL_CTX_set_client_hello_cb)(
+                ctx,
+                Some(client_hello_callback),
+                std::ptr::null_mut(),
+            );
             (api.SSL_CTX_set_cert_cb)(ctx, Some(cert_callback), std::ptr::null_mut());
             (api.SSL_CTX_set_alpn_select_cb)(ctx, Some(alpn_select_callback), std::ptr::null_mut());
             (api.SSL_CTX_set_keylog_callback)(ctx, Some(keylog_callback));
@@ -734,14 +791,23 @@ impl Context {
         let ctx = self.live()?;
         let bio = api.mem_bio(pem)?;
         unsafe { (api.ERR_clear_error)() };
-        let pass = passphrase
-            .map(|bytes| CString::new(bytes.iter().copied().filter(|b| *b != 0).collect::<Vec<u8>>()).unwrap());
+        let pass = passphrase.map(|bytes| {
+            CString::new(
+                bytes
+                    .iter()
+                    .copied()
+                    .filter(|b| *b != 0)
+                    .collect::<Vec<u8>>(),
+            )
+            .unwrap()
+        });
         let key = unsafe {
             (api.PEM_read_bio_PrivateKey)(
                 bio,
                 std::ptr::null_mut(),
                 std::ptr::null(),
-                pass.as_ref().map_or(std::ptr::null_mut(), |p| p.as_ptr() as Ptr),
+                pass.as_ref()
+                    .map_or(std::ptr::null_mut(), |p| p.as_ptr() as Ptr),
             )
         };
         unsafe { (api.BIO_free)(bio) };
@@ -764,7 +830,12 @@ impl Context {
         unsafe { (api.ERR_clear_error)() };
         let bio = api.mem_bio(pem)?;
         let leaf = unsafe {
-            (api.PEM_read_bio_X509_AUX)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+            (api.PEM_read_bio_X509_AUX)(
+                bio,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         if leaf.is_null() {
             unsafe { (api.BIO_free)(bio) };
@@ -773,7 +844,12 @@ impl Context {
         let mut extras: Vec<Ptr> = Vec::new();
         loop {
             let extra = unsafe {
-                (api.PEM_read_bio_X509)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+                (api.PEM_read_bio_X509)(
+                    bio,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
             };
             if extra.is_null() {
                 break;
@@ -806,7 +882,14 @@ impl Context {
         if unsafe { (api.SSL_CTX_use_certificate)(ctx, leaf) } != 1 {
             return Err(api.take_error("SSL_CTX_use_certificate_chain"));
         }
-        unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_CLEAR_EXTRA_CHAIN_CERTS, 0, std::ptr::null_mut()) };
+        unsafe {
+            (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_CLEAR_EXTRA_CHAIN_CERTS,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
         let mut issuer: Ptr = std::ptr::null_mut();
         for extra in extras {
             if unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_CHAIN_CERT, 1, *extra) } != 1 {
@@ -838,7 +921,12 @@ impl Context {
         let mut found: Ptr = std::ptr::null_mut();
         let mut der = Vec::new();
         unsafe {
-            if (api.X509_STORE_CTX_init)(store_ctx, store, std::ptr::null_mut(), std::ptr::null_mut()) == 1
+            if (api.X509_STORE_CTX_init)(
+                store_ctx,
+                store,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 1
                 && (api.X509_STORE_CTX_get1_issuer)(&mut found, store_ctx, leaf) == 1
                 && !found.is_null()
             {
@@ -883,7 +971,12 @@ impl Context {
         unsafe { (api.ERR_clear_error)() };
         loop {
             let x509 = unsafe {
-                (api.PEM_read_bio_X509_AUX)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+                (api.PEM_read_bio_X509_AUX)(
+                    bio,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
             };
             if x509.is_null() {
                 break;
@@ -917,7 +1010,12 @@ impl Context {
         let bio = api.mem_bio(pem)?;
         unsafe { (api.ERR_clear_error)() };
         let crl = unsafe {
-            (api.PEM_read_bio_X509_CRL)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+            (api.PEM_read_bio_X509_CRL)(
+                bio,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         unsafe { (api.BIO_free)(bio) };
         if crl.is_null() {
@@ -983,7 +1081,9 @@ impl Context {
         let ctx = self.live()?;
         let list = CString::new(list).map_err(|_| EngineError::plain("invalid sigalgs"))?;
         unsafe { (api.ERR_clear_error)() };
-        if unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_SIGALGS_LIST, 0, list.as_ptr() as Ptr) } != 1 {
+        if unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_SIGALGS_LIST, 0, list.as_ptr() as Ptr) }
+            != 1
+        {
             return Err(api.take_error("SSL_CTX_set1_sigalgs_list"));
         }
         Ok(())
@@ -997,7 +1097,9 @@ impl Context {
         }
         let c_curve = CString::new(curve).map_err(|_| EngineError::plain("invalid curve"))?;
         unsafe { (api.ERR_clear_error)() };
-        if unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_GROUPS_LIST, 0, c_curve.as_ptr() as Ptr) } != 1 {
+        if unsafe { (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_GROUPS_LIST, 0, c_curve.as_ptr() as Ptr) }
+            != 1
+        {
             unsafe { (api.ERR_clear_error)() };
             return Err(EngineError::with_code(
                 "Failed to set ECDH curve",
@@ -1009,7 +1111,10 @@ impl Context {
     }
 
     /// Returns a warning for parameters under 2048 bits.
-    pub fn set_dh_param(&mut self, pem: Option<&[u8]>) -> Result<Option<&'static str>, EngineError> {
+    pub fn set_dh_param(
+        &mut self,
+        pem: Option<&[u8]>,
+    ) -> Result<Option<&'static str>, EngineError> {
         let api = self.api;
         let ctx = self.live()?;
         let Some(pem) = pem else {
@@ -1019,7 +1124,12 @@ impl Context {
         let bio = api.mem_bio(pem)?;
         unsafe { (api.ERR_clear_error)() };
         let dh = unsafe {
-            (api.PEM_read_bio_DHparams)(bio, std::ptr::null_mut(), std::ptr::null(), std::ptr::null_mut())
+            (api.PEM_read_bio_DHparams)(
+                bio,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
         };
         unsafe { (api.BIO_free)(bio) };
         if dh.is_null() {
@@ -1057,13 +1167,27 @@ impl Context {
 
     pub fn set_min_proto(&mut self, version: i32) -> Result<(), EngineError> {
         let ctx = self.live()?;
-        unsafe { (self.api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, version as c_long, std::ptr::null_mut()) };
+        unsafe {
+            (self.api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_MIN_PROTO_VERSION,
+                version as c_long,
+                std::ptr::null_mut(),
+            )
+        };
         Ok(())
     }
 
     pub fn set_max_proto(&mut self, version: i32) -> Result<(), EngineError> {
         let ctx = self.live()?;
-        unsafe { (self.api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, version as c_long, std::ptr::null_mut()) };
+        unsafe {
+            (self.api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_MAX_PROTO_VERSION,
+                version as c_long,
+                std::ptr::null_mut(),
+            )
+        };
         Ok(())
     }
 
@@ -1071,14 +1195,28 @@ impl Context {
         if self.ctx.is_null() {
             return 0;
         }
-        unsafe { (self.api.SSL_CTX_ctrl)(self.ctx, SSL_CTRL_GET_MIN_PROTO_VERSION, 0, std::ptr::null_mut()) as i32 }
+        unsafe {
+            (self.api.SSL_CTX_ctrl)(
+                self.ctx,
+                SSL_CTRL_GET_MIN_PROTO_VERSION,
+                0,
+                std::ptr::null_mut(),
+            ) as i32
+        }
     }
 
     pub fn max_proto(&self) -> i32 {
         if self.ctx.is_null() {
             return 0;
         }
-        unsafe { (self.api.SSL_CTX_ctrl)(self.ctx, SSL_CTRL_GET_MAX_PROTO_VERSION, 0, std::ptr::null_mut()) as i32 }
+        unsafe {
+            (self.api.SSL_CTX_ctrl)(
+                self.ctx,
+                SSL_CTRL_GET_MAX_PROTO_VERSION,
+                0,
+                std::ptr::null_mut(),
+            ) as i32
+        }
     }
 
     pub fn set_options(&mut self, options: u64) -> Result<(), EngineError> {
@@ -1091,7 +1229,10 @@ impl Context {
         let api = self.api;
         let ctx = self.live()?;
         unsafe { (api.ERR_clear_error)() };
-        if unsafe { (api.SSL_CTX_set_session_id_context)(ctx, context.as_ptr(), context.len() as c_uint) } != 1 {
+        if unsafe {
+            (api.SSL_CTX_set_session_id_context)(ctx, context.as_ptr(), context.len() as c_uint)
+        } != 1
+        {
             let mut error = api.take_error("SSL_CTX_set_session_id_context error");
             error.kind = Some("TypeError");
             return Err(error);
@@ -1108,10 +1249,17 @@ impl Context {
     pub fn set_ticket_keys(&mut self, keys: &[u8]) -> Result<(), EngineError> {
         let ctx = self.live()?;
         if keys.len() != 48 {
-            return Err(EngineError::plain("Session ticket keys must be a 48-byte buffer"));
+            return Err(EngineError::plain(
+                "Session ticket keys must be a 48-byte buffer",
+            ));
         }
         unsafe {
-            (self.api.SSL_CTX_ctrl)(ctx, SSL_CTRL_SET_TLSEXT_TICKET_KEYS, 48, keys.as_ptr() as Ptr)
+            (self.api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_SET_TLSEXT_TICKET_KEYS,
+                48,
+                keys.as_ptr() as Ptr,
+            )
         };
         Ok(())
     }
@@ -1131,7 +1279,11 @@ impl Context {
         keys
     }
 
-    pub fn load_pkcs12(&mut self, data: &[u8], passphrase: Option<&[u8]>) -> Result<(), EngineError> {
+    pub fn load_pkcs12(
+        &mut self,
+        data: &[u8],
+        passphrase: Option<&[u8]>,
+    ) -> Result<(), EngineError> {
         let api = self.api;
         let ctx = self.live()?;
         unsafe { (api.ERR_clear_error)() };
@@ -1158,9 +1310,13 @@ impl Context {
                 .collect::<Vec<u8>>(),
         )
         .unwrap();
-        let (mut key, mut cert, mut chain): (Ptr, Ptr, Ptr) =
-            (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
-        let parsed = unsafe { (api.PKCS12_parse)(p12, pass.as_ptr(), &mut key, &mut cert, &mut chain) };
+        let (mut key, mut cert, mut chain): (Ptr, Ptr, Ptr) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        let parsed =
+            unsafe { (api.PKCS12_parse)(p12, pass.as_ptr(), &mut key, &mut cert, &mut chain) };
         unsafe { (api.PKCS12_free)(p12) };
         if parsed != 1 {
             return Err(fail(api));
@@ -1334,7 +1490,9 @@ unsafe extern "C" fn info_callback(ssl: CPtr, where_: c_int, _ret: c_int) {
         return;
     }
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return };
+    let Some(state) = state_of(api, ssl) else {
+        return;
+    };
     if where_ & SSL_CB_HANDSHAKE_START != 0 {
         state.events.push(Event::HandshakeStart);
     }
@@ -1345,7 +1503,9 @@ unsafe extern "C" fn info_callback(ssl: CPtr, where_: c_int, _ret: c_int) {
 
 unsafe extern "C" fn new_session_callback(ssl: Ptr, session: Ptr) -> c_int {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return 0 };
+    let Some(state) = state_of(api, ssl) else {
+        return 0;
+    };
     if !state.session_callbacks {
         return 0;
     }
@@ -1367,7 +1527,12 @@ unsafe extern "C" fn new_session_callback(ssl: Ptr, session: Ptr) -> c_int {
     0
 }
 
-unsafe extern "C" fn get_session_callback(ssl: Ptr, _id: *const u8, _len: c_int, copy: *mut c_int) -> Ptr {
+unsafe extern "C" fn get_session_callback(
+    ssl: Ptr,
+    _id: *const u8,
+    _len: c_int,
+    copy: *mut c_int,
+) -> Ptr {
     let api = global_api();
     let Some(state) = state_of(api, ssl) else {
         return std::ptr::null_mut();
@@ -1412,7 +1577,9 @@ fn parse_hello(api: &Api, ssl: Ptr) -> ClientHello {
 
 unsafe extern "C" fn client_hello_callback(ssl: Ptr, _alert: *mut c_int, _arg: Ptr) -> c_int {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return 1 };
+    let Some(state) = state_of(api, ssl) else {
+        return 1;
+    };
     if state.hello_done || !state.is_server {
         return 1;
     }
@@ -1430,15 +1597,23 @@ unsafe extern "C" fn client_hello_callback(ssl: Ptr, _alert: *mut c_int, _arg: P
 
 unsafe extern "C" fn cert_callback(ssl: Ptr, _arg: Ptr) -> c_int {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return 1 };
+    let Some(state) = state_of(api, ssl) else {
+        return 1;
+    };
     if !state.is_server || !state.cert_cb || state.cert_done {
         return 1;
     }
     if !state.cert_reported {
         state.cert_reported = true;
         let name = cstr(unsafe { (api.SSL_get_servername)(ssl, 0) }).unwrap_or_default();
-        let ocsp = unsafe { (api.SSL_ctrl)(ssl, SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE, 0, std::ptr::null_mut()) }
-            == TLSEXT_STATUSTYPE_OCSP;
+        let ocsp = unsafe {
+            (api.SSL_ctrl)(
+                ssl,
+                SSL_CTRL_GET_TLSEXT_STATUS_REQ_TYPE,
+                0,
+                std::ptr::null_mut(),
+            )
+        } == TLSEXT_STATUSTYPE_OCSP;
         state.cert_info = Some((name, ocsp));
     }
     -1
@@ -1453,9 +1628,13 @@ unsafe extern "C" fn alpn_select_callback(
     _arg: Ptr,
 ) -> c_int {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return 3 };
+    let Some(state) = state_of(api, ssl) else {
+        return 3;
+    };
     if state.alpn_callback {
-        let Some(offset) = state.alpn_choice else { return 2 };
+        let Some(offset) = state.alpn_choice else {
+            return 2;
+        };
         if offset >= input_length as usize {
             return 2;
         }
@@ -1492,7 +1671,9 @@ unsafe extern "C" fn alpn_select_callback(
 
 unsafe extern "C" fn keylog_callback(ssl: CPtr, line: *const c_char) {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return };
+    let Some(state) = state_of(api, ssl) else {
+        return;
+    };
     if !state.keylog {
         return;
     }
@@ -1503,7 +1684,9 @@ unsafe extern "C" fn keylog_callback(ssl: CPtr, line: *const c_char) {
 
 unsafe extern "C" fn status_callback(ssl: Ptr, _arg: Ptr) -> c_int {
     let api = global_api();
-    let Some(state) = state_of(api, ssl) else { return 1 };
+    let Some(state) = state_of(api, ssl) else {
+        return 1;
+    };
     if !state.is_server {
         let mut response: *mut u8 = std::ptr::null_mut();
         let length = unsafe {
@@ -1522,7 +1705,9 @@ unsafe extern "C" fn status_callback(ssl: Ptr, _arg: Ptr) -> c_int {
         state.events.push(Event::OcspResponse(bytes));
         return 1;
     }
-    let Some(response) = state.ocsp_response.take() else { return 3 };
+    let Some(response) = state.ocsp_response.take() else {
+        return 3;
+    };
     let data = unsafe { (api.CRYPTO_malloc)(response.len(), c"lumen".as_ptr(), 0) } as *mut u8;
     if data.is_null() {
         return 3;
@@ -1567,7 +1752,12 @@ impl Session {
         unsafe {
             (api.SSL_set_ex_data)(ssl, 0, &mut *state as *mut State as Ptr);
             (api.SSL_set_verify)(ssl, 0, Some(accept_all));
-            (api.SSL_ctrl)(ssl, SSL_CTRL_MODE, SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS | 2, std::ptr::null_mut());
+            (api.SSL_ctrl)(
+                ssl,
+                SSL_CTRL_MODE,
+                SSL_MODE_AUTO_RETRY | SSL_MODE_RELEASE_BUFFERS | 2,
+                std::ptr::null_mut(),
+            );
             (api.SSL_set_info_callback)(ssl, Some(info_callback));
             if is_server {
                 (api.SSL_set_accept_state)(ssl);
@@ -1594,7 +1784,9 @@ impl Session {
         let mut offset = 0;
         while offset < bytes.len() {
             let chunk = (bytes.len() - offset).min(c_int::MAX as usize);
-            let written = unsafe { (self.api.BIO_write)(self.rbio, bytes[offset..].as_ptr() as CPtr, chunk as c_int) };
+            let written = unsafe {
+                (self.api.BIO_write)(self.rbio, bytes[offset..].as_ptr() as CPtr, chunk as c_int)
+            };
             if written <= 0 {
                 return false;
             }
@@ -1613,7 +1805,11 @@ impl Session {
         let mut filled = 0;
         while filled < pending {
             let read = unsafe {
-                (self.api.BIO_read)(self.wbio, out[filled..].as_mut_ptr() as Ptr, (pending - filled) as c_int)
+                (self.api.BIO_read)(
+                    self.wbio,
+                    out[filled..].as_mut_ptr() as Ptr,
+                    (pending - filled) as c_int,
+                )
             };
             if read <= 0 {
                 break;
@@ -1626,7 +1822,9 @@ impl Session {
 
     pub fn read(&mut self, max: usize) -> Io {
         let mut buffer = vec![0u8; max.clamp(1, 1 << 20)];
-        let read = unsafe { (self.api.SSL_read)(self.ssl, buffer.as_mut_ptr() as Ptr, buffer.len() as c_int) };
+        let read = unsafe {
+            (self.api.SSL_read)(self.ssl, buffer.as_mut_ptr() as Ptr, buffer.len() as c_int)
+        };
         if read > 0 {
             buffer.truncate(read as usize);
             return Io::Data(buffer);
@@ -1639,7 +1837,8 @@ impl Session {
         if bytes.is_empty() {
             return 0;
         }
-        let written = unsafe { (self.api.SSL_write)(self.ssl, bytes.as_ptr() as CPtr, bytes.len() as c_int) };
+        let written =
+            unsafe { (self.api.SSL_write)(self.ssl, bytes.as_ptr() as CPtr, bytes.len() as c_int) };
         if written > 0 {
             written as i64
         } else {
@@ -1705,7 +1904,8 @@ impl Session {
         if result == 0 {
             return None;
         }
-        let reason = cstr(unsafe { (api.X509_verify_cert_error_string)(result) }).unwrap_or_default();
+        let reason =
+            cstr(unsafe { (api.X509_verify_cert_error_string)(result) }).unwrap_or_default();
         Some((result as i32, reason))
     }
 
@@ -1742,7 +1942,13 @@ impl Session {
             self.state.alpn_protos = protocols.to_vec();
             true
         } else {
-            unsafe { (self.api.SSL_set_alpn_protos)(self.ssl, protocols.as_ptr(), protocols.len() as c_uint) == 0 }
+            unsafe {
+                (self.api.SSL_set_alpn_protos)(
+                    self.ssl,
+                    protocols.as_ptr(),
+                    protocols.len() as c_uint,
+                ) == 0
+            }
         }
     }
 
@@ -1754,7 +1960,14 @@ impl Session {
         let Ok(name) = CString::new(name) else {
             return false;
         };
-        unsafe { (self.api.SSL_ctrl)(self.ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, 0, name.as_ptr() as Ptr) == 1 }
+        unsafe {
+            (self.api.SSL_ctrl)(
+                self.ssl,
+                SSL_CTRL_SET_TLSEXT_HOSTNAME,
+                0,
+                name.as_ptr() as Ptr,
+            ) == 1
+        }
     }
 
     pub fn session_bytes(&self) -> Option<Vec<u8>> {
@@ -1779,7 +1992,9 @@ impl Session {
 
     fn decode_session(&self, bytes: &[u8]) -> Ptr {
         let mut cursor = bytes.as_ptr();
-        unsafe { (self.api.d2i_SSL_SESSION)(std::ptr::null_mut(), &mut cursor, bytes.len() as c_long) }
+        unsafe {
+            (self.api.d2i_SSL_SESSION)(std::ptr::null_mut(), &mut cursor, bytes.len() as c_long)
+        }
     }
 
     pub fn set_session(&mut self, bytes: &[u8]) -> bool {
@@ -1824,7 +2039,12 @@ impl Session {
         Some(buffer)
     }
 
-    pub fn export_keying_material(&mut self, length: usize, label: &str, context: Option<&[u8]>) -> Result<Vec<u8>, EngineError> {
+    pub fn export_keying_material(
+        &mut self,
+        length: usize,
+        label: &str,
+        context: Option<&[u8]>,
+    ) -> Result<Vec<u8>, EngineError> {
         let mut out = vec![0u8; length];
         let (context_ptr, context_len, use_context) = match context {
             Some(context) => (context.as_ptr(), context.len(), 1),
@@ -1888,7 +2108,12 @@ impl Session {
             let cert = (api.SSL_CTX_get0_certificate)(ctx);
             let key = (api.SSL_CTX_get0_privatekey)(ctx);
             let mut chain: Ptr = std::ptr::null_mut();
-            let mut ok = (api.SSL_CTX_ctrl)(ctx, SSL_CTRL_GET_CHAIN_CERTS, 0, &mut chain as *mut Ptr as Ptr) as c_int;
+            let mut ok = (api.SSL_CTX_ctrl)(
+                ctx,
+                SSL_CTRL_GET_CHAIN_CERTS,
+                0,
+                &mut chain as *mut Ptr as Ptr,
+            ) as c_int;
             if ok == 1 && !cert.is_null() {
                 ok = (api.SSL_use_certificate)(self.ssl, cert);
             }
@@ -1917,12 +2142,24 @@ impl Session {
     }
 
     pub fn set_max_send_fragment(&mut self, size: i64) -> bool {
-        unsafe { (self.api.SSL_ctrl)(self.ssl, SSL_CTRL_SET_MAX_SEND_FRAGMENT, size as c_long, std::ptr::null_mut()) == 1 }
+        unsafe {
+            (self.api.SSL_ctrl)(
+                self.ssl,
+                SSL_CTRL_SET_MAX_SEND_FRAGMENT,
+                size as c_long,
+                std::ptr::null_mut(),
+            ) == 1
+        }
     }
 
     pub fn request_ocsp(&mut self) {
         unsafe {
-            (self.api.SSL_ctrl)(self.ssl, SSL_CTRL_SET_TLSEXT_STATUS_REQ_TYPE, TLSEXT_STATUSTYPE_OCSP, std::ptr::null_mut())
+            (self.api.SSL_ctrl)(
+                self.ssl,
+                SSL_CTRL_SET_TLSEXT_STATUS_REQ_TYPE,
+                TLSEXT_STATUSTYPE_OCSP,
+                std::ptr::null_mut(),
+            )
         };
     }
 
@@ -1998,7 +2235,14 @@ impl Session {
     pub fn ephemeral_key(&self) -> Option<(i32, i32)> {
         let api = self.api;
         let mut key: Ptr = std::ptr::null_mut();
-        let ok = unsafe { (api.SSL_ctrl)(self.ssl, SSL_CTRL_GET_PEER_TMP_KEY, 0, &mut key as *mut Ptr as Ptr) };
+        let ok = unsafe {
+            (api.SSL_ctrl)(
+                self.ssl,
+                SSL_CTRL_GET_PEER_TMP_KEY,
+                0,
+                &mut key as *mut Ptr as Ptr,
+            )
+        };
         if ok != 1 || key.is_null() {
             return None;
         }

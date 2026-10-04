@@ -44,7 +44,11 @@ pub mod _zoneinfo {
     /// ZoneInfo(key)
     ///
     /// Create a ZoneInfo object for the time zone `key`.
-    #[class(name = "ZoneInfo", module = "zoneinfo", hint(py(base = "datetime.tzinfo")))]
+    #[class(
+        name = "ZoneInfo",
+        module = "zoneinfo",
+        hint(py(base = "datetime.tzinfo"))
+    )]
     pub struct ZoneInfo {
         key: Value,
         file_repr: Option<String>,
@@ -64,12 +68,20 @@ pub mod _zoneinfo {
         let td = it.get_attr_str(&Value::Obj(m), "timedelta")?;
         let kw = vec![(it.str_obj("seconds"), Value::Int(secs))];
         let v = it.call(&td, Vec::new(), kw)?;
-        it.native_state::<State>().timedeltas.insert(secs, v.clone());
+        it.native_state::<State>()
+            .timedeltas
+            .insert(secs, v.clone());
         Ok(v)
     }
 
     fn ttinfo(it: &mut Interp, utcoff: i64, dstoff: i64, tzname: Value) -> R<TtInfo> {
-        Ok(TtInfo { utcoff: timedelta(it, utcoff)?, dstoff: timedelta(it, dstoff)?, tzname, utcoff_secs: utcoff, dstoff_secs: dstoff })
+        Ok(TtInfo {
+            utcoff: timedelta(it, utcoff)?,
+            dstoff: timedelta(it, dstoff)?,
+            tzname,
+            utcoff_secs: utcoff,
+            dstoff_secs: dstoff,
+        })
     }
 
     fn module_attr(it: &mut Interp, module: &str, name: &str) -> R<Value> {
@@ -82,11 +94,19 @@ pub mod _zoneinfo {
     }
 
     /// Builds a zone from a TZif file object (CPython's `load_data`).
-    fn load(it: &mut Interp, file_obj: &Value, key: Value, source: Source, file_repr: Option<String>) -> R<ZoneInfo> {
+    fn load(
+        it: &mut Interp,
+        file_obj: &Value,
+        key: Value,
+        source: Source,
+        file_repr: Option<String>,
+    ) -> R<ZoneInfo> {
         let load_data = module_attr(it, "zoneinfo._common", "load_data")?;
         let data = it.call(&load_data, vec![file_obj.clone()], Vec::new())?;
         let fields = match &data {
-            Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Tuple(_)) => data.tuple_items().unwrap_or(&[]).to_vec(),
+            Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Tuple(_)) => {
+                data.tuple_items().unwrap_or(&[]).to_vec()
+            }
             _ => {
                 let r = it.repr_of(&data)?;
                 return Err(it.type_error(&format!("Invalid data result type: {r}")));
@@ -106,7 +126,9 @@ pub mod _zoneinfo {
             trans.push(it.index_of(t)?);
             let n = it.index_of(trans_idx_list.get(i).unwrap_or(&Value::Int(-1)))?;
             if n < 0 || n as usize > utcoff_list.len() {
-                return Err(it.value_error(&format!("Invalid transition index found while reading TZif: {n}")));
+                return Err(it.value_error(&format!(
+                    "Invalid transition index found while reading TZif: {n}"
+                )));
             }
             idx.push(n as usize);
         }
@@ -125,7 +147,9 @@ pub mod _zoneinfo {
         let rules = match ZoneRules::new(idx, trans, utcoff, &isdst, tz_str.as_deref()) {
             Ok(r) => r,
             Err(ZoneError::BadIndex(n)) => {
-                return Err(it.value_error(&format!("Invalid transition index found while reading TZif: {n}")));
+                return Err(it.value_error(&format!(
+                    "Invalid transition index found while reading TZif: {n}"
+                )));
             }
             Err(ZoneError::NoInfo) => return Err(it.value_error("No time zone information found.")),
             Err(ZoneError::TzStr(e)) => {
@@ -142,7 +166,12 @@ pub mod _zoneinfo {
             After::Rule(r) => {
                 let std = ttinfo(it, r.std_offset, 0, Value::string(r.std_abbr.clone()))?;
                 let dst = match &r.dst {
-                    Some(d) => Some(ttinfo(it, d.offset, d.offset - r.std_offset, Value::string(d.abbr.clone()))?),
+                    Some(d) => Some(ttinfo(
+                        it,
+                        d.offset,
+                        d.offset - r.std_offset,
+                        Value::string(d.abbr.clone()),
+                    )?),
                     None => None,
                 };
                 (Some(std), dst)
@@ -161,12 +190,23 @@ pub mod _zoneinfo {
             match after_std {
                 Some(a) => {
                     let t = &types[0];
-                    t.utcoff_secs == a.utcoff_secs && t.dstoff_secs == a.dstoff_secs && it.values_eq(&t.tzname, &a.tzname)?
+                    t.utcoff_secs == a.utcoff_secs
+                        && t.dstoff_secs == a.dstoff_secs
+                        && it.values_eq(&t.tzname, &a.tzname)?
                 }
                 None => false,
             }
         };
-        Ok(ZoneInfo { key, file_repr, source, rules, types, std, dst, fixed_offset })
+        Ok(ZoneInfo {
+            key,
+            file_repr,
+            source,
+            rules,
+            types,
+            std,
+            dst,
+            fixed_offset,
+        })
     }
 
     /// Opens and loads the zone `key` (CPython's `zoneinfo_new_instance`).
@@ -209,7 +249,12 @@ pub mod _zoneinfo {
     }
 
     fn strong_position(it: &mut Interp, key: &Value) -> R<Option<usize>> {
-        let keys: Vec<Value> = it.native_state::<State>().strong_cache.iter().map(|(k, _)| k.clone()).collect();
+        let keys: Vec<Value> = it
+            .native_state::<State>()
+            .strong_cache
+            .iter()
+            .map(|(k, _)| k.clone())
+            .collect();
         for (i, k) in keys.iter().enumerate() {
             if it.values_eq(key, k)? {
                 return Ok(Some(i));
@@ -243,7 +288,11 @@ pub mod _zoneinfo {
             match a {
                 Applies::Type(i) => &self.types[i],
                 Applies::Std => self.std.as_ref().expect("a TZ footer has a standard time"),
-                Applies::Dst => self.dst.as_ref().or(self.std.as_ref()).expect("a TZ footer has a standard time"),
+                Applies::Dst => self
+                    .dst
+                    .as_ref()
+                    .or(self.std.as_ref())
+                    .expect("a TZ footer has a standard time"),
             }
         }
 
@@ -257,7 +306,9 @@ pub mod _zoneinfo {
 
     /// The zone's local time type at `dt` (`None` for `datetime.time`'s calls).
     fn find(it: &mut Interp, slf: &Value, dt: &Value) -> R<Option<TtInfo>> {
-        let Some((fixed, std)) = with_opaque::<ZoneInfo, _>(slf, |z| (z.fixed_offset, z.after_std().clone())) else {
+        let Some((fixed, std)) =
+            with_opaque::<ZoneInfo, _>(slf, |z| (z.fixed_offset, z.after_std().clone()))
+        else {
             return Err(it.type_error("descriptor requires a 'zoneinfo.ZoneInfo' object"));
         };
         if dt.is_none() {
@@ -266,14 +317,18 @@ pub mod _zoneinfo {
         let ts = timestamp_of(it, dt)?;
         let fold = int_attr(it, dt, "fold")? != 0;
         let year = int_attr(it, dt, "year")?;
-        Ok(with_opaque::<ZoneInfo, _>(slf, |z| z.ttinfo(z.rules.find_local(ts, fold, year)).clone()))
+        Ok(with_opaque::<ZoneInfo, _>(slf, |z| {
+            z.ttinfo(z.rules.find_local(ts, fold, year)).clone()
+        }))
     }
 
     #[methods]
     impl ZoneInfo {
         #[constructor(hint(py(text_signature = "")))]
         fn new(cls: This<Value>, it: &mut Interp, #[kw] key: &Value) -> R<Value> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("ZoneInfo.__new__(X): X is not a type object")) };
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("ZoneInfo.__new__(X): X is not a type object"));
+            };
             let base = is_base(it, &cls);
             if base {
                 if let Some(i) = strong_position(it, key)? {
@@ -301,8 +356,15 @@ pub mod _zoneinfo {
 
         // CPython's clinic classmethods carry no docstring.
         #[classmethod(hint(py(text_signature = "($type, file_obj, /, key=None)")))]
-        fn from_file(cls: This<Value>, it: &mut Interp, file_obj: &Value, #[kw] key: Option<&Value>) -> R<Value> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("from_file() needs a class")) };
+        fn from_file(
+            cls: This<Value>,
+            it: &mut Interp,
+            file_obj: &Value,
+            #[kw] key: Option<&Value>,
+        ) -> R<Value> {
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("from_file() needs a class"));
+            };
             let file_repr = it.repr_of(file_obj)?;
             let key = key.cloned().unwrap_or(Value::None);
             let zone = load(it, file_obj, key, Source::File, Some(file_repr))?;
@@ -311,13 +373,21 @@ pub mod _zoneinfo {
 
         #[classmethod(hint(py(text_signature = "($type, /, key)")))]
         fn no_cache(cls: This<Value>, it: &mut Interp, #[kw] key: &Value) -> R<Value> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("no_cache() needs a class")) };
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("no_cache() needs a class"));
+            };
             new_instance(it, &cls, key)
         }
 
         #[classmethod(hint(py(text_signature = "($type, /, *, only_keys=None)")))]
-        fn clear_cache(cls: This<Value>, it: &mut Interp, #[kwonly] only_keys: Option<&Value>) -> R<()> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("clear_cache() needs a class")) };
+        fn clear_cache(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[kwonly] only_keys: Option<&Value>,
+        ) -> R<()> {
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("clear_cache() needs a class"));
+            };
             let base = is_base(it, &cls);
             let cache = weak_cache(it, &cls)?;
             match only_keys.filter(|k| !k.is_none()) {
@@ -391,12 +461,20 @@ pub mod _zoneinfo {
         /// Function for serialization with the pickle protocol.
         #[method(name = "__reduce__", hint(py(text_signature = "")))]
         fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
-            let Some((source, key)) = with_opaque::<ZoneInfo, _>(&slf.0, |z| (z.source, z.key.clone())) else {
+            let Some((source, key)) =
+                with_opaque::<ZoneInfo, _>(&slf.0, |z| (z.source, z.key.clone()))
+            else {
                 return Err(it.type_error("descriptor requires a 'zoneinfo.ZoneInfo' object"));
             };
             if source == Source::File {
                 let err = module_attr(it, "pickle", "PicklingError")?;
-                let e = it.call(&err, vec![Value::str("Cannot pickle a ZoneInfo file from a file stream.")], Vec::new())?;
+                let e = it.call(
+                    &err,
+                    vec![Value::str(
+                        "Cannot pickle a ZoneInfo file from a file stream.",
+                    )],
+                    Vec::new(),
+                )?;
                 return Err(match e {
                     Value::Obj(o) => o,
                     _ => it.type_error("exceptions must derive from BaseException"),
@@ -408,8 +486,15 @@ pub mod _zoneinfo {
         }
 
         #[classmethod(hint(py(text_signature = "($type, key, from_cache, /)")))]
-        fn _unpickle(cls: This<Value>, it: &mut Interp, key: &Value, from_cache: &Value) -> R<Value> {
-            let Value::Obj(c) = &cls.0 else { return Err(it.type_error("_unpickle() needs a class")) };
+        fn _unpickle(
+            cls: This<Value>,
+            it: &mut Interp,
+            key: &Value,
+            from_cache: &Value,
+        ) -> R<Value> {
+            let Value::Obj(c) = &cls.0 else {
+                return Err(it.type_error("_unpickle() needs a class"));
+            };
             let from_cache = it.index_of(from_cache)? & 0xff != 0;
             if from_cache {
                 it.call(&cls.0, vec![key.clone()], Vec::new())
@@ -420,7 +505,12 @@ pub mod _zoneinfo {
 
         /// Function to initialize subclasses.
         #[classmethod(hint(py(text_signature = "")))]
-        fn __init_subclass__(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: crate::bind::KwArgs) -> R<()> {
+        fn __init_subclass__(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: crate::bind::KwArgs,
+        ) -> R<()> {
             let _ = (args, kwargs);
             let cache = new_weak_cache(it)?;
             it.set_attr_str(&cls.0, "_weak_cache", cache)
@@ -433,13 +523,22 @@ pub mod _zoneinfo {
 
         #[proto(repr)]
         fn repr(slf: This<Value>, it: &mut Interp) -> R<String> {
-            let Some((key, file_repr)) = with_opaque::<ZoneInfo, _>(&slf.0, |z| (z.key.clone(), z.file_repr.clone())) else {
+            let Some((key, file_repr)) =
+                with_opaque::<ZoneInfo, _>(&slf.0, |z| (z.key.clone(), z.file_repr.clone()))
+            else {
                 return Err(it.type_error("descriptor requires a 'zoneinfo.ZoneInfo' object"));
             };
             let cls = it.type_of(&slf.0);
-            let name = if is_base(it, &cls) { "zoneinfo.ZoneInfo".to_string() } else { it.tp_name(&cls) };
+            let name = if is_base(it, &cls) {
+                "zoneinfo.ZoneInfo".to_string()
+            } else {
+                it.tp_name(&cls)
+            };
             if key.is_none() {
-                return Ok(format!("{name}.from_file({})", file_repr.unwrap_or_default()));
+                return Ok(format!(
+                    "{name}.from_file({})",
+                    file_repr.unwrap_or_default()
+                ));
             }
             Ok(format!("{name}(key={})", it.repr_of(&key)?))
         }

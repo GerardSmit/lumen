@@ -30,7 +30,12 @@ fn text_of(cps: &[u32]) -> String {
 
 /// CPython's `_PyIO_find_line_ending`: the length of the first line of `s` including its
 /// ending, or `None` when it has no complete ending.
-pub fn find_line_ending(translated: bool, universal: bool, readnl: &[u32], s: &[u32]) -> Option<usize> {
+pub fn find_line_ending(
+    translated: bool,
+    universal: bool,
+    readnl: &[u32],
+    s: &[u32],
+) -> Option<usize> {
     if translated {
         return s.iter().position(|&c| c == '\n' as u32).map(|p| p + 1);
     }
@@ -53,7 +58,9 @@ pub fn find_line_ending(translated: bool, universal: bool, readnl: &[u32], s: &[
     if readnl.is_empty() {
         return None;
     }
-    s.windows(readnl.len()).position(|w| w == readnl).map(|p| p + readnl.len())
+    s.windows(readnl.len())
+        .position(|w| w == readnl)
+        .map(|p| p + readnl.len())
 }
 
 impl StringIO {
@@ -103,10 +110,19 @@ impl StringIO {
         }
         let start = self.pos;
         let avail = self.buf.len() - start;
-        let limit = if limit < 0 || limit as usize > avail { avail } else { limit as usize };
-        let readnl: Vec<u32> = self.readnl.as_deref().map(|s| code_points(s).collect()).unwrap_or_default();
+        let limit = if limit < 0 || limit as usize > avail {
+            avail
+        } else {
+            limit as usize
+        };
+        let readnl: Vec<u32> = self
+            .readnl
+            .as_deref()
+            .map(|s| code_points(s).collect())
+            .unwrap_or_default();
         let line = &self.buf[start..start + limit];
-        let n = find_line_ending(self.readtranslate, self.readuniversal, &readnl, line).unwrap_or(limit);
+        let n = find_line_ending(self.readtranslate, self.readuniversal, &readnl, line)
+            .unwrap_or(limit);
         self.pos += n;
         text_of(&self.buf[start..start + n])
     }
@@ -168,7 +184,9 @@ impl StringIO {
                 Some(s) => s.to_string(),
                 None => {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("initial_value must be str or None, not {}", t)));
+                    return Err(
+                        it.type_error(&format!("initial_value must be str or None, not {}", t))
+                    );
                 }
             },
         };
@@ -202,7 +220,11 @@ impl StringIO {
         st(it, &slf.0, |s| {
             let start = s.pos.min(s.buf.len());
             let avail = s.buf.len() - start;
-            let n = if n < 0 || n as usize > avail { avail } else { n as usize };
+            let n = if n < 0 || n as usize > avail {
+                avail
+            } else {
+                n as usize
+            };
             s.pos = start + n;
             text_of(&s.buf[start..start + n])
         })
@@ -227,7 +249,9 @@ impl StringIO {
     fn seek(slf: This<Py<Self>>, it: &mut Interp, pos: i64, #[default(0)] whence: i32) -> R<usize> {
         let len = st(it, &slf.0, |s| s.buf.len())?;
         if !(0..=2).contains(&whence) {
-            return Err(it.value_error(&format!("Invalid whence ({}, should be 0, 1 or 2)", whence)));
+            return Err(
+                it.value_error(&format!("Invalid whence ({}, should be 0, 1 or 2)", whence))
+            );
         }
         if pos < 0 && whence == 0 {
             return Err(it.value_error(&format!("Negative seek position {}", pos)));
@@ -304,7 +328,9 @@ impl StringIO {
 
     #[getter]
     fn newlines(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        st(it, &slf.0, |s| s.nl.as_ref().map_or(Value::None, NlState::newlines))
+        st(it, &slf.0, |s| {
+            s.nl.as_ref().map_or(Value::None, NlState::newlines)
+        })
     }
 
     #[proto(next)]
@@ -316,7 +342,10 @@ impl StringIO {
             let l = it.call_method(slf.0.value(), "readline", Vec::new())?;
             if l.as_str().is_none() {
                 let t = it.type_name_of(&l);
-                return Err(it.new_exc_str("OSError", &format!("readline() should have returned a str object, not '{}'", t)));
+                return Err(it.new_exc_str(
+                    "OSError",
+                    &format!("readline() should have returned a str object, not '{}'", t),
+                ));
             }
             l
         };
@@ -325,14 +354,21 @@ impl StringIO {
 
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (value, readnl, pos) = st(it, &slf.0, |s| (text_of(&s.buf), s.readnl.clone(), s.pos))?;
-        let Value::Obj(o) = slf.0.value() else { unreachable!() };
+        let Value::Obj(o) = slf.0.value() else {
+            unreachable!()
+        };
         let d = o.dict.borrow().clone();
         let d = match d {
             Some(d) => it.call_method(&Value::Obj(d), "copy", Vec::new())?,
             None => Value::None,
         };
         let nl = readnl.map_or(Value::None, Value::string);
-        Ok(Value::tuple(vec![Value::string(value), nl, Value::Int(pos as i64), d]))
+        Ok(Value::tuple(vec![
+            Value::string(value),
+            nl,
+            Value::Int(pos as i64),
+            d,
+        ]))
     }
 
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
@@ -340,7 +376,10 @@ impl StringIO {
             Some(t) if t.len() >= 4 => t.to_vec(),
             _ => {
                 let (t, g) = (it.type_name_of(slf.0.value()), it.type_name_of(state));
-                return Err(it.type_error(&format!("{}.__setstate__ argument should be 4-tuple, got {}", t, g)));
+                return Err(it.type_error(&format!(
+                    "{}.__setstate__ argument should be 4-tuple, got {}",
+                    t, g
+                )));
             }
         };
         let init = it.get_attr_str(slf.0.value(), "__init__")?;
@@ -355,7 +394,9 @@ impl StringIO {
             s.pos = pos as usize;
         })?;
         if let Value::Obj(d) = &items[3] {
-            let Value::Obj(o) = slf.0.value() else { unreachable!() };
+            let Value::Obj(o) = slf.0.value() else {
+                unreachable!()
+            };
             let dd = it.instance_dict(o);
             it.call_method(&Value::Obj(dd), "update", vec![Value::Obj(d.clone())])?;
         }

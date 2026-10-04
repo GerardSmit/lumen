@@ -1,8 +1,8 @@
 //! Object model: values, heap objects and their payloads.
 
-use crate::pyint::BigInt;
 use crate::bytecode::Code;
 use crate::dict::PyDict;
+use crate::pyint::BigInt;
 use crate::vm::{Frame, Interp};
 pub use lumen_common::buffer::ByteStore;
 use std::cell::{Cell, RefCell};
@@ -93,8 +93,18 @@ impl PyStr {
 
     pub fn from_box(s: Box<str>) -> PyStr {
         let ascii = s.is_ascii();
-        let nchars = if ascii { s.len() } else { lumen_common::smuggle::count_code_points(&s) };
-        PyStr { s, ascii, nchars, hash: Cell::new(0), hashed: Cell::new(false) }
+        let nchars = if ascii {
+            s.len()
+        } else {
+            lumen_common::smuggle::count_code_points(&s)
+        };
+        PyStr {
+            s,
+            ascii,
+            nchars,
+            hash: Cell::new(0),
+            hashed: Cell::new(false),
+        }
     }
 
     pub fn hash(&self) -> i64 {
@@ -263,20 +273,67 @@ pub enum ViewKind {
 }
 
 pub enum IterState {
-    List { list: Obj, idx: usize },
-    Tuple { tup: Obj, idx: usize },
-    Str { s: Obj, pos: usize },
-    Bytes { b: Obj, idx: usize },
-    Range { cur: i64, stop: i64, step: i64 },
-    Dict { dict: Obj, pos: usize, len: usize, kind: ViewKind },
-    Set { set: Obj, pos: usize, len: usize },
-    Seq { obj: Value, idx: i64 },
-    CallIter { f: Value, sentinel: Value, done: bool },
-    Reversed { seq: Value, idx: i64 },
-    Enumerate { it: Value, idx: i64 },
-    Zip { its: Vec<Value>, strict: bool },
-    Map { f: Value, its: Vec<Value> },
-    Filter { f: Value, it: Value },
+    List {
+        list: Obj,
+        idx: usize,
+    },
+    Tuple {
+        tup: Obj,
+        idx: usize,
+    },
+    Str {
+        s: Obj,
+        pos: usize,
+    },
+    Bytes {
+        b: Obj,
+        idx: usize,
+    },
+    Range {
+        cur: i64,
+        stop: i64,
+        step: i64,
+    },
+    Dict {
+        dict: Obj,
+        pos: usize,
+        len: usize,
+        kind: ViewKind,
+    },
+    Set {
+        set: Obj,
+        pos: usize,
+        len: usize,
+    },
+    Seq {
+        obj: Value,
+        idx: i64,
+    },
+    CallIter {
+        f: Value,
+        sentinel: Value,
+        done: bool,
+    },
+    Reversed {
+        seq: Value,
+        idx: i64,
+    },
+    Enumerate {
+        it: Value,
+        idx: i64,
+    },
+    Zip {
+        its: Vec<Value>,
+        strict: bool,
+    },
+    Map {
+        f: Value,
+        its: Vec<Value>,
+    },
+    Filter {
+        f: Value,
+        it: Value,
+    },
     Native(Box<dyn FnMut(&mut Interp) -> R<Option<Value>>>),
     /// A `Native` iterator whose step is running (its closure is out of the cell).
     Running,
@@ -329,15 +386,30 @@ pub enum Kind {
 
 impl Object {
     pub fn new(kind: Kind) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(None), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: None,
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn with_cls(cls: Obj, kind: Kind) -> Obj {
-        Rc::new(Object { cls: Some(cls), dict: RefCell::new(None), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: Some(cls),
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn with_dict(kind: Kind, dict: Obj) -> Obj {
-        Rc::new(Object { cls: None, dict: RefCell::new(Some(dict)), id: Cell::new(0), kind })
+        Rc::new(Object {
+            cls: None,
+            dict: RefCell::new(Some(dict)),
+            id: Cell::new(0),
+            kind,
+        })
     }
 
     pub fn type_data(&self) -> Option<&TypeData> {
@@ -460,7 +532,9 @@ impl Value {
 
     pub fn is(&self, o: &Value) -> bool {
         match (self, o) {
-            (Value::None, Value::None) | (Value::NotImplemented, Value::NotImplemented) | (Value::Ellipsis, Value::Ellipsis) => true,
+            (Value::None, Value::None)
+            | (Value::NotImplemented, Value::NotImplemented)
+            | (Value::Ellipsis, Value::Ellipsis) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),

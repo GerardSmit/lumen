@@ -63,7 +63,9 @@ impl InterruptHandle {
 
 impl fmt::Debug for InterruptHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("InterruptHandle").field("interrupted", &self.is_interrupted()).finish()
+        f.debug_struct("InterruptHandle")
+            .field("interrupted", &self.is_interrupted())
+            .finish()
     }
 }
 
@@ -77,7 +79,9 @@ struct YieldHook {
 
 impl fmt::Debug for YieldHook {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("YieldHook").field("pending", &self.flag.load(Relaxed)).finish()
+        f.debug_struct("YieldHook")
+            .field("pending", &self.flag.load(Relaxed))
+            .finish()
     }
 }
 
@@ -93,11 +97,19 @@ pub struct StopFlags {
 
 impl StopFlags {
     pub const fn new() -> StopFlags {
-        StopFlags { interrupt: None, deadline: None, yield_hook: None }
+        StopFlags {
+            interrupt: None,
+            deadline: None,
+            yield_hook: None,
+        }
     }
 
     pub fn from_handle(handle: &InterruptHandle) -> StopFlags {
-        StopFlags { interrupt: Some(handle.flag.clone()), deadline: None, yield_hook: None }
+        StopFlags {
+            interrupt: Some(handle.flag.clone()),
+            deadline: None,
+            yield_hook: None,
+        }
     }
 
     pub fn set_interrupt(&mut self, flag: Arc<AtomicBool>) {
@@ -114,7 +126,9 @@ impl StopFlags {
 
     /// The deadline flag, created on first use.
     pub fn deadline_flag(&mut self) -> Arc<AtomicBool> {
-        self.deadline.get_or_insert_with(|| Arc::new(AtomicBool::new(false))).clone()
+        self.deadline
+            .get_or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     }
 
     /// Install the cooperative yield: see [`StopFlags::poll`].

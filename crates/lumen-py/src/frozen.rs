@@ -20,7 +20,12 @@ pub fn table() -> &'static [(&'static str, &'static str)] {
 pub fn fs() -> MemFs {
     let fs = MemPlatform::bundle();
     for (rel, src) in table() {
-        fs.insert(&format!("{}/{}", FROZEN_DIR, rel), src.as_bytes(), 0o444, 0o555);
+        fs.insert(
+            &format!("{}/{}", FROZEN_DIR, rel),
+            src.as_bytes(),
+            0o444,
+            0o555,
+        );
     }
     fs
 }

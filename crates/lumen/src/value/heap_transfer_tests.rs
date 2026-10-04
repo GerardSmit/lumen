@@ -48,10 +48,11 @@ fn absorb_preserves_addresses_and_rehomes_free_lists() {
         .set(receiver.live.get() + parcel.live.replace(0));
     assert_eq!(parcel.heap.chunk_count(), 0);
     assert_eq!(live_objects(), 2001);
-    assert!(kept
-        .iter()
-        .enumerate()
-        .all(|(i, object)| Gc::as_ptr(object) == addresses[i * 3]));
+    assert!(
+        kept.iter()
+            .enumerate()
+            .all(|(i, object)| Gc::as_ptr(object) == addresses[i * 3])
+    );
     let mut walked = 0;
     receiver.heap.for_each_live(|_| walked += 1);
     assert_eq!(walked, 2001);

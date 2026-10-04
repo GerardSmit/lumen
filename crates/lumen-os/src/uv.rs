@@ -25,7 +25,11 @@ static TABLE: &[(&str, i32, &str)] = &[
     ("EAI_NONAME", -3008, "unknown node or service"),
     ("EAI_OVERFLOW", -3009, "argument buffer overflow"),
     ("EAI_PROTOCOL", -3014, "resolved protocol is unknown"),
-    ("EAI_SERVICE", -3010, "service not available for socket type"),
+    (
+        "EAI_SERVICE",
+        -3010,
+        "service not available for socket type",
+    ),
     ("EAI_SOCKTYPE", -3011, "socket type not supported"),
     ("EALREADY", -4084, "connection already in progress"),
     ("EBADF", -4083, "bad file descriptor"),
@@ -73,7 +77,11 @@ static TABLE: &[(&str, i32, &str)] = &[
     ("EPROTOTYPE", -4044, "protocol wrong type for socket"),
     ("ERANGE", -4034, "result too large"),
     ("EROFS", -4043, "read-only file system"),
-    ("ESHUTDOWN", -4042, "cannot send after transport endpoint shutdown"),
+    (
+        "ESHUTDOWN",
+        -4042,
+        "cannot send after transport endpoint shutdown",
+    ),
     ("ESPIPE", -4041, "invalid seek"),
     ("ESRCH", -4040, "no such process"),
     ("ETIMEDOUT", -4039, "connection timed out"),
@@ -104,12 +112,17 @@ fn platform_value(name: &str, portable: i32) -> i32 {
 
 /// Every libuv error as `(name, errno on this platform, description)`, in libuv's order.
 pub fn errors() -> impl Iterator<Item = (&'static str, i32, &'static str)> {
-    TABLE.iter().map(|&(name, portable, desc)| (name, platform_value(name, portable), desc))
+    TABLE
+        .iter()
+        .map(|&(name, portable, desc)| (name, platform_value(name, portable), desc))
 }
 
 /// The libuv errno of `name` on this platform (`errno("ENOENT")` is `-2` on Unix).
 pub fn errno(name: &str) -> Option<i32> {
-    TABLE.iter().find(|e| e.0 == name).map(|&(n, portable, _)| platform_value(n, portable))
+    TABLE
+        .iter()
+        .find(|e| e.0 == name)
+        .map(|&(n, portable, _)| platform_value(n, portable))
 }
 
 /// The name of a libuv errno on this platform.

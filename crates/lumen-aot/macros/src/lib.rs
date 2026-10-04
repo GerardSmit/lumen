@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 use proc_macro::{Delimiter, Literal, TokenStream, TokenTree};
 
+#[path = "../../src/assets.rs"]
+mod assets;
 #[path = "../../src/walk.rs"]
 #[allow(dead_code)]
 mod walk;
-#[path = "../../src/assets.rs"]
-mod assets;
 
 /// Precompile JavaScript at compile time into a `lumen::Precompiled` (see `lumen-aot`).
 #[proc_macro]

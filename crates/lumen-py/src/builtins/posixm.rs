@@ -4,7 +4,10 @@
 //! [`Platform`]: crate::platform::Platform
 
 /// `PyObject_AsFileDescriptor`: an int, or the result of the object's `fileno()`.
-pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) -> crate::object::R<i32> {
+pub fn as_file_descriptor(
+    it: &mut crate::vm::Interp,
+    v: &crate::object::Value,
+) -> crate::object::R<i32> {
     let fd = if v.is_int_like() {
         it.index_of(v)?
     } else if it.get_attr_str(v, "fileno").is_ok() {
@@ -17,7 +20,9 @@ pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) 
         return Err(it.type_error("argument must be an int, or have a fileno() method."));
     };
     if fd < 0 {
-        return Err(it.value_error(&format!("file descriptor cannot be a negative integer ({fd})")));
+        return Err(it.value_error(&format!(
+            "file descriptor cannot be a negative integer ({fd})"
+        )));
     }
     i32::try_from(fd).map_err(|_| it.overflow_err("Python int too large to convert to C int"))
 }
@@ -29,7 +34,7 @@ pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) 
 #[lumen_bind::module(name = "posix")]
 pub mod posix {
     use super::super::sysextra::{structseq_full, structseq_type};
-    use crate::bind::{convert_path, fspath, wrap_path, Py, PathArg, PathOrFd, This};
+    use crate::bind::{convert_path, fspath, wrap_path, PathArg, PathOrFd, Py, This};
     use crate::object::*;
     use crate::platform::{DirentKind, IoError, OsStat, ProcGroup, Timespec};
     use crate::pyint::BigInt;
@@ -41,9 +46,28 @@ pub mod posix {
     struct TimesResult;
 
     const STAT_FIELDS: [&str; 22] = [
-        "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "", "", "", "st_atime", "st_mtime",
-        "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns", "st_blksize", "st_blocks", "st_rdev", "st_flags",
-        "st_gen", "st_birthtime",
+        "st_mode",
+        "st_ino",
+        "st_dev",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "",
+        "",
+        "",
+        "st_atime",
+        "st_mtime",
+        "st_ctime",
+        "st_atime_ns",
+        "st_mtime_ns",
+        "st_ctime_ns",
+        "st_blksize",
+        "st_blocks",
+        "st_rdev",
+        "st_flags",
+        "st_gen",
+        "st_birthtime",
     ];
 
     fn stat_result_type(it: &mut Interp) -> Obj {
@@ -55,11 +79,23 @@ pub mod posix {
     }
 
     fn uname_result_type(it: &mut Interp) -> Obj {
-        structseq_type::<UnameResult>(it, "posix", "uname_result", &["sysname", "nodename", "release", "version", "machine"], 5)
+        structseq_type::<UnameResult>(
+            it,
+            "posix",
+            "uname_result",
+            &["sysname", "nodename", "release", "version", "machine"],
+            5,
+        )
     }
 
     fn times_result_type(it: &mut Interp) -> Obj {
-        let f = ["user", "system", "children_user", "children_system", "elapsed"];
+        let f = [
+            "user",
+            "system",
+            "children_user",
+            "children_system",
+            "elapsed",
+        ];
         structseq_type::<TimesResult>(it, "posix", "times_result", &f, 5)
     }
 
@@ -124,7 +160,13 @@ pub mod posix {
 
     fn unavailable(it: &mut Interp, fname: &str, arg: &str) -> Obj {
         let cls = it.exc_type("NotImplementedError");
-        it.new_exc(&cls, vec![Value::string(format!("{}: {} unavailable on this platform", fname, arg))])
+        it.new_exc(
+            &cls,
+            vec![Value::string(format!(
+                "{}: {} unavailable on this platform",
+                fname, arg
+            ))],
+        )
     }
 
     fn no_dir_fd(it: &mut Interp, fname: &str, dir_fd: Option<i32>) -> R<()> {
@@ -216,7 +258,11 @@ pub mod posix {
         if !follow_symlinks {
             return Err(unavailable(it, "access", "follow_symlinks"));
         }
-        Ok(it.platform.borrow_mut().access(&path.path, mode as u32).is_ok())
+        Ok(it
+            .platform
+            .borrow_mut()
+            .access(&path.path, mode as u32)
+            .is_ok())
     }
 
     // ---- directories ---------------------------------------------------------------------------
@@ -242,7 +288,11 @@ pub mod posix {
         r.map(|s| wrap_path(true, s)).map_err(|e| os_err(it, e))
     }
 
-    fn list_dir(it: &mut Interp, fname: &str, path: &Value) -> R<(PathOrFd, Vec<(String, DirentKind)>)> {
+    fn list_dir(
+        it: &mut Interp,
+        fname: &str,
+        path: &Value,
+    ) -> R<(PathOrFd, Vec<(String, DirentKind)>)> {
         let p: PathOrFd = convert_path(it, fname, "path", path, true, true)?;
         if p.fd.is_some() {
             return Err(unavailable(it, fname, "path should not be an integer;"));
@@ -258,15 +308,26 @@ pub mod posix {
     #[op]
     fn listdir(it: &mut Interp, #[kw] path: Option<&Value>) -> R<Value> {
         let (p, entries) = list_dir(it, "listdir", path.unwrap_or(&Value::None))?;
-        Ok(Value::list(entries.into_iter().map(|(n, _)| p.wrap(n)).collect()))
+        Ok(Value::list(
+            entries.into_iter().map(|(n, _)| p.wrap(n)).collect(),
+        ))
     }
 
     /// Return an iterator of DirEntry objects for given path.
     #[op]
     fn scandir(it: &mut Interp, #[kw] path: Option<&Value>) -> R<Py<ScandirIterator>> {
         let (p, entries) = list_dir(it, "scandir", path.unwrap_or(&Value::None))?;
-        let dir = if matches!(p.obj, Value::None) { ".".to_string() } else { p.path.clone() };
-        let it_state = ScandirIterator { dir, bytes: p.bytes, entries: entries.into_iter(), closed: false };
+        let dir = if matches!(p.obj, Value::None) {
+            ".".to_string()
+        } else {
+            p.path.clone()
+        };
+        let it_state = ScandirIterator {
+            dir,
+            bytes: p.bytes,
+            entries: entries.into_iter(),
+            closed: false,
+        };
         Ok(Py::new(it, it_state))
     }
 
@@ -289,13 +350,21 @@ pub mod posix {
         fn __next__(slf: This<Py<Self>>, it: &mut Interp) -> R<Option<Value>> {
             let next = {
                 let mut s = slf.0.borrow_mut(it)?;
-                if s.closed { None } else { s.entries.next().map(|e| (e, s.dir.clone(), s.bytes)) }
+                if s.closed {
+                    None
+                } else {
+                    s.entries.next().map(|e| (e, s.dir.clone(), s.bytes))
+                }
             };
             let Some(((name, kind), dir, bytes)) = next else {
                 slf.0.borrow_mut(it)?.closed = true;
                 return Ok(None);
             };
-            let path = if dir.ends_with('/') { format!("{}{}", dir, name) } else { format!("{}/{}", dir, name) };
+            let path = if dir.ends_with('/') {
+                format!("{}{}", dir, name)
+            } else {
+                format!("{}/{}", dir, name)
+            };
             let entry = DirEntry {
                 name: wrap_path(bytes, name),
                 path: wrap_path(bytes, path.clone()),
@@ -339,7 +408,16 @@ pub mod posix {
             let (cached, text, is_link, path) = {
                 let s = slf.borrow(it)?;
                 let follow = follow && matches!(s.kind, DirentKind::Link | DirentKind::Unknown);
-                (if follow { s.stat.clone() } else { s.lstat.clone() }, s.text.clone(), follow, s.path.clone())
+                (
+                    if follow {
+                        s.stat.clone()
+                    } else {
+                        s.lstat.clone()
+                    },
+                    s.text.clone(),
+                    follow,
+                    s.path.clone(),
+                )
             };
             if let Some(v) = cached {
                 return Ok(v);
@@ -350,19 +428,32 @@ pub mod posix {
                 Err(e) => return Err(it.os_error_io(&e, Some(&path))),
             };
             let mut s = slf.borrow_mut(it)?;
-            if is_link { s.stat = Some(st.clone()) } else { s.lstat = Some(st.clone()) }
+            if is_link {
+                s.stat = Some(st.clone())
+            } else {
+                s.lstat = Some(st.clone())
+            }
             Ok(st)
         }
 
         fn mode(slf: &Py<Self>, it: &mut Interp, follow: bool) -> R<Option<u32>> {
             match Self::fetch(slf, it, follow) {
-                Ok(st) => Ok(st.tuple_items().and_then(|t| t[0].as_i64()).map(|m| m as u32)),
+                Ok(st) => Ok(st
+                    .tuple_items()
+                    .and_then(|t| t[0].as_i64())
+                    .map(|m| m as u32)),
                 Err(e) if it.exc_is(&e, "FileNotFoundError") => Ok(None),
                 Err(e) => Err(e),
             }
         }
 
-        fn is_type(slf: &Py<Self>, it: &mut Interp, follow: bool, want: DirentKind, fmt: u32) -> R<bool> {
+        fn is_type(
+            slf: &Py<Self>,
+            it: &mut Interp,
+            follow: bool,
+            want: DirentKind,
+            fmt: u32,
+        ) -> R<bool> {
             let kind = slf.borrow(it)?.kind;
             if kind != DirentKind::Unknown && !(follow && kind == DirentKind::Link) {
                 return Ok(kind == want);
@@ -384,13 +475,37 @@ pub mod posix {
         }
 
         /// Return True if the entry is a directory; cached per entry.
-        fn is_dir(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<bool> {
-            Self::is_type(&slf.0, it, follow_symlinks, DirentKind::Dir, lumen_os::fs::S_IFDIR)
+        fn is_dir(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<bool> {
+            Self::is_type(
+                &slf.0,
+                it,
+                follow_symlinks,
+                DirentKind::Dir,
+                lumen_os::fs::S_IFDIR,
+            )
         }
 
         /// Return True if the entry is a file; cached per entry.
-        fn is_file(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<bool> {
-            Self::is_type(&slf.0, it, follow_symlinks, DirentKind::File, lumen_os::fs::S_IFREG)
+        fn is_file(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<bool> {
+            Self::is_type(
+                &slf.0,
+                it,
+                follow_symlinks,
+                DirentKind::File,
+                lumen_os::fs::S_IFREG,
+            )
         }
 
         /// Return True if the entry is a symbolic link; cached per entry.
@@ -404,7 +519,13 @@ pub mod posix {
         }
 
         /// Return stat_result object for the entry; cached per entry.
-        fn stat(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<Value> {
+        fn stat(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<Value> {
             Self::fetch(&slf.0, it, follow_symlinks)
         }
 
@@ -465,7 +586,14 @@ pub mod posix {
         r.map_err(|e| path_err(it, e, &path))
     }
 
-    fn do_rename(it: &mut Interp, fname: &str, src: &PathArg, dst: &PathArg, src_dir_fd: Option<i32>, dst_dir_fd: Option<i32>) -> R<()> {
+    fn do_rename(
+        it: &mut Interp,
+        fname: &str,
+        src: &PathArg,
+        dst: &PathArg,
+        src_dir_fd: Option<i32>,
+        dst_dir_fd: Option<i32>,
+    ) -> R<()> {
         if src_dir_fd.is_some() {
             return Err(unavailable(it, fname, "src_dir_fd"));
         }
@@ -541,7 +669,10 @@ pub mod posix {
         if src.bytes != dst.bytes {
             return Err(it.type_error("symlink: src and dst must be the same type"));
         }
-        let r = it.platform.borrow_mut().symlink(&src.path, &dst.path, target_is_directory);
+        let r = it
+            .platform
+            .borrow_mut()
+            .symlink(&src.path, &dst.path, target_is_directory);
         r.map_err(|e| it.os_error_errno(e.errno, Some(&src.obj), Some(&dst.obj)))
     }
 
@@ -595,14 +726,20 @@ pub mod posix {
         follow_symlinks: bool,
     ) -> R<()> {
         no_dir_fd(it, "chown", dir_fd)?;
-        let r = it.platform.borrow_mut().chown(&path.path, uid as u32, gid as u32, follow_symlinks);
+        let r = it
+            .platform
+            .borrow_mut()
+            .chown(&path.path, uid as u32, gid as u32, follow_symlinks);
         r.map_err(|e| path_err(it, e, &path))
     }
 
     /// Change the owner and group id of path to the numeric uid and gid, without following links.
     #[op]
     fn lchown(it: &mut Interp, #[kw] path: PathArg, #[kw] uid: i64, #[kw] gid: i64) -> R<()> {
-        let r = it.platform.borrow_mut().chown(&path.path, uid as u32, gid as u32, false);
+        let r = it
+            .platform
+            .borrow_mut()
+            .chown(&path.path, uid as u32, gid as u32, false);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -619,15 +756,24 @@ pub mod posix {
                     sec += 1;
                     nsec -= 1e9;
                 }
-                Ok(Timespec { sec, nsec: nsec as u32 })
+                Ok(Timespec {
+                    sec,
+                    nsec: nsec as u32,
+                })
             }
-            _ => Ok(Timespec { sec: it.index_of(v)?, nsec: 0 }),
+            _ => Ok(Timespec {
+                sec: it.index_of(v)?,
+                nsec: 0,
+            }),
         }
     }
 
     fn ns_timespec(it: &mut Interp, v: &Value) -> R<Timespec> {
         let n = it.index_of(v)?;
-        Ok(Timespec { sec: n.div_euclid(1_000_000_000), nsec: n.rem_euclid(1_000_000_000) as u32 })
+        Ok(Timespec {
+            sec: n.div_euclid(1_000_000_000),
+            nsec: n.rem_euclid(1_000_000_000) as u32,
+        })
     }
 
     /// Set the access and modified time of path.
@@ -644,13 +790,21 @@ pub mod posix {
     ) -> R<()> {
         no_dir_fd(it, "utime", dir_fd)?;
         let (atime, mtime) = match (times, ns) {
-            (Some(_), Some(_)) => return Err(it.value_error("utime: you may specify either 'times' or 'ns' but not both")),
+            (Some(_), Some(_)) => {
+                return Err(
+                    it.value_error("utime: you may specify either 'times' or 'ns' but not both")
+                )
+            }
             (Some(t), None) => match t.tuple_items() {
                 Some([a, m]) if a.is_int_like() || matches!(a, Value::Float(_)) => {
                     let (a, m) = (a.clone(), m.clone());
                     (timespec_of(it, &a)?, timespec_of(it, &m)?)
                 }
-                _ => return Err(it.type_error("utime: 'times' must be either a tuple of two ints or None")),
+                _ => {
+                    return Err(
+                        it.type_error("utime: 'times' must be either a tuple of two ints or None")
+                    )
+                }
             },
             (None, Some(n)) => match n.tuple_items() {
                 Some([a, m]) => {
@@ -661,13 +815,19 @@ pub mod posix {
             },
             (None, None) => {
                 let now = it.platform.borrow().wall_time_ns() as i64;
-                let t = Timespec { sec: now / 1_000_000_000, nsec: (now % 1_000_000_000) as u32 };
+                let t = Timespec {
+                    sec: now / 1_000_000_000,
+                    nsec: (now % 1_000_000_000) as u32,
+                };
                 (t, t)
             }
         };
         let r = match path.fd {
             Some(fd) => it.platform.borrow_mut().fd_utimes(fd, atime, mtime),
-            None => it.platform.borrow_mut().utimes(&path.path, atime, mtime, follow_symlinks),
+            None => it
+                .platform
+                .borrow_mut()
+                .utimes(&path.path, atime, mtime, follow_symlinks),
         };
         r.map_err(|e| path_err(it, e, &path))
     }
@@ -703,7 +863,10 @@ pub mod posix {
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<i32> {
         no_dir_fd(it, "open", dir_fd)?;
-        let r = it.platform.borrow_mut().fd_open(&path.path, flags, mode as u32);
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_open(&path.path, flags, mode as u32);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -732,7 +895,14 @@ pub mod posix {
 
     /// Duplicate file descriptor.
     #[op]
-    fn dup2(it: &mut Interp, #[kw] fd: i32, #[kw] fd2: i32, #[kw] #[default(true)] inheritable: bool) -> R<i32> {
+    fn dup2(
+        it: &mut Interp,
+        #[kw] fd: i32,
+        #[kw] fd2: i32,
+        #[kw]
+        #[default(true)]
+        inheritable: bool,
+    ) -> R<i32> {
         let r = it.platform.borrow_mut().fd_dup2(fd, fd2, inheritable);
         r.map_err(|e| os_err(it, e))
     }
@@ -757,7 +927,10 @@ pub mod posix {
             return Err(it.os_error_errno(einval(), None, None));
         }
         let mut buf = vec![0u8; length as usize];
-        let r = it.platform.borrow_mut().fd_read(fd, &mut buf, Some(offset as u64));
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_read(fd, &mut buf, Some(offset as u64));
         let n = r.map_err(|e| os_err(it, e))?;
         buf.truncate(n);
         Ok(Value::bytes(buf))
@@ -773,7 +946,10 @@ pub mod posix {
     /// Write bytes to a file descriptor starting at a particular offset.
     #[op]
     fn pwrite(it: &mut Interp, fd: i32, buffer: &[u8], offset: i64) -> R<usize> {
-        let r = it.platform.borrow_mut().fd_write(fd, buffer, Some(offset as u64));
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_write(fd, buffer, Some(offset as u64));
         r.map_err(|e| os_err(it, e))
     }
 
@@ -822,7 +998,10 @@ pub mod posix {
     /// Set the inheritable flag of the specified file descriptor.
     #[op]
     fn set_inheritable(it: &mut Interp, fd: i32, inheritable: i32) -> R<()> {
-        let r = it.platform.borrow_mut().fd_set_inheritable(fd, inheritable != 0);
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_set_inheritable(fd, inheritable != 0);
         r.map_err(|e| os_err(it, e))
     }
 
@@ -843,7 +1022,11 @@ pub mod posix {
     /// Return a string describing the encoding of a terminal's file descriptor.
     #[op]
     fn device_encoding(it: &mut Interp, #[kw] fd: i32) -> Value {
-        if it.platform.borrow_mut().fd_isatty(fd) { Value::str("UTF-8") } else { Value::None }
+        if it.platform.borrow_mut().fd_isatty(fd) {
+            Value::str("UTF-8")
+        } else {
+            Value::None
+        }
     }
 
     /// Return the size of the terminal window as (columns, lines).
@@ -852,7 +1035,10 @@ pub mod posix {
         let r = it.platform.borrow_mut().terminal_size(fd);
         let (cols, lines) = r.map_err(|e| os_err(it, e))?;
         let ty = terminal_size_type(it);
-        Ok(structseq_full(&ty, vec![Value::Int(cols as i64), Value::Int(lines as i64)]))
+        Ok(structseq_full(
+            &ty,
+            vec![Value::Int(cols as i64), Value::Int(lines as i64)],
+        ))
     }
 
     // ---- process -------------------------------------------------------------------------------
@@ -877,7 +1063,10 @@ pub mod posix {
         let r = it.platform.borrow().process_times();
         let t = r.map_err(|e| os_err(it, e))?;
         let ty = times_result_type(it);
-        Ok(structseq_full(&ty, t.into_iter().map(Value::Float).collect()))
+        Ok(structseq_full(
+            &ty,
+            t.into_iter().map(Value::Float).collect(),
+        ))
     }
 
     /// Return a bytes object containing random bytes suitable for cryptographic use.
@@ -939,7 +1128,9 @@ pub mod posix {
     fn getgroups(it: &mut Interp) -> R<Value> {
         let r = it.platform.borrow_mut().getgroups();
         let g = r.map_err(|e| os_err(it, e))?;
-        Ok(Value::list(g.into_iter().map(|g| Value::Int(g as i64)).collect()))
+        Ok(Value::list(
+            g.into_iter().map(|g| Value::Int(g as i64)).collect(),
+        ))
     }
 
     fn group(it: &mut Interp, call: ProcGroup) -> R<i32> {
@@ -1148,7 +1339,14 @@ pub mod posix {
         fspath(it, path)
     }
 
-    const HAVE_FUNCTIONS: [&str; 6] = ["HAVE_FCHMOD", "HAVE_FTRUNCATE", "HAVE_FUTIMES", "HAVE_LCHOWN", "HAVE_LSTAT", "HAVE_LUTIMES"];
+    const HAVE_FUNCTIONS: [&str; 6] = [
+        "HAVE_FCHMOD",
+        "HAVE_FTRUNCATE",
+        "HAVE_FUTIMES",
+        "HAVE_LCHOWN",
+        "HAVE_LSTAT",
+        "HAVE_LUTIMES",
+    ];
 
     #[init]
     fn init(it: &mut Interp, m: &Value) {
@@ -1180,6 +1378,10 @@ pub mod posix {
             let _ = it.dict_set(&env, Value::bytes(k), Value::bytes(v));
         }
         dict_set_str(&d, "environ", Value::Obj(env));
-        dict_set_str(&d, "_have_functions", Value::list(HAVE_FUNCTIONS.iter().map(|n| Value::str(n)).collect()));
+        dict_set_str(
+            &d,
+            "_have_functions",
+            Value::list(HAVE_FUNCTIONS.iter().map(|n| Value::str(n)).collect()),
+        );
     }
 }

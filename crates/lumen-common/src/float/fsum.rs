@@ -62,7 +62,11 @@ impl Fsum {
             return Err(FsumError::Overflow);
         }
         if self.special != 0.0 {
-            return if self.inf.is_nan() { Err(FsumError::InfMinusInf) } else { Ok(self.special) };
+            return if self.inf.is_nan() {
+                Err(FsumError::InfMinusInf)
+            } else {
+                Ok(self.special)
+            };
         }
         let p = &self.partials;
         let mut n = p.len();
@@ -111,10 +115,16 @@ mod tests {
     #[test]
     fn exact_and_special() {
         assert_eq!(fsum(&[0.1; 10]), Ok(1.0));
-        assert_eq!(fsum(&[1e100, 1.0, -1e100, 1e-100, 1e50, -1.0, -1e50]), Ok(1e-100));
+        assert_eq!(
+            fsum(&[1e100, 1.0, -1e100, 1e-100, 1e50, -1.0, -1e50]),
+            Ok(1e-100)
+        );
         assert_eq!(fsum(&[1.0, 1e-16, 1e-16]), Ok(1.0000000000000002));
         assert_eq!(fsum(&[f64::MAX, f64::MAX]), Err(FsumError::Overflow));
-        assert_eq!(fsum(&[f64::INFINITY, f64::NEG_INFINITY]), Err(FsumError::InfMinusInf));
+        assert_eq!(
+            fsum(&[f64::INFINITY, f64::NEG_INFINITY]),
+            Err(FsumError::InfMinusInf)
+        );
         assert_eq!(fsum(&[f64::INFINITY, 1.0]), Ok(f64::INFINITY));
         assert!(fsum(&[f64::NAN, 1.0]).unwrap().is_nan());
         assert_eq!(fsum(&[]), Ok(0.0));

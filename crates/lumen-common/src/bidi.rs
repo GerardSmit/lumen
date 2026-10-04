@@ -40,13 +40,11 @@ mod tests {
         let info = resolve(text, Some(false)).unwrap();
         assert!(info.has_rtl());
         assert!(info.levels.iter().all(|level| level.number() <= 125));
-        assert!(
-            resolve(
-                &alloc::string::String::from_iter(core::iter::repeat_n('a', MAX_TEXT_BYTES + 1)),
-                None
-            )
-            .is_err()
-        );
+        assert!(resolve(
+            &alloc::string::String::from_iter(core::iter::repeat_n('a', MAX_TEXT_BYTES + 1)),
+            None
+        )
+        .is_err());
         assert_eq!(UNICODE_VERSION, (16, 0, 0));
     }
 }

@@ -12,7 +12,12 @@ pub enum TransitionRule {
     /// `Jn` (`julian`, 1..=365, February 29th never counted) or `n` (0..=365).
     Day { julian: bool, day: i64, secs: i64 },
     /// `Mm.w.d`: day `d` (0 = Sunday) of week `w` (5 = last) of month `m`.
-    Calendar { month: i64, week: i64, day: i64, secs: i64 },
+    Calendar {
+        month: i64,
+        week: i64,
+        day: i64,
+        secs: i64,
+    },
 }
 
 impl TransitionRule {
@@ -21,10 +26,19 @@ impl TransitionRule {
         match *self {
             TransitionRule::Day { julian, day, secs } => {
                 let days_before_year = days_from_civil(year, 1, 1) - 1;
-                let day = if julian && day >= 59 && is_leap(year) { day + 1 } else { day };
+                let day = if julian && day >= 59 && is_leap(year) {
+                    day + 1
+                } else {
+                    day
+                };
                 (days_before_year + day) * 86_400 + secs
             }
-            TransitionRule::Calendar { month, week, day, secs } => {
+            TransitionRule::Calendar {
+                month,
+                week,
+                day,
+                secs,
+            } => {
                 let first = days_from_civil(year, month, 1);
                 let first_day = (first + 3).rem_euclid(7);
                 let mut month_day = (day - (first_day + 1)).rem_euclid(7) + 1 + (week - 1) * 7;
@@ -187,11 +201,20 @@ impl Cursor<'_> {
                 self.i += 1;
                 time = self.time()?;
             }
-            if !(1..=12).contains(&month) || !(1..=5).contains(&week) || !(0..=6).contains(&day) || !(-167..=167).contains(&time.0) {
+            if !(1..=12).contains(&month)
+                || !(1..=5).contains(&week)
+                || !(0..=6).contains(&day)
+                || !(-167..=167).contains(&time.0)
+            {
                 return None;
             }
             let secs = time.0 * 3600 + time.1 * 60 + time.2;
-            Some(TransitionRule::Calendar { month, week, day, secs })
+            Some(TransitionRule::Calendar {
+                month,
+                week,
+                day,
+                secs,
+            })
         } else {
             let julian = self.peek() == b'J';
             if julian {
@@ -218,10 +241,18 @@ pub fn parse_tz_str(s: &[u8]) -> Result<PosixTz, TzStrError> {
     let std_abbr = c.abbr().ok_or(TzStrError::StdFormat)?;
     let std_offset = c.delta().ok_or(TzStrError::StdOffset)?;
     if c.peek() == 0 {
-        return Ok(PosixTz { std_abbr, std_offset, dst: None });
+        return Ok(PosixTz {
+            std_abbr,
+            std_offset,
+            dst: None,
+        });
     }
     let abbr = c.abbr().ok_or(TzStrError::DstFormat)?;
-    let offset = if c.peek() == b',' { std_offset + 3600 } else { c.delta().ok_or(TzStrError::DstOffset)? };
+    let offset = if c.peek() == b',' {
+        std_offset + 3600
+    } else {
+        c.delta().ok_or(TzStrError::DstOffset)?
+    };
     let mut rules = Vec::with_capacity(2);
     for _ in 0..2 {
         if c.peek() != b',' {
@@ -233,9 +264,26 @@ pub fn parse_tz_str(s: &[u8]) -> Result<PosixTz, TzStrError> {
     if c.peek() != 0 {
         return Err(TzStrError::Extraneous);
     }
-    let end = rules.pop().unwrap_or(TransitionRule::Day { julian: false, day: 0, secs: 0 });
-    let start = rules.pop().unwrap_or(TransitionRule::Day { julian: false, day: 0, secs: 0 });
-    Ok(PosixTz { std_abbr, std_offset, dst: Some(DstRule { abbr, offset, start, end }) })
+    let end = rules.pop().unwrap_or(TransitionRule::Day {
+        julian: false,
+        day: 0,
+        secs: 0,
+    });
+    let start = rules.pop().unwrap_or(TransitionRule::Day {
+        julian: false,
+        day: 0,
+        secs: 0,
+    });
+    Ok(PosixTz {
+        std_abbr,
+        std_offset,
+        dst: Some(DstRule {
+            abbr,
+            offset,
+            start,
+            end,
+        }),
+    })
 }
 
 /// Which local time type applies.
@@ -302,13 +350,24 @@ impl ZoneRules {
         }
         let dstoff = utcoff_to_dstoff(&trans_idx, &utcoff, isdst);
         let trans_local = ts_to_local(&trans_idx, &trans_utc, &utcoff);
-        let before = isdst.iter().position(|d| !d).or(if n_types > 0 { Some(0) } else { None });
+        let before = isdst
+            .iter()
+            .position(|d| !d)
+            .or(if n_types > 0 { Some(0) } else { None });
         let after = match tz_str.filter(|s| !s.is_empty()) {
             Some(s) => After::Rule(parse_tz_str(s).map_err(ZoneError::TzStr)?),
             None if n_types == 0 => return Err(ZoneError::NoInfo),
             None => After::Type(trans_idx.last().copied().unwrap_or(n_types - 1)),
         };
-        Ok(ZoneRules { trans_utc, trans_local, trans_idx, utcoff, dstoff, before, after })
+        Ok(ZoneRules {
+            trans_utc,
+            trans_local,
+            trans_idx,
+            utcoff,
+            dstoff,
+            before,
+            after,
+        })
     }
 
     fn utcoff_of(&self, a: Applies) -> i64 {
@@ -335,7 +394,11 @@ impl ZoneRules {
         } else {
             start += dst_diff;
         }
-        let isdst = if start < end { ts >= start && ts < end } else { ts < end || ts >= start };
+        let isdst = if start < end {
+            ts >= start && ts < end
+        } else {
+            ts < end || ts >= start
+        };
         if isdst {
             Applies::Dst
         } else {
@@ -349,12 +412,22 @@ impl ZoneRules {
             After::Type(i) => return (Applies::Type(*i), false),
             After::Rule(r) => r,
         };
-        let Some(d) = &r.dst else { return (Applies::Std, false) };
+        let Some(d) = &r.dst else {
+            return (Applies::Std, false);
+        };
         let start = d.start.year_to_timestamp(year) - r.std_offset;
         let end = d.end.year_to_timestamp(year) - d.offset;
         let dst_diff = d.offset - r.std_offset;
-        let isdst = if start < end { ts >= start && ts < end } else { ts < end || ts >= start };
-        let (lo, hi) = if dst_diff > 0 { (end, end + dst_diff) } else { (start, start - dst_diff) };
+        let isdst = if start < end {
+            ts >= start && ts < end
+        } else {
+            ts < end || ts >= start
+        };
+        let (lo, hi) = if dst_diff > 0 {
+            (end, end + dst_diff)
+        } else {
+            (start, start - dst_diff)
+        };
         let fold = ts >= lo && ts < hi;
         (if isdst { Applies::Dst } else { Applies::Std }, fold)
     }
@@ -385,7 +458,11 @@ impl ZoneRules {
             let (tti, mut fold) = self.rule_from_utc(ts, year);
             // Just after the last explicit transition the fold is against the type before it.
             if n > 0 {
-                let prev = if n == 1 { before() } else { Applies::Type(self.trans_idx[n - 2]) };
+                let prev = if n == 1 {
+                    before()
+                } else {
+                    Applies::Type(self.trans_idx[n - 2])
+                };
                 let diff = self.utcoff_of(prev) - self.utcoff_of(tti);
                 if diff > 0 && ts < self.trans_utc[n - 1] + diff {
                     fold = true;
@@ -395,7 +472,10 @@ impl ZoneRules {
         }
         let idx = self.trans_utc.partition_point(|&t| t <= ts);
         let (prev, tti) = if idx >= 2 {
-            (Applies::Type(self.trans_idx[idx - 2]), Applies::Type(self.trans_idx[idx - 1]))
+            (
+                Applies::Type(self.trans_idx[idx - 2]),
+                Applies::Type(self.trans_idx[idx - 1]),
+            )
         } else {
             (before(), Applies::Type(self.trans_idx[0]))
         };
@@ -428,7 +508,9 @@ fn utcoff_to_dstoff(trans_idx: &[usize], utcoffs: &[i64], isdsts: &[bool]) -> Ve
             dstoff = utcoff - utcoffs[comp_idx];
         }
         if dstoff == 0 && idx + 1 < n_types {
-            let Some(&next) = trans_idx.get(i + 1) else { continue };
+            let Some(&next) = trans_idx.get(i + 1) else {
+                continue;
+            };
             comp_idx = next;
             if isdsts[comp_idx] {
                 continue;
@@ -457,7 +539,11 @@ fn ts_to_local(trans_idx: &[usize], trans_utc: &[i64], utcoff: &[i64]) -> [Vec<i
         return [Vec::new(), Vec::new()];
     }
     let mut out = [trans_utc.to_vec(), trans_utc.to_vec()];
-    let (mut o0, mut o1) = if utcoff.len() > 1 { (utcoff[0], utcoff[trans_idx[0]]) } else { (utcoff[0], utcoff[0]) };
+    let (mut o0, mut o1) = if utcoff.len() > 1 {
+        (utcoff[0], utcoff[trans_idx[0]])
+    } else {
+        (utcoff[0], utcoff[0])
+    };
     if o1 > o0 {
         std::mem::swap(&mut o0, &mut o1);
     }
@@ -490,18 +576,38 @@ mod tests {
         assert_eq!(parse_tz_str(b"<+0330>-3:30").unwrap().std_offset, 12_600);
         assert_eq!(parse_tz_str(b"EST5EDT"), Err(TzStrError::DstOffset));
         assert_eq!(parse_tz_str(b"EST5EDT4"), Err(TzStrError::MissingRules));
-        assert_eq!(parse_tz_str(b"EST5EDT,M13.1.0,M11.1.0"), Err(TzStrError::MalformedRule));
+        assert_eq!(
+            parse_tz_str(b"EST5EDT,M13.1.0,M11.1.0"),
+            Err(TzStrError::MalformedRule)
+        );
         assert_eq!(parse_tz_str(b"5"), Err(TzStrError::StdFormat));
         assert_eq!(parse_tz_str(b"AAA"), Err(TzStrError::StdOffset));
-        let j = TransitionRule::Day { julian: true, day: 60, secs: 0 };
-        assert_eq!(j.year_to_timestamp(2024), days_from_civil(2024, 3, 1) * 86_400);
+        let j = TransitionRule::Day {
+            julian: true,
+            day: 60,
+            secs: 0,
+        };
+        assert_eq!(
+            j.year_to_timestamp(2024),
+            days_from_civil(2024, 3, 1) * 86_400
+        );
     }
 
     #[test]
     fn footer_lookup() {
-        let z = ZoneRules::new(vec![], vec![], vec![3600], &[false], Some(b"CET-1CEST,M3.5.0,M10.5.0/3")).unwrap();
+        let z = ZoneRules::new(
+            vec![],
+            vec![],
+            vec![3600],
+            &[false],
+            Some(b"CET-1CEST,M3.5.0,M10.5.0/3"),
+        )
+        .unwrap();
         assert_eq!(z.find_local(1_711_850_400 - 1, false, 2024), Applies::Std);
-        assert_eq!(z.find_local(1_711_850_400 + 3600, false, 2024), Applies::Dst);
+        assert_eq!(
+            z.find_local(1_711_850_400 + 3600, false, 2024),
+            Applies::Dst
+        );
         // 02:30 on the autumn change exists twice: fold 0 is summer time, fold 1 winter time.
         let amb = 1_729_998_000 - 1800;
         assert_eq!(z.find_local(amb, false, 2024), Applies::Dst);

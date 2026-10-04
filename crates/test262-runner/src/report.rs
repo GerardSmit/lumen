@@ -56,4 +56,3 @@ fn json_str_array(items: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-

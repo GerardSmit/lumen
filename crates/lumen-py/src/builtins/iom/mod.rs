@@ -26,11 +26,18 @@ pub fn unsupported_type(it: &mut Interp) -> Obj {
     if let Some(t) = it.native_types.get(&key) {
         return t.clone();
     }
-    let bases = Value::tuple(vec![Value::Obj(it.exc_type("OSError")), Value::Obj(it.exc_type("ValueError"))]);
+    let bases = Value::tuple(vec![
+        Value::Obj(it.exc_type("OSError")),
+        Value::Obj(it.exc_type("ValueError")),
+    ]);
     let ns = it.new_dict();
     crate::vm::dict_set_str(&ns, "__module__", Value::str("io"));
     let meta = it.types.type_.clone();
-    let t = match it.type_new_from_args(meta, &[Value::str("UnsupportedOperation"), bases, Value::Obj(ns)], Vec::new()) {
+    let t = match it.type_new_from_args(
+        meta,
+        &[Value::str("UnsupportedOperation"), bases, Value::Obj(ns)],
+        Vec::new(),
+    ) {
         Ok(Value::Obj(t)) => t,
         _ => it.exc_type("OSError"),
     };
@@ -82,11 +89,21 @@ pub fn check_closed(it: &mut Interp, v: &Value) -> R<()> {
 pub fn bytes_result(it: &mut Interp, v: &Value, what: &str) -> R<Option<Vec<u8>>> {
     match v {
         Value::None => Ok(None),
-        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(v).map(Some),
-        Value::Obj(o) if matches!(o.kind, Kind::Opaque(_)) && crate::builtins::memview::is_buffer_object(it, v) => it.bytes_of(v).map(Some),
+        Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+            it.bytes_of(v).map(Some)
+        }
+        Value::Obj(o)
+            if matches!(o.kind, Kind::Opaque(_))
+                && crate::builtins::memview::is_buffer_object(it, v) =>
+        {
+            it.bytes_of(v).map(Some)
+        }
         _ => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("{}() should have returned a bytes-like object, not '{}'", what, t)))
+            Err(it.type_error(&format!(
+                "{}() should have returned a bytes-like object, not '{}'",
+                what, t
+            )))
         }
     }
 }
@@ -123,7 +140,9 @@ pub fn utf8_mode(it: &mut Interp) -> bool {
         Some("0") => return false,
         _ => {}
     }
-    let locale = ["LC_ALL", "LC_CTYPE", "LANG"].iter().find_map(|k| p.env_var(k).filter(|v| !v.is_empty()));
+    let locale = ["LC_ALL", "LC_CTYPE", "LANG"]
+        .iter()
+        .find_map(|k| p.env_var(k).filter(|v| !v.is_empty()));
     matches!(locale.as_deref(), None | Some("C" | "POSIX"))
 }
 
@@ -190,13 +209,25 @@ pub mod _io {
         closefd: bool,
         #[kw] opener: Option<&Value>,
     ) -> R<Value> {
-        super::open_impl(it, file, mode, buffering, encoding, errors, newline, closefd, opener)
+        super::open_impl(
+            it, file, mode, buffering, encoding, errors, newline, closefd, opener,
+        )
     }
 
     /// Opens the provided file with the intent to import the contents.
     #[op]
     fn open_code(it: &mut Interp, #[kw] path: &str) -> R<Value> {
-        super::open_impl(it, &Value::str(path), "rb", -1, None, None, None, true, None)
+        super::open_impl(
+            it,
+            &Value::str(path),
+            "rb",
+            -1,
+            None,
+            None,
+            None,
+            true,
+            None,
+        )
     }
 
     /// A helper function to choose the text encoding.
@@ -223,10 +254,26 @@ pub mod _io {
         let classes = [
             ("FileIO", type_object::<FileIO>(it), &raw),
             ("BytesIO", type_object::<BytesIO>(it), &buffered),
-            ("BufferedReader", type_object::<BufferedReader>(it), &buffered),
-            ("BufferedWriter", type_object::<BufferedWriter>(it), &buffered),
-            ("BufferedRandom", type_object::<BufferedRandom>(it), &buffered),
-            ("BufferedRWPair", type_object::<BufferedRWPair>(it), &buffered),
+            (
+                "BufferedReader",
+                type_object::<BufferedReader>(it),
+                &buffered,
+            ),
+            (
+                "BufferedWriter",
+                type_object::<BufferedWriter>(it),
+                &buffered,
+            ),
+            (
+                "BufferedRandom",
+                type_object::<BufferedRandom>(it),
+                &buffered,
+            ),
+            (
+                "BufferedRWPair",
+                type_object::<BufferedRWPair>(it),
+                &buffered,
+            ),
             ("TextIOWrapper", type_object::<TextIOWrapper>(it), &text),
             ("StringIO", type_object::<StringIO>(it), &text),
         ];
@@ -235,14 +282,23 @@ pub mod _io {
             it.set_bases(&t, vec![(*base).clone()]);
             dict_set_str(&d, name, Value::Obj(t));
         }
-        for (name, t) in [("_IOBase", iobase), ("_RawIOBase", raw), ("_BufferedIOBase", buffered), ("_TextIOBase", text)] {
+        for (name, t) in [
+            ("_IOBase", iobase),
+            ("_RawIOBase", raw),
+            ("_BufferedIOBase", buffered),
+            ("_TextIOBase", text),
+        ] {
             dict_set_str(&d, name, Value::Obj(t));
         }
         let nl = type_object::<IncrementalNewlineDecoder>(it);
         dict_set_str(&d, "IncrementalNewlineDecoder", Value::Obj(nl));
         let unsupported = super::unsupported_type(it);
         dict_set_str(&d, "UnsupportedOperation", Value::Obj(unsupported));
-        dict_set_str(&d, "BlockingIOError", Value::Obj(it.exc_type("BlockingIOError")));
+        dict_set_str(
+            &d,
+            "BlockingIOError",
+            Value::Obj(it.exc_type("BlockingIOError")),
+        );
         if let Some(open) = crate::vm::dict_get_str(&d, "open") {
             dict_set_str(&it.builtins.clone(), "open", open);
         }
@@ -265,10 +321,20 @@ pub fn init_std_streams(it: &mut Interp, sys: &Obj) {
 
 fn std_stream(it: &mut Interp, fd: i32, attr: &str) -> R<Value> {
     let write = fd != 0;
-    let raw = fileio::new_fileio(it, &Value::Int(fd as i64), if write { "wb" } else { "rb" }, false, None)?;
+    let raw = fileio::new_fileio(
+        it,
+        &Value::Int(fd as i64),
+        if write { "wb" } else { "rb" },
+        false,
+        None,
+    )?;
     it.set_attr_str(&raw, "name", Value::string(format!("<{}>", attr)))?;
     let tty = it.platform.borrow_mut().fd_isatty(fd);
-    let mode = if write { buffered::Mode::Writer } else { buffered::Mode::Reader };
+    let mode = if write {
+        buffered::Mode::Writer
+    } else {
+        buffered::Mode::Reader
+    };
     let buffer = buffered::new_buffered(it, mode, raw, DEFAULT_BUFFER_SIZE)?;
     let errors = if fd == 2 {
         "backslashreplace"
@@ -277,7 +343,15 @@ fn std_stream(it: &mut Interp, fd: i32, attr: &str) -> R<Value> {
     } else {
         "strict"
     };
-    let text = textio::new_textio(it, buffer, Some("utf-8"), Some(errors), Some("\n"), tty || fd == 2, false)?;
+    let text = textio::new_textio(
+        it,
+        buffer,
+        Some("utf-8"),
+        Some(errors),
+        Some("\n"),
+        tty || fd == 2,
+        false,
+    )?;
     it.set_attr_str(&text, "mode", Value::str(if write { "w" } else { "r" }))?;
     Ok(text)
 }
@@ -305,16 +379,29 @@ pub fn open_impl(
     closefd: bool,
     opener: Option<&Value>,
 ) -> R<Value> {
-    let file = if file.is_int_like() && !matches!(file, Value::Bool(_)) { file.clone() } else { crate::bind::fspath(it, file)? };
+    let file = if file.is_int_like() && !matches!(file, Value::Bool(_)) {
+        file.clone()
+    } else {
+        crate::bind::fspath(it, file)?
+    };
     let mut seen = std::collections::BTreeSet::new();
-    let ok = mode.chars().all(|c| "axrwb+t".contains(c) && seen.insert(c));
+    let ok = mode
+        .chars()
+        .all(|c| "axrwb+t".contains(c) && seen.insert(c));
     if !ok {
         let r = it.repr_of(&Value::str(mode))?;
         return Err(it.value_error(&format!("invalid mode: {}", r)));
     }
     let has = |c: char| seen.contains(&c);
-    let (creating, reading, writing, appending, updating, text, binary) =
-        (has('x'), has('r'), has('w'), has('a'), has('+'), has('t'), has('b'));
+    let (creating, reading, writing, appending, updating, text, binary) = (
+        has('x'),
+        has('r'),
+        has('w'),
+        has('a'),
+        has('+'),
+        has('t'),
+        has('b'),
+    );
     if text && binary {
         return Err(it.value_error("can't have text and binary mode at once"));
     }
@@ -322,7 +409,9 @@ pub fn open_impl(
         return Err(it.value_error("must have exactly one of create/read/write/append mode"));
     }
     if !(creating || reading || writing || appending) {
-        return Err(it.value_error("Must have exactly one of create/read/write/append mode and at most one plus"));
+        return Err(it.value_error(
+            "Must have exactly one of create/read/write/append mode and at most one plus",
+        ));
     }
     if binary && encoding.is_some() {
         return Err(it.value_error("binary mode doesn't take an encoding argument"));
@@ -338,7 +427,13 @@ pub fn open_impl(
         crate::builtins::warningsm::warn_category(it, "RuntimeWarning", msg, 1)?;
     }
     let mut rawmode = String::new();
-    for (on, c) in [(creating, 'x'), (reading, 'r'), (writing, 'w'), (appending, 'a'), (updating, '+')] {
+    for (on, c) in [
+        (creating, 'x'),
+        (reading, 'r'),
+        (writing, 'w'),
+        (appending, 'a'),
+        (updating, '+'),
+    ] {
         if on {
             rawmode.push(c);
         }
@@ -353,7 +448,11 @@ pub fn open_impl(
         }
         if buffering < 0 {
             let bs = fileio::blksize(it, &raw);
-            buffering = if bs > 1 { bs } else { DEFAULT_BUFFER_SIZE as i64 };
+            buffering = if bs > 1 {
+                bs
+            } else {
+                DEFAULT_BUFFER_SIZE as i64
+            };
         }
         if buffering == 0 {
             if binary {
@@ -373,7 +472,15 @@ pub fn open_impl(
             return Ok(buffer);
         }
         let enc = encoding.unwrap_or("locale");
-        let text = textio::new_textio(it, buffer.clone(), Some(enc), errors, newline, line_buffering, false);
+        let text = textio::new_textio(
+            it,
+            buffer.clone(),
+            Some(enc),
+            errors,
+            newline,
+            line_buffering,
+            false,
+        );
         let text = match text {
             Ok(t) => t,
             Err(e) => {

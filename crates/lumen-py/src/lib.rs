@@ -18,11 +18,11 @@ pub mod compile;
 pub mod containers;
 pub mod dict;
 pub mod exc;
+pub mod fmath;
+pub mod frozen;
 pub mod import;
 pub mod iter;
 pub mod lexer;
-pub mod fmath;
-pub mod frozen;
 pub mod limits;
 pub mod num;
 pub mod object;
@@ -37,10 +37,10 @@ pub mod unicode;
 pub mod vm;
 pub mod weak;
 
-pub use parser::{parse, SyntaxError};
 pub use cli::run_main;
-pub use lumen_common::limits::InterruptHandle;
-pub use platform::{MemFs, MemPlatform, Platform, StdPlatform};
-pub use vm::{Interp, Output, ProcessOutput};
 /// The binding macros (see `lumen_bind`; the Python host is [`bind`]).
 pub use lumen_bind::{class, methods, module, op};
+pub use lumen_common::limits::InterruptHandle;
+pub use parser::{parse, SyntaxError};
+pub use platform::{MemFs, MemPlatform, Platform, StdPlatform};
+pub use vm::{Interp, Output, ProcessOutput};

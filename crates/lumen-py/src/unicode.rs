@@ -11,7 +11,12 @@ pub fn has(c: u32, f: u16) -> bool {
 }
 
 pub fn is_xid_start(c: char) -> bool {
-    c == '_' || if c.is_ascii() { c.is_ascii_alphabetic() } else { has(c as u32, flag::XID_START) }
+    c == '_'
+        || if c.is_ascii() {
+            c.is_ascii_alphabetic()
+        } else {
+            has(c as u32, flag::XID_START)
+        }
 }
 
 pub fn is_xid_continue(c: char) -> bool {
@@ -87,7 +92,11 @@ pub fn convert(s: &str, case: Case) -> String {
                 Case::Capitalize => first,
                 Case::SwapCase => b.is_ascii_lowercase(),
             };
-            out.push(if up { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() } as char);
+            out.push(if up {
+                b.to_ascii_uppercase()
+            } else {
+                b.to_ascii_lowercase()
+            } as char);
             cased = b.is_ascii_alphabetic();
             ignorable = matches!(b, b'\'' | b'.' | b':' | b'^' | b'`');
         } else {
@@ -126,7 +135,13 @@ fn convert_ascii(s: &str, case: Case) -> String {
         Case::Lower | Case::Fold => s.to_ascii_lowercase(),
         Case::SwapCase => s
             .chars()
-            .map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() })
+            .map(|c| {
+                if c.is_ascii_uppercase() {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
             .collect(),
         Case::Capitalize => {
             let mut out = s.to_ascii_lowercase();
@@ -139,7 +154,11 @@ fn convert_ascii(s: &str, case: Case) -> String {
             let mut out = String::with_capacity(s.len());
             let mut prev_cased = false;
             for c in s.chars() {
-                out.push(if prev_cased { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() });
+                out.push(if prev_cased {
+                    c.to_ascii_lowercase()
+                } else {
+                    c.to_ascii_uppercase()
+                });
                 prev_cased = c.is_ascii_alphabetic();
             }
             out
@@ -153,7 +172,10 @@ fn lower_with(t: &ucd::CharType, cased_before: bool, rest: &CodePoints) -> ucd::
     if t.cp() != 0x3A3 {
         return t.lower();
     }
-    let after = rest.clone().find(|&c| !has(c, flag::CASE_IGNORABLE)).is_some_and(|c| has(c, flag::CASED));
+    let after = rest
+        .clone()
+        .find(|&c| !has(c, flag::CASE_IGNORABLE))
+        .is_some_and(|c| has(c, flag::CASED));
     ucd::CaseMapping::single(if cased_before && !after { 0x3C2 } else { 0x3C3 })
 }
 
@@ -174,7 +196,11 @@ mod tests {
         for b in 0u8..0x80 {
             let t = char_type(b as u32);
             assert_eq!(t.is(flag::CASED), b.is_ascii_alphabetic(), "{b}");
-            assert_eq!(t.is(flag::CASE_IGNORABLE), matches!(b, b'\'' | b'.' | b':' | b'^' | b'`'), "{b}");
+            assert_eq!(
+                t.is(flag::CASE_IGNORABLE),
+                matches!(b, b'\'' | b'.' | b':' | b'^' | b'`'),
+                "{b}"
+            );
         }
     }
 

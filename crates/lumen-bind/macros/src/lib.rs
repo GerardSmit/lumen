@@ -59,7 +59,10 @@ fn expand_op(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let toks: Vec<TokenTree> = item.into_iter().collect();
     let sig = parse_fn(&toks)?;
     if sig.receiver.is_some() {
-        return Err((sig.name_span, "a free fn has no receiver (use #[methods] for members)".into()));
+        return Err((
+            sig.name_span,
+            "a free fn has no receiver (use #[methods] for members)".into(),
+        ));
     }
     let spec = Spec {
         sig: &sig,
@@ -85,7 +88,9 @@ fn expand_op(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
 
 fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let opts = parse_opts(attr)?;
-    opts.check(&["name", "rename", "only", "skip", "module", "generic", "hint", "extends"])?;
+    opts.check(&[
+        "name", "rename", "only", "skip", "module", "generic", "hint", "extends",
+    ])?;
     let toks: Vec<TokenTree> = item.clone().into_iter().collect();
     let doc = doc_of(&toks);
     let (_, mut i) = take_attrs(&toks, 0);
@@ -100,7 +105,11 @@ fn expand_class(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     }
     let ty = name.to_string();
     let module = opts.get("module").or(opts.get("__module"));
-    let flags = if opts.has("generic") { format!("{B}::CLASS_GENERIC") } else { "0".into() };
+    let flags = if opts.has("generic") {
+        format!("{B}::CLASS_GENERIC")
+    } else {
+        "0".into()
+    };
     let doc = match &doc {
         Some(d) => format!("::core::option::Option::Some({d:?})"),
         None => "::core::option::Option::None".into(),
@@ -144,11 +153,14 @@ fn split_items(toks: &[TokenTree]) -> Vec<Vec<TokenTree>> {
     let mut i = 0;
     while i < toks.len() {
         let (_, after_attrs) = take_attrs(toks, i);
-        let semi_item = toks[after_attrs..]
+        let semi_item = toks[after_attrs..].iter().take(4).any(|t| {
+            ["const", "static", "use", "type"]
+                .iter()
+                .any(|k| is_ident(t, k))
+        }) && !toks[after_attrs..]
             .iter()
             .take(4)
-            .any(|t| ["const", "static", "use", "type"].iter().any(|k| is_ident(t, k)))
-            && !toks[after_attrs..].iter().take(4).any(|t| is_ident(t, "fn"));
+            .any(|t| is_ident(t, "fn"));
         let mut j = after_attrs;
         while j < toks.len() {
             let t = &toks[j];
@@ -168,11 +180,22 @@ fn split_items(toks: &[TokenTree]) -> Vec<Vec<TokenTree>> {
     out
 }
 
-const MEMBER_ATTRS: &[&str] = &["constructor", "classmethod", "getter", "setter", "proto", "method", "skip"];
+const MEMBER_ATTRS: &[&str] = &[
+    "constructor",
+    "classmethod",
+    "getter",
+    "setter",
+    "proto",
+    "method",
+    "skip",
+];
 
 fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     if !attr.is_empty() {
-        return Err((Span::call_site(), "#[methods] takes no options (put them on #[class])".into()));
+        return Err((
+            Span::call_site(),
+            "#[methods] takes no options (put them on #[class])".into(),
+        ));
     }
     let toks: Vec<TokenTree> = item.into_iter().collect();
     let (_, mut i) = take_attrs(&toks, 0);
@@ -181,7 +204,10 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     }
     i += 1;
     if toks.get(i).is_some_and(|t| is_punct(t, '<')) {
-        return Err((toks[i].span(), "generic impl blocks are not supported".into()));
+        return Err((
+            toks[i].span(),
+            "generic impl blocks are not supported".into(),
+        ));
     }
     let body_idx = toks
         .iter()
@@ -189,9 +215,14 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         .ok_or((Span::call_site(), "expected an impl body".to_string()))?;
     let self_ty = type_str(&toks[i..body_idx]);
     if self_ty.contains(" for ") || self_ty.contains('<') {
-        return Err((toks[i].span(), "#[methods] goes on an inherent impl of a non-generic #[class]".into()));
+        return Err((
+            toks[i].span(),
+            "#[methods] goes on an inherent impl of a non-generic #[class]".into(),
+        ));
     }
-    let TokenTree::Group(body) = &toks[body_idx] else { unreachable!() };
+    let TokenTree::Group(body) = &toks[body_idx] else {
+        unreachable!()
+    };
     let body_toks: Vec<TokenTree> = body.stream().into_iter().collect();
     let modname = format!("__lumen_bind_{self_ty}");
     let mut gen_items = String::new();
@@ -213,7 +244,10 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
             continue;
         }
         let sig = parse_fn(&it)?;
-        let has_this = sig.params.iter().any(|p| base_name(&p.ts) == "This" && !p.ts.starts_with('&'));
+        let has_this = sig
+            .params
+            .iter()
+            .any(|p| base_name(&p.ts) == "This" && !p.ts.starts_with('&'));
         let instance = sig.receiver.is_some() || has_this;
         let mut opts = Opts::default();
         let mut role = if instance { Role::Method } else { Role::Static };
@@ -229,7 +263,13 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                 "proto" => {
                     let p = a.args_ts().to_string();
                     if !PROTOCOLS.contains(&p.as_str()) {
-                        return Err((a.span, format!("unknown protocol `{p}` (expected one of: {})", PROTOCOLS.join(", "))));
+                        return Err((
+                            a.span,
+                            format!(
+                                "unknown protocol `{p}` (expected one of: {})",
+                                PROTOCOLS.join(", ")
+                            ),
+                        ));
                     }
                     role = Role::Proto(p);
                     continue;
@@ -259,8 +299,16 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     g.set_span(body.span());
     out.push(TokenTree::Group(g));
     out.extend(toks[body_idx + 1..].iter().cloned());
-    let bounds = members.iter().map(|m| format!("{modname}::{m}: {B}::Native<H>")).collect::<Vec<_>>().join(", ");
-    let pushes = members.iter().map(|m| format!("out.push({B}::FnItem::of::<{modname}::{m}>());")).collect::<Vec<_>>().join("\n");
+    let bounds = members
+        .iter()
+        .map(|m| format!("{modname}::{m}: {B}::Native<H>"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let pushes = members
+        .iter()
+        .map(|m| format!("out.push({B}::FnItem::of::<{modname}::{m}>());"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let code = format!(
         "#[doc(hidden)]\n#[allow(non_snake_case, non_upper_case_globals, unused_imports, unused_mut, unused_variables, clippy::all)]\n\
          mod {modname} {{\nuse super::*;\n{gen_items}}}\n\
@@ -276,10 +324,11 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
 }
 
 const PROTOCOLS: &[&str] = &[
-    "init", "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "reversed", "repr", "str", "hash",
-    "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul",
-    "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int",
-    "float", "call", "copy", "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
+    "init", "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "reversed", "repr",
+    "str", "hash", "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub",
+    "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or", "ror", "ior", "xor",
+    "rxor", "ixor", "neg", "pos", "abs", "invert", "index", "int", "float", "call", "copy",
+    "deepcopy", "reduce", "sizeof", "enter", "exit", "await", "aiter", "anext",
 ];
 
 fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
@@ -297,20 +346,30 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let Some(TokenTree::Group(body)) = toks.get(i + 2) else {
         return Err((mod_name.span(), "expected an inline module body".into()));
     };
-    let mname = opts.get("name").unwrap_or(&mod_name.to_string()).to_string();
+    let mname = opts
+        .get("name")
+        .unwrap_or(&mod_name.to_string())
+        .to_string();
     let body_toks: Vec<TokenTree> = body.stream().into_iter().collect();
     let mut new_body: Vec<TokenTree> = Vec::new();
     let mut bounds: Vec<String> = Vec::new();
     let mut pushes: Vec<String> = Vec::new();
     for it in split_items(&body_toks) {
         let (attrs, after) = take_attrs(&it, 0);
-        let bind = attrs.iter().find(|a| ["op", "class", "methods", "constant", "init"].iter().any(|n| a.is(n)));
+        let bind = attrs.iter().find(|a| {
+            ["op", "class", "methods", "constant", "init"]
+                .iter()
+                .any(|n| a.is(n))
+        });
         let Some(bind) = bind else {
             new_body.extend(it);
             continue;
         };
         if attrs.iter().any(|a| a.path == "cfg") {
-            return Err((bind.span, "a cfg-gated item cannot be registered by #[module]".into()));
+            return Err((
+                bind.span,
+                "a cfg-gated item cannot be registered by #[module]".into(),
+            ));
         }
         let kind = bind.name().to_string();
         let mut kept: Vec<TokenTree> = Vec::new();
@@ -340,19 +399,26 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
             "op" => {
                 let name = ident_after("fn").ok_or((bind.span, "expected a fn".to_string()))?;
                 bounds.push(format!("{name}::Op: {B}::Native<H>"));
-                pushes.push(format!("out.functions.push({B}::FnItem::of::<{name}::Op>());"));
+                pushes.push(format!(
+                    "out.functions.push({B}::FnItem::of::<{name}::Op>());"
+                ));
             }
             "class" => {
-                let name = ident_after("struct").ok_or((bind.span, "expected a struct".to_string()))?;
+                let name =
+                    ident_after("struct").ok_or((bind.span, "expected a struct".to_string()))?;
                 bounds.push(format!("{name}: {B}::Methods<H>"));
                 pushes.push(format!(
                     "out.classes.push({B}::ClassItem {{ desc: <{name} as {B}::Class>::DESC, object: <H as {B}::Host>::class_object::<{name}> }});"
                 ));
             }
             "constant" => {
-                let name = ident_after("const").ok_or((bind.span, "expected a `const`".to_string()))?;
+                let name =
+                    ident_after("const").ok_or((bind.span, "expected a `const`".to_string()))?;
                 let k = rest.iter().position(|t| is_ident(t, "const")).unwrap();
-                let eq = rest.iter().position(|t| is_punct(t, '=')).ok_or((bind.span, "expected `const X: T = ..;`".to_string()))?;
+                let eq = rest
+                    .iter()
+                    .position(|t| is_punct(t, '='))
+                    .ok_or((bind.span, "expected `const X: T = ..;`".to_string()))?;
                 let ty = render(&rest[k + 3..eq], None, Lt::Infer);
                 let o = parse_opts(bind.args_ts())?;
                 o.check(&["name"])?;
@@ -365,11 +431,18 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
             "init" => {
                 let sig = parse_fn(rest)?;
                 if sig.params.len() != 2 {
-                    return Err((sig.name_span, "#[init] fn takes `(ctx: &mut Ctx, module: &Value)`".into()));
+                    return Err((
+                        sig.name_span,
+                        "#[init] fn takes `(ctx: &mut Ctx, module: &Value)`".into(),
+                    ));
                 }
                 let ctx = render(&sig.params[0].ty[2..], None, Lt::Infer);
                 let val = render(&sig.params[1].ty[1..], None, Lt::Infer);
-                let ret = sig.ret.as_ref().map(|r| render(r, None, Lt::Infer)).unwrap_or_else(|| "()".into());
+                let ret = sig
+                    .ret
+                    .as_ref()
+                    .map(|r| render(r, None, Lt::Infer))
+                    .unwrap_or_else(|| "()".into());
                 bounds.push(format!("H: {B}::Host<Ctx = {ctx}, Value = {val}>"));
                 bounds.push(format!("{ret}: {B}::IntoRet<H>"));
                 pushes.push(format!(
@@ -386,7 +459,12 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
         Some(d) => format!("::core::option::Option::Some({d:?})"),
         None => "::core::option::Option::None".into(),
     };
-    let renames = opts.map("rename").iter().map(|(h, n)| format!("({h:?}, {n:?})")).collect::<Vec<_>>().join(", ");
+    let renames = opts
+        .map("rename")
+        .iter()
+        .map(|(h, n)| format!("({h:?}, {n:?})"))
+        .collect::<Vec<_>>()
+        .join(", ");
     let explicit = match opts.get("name") {
         Some(n) => format!("::core::option::Option::Some({n:?})"),
         None => "::core::option::Option::None".into(),

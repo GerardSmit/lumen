@@ -43,7 +43,11 @@ fn run_limited(limit: usize, src: &str) -> (i32, String, String) {
             let code = it.run_source(&src, "<heap>");
             it.flush_out();
             let c = cap.borrow();
-            (code, String::from_utf8_lossy(&c.out).into_owned(), String::from_utf8_lossy(&c.err).into_owned())
+            (
+                code,
+                String::from_utf8_lossy(&c.out).into_owned(),
+                String::from_utf8_lossy(&c.err).into_owned(),
+            )
         })
         .unwrap()
         .join()
@@ -115,7 +119,10 @@ for _ in range(3):
 
 #[test]
 fn memory_error_is_an_ordinary_exception() {
-    let (code, out, err) = run_limited(8 * MB, "try:\n    [0] * 10**8\nexcept Exception as e:\n    print(type(e).__name__)\n");
+    let (code, out, err) = run_limited(
+        8 * MB,
+        "try:\n    [0] * 10**8\nexcept Exception as e:\n    print(type(e).__name__)\n",
+    );
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "MemoryError\n");
 }

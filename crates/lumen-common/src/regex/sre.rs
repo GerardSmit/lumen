@@ -117,8 +117,18 @@ fn category_ranges(category: u32) -> Option<Vec<(u32, u32)>> {
     let (set, negated): (&[u32], bool) = match category {
         6 => (&[0x0A], false),
         7 => (&[0x0A], true),
-        16 => (&[0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029], false),
-        17 => (&[0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029], true),
+        16 => (
+            &[
+                0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029,
+            ],
+            false,
+        ),
+        17 => (
+            &[
+                0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029,
+            ],
+            true,
+        ),
         _ => return None,
     };
     let mut sorted = set.to_vec();
@@ -264,8 +274,7 @@ impl Decoder<'_> {
                 }
                 BIGCHARSET => {
                     let count = self.word(p + 1)? as usize;
-                    let index_words =
-                        self.code.get(p + 2..p + 66).ok_or(SreError::Invalid)?;
+                    let index_words = self.code.get(p + 2..p + 66).ok_or(SreError::Invalid)?;
                     let blocks_at = p + 66;
                     let blocks = self
                         .code
@@ -362,8 +371,12 @@ impl Decoder<'_> {
                     items.push(self.ignore_class(None, self.word(p + 1)?, true));
                     p += 2;
                 }
-                LITERAL_IGNORE | LITERAL_UNI_IGNORE | LITERAL_LOC_IGNORE | NOT_LITERAL_IGNORE
-                | NOT_LITERAL_UNI_IGNORE | NOT_LITERAL_LOC_IGNORE => {
+                LITERAL_IGNORE
+                | LITERAL_UNI_IGNORE
+                | LITERAL_LOC_IGNORE
+                | NOT_LITERAL_IGNORE
+                | NOT_LITERAL_UNI_IGNORE
+                | NOT_LITERAL_LOC_IGNORE => {
                     let pre = match op {
                         LITERAL_IGNORE | NOT_LITERAL_IGNORE => PreMap::AsciiLower,
                         LITERAL_UNI_IGNORE | NOT_LITERAL_UNI_IGNORE => PreMap::PyLower,

@@ -36,10 +36,12 @@ pub mod _struct {
     use crate::bind::{buffer_error, Py, This};
     use crate::object::*;
     use crate::vm::{dict_get_str, dict_set_str, Interp};
-    use lumen_common::buffer::{load, store_f64, store_float_checked, store_int_checked, store_int_wrapping, struct_code};
+    use lumen_common::buffer::{
+        load, store_f64, store_float_checked, store_int_checked, store_int_wrapping, struct_code,
+    };
     use lumen_common::buffer::{ElemKind, PackError, StructMode, ViewDesc};
-    use std::cell::RefCell;
     use lumen_common::fasthash::FastMap;
+    use std::cell::RefCell;
     use std::rc::Rc;
 
     const MAX_CACHE: usize = 100;
@@ -67,12 +69,23 @@ pub mod _struct {
         /// The format of a `Struct` created by `__new__` without `__init__`: CPython reports its
         /// size and item count as -1.
         fn uninitialized() -> Fmt {
-            Fmt { text: String::new(), codes: Vec::new(), size: 0, nvalues: 0, mode: StructMode::Native, uninit: true }
+            Fmt {
+                text: String::new(),
+                codes: Vec::new(),
+                size: 0,
+                nvalues: 0,
+                mode: StructMode::Native,
+                uninit: true,
+            }
         }
     }
 
     fn shown(f: &Fmt, n: usize) -> i64 {
-        if f.uninit { -1 } else { n as i64 }
+        if f.uninit {
+            -1
+        } else {
+            n as i64
+        }
     }
 
     thread_local! {
@@ -128,7 +141,10 @@ pub mod _struct {
                 num = (c - b'0') as usize;
                 loop {
                     let Some(&d) = rest.get(i) else {
-                        return Err(struct_error(it, "repeat count given without format specifier"));
+                        return Err(struct_error(
+                            it,
+                            "repeat count given without format specifier",
+                        ));
                     };
                     i += 1;
                     if !d.is_ascii_digit() {
@@ -153,23 +169,50 @@ pub mod _struct {
             }
             match c {
                 b's' | b'p' => {
-                    codes.push(Code { ch: c, kind: None, offset: size, size: num, repeat: 1 });
+                    codes.push(Code {
+                        ch: c,
+                        kind: None,
+                        offset: size,
+                        size: num,
+                        repeat: 1,
+                    });
                     nvalues += 1;
-                    size = size.checked_add(num).filter(|s| *s <= max).ok_or_else(|| too_long(it))?;
+                    size = size
+                        .checked_add(num)
+                        .filter(|s| *s <= max)
+                        .ok_or_else(|| too_long(it))?;
                 }
-                b'x' => size = size.checked_add(num).filter(|s| *s <= max).ok_or_else(|| too_long(it))?,
+                b'x' => {
+                    size = size
+                        .checked_add(num)
+                        .filter(|s| *s <= max)
+                        .ok_or_else(|| too_long(it))?
+                }
                 _ if num > 0 => {
                     if num > (max - size) / sc.size {
                         return Err(too_long(it));
                     }
-                    codes.push(Code { ch: c, kind: sc.kind, offset: size, size: sc.size, repeat: num });
+                    codes.push(Code {
+                        ch: c,
+                        kind: sc.kind,
+                        offset: size,
+                        size: sc.size,
+                        repeat: num,
+                    });
                     nvalues += num;
                     size += sc.size * num;
                 }
                 _ => {}
             }
         }
-        Ok(Fmt { text: text.to_string(), codes, size, nvalues, mode, uninit: false })
+        Ok(Fmt {
+            text: text.to_string(),
+            codes,
+            size,
+            nvalues,
+            mode,
+            uninit: false,
+        })
     }
 
     fn compile_value(it: &mut Interp, v: &Value) -> R<Fmt> {
@@ -192,7 +235,10 @@ pub mod _struct {
 
     fn format_type_error(it: &mut Interp, v: &Value) -> Obj {
         let t = it.type_name_of(v);
-        it.type_error(&format!("Struct() argument 1 must be a str or bytes object, not {}", t))
+        it.type_error(&format!(
+            "Struct() argument 1 must be a str or bytes object, not {}",
+            t
+        ))
     }
 
     fn cached_fmt(it: &mut Interp, v: &Value) -> R<Rc<Fmt>> {
@@ -227,7 +273,9 @@ pub mod _struct {
         let mut out = Vec::with_capacity(f.nvalues);
         for c in &f.codes {
             match c.kind {
-                None if c.ch == b's' => out.push(Value::bytes(data[c.offset..c.offset + c.size].to_vec())),
+                None if c.ch == b's' => {
+                    out.push(Value::bytes(data[c.offset..c.offset + c.size].to_vec()))
+                }
                 None => {
                     let n = c.size;
                     let v = if n == 0 {
@@ -270,15 +318,29 @@ pub mod _struct {
         Err(struct_error(it, "required argument is not a float"))
     }
 
-    fn pack_one(it: &mut Interp, f: &Fmt, c: &Code, kind: ElemKind, v: &Value, out: &mut [u8]) -> R<()> {
+    fn pack_one(
+        it: &mut Interp,
+        f: &Fmt,
+        c: &Code,
+        kind: ElemKind,
+        v: &Value,
+        out: &mut [u8],
+    ) -> R<()> {
         let order = f.mode.order();
         match kind {
             ElemKind::Char => match v {
                 Value::Obj(o) if matches!(&o.kind, Kind::Bytes(b) if b.len() == 1) => {
-                    out[0] = if let Kind::Bytes(b) = &o.kind { b[0] } else { 0 };
+                    out[0] = if let Kind::Bytes(b) = &o.kind {
+                        b[0]
+                    } else {
+                        0
+                    };
                     Ok(())
                 }
-                _ => Err(struct_error(it, "char format requires a bytes object of length 1")),
+                _ => Err(struct_error(
+                    it,
+                    "char format requires a bytes object of length 1",
+                )),
             },
             ElemKind::Bool => {
                 out[0] = it.truthy(v)? as u8;
@@ -293,7 +355,10 @@ pub mod _struct {
                 }
                 match store_float_checked(k, x, out, order) {
                     Ok(()) => Ok(()),
-                    Err(_) => Err(it.overflow_err(&format!("float too large to pack with {} format", c.ch as char))),
+                    Err(_) => Err(it.overflow_err(&format!(
+                        "float too large to pack with {} format",
+                        c.ch as char
+                    ))),
                 }
             }
             _ => {
@@ -317,9 +382,13 @@ pub mod _struct {
                 };
                 match r {
                     Ok(()) => Ok(()),
-                    Err(PackError::OutOfRange { lo, hi }) => {
-                        Err(struct_error(it, &format!("'{}' format requires {} <= number <= {}", c.ch as char, lo, hi)))
-                    }
+                    Err(PackError::OutOfRange { lo, hi }) => Err(struct_error(
+                        it,
+                        &format!(
+                            "'{}' format requires {} <= number <= {}",
+                            c.ch as char, lo, hi
+                        ),
+                    )),
                     Err(_) => Err(struct_error(it, "required argument is not an integer")),
                 }
             }
@@ -339,7 +408,15 @@ pub mod _struct {
 
     fn pack_values(it: &mut Interp, f: &Fmt, fname: &str, args: &[Value]) -> R<Vec<u8>> {
         if args.len() != f.nvalues || f.uninit {
-            return Err(struct_error(it, &format!("{} expected {} items for packing (got {})", fname, shown(f, f.nvalues), args.len())));
+            return Err(struct_error(
+                it,
+                &format!(
+                    "{} expected {} items for packing (got {})",
+                    fname,
+                    shown(f, f.nvalues),
+                    args.len()
+                ),
+            ));
         }
         let mut buf: Vec<u8> = it.vec_with_capacity(f.size, crate::limits::MAX_BYTES_LEN)?;
         buf.resize(f.size, 0);
@@ -350,7 +427,10 @@ pub mod _struct {
                     let v = &args[next];
                     next += 1;
                     let Some(data) = bytes_arg(v) else {
-                        return Err(struct_error(it, &format!("argument for '{}' must be a bytes object", c.ch as char)));
+                        return Err(struct_error(
+                            it,
+                            &format!("argument for '{}' must be a bytes object", c.ch as char),
+                        ));
                     };
                     let dst = &mut buf[c.offset..c.offset + c.size];
                     if c.ch == b's' {
@@ -376,7 +456,10 @@ pub mod _struct {
 
     fn do_unpack(it: &mut Interp, f: &Fmt, data: &[u8]) -> R<Value> {
         if data.len() != f.size || f.uninit {
-            return Err(struct_error(it, &format!("unpack requires a buffer of {} bytes", shown(f, f.size))));
+            return Err(struct_error(
+                it,
+                &format!("unpack requires a buffer of {} bytes", shown(f, f.size)),
+            ));
         }
         Ok(Value::tuple(unpack_values(f, data)))
     }
@@ -387,10 +470,16 @@ pub mod _struct {
         let size = f.size as i64;
         if off < 0 {
             if off.saturating_add(size) > 0 {
-                return Err(struct_error(it, &format!("not enough data to unpack {} bytes at offset {}", size, off)));
+                return Err(struct_error(
+                    it,
+                    &format!("not enough data to unpack {} bytes at offset {}", size, off),
+                ));
             }
             if off.saturating_add(len) < 0 {
-                return Err(struct_error(it, &format!("offset {} out of range for {}-byte buffer", off, len)));
+                return Err(struct_error(
+                    it,
+                    &format!("offset {} out of range for {}-byte buffer", off, len),
+                ));
             }
             off += len;
         }
@@ -418,15 +507,22 @@ pub mod _struct {
         // A `bytearray` (the usual target) is exported directly, without a view descriptor.
         let (src, base, len) = match &args[0] {
             Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => {
-                let Kind::ByteArray(store) = &o.kind else { unreachable!() };
+                let Kind::ByteArray(store) = &o.kind else {
+                    unreachable!()
+                };
                 let e = store.export().map_err(|e| buffer_error(it, e))?;
                 (memview::Source::Store(e), 0, store.len())
             }
             v => match memview::export(it, v)? {
-                Some(e) if !e.view.readonly && e.view.is_c_contiguous() => (e.src, e.view.offset, e.view.nbytes()),
+                Some(e) if !e.view.readonly && e.view.is_c_contiguous() => {
+                    (e.src, e.view.offset, e.view.nbytes())
+                }
                 _ => {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("argument must be read-write bytes-like object, not {}", t)));
+                    return Err(it.type_error(&format!(
+                        "argument must be read-write bytes-like object, not {}",
+                        t
+                    )));
                 }
             },
         };
@@ -434,7 +530,10 @@ pub mod _struct {
             Ok(o) => o,
             Err(e) if it.exc_is(&e, "OverflowError") => {
                 let t = it.type_name_of(&args[1]);
-                return Err(it.new_exc_str("IndexError", &format!("cannot fit '{}' into an index-sized integer", t)));
+                return Err(it.new_exc_str(
+                    "IndexError",
+                    &format!("cannot fit '{}' into an index-sized integer", t),
+                ));
             }
             Err(e) => return Err(e),
         };
@@ -443,10 +542,16 @@ pub mod _struct {
         let size = f.size as i64;
         if off < 0 {
             if off.saturating_add(size) > 0 {
-                return Err(struct_error(it, &format!("no space to pack {} bytes at offset {}", size, off)));
+                return Err(struct_error(
+                    it,
+                    &format!("no space to pack {} bytes at offset {}", size, off),
+                ));
             }
             if off.saturating_add(len) < 0 {
-                return Err(struct_error(it, &format!("offset {} out of range for {}-byte buffer", off, len)));
+                return Err(struct_error(
+                    it,
+                    &format!("offset {} out of range for {}-byte buffer", off, len),
+                ));
             }
             off += len;
         }
@@ -475,14 +580,29 @@ pub mod _struct {
             }
         };
         if f.size == 0 {
-            return Err(struct_error(it, "cannot iteratively unpack with a struct of length 0"));
+            return Err(struct_error(
+                it,
+                "cannot iteratively unpack with a struct of length 0",
+            ));
         }
         let len = src.view.nbytes();
         if len % f.size != 0 {
-            let msg = format!("iterative unpacking requires a buffer of a multiple of {} bytes", f.size);
+            let msg = format!(
+                "iterative unpacking requires a buffer of a multiple of {} bytes",
+                f.size
+            );
             return Err(struct_error(it, &msg));
         }
-        Ok(Py::new(it, UnpackIterator { fmt: f, src: Some(src.src), view: src.view, index: 0 }).into_value())
+        Ok(Py::new(
+            it,
+            UnpackIterator {
+                fmt: f,
+                src: Some(src.src),
+                view: src.view,
+                index: 0,
+            },
+        )
+        .into_value())
     }
 
     /// Struct(fmt) --> compiled struct object
@@ -495,7 +615,10 @@ pub mod _struct {
     impl Struct {
         fn fmt(&self, it: &mut Interp) -> R<Rc<Fmt>> {
             let _ = it;
-            Ok(self.fmt.clone().unwrap_or_else(|| Rc::new(Fmt::uninitialized())))
+            Ok(self
+                .fmt
+                .clone()
+                .unwrap_or_else(|| Rc::new(Fmt::uninitialized())))
         }
     }
 
@@ -516,7 +639,9 @@ pub mod _struct {
 
         #[getter]
         fn format(&self) -> Value {
-            self.fmt.as_ref().map_or(Value::None, |f| Value::string(f.text.clone()))
+            self.fmt
+                .as_ref()
+                .map_or(Value::None, |f| Value::string(f.text.clone()))
         }
 
         #[getter]
@@ -541,7 +666,14 @@ pub mod _struct {
             do_unpack(it, &f, buffer)
         }
 
-        fn unpack_from(&self, it: &mut Interp, #[kw] buffer: &[u8], #[kw] #[default(0)] offset: isize) -> R<Value> {
+        fn unpack_from(
+            &self,
+            it: &mut Interp,
+            #[kw] buffer: &[u8],
+            #[kw]
+            #[default(0)]
+            offset: isize,
+        ) -> R<Value> {
             let f = self.fmt(it)?;
             do_unpack_from(it, &f, buffer, offset)
         }
@@ -577,7 +709,9 @@ pub mod _struct {
         #[proto(next)]
         fn __next__(&mut self, it: &mut Interp) -> R<Option<Value>> {
             let size = self.fmt.size;
-            let Some(src) = &self.src else { return Ok(None) };
+            let Some(src) = &self.src else {
+                return Ok(None);
+            };
             if self.index + size > self.view.nbytes() {
                 self.src = None;
                 return Ok(None);
@@ -606,14 +740,18 @@ pub mod _struct {
 
     #[op(hint(py(text_signature = "")))]
     fn pack(it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
-        let Some(fv) = args.first() else { return Err(it.type_error("missing format argument")) };
+        let Some(fv) = args.first() else {
+            return Err(it.type_error("missing format argument"));
+        };
         let f = cached_fmt(it, fv)?;
         Ok(Value::bytes(pack_values(it, &f, "pack", &args[1..])?))
     }
 
     #[op(hint(py(text_signature = "")))]
     fn pack_into(it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
-        let Some(fv) = args.first() else { return Err(it.type_error("missing format argument")) };
+        let Some(fv) = args.first() else {
+            return Err(it.type_error("missing format argument"));
+        };
         let f = cached_fmt(it, fv)?;
         do_pack_into(it, &f, &args[1..])
     }
@@ -625,7 +763,14 @@ pub mod _struct {
     }
 
     #[op]
-    fn unpack_from(it: &mut Interp, format: &Value, #[kw] buffer: &[u8], #[kw] #[default(0)] offset: isize) -> R<Value> {
+    fn unpack_from(
+        it: &mut Interp,
+        format: &Value,
+        #[kw] buffer: &[u8],
+        #[kw]
+        #[default(0)]
+        offset: isize,
+    ) -> R<Value> {
         let f = cached_fmt(it, format)?;
         do_unpack_from(it, &f, buffer, offset)
     }

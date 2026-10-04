@@ -66,10 +66,11 @@ pub fn native_codec(norm: &str) -> Option<Native> {
         "utf_32" | "utf32" | "u32" => Native::Utf32(0),
         "utf_32_le" | "utf_32le" => Native::Utf32(-1),
         "utf_32_be" | "utf_32be" => Native::Utf32(1),
-        "latin_1" | "latin1" | "iso_8859_1" | "iso8859_1" | "8859" | "cp819" | "latin" | "l1" | "iso_ir_100"
-        | "csisolatin1" | "ibm819" | "iso8859" | "iso_8859_1_1987" => Native::Latin1,
-        "ascii" | "us_ascii" | "646" | "us" | "cp367" | "csascii" | "ibm367" | "iso646_us" | "iso_ir_6"
-        | "ansi_x3.4_1968" | "ansi_x3_4_1968" | "ansi_x3.4_1986" | "iso_646.irv_1991" => Native::Ascii,
+        "latin_1" | "latin1" | "iso_8859_1" | "iso8859_1" | "8859" | "cp819" | "latin" | "l1"
+        | "iso_ir_100" | "csisolatin1" | "ibm819" | "iso8859" | "iso_8859_1_1987" => Native::Latin1,
+        "ascii" | "us_ascii" | "646" | "us" | "cp367" | "csascii" | "ibm367" | "iso646_us"
+        | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968" | "ansi_x3.4_1986"
+        | "iso_646.irv_1991" => Native::Ascii,
         _ => return None,
     })
 }
@@ -124,23 +125,40 @@ impl SurrogateForm {
 
     fn put(self, out: &mut Vec<u8>, cp: u32) {
         match self {
-            SurrogateForm::Utf8 => out.extend([0xe0 | (cp >> 12) as u8, 0x80 | ((cp >> 6) & 0x3f) as u8, 0x80 | (cp & 0x3f) as u8]),
-            SurrogateForm::Utf16(be) => out.extend(if be { (cp as u16).to_be_bytes() } else { (cp as u16).to_le_bytes() }),
-            SurrogateForm::Utf32(be) => out.extend(if be { cp.to_be_bytes() } else { cp.to_le_bytes() }),
+            SurrogateForm::Utf8 => out.extend([
+                0xe0 | (cp >> 12) as u8,
+                0x80 | ((cp >> 6) & 0x3f) as u8,
+                0x80 | (cp & 0x3f) as u8,
+            ]),
+            SurrogateForm::Utf16(be) => out.extend(if be {
+                (cp as u16).to_be_bytes()
+            } else {
+                (cp as u16).to_le_bytes()
+            }),
+            SurrogateForm::Utf32(be) => out.extend(if be {
+                cp.to_be_bytes()
+            } else {
+                cp.to_le_bytes()
+            }),
         }
     }
 
     fn read(self, p: &[u8]) -> Option<u32> {
         let cp = match self {
             SurrogateForm::Utf8 => {
-                if p.len() < 3 || p[0] & 0xf0 != 0xe0 || p[1] & 0xc0 != 0x80 || p[2] & 0xc0 != 0x80 {
+                if p.len() < 3 || p[0] & 0xf0 != 0xe0 || p[1] & 0xc0 != 0x80 || p[2] & 0xc0 != 0x80
+                {
                     return None;
                 }
                 ((p[0] as u32 & 0x0f) << 12) | ((p[1] as u32 & 0x3f) << 6) | (p[2] as u32 & 0x3f)
             }
             SurrogateForm::Utf16(be) => {
                 let b: [u8; 2] = p.get(..2)?.try_into().ok()?;
-                (if be { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }) as u32
+                (if be {
+                    u16::from_be_bytes(b)
+                } else {
+                    u16::from_le_bytes(b)
+                }) as u32
             }
             SurrogateForm::Utf32(be) => {
                 let b: [u8; 4] = p.get(..4)?.try_into().ok()?;
@@ -179,7 +197,11 @@ impl SurrogateForm {
                 _ => return None,
             }
         };
-        Some(if wide { SurrogateForm::Utf32(be) } else { SurrogateForm::Utf16(be) })
+        Some(if wide {
+            SurrogateForm::Utf32(be)
+        } else {
+            SurrogateForm::Utf16(be)
+        })
     }
 }
 
@@ -219,7 +241,11 @@ fn xmlcharref_chars(chars: &[u32]) -> String {
 fn namereplace_chars(chars: &[u32]) -> String {
     let mut s = String::new();
     for &c in chars {
-        let name = if is_surrogate(c) { None } else { char::from_u32(c).and_then(crate::lexer::string::char_name) };
+        let name = if is_surrogate(c) {
+            None
+        } else {
+            char::from_u32(c).and_then(crate::lexer::string::char_name)
+        };
         match name {
             Some(n) => {
                 s.push_str("\\N{");
@@ -233,7 +259,10 @@ fn namereplace_chars(chars: &[u32]) -> String {
 }
 
 fn surrogateescape_encode(chars: &[u32]) -> Option<Vec<u8>> {
-    chars.iter().map(|&cp| (0xDC80..0xDD00).contains(&cp).then(|| (cp - 0xDC00) as u8)).collect()
+    chars
+        .iter()
+        .map(|&cp| (0xDC80..0xDD00).contains(&cp).then(|| (cp - 0xDC00) as u8))
+        .collect()
 }
 
 fn surrogatepass_encode(chars: &[u32], form: SurrogateForm) -> Option<Vec<u8>> {
@@ -282,16 +311,37 @@ impl ExcKind {
     }
 }
 
-fn new_unicode_exc(it: &mut Interp, kind: ExcKind, encoding: &str, object: Value, start: usize, end: usize, reason: &str) -> Obj {
+fn new_unicode_exc(
+    it: &mut Interp,
+    kind: ExcKind,
+    encoding: &str,
+    object: Value,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Obj {
     let cls = it.exc_type(kind.class());
     let mut args = Vec::with_capacity(5);
     if kind != ExcKind::Translate {
         args.push(Value::str(encoding));
     }
-    args.extend([object.clone(), Value::Int(start as i64), Value::Int(end as i64), Value::str(reason)]);
+    args.extend([
+        object.clone(),
+        Value::Int(start as i64),
+        Value::Int(end as i64),
+        Value::str(reason),
+    ]);
     let e = it.new_exc(&cls, args);
     let d = it.instance_dict(&e);
-    dict_set_str(&d, "encoding", if kind == ExcKind::Translate { Value::None } else { Value::str(encoding) });
+    dict_set_str(
+        &d,
+        "encoding",
+        if kind == ExcKind::Translate {
+            Value::None
+        } else {
+            Value::str(encoding)
+        },
+    );
     dict_set_str(&d, "object", object);
     dict_set_str(&d, "start", Value::Int(start as i64));
     dict_set_str(&d, "end", Value::Int(end as i64));
@@ -299,12 +349,42 @@ fn new_unicode_exc(it: &mut Interp, kind: ExcKind, encoding: &str, object: Value
     e
 }
 
-pub fn encode_error(it: &mut Interp, encoding: &str, s: &str, start: usize, end: usize, reason: &str) -> Obj {
-    new_unicode_exc(it, ExcKind::Encode, encoding, Value::str(s), start, end, reason)
+pub fn encode_error(
+    it: &mut Interp,
+    encoding: &str,
+    s: &str,
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Obj {
+    new_unicode_exc(
+        it,
+        ExcKind::Encode,
+        encoding,
+        Value::str(s),
+        start,
+        end,
+        reason,
+    )
 }
 
-pub fn decode_error(it: &mut Interp, encoding: &str, data: &[u8], start: usize, end: usize, reason: &str) -> Obj {
-    new_unicode_exc(it, ExcKind::Decode, encoding, Value::bytes(data.to_vec()), start, end, reason)
+pub fn decode_error(
+    it: &mut Interp,
+    encoding: &str,
+    data: &[u8],
+    start: usize,
+    end: usize,
+    reason: &str,
+) -> Obj {
+    new_unicode_exc(
+        it,
+        ExcKind::Decode,
+        encoding,
+        Value::bytes(data.to_vec()),
+        start,
+        end,
+        reason,
+    )
 }
 
 /// What an encode error handler substitutes.
@@ -332,10 +412,22 @@ fn update_exc(e: &Obj, start: usize, end: usize, reason: &str) {
 
 impl<'a> ErrCtx<'a> {
     fn new(errors: &str, encoding: &'a str) -> Self {
-        ErrCtx { mode: ErrorMode::parse(errors), encoding, handler: None, exc: None }
+        ErrCtx {
+            mode: ErrorMode::parse(errors),
+            encoding,
+            handler: None,
+            exc: None,
+        }
     }
 
-    fn encode_exc(&mut self, it: &mut Interp, s: &str, start: usize, end: usize, reason: &str) -> Obj {
+    fn encode_exc(
+        &mut self,
+        it: &mut Interp,
+        s: &str,
+        start: usize,
+        end: usize,
+        reason: &str,
+    ) -> Obj {
         match &self.exc {
             Some(e) => {
                 update_exc(e, start, end, reason);
@@ -349,7 +441,14 @@ impl<'a> ErrCtx<'a> {
         }
     }
 
-    fn decode_exc(&mut self, it: &mut Interp, data: &[u8], start: usize, end: usize, reason: &str) -> Obj {
+    fn decode_exc(
+        &mut self,
+        it: &mut Interp,
+        data: &[u8],
+        start: usize,
+        end: usize,
+        reason: &str,
+    ) -> Obj {
         match &self.exc {
             Some(e) => {
                 update_exc(e, start, end, reason);
@@ -373,7 +472,16 @@ impl<'a> ErrCtx<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn on_encode(&mut self, it: &mut Interp, s: &str, chars: &[u32], start: usize, end: usize, reason: &str, sp: Option<SurrogateForm>) -> R<(Repl, usize)> {
+    fn on_encode(
+        &mut self,
+        it: &mut Interp,
+        s: &str,
+        chars: &[u32],
+        start: usize,
+        end: usize,
+        reason: &str,
+        sp: Option<SurrogateForm>,
+    ) -> R<(Repl, usize)> {
         let seg = &chars[start..end];
         let r = match &self.mode {
             ErrorMode::Strict => return Err(self.encode_exc(it, s, start, end, reason)),
@@ -396,8 +504,16 @@ impl<'a> ErrCtx<'a> {
                 let e = self.encode_exc(it, s, start, end, reason);
                 let r = it.call(&h, vec![Value::Obj(e)], vec![])?;
                 let (rep, pos) = match r.tuple_items() {
-                    Some([rep, pos]) if (rep.as_str().is_some() || is_bytes(rep)) && pos.is_int_like() => (rep.clone(), pos.clone()),
-                    _ => return Err(it.type_error("encoding error handler must return (str/bytes, int) tuple")),
+                    Some([rep, pos])
+                        if (rep.as_str().is_some() || is_bytes(rep)) && pos.is_int_like() =>
+                    {
+                        (rep.clone(), pos.clone())
+                    }
+                    _ => {
+                        return Err(it.type_error(
+                            "encoding error handler must return (str/bytes, int) tuple",
+                        ))
+                    }
                 };
                 let newpos = handler_pos(it, &pos, chars.len())?;
                 let rep = match rep.as_str() {
@@ -411,43 +527,73 @@ impl<'a> ErrCtx<'a> {
     }
 
     /// [`Self::on_decode`] for a [`utf::Malformed`] sequence, appending the replacement.
-    fn on_malformed(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, m: utf::Malformed, out: &mut String, sp: SurrogateForm) -> R<usize> {
+    fn on_malformed(
+        &mut self,
+        it: &mut Interp,
+        data: &mut Cow<'_, [u8]>,
+        m: utf::Malformed,
+        out: &mut String,
+        sp: SurrogateForm,
+    ) -> R<usize> {
         let (rep, pos) = self.on_decode(it, data, m.start, m.end, m.reason, Some(sp))?;
         out.push_str(&rep);
         Ok(pos)
     }
 
-    fn on_decode(&mut self, it: &mut Interp, data: &mut Cow<'_, [u8]>, start: usize, end: usize, reason: &str, sp: Option<SurrogateForm>) -> R<(String, usize)> {
+    fn on_decode(
+        &mut self,
+        it: &mut Interp,
+        data: &mut Cow<'_, [u8]>,
+        start: usize,
+        end: usize,
+        reason: &str,
+        sp: Option<SurrogateForm>,
+    ) -> R<(String, usize)> {
         let r = match &self.mode {
             ErrorMode::Strict => return Err(self.decode_exc(it, data, start, end, reason)),
             ErrorMode::Ignore => String::new(),
             ErrorMode::Replace => "\u{fffd}".to_string(),
             ErrorMode::BackslashReplace => backslash_bytes(&data[start..end]),
             ErrorMode::XmlCharRefReplace | ErrorMode::NameReplace => {
-                return Err(it.type_error("don't know how to handle UnicodeDecodeError in error callback"))
+                return Err(
+                    it.type_error("don't know how to handle UnicodeDecodeError in error callback")
+                )
             }
             ErrorMode::SurrogateEscape => match surrogateescape_decode(data, start, end) {
                 Some(r) => return Ok(r),
                 None => return Err(self.decode_exc(it, data, start, end, reason)),
             },
-            ErrorMode::SurrogatePass => match sp.and_then(|f| f.read(&data[start..]).map(|cp| (cp, f.len()))) {
-                Some((cp, n)) => {
-                    let mut s = String::new();
-                    push_cp(&mut s, cp);
-                    return Ok((s, start + n));
+            ErrorMode::SurrogatePass => {
+                match sp.and_then(|f| f.read(&data[start..]).map(|cp| (cp, f.len()))) {
+                    Some((cp, n)) => {
+                        let mut s = String::new();
+                        push_cp(&mut s, cp);
+                        return Ok((s, start + n));
+                    }
+                    None => return Err(self.decode_exc(it, data, start, end, reason)),
                 }
-                None => return Err(self.decode_exc(it, data, start, end, reason)),
-            },
+            }
             ErrorMode::Other(name) => {
                 let name = name.clone();
                 let h = self.handler(it, &name)?;
                 let e = self.decode_exc(it, data, start, end, reason);
                 let r = it.call(&h, vec![Value::Obj(e.clone())], vec![])?;
                 let (rep, pos) = match r.tuple_items() {
-                    Some([rep, pos]) if rep.as_str().is_some() && pos.is_int_like() => (rep.as_str().unwrap_or("").to_string(), pos.clone()),
-                    _ => return Err(it.type_error("decoding error handler must return (str, int) tuple")),
+                    Some([rep, pos]) if rep.as_str().is_some() && pos.is_int_like() => {
+                        (rep.as_str().unwrap_or("").to_string(), pos.clone())
+                    }
+                    _ => {
+                        return Err(
+                            it.type_error("decoding error handler must return (str, int) tuple")
+                        )
+                    }
                 };
-                if let Some(Value::Obj(o)) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "object")) {
+                if let Some(Value::Obj(o)) = e
+                    .dict
+                    .borrow()
+                    .as_ref()
+                    .and_then(|d| dict_get_str(d, "object"))
+                {
                     if let Kind::Bytes(b) = &o.kind {
                         if b[..] != data[..] {
                             *data = Cow::Owned(b.clone());
@@ -472,7 +618,10 @@ fn handler_pos(it: &mut Interp, pos: &Value, len: usize) -> R<usize> {
         p += len as i64;
     }
     if p < 0 || p > len as i64 {
-        return Err(it.new_exc_str("IndexError", &format!("position {} from error handler out of bounds", p)));
+        return Err(it.new_exc_str(
+            "IndexError",
+            &format!("position {} from error handler out of bounds", p),
+        ));
     }
     Ok(p as usize)
 }
@@ -512,7 +661,11 @@ impl UnitEnc {
                     out.extend(if be { u.to_be_bytes() } else { u.to_le_bytes() });
                 }
             }
-            UnitEnc::Utf32(be) => out.extend(if be { (c as u32).to_be_bytes() } else { (c as u32).to_le_bytes() }),
+            UnitEnc::Utf32(be) => out.extend(if be {
+                (c as u32).to_be_bytes()
+            } else {
+                (c as u32).to_le_bytes()
+            }),
             UnitEnc::Latin1 | UnitEnc::Ascii => out.push(c as u32 as u8),
         }
     }
@@ -543,7 +696,14 @@ impl UnitEnc {
     }
 }
 
-fn encode_units(it: &mut Interp, enc: UnitEnc, name: &str, s: &str, errors: &str, out: &mut Vec<u8>) -> R<()> {
+fn encode_units(
+    it: &mut Interp,
+    enc: UnitEnc,
+    name: &str,
+    s: &str,
+    errors: &str,
+    out: &mut Vec<u8>,
+) -> R<()> {
     let clean = match enc {
         UnitEnc::Utf8 => {
             if !may_contain(s) {
@@ -584,7 +744,8 @@ fn encode_units(it: &mut Interp, enc: UnitEnc, name: &str, s: &str, errors: &str
                 end += 1;
             }
         }
-        let (rep, newpos) = ctx.on_encode(it, s, &chars, i, end, enc.reason(), enc.surrogate_form())?;
+        let (rep, newpos) =
+            ctx.on_encode(it, s, &chars, i, end, enc.reason(), enc.surrogate_form())?;
         match rep {
             Repl::Str(r) => {
                 for rc in code_points(&r) {
@@ -749,7 +910,9 @@ fn charmap_put(it: &mut Interp, mapping: &Value, cp: u32, out: &mut Vec<u8>) -> 
             }
             Ok(true)
         }
-        Some(_) => Err(it.type_error("character mapping must return integer, bytes or None, not str")),
+        Some(_) => {
+            Err(it.type_error("character mapping must return integer, bytes or None, not str"))
+        }
     }
 }
 
@@ -914,20 +1077,35 @@ pub fn utf7_encode(s: &str) -> Vec<u8> {
 
 // ---- decoders --------------------------------------------------------------------------------
 
-pub fn utf8_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) -> R<(String, usize)> {
+pub fn utf8_decode(
+    it: &mut Interp,
+    input: &[u8],
+    errors: &str,
+    final_: bool,
+) -> R<(String, usize)> {
     if let Ok(s) = std::str::from_utf8(input) {
         return Ok((escape_text(s).into_owned(), input.len()));
     }
     let mut out = String::with_capacity(input.len());
     let mut ctx = ErrCtx::new(errors, "utf-8");
-    let pos = utf::decode_utf8(&mut Cow::Borrowed(input), final_, Spelling::CodePoints, &mut out, |data, m, out| {
-        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf8)
-    })?;
+    let pos = utf::decode_utf8(
+        &mut Cow::Borrowed(input),
+        final_,
+        Spelling::CodePoints,
+        &mut out,
+        |data, m, out| ctx.on_malformed(it, data, m, out, SurrogateForm::Utf8),
+    )?;
     Ok((out, pos))
 }
 
 /// UTF-16 with byte order `bo` (0 = read a BOM, else little-endian; updated when a BOM is read).
-pub fn utf16_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, final_: bool) -> R<(String, usize)> {
+pub fn utf16_decode(
+    it: &mut Interp,
+    input: &[u8],
+    errors: &str,
+    bo: &mut i32,
+    final_: bool,
+) -> R<(String, usize)> {
     let mut pos = 0;
     if *bo == 0 && input.len() >= 2 {
         match (input[0], input[1]) {
@@ -945,14 +1123,26 @@ pub fn utf16_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, f
     let be = *bo > 0;
     let mut out = String::with_capacity(input.len() / 2);
     let mut ctx = ErrCtx::new(errors, if be { "utf-16-be" } else { "utf-16-le" });
-    let pos = utf::decode_utf16(&mut Cow::Borrowed(input), pos, be, final_, Spelling::CodePoints, &mut out, |data, m, out| {
-        ctx.on_malformed(it, data, m, out, SurrogateForm::Utf16(be))
-    })?;
+    let pos = utf::decode_utf16(
+        &mut Cow::Borrowed(input),
+        pos,
+        be,
+        final_,
+        Spelling::CodePoints,
+        &mut out,
+        |data, m, out| ctx.on_malformed(it, data, m, out, SurrogateForm::Utf16(be)),
+    )?;
     Ok((out, pos))
 }
 
 /// UTF-32 with byte order `bo`, as [`utf16_decode`].
-pub fn utf32_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, final_: bool) -> R<(String, usize)> {
+pub fn utf32_decode(
+    it: &mut Interp,
+    input: &[u8],
+    errors: &str,
+    bo: &mut i32,
+    final_: bool,
+) -> R<(String, usize)> {
     let mut pos = 0;
     if *bo == 0 && input.len() >= 4 {
         match input[..4] {
@@ -981,11 +1171,19 @@ pub fn utf32_decode(it: &mut Interp, input: &[u8], errors: &str, bo: &mut i32, f
             (pos, data.len(), "truncated data")
         } else {
             let b = [data[pos], data[pos + 1], data[pos + 2], data[pos + 3]];
-            let cp = if be { u32::from_be_bytes(b) } else { u32::from_le_bytes(b) };
+            let cp = if be {
+                u32::from_be_bytes(b)
+            } else {
+                u32::from_le_bytes(b)
+            };
             if cp > 0x10FFFF {
                 (pos, pos + 4, "code point not in range(0x110000)")
             } else if is_surrogate(cp) {
-                (pos, pos + 4, "code point in surrogate code point range(0xd800, 0xe000)")
+                (
+                    pos,
+                    pos + 4,
+                    "code point in surrogate code point range(0xd800, 0xe000)",
+                )
             } else {
                 push_cp(&mut out, cp);
                 pos += 4;
@@ -1018,7 +1216,14 @@ pub fn ascii_decode(it: &mut Interp, input: &[u8], errors: &str) -> R<String> {
             pos += 1;
             continue;
         }
-        let (rep, newpos) = ctx.on_decode(it, &mut data, pos, pos + 1, "ordinal not in range(128)", None)?;
+        let (rep, newpos) = ctx.on_decode(
+            it,
+            &mut data,
+            pos,
+            pos + 1,
+            "ordinal not in range(128)",
+            None,
+        )?;
         out.push_str(&rep);
         pos = newpos;
     }
@@ -1066,7 +1271,11 @@ pub fn charmap_decode(it: &mut Interp, input: &[u8], errors: &str, mapping: &Val
                         out.push_str(s);
                         true
                     }
-                    None => return Err(it.type_error("character mapping must return integer, None or str")),
+                    None => {
+                        return Err(
+                            it.type_error("character mapping must return integer, None or str")
+                        )
+                    }
                 },
             },
         };
@@ -1074,7 +1283,14 @@ pub fn charmap_decode(it: &mut Interp, input: &[u8], errors: &str, mapping: &Val
             pos += 1;
             continue;
         }
-        let (rep, newpos) = ctx.on_decode(it, &mut data, pos, pos + 1, "character maps to <undefined>", None)?;
+        let (rep, newpos) = ctx.on_decode(
+            it,
+            &mut data,
+            pos,
+            pos + 1,
+            "character maps to <undefined>",
+            None,
+        )?;
         out.push_str(&rep);
         pos = newpos;
     }
@@ -1086,8 +1302,18 @@ fn hex_val(b: u8) -> Option<u32> {
 }
 
 /// `unicode_escape_decode` (or `raw_unicode_escape_decode` when `raw`).
-pub fn unicode_escape_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool, raw: bool) -> R<(String, usize)> {
-    let name = if raw { "rawunicodeescape" } else { "unicodeescape" };
+pub fn unicode_escape_decode(
+    it: &mut Interp,
+    input: &[u8],
+    errors: &str,
+    final_: bool,
+    raw: bool,
+) -> R<(String, usize)> {
+    let name = if raw {
+        "rawunicodeescape"
+    } else {
+        "unicodeescape"
+    };
     let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len());
     let mut ctx = ErrCtx::new(errors, name);
@@ -1110,7 +1336,8 @@ pub fn unicode_escape_decode(it: &mut Interp, input: &[u8], errors: &str, final_
                 continue;
             }
             let dlen = data.len();
-            let (rep, newpos) = ctx.on_decode(it, &mut data, start, dlen, "\\ at end of string", None)?;
+            let (rep, newpos) =
+                ctx.on_decode(it, &mut data, start, dlen, "\\ at end of string", None)?;
             out.push_str(&rep);
             pos = newpos;
             continue;
@@ -1253,7 +1480,14 @@ pub fn unicode_escape_decode(it: &mut Interp, input: &[u8], errors: &str, final_
             }
         }
         if err.is_none() && v > 0x10FFFF {
-            err = Some((pos, if raw { "\\Uxxxxxxxx out of range" } else { "illegal Unicode character" }));
+            err = Some((
+                pos,
+                if raw {
+                    "\\Uxxxxxxxx out of range"
+                } else {
+                    "illegal Unicode character"
+                },
+            ));
         }
         match err {
             None => push_cp(&mut out, v),
@@ -1314,13 +1548,20 @@ pub fn escape_decode(data: &[u8], errors: &str) -> Result<Vec<u8>, String> {
                         i += 2;
                     }
                     _ => match errors {
-                        "strict" => return Err(format!("invalid \\x escape at position {}", i - 2)),
+                        "strict" => {
+                            return Err(format!("invalid \\x escape at position {}", i - 2))
+                        }
                         "replace" => {
                             out.push(b'?');
                             i += hi.is_some() as usize;
                         }
                         "ignore" => i += hi.is_some() as usize,
-                        other => return Err(format!("decoding error; unknown error handling code: {}", other)),
+                        other => {
+                            return Err(format!(
+                                "decoding error; unknown error handling code: {}",
+                                other
+                            ))
+                        }
                     },
                 }
             }
@@ -1333,7 +1574,12 @@ pub fn escape_decode(data: &[u8], errors: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-pub fn utf7_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) -> R<(String, usize)> {
+pub fn utf7_decode(
+    it: &mut Interp,
+    input: &[u8],
+    errors: &str,
+    final_: bool,
+) -> R<(String, usize)> {
     let mut data = Cow::Borrowed(input);
     let mut out = String::with_capacity(input.len());
     let mut ctx = ErrCtx::new(errors, "utf7");
@@ -1359,7 +1605,10 @@ pub fn utf7_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) ->
                         buf &= (1u64 << bits) - 1;
                         if surrogate != 0 {
                             if (0xDC00..0xE000).contains(&out_ch) {
-                                push_cp(&mut out, 0x10000 + ((surrogate - 0xD800) << 10) + (out_ch - 0xDC00));
+                                push_cp(
+                                    &mut out,
+                                    0x10000 + ((surrogate - 0xD800) << 10) + (out_ch - 0xDC00),
+                                );
                                 surrogate = 0;
                                 continue;
                             }
@@ -1424,7 +1673,14 @@ pub fn utf7_decode(it: &mut Interp, input: &[u8], errors: &str, final_: bool) ->
             in_shift = false;
             if surrogate != 0 || bits >= 6 || (bits > 0 && buf != 0) {
                 let end = data.len();
-                let (rep, newpos) = ctx.on_decode(it, &mut data, start, end, "unterminated shift sequence", None)?;
+                let (rep, newpos) = ctx.on_decode(
+                    it,
+                    &mut data,
+                    start,
+                    end,
+                    "unterminated shift sequence",
+                    None,
+                )?;
                 out.push_str(&rep);
                 pos = newpos;
                 if pos < data.len() {
@@ -1517,7 +1773,10 @@ pub fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value>
             if !it.truthy(&flag)? {
                 return Err(it.new_exc_str(
                     "LookupError",
-                    &format!("'{}' is not a text encoding; use {} to handle arbitrary codecs", encoding, alternate),
+                    &format!(
+                        "'{}' is not a text encoding; use {} to handle arbitrary codecs",
+                        encoding, alternate
+                    ),
                 ));
             }
         }
@@ -1526,7 +1785,10 @@ pub fn lookup_text(it: &mut Interp, encoding: &str, alternate: &str) -> R<Value>
 }
 
 fn codec_item(codec: &Value, i: usize) -> Value {
-    codec.tuple_items().and_then(|t| t.get(i).cloned()).unwrap_or(Value::None)
+    codec
+        .tuple_items()
+        .and_then(|t| t.get(i).cloned())
+        .unwrap_or(Value::None)
 }
 
 fn pair_first(it: &mut Interp, r: &Value, what: &str) -> R<Value> {
@@ -1585,7 +1847,11 @@ pub fn decode(it: &mut Interp, b: &[u8], encoding: &str, errors: &str) -> R<Stri
     }
     let codec = lookup_text(it, encoding, "codecs.decode()")?;
     let f = codec_item(&codec, 1);
-    let r = it.call(&f, vec![Value::bytes(b.to_vec()), Value::str(errors)], vec![])?;
+    let r = it.call(
+        &f,
+        vec![Value::bytes(b.to_vec()), Value::str(errors)],
+        vec![],
+    )?;
     let v = match r.tuple_items() {
         Some([v, _]) => v.clone(),
         _ => return Err(it.type_error("decoder must return a tuple (object,integer)")),
@@ -1620,7 +1886,16 @@ fn ensure_errors(it: &mut Interp) {
         return;
     }
     it.codecs.builtin_errors_ready = true;
-    let fns: [NativeFn; 8] = [strict_errors, ignore_errors, replace_errors, xmlcharrefreplace_errors, backslashreplace_errors, namereplace_errors, surrogateescape_errors, surrogatepass_errors];
+    let fns: [NativeFn; 8] = [
+        strict_errors,
+        ignore_errors,
+        replace_errors,
+        xmlcharrefreplace_errors,
+        backslashreplace_errors,
+        namereplace_errors,
+        surrogateescape_errors,
+        surrogatepass_errors,
+    ];
     for ((name, fname), f) in BUILTIN_ERRORS.iter().zip(fns) {
         let v = it.new_native(fname, f, false);
         it.codecs.errors.insert(name.to_string(), v);
@@ -1631,7 +1906,10 @@ pub fn lookup_error(it: &mut Interp, name: &str) -> R<Value> {
     ensure_errors(it);
     match it.codecs.errors.get(name) {
         Some(v) => Ok(v.clone()),
-        None => Err(it.new_exc_str("LookupError", &format!("unknown error handler name '{}'", name))),
+        None => Err(it.new_exc_str(
+            "LookupError",
+            &format!("unknown error handler name '{}'", name),
+        )),
     }
 }
 
@@ -1647,7 +1925,10 @@ pub fn register_error(it: &mut Interp, name: &str, handler: Value) -> R<()> {
 /// `_codecs._unregister_error`: whether a handler was removed; built-in ones cannot be.
 pub fn unregister_error(it: &mut Interp, name: &str) -> R<bool> {
     if BUILTIN_ERRORS.iter().any(|(n, _)| *n == name) {
-        return Err(it.value_error(&format!("cannot un-register built-in error handler '{}'", name)));
+        return Err(it.value_error(&format!(
+            "cannot un-register built-in error handler '{}'",
+            name
+        )));
     }
     ensure_errors(it);
     Ok(it.codecs.errors.remove(name).is_some())
@@ -1665,10 +1946,12 @@ struct ExcView {
 
 fn exc_kind_of(it: &mut Interp, v: &Value) -> Option<ExcKind> {
     let t = it.type_of(v);
-    [ExcKind::Encode, ExcKind::Decode, ExcKind::Translate].into_iter().find(|k| {
-        let c = it.exc_type(k.class());
-        it.is_subtype(&t, &c)
-    })
+    [ExcKind::Encode, ExcKind::Decode, ExcKind::Translate]
+        .into_iter()
+        .find(|k| {
+            let c = it.exc_type(k.class());
+            it.is_subtype(&t, &c)
+        })
 }
 
 fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
@@ -1689,14 +1972,34 @@ fn exc_view(it: &mut Interp, a: &[Value], name: &str) -> R<ExcView> {
     let ev = it.get_attr_str(&a[0], "end")?;
     let start = it.index_of(&sv)?;
     let end = it.index_of(&ev)?;
-    let start = if start < 0 { 0 } else if start as usize >= len { len.saturating_sub(1) } else { start as usize };
-    let end = if end < 1 { 1 } else if end as usize > len { len } else { end as usize };
-    Ok(ExcView { kind, object, start, end })
+    let start = if start < 0 {
+        0
+    } else if start as usize >= len {
+        len.saturating_sub(1)
+    } else {
+        start as usize
+    };
+    let end = if end < 1 {
+        1
+    } else if end as usize > len {
+        len
+    } else {
+        end as usize
+    };
+    Ok(ExcView {
+        kind,
+        object,
+        start,
+        end,
+    })
 }
 
 fn view_chars(v: &ExcView) -> Vec<u32> {
     let s = v.object.as_str().unwrap_or("");
-    code_points(s).skip(v.start).take(v.end.saturating_sub(v.start)).collect()
+    code_points(s)
+        .skip(v.start)
+        .take(v.end.saturating_sub(v.start))
+        .collect()
 }
 
 fn unhandled(it: &mut Interp, a: &[Value]) -> Obj {
@@ -1732,7 +2035,10 @@ fn replace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value
         ExcKind::Decode => "\u{fffd}".to_string(),
         ExcKind::Translate => "\u{fffd}".repeat(n),
     };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
+    Ok(Value::tuple(vec![
+        Value::string(r),
+        Value::Int(v.end as i64),
+    ]))
 }
 
 fn xmlcharrefreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
@@ -1740,7 +2046,10 @@ fn xmlcharrefreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) 
     if v.kind != ExcKind::Encode {
         return Err(unhandled(it, a));
     }
-    Ok(Value::tuple(vec![Value::string(xmlcharref_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
+    Ok(Value::tuple(vec![
+        Value::string(xmlcharref_chars(&view_chars(&v))),
+        Value::Int(v.end as i64),
+    ]))
 }
 
 fn backslashreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
@@ -1752,7 +2061,10 @@ fn backslashreplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -
         }
         _ => backslash_chars(&view_chars(&v)),
     };
-    Ok(Value::tuple(vec![Value::string(r), Value::Int(v.end as i64)]))
+    Ok(Value::tuple(vec![
+        Value::string(r),
+        Value::Int(v.end as i64),
+    ]))
 }
 
 fn namereplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
@@ -1760,14 +2072,20 @@ fn namereplace_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<V
     if v.kind != ExcKind::Encode {
         return Err(unhandled(it, a));
     }
-    Ok(Value::tuple(vec![Value::string(namereplace_chars(&view_chars(&v))), Value::Int(v.end as i64)]))
+    Ok(Value::tuple(vec![
+        Value::string(namereplace_chars(&view_chars(&v))),
+        Value::Int(v.end as i64),
+    ]))
 }
 
 fn surrogateescape_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     let v = exc_view(it, a, "surrogateescape")?;
     match v.kind {
         ExcKind::Encode => match surrogateescape_encode(&view_chars(&v)) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+            Some(b) => Ok(Value::tuple(vec![
+                Value::bytes(b),
+                Value::Int(v.end as i64),
+            ])),
             None => Err(raise_exc(it, &a[0])),
         },
         ExcKind::Decode => {
@@ -1788,10 +2106,15 @@ fn surrogatepass_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R
     }
     let enc = it.get_attr_str(&a[0], "encoding")?;
     let form = enc.as_str().and_then(SurrogateForm::from_name);
-    let Some(form) = form else { return Err(raise_exc(it, &a[0])) };
+    let Some(form) = form else {
+        return Err(raise_exc(it, &a[0]));
+    };
     match v.kind {
         ExcKind::Encode => match surrogatepass_encode(&view_chars(&v), form) {
-            Some(b) => Ok(Value::tuple(vec![Value::bytes(b), Value::Int(v.end as i64)])),
+            Some(b) => Ok(Value::tuple(vec![
+                Value::bytes(b),
+                Value::Int(v.end as i64),
+            ])),
             None => Err(raise_exc(it, &a[0])),
         },
         _ => {
@@ -1800,7 +2123,10 @@ fn surrogatepass_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R
                 Some(cp) => {
                     let mut s = String::new();
                     push_cp(&mut s, cp);
-                    Ok(Value::tuple(vec![Value::string(s), Value::Int((v.start + form.len()) as i64)]))
+                    Ok(Value::tuple(vec![
+                        Value::string(s),
+                        Value::Int((v.start + form.len()) as i64),
+                    ]))
                 }
                 None => Err(raise_exc(it, &a[0])),
             }
@@ -1813,7 +2139,12 @@ fn surrogatepass_errors(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R
 enum DecState {
     /// Native decoder; `bo` is the UTF-16/32 byte order (0 = no BOM read yet) and `first` whether
     /// a UTF-8 signature may still follow.
-    Native { codec: Native, buf: Vec<u8>, bo: i32, first: bool },
+    Native {
+        codec: Native,
+        buf: Vec<u8>,
+        bo: i32,
+        first: bool,
+    },
     Py(Value),
 }
 
@@ -1831,7 +2162,15 @@ impl IncrementalDecoder {
                 Native::Utf16(b) | Native::Utf32(b) => b,
                 _ => 0,
             };
-            return Ok(IncrementalDecoder { state: DecState::Native { codec, buf: Vec::new(), bo, first: true }, errors: errors.to_string() });
+            return Ok(IncrementalDecoder {
+                state: DecState::Native {
+                    codec,
+                    buf: Vec::new(),
+                    bo,
+                    first: true,
+                },
+                errors: errors.to_string(),
+            });
         }
         let codec = lookup_text(it, encoding, "codecs.decode()")?;
         let factory = it.get_attr_str(&codec, "incrementaldecoder")?;
@@ -1839,7 +2178,10 @@ impl IncrementalDecoder {
             return Err(lookup_err(it, encoding));
         }
         let obj = it.call(&factory, vec![Value::str(errors)], vec![])?;
-        Ok(IncrementalDecoder { state: DecState::Py(obj), errors: errors.to_string() })
+        Ok(IncrementalDecoder {
+            state: DecState::Py(obj),
+            errors: errors.to_string(),
+        })
     }
 
     pub fn decode(&mut self, it: &mut Interp, input: &[u8], final_: bool) -> R<String> {
@@ -1847,16 +2189,28 @@ impl IncrementalDecoder {
         match &mut self.state {
             DecState::Py(obj) => {
                 let obj = obj.clone();
-                let r = it.call_method(&obj, "decode", vec![Value::bytes(input.to_vec()), Value::Bool(final_)])?;
+                let r = it.call_method(
+                    &obj,
+                    "decode",
+                    vec![Value::bytes(input.to_vec()), Value::Bool(final_)],
+                )?;
                 match r.as_str() {
                     Some(s) => Ok(s.to_string()),
                     None => {
                         let t = it.type_name_of(&r);
-                        Err(it.type_error(&format!("decoder should return a string result, not '{}'", t)))
+                        Err(it.type_error(&format!(
+                            "decoder should return a string result, not '{}'",
+                            t
+                        )))
                     }
                 }
             }
-            DecState::Native { codec, buf, bo, first } => {
+            DecState::Native {
+                codec,
+                buf,
+                bo,
+                first,
+            } => {
                 let codec = *codec;
                 let mut data = std::mem::take(buf);
                 data.extend_from_slice(input);
@@ -1883,9 +2237,17 @@ impl IncrementalDecoder {
                     Native::Utf16(_) | Native::Utf32(_) => {
                         let wide = matches!(codec, Native::Utf32(_));
                         let had_bo = *bo != 0;
-                        let r = if wide { utf32_decode(it, &data, &errors, bo, final_)? } else { utf16_decode(it, &data, &errors, bo, final_)? };
+                        let r = if wide {
+                            utf32_decode(it, &data, &errors, bo, final_)?
+                        } else {
+                            utf16_decode(it, &data, &errors, bo, final_)?
+                        };
                         if !had_bo && *bo == 0 && r.1 >= if wide { 4 } else { 2 } {
-                            let msg = if wide { "UTF-32 stream does not start with BOM" } else { "UTF-16 stream does not start with BOM" };
+                            let msg = if wide {
+                                "UTF-32 stream does not start with BOM"
+                            } else {
+                                "UTF-16 stream does not start with BOM"
+                            };
                             return Err(it.new_exc_str("UnicodeError", msg));
                         }
                         r
@@ -1903,7 +2265,12 @@ impl IncrementalDecoder {
                 let obj = obj.clone();
                 it.call_method(&obj, "reset", vec![])?;
             }
-            DecState::Native { codec, buf, bo, first } => {
+            DecState::Native {
+                codec,
+                buf,
+                bo,
+                first,
+            } => {
                 buf.clear();
                 *first = true;
                 *bo = match codec {
@@ -1929,7 +2296,12 @@ impl IncrementalDecoder {
                     _ => Err(it.type_error("illegal decoder state")),
                 }
             }
-            DecState::Native { codec, buf, bo, first } => {
+            DecState::Native {
+                codec,
+                buf,
+                bo,
+                first,
+            } => {
                 let flag = match codec {
                     Native::Utf8Sig => *first as i64,
                     Native::Utf16(0) | Native::Utf32(0) => match *bo {
@@ -1948,9 +2320,18 @@ impl IncrementalDecoder {
         match &mut self.state {
             DecState::Py(obj) => {
                 let obj = obj.clone();
-                it.call_method(&obj, "setstate", vec![Value::tuple(vec![Value::bytes(buf), Value::Int(flag)])])?;
+                it.call_method(
+                    &obj,
+                    "setstate",
+                    vec![Value::tuple(vec![Value::bytes(buf), Value::Int(flag)])],
+                )?;
             }
-            DecState::Native { codec, buf: b, bo, first } => {
+            DecState::Native {
+                codec,
+                buf: b,
+                bo,
+                first,
+            } => {
                 *b = buf;
                 match codec {
                     Native::Utf8Sig => *first = flag != 0,
@@ -1971,7 +2352,10 @@ impl IncrementalDecoder {
 
 enum EncState {
     /// `started`: the BOM/signature has been written (or `setstate` said not to write one).
-    Native { codec: Native, started: bool },
+    Native {
+        codec: Native,
+        started: bool,
+    },
     Py(Value),
 }
 
@@ -1984,7 +2368,13 @@ pub struct IncrementalEncoder {
 impl IncrementalEncoder {
     pub fn new(it: &mut Interp, encoding: &str, errors: &str) -> R<Self> {
         if let Some(codec) = native_codec(&normalize_encoding(encoding)) {
-            return Ok(IncrementalEncoder { state: EncState::Native { codec, started: false }, errors: errors.to_string() });
+            return Ok(IncrementalEncoder {
+                state: EncState::Native {
+                    codec,
+                    started: false,
+                },
+                errors: errors.to_string(),
+            });
         }
         let codec = lookup_text(it, encoding, "codecs.encode()")?;
         let factory = it.get_attr_str(&codec, "incrementalencoder")?;
@@ -1992,7 +2382,10 @@ impl IncrementalEncoder {
             return Err(lookup_err(it, encoding));
         }
         let obj = it.call(&factory, vec![Value::str(errors)], vec![])?;
-        Ok(IncrementalEncoder { state: EncState::Py(obj), errors: errors.to_string() })
+        Ok(IncrementalEncoder {
+            state: EncState::Py(obj),
+            errors: errors.to_string(),
+        })
     }
 
     pub fn encode(&mut self, it: &mut Interp, s: &str, final_: bool) -> R<Vec<u8>> {
@@ -2002,10 +2395,15 @@ impl IncrementalEncoder {
                 let obj = obj.clone();
                 let r = it.call_method(&obj, "encode", vec![Value::str(s), Value::Bool(final_)])?;
                 match &r {
-                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(&r),
+                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                        it.bytes_of(&r)
+                    }
                     _ => {
                         let t = it.type_name_of(&r);
-                        Err(it.type_error(&format!("encoder should return a bytes object, not '{}'", t)))
+                        Err(it.type_error(&format!(
+                            "encoder should return a bytes object, not '{}'",
+                            t
+                        )))
                     }
                 }
             }
@@ -2084,8 +2482,14 @@ mod tests {
 
     #[test]
     fn surrogate_forms() {
-        assert_eq!(SurrogateForm::from_name("utf-16"), Some(SurrogateForm::Utf16(false)));
-        assert_eq!(SurrogateForm::from_name("UTF_32_BE"), Some(SurrogateForm::Utf32(true)));
+        assert_eq!(
+            SurrogateForm::from_name("utf-16"),
+            Some(SurrogateForm::Utf16(false))
+        );
+        assert_eq!(
+            SurrogateForm::from_name("UTF_32_BE"),
+            Some(SurrogateForm::Utf32(true))
+        );
         assert_eq!(SurrogateForm::from_name("utf-8"), Some(SurrogateForm::Utf8));
         assert_eq!(SurrogateForm::from_name("latin-1"), None);
         let mut v = Vec::new();
@@ -2098,9 +2502,15 @@ mod tests {
     fn utf7_and_escapes() {
         assert_eq!(utf7_encode("a\u{20ac}\u{1f600}"), b"a+IKzYPd4A-");
         assert_eq!(utf7_encode("1+1"), b"1+-1");
-        assert_eq!(escape_encode(b"A\n\x00'\"\\\xff"), b"A\\n\\x00\\'\"\\\\\\xff");
+        assert_eq!(
+            escape_encode(b"A\n\x00'\"\\\xff"),
+            b"A\\n\\x00\\'\"\\\\\\xff"
+        );
         assert_eq!(unicode_escape_encode("a\u{e9}\n", false), b"a\\xe9\\n");
-        assert_eq!(unicode_escape_encode("a\u{e9}\u{20ac}", true), b"a\xe9\\u20ac");
+        assert_eq!(
+            unicode_escape_encode("a\u{e9}\u{20ac}", true),
+            b"a\xe9\\u20ac"
+        );
         assert_eq!(escape_decode(b"\\x41\\n\\101", "strict").unwrap(), b"A\nA");
         assert!(escape_decode(b"\\x4", "strict").is_err());
     }

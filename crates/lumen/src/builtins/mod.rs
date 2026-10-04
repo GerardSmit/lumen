@@ -33,7 +33,7 @@ mod primitives;
 mod promise;
 pub(crate) use promise::{make_aggregate_error_value, promise_then_is_silent};
 pub(crate) mod proxy;
-mod reflect;
+pub(crate) mod reflect;
 mod regexp;
 mod shadowrealm;
 mod string_code_point;
@@ -341,21 +341,7 @@ pub(crate) fn proxy_own_keys(
 ) -> Result<Vec<Value>, Value> {
     let trap = ab(i.proxy_trap(handler, "ownKeys"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        // Forward to the target's [[OwnPropertyKeys]] (recursing for a proxy target).
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_own_keys(i, &t2, &h2);
-        }
-        return Ok(match target {
-            Value::Obj(t) => {
-                // OrdinaryOwnPropertyKeys order: array-index keys ascending, then other string keys in
-                // insertion order, then symbol keys (as their Symbol values) in insertion order.
-                ordinary_own_keys_ordered(i, t)
-                    .into_iter()
-                    .map(|k| i.sym_from_key(&k).unwrap_or_else(|| Value::from_string(k)))
-                    .collect()
-            }
-            _ => Vec::new(),
-        });
+        return proxy_target_own_keys(i, target);
     }
     if !trap.is_callable() {
         return Err(i.make_error("TypeError", "proxy 'ownKeys' trap is not callable"));
@@ -385,47 +371,49 @@ pub(crate) fn proxy_own_keys(
                 "'ownKeys' on proxy: trap returned duplicate entries",
             ));
         }
-        // Invariants relative to the target's own keys / extensibility.
-        if let Value::Obj(t) = target {
-            let extensible = t.borrow().extensible;
-            let target_keys: Vec<(String, bool)> = t
-                .borrow()
-                .props
-                .keys()
-                .into_iter()
-                .map(|k| {
-                    let conf = t
-                        .borrow()
-                        .props
-                        .get(&k)
-                        .map(|p| p.configurable())
-                        .unwrap_or(true);
-                    (k.to_string(), conf)
-                })
-                .collect();
-            for (tk, conf) in &target_keys {
-                if !conf && !result_set.contains(tk.as_str()) {
+        // Invariants relative to the target's own [[OwnPropertyKeys]], [[GetOwnProperty]], and
+        // [[IsExtensible]] methods. In particular, a wrapped WindowProxy is always extensible and
+        // contributes its child-window index descriptors here.
+        let extensible = proxy_target_is_extensible(i, target)?;
+        let mut target_keys = Vec::new();
+        for target_key in proxy_target_own_keys(i, target)? {
+            let target_key = ab(i.to_property_key(&target_key))?;
+            let descriptor = proxy_target_own_property(i, target, &target_key)?;
+            let Value::Obj(descriptor) = descriptor else {
+                continue;
+            };
+            let configurable = matches!(
+                descriptor
+                    .borrow()
+                    .props
+                    .get("configurable")
+                    .map(|property| property.value()),
+                Some(Value::Bool(true))
+            );
+            target_keys.push((target_key, configurable));
+        }
+        for (target_key, configurable) in &target_keys {
+            if !configurable && !result_set.contains(target_key.as_str()) {
+                return Err(i.make_error(
+                    "TypeError",
+                    &format!("'ownKeys' on proxy: trap result did not include '{target_key}'"),
+                ));
+            }
+        }
+        if !extensible {
+            for (target_key, _) in &target_keys {
+                if !result_set.contains(target_key.as_str()) {
                     return Err(i.make_error(
                         "TypeError",
-                        &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
+                        &format!("'ownKeys' on proxy: trap result did not include '{target_key}'"),
                     ));
                 }
             }
-            if !extensible {
-                for (tk, _) in &target_keys {
-                    if !result_set.contains(tk.as_str()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            &format!("'ownKeys' on proxy: trap result did not include '{tk}'"),
-                        ));
-                    }
-                }
-                if key_strs.len() != target_keys.len() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
-                    ));
-                }
+            if key_strs.len() != target_keys.len() {
+                return Err(i.make_error(
+                    "TypeError",
+                    "'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible",
+                ));
             }
         }
         Ok(keys)
@@ -444,6 +432,10 @@ pub(crate) fn proxy_own_keys(
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
 /// `[[IsExtensible]]`, proxy-aware (recurses into a proxy target, enforcing the trap invariant).
 fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(obj, Value::Obj(o) if i.is_window_proxy(o)) {
+        return Ok(true);
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -471,6 +463,39 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         Value::Obj(o) => o.clone(),
         _ => return Ok(true),
     };
+    #[cfg(feature = "embed")]
+    if i.is_window_proxy(&o) {
+        let Some(decision) = ab(i.window_proxy_decision(
+            &o,
+            crate::embed_realms::WindowProxyOperation::SetPrototypeOf {
+                prototype: proto.clone(),
+            },
+        ))?
+        else {
+            unreachable!("WindowProxy registry entry disappeared during operation")
+        };
+        return match decision {
+            crate::embed_realms::WindowProxyDecision::Handled(
+                crate::embed_realms::WindowProxyResult::SetPrototypeOf(success),
+            ) => Ok(success),
+            crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            )),
+            crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                let target = forward.target.as_obj().ok_or_else(|| {
+                    i.make_error("TypeError", "WindowProxy target is not an object")
+                })?;
+                let current = target
+                    .borrow()
+                    .proto
+                    .clone()
+                    .map(Value::Obj)
+                    .unwrap_or(Value::Null);
+                Ok(i.strict_equals(proto, &current))
+            }
+        };
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -573,6 +598,10 @@ pub(crate) fn proxy_enum_string_keys(i: &mut Interp, proxy: &Value) -> Result<Ve
 
 /// `[[PreventExtensions]]`, proxy-aware. Returns whether it succeeded.
 fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(obj, Value::Obj(o) if i.is_window_proxy(o)) {
+        return Ok(false);
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -686,6 +715,232 @@ pub(crate) fn proxy_pair(i: &Interp, v: &Value) -> Option<(Value, Value)> {
     }
 }
 
+/// WindowProxy `[[GetOwnProperty]]`, returning `None` only when `object` is not a WindowProxy.
+/// `Undefined` is the (authorized) absent-property result.
+#[cfg(feature = "embed")]
+pub(crate) fn window_proxy_get_own_property(
+    i: &mut Interp,
+    object: &Value,
+    key: &str,
+) -> Result<Option<Value>, Value> {
+    let Some(window_proxy) = object.as_obj() else {
+        return Ok(None);
+    };
+    if !i.is_window_proxy(window_proxy) {
+        return Ok(None);
+    }
+    let key_value = i
+        .sym_from_key(key)
+        .unwrap_or_else(|| Value::from_string(key.to_owned()));
+    let Some(decision) = ab(i.window_proxy_decision(
+        window_proxy,
+        crate::embed_realms::WindowProxyOperation::GetOwnProperty { key: key_value },
+    ))?
+    else {
+        unreachable!("WindowProxy registry entry disappeared during operation")
+    };
+    let descriptor = match decision {
+        crate::embed_realms::WindowProxyDecision::Handled(
+            crate::embed_realms::WindowProxyResult::GetOwnProperty(descriptor),
+        ) => descriptor.unwrap_or(Value::Undefined),
+        crate::embed_realms::WindowProxyDecision::Handled(_) => {
+            return Err(i.make_error(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            ));
+        }
+        crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+            if let Some(index) = crate::value::canonical_index(key) {
+                return Ok(Some(match ab(i.window_proxy_child_at(&forward, index))? {
+                    Some(child) => {
+                        descriptor_from_prop(i, Property::data(child, false, true, true))
+                    }
+                    None => Value::Undefined,
+                }));
+            }
+            let target = forward
+                .target
+                .as_obj()
+                .ok_or_else(|| i.make_error("TypeError", "WindowProxy target is not an object"))?;
+            let property = target
+                .borrow()
+                .props
+                .get(key)
+                .map(|property| property.clone());
+            property
+                .map(|property| descriptor_from_prop(i, property))
+                .unwrap_or(Value::Undefined)
+        }
+    };
+    Ok(Some(descriptor))
+}
+
+/// WindowProxy `[[OwnPropertyKeys]]`, returning `None` only for non-WindowProxy values.
+#[cfg(feature = "embed")]
+pub(crate) fn window_proxy_own_property_keys(
+    i: &mut Interp,
+    object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    let Some(window_proxy) = object.as_obj() else {
+        return Ok(None);
+    };
+    if !i.is_window_proxy(window_proxy) {
+        return Ok(None);
+    }
+    let Some(decision) = ab(i.window_proxy_decision(
+        window_proxy,
+        crate::embed_realms::WindowProxyOperation::OwnPropertyKeys,
+    ))?
+    else {
+        unreachable!("WindowProxy registry entry disappeared during operation")
+    };
+    match decision {
+        crate::embed_realms::WindowProxyDecision::Handled(
+            crate::embed_realms::WindowProxyResult::OwnPropertyKeys(keys),
+        ) => Ok(Some(keys)),
+        crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+            "TypeError",
+            "WindowProxy policy returned a result for the wrong operation",
+        )),
+        crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+            let count = i.window_proxy_child_count(&forward);
+            let target = forward
+                .target
+                .as_obj()
+                .ok_or_else(|| i.make_error("TypeError", "WindowProxy target is not an object"))?;
+            let ordinary_keys = ordinary_own_keys_ordered(i, target);
+            let mut keys = Vec::with_capacity(count.saturating_add(ordinary_keys.len()));
+            for index in 0..count {
+                keys.push(Value::from_string(index.to_string()));
+            }
+            for key in ordinary_keys {
+                if Interp::is_private_key(&key) {
+                    continue;
+                }
+                if let Some(symbol) = i.sym_from_key(&key) {
+                    keys.push(symbol);
+                } else {
+                    keys.push(Value::from_string(key));
+                }
+            }
+            Ok(Some(keys))
+        }
+    }
+}
+
+// WindowProxy identities can only be installed by the embed realm API. With
+// that feature disabled these helpers leave ordinary object behavior intact.
+#[cfg(not(feature = "embed"))]
+pub(crate) fn window_proxy_get_own_property(
+    _i: &mut Interp,
+    _object: &Value,
+    _key: &str,
+) -> Result<Option<Value>, Value> {
+    Ok(None)
+}
+
+#[cfg(not(feature = "embed"))]
+pub(crate) fn window_proxy_own_property_keys(
+    _i: &mut Interp,
+    _object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    Ok(None)
+}
+
+/// Own enumerable string keys of a WindowProxy, preserving internal-method authorization and
+/// child-index descriptors.
+pub(crate) fn window_proxy_enum_string_keys(
+    i: &mut Interp,
+    object: &Value,
+) -> Result<Option<Vec<Value>>, Value> {
+    let Some(keys) = window_proxy_own_property_keys(i, object)? else {
+        return Ok(None);
+    };
+    let mut enumerable = Vec::new();
+    for key in keys {
+        let Value::Str(_) = key else {
+            continue;
+        };
+        let property = ab(i.to_property_key(&key))?;
+        let Some(descriptor) = window_proxy_get_own_property(i, object, &property)? else {
+            unreachable!("WindowProxy disappeared during key enumeration")
+        };
+        let Value::Obj(descriptor) = descriptor else {
+            continue;
+        };
+        if matches!(
+            descriptor
+                .borrow()
+                .props
+                .get("enumerable")
+                .map(|property| property.value()),
+            Some(Value::Bool(true))
+        ) {
+            enumerable.push(key);
+        }
+    }
+    Ok(Some(enumerable))
+}
+
+/// The target side of an ordinary Proxy internal-method operation. A Proxy whose target is a
+/// WindowProxy still invokes the target's exotic methods; it must never see the holder's empty
+/// ordinary property table.
+fn proxy_target_own_property(i: &mut Interp, target: &Value, key: &str) -> Result<Value, Value> {
+    if let Some(descriptor) = window_proxy_get_own_property(i, target, key)? {
+        return Ok(descriptor);
+    }
+    if let Some((nested_target, nested_handler)) = proxy_pair(i, target) {
+        return proxy_gopd_value(i, &nested_target, &nested_handler, key);
+    }
+    if let Value::Obj(object) = target {
+        let property = object
+            .borrow()
+            .props
+            .get(key)
+            .map(|property| property.clone());
+        return Ok(property
+            .map(|property| descriptor_from_prop(i, property))
+            .unwrap_or(Value::Undefined));
+    }
+    Ok(Value::Undefined)
+}
+
+pub(crate) fn proxy_target_property(
+    i: &mut Interp,
+    target: &Value,
+    key: &str,
+) -> Result<Option<Property>, Value> {
+    let descriptor = proxy_target_own_property(i, target, key)?;
+    if matches!(descriptor, Value::Undefined) {
+        return Ok(None);
+    }
+    let partial = ab(build_partial(i, &descriptor))?;
+    Ok(Some(complete_descriptor(partial)))
+}
+
+fn proxy_target_own_keys(i: &mut Interp, target: &Value) -> Result<Vec<Value>, Value> {
+    if let Some(keys) = window_proxy_own_property_keys(i, target)? {
+        return Ok(keys);
+    }
+    if let Some((nested_target, nested_handler)) = proxy_pair(i, target) {
+        return proxy_own_keys(i, &nested_target, &nested_handler);
+    }
+    Ok(match target {
+        Value::Obj(object) => ordinary_own_keys_ordered(i, object)
+            .into_iter()
+            .map(|key| {
+                i.sym_from_key(&key)
+                    .unwrap_or_else(|| Value::from_string(key))
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn proxy_target_is_extensible(i: &mut Interp, target: &Value) -> Result<bool, Value> {
+    js_is_extensible(i, target)
+}
+
 fn ta_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     let (info, _) = ta_receiver(i, &this)?;
     Ok(Value::Num(
@@ -703,6 +958,38 @@ const TA_META_KEYS: [&str; 5] = [
 
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
+    #[cfg(feature = "embed")]
+    if let Value::Obj(window_proxy) = obj {
+        if i.is_window_proxy(window_proxy) {
+            let Some(decision) = ab(i.window_proxy_decision(
+                window_proxy,
+                crate::embed_realms::WindowProxyOperation::GetPrototypeOf,
+            ))?
+            else {
+                unreachable!("WindowProxy registry entry disappeared during operation")
+            };
+            return match decision {
+                crate::embed_realms::WindowProxyDecision::Handled(
+                    crate::embed_realms::WindowProxyResult::GetPrototypeOf(prototype),
+                ) => Ok(prototype),
+                crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.make_error(
+                    "TypeError",
+                    "WindowProxy policy returned a result for the wrong operation",
+                )),
+                crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                    let target = forward.target.as_obj().ok_or_else(|| {
+                        i.make_error("TypeError", "WindowProxy target is not an object")
+                    })?;
+                    Ok(target
+                        .borrow()
+                        .proto
+                        .clone()
+                        .map(Value::Obj)
+                        .unwrap_or(Value::Null))
+                }
+            };
+        }
+    }
     if let Some((target, handler)) = proxy_pair(i, obj) {
         if matches!(handler, Value::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
@@ -729,6 +1016,9 @@ pub(crate) fn has_own_property_trapped(
     v: &Value,
     key: &str,
 ) -> Result<bool, Value> {
+    if let Some(descriptor) = window_proxy_get_own_property(i, v, key)? {
+        return Ok(!matches!(descriptor, Value::Undefined));
+    }
     if let Some((t, h)) = proxy_pair(i, v) {
         return Ok(!matches!(
             proxy_gopd_value(i, &t, &h, key)?,
@@ -753,16 +1043,7 @@ pub(crate) fn proxy_gopd_value(
     }
     let trap = ab(i.proxy_trap(handler, "getOwnPropertyDescriptor"))?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_gopd_value(i, &t2, &h2, key);
-        }
-        if let Value::Obj(t) = target {
-            let prop = t.borrow().props.get(key).map(|p| p.clone());
-            return Ok(prop
-                .map(|p| descriptor_from_prop(i, p))
-                .unwrap_or(Value::Undefined));
-        }
-        return Ok(Value::Undefined);
+        return proxy_target_own_property(i, target, key);
     }
     if !trap.is_callable() {
         return Err(i.make_error(
@@ -774,23 +1055,24 @@ pub(crate) fn proxy_gopd_value(
         .sym_from_key(key)
         .unwrap_or_else(|| Value::from_string(key.to_string()));
     let res = ab(i.call(trap, handler.clone(), &[target.clone(), key_val]))?;
+    let target_descriptor = proxy_target_own_property(i, target, key)?;
+    let target_exists = !matches!(target_descriptor, Value::Undefined);
+    let target_extensible = proxy_target_is_extensible(i, target)?;
     if matches!(res, Value::Undefined) {
         // The trap may report a property absent only if the target permits it.
-        if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).map(|p| p.clone());
-            if let Some(p) = tprop {
-                if !p.configurable() {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-configurable property",
-                    ));
-                }
-                if !t.borrow().extensible {
-                    return Err(i.make_error(
-                        "TypeError",
-                        "gOPD trap reported undefined for a non-extensible target's property",
-                    ));
-                }
+        if target_exists {
+            let target_pd = ab(build_partial(i, &target_descriptor))?;
+            if !target_pd.configurable.unwrap_or(false) {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported undefined for a non-configurable property",
+                ));
+            }
+            if !target_extensible {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported undefined for a non-extensible target's property",
+                ));
             }
         }
         return Ok(Value::Undefined);
@@ -807,103 +1089,112 @@ pub(crate) fn proxy_gopd_value(
         return Ok(descriptor_from_prop(i, complete_descriptor(pd)));
     }
     // A descriptor may be reported for a property the target lacks only on an extensible target.
-    if let Value::Obj(t) = target {
-        if !t.borrow().props.contains(key) && !t.borrow().extensible {
-            return Err(i.make_error(
-                "TypeError",
-                "gOPD trap reported a property missing from a non-extensible target",
-            ));
-        }
+    if !target_exists && !target_extensible {
+        return Err(i.make_error(
+            "TypeError",
+            "gOPD trap reported a property missing from a non-extensible target",
+        ));
     }
     // A non-configurable target property pins the reported descriptor: configurability,
     // enumerability and the data/accessor shape must all match (IsCompatiblePropertyDescriptor).
-    if let Value::Obj(t) = target {
-        if let Some(p) = t.borrow().props.get(key) {
-            if !p.configurable() {
-                if !matches!(pd.configurable, Some(false)) {
+    let target_pd = if target_exists {
+        Some(ab(build_partial(i, &target_descriptor))?)
+    } else {
+        None
+    };
+    if let Some(target_pd) = &target_pd {
+        if !target_pd.configurable.unwrap_or(false) {
+            if !matches!(pd.configurable, Some(false)) {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report an existing non-configurable property '{key}' as configurable"),
+                ));
+            }
+            if let Some(enumerable) = pd.enumerable {
+                if enumerable != target_pd.enumerable.unwrap_or(false) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report an existing non-configurable property '{key}' as configurable"),
+                        format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
                     ));
                 }
-                if let Some(e) = pd.enumerable {
-                    if e != p.enumerable() {
+            }
+            let target_accessor = target_pd.is_accessor();
+            let reported_accessor = pd.is_accessor();
+            let reported_data = pd.is_data();
+            if (reported_accessor && !target_accessor) || (reported_data && target_accessor) {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report a differently-shaped descriptor for the non-configurable property '{key}'"),
+                ));
+            }
+            if !target_accessor
+                && !target_pd.writable.unwrap_or(false)
+                && matches!(pd.writable, Some(true))
+            {
+                return Err(i.make_error(
+                    "TypeError",
+                    format!("proxy can't report a non-configurable, non-writable property '{key}' as writable"),
+                ));
+            }
+            if !target_accessor && !target_pd.writable.unwrap_or(false) {
+                if let Some(value) = &pd.value {
+                    if !target_pd
+                        .value
+                        .as_ref()
+                        .is_some_and(|target_value| same_value(value, target_value))
+                    {
                         return Err(i.make_error(
                             "TypeError",
-                            format!("proxy can't report a different 'enumerable' for '{key}' when the target property is not configurable"),
+                            format!("proxy must report the same value for the non-writable, non-configurable property '{key}'"),
                         ));
                     }
                 }
-                let reported_accessor = pd.get.is_some() || pd.set.is_some();
-                let reported_data = pd.value.is_some() || pd.writable.is_some();
-                if (reported_accessor && !p.accessor()) || (reported_data && p.accessor()) {
+            }
+            let same_fn = |left: &Option<Value>, right: &Option<Value>| match (left, right) {
+                (Some(x), Some(y)) => same_value(x, y),
+                (None, None) => true,
+                (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
+            };
+            if target_accessor {
+                if pd.get.is_some() && !same_fn(&pd.get, &target_pd.get) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report a differently-shaped descriptor for the non-configurable property '{key}'"),
+                        format!("proxy must report the same getter for the non-configurable property '{key}'"),
                     ));
                 }
-                if !p.accessor() && !p.writable() && matches!(pd.writable, Some(true)) {
+                if pd.set.is_some() && !same_fn(&pd.set, &target_pd.set) {
                     return Err(i.make_error(
                         "TypeError",
-                        format!("proxy can't report a non-configurable, non-writable property '{key}' as writable"),
+                        format!("proxy must report the same setter for the non-configurable property '{key}'"),
                     ));
-                }
-                if !p.accessor() && !p.writable() {
-                    if let Some(v) = &pd.value {
-                        if !same_value(v, &p.value()) {
-                            return Err(i.make_error(
-                                "TypeError",
-                                format!("proxy must report the same value for the non-writable, non-configurable property '{key}'"),
-                            ));
-                        }
-                    }
-                }
-                if p.accessor() {
-                    let same_fn = |a: &Option<Value>, b: &Option<Value>| match (a, b) {
-                        (Some(x), Some(y)) => same_value(x, y),
-                        (None, None) => true,
-                        (Some(x), None) | (None, Some(x)) => matches!(x, Value::Undefined),
-                    };
-                    if pd.get.is_some() && !same_fn(&pd.get, &p.getter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same getter for the non-configurable property '{key}'"),
-                        ));
-                    }
-                    if pd.set.is_some() && !same_fn(&pd.set, &p.setter().cloned()) {
-                        return Err(i.make_error(
-                            "TypeError",
-                            format!("proxy must report the same setter for the non-configurable property '{key}'"),
-                        ));
-                    }
                 }
             }
         }
     }
     // A reported non-configurable descriptor must be backed by the target.
     if matches!(pd.configurable, Some(false)) {
-        if let Value::Obj(t) = target {
-            let tprop = t.borrow().props.get(key).map(|p| p.clone());
-            match tprop {
-                None => {
+        match target_pd.as_ref() {
+            None => {
+                return Err(i.make_error(
+                    "TypeError",
+                    "gOPD trap reported a non-configurable descriptor the target lacks",
+                ));
+            }
+            Some(target_pd) => {
+                if target_pd.configurable.unwrap_or(false) {
                     return Err(i.make_error(
                         "TypeError",
-                        "gOPD trap reported a non-configurable descriptor the target lacks",
+                        "gOPD trap reported non-configurable for a configurable target property",
                     ));
                 }
-                Some(p) => {
-                    if p.configurable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-configurable for a configurable target property",
-                        ));
-                    }
-                    if matches!(pd.writable, Some(false)) && !p.accessor() && p.writable() {
-                        return Err(i.make_error(
-                            "TypeError",
-                            "gOPD trap reported non-writable for a writable target property",
-                        ));
-                    }
+                if matches!(pd.writable, Some(false))
+                    && !target_pd.is_accessor()
+                    && target_pd.writable.unwrap_or(false)
+                {
+                    return Err(i.make_error(
+                        "TypeError",
+                        "gOPD trap reported non-writable for a writable target property",
+                    ));
                 }
             }
         }
@@ -928,17 +1219,8 @@ fn proxy_key_enumerable(
         }
         let enum_v = ab(i.get_member(&res, "enumerable"))?;
         Ok(i.to_boolean(&enum_v))
-    } else if let Some((t2, h2)) = proxy_pair(i, target) {
-        // Absent gOPD trap over a proxy target: forward to the target's [[GetOwnProperty]].
-        proxy_key_enumerable(i, &t2, &h2, key)
-    } else if let Value::Obj(t) = target {
-        Ok(t.borrow()
-            .props
-            .get(key)
-            .map(|p| p.enumerable())
-            .unwrap_or(false))
     } else {
-        Ok(false)
+        Ok(proxy_target_property(i, target, key)?.is_some_and(|property| property.enumerable()))
     }
 }
 
@@ -951,11 +1233,10 @@ fn proxy_define_property(
 ) -> Result<bool, Abrupt> {
     let trap = i.proxy_trap(handler, "defineProperty")?;
     if matches!(trap, Value::Undefined | Value::Null) {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
-            return proxy_define_property(i, &t2, &h2, key, desc);
-        }
-        return if let Value::Obj(t) = target {
-            define_own_property(i, t, key, desc)
+        return if let Some((t2, h2)) = proxy_pair(i, target) {
+            proxy_define_property(i, &t2, &h2, key, desc)
+        } else if let Value::Obj(target) = target {
+            define_own_property(i, target, key, desc)
         } else {
             Ok(false)
         };
@@ -1001,9 +1282,12 @@ fn proxy_define_property(
     }
     // Invariants relative to the target's existing property and extensibility.
     let setting_config_false = matches!(pd.configurable, Some(false));
-    if let Value::Obj(t) = target {
-        let tprop = t.borrow().props.get(key).map(|p| p.clone());
-        let extensible = t.borrow().extensible;
+    if matches!(target, Value::Obj(_)) {
+        // A Proxy's target can itself be exotic. In particular, querying the ordinary property
+        // table here would miss WindowProxy's child-index properties and policy-controlled
+        // descriptors, so use its actual [[GetOwnProperty]] and [[IsExtensible]] operations.
+        let tprop = proxy_target_property(i, target, key).map_err(Abrupt::Throw)?;
+        let extensible = proxy_target_is_extensible(i, target).map_err(Abrupt::Throw)?;
         match tprop {
             None => {
                 if !extensible {
@@ -1192,6 +1476,18 @@ pub(crate) fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
 /// observable trap order on proxies). `entries` controls value vs `[key, value]` output.
 fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result<Value, Value> {
     let mut out = Vec::new();
+    if let Some(keys) = window_proxy_enum_string_keys(i, o)? {
+        for key in keys {
+            let property = ab(i.to_property_key(&key))?;
+            let value = ab(i.get_member(o, &property))?;
+            out.push(if entries {
+                i.make_array(vec![key, value])
+            } else {
+                value
+            });
+        }
+        return Ok(i.make_array(out));
+    }
     if let Some((t, h)) = proxy_pair(i, o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let Value::Str(ks) = &k {
@@ -1295,6 +1591,10 @@ fn reflect_ordinary_set(
     value: Value,
     receiver: &Value,
 ) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(target, Value::Obj(o) if i.is_window_proxy(o)) {
+        return ab(i.set_member_recv(target, key, value, receiver.clone()));
+    }
     // Integer-indexed exotic [[Set]]: a canonical numeric index on a TypedArray is handled by
     // TypedArraySetElement (which coerces the value unconditionally, writing only when the index is
     // in range) and never falls back to creating an ordinary shadowing property.
@@ -1382,6 +1682,38 @@ pub(crate) fn reflect_define_on_receiver(
     key: &str,
     value: Value,
 ) -> Result<bool, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(receiver, Value::Obj(o) if i.is_window_proxy(o)) {
+        let existing = window_proxy_get_own_property(i, receiver, key)?
+            .expect("WindowProxy receiver was recognized");
+        let desc = i.new_object();
+        if let Value::Obj(existing) = &existing {
+            let (is_accessor, writable) = {
+                let properties = existing.borrow();
+                (
+                    properties.props.contains("get") || properties.props.contains("set"),
+                    matches!(
+                        properties
+                            .props
+                            .get("writable")
+                            .map(|property| property.value()),
+                        Some(Value::Bool(true))
+                    ),
+                )
+            };
+            if is_accessor || !writable {
+                return Ok(false);
+            }
+            set_data(&desc, "value", value);
+        } else {
+            set_data(&desc, "value", value);
+            set_data(&desc, "writable", Value::Bool(true));
+            set_data(&desc, "enumerable", Value::Bool(true));
+            set_data(&desc, "configurable", Value::Bool(true));
+        }
+        let object = receiver.as_obj().expect("WindowProxy object");
+        return ab(define_own_property(i, object, key, &Value::Obj(desc)));
+    }
     if proxy_pair(i, receiver).is_some() {
         let (target, handler) = proxy_pair(i, receiver).unwrap();
         // OrdinarySetWithOwnDescriptor: the receiver's [[GetOwnProperty]] runs first (its trap is
@@ -1473,6 +1805,10 @@ pub(crate) fn reflect_ordinary_get(
     key: &str,
     receiver: &Value,
 ) -> Result<Value, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(target, Value::Obj(o) if i.is_window_proxy(o)) {
+        return ab(i.get_member_recv(target, key, receiver.clone()));
+    }
     let mut current = target.clone();
     loop {
         if proxy_pair(i, &current).is_some() {
@@ -2396,7 +2732,10 @@ pub fn install(it: &mut Interp) {
             .props
             .insert(name, Property::data(val, false, false, false));
     }
-    set_builtin(&g, "globalThis", Value::Obj(g.clone()));
+    g.borrow_mut().props.insert(
+        "globalThis",
+        Property::data(Value::Obj(g.clone()), true, false, true),
+    );
 
     function_proto::install_function_proto(it);
     install_object(it);
@@ -3224,6 +3563,19 @@ fn install_object(it: &mut Interp) {
             };
             return Ok(Value::Bool(e));
         }
+        if let Some(desc) = window_proxy_get_own_property(i, &Value::Obj(o.clone()), &key)? {
+            let enumerable = match desc {
+                Value::Obj(desc) => matches!(
+                    desc.borrow()
+                        .props
+                        .get("enumerable")
+                        .map(|property| property.value()),
+                    Some(Value::Bool(true))
+                ),
+                _ => false,
+            };
+            return Ok(Value::Bool(enumerable));
+        }
         let e = o
             .borrow()
             .props
@@ -3367,6 +3719,9 @@ fn install_object(it: &mut Interp) {
             return Ok(i.make_array(keys));
         }
         ab(i.defer_trigger(&o, None))?;
+        if let Some(keys) = window_proxy_enum_string_keys(i, &Value::Obj(o.clone()))? {
+            return Ok(i.make_array(keys));
+        }
         if proxy_pair(i, &Value::Obj(o.clone())).is_some() {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o.clone()))?;
             return Ok(i.make_array(keys));
@@ -3407,6 +3762,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(strs));
         }
+        if let Some(keys) = window_proxy_own_property_keys(i, &Value::Obj(o.clone()))? {
+            return Ok(i.make_array(
+                keys.into_iter()
+                    .filter(|key| matches!(key, Value::Str(_)))
+                    .collect(),
+            ));
+        }
         // A TypedArray's own keys are its integer indices, then any string expandos (the
         // length/buffer/... metadata are inherited, not own).
         if let Some(info) = ta_info(i, &o) {
@@ -3446,6 +3808,13 @@ fn install_object(it: &mut Interp) {
                 .collect();
             return Ok(i.make_array(syms));
         }
+        if let Some(keys) = window_proxy_own_property_keys(i, &ov)? {
+            return Ok(i.make_array(
+                keys.into_iter()
+                    .filter(|key| matches!(key, Value::Sym(_)))
+                    .collect(),
+            ));
+        }
         let syms: Vec<Value> = o
             .borrow()
             .props
@@ -3458,16 +3827,7 @@ fn install_object(it: &mut Interp) {
     });
     it.def_method(&ctor, "getPrototypeOf", 1, |i, _this, args| {
         match arg(args, 0) {
-            Value::Obj(o) => {
-                if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
-                    return proxy_get_prototype(i, &target, &handler);
-                }
-                Ok(o.borrow()
-                    .proto
-                    .clone()
-                    .map(Value::Obj)
-                    .unwrap_or(Value::Null))
-            }
+            Value::Obj(o) => js_get_prototype_of(i, &Value::Obj(o)),
             // ToObject coerces a primitive (Object.getPrototypeOf('') → String.prototype).
             Value::Undefined | Value::Empty | Value::Null => {
                 Err(i.make_error("TypeError", "Cannot convert undefined or null to object"))
@@ -3558,6 +3918,9 @@ fn install_object(it: &mut Interp) {
         if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o.clone())) {
             return proxy_gopd_value(i, &target, &handler, &key);
         }
+        if let Some(descriptor) = window_proxy_get_own_property(i, &Value::Obj(o.clone()), &key)? {
+            return Ok(descriptor);
+        }
         let ptr = Gc::as_ptr(&o) as usize;
         if i.is_namespace(ptr) {
             if let Some(res) = i.namespace_own_property(ptr, &key) {
@@ -3585,6 +3948,20 @@ fn install_object(it: &mut Interp) {
                         .borrow_mut()
                         .props
                         .insert(key.as_str(), Property::plain(desc));
+                }
+            }
+            return Ok(Value::Obj(result));
+        }
+        if let Some(keys) = window_proxy_own_property_keys(i, &ov)? {
+            for key_value in keys {
+                let key = ab(i.to_property_key(&key_value))?;
+                let descriptor = window_proxy_get_own_property(i, &ov, &key)?
+                    .expect("WindowProxy descriptor operation remains registered");
+                if !matches!(descriptor, Value::Undefined) {
+                    result
+                        .borrow_mut()
+                        .props
+                        .insert(key, Property::plain(descriptor));
                 }
             }
             return Ok(Value::Obj(result));
@@ -3651,6 +4028,29 @@ fn install_object(it: &mut Interp) {
                     if proxy_key_enumerable(i, &t, &h, &pk)? {
                         let v = ab(i.get_member(&from, &pk))?;
                         assign_set(i, &to_val, &pk, v)?;
+                    }
+                }
+                continue;
+            }
+            if let Some(keys) = window_proxy_own_property_keys(i, &from)? {
+                for key_value in keys {
+                    let key = ab(i.to_property_key(&key_value))?;
+                    let descriptor = window_proxy_get_own_property(i, &from, &key)?
+                        .expect("WindowProxy descriptor operation remains registered");
+                    let enumerable = match &descriptor {
+                        Value::Obj(descriptor) => matches!(
+                            descriptor
+                                .borrow()
+                                .props
+                                .get("enumerable")
+                                .map(|property| property.value()),
+                            Some(Value::Bool(true))
+                        ),
+                        _ => false,
+                    };
+                    if enumerable {
+                        let value = ab(i.get_member(&from, &key))?;
+                        assign_set(i, &to_val, &key, value)?;
                     }
                 }
                 continue;
@@ -3755,6 +4155,16 @@ pub(crate) fn nf_has_own_property(
     this: Value,
     args: &[Value],
 ) -> Result<Value, Value> {
+    #[cfg(feature = "embed")]
+    if matches!(&this, Value::Obj(object) if i.is_window_proxy(object)) {
+        let key = ab(i.to_property_key(&arg(args, 0)))?;
+        if Interp::is_private_key(&key) {
+            return Ok(Value::Bool(false));
+        }
+        let descriptor = window_proxy_get_own_property(i, &this, &key)?
+            .expect("WindowProxy descriptor operation remains registered");
+        return Ok(Value::Bool(!matches!(descriptor, Value::Undefined)));
+    }
     // A string key on an ordinary object or array (no proxy, namespace or typed array —
     // those clear `ic_plain`): the own entries decide, with no key copy.
     if let (Some(Value::Str(k)), Value::Obj(o)) = (args.first(), &this) {
@@ -3864,7 +4274,7 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
 
 /// Build a property descriptor from a JS descriptor object.
 /// Build a descriptor object (`{value, writable, enumerable, configurable}` or `{get, set, ...}`).
-fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
+pub(crate) fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
     let d = i.new_object();
     if p.accessor() {
         set_data(&d, "get", p.getter().cloned().unwrap_or(Value::Undefined));
@@ -4034,6 +4444,38 @@ fn defer_trigger_v(i: &mut Interp, v: &Value, key: Option<&str>) -> Result<(), V
 }
 
 fn define_own_property(i: &mut Interp, o: &Gc, key: &str, desc: &Value) -> Result<bool, Abrupt> {
+    #[cfg(feature = "embed")]
+    if i.is_window_proxy(o) {
+        let key_value = i
+            .sym_from_key(key)
+            .unwrap_or_else(|| Value::from_string(key.to_owned()));
+        let operation = crate::embed_realms::WindowProxyOperation::DefineOwnProperty {
+            key: key_value,
+            descriptor: desc.clone(),
+        };
+        let Some(decision) = i.window_proxy_decision(o, operation)? else {
+            unreachable!("WindowProxy registry entry disappeared during operation")
+        };
+        return match decision {
+            crate::embed_realms::WindowProxyDecision::Handled(
+                crate::embed_realms::WindowProxyResult::DefineOwnProperty(success),
+            ) => Ok(success),
+            crate::embed_realms::WindowProxyDecision::Handled(_) => Err(i.throw(
+                "TypeError",
+                "WindowProxy policy returned a result for the wrong operation",
+            )),
+            crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                if crate::value::canonical_index(key).is_some() {
+                    return Ok(false);
+                }
+                let target = forward
+                    .target
+                    .as_obj()
+                    .ok_or_else(|| i.throw("TypeError", "WindowProxy target is not an object"))?;
+                define_own_property(i, target, key, desc)
+            }
+        };
+    }
     i.defer_trigger(o, Some(key))?;
     let d = build_partial(i, desc)?;
     // ArgumentsExoticObject [[DefineOwnProperty]]: sync the live parameter value into the

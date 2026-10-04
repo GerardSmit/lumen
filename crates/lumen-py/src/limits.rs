@@ -162,7 +162,9 @@ impl Interp {
         self.int_max_str_digits = n;
         if let Some(sys) = self.sys_module.clone() {
             let d = self.module_dict(&sys);
-            if let (Some(flags), Value::Obj(name)) = (dict_get_str(&d, "flags"), Value::str("int_max_str_digits")) {
+            if let (Some(flags), Value::Obj(name)) =
+                (dict_get_str(&d, "flags"), Value::str("int_max_str_digits"))
+            {
                 let _ = self.set_attr(&flags, &name, Value::Int(n as i64));
             }
         }

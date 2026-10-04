@@ -61,19 +61,25 @@ fn scalar_registration_survives_runtime_move_and_async_execution() {
 #[cfg(feature = "bundled-sqlite")]
 #[test]
 fn bundled_sqlite_is_wal_reset_safe_and_custom_library_errors_are_honest() {
-    assert_eq!(run(r#"
+    assert_eq!(
+        run(r#"
         const assert=require('node:assert/strict');
         const {DatabaseSync}=require('node:sqlite');
         const db=new DatabaseSync(':memory:');
         assert.equal(db.prepare('SELECT sqlite_version() AS version').get().version,'3.51.3');
         db.close();
         'verified';
-    "#), "verified");
-    assert_eq!(run(r#"
+    "#),
+        "verified"
+    );
+    assert_eq!(
+        run(r#"
         const assert=require('node:assert/strict');
         process.env.LUMEN_SQLITE_LIBRARY='/nonexistent/hashset-sqlite-library';
         const {DatabaseSync}=require('node:sqlite');
         assert.throws(()=>new DatabaseSync(':memory:'), /library not found/);
         'verified';
-    "#), "verified");
+    "#),
+        "verified"
+    );
 }

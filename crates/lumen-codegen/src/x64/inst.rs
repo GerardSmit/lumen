@@ -215,9 +215,19 @@ pub enum MInst {
         dst: VReg,
         src: VReg,
     },
-    Prefetch { addr: Amode },
-    AtomicAdd { addr: VReg, dst: VReg },
-    AtomicCas { addr: VReg, expected: VReg, replacement: VReg, dst: VReg },
+    Prefetch {
+        addr: Amode,
+    },
+    AtomicAdd {
+        addr: VReg,
+        dst: VReg,
+    },
+    AtomicCas {
+        addr: VReg,
+        expected: VReg,
+        replacement: VReg,
+        dst: VReg,
+    },
     /// Function entry: parameters arrive in fixed registers or incoming stack slots
     /// (`[rbp + offset]`).
     Args {
@@ -472,13 +482,27 @@ impl MachInst for MInst {
             }
             Prefetch { addr } => amode_uses(addr, out),
             AtomicAdd { addr, dst } => {
-                out.push(Operand { late: true, ..Operand::use_reg(*addr) });
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*addr)
+                });
                 out.push(Operand::mod_reg(*dst));
             }
-            AtomicCas { addr, expected, replacement, dst } => {
-                out.push(Operand { late: true, ..Operand::use_reg(*addr) });
+            AtomicCas {
+                addr,
+                expected,
+                replacement,
+                dst,
+            } => {
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*addr)
+                });
                 out.push(Operand::use_fixed(*expected, super::regs::RAX));
-                out.push(Operand { late: true, ..Operand::use_reg(*replacement) });
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*replacement)
+                });
                 out.push(Operand::def_fixed(*dst, super::regs::RAX));
             }
             Args { regs, stack } => {

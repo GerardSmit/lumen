@@ -1,4 +1,4 @@
-use super::{ImageError, MAX_LAYER_BYTES, Rgba8Image};
+use super::{ImageError, Rgba8Image, MAX_LAYER_BYTES};
 use lumen_html::paint::{Affine, Rect};
 
 pub(super) fn rasterize(
@@ -261,19 +261,17 @@ mod tests {
     }
     #[test]
     fn singular_and_invalid_geometry_are_checked() {
-        assert!(
-            sample(
-                &source(),
-                rect(),
-                1.0,
-                Affine {
-                    a: 0.0,
-                    ..Affine::IDENTITY
-                }
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(sample(
+            &source(),
+            rect(),
+            1.0,
+            Affine {
+                a: 0.0,
+                ..Affine::IDENTITY
+            }
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(
             sample(&source(), rect(), f32::NAN, Affine::IDENTITY),
             Err(ImageError::InvalidViewport)

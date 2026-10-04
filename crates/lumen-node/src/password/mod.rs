@@ -16,13 +16,13 @@
 //! Not preserved: the argon2 crate rejects `m < 8 * p`, where Zig (and so Bun) clamped the
 //! matrix and still recorded the requested `m`; and associated data is limited to 32 bytes.
 
+use crate::hash::{digest, Algo};
 use argon2::password_hash::{
     Error as PhError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 use base64::Engine;
 use lumen_host::{ops, Ctx, OpDecl, Value};
-use crate::hash::{digest, Algo};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -178,7 +178,9 @@ fn bcrypt_verify(password: &[u8], hash: &str) -> Result<bool, PasswordError> {
         .try_into()
         .map_err(|_| inv)?;
     let expect = bcrypt::BASE_64.decode(&hash[29..60]).map_err(|_| inv)?;
-    Ok(bool::from(bcrypt_raw(password, &salt, cost)[..].ct_eq(&expect)))
+    Ok(bool::from(
+        bcrypt_raw(password, &salt, cost)[..].ct_eq(&expect),
+    ))
 }
 
 /// Verify `password` against a PHC argon2 string or a `$2[abxy]$` bcrypt string,

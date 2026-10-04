@@ -209,7 +209,8 @@ impl CharClass {
             let hit = match pre {
                 PreMap::AsciiEither => {
                     let (lo, up) = (ascii_lower(u), ascii_upper(u));
-                    self.matches_raw(lo, false, fold) || (up != lo && self.matches_raw(up, false, fold))
+                    self.matches_raw(lo, false, fold)
+                        || (up != lo && self.matches_raw(up, false, fold))
                 }
                 _ => self.matches_raw(pre.apply(u), false, fold),
             };
@@ -218,9 +219,15 @@ impl CharClass {
         let mut hit = self.matches_raw(u, icase, fold);
         if !hit && icase {
             hit = match fold {
-                CaseFold::Full => fold_orbit(u).any(|alt| alt != u && self.matches_raw(alt, icase, fold)),
-                CaseFold::Legacy => char::from_u32(u).is_some_and(|c| self.legacy_variant(c, icase)),
-                CaseFold::Python => py_any_variant(u, |alt| alt != u && self.matches_raw(alt, icase, fold)),
+                CaseFold::Full => {
+                    fold_orbit(u).any(|alt| alt != u && self.matches_raw(alt, icase, fold))
+                }
+                CaseFold::Legacy => {
+                    char::from_u32(u).is_some_and(|c| self.legacy_variant(c, icase))
+                }
+                CaseFold::Python => {
+                    py_any_variant(u, |alt| alt != u && self.matches_raw(alt, icase, fold))
+                }
                 CaseFold::PythonAscii => {
                     let other = match u {
                         0x41..=0x5A => u + 32,

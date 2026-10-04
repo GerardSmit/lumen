@@ -3,14 +3,15 @@
 
 pub mod child;
 pub mod consts;
-pub mod errno;
 pub mod embedded;
+pub mod errno;
 pub mod fdctl;
 pub mod fs;
 pub mod ident;
+pub mod http_body;
 pub mod jitmem;
-pub mod net;
 pub mod native;
+pub mod net;
 pub mod poll;
 pub mod proc;
 pub mod signal;

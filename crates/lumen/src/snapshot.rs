@@ -513,6 +513,15 @@ pub(crate) fn encode_split(
 /// `Rc<str>` of it is shared by every decoded function's `toString` text and lazy body. `Err`
 /// (skew/truncation/corruption/another source) tells the caller to fall back to parsing `src`.
 pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
+    decode_shared(bytes, Rc::from(src))
+}
+
+/// Decode a snapshot while reusing an embedder-owned source allocation across realms.
+///
+/// The decoded AST and lazy function bodies are still created separately for each realm, but
+/// all of them retain this same `Rc<str>` instead of copying a large generated glue source for
+/// every child realm.
+pub(crate) fn decode_shared(bytes: &[u8], src: Rc<str>) -> R<Vec<Stmt>> {
     let _mem = crate::memstats::enter(crate::memstats::Cat::AstDecode);
     decode_inner(bytes, src, false).map(|(body, _)| body)
 }
@@ -521,7 +530,7 @@ pub fn decode(bytes: &[u8], src: &str) -> R<Vec<Stmt>> {
 /// [`encode_stripped_with_functions`]).
 #[allow(dead_code)] // the non-split form; blobs use `SplitUnit`
 pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Vec<Rc<Function>>)> {
-    let (body, funcs) = decode_inner(bytes, src, true)?;
+    let (body, funcs) = decode_inner(bytes, Rc::from(src), true)?;
     let funcs = funcs
         .unwrap_or_default()
         .into_iter()
@@ -532,7 +541,7 @@ pub(crate) fn decode_with_functions(bytes: &[u8], src: &str) -> R<(Vec<Stmt>, Ve
 
 type Decoded = (Vec<Stmt>, Option<Vec<Option<Rc<Function>>>>);
 
-fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
+fn decode_inner(bytes: &[u8], src: Rc<str>, collect: bool) -> R<Decoded> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
@@ -547,10 +556,10 @@ fn decode_inner(bytes: &[u8], src: &str, collect: bool) -> R<Decoded> {
     if r.uv()? != VERSION as u64 {
         return Err("snapshot: version mismatch".into());
     }
-    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(src) {
+    if r.uv()? != src.len() as u64 || r.u64()? != source_hash(&src) {
         return Err("snapshot: source mismatch".into());
     }
-    r.src = Rc::from(src);
+    r.src = src;
     let body = dec_stmts(&mut r)?;
     crate::interpreter::stack_trace::note_parsed_source(r.src.clone(), None);
     Ok((body, r.funcs))
@@ -1385,13 +1394,19 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
             pos,
         } => {
             if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
-                if matches!(name.as_str(), "eval" | "Function" | "AsyncFunction" | "GeneratorFunction") {
-                    deps.dynamic_code_sites.push((*pos, match name.as_str() {
-                        "eval" => "eval",
-                        "Function" => "Function",
-                        "AsyncFunction" => "AsyncFunction",
-                        _ => "GeneratorFunction",
-                    }));
+                if matches!(
+                    name.as_str(),
+                    "eval" | "Function" | "AsyncFunction" | "GeneratorFunction"
+                ) {
+                    deps.dynamic_code_sites.push((
+                        *pos,
+                        match name.as_str() {
+                            "eval" => "eval",
+                            "Function" => "Function",
+                            "AsyncFunction" => "AsyncFunction",
+                            _ => "GeneratorFunction",
+                        },
+                    ));
                 }
             }
             if let (Some(deps), Expr::Ident(name), [ArrayElem::Item(Expr::Str(spec))]) =
@@ -1409,12 +1424,18 @@ fn enc_expr(w: &mut Writer, e: &Expr) {
         }
         Expr::New { callee, args, pos } => {
             if let (Some(deps), Expr::Ident(name)) = (&mut w.deps, &**callee) {
-                if matches!(name.as_str(), "Function" | "AsyncFunction" | "GeneratorFunction") {
-                    deps.dynamic_code_sites.push((*pos, match name.as_str() {
-                        "Function" => "Function",
-                        "AsyncFunction" => "AsyncFunction",
-                        _ => "GeneratorFunction",
-                    }));
+                if matches!(
+                    name.as_str(),
+                    "Function" | "AsyncFunction" | "GeneratorFunction"
+                ) {
+                    deps.dynamic_code_sites.push((
+                        *pos,
+                        match name.as_str() {
+                            "Function" => "Function",
+                            "AsyncFunction" => "AsyncFunction",
+                            _ => "GeneratorFunction",
+                        },
+                    ));
                 }
             }
             w.u8(25);
@@ -2357,9 +2378,10 @@ fn dec_declkind(r: &mut Reader) -> R<DeclKind> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, encode};
+    use super::{decode, decode_shared, encode};
     use crate::ast::{Expr, Stmt};
     use crate::{Completion, Engine};
+    use std::rc::Rc;
 
     /// `encode` and `decode` must be exact inverses: re-encoding a decoded tree reproduces the
     /// bytes. This catches every tag/field-order asymmetry (a *dropped* field is caught instead
@@ -2624,6 +2646,30 @@ function fine() { return 'ok'; }";
         assert_eq!(crate::value::flush_cold_lazy_bodies(), 1);
         assert!(f.parsed_body().is_none());
         assert_eq!(f.body().len(), 2);
+    }
+
+    #[test]
+    fn child_snapshot_decodes_reuse_the_shared_source_allocation() {
+        let src: Rc<str> = Rc::from("function f(a) { return a + 1; }");
+        let blob = crate::compile_snapshot(&src).unwrap();
+        let first = decode_shared(&blob, src.clone()).unwrap();
+        let second = decode_shared(&blob, src.clone()).unwrap();
+        let Stmt::FuncDecl(first_fn) = &first[0] else {
+            panic!("snapshot preserves the function declaration");
+        };
+        let Stmt::FuncDecl(second_fn) = &second[0] else {
+            panic!("snapshot preserves the function declaration");
+        };
+        let first_source = first_fn.lazy.borrow();
+        let second_source = second_fn.lazy.borrow();
+        assert!(Rc::ptr_eq(
+            &first_source.as_ref().expect("lazy source is retained").src,
+            &src
+        ));
+        assert!(Rc::ptr_eq(
+            &second_source.as_ref().expect("lazy source is retained").src,
+            &src
+        ));
     }
 
     #[test]

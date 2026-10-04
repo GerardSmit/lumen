@@ -32,12 +32,6 @@ mod bunhash;
 #[cfg(not(target_arch = "wasm32"))]
 mod child;
 mod codec;
-#[cfg(feature = "compiler")]
-mod glue_dev;
-#[cfg(windows)]
-mod win_spawn;
-#[cfg(windows)]
-mod win_pipe;
 mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 mod dns;
@@ -45,14 +39,22 @@ mod dns;
 mod dylib;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod ffi;
+#[cfg(feature = "compiler")]
+mod glue_dev;
+#[cfg(windows)]
+mod win_pipe;
+#[cfg(windows)]
+mod win_spawn;
 use lumen_common::hash;
+#[cfg(target_arch = "wasm32")]
+mod browser;
+mod fsb;
 #[cfg(not(target_arch = "wasm32"))]
 mod napi;
-mod fsb;
 mod native;
-mod oscon;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
+mod oscon;
 mod password;
 mod pathops;
 mod signals;
@@ -64,8 +66,6 @@ mod vm_context;
 #[cfg(not(target_arch = "wasm32"))]
 mod vm_timeout;
 mod zlib;
-#[cfg(target_arch = "wasm32")]
-mod browser;
 #[cfg(target_arch = "wasm32")]
 use browser::{child, dns, napi, net, tls, vm_timeout};
 #[cfg(all(feature = "bun", target_arch = "wasm32"))]
@@ -229,7 +229,11 @@ pub fn extension() -> Extension {
             state.put(zlib::ZlibHandles::default());
         }),
         js_init: dev_glue,
-        js_init_snapshot: if dev_glue.is_some() { None } else { Some(JS_GLUE_AOT) },
+        js_init_snapshot: if dev_glue.is_some() {
+            None
+        } else {
+            Some(JS_GLUE_AOT)
+        },
     }
 }
 
@@ -314,7 +318,10 @@ fn op_heap_snapshot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
             });
             match written {
                 Ok(()) => Ok(Value::Undefined),
-                Err(e) => Err(ctx.make_error("Error", format!("cannot write heap snapshot '{path}': {e}"))),
+                Err(e) => {
+                    Err(ctx
+                        .make_error("Error", format!("cannot write heap snapshot '{path}': {e}")))
+                }
             }
         }
         _ => {
@@ -330,10 +337,16 @@ fn op_heap_snapshot(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
 /// memory ceiling (Node's `v8.setHeapSnapshotNearHeapLimit`); `0` stops. The realm then runs on
 /// with a slightly higher ceiling, and the last crossing is the limit for good.
 fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let times = args.first().and_then(Value::as_num_opt).unwrap_or(0.0).max(0.0) as u32;
+    let times = args
+        .first()
+        .and_then(Value::as_num_opt)
+        .unwrap_or(0.0)
+        .max(0.0) as u32;
     let thread_id = args.get(1).and_then(Value::as_num_opt).unwrap_or(0.0) as u32;
     let dir = match args.get(2) {
-        Some(Value::Str(d)) if !d.to_string().is_empty() => Some(std::path::PathBuf::from(d.to_string())),
+        Some(Value::Str(d)) if !d.to_string().is_empty() => {
+            Some(std::path::PathBuf::from(d.to_string()))
+        }
         _ => None,
     };
     ctx.set_near_limit_hook(
@@ -346,7 +359,9 @@ fn op_set_near_heap_limit(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
                 local_stamp(),
                 std::process::id()
             );
-            let path = dir.as_ref().map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
+            let path = dir
+                .as_ref()
+                .map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
             let _ = std::fs::File::create(&path).and_then(|f| {
                 let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
                 interp.write_heap_snapshot(&mut out)
@@ -362,7 +377,10 @@ fn local_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     match lumen_os::time::localtime(secs) {
-        Ok(tm) => format!("{:04}{:02}{:02}.{:02}{:02}{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec),
+        Ok(tm) => format!(
+            "{:04}{:02}{:02}.{:02}{:02}{:02}",
+            tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec
+        ),
         Err(_) => format!("{}.{:06}", secs / 86_400, secs % 86_400),
     }
 }
@@ -404,7 +422,11 @@ fn op_report_task_error(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<V
 
 /// `(hook)` — call `hook(type, promise, value)` when a settled promise is resolved again
 /// (process 'multipleResolves'); a non-function removes it.
-fn op_set_multiple_resolves_hook(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn op_set_multiple_resolves_hook(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     ctx.set_multiple_resolves_hook(args.first().cloned().unwrap_or(Value::Undefined));
     Ok(Value::Undefined)
 }
@@ -425,7 +447,10 @@ fn op_collect_garbage(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Va
 /// `[nodeStart, v8Start, environment, bootstrapComplete, loopStart, loopExit, idleTime]` in
 /// milliseconds on the `performance.now()` clock (-1: not reached yet).
 fn op_perf_timing(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    let values = lumen_host::perf::snapshot().into_iter().map(Value::Num).collect();
+    let values = lumen_host::perf::snapshot()
+        .into_iter()
+        .map(Value::Num)
+        .collect();
     Ok(ctx.make_array(values))
 }
 
@@ -484,12 +509,22 @@ fn op_transform_jsx(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value
     let source = ctx
         .coerce_string(args.first().unwrap_or(&Value::Undefined))?
         .to_string();
-    let ts = args.get(1).is_some_and(|value| matches!(value, Value::Bool(true)));
+    let ts = args
+        .get(1)
+        .is_some_and(|value| matches!(value, Value::Bool(true)));
     // Bun's default classic output keeps transformSync usable as a standalone script.
-    let options = lumen::JsxOptions { runtime: lumen::JsxRuntime::Classic, ..Default::default() };
+    let options = lumen::JsxOptions {
+        runtime: lumen::JsxRuntime::Classic,
+        ..Default::default()
+    };
     lumen::transpile_jsx(&source, ts, &options)
         .map(Value::from_string)
-        .map_err(|error| ctx.make_error("SyntaxError", format!("{} (line {})", error.message, error.line)))
+        .map_err(|error| {
+            ctx.make_error(
+                "SyntaxError",
+                format!("{} (line {})", error.message, error.line),
+            )
+        })
 }
 
 /// `stripTypes(code)`: Node's strip-only TypeScript erasure (the engine parser's TypeScript
@@ -719,7 +754,9 @@ fn op_realm_cwd(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, V
 }
 
 /// Finalize native addon producers while the owning realm remains alive.
-pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }
+pub fn shutdown_native_addons(ctx: &mut Ctx) {
+    napi::shutdown(ctx);
+}
 
 /// Close every socket and listener the realm still holds, ending the threads blocked on them.
 pub fn close_native_io(ctx: &mut Ctx) {
@@ -738,14 +775,20 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
 }
 
 /// Wake child realms blocked on their stdio pipes (see `child::close_child_pipes`).
-pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
+pub fn close_child_pipes(ctx: &mut Ctx) {
+    child::close_child_pipes(ctx);
+}
 
 /// Live facts for `os.uptime/loadavg/freemem/userInfo`: `{ uptime, load1/5/15, freemem, uid, gid,
 /// username, shell, homedir }`, read fresh on each call.
 fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
     let obj = Value::Obj(ctx.new_object());
     let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::sysinfo::uptime()));
-    let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::sysinfo::free_memory()));
+    let _ = ctx.set_member(
+        &obj,
+        "freemem",
+        Value::Num(lumen_os::sysinfo::free_memory()),
+    );
     let load = lumen_os::sysinfo::loadavg();
     for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
         let _ = ctx.set_member(&obj, key, Value::Num(n));
@@ -753,10 +796,21 @@ fn op_os_sysinfo(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, 
     let user = lumen_os::ident::current_user();
     let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
     let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
-    let _ = ctx.set_member(&obj, "username", Value::from_string(user.name.unwrap_or_default()));
+    let _ = ctx.set_member(
+        &obj,
+        "username",
+        Value::from_string(user.name.unwrap_or_default()),
+    );
     let shell = user.shell.filter(|s| !s.is_empty());
-    let _ = ctx.set_member(&obj, "shell", shell.map(Value::from_string).unwrap_or(Value::Null));
-    let _ = ctx.set_member(&obj, "homedir", Value::from_string(user.dir.unwrap_or_default()));
+    let _ = ctx.set_member(
+        &obj,
+        "shell",
+        shell.map(Value::from_string).unwrap_or(Value::Null),
+    );
+    let _ = ctx.set_member(
+        &obj,
+        "homedir",
+        Value::from_string(user.dir.unwrap_or_default()),
+    );
     Ok(obj)
 }
-

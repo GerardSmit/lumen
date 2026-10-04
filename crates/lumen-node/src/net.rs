@@ -47,27 +47,52 @@ use lumen_host::{ops, CallbackQueue, CompletionSender, Ctx, OpDecl, TaskId, Task
 const UDP_POLL: Duration = Duration::from_millis(200);
 
 #[cfg(unix)]
-mod wake;
-#[cfg(unix)]
 mod fdpass;
+#[cfg(unix)]
+mod wake;
 /// Descriptor passing is unix-only (Windows IPC rides the child's stdio instead).
 #[cfg(not(unix))]
 mod fdpass {
     use lumen_host::{Ctx, Value};
     fn unsupported(ctx: &mut Ctx) -> Result<Value, Value> {
-        Err(ctx.make_error("Error", "socket descriptor passing is not supported on this platform"))
+        Err(ctx.make_error(
+            "Error",
+            "socket descriptor passing is not supported on this platform",
+        ))
     }
-    pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_socket_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_server_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_udp_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_release(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { unsupported(ctx) }
-    pub(super) fn op_guess_handle(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::str("UNKNOWN")) }
-    pub(super) fn op_dup_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Num(-1.0)) }
-    pub(super) fn op_close_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> { Ok(Value::Undefined) }
+    pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_socket_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_server_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_udp_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_release(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        unsupported(ctx)
+    }
+    pub(super) fn op_guess_handle(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::str("UNKNOWN"))
+    }
+    pub(super) fn op_dup_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Num(-1.0))
+    }
+    pub(super) fn op_close_fd(_c: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
+        Ok(Value::Undefined)
+    }
 }
 
 // ---- op tables --------------------------------------------------------------------------------
@@ -540,12 +565,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
     let local_port = arg_u64(args, 3) as u16;
     let (resolve, reject) = take_resolve_reject(ctx, args.get(4), args.get(5))?;
 
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_connect,
-    );
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
     completions(ctx).run_blocking(id, move || {
         let result: Result<NetStream, NetErr> = (|| {
             let addrs: Vec<SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
@@ -566,8 +586,7 @@ fn op_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> 
             } else {
                 local_host.parse().ok()
             };
-            let local = (local_ip.is_some() || local_port != 0)
-                .then_some((local_ip, local_port));
+            let local = (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
             let mut last = None;
             for addr in addrs {
                 match connect_tcp(addr, local) {
@@ -627,7 +646,11 @@ fn connect_tcp_from(
     if ip.is_ipv6() != addr.is_ipv6() {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
@@ -814,12 +837,7 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
     #[cfg(unix)]
     {
-        let id = lumen_host::register_task(
-        ctx,
-            resolve,
-            Some(reject),
-            decode_connect,
-        );
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
         completions(ctx).run_blocking(id, move || {
             let result = UnixStream::connect(&path)
                 .map(NetStream::Unix)
@@ -830,12 +848,7 @@ fn op_connect_path(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Va
     }
     #[cfg(windows)]
     {
-        let id = lumen_host::register_task(
-        ctx,
-            resolve,
-            Some(reject),
-            decode_connect,
-        );
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_connect);
         completions(ctx).run_blocking(id, move || {
             let result = crate::win_pipe::PipeStream::connect(&path)
                 .map(NetStream::Pipe)
@@ -955,12 +968,7 @@ fn op_write(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
         return Ok(Value::Undefined);
     };
 
-    let id = lumen_host::register_task(
-        ctx,
-        resolve,
-        Some(reject),
-        decode_write,
-    );
+    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
     completions(ctx).run_blocking(id, move || {
         let mut s: &NetStream = &stream;
         let result: Result<(), NetErr> = s
@@ -1027,7 +1035,8 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
             let mut v: i32 = 0;
             let mut len = 4u32;
             // SAFETY: `v` is a live i32 and `len` its size, for an open socket.
-            let rc = unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
+            let rc =
+                unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
             (rc == 0 && v >= 0).then_some(v as usize)
         };
         let space = match (query(SO_SNDBUF), query(SO_NWRITE)) {
@@ -1041,7 +1050,11 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
     }
     // SAFETY: `fd` is an open socket owned by `stream`, and `data` is a live buffer of `len` bytes.
     let n = unsafe { send(fd, data.as_ptr().cast(), data.len(), MSG_DONTWAIT) };
-    if n > 0 { n as usize } else { 0 }
+    if n > 0 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 /// Windows has no per-call non-blocking send; the socket stays blocking (its reader thread
@@ -1228,13 +1241,23 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
             .next()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL))?,
     };
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
     os::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).map_err(os_error)?;
     if addr.is_ipv6() {
-        os::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (flags & IPV6ONLY != 0) as i32).map_err(os_error)?;
+        os::setsockopt_int(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (flags & IPV6ONLY != 0) as i32,
+        )
+        .map_err(os_error)?;
     }
     os::bind(fd, &addr.into()).map_err(os_error)?;
     os::listen(fd, backlog).map_err(os_error)?;
@@ -1423,7 +1446,13 @@ fn op_accept(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
                     };
                     break Ok(stream);
                 }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(e) => break Err(e),
             }
         };
@@ -1607,11 +1636,21 @@ fn op_udp_bind(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value>
 
     let addr = match parse_udp_addr(&host, port, kind6) {
         Ok(a) => a,
-        Err(e) => return Err(net_error_value(ctx, &net_err("bind", &e, Some((host, port))))),
+        Err(e) => {
+            return Err(net_error_value(
+                ctx,
+                &net_err("bind", &e, Some((host, port))),
+            ))
+        }
     };
     let socket = match bind_udp(addr, flags) {
         Ok(s) => s,
-        Err(e) => return Err(net_error_value(ctx, &net_err("bind", &e, Some((host, port))))),
+        Err(e) => {
+            return Err(net_error_value(
+                ctx,
+                &net_err("bind", &e, Some((host, port))),
+            ))
+        }
     };
     // Bounded read timeout so the recv thread can notice close() and exit.
     let _ = socket.set_read_timeout(Some(UDP_POLL));
@@ -1682,7 +1721,11 @@ fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     const REUSEADDR: u32 = 4;
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_DGRAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
@@ -1719,9 +1762,9 @@ fn op_udp_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Val
         return Err(ctx.make_error("Error", "dgram: unknown socket"));
     };
     let result = parse_udp_addr(&host, port, kind6).and_then(|addr| socket.connect(addr));
-    result.map(|()| Value::Undefined).map_err(|e| {
-        net_error_value(ctx, &net_err("connect", &e, Some((host, port))))
-    })
+    result
+        .map(|()| Value::Undefined)
+        .map_err(|e| net_error_value(ctx, &net_err("connect", &e, Some((host, port)))))
 }
 
 /// `(socketId)` — dissolve the association made by `connect`.
@@ -1960,7 +2003,13 @@ fn op_udp_set_multicast_ttl(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
 #[cfg(unix)]
 fn set_ipv6_multicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    lumen_os::net::setsockopt_int(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, hops).map_err(os_error)
+    lumen_os::net::setsockopt_int(
+        socket.as_raw_fd(),
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MULTICAST_HOPS,
+        hops,
+    )
+    .map_err(os_error)
 }
 
 #[cfg(not(unix))]
@@ -2315,7 +2364,9 @@ fn win_setsockopt<T>(socket: &UdpSocket, level: i32, name: i32, value: &T) -> st
         Ok(())
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
@@ -2531,12 +2582,22 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
     use std::os::windows::io::AsRawSocket;
     #[link(name = "ws2_32")]
     extern "system" {
-        fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, length: *mut i32) -> i32;
+        fn getsockopt(
+            socket: usize,
+            level: i32,
+            name: i32,
+            value: *mut u8,
+            length: *mut i32,
+        ) -> i32;
         fn WSAGetLastError() -> i32;
     }
     let mut value = 0i32;
     let mut length = std::mem::size_of::<i32>() as i32;
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     // SAFETY: the socket is live for the borrow; value/length describe a valid i32 buffer.
     let rc = unsafe {
         getsockopt(
@@ -2551,13 +2612,19 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
         Ok(value)
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
 #[cfg(windows)]
 fn set_socket_buffer_size(socket: &UdpSocket, receive: bool, size: i32) -> std::io::Result<()> {
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     win_setsockopt(socket, WIN_SOL_SOCKET, name, &size)
 }
 

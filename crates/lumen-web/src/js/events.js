@@ -221,23 +221,6 @@ for (const name of ["target", "currentTarget", "srcElement", "type", "cancelable
   Object.defineProperty(Event.prototype, name, { enumerable: true });
 }
 
-const kDetail = Symbol("kDetail");
-class CustomEvent extends Event {
-  constructor(type, options = kEmptyObject) {
-    if (arguments.length === 0) {
-      throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "type" argument must be specified');
-    }
-    super(type, options);
-    this[kDetail] = options?.detail ?? null;
-  }
-  get detail() {
-    if (!(kDetail in Object(this))) throw invalidThis("CustomEvent");
-    return this[kDetail];
-  }
-}
-Object.defineProperty(CustomEvent.prototype, Symbol.toStringTag, { value: "CustomEvent", configurable: true });
-Object.defineProperty(CustomEvent.prototype, "detail", { enumerable: true });
-
 class NodeCustomEvent extends Event {
   constructor(type, options) {
     super(type, options);
@@ -777,19 +760,23 @@ function cloneTransferableSignal(signal) {
 }
 
 Object.defineProperty(globalThis, "__cloneTransferableSignal", { value: cloneTransferableSignal, configurable: true });
+const eventTargetInternals = {
+  Event, get CustomEvent() { return globalThis.CustomEvent; }, EventTarget, NodeEventTarget, kEvents, kWeakHandler, kResistStopPropagation, kTrustEvent,
+  kNewListener, kRemoveListener, kCreateEvent, kHybridDispatch, kIsNodeStyleListener, kMaxEventTargetListeners,
+  kMaxEventTargetListenersWarned, defineEventHandler: defineNodeEventHandler, initEventTarget, isEventTarget, isNodeEventTarget,
+  isAbortSignal, isEvent, kTarget, kDispatching, kStop, createAbortSignal: () => new AbortSignal(kSignalCreate),
+  abortSignal,
+};
+Object.defineProperties(eventTargetInternals, {
+  codedError: { value: codedError },
+  invalidThis: { value: invalidThis },
+});
 Object.defineProperty(globalThis, "__eventTargetInternals", {
-  value: {
-    Event, CustomEvent, EventTarget, NodeEventTarget, kEvents, kWeakHandler, kResistStopPropagation, kTrustEvent,
-    kNewListener, kRemoveListener, kCreateEvent, kHybridDispatch, kIsNodeStyleListener, kMaxEventTargetListeners,
-    kMaxEventTargetListenersWarned, defineEventHandler: defineNodeEventHandler, initEventTarget, isEventTarget, isNodeEventTarget,
-    isAbortSignal, isEvent, kTarget, kDispatching, kStop, createAbortSignal: () => new AbortSignal(kSignalCreate),
-    abortSignal,
-  },
+  value: eventTargetInternals,
   configurable: true,
 });
 globalThis.DOMException = DOMException;
 globalThis.Event = Event;
-globalThis.CustomEvent = CustomEvent;
 globalThis.EventTarget = EventTarget;
 globalThis.AbortSignal = AbortSignal;
 globalThis.AbortController = AbortController;

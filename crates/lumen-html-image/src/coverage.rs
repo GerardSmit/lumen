@@ -12,6 +12,22 @@ pub(super) fn rounded(
     bottom: f32,
     radius: f32,
 ) -> f32 {
+    let radius = radius
+        .max(0.0)
+        .min((right - left) * 0.5)
+        .min((bottom - top) * 0.5);
+    rounded_corners(x, y, left, top, right, bottom, [[radius, radius]; 4])
+}
+
+pub(super) fn rounded_corners(
+    x: f32,
+    y: f32,
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    radii: [[f32; 2]; 4],
+) -> f32 {
     let (x0, y0, x1, y1) = (
         x.max(left),
         y.max(top),
@@ -22,56 +38,74 @@ pub(super) fn rounded(
         return 0.0;
     }
     let mut area = f64::from(x1 - x0) * f64::from(y1 - y0);
-    let radius = radius
-        .max(0.0)
-        .min((right - left) * 0.5)
-        .min((bottom - top) * 0.5);
-    if radius == 0.0
-        || x0 >= left + radius && x1 <= right - radius
-        || y0 >= top + radius && y1 <= bottom - radius
+    if radii.iter().all(|r| r[0] == 0.0 || r[1] == 0.0)
+        || x0 >= left + radii[0][0].max(radii[3][0]) && x1 <= right - radii[1][0].max(radii[2][0])
+        || y0 >= top + radii[0][1].max(radii[1][1]) && y1 <= bottom - radii[2][1].max(radii[3][1])
     {
         return area as f32;
     }
-    for (cx, cy, flip_x, flip_y) in [
-        (left + radius, top + radius, true, true),
-        (right - radius, top + radius, false, true),
-        (left + radius, bottom - radius, true, false),
-        (right - radius, bottom - radius, false, false),
+    for (cx, cy, flip_x, flip_y, [rx, ry]) in [
+        (left + radii[0][0], top + radii[0][1], true, true, radii[0]),
+        (
+            right - radii[1][0],
+            top + radii[1][1],
+            false,
+            true,
+            radii[1],
+        ),
+        (
+            left + radii[3][0],
+            bottom - radii[3][1],
+            true,
+            false,
+            radii[3],
+        ),
+        (
+            right - radii[2][0],
+            bottom - radii[2][1],
+            false,
+            false,
+            radii[2],
+        ),
     ] {
+        if rx == 0.0 || ry == 0.0 {
+            continue;
+        }
         if (if flip_x { x1 <= cx } else { x0 >= cx }) && (if flip_y { y1 <= cy } else { y0 >= cy })
         {
             let dx = f64::from(cx) - f64::from(cx.clamp(x0, x1));
             let dy = f64::from(cy) - f64::from(cy.clamp(y0, y1));
-            if dx * dx + dy * dy >= f64::from(radius).powi(2) {
+            if (dx / f64::from(rx)).powi(2) + (dy / f64::from(ry)).powi(2) >= 1.0 {
                 return 0.0;
             }
         }
         let (lo_x, hi_x) = if flip_x {
-            ((cx - x1).max(0.0), (cx - x0).min(radius))
+            ((cx - x1).max(0.0), (cx - x0).min(rx))
         } else {
-            ((x0 - cx).max(0.0), (x1 - cx).min(radius))
+            ((x0 - cx).max(0.0), (x1 - cx).min(rx))
         };
         let (lo_y, hi_y) = if flip_y {
-            ((cy - y1).max(0.0), (cy - y0).min(radius))
+            ((cy - y1).max(0.0), (cy - y0).min(ry))
         } else {
-            ((y0 - cy).max(0.0), (y1 - cy).min(radius))
+            ((y0 - cy).max(0.0), (y1 - cy).min(ry))
         };
         if hi_x <= lo_x || hi_y <= lo_y {
             continue;
         }
-        let (lo_x, hi_x, lo_y, hi_y, r) = (
+        let (lo_x, hi_x, lo_y, hi_y, rx, ry) = (
             f64::from(lo_x),
             f64::from(hi_x),
             f64::from(lo_y),
             f64::from(hi_y),
-            f64::from(radius),
+            f64::from(rx),
+            f64::from(ry),
         );
         let square = (hi_x - lo_x) * (hi_y - lo_y);
-        let inside = if lo_x * lo_x + lo_y * lo_y >= r * r {
+        let inside = if (lo_x / rx).powi(2) + (lo_y / ry).powi(2) >= 1.0 {
             0.0
         } else {
             contour_area(
-                [[r, 0.0], [r, r], [0.0, r]],
+                [[rx, 0.0], [rx, ry], [0.0, ry]],
                 std::f64::consts::FRAC_1_SQRT_2,
                 [lo_x, lo_y, hi_x, hi_y],
                 0,

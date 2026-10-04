@@ -14,14 +14,18 @@ struct Run {
 }
 
 fn script(name: &str, src: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!("lumen-py-cli-{}-{}.py", std::process::id(), name));
+    let path =
+        std::env::temp_dir().join(format!("lumen-py-cli-{}-{}.py", std::process::id(), name));
     std::fs::write(&path, src).unwrap();
     path
 }
 
 fn command(args: &[&str], path: &PathBuf) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_lumen-py"));
-    c.args(args).arg(path).env_remove("PYTHONINTMAXSTRDIGITS").env_remove("LUMEN_TIMEOUT_MS");
+    c.args(args)
+        .arg(path)
+        .env_remove("PYTHONINTMAXSTRDIGITS")
+        .env_remove("LUMEN_TIMEOUT_MS");
     c
 }
 
@@ -43,12 +47,22 @@ fn finish(mut child: std::process::Child, limit: Duration) -> Run {
         .unwrap()
         .unwrap_or_else(|| panic!("process did not exit within {limit:?}"))
         .code();
-    Run { code, out: out_h.join().unwrap(), err: err_h.join().unwrap(), elapsed: started.elapsed() }
+    Run {
+        code,
+        out: out_h.join().unwrap(),
+        err: err_h.join().unwrap(),
+        elapsed: started.elapsed(),
+    }
 }
 
 fn run(args: &[&str], name: &str, src: &str) -> Run {
     let path = script(name, src);
-    let child = command(args, &path).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let child = command(args, &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let r = finish(child, Duration::from_secs(20));
     let _ = std::fs::remove_file(path);
     r
@@ -81,7 +95,11 @@ fn timeout_can_come_from_the_environment() {
     let path = script("envtimeout", "while True:\n    pass\n");
     let mut c = command(&[], &path);
     c.env("LUMEN_TIMEOUT_MS", "200");
-    let child = c.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let child = c
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let r = finish(child, Duration::from_secs(20));
     let _ = std::fs::remove_file(path);
     assert_eq!(r.code, Some(124), "{}", r.err);
@@ -96,14 +114,22 @@ fn invalid_timeout_is_a_usage_error() {
 
 #[test]
 fn max_memory_raises_memory_error() {
-    let r = run(&["--max-memory=64"], "maxmem", "l = []\nwhile True:\n    l.append(bytearray(100000))\n");
+    let r = run(
+        &["--max-memory=64"],
+        "maxmem",
+        "l = []\nwhile True:\n    l.append(bytearray(100000))\n",
+    );
     assert_eq!(r.code, Some(1), "{}", r.err);
     assert!(r.err.contains("MemoryError"), "{}", r.err);
 }
 
 #[test]
 fn max_memory_leaves_ordinary_scripts_alone() {
-    let r = run(&["--max-memory=64"], "smallmem", "print(len([0] * 100000))\n");
+    let r = run(
+        &["--max-memory=64"],
+        "smallmem",
+        "print(len([0] * 100000))\n",
+    );
     assert_eq!(r.code, Some(0), "{}", r.err);
     assert_eq!(r.out, "100000\n");
 }
@@ -113,43 +139,100 @@ const DIGITS: &str = "import sys\nprint(sys.get_int_max_str_digits(), sys.flags.
 #[test]
 fn int_max_str_digits_option_and_environment() {
     assert_eq!(run(&[], "d0", DIGITS).out, "4300 4300\nunlimited\n");
-    assert_eq!(run(&["-X", "int_max_str_digits=700"], "d1", DIGITS).out, "700 700\nlimited\n");
-    assert_eq!(run(&["-Xint_max_str_digits=0"], "d2", DIGITS).out, "0 0\nunlimited\n");
+    assert_eq!(
+        run(&["-X", "int_max_str_digits=700"], "d1", DIGITS).out,
+        "700 700\nlimited\n"
+    );
+    assert_eq!(
+        run(&["-Xint_max_str_digits=0"], "d2", DIGITS).out,
+        "0 0\nunlimited\n"
+    );
 
     let path = script("d3", DIGITS);
-    let child = command(&[], &path).env("PYTHONINTMAXSTRDIGITS", "640").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    assert_eq!(finish(child, Duration::from_secs(20)).out, "640 640\nlimited\n");
+    let child = command(&[], &path)
+        .env("PYTHONINTMAXSTRDIGITS", "640")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        finish(child, Duration::from_secs(20)).out,
+        "640 640\nlimited\n"
+    );
 
-    let child = command(&["-X", "int_max_str_digits=5000"], &path).env("PYTHONINTMAXSTRDIGITS", "640").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    assert_eq!(finish(child, Duration::from_secs(20)).out, "5000 5000\nunlimited\n");
+    let child = command(&["-X", "int_max_str_digits=5000"], &path)
+        .env("PYTHONINTMAXSTRDIGITS", "640")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(
+        finish(child, Duration::from_secs(20)).out,
+        "5000 5000\nunlimited\n"
+    );
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn invalid_digit_limits_are_fatal_like_cpython() {
     for bad in ["5", "-1", "abc", "639"] {
-        let r = run(&["-X", &format!("int_max_str_digits={bad}")], "dbad", "print(1)\n");
+        let r = run(
+            &["-X", &format!("int_max_str_digits={bad}")],
+            "dbad",
+            "print(1)\n",
+        );
         assert_eq!(r.code, Some(1), "{bad}");
-        assert!(r.err.contains("-X int_max_str_digits: invalid limit; must be >= 640 or 0 for unlimited."), "{}", r.err);
+        assert!(
+            r.err.contains(
+                "-X int_max_str_digits: invalid limit; must be >= 640 or 0 for unlimited."
+            ),
+            "{}",
+            r.err
+        );
         assert_eq!(r.out, "");
     }
     let path = script("dbadenv", "print(1)\n");
-    let child = command(&[], &path).env("PYTHONINTMAXSTRDIGITS", "12").stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let child = command(&[], &path)
+        .env("PYTHONINTMAXSTRDIGITS", "12")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let r = finish(child, Duration::from_secs(20));
     let _ = std::fs::remove_file(path);
     assert_eq!(r.code, Some(1));
-    assert!(r.err.contains("PYTHONINTMAXSTRDIGITS: invalid limit; must be >= 640 or 0 for unlimited."), "{}", r.err);
+    assert!(
+        r.err
+            .contains("PYTHONINTMAXSTRDIGITS: invalid limit; must be >= 640 or 0 for unlimited."),
+        "{}",
+        r.err
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn ctrl_c_becomes_keyboard_interrupt() {
-    let path = script("sigint", "import sys\nprint('ready')\nsys.stdout.flush()\nwhile True:\n    pass\n");
-    let mut child = command(&[], &path).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let path = script(
+        "sigint",
+        "import sys\nprint('ready')\nsys.stdout.flush()\nwhile True:\n    pass\n",
+    );
+    let mut child = command(&[], &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut ready = [0u8; 6];
-    child.stdout.as_mut().unwrap().read_exact(&mut ready).unwrap();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
     assert_eq!(&ready, b"ready\n");
-    let status = Command::new("kill").args(["-INT", &child.id().to_string()]).status().unwrap();
+    let status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
     assert!(status.success());
     let r = finish(child, Duration::from_secs(10));
     let _ = std::fs::remove_file(path);

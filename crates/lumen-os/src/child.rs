@@ -26,7 +26,11 @@ pub fn wait_or_kill(
 }
 
 /// [`wait_or_kill`] with a wall-clock `limit` from now.
-pub fn wait_timeout(child: &mut Child, limit: Duration, poll: Duration) -> io::Result<Option<ExitStatus>> {
+pub fn wait_timeout(
+    child: &mut Child,
+    limit: Duration,
+    poll: Duration,
+) -> io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + limit;
     wait_or_kill(child, poll, || Instant::now() >= deadline)
 }
@@ -68,7 +72,11 @@ pub fn wait_or_kill_group(
 }
 
 /// [`wait_or_kill_group`] with a wall-clock `limit` from now.
-pub fn wait_timeout_group(child: &mut Child, limit: Duration, poll: Duration) -> io::Result<Option<ExitStatus>> {
+pub fn wait_timeout_group(
+    child: &mut Child,
+    limit: Duration,
+    poll: Duration,
+) -> io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + limit;
     wait_or_kill_group(child, poll, || Instant::now() >= deadline)
 }
@@ -80,11 +88,21 @@ mod tests {
     #[test]
     fn exits_or_is_killed() {
         let mut quick = Command::new("true").spawn().unwrap();
-        let status = wait_timeout(&mut quick, Duration::from_secs(10), Duration::from_millis(5)).unwrap();
+        let status = wait_timeout(
+            &mut quick,
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+        )
+        .unwrap();
         assert!(status.is_some_and(|s| s.success()));
         let mut slow = Command::new("sleep").arg("10").spawn().unwrap();
         let started = Instant::now();
-        let status = wait_timeout(&mut slow, Duration::from_millis(50), Duration::from_millis(5)).unwrap();
+        let status = wait_timeout(
+            &mut slow,
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        )
+        .unwrap();
         assert!(status.is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -101,8 +119,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let pidfile = dir.join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > {}; exit 0", pidfile.display());
-        let mut child = new_group(Command::new("sh").args(["-c", &script])).spawn().unwrap();
-        let status = wait_timeout_group(&mut child, Duration::from_secs(10), Duration::from_millis(5)).unwrap();
+        let mut child = new_group(Command::new("sh").args(["-c", &script]))
+            .spawn()
+            .unwrap();
+        let status = wait_timeout_group(
+            &mut child,
+            Duration::from_secs(10),
+            Duration::from_millis(5),
+        )
+        .unwrap();
         assert!(status.is_some_and(|s| s.success()));
         let pid = std::fs::read_to_string(&pidfile).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

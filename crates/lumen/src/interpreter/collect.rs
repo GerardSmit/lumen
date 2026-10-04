@@ -160,7 +160,9 @@ impl Interp {
     /// object's aliased parameter scope, and a class constructor's field-initializer environment.
     fn visit_object_scopes(&self, o: &Gc, f: &mut impl FnMut(&Env)) {
         #[cfg(feature = "aot-native")]
-        if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) { f(&class.env); }
+        if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) {
+            f(&class.env);
+        }
         // Only a user function (a class constructor) can have `class_info`, and only an
         // arguments exotic object `mapped_arguments`: the rest of the heap skips both probes.
         let (user, arguments) = {
@@ -170,7 +172,9 @@ impl Interp {
                 true
             } else {
                 #[cfg(feature = "aot-native")]
-                if let Callable::Aot(native) = &b.call { f(&native.env); }
+                if let Callable::Aot(native) = &b.call {
+                    f(&native.env);
+                }
                 false
             };
             (user, matches!(b.exotic, Exotic::Arguments))
@@ -221,7 +225,11 @@ impl Interp {
         self.visit_object_scopes(&o, &mut |e| tr.mark_scope(Rc::as_ptr(e)));
         #[cfg(feature = "aot-native")]
         if let Some(class) = self.native_classes.get(&(p as usize)) {
-            class.visit_values(|value| { if let Value::Obj(object) = value { tr.mark_obj(object); } });
+            class.visit_values(|value| {
+                if let Value::Obj(object) = value {
+                    tr.mark_obj(object);
+                }
+            });
         }
         if !self.proxies.is_empty() {
             if let Some((t, h)) = self.proxies.get(&(p as usize)) {
@@ -230,6 +238,12 @@ impl Interp {
                         tr.mark_obj(c);
                     }
                 }
+            }
+        }
+        #[cfg(feature = "embed")]
+        if let Some(target) = self.window_proxy_target(p as usize) {
+            if let Value::Obj(target) = target {
+                tr.mark_obj(&target);
             }
         }
         if self.multi_realm() {
@@ -288,7 +302,11 @@ impl Interp {
             self.visit_object_scopes(o, &mut |e| counts.add(Rc::as_ptr(e)));
             #[cfg(feature = "aot-native")]
             if let Some(class) = self.native_classes.get(&(Gc::as_ptr(o) as usize)) {
-                class.visit_values(|value| { if let Value::Obj(object) = value { object.gc_add_ref(); } });
+                class.visit_values(|value| {
+                    if let Value::Obj(object) = value {
+                        object.gc_add_ref();
+                    }
+                });
             }
         });
         // The first registry walk purges dead entries; the later ones rely on that.
@@ -316,8 +334,22 @@ impl Interp {
                 }
             }
         }
-        // A `vm` context realm's registry entry is bookkeeping too: it is traced from the realm's
-        // global and dropped with it.
+        // A WindowProxy registry entry owns exactly one strong RealmHandle global. Count that
+        // reference as an internal edge here and trace it only when its holder is marked; the
+        // holder's gc_pins entry is separately counted above and is removed in the same sweep.
+        #[cfg(feature = "embed")]
+        if let Some(registry) = self
+            .host_state
+            .get::<crate::embed_realms::WindowProxyRegistry>()
+        {
+            for entry in registry.entries.values() {
+                if let Value::Obj(target) = entry.target.global() {
+                    target.gc_add_ref();
+                }
+            }
+        }
+        // VM/host realm registry entries are bookkeeping too: they are traced from reachable
+        // globals/scopes and dropped with them.
         let vm_realms = self.multi_realm() && self.realms.values().any(|r| r.collectable);
         if vm_realms {
             // Per-realm `arguments` templates are rebuilt on demand; they must not pin a realm.
@@ -351,15 +383,23 @@ impl Interp {
         if let Some(units) = &self.snapshot_cjs {
             for unit in units.borrow().iter().flatten() {
                 tr.mark_scope(Rc::as_ptr(&unit.env));
-                if let Value::Obj(module) = &unit.module { tr.mark_obj(module); }
-                if let Value::Obj(require) = &unit.require { tr.mark_obj(require); }
+                if let Value::Obj(module) = &unit.module {
+                    tr.mark_obj(module);
+                }
+                if let Value::Obj(require) = &unit.require {
+                    tr.mark_obj(require);
+                }
             }
         }
         #[cfg(feature = "aot-native")]
         for unit in self.native_units.values().flatten() {
             tr.mark_scope(Rc::as_ptr(&unit.env));
-            if let Value::Obj(namespace) = &unit.namespace { tr.mark_obj(namespace); }
-            if let Some(Value::Obj(promise)) = &unit.evaluation { tr.mark_obj(promise); }
+            if let Value::Obj(namespace) = &unit.namespace {
+                tr.mark_obj(namespace);
+            }
+            if let Some(Value::Obj(promise)) = &unit.evaluation {
+                tr.mark_obj(promise);
+            }
         }
         value::gc_for_each_live(|o| {
             if Gc::strong_count(o) > o.gc_refs() as usize {
@@ -408,6 +448,28 @@ impl Interp {
                     Edge::Scope(e) => tr.mark_scope(Rc::as_ptr(e)),
                 });
                 continue;
+            }
+            // A retained closure may keep a retired realm's global environment alive after its
+            // WindowProxy has navigated to another global. Preserve that realm's intrinsics when
+            // its root environment is reached, even though the old backing global is no longer
+            // reachable from the proxy.
+            if vm_realms {
+                let mut retained_realm = false;
+                for realm in self.realms.values() {
+                    if realm.collectable && !realm.global.gc_marked() {
+                        // SAFETY: the scope belongs to a live RealmState in this registry.
+                        let global_env_marked = unsafe {
+                            scope_scratch(Rc::as_ptr(&realm.global_env)).get() & SCOPE_MARK != 0
+                        };
+                        if global_env_marked {
+                            tr.mark_obj(&realm.global);
+                            retained_realm = true;
+                        }
+                    }
+                }
+                if retained_realm {
+                    continue;
+                }
             }
             // Ephemerons: mark the values of live weak collections whose keys are marked,
             // then resume marking from them until nothing changes.
@@ -524,6 +586,13 @@ impl Interp {
                 module_ns,
                 gc_pins
             );
+            #[cfg(feature = "embed")]
+            if let Some(registry) = self
+                .host_state
+                .get_mut::<crate::embed_realms::WindowProxyRegistry>()
+            {
+                registry.sweep(ptr);
+            }
             #[cfg(feature = "aot-native")]
             self.native_classes.remove(&ptr);
             let mut b = o.borrow_mut();

@@ -8,6 +8,11 @@ publish = false
 [features]
 # Hash-flooding test helpers (`fasthash::tests`) shared with the engine's own tests.
 test-support = []
+video = ["dep:shiguredo_mp4", "dep:rusty_h264-decoder", "dep:rusty_h264-common"]
+# AAC decoding is isolated because the pinned decoder currently requires std;
+# the portable MP4/H.264 demux path stays available without it.
+aac = ["video", "dep:rusty_aac"]
+cookies = ["dep:psl"]
 # Exact allocation counters in `fastalloc` (see the engine's `memstats`); they sit on the allocation fast path.
 mem-stats = []
 native-signing = ["dep:ed25519-dalek"]
@@ -15,7 +20,7 @@ native-sidecar = ["dep:sha2"]
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
 # `compress`: zlib / gzip / raw deflate, Brotli and Zstandard over maintained crates.
-compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd"]
+compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:wuff"]
 
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
@@ -24,6 +29,7 @@ unicode-linebreak = { version = "=0.1.5", default-features = false }
 unicode-segmentation = { version = "=1.12.0", default-features = false }
 unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"] }
 unicode-script = "=0.5.8"
+psl = { version = "=2.1.238", optional = true }
 ed25519-dalek = { version = "2", default-features = false, optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
@@ -39,6 +45,15 @@ pbkdf2 = { version = "0.12", default-features = false, optional = true }
 scrypt = { version = "0.11", default-features = false, optional = true }
 libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "rust-allocator"], optional = true }
 brotli = { version = "8", optional = true }
+wuff = { path = "../../vendor/wuff", default-features = false, optional = true }
+shiguredo_mp4 = { version = "=2026.3.0", default-features = false, optional = true }
+rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["libm"], optional = true }
+rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["libm"], optional = true }
+rusty_aac = { version = "=0.5.0", default-features = false, optional = true }
+
+[dev-dependencies]
+# Used only to create real encoded MP4 fixtures for the video decoder tests.
+rusty_h264 = { version = "=0.16.0", default-features = false, features = ["std"] }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
 # browser and bare-metal builds use the pure-Rust ruzstd.

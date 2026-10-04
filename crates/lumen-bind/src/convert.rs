@@ -234,7 +234,11 @@ impl<'a, H: Host, T: FromArg<'a, H> + Elem> FromArg<'a, H> for Vec<T> {
     /// A sequence, element by element.
     fn from_arg(cx: &'a H::Cx<'_>, v: &'a H::Value, at: Slot) -> Result<Self, H::Error> {
         let items = H::to_seq(cx, v, at)?;
-        items.iter().enumerate().map(|(k, e)| T::from_arg(cx, e, at.elem(k as u32))).collect()
+        items
+            .iter()
+            .enumerate()
+            .map(|(k, e)| T::from_arg(cx, e, at.elem(k as u32)))
+            .collect()
     }
 }
 
@@ -254,7 +258,10 @@ impl<'a, H: Host, T: Class> FromArg<'a, H> for &'a mut T {
 
 impl<'a, H: Host, T: FromArg<'a, H>> FromRest<'a, H> for Vec<T> {
     fn from_rest(cx: &'a H::Cx<'_>, vals: &'a [H::Value], first: u32) -> Result<Self, H::Error> {
-        vals.iter().enumerate().map(|(k, v)| T::from_arg(cx, v, Slot::arg(first + k as u32))).collect()
+        vals.iter()
+            .enumerate()
+            .map(|(k, v)| T::from_arg(cx, v, Slot::arg(first + k as u32)))
+            .collect()
     }
 }
 
@@ -267,7 +274,10 @@ impl<'a, H: Host> FromRest<'a, H> for &'a [H::Value] {
 
 impl<'a, H: Host, T: FromArg<'a, H>> FromVarKw<'a, H> for Vec<(String, T)> {
     fn from_varkw(cx: &'a H::Cx<'_>) -> Result<Self, H::Error> {
-        H::varkw(cx).into_iter().map(|(k, v)| Ok((k.to_owned(), T::from_arg(cx, v, Slot::arg(u32::MAX - 1))?))).collect()
+        H::varkw(cx)
+            .into_iter()
+            .map(|(k, v)| Ok((k.to_owned(), T::from_arg(cx, v, Slot::arg(u32::MAX - 1))?)))
+            .collect()
     }
 }
 
@@ -530,7 +540,25 @@ impl<H: Host> IntoError<H> for std::io::Error {
 macro_rules! elem {
     ($($t:ty),*) => {$( impl Elem for $t {} )*};
 }
-elem!(f64, f32, i8, i16, u16, i32, u32, i64, u64, isize, usize, i128, bool, char, String, BigInt, Vec<u8>);
+elem!(
+    f64,
+    f32,
+    i8,
+    i16,
+    u16,
+    i32,
+    u32,
+    i64,
+    u64,
+    isize,
+    usize,
+    i128,
+    bool,
+    char,
+    String,
+    BigInt,
+    Vec<u8>
+);
 impl Elem for &str {}
 impl Elem for Cow<'_, str> {}
 impl<T: Elem> Elem for Option<T> {}

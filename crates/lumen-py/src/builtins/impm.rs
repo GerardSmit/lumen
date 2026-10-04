@@ -142,7 +142,10 @@ pub mod _imp {
         let _ = file;
         let name = it.get_attr_str(spec, "name")?;
         let n = it.str_of(&name)?;
-        let e = it.new_exc_str("ImportError", &format!("extension modules are not supported: '{n}'"));
+        let e = it.new_exc_str(
+            "ImportError",
+            &format!("extension modules are not supported: '{n}'"),
+        );
         it.set_exc_attr(&e, "name", name);
         Err(e)
     }
@@ -171,7 +174,11 @@ pub mod _imp {
             let t = it.type_name_of(source);
             return Err(it.type_error(&format!("a bytes-like object is required, not '{t}'")));
         };
-        Ok(Value::bytes(lumen_common::siphash::siphash13(key as u64, 0, &data).to_le_bytes().to_vec()))
+        Ok(Value::bytes(
+            lumen_common::siphash::siphash13(key as u64, 0, &data)
+                .to_le_bytes()
+                .to_vec(),
+        ))
     }
 
     /// (internal-only) Override PyConfig.use_frozen_modules.

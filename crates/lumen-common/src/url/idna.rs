@@ -38,17 +38,17 @@ fn map(input: &[u32]) -> Option<Vec<u32>> {
 }
 
 fn normalize(input: &[u32]) -> Vec<u32> {
-    lumen_common::unicode_norm_impl::normalize(input, "NFC")
+    crate::unicode_norm_impl::normalize(input, "NFC")
 }
 
 fn is_mark(c: u32) -> bool {
-    let marks = lumen_common::unicode_props::lookup("gc", Some("M")).unwrap_or(&[]);
+    let marks = crate::unicode_props::lookup("gc", Some("M")).unwrap_or(&[]);
     let i = marks.partition_point(|&(_, last)| last < c);
     marks.get(i).is_some_and(|&(first, _)| first <= c)
 }
 
 fn is_virama(c: u32) -> bool {
-    lumen_common::unicode_norm_impl::ccc(c) == 9
+    crate::unicode_norm_impl::ccc(c) == 9
 }
 
 // ---- punycode (RFC 3492) ----
@@ -431,7 +431,7 @@ fn non_empty(s: String) -> Option<String> {
 }
 
 /// ada's ToUnicode: decode each well-formed `xn--` label, leave everything else untouched.
-pub(crate) fn to_unicode(input: &str) -> String {
+pub fn to_unicode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let labels: Vec<&str> = input.split('.').collect();
     for (n, label) in labels.iter().enumerate() {

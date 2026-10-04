@@ -67,7 +67,10 @@ fn async_ops_run_off_the_loop_thread() {
     let report = REPORT.lock().unwrap().clone();
     assert!(report.contains(&"off-loop true".to_string()), "{report:?}");
     assert!(report.contains(&"ticks true".to_string()), "{report:?}");
-    assert!(report.contains(&"rejected true E_NOPE no luck".to_string()), "{report:?}");
+    assert!(
+        report.contains(&"rejected true E_NOPE no luck".to_string()),
+        "{report:?}"
+    );
     // Three 200 ms bodies on a 4-thread pool overlap.
     assert!(elapsed < Duration::from_millis(550), "took {elapsed:?}");
 }

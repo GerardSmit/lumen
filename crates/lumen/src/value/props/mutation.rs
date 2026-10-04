@@ -1,10 +1,10 @@
 //! Property insertion, removal, and shape maintenance.
 use super::shapes::{
-    fresh_owned_id, shape_by_id, shape_owned_from, shape_transition, Shape, OWNED_THRESHOLD,
-    SHAPE_EMPTY,
+    OWNED_THRESHOLD, SHAPE_EMPTY, Shape, fresh_owned_id, shape_by_id, shape_owned_from,
+    shape_transition,
 };
-use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
-use crate::value::{canonical_index, PackedValue, Property, Value};
+use super::{MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT, Props};
+use crate::value::{PackedValue, Property, Value, canonical_index};
 use std::rc::Rc;
 
 impl Props {

@@ -123,11 +123,11 @@ pub mod tls {
 }
 
 pub mod dns {
+    pub use super::empty_list as op_get_servers;
     pub use super::unsupported as op_lookup;
     pub use super::unsupported as op_resolve;
     pub use super::unsupported as op_getaddrinfo;
     pub use super::unsupported as op_getnameinfo;
-    pub use super::empty_list as op_get_servers;
 }
 
 pub mod napi {

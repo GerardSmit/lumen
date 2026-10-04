@@ -28,7 +28,12 @@ thread_local! {
 pub fn register(target: &Obj, weakref: &Obj) {
     ACTIVE.with(|a| a.set(true));
     let id = target.identity();
-    REGISTRY.with(|r| r.borrow_mut().entry(id).or_default().push(Rc::downgrade(weakref)));
+    REGISTRY.with(|r| {
+        r.borrow_mut()
+            .entry(id)
+            .or_default()
+            .push(Rc::downgrade(weakref))
+    });
 }
 
 pub fn live_refs(target: &Obj) -> Vec<Obj> {
@@ -38,14 +43,18 @@ pub fn live_refs(target: &Obj) -> Vec<Obj> {
     }
     REGISTRY.with(|r| {
         let mut r = r.borrow_mut();
-        let Some(list) = r.get_mut(&id) else { return Vec::new() };
+        let Some(list) = r.get_mut(&id) else {
+            return Vec::new();
+        };
         list.retain(|w| w.strong_count() > 0);
         list.iter().filter_map(|w| w.upgrade()).collect()
     })
 }
 
 fn callback_of(o: &Obj) -> Option<Value> {
-    let Kind::Opaque(cell) = &o.kind else { return None };
+    let Kind::Opaque(cell) = &o.kind else {
+        return None;
+    };
     let b = cell.try_borrow().ok()?;
     if let Some(w) = b.downcast_ref::<WeakRefData>() {
         return Some(w.callback.clone()).filter(|c| !c.is_none());
@@ -61,7 +70,10 @@ pub fn on_object_drop(id: u32) {
     if !ACTIVE.try_with(|a| a.get()).unwrap_or(false) {
         return;
     }
-    let refs = REGISTRY.try_with(|r| r.try_borrow_mut().ok().and_then(|mut r| r.remove(&id))).ok().flatten();
+    let refs = REGISTRY
+        .try_with(|r| r.try_borrow_mut().ok().and_then(|mut r| r.remove(&id)))
+        .ok()
+        .flatten();
     let Some(refs) = refs else { return };
     for w in refs {
         if let Some(o) = w.upgrade() {
@@ -85,7 +97,9 @@ pub fn take_pending() -> Vec<Obj> {
 
 /// Removes and returns the callback so it fires at most once.
 pub fn take_callback(o: &Obj) -> Option<Value> {
-    let Kind::Opaque(cell) = &o.kind else { return None };
+    let Kind::Opaque(cell) = &o.kind else {
+        return None;
+    };
     let mut b = cell.try_borrow_mut().ok()?;
     if let Some(w) = b.downcast_mut::<WeakRefData>() {
         return Some(std::mem::replace(&mut w.callback, Value::None)).filter(|c| !c.is_none());

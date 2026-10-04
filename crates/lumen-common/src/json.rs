@@ -49,7 +49,10 @@ impl Quote {
         spelling: Spelling::Plain,
     };
     /// A double-quoted JavaScript literal of plain text.
-    pub const JS_SOURCE: Quote = Quote { escapes: Escapes::JsSource, ..Quote::JSON };
+    pub const JS_SOURCE: Quote = Quote {
+        escapes: Escapes::JsSource,
+        ..Quote::JSON
+    };
 }
 
 /// `s` quoted as `q` says.
@@ -136,7 +139,10 @@ fn decode_at(s: &str, i: usize, spelling: Spelling) -> (u32, usize) {
             Some(hi) if smuggle::smuggled_high(c).is_some() => {
                 let next = s[i + 4..].chars().next();
                 match next.and_then(smuggle::smuggled_low) {
-                    Some(lo) => (0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00), 8),
+                    Some(lo) => (
+                        0x10000 + ((hi as u32 - 0xD800) << 10) + (lo as u32 - 0xDC00),
+                        8,
+                    ),
                     None => (hi as u32, 4),
                 }
             }
@@ -251,8 +257,16 @@ pub struct Options {
 }
 
 impl Options {
-    pub const JSON: Options = Options { strict: true, constants: false, jsonc: false, spelling: Spelling::Plain };
-    pub const JSONC: Options = Options { jsonc: true, ..Options::JSON };
+    pub const JSON: Options = Options {
+        strict: true,
+        constants: false,
+        jsonc: false,
+        spelling: Spelling::Plain,
+    };
+    pub const JSONC: Options = Options {
+        jsonc: true,
+        ..Options::JSON
+    };
 }
 
 /// A decoded string. `text` borrows the source when the literal has no escapes.
@@ -334,7 +348,12 @@ pub trait Sink<'a> {
 
     fn object(&mut self) -> Result<Self::Object, Self::Error>;
     fn key(&mut self, s: Str<'a>) -> Result<Self::Key, Self::Error>;
-    fn member(&mut self, obj: &mut Self::Object, key: Self::Key, v: Self::Value) -> Result<(), Self::Error>;
+    fn member(
+        &mut self,
+        obj: &mut Self::Object,
+        key: Self::Key,
+        v: Self::Value,
+    ) -> Result<(), Self::Error>;
     fn end_object(&mut self, obj: Self::Object) -> Result<Self::Value, Self::Error>;
 
     fn array(&mut self) -> Result<Self::Array, Self::Error>;
@@ -352,7 +371,12 @@ pub struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str, opts: Options) -> Self {
-        Parser { src, b: src.as_bytes(), pos: 0, opts }
+        Parser {
+            src,
+            b: src.as_bytes(),
+            pos: 0,
+            opts,
+        }
     }
 
     pub fn src(&self) -> &'a str {
@@ -390,7 +414,10 @@ impl<'a> Parser<'a> {
             self.pos += rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len());
         } else if rest.starts_with(b"/*") {
             let close = rest[2..].windows(2).position(|w| w == b"*/");
-            let close = close.ok_or(Error { kind: ErrorKind::UnterminatedComment, pos: self.pos })?;
+            let close = close.ok_or(Error {
+                kind: ErrorKind::UnterminatedComment,
+                pos: self.pos,
+            })?;
             self.pos += close + 4;
         } else {
             return Ok(false);
@@ -406,7 +433,9 @@ impl<'a> Parser<'a> {
     #[inline(always)]
     fn space<S: Sink<'a>>(&mut self, sink: &mut S) -> Result<(), S::Error> {
         match self.peek() {
-            Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | 0xEF) => self.ws().map_err(|e| sink.error(e)),
+            Some(b' ' | b'\t' | b'\n' | b'\r' | b'/' | 0xEF) => {
+                self.ws().map_err(|e| sink.error(e))
+            }
             _ => Ok(()),
         }
     }
@@ -453,8 +482,12 @@ impl<'a> Parser<'a> {
             b't' if self.word(b"true") => sink.bool(true),
             b'f' if self.word(b"false") => sink.bool(false),
             b'N' if self.opts.constants && self.word(b"NaN") => sink.constant(Constant::NaN),
-            b'I' if self.opts.constants && self.word(b"Infinity") => sink.constant(Constant::Infinity),
-            b'-' if self.opts.constants && self.word(b"-Infinity") => sink.constant(Constant::NegInfinity),
+            b'I' if self.opts.constants && self.word(b"Infinity") => {
+                sink.constant(Constant::Infinity)
+            }
+            b'-' if self.opts.constants && self.word(b"-Infinity") => {
+                sink.constant(Constant::NegInfinity)
+            }
             _ => match self.number() {
                 Some(n) => sink.number(n),
                 None => Err(self.fail(sink, ErrorKind::ExpectingValue, self.pos)),
@@ -588,7 +621,11 @@ impl<'a> Parser<'a> {
             small = None;
         }
         self.pos = i;
-        Some(Number { text: &self.src[start..i], is_float, small })
+        Some(Number {
+            text: &self.src[start..i],
+            is_float,
+            small,
+        })
     }
 
     /// A string's contents from the cursor (just past its opening quote) through the closing
@@ -600,7 +637,12 @@ impl<'a> Parser<'a> {
         while let Some(&c) = self.b.get(i) {
             if c == b'"' {
                 self.pos = i + 1;
-                return Ok(Str { text: Cow::Borrowed(&self.src[start..i]), start: start.saturating_sub(1), end: i + 1, lone_surrogate: false });
+                return Ok(Str {
+                    text: Cow::Borrowed(&self.src[start..i]),
+                    start: start.saturating_sub(1),
+                    end: i + 1,
+                    lone_surrogate: false,
+                });
             }
             if c == b'\\' || c < 0x20 {
                 break;
@@ -626,7 +668,9 @@ impl<'a> Parser<'a> {
                 match b.get(i) {
                     None => return Err(err(ErrorKind::UnterminatedString, begin)),
                     Some(b'"' | b'\\') => break,
-                    Some(&c) if c < 0x20 && strict => return Err(err(ErrorKind::ControlCharacter, i)),
+                    Some(&c) if c < 0x20 && strict => {
+                        return Err(err(ErrorKind::ControlCharacter, i))
+                    }
                     Some(_) => i += 1,
                 }
             }
@@ -662,7 +706,11 @@ impl<'a> Parser<'a> {
             }
             let mut cp = hex4(&b[i..i + 4]).ok_or(err(ErrorKind::BadUnicodeEscape, u))?;
             i += 4;
-            if (0xD800..0xDC00).contains(&cp) && i + 6 < b.len() && b[i] == b'\\' && b[i + 1] == b'u' {
+            if (0xD800..0xDC00).contains(&cp)
+                && i + 6 < b.len()
+                && b[i] == b'\\'
+                && b[i + 1] == b'u'
+            {
                 let lo = hex4(&b[i + 2..i + 6]).ok_or(err(ErrorKind::BadUnicodeEscape, i + 1))?;
                 if (0xDC00..0xE000).contains(&lo) {
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
@@ -672,13 +720,19 @@ impl<'a> Parser<'a> {
             lone |= self.opts.spelling.push(&mut out, cp);
         }
         self.pos = i;
-        Ok(Str { text: Cow::Owned(out), start: begin, end: i, lone_surrogate: lone })
+        Ok(Str {
+            text: Cow::Owned(out),
+            start: begin,
+            end: i,
+            lone_surrogate: lone,
+        })
     }
 }
 
 #[inline]
 fn hex4(h: &[u8]) -> Option<u32> {
-    h.iter().try_fold(0u32, |n, &c| Some(n * 16 + (c as char).to_digit(16)?))
+    h.iter()
+        .try_fold(0u32, |n, &c| Some(n * 16 + (c as char).to_digit(16)?))
 }
 
 // ---- a plain value tree -------------------------------------------------------------------------
@@ -740,7 +794,10 @@ impl<'a> Sink<'a> for TreeSink {
     fn enter(&mut self, _array: bool) -> Result<(), Error> {
         self.depth += 1;
         if self.depth > TREE_DEPTH {
-            return Err(Error { kind: ErrorKind::TooDeep, pos: 0 });
+            return Err(Error {
+                kind: ErrorKind::TooDeep,
+                pos: 0,
+            });
         }
         Ok(())
     }
@@ -802,11 +859,22 @@ mod tests {
 
     #[test]
     fn parses_documents() {
-        let v = parse(r#" {"a": [1, -2.5e1, true, false, null], "b": "x\u00e9\ud83d\ude00", "a": 0} "#).unwrap();
+        let v =
+            parse(r#" {"a": [1, -2.5e1, true, false, null], "b": "x\u00e9\ud83d\ude00", "a": 0} "#)
+                .unwrap();
         assert_eq!(v.get("a"), Some(&Value::Num(0.0)));
         assert_eq!(v.get("b").and_then(Value::as_str), Some("xé😀"));
         let Value::Obj(items) = &v else { panic!() };
-        assert_eq!(items[0].1, Value::Arr(vec![Value::Num(1.0), Value::Num(-25.0), Value::Bool(true), Value::Bool(false), Value::Null]));
+        assert_eq!(
+            items[0].1,
+            Value::Arr(vec![
+                Value::Num(1.0),
+                Value::Num(-25.0),
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Null
+            ])
+        );
     }
 
     #[test]
@@ -822,7 +890,18 @@ mod tests {
         assert_eq!(err("\"\\u12\""), (ErrorKind::BadUnicodeEscape, 2));
         assert_eq!(err("\"\\ud834\\u0x20\""), (ErrorKind::BadUnicodeEscape, 8));
         assert_eq!(err("\"a\nb\""), (ErrorKind::ControlCharacter, 2));
-        for bad in ["01", "1.", "1e", "-", ".5", "+1", "NaN", "tru", "[1,]", "{\"a\":1,}"] {
+        for bad in [
+            "01",
+            "1.",
+            "1e",
+            "-",
+            ".5",
+            "+1",
+            "NaN",
+            "tru",
+            "[1,]",
+            "{\"a\":1,}",
+        ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
     }
@@ -837,29 +916,54 @@ mod tests {
         assert_eq!((n.text, n.is_float, n.to_f64()), ("-0.5E+3", true, -500.0));
         let n = Parser::new("-0", Options::JSON).number().unwrap();
         assert_eq!(n.to_f64().to_bits(), (-0.0f64).to_bits());
-        let n = Parser::new("-123456789012345 ", Options::JSON).number().unwrap();
-        assert_eq!((n.small_int(), n.to_f64()), (Some(-123456789012345), -123456789012345.0));
-        let n = Parser::new("1234567890123456", Options::JSON).number().unwrap();
+        let n = Parser::new("-123456789012345 ", Options::JSON)
+            .number()
+            .unwrap();
+        assert_eq!(
+            (n.small_int(), n.to_f64()),
+            (Some(-123456789012345), -123456789012345.0)
+        );
+        let n = Parser::new("1234567890123456", Options::JSON)
+            .number()
+            .unwrap();
         assert_eq!((n.small_int(), n.to_f64()), (None, 1234567890123456.0));
     }
 
     #[test]
     fn jsonc_allows_comments_trailing_commas_and_bom() {
         let v = parse_jsonc("\u{feff}// head\n{ /* c */ \"a\": [1, 2,], }").unwrap();
-        assert_eq!(v.get("a"), Some(&Value::Arr(vec![Value::Num(1.0), Value::Num(2.0)])));
-        assert_eq!(parse_jsonc("{} /* open").unwrap_err().kind, ErrorKind::UnterminatedComment);
+        assert_eq!(
+            v.get("a"),
+            Some(&Value::Arr(vec![Value::Num(1.0), Value::Num(2.0)]))
+        );
+        assert_eq!(
+            parse_jsonc("{} /* open").unwrap_err().kind,
+            ErrorKind::UnterminatedComment
+        );
     }
 
     #[test]
     fn lone_surrogates_follow_the_spelling() {
         let parse_str = |text: &str, spelling| {
-            let mut p = Parser::new(text, Options { spelling, ..Options::JSON });
+            let mut p = Parser::new(
+                text,
+                Options {
+                    spelling,
+                    ..Options::JSON
+                },
+            );
             p.pos = 1;
             let s = p.string_body().unwrap();
             (s.text.into_owned(), s.lone_surrogate)
         };
-        assert_eq!(parse_str("\"\\ud800\"", Spelling::Plain), ("\u{FFFD}".into(), true));
-        assert_eq!(parse_str("\"\\ud800\"", Spelling::Utf16).0, smuggle::smuggle(0xD800).to_string());
+        assert_eq!(
+            parse_str("\"\\ud800\"", Spelling::Plain),
+            ("\u{FFFD}".into(), true)
+        );
+        assert_eq!(
+            parse_str("\"\\ud800\"", Spelling::Utf16).0,
+            smuggle::smuggle(0xD800).to_string()
+        );
         let mut cp = String::new();
         smuggle::push_code_point(&mut cp, 0xDC00);
         assert_eq!(parse_str("\"\\udc00\"", Spelling::CodePoints).0, cp);
@@ -867,19 +971,48 @@ mod tests {
 
     #[test]
     fn quotes() {
-        assert_eq!(json_string("a\"\\\n\u{1}é\u{2028}"), "\"a\\\"\\\\\\n\\u0001é\u{2028}\"");
+        assert_eq!(
+            json_string("a\"\\\n\u{1}é\u{2028}"),
+            "\"a\\\"\\\\\\n\\u0001é\u{2028}\""
+        );
         assert_eq!(quote("\u{2028}", &Quote::JS_SOURCE), "\"\\u2028\"");
-        let ascii = Quote { ascii_only: true, ..Quote::JSON };
-        assert_eq!(quote("é😀\u{7f}", &ascii), "\"\\u00e9\\ud83d\\ude00\\u007f\"");
-        let inspect = Quote { quote: b'\'', escapes: Escapes::Inspect, ..Quote::JSON };
-        assert_eq!(quote("it's \"q\"\u{1b}\u{85}", &inspect), "'it\\'s \"q\"\\x1B\\x85'");
+        let ascii = Quote {
+            ascii_only: true,
+            ..Quote::JSON
+        };
+        assert_eq!(
+            quote("é😀\u{7f}", &ascii),
+            "\"\\u00e9\\ud83d\\ude00\\u007f\""
+        );
+        let inspect = Quote {
+            quote: b'\'',
+            escapes: Escapes::Inspect,
+            ..Quote::JSON
+        };
+        assert_eq!(
+            quote("it's \"q\"\u{1b}\u{85}", &inspect),
+            "'it\\'s \"q\"\\x1B\\x85'"
+        );
         let mut lone = String::from("a");
         lone.push(smuggle::smuggle(0xD800));
-        let js = Quote { lone_surrogates: true, spelling: Spelling::Utf16, ..Quote::JSON };
+        let js = Quote {
+            lone_surrogates: true,
+            spelling: Spelling::Utf16,
+            ..Quote::JSON
+        };
         assert_eq!(quote(&lone, &js), "\"a\\ud800\"");
         let mut pair = String::new();
         smuggle::push_char_utf16(&mut pair, '\u{10FFFF}');
         assert_eq!(quote(&pair, &js), format!("\"{pair}\""));
-        assert_eq!(quote(&pair, &Quote { ascii_only: true, ..js }), "\"\\udbff\\udfff\"");
+        assert_eq!(
+            quote(
+                &pair,
+                &Quote {
+                    ascii_only: true,
+                    ..js
+                }
+            ),
+            "\"\\udbff\\udfff\""
+        );
     }
 }

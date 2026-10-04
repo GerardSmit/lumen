@@ -83,9 +83,15 @@ impl RawOptions {
                 _ => return Err(format!("unsupported tsconfig jsx option: {jsx}")),
             };
         }
-        if let Some(value) = &self.jsx_factory { options.factory = value.clone(); }
-        if let Some(value) = &self.jsx_fragment_factory { options.fragment_factory = value.clone(); }
-        if let Some(value) = &self.jsx_import_source { options.import_source = value.clone(); }
+        if let Some(value) = &self.jsx_factory {
+            options.factory = value.clone();
+        }
+        if let Some(value) = &self.jsx_fragment_factory {
+            options.fragment_factory = value.clone();
+        }
+        if let Some(value) = &self.jsx_import_source {
+            options.import_source = value.clone();
+        }
         Ok(options)
     }
 }
@@ -117,8 +123,15 @@ fn raw_from(json: &Json) -> RawOptions {
     if let Some(Json::Str(t)) = opts.get("target") {
         raw.target = Some(t.clone());
     }
-    for (name, field) in [("jsx", &mut raw.jsx), ("jsxFactory", &mut raw.jsx_factory), ("jsxFragmentFactory", &mut raw.jsx_fragment_factory), ("jsxImportSource", &mut raw.jsx_import_source)] {
-        if let Some(Json::Str(value)) = opts.get(name) { *field = Some(value.clone()); }
+    for (name, field) in [
+        ("jsx", &mut raw.jsx),
+        ("jsxFactory", &mut raw.jsx_factory),
+        ("jsxFragmentFactory", &mut raw.jsx_fragment_factory),
+        ("jsxImportSource", &mut raw.jsx_import_source),
+    ] {
+        if let Some(Json::Str(value)) = opts.get(name) {
+            *field = Some(value.clone());
+        }
     }
     raw
 }
@@ -156,7 +169,8 @@ fn load_raw(path: &Path, depth: usize) -> Result<RawOptions, String> {
     if depth > 32 {
         return Err("tsconfig `extends` chain too deep".into());
     }
-    let text = lumen_host::sysfs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let text =
+        lumen_host::sysfs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let json = parse_jsonc(&text).map_err(|e| format!("{}: {e}", path.display()))?;
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut raw = RawOptions::default();
@@ -199,7 +213,10 @@ pub fn load_for(file: &Path) -> Result<CompilerOptions, String> {
     }
 }
 
-pub fn load_jsx_for(file: &Path, defaults: &lumen::JsxOptions) -> Result<lumen::JsxOptions, String> {
+pub fn load_jsx_for(
+    file: &Path,
+    defaults: &lumen::JsxOptions,
+) -> Result<lumen::JsxOptions, String> {
     match find_config(file)? {
         Some(path) => load_raw(&path, 0)?.resolve_jsx(defaults),
         None => Ok(defaults.clone()),
@@ -232,14 +249,19 @@ mod tests {
     #[test]
     fn jsx_options_and_inherited_fields() {
         let mut raw = raw_from(&parse_jsonc(r#"{"compilerOptions":{"jsx":"react-jsxdev","jsxFactory":"h","jsxFragmentFactory":"F","jsxImportSource":"preact"}}"#).unwrap());
-        raw.merge_from(&raw_from(&parse_jsonc(r#"{"compilerOptions":{"jsx":"react"}}"#).unwrap()));
+        raw.merge_from(&raw_from(
+            &parse_jsonc(r#"{"compilerOptions":{"jsx":"react"}}"#).unwrap(),
+        ));
         let options = raw.resolve_jsx(&lumen::JsxOptions::default()).unwrap();
         assert_eq!(options.runtime, lumen::JsxRuntime::Classic);
         assert_eq!(options.factory, "h");
         assert_eq!(options.fragment_factory, "F");
         assert_eq!(options.import_source, "preact");
         raw.jsx = Some("preserve".into());
-        assert_eq!(raw.resolve_jsx(&options).unwrap().runtime, lumen::JsxRuntime::Preserve);
+        assert_eq!(
+            raw.resolve_jsx(&options).unwrap().runtime,
+            lumen::JsxRuntime::Preserve
+        );
         raw.jsx = Some("unknown".into());
         assert!(raw.resolve_jsx(&options).is_err());
     }

@@ -2,7 +2,9 @@
 
 use super::native::*;
 use crate::ast::{BinOp, CmpOp};
-use crate::bind::{opaque_instance, type_object, Inst, KwArgs, NativeError, NativeResult, Py, This};
+use crate::bind::{
+    opaque_instance, type_object, Inst, KwArgs, NativeError, NativeResult, Py, This,
+};
 use crate::object::*;
 use crate::vm::*;
 use std::collections::VecDeque;
@@ -18,7 +20,10 @@ impl TupleGetter {
     #[constructor]
     fn new(it: &mut Interp, index: &Value, doc: &Value) -> R<TupleGetter> {
         let index = it.index_of(index)?;
-        Ok(TupleGetter { index, doc: doc.clone() })
+        Ok(TupleGetter {
+            index,
+            doc: doc.clone(),
+        })
     }
 
     #[method(name = "__get__")]
@@ -56,9 +61,16 @@ impl TupleGetter {
 
     #[method(name = "__reduce__")]
     fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
-        let Some((index, doc)) = with_opaque::<TupleGetter, _>(&slf.0, |g| (g.index, g.doc.clone())) else { return Err(it.self_state_err("_tuplegetter")) };
+        let Some((index, doc)) =
+            with_opaque::<TupleGetter, _>(&slf.0, |g| (g.index, g.doc.clone()))
+        else {
+            return Err(it.self_state_err("_tuplegetter"));
+        };
         let t = it.type_of(&slf.0);
-        Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(vec![Value::Int(index), doc])]))
+        Ok(Value::tuple(vec![
+            Value::Obj(t),
+            Value::tuple(vec![Value::Int(index), doc]),
+        ]))
     }
 }
 
@@ -93,7 +105,11 @@ impl Deque {
     }
 
     fn extend_with(slf: &Py<Self>, it: &mut Interp, src: &Value, left: bool) -> R<()> {
-        let items = if src.is(slf.value()) { Self::snapshot(slf, it)? } else { it.iterate_to_vec(src)? };
+        let items = if src.is(slf.value()) {
+            Self::snapshot(slf, it)?
+        } else {
+            it.iterate_to_vec(src)?
+        };
         let mut d = slf.borrow_mut(it)?;
         for v in items {
             if left {
@@ -107,7 +123,13 @@ impl Deque {
 
     /// The item at `i` unless the deque changed since `state` (Python code run by a comparison
     /// may mutate it).
-    fn item_checked(slf: &Py<Self>, it: &mut Interp, i: usize, state: u64, exc: &str) -> R<Option<Value>> {
+    fn item_checked(
+        slf: &Py<Self>,
+        it: &mut Interp,
+        i: usize,
+        state: u64,
+        exc: &str,
+    ) -> R<Option<Value>> {
         let d = slf.borrow(it)?;
         if d.state != state {
             drop(d);
@@ -117,10 +139,19 @@ impl Deque {
     }
 
     /// The position of the first item equal to `value` in `start..stop`.
-    fn find(slf: &Py<Self>, it: &mut Interp, value: &Value, start: usize, stop: usize, exc: &str) -> R<Option<usize>> {
+    fn find(
+        slf: &Py<Self>,
+        it: &mut Interp,
+        value: &Value,
+        start: usize,
+        stop: usize,
+        exc: &str,
+    ) -> R<Option<usize>> {
         let state = slf.borrow(it)?.state;
         for i in start..stop {
-            let Some(x) = Self::item_checked(slf, it, i, state, exc)? else { break };
+            let Some(x) = Self::item_checked(slf, it, i, state, exc)? else {
+                break;
+            };
             let eq = it.values_eq(&x, value)?;
             if slf.borrow(it)?.state != state {
                 return Err(it.new_exc_str(exc, MUTATED));
@@ -147,11 +178,17 @@ impl Deque {
 
     fn clamp_index(it: &mut Interp, v: &Value, len: usize) -> R<usize> {
         let i = it.slice_index(v)?;
-        Ok(if i < 0 { i.saturating_add(len as i64).max(0) as usize } else { (i as usize).min(len) })
+        Ok(if i < 0 {
+            i.saturating_add(len as i64).max(0) as usize
+        } else {
+            (i as usize).min(len)
+        })
     }
 
     fn compare(slf: Py<Self>, it: &mut Interp, other: &Value, op: CmpOp) -> R<Value> {
-        let Some(other) = Py::<Deque>::from_value(it, other) else { return Ok(Value::NotImplemented) };
+        let Some(other) = Py::<Deque>::from_value(it, other) else {
+            return Ok(Value::NotImplemented);
+        };
         let x = Value::list(Self::snapshot(&slf, it)?);
         let y = Value::list(Self::snapshot(&other, it)?);
         it.compare_op(op, &x, &y)
@@ -188,12 +225,21 @@ impl Deque {
     #[constructor(hint(py(text_signature = "")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Deque {
         let _ = (args, kwargs);
-        Deque { items: VecDeque::new(), maxlen: None, state: 0 }
+        Deque {
+            items: VecDeque::new(),
+            maxlen: None,
+            state: 0,
+        }
     }
 
     #[proto(init)]
     #[method(hint(py(text_signature = "($self, /, *args, **kwargs)")))]
-    fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] iterable: Option<&Value>, #[kw] maxlen: Option<&Value>) -> R<()> {
+    fn __init__(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] iterable: Option<&Value>,
+        #[kw] maxlen: Option<&Value>,
+    ) -> R<()> {
         let slf = slf.0;
         let maxlen = match maxlen {
             Some(v) => {
@@ -234,13 +280,17 @@ impl Deque {
     #[method(hint(py(text_signature = "")))]
     fn pop(&mut self) -> NativeResult<Value> {
         self.state += 1;
-        self.items.pop_back().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
+        self.items
+            .pop_back()
+            .ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
     #[method(hint(py(text_signature = "")))]
     fn popleft(&mut self) -> NativeResult<Value> {
         self.state += 1;
-        self.items.pop_front().ok_or_else(|| NativeError::index_error("pop from an empty deque"))
+        self.items
+            .pop_front()
+            .ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
     #[method(hint(py(text_signature = "")))]
@@ -275,9 +325,19 @@ impl Deque {
         let ty = it.type_of(slf.value());
         let exact = type_object::<Deque>(it);
         if it.is_exact(slf.value(), &exact) {
-            return Ok(opaque_instance(&ty, Deque { items: items.into(), maxlen, state: 0 }));
+            return Ok(opaque_instance(
+                &ty,
+                Deque {
+                    items: items.into(),
+                    maxlen,
+                    state: 0,
+                },
+            ));
         }
-        let args = vec![Value::list(items), maxlen.map(|m| Value::Int(m as i64)).unwrap_or(Value::None)];
+        let args = vec![
+            Value::list(items),
+            maxlen.map(|m| Value::Int(m as i64)).unwrap_or(Value::None),
+        ];
         it.call(&Value::Obj(ty), args, Vec::new())
     }
 
@@ -290,7 +350,9 @@ impl Deque {
         };
         let mut count = 0;
         for i in 0..n {
-            let Some(x) = Self::item_checked(&slf, it, i, state, "RuntimeError")? else { break };
+            let Some(x) = Self::item_checked(&slf, it, i, state, "RuntimeError")? else {
+                break;
+            };
             if it.values_eq(&x, value)? {
                 count += 1;
             }
@@ -302,7 +364,13 @@ impl Deque {
     }
 
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
-    fn index(slf: This<Py<Self>>, it: &mut Interp, value: &Value, start: Option<&Value>, stop: Option<&Value>) -> R<usize> {
+    fn index(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        value: &Value,
+        start: Option<&Value>,
+        stop: Option<&Value>,
+    ) -> R<usize> {
         let slf = slf.0;
         let n = slf.borrow(it)?.items.len();
         let start = match start {
@@ -323,10 +391,16 @@ impl Deque {
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
     fn insert(&mut self, index: isize, value: Value) -> NativeResult<()> {
         if self.maxlen.is_some_and(|m| self.items.len() >= m) {
-            return Err(NativeError::index_error("deque already at its maximum size"));
+            return Err(NativeError::index_error(
+                "deque already at its maximum size",
+            ));
         }
         let n = self.items.len() as isize;
-        let pos = if index < 0 { (index + n).max(0) } else { index.min(n) } as usize;
+        let pos = if index < 0 {
+            (index + n).max(0)
+        } else {
+            index.min(n)
+        } as usize;
         self.items.insert(pos, value);
         self.state += 1;
         Ok(())
@@ -388,7 +462,11 @@ impl Deque {
         let slf = slf.0;
         let n = slf.borrow(it)?.items.len();
         let i = Self::index_arg(it, key, n)?;
-        let old = slf.borrow_mut(it)?.items.get_mut(i).map(|slot| std::mem::replace(slot, value));
+        let old = slf
+            .borrow_mut(it)?
+            .items
+            .get_mut(i)
+            .map(|slot| std::mem::replace(slot, value));
         drop(old);
         Ok(())
     }
@@ -430,7 +508,9 @@ impl Deque {
     #[proto(repr)]
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let slf = slf.0;
-        let Value::Obj(o) = slf.value() else { return Ok(Value::str("deque([])")) };
+        let Value::Obj(o) = slf.value() else {
+            return Ok(Value::str("deque([])"));
+        };
         let ty = it.type_of(slf.value());
         let name = it.type_name(&ty);
         if it.repr_enter(o) {
@@ -507,7 +587,10 @@ impl Deque {
         let slf = slf.0;
         if Py::<Deque>::from_value(it, other).is_none() {
             let t = it.type_name_of(other);
-            return Err(it.type_error(&format!("can only concatenate deque (not \"{}\") to deque", t)));
+            return Err(it.type_error(&format!(
+                "can only concatenate deque (not \"{}\") to deque",
+                t
+            )));
         }
         let copy = Self::copy(This(slf), it)?;
         if let Some(copy_d) = Py::<Deque>::from_value(it, &copy) {
@@ -585,7 +668,12 @@ impl DequeIter {
             let d = deque.borrow(it)?;
             (d.state, d.items.len())
         };
-        Ok(DequeIter { deque, idx: 0, state, remaining })
+        Ok(DequeIter {
+            deque,
+            idx: 0,
+            state,
+            remaining,
+        })
     }
 
     fn step(&mut self, it: &mut Interp, reverse: bool) -> R<Option<Value>> {
@@ -599,7 +687,11 @@ impl DequeIter {
             return Ok(None);
         }
         let n = d.items.len();
-        let pos = if reverse { n.checked_sub(1 + self.idx) } else { Some(self.idx) };
+        let pos = if reverse {
+            n.checked_sub(1 + self.idx)
+        } else {
+            Some(self.idx)
+        };
         let v = pos.and_then(|p| d.items.get(p).cloned());
         self.idx += 1;
         self.remaining -= 1;
@@ -686,7 +778,12 @@ pub struct DefaultDict;
 impl DefaultDict {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Dd<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Dd<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let factory = match args.first() {
             Some(f) => {
                 if !f.is_none() && !it.is_callable(f) {
@@ -700,7 +797,9 @@ impl DefaultDict {
         let d = it.instance_dict(o);
         dict_set_str(&d, "default_factory", factory);
         let dict_ty = it.types.dict.clone();
-        let init = it.lookup_mro(&dict_ty, "__init__").ok_or_else(|| it.type_error("dict has no __init__"))?;
+        let init = it
+            .lookup_mro(&dict_ty, "__init__")
+            .ok_or_else(|| it.type_error("dict has no __init__"))?;
         let mut rest = vec![Value::Obj(o.clone())];
         rest.extend(args.iter().skip(1).cloned());
         it.call(&init, rest, kwargs.to_vec())?;
@@ -756,10 +855,20 @@ impl DefaultDict {
         let o = slf.0 .0;
         let f = factory_of(it, o);
         let ty = Value::Obj(it.type_of_obj(o));
-        let args = if f.is_none() { Value::tuple(Vec::new()) } else { Value::tuple(vec![f]) };
+        let args = if f.is_none() {
+            Value::tuple(Vec::new())
+        } else {
+            Value::tuple(vec![f])
+        };
         let items = it.call_method(&Value::Obj(o.clone()), "items", Vec::new())?;
         let items = it.get_iter(&items)?;
-        Ok(Value::tuple(vec![ty, args, Value::None, Value::None, items]))
+        Ok(Value::tuple(vec![
+            ty,
+            args,
+            Value::None,
+            Value::None,
+            items,
+        ]))
     }
 
     /// Return self|value.
@@ -799,7 +908,9 @@ impl DefaultDict {
 // ---- helpers ------------------------------------------------------------------------------------
 
 fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
-    let Some(index) = with_opaque::<TupleGetter, _>(getter, |g| g.index) else { return Err(it.self_state_err("_tuplegetter")) };
+    let Some(index) = with_opaque::<TupleGetter, _>(getter, |g| g.index) else {
+        return Err(it.self_state_err("_tuplegetter"));
+    };
     match obj.tuple_items() {
         Some(items) => match usize::try_from(index).ok().and_then(|i| items.get(i)) {
             Some(v) => Ok(v.clone()),
@@ -807,7 +918,10 @@ fn tuple_getter_get(it: &mut Interp, getter: &Value, obj: &Value) -> R<Value> {
         },
         None => {
             let t = it.type_name_of(obj);
-            Err(it.type_error(&format!("descriptor for index '{}' for tuple subclasses doesn't apply to '{}' object", index, t)))
+            Err(it.type_error(&format!(
+                "descriptor for index '{}' for tuple subclasses doesn't apply to '{}' object",
+                index, t
+            )))
         }
     }
 }
@@ -850,10 +964,22 @@ pub mod _collections {
         let ty = type_object::<DequeRevIter>(it);
         set_type(&d, "_deque_reverse_iterator", &ty);
         let dict_ty = it.types.dict.clone();
-        let dd = new_type(it, "collections", "defaultdict", Some(&dict_ty), Layout::Dict);
+        let dd = new_type(
+            it,
+            "collections",
+            "defaultdict",
+            Some(&dict_ty),
+            Layout::Dict,
+        );
         crate::bind::extend_type::<DefaultDict>(it, &dd);
         if let Some(td) = dd.dict.borrow().as_ref() {
-            dict_set_str(td, "__doc__", <DefaultDict as lumen_bind::Class>::DESC.doc.map_or(Value::None, Value::str));
+            dict_set_str(
+                td,
+                "__doc__",
+                <DefaultDict as lumen_bind::Class>::DESC
+                    .doc
+                    .map_or(Value::None, Value::str),
+            );
         }
         set_type(&d, "defaultdict", &dd);
         let tg = type_object::<TupleGetter>(it);

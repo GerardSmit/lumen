@@ -30,7 +30,10 @@ impl Capture {
 
 impl Write for Capture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -61,7 +64,10 @@ impl vfs::Backend for Remote {
         let (kind, rest) = out.split_first()?;
         let size = u64::from_le_bytes(rest.get(..8)?.try_into().ok()?);
         match kind {
-            1 => Some(vfs::RemoteStat { is_dir: false, size }),
+            1 => Some(vfs::RemoteStat {
+                is_dir: false,
+                size,
+            }),
             2 => Some(vfs::RemoteStat { is_dir: true, size }),
             _ => None,
         }
@@ -138,7 +144,9 @@ impl RuntimeSession {
     pub fn new(host: JsValue, options: JsValue) -> RuntimeSession {
         browser::set_host(host);
         lumen_host::time::install_engine_clock();
-        let cwd = get(&options, "cwd").as_string().unwrap_or_else(|| "/".to_string());
+        let cwd = get(&options, "cwd")
+            .as_string()
+            .unwrap_or_else(|| "/".to_string());
         let _ = vfs::mem().mkdir(&cwd, 0o755, true);
         let _ = vfs::mem().chdir(&cwd);
         let argv: Vec<String> = match get(&options, "argv").dyn_ref::<Array>() {
@@ -149,7 +157,10 @@ impl RuntimeSession {
         let env_obj = get(&options, "env");
         if env_obj.is_object() {
             for key in Object::keys(env_obj.unchecked_ref::<Object>()).iter() {
-                if let (Some(k), Some(v)) = (key.as_string(), get(&env_obj, &key.as_string().unwrap_or_default()).as_string()) {
+                if let (Some(k), Some(v)) = (
+                    key.as_string(),
+                    get(&env_obj, &key.as_string().unwrap_or_default()).as_string(),
+                ) {
                     env.push((k, v));
                 }
             }
@@ -168,7 +179,13 @@ impl RuntimeSession {
             spawner: None,
         });
         let sender = rt.completion_sender();
-        RuntimeSession { rt, sender, stdout, stderr, ended: Vec::new() }
+        RuntimeSession {
+            rt,
+            sender,
+            stdout,
+            stderr,
+            ended: Vec::new(),
+        }
     }
 
     /// Run `src` as a script, then every turn that is ready. The result is
@@ -228,18 +245,27 @@ impl RuntimeSession {
             }
         }
         use lumen_os::fs::flags::{O_CREAT, O_TRUNC, O_WRONLY};
-        vfs::mem().write_file(path, data, O_WRONLY | O_CREAT | O_TRUNC, 0o666).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
+        vfs::mem()
+            .write_file(path, data, O_WRONLY | O_CREAT | O_TRUNC, 0o666)
+            .map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
     }
 
     #[wasm_bindgen(js_name = readFile)]
     pub fn read_file(&mut self, path: &str) -> Result<Vec<u8>, JsValue> {
-        vfs::mem().read_file(path, 0).map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
+        vfs::mem()
+            .read_file(path, 0)
+            .map_err(|e| JsValue::from_str(&format!("{}: {path}", e.code())))
     }
 
     /// Serve the paths under `prefix` through the host's `syncCall("fs.*")` (see [`Remote`]).
     #[wasm_bindgen(js_name = mountRemote)]
     pub fn mount_remote(&mut self, prefix: &str) {
-        vfs::mem().mount(prefix, Arc::new(Remote { prefix: prefix.to_string() }));
+        vfs::mem().mount(
+            prefix,
+            Arc::new(Remote {
+                prefix: prefix.to_string(),
+            }),
+        );
     }
 }
 
@@ -279,9 +305,15 @@ fn status_object(status: LoopStatus) -> JsValue {
     let _ = Reflect::set(
         &o,
         &"nextTimerMs".into(),
-        &status.next_timer_ms.map_or(JsValue::NULL, JsValue::from_f64),
+        &status
+            .next_timer_ms
+            .map_or(JsValue::NULL, JsValue::from_f64),
     );
-    let _ = Reflect::set(&o, &"pendingTasks".into(), &JsValue::from_bool(status.pending_tasks));
+    let _ = Reflect::set(
+        &o,
+        &"pendingTasks".into(),
+        &JsValue::from_bool(status.pending_tasks),
+    );
     let _ = Reflect::set(&o, &"idle".into(), &JsValue::from_bool(status.idle));
     let _ = Reflect::set(&o, &"halted".into(), &JsValue::from_bool(status.halted));
     o.into()

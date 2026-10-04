@@ -31,7 +31,9 @@ pub mod _posixsubprocess {
         if n == -1 {
             return Ok(Some(u32::MAX));
         }
-        u32::try_from(n).map(Some).map_err(|_| it.overflow_err(&format!("{what} is greater than maximum")))
+        u32::try_from(n)
+            .map(Some)
+            .map_err(|_| it.overflow_err(&format!("{what} is greater than maximum")))
     }
 
     /// Spawn a fresh new child process.
@@ -94,7 +96,12 @@ pub mod _posixsubprocess {
         let mut fds_to_keep = Vec::with_capacity(keep.len());
         for v in keep {
             let fd = match v {
-                Value::Int(n) if (0..=i32::MAX as i64).contains(n) && fds_to_keep.last().is_none_or(|&p| (p as i64) < *n) => *n as i32,
+                Value::Int(n)
+                    if (0..=i32::MAX as i64).contains(n)
+                        && fds_to_keep.last().is_none_or(|&p| (p as i64) < *n) =>
+                {
+                    *n as i32
+                }
                 _ => return Err(it.value_error("bad value(s) in fds_to_keep")),
             };
             fds_to_keep.push(fd);

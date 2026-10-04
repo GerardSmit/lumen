@@ -12,9 +12,15 @@ use lumen_host::{CompletionSender, Ctx, TaskId, TaskRegistry, Value};
 pub(crate) use lumen_os::signal::number;
 
 /// `(name)` — the platform's number for signal `name`, or `undefined` if it is not one.
-pub(crate) fn op_signal_number(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_number(
+    _ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     Ok(match args.first() {
-        Some(Value::Str(s)) => number(&s.to_string()).map_or(Value::Undefined, |n| Value::Num(n as f64)),
+        Some(Value::Str(s)) => {
+            number(&s.to_string()).map_or(Value::Undefined, |n| Value::Num(n as f64))
+        }
         _ => Value::Undefined,
     })
 }
@@ -53,7 +59,11 @@ mod imp {
         targets: Vec<Target>,
     }
 
-    static WATCH: Mutex<Watch> = Mutex::new(Watch { depth: 0, pending: false, targets: Vec::new() });
+    static WATCH: Mutex<Watch> = Mutex::new(Watch {
+        depth: 0,
+        pending: false,
+        targets: Vec::new(),
+    });
     static WATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
     fn start_watcher() -> bool {
@@ -76,7 +86,9 @@ mod imp {
                             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                         };
                         if n < 0 {
-                            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
                                 continue;
                             }
                             return;
@@ -119,7 +131,16 @@ mod imp {
 
     fn set_handler(sig: i32, install: bool) -> bool {
         use lumen_os::signal::{set_disposition, Disposition};
-        set_disposition(sig, if install { Disposition::Catch } else { Disposition::Default }, true).is_ok()
+        set_disposition(
+            sig,
+            if install {
+                Disposition::Catch
+            } else {
+                Disposition::Default
+            },
+            true,
+        )
+        .is_ok()
     }
 
     pub(super) fn catchable(sig: i32) -> bool {
@@ -136,7 +157,12 @@ mod imp {
             return None;
         }
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        listeners.push(Listener { sig, key, sender, task });
+        listeners.push(Listener {
+            sig,
+            key,
+            sender,
+            task,
+        });
         Some(key)
     }
 
@@ -161,7 +187,13 @@ mod imp {
         if watch.depth > 0 {
             watch.depth -= 1;
             WATCH_DEPTH.store(watch.depth, Ordering::SeqCst);
-            if watch.depth == 0 && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == libc::SIGINT) {
+            if watch.depth == 0
+                && !LISTENERS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.sig == libc::SIGINT)
+            {
                 set_handler(libc::SIGINT, false);
             }
         }
@@ -174,7 +206,11 @@ mod imp {
 
     pub(super) fn break_register(raised: Arc<AtomicBool>, fired: Arc<AtomicBool>) -> u64 {
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        WATCH.lock().unwrap().targets.push(Target { key, raised, fired });
+        WATCH
+            .lock()
+            .unwrap()
+            .targets
+            .push(Target { key, raised, fired });
         key
     }
 
@@ -208,7 +244,10 @@ mod imp {
     }
 }
 
-fn decode_signal(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_signal(
+    _ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
     let sig = payload.downcast::<i32>().map(|b| *b).unwrap_or(0);
     Ok(vec![Value::Num(sig as f64)])
 }
@@ -233,7 +272,9 @@ pub(crate) fn op_signal_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             return Ok(Value::Undefined);
         };
         if imp::catchable(sig) {
-            let registry = ctx.host_mut::<TaskRegistry>().expect("runtime task registry");
+            let registry = ctx
+                .host_mut::<TaskRegistry>()
+                .expect("runtime task registry");
             let task = registry.register_stream(callback, decode_signal);
             registry.set_unref(task);
             if let Some(key) = imp::watch(sig, sender, task) {
@@ -255,7 +296,11 @@ pub(crate) fn op_signal_watch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
 }
 
 /// `(key)` — stop a `signalWatch`.
-pub(crate) fn op_signal_unwatch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_unwatch(
+    ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     if let Some(Value::Num(key)) = args.first() {
         if let Some(task) = imp::unwatch(*key as u64) {
@@ -270,7 +315,11 @@ pub(crate) fn op_signal_unwatch(ctx: &mut Ctx, _this: Value, args: &[Value]) -> 
 
 /// `(signum)` — deliver `signum` to this process synchronously if it has a listener for it
 /// (see `imp::raise_watched`); `false` when it has none and the caller should `kill(2)`.
-pub(crate) fn op_signal_raise(_ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_signal_raise(
+    _ctx: &mut Ctx,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     if let Some(Value::Num(sig)) = args.first() {
         return Ok(Value::Bool(imp::raise_watched(*sig as i32)));
@@ -293,7 +342,8 @@ impl SigintBreak {
         let fired = Arc::new(AtomicBool::new(false));
         #[cfg(all(unix, not(target_arch = "wasm32")))]
         {
-            let key = imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
+            let key =
+                imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
             SigintBreak { fired, key }
         }
         #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
@@ -323,14 +373,22 @@ impl Drop for SigintBreak {
 }
 
 /// `()` — Node's `startSigintWatchdog`.
-pub(crate) fn op_sigint_watchdog_start(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_start(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     imp::watchdog_start();
     Ok(Value::Undefined)
 }
 
 /// `()` — Node's `stopSigintWatchdog`: whether a SIGINT arrived while it was watching.
-pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_stop(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     return Ok(Value::Bool(imp::watchdog_stop()));
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]
@@ -338,7 +396,11 @@ pub(crate) fn op_sigint_watchdog_stop(_ctx: &mut Ctx, _this: Value, _args: &[Val
 }
 
 /// `()` — Node's `watchdogHasPendingSigint`.
-pub(crate) fn op_sigint_watchdog_pending(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+pub(crate) fn op_sigint_watchdog_pending(
+    _ctx: &mut Ctx,
+    _this: Value,
+    _args: &[Value],
+) -> Result<Value, Value> {
     #[cfg(all(unix, not(target_arch = "wasm32")))]
     return Ok(Value::Bool(imp::watchdog_pending()));
     #[cfg(not(all(unix, not(target_arch = "wasm32"))))]

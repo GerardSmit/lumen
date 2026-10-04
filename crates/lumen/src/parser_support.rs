@@ -9,7 +9,12 @@ pub struct ParseError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JsxRuntime { Automatic, Development, Classic, Preserve }
+pub enum JsxRuntime {
+    Automatic,
+    Development,
+    Classic,
+    Preserve,
+}
 
 #[derive(Debug, Clone)]
 pub struct JsxOptions {
@@ -22,7 +27,13 @@ pub struct JsxOptions {
 
 impl Default for JsxOptions {
     fn default() -> Self {
-        Self { runtime: JsxRuntime::Automatic, import_source: "react".into(), factory: "React.createElement".into(), fragment_factory: "React.Fragment".into(), filename: String::new() }
+        Self {
+            runtime: JsxRuntime::Automatic,
+            import_source: "react".into(),
+            factory: "React.createElement".into(),
+            fragment_factory: "React.Fragment".into(),
+            filename: String::new(),
+        }
     }
 }
 
@@ -50,7 +61,11 @@ pub(crate) fn enter_template_sites(
     TEMPLATE_SITES.with(|current| std::mem::replace(&mut *current.borrow_mut(), state))
 }
 
-pub(crate) fn template_site(src: &Rc<str>, offset: u32, quasis: &[(Option<String>, String)]) -> u32 {
+pub(crate) fn template_site(
+    src: &Rc<str>,
+    offset: u32,
+    quasis: &[(Option<String>, String)],
+) -> u32 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for (_, raw) in quasis {
@@ -81,4 +96,3 @@ pub(crate) fn fresh_template_site() -> u32 {
         *next
     })
 }
-

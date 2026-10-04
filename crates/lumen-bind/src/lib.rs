@@ -69,7 +69,10 @@
 //! `aliases = "a, b"` (extra names for the same native);
 //! on a class: `unhashable` (`__hash__ = None`), `native_iter` (the constructor returns a step
 //! closure the VM drives), `final` (no subclasses), `base = "module.Class"` (a Python base
-//! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`. The JS host reads no hints.
+//! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`.
+//! The JS host recognizes `hint(js(webidl))` on a class to make named operations
+//! and attributes enumerable as required by Web IDL; ordinary native classes
+//! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable.
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.
@@ -132,14 +135,16 @@ mod convert;
 mod desc;
 mod host;
 
-pub use convert::{CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed};
+pub use convert::{
+    CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed,
+};
 pub use desc::{
-    camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner, Param, ParamKind, Role, Scalar,
-    ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,
+    camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner,
+    Param, ParamKind, Role, Scalar, ScalarEntry, Slot, CLASS_GENERIC, PROTOCOLS,
 };
 pub use host::{
-    Class, ClassItem, ConstItem, FnItem, Host, Inheritance, IntKind, Make, Methods, Module, ModuleItems, Native, SpawnHost, State,
-    StateHost, This,
+    Class, ClassItem, ConstItem, FnItem, Host, Inheritance, IntKind, Make, Methods, Module,
+    ModuleItems, Native, SpawnHost, State, StateHost, This,
 };
 pub use lumen_bind_macros::{class, methods, module, op};
 pub use lumen_common::bigint::BigInt;
@@ -152,7 +157,11 @@ pub mod __private {
     pub use crate::host::__this as this;
 
     #[inline(always)]
-    pub fn arg<'a, H: Host, T: FromArg<'a, H>>(cx: &'a H::Cx<'_>, v: Option<&'a H::Value>, at: Slot) -> Result<T, H::Error> {
+    pub fn arg<'a, H: Host, T: FromArg<'a, H>>(
+        cx: &'a H::Cx<'_>,
+        v: Option<&'a H::Value>,
+        at: Slot,
+    ) -> Result<T, H::Error> {
         match v {
             Some(v) => T::from_arg(cx, v, at),
             None => T::from_missing(cx, at),
@@ -160,7 +169,10 @@ pub mod __private {
     }
 
     #[inline(always)]
-    pub fn rest<'a, H: Host, T: FromRest<'a, H>>(cx: &'a H::Cx<'_>, first: u32) -> Result<T, H::Error> {
+    pub fn rest<'a, H: Host, T: FromRest<'a, H>>(
+        cx: &'a H::Cx<'_>,
+        first: u32,
+    ) -> Result<T, H::Error> {
         T::from_rest(cx, H::rest(cx), first)
     }
 
@@ -170,7 +182,10 @@ pub mod __private {
     }
 
     #[inline(always)]
-    pub fn ctor<H: Host, T: Class, R: CtorRet<H, T>>(cx: &H::Cx<'_>, r: R) -> Result<H::Value, H::Error> {
+    pub fn ctor<H: Host, T: Class, R: CtorRet<H, T>>(
+        cx: &H::Cx<'_>,
+        r: R,
+    ) -> Result<H::Value, H::Error> {
         r.into_ctor(cx)
     }
 

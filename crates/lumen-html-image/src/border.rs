@@ -25,8 +25,457 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
-use super::{Raster, composite, rounded_contains};
+use super::{composite, rounded_contains, Raster};
 use lumen_html::paint::{BorderPattern, Rect, Rgba};
+
+fn inset_radii(radii: [[f32; 2]; 4], widths: [f32; 4]) -> [[f32; 2]; 4] {
+    core::array::from_fn(|corner| {
+        let horizontal = if corner == 0 || corner == 3 { 3 } else { 1 };
+        let vertical = if corner < 2 { 0 } else { 2 };
+        [
+            (radii[corner][0] - widths[horizontal]).max(0.0),
+            (radii[corner][1] - widths[vertical]).max(0.0),
+        ]
+    })
+}
+
+fn corners_contains(x: f32, y: f32, bounds: [f32; 4], radii: [[f32; 2]; 4]) -> bool {
+    let [left, top, right, bottom] = bounds;
+    if left >= right || top >= bottom || x < left || x >= right || y < top || y >= bottom {
+        return false;
+    }
+    for (corner, [rx, ry]) in radii.into_iter().enumerate() {
+        let far_x = corner == 1 || corner == 2;
+        let far_y = corner >= 2;
+        let cx = if far_x { right - rx } else { left + rx };
+        let cy = if far_y { bottom - ry } else { top + ry };
+        if (if far_x { x > cx } else { x < cx })
+            && (if far_y { y > cy } else { y < cy })
+            && rx > 0.0
+            && ry > 0.0
+        {
+            return ((x - cx) / rx).powi(2) + ((y - cy) / ry).powi(2) < 1.0;
+        }
+    }
+    true
+}
+
+fn border_tone(color: Rgba, pattern: Option<BorderPattern>, side: usize, outer: bool) -> Rgba {
+    let top_left = side == 0 || side == 3;
+    let dark = match pattern {
+        Some(BorderPattern::Inset) => top_left,
+        Some(BorderPattern::Outset) => !top_left,
+        Some(BorderPattern::Groove) => outer == top_left,
+        Some(BorderPattern::Ridge) => outer != top_left,
+        _ => return color,
+    };
+    // Jixr DisplayList's deterministic CSS 2.1 UA tones: 45% toward black/white.
+    let tone = |channel: u8| {
+        (if dark {
+            channel as f32 * 0.55
+        } else {
+            channel as f32 + (255.0 - channel as f32) * 0.45
+        })
+        .round() as u8
+    };
+    Rgba {
+        r: tone(color.r),
+        g: tone(color.g),
+        b: tone(color.b),
+        a: color.a,
+    }
+}
+
+// CSS Backgrounds and Borders 3 section 4.3: inner curves subtract the
+// adjacent border widths independently; different edge colors meet along
+// the line joining each outer corner to the corresponding inner corner.
+pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxBorder) {
+    let patterns = border.side_patterns.unwrap_or([border.pattern; 4]);
+    if patterns == [Some(BorderPattern::Double); 4] {
+        let widths = border.widths;
+        let bands = widths.map(|width| {
+            if width < 3.0 {
+                width
+            } else {
+                (width / 3.0).round()
+            }
+        });
+        let mut outer = border.clone();
+        outer.pattern = None;
+        outer.side_patterns = None;
+        outer.widths = bands;
+        draw_box(raster, &outer);
+        let insets = core::array::from_fn(|side| widths[side] - bands[side]);
+        let rect = Rect {
+            x: border.rect.x + insets[3],
+            y: border.rect.y + insets[0],
+            width: (border.rect.width - insets[3] - insets[1]).max(0.0),
+            height: (border.rect.height - insets[0] - insets[2]).max(0.0),
+        };
+        let radius = border
+            .radius
+            .min(border.rect.width * 0.5)
+            .min(border.rect.height * 0.5);
+        let corners = inset_radii(border.corners.unwrap_or([[radius; 2]; 4]), insets);
+        let inner = lumen_html::paint::BoxBorder {
+            rect,
+            radius: 0.0,
+            widths: core::array::from_fn(|side| if widths[side] < 3.0 { 0.0 } else { bands[side] }),
+            colors: border.colors,
+            pattern: None,
+            side_patterns: None,
+            corners: Some(corners),
+        };
+        draw_box(raster, &inner);
+        return;
+    }
+    let Some(visible) = raster
+        .clips
+        .last()
+        .and_then(|clip| clip.intersection(border.rect))
+    else {
+        return;
+    };
+    let scale = raster.scale;
+    let rect = border.rect;
+    let (left, top, right, bottom) = (
+        rect.x * scale,
+        rect.y * scale,
+        (rect.x + rect.width) * scale,
+        (rect.y + rect.height) * scale,
+    );
+    let radius = (border.radius * scale)
+        .min((right - left) * 0.5)
+        .min((bottom - top) * 0.5);
+    let widths = border.widths.map(|width| width * scale);
+    let inner = [
+        left + widths[3],
+        top + widths[0],
+        right - widths[1],
+        bottom - widths[2],
+    ];
+    let outer_radii = border
+        .corners
+        .map(|corners| corners.map(|r| r.map(|v| v * scale)))
+        .unwrap_or([[radius; 2]; 4]);
+    let inner_radii = inset_radii(outer_radii, widths);
+    let inner_contains = |px, py| corners_contains(px, py, inner, inner_radii);
+    let has_double = patterns.contains(&Some(BorderPattern::Double));
+    let bands = widths.map(|width| {
+        if width < 3.0 {
+            width
+        } else {
+            (width / 3.0).round()
+        }
+    });
+    let band_widths = core::array::from_fn(|side| {
+        if patterns[side] == Some(BorderPattern::Double) {
+            bands[side]
+        } else {
+            widths[side]
+        }
+    });
+    let gap_inner = [
+        left + band_widths[3],
+        top + band_widths[0],
+        right - band_widths[1],
+        bottom - band_widths[2],
+    ];
+    let gap_inner_radii = inset_radii(outer_radii, band_widths);
+    let insets = core::array::from_fn(|side| {
+        if patterns[side] == Some(BorderPattern::Double) {
+            widths[side] - bands[side]
+        } else {
+            0.0
+        }
+    });
+    let gap_outer = [
+        left + insets[3],
+        top + insets[0],
+        right - insets[1],
+        bottom - insets[2],
+    ];
+    let gap_outer_radii = inset_radii(outer_radii, insets);
+    let half_widths = widths.map(|width| width * 0.5);
+    let middle = [
+        left + half_widths[3],
+        top + half_widths[0],
+        right - half_widths[1],
+        bottom - half_widths[2],
+    ];
+    let middle_radii = inset_radii(outer_radii, half_widths);
+    let colors: [Rgba; 8] = core::array::from_fn(|band| {
+        border_tone(
+            border.colors[band % 4],
+            patterns[band % 4],
+            band % 4,
+            band < 4,
+        )
+    });
+    let has_stroke = patterns
+        .iter()
+        .any(|pattern| matches!(pattern, Some(BorderPattern::Dashed | BorderPattern::Dotted)));
+
+    let (x0, y0, x1, y1) = raster.pixel_span(visible);
+    let samples = if raster.antialias { 8 } else { 1 };
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if inner_contains(x as f32, y as f32)
+                && inner_contains(x as f32 + 1.0, y as f32)
+                && inner_contains(x as f32, y as f32 + 1.0)
+                && inner_contains(x as f32 + 1.0, y as f32 + 1.0)
+            {
+                continue;
+            }
+            let coverage = if raster.antialias {
+                (super::coverage::rounded_corners(
+                    x as f32,
+                    y as f32,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    outer_radii,
+                ) - super::coverage::rounded_corners(
+                    x as f32,
+                    y as f32,
+                    inner[0],
+                    inner[1],
+                    inner[2],
+                    inner[3],
+                    inner_radii,
+                ))
+                .clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            if coverage == 0.0 {
+                continue;
+            }
+            let mut hits = [0u32; 8];
+            for sy in 0..samples {
+                for sx in 0..samples {
+                    let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
+                    let py = y as f32 + (sy as f32 + 0.5) / samples as f32;
+                    if !corners_contains(px, py, [left, top, right, bottom], outer_radii)
+                        || inner_contains(px, py)
+                    {
+                        continue;
+                    }
+                    let distances = [py - top, right - px, bottom - py, px - left];
+                    let side = (0..4).filter(|&side| widths[side] > 0.0).min_by(|&a, &b| {
+                        (distances[a] / widths[a]).total_cmp(&(distances[b] / widths[b]))
+                    });
+                    let Some(side) = side else { continue };
+                    if patterns[side] == Some(BorderPattern::Double)
+                        && widths[side] >= 3.0
+                        && corners_contains(px, py, gap_inner, gap_inner_radii)
+                        && !corners_contains(px, py, gap_outer, gap_outer_radii)
+                    {
+                        continue;
+                    }
+                    if let Some(pattern @ (BorderPattern::Dashed | BorderPattern::Dotted)) =
+                        patterns[side]
+                    {
+                        let width = widths[side];
+                        if !patterned(
+                            px,
+                            py,
+                            left + width * 0.5,
+                            top + width * 0.5,
+                            right - width * 0.5,
+                            bottom - width * 0.5,
+                            (radius - width * 0.5).max(0.0),
+                            width,
+                            pattern,
+                            None,
+                        ) {
+                            continue;
+                        }
+                    }
+                    let inner_band = matches!(
+                        patterns[side],
+                        Some(BorderPattern::Groove | BorderPattern::Ridge)
+                    ) && corners_contains(px, py, middle, middle_radii);
+                    hits[side + if inner_band { 4 } else { 0 }] += 1;
+                }
+            }
+            let total = hits.iter().sum::<u32>();
+            let coverage = if has_double || has_stroke {
+                total as f32 / (samples * samples) as f32
+            } else {
+                coverage
+            };
+            if total == 0 {
+                continue;
+            }
+            let offset = (y as usize * raster.image.width as usize + x as usize) * 4;
+            if colors.iter().all(|color| *color == colors[0]) {
+                composite(
+                    &mut raster.image.pixels[offset..offset + 4],
+                    colors[0],
+                    coverage,
+                );
+            } else {
+                for side in 0..8 {
+                    if hits[side] != 0 {
+                        composite(
+                            &mut raster.image.pixels[offset..offset + 4],
+                            colors[side],
+                            coverage * hits[side] as f32 / total as f32,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+#[cfg(test)]
+mod box_tests {
+    use lumen_html::paint::{BoxBorder, Command, DisplayList, Rect, Rgba};
+    use std::boxed::Box;
+
+    #[test]
+    fn double_borders_leave_the_background_visible_between_bands() {
+        let red = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        let list = DisplayList(vec![Command::StrokeBoxBorder(Box::new(BoxBorder {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            radius: 0.0,
+            widths: [6.0, 9.0, 6.0, 3.0],
+            colors: [red; 4],
+            pattern: Some(lumen_html::paint::BorderPattern::Double),
+            side_patterns: None,
+            corners: None,
+        }))]);
+        let image = crate::render(&list, 40, 30, 1.0, true).unwrap();
+        let alpha = |x: usize, y: usize| image.pixels[(y * 40 + x) * 4 + 3];
+        assert_eq!(alpha(20, 0), 128);
+        assert_eq!(alpha(20, 2), 0);
+        assert_eq!(alpha(20, 4), 128);
+        assert_eq!(alpha(35, 15), 0);
+        assert_eq!(alpha(32, 15), 128);
+        assert_eq!(alpha(20, 15), 0);
+    }
+
+    #[test]
+    fn mixed_solid_double_translucent_edges_composite_once() {
+        let red = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        let double = Some(lumen_html::paint::BorderPattern::Double);
+        let list = DisplayList(vec![Command::StrokeBoxBorder(Box::new(BoxBorder {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            radius: 0.0,
+            widths: [6.0; 4],
+            colors: [red; 4],
+            pattern: double,
+            side_patterns: Some([None, double, double, double]),
+            corners: None,
+        }))]);
+        let image = crate::render(&list, 40, 30, 1.0, true).unwrap();
+        let alpha = |x: usize, y: usize| image.pixels[(y * 40 + x) * 4 + 3];
+        assert_eq!(alpha(20, 2), 128);
+        assert_eq!(alpha(2, 2), 128);
+        assert_eq!(alpha(2, 15), 0);
+        assert_eq!(alpha(4, 15), 128);
+    }
+
+    #[test]
+    fn three_dimensional_border_tones_preserve_alpha_and_reverse_faces() {
+        use lumen_html::paint::BorderPattern;
+        let color = Rgba {
+            r: 200,
+            g: 100,
+            b: 50,
+            a: 128,
+        };
+        let dark = super::border_tone(color, Some(BorderPattern::Inset), 0, true);
+        assert_eq!(
+            dark,
+            Rgba {
+                r: 110,
+                g: 55,
+                b: 28,
+                a: 128
+            }
+        );
+        assert_eq!(
+            dark,
+            super::border_tone(color, Some(BorderPattern::Outset), 2, true)
+        );
+        assert_eq!(
+            dark,
+            super::border_tone(color, Some(BorderPattern::Groove), 0, true)
+        );
+        assert_eq!(
+            dark,
+            super::border_tone(color, Some(BorderPattern::Ridge), 0, false)
+        );
+        assert_ne!(
+            dark,
+            super::border_tone(color, Some(BorderPattern::Groove), 0, false)
+        );
+    }
+
+    #[test]
+    fn asymmetric_round_border_preserves_inner_hole_and_edge_colors() {
+        let red = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 255,
+        };
+        let blue = Rgba {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        let list = DisplayList(vec![Command::StrokeBoxBorder(Box::new(BoxBorder {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 30.0,
+            },
+            radius: 12.0,
+            widths: [4.0, 8.0, 6.0, 2.0],
+            colors: [red, blue, red, blue],
+            pattern: None,
+            side_patterns: None,
+            corners: None,
+        }))]);
+        let image = crate::render(&list, 40, 30, 1.0, true).unwrap();
+        let pixel = |x: usize, y: usize| &image.pixels[(y * 40 + x) * 4..(y * 40 + x) * 4 + 4];
+        assert_eq!(pixel(20, 1), &[255, 0, 0, 255]);
+        assert_eq!(pixel(37, 15), &[0, 0, 255, 255]);
+        assert_eq!(pixel(20, 15), &[0, 0, 0, 0]);
+        assert_eq!(pixel(0, 0), &[0, 0, 0, 0]);
+        // The top-right inner curve is elliptical (rx 4, ry 8), not a
+        // circular curve obtained by subtracting a single uniform width.
+        assert_eq!(pixel(31, 11)[3], 0);
+        assert_eq!(pixel(31, 5)[3], 255);
+    }
+}
+
 pub(super) fn draw(
     raster: &mut Raster<'_>,
     rect: Rect,
@@ -35,6 +484,30 @@ pub(super) fn draw(
     color: Rgba,
     pattern: Option<BorderPattern>,
 ) {
+    if matches!(
+        pattern,
+        Some(
+            BorderPattern::Double
+                | BorderPattern::Groove
+                | BorderPattern::Ridge
+                | BorderPattern::Inset
+                | BorderPattern::Outset
+        )
+    ) {
+        draw_box(
+            raster,
+            &lumen_html::paint::BoxBorder {
+                rect,
+                radius,
+                widths: [width; 4],
+                colors: [color; 4],
+                pattern,
+                side_patterns: None,
+                corners: None,
+            },
+        );
+        return;
+    }
     let Some(visible) = raster
         .clips
         .last()
@@ -43,14 +516,7 @@ pub(super) fn draw(
     else {
         return;
     };
-    let x0 = (visible.x * raster.scale).floor().max(0.0) as u32;
-    let y0 = (visible.y * raster.scale).floor().max(0.0) as u32;
-    let x1 = ((visible.x + visible.width) * raster.scale)
-        .ceil()
-        .min(raster.image.width as f32) as u32;
-    let y1 = ((visible.y + visible.height) * raster.scale)
-        .ceil()
-        .min(raster.image.height as f32) as u32;
+    let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let left = rect.x * raster.scale;
     let top = rect.y * raster.scale;
     let right = (rect.x + rect.width) * raster.scale;
@@ -70,9 +536,26 @@ pub(super) fn draw(
         .filter(|_| outer_radius > border * 0.5)
         .map(|_| ArcMeasure::new(outer_radius - border * 0.5));
     for y in y0..y1 {
-        for x in x0..x1 {
+        let fy = y as f32;
+        let inside = if fy >= inner_top && fy + 1.0 <= inner_bottom {
+            if fy >= inner_top + inner_radius && fy + 1.0 <= inner_bottom - inner_radius {
+                Some((inner_left, inner_right))
+            } else {
+                Some((inner_left + inner_radius, inner_right - inner_radius))
+            }
+        } else {
+            None
+        };
+        let mut spans = (x0..x1, 0..0);
+        if let Some((from, to)) = inside {
+            let start = (from.ceil().max(x0 as f32) as u32).min(x1);
+            let end = (to.floor().min(x1 as f32) as u32).max(start);
+            if start < end {
+                spans = (x0..start, end..x1);
+            }
+        }
+        for x in spans.0.chain(spans.1) {
             let fx = x as f32;
-            let fy = y as f32;
             if fx >= inner_left + inner_radius
                 && fx + 1.0 <= inner_right - inner_radius
                 && fy >= inner_top
@@ -483,9 +966,7 @@ mod tests {
             .collect();
         assert_eq!(
             dashed,
-            [
-                0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 18, 19, 20, 21, 22, 23
-            ]
+            [0, 1, 2, 3, 4, 5, 9, 10, 11, 12, 13, 14, 18, 19, 20, 21, 22, 23]
         );
     }
 

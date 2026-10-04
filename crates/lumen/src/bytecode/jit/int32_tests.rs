@@ -1,5 +1,5 @@
-use super::{Kind, Widen, build};
-use crate::{Completion, Engine, JitMode, bytecode::Tier};
+use super::{build, Kind, Widen};
+use crate::{bytecode::Tier, Completion, Engine, JitMode};
 use lumen_codegen::{CheckedOp, InstData};
 
 #[test]
@@ -11,18 +11,40 @@ fn vector_loop_shapes_match_compiler_output() {
         "function mul(out,a,b,n){for(var i=0;i<n;i++)out[i]=a[i]*b[i];}",
     ] {
         let program = crate::parser::parse_script(source, false).unwrap();
-        let crate::ast::Stmt::FuncDecl(function) = &program[0] else { unreachable!() };
+        let crate::ast::Stmt::FuncDecl(function) = &program[0] else {
+            unreachable!()
+        };
         let chunk = crate::bytecode::compile(function).unwrap();
         let ops = chunk.jit_ops();
-        let (header,index) = ops.iter().enumerate().find_map(|(pc,op)| match op {
-            Op::JumpIfNotCmpLL(CmpKind::Lt,index,_,_) => Some((pc,*index)), _ => None,
-        }).expect("counted loop header");
-        assert!(matches!(ops[header+1], Op::LoadLocal(s) if s==index), "{ops:?}");
-        assert!(matches!(ops[header+2], Op::LoadLocal(s) if s==index), "{ops:?}");
-        assert!(matches!(ops[header+3], Op::GetElemLocal(_)), "{ops:?}");
-        let store = ops.iter().position(|op| matches!(op,Op::SetElemLocalDrop(_))).unwrap();
-        assert!(matches!(ops[store+1], Op::UpdateLocal(s,UpdKind::IncDiscard) if s==index), "{ops:?}");
-        assert!(matches!(ops[store+2], Op::Jump(pc) if pc as usize==header), "{ops:?}");
+        let (header, index) = ops
+            .iter()
+            .enumerate()
+            .find_map(|(pc, op)| match op {
+                Op::JumpIfNotCmpLL(CmpKind::Lt, index, _, _) => Some((pc, *index)),
+                _ => None,
+            })
+            .expect("counted loop header");
+        assert!(
+            matches!(ops[header+1], Op::LoadLocal(s) if s==index),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(ops[header+2], Op::LoadLocal(s) if s==index),
+            "{ops:?}"
+        );
+        assert!(matches!(ops[header + 3], Op::GetElemLocal(_)), "{ops:?}");
+        let store = ops
+            .iter()
+            .position(|op| matches!(op, Op::SetElemLocalDrop(_)))
+            .unwrap();
+        assert!(
+            matches!(ops[store+1], Op::UpdateLocal(s,UpdKind::IncDiscard) if s==index),
+            "{ops:?}"
+        );
+        assert!(
+            matches!(ops[store+2], Op::Jump(pc) if pc as usize==header),
+            "{ops:?}"
+        );
     }
 }
 
@@ -35,10 +57,14 @@ fn jit_code_map_reports_native_lifetimes() {
         if event.name.contains("code_map_probe") {
             assert_ne!(event.start, 0);
             assert_ne!(event.length, 0);
-            if event.loaded { LOADED.fetch_add(1, Ordering::SeqCst); }
-            else { RETIRED.fetch_add(1, Ordering::SeqCst); }
+            if event.loaded {
+                LOADED.fetch_add(1, Ordering::SeqCst);
+            } else {
+                RETIRED.fetch_add(1, Ordering::SeqCst);
+            }
         }
-    }).unwrap();
+    })
+    .unwrap();
     let (_, stats) = evaluate("function code_map_probe(n){var x=0;for(var i=0;i<n;i++)x+=i;return x;}code_map_probe(2048)",
         Tier::Bytecode, JitMode::Eager);
     assert!(stats.executed_entries > 0);
@@ -51,30 +77,63 @@ fn int32_guards_and_widening_keep_number_semantics() {
     for n in [0.0, 1.0, -1.0, i32::MIN as f64, i32::MAX as f64] {
         assert!(Kind::Int32.accepts(&crate::value::Value::Num(n)));
     }
-    for n in [-0.0, 0.5, i32::MAX as f64 + 1.0, i32::MIN as f64 - 1.0,
-        f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+    for n in [
+        -0.0,
+        0.5,
+        i32::MAX as f64 + 1.0,
+        i32::MIN as f64 - 1.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
         assert!(!Kind::Int32.accepts(&crate::value::Value::Num(n)));
         assert!(Kind::Num.accepts(&crate::value::Value::Num(n)));
     }
     let mut interp = crate::interpreter::Interp::new();
     let env = interp.global_env.clone();
     let program = crate::parser::parse_script(
-        "function f(x,y) { x += y; x *= y; x -= y; x++; return x; }", false).unwrap();
-    let crate::ast::Stmt::FuncDecl(function) = &program[0] else { panic!("function") };
+        "function f(x,y) { x += y; x *= y; x -= y; x++; return x; }",
+        false,
+    )
+    .unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &program[0] else {
+        panic!("function")
+    };
     let chunk = crate::bytecode::compile(function).unwrap();
     let mut slots = vec![crate::value::Value::Undefined; chunk.n_slots];
     slots[0] = crate::value::Value::Num(2.0);
     slots[1] = crate::value::Value::Num(3.0);
-    let compiled = build::build_fn(&mut interp, &env, &chunk, &slots, &[], &[], true,
-        &crate::value::Value::Undefined).unwrap();
+    let compiled = build::build_fn(
+        &mut interp,
+        &env,
+        &chunk,
+        &slots,
+        &[],
+        &[],
+        true,
+        &crate::value::Value::Undefined,
+    )
+    .unwrap();
     assert_eq!(compiled.kinds[0], Kind::Int32);
     assert_eq!(compiled.kinds[1], Kind::Int32);
     for want in [CheckedOp::IaddOv, CheckedOp::IsubOv, CheckedOp::ImulOv] {
-        assert!(compiled.func.insts.iter().any(|i| matches!(i,
-            InstData::CheckedBinary { op, .. } if *op == want)), "missing {want:?}");
+        assert!(
+            compiled.func.insts.iter().any(|i| matches!(i,
+            InstData::CheckedBinary { op, .. } if *op == want)),
+            "missing {want:?}"
+        );
     }
-    let compiled = build::build_fn(&mut interp, &env, &chunk, &slots,
-        &[Widen::Number, Widen::Number], &[], true, &crate::value::Value::Undefined).unwrap();
+    let compiled = build::build_fn(
+        &mut interp,
+        &env,
+        &chunk,
+        &slots,
+        &[Widen::Number, Widen::Number],
+        &[],
+        true,
+        &crate::value::Value::Undefined,
+    )
+    .unwrap();
     assert_eq!(compiled.kinds[0], Kind::Num);
     assert_eq!(compiled.kinds[1], Kind::Num);
 }
@@ -84,7 +143,9 @@ fn evaluate(src: &str, tier: Tier, mode: JitMode) -> (String, crate::JitStats) {
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
     engine.set_jit_mode(mode);
-    let Completion::Value(v) = engine.eval(src, false).unwrap() else { panic!("threw") };
+    let Completion::Value(v) = engine.eval(src, false).unwrap() else {
+        panic!("threw")
+    };
     (v, engine.jit_stats())
 }
 
@@ -110,20 +171,38 @@ fn inline_atomics_keep_identity_coercion_unsigned_and_exchange_semantics() {
     }
     let mut interp = crate::interpreter::Interp::new();
     let env = interp.global_env.clone();
-    let program = crate::parser::parse_script("function f(a,x) { return Atomics.add(a,0,x); }", false).unwrap();
-    let crate::ast::Stmt::FuncDecl(function) = &program[0] else { panic!("function") };
+    let program =
+        crate::parser::parse_script("function f(a,x) { return Atomics.add(a,0,x); }", false)
+            .unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &program[0] else {
+        panic!("function")
+    };
     let chunk = crate::bytecode::compile(function).unwrap();
     let mut slots = vec![crate::value::Value::Undefined; chunk.n_slots];
     slots[1] = crate::value::Value::Num(1.0);
-    let built = build::build_fn(&mut interp, &env, &chunk, &slots, &[], &[], true,
-        &crate::value::Value::Undefined).unwrap();
-    assert!(built.func.funcs.iter().any(|f| f.id == lumen_codegen::atomics::ADD32));
+    let built = build::build_fn(
+        &mut interp,
+        &env,
+        &chunk,
+        &slots,
+        &[],
+        &[],
+        true,
+        &crate::value::Value::Undefined,
+    )
+    .unwrap();
+    assert!(built
+        .func
+        .funcs
+        .iter()
+        .any(|f| f.id == lumen_codegen::atomics::ADD32));
 }
 
 #[test]
 fn int32_native_arithmetic_matches_interpreter_on_guard_exits() {
     for op in ["+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", ">>>"] {
-        let src = format!(r#"
+        let src = format!(
+            r#"
             function f(x,y) {{ x = x {op} y; return x; }}
             for (var k=0; k<2048; k++) f(12,3);
             var cases = [[2147483647,1],[-2147483648,-1],[0,-1],[-4,2],
@@ -131,13 +210,19 @@ fn int32_native_arithmetic_matches_interpreter_on_guard_exits() {
                 [3.5,2],[-0,1],[NaN,1],[Infinity,2],['7',2]];
             cases.map(function(v) {{ var r=f(v[0],v[1]);
                 return Object.is(r,-0) ? '-0' : String(r); }}).join(':')
-        "#);
+        "#
+        );
         let expected = evaluate(&src, Tier::Interp, JitMode::Disabled).0;
         for mode in [JitMode::Disabled, JitMode::Hot, JitMode::Eager] {
             let (actual, stats) = evaluate(&src, Tier::Bytecode, mode);
             assert_eq!(actual, expected, "{op} {mode:?}");
-            if mode != JitMode::Disabled && cfg!(any(target_arch="x86_64", target_arch="aarch64")) {
-                assert!(stats.executed_entries > 0, "no native execution: {op} {mode:?}");
+            if mode != JitMode::Disabled
+                && cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+            {
+                assert!(
+                    stats.executed_entries > 0,
+                    "no native execution: {op} {mode:?}"
+                );
                 assert_eq!(stats.failed_compilations, 0, "{op} {mode:?}");
             }
         }
@@ -179,13 +264,35 @@ fn int32_loop_locals_and_tail_call_guards_preserve_state() {
     let mut interp = crate::interpreter::Interp::new();
     let env = interp.global_env.clone();
     let program = crate::parser::parse_script(
-        "function sum(n) { var s=0; for(var i=0;i<n;i++) s+=i; return s; }", false).unwrap();
-    let crate::ast::Stmt::FuncDecl(function) = &program[0] else { panic!("function") };
+        "function sum(n) { var s=0; for(var i=0;i<n;i++) s+=i; return s; }",
+        false,
+    )
+    .unwrap();
+    let crate::ast::Stmt::FuncDecl(function) = &program[0] else {
+        panic!("function")
+    };
     let chunk = crate::bytecode::compile(function).unwrap();
     let mut slots = vec![crate::value::Value::Undefined; chunk.n_slots];
     slots[0] = crate::value::Value::Num(4.0);
-    let compiled = build::build_fn(&mut interp, &env, &chunk, &slots, &[], &[], true,
-        &crate::value::Value::Undefined).unwrap();
-    assert!(compiled.kinds.iter().skip(1).filter(|k| **k == Kind::Int32).count() >= 2);
+    let compiled = build::build_fn(
+        &mut interp,
+        &env,
+        &chunk,
+        &slots,
+        &[],
+        &[],
+        true,
+        &crate::value::Value::Undefined,
+    )
+    .unwrap();
+    assert!(
+        compiled
+            .kinds
+            .iter()
+            .skip(1)
+            .filter(|k| **k == Kind::Int32)
+            .count()
+            >= 2
+    );
     lumen_codegen::verify::verify(&compiled.func).unwrap();
 }

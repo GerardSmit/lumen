@@ -42,7 +42,10 @@ pub fn index(it: &mut Interp, v: &Value) -> R<Value> {
 #[cold]
 fn not_integer(it: &mut Interp, v: &Value) -> Obj {
     let t = it.type_name_of(v);
-    it.type_error(&format!("'{}' object cannot be interpreted as an integer", t))
+    it.type_error(&format!(
+        "'{}' object cannot be interpreted as an integer",
+        t
+    ))
 }
 
 /// An index as i128 (big values saturate: callers only compare against narrower ranges).
@@ -50,7 +53,11 @@ fn index_i128(it: &mut Interp, v: &Value) -> R<i128> {
     match index(it, v)? {
         Value::Int(i) => Ok(i as i128),
         Value::Obj(o) => match &o.kind {
-            Kind::Int(b) => Ok(b.to_i128().unwrap_or(if b.is_negative() { i128::MIN } else { i128::MAX })),
+            Kind::Int(b) => Ok(b.to_i128().unwrap_or(if b.is_negative() {
+                i128::MIN
+            } else {
+                i128::MAX
+            })),
             _ => Ok(0),
         },
         _ => Ok(0),
@@ -91,7 +98,11 @@ pub fn to_int(it: &mut Interp, v: &Value, k: IntKind) -> R<i128> {
 #[inline(never)]
 fn int_overflow(it: &mut Interp, n: i128, k: IntKind) -> Obj {
     let msg = if n < 0 && !k.signed {
-        if k.size { "can't convert negative value to size_t".to_string() } else { "can't convert negative int to unsigned".to_string() }
+        if k.size {
+            "can't convert negative value to size_t".to_string()
+        } else {
+            "can't convert negative int to unsigned".to_string()
+        }
     } else {
         format!("Python int too large to convert to C {}", c_name(k))
     };
@@ -125,12 +136,20 @@ pub fn native_error(it: &mut Interp, e: NativeError) -> Obj {
 /// A shared-buffer error as CPython words it for `bytearray` / `memoryview`.
 pub fn buffer_error(it: &mut Interp, e: BufferError) -> Obj {
     match e {
-        BufferError::Pinned => it.new_exc_str("BufferError", "Existing exports of data: object cannot be re-sized"),
-        BufferError::Detached => it.value_error("operation forbidden on released memoryview object"),
+        BufferError::Pinned => it.new_exc_str(
+            "BufferError",
+            "Existing exports of data: object cannot be re-sized",
+        ),
+        BufferError::Detached => {
+            it.value_error("operation forbidden on released memoryview object")
+        }
         BufferError::ReadOnly => it.type_error("cannot modify read-only memory"),
         BufferError::TooLarge => it.new_exc_str("MemoryError", ""),
         BufferError::NotResizable => it.new_exc_str("BufferError", "buffer is not resizable"),
         BufferError::OutOfBounds => it.new_exc_str("IndexError", "index out of range"),
-        BufferError::Borrowed => it.new_exc_str("BufferError", "Existing exports of data: object cannot be re-sized"),
+        BufferError::Borrowed => it.new_exc_str(
+            "BufferError",
+            "Existing exports of data: object cannot be re-sized",
+        ),
     }
 }

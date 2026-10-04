@@ -8,8 +8,8 @@ use crate::object::*;
 use crate::pyint::BigInt;
 use crate::vm::{dict_set_str, Interp};
 use lumen_common::buffer::{
-    adjust_slice, load, store, struct_code, BufferError, ByteOrder, CastError, ElemKind, Export, PackError, Scalar, StructMode,
-    ViewDesc,
+    adjust_slice, load, store, struct_code, BufferError, ByteOrder, CastError, ElemKind, Export,
+    PackError, Scalar, StructMode, ViewDesc,
 };
 use std::rc::Rc;
 
@@ -68,21 +68,45 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
         })),
         Kind::ByteArray(s) => {
             let e = s.export().map_err(|e| buffer_error(it, e))?;
-            Ok(Some(Exported { view: ViewDesc::bytes(0, s.len(), false), src: Source::Store(e), obj: v.clone(), fmt: "B".into() }))
+            Ok(Some(Exported {
+                view: ViewDesc::bytes(0, s.len(), false),
+                src: Source::Store(e),
+                obj: v.clone(),
+                fmt: "B".into(),
+            }))
         }
         Kind::Opaque(_) => match Py::<MemoryView>::from_value(it, v) {
             Some(p) => {
                 let m = p.borrow(it)?;
-                let Some(src) = &m.src else { return Err(released(it)) };
+                let Some(src) = &m.src else {
+                    return Err(released(it));
+                };
                 let src = src.reexport().map_err(|e| buffer_error(it, e))?;
-                Ok(Some(Exported { src, view: m.view.clone(), obj: m.obj.clone(), fmt: m.fmt.clone() }))
+                Ok(Some(Exported {
+                    src,
+                    view: m.view.clone(),
+                    obj: m.obj.clone(),
+                    fmt: m.fmt.clone(),
+                }))
             }
             None => match super::arraym::array::parts(it, v) {
                 Some((spec, store)) => {
                     let e = store.export().map_err(|e| buffer_error(it, e))?;
                     let n = store.len() / spec.size;
-                    let view = ViewDesc::contiguous(0, Some(spec.kind), spec.size, ByteOrder::NATIVE, vec![n], false);
-                    Ok(Some(Exported { src: Source::Store(e), view, obj: v.clone(), fmt: spec.format().into() }))
+                    let view = ViewDesc::contiguous(
+                        0,
+                        Some(spec.kind),
+                        spec.size,
+                        ByteOrder::NATIVE,
+                        vec![n],
+                        false,
+                    );
+                    Ok(Some(Exported {
+                        src: Source::Store(e),
+                        view,
+                        obj: v.clone(),
+                        fmt: spec.format().into(),
+                    }))
                 }
                 None => Ok(None),
             },
@@ -92,15 +116,30 @@ pub fn export(it: &mut Interp, v: &Value) -> R<Option<Exported>> {
 }
 
 /// A writable `memoryview` of `store`, exported by `obj`.
-pub fn view_of_store(it: &mut Interp, obj: Value, store: &Rc<lumen_common::buffer::ByteStore>) -> R<Value> {
+pub fn view_of_store(
+    it: &mut Interp,
+    obj: Value,
+    store: &Rc<lumen_common::buffer::ByteStore>,
+) -> R<Value> {
     let e = store.export().map_err(|e| buffer_error(it, e))?;
     let view = ViewDesc::bytes(0, store.len(), false);
-    Ok(Py::new(it, MemoryView { obj, src: Some(Source::Store(e)), view, fmt: "B".into() }).into_value())
+    Ok(Py::new(
+        it,
+        MemoryView {
+            obj,
+            src: Some(Source::Store(e)),
+            view,
+            fmt: "B".into(),
+        },
+    )
+    .into_value())
 }
 
 /// The bytes of any bytes-like object, in C order (`bytes(x)` for a buffer).
 pub fn contiguous_bytes(it: &mut Interp, v: &Value) -> R<Option<Vec<u8>>> {
-    let Some(e) = export(it, v)? else { return Ok(None) };
+    let Some(e) = export(it, v)? else {
+        return Ok(None);
+    };
     gather(it, &e.src, &e.view).map(Some)
 }
 
@@ -110,13 +149,18 @@ fn released(it: &mut Interp) -> Obj {
 
 fn inaccessible(it: &mut Interp, e: BufferError) -> Obj {
     match e {
-        BufferError::OutOfBounds | BufferError::Detached => it.new_exc_str("BufferError", "memoryview: underlying buffer is not accessible"),
+        BufferError::OutOfBounds | BufferError::Detached => it.new_exc_str(
+            "BufferError",
+            "memoryview: underlying buffer is not accessible",
+        ),
         e => buffer_error(it, e),
     }
 }
 
 fn gather(it: &mut Interp, src: &Source, view: &ViewDesc) -> R<Vec<u8>> {
-    src.with(|b| view.check(b.len()).map(|()| view.gather(b))).and_then(|r| r).map_err(|e| inaccessible(it, e))
+    src.with(|b| view.check(b.len()).map(|()| view.gather(b)))
+        .and_then(|r| r)
+        .map_err(|e| inaccessible(it, e))
 }
 
 /// The element kind of a native single-character format (`"B"`, `"@i"`), as memoryview accepts.
@@ -130,7 +174,10 @@ fn parse_fmt(fmt: &str) -> Option<(ElemKind, usize)> {
 }
 
 fn is_byte_fmt(fmt: &str) -> bool {
-    matches!(parse_fmt(fmt), Some((ElemKind::U8 | ElemKind::I8 | ElemKind::Char, _)))
+    matches!(
+        parse_fmt(fmt),
+        Some((ElemKind::U8 | ElemKind::I8 | ElemKind::Char, _))
+    )
 }
 
 /// A decoded element as a Python value (shared with `_struct`).
@@ -169,8 +216,11 @@ pub fn index_i128(it: &mut Interp, v: &Value) -> R<Option<i128>> {
 }
 
 fn pack_item(it: &mut Interp, fmt: &str, kind: ElemKind, v: &Value, out: &mut [u8]) -> R<()> {
-    let bad_type = |it: &mut Interp| it.type_error(&format!("memoryview: invalid type for format '{}'", fmt));
-    let bad_value = |it: &mut Interp| it.value_error(&format!("memoryview: invalid value for format '{}'", fmt));
+    let bad_type =
+        |it: &mut Interp| it.type_error(&format!("memoryview: invalid type for format '{}'", fmt));
+    let bad_value = |it: &mut Interp| {
+        it.value_error(&format!("memoryview: invalid value for format '{}'", fmt))
+    };
     let scalar = match kind {
         ElemKind::Char => match v {
             Value::Obj(o) => match &o.kind {
@@ -233,10 +283,18 @@ enum Key {
 impl MemoryView {
     fn of(it: &mut Interp, v: &Value) -> R<MemoryView> {
         match export(it, v)? {
-            Some(e) => Ok(MemoryView { obj: e.obj, src: Some(e.src), view: e.view, fmt: e.fmt }),
+            Some(e) => Ok(MemoryView {
+                obj: e.obj,
+                src: Some(e.src),
+                view: e.view,
+                fmt: e.fmt,
+            }),
             None => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("memoryview: a bytes-like object is required, not '{}'", t)))
+                Err(it.type_error(&format!(
+                    "memoryview: a bytes-like object is required, not '{}'",
+                    t
+                )))
             }
         }
     }
@@ -251,13 +309,25 @@ impl MemoryView {
     /// A new view of the same source.
     fn derive(&self, it: &mut Interp, view: ViewDesc, fmt: Rc<str>) -> R<Value> {
         let src = self.src(it)?.reexport().map_err(|e| buffer_error(it, e))?;
-        Ok(Py::new(it, MemoryView { obj: self.obj.clone(), src: Some(src), view, fmt }).into_value())
+        Ok(Py::new(
+            it,
+            MemoryView {
+                obj: self.obj.clone(),
+                src: Some(src),
+                view,
+                fmt,
+            },
+        )
+        .into_value())
     }
 
     fn kind(&self, it: &mut Interp) -> R<ElemKind> {
         match parse_fmt(&self.fmt) {
             Some((k, _)) => Ok(k),
-            None => Err(it.new_exc_str("NotImplementedError", &format!("memoryview: unsupported format {}", self.fmt))),
+            None => Err(it.new_exc_str(
+                "NotImplementedError",
+                &format!("memoryview: unsupported format {}", self.fmt),
+            )),
         }
     }
 
@@ -265,7 +335,10 @@ impl MemoryView {
         let kind = self.kind(it)?;
         let size = self.view.itemsize;
         let src = self.src(it)?;
-        match src.with(|b| b.get(pos..pos + size).map(|s| load(kind, s, ByteOrder::NATIVE))) {
+        match src.with(|b| {
+            b.get(pos..pos + size)
+                .map(|s| load(kind, s, ByteOrder::NATIVE))
+        }) {
             Ok(Some(s)) => Ok(scalar_value(s)),
             Ok(None) => Err(it.new_exc_str("IndexError", "index out of bounds on dimension 1")),
             Err(e) => Err(inaccessible(it, e)),
@@ -280,14 +353,20 @@ impl MemoryView {
     fn values(&self, it: &mut Interp) -> R<Vec<Value>> {
         let kind = self.kind(it)?;
         let data = self.bytes(it)?;
-        Ok(data.chunks(self.view.itemsize.max(1)).map(|c| scalar_value(load(kind, c, ByteOrder::NATIVE))).collect())
+        Ok(data
+            .chunks(self.view.itemsize.max(1))
+            .map(|c| scalar_value(load(kind, c, ByteOrder::NATIVE)))
+            .collect())
     }
 
     fn index_pos(&self, it: &mut Interp, dim: usize, key: &Value) -> R<usize> {
         let i = it.seq_index(key)?;
         match self.view.index(dim, i as isize) {
             Some(j) => Ok(j),
-            None => Err(it.new_exc_str("IndexError", &format!("index out of bounds on dimension {}", dim + 1))),
+            None => Err(it.new_exc_str(
+                "IndexError",
+                &format!("index out of bounds on dimension {}", dim + 1),
+            )),
         }
     }
 
@@ -302,10 +381,16 @@ impl MemoryView {
             }
             if items.iter().all(|k| it.has_index(k)) {
                 if items.len() < v.ndim() {
-                    return Err(it.new_exc_str("NotImplementedError", "sub-views are not implemented"));
+                    return Err(
+                        it.new_exc_str("NotImplementedError", "sub-views are not implemented")
+                    );
                 }
                 if items.len() > v.ndim() {
-                    return Err(it.type_error(&format!("cannot index {}-dimension view with {}-element tuple", v.ndim(), items.len())));
+                    return Err(it.type_error(&format!(
+                        "cannot index {}-dimension view with {}-element tuple",
+                        v.ndim(),
+                        items.len()
+                    )));
                 }
                 let mut idx = Vec::with_capacity(items.len());
                 for (d, k) in items.iter().enumerate() {
@@ -314,7 +399,10 @@ impl MemoryView {
                 return Ok(Key::Elem(v.item_offset(&idx)));
             }
             if items.iter().all(|k| it.is_slice(k)) {
-                return Err(it.new_exc_str("NotImplementedError", "multi-dimensional slicing is not implemented"));
+                return Err(it.new_exc_str(
+                    "NotImplementedError",
+                    "multi-dimensional slicing is not implemented",
+                ));
             }
             return Err(it.type_error("memoryview: invalid slice key"));
         }
@@ -328,7 +416,10 @@ impl MemoryView {
         }
         if it.has_index(key) {
             if v.ndim() != 1 {
-                return Err(it.new_exc_str("NotImplementedError", "multi-dimensional sub-views are not implemented"));
+                return Err(it.new_exc_str(
+                    "NotImplementedError",
+                    "multi-dimensional sub-views are not implemented",
+                ));
             }
             let j = self.index_pos(it, 0, key)?;
             return Ok(Key::Elem(v.item_offset(&[j])));
@@ -337,12 +428,16 @@ impl MemoryView {
     }
 
     fn equal(&self, it: &mut Interp, other: &Value) -> R<Value> {
-        let Some(y) = export(it, other)? else { return Ok(Value::NotImplemented) };
+        let Some(y) = export(it, other)? else {
+            return Ok(Value::NotImplemented);
+        };
         if y.view.shape != self.view.shape {
             return Ok(Value::Bool(false));
         }
         let (fx, fy) = (parse_fmt(&self.fmt), parse_fmt(&y.fmt));
-        let (Some((kx, _)), Some((ky, _))) = (fx, fy) else { return Ok(Value::Bool(false)) };
+        let (Some((kx, _)), Some((ky, _))) = (fx, fy) else {
+            return Ok(Value::Bool(false));
+        };
         if kx == ky && !kx.is_float() {
             let a = self.bytes(it)?;
             let b = gather(it, &y.src, &y.view)?;
@@ -350,7 +445,10 @@ impl MemoryView {
         }
         let xs = self.values(it)?;
         let data = gather(it, &y.src, &y.view)?;
-        let ys: Vec<Value> = data.chunks(y.view.itemsize.max(1)).map(|c| scalar_value(load(ky, c, ByteOrder::NATIVE))).collect();
+        let ys: Vec<Value> = data
+            .chunks(y.view.itemsize.max(1))
+            .map(|c| scalar_value(load(ky, c, ByteOrder::NATIVE)))
+            .collect();
         for (p, q) in xs.iter().zip(&ys) {
             if !it.values_eq(p, q)? {
                 return Ok(Value::Bool(false));
@@ -369,11 +467,21 @@ fn slice_parts(it: &mut Interp, s: &Value) -> R<(Option<isize>, Option<isize>, i
         },
         _ => return Err(it.type_error("slice expected")),
     };
-    let step = if c.is_none() { 1 } else { it.slice_index(&c)? as isize };
+    let step = if c.is_none() {
+        1
+    } else {
+        it.slice_index(&c)? as isize
+    };
     if step == 0 {
         return Err(it.value_error("slice step cannot be zero"));
     }
-    let bound = |it: &mut Interp, v: &Value| -> R<Option<isize>> { if v.is_none() { Ok(None) } else { Ok(Some(it.slice_index(v)? as isize)) } };
+    let bound = |it: &mut Interp, v: &Value| -> R<Option<isize>> {
+        if v.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(it.slice_index(v)? as isize))
+        }
+    };
     Ok((bound(it, &a)?, bound(it, &b)?, step))
 }
 
@@ -410,16 +518,20 @@ impl MemoryView {
             Key::Elem(pos) => {
                 let mut buf = vec![0u8; self.view.itemsize];
                 pack_item(it, &self.fmt, kind, value, &mut buf)?;
-                let r = self.src(it)?.with_mut(|b| match b.get_mut(pos..pos + buf.len()) {
-                    Some(d) => {
-                        d.copy_from_slice(&buf);
-                        true
-                    }
-                    None => false,
-                });
+                let r = self
+                    .src(it)?
+                    .with_mut(|b| match b.get_mut(pos..pos + buf.len()) {
+                        Some(d) => {
+                            d.copy_from_slice(&buf);
+                            true
+                        }
+                        None => false,
+                    });
                 return match r {
                     Ok(true) => Ok(()),
-                    Ok(false) => Err(it.new_exc_str("IndexError", "index out of bounds on dimension 1")),
+                    Ok(false) => {
+                        Err(it.new_exc_str("IndexError", "index out of bounds on dimension 1"))
+                    }
                     Err(e) => Err(inaccessible(it, e)),
                 };
             }
@@ -431,11 +543,15 @@ impl MemoryView {
             return Err(it.type_error(&format!("a bytes-like object is required, not '{}'", t)));
         };
         if parse_fmt(&src.fmt).map(|f| f.0) != Some(kind) || src.view.shape != dst.shape {
-            return Err(it.value_error("memoryview assignment: lvalue and rvalue have different structures"));
+            return Err(it.value_error(
+                "memoryview assignment: lvalue and rvalue have different structures",
+            ));
         }
         let data = gather(it, &src.src, &src.view)?;
         drop(src);
-        let r = self.src(it)?.with_mut(|b| dst.check(b.len()).map(|()| dst.scatter(b, &data)));
+        let r = self
+            .src(it)?
+            .with_mut(|b| dst.check(b.len()).map(|()| dst.scatter(b, &data)));
         r.and_then(|r| r).map_err(|e| inaccessible(it, e))
     }
 
@@ -468,7 +584,10 @@ impl MemoryView {
                 return Err(it.type_error("invalid indexing of 0-dim memory"));
             }
             if m.view.ndim() != 1 {
-                return Err(it.new_exc_str("NotImplementedError", "multi-dimensional sub-views are not implemented"));
+                return Err(it.new_exc_str(
+                    "NotImplementedError",
+                    "multi-dimensional sub-views are not implemented",
+                ));
             }
             m.kind(it)?;
         }
@@ -491,7 +610,9 @@ impl MemoryView {
             return Ok(Value::Bool(true));
         }
         let m = slf.0.borrow(it)?;
-        let other_released = Py::<MemoryView>::from_value(it, other).map(|p| p.borrow(it).map(|o| o.src.is_none())).transpose()?;
+        let other_released = Py::<MemoryView>::from_value(it, other)
+            .map(|p| p.borrow(it).map(|o| o.src.is_none()))
+            .transpose()?;
         if m.src.is_none() || other_released == Some(true) {
             return Ok(Value::Bool(false));
         }
@@ -513,7 +634,9 @@ impl MemoryView {
             return Err(it.value_error("cannot hash writable memoryview object"));
         }
         if !is_byte_fmt(&self.fmt) {
-            return Err(it.value_error("memoryview: hashing is restricted to formats 'B', 'b' or 'c'"));
+            return Err(
+                it.value_error("memoryview: hashing is restricted to formats 'B', 'b' or 'c'")
+            );
         }
         let data = self.bytes(it)?;
         Ok(hash_bytes(&data))
@@ -523,7 +646,11 @@ impl MemoryView {
     fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
         let released = slf.0.borrow(it)?.src.is_none();
         let id = it.id_of(slf.0.value());
-        Ok(if released { format!("<released memory at {:#x}>", id) } else { format!("<memory at {:#x}>", id) })
+        Ok(if released {
+            format!("<released memory at {:#x}>", id)
+        } else {
+            format!("<memory at {:#x}>", id)
+        })
     }
 
     #[proto(enter)]
@@ -590,7 +717,12 @@ impl MemoryView {
     }
 
     #[method(hint(py(text_signature = "($self, /, sep=<unrepresentable>, bytes_per_sep=1)")))]
-    fn hex(&self, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<String> {
+    fn hex(
+        &self,
+        it: &mut Interp,
+        #[kw] sep: Option<&Value>,
+        #[kw] bytes_per_sep: Option<&Value>,
+    ) -> R<String> {
         let data = self.bytes(it)?;
         let sep = hex_sep_arg(it, sep)?;
         let per = match bytes_per_sep {
@@ -621,16 +753,22 @@ impl MemoryView {
         }
         let shape = shape.filter(|s| !s.is_none());
         if (shape.is_some() || self.view.ndim() != 1) && self.view.shape.contains(&0) {
-            return Err(it.type_error("memoryview: cannot cast view with zeros in shape or strides"));
+            return Err(
+                it.type_error("memoryview: cannot cast view with zeros in shape or strides")
+            );
         }
         let dims = match shape {
             Some(s) => {
                 let items = match s {
-                    Value::Obj(o) if matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) => it.iterate_to_vec(s)?,
+                    Value::Obj(o) if matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) => {
+                        it.iterate_to_vec(s)?
+                    }
                     _ => return Err(it.type_error("shape must be a list or a tuple")),
                 };
                 if items.len() > MAX_NDIM {
-                    return Err(it.value_error("memoryview: number of dimensions must not exceed 64"));
+                    return Err(
+                        it.value_error("memoryview: number of dimensions must not exceed 64")
+                    );
                 }
                 if self.view.ndim() != 1 && items.len() != 1 {
                     return Err(it.type_error("memoryview: cast must be 1D -> ND or ND -> 1D"));
@@ -658,11 +796,15 @@ impl MemoryView {
                 let mut out = Vec::with_capacity(items.len());
                 for v in &items {
                     if !matches!(v, Value::Int(_) | Value::Bool(_)) && v.as_bigint().is_none() {
-                        return Err(it.type_error("memoryview.cast(): elements of shape must be integers"));
+                        return Err(
+                            it.type_error("memoryview.cast(): elements of shape must be integers")
+                        );
                     }
                     let n = it.index_of(v)?;
                     if n <= 0 {
-                        return Err(it.value_error("memoryview.cast(): elements of shape must be integers > 0"));
+                        return Err(it.value_error(
+                            "memoryview.cast(): elements of shape must be integers > 0",
+                        ));
                     }
                     out.push(n as usize);
                     if lumen_common::buffer::shape_product(&out).is_none() {
@@ -673,11 +815,20 @@ impl MemoryView {
             }
             None => None,
         };
-        let v = match self.view.cast(Some(kind), itemsize, ByteOrder::NATIVE, shape) {
+        let v = match self
+            .view
+            .cast(Some(kind), itemsize, ByteOrder::NATIVE, shape)
+        {
             Ok(v) => v,
-            Err(CastError::TooLarge) => return Err(it.value_error("memoryview.cast(): product(shape) > SSIZE_MAX")),
-            Err(CastError::NotContiguous) => return Err(it.type_error("memoryview: casts are restricted to C-contiguous views")),
-            Err(CastError::SizeMismatch) => return Err(it.type_error("memoryview: product(shape) * itemsize != buffer size")),
+            Err(CastError::TooLarge) => {
+                return Err(it.value_error("memoryview.cast(): product(shape) > SSIZE_MAX"))
+            }
+            Err(CastError::NotContiguous) => {
+                return Err(it.type_error("memoryview: casts are restricted to C-contiguous views"))
+            }
+            Err(CastError::SizeMismatch) => {
+                return Err(it.type_error("memoryview: product(shape) * itemsize != buffer size"))
+            }
         };
         self.derive(it, v, fmt.as_str().into())
     }
@@ -715,13 +866,25 @@ impl MemoryView {
     #[getter]
     fn shape(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
-        Ok(Value::tuple(self.view.shape.iter().map(|n| Value::Int(*n as i64)).collect()))
+        Ok(Value::tuple(
+            self.view
+                .shape
+                .iter()
+                .map(|n| Value::Int(*n as i64))
+                .collect(),
+        ))
     }
 
     #[getter]
     fn strides(&self, it: &mut Interp) -> R<Value> {
         self.src(it)?;
-        Ok(Value::tuple(self.view.strides.iter().map(|n| Value::Int(*n as i64)).collect()))
+        Ok(Value::tuple(
+            self.view
+                .strides
+                .iter()
+                .map(|n| Value::Int(*n as i64))
+                .collect(),
+        ))
     }
 
     #[getter]
@@ -758,7 +921,9 @@ impl MemoryView {
 /// The `sep` argument of `bytes.hex()` and friends: one ASCII character (from a str or a
 /// bytes-like object), or `None`.
 pub fn hex_sep_arg(it: &mut Interp, sep: Option<&Value>) -> R<Option<char>> {
-    let Some(v) = sep.filter(|v| !v.is_none()) else { return Ok(None) };
+    let Some(v) = sep.filter(|v| !v.is_none()) else {
+        return Ok(None);
+    };
     let chars: Vec<char> = match v.as_str() {
         Some(s) => s.chars().collect(),
         None => {
@@ -793,7 +958,10 @@ pub fn contiguous_part(it: &mut Interp, v: &Value) -> R<Option<Part>> {
     let m = p.borrow(it)?;
     let src = m.src(it)?;
     if !m.view.is_c_contiguous() {
-        return Err(it.new_exc_str("BufferError", "memoryview: underlying buffer is not C-contiguous"));
+        return Err(it.new_exc_str(
+            "BufferError",
+            "memoryview: underlying buffer is not C-contiguous",
+        ));
     }
     let len = src.with(|b| b.len()).map_err(|e| inaccessible(it, e))?;
     m.view.check(len).map_err(|e| inaccessible(it, e))?;

@@ -116,9 +116,17 @@ struct Lower<'a> {
 }
 
 pub fn lower(f: &Function, cfg: &Cfg, abi: &Abi, feat: &Features) -> Result<Lowered, String> {
-    if f.sig.params.iter().chain(&f.sig.results)
-        .chain(f.sigs.iter().flat_map(|s| s.params.iter().chain(&s.results)))
-        .any(|t| *t == Type::V128) {
+    if f.sig
+        .params
+        .iter()
+        .chain(&f.sig.results)
+        .chain(
+            f.sigs
+                .iter()
+                .flat_map(|s| s.params.iter().chain(&s.results)),
+        )
+        .any(|t| *t == Type::V128)
+    {
         return Err("x64: vectors are internal values, not C ABI parameters/results".into());
     }
     if f.sig.results.len() > 1 {
@@ -604,7 +612,11 @@ impl Lower<'_> {
             }
             InstData::Vzero => {
                 let dst = self.vreg(res[0]);
-                self.push(MInst::XmmConst { double: true, dst, bits: 0 });
+                self.push(MInst::XmmConst {
+                    double: true,
+                    dst,
+                    bits: 0,
+                });
             }
             InstData::VectorBinary { op, args } => {
                 self.vector(*op, args[0], args[1], res[0]);
@@ -621,12 +633,27 @@ impl Lower<'_> {
                 let src = self.use_val(args[1]);
                 self.copy_into(dst, args[0]);
                 match op {
-                    CheckedOp::ImulOv => self.push(MInst::Imul { size: Size::S32, dst, src }),
-                    _ => self.push(MInst::Alu { op: if *op == CheckedOp::IaddOv { AluOp::Add } else { AluOp::Sub },
-                        size: Size::S32, dst, src: RegImm::Reg(src) }),
+                    CheckedOp::ImulOv => self.push(MInst::Imul {
+                        size: Size::S32,
+                        dst,
+                        src,
+                    }),
+                    _ => self.push(MInst::Alu {
+                        op: if *op == CheckedOp::IaddOv {
+                            AluOp::Add
+                        } else {
+                            AluOp::Sub
+                        },
+                        size: Size::S32,
+                        dst,
+                        src: RegImm::Reg(src),
+                    }),
                 }
                 let flag = self.vreg(res[1]);
-                self.push(MInst::Setcc { cc: CC::O, dst: flag });
+                self.push(MInst::Setcc {
+                    cc: CC::O,
+                    dst: flag,
+                });
             }
             InstData::IntCmp { cc, args } => {
                 let dst = self.vreg(res[0]);
@@ -726,7 +753,9 @@ impl Lower<'_> {
                 let ext = &f.funcs[func.index()];
                 let sig = f.sigs[ext.sig.index()].clone();
                 if let Some(expected) = crate::atomics::signature(ext.id) {
-                    if sig != expected { return Err("x64: invalid atomic intrinsic signature".into()); }
+                    if sig != expected {
+                        return Err("x64: invalid atomic intrinsic signature".into());
+                    }
                     let addr = self.use_val(args[0]);
                     let dst = self.vreg(res[0]);
                     if ext.id == crate::atomics::ADD32 {
@@ -735,9 +764,16 @@ impl Lower<'_> {
                     } else {
                         let expected = self.use_val(args[1]);
                         let replacement = self.use_val(args[2]);
-                        self.push(MInst::AtomicCas { addr, expected, replacement, dst });
+                        self.push(MInst::AtomicCas {
+                            addr,
+                            expected,
+                            replacement,
+                            dst,
+                        });
                     }
-                } else { self.call(&sig, CallTarget::Func(ext.id), args, res)?; }
+                } else {
+                    self.call(&sig, CallTarget::Func(ext.id), args, res)?;
+                }
             }
             InstData::CallIndirect { sig, callee, args } => {
                 let sig = f.sigs[sig.index()].clone();
@@ -801,12 +837,21 @@ impl Lower<'_> {
     }
 
     fn packed(&mut self, opcode: u16, imm: Option<u8>, dst: VReg, src: VReg) {
-        self.push(MInst::Packed { opcode, imm, dst, src });
+        self.push(MInst::Packed {
+            opcode,
+            imm,
+            dst,
+            src,
+        });
     }
 
     fn vector_copy(&mut self, src: VReg) -> VReg {
         let dst = self.fresh(Type::V128);
-        self.push(MInst::XmmMov { double: true, dst, src });
+        self.push(MInst::XmmMov {
+            double: true,
+            dst,
+            src,
+        });
         dst
     }
 
@@ -845,13 +890,17 @@ impl Lower<'_> {
                 self.packed(0x70, Some(0x88), odd_a, odd_a);
                 self.packed(0x62, None, value, odd_a); // PUNPCKLDQ
             }
-            I32x4Min | I32x4Max if self.feat.sse41 =>
-                self.packed(if op == I32x4Min { 0x3839 } else { 0x383d }, None, value, b),
+            I32x4Min | I32x4Max if self.feat.sse41 => {
+                self.packed(if op == I32x4Min { 0x3839 } else { 0x383d }, None, value, b)
+            }
             I32x4Min | I32x4Max => {
                 let mask = self.vector_copy(a);
                 self.packed(0x66, None, mask, b);
-                value = if op == I32x4Min { self.vector_select(mask, b, a) }
-                    else { self.vector_select(mask, a, b) };
+                value = if op == I32x4Min {
+                    self.vector_select(mask, b, a)
+                } else {
+                    self.vector_select(mask, a, b)
+                };
             }
             F64x2Add => self.packed(0x58, None, value, b),
             F64x2Mul => self.packed(0x59, None, value, b),
@@ -861,8 +910,11 @@ impl Lower<'_> {
                 // MINPD/MAXPD do not implement the IR's NaN and signed-zero rules.
                 let less = self.vector_copy(a);
                 self.packed(0xc2, Some(1), less, b);
-                value = if op == F64x2Min { self.vector_select(less, a, b) }
-                    else { self.vector_select(less, b, a) };
+                value = if op == F64x2Min {
+                    self.vector_select(less, a, b)
+                } else {
+                    self.vector_select(less, b, a)
+                };
                 let equal = self.vector_copy(a);
                 self.packed(0xc2, Some(0), equal, b);
                 let zeros = self.vector_copy(a);
@@ -881,7 +933,11 @@ impl Lower<'_> {
                 self.packed(0xdf, None, value, a);
             }
         }
-        self.push(MInst::XmmMov { double: true, dst, src: value });
+        self.push(MInst::XmmMov {
+            double: true,
+            dst,
+            src: value,
+        });
     }
 
     fn unary(&mut self, op: UnaryOp, arg: Value, r: Value) -> Result<(), String> {

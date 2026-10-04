@@ -9,9 +9,9 @@
 //!   from bytecode enters an inline frame ([`inline_class_ctor`]); other constructs
 //!   ([`construct_class`]) and `super(…)` reaching a class parent ([`run_class_ctor_on`]) run
 //!   the body on a fresh driver.
+use super::{ArrayElem, Op};
 #[cfg(feature = "compiler")]
 use super::{Bail, CResult, Compiler};
-use super::{ArrayElem, Op};
 use crate::ast::Expr;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::{Callable, Gc, Value};

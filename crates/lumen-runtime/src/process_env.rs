@@ -1,6 +1,6 @@
 //! Realm-owned environment data. SHARE_ENV passes this backing only to admitted child workers;
 //! writes never mutate the embedding process's OS environment.
-use lumen_host::{Ctx, Extension, OpState, Value, ops};
+use lumen_host::{ops, Ctx, Extension, OpState, Value};
 use std::sync::{Arc, Mutex};
 
 const MAX_KEYS: usize = 16_384;

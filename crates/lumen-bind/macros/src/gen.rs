@@ -357,9 +357,10 @@ pub fn gen(s: &Spec) -> Res<String> {
             _ => continue,
         };
         params_src.push(format!(
-            "{B}::Param {{ name: {:?}, kind: {B}::ParamKind::{kind}, default: {} }}",
+            "{B}::Param {{ name: {:?}, kind: {B}::ParamKind::{kind}, default: {}, pass_undefined: {} }}",
             p.name.trim_start_matches("r#").trim_start_matches('_'),
-            opt_str(default.as_deref())
+            opt_str(default.as_deref()),
+            base_name(&p.ts) == "Passed"
         ));
     }
     let mut flags = Vec::new();

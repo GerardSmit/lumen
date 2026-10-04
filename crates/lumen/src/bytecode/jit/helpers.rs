@@ -2822,32 +2822,86 @@ pub(crate) fn take_ta_exit(chunk: &Chunk, pc: usize) -> bool {
     })
 }
 
-unsafe extern "C" fn atomic_prepare(f: *mut JitFrame, callee: *const Value, target: *const Value,
-    index: f64, argc: u32) -> usize {
+unsafe extern "C" fn atomic_prepare(
+    f: *mut JitFrame,
+    callee: *const Value,
+    target: *const Value,
+    index: f64,
+    argc: u32,
+) -> usize {
     let i = &mut *(*f).interp;
-    if i.jit_atomic_lease.is_some() { return 0; }
-    let Value::Obj(callee) = &*callee else { return 0 };
-    let Ok(callee) = callee.try_borrow() else { return 0 };
-    let crate::value::Callable::Native(function) = &callee.call else { return 0 };
-    let which = match argc { 3 => 0, 4 => 1, _ => return 0 };
-    if *function as *const () as usize != i.atomic_intrinsics[which] { return 0; }
-    let Value::Obj(target) = &*target else { return 0 };
-    let Some(info) = i.typed_arrays.get(&(crate::value::Gc::as_ptr(target) as usize)).copied() else { return 0 };
-    if !matches!(info.kind, crate::value::TaKind::I32 | crate::value::TaKind::U32) { return 0; }
-    let Some(&id) = i.shared_buffers.get(&info.buffer) else { return 0 };
+    if i.jit_atomic_lease.is_some() {
+        return 0;
+    }
+    let Value::Obj(callee) = &*callee else {
+        return 0;
+    };
+    let Ok(callee) = callee.try_borrow() else {
+        return 0;
+    };
+    let crate::value::Callable::Native(function) = &callee.call else {
+        return 0;
+    };
+    let which = match argc {
+        3 => 0,
+        4 => 1,
+        _ => return 0,
+    };
+    if *function as *const () as usize != i.atomic_intrinsics[which] {
+        return 0;
+    }
+    let Value::Obj(target) = &*target else {
+        return 0;
+    };
+    let Some(info) = i
+        .typed_arrays
+        .get(&(crate::value::Gc::as_ptr(target) as usize))
+        .copied()
+    else {
+        return 0;
+    };
+    if !matches!(
+        info.kind,
+        crate::value::TaKind::I32 | crate::value::TaKind::U32
+    ) {
+        return 0;
+    }
+    let Some(&id) = i.shared_buffers.get(&info.buffer) else {
+        return 0;
+    };
     let index = if index.is_nan() { 0.0 } else { index.trunc() };
-    if index < 0.0 || !index.is_finite() || index >= i.ta_len(&info).unwrap_or(0) as f64 { return 0; }
-    let Some(memory) = crate::interpreter::shared_mem_get(id) else { return 0 };
-    let Ok(mut guard) = memory.lock() else { return 0 };
-    let Some(offset) = (index as usize).checked_mul(4).and_then(|n| info.offset.checked_add(n)) else { return 0 };
-    if offset.checked_add(4).map_or(true, |end| end > guard.len()) { return 0; }
+    if index < 0.0 || !index.is_finite() || index >= i.ta_len(&info).unwrap_or(0) as f64 {
+        return 0;
+    }
+    let Some(memory) = crate::interpreter::shared_mem_get(id) else {
+        return 0;
+    };
+    let Ok(mut guard) = memory.lock() else {
+        return 0;
+    };
+    let Some(offset) = (index as usize)
+        .checked_mul(4)
+        .and_then(|n| info.offset.checked_add(n))
+    else {
+        return 0;
+    };
+    if offset.checked_add(4).map_or(true, |end| end > guard.len()) {
+        return 0;
+    }
     let pointer = guard.as_mut_ptr().add(offset) as usize;
-    if pointer & 3 != 0 { return 0; }
+    if pointer & 3 != 0 {
+        return 0;
+    }
     // The Arc owns the mutex for the lease's lifetime. No JS call or guard exit is
     // emitted between prepare and release; a native entry also releases on return.
-    let guard = std::mem::transmute::<std::sync::MutexGuard<'_, Vec<u8>>,
-        std::sync::MutexGuard<'static, Vec<u8>>>(guard);
-    i.jit_atomic_lease = Some(crate::interpreter::AtomicLease { _guard: guard, _memory: memory });
+    let guard = std::mem::transmute::<
+        std::sync::MutexGuard<'_, Vec<u8>>,
+        std::sync::MutexGuard<'static, Vec<u8>>,
+    >(guard);
+    i.jit_atomic_lease = Some(crate::interpreter::AtomicLease {
+        _guard: guard,
+        _memory: memory,
+    });
     pointer | usize::from(info.kind == crate::value::TaKind::U32)
 }
 

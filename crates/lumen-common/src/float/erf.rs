@@ -285,7 +285,11 @@ fn fdlibm_erf(x: f64) -> f64 {
         y = 1.0 - x1p_1022;
     }
 
-    if sign != 0 { -y } else { y }
+    if sign != 0 {
+        -y
+    } else {
+        y
+    }
 }
 
 /// Complementary error function (f64)

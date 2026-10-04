@@ -63,7 +63,7 @@ const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 /// allocation fast path, so they only exist with the `mem-stats` cargo feature.
 #[cfg(feature = "mem-stats")]
 mod stats {
-    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering::Relaxed};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering, Ordering::Relaxed};
     pub static LIVE: AtomicIsize = AtomicIsize::new(0);
     pub static PEAK: AtomicIsize = AtomicIsize::new(0);
     pub static CACHED: AtomicIsize = AtomicIsize::new(0);
@@ -89,9 +89,166 @@ mod stats {
     pub fn cat_add(cat: u8, delta: isize) {
         CATS[(cat & 31) as usize].fetch_add(delta, Relaxed);
     }
+    /// Outstanding normal-alignment blocks, grouped by their stored category header.
+    pub static CAT_ALLOCATIONS: [AtomicIsize; 32] = [const { AtomicIsize::new(0) }; 32];
+    /// Live ClassAlloc inner-layout overhead above each block's requested payload. This includes
+    /// the 16-byte category header and any size-class rounding used by `raw_alloc`.
+    pub static CAT_ALLOCATOR_OVERHEAD: [AtomicIsize; 32] = [const { AtomicIsize::new(0) }; 32];
+    #[inline(always)]
+    pub fn cat_allocation_add(cat: u8, delta: isize) {
+        CAT_ALLOCATIONS[(cat & 31) as usize].fetch_add(delta, Relaxed);
+    }
+    #[inline(always)]
+    pub fn cat_overhead_add(cat: u8, delta: isize) {
+        CAT_ALLOCATOR_OVERHEAD[(cat & 31) as usize].fetch_add(delta, Relaxed);
+    }
+    /// Cumulative over-aligned allocation requests by active category. These
+    /// counters answer whether a category's logical bytes escaped the usual
+    /// per-block category header and were therefore charged to the slab bucket.
+    pub static OVERALIGNED_COUNT: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+    pub static OVERALIGNED_BYTES: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
+    #[inline(always)]
+    pub fn overaligned(cat: u8, bytes: usize) {
+        let index = (cat & 31) as usize;
+        OVERALIGNED_COUNT[index].fetch_add(1, Relaxed);
+        OVERALIGNED_BYTES[index].fetch_add(bytes, Relaxed);
+    }
+
+    /// Over-aligned blocks do not carry an in-band category header, so mem-stats uses this
+    /// bounded side table to retain their allocation category and requested size until free.
+    /// The table is intentionally fixed-size and allocator-recursion-safe. If it ever fills or
+    /// sees an unknown pointer, `OVERALIGNED_LEDGER_OVERFLOW` remains set and consumers must not
+    /// claim complete category attribution.
+    const OVERALIGNED_LEDGER_CAPACITY: usize = 4096;
+    const EMPTY_POINTER: usize = 0;
+    const TOMBSTONE_POINTER: usize = 1;
+
+    struct OveralignedRecord {
+        pointer: AtomicUsize,
+        size: AtomicUsize,
+        category: AtomicUsize,
+    }
+
+    impl OveralignedRecord {
+        const fn new() -> Self {
+            Self {
+                pointer: AtomicUsize::new(EMPTY_POINTER),
+                size: AtomicUsize::new(0),
+                category: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    static OVERALIGNED_LEDGER: [OveralignedRecord; OVERALIGNED_LEDGER_CAPACITY] =
+        [const { OveralignedRecord::new() }; OVERALIGNED_LEDGER_CAPACITY];
+    static OVERALIGNED_LEDGER_LOCK: AtomicBool = AtomicBool::new(false);
+    static OVERALIGNED_LEDGER_OVERFLOW: AtomicBool = AtomicBool::new(false);
+    static OVERALIGNED_LIVE_COUNTS: [AtomicIsize; 32] = [const { AtomicIsize::new(0) }; 32];
+    static OVERALIGNED_LIVE_BYTES: [AtomicIsize; 32] = [const { AtomicIsize::new(0) }; 32];
+
+    struct OveralignedLedgerGuard;
+
+    impl Drop for OveralignedLedgerGuard {
+        fn drop(&mut self) {
+            OVERALIGNED_LEDGER_LOCK.store(false, Ordering::Release);
+        }
+    }
+
+    #[inline(always)]
+    fn lock_overaligned_ledger() -> OveralignedLedgerGuard {
+        while OVERALIGNED_LEDGER_LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        OveralignedLedgerGuard
+    }
+
+    /// Record a successful over-aligned allocation. If the bounded attribution table cannot
+    /// represent it, the live allocation still succeeds, but profile gates fail closed when they
+    /// observe the overflow flag.
+    pub fn overaligned_live_alloc(pointer: *mut u8, size: usize, category: u8) {
+        let _guard = lock_overaligned_ledger();
+        let pointer = pointer as usize;
+        let category = (category & 31) as usize;
+        let mut deleted = None;
+        let mut slot = None;
+        for (index, record) in OVERALIGNED_LEDGER.iter().enumerate() {
+            let current = record.pointer.load(Relaxed);
+            if current == pointer {
+                OVERALIGNED_LEDGER_OVERFLOW.store(true, Relaxed);
+                return;
+            }
+            if current == TOMBSTONE_POINTER {
+                deleted.get_or_insert(index);
+            } else if current == EMPTY_POINTER {
+                slot = Some(deleted.unwrap_or(index));
+                break;
+            }
+        }
+        let Some(index) = slot.or(deleted) else {
+            OVERALIGNED_LEDGER_OVERFLOW.store(true, Relaxed);
+            return;
+        };
+        let record = &OVERALIGNED_LEDGER[index];
+        record.size.store(size, Relaxed);
+        record.category.store(category, Relaxed);
+        record.pointer.store(pointer, Ordering::Release);
+        OVERALIGNED_LIVE_COUNTS[category].fetch_add(1, Relaxed);
+        OVERALIGNED_LIVE_BYTES[category].fetch_add(size as isize, Relaxed);
+    }
+
+    /// Remove a freed over-aligned block from the ledger. An untracked pointer marks the
+    /// category snapshot incomplete rather than silently undercounting it.
+    pub fn overaligned_live_free(pointer: *mut u8) {
+        let _guard = lock_overaligned_ledger();
+        let pointer = pointer as usize;
+        for record in &OVERALIGNED_LEDGER {
+            if record.pointer.load(Relaxed) == pointer {
+                let size = record.size.load(Relaxed);
+                let category = record.category.load(Relaxed) & 31;
+                record.pointer.store(TOMBSTONE_POINTER, Relaxed);
+                record.size.store(0, Relaxed);
+                OVERALIGNED_LIVE_COUNTS[category].fetch_sub(1, Relaxed);
+                OVERALIGNED_LIVE_BYTES[category].fetch_sub(size as isize, Relaxed);
+                return;
+            }
+        }
+        OVERALIGNED_LEDGER_OVERFLOW.store(true, Relaxed);
+    }
+
+    /// Preserve the original category while updating a successful over-aligned realloc.
+    pub fn overaligned_live_realloc(old_pointer: *mut u8, new_pointer: *mut u8, new_size: usize) {
+        let _guard = lock_overaligned_ledger();
+        let old_pointer = old_pointer as usize;
+        let new_pointer = new_pointer as usize;
+        for record in &OVERALIGNED_LEDGER {
+            if record.pointer.load(Relaxed) == old_pointer {
+                let old_size = record.size.load(Relaxed);
+                let category = record.category.load(Relaxed) & 31;
+                record.size.store(new_size, Relaxed);
+                record.pointer.store(new_pointer, Ordering::Release);
+                OVERALIGNED_LIVE_BYTES[category]
+                    .fetch_add(new_size as isize - old_size as isize, Relaxed);
+                return;
+            }
+        }
+        OVERALIGNED_LEDGER_OVERFLOW.store(true, Relaxed);
+    }
+
+    /// Exact outstanding over-aligned count and requested live bytes per allocation category,
+    /// plus whether any block could not be attributed.
+    pub fn overaligned_live_by_category() -> ([isize; 32], [isize; 32], bool) {
+        let _guard = lock_overaligned_ledger();
+        (
+            std::array::from_fn(|index| OVERALIGNED_LIVE_COUNTS[index].load(Relaxed)),
+            std::array::from_fn(|index| OVERALIGNED_LIVE_BYTES[index].load(Relaxed)),
+            OVERALIGNED_LEDGER_OVERFLOW.load(Relaxed),
+        )
+    }
     /// Live bytes per category and block-size bucket (see [`bucket`]).
-    pub static SIZES: [[AtomicIsize; 8]; 32] =
-        [const { [const { AtomicIsize::new(0) }; 8] }; 32];
+    pub static SIZES: [[AtomicIsize; 8]; 32] = [const { [const { AtomicIsize::new(0) }; 8] }; 32];
     /// Block-size buckets: <=32, <=64, <=128, <=256, <=1K, <=4K, <=64K, larger.
     #[inline(always)]
     pub fn bucket(n: usize) -> usize {
@@ -121,8 +278,10 @@ mod stats {
             return;
         }
         let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!("[mem] alloc {size} B in category {cat}:
-{bt}");
+        eprintln!(
+            "[mem] alloc {size} B in category {cat}:
+{bt}"
+        );
         TRACING.with(|t| t.set(false));
     }
 }
@@ -153,6 +312,35 @@ pub fn note_slab(delta: isize) {
 #[cfg(feature = "mem-stats")]
 pub fn category_bytes() -> [isize; 32] {
     std::array::from_fn(|k| stats::CATS[k].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Cumulative count and logical requested bytes for over-aligned allocations,
+/// indexed by the category active when `alloc` or `realloc` was requested.
+#[cfg(feature = "mem-stats")]
+pub fn overaligned_by_category() -> ([usize; 32], [usize; 32]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        std::array::from_fn(|index| stats::OVERALIGNED_COUNT[index].load(Relaxed)),
+        std::array::from_fn(|index| stats::OVERALIGNED_BYTES[index].load(Relaxed)),
+    )
+}
+
+/// Exact outstanding over-aligned count and requested live bytes by allocation category, plus
+/// whether the bounded attribution table ever overflowed or lost a pointer.
+#[cfg(feature = "mem-stats")]
+pub fn overaligned_live_by_category() -> ([isize; 32], [isize; 32], bool) {
+    stats::overaligned_live_by_category()
+}
+
+/// Outstanding normal-alignment allocation counts and ClassAlloc inner-layout overhead by
+/// category. Over-aligned requests are excluded because their blocks carry no category header.
+#[cfg(feature = "mem-stats")]
+pub fn category_allocation_overhead() -> ([isize; 32], [isize; 32]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        std::array::from_fn(|index| stats::CAT_ALLOCATIONS[index].load(Relaxed)),
+        std::array::from_fn(|index| stats::CAT_ALLOCATOR_OVERHEAD[index].load(Relaxed)),
+    )
 }
 
 /// `(live bytes, peak live bytes, free-list cached bytes, allocation count)`.
@@ -325,6 +513,19 @@ fn class_of(size: usize, align: usize) -> Option<usize> {
     }
 }
 
+/// Bytes between a normally aligned user's requested payload and the complete inner layout
+/// handed to this allocator. The calculation mirrors `alloc`: one 16-byte category header,
+/// rounded to a cached size class when possible, otherwise an exact `size + 16` system request.
+#[inline]
+#[cfg(feature = "mem-stats")]
+fn class_alloc_overhead(size: usize) -> usize {
+    let inner_size = size + STEP;
+    let backing_size = class_of(inner_size, STEP)
+        .map(|class| class_layout(class).size())
+        .unwrap_or(inner_size);
+    backing_size - size
+}
+
 #[inline]
 fn class_layout(class: usize) -> Layout {
     // Size is a non-zero multiple of STEP with STEP alignment: always valid.
@@ -452,7 +653,8 @@ impl ClassAlloc {
         ) {
             if a == b {
                 let c = cache();
-                c.live.set(c.live.get() + new_size as isize - layout.size() as isize);
+                c.live
+                    .set(c.live.get() + new_size as isize - layout.size() as isize);
                 return ptr;
             }
         }
@@ -486,15 +688,24 @@ unsafe impl GlobalAlloc for ClassAlloc {
 
 /// With `mem-stats`, every block of alignment <= 16 carries a 16-byte header recording the
 /// allocation category that was current when it was allocated, so live bytes can be
-/// attributed by category (parser, AST decode, bytecode, ...). Over-aligned blocks (the object
-/// slab's chunks) carry none and are counted as the slab category.
+/// attributed by category (parser, AST decode, bytecode, ...). Over-aligned blocks carry no
+/// category header and their live bytes are charged to the slab category. Their cumulative
+/// requested sizes are also recorded by the active category at each successful allocation or
+/// reallocation, allowing a caller to conservatively account for logical bytes that cannot be
+/// recovered from the slab live-byte bucket.
 #[cfg(feature = "mem-stats")]
 unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        stats::alloc(layout.size());
         if layout.align() > STEP {
-            stats::cat_add(CAT_SLAB, layout.size() as isize);
-            return self.raw_alloc(layout);
+            let cat = crate::memcat::current();
+            let p = self.raw_alloc(layout);
+            if !p.is_null() {
+                stats::alloc(layout.size());
+                stats::overaligned(cat, layout.size());
+                stats::overaligned_live_alloc(p, layout.size(), cat);
+                stats::cat_add(CAT_SLAB, layout.size() as isize);
+            }
+            return p;
         }
         let cat = crate::memcat::current();
         let inner = Layout::from_size_align_unchecked(layout.size() + STEP, STEP);
@@ -502,8 +713,11 @@ unsafe impl GlobalAlloc for ClassAlloc {
         if p.is_null() {
             return p;
         }
+        stats::alloc(layout.size());
         *(p as *mut usize) = cat as usize;
         stats::cat_add(cat, layout.size() as isize);
+        stats::cat_allocation_add(cat, 1);
+        stats::cat_overhead_add(cat, class_alloc_overhead(layout.size()) as isize);
         stats::size_add(cat, layout.size(), layout.size() as isize);
         let at = stats::TRACE_AT.load(std::sync::atomic::Ordering::Relaxed);
         if at != 0 && layout.size() >= at {
@@ -514,14 +728,20 @@ unsafe impl GlobalAlloc for ClassAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         stats::free(layout.size());
         if layout.align() > STEP {
+            stats::overaligned_live_free(ptr);
             stats::cat_add(CAT_SLAB, -(layout.size() as isize));
             return self.raw_dealloc(ptr, layout);
         }
         let p = ptr.sub(STEP);
         let cat = *(p as *const usize) as u8;
         stats::cat_add(cat, -(layout.size() as isize));
+        stats::cat_allocation_add(cat, -1);
+        stats::cat_overhead_add(cat, -(class_alloc_overhead(layout.size()) as isize));
         stats::size_add(cat, layout.size(), -(layout.size() as isize));
-        self.raw_dealloc(p, Layout::from_size_align_unchecked(layout.size() + STEP, STEP))
+        self.raw_dealloc(
+            p,
+            Layout::from_size_align_unchecked(layout.size() + STEP, STEP),
+        )
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() > STEP {
@@ -529,6 +749,8 @@ unsafe impl GlobalAlloc for ClassAlloc {
             if !n.is_null() {
                 stats::free(layout.size());
                 stats::alloc(new_size);
+                stats::overaligned(crate::memcat::current(), new_size);
+                stats::overaligned_live_realloc(ptr, n, new_size);
                 let d = new_size as isize - layout.size() as isize;
                 stats::cat_add(CAT_SLAB, d);
             }
@@ -544,6 +766,10 @@ unsafe impl GlobalAlloc for ClassAlloc {
         stats::free(layout.size());
         stats::alloc(new_size);
         stats::cat_add(cat, new_size as isize - layout.size() as isize);
+        stats::cat_overhead_add(
+            cat,
+            class_alloc_overhead(new_size) as isize - class_alloc_overhead(layout.size()) as isize,
+        );
         stats::size_add(cat, layout.size(), -(layout.size() as isize));
         stats::size_add(cat, new_size, new_size as isize);
         let at = stats::TRACE_AT.load(std::sync::atomic::Ordering::Relaxed);
@@ -557,6 +783,92 @@ unsafe impl GlobalAlloc for ClassAlloc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "mem-stats")]
+    #[test]
+    fn tagged_live_counts_overhead_and_overaligned_requests_are_accounted() {
+        let allocator = ClassAlloc;
+        let category = crate::memcat::HTML_CATEGORY_ID as usize;
+        let _tag = crate::memcat::enter(crate::memcat::CategoryTag::HTML);
+
+        let (counts_before, overhead_before) = category_allocation_overhead();
+        let layout = Layout::from_size_align(17, STEP).unwrap();
+        let pointer = unsafe { allocator.alloc(layout) };
+        assert!(!pointer.is_null());
+        let (counts_live, overhead_live) = category_allocation_overhead();
+        assert_eq!(counts_live[category] - counts_before[category], 1);
+        assert_eq!(
+            overhead_live[category] - overhead_before[category],
+            class_alloc_overhead(layout.size()) as isize
+        );
+        let resized_layout = Layout::from_size_align(25, STEP).unwrap();
+        let pointer = unsafe { allocator.realloc(pointer, layout, resized_layout.size()) };
+        assert!(!pointer.is_null());
+        let (counts_resized, overhead_resized) = category_allocation_overhead();
+        assert_eq!(counts_resized[category], counts_live[category]);
+        assert_eq!(
+            overhead_resized[category] - overhead_before[category],
+            class_alloc_overhead(resized_layout.size()) as isize
+        );
+        unsafe { allocator.dealloc(pointer, resized_layout) };
+        let (counts_after, overhead_after) = category_allocation_overhead();
+        assert_eq!(counts_after[category], counts_before[category]);
+        assert_eq!(overhead_after[category], overhead_before[category]);
+
+        let (overaligned_counts_before, overaligned_bytes_before) = overaligned_by_category();
+        let (live_counts_before, live_bytes_before, overflow_before) =
+            overaligned_live_by_category();
+        assert!(
+            !overflow_before,
+            "over-aligned ledger was already incomplete"
+        );
+        let layout = Layout::from_size_align(73, 32).unwrap();
+        let pointer = unsafe { allocator.alloc(layout) };
+        assert!(!pointer.is_null());
+        let (overaligned_counts_live, overaligned_bytes_live) = overaligned_by_category();
+        assert_eq!(
+            overaligned_counts_live[category] - overaligned_counts_before[category],
+            1
+        );
+        assert_eq!(
+            overaligned_bytes_live[category] - overaligned_bytes_before[category],
+            layout.size()
+        );
+        let (live_counts, live_bytes, overflow) = overaligned_live_by_category();
+        assert!(!overflow);
+        assert_eq!(live_counts[category] - live_counts_before[category], 1);
+        assert_eq!(
+            live_bytes[category] - live_bytes_before[category],
+            layout.size() as isize
+        );
+
+        // A realloc keeps the original allocation category even if the active tag has changed.
+        let resized_layout = Layout::from_size_align(97, 32).unwrap();
+        let other_category = crate::memcat::CategoryTag::from_id((category as u8 + 1) & 31);
+        let pointer = {
+            let _other_tag = crate::memcat::enter(other_category);
+            unsafe { allocator.realloc(pointer, layout, resized_layout.size()) }
+        };
+        assert!(!pointer.is_null());
+        let (live_counts, live_bytes, overflow) = overaligned_live_by_category();
+        assert!(!overflow);
+        assert_eq!(live_counts[category] - live_counts_before[category], 1);
+        assert_eq!(
+            live_bytes[category] - live_bytes_before[category],
+            resized_layout.size() as isize
+        );
+        {
+            let _other_tag = crate::memcat::enter(other_category);
+            unsafe { allocator.dealloc(pointer, resized_layout) };
+        }
+        let (counts_final, bytes_final) = overaligned_by_category();
+        assert_eq!(counts_final[category], overaligned_counts_live[category]);
+        assert_eq!(bytes_final[category], overaligned_bytes_live[category]);
+        let (live_counts_final, live_bytes_final, overflow_final) = overaligned_live_by_category();
+        assert!(!overflow_final);
+        assert_eq!(live_counts_final[category], live_counts_before[category]);
+        assert_eq!(live_bytes_final[category], live_bytes_before[category]);
+    }
 
     #[test]
     fn thread_live_bytes_follows_requested_sizes() {
@@ -586,14 +898,19 @@ mod tests {
             for class in 0..8 {
                 let layout = class_layout(class);
                 let n = BYTES_PER_SMALL_CLASS / layout.size();
-                let blocks: Vec<_> = (0..n).map(|_| unsafe { allocator.raw_alloc(layout) }).collect();
+                let blocks: Vec<_> = (0..n)
+                    .map(|_| unsafe { allocator.raw_alloc(layout) })
+                    .collect();
                 for b in blocks {
                     unsafe { allocator.raw_dealloc(b, layout) };
                 }
             }
             let cached = cached_bytes_for_test();
             assert!(cached <= TOTAL_CACHE_BYTES, "{cached} bytes cached");
-            assert!(cached >= TOTAL_CACHE_BYTES - MAX_CLASS, "{cached} bytes cached");
+            assert!(
+                cached >= TOTAL_CACHE_BYTES - MAX_CLASS,
+                "{cached} bytes cached"
+            );
             trim();
             assert_eq!(cached_bytes_for_test(), 0);
         })

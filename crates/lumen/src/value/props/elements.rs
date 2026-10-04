@@ -1,6 +1,6 @@
 //! Dense element storage and array length access.
 
-use super::{Props, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT};
+use super::{MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT, Props};
 use crate::value::{PackedValue, PropRef, Property, Value};
 
 impl Props {

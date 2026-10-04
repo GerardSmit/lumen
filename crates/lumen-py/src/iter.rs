@@ -36,25 +36,68 @@ impl Interp {
     pub fn native_get_iter(&mut self, v: &Value) -> R<Value> {
         if let Value::Obj(o) = v {
             match &o.kind {
-                Kind::List(_) => return Ok(self.mk_iter(IterState::List { list: o.clone(), idx: 0 })),
-                Kind::Tuple(_) => return Ok(self.mk_iter(IterState::Tuple { tup: o.clone(), idx: 0 })),
-                Kind::Str(_) => return Ok(self.mk_iter(IterState::Str { s: o.clone(), pos: 0 })),
-                Kind::Bytes(_) | Kind::ByteArray(_) => return Ok(self.mk_iter(IterState::Bytes { b: o.clone(), idx: 0 })),
-                Kind::Range(r) => {
-                    return Ok(self.mk_iter(IterState::Range { cur: r.start, stop: r.stop, step: r.step }));
+                Kind::List(_) => {
+                    return Ok(self.mk_iter(IterState::List {
+                        list: o.clone(),
+                        idx: 0,
+                    }))
                 }
-                Kind::BigRange(_) => return Ok(self.mk_iter(IterState::Seq { obj: v.clone(), idx: 0 })),
+                Kind::Tuple(_) => {
+                    return Ok(self.mk_iter(IterState::Tuple {
+                        tup: o.clone(),
+                        idx: 0,
+                    }))
+                }
+                Kind::Str(_) => {
+                    return Ok(self.mk_iter(IterState::Str {
+                        s: o.clone(),
+                        pos: 0,
+                    }))
+                }
+                Kind::Bytes(_) | Kind::ByteArray(_) => {
+                    return Ok(self.mk_iter(IterState::Bytes {
+                        b: o.clone(),
+                        idx: 0,
+                    }))
+                }
+                Kind::Range(r) => {
+                    return Ok(self.mk_iter(IterState::Range {
+                        cur: r.start,
+                        stop: r.stop,
+                        step: r.step,
+                    }));
+                }
+                Kind::BigRange(_) => {
+                    return Ok(self.mk_iter(IterState::Seq {
+                        obj: v.clone(),
+                        idx: 0,
+                    }))
+                }
                 Kind::Dict(d) => {
                     let len = d.borrow().len();
-                    return Ok(self.mk_iter(IterState::Dict { dict: o.clone(), pos: 0, len, kind: ViewKind::Keys }));
+                    return Ok(self.mk_iter(IterState::Dict {
+                        dict: o.clone(),
+                        pos: 0,
+                        len,
+                        kind: ViewKind::Keys,
+                    }));
                 }
                 Kind::Set(d) | Kind::FrozenSet(d) => {
                     let len = d.borrow().len();
-                    return Ok(self.mk_iter(IterState::Set { set: o.clone(), pos: 0, len }));
+                    return Ok(self.mk_iter(IterState::Set {
+                        set: o.clone(),
+                        pos: 0,
+                        len,
+                    }));
                 }
                 Kind::DictView(d, vk) => {
                     let len = pydict_of(d).map(|p| p.borrow().len()).unwrap_or(0);
-                    return Ok(self.mk_iter(IterState::Dict { dict: d.clone(), pos: 0, len, kind: *vk }));
+                    return Ok(self.mk_iter(IterState::Dict {
+                        dict: d.clone(),
+                        pos: 0,
+                        len,
+                        kind: *vk,
+                    }));
                 }
                 Kind::Iter(_) => return Ok(v.clone()),
                 Kind::Generator(g) => {
@@ -82,7 +125,10 @@ impl Interp {
             return self.check_iterator(it);
         }
         if self.lookup_mro(&cls, "__getitem__").is_some() && !v.is_type() {
-            return Ok(self.mk_iter(IterState::Seq { obj: v.clone(), idx: 0 }));
+            return Ok(self.mk_iter(IterState::Seq {
+                obj: v.clone(),
+                idx: 0,
+            }));
         }
         let t = self.type_name_of(v);
         Err(self.type_error(&format!("'{}' object is not iterable", t)))
@@ -242,7 +288,11 @@ impl Interp {
                 }
             }
             IterState::Range { cur, stop, step } => {
-                let more = if *step > 0 { *cur < *stop } else { *cur > *stop };
+                let more = if *step > 0 {
+                    *cur < *stop
+                } else {
+                    *cur > *stop
+                };
                 if more {
                     let v = *cur;
                     match cur.checked_add(*step) {
@@ -254,7 +304,12 @@ impl Interp {
                     Ok(None)
                 }
             }
-            IterState::Dict { dict, pos, len, kind } => {
+            IterState::Dict {
+                dict,
+                pos,
+                len,
+                kind,
+            } => {
                 let pd = match pydict_of(dict) {
                     Some(p) => p,
                     None => return Ok(None),
@@ -264,7 +319,8 @@ impl Interp {
                     drop(pdb);
                     *len = usize::MAX;
                     drop(s);
-                    return Err(self.new_exc_str("RuntimeError", "dictionary changed size during iteration"));
+                    return Err(self
+                        .new_exc_str("RuntimeError", "dictionary changed size during iteration"));
                 }
                 match pdb.next_live(*pos) {
                     Some(i) => {
@@ -292,7 +348,9 @@ impl Interp {
                 if pdb.len() != *len {
                     drop(pdb);
                     drop(s);
-                    return Err(self.new_exc_str("RuntimeError", "Set changed size during iteration"));
+                    return Err(
+                        self.new_exc_str("RuntimeError", "Set changed size during iteration")
+                    );
                 }
                 match pdb.next_live(*pos) {
                     Some(i) => {
@@ -398,7 +456,11 @@ impl Interp {
                                         "zip() argument {} is shorter than argument{} 1{}",
                                         n + 1,
                                         if n > 1 { "s" } else { "" },
-                                        if n > 1 { format!("-{}", n) } else { String::new() }
+                                        if n > 1 {
+                                            format!("-{}", n)
+                                        } else {
+                                            String::new()
+                                        }
                                     );
                                     return Err(self.value_error(&msg));
                                 }
@@ -408,7 +470,11 @@ impl Interp {
                                             "zip() argument {} is longer than argument{} 1{}",
                                             m + 1,
                                             if m > 1 { "s" } else { "" },
-                                            if m > 1 { format!("-{}", m) } else { String::new() }
+                                            if m > 1 {
+                                                format!("-{}", m)
+                                            } else {
+                                                String::new()
+                                            }
                                         );
                                         return Err(self.value_error(&msg));
                                     }
@@ -505,7 +571,11 @@ impl Interp {
                 Kind::Range(r) => crate::ops::slice_len(r.start, r.stop, r.step),
                 Kind::BigRange(r) => match crate::ops::big_range_len(r).to_i64() {
                     Some(n) => n as usize,
-                    None => return Err(self.overflow_err("Python int too large to convert to C ssize_t")),
+                    None => {
+                        return Err(
+                            self.overflow_err("Python int too large to convert to C ssize_t")
+                        )
+                    }
                 },
                 _ => 0,
             },

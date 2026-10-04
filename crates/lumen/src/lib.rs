@@ -32,12 +32,14 @@ mod coroutine;
 /// Typed Rust <-> JS conversions and the runtime of the binding macros (see [`embed`]).
 #[cfg(feature = "embed")]
 mod embed_convert;
+#[cfg(feature = "embed")]
+mod embed_realms;
 mod eval;
-mod native_ops;
 #[cfg(feature = "compiler")]
 pub mod feedback;
 #[cfg(feature = "compiler")]
 pub mod heap_snapshot;
+mod native_ops;
 #[cfg(all(feature = "compiler", feature = "jit"))]
 mod snapshot_cjs;
 /// The engine's size-class caching allocator — allocation-bound workloads (one refcounted box
@@ -69,20 +71,20 @@ mod numbering;
 use lumen_common::lzh;
 /// Opt-in memory accounting (`LUMEN_MEM_STATS=1`).
 pub mod memstats;
-mod parser_support;
+#[cfg(feature = "aot-native")]
+pub mod native_aot;
 #[cfg(feature = "compiler")]
 mod parser;
 #[cfg(not(feature = "compiler"))]
 #[path = "parser_unavailable.rs"]
 mod parser;
-#[cfg(feature = "aot-native")]
-pub mod native_aot;
+mod parser_support;
 pub mod precompiled;
-pub mod target;
 mod regex;
 mod snapshot;
 mod split_view;
 mod str_index;
+pub mod target;
 use lumen_common::stack;
 mod sync_callbacks;
 mod temporal;
@@ -137,7 +139,8 @@ pub fn set_host_clock(f: fn() -> f64) {
     let _ = HOST_CLOCK.set(f);
 }
 
-pub(crate) static TAIL_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) static TAIL_CALLS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Turn proper tail calls (ES2015 PrepareForTailCall) off for this process. V8 has none, and
 /// hosts that mirror its stack traces need every caller's frame to stay visible.
@@ -181,7 +184,7 @@ pub(crate) fn host_now_ms() -> Option<f64> {
     HOST_CLOCK.get().map(|f| f())
 }
 
-pub use lumen_os::jitmem::{NativeBackend, install_native_backend as install_native_jit_backend};
+pub use lumen_os::jitmem::{install_native_backend as install_native_jit_backend, NativeBackend};
 
 /// Native code lifetime notification. The name is borrowed only during the callback.
 pub struct JitCodeEvent<'a> {
@@ -198,7 +201,9 @@ pub fn set_jit_code_hook(hook: fn(JitCodeEvent<'_>)) -> Result<(), fn(JitCodeEve
 }
 
 pub(crate) fn jit_code_event(event: JitCodeEvent<'_>) {
-    if let Some(hook) = JIT_CODE_HOOK.get() { hook(event); }
+    if let Some(hook) = JIT_CODE_HOOK.get() {
+        hook(event);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -261,10 +266,10 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
     Ok(snapshot::encode(&body, src))
 }
 
-pub use parser::with_eager_bodies;
-pub use parser::{JsxOptions, JsxRuntime};
 #[cfg(feature = "compiler")]
 pub use parser::transpile_jsx;
+pub use parser::with_eager_bodies;
+pub use parser::{JsxOptions, JsxRuntime};
 pub use stack::{set_thread_stack_bounds, set_thread_stack_size, THREAD_STACK_SIZE};
 
 /// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
@@ -306,6 +311,26 @@ pub struct ParseError {
     pub at_eof: bool,
 }
 
+/// One statically declared module request, extracted by the same parser used for evaluation.
+/// Dynamic `import()` expressions are intentionally not included.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleRequest {
+    pub specifier: String,
+    pub attribute_type: Option<String>,
+}
+
+/// A host request for an asynchronous dynamic `import()`. Hosts that cannot
+/// synchronously fetch a module may install the async loader and complete the
+/// request later with [`Engine::complete_async_module_import`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsyncModuleImportRequest {
+    pub id: u64,
+    pub specifier: String,
+    pub referrer: String,
+    pub attribute_type: Option<String>,
+    pub defer: bool,
+}
+
 /// The outcome of evaluating a script.
 pub enum Completion {
     /// Ran to completion; the last statement value rendered to a string (best-effort).
@@ -313,6 +338,32 @@ pub enum Completion {
     /// A value was thrown. `name` is the error's constructor name (`"TypeError"`, …) when the
     /// thrown value is an Error object, else `""`.
     Throw { name: String, message: String },
+}
+
+/// A module graph whose evaluation is still owned by the engine's normal job queue. Hosts such as
+/// a browser can retain this handle while pumping their own tasks, without asking the engine to
+/// run its agent timer loop to completion.
+#[cfg(feature = "embed")]
+#[derive(Clone)]
+pub struct ModuleEvaluationHandle {
+    promise: embed::Value,
+    namespace: embed::Value,
+}
+
+#[cfg(feature = "embed")]
+impl ModuleEvaluationHandle {
+    /// The linked namespace for the root module. Its bindings remain live as evaluation proceeds.
+    pub fn namespace(&self) -> &embed::Value {
+        &self.namespace
+    }
+}
+
+/// Current state of a module graph started with [`Engine::eval_module_attrs_pending`].
+#[cfg(feature = "embed")]
+pub enum ModuleEvaluationStatus {
+    Pending,
+    Fulfilled,
+    Rejected(embed::Value),
 }
 
 /// Parse `src` as a plain script without running it.
@@ -324,6 +375,25 @@ pub fn check_script_syntax(src: &str) -> Result<(), ParseError> {
             line: e.line,
             at_eof: e.at_eof,
         })
+}
+
+/// Parse a module source and return its static import/re-export requests in source order. Hosts
+/// that prepare module graphs asynchronously can use this to discover dependencies without
+/// maintaining a second JavaScript source scanner. Dynamic imports remain runtime operations and
+/// are not included.
+pub fn module_requests(src: &str) -> Result<Vec<ModuleRequest>, ParseError> {
+    let body = parser::parse_module(src).map_err(|error| ParseError {
+        message: error.message,
+        line: error.line,
+        at_eof: error.at_eof,
+    })?;
+    Ok(modules::module_dependency_specifiers(&body)
+        .into_iter()
+        .map(|(specifier, attribute_type)| ModuleRequest {
+            specifier,
+            attribute_type,
+        })
+        .collect())
 }
 
 /// A JavaScript engine instance: one realm (global object + intrinsics) that persists across
@@ -371,7 +441,9 @@ pub fn collect_quiescent_realms() {
         let remaining = crate::value::live_objects();
         // Sweeping a retired function can drop native code whose constant
         // handles rooted other cycles during this pass. Finish those next.
-        if remaining >= previous { break; }
+        if remaining >= previous {
+            break;
+        }
         previous = remaining;
     }
     drop(collector);
@@ -437,7 +509,9 @@ impl Engine {
     /// Select compact (16) or measured hot (64) native code alignment for future compilations.
     /// Existing code remains valid; extra padding stays subject to the host arena budget.
     pub fn set_jit_alignment(&mut self, alignment: usize) -> bool {
-        if !matches!(alignment, 16 | 64) { return false; }
+        if !matches!(alignment, 16 | 64) {
+            return false;
+        }
         self.interp.jit_alignment = alignment;
         true
     }
@@ -502,7 +576,11 @@ impl Engine {
     /// `"use strict"` directive in the source also enables it.
     pub fn eval(&mut self, src: &str, strict: bool) -> Result<Completion, ParseError> {
         if native_ops::dynamic_code_disabled() {
-            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+            return Err(ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            });
         }
         let body = parser::parse_script(src, strict).map_err(|e| ParseError {
             message: e.message,
@@ -539,7 +617,11 @@ impl Engine {
         strict: bool,
     ) -> Result<Completion, ParseError> {
         if native_ops::dynamic_code_disabled() {
-            return Err(ParseError { message: "source snapshots are unavailable in the Aot profile".into(), line: 0, at_eof: false });
+            return Err(ParseError {
+                message: "source snapshots are unavailable in the Aot profile".into(),
+                line: 0,
+                at_eof: false,
+            });
         }
         let body = snapshot::decode(bytes, src).map_err(|message| ParseError {
             message,
@@ -568,7 +650,11 @@ impl Engine {
     /// that fails validation (built by another lumen version, corrupt) is `Err(ParseError)`.
     pub fn load_precompiled(&mut self, blob: &Precompiled) -> Result<Completion, ParseError> {
         if native_ops::dynamic_code_disabled() {
-            return Err(ParseError { message: "bytecode loading is unavailable in native execution".into(), line: 0, at_eof: false });
+            return Err(ParseError {
+                message: "bytecode loading is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            });
         }
         let bad = |message: String| ParseError {
             message,
@@ -611,7 +697,10 @@ impl Engine {
 
     /// Load uploaded bytes without requiring static storage. Functions and registered
     /// modules retain the blob's backing until their last reference is released.
-    pub fn load_precompiled_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<Completion, ParseError> {
+    pub fn load_precompiled_owned(
+        &mut self,
+        bytes: std::sync::Arc<[u8]>,
+    ) -> Result<Completion, ParseError> {
         self.load_precompiled(&Precompiled::from_bytes(bytes))
     }
 
@@ -624,7 +713,13 @@ impl Engine {
         allowed_keys: &[[u8; 32]],
         allow_unsigned: bool,
     ) -> Result<Completion, String> {
-        let value = native_aot::load_engine(&mut self.interp, bytes, signature, allowed_keys, allow_unsigned)?;
+        let value = native_aot::load_engine(
+            &mut self.interp,
+            bytes,
+            signature,
+            allowed_keys,
+            allow_unsigned,
+        )?;
         Ok(Completion::Value(self.render(&value)))
     }
 
@@ -669,6 +764,37 @@ impl Engine {
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
     }
 
+    /// Route dynamic `import()` requests to an asynchronous host. Static module
+    /// linking keeps using the loader passed to `eval_module_attrs_pending`;
+    /// hosts complete these requests after preparing the graph.
+    #[cfg(feature = "embed")]
+    pub fn set_async_module_import_handler(
+        &mut self,
+        handler: impl Fn(AsyncModuleImportRequest) + 'static,
+    ) {
+        self.interp.async_module_import_handler = Some(std::rc::Rc::new(handler));
+    }
+
+    /// Complete a request previously delivered to the async module handler.
+    /// The returned handle tracks the module's evaluation, including TLA; the
+    /// original `import()` promise resolves to its namespace after evaluation.
+    #[cfg(feature = "embed")]
+    pub fn complete_async_module_import(
+        &mut self,
+        id: u64,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<ModuleEvaluationHandle, String> {
+        let (namespace, promise) = self.interp.complete_async_module_import(id, loader)?;
+        Ok(ModuleEvaluationHandle { promise, namespace })
+    }
+
+    /// Reject an asynchronous dynamic import whose managed fetch or graph
+    /// preparation failed. The returned promise receives a TypeError rejection.
+    #[cfg(feature = "embed")]
+    pub fn reject_async_module_import(&mut self, id: u64, message: &str) -> Result<(), String> {
+        self.interp.reject_async_module_import(id, message)
+    }
+
     /// The default referrer for a bare `import()` in script code (so relative specifiers resolve).
     pub fn set_import_base(&mut self, base: &str) {
         self.interp.import_base = base.to_string();
@@ -695,7 +821,10 @@ impl Engine {
     }
 
     /// Resolve host JSX configuration per source file, before applying its pragmas.
-    pub fn set_jsx_options_loader(&mut self, loader: impl Fn(&str, &JsxOptions) -> Result<JsxOptions, String> + 'static) {
+    pub fn set_jsx_options_loader(
+        &mut self,
+        loader: impl Fn(&str, &JsxOptions) -> Result<JsxOptions, String> + 'static,
+    ) {
         self.interp.jsx_options_loader = Some(std::rc::Rc::new(loader));
     }
 
@@ -707,7 +836,9 @@ impl Engine {
         typescript: bool,
         loader: impl Fn(&str, &str) -> Option<(String, String)> + 'static,
     ) -> Result<Completion, ParseError> {
-        self.interp.jsx_module_keys.insert(key.to_string(), typescript);
+        self.interp
+            .jsx_module_keys
+            .insert(key.to_string(), typescript);
         self.eval_module(src, key, loader)
     }
 
@@ -720,7 +851,11 @@ impl Engine {
         loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
     ) -> Result<Completion, ParseError> {
         if native_ops::dynamic_code_disabled() {
-            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+            return Err(ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            });
         }
         self.interp.module_loader = Some(std::rc::Rc::new(loader));
         let result = self.interp.load_module(key, src);
@@ -729,6 +864,77 @@ impl Engine {
             Ok(_) => Completion::Value(String::new()),
             Err(a) => self.describe_throw(interpreter::abrupt_value(a)),
         })
+    }
+
+    /// Parse, link, and start evaluating a module graph, returning its actual evaluation promise
+    /// without draining the agent's timer loop. `record_key` is the module-map identity, while
+    /// `module_url` is the URL used for relative imports and `import.meta.url`; inline HTML modules
+    /// use a unique record key and the owning document URL here.
+    #[cfg(feature = "embed")]
+    pub fn eval_module_attrs_pending(
+        &mut self,
+        src: &str,
+        record_key: &str,
+        module_url: &str,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<ModuleEvaluationHandle, ParseError> {
+        self.eval_module_attrs_pending_with_base(src, record_key, module_url, module_url, loader)
+    }
+
+    /// Like [`Self::eval_module_attrs_pending`], but separates the module's visible URL
+    /// (`import.meta.url`) from the base used for its static imports. Inline HTML modules use the
+    /// document URL for `import.meta.url` and the document base URL for their imports.
+    #[cfg(feature = "embed")]
+    pub fn eval_module_attrs_pending_with_base(
+        &mut self,
+        src: &str,
+        record_key: &str,
+        module_url: &str,
+        resolution_url: &str,
+        loader: impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> + 'static,
+    ) -> Result<ModuleEvaluationHandle, ParseError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            });
+        }
+        self.interp.module_loader = Some(std::rc::Rc::new(loader));
+        let (namespace, promise) = match self.interp.start_module_with_base(
+            record_key,
+            src,
+            module_url,
+            resolution_url,
+            true,
+        ) {
+            Ok((namespace, promise)) => (namespace, promise),
+            Err(error) => {
+                let promise = self.interp.new_promise();
+                // The host consumes this promise and dispatches the corresponding script error.
+                // Mark it handled before rejecting so Node's rejection policy cannot claim it.
+                self.interp.observe_promise_for_host(&promise);
+                self.interp
+                    .reject_promise(&promise, interpreter::abrupt_value(error));
+                (embed::Value::Undefined, promise)
+            }
+        };
+        Ok(ModuleEvaluationHandle { promise, namespace })
+    }
+
+    /// Poll the promise returned by [`Engine::eval_module_attrs_pending`]. Call after normal
+    /// engine/runtime job checkpoints; this method itself never runs JavaScript.
+    #[cfg(feature = "embed")]
+    pub fn module_evaluation_status(
+        &self,
+        handle: &ModuleEvaluationHandle,
+    ) -> ModuleEvaluationStatus {
+        match self.interp.promise_state_for_host(&handle.promise) {
+            Some((0, _)) => ModuleEvaluationStatus::Pending,
+            Some((1, _)) => ModuleEvaluationStatus::Fulfilled,
+            Some((2, reason)) => ModuleEvaluationStatus::Rejected(reason),
+            _ => ModuleEvaluationStatus::Fulfilled,
+        }
     }
 
     /// Select the execution tier (see [`bytecode::Tier`]). `Interp` never touches any codegen
@@ -866,7 +1072,9 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    fn describe_throw(&mut self, thrown: Value) -> Completion {
+    /// Describe a thrown value using the same error rendering as `eval`, without running a
+    /// microtask checkpoint. Embedders using `eval_value` own the checkpoint ordering.
+    pub fn describe_throw(&mut self, thrown: Value) -> Completion {
         // A rejected TypeScript source reports as Node prints it (its `stack` and `code`),
         // with an empty name: callers print the message alone.
         if let Some(text) = self.ts_uncaught_text(&thrown) {
@@ -905,11 +1113,16 @@ impl Engine {
 /// published crate; it stabilizes together with the `lumen-host`/`lumen-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
+    pub use crate::embed_realms::{
+        HostGlobalThisError, HostRealmDisposeError, HostRealmEvalError, HostRealmScopeError,
+        RealmHandle, WindowProxyDisposition, WindowProxyError, WindowProxyOperation,
+        WindowProxyPolicy, WindowProxyResult,
+    };
     pub use crate::host::{OpState, ResourceId, ResourceTable};
+    pub use crate::interpreter::SharedBufferHandle;
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
-    pub use crate::interpreter::Interp as Ctx;
-    pub use crate::interpreter::SharedBufferHandle;
+    pub use crate::interpreter::{abrupt_value, Interp as Ctx};
     /// JS values. Matching/constructing the primitive variants is supported API; object
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
@@ -924,10 +1137,10 @@ pub mod embed {
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
-    /// The language-neutral op error (maps to `TypeError` / `RangeError` / `Error`).
-    pub use lumen_common::native::{ErrorKind as NativeErrorKind, NativeError, NativeResult};
     /// The binding framework (declare natives with `lumen_bind::{op, class, methods, module}`).
     pub use lumen_bind::{self as bind, State, This};
+    /// The language-neutral op error (maps to `TypeError` / `RangeError` / `Error`).
+    pub use lumen_common::native::{ErrorKind as NativeErrorKind, NativeError, NativeResult};
 }
 
 /// Embedder methods (`feature = "embed"`). Native functions registered here are bare `fn`
@@ -947,8 +1160,23 @@ impl Engine {
         native_aot::load_static_glue_engine(&mut self.interp, bytes)
     }
 
+    /// Run static AOT bootstrap glue in a registered host realm without draining shared jobs.
     #[cfg(feature = "aot-native")]
-    pub fn validate_native_install(&self, bytes: &[u8], additional_modules: &[&str]) -> Result<(), String> {
+    pub fn load_native_glue_value_in_host_realm(
+        &mut self,
+        realm: &embed::RealmHandle,
+        bytes: &'static [u8],
+    ) -> Result<Result<embed::Value, String>, embed::HostRealmScopeError> {
+        self.interp
+            .with_host_realm(realm, |ctx| native_aot::load_static_glue_engine(ctx, bytes))
+    }
+
+    #[cfg(feature = "aot-native")]
+    pub fn validate_native_install(
+        &self,
+        bytes: &[u8],
+        additional_modules: &[&str],
+    ) -> Result<(), String> {
         native_aot::validate_install(&self.interp, bytes, additional_modules)
     }
 
@@ -961,7 +1189,13 @@ impl Engine {
         allowed_keys: &[[u8; 32]],
         allow_unsigned: bool,
     ) -> Result<embed::Value, String> {
-        native_aot::load_engine(&mut self.interp, bytes, signature, allowed_keys, allow_unsigned)
+        native_aot::load_engine(
+            &mut self.interp,
+            bytes,
+            signature,
+            allowed_keys,
+            allow_unsigned,
+        )
     }
 
     /// Load process-linked code and its writable GOT without copying executable pages.
@@ -971,15 +1205,25 @@ impl Engine {
     /// must be serialized with all other loads of this same linked image.
     #[cfg(feature = "aot-native")]
     pub unsafe fn load_native_linked_value_owned(
-        &mut self, bytes: std::sync::Arc<[u8]>, code: *const u8, code_len: usize,
-        got: *mut usize, got_len: usize,
+        &mut self,
+        bytes: std::sync::Arc<[u8]>,
+        code: *const u8,
+        code_len: usize,
+        got: *mut usize,
+        got_len: usize,
     ) -> Result<embed::Value, String> {
-        unsafe { native_aot::load_linked_engine(&mut self.interp, bytes, code, code_len, got, got_len) }
+        unsafe {
+            native_aot::load_linked_engine(&mut self.interp, bytes, code, code_len, got, got_len)
+        }
     }
 
-    /// The realm's global object — the root from which an embedder reaches user-defined JS
-    /// (e.g. `ctx().get_member(&engine.global_this(), "myCallback")`).
+    /// The realm's published global-this value, which may be a host-managed WindowProxy.
     pub fn global_this(&self) -> embed::Value {
+        self.interp.global_this()
+    }
+
+    /// The realm's backing global object used for host installation and global bindings.
+    pub fn global_object(&self) -> embed::Value {
         Value::Obj(self.interp.global.clone())
     }
 
@@ -996,8 +1240,7 @@ impl Engine {
         }
         let catalog = target::host().builtin_modules_hash;
         if catalog == target::EMPTY_BUILTIN_MODULES_HASH
-            || (catalog == target::PARALLEL_BUILTIN_MODULES_HASH
-                && specifier != "lumen:parallel")
+            || (catalog == target::PARALLEL_BUILTIN_MODULES_HASH && specifier != "lumen:parallel")
         {
             return Err("module is absent from the built-in native catalog");
         }
@@ -1032,10 +1275,16 @@ impl Engine {
         {
             return Err("native binding is absent from the built-in catalog");
         }
-        if self.interp.native_bindings.contains_key(&(module.clone(), name.clone())) {
+        if self
+            .interp
+            .native_bindings
+            .contains_key(&(module.clone(), name.clone()))
+        {
             return Err("native binding already registered");
         }
-        self.interp.native_bindings.insert((module, name), (signature_hash, address));
+        self.interp
+            .native_bindings
+            .insert((module, name), (signature_hash, address));
         Ok(())
     }
 
@@ -1048,7 +1297,11 @@ impl Engine {
         src: &str,
     ) -> Result<Result<embed::Value, embed::Value>, ParseError> {
         if native_ops::dynamic_code_disabled() {
-            return Err(ParseError { message: "dynamic code is unavailable in native execution".into(), line: 0, at_eof: false });
+            return Err(ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            });
         }
         let body = parser::parse_script(src, false).map_err(|e| ParseError {
             message: e.message,
@@ -1064,6 +1317,96 @@ impl Engine {
             Ok(Value::Empty) => Ok(Value::Undefined),
             result => result,
         })
+    }
+
+    /// Parse and execute a classic Script in a registered host realm without running a
+    /// microtask checkpoint. This is for host bootstrap scripts whose jobs belong to the
+    /// Runtime's shared event loop. Script lexical declarations persist in that realm.
+    pub fn eval_value_in_host_realm(
+        &mut self,
+        realm: &embed::RealmHandle,
+        src: &str,
+        strict: bool,
+    ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(embed::HostRealmEvalError::Parse(ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            }));
+        }
+        let body = parser::parse_script(src, strict).map_err(|error| {
+            embed::HostRealmEvalError::Parse(ParseError {
+                message: error.message,
+                line: error.line,
+                at_eof: error.at_eof,
+            })
+        })?;
+        self.run_script_body_in_host_realm(realm, body, strict)
+    }
+
+    /// Decode and execute a classic Script snapshot in a registered host realm without running
+    /// a microtask checkpoint. The source is required because lazily decoded functions retain
+    /// source ranges into it.
+    pub fn eval_snapshot_value_in_host_realm(
+        &mut self,
+        realm: &embed::RealmHandle,
+        bytes: &[u8],
+        src: &str,
+        strict: bool,
+    ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
+        self.eval_snapshot_shared_source_in_host_realm(realm, bytes, std::rc::Rc::from(src), strict)
+    }
+
+    /// Variant of [`Self::eval_snapshot_value_in_host_realm`] that accepts a shared source
+    /// allocation. The parsed AST remains realm-local, while its lazy function bodies retain a
+    /// clone of this `Rc<str>` instead of copying the source for each realm.
+    pub fn eval_snapshot_shared_source_in_host_realm(
+        &mut self,
+        realm: &embed::RealmHandle,
+        bytes: &[u8],
+        src: std::rc::Rc<str>,
+        strict: bool,
+    ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
+        if native_ops::dynamic_code_disabled() {
+            return Err(embed::HostRealmEvalError::Parse(ParseError {
+                message: "source snapshots are unavailable in the Aot profile".into(),
+                line: 0,
+                at_eof: false,
+            }));
+        }
+        let body = snapshot::decode_shared(bytes, src).map_err(|message| {
+            embed::HostRealmEvalError::Parse(ParseError {
+                message,
+                line: 0,
+                at_eof: false,
+            })
+        })?;
+        self.run_script_body_in_host_realm(realm, body, strict)
+    }
+
+    fn run_script_body_in_host_realm(
+        &mut self,
+        realm: &embed::RealmHandle,
+        body: Vec<ast::Stmt>,
+        strict: bool,
+    ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
+        let directive_strict = matches!(
+            body.first(),
+            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
+        );
+        self.interp
+            .with_host_realm(realm, |ctx| {
+                let old_strict = ctx.strict;
+                ctx.strict = strict || directive_strict;
+                let result = ctx.run_program_parsed(&body).map(|value| match value {
+                    Value::Empty => Value::Undefined,
+                    value => value,
+                });
+                ctx.strict = old_strict;
+                result
+            })
+            .map_err(embed::HostRealmEvalError::Scope)
     }
 
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
@@ -1109,7 +1452,9 @@ impl Engine {
         // bytes. Its driver is active, but moving those bytes would invalidate the borrow.
         // This registry count includes both generators and ordinary async coroutines
         // retained by promise data; no heap scan or generator-only ownership assumption.
-        if crate::lstr::views_can_compact() { crate::lstr::compact_views(); }
+        if crate::lstr::views_can_compact() {
+            crate::lstr::compact_views();
+        }
     }
 
     /// `(roots, views, root bytes)` of the string-view registry (see `lstr`), for tests and
@@ -1147,7 +1492,9 @@ impl Engine {
     /// Start recording rejections that get a handler after being reported unhandled (see
     /// [`Engine::take_late_handled_rejections`]).
     pub fn track_late_handled_rejections(&mut self) {
-        self.interp.late_handled_rejections.get_or_insert_with(Vec::new);
+        self.interp
+            .late_handled_rejections
+            .get_or_insert_with(Vec::new);
     }
 
     /// Promises reported by [`Engine::take_unhandled_rejections_full`] that have since been

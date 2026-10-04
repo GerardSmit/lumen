@@ -72,15 +72,21 @@ fn real_main() {
     match lumen_os::embedded::blob() {
         Ok(Some(blob)) => {
             let mut runtime = Runtime::new();
-            if let Err(message) = runtime.install_embedded_assets(blob) { die(1, &message); }
+            if let Err(message) = runtime.install_embedded_assets(blob) {
+                die(1, &message);
+            }
             runtime.set_process_args(&all_args[0], &[], &all_args);
-            let native = blob.get(8..12).is_some_and(|bytes| bytes == 7u32.to_le_bytes());
+            let native = blob
+                .get(8..12)
+                .is_some_and(|bytes| bytes == 7u32.to_le_bytes());
             let result = if native {
                 runtime.run_native_owned(blob.into())
             } else {
                 runtime.run_precompiled(&lumen::Precompiled::from_static(blob))
             };
-            if let Err(message) = result { die(1, &message); }
+            if let Err(message) = result {
+                die(1, &message);
+            }
             finish(&mut runtime);
             return;
         }
@@ -88,8 +94,12 @@ fn real_main() {
         Err(message) => die(1, &message),
     }
     if all_args.get(1).map(String::as_str) == Some("record-profile")
-        || (all_args.get(1).map(String::as_str) == Some("run") && all_args.iter().any(|arg| arg == "--record-profile")) {
-        if let Err(message) = aot::record_profile(&all_args[2..]) { die(1, &message); }
+        || (all_args.get(1).map(String::as_str) == Some("run")
+            && all_args.iter().any(|arg| arg == "--record-profile"))
+    {
+        if let Err(message) = aot::record_profile(&all_args[2..]) {
+            die(1, &message);
+        }
         return;
     }
     if all_args.get(1).map(String::as_str) == Some("compile") {

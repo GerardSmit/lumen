@@ -228,7 +228,9 @@ fn parse(object: &Map<String, Value>, root: &Path) -> Result<Config, String> {
                     }
                     result.signing_key = Some(if let Some(file) = key.strip_prefix("file:") {
                         format!("file:{}", root.join(file).display())
-                    } else { key.to_owned() });
+                    } else {
+                        key.to_owned()
+                    });
                 }
             }
             "trim" => {
@@ -277,18 +279,31 @@ fn parse(object: &Map<String, Value>, root: &Path) -> Result<Config, String> {
             }
             "targets" => {
                 for (name, value) in value.as_object().ok_or("targets must be an object")? {
-                    if name.is_empty() { return Err("target name must not be empty".into()); }
+                    if name.is_empty() {
+                        return Err("target name must not be empty".into());
+                    }
                     let mut target = NamedTarget::default();
                     for (key, value) in value.as_object().ok_or("named target must be an object")? {
                         let key = snake_to_camel(key);
                         let text = string(value, &key)?;
                         match key.as_str() {
-                            "exe" => { target.executable = true; target.output = Some(root.join(text)); }
+                            "exe" => {
+                                target.executable = true;
+                                target.output = Some(root.join(text));
+                            }
                             "out" => target.output = Some(root.join(text)),
-                            "os" if matches!(text, "windows" | "linux" | "macos") => target.os = Some(text.into()),
-                            "arch" if matches!(text, "x86_64" | "aarch64") => target.arch = Some(text.into()),
-                            "mode" if matches!(text, "stub" | "link") => target.mode = Some(text.into()),
-                            "subsystem" if matches!(text, "gui" | "console") => target.gui = text == "gui",
+                            "os" if matches!(text, "windows" | "linux" | "macos") => {
+                                target.os = Some(text.into())
+                            }
+                            "arch" if matches!(text, "x86_64" | "aarch64") => {
+                                target.arch = Some(text.into())
+                            }
+                            "mode" if matches!(text, "stub" | "link") => {
+                                target.mode = Some(text.into())
+                            }
+                            "subsystem" if matches!(text, "gui" | "console") => {
+                                target.gui = text == "gui"
+                            }
                             "device" => target.device = Some(text.into()),
                             "descriptor" => target.descriptor = Some(root.join(text)),
                             "icon" => target.icon = Some(root.join(text)),
@@ -297,7 +312,9 @@ fn parse(object: &Map<String, Value>, root: &Path) -> Result<Config, String> {
                             _ => return Err(format!("invalid named target option {name}.{key}")),
                         }
                     }
-                    if target.device.is_some() && target.descriptor.is_some() { return Err("named target cannot combine device and descriptor".into()); }
+                    if target.device.is_some() && target.descriptor.is_some() {
+                        return Err("named target cannot combine device and descriptor".into());
+                    }
                     result.targets.insert(name.clone(), target);
                 }
             }
@@ -318,8 +335,13 @@ fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
 
 pub(crate) fn valid_locale(locale: &str) -> bool {
     let language = locale.split('-').next().unwrap_or_default();
-    (2..=8).contains(&language.len()) && language.bytes().all(|byte| byte.is_ascii_alphabetic())
-        && locale.split('-').all(|part| !part.is_empty() && part.len() <= 8 && part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    (2..=8).contains(&language.len())
+        && language.bytes().all(|byte| byte.is_ascii_alphabetic())
+        && locale.split('-').all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 fn boolean(value: &Value, key: &str) -> Result<bool, String> {
     value
@@ -384,10 +406,16 @@ mod tests {
     fn rejects_unknown_keys_and_unsupported_codecs() {
         let typo = serde_json::json!({"stripLins": true});
         assert!(parse(typo.as_object().unwrap(), Path::new("."))
-            .err().unwrap().contains("stripLines"));
+            .err()
+            .unwrap()
+            .contains("stripLines"));
         let codec = serde_json::json!({"compression": "zstd"});
-        assert_eq!(parse(codec.as_object().unwrap(), Path::new("."))
-            .unwrap().unsupported, ["compression"]);
+        assert_eq!(
+            parse(codec.as_object().unwrap(), Path::new("."))
+                .unwrap()
+                .unsupported,
+            ["compression"]
+        );
     }
 
     #[test]

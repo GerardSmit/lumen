@@ -78,7 +78,10 @@ fn op_compile_function(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Va
             .and_then(|l| l.as_num_opt())
             .unwrap_or(0.0) as usize;
         (0..n)
-            .map(|k| ctx.get_member(v, &k.to_string()).unwrap_or(Value::Undefined))
+            .map(|k| {
+                ctx.get_member(v, &k.to_string())
+                    .unwrap_or(Value::Undefined)
+            })
             .collect()
     };
     let params = list(ctx, args.get(2))

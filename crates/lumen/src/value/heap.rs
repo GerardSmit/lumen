@@ -58,11 +58,7 @@ const fn round_up(n: usize, align: usize) -> usize {
     n.div_ceil(align) * align
 }
 const fn max(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
+    if a > b { a } else { b }
 }
 /// Offset of the inline property area from the start of its box. Sizes and alignments differ
 /// by pointer width (on wasm32 / armv7 `Property` can be more aligned than `GcBox`'s size), so
@@ -248,7 +244,7 @@ mod os {
     #[link(name = "kernel32")]
     extern "system" {
         pub fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32)
-            -> *mut c_void;
+        -> *mut c_void;
         pub fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
     }
 }

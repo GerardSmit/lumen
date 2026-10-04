@@ -7,6 +7,11 @@ impl Lexer<'_> {
         if tail.starts_with('>') {
             return true;
         }
+        // A JSX fragment may contain spaces and comments between the angle brackets.
+        // This is distinct from `< expression`, which remains a relational operator.
+        if jsx_fragment_start(tail) {
+            return true;
+        }
         if !tail.chars().next().is_some_and(is_ident_start) {
             return false;
         }
@@ -29,13 +34,36 @@ impl Lexer<'_> {
         self.err(message)
     }
 
-    fn jsx_space(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.bump();
+    fn jsx_space(&mut self) -> Result<(), LexError> {
+        loop {
+            while self.peek().is_some_and(char::is_whitespace) {
+                self.bump();
+            }
+            if self.peek() == Some('/') && self.peek2() == Some('*') {
+                self.bump();
+                self.bump();
+                while !(self.peek() == Some('*') && self.peek2() == Some('/')) {
+                    if self.bump().is_none() {
+                        return Err(self.jsx_error("unterminated comment in JSX tag"));
+                    }
+                }
+                self.bump();
+                self.bump();
+                continue;
+            }
+            if self.peek() == Some('/') && self.peek2() == Some('/') {
+                self.bump();
+                self.bump();
+                while self.peek().is_some_and(|c| c != '\n' && c != '\r') {
+                    self.bump();
+                }
+                continue;
+            }
+            return Ok(());
         }
     }
 
-    fn jsx_name(&mut self, member: bool) -> Result<String, LexError> {
+    fn jsx_identifier(&mut self) -> Result<String, LexError> {
         let start = self.pos;
         if !self.peek().is_some_and(is_ident_start) {
             return Err(self.jsx_error("expected JSX name"));
@@ -44,16 +72,27 @@ impl Lexer<'_> {
         while self.peek().is_some_and(|c| is_ident_part(c) || c == '-') {
             self.bump();
         }
+        Ok(self.src[start..self.pos].to_string())
+    }
+
+    fn jsx_name(&mut self, member: bool) -> Result<String, LexError> {
+        let mut name = self.jsx_identifier()?;
+        self.jsx_space()?;
         if self.peek() == Some(':') {
             self.bump();
-            self.jsx_name(false)?;
+            self.jsx_space()?;
+            name.push(':');
+            name.push_str(&self.jsx_identifier()?);
         } else if member {
             while self.peek() == Some('.') {
                 self.bump();
-                self.jsx_name(false)?;
+                self.jsx_space()?;
+                name.push('.');
+                name.push_str(&self.jsx_identifier()?);
+                self.jsx_space()?;
             }
         }
-        Ok(self.src[start..self.pos].to_string())
+        Ok(name)
     }
 
     fn jsx_container(&mut self) -> Result<SubToks, LexError> {
@@ -76,15 +115,19 @@ impl Lexer<'_> {
         }
         let (start, line) = (self.pos as u32 + self.offset, self.line);
         self.bump(); // <
+        self.jsx_space()?;
         let name = if self.peek() == Some('>') {
             None
         } else {
             Some(self.jsx_name(true)?)
         };
+        if self.ts && name.is_some() && self.peek() == Some('<') {
+            self.jsx_type_arguments()?;
+        }
         let mut attributes = Vec::new();
         if name.is_some() {
             loop {
-                self.jsx_space();
+                self.jsx_space()?;
                 match self.peek() {
                     Some('>') => break,
                     Some('/') if self.peek2() == Some('>') => {
@@ -111,10 +154,10 @@ impl Lexer<'_> {
                     None => return Err(self.jsx_error("unterminated JSX opening element")),
                     _ => {
                         let key = self.jsx_name(false)?;
-                        self.jsx_space();
+                        self.jsx_space()?;
                         let value = if self.peek() == Some('=') {
                             self.bump();
-                            self.jsx_space();
+                            self.jsx_space()?;
                             Some(match self.peek() {
                                 Some(q @ ('\'' | '"')) => {
                                     self.bump();
@@ -136,7 +179,10 @@ impl Lexer<'_> {
                                 }
                                 Some('{') => {
                                     let tokens = self.jsx_container()?;
-                                    if matches!(tokens.0.get(0).map(|t| &t.kind), Some(Tok::Eof)) {
+                                    if matches!(
+                                        tokens.0.get(0).map(|token| &token.kind),
+                                        Some(Tok::Eof)
+                                    ) {
                                         return Err(self.jsx_error(
                                             "JSX attribute expression must not be empty",
                                         ));
@@ -164,12 +210,13 @@ impl Lexer<'_> {
                 Some('<') if self.peek2() == Some('/') => {
                     self.bump();
                     self.bump();
+                    self.jsx_space()?;
                     let closing = if self.peek() == Some('>') {
                         None
                     } else {
                         Some(self.jsx_name(true)?)
                     };
-                    self.jsx_space();
+                    self.jsx_space()?;
                     if closing != name {
                         return Err(self.jsx_error(format!(
                             "JSX closing tag does not match {}",
@@ -196,7 +243,7 @@ impl Lexer<'_> {
                 _ => {
                     let from = self.pos;
                     while self.peek().is_some_and(|c| c != '<' && c != '{') {
-                        if matches!(self.peek(), Some('}' | '>')) {
+                        if self.ts && matches!(self.peek(), Some('}' | '>')) {
                             return Err(self.jsx_error("unescaped '}' or '>' in JSX text"));
                         }
                         self.bump();
@@ -216,6 +263,116 @@ impl Lexer<'_> {
             end: self.pos as u32 + self.offset,
             line,
         })
+    }
+
+    /// TypeScript permits type arguments after a JSX component name. They carry no run-time
+    /// value, so the lexer consumes their balanced source form while preserving the component
+    /// name and attributes used by the runtime AST.
+    fn jsx_type_arguments(&mut self) -> Result<(), LexError> {
+        debug_assert!(self.ts && self.peek() == Some('<'));
+        self.bump();
+        let mut angles = 1usize;
+        let mut delimiters = Vec::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let mut saw_type_content = false;
+        while let Some(c) = self.peek() {
+            if let Some(q) = quote {
+                self.bump();
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    quote = None;
+                }
+                continue;
+            }
+            if matches!(c, '\'' | '"' | '`') {
+                quote = Some(c);
+                self.bump();
+                continue;
+            }
+            if c == '/' && self.peek2() == Some('/') {
+                self.bump();
+                self.bump();
+                while self.peek().is_some_and(|d| d != '\n' && d != '\r') {
+                    self.bump();
+                }
+                continue;
+            }
+            if c == '/' && self.peek2() == Some('*') {
+                self.bump();
+                self.bump();
+                while !(self.peek() == Some('*') && self.peek2() == Some('/')) {
+                    if self.bump().is_none() {
+                        return Err(self.jsx_error("unterminated comment in JSX type arguments"));
+                    }
+                }
+                self.bump();
+                self.bump();
+                continue;
+            }
+            match c {
+                '(' | '[' | '{' => delimiters.push(match c {
+                    '(' => ')',
+                    '[' => ']',
+                    _ => '}',
+                }),
+                ')' | ']' | '}' => {
+                    if delimiters.pop() != Some(c) {
+                        return Err(self.jsx_error("unbalanced JSX type arguments"));
+                    }
+                }
+                '<' if delimiters.is_empty() => angles += 1,
+                '>' if delimiters.is_empty() && !self.src[..self.pos].ends_with('=') => {
+                    angles -= 1;
+                    self.bump();
+                    if angles == 0 {
+                        if !saw_type_content {
+                            return Err(
+                                self.jsx_error("TypeScript JSX type argument list cannot be empty")
+                            );
+                        }
+                        return Ok(());
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                saw_type_content = true;
+            }
+            self.bump();
+        }
+        Err(self.jsx_error("unterminated JSX type arguments"))
+    }
+}
+
+fn jsx_fragment_start(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    loop {
+        while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            let Some(end) = tail[i + 2..].find("*/") else {
+                return false;
+            };
+            i += end + 4;
+            continue;
+        }
+        if bytes.get(i..i + 2) == Some(b"//") {
+            while bytes
+                .get(i)
+                .is_some_and(|byte| *byte != b'\n' && *byte != b'\r')
+            {
+                i += 1;
+            }
+            continue;
+        }
+        return bytes.get(i) == Some(&b'>');
     }
 }
 

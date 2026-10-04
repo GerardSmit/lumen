@@ -6,8 +6,8 @@ use crate::lexer::{tokenize_opts, LexOpts};
 use crate::token::{RegexTok, SubToks, Tok, TokVec, Token, TplPart, KEYWORDS};
 use std::rc::Rc;
 
-mod ts;
 mod jsx;
+mod ts;
 pub use crate::parser_support::*;
 pub(crate) use ts::error_span as ts_error_span;
 #[cfg(feature = "typed")]
@@ -271,9 +271,11 @@ fn parse_script_impl(
     let body = p.parse_stmts_until_eof();
     let (body, text) = match body {
         Ok(mut b) => {
-            if let Some(jsx) = &p.jsx { jsx.requires(&mut b); }
+            if let Some(jsx) = &p.jsx {
+                jsx.requires(&mut b);
+            }
             (b, finish_parse(&mut p, &docs, Ok(()), ts)?)
-        },
+        }
         Err(e) => {
             finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
             return Err(e);
@@ -334,7 +336,11 @@ pub fn parse_module_ts(src: &str) -> Result<Vec<Stmt>, ParseError> {
 }
 
 /// Parse JSX or TSX natively, with the same expression grammar and source coordinates as JS/TS.
-pub fn parse_module_jsx(src: &str, ts: bool, options: &JsxOptions) -> Result<Vec<Stmt>, ParseError> {
+pub fn parse_module_jsx(
+    src: &str,
+    ts: bool,
+    options: &JsxOptions,
+) -> Result<Vec<Stmt>, ParseError> {
     let options = options.with_pragmas(src)?;
     parse_module_impl(src, ts, false, false, Some(&options), false).map(|r| r.0)
 }
@@ -347,7 +353,13 @@ pub fn transpile_jsx(src: &str, ts: bool, options: &JsxOptions) -> Result<String
 
 pub(crate) fn jsx_path(key: &str) -> Option<bool> {
     let path = key.split(['?', '#']).next().unwrap_or(key);
-    if path.ends_with(".tsx") { Some(true) } else if path.ends_with(".jsx") { Some(false) } else { None }
+    if path.ends_with(".tsx") {
+        Some(true)
+    } else if path.ends_with(".jsx") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// A CommonJS module as the function `function (params…) { src }`, parsed with no synthesized
@@ -357,7 +369,12 @@ pub fn parse_cjs_function(src: &str, params: &[&str], ts: bool) -> Result<Functi
     parse_cjs_function_jsx(src, params, ts, None)
 }
 
-pub(crate) fn parse_cjs_function_jsx(src: &str, params: &[&str], ts: bool, jsx: Option<&JsxOptions>) -> Result<Function, ParseError> {
+pub(crate) fn parse_cjs_function_jsx(
+    src: &str,
+    params: &[&str],
+    ts: bool,
+    jsx: Option<&JsxOptions>,
+) -> Result<Function, ParseError> {
     let options = jsx.map(|options| options.with_pragmas(src)).transpose()?;
     let (body, _, strict) = parse_script_impl(
         src,
@@ -422,7 +439,18 @@ pub fn strip_types(src: &str) -> Result<String, (ParseError, Option<(u32, u32)>)
         Ok((_, text)) => Ok(text.unwrap_or_default()),
         Err(e) => {
             let at = ts::error_span();
-            match parse_script_impl(src, false, false, false, &[], true, false, true, false, None) {
+            match parse_script_impl(
+                src,
+                false,
+                false,
+                false,
+                &[],
+                true,
+                false,
+                true,
+                false,
+                None,
+            ) {
                 Ok((_, text, _)) => Ok(text.unwrap_or_default()),
                 Err(_) => Err((e, at)),
             }
@@ -493,9 +521,11 @@ fn parse_module_impl(
     let body = p.parse_stmts_until_eof();
     let (body, mut text) = match body {
         Ok(mut b) => {
-            if let Some(jsx) = &p.jsx { jsx.imports(&mut b); }
+            if let Some(jsx) = &p.jsx {
+                jsx.imports(&mut b);
+            }
             (b, finish_parse(&mut p, &docs, Ok(()), ts)?)
-        },
+        }
         Err(e) => {
             finish_parse(&mut p, &docs, Err(e.clone()), ts)?;
             return Err(e);
@@ -512,7 +542,9 @@ fn parse_module_impl(
         message,
         line: 0,
     })?;
-    if print_jsx { text = Some(p.print_jsx(text.as_deref().unwrap_or(src))?); }
+    if print_jsx {
+        text = Some(p.print_jsx(text.as_deref().unwrap_or(src))?);
+    }
     // The caller running this module names its stack-trace frames after this source.
     crate::interpreter::stack_trace::note_parsed_source(p.src.src.clone(), None);
     drop(p);
@@ -3433,7 +3465,12 @@ impl Parser {
             }
             Tok::Jsx(element) => {
                 self.advance();
-                self.jsx.as_ref().expect("JSX parser context").elements.borrow_mut().push(element.clone());
+                self.jsx
+                    .as_ref()
+                    .expect("JSX parser context")
+                    .elements
+                    .borrow_mut()
+                    .push(element.clone());
                 self.build_jsx(&element)
             }
             Tok::Regex(re) => {

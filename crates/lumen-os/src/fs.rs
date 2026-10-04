@@ -165,7 +165,12 @@ pub mod flags {
         pub const O_DIRECTORY: i32 = 0o200000;
         pub const O_NOFOLLOW: i32 = 0o400000;
     }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "android", target_arch = "wasm32")))]
+    #[cfg(not(any(
+        windows,
+        target_os = "linux",
+        target_os = "android",
+        target_arch = "wasm32"
+    )))]
     mod v {
         pub const O_WRONLY: i32 = 1;
         pub const O_RDWR: i32 = 2;
@@ -350,7 +355,10 @@ impl Timespec {
         }
         let sec = t.floor();
         let nsec = (((t - sec) * 1e9).round() as u32).min(999_999_999);
-        Timespec { sec: sec as i64, nsec }
+        Timespec {
+            sec: sec as i64,
+            nsec,
+        }
     }
 
     pub fn as_secs_f64(self) -> f64 {
@@ -359,15 +367,26 @@ impl Timespec {
 
     #[cfg_attr(windows, allow(dead_code))]
     fn from_system_time(t: Option<SystemTime>) -> Timespec {
-        let Some(t) = t else { return Timespec::default() };
+        let Some(t) = t else {
+            return Timespec::default();
+        };
         match t.duration_since(UNIX_EPOCH) {
-            Ok(d) => Timespec { sec: d.as_secs() as i64, nsec: d.subsec_nanos() },
+            Ok(d) => Timespec {
+                sec: d.as_secs() as i64,
+                nsec: d.subsec_nanos(),
+            },
             Err(e) => {
                 let d = e.duration();
                 if d.subsec_nanos() == 0 {
-                    Timespec { sec: -(d.as_secs() as i64), nsec: 0 }
+                    Timespec {
+                        sec: -(d.as_secs() as i64),
+                        nsec: 0,
+                    }
                 } else {
-                    Timespec { sec: -(d.as_secs() as i64) - 1, nsec: 1_000_000_000 - d.subsec_nanos() }
+                    Timespec {
+                        sec: -(d.as_secs() as i64) - 1,
+                        nsec: 1_000_000_000 - d.subsec_nanos(),
+                    }
                 }
             }
         }
@@ -426,9 +445,18 @@ fn stat_of(m: &std::fs::Metadata) -> Stat {
         ino: m.ino(),
         size: m.size(),
         blocks: m.blocks(),
-        atime: Timespec { sec: m.atime(), nsec: m.atime_nsec() as u32 },
-        mtime: Timespec { sec: m.mtime(), nsec: m.mtime_nsec() as u32 },
-        ctime: Timespec { sec: m.ctime(), nsec: m.ctime_nsec() as u32 },
+        atime: Timespec {
+            sec: m.atime(),
+            nsec: m.atime_nsec() as u32,
+        },
+        mtime: Timespec {
+            sec: m.mtime(),
+            nsec: m.mtime_nsec() as u32,
+        },
+        ctime: Timespec {
+            sec: m.ctime(),
+            nsec: m.ctime_nsec() as u32,
+        },
         birthtime: Timespec::from_system_time(m.created().ok()),
     }
 }
@@ -492,7 +520,12 @@ mod win {
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetFileInformationByHandle(h: HANDLE, info: *mut ByHandleInfo) -> i32;
-        pub fn GetFileInformationByHandleEx(h: HANDLE, class: i32, info: *mut c_void, size: u32) -> i32;
+        pub fn GetFileInformationByHandleEx(
+            h: HANDLE,
+            class: i32,
+            info: *mut c_void,
+            size: u32,
+        ) -> i32;
         pub fn GetFileType(h: HANDLE) -> u32;
         pub fn GetVolumePathNameW(path: *const u16, out: *mut u16, len: u32) -> i32;
         pub fn GetDiskFreeSpaceW(
@@ -516,7 +549,10 @@ mod win {
 
     pub fn wide(s: &str) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;
-        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
     }
 }
 
@@ -524,7 +560,10 @@ mod win {
 #[cfg(windows)]
 fn filetime(t: i64) -> Timespec {
     let unix = t - 116_444_736_000_000_000;
-    Timespec { sec: unix.div_euclid(10_000_000), nsec: (unix.rem_euclid(10_000_000) * 100) as u32 }
+    Timespec {
+        sec: unix.div_euclid(10_000_000),
+        nsec: (unix.rem_euclid(10_000_000) * 100) as u32,
+    }
 }
 
 /// libuv's `fs__stat_handle`: stat by handle, as the CRT never could (ino, dev, nlink, ctime).
@@ -538,7 +577,12 @@ fn handle_stat(f: &File) -> R<Stat> {
         if kind == 2 || kind == 3 {
             // A console or a pipe: libuv reports a character device / FIFO with no times.
             let ty = if kind == 2 { S_IFCHR } else { S_IFIFO };
-            return Ok(Stat { mode: ty + 0o666, nlink: 1, blksize: 4096, ..Stat::default() });
+            return Ok(Stat {
+                mode: ty + 0o666,
+                nlink: 1,
+                blksize: 4096,
+                ..Stat::default()
+            });
         }
         let mut bh = win::ByHandleInfo::default();
         if win::GetFileInformationByHandle(h, &mut bh) == 0 {
@@ -712,7 +756,8 @@ pub fn statfs(path: &str) -> R<StatFs> {
             if win::GetVolumePathNameW(wpath.as_ptr(), root.as_mut_ptr(), root.len() as u32) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            if win::GetDiskFreeSpaceW(root.as_ptr(), &mut spc, &mut bps, &mut free, &mut total) == 0 {
+            if win::GetDiskFreeSpaceW(root.as_ptr(), &mut spc, &mut bps, &mut free, &mut total) == 0
+            {
                 return Err(std::io::Error::last_os_error().into());
             }
         }
@@ -725,7 +770,12 @@ pub fn statfs(path: &str) -> R<StatFs> {
             ffree: 0,
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )))]
     {
         let _ = path;
         Err(FsError("ENOSYS"))
@@ -846,7 +896,8 @@ pub fn fchmod(fd: i32, mode: u32) -> R<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        e.file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        e.file
+            .set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
     {
@@ -1039,7 +1090,10 @@ pub fn readdir(path: &str) -> R<Vec<(String, DirentKind)>> {
     let rd = match std::fs::read_dir(path) {
         Ok(rd) => rd,
         Err(e) => {
-            if std::fs::metadata(path).map(|m| !m.is_dir()).unwrap_or(false) {
+            if std::fs::metadata(path)
+                .map(|m| !m.is_dir())
+                .unwrap_or(false)
+            {
                 return Err(FsError("ENOTDIR"));
             }
             return Err(e.into());
@@ -1300,7 +1354,10 @@ mod tests {
         std::env::temp_dir().join(format!(
             "lumen-os-{tag}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ))
     }
 
@@ -1320,7 +1377,10 @@ mod tests {
         assert!(!is_open(fd));
         let entry = get(fd).expect("borrow native descriptor");
         assert_ne!(entry.file.as_raw_fd(), fd);
-        assert_ne!(unsafe { libc::fcntl(entry.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC, 0);
+        assert_ne!(
+            unsafe { libc::fcntl(entry.file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
         assert_eq!(fstat(fd).expect("stat").size, 6);
         let mut bytes = [0; 3];
         assert_eq!(read_entry_raw(&entry, &mut bytes, None).ok(), Some(3));
@@ -1349,7 +1409,12 @@ mod tests {
     #[test]
     fn open_write_read_stat_round_trip() {
         let dir = tmp("rt");
-        assert_eq!(mkdir(dir.to_str().unwrap(), 0o755, true).unwrap().as_deref(), dir.to_str());
+        assert_eq!(
+            mkdir(dir.to_str().unwrap(), 0o755, true)
+                .unwrap()
+                .as_deref(),
+            dir.to_str()
+        );
         let path = dir.join("f.txt");
         let p = path.to_str().unwrap();
         let fd = open(p, O_CREAT | O_RDWR, 0o644).unwrap();
@@ -1364,31 +1429,66 @@ mod tests {
         close(fd).unwrap();
         assert_eq!(close(fd).unwrap_err().code(), "EBADF");
 
-        utimes(p, Timespec { sec: 1_000_000, nsec: 500 }, Timespec { sec: -5, nsec: 250_000_000 }, true).unwrap();
+        utimes(
+            p,
+            Timespec {
+                sec: 1_000_000,
+                nsec: 500,
+            },
+            Timespec {
+                sec: -5,
+                nsec: 250_000_000,
+            },
+            true,
+        )
+        .unwrap();
         let st = stat(p, true).unwrap();
         assert_eq!(st.atime.sec, 1_000_000);
-        assert_eq!(st.mtime, Timespec { sec: -5, nsec: 250_000_000 });
+        assert_eq!(
+            st.mtime,
+            Timespec {
+                sec: -5,
+                nsec: 250_000_000
+            }
+        );
 
         let names: Vec<_> = readdir(dir.to_str().unwrap()).unwrap();
         assert_eq!(names, vec![("f.txt".to_string(), DirentKind::File)]);
         assert_eq!(readdir(p).unwrap_err().code(), "ENOTDIR");
         assert_eq!(mkdir(p, 0o755, true).unwrap_err().code(), "EEXIST");
-        assert_eq!(stat(dir.join("none").to_str().unwrap(), true).unwrap_err().code(), "ENOENT");
+        assert_eq!(
+            stat(dir.join("none").to_str().unwrap(), true)
+                .unwrap_err()
+                .code(),
+            "ENOENT"
+        );
 
         let link = dir.join("l");
         symlink(p, link.to_str().unwrap(), 0).unwrap();
         assert_eq!(readlink(link.to_str().unwrap()).unwrap(), p);
-        assert_eq!(stat(link.to_str().unwrap(), false).unwrap().mode & S_IFMT, S_IFLNK);
-        assert_eq!(realpath(link.to_str().unwrap()).unwrap(), std::fs::canonicalize(p).unwrap().to_str().unwrap());
+        assert_eq!(
+            stat(link.to_str().unwrap(), false).unwrap().mode & S_IFMT,
+            S_IFLNK
+        );
+        assert_eq!(
+            realpath(link.to_str().unwrap()).unwrap(),
+            std::fs::canonicalize(p).unwrap().to_str().unwrap()
+        );
 
         let copy = dir.join("c");
         copy_file(p, copy.to_str().unwrap(), 0).unwrap();
-        assert_eq!(copy_file(p, copy.to_str().unwrap(), 1).unwrap_err().code(), "EEXIST");
+        assert_eq!(
+            copy_file(p, copy.to_str().unwrap(), 1).unwrap_err().code(),
+            "EEXIST"
+        );
         assert_eq!(read_file(copy.to_str().unwrap(), 0).unwrap(), b"hello");
         write_file(copy.to_str().unwrap(), b"x", O_WRONLY | O_TRUNC, 0o644).unwrap();
         assert_eq!(read_file(copy.to_str().unwrap(), 0).unwrap(), b"x");
         assert!(access(p, 4).is_ok());
-        assert_eq!(rmdir(dir.to_str().unwrap()).unwrap_err().code(), "ENOTEMPTY");
+        assert_eq!(
+            rmdir(dir.to_str().unwrap()).unwrap_err().code(),
+            "ENOTEMPTY"
+        );
         for n in ["l", "c", "f.txt"] {
             unlink(dir.join(n).to_str().unwrap()).unwrap();
         }
@@ -1398,8 +1498,20 @@ mod tests {
 
     #[test]
     fn timespec_conversions() {
-        assert_eq!(Timespec::from_secs_f64(1.5), Timespec { sec: 1, nsec: 500_000_000 });
-        assert_eq!(Timespec::from_secs_f64(-0.25), Timespec { sec: -1, nsec: 750_000_000 });
+        assert_eq!(
+            Timespec::from_secs_f64(1.5),
+            Timespec {
+                sec: 1,
+                nsec: 500_000_000
+            }
+        );
+        assert_eq!(
+            Timespec::from_secs_f64(-0.25),
+            Timespec {
+                sec: -1,
+                nsec: 750_000_000
+            }
+        );
         assert_eq!(Timespec::from_secs_f64(f64::NAN), Timespec::default());
         let t = Timespec { sec: -3, nsec: 100 };
         assert_eq!(Timespec::from_system_time(Some(t.to_system_time())), t);

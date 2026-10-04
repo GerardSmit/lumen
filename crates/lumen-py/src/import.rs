@@ -2,28 +2,49 @@
 
 use crate::dict::PyDict;
 use crate::object::*;
+use crate::platform::{parent_dir, FoundModule};
 use crate::vm::*;
 use lumen_common::limits::StopFlags;
 use std::cell::RefCell;
-use crate::platform::{parent_dir, FoundModule};
 use std::rc::Rc;
 
 /// The encoding a `coding[:=]` comment line declares (`^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)`).
 fn coding_cookie(line: &[u8]) -> Option<String> {
-    let rest = line.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\x0c')).map(|i| &line[i..])?;
+    let rest = line
+        .iter()
+        .position(|&b| !matches!(b, b' ' | b'\t' | b'\x0c'))
+        .map(|i| &line[i..])?;
     if rest.first() != Some(&b'#') {
         return None;
     }
-    let at = rest.windows(7).position(|w| w.starts_with(b"coding") && matches!(w[6], b':' | b'='))?;
+    let at = rest
+        .windows(7)
+        .position(|w| w.starts_with(b"coding") && matches!(w[6], b':' | b'='))?;
     let tail = &rest[at + 7..];
-    let tail = &tail[tail.iter().position(|&b| b != b' ' && b != b'\t').unwrap_or(tail.len())..];
-    let n = tail.iter().take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')).count();
+    let tail = &tail[tail
+        .iter()
+        .position(|&b| b != b' ' && b != b'\t')
+        .unwrap_or(tail.len())..];
+    let n = tail
+        .iter()
+        .take_while(|&&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        .count();
     (n > 0).then(|| String::from_utf8_lossy(&tail[..n]).into_owned())
 }
 
 /// The tokenizer's `get_normal_name`: UTF-8 and Latin-1 aliases spelled one way.
 fn normal_encoding_name(enc: &str) -> String {
-    let low: String = enc.chars().take(12).map(|c| if c == '_' { '-' } else { c.to_ascii_lowercase() }).collect();
+    let low: String = enc
+        .chars()
+        .take(12)
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
     let is = |name: &str| low == name || low.starts_with(&format!("{name}-"));
     if is("utf-8") {
         "utf-8".to_string()
@@ -75,15 +96,32 @@ impl Interp {
 
     /// A `SyntaxError` (or the `IndentationError` / `TabError` its message calls for) at
     /// `line`, 0-based column `col` (`None`: unknown) of `src`.
-    pub fn syntax_error(&mut self, msg: &str, file: &str, line: u32, col: Option<u32>, src: &str) -> Obj {
-        let text = src.split_inclusive('\n').nth((line as usize).wrapping_sub(1)).map(|l| match l.ends_with('\n') {
-            true => l.to_string(),
-            false => format!("{l}\n"),
-        });
+    pub fn syntax_error(
+        &mut self,
+        msg: &str,
+        file: &str,
+        line: u32,
+        col: Option<u32>,
+        src: &str,
+    ) -> Obj {
+        let text = src
+            .split_inclusive('\n')
+            .nth((line as usize).wrapping_sub(1))
+            .map(|l| match l.ends_with('\n') {
+                true => l.to_string(),
+                false => format!("{l}\n"),
+            });
         let text = text.map_or(Value::None, Value::string);
         let offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 1));
         let end_offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 2));
-        let detail = Value::tuple(vec![Value::str(file), Value::Int(line as i64), offset, text, Value::Int(line as i64), end_offset]);
+        let detail = Value::tuple(vec![
+            Value::str(file),
+            Value::Int(line as i64),
+            offset,
+            text,
+            Value::Int(line as i64),
+            end_offset,
+        ]);
         let cls = Value::Obj(self.exc_type(syntax_error_kind(msg)));
         match self.call(&cls, vec![Value::str(msg), detail], Vec::new()) {
             Ok(Value::Obj(e)) => e,
@@ -107,11 +145,19 @@ impl Interp {
         }
         let enc = cookie.map_or_else(|| "utf-8".to_string(), |(c, _)| normal_encoding_name(&c));
         if bom && enc != "utf-8" {
-            return Err(self.syntax_error(&format!("encoding problem: {enc} with BOM"), filename, 0, None, ""));
+            return Err(self.syntax_error(
+                &format!("encoding problem: {enc} with BOM"),
+                filename,
+                0,
+                None,
+                "",
+            ));
         }
         match self.decode_bytes(body, &enc, "strict") {
             Ok(s) => Ok(s),
-            Err(e) if self.exc_is(&e, "LookupError") => Err(self.syntax_error(&format!("unknown encoding: {enc}"), filename, 0, None, "")),
+            Err(e) if self.exc_is(&e, "LookupError") => {
+                Err(self.syntax_error(&format!("unknown encoding: {enc}"), filename, 0, None, ""))
+            }
             Err(e) => {
                 // CPython's tokenizer reports the line holding the bad bytes, decoding only those.
                 let field = |n: &str| e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, n));
@@ -120,11 +166,18 @@ impl Interp {
                     _ => (0, 0),
                 };
                 let e = match start < end && end <= body.len() {
-                    true => self.decode_bytes(&body[start..end], &enc, "strict").err().unwrap_or(e),
+                    true => self
+                        .decode_bytes(&body[start..end], &enc, "strict")
+                        .err()
+                        .unwrap_or(e),
                     false => e,
                 };
                 let msg = self.str_of(&Value::Obj(e)).unwrap_or_default();
-                let line = body[..start.min(body.len())].iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+                let line = body[..start.min(body.len())]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count() as u32
+                    + 1;
                 Err(self.syntax_error(&format!("(unicode error) {msg}"), filename, line, None, ""))
             }
         }
@@ -134,8 +187,15 @@ impl Interp {
         self.compile_source_mode(src, filename, false)
     }
 
-    pub fn compile_source_mode(&mut self, src: &str, filename: &str, interactive: bool) -> R<Rc<crate::bytecode::Code>> {
-        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(src, filename));
+    pub fn compile_source_mode(
+        &mut self,
+        src: &str,
+        filename: &str,
+        interactive: bool,
+    ) -> R<Rc<crate::bytecode::Code>> {
+        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || {
+            crate::parser::parse(src, filename)
+        });
         let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), src)),
@@ -153,7 +213,11 @@ impl Interp {
     pub fn set_argv(&mut self, argv: &[String]) {
         self.argv = argv.to_vec();
         if let Some(d) = self.sys_dict() {
-            dict_set_str(&d, "argv", Value::list(argv.iter().map(|a| Value::str(a)).collect()));
+            dict_set_str(
+                &d,
+                "argv",
+                Value::list(argv.iter().map(|a| Value::str(a)).collect()),
+            );
         }
     }
 
@@ -216,9 +280,11 @@ impl Interp {
         self.main_globals = Some(globals.clone());
         self.interrupted = false;
         let stop = StopFlags::from_handle(&self.interrupt);
-        let outcome = lumen_common::bigint::interruptible(&stop, || match self.compile_source(src, filename) {
-            Ok(code) => self.run_code(code, globals.clone(), globals),
-            Err(e) => Err(e),
+        let outcome = lumen_common::bigint::interruptible(&stop, || {
+            match self.compile_source(src, filename) {
+                Ok(code) => self.run_code(code, globals.clone(), globals),
+                Err(e) => Err(e),
+            }
         });
         let result = match outcome {
             Some(r) => r,
@@ -254,7 +320,11 @@ impl Interp {
             let d = self.module_dict(&sys);
             if let Some(p) = dict_get_str(&d, "path") {
                 if let Some(l) = list_of(&p) {
-                    return l.borrow().iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+                    return l
+                        .borrow()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect();
                 }
             }
         }
@@ -270,7 +340,12 @@ impl Interp {
     pub fn import_module(&mut self, full: &str) -> R<Obj> {
         match dict_get_str(&self.modules, full) {
             Some(Value::Obj(m)) => return Ok(m),
-            Some(Value::None) => return Err(self.module_not_found(full, format!("import of {full} halted; None in sys.modules"))),
+            Some(Value::None) => {
+                return Err(self.module_not_found(
+                    full,
+                    format!("import of {full} halted; None in sys.modules"),
+                ))
+            }
             _ => {}
         }
         if let Some(m) = crate::builtins::modules::builtin_module(self, full) {
@@ -288,10 +363,19 @@ impl Interp {
                 let pd = self.module_dict(&pm);
                 let path = match dict_get_str(&pd, "__path__") {
                     Some(v) => v,
-                    None => return Err(self.module_not_found(full, format!("No module named '{}'; '{}' is not a package", full, p))),
+                    None => {
+                        return Err(self.module_not_found(
+                            full,
+                            format!("No module named '{}'; '{}' is not a package", full, p),
+                        ))
+                    }
                 };
                 let dirs: Vec<String> = match list_of(&path) {
-                    Some(l) => l.borrow().iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect(),
+                    Some(l) => l
+                        .borrow()
+                        .iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect(),
                     None => Vec::new(),
                 };
                 (dirs, Some(pm))
@@ -299,7 +383,12 @@ impl Interp {
             None => (self.sys_path(), None),
         };
         let found = self.platform.borrow_mut().find_module(&dirs, leaf);
-        let Some(FoundModule { filename: file_s, source, is_package: is_pkg }) = found else {
+        let Some(FoundModule {
+            filename: file_s,
+            source,
+            is_package: is_pkg,
+        }) = found
+        else {
             return Err(self.module_not_found(full, format!("No module named '{}'", full)));
         };
         let src = self.decode_source(&source, &file_s)?;
@@ -309,7 +398,11 @@ impl Interp {
         dict_set_str(&g, "__builtins__", Value::Obj(self.builtins.clone()));
         if is_pkg {
             dict_set_str(&g, "__package__", Value::str(full));
-            dict_set_str(&g, "__path__", Value::list(vec![Value::str(&parent_dir(&file_s))]));
+            dict_set_str(
+                &g,
+                "__path__",
+                Value::list(vec![Value::str(&parent_dir(&file_s))]),
+            );
         } else {
             dict_set_str(&g, "__package__", Value::str(parent_name.unwrap_or("")));
         }
@@ -342,7 +435,9 @@ impl Interp {
     fn install_importlib(&mut self) -> R<()> {
         let bootstrap = Value::Obj(self.import_module("importlib._bootstrap")?);
         let external = Value::Obj(self.import_module("importlib._bootstrap_external")?);
-        let Some(sys) = self.sys_module.clone() else { return Ok(()) };
+        let Some(sys) = self.sys_module.clone() else {
+            return Ok(());
+        };
         let meta_path = self.get_attr_str(&Value::Obj(sys), "meta_path")?;
         for name in ["BuiltinImporter", "FrozenImporter"] {
             let finder = self.get_attr_str(&bootstrap, name)?;
@@ -358,11 +453,17 @@ impl Interp {
         };
         *self.native_state::<ImportlibHooks>() = hooks;
         let loaded: Vec<(Value, Value)> = match &self.modules.kind {
-            Kind::Dict(d) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
+            Kind::Dict(d) => d
+                .borrow()
+                .iter()
+                .map(|e| (e.key.clone(), e.val.clone()))
+                .collect(),
             _ => Vec::new(),
         };
         for (name, m) in loaded {
-            let (Some(name), Value::Obj(m)) = (name.as_str(), m) else { continue };
+            let (Some(name), Value::Obj(m)) = (name.as_str(), m) else {
+                continue;
+            };
             if name == "__main__" || !matches!(m.kind, Kind::Module) {
                 continue;
             }
@@ -378,26 +479,47 @@ impl Interp {
 
     /// `__spec__` and `__loader__` of a source module, once importlib is installed.
     fn set_module_spec(&mut self, m: &Obj, name: &str, file: &str) -> R<()> {
-        let Some(spec_fn) = self.native_state::<ImportlibHooks>().spec_from_file.clone() else { return Ok(()) };
-        let spec = self.call(&spec_fn, vec![Value::str(name), Value::str(file)], Vec::new())?;
+        let Some(spec_fn) = self.native_state::<ImportlibHooks>().spec_from_file.clone() else {
+            return Ok(());
+        };
+        let spec = self.call(
+            &spec_fn,
+            vec![Value::str(name), Value::str(file)],
+            Vec::new(),
+        )?;
         self.init_module_attrs(m, spec)
     }
 
     /// `BuiltinImporter.find_spec`'s spec for a native module, once importlib is installed.
     fn set_builtin_spec(&mut self, m: &Obj, name: &str) -> R<()> {
         let hooks = self.native_state::<ImportlibHooks>();
-        let (Some(spec_fn), Some(importer)) = (hooks.spec_from_loader.clone(), hooks.builtin_importer.clone()) else { return Ok(()) };
+        let (Some(spec_fn), Some(importer)) = (
+            hooks.spec_from_loader.clone(),
+            hooks.builtin_importer.clone(),
+        ) else {
+            return Ok(());
+        };
         let d = self.module_dict(m);
         if dict_get_str(&d, "__spec__").is_some_and(|s| !s.is_none()) {
             return Ok(());
         }
         let origin = self.str_obj("origin");
-        let spec = self.call(&spec_fn, vec![Value::str(name), importer], vec![(origin, Value::str("built-in"))])?;
+        let spec = self.call(
+            &spec_fn,
+            vec![Value::str(name), importer],
+            vec![(origin, Value::str("built-in"))],
+        )?;
         self.init_module_attrs(m, spec)
     }
 
     fn init_module_attrs(&mut self, m: &Obj, spec: Value) -> R<()> {
-        let Some(init) = self.native_state::<ImportlibHooks>().init_module_attrs.clone() else { return Ok(()) };
+        let Some(init) = self
+            .native_state::<ImportlibHooks>()
+            .init_module_attrs
+            .clone()
+        else {
+            return Ok(());
+        };
         if spec.is_none() {
             return Ok(());
         }
@@ -409,34 +531,61 @@ impl Interp {
         let globals = self.frames.last().map(|f| f.globals.clone());
         let g = match globals {
             Some(g) => g,
-            None => return Err(self.new_exc_str("ImportError", "attempted relative import with no known parent package")),
+            None => {
+                return Err(self.new_exc_str(
+                    "ImportError",
+                    "attempted relative import with no known parent package",
+                ))
+            }
         };
         let pkg = match dict_get_str(&g, "__package__") {
-            Some(Value::Obj(o)) if matches!(o.kind, Kind::Str(_)) => o.as_str_kind().unwrap_or("").to_string(),
+            Some(Value::Obj(o)) if matches!(o.kind, Kind::Str(_)) => {
+                o.as_str_kind().unwrap_or("").to_string()
+            }
             _ => {
-                let n = dict_get_str(&g, "__name__").and_then(|v| v.as_str().map(|s| s.to_string())).unwrap_or_default();
+                let n = dict_get_str(&g, "__name__")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
                 if dict_get_str(&g, "__path__").is_some() {
                     n
                 } else {
-                    n.rsplit_once('.').map(|(a, _)| a.to_string()).unwrap_or_default()
+                    n.rsplit_once('.')
+                        .map(|(a, _)| a.to_string())
+                        .unwrap_or_default()
                 }
             }
         };
         if pkg.is_empty() {
-            return Err(self.new_exc_str("ImportError", "attempted relative import with no known parent package"));
+            return Err(self.new_exc_str(
+                "ImportError",
+                "attempted relative import with no known parent package",
+            ));
         }
         let mut base: &str = &pkg;
         for _ in 1..level {
             match base.rfind('.') {
                 Some(i) => base = &base[..i],
-                None => return Err(self.new_exc_str("ImportError", "attempted relative import beyond top-level package")),
+                None => {
+                    return Err(self.new_exc_str(
+                        "ImportError",
+                        "attempted relative import beyond top-level package",
+                    ))
+                }
             }
         }
-        Ok(if name.is_empty() { base.to_string() } else { format!("{}.{}", base, name) })
+        Ok(if name.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}.{}", base, name)
+        })
     }
 
     pub fn import_name(&mut self, name: &str, level: usize, fromlist: &Value) -> R<Value> {
-        let full = if level > 0 { self.resolve_relative(name, level)? } else { name.to_string() };
+        let full = if level > 0 {
+            self.resolve_relative(name, level)?
+        } else {
+            name.to_string()
+        };
         let mut prefix = String::new();
         let mut top: Option<Obj> = None;
         for (i, part) in full.split('.').enumerate() {
@@ -462,7 +611,9 @@ impl Interp {
                         }
                         let sub = format!("{}.{}", full, s);
                         if let Err(e) = self.import_module(&sub) {
-                            if !(self.exc_is(&e, "ModuleNotFoundError") && self.exc_name_is(&e, &sub)) {
+                            if !(self.exc_is(&e, "ModuleNotFoundError")
+                                && self.exc_name_is(&e, &sub))
+                            {
                                 return Err(e);
                             }
                         }
@@ -478,7 +629,12 @@ impl Interp {
     }
 
     fn exc_name_is(&mut self, e: &Obj, name: &str) -> bool {
-        match e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "name")) {
+        match e
+            .dict
+            .borrow()
+            .as_ref()
+            .and_then(|d| dict_get_str(d, "name"))
+        {
             Some(v) => v.as_str() == Some(name),
             None => false,
         }
@@ -496,8 +652,10 @@ impl Interp {
                     Value::Obj(o) if matches!(o.kind, Kind::Module) => {
                         let d = self.module_dict(o);
                         (
-                            dict_get_str(&d, "__name__").and_then(|v| v.as_str().map(|s| s.to_string())),
-                            dict_get_str(&d, "__file__").and_then(|v| v.as_str().map(|s| s.to_string())),
+                            dict_get_str(&d, "__name__")
+                                .and_then(|v| v.as_str().map(|s| s.to_string())),
+                            dict_get_str(&d, "__file__")
+                                .and_then(|v| v.as_str().map(|s| s.to_string())),
                         )
                     }
                     _ => (None, None),
@@ -510,7 +668,10 @@ impl Interp {
                 let mn = modname.unwrap_or_else(|| "<unknown module name>".into());
                 let msg = match file {
                     Some(f) => format!("cannot import name '{}' from '{}' ({})", nm, mn, f),
-                    None => format!("cannot import name '{}' from '{}' (unknown location)", nm, mn),
+                    None => format!(
+                        "cannot import name '{}' from '{}' (unknown location)",
+                        nm, mn
+                    ),
                 };
                 let err = self.new_exc_str("ImportError", &msg);
                 self.set_exc_attr(&err, "name", Value::str(&mn));
@@ -527,7 +688,12 @@ impl Interp {
         let names: Vec<Value> = match dict_get_str(&d, "__all__") {
             Some(all) => self.iterate_to_vec(&all)?,
             None => match &d.kind {
-                Kind::Dict(p) => p.borrow().keys().into_iter().filter(|k| k.as_str().map(|s| !s.starts_with('_')).unwrap_or(false)).collect(),
+                Kind::Dict(p) => p
+                    .borrow()
+                    .keys()
+                    .into_iter()
+                    .filter(|k| k.as_str().map(|s| !s.starts_with('_')).unwrap_or(false))
+                    .collect(),
                 _ => Vec::new(),
             },
         };

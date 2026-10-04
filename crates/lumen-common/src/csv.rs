@@ -126,7 +126,13 @@ pub struct Parser {
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser { state: State::StartRecord, fields: Vec::new(), field: String::new(), field_len: 0, numeric: false }
+        Parser {
+            state: State::StartRecord,
+            fields: Vec::new(),
+            field: String::new(),
+            field_len: 0,
+            numeric: false,
+        }
     }
 }
 
@@ -167,7 +173,10 @@ impl Parser {
 
     fn save_field(&mut self) {
         let text = std::mem::take(&mut self.field);
-        self.fields.push(Field { text, numeric: self.numeric });
+        self.fields.push(Field {
+            text,
+            numeric: self.numeric,
+        });
         self.field_len = 0;
         self.numeric = false;
     }
@@ -183,10 +192,17 @@ impl Parser {
 
     fn process(&mut self, d: &Dialect, c: Option<char>, limit: i64) -> Result<(), Error> {
         let is_nl = |c: Option<char>| matches!(c, Some('\n' | '\r'));
-        let is_quote = |c: Option<char>| c.is_some() && c == d.quotechar && d.quoting != Quoting::None;
+        let is_quote =
+            |c: Option<char>| c.is_some() && c == d.quotechar && d.quoting != Quoting::None;
         let is_escape = |c: Option<char>| c.is_some() && c == d.escapechar;
         let is_delim = |c: Option<char>| c == Some(d.delimiter);
-        let end_state = |c: Option<char>| if c == EOL { State::StartRecord } else { State::EatCrnl };
+        let end_state = |c: Option<char>| {
+            if c == EOL {
+                State::StartRecord
+            } else {
+                State::EatCrnl
+            }
+        };
         let mut state = self.state;
         if state == State::StartRecord {
             if c == EOL {
@@ -256,7 +272,11 @@ impl Parser {
                 } else if is_escape(c) {
                     self.state = State::EscapeInQuotedField;
                 } else if is_quote(c) {
-                    self.state = if d.doublequote { State::QuoteInQuotedField } else { State::InField };
+                    self.state = if d.doublequote {
+                        State::QuoteInQuotedField
+                    } else {
+                        State::InField
+                    };
                 } else {
                     self.add_char(c.unwrap_or('\n'), limit)?;
                 }
@@ -279,7 +299,10 @@ impl Parser {
                     self.add_char(c.unwrap_or('\n'), limit)?;
                     self.state = State::InField;
                 } else {
-                    return Err(Error::QuoteExpected { delimiter: d.delimiter, quotechar: d.quotechar.unwrap_or('"') });
+                    return Err(Error::QuoteExpected {
+                        delimiter: d.delimiter,
+                        quotechar: d.quotechar.unwrap_or('"'),
+                    });
                 }
             }
             State::EatCrnl => {
@@ -312,10 +335,17 @@ impl RowWriter {
         self.append_field(d, field, quoted)
     }
 
-    fn append_field(&mut self, d: &Dialect, field: Option<&str>, mut quoted: bool) -> Result<(), Error> {
+    fn append_field(
+        &mut self,
+        d: &Dialect,
+        field: Option<&str>,
+        mut quoted: bool,
+    ) -> Result<(), Error> {
         let text = field.unwrap_or("");
         if text.is_empty() && d.delimiter == ' ' && d.skipinitialspace {
-            if d.quoting == Quoting::None || (field.is_none() && matches!(d.quoting, Quoting::Strings | Quoting::NotNull)) {
+            if d.quoting == Quoting::None
+                || (field.is_none() && matches!(d.quoting, Quoting::Strings | Quoting::NotNull))
+            {
                 return Err(Error::EmptyFieldWithSpace);
             }
             quoted = true;
@@ -366,7 +396,9 @@ impl RowWriter {
     /// The finished record with its line terminator; the writer is reset for the next one.
     pub fn finish(&mut self, d: &Dialect) -> Result<String, Error> {
         if self.num_fields > 0 && self.rec.is_empty() {
-            if d.quoting == Quoting::None || (self.last_null && matches!(d.quoting, Quoting::Strings | Quoting::NotNull)) {
+            if d.quoting == Quoting::None
+                || (self.last_null && matches!(d.quoting, Quoting::Strings | Quoting::NotNull))
+            {
                 return Err(Error::SingleEmptyField);
             }
             self.num_fields -= 1;
@@ -400,7 +432,10 @@ mod tests {
     #[test]
     fn parses_quoted_fields_across_lines() {
         let d = Dialect::default();
-        assert_eq!(parse(&d, &["a,\"b\"\"c\",d\r\n", "\"x\n", "y\",z\n"]), vec![vec!["a", "b\"c", "d"], vec!["x\ny", "z"]]);
+        assert_eq!(
+            parse(&d, &["a,\"b\"\"c\",d\r\n", "\"x\n", "y\",z\n"]),
+            vec![vec!["a", "b\"c", "d"], vec!["x\ny", "z"]]
+        );
         assert_eq!(parse(&d, &["\n"]), vec![Vec::<String>::new()]);
     }
 

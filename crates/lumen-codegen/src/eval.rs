@@ -93,7 +93,11 @@ macro_rules! fminmax {
             x + y
         } else if x == y {
             // Only the sign of zero can differ.
-            if $min == x.is_sign_negative() { x } else { y }
+            if $min == x.is_sign_negative() {
+                x
+            } else {
+                y
+            }
         } else if (x < y) == $min {
             x
         } else {
@@ -271,7 +275,9 @@ pub fn convert(op: ConvOp, from: Type, to: Type, a: u64) -> Option<u64> {
                 && match (to, signed) {
                     (Type::I32, true) => (-2147483648.0..=2147483647.0).contains(&t),
                     (Type::I32, false) => t > -1.0 && t <= 4294967295.0,
-                    (Type::I64, true) => (-9223372036854775808.0..9223372036854775808.0).contains(&t),
+                    (Type::I64, true) => {
+                        (-9223372036854775808.0..9223372036854775808.0).contains(&t)
+                    }
                     (Type::I64, false) => t > -1.0 && t < 18446744073709551616.0,
                     _ => unreachable!(),
                 };
@@ -323,10 +329,15 @@ pub fn pure_inst(func: &Function, data: &InstData, arg: impl Fn(Value) -> u64) -
 pub fn vector(op: VectorOp, a: u128, b: u128) -> u128 {
     use VectorOp::*;
     match op {
-        And => return a & b, AndNot => return a & !b, Or => return a | b,
+        And => return a & b,
+        AndNot => return a & !b,
+        Or => return a | b,
         _ => {}
     }
-    let floating = matches!(op, F64x2Add | F64x2Mul | F64x2Min | F64x2Max | F64x2Eq | F64x2Lt);
+    let floating = matches!(
+        op,
+        F64x2Add | F64x2Mul | F64x2Min | F64x2Max | F64x2Eq | F64x2Lt
+    );
     let width = if floating { 64 } else { 32 };
     let mut result = 0u128;
     for lane in 0..128 / width {
@@ -337,14 +348,46 @@ pub fn vector(op: VectorOp, a: u128, b: u128) -> u128 {
             I32x4Mul => (x as u32).wrapping_mul(y as u32) as u64,
             I32x4Min => (x as i32).min(y as i32) as u32 as u64,
             I32x4Max => (x as i32).max(y as i32) as u32 as u64,
-            I32x4Eq => if x as u32 == y as u32 { u32::MAX as u64 } else { 0 },
-            I32x4Lt => if (x as i32) < y as i32 { u32::MAX as u64 } else { 0 },
-            F64x2Eq => if f64of(x) == f64of(y) { u64::MAX } else { 0 },
-            F64x2Lt => if f64of(x) < f64of(y) { u64::MAX } else { 0 },
-            F64x2Add | F64x2Mul | F64x2Min | F64x2Max => binary(match op {
-                F64x2Add => BinaryOp::Fadd, F64x2Mul => BinaryOp::Fmul,
-                F64x2Min => BinaryOp::Fmin, _ => BinaryOp::Fmax,
-            }, Type::F64, x, y).unwrap(),
+            I32x4Eq => {
+                if x as u32 == y as u32 {
+                    u32::MAX as u64
+                } else {
+                    0
+                }
+            }
+            I32x4Lt => {
+                if (x as i32) < y as i32 {
+                    u32::MAX as u64
+                } else {
+                    0
+                }
+            }
+            F64x2Eq => {
+                if f64of(x) == f64of(y) {
+                    u64::MAX
+                } else {
+                    0
+                }
+            }
+            F64x2Lt => {
+                if f64of(x) < f64of(y) {
+                    u64::MAX
+                } else {
+                    0
+                }
+            }
+            F64x2Add | F64x2Mul | F64x2Min | F64x2Max => binary(
+                match op {
+                    F64x2Add => BinaryOp::Fadd,
+                    F64x2Mul => BinaryOp::Fmul,
+                    F64x2Min => BinaryOp::Fmin,
+                    _ => BinaryOp::Fmax,
+                },
+                Type::F64,
+                x,
+                y,
+            )
+            .unwrap(),
             _ => unreachable!(),
         };
         result |= (bits as u128) << (lane * width);

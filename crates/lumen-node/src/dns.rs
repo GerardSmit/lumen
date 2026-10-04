@@ -101,13 +101,14 @@ pub fn op_getaddrinfo(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
 
 #[cfg(unix)]
 fn gai_lookup(hostname: &str, family: u8, flags: i32) -> Result<Vec<(String, u8)>, &'static str> {
-    use lumen_os::net::{getaddrinfo, gai_code_name, SockAddr};
+    use lumen_os::net::{gai_code_name, getaddrinfo, SockAddr};
     let family = match family {
         4 => libc::AF_INET,
         6 => libc::AF_INET6,
         _ => libc::AF_UNSPEC,
     };
-    let list = getaddrinfo(Some(hostname), None, family, libc::SOCK_STREAM, 0, flags).map_err(|e| gai_code_name(e.code))?;
+    let list = getaddrinfo(Some(hostname), None, family, libc::SOCK_STREAM, 0, flags)
+        .map_err(|e| gai_code_name(e.code))?;
     let out: Vec<(String, u8)> = list
         .into_iter()
         .filter_map(|ai| match ai.addr {
@@ -191,10 +192,9 @@ fn decode_name_info(
         .downcast::<Result<(String, String), &'static str>>()
         .expect("getnameinfo payload")
     {
-        Ok((host, service)) => Ok(vec![ctx.make_array(vec![
-            Value::from_string(host),
-            Value::from_string(service),
-        ])]),
+        Ok((host, service)) => Ok(vec![
+            ctx.make_array(vec![Value::from_string(host), Value::from_string(service)])
+        ]),
         Err(code) => {
             let err = ctx.make_error("Error", format!("getnameinfo {code}"));
             let _ = ctx.set_member(&err, "code", Value::str(code));

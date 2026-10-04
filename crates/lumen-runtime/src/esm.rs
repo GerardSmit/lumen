@@ -24,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use lumen_host::sysfs::PathExt as _;
 
@@ -70,11 +71,199 @@ pub fn make_cached_loader(
     impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
     std::rc::Rc<LoaderCache>,
 ) {
+    make_cached_loader_with_resource_loader(builtins, default_network_module_resource)
+}
+
+/// A loader bound to one immutable native fetch-routing and trust snapshot. This keeps network
+/// module requests on the same per-runtime routes as `fetch()` without consulting process-global
+/// DNS or trust configuration after the loader is created.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn make_loader_with_fetch_config(
+    builtins: BuiltinModules,
+    fetch_config: lumen_web::FetchConfig,
+) -> impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> {
+    make_cached_loader_with_fetch_config(builtins, fetch_config).0
+}
+
+/// [`make_loader_with_fetch_config`], with a cache handle for callers that load a complete graph.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn make_cached_loader_with_fetch_config(
+    builtins: BuiltinModules,
+    fetch_config: lumen_web::FetchConfig,
+) -> (
+    impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
+    std::rc::Rc<LoaderCache>,
+) {
+    make_cached_loader_with_fetch_config_and_prefetched(
+        builtins,
+        fetch_config,
+        PrefetchedModuleResources::default(),
+    )
+}
+
+/// A configured ESM loader which first consults resources fetched by an embedder's asynchronous
+/// document loader. Missing cache entries retain the ordinary native loader behavior. Failed
+/// entries are remembered too, so a graph that was prepared asynchronously does not silently
+/// issue the same failed request again on the runtime thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn make_cached_loader_with_fetch_config_and_prefetched(
+    builtins: BuiltinModules,
+    fetch_config: lumen_web::FetchConfig,
+    prefetched: PrefetchedModuleResources,
+) -> (
+    impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
+    std::rc::Rc<LoaderCache>,
+) {
+    make_cached_loader_with_resource_loader(builtins, move |url| {
+        if let Some(entry) = prefetched.get(url) {
+            return entry
+                .ok()
+                .map(|resource| (resource.final_url, resource.content_type, resource.bytes));
+        }
+        let resource = lumen_web::load_module_resource_with_config(url, &fetch_config).ok()?;
+        Some((resource.url, resource.content_type, resource.bytes))
+    })
+}
+
+type NetworkModuleResource = (String, Option<String>, Vec<u8>);
+
+const PREFETCHED_MODULE_BYTES: usize = 32 * 1024 * 1024;
+const PREFETCHED_MODULE_ENTRIES: usize = 512;
+
+/// A successfully fetched module resource before ESM MIME, redirect-origin, and import-attribute
+/// policy are applied by the canonical ESM resolver.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefetchedModuleResource {
+    pub final_url: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct PrefetchedModuleState {
+    entries: HashMap<String, Result<PrefetchedModuleResource, String>>,
+    bytes: usize,
+}
+
+/// Bounded, shareable resource snapshot populated by a browser's asynchronous module graph
+/// fetcher and consumed by the normal ESM resolver on the runtime thread.
+#[derive(Clone, Default)]
+pub struct PrefetchedModuleResources {
+    state: Arc<Mutex<PrefetchedModuleState>>,
+}
+
+impl PrefetchedModuleResources {
+    /// Record one request URL and its actual final response. The URL is the wire URL (without a
+    /// fragment); fragments remain part of each module-map key and are applied by the resolver.
+    pub fn insert(
+        &self,
+        request_url: String,
+        result: Result<PrefetchedModuleResource, String>,
+    ) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "prefetched module resource cache is poisoned".to_owned())?;
+        if state.entries.contains_key(&request_url) {
+            return Ok(());
+        }
+        if state.entries.len() >= PREFETCHED_MODULE_ENTRIES {
+            return Err("module graph exceeded the prefetched resource count limit".into());
+        }
+        let weight = result.as_ref().map_or(0, |resource| {
+            request_url
+                .len()
+                .saturating_add(resource.final_url.len())
+                .saturating_add(resource.content_type.as_ref().map_or(0, String::len))
+                .saturating_add(resource.bytes.len())
+        });
+        if state.bytes.saturating_add(weight) > PREFETCHED_MODULE_BYTES {
+            return Err("module graph exceeded the prefetched resource byte limit".into());
+        }
+        state.bytes += weight;
+        state.entries.insert(request_url, result);
+        Ok(())
+    }
+
+    /// Read a cached response without changing its response URL or bytes.
+    pub fn get(&self, request_url: &str) -> Option<Result<PrefetchedModuleResource, String>> {
+        self.state.lock().ok()?.entries.get(request_url).cloned()
+    }
+}
+
+/// Resolve a static network module request to the exact fragment-free URL used on the wire.
+/// This shares the ESM loader's scheme and same-origin rules with an embedder that prepares
+/// several module graphs concurrently. Non-network requests (builtins, data URLs, bare names)
+/// return `None` and remain the canonical resolver's responsibility.
+pub fn resolve_network_module_request(specifier: &str, referrer: &str) -> Option<String> {
+    let remote_relative = is_http_url(referrer)
+        && (specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with('/')
+            || specifier.starts_with('?')
+            || specifier.starts_with('#'));
+    if !is_http_url(specifier) && !remote_relative {
+        return None;
+    }
+    if !is_http_url(referrer) {
+        return None;
+    }
+    let target = lumen_common::url::parse(specifier, Some(referrer)).ok()?;
+    if !matches!(target.scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let requested_url = strip_url_fragment(&target.href());
+    (url_origin(&requested_url)? == url_origin(referrer)?).then_some(requested_url)
+}
+
+/// Fetch one static module graph resource using the same route and trust snapshot as the runtime.
+/// HTTP status and content type are retained here; the resolver applies module MIME and final
+/// origin rules after it reads the prefetched response.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn fetch_network_module_resource(
+    url: &str,
+    fetch_config: &lumen_web::FetchConfig,
+) -> Result<PrefetchedModuleResource, String> {
+    let response = lumen_web::load_resource_with_config(url, fetch_config)?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "module response returned HTTP {} {}",
+            response.status, response.status_text
+        ));
+    }
+    let content_type = response.content_type();
+    Ok(PrefetchedModuleResource {
+        final_url: response.url,
+        content_type,
+        bytes: response.body,
+    })
+}
+
+fn default_network_module_resource(url: &str) -> Option<NetworkModuleResource> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let resource = lumen_web::load_module_resource(url).ok()?;
+        Some((resource.url, resource.content_type, resource.bytes))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = url;
+        None
+    }
+}
+
+fn make_cached_loader_with_resource_loader(
+    builtins: BuiltinModules,
+    load_resource: impl Fn(&str) -> Option<NetworkModuleResource> + 'static,
+) -> (
+    impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
+    std::rc::Rc<LoaderCache>,
+) {
     let cache = std::rc::Rc::new(LoaderCache::default());
     let handle = std::rc::Rc::clone(&cache);
     let loader = move |specifier: &str, referrer: &str, attr_type: Option<&str>| {
         cache.resolve(specifier, referrer, attr_type, |s, r, a| {
-            resolve(s, r, &builtins, a)
+            resolve(s, r, &builtins, a, &load_resource)
         })
     };
     (loader, handle)
@@ -204,9 +393,7 @@ fn canonical_key(file: &Path) -> String {
     let memoized = MEMO.with(|m| m.borrow().is_some());
     let via_dir = || -> Option<PathBuf> {
         let (dir, name) = (file.parent()?, file.file_name()?);
-        if dir.as_os_str().is_empty()
-            || !lumen_host::sysfs::exists_not_symlink(file)
-        {
+        if dir.as_os_str().is_empty() || !lumen_host::sysfs::exists_not_symlink(file) {
             return None;
         }
         MEMO.with(|m| {
@@ -285,6 +472,10 @@ impl LoaderCache {
         // An `aot:` referrer resolves against the current directory, not its own location.
         let base = if referrer.starts_with("aot:") {
             None
+        } else if is_http_url(referrer) {
+            // A network module is identified by its complete URL, not its directory. Keeping
+            // the query string here matters because it can select distinct module resources.
+            Some(strip_url_fragment(referrer))
         } else {
             let r = strip_file_scheme(referrer);
             Some(
@@ -333,6 +524,7 @@ fn resolve(
     referrer: &str,
     builtins: &BuiltinModules,
     attr_type: Option<&str>,
+    load_resource: &dyn Fn(&str) -> Option<NetworkModuleResource>,
 ) -> Option<(String, String)> {
     // Builtins: `node:fs` or a bare `fs`/`path`/… name.
     let bare = specifier.strip_prefix("node:").unwrap_or(specifier);
@@ -360,11 +552,66 @@ fn resolve(
             return None;
         }
         if Path::new(specifier).is_absolute() || specifier.starts_with("file://") {
-            return resolve(specifier, "", builtins, attr_type);
+            return resolve(specifier, "", builtins, attr_type, load_resource);
         }
         let cwd = lumen_host::sysfs::current_dir().ok()?;
         let (file, is_esm_pkg) = resolve_node_modules(specifier, &cwd)?;
         return load_as_module(&file, !is_esm_pkg);
+    }
+
+    // Network module graphs use the same HTTP(S) transport as fetch(). Keep this branch before
+    // filesystem normalization: treating an https referrer as a Path silently turns imports
+    // into local paths and loses both redirect identity and URL resolution semantics.
+    let remote_relative = is_http_url(referrer)
+        && (specifier.starts_with("./")
+            || specifier.starts_with("../")
+            || specifier.starts_with('/')
+            || specifier.starts_with('?')
+            || specifier.starts_with('#'));
+    if is_http_url(specifier) || remote_relative {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return None;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let requested_url = resolve_network_module_request(specifier, referrer)?;
+            let requested_fragment = lumen_common::url::parse(specifier, Some(referrer))
+                .ok()?
+                .fragment;
+            let (resource_url, content_type, bytes) = load_resource(&requested_url)?;
+            // Module redirects use same-origin mode here. A prefetched response follows the same
+            // final-origin check as the ordinary synchronous loader.
+            if url_origin(&resource_url)? != url_origin(&requested_url)? {
+                return None;
+            }
+            if attr_type.is_none() && !lumen_web::is_javascript_module_mime(content_type.as_deref())
+            {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            let source = text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned();
+            // Fragments do not go on the HTTP request, but they remain part of the module-map
+            // identity and import.meta.url. A redirect-provided fragment takes precedence;
+            // otherwise URL fetching inherits the request fragment.
+            let final_fragment = lumen_common::url::parse(&resource_url, None)
+                .ok()?
+                .fragment
+                .or(requested_fragment);
+            let mut final_key = strip_url_fragment(&resource_url);
+            if let Some(fragment) = final_fragment {
+                final_key.push('#');
+                final_key.push_str(&fragment);
+            }
+            return Some((final_key, source));
+        }
+    }
+
+    // A network graph may import only URL-relative or absolute network modules (and the
+    // built-ins/data URLs handled above). In particular, never reinterpret a bare or file: URL
+    // as a path on the runtime host's filesystem.
+    if is_http_url(referrer) {
+        return None;
     }
 
     // A dynamic import's referrer is `import.meta.url`, a `file://` URL — reduce it (and a
@@ -420,6 +667,31 @@ fn resolve(
     let from = Path::new(referrer).parent()?;
     let (file, is_esm_pkg) = resolve_node_modules(specifier, from)?;
     load_as_module(&file, !is_esm_pkg)
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+fn strip_url_fragment(value: &str) -> String {
+    match value.find('#') {
+        Some(index) => value[..index].to_owned(),
+        None => value.to_owned(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn url_origin(value: &str) -> Option<String> {
+    let url = lumen_common::url::parse(value, None).ok()?;
+    if !matches!(url.scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let host = url.host?;
+    let default_port = if url.scheme == "https" { 443 } else { 80 };
+    Some(match url.port {
+        Some(port) if port != default_port => format!("{}://{}:{port}", url.scheme, host),
+        _ => format!("{}://{}", url.scheme, host),
+    })
 }
 
 /// The source of a `data:text/javascript,...` (or `application/javascript`) module URL, whose
@@ -576,10 +848,15 @@ fn resolve_node_modules(name: &str, start: &Path) -> Option<(PathBuf, bool)> {
         if let Some(subpath) = package_subpath(name) {
             let pkg_dir = package_dir(d, name);
             if let Ok(text) = lumen_host::sysfs::read_to_string(pkg_dir.join("package.json")) {
-                if crate::tsconfig::parse_jsonc(&text).ok().is_some_and(|json| json.get("exports").is_some()) {
+                if crate::tsconfig::parse_jsonc(&text)
+                    .ok()
+                    .is_some_and(|json| json.get("exports").is_some())
+                {
                     let entry = exports_subpath(&text, &subpath)?;
                     let mapped = normalize(&pkg_dir.join(entry));
-                    if !mapped.fs_is_file() { return None; }
+                    if !mapped.fs_is_file() {
+                        return None;
+                    }
                     let esm = file_is_esm(&mapped);
                     return Some((mapped, esm));
                 }
@@ -1252,6 +1529,118 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn network_request_resolution_preserves_query_and_drops_fragment() {
+        assert_eq!(
+            super::resolve_network_module_request(
+                "../dep.js?variant=slow#identity",
+                "http://web-platform.test:8000/a/b/main.js?root=1"
+            )
+            .as_deref(),
+            Some("http://web-platform.test:8000/a/dep.js?variant=slow")
+        );
+        assert_eq!(
+            super::resolve_network_module_request(
+                "/dep.js?x=1",
+                "https://web-platform.test:8443/a/main.js"
+            )
+            .as_deref(),
+            Some("https://web-platform.test:8443/dep.js?x=1")
+        );
+        assert!(super::resolve_network_module_request(
+            "https://other.test/dep.js",
+            "https://web-platform.test/main.js"
+        )
+        .is_none());
+        assert!(super::resolve_network_module_request("./dep.js", "file:///wpt/main.js").is_none());
+    }
+
+    #[test]
+    fn prefetched_module_resources_are_bounded_and_remember_failures() {
+        use super::{PrefetchedModuleResource, PrefetchedModuleResources};
+
+        let resources = PrefetchedModuleResources::default();
+        resources
+            .insert(
+                "http://example.test/a.js?x=1".into(),
+                Ok(PrefetchedModuleResource {
+                    final_url: "http://example.test/final.js?x=1".into(),
+                    content_type: Some("text/javascript".into()),
+                    bytes: b"export {};".to_vec(),
+                }),
+            )
+            .unwrap();
+        resources
+            .insert(
+                "http://example.test/missing.js".into(),
+                Err("HTTP 404".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            resources
+                .get("http://example.test/a.js?x=1")
+                .unwrap()
+                .unwrap()
+                .final_url,
+            "http://example.test/final.js?x=1"
+        );
+        assert_eq!(
+            resources.get("http://example.test/missing.js").unwrap(),
+            Err("HTTP 404".into())
+        );
+        let oversized = "x".repeat(super::PREFETCHED_MODULE_BYTES + 1);
+        assert!(resources
+            .insert(
+                "http://example.test/large.js".into(),
+                Ok(PrefetchedModuleResource {
+                    final_url: "http://example.test/large.js".into(),
+                    content_type: Some("text/javascript".into()),
+                    bytes: oversized.into_bytes(),
+                }),
+            )
+            .is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn canonical_esm_loader_consumes_prefetched_redirected_resource_without_network_fallback() {
+        use super::{
+            make_cached_loader_with_fetch_config_and_prefetched, BuiltinModules,
+            PrefetchedModuleResource, PrefetchedModuleResources,
+        };
+        use std::collections::HashMap;
+
+        let mut config = lumen_web::FetchConfig::default();
+        config.set_require_routes(true);
+        let cache = PrefetchedModuleResources::default();
+        cache
+            .insert(
+                "http://example.test:8000/dep.js?variant=one".into(),
+                Ok(PrefetchedModuleResource {
+                    final_url: "http://example.test:8000/final/dep.js?variant=one".into(),
+                    content_type: Some("text/javascript".into()),
+                    bytes: b"export const answer = 42;".to_vec(),
+                }),
+            )
+            .unwrap();
+        let (loader, _cache_handle) = make_cached_loader_with_fetch_config_and_prefetched(
+            BuiltinModules(HashMap::new()),
+            config,
+            cache,
+        );
+        let (key, source) = loader(
+            "./dep.js?variant=one#module-fragment",
+            "http://example.test:8000/page.html",
+            None,
+        )
+        .expect("the normal ESM resolver consumes the prefetched graph edge");
+        assert_eq!(
+            key,
+            "http://example.test:8000/final/dep.js?variant=one#module-fragment"
+        );
+        assert_eq!(source, "export const answer = 42;");
+    }
+
+    #[test]
     fn malformed_jsx_dependency_reports_native_parse_error() {
         let file = std::env::temp_dir().join(format!("lumen-malformed-{}.jsx", std::process::id()));
         std::fs::write(&file, "export default <div>").unwrap();
@@ -1348,6 +1737,76 @@ mod tests {
         );
         assert_eq!(calls.get(), 2);
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn configured_network_module_loader_uses_its_route_snapshot() {
+        use super::*;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local module listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("module request");
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).expect("read module request");
+                assert_ne!(read, 0, "module connection closed before request headers");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.starts_with("GET /dependency.mjs?flavor=blue HTTP/1.1\r\n"),
+                "the fragment must stay off the wire while the query is preserved: {request}"
+            );
+            assert!(
+                request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("Host: 127.0.0.1:1")),
+                "logical Host header was not preserved: {request}"
+            );
+
+            let body = b"export const answer = 42;";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("write response headers");
+            stream.write_all(body).expect("write module body");
+        });
+
+        // The logical module URL uses port 1, while the captured route sends the socket to the
+        // ephemeral listener. Mutating the caller's config after loader creation must not retarget
+        // the loader; clones are immutable snapshots and preserve the URL's Host header.
+        let mut config = lumen_web::FetchConfig::default();
+        config.set_require_routes(true);
+        config
+            .set_route("127.0.0.1", 1, address)
+            .expect("configure module route");
+        let loader = make_loader_with_fetch_config(BuiltinModules(HashMap::new()), config.clone());
+        config
+            .set_route("127.0.0.1", 1, "127.0.0.1:2".parse().unwrap())
+            .expect("mutate caller config");
+
+        let referrer = "http://127.0.0.1:1/main.mjs";
+        let (key, source) = loader(
+            "./dependency.mjs?flavor=blue#module-fragment",
+            referrer,
+            None,
+        )
+        .expect("configured network dependency resolves");
+        assert_eq!(
+            key,
+            "http://127.0.0.1:1/dependency.mjs?flavor=blue#module-fragment"
+        );
+        assert_eq!(source, "export const answer = 42;");
+        server.join().expect("module fixture server exits");
+    }
+
     #[test]
     fn export_patterns_preserve_exact_blocks_specificity_and_boundaries() {
         let manifest = r#"{"exports":{"./*":{"import":"./dist/esm/*","require":"./dist/cjs/*"},"./feature/*":"./feature/*","./feature/*.js":"./specific/*.mjs","./blocked.js":null,"./internal/*":null}}"#;
@@ -1561,17 +2020,34 @@ mod tests {
     }
     #[test]
     fn subpath_exports_own_legacy_files_and_refuse_blocked_disk_fallback() {
-        let dir=std::env::temp_dir().join(format!("lumen-exports-shadow-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let pkg=dir.join("node_modules/shadow");std::fs::create_dir_all(pkg.join("dist")).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "lumen-exports-shadow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pkg = dir.join("node_modules/shadow");
+        std::fs::create_dir_all(pkg.join("dist")).unwrap();
         std::fs::write(pkg.join("package.json"),r#"{"type":"module","exports":{"./stream":{"import":"./dist/stream.js","require":"./dist/stream.cjs"},"./cjs":"./dist/stream.cjs","./blocked":null}}"#).unwrap();
-        for path in ["stream.js","blocked.js","dist/stream.js","dist/stream.cjs"] {std::fs::write(pkg.join(path),"").unwrap();}
-        let (path,esm)=super::resolve_node_modules("shadow/stream",&dir).expect("mapped module");
-        assert_eq!(path,pkg.join("dist/stream.js"));assert!(esm);
-        let (path,esm)=super::resolve_node_modules("shadow/cjs",&dir).expect("mapped cjs");
-        assert_eq!(path,pkg.join("dist/stream.cjs"));assert!(!esm);
-        assert!(super::resolve_node_modules("shadow/blocked",&dir).is_none());
-        assert!(super::resolve_node_modules("shadow/stream.js",&dir).is_none());
+        for path in [
+            "stream.js",
+            "blocked.js",
+            "dist/stream.js",
+            "dist/stream.cjs",
+        ] {
+            std::fs::write(pkg.join(path), "").unwrap();
+        }
+        let (path, esm) =
+            super::resolve_node_modules("shadow/stream", &dir).expect("mapped module");
+        assert_eq!(path, pkg.join("dist/stream.js"));
+        assert!(esm);
+        let (path, esm) = super::resolve_node_modules("shadow/cjs", &dir).expect("mapped cjs");
+        assert_eq!(path, pkg.join("dist/stream.cjs"));
+        assert!(!esm);
+        assert!(super::resolve_node_modules("shadow/blocked", &dir).is_none());
+        assert!(super::resolve_node_modules("shadow/stream.js", &dir).is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
-
 }

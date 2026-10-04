@@ -60,7 +60,11 @@ macro_rules! ctors {
 
 impl NativeError {
     pub fn new(kind: ErrorKind, message: impl Into<Cow<'static, str>>) -> NativeError {
-        NativeError { kind, message: message.into(), code: None }
+        NativeError {
+            kind,
+            message: message.into(),
+            code: None,
+        }
     }
 
     ctors! {

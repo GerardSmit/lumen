@@ -35,10 +35,19 @@ pub mod _warnings {
         if it.isinstance_value(message, &warning)? {
             return Ok((message.clone(), Value::Obj(it.type_of(message))));
         }
-        let cat = if category.is_none() { Value::Obj(it.exc_types["UserWarning"].clone()) } else { category.clone() };
-        if !matches!(&cat, Value::Obj(c) if matches!(c.kind, Kind::Type(_))) || !it.issubclass_value(&cat, &warning)? {
+        let cat = if category.is_none() {
+            Value::Obj(it.exc_types["UserWarning"].clone())
+        } else {
+            category.clone()
+        };
+        if !matches!(&cat, Value::Obj(c) if matches!(c.kind, Kind::Type(_)))
+            || !it.issubclass_value(&cat, &warning)?
+        {
             let r = it.repr_of(&cat)?;
-            return Err(it.type_error(&format!("category must be a Warning subclass, not '{}'", r.trim_matches('\''))));
+            return Err(it.type_error(&format!(
+                "category must be a Warning subclass, not '{}'",
+                r.trim_matches('\'')
+            )));
         }
         let inst = it.call(&cat, vec![message.clone()], Vec::new())?;
         Ok((inst, cat))
@@ -58,7 +67,13 @@ pub mod _warnings {
         it.truthy(&m)
     }
 
-    fn get_action(it: &mut Interp, text: &Value, category: &Value, module: &Value, lineno: i64) -> R<Value> {
+    fn get_action(
+        it: &mut Interp,
+        text: &Value,
+        category: &Value,
+        module: &Value,
+        lineno: i64,
+    ) -> R<Value> {
         let filters = setting(it, "filters")?;
         for f in it.iterate_to_vec(&filters)? {
             let Some(t) = f.tuple_items() else { continue };
@@ -66,30 +81,77 @@ pub mod _warnings {
                 continue;
             }
             let ln = it.index_of(&t[4])?;
-            if matches_opt(it, &t[1], text)? && it.issubclass_value(category, &t[2])? && matches_opt(it, &t[3], module)? && (ln == 0 || ln == lineno) {
+            if matches_opt(it, &t[1], text)?
+                && it.issubclass_value(category, &t[2])?
+                && matches_opt(it, &t[3], module)?
+                && (ln == 0 || ln == lineno)
+            {
                 return Ok(t[0].clone());
             }
         }
         setting(it, "defaultaction")
     }
 
-    fn emit(it: &mut Interp, message: &Value, category: &Value, filename: &Value, lineno: i64, source: &Value) -> R<()> {
+    fn emit(
+        it: &mut Interp,
+        message: &Value,
+        category: &Value,
+        filename: &Value,
+        lineno: i64,
+        source: &Value,
+    ) -> R<()> {
         if let Some(w) = warnings_module(it) {
-            if let (Ok(wm), Ok(show)) = (it.get_attr_str(&w, "WarningMessage"), it.get_attr_str(&w, "_showwarnmsg")) {
-                let msg = it.call(&wm, vec![message.clone(), category.clone(), filename.clone(), Value::Int(lineno), Value::None, Value::None, source.clone()], Vec::new())?;
+            if let (Ok(wm), Ok(show)) = (
+                it.get_attr_str(&w, "WarningMessage"),
+                it.get_attr_str(&w, "_showwarnmsg"),
+            ) {
+                let msg = it.call(
+                    &wm,
+                    vec![
+                        message.clone(),
+                        category.clone(),
+                        filename.clone(),
+                        Value::Int(lineno),
+                        Value::None,
+                        Value::None,
+                        source.clone(),
+                    ],
+                    Vec::new(),
+                )?;
                 it.call(&show, vec![msg], Vec::new())?;
                 return Ok(());
             }
         }
         let name = it.get_attr_str(category, "__name__")?;
-        let line = format!("{}:{}: {}: {}\n", it.str_of(filename)?, lineno, it.str_of(&name)?, it.str_of(message)?);
+        let line = format!(
+            "{}:{}: {}: {}\n",
+            it.str_of(filename)?,
+            lineno,
+            it.str_of(&name)?,
+            it.str_of(message)?
+        );
         it.write_stderr(&line);
         Ok(())
     }
 
-    fn warn_explicit_impl(it: &mut Interp, message: &Value, category: &Value, filename: &Value, lineno: i64, module: &Value, registry: &Value, source: &Value) -> R<()> {
+    fn warn_explicit_impl(
+        it: &mut Interp,
+        message: &Value,
+        category: &Value,
+        filename: &Value,
+        lineno: i64,
+        module: &Value,
+        registry: &Value,
+        source: &Value,
+    ) -> R<()> {
         let (inst, cat) = category_of(it, message, category)?;
-        let text = if matches!(&inst, Value::Obj(_)) && !it.isinstance_value(message, &Value::Obj(it.types.str_.clone()))? { Value::string(it.str_of(&inst)?) } else { message.clone() };
+        let text = if matches!(&inst, Value::Obj(_))
+            && !it.isinstance_value(message, &Value::Obj(it.types.str_.clone()))?
+        {
+            Value::string(it.str_of(&inst)?)
+        } else {
+            message.clone()
+        };
         let key = Value::tuple(vec![text.clone(), cat.clone(), Value::Int(lineno)]);
         let has_registry = !registry.is_none();
         if has_registry {
@@ -141,13 +203,19 @@ pub mod _warnings {
         let m = it.import_module("_warnings")?;
         let f = it.get_attr_str(&Value::Obj(m), "warn")?;
         let cat = Value::Obj(it.exc_type(category));
-        it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
+        it.call(
+            &f,
+            vec![Value::str(msg), cat, Value::Int(stacklevel)],
+            Vec::new(),
+        )?;
         Ok(())
     }
 
     fn skipped(it: &Interp, frame: usize, prefixes: &[Value]) -> bool {
         let name = &it.frames[frame].code.filename;
-        prefixes.iter().any(|p| p.as_str().is_some_and(|p| name.starts_with(p)))
+        prefixes
+            .iter()
+            .any(|p| p.as_str().is_some_and(|p| name.starts_with(p)))
     }
 
     /// Issue a warning, or maybe ignore it or raise an exception.
@@ -181,7 +249,9 @@ pub mod _warnings {
                 Some(t) => t.to_vec(),
                 None => {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("warn() argument 'skip_file_prefixes' must be tuple, not {t}")));
+                    return Err(it.type_error(&format!(
+                        "warn() argument 'skip_file_prefixes' must be tuple, not {t}"
+                    )));
                 }
             },
         };
@@ -203,7 +273,11 @@ pub mod _warnings {
         let (filename, lineno, globals) = match frame {
             Some(i) => {
                 let f = &it.frames[i];
-                (Value::str(&f.code.filename), f.code.line_at(f.pc.saturating_sub(1)) as i64, Some(f.globals.clone()))
+                (
+                    Value::str(&f.code.filename),
+                    f.code.line_at(f.pc.saturating_sub(1)) as i64,
+                    Some(f.globals.clone()),
+                )
             }
             None => (Value::str("sys"), 1, None),
         };
@@ -224,7 +298,9 @@ pub mod _warnings {
         };
         let category = category.cloned().unwrap_or(Value::None);
         let source = source.cloned().unwrap_or(Value::None);
-        warn_explicit_impl(it, message, &category, &filename, lineno, &module, &registry, &source)?;
+        warn_explicit_impl(
+            it, message, &category, &filename, lineno, &module, &registry, &source,
+        )?;
         Ok(Value::None)
     }
 
@@ -251,7 +327,16 @@ pub mod _warnings {
             }
         };
         let none = Value::None;
-        warn_explicit_impl(it, message, category, filename, lineno, &module, registry.unwrap_or(&none), source.unwrap_or(&none))?;
+        warn_explicit_impl(
+            it,
+            message,
+            category,
+            filename,
+            lineno,
+            &module,
+            registry.unwrap_or(&none),
+            source.unwrap_or(&none),
+        )?;
         Ok(Value::None)
     }
 
@@ -262,12 +347,24 @@ pub mod _warnings {
     fn init(it: &mut Interp, m: &Value) {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
-        let default_filters = [("default", "DeprecationWarning", Some("__main__")), ("ignore", "DeprecationWarning", None), ("ignore", "PendingDeprecationWarning", None), ("ignore", "ImportWarning", None), ("ignore", "ResourceWarning", None)];
+        let default_filters = [
+            ("default", "DeprecationWarning", Some("__main__")),
+            ("ignore", "DeprecationWarning", None),
+            ("ignore", "PendingDeprecationWarning", None),
+            ("ignore", "ImportWarning", None),
+            ("ignore", "ResourceWarning", None),
+        ];
         let filters: Vec<Value> = default_filters
             .iter()
             .map(|(action, cat, module)| {
                 let module = module.map(Value::str).unwrap_or(Value::None);
-                Value::tuple(vec![Value::str(action), Value::None, Value::Obj(it.exc_types[cat].clone()), module, Value::Int(0)])
+                Value::tuple(vec![
+                    Value::str(action),
+                    Value::None,
+                    Value::Obj(it.exc_types[cat].clone()),
+                    module,
+                    Value::Int(0),
+                ])
             })
             .collect();
         dict_set_str(&d, "filters", Value::list(filters));

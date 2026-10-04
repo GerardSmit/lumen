@@ -1,6 +1,9 @@
 //! Run fresh Chrome references and save both renders, absolute pixel diffs, and CSV metrics.
+use lumen_html::paint::FontStyle;
 use lumen_html_image::{decode_png, encode_png, render_html_with_images, FileImages, Rgba8Image};
-use lumen_html_text::{FontFace, TEST_FONT_BYTES};
+use lumen_html_text::{
+    FontFace, FontSet, RegisteredFont, DEFAULT_FONT_BYTES, TEST_FONT_BOLD_BYTES, TEST_FONT_BYTES,
+};
 use std::{path::PathBuf, sync::Arc};
 
 #[path = "support/chrome.rs"]
@@ -32,9 +35,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut chrome = chrome::Chrome::launch(&browser, &output)?;
     let mut cdp = chrome.connect()?;
-    let font = FontFace::new(Arc::from(TEST_FONT_BYTES))?;
+    let regular = Arc::new(FontFace::new(Arc::from(TEST_FONT_BYTES))?);
+    let bold = Arc::new(FontFace::new(Arc::from(TEST_FONT_BOLD_BYTES))?);
+    let mono = Arc::new(FontFace::new(Arc::from(DEFAULT_FONT_BYTES))?);
+    let mut registered = Vec::new();
+    for family in [
+        "LumenTest",
+        "LumenFixture",
+        "Arial",
+        "Helvetica",
+        "Test",
+        "Liberation Sans",
+        "sans-serif",
+    ] {
+        registered.push(RegisteredFont {
+            stretch: 100.0,
+            family: Arc::from(family),
+            weight: 400,
+            style: FontStyle::Normal,
+            face: regular.clone(),
+        });
+        registered.push(RegisteredFont {
+            stretch: 100.0,
+            family: Arc::from(family),
+            weight: 700,
+            style: FontStyle::Normal,
+            face: bold.clone(),
+        });
+    }
+    for family in ["LumenMono", "monospace", "Inconsolata"] {
+        registered.push(RegisteredFont {
+            stretch: 100.0,
+            family: Arc::from(family),
+            weight: 400,
+            style: FontStyle::Normal,
+            face: mono.clone(),
+        });
+    }
+    let fonts = FontSet::new(registered)?;
     let mut metrics = String::from(
         "fixture,differing_pixels,total_pixels,max_channel_delta,mean_channel_delta\n",
+    );
+    let jixr_directory = std::env::var_os("LUMEN_JIXR_DIRECTORY").map(PathBuf::from);
+    let mut jixr_metrics = String::from(
+        "fixture,backend,differing_pixels,total_pixels,max_channel_delta,mean_channel_delta\n",
     );
     let mut errors = Vec::new();
     let mut names = std::fs::read_dir(&fixtures)?
@@ -64,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             width,
             height,
             1.0,
-            &font,
+            &fonts,
             &FileImages::new(&fixtures),
         ) {
             Ok(actual) => actual,
@@ -83,6 +127,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             output.join(format!("{name}-lumen.png")),
             encode_png(&actual),
         )?;
+        if let Some(directory) = &jixr_directory {
+            for backend in ["image", "window"] {
+                let path = directory.join(name).join(format!("jixr-{backend}.png"));
+                let result = std::fs::read(&path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|bytes| decode_png(&bytes).map_err(|error| format!("{error:?}")))
+                    .and_then(|reference| {
+                        jixr_diff(name, backend, &actual, &reference, &output)
+                            .map_err(|error| error.to_string())
+                    });
+                match result {
+                    Ok(row) => jixr_metrics.push_str(&row),
+                    Err(error) => errors.push(serde_json::json!({"fixture":name,"stage":format!("jixr-{backend}"),"error":error})),
+                }
+            }
+        }
         let mut diff = Rgba8Image {
             width: actual.width,
             height: actual.height,
@@ -175,6 +235,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     std::fs::write(output.join("metrics.csv"), metrics)?;
+    if jixr_directory.is_some() {
+        std::fs::write(output.join("jixr-metrics.csv"), jixr_metrics)?;
+    }
     std::fs::write(
         output.join("errors.json"),
         serde_json::to_vec_pretty(&errors)?,
@@ -186,4 +249,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(format!("{} fixtures failed; see errors.json", errors.len()).into())
     }
+}
+
+fn jixr_diff(
+    name: &str,
+    backend: &str,
+    actual: &Rgba8Image,
+    reference: &Rgba8Image,
+    output: &std::path::Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if (actual.width, actual.height) != (reference.width, reference.height) {
+        return Err("Jixr dimensions differ".into());
+    }
+    let mut diff = Rgba8Image {
+        width: actual.width,
+        height: actual.height,
+        pixels: vec![0; actual.pixels.len()],
+    };
+    let (mut changed, mut maximum, mut sum) = (0usize, 0u8, 0u64);
+    for ((a, b), d) in actual
+        .pixels
+        .chunks_exact(4)
+        .zip(reference.pixels.chunks_exact(4))
+        .zip(diff.pixels.chunks_exact_mut(4))
+    {
+        changed += usize::from(a != b);
+        for channel in 0..4 {
+            let delta = a[channel].abs_diff(b[channel]);
+            maximum = maximum.max(delta);
+            sum += u64::from(delta);
+            d[channel] = delta;
+        }
+        d[3] = 255;
+    }
+    std::fs::write(
+        output.join(format!("{name}-jixr-{backend}-diff.png")),
+        encode_png(&diff),
+    )?;
+    let total = u64::from(actual.width) * u64::from(actual.height);
+    Ok(format!(
+        "{name},{backend},{changed},{total},{maximum},{:.6}\n",
+        sum as f64 / (total * 4) as f64
+    ))
 }

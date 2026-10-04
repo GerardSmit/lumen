@@ -13,7 +13,10 @@ fn errors_arg(it: &mut Interp, v: &Option<Value>, fname: &str, pos: usize) -> R<
             Some(s) => Ok(s.to_string()),
             None => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("{}() argument {} must be str or None, not {}", fname, pos, t)))
+                Err(it.type_error(&format!(
+                    "{}() argument {} must be str or None, not {}",
+                    fname, pos, t
+                )))
             }
         },
     }
@@ -25,13 +28,19 @@ fn str_arg(it: &mut Interp, v: &Option<Value>, fname: &str, pos: usize) -> R<Str
         Some(s) => Ok(s.to_string()),
         None => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("{}() argument {} must be str, not {}", fname, pos, t)))
+            Err(it.type_error(&format!(
+                "{}() argument {} must be str, not {}",
+                fname, pos, t
+            )))
         }
     }
 }
 
 fn nchars(v: &Option<Value>) -> i64 {
-    v.as_ref().and_then(|v| v.as_pystr()).map(|s| s.nchars as i64).unwrap_or(0)
+    v.as_ref()
+        .and_then(|v| v.as_pystr())
+        .map(|s| s.nchars as i64)
+        .unwrap_or(0)
 }
 
 /// A bytes-like argument (bytes, bytearray, or a str read as UTF-8 where CPython's `s*` allows it).
@@ -107,14 +116,23 @@ fn forget_codec(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::None)
 }
 
-fn named_str(it: &mut Interp, v: &Option<Value>, fname: &str, arg: &str, default: &str) -> R<String> {
+fn named_str(
+    it: &mut Interp,
+    v: &Option<Value>,
+    fname: &str,
+    arg: &str,
+    default: &str,
+) -> R<String> {
     match v {
         None => Ok(default.into()),
         Some(v) => match v.as_str() {
             Some(s) => Ok(s.to_string()),
             None => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("{}() argument '{}' must be str, not {}", fname, arg, t)))
+                Err(it.type_error(&format!(
+                    "{}() argument '{}' must be str, not {}",
+                    fname, arg, t
+                )))
             }
         },
     }
@@ -162,7 +180,13 @@ fn enc_args(it: &mut Interp, a: &[Value], kw: Kw, fname: &str) -> R<(String, Str
 }
 
 /// `(data, errors=None, final=False)` for the stateful decoders.
-fn dec_args(it: &mut Interp, a: &[Value], kw: Kw, fname: &str, final_default: bool) -> R<(Vec<u8>, String, bool)> {
+fn dec_args(
+    it: &mut Interp,
+    a: &[Value],
+    kw: Kw,
+    fname: &str,
+    final_default: bool,
+) -> R<(Vec<u8>, String, bool)> {
     let b = it.bind_args(fname, a, kw, &["data", "errors", "final"], 1)?;
     let data = buf_arg(it, &b[0], false)?;
     let errors = errors_arg(it, &b[1], fname, 2)?;
@@ -192,7 +216,14 @@ fn utf_7_decode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     Ok(pair_str(s, n))
 }
 
-fn utf_bo_encode(it: &mut Interp, a: &[Value], kw: Kw, fname: &str, wide: bool, fixed: Option<i32>) -> R<Value> {
+fn utf_bo_encode(
+    it: &mut Interp,
+    a: &[Value],
+    kw: Kw,
+    fname: &str,
+    wide: bool,
+    fixed: Option<i32>,
+) -> R<Value> {
     let (s, errors, n, bo) = if fixed.is_some() {
         let (s, e, n) = enc_args(it, a, kw, fname)?;
         (s, e, n, fixed.unwrap_or(0))
@@ -203,14 +234,29 @@ fn utf_bo_encode(it: &mut Interp, a: &[Value], kw: Kw, fname: &str, wide: bool, 
         let bo = int_arg(it, &b[2])?;
         (s, errors, nchars(&b[0]), bo.clamp(-1, 1) as i32)
     };
-    let out = if wide { codecs::utf32_encode(it, &s, &errors, bo)? } else { codecs::utf16_encode(it, &s, &errors, bo)? };
+    let out = if wide {
+        codecs::utf32_encode(it, &s, &errors, bo)?
+    } else {
+        codecs::utf16_encode(it, &s, &errors, bo)?
+    };
     Ok(pair_bytes(out, n))
 }
 
-fn utf_bo_decode(it: &mut Interp, a: &[Value], kw: Kw, fname: &str, wide: bool, bo: i32) -> R<Value> {
+fn utf_bo_decode(
+    it: &mut Interp,
+    a: &[Value],
+    kw: Kw,
+    fname: &str,
+    wide: bool,
+    bo: i32,
+) -> R<Value> {
     let (d, errors, final_) = dec_args(it, a, kw, fname, false)?;
     let mut bo = bo;
-    let (s, n) = if wide { codecs::utf32_decode(it, &d, &errors, &mut bo, final_)? } else { codecs::utf16_decode(it, &d, &errors, &mut bo, final_)? };
+    let (s, n) = if wide {
+        codecs::utf32_decode(it, &d, &errors, &mut bo, final_)?
+    } else {
+        codecs::utf16_decode(it, &d, &errors, &mut bo, final_)?
+    };
     Ok(pair_str(s, n))
 }
 
@@ -220,8 +266,16 @@ fn utf_ex_decode(it: &mut Interp, a: &[Value], kw: Kw, fname: &str, wide: bool) 
     let errors = errors_arg(it, &b[1], fname, 2)?;
     let mut bo = int_arg(it, &b[2])?.clamp(-1, 1) as i32;
     let final_ = final_arg(it, &b[3], false)?;
-    let (s, n) = if wide { codecs::utf32_decode(it, &d, &errors, &mut bo, final_)? } else { codecs::utf16_decode(it, &d, &errors, &mut bo, final_)? };
-    Ok(Value::tuple(vec![Value::string(s), Value::Int(n as i64), Value::Int(bo as i64)]))
+    let (s, n) = if wide {
+        codecs::utf32_decode(it, &d, &errors, &mut bo, final_)?
+    } else {
+        codecs::utf16_decode(it, &d, &errors, &mut bo, final_)?
+    };
+    Ok(Value::tuple(vec![
+        Value::string(s),
+        Value::Int(n as i64),
+        Value::Int(bo as i64),
+    ]))
 }
 
 fn utf_16_encode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -350,10 +404,15 @@ fn raw_unicode_escape_decode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 fn escape_encode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let b = it.bind_args("escape_encode", a, kw, &["data", "errors"], 1)?;
     let d = match &b[0] {
-        Some(Value::Obj(o)) if matches!(o.kind, Kind::Bytes(_)) => it.bytes_of(b[0].as_ref().unwrap_or(&Value::None))?,
+        Some(Value::Obj(o)) if matches!(o.kind, Kind::Bytes(_)) => {
+            it.bytes_of(b[0].as_ref().unwrap_or(&Value::None))?
+        }
         other => {
             let t = it.type_name_of(other.as_ref().unwrap_or(&Value::None));
-            return Err(it.type_error(&format!("escape_encode() argument 1 must be bytes, not {}", t)));
+            return Err(it.type_error(&format!(
+                "escape_encode() argument 1 must be bytes, not {}",
+                t
+            )));
         }
     };
     errors_arg(it, &b[1], "escape_encode", 2)?;
@@ -447,7 +506,14 @@ fn arg_type_err(it: &mut Interp, n: usize, want: &str, v: &Value) -> Obj {
 
 /// Shared `__init__`: `(encoding, object, start, end, reason)`, or without `encoding` for
 /// `UnicodeTranslateError`.
-fn unicode_init(it: &mut Interp, a: &[Value], kw: Kw, cls: &str, with_encoding: bool, bytes_object: bool) -> R<Value> {
+fn unicode_init(
+    it: &mut Interp,
+    a: &[Value],
+    kw: Kw,
+    cls: &str,
+    with_encoding: bool,
+    bytes_object: bool,
+) -> R<Value> {
     let e = exc_self(it, a)?;
     if !kw.is_empty() {
         return Err(it.type_error(&format!("{}() takes no keyword arguments", cls)));
@@ -458,7 +524,11 @@ fn unicode_init(it: &mut Interp, a: &[Value], kw: Kw, cls: &str, with_encoding: 
     }
     let want = if with_encoding { 5 } else { 4 };
     if args.len() != want {
-        return Err(it.type_error(&format!("function takes exactly {} arguments ({} given)", want, args.len())));
+        return Err(it.type_error(&format!(
+            "function takes exactly {} arguments ({} given)",
+            want,
+            args.len()
+        )));
     }
     let off = with_encoding as usize;
     let encoding = if with_encoding {
@@ -472,7 +542,9 @@ fn unicode_init(it: &mut Interp, a: &[Value], kw: Kw, cls: &str, with_encoding: 
     let object = if bytes_object {
         match &args[off] {
             Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => args[off].clone(),
-            Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => Value::bytes(it.bytes_of(&args[off])?),
+            Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => {
+                Value::bytes(it.bytes_of(&args[off])?)
+            }
             v => {
                 let t = it.type_name_of(v);
                 return Err(it.type_error(&format!("a bytes-like object is required, not '{}'", t)));
@@ -530,25 +602,54 @@ enum StrKind {
 fn unicode_str(it: &mut Interp, a: &[Value], kind: StrKind) -> R<Value> {
     let e = exc_self(it, a)?;
     let d = it.instance_dict(&e);
-    let Some(object) = dict_get_str(&d, "object") else { return Ok(Value::str("")) };
+    let Some(object) = dict_get_str(&d, "object") else {
+        return Ok(Value::str(""));
+    };
     let get = |n: &str| dict_get_str(&d, n).unwrap_or(Value::None);
     let (sv, ev, rv, encv) = (get("start"), get("end"), get("reason"), get("encoding"));
     let start = it.index_of(&sv)?;
     let end = it.index_of(&ev)?;
     let reason = it.str_of(&rv)?;
-    let prefix = if kind == StrKind::Translate { "can't translate".to_string() } else { format!("'{}' codec can't {}", it.str_of(&encv)?, if kind == StrKind::Encode { "encode" } else { "decode" }) };
+    let prefix = if kind == StrKind::Translate {
+        "can't translate".to_string()
+    } else {
+        format!(
+            "'{}' codec can't {}",
+            it.str_of(&encv)?,
+            if kind == StrKind::Encode {
+                "encode"
+            } else {
+                "decode"
+            }
+        )
+    };
     let single = if kind == StrKind::Decode {
         let b = it.bytes_of(&object)?;
-        (start >= 0 && (start as usize) < b.len() && end == start + 1).then(|| format!("byte 0x{:02x}", b[start as usize]))
+        (start >= 0 && (start as usize) < b.len() && end == start + 1)
+            .then(|| format!("byte 0x{:02x}", b[start as usize]))
     } else {
-        let c = object.as_pystr().filter(|s| start >= 0 && (start as usize) < s.nchars && end == start + 1).and_then(|s| s.char_at(start as usize));
+        let c = object
+            .as_pystr()
+            .filter(|s| start >= 0 && (start as usize) < s.nchars && end == start + 1)
+            .and_then(|s| s.char_at(start as usize));
         c.map(|c| format!("character '{}'", char_escape(c)))
     };
     let msg = match single {
         Some(what) => format!("{} {} in position {}: {}", prefix, what, start, reason),
         None => {
-            let what = if kind == StrKind::Decode { "bytes" } else { "characters" };
-            format!("{} {} in position {}-{}: {}", prefix, what, start, end - 1, reason)
+            let what = if kind == StrKind::Decode {
+                "bytes"
+            } else {
+                "characters"
+            };
+            format!(
+                "{} {} in position {}-{}: {}",
+                prefix,
+                what,
+                start,
+                end - 1,
+                reason
+            )
         }
     };
     Ok(Value::string(msg))

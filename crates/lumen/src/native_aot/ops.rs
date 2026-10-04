@@ -3,11 +3,19 @@ use super::{NativeFrame, STATUS_OK, STATUS_THROW};
 use crate::interpreter::Abrupt;
 use crate::value::Value;
 
-fn publish_slot(i: &mut crate::interpreter::Interp, frame: &NativeFrame, slot: u32, value: Value) -> Result<(), Abrupt> {
+fn publish_slot(
+    i: &mut crate::interpreter::Interp,
+    frame: &NativeFrame,
+    slot: u32,
+    value: Value,
+) -> Result<(), Abrupt> {
     let function = &frame.program.metadata.functions[frame.function as usize];
-    if function.flags & 64 == 0 { return Ok(()); }
+    if function.flags & 64 == 0 {
+        return Ok(());
+    }
     let name = &function.slot_names[slot as usize];
-    if std::rc::Rc::ptr_eq(&frame.env, &i.global_env) && i.global_var_names.contains(name.as_str()) {
+    if std::rc::Rc::ptr_eq(&frame.env, &i.global_env) && i.global_var_names.contains(name.as_str())
+    {
         let global = Value::Obj(i.global.clone());
         return i.set_member(&global, name, value);
     }
@@ -19,8 +27,12 @@ fn publish_slot(i: &mut crate::interpreter::Interp, frame: &NativeFrame, slot: u
 }
 
 pub(crate) fn address(id: u32) -> Option<usize> {
-    if id == crate::native_ops::SHAPE_GUARD { return Some(shape_guard as usize); }
-    if id == crate::native_ops::SHAPE_GET_PROP { return Some(shape_get_prop as usize); }
+    if id == crate::native_ops::SHAPE_GUARD {
+        return Some(shape_guard as usize);
+    }
+    if id == crate::native_ops::SHAPE_GET_PROP {
+        return Some(shape_get_prop as usize);
+    }
     let index = id.checked_sub(0x1000)?;
     let helpers: &[unsafe extern "C" fn(*mut NativeFrame, u32, u32, u32, u32, u32, u32) -> u32] =
         &include!("op_addresses.rs");
@@ -30,14 +42,30 @@ pub(crate) fn address(id: u32) -> Option<usize> {
 pub(crate) unsafe extern "C" fn shape_guard(frame: *mut NativeFrame, lo: u32, hi: u32) -> u32 {
     let frame = unsafe { &*frame };
     let expected = u64::from(lo) | (u64::from(hi) << 32);
-    u32::from(expected != 0 && frame.stack.last().is_some_and(|value| crate::native_ops::shape_hash(value) == expected))
+    u32::from(
+        expected != 0
+            && frame
+                .stack
+                .last()
+                .is_some_and(|value| crate::native_ops::shape_hash(value) == expected),
+    )
 }
 
-pub(crate) unsafe extern "C" fn shape_get_prop(frame: *mut NativeFrame, name: u32, _cache: u32, depth: u32, resume: u32) -> u32 {
+pub(crate) unsafe extern "C" fn shape_get_prop(
+    frame: *mut NativeFrame,
+    name: u32,
+    _cache: u32,
+    depth: u32,
+    resume: u32,
+) -> u32 {
     let frame = unsafe { &mut *frame };
-    frame.depth = depth; frame.resume = resume;
+    frame.depth = depth;
+    frame.resume = resume;
     match execute(frame, "GetProp", name, 0, 0, 0) {
-        Ok(status) => { frame.depth = frame.stack.len() as u32; status }
+        Ok(status) => {
+            frame.depth = frame.stack.len() as u32;
+            status
+        }
         Err(error) => super::failed(frame, error),
     }
 }
@@ -151,7 +179,9 @@ fn execute(
                 stored = Some(value);
                 Ok(())
             })?;
-            if let Some(value) = stored { publish_slot(i, frame, a, value)?; }
+            if let Some(value) = stored {
+                publish_slot(i, frame, a, value)?;
+            }
         }
         "UpdateName" | "UpdateNameCached" => {
             let name = &function.names[a as usize];
@@ -205,7 +235,9 @@ fn execute(
                     scope = env.parent.clone();
                 }
                 if !initialized {
-                    if !i.global_var_names.contains(name.as_str()) { return Err(i.throw("ReferenceError", "native captured binding missing")); }
+                    if !i.global_var_names.contains(name.as_str()) {
+                        return Err(i.throw("ReferenceError", "native captured binding missing"));
+                    }
                     let global = Value::Obj(i.global.clone());
                     i.set_member(&global, name, value)?;
                 }
@@ -219,7 +251,10 @@ fn execute(
         "LoadLexicalThis" => frame.stack.push(i.lexical_this(&frame.env)?),
         "MakeClosure" => {
             let child = function.children[a as usize];
-            let env = frame.pending_env.take().unwrap_or_else(|| frame.env.clone());
+            let env = frame
+                .pending_env
+                .take()
+                .unwrap_or_else(|| frame.env.clone());
             let value = i.make_native_function(program.clone(), child, env);
             if b != u32::MAX {
                 i.set_fn_name(&value, &function.names[b as usize]);
@@ -499,12 +534,10 @@ fn execute(
             let values = frame.stack.split_off(at);
             frame.stack.push(i.make_plain_object_vm(&keys, values));
         }
-        "MakeRegExp" => frame
-            .stack
-            .push(i.make_regexp_literal(
-                &std::rc::Rc::from(function.names[a as usize].as_str()),
-                &std::rc::Rc::from(function.names[b as usize].as_str()),
-            )?),
+        "MakeRegExp" => frame.stack.push(i.make_regexp_literal(
+            &std::rc::Rc::from(function.names[a as usize].as_str()),
+            &std::rc::Rc::from(function.names[b as usize].as_str()),
+        )?),
         "ForInKeys" => {
             let base = pop(frame)?;
             let keys = i.for_in_keys(&base)?;
@@ -613,15 +646,46 @@ fn execute(
             crate::bytecode::ext_ops::init_prop_computed(i, a != 0, &mut frame.stack)?
         }
         "InitMethod" => {
-            let key = if b == u32::MAX { let key = pop(frame)?; i.to_property_key(&key)? } else { function.names[b as usize].clone() };
-            let object = frame.stack.last().and_then(Value::as_obj).cloned().ok_or_else(|| i.throw("Error", "native object literal missing"))?;
-            let env = frame.pending_env.take().unwrap_or_else(|| frame.env.clone());
-            super::classes::init_method(i, &program, function.children[a as usize], env, key, c, object)?;
+            let key = if b == u32::MAX {
+                let key = pop(frame)?;
+                i.to_property_key(&key)?
+            } else {
+                function.names[b as usize].clone()
+            };
+            let object = frame
+                .stack
+                .last()
+                .and_then(Value::as_obj)
+                .cloned()
+                .ok_or_else(|| i.throw("Error", "native object literal missing"))?;
+            let env = frame
+                .pending_env
+                .take()
+                .unwrap_or_else(|| frame.env.clone());
+            super::classes::init_method(
+                i,
+                &program,
+                function.children[a as usize],
+                env,
+                key,
+                c,
+                object,
+            )?;
         }
         "MakeClass" => {
-            let env = frame.pending_env.take().unwrap_or_else(|| frame.env.clone());
+            let env = frame
+                .pending_env
+                .take()
+                .unwrap_or_else(|| frame.env.clone());
             let name = (b != u32::MAX).then(|| function.names[b as usize].as_str());
-            frame.stack.push(super::classes::make(i, &program, frame.function, a, env, name)?);
+            frame.stack.push(super::classes::make(
+                i,
+                &program,
+                frame.function,
+                a,
+                env,
+                name,
+            )?);
         }
         "CopyDataProps" => crate::bytecode::ext_ops::copy_data_props(i, &mut frame.stack)?,
         "SetProtoLit" => crate::bytecode::ext_ops::set_proto_lit(&mut frame.stack),
@@ -741,7 +805,9 @@ fn execute(
             c != 0,
         ),
         "BlkCopy" => crate::bytecode::block_env::copy(&mut frame.slots, a as u16),
-        "InEnv" => frame.pending_env = Some(crate::bytecode::block_env::env_of(&frame.slots[a as usize])),
+        "InEnv" => {
+            frame.pending_env = Some(crate::bytecode::block_env::env_of(&frame.slots[a as usize]))
+        }
         "BlkLoad" => frame.stack.push(crate::bytecode::block_env::load(
             i,
             &frame.slots,
@@ -964,7 +1030,11 @@ fn execute(
             crate::bytecode::generator::async_special(i, &frame.slots, a as u16, error)?;
         }
         "Await" | "Yield" => {
-            frame.parked = if op == "Await" { super::coroutines::Parked::Await } else { super::coroutines::Parked::Yield };
+            frame.parked = if op == "Await" {
+                super::coroutines::Parked::Await
+            } else {
+                super::coroutines::Parked::Yield
+            };
             frame.result = pop(frame)?;
             return Ok(super::STATUS_SUSPEND);
         }

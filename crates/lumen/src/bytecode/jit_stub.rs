@@ -5,7 +5,7 @@ use crate::interpreter::{Abrupt, Env, FnFrame, Interp};
 use crate::value::Value;
 use std::rc::Rc;
 
-pub(crate) use super::seed::{Seed, seed_raw};
+pub(crate) use super::seed::{seed_raw, Seed};
 
 #[derive(Default)]
 pub(crate) struct ChunkJit;

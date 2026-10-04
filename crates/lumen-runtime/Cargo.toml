@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 lumen-common = { path = "../lumen-common" }
+lumen-bind = { path = "../lumen-bind" }
 lumen = { path = "../lumen", default-features = false }
 lumen-host = { path = "../lumen-host", default-features = false }
 lumen-node = { path = "../lumen-node", default-features = false }
@@ -25,8 +26,7 @@ lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 [dev-dependencies]
-# tests/async_ops.rs binds its ops with lumen-bind.
-lumen-bind = { path = "../lumen-bind" }
+lumen-html-js = { path = "../lumen-html-js" }
 
 # lumen-node's optional builtins (see its Cargo.toml), all on by default.
 [features]

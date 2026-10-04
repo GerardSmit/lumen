@@ -1,7 +1,7 @@
 //! Compiled chunks outlive the pooled coroutine thread that first compiled them.
 //! Different engines must keep their direct-call records independent when workers
 //! are reused and their cached chunks execute on other physical threads.
-use lumen::{Completion, Engine, bytecode::Tier};
+use lumen::{bytecode::Tier, Completion, Engine};
 use std::sync::{Arc, Barrier};
 
 #[test]

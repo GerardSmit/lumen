@@ -12,7 +12,12 @@ use std::cmp::Ordering;
 use std::rc::Rc;
 
 impl Interp {
-    pub fn sort_values(&mut self, items: &mut Vec<Value>, key: Option<Value>, reverse: bool) -> R<()> {
+    pub fn sort_values(
+        &mut self,
+        items: &mut Vec<Value>,
+        key: Option<Value>,
+        reverse: bool,
+    ) -> R<()> {
         let n = items.len();
         if n < 2 {
             return Ok(());
@@ -32,14 +37,29 @@ impl Interp {
             order.reverse();
         }
         if keys.iter().all(|k| matches!(k, Value::Int(_))) {
-            let ik: Vec<i64> = keys.iter().map(|k| if let Value::Int(i) = k { *i } else { 0 }).collect();
+            let ik: Vec<i64> = keys
+                .iter()
+                .map(|k| if let Value::Int(i) = k { *i } else { 0 })
+                .collect();
             self.sort_order(&mut order, |a, b| ik[a].cmp(&ik[b]))?;
-        } else if keys.iter().all(|k| matches!(k, Value::Float(f) if !f.is_nan())) {
-            let fk: Vec<f64> = keys.iter().map(|k| if let Value::Float(f) = k { *f } else { 0.0 }).collect();
-            self.sort_order(&mut order, |a, b| fk[a].partial_cmp(&fk[b]).unwrap_or(Ordering::Equal))?;
-        } else if keys.iter().all(|k| matches!(k, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Str(_)))) {
+        } else if keys
+            .iter()
+            .all(|k| matches!(k, Value::Float(f) if !f.is_nan()))
+        {
+            let fk: Vec<f64> = keys
+                .iter()
+                .map(|k| if let Value::Float(f) = k { *f } else { 0.0 })
+                .collect();
+            self.sort_order(&mut order, |a, b| {
+                fk[a].partial_cmp(&fk[b]).unwrap_or(Ordering::Equal)
+            })?;
+        } else if keys.iter().all(
+            |k| matches!(k, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Str(_))),
+        ) {
             let sk: Vec<&str> = keys.iter().map(|k| k.as_str().unwrap_or("")).collect();
-            self.sort_order(&mut order, |a, b| lumen_common::smuggle::cmp_code_points(sk[a], sk[b]))?;
+            self.sort_order(&mut order, |a, b| {
+                lumen_common::smuggle::cmp_code_points(sk[a], sk[b])
+            })?;
         } else {
             order = self.merge_sort_indices(order, &keys)?;
         }
@@ -54,7 +74,11 @@ impl Interp {
 
     /// A stable sort of `order` that polls for interrupts between runs: sorted runs of
     /// `SORT_RUN` indices are merged pairwise.
-    fn sort_order(&mut self, order: &mut Vec<usize>, mut cmp: impl FnMut(usize, usize) -> Ordering) -> R<()> {
+    fn sort_order(
+        &mut self,
+        order: &mut Vec<usize>,
+        mut cmp: impl FnMut(usize, usize) -> Ordering,
+    ) -> R<()> {
         const SORT_RUN: usize = 1 << 15;
         let n = order.len();
         if n <= SORT_RUN {
@@ -137,7 +161,6 @@ impl Interp {
     }
 }
 
-
 /// A `list` (or subclass instance): the receiver of the list methods.
 #[derive(Clone, Copy)]
 pub struct ListRef<'a>(pub &'a Value, pub &'a RefCell<Vec<Value>>);
@@ -172,9 +195,16 @@ pub struct List;
 #[lumen_bind::methods]
 impl List {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let _ = (args, kwargs);
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         it.alloc_instance(cls)
     }
 
@@ -258,7 +288,13 @@ impl List {
     ///
     /// Raises ValueError if the value is not present.
     #[method(hint(py(text_signature = "($self, value, start=0, stop=sys.maxsize, /)")))]
-    fn index(slf: This<ListRef<'_>>, it: &mut Interp, value: &Value, start: Passed<&Value>, stop: Passed<&Value>) -> R<i64> {
+    fn index(
+        slf: This<ListRef<'_>>,
+        it: &mut Interp,
+        value: &Value,
+        start: Passed<&Value>,
+        stop: Passed<&Value>,
+    ) -> R<i64> {
         let items = slf.0 .1.borrow().clone();
         match seq_index(it, &items, value, start, stop)? {
             Some(i) => Ok(i),
@@ -292,7 +328,14 @@ impl List {
     ///
     /// The reverse flag can be set to sort in descending order.
     #[method(hint(py(text_signature = "($self, /, *, key=None, reverse=False)")))]
-    fn sort(slf: This<ListRef<'_>>, it: &mut Interp, #[kwonly] key: Option<&Value>, #[kwonly] #[default(false)] reverse: bool) -> R<()> {
+    fn sort(
+        slf: This<ListRef<'_>>,
+        it: &mut Interp,
+        #[kwonly] key: Option<&Value>,
+        #[kwonly]
+        #[default(false)]
+        reverse: bool,
+    ) -> R<()> {
         let l = slf.0 .1;
         let mut items = std::mem::take(&mut *l.borrow_mut());
         let r = it.sort_values(&mut items, key.cloned(), reverse);
@@ -331,7 +374,13 @@ impl List {
 }
 
 /// The first index in `items[start:stop]` equal to `value` (`list.index` / `tuple.index`).
-fn seq_index(it: &mut Interp, items: &[Value], value: &Value, start: Passed<&Value>, stop: Passed<&Value>) -> R<Option<i64>> {
+fn seq_index(
+    it: &mut Interp,
+    items: &[Value],
+    value: &Value,
+    start: Passed<&Value>,
+    stop: Passed<&Value>,
+) -> R<Option<i64>> {
     let n = items.len() as i64;
     let mut start = match start.0 {
         Some(v) => it.slice_index(v)?,
@@ -377,7 +426,9 @@ pub struct Tuple;
 impl Tuple {
     #[constructor(hint(py(text_signature = "")))]
     fn new(cls: This<Value>, it: &mut Interp, iterable: Passed<&Value>) -> R<Value> {
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let exact = Rc::ptr_eq(cls, &it.types.tuple);
         let items = match iterable.0 {
             Some(src) => {
@@ -395,7 +446,10 @@ impl Tuple {
         if exact {
             Ok(Value::tuple(items))
         } else {
-            Ok(Value::Obj(Object::with_cls(cls.clone(), Kind::Tuple(items))))
+            Ok(Value::Obj(Object::with_cls(
+                cls.clone(),
+                Kind::Tuple(items),
+            )))
         }
     }
 
@@ -403,7 +457,13 @@ impl Tuple {
     ///
     /// Raises ValueError if the value is not present.
     #[method(hint(py(text_signature = "($self, value, start=0, stop=sys.maxsize, /)")))]
-    fn index(slf: This<TupleRef<'_>>, it: &mut Interp, value: &Value, start: Passed<&Value>, stop: Passed<&Value>) -> R<i64> {
+    fn index(
+        slf: This<TupleRef<'_>>,
+        it: &mut Interp,
+        value: &Value,
+        start: Passed<&Value>,
+        stop: Passed<&Value>,
+    ) -> R<i64> {
         match seq_index(it, slf.0 .0, value, start, stop)? {
             Some(i) => Ok(i),
             None => Err(it.value_error("tuple.index(x): x not in tuple")),
@@ -438,13 +498,28 @@ pub fn init(it: &mut Interp) {
     if let Some(d) = list.dict.borrow().as_ref() {
         dict_set_str(d, "__hash__", Value::None);
     }
-    reg_slots(it, &list, &["__setitem__", "__delitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
+    reg_slots(
+        it,
+        &list,
+        &[
+            "__setitem__",
+            "__delitem__",
+            "__len__",
+            "__contains__",
+            "__iter__",
+            "__reversed__",
+        ],
+    );
     reg_method_forms(&list, &["__getitem__"]);
     reg_binops(it, &list, &["__add__", "__mul__", "__rmul__"]);
     reg_compare(it, &list, true);
 
     crate::bind::extend_type::<Tuple>(it, &tuple);
-    reg_slots(it, &tuple, &["__getitem__", "__len__", "__contains__", "__iter__"]);
+    reg_slots(
+        it,
+        &tuple,
+        &["__getitem__", "__len__", "__contains__", "__iter__"],
+    );
     reg_binops(it, &tuple, &["__add__", "__mul__", "__rmul__"]);
     reg_compare(it, &tuple, true);
 }

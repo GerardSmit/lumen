@@ -1,5 +1,5 @@
 use super::{CODE_CACHE, FS_DEAD};
-use crate::{Completion, Engine, JitMode, JitStats, bytecode::Tier};
+use crate::{bytecode::Tier, Completion, Engine, JitMode, JitStats};
 
 fn engine(mode: JitMode) -> Engine {
     let mut engine = Engine::new();
@@ -18,7 +18,9 @@ fn run(engine: &mut Engine, src: &str) -> String {
 
 fn functions(count: usize) -> String {
     (0..count)
-        .map(|k| format!("function f{k}(x){{var s=0;for(var j=0;j<16;j++){{s+=x*j+{k};}}return s;}}\n"))
+        .map(|k| {
+            format!("function f{k}(x){{var s=0;for(var j=0;j<16;j++){{s+=x*j+{k};}}return s;}}\n")
+        })
         .collect()
 }
 
@@ -84,7 +86,10 @@ fn full_arena_evicts_least_recently_used_code_and_keeps_compiling() {
     assert!(stats.compiled_units as usize >= COUNT, "{stats:?}");
     assert_eq!(stats.allocation_failures, 0, "{stats:?}");
     assert_eq!(dead_chunks(), 0);
-    assert!(stats.code_bytes - stats.evicted_bytes <= unit * 4 + unit, "{stats:?}");
+    assert!(
+        stats.code_bytes - stats.evicted_bytes <= unit * 4 + unit,
+        "{stats:?}"
+    );
 }
 
 #[test]
@@ -100,7 +105,10 @@ fn evicted_function_recompiles_when_hot_again() {
     let (again, want) = call_all(COUNT, 2);
     assert_eq!(run(&mut engine, &again), want.to_string());
     let after = engine.jit_stats();
-    assert!(after.compiled_units > before.compiled_units, "{before:?} {after:?}");
+    assert!(
+        after.compiled_units > before.compiled_units,
+        "{before:?} {after:?}"
+    );
     assert!(after.evictions > before.evictions, "{before:?} {after:?}");
     assert_eq!(dead_chunks(), 0);
 }
@@ -134,10 +142,16 @@ fn code_on_the_stack_is_never_evicted() {
         "function outer(n){{var s=0;for(var i=0;i<n;i++){{{calls}}}return s;}}
          function rec(d){{if(d==0)return 0;var s=0;{}return s+rec(d-1);}}
          String(outer(40)+':'+rec(30))",
-        (0..COUNT).map(|k| format!("s+=f{k}(d);")).collect::<String>()
+        (0..COUNT)
+            .map(|k| format!("s+=f{k}(d);"))
+            .collect::<String>()
     );
     let outer: i64 = (0..40i64)
-        .map(|i| (0..COUNT as i64).map(|k| (i & 7) * 120 + 16 * k).sum::<i64>())
+        .map(|i| {
+            (0..COUNT as i64)
+                .map(|k| (i & 7) * 120 + 16 * k)
+                .sum::<i64>()
+        })
         .sum();
     let rec: i64 = (1..=30i64)
         .map(|d| (0..COUNT as i64).map(|k| d * 120 + 16 * k).sum::<i64>())

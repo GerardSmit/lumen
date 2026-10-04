@@ -66,10 +66,10 @@
 pub mod _csv {
     #![allow(clippy::new_ret_no_self)]
     use crate::bind::{is_instance, opaque_instance, type_object, KwArgs, Py, This};
-    use lumen_bind::Passed;
     use crate::builtins::native::with_opaque;
     use crate::object::*;
     use crate::vm::{dict_set_str, Interp};
+    use lumen_bind::Passed;
     use lumen_common::csv::{self as core, Quoting};
 
     struct State {
@@ -80,12 +80,20 @@ pub mod _csv {
 
     impl Default for State {
         fn default() -> Self {
-            State { error: None, dialects: None, field_limit: 128 * 1024 }
+            State {
+                error: None,
+                dialects: None,
+                field_limit: 128 * 1024,
+            }
         }
     }
 
     fn csv_error(it: &mut Interp, msg: &str) -> Obj {
-        let cls = it.native_state::<State>().error.clone().unwrap_or_else(|| it.exc_type("Exception"));
+        let cls = it
+            .native_state::<State>()
+            .error
+            .clone()
+            .unwrap_or_else(|| it.exc_type("Exception"));
         it.new_exc(&cls, vec![Value::str(msg)])
     }
 
@@ -97,7 +105,9 @@ pub mod _csv {
         if let Some(d) = it.native_state::<State>().dialects.clone() {
             return d;
         }
-        let d = Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())));
+        let d = Object::new(Kind::Dict(std::cell::RefCell::new(
+            crate::dict::PyDict::new(),
+        )));
         it.native_state::<State>().dialects = Some(d.clone());
         d
     }
@@ -111,7 +121,16 @@ pub mod _csv {
         }
     }
 
-    const FIELDS: [&str; 8] = ["delimiter", "doublequote", "escapechar", "lineterminator", "quotechar", "quoting", "skipinitialspace", "strict"];
+    const FIELDS: [&str; 8] = [
+        "delimiter",
+        "doublequote",
+        "escapechar",
+        "lineterminator",
+        "quotechar",
+        "quoting",
+        "skipinitialspace",
+        "strict",
+    ];
 
     fn one_char(it: &mut Interp, name: &str, v: &Value, or_none: bool) -> R<Option<char>> {
         if or_none && v.is_none() {
@@ -131,7 +150,11 @@ pub mod _csv {
 
     /// `_csv.Dialect(dialect, **fmtparams)`'s settings: each given value, else the base
     /// dialect's attribute, else the default.
-    fn settings(it: &mut Interp, base: Option<&Value>, given: [Option<Value>; 8]) -> R<core::Dialect> {
+    fn settings(
+        it: &mut Interp,
+        base: Option<&Value>,
+        given: [Option<Value>; 8],
+    ) -> R<core::Dialect> {
         let mut vals = given;
         if let Some(b) = base {
             for (slot, name) in vals.iter_mut().zip(FIELDS) {
@@ -140,7 +163,8 @@ pub mod _csv {
                 }
             }
         }
-        let [delimiter, doublequote, escapechar, lineterminator, quotechar, quoting, skipinitialspace, strict] = vals;
+        let [delimiter, doublequote, escapechar, lineterminator, quotechar, quoting, skipinitialspace, strict] =
+            vals;
         let mut d = core::Dialect::default();
         if let Some(v) = &delimiter {
             d.delimiter = one_char(it, "delimiter", v, false)?.unwrap_or(',');
@@ -165,10 +189,18 @@ pub mod _csv {
         if let Some(v) = &quoting {
             let n = match v {
                 Value::Int(n) => *n,
-                Value::Obj(o) if matches!(o.kind, Kind::Int(_)) && o.cls.as_ref().is_none_or(|c| std::rc::Rc::ptr_eq(c, &it.types.int)) => i64::MAX,
+                Value::Obj(o)
+                    if matches!(o.kind, Kind::Int(_))
+                        && o.cls
+                            .as_ref()
+                            .is_none_or(|c| std::rc::Rc::ptr_eq(c, &it.types.int)) =>
+                {
+                    i64::MAX
+                }
                 _ => return Err(it.type_error("\"quoting\" must be an integer")),
             };
-            d.quoting = Quoting::from_i64(n).ok_or_else(|| it.type_error("bad \"quoting\" value"))?;
+            d.quoting =
+                Quoting::from_i64(n).ok_or_else(|| it.type_error("bad \"quoting\" value"))?;
         }
         if let Some(v) = &skipinitialspace {
             d.skipinitialspace = it.truthy(v)?;
@@ -214,7 +246,17 @@ pub mod _csv {
             #[kw] skipinitialspace: Passed<&Value>,
             #[kw] strict: Passed<&Value>,
         ) -> R<Value> {
-            let given = [delimiter, doublequote, escapechar, lineterminator, quotechar, quoting, skipinitialspace, strict].map(|v| v.0.cloned());
+            let given = [
+                delimiter,
+                doublequote,
+                escapechar,
+                lineterminator,
+                quotechar,
+                quoting,
+                skipinitialspace,
+                strict,
+            ]
+            .map(|v| v.0.cloned());
             let base = match dialect {
                 Some(v) if v.as_str().is_some() => Some(registered(it, v)?),
                 Some(v) => Some(v.clone()),
@@ -226,7 +268,9 @@ pub mod _csv {
                 }
             }
             let d = settings(it, base.as_ref(), given)?;
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
             Ok(opaque_instance(cls, Dialect { d }))
         }
 
@@ -292,7 +336,11 @@ pub mod _csv {
     }
 
     /// The `Dialect` for a reader, writer or registration: `Dialect(dialect, **kwargs)`.
-    fn call_dialect(it: &mut Interp, dialect: Option<&Value>, kw: Vec<(Obj, Value)>) -> R<(Value, core::Dialect)> {
+    fn call_dialect(
+        it: &mut Interp,
+        dialect: Option<&Value>,
+        kw: Vec<(Obj, Value)>,
+    ) -> R<(Value, core::Dialect)> {
         let cls = Value::Obj(type_object::<Dialect>(it));
         let v = it.call(&cls, dialect.into_iter().cloned().collect(), kw)?;
         let d = with_opaque::<Dialect, _>(&v, |d| d.d.clone()).unwrap_or_default();
@@ -304,7 +352,10 @@ pub mod _csv {
             [a] => Ok((a, None)),
             [a, b] => Ok((a, Some(b))),
             [] => Err(it.type_error(" expected at least 1 argument, got 0")),
-            _ => Err(it.type_error(&format!(" expected at most 2 arguments, got {}", args.len()))),
+            _ => Err(it.type_error(&format!(
+                " expected at most 2 arguments, got {}",
+                args.len()
+            ))),
         }
     }
 
@@ -337,7 +388,9 @@ pub mod _csv {
             })?;
             loop {
                 let Some(line) = it.iter_next(&input)? else {
-                    let pending = r.with(it, |s| s.parser.finish(&d))?.map_err(|e| core_error(it, e))?;
+                    let pending = r
+                        .with(it, |s| s.parser.finish(&d))?
+                        .map_err(|e| core_error(it, e))?;
                     if !pending {
                         return Ok(None);
                     }
@@ -350,7 +403,9 @@ pub mod _csv {
                 let limit = it.native_state::<State>().field_limit;
                 let done = r.with(it, |s| {
                     s.line_num += 1;
-                    s.parser.feed_line(&d, text, limit).map(|_| s.parser.record_done())
+                    s.parser
+                        .feed_line(&d, text, limit)
+                        .map(|_| s.parser.record_done())
                 })?;
                 if done.map_err(|e| core_error(it, e))? {
                     break;
@@ -417,7 +472,8 @@ pub mod _csv {
                 v if is_str => v.as_str().map(str::to_string),
                 v => Some(it.str_of(v)?),
             };
-            w.append(d, text.as_deref(), quoted).map_err(|e| core_error(it, e))?;
+            w.append(d, text.as_deref(), quoted)
+                .map_err(|e| core_error(it, e))?;
         }
         let line = w.finish(d).map_err(|e| core_error(it, e))?;
         it.call(write, vec![Value::string(line)], Vec::new())
@@ -472,7 +528,16 @@ pub mod _csv {
         let input = it.get_iter(iterable)?;
         let (dialect, d) = call_dialect(it, dialect, kw.to_vec())?;
         let cls = type_object::<Reader>(it);
-        Ok(opaque_instance(&cls, Reader { input, dialect, d, parser: core::Parser::default(), line_num: 0 }))
+        Ok(opaque_instance(
+            &cls,
+            Reader {
+                input,
+                dialect,
+                d,
+                parser: core::Parser::default(),
+                line_num: 0,
+            },
+        ))
     }
 
     ///     csv_writer = csv.writer(fileobj [, dialect='excel']
@@ -556,7 +621,12 @@ pub mod _csv {
         if let Some(v) = new_limit {
             let exact_int = match v {
                 Value::Int(_) => true,
-                Value::Obj(o) => matches!(o.kind, Kind::Int(_)) && o.cls.as_ref().is_none_or(|c| std::rc::Rc::ptr_eq(c, &it.types.int)),
+                Value::Obj(o) => {
+                    matches!(o.kind, Kind::Int(_))
+                        && o.cls
+                            .as_ref()
+                            .is_none_or(|c| std::rc::Rc::ptr_eq(c, &it.types.int))
+                }
                 _ => false,
             };
             if !exact_int {
@@ -573,7 +643,8 @@ pub mod _csv {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let exc = it.exc_type("Exception");
-        let error = crate::builtins::native::new_type(it, "_csv", "Error", Some(&exc), Layout::Exception);
+        let error =
+            crate::builtins::native::new_type(it, "_csv", "Error", Some(&exc), Layout::Exception);
         it.native_state::<State>().error = Some(error.clone());
         dict_set_str(&d, "Error", Value::Obj(error));
         let reg = registry(it);

@@ -67,7 +67,9 @@ fn incoming_all(func: &Function) -> Vec<Vec<(Inst, usize)>> {
 /// `edges`.
 fn remove_param(func: &mut Function, block: Block, idx: usize, edges: &[(Inst, usize)]) {
     for &(t, slot) in edges {
-        func.insts[t.index()].successors_mut()[slot].args.remove(idx);
+        func.insts[t.index()].successors_mut()[slot]
+            .args
+            .remove(idx);
     }
     func.blocks[block.index()].params.remove(idx);
     let params = func.blocks[block.index()].params.clone();
@@ -249,9 +251,19 @@ pub fn gvn(func: &mut Function) {
             }
             // Every signed I32 is exactly representable as F64. Recover it without an FP
             // conversion when JS bit operations or array indexing consume an unboxed local.
-            if let InstData::Convert { op: ConvOp::ToJsInt32 | ConvOp::ToSintSat, to, arg } = func.inst(inst) {
+            if let InstData::Convert {
+                op: ConvOp::ToJsInt32 | ConvOp::ToSintSat,
+                to,
+                arg,
+            } = func.inst(inst)
+            {
                 if let ValueDef::Result(source, 0) = func.values[arg.index()].def {
-                    if let InstData::Convert { op: ConvOp::FromSint, to: Type::F64, arg: integer } = *func.inst(source) {
+                    if let InstData::Convert {
+                        op: ConvOp::FromSint,
+                        to: Type::F64,
+                        arg: integer,
+                    } = *func.inst(source)
+                    {
                         if func.value_type(integer) == Type::I32 {
                             match *to {
                                 Type::I32 => {
@@ -260,9 +272,13 @@ pub fn gvn(func: &mut Function) {
                                     removed.push(inst);
                                     continue;
                                 }
-                                Type::I64 => func.insts[inst.index()] = InstData::Convert {
-                                    op: ConvOp::Sext, to: Type::I64, arg: integer,
-                                },
+                                Type::I64 => {
+                                    func.insts[inst.index()] = InstData::Convert {
+                                        op: ConvOp::Sext,
+                                        to: Type::I64,
+                                        arg: integer,
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -316,14 +332,21 @@ pub fn gvn(func: &mut Function) {
                 continue;
             }
             // Multi-result arithmetic must preserve both the value and overflow flag.
-            if func.results(inst).len() != 1 { continue; }
+            if func.results(inst).len() != 1 {
+                continue;
+            }
             let result = func.results(inst)[0];
             let ty = func.value_type(result);
 
             // Constant folding (trapping ops fold only when defined).
             let mut args_const = true;
             data.for_each_arg(|a| args_const &= const_of(func, a).is_some());
-            if args_const && !matches!(data, InstData::Iconst { .. } | InstData::F32const { .. } | InstData::F64const { .. }) {
+            if args_const
+                && !matches!(
+                    data,
+                    InstData::Iconst { .. } | InstData::F32const { .. } | InstData::F64const { .. }
+                )
+            {
                 if let Some(bits) = eval::pure_inst(func, &data, |a| const_of(func, a).unwrap()) {
                     func.insts[inst.index()] = const_data(ty, bits);
                 }
@@ -349,7 +372,9 @@ pub fn gvn(func: &mut Function) {
             }
         }
         if !removed.is_empty() {
-            func.blocks[b.index()].insts.retain(|i| !removed.contains(i));
+            func.blocks[b.index()]
+                .insts
+                .retain(|i| !removed.contains(i));
         }
         stack.push(Step::Leave(added));
         for &c in children[b.index()].iter().rev() {
@@ -404,7 +429,8 @@ pub fn dce(func: &mut Function) {
     while let Some(v) = work.pop() {
         match func.values[v.index()].def {
             ValueDef::Result(inst, _) => {
-                func.inst(inst).for_each_arg(|a| mark(a, &mut live, &mut work));
+                func.inst(inst)
+                    .for_each_arg(|a| mark(a, &mut live, &mut work));
             }
             ValueDef::Param(b, n) => {
                 for &(t, slot) in &edges[b.index()] {

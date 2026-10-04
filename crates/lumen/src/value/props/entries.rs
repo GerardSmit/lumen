@@ -16,7 +16,7 @@
 //! entries to an ordinary heap buffer. The JIT only needs `cap != 0` ("owned, writable in
 //! place"), which inline mode satisfies.
 use crate::value::Property;
-use std::alloc::{alloc, dealloc, handle_alloc_error, realloc, Layout};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc};
 use std::cell::Cell;
 use std::ptr::NonNull;
 

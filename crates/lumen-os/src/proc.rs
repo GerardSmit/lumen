@@ -63,10 +63,20 @@ pub fn uname() -> R<[String; 5]> {
             return Err(std::io::Error::last_os_error().into());
         }
         let s = |f: &[libc::c_char]| {
-            let bytes: Vec<u8> = f.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+            let bytes: Vec<u8> = f
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
             String::from_utf8_lossy(&bytes).into_owned()
         };
-        Ok([s(&u.sysname), s(&u.nodename), s(&u.release), s(&u.version), s(&u.machine)])
+        Ok([
+            s(&u.sysname),
+            s(&u.nodename),
+            s(&u.release),
+            s(&u.version),
+            s(&u.machine),
+        ])
     }
     #[cfg(not(unix))]
     {
@@ -74,7 +84,13 @@ pub fn uname() -> R<[String; 5]> {
             "windows" => "Windows",
             other => other,
         };
-        Ok([sys.to_string(), String::new(), String::new(), String::new(), std::env::consts::ARCH.to_string()])
+        Ok([
+            sys.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            std::env::consts::ARCH.to_string(),
+        ])
     }
 }
 
@@ -164,11 +180,20 @@ pub fn environ() -> Vec<(Vec<u8>, Vec<u8>)> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
-        std::env::vars_os().map(|(k, v)| (k.into_vec(), v.into_vec())).collect()
+        std::env::vars_os()
+            .map(|(k, v)| (k.into_vec(), v.into_vec()))
+            .collect()
     }
     #[cfg(not(unix))]
     {
-        std::env::vars_os().map(|(k, v)| (k.to_string_lossy().into_owned().into_bytes(), v.to_string_lossy().into_owned().into_bytes())).collect()
+        std::env::vars_os()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned().into_bytes(),
+                    v.to_string_lossy().into_owned().into_bytes(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -380,10 +405,16 @@ pub fn getlogin() -> R<String> {
         let p = unsafe { libc::getlogin() };
         if p.is_null() {
             let e = std::io::Error::last_os_error();
-            return Err(if e.raw_os_error() == Some(0) { FsError("ENOENT") } else { e.into() });
+            return Err(if e.raw_os_error() == Some(0) {
+                FsError("ENOENT")
+            } else {
+                e.into()
+            });
         }
         // SAFETY: a non-null result is a NUL-terminated string.
-        Ok(unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy().into_owned())
+        Ok(unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned())
     }
     #[cfg(not(unix))]
     Err(FsError("ENOSYS"))

@@ -1,10 +1,11 @@
-use super::{ImageError, MAX_LAYER_BYTES, Raster, composite};
+use super::{composite, ImageError, Raster, MAX_LAYER_BYTES};
 use lumen_html::paint::{BoxShadow, Rect};
 
 pub(super) fn draw(
     raster: &mut Raster<'_>,
     rect: Rect,
     radius: f32,
+    corners: Option<&[[f32; 2]; 4]>,
     shadow: BoxShadow,
 ) -> Result<(), ImageError> {
     if shadow.color.a == 0 {
@@ -38,7 +39,7 @@ pub(super) fn draw(
         return Err(ImageError::TooLarge);
     }
     let (width, height) = (width as usize, height as usize);
-    let ring_bytes = sizes.iter().sum::<usize>() * 8;
+    let ring_bytes = sizes.iter().sum::<usize>() * 8 * LANES;
     let pixels =
         lumen_common::limits::size::repeat(width, height, (MAX_LAYER_BYTES - ring_bytes) / 2)
             .map_err(|_| ImageError::TooLarge)?;
@@ -59,11 +60,23 @@ pub(super) fn draw(
     } else {
         (radius + spread).max(0.0)
     };
-    for y in 0..height {
-        for x in 0..width {
-            mask[y * width + x] = (coverage(
+    let shape_corners = corners.map(|corners| {
+        corners.map(|r| {
+            r.map(|radius| {
+                if spread > 0.0 && radius < spread {
+                    radius + spread * (1.0 - (1.0 - radius / spread).powi(3))
+                } else {
+                    (radius + spread).max(0.0)
+                }
+            })
+        })
+    });
+    for (y, row) in mask.chunks_exact_mut(width).enumerate() {
+        for (x, value) in row.iter_mut().enumerate() {
+            *value = (coverage(
                 shape,
                 shape_radius,
+                shape_corners.as_ref(),
                 left + x as f32,
                 top + y as f32,
                 raster.scale,
@@ -74,7 +87,7 @@ pub(super) fn draw(
     }
     if window > 1 {
         let mut scratch = vec![0u8; pixels];
-        let mut ring = vec![0u64; sizes.iter().sum()];
+        let mut ring = vec![0u64; sizes.iter().sum::<usize>() * LANES];
         for y in 0..height {
             scan(
                 &mask[y * width..],
@@ -85,37 +98,32 @@ pub(super) fn draw(
                 &mut ring,
             );
         }
-        for x in 0..width {
-            scan(
-                &scratch[x..],
-                &mut mask[x..],
-                height,
-                width,
-                sizes,
-                &mut ring,
+        for x0 in (0..width).step_by(LANES) {
+            let lanes = LANES.min(width - x0);
+            scan_columns(
+                &scratch, &mut mask, width, height, x0, lanes, sizes, &mut ring,
             );
         }
     }
-    let x0 = (visible.x * raster.scale).floor().max(0.0) as u32;
-    let y0 = (visible.y * raster.scale).floor().max(0.0) as u32;
-    let x1 = ((visible.x + visible.width) * raster.scale)
-        .ceil()
-        .min(raster.image.width as f32) as u32;
-    let y1 = ((visible.y + visible.height) * raster.scale)
-        .ceil()
-        .min(raster.image.height as f32) as u32;
+    let (x0, y0, x1, y1) = raster.pixel_span(visible);
+    let transparent = if shadow.inset { 255 } else { 0 };
     for y in y0..y1 {
         for x in x0..x1 {
+            let mask_offset = (y as f32 - top) as usize * width + (x as f32 - left) as usize;
+            let level = mask[mask_offset];
+            if level == transparent {
+                continue;
+            }
             let original = coverage(
                 rect,
                 radius,
+                corners,
                 x as f32,
                 y as f32,
                 raster.scale,
                 raster.antialias,
             );
-            let mask_offset = (y as f32 - top) as usize * width + (x as f32 - left) as usize;
-            let alpha = mask[mask_offset] as f32 / 255.0;
+            let alpha = level as f32 / 255.0;
             let alpha = if shadow.inset {
                 (1.0 - alpha) * original
             } else {
@@ -135,9 +143,40 @@ pub(super) fn draw(
     Ok(())
 }
 
-fn coverage(rect: Rect, radius: f32, x: f32, y: f32, scale: f32, antialias: bool) -> f32 {
+fn coverage(
+    rect: Rect,
+    radius: f32,
+    corners: Option<&[[f32; 2]; 4]>,
+    x: f32,
+    y: f32,
+    scale: f32,
+    antialias: bool,
+) -> f32 {
+    if let Some(corners) = corners {
+        return if antialias {
+            super::coverage::rounded_corners(
+                x,
+                y,
+                rect.x * scale,
+                rect.y * scale,
+                (rect.x + rect.width) * scale,
+                (rect.y + rect.height) * scale,
+                corners.map(|r| [r[0] * scale, r[1] * scale]),
+            )
+        } else {
+            rect.contains_corners((x + 0.5) / scale, (y + 0.5) / scale, corners) as u8 as f32
+        };
+    }
     let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
     let (left, top, right, bottom) = (x / scale, y / scale, (x + 1.0) / scale, (y + 1.0) / scale);
+    // Every sample point lies inside the pixel, so none can hit a disjoint rect.
+    if right < rect.x
+        || bottom < rect.y
+        || left >= rect.x + rect.width
+        || top >= rect.y + rect.height
+    {
+        return 0.0;
+    }
     if left >= rect.x
         && top >= rect.y
         && right <= rect.x + rect.width
@@ -200,6 +239,59 @@ fn scan(
     }
 }
 
+const LANES: usize = 16;
+
+// Column-wise `scan` over `lanes` adjacent columns at once, so every row read touches
+// contiguous bytes. ring holds `LANES` entries per slot.
+#[allow(clippy::too_many_arguments)]
+fn scan_columns(
+    source: &[u8],
+    output: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    lanes: usize,
+    sizes: [usize; 3],
+    ring: &mut [u64],
+) {
+    ring.fill(0);
+    let starts = [0, sizes[0], sizes[0] + sizes[1]];
+    let mut cursors = [0; 3];
+    let mut sums = [[0u64; LANES]; 3];
+    let divisor = sizes.iter().map(|n| *n as u64).product::<u64>();
+    let padding = (sizes.iter().sum::<usize>() - 3) / 2;
+    for index in 0..height + padding {
+        let mut value = [0u64; LANES];
+        if index < height {
+            let row = &source[index * width + x0..][..lanes];
+            for (slot, byte) in value.iter_mut().zip(row) {
+                *slot = *byte as u64;
+            }
+        }
+        for stage in 0..3 {
+            let base = (starts[stage] + cursors[stage]) * LANES;
+            let slots = &mut ring[base..base + lanes];
+            let sum = &mut sums[stage];
+            for lane in 0..lanes {
+                sum[lane] += value[lane];
+                sum[lane] -= slots[lane];
+                slots[lane] = value[lane];
+                value[lane] = sum[lane];
+            }
+            cursors[stage] += 1;
+            if cursors[stage] == sizes[stage] {
+                cursors[stage] = 0;
+            }
+        }
+        if index >= padding {
+            let out = &mut output[(index - padding) * width + x0..][..lanes];
+            for (byte, total) in out.iter_mut().zip(&value) {
+                *byte = ((total + divisor / 2) / divisor) as u8;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +328,7 @@ mod tests {
                 inset,
             };
             let list = DisplayList(vec![Command::BoxShadow {
+                corners: None,
                 rect,
                 radius: 0.0,
                 shadow,
@@ -270,6 +363,7 @@ mod tests {
             inset: false,
         };
         let list = DisplayList(vec![Command::BoxShadow {
+            corners: None,
             rect: Rect {
                 x: 2.0,
                 y: 2.0,
@@ -299,6 +393,7 @@ mod tests {
             inset: false,
         };
         let list = DisplayList(vec![Command::BoxShadow {
+            corners: None,
             rect: Rect {
                 x: 2.0,
                 y: 2.0,

@@ -276,7 +276,11 @@ impl<I: MachInst> Default for VCode<I> {
 impl<I: MachInst> fmt::Display for VCode<I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (bi, b) in self.blocks.iter().enumerate() {
-            writeln!(f, "vblock{bi}{:?} (depth {}) -> {:?}:", b.params, b.loop_depth, b.succs)?;
+            writeln!(
+                f,
+                "vblock{bi}{:?} (depth {}) -> {:?}:",
+                b.params, b.loop_depth, b.succs
+            )?;
             for i in b.start..b.end {
                 writeln!(f, "  {i:4}: {:?}", self.insts[i])?;
             }

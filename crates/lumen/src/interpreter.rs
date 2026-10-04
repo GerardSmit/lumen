@@ -7,14 +7,14 @@
 mod arrays;
 mod async_body;
 mod bindings;
-mod collect;
 pub(crate) mod class_fields;
+mod collect;
 mod constructor_body;
 mod generator_body;
 mod heap_snapshot;
 pub(crate) mod name_cache;
-mod this_binding;
 pub(crate) mod ta_meta;
+mod this_binding;
 pub(crate) use bindings::BindingLayout;
 pub use bindings::VarMap;
 
@@ -57,8 +57,14 @@ pub struct SharedBufferHandle {
 impl SharedBufferHandle {
     pub(crate) fn adopt_into(&self, interp: &mut Interp, pointer: usize) {
         let length = self.backing.lock().unwrap().len();
-        interp.array_buffers.insert(pointer, ByteStore::zeroed(length).into());
-        shared_mem_registry().lock().unwrap().entry(self.id).or_insert_with(|| self.backing.clone());
+        interp
+            .array_buffers
+            .insert(pointer, ByteStore::zeroed(length).into());
+        shared_mem_registry()
+            .lock()
+            .unwrap()
+            .entry(self.id)
+            .or_insert_with(|| self.backing.clone());
         interp.shared_buffers.insert(pointer, self.id);
     }
 }
@@ -163,10 +169,11 @@ pub fn futex_block(
             None => None,
         };
         woken = match (left, interrupt) {
-            (Some(left), Some(_)) => cvar
-                .wait_timeout(woken, left.min(FUTEX_INTERRUPT_POLL))
-                .unwrap()
-                .0,
+            (Some(left), Some(_)) => {
+                cvar.wait_timeout(woken, left.min(FUTEX_INTERRUPT_POLL))
+                    .unwrap()
+                    .0
+            }
             (Some(left), None) => cvar.wait_timeout(woken, left).unwrap().0,
             (None, Some(_)) => cvar.wait_timeout(woken, FUTEX_INTERRUPT_POLL).unwrap().0,
             (None, None) => cvar.wait(woken).unwrap(),
@@ -177,7 +184,9 @@ pub fn futex_block(
         let mut table = wait_table().lock().unwrap();
         if let Some(v) = table.get_mut(&(id, index)) {
             v.retain(|w| !Arc::ptr_eq(w, waiter));
-            if v.is_empty() { table.remove(&(id, index)); }
+            if v.is_empty() {
+                table.remove(&(id, index));
+            }
         }
     }
     result
@@ -193,7 +202,9 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
                 (max as usize).min(v.len())
             };
             let waiters = v.drain(0..n).collect();
-            if v.is_empty() { t.remove(&(id, index)); }
+            if v.is_empty() {
+                t.remove(&(id, index));
+            }
             waiters
         } else {
             Vec::new()
@@ -316,17 +327,29 @@ pub(crate) const SCOPE_CATCH_PARAM: u8 = 4;
 
 impl Scope {
     #[cfg(feature = "aot-native")]
-    pub(crate) fn restore_snapshot_state(&mut self, parent: Option<Env>, flags: u8, with_object: Option<Value>, lexical_names: Vec<Rc<str>>) {
+    pub(crate) fn restore_snapshot_state(
+        &mut self,
+        parent: Option<Env>,
+        flags: u8,
+        with_object: Option<Value>,
+        lexical_names: Vec<Rc<str>>,
+    ) {
         self.parent = parent;
         self.vars.clear();
         self.vars.set_scope_flags(flags);
         self.rare = None;
-        if let Some(object) = with_object { self.rare_mut().with_obj = Some(object); }
-        if !lexical_names.is_empty() { self.rare_mut().lexical_names = lexical_names; }
+        if let Some(object) = with_object {
+            self.rare_mut().with_obj = Some(object);
+        }
+        if !lexical_names.is_empty() {
+            self.rare_mut().lexical_names = lexical_names;
+        }
     }
     #[cfg(feature = "compiler")]
     pub(crate) fn snapshot_lexical_names(&self) -> &[Rc<str>] {
-        self.rare.as_ref().map_or(&[], |rare| rare.lexical_names.as_slice())
+        self.rare
+            .as_ref()
+            .map_or(&[], |rare| rare.lexical_names.as_slice())
     }
     fn new(vars: VarMap, parent: Option<Env>, flags: u8, rare: Option<Box<ScopeRare>>) -> Scope {
         let mut s = Scope {
@@ -846,6 +869,9 @@ impl Interp {
 
 pub struct Interp {
     pub(crate) global: Gc,
+    /// The realm's published global-this value. Usually this is the backing global; host realms
+    /// may use a registered WindowProxy while name resolution still targets `global`.
+    pub(crate) global_this: Value,
     pub(crate) global_env: Env,
     #[cfg(feature = "aot-native")]
     pub(crate) native_units: HashMap<[u8; 32], Vec<crate::native_aot::UnitState>>,
@@ -943,10 +969,16 @@ pub struct Interp {
     /// (kept alive by the entry). See [`crate::bytecode::ctor_plan`].
     pub(crate) ctor_plans: crate::fasthash::FastMap<
         usize,
-        (Rc<Function>, Option<Rc<crate::bytecode::ctor_plan::CtorPlan>>),
+        (
+            Rc<Function>,
+            Option<Rc<crate::bytecode::ctor_plan::CtorPlan>>,
+        ),
     >,
     /// The last constructor whose plan was looked up (a weak handle: its address stays unique).
-    pub(crate) plan_cache: Option<(crate::value::WeakGc, Rc<crate::bytecode::ctor_plan::CtorPlan>)>,
+    pub(crate) plan_cache: Option<(
+        crate::value::WeakGc,
+        Rc<crate::bytecode::ctor_plan::CtorPlan>,
+    )>,
     /// The global `eval` function object, so a *direct* eval call (`eval(src)` by that name) can be
     /// distinguished from an indirect one and run in the caller's scope.
     pub(crate) eval_fn: Option<Gc>,
@@ -992,9 +1024,16 @@ pub struct Interp {
     #[allow(clippy::type_complexity)]
     pub(crate) module_loader:
         Option<Rc<dyn Fn(&str, &str, Option<&str>) -> Option<(String, String)>>>,
+    /// Optional asynchronous module request bridge used by browser embedders.
+    #[allow(clippy::type_complexity)]
+    pub(crate) async_module_import_handler: Option<Rc<dyn Fn(crate::AsyncModuleImportRequest)>>,
+    pub(crate) pending_async_module_imports:
+        std::collections::HashMap<u64, (crate::AsyncModuleImportRequest, Value)>,
+    pub(crate) next_async_module_import_id: u64,
     pub(crate) jsx_options: crate::parser::JsxOptions,
     #[allow(clippy::type_complexity)]
-    pub(crate) jsx_options_loader: Option<Rc<dyn Fn(&str, &crate::JsxOptions) -> Result<crate::JsxOptions, String>>>,
+    pub(crate) jsx_options_loader:
+        Option<Rc<dyn Fn(&str, &crate::JsxOptions) -> Result<crate::JsxOptions, String>>>,
     pub(crate) jsx_module_keys: crate::fasthash::FastMap<String, bool>,
     /// Live module-namespace state keyed by the namespace object's pointer: for each exported name,
     /// how to read its current value (a live binding in some module scope, or a static value for a
@@ -1071,6 +1110,11 @@ pub struct Interp {
     pub(crate) new_target: Value,
     /// The `new.target` to install for the next constructor invocation (set by `construct`).
     pub(crate) pending_new_target: Value,
+    /// Native-super replacement requests, one slot per active native constructor frame. Most
+    /// built-ins request no replacement and keep the usual internal-slot/property graft. A host
+    /// constructor may explicitly return a platform object instead, which lets derived JS
+    /// constructors bind `this` to an existing host object without changing other built-ins.
+    pub(crate) native_super_return_overrides: Vec<Option<Value>>,
     /// The `$262.IsHTMLDDA` objects, one per realm (emulate `document.all`): typeof "undefined",
     /// falsy, and loosely equal to undefined/null, despite being callable Objects.
     pub(crate) htmldda: Vec<Gc>,
@@ -1373,6 +1417,7 @@ const _: () = assert!(MAX_STR_LEN < MAX_ARRAY_OP_LEN, "split relies on it");
 /// installed by `builtins::install`. Well-known symbols and the engine side tables are shared, not here.
 pub struct RealmState {
     pub global: Gc,
+    pub global_this: Value,
     pub global_env: Env,
     pub object_proto: Gc,
     pub function_proto: Gc,
@@ -1386,8 +1431,11 @@ pub struct RealmState {
     pub extra_protos: crate::fasthash::FastMap<&'static str, Gc>,
     /// A `vm` context's global proxy (see [`Interp::global_proxy`]).
     pub global_proxy: Option<Gc>,
-    /// A `vm` context realm: dropped by the collector once nothing reaches its global.
+    /// A VM or host-created realm: dropped by the collector once nothing reaches its global or
+    /// global environment.
     pub collectable: bool,
+    /// Realm was created through the native host realm API and can be retired there.
+    pub host_managed: bool,
 }
 
 impl Interp {
@@ -1395,6 +1443,7 @@ impl Interp {
     pub(crate) fn snapshot_realm(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
+            global_this: self.global_this.clone(),
             global_env: self.global_env.clone(),
             object_proto: self.object_proto.clone(),
             function_proto: self.function_proto.clone(),
@@ -1408,12 +1457,14 @@ impl Interp {
             extra_protos: self.extra_protos.clone(),
             global_proxy: self.global_proxy.clone(),
             collectable: false,
+            host_managed: false,
         }
     }
 
     /// Install a realm's intrinsics as the active ones.
     pub(crate) fn restore_realm(&mut self, r: &RealmState) {
         self.global = r.global.clone();
+        self.global_this = r.global_this.clone();
         self.global_env = r.global_env.clone();
         self.object_proto = r.object_proto.clone();
         self.function_proto = r.function_proto.clone();
@@ -1428,22 +1479,23 @@ impl Interp {
         self.global_proxy = r.global_proxy.clone();
     }
 
-    /// `$262.createRealm()`: build a fresh realm (its own global + intrinsics) and register it. The
-    /// well-known symbols are shared with the creating realm so `@@iterator` etc. match cross-realm.
-    /// Whether a SECOND realm exists (`$262.createRealm`). `Interp::new` always registers the
-    /// main realm, so `realms.is_empty()` never distinguishes anything — cross-realm dispatch
-    /// only becomes possible once another realm joins, and realms are never removed. Every
-    /// single-realm fast-path gate keys on this.
+    /// The object used for global name resolution (distinct from a published global-this proxy).
     #[inline]
     pub(crate) fn name_global(&self) -> &Gc {
         self.global_proxy.as_ref().unwrap_or(&self.global)
     }
 
+    /// Whether a second live realm is registered. `Interp::new` always registers the main realm,
+    /// so cross-realm dispatch becomes possible once another realm joins; collectable VM/host
+    /// realms are removed after their globals and environments become unreachable.
     #[inline]
     pub(crate) fn multi_realm(&self) -> bool {
         self.realms.len() > 1
     }
 
+    /// `$262.createRealm()`: build a fresh realm (its own global + intrinsics) and register it.
+    /// The well-known symbols are shared with the creating realm so `@@iterator` etc. match
+    /// cross-realm.
     pub(crate) fn create_realm(&mut self) -> Value {
         // Register the creating (main) realm too, so cross-realm dispatch can switch BACK to it
         // and resolve its intrinsics like any other realm's.
@@ -1491,6 +1543,7 @@ impl Interp {
         self.boolean_proto = boolean_proto;
         self.symbol_proto = symbol_proto;
         self.global = global.clone();
+        self.global_this = Value::Obj(global.clone());
         self.global_env = new_var_scope(None);
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
@@ -1498,7 +1551,7 @@ impl Interp {
         self.global_proxy = None;
         crate::builtins::install(self);
         // Top-level `this` is the new global.
-        let g = Value::Obj(self.global.clone());
+        let g = self.global_this.clone();
         self.global_env.borrow_mut().vars.insert(
             "this".to_string(),
             Binding {
@@ -1540,12 +1593,22 @@ impl Interp {
     /// Run `src` as a script in the realm whose global is `realm_global`.
     pub fn eval_in_realm(&mut self, realm_global: &Value, src: &str) -> Result<Value, Abrupt> {
         if crate::native_ops::dynamic_code_disabled() {
-            return Err(self.throw("EvalError", "dynamic code is unavailable in native execution"));
+            return Err(self.throw(
+                "EvalError",
+                "dynamic code is unavailable in native execution",
+            ));
         }
         let ptr = match realm_global {
             Value::Obj(o) => Gc::as_ptr(o) as usize,
             _ => return Err(self.throw("TypeError", "not a realm global")),
         };
+        if ptr == Gc::as_ptr(&self.global) as usize {
+            // The initial realm need not have been captured as a host handle. The current
+            // realm is already live; restoring a saved registry entry would lose native
+            // installation changes made during the active host scope.
+            let env = self.global_env.clone();
+            return self.perform_eval(src, &env, false);
+        }
         let realm = match self.realms.get(&ptr) {
             Some(r) => r.snapshot_clone(),
             None => return Err(self.throw("TypeError", "unknown realm")),
@@ -1557,6 +1620,167 @@ impl Interp {
         let result = self.perform_eval(src, &env, false);
         self.restore_realm(&saved);
         result
+    }
+
+    /// Compile an HTML event-handler body in the current realm, with the platform-provided
+    /// object environments nested inside the global environment. `scope_objects` are supplied
+    /// from outermost to innermost (document, form owner, element). The generated function has
+    /// the handler's observable name and the standard one-argument signature, except for a
+    /// Window `onerror` handler, which receives its historical five arguments.
+    ///
+    /// The body is parsed by the same dynamic-function parser as the `Function` constructor;
+    /// no author-visible constructor or mutable global is consulted.
+    pub fn compile_event_handler(
+        &mut self,
+        name: &str,
+        body: &str,
+        scope_objects: &[Value],
+        window_onerror: bool,
+    ) -> Result<Value, Abrupt> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(self.throw(
+                "EvalError",
+                "dynamic code is unavailable in native execution",
+            ));
+        }
+        let parameters = if window_onerror {
+            "event, source, lineno, colno, error"
+        } else {
+            "event"
+        };
+        let source = format!("function {name}({parameters}) {{\n{body}\n}}");
+        let statements = crate::parser::parse_dynamic_function(&source)
+            .map_err(|error| self.throw("SyntaxError", error.message))?;
+        let function = match statements.into_iter().next() {
+            Some(crate::ast::Stmt::FuncDecl(function)) => {
+                function
+                    .ensure_body()
+                    .map_err(|error| self.throw("SyntaxError", error.message))?;
+                function
+            }
+            _ => return Err(self.throw("SyntaxError", "invalid event-handler body")),
+        };
+
+        let mut environment = self.global_env.clone();
+        for object in scope_objects {
+            environment = new_with_scope(environment, object.clone());
+        }
+        Ok(self.make_function(function, environment))
+    }
+}
+
+#[cfg(test)]
+mod event_handler_compile_tests {
+    use super::*;
+    use crate::Engine;
+
+    fn evaluate(engine: &mut Engine, source: &str) -> Value {
+        engine
+            .eval_value(source)
+            .expect("valid test source")
+            .ok()
+            .expect("test script did not throw")
+    }
+
+    #[test]
+    fn compiled_handler_uses_dom_scopes_this_and_one_event_argument() {
+        let mut engine = Engine::new();
+        evaluate(
+            &mut engine,
+            "globalThis.globalOnly = 'global';\
+             globalThis.docScope = {chosen:'document', docOnly:'doc'};\
+             globalThis.formScope = {chosen:'form', formOnly:'form'};\
+             globalThis.elementScope = {chosen:'element', elemOnly:'element'};\
+             globalThis.eventTarget = elementScope;\
+             globalThis.eventValue = {type:'load'};",
+        );
+        let global = engine.ctx().global_object();
+        let doc = engine
+            .ctx()
+            .member_get(&global, "docScope")
+            .ok()
+            .expect("document scope");
+        let form = engine
+            .ctx()
+            .member_get(&global, "formScope")
+            .ok()
+            .expect("form scope");
+        let element = engine
+            .ctx()
+            .member_get(&global, "elementScope")
+            .ok()
+            .expect("element scope");
+        let event = engine
+            .ctx()
+            .member_get(&global, "eventValue")
+            .ok()
+            .expect("event argument");
+        let handler = engine
+            .ctx()
+            .compile_event_handler(
+                "onload",
+                "return [chosen, docOnly, formOnly, elemOnly, globalOnly, this === eventTarget, arguments.length, event.type].join(':');",
+                &[doc, form, element.clone()],
+                false,
+            )
+            .ok()
+            .expect("compile handler");
+        let result = engine
+            .ctx()
+            .call(handler, element, &[event])
+            .ok()
+            .expect("invoke handler");
+        assert!(
+            matches!(result, Value::Str(value) if value.as_str() == "element:doc:form:element:global:true:1:load")
+        );
+    }
+
+    #[test]
+    fn compiled_window_onerror_has_five_arguments_and_keeps_error_identity() {
+        let mut engine = Engine::new();
+        evaluate(
+            &mut engine,
+            "globalThis.errorTarget = {}; globalThis.errorObject = {};",
+        );
+        let global = engine.ctx().global_object();
+        let target = engine
+            .ctx()
+            .member_get(&global, "errorTarget")
+            .ok()
+            .expect("window target");
+        let error = engine
+            .ctx()
+            .member_get(&global, "errorObject")
+            .ok()
+            .expect("error value");
+        let handler = engine
+            .ctx()
+            .compile_event_handler(
+                "onerror",
+                "return [event, source, lineno, colno, error === errorObject, this === errorTarget, arguments.length].join(':');",
+                &[],
+                true,
+            )
+            .ok()
+            .expect("compile Window onerror");
+        let result = engine
+            .ctx()
+            .call(
+                handler,
+                target,
+                &[
+                    Value::str("message"),
+                    Value::str("source.js"),
+                    Value::Num(7.0),
+                    Value::Num(9.0),
+                    error,
+                ],
+            )
+            .ok()
+            .expect("invoke Window onerror");
+        assert!(
+            matches!(result, Value::Str(value) if value.as_str() == "message:source.js:7:9:true:true:5")
+        );
     }
 }
 
@@ -1579,11 +1803,15 @@ impl RealmState {
         self.extra_protos.values().for_each(&mut f);
         self.eval_fn.iter().for_each(&mut f);
         self.global_proxy.iter().for_each(&mut f);
+        if let Value::Obj(global_this) = &self.global_this {
+            f(global_this);
+        }
     }
 
     pub(crate) fn snapshot_clone(&self) -> RealmState {
         RealmState {
             global: self.global.clone(),
+            global_this: self.global_this.clone(),
             global_env: self.global_env.clone(),
             object_proto: self.object_proto.clone(),
             function_proto: self.function_proto.clone(),
@@ -1596,7 +1824,8 @@ impl RealmState {
             eval_fn: self.eval_fn.clone(),
             extra_protos: self.extra_protos.clone(),
             global_proxy: self.global_proxy.clone(),
-            collectable: false,
+            collectable: self.collectable,
+            host_managed: self.host_managed,
         }
     }
 }
@@ -1646,7 +1875,8 @@ impl Interp {
         let global = Object::new(Some(object_proto.clone()));
         let global_env = new_var_scope(None);
         Interp {
-            global,
+            global: global.clone(),
+            global_this: Value::Obj(global.clone()),
             global_env,
             #[cfg(feature = "aot-native")]
             native_units: HashMap::new(),
@@ -1689,6 +1919,9 @@ impl Interp {
             native_bindings: Default::default(),
             module_recs: Default::default(),
             module_loader: None,
+            async_module_import_handler: None,
+            pending_async_module_imports: Default::default(),
+            next_async_module_import_id: 1,
             jsx_options: Default::default(),
             jsx_options_loader: None,
             jsx_module_keys: Default::default(),
@@ -1740,6 +1973,7 @@ impl Interp {
             proxies: Default::default(),
             new_target: Value::Undefined,
             pending_new_target: Value::Undefined,
+            native_super_return_overrides: Vec::new(),
             htmldda: Vec::new(),
             ctor_caller_realm: None,
             realms: Default::default(),
@@ -1811,7 +2045,7 @@ impl Interp {
         let mut interp = Self::uninitialized();
         crate::builtins::install(&mut interp);
         // `this` at the top level is the global object (sloppy mode).
-        let g = Value::Obj(interp.global.clone());
+        let g = interp.global_this.clone();
         interp.global_env.borrow_mut().vars.insert(
             "this".to_string(),
             Binding {
@@ -1906,7 +2140,11 @@ impl Interp {
     /// Run `f` on the bytes of ArrayBuffer `buffer` (a SharedArrayBuffer's under its lock), or
     /// `None` when it is detached.
     #[inline]
-    pub(crate) fn with_buffer_bytes<R>(&self, buffer: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    pub(crate) fn with_buffer_bytes<R>(
+        &self,
+        buffer: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
         if !self.shared_buffers.is_empty() {
             if let Some(&id) = self.shared_buffers.get(&buffer) {
                 return shared_mem_get(id).map(|mem| f(&mem.lock().unwrap()));
@@ -1927,13 +2165,17 @@ impl Interp {
                 return shared_mem_get(id).map(|mem| f(&mut mem.lock().unwrap()));
             }
         }
-        self.array_buffers.get(&buffer).map(|b| f(&mut b.bytes_mut()))
+        self.array_buffers
+            .get(&buffer)
+            .map(|b| f(&mut b.bytes_mut()))
     }
 
     /// Whether ArrayBuffer `buffer` is immutable (a readonly store).
     #[inline]
     pub(crate) fn buffer_immutable(&self, buffer: usize) -> bool {
-        self.array_buffers.get(&buffer).is_some_and(|b| b.is_readonly())
+        self.array_buffers
+            .get(&buffer)
+            .is_some_and(|b| b.is_readonly())
     }
 
     /// Read element `idx` of a TypedArray as a Number (or undefined if out of range / detached).
@@ -2108,10 +2350,15 @@ impl Interp {
         Object::new(Some(self.object_proto.clone()))
     }
 
-    /// The global object (`globalThis`) as a value — for embedders that must expose it
-    /// (N-API's `napi_get_global`).
+    /// The active realm's published global-this value. For a browser window this is its
+    /// WindowProxy; the backing global object remains available as `Ctx::global_object()`.
     pub fn global_this(&self) -> Value {
-        Value::Obj(self.global.clone())
+        self.global_this_value()
+    }
+
+    /// The active realm's published global-this value.
+    pub fn global_this_value(&self) -> Value {
+        self.global_this.clone()
     }
 
     /// [[Get]] for embedders: like [`Self::get_member`] but surfaces a thrown value rather than
@@ -2124,6 +2371,56 @@ impl Interp {
                 "unexpected non-throw completion during property get",
             ),
         })
+    }
+
+    /// Perform the intrinsic `Reflect.get(target, key, receiver)` operation without looking up
+    /// the author-visible `Reflect` global. Host adapters use this when their native behavior
+    /// must remain stable after script code replaces `Reflect.get`.
+    pub fn reflect_get(
+        &mut self,
+        target: &Value,
+        key: &Value,
+        receiver: &Value,
+    ) -> Result<Value, Value> {
+        crate::builtins::reflect::reflect_get(
+            self,
+            Value::Undefined,
+            &[target.clone(), key.clone(), receiver.clone()],
+        )
+    }
+
+    /// Perform the intrinsic `Reflect.has(target, key)` operation without looking up the
+    /// author-visible `Reflect` global.
+    pub fn reflect_has(&mut self, target: &Value, key: &Value) -> Result<bool, Value> {
+        match crate::builtins::reflect::reflect_has(
+            self,
+            Value::Undefined,
+            &[target.clone(), key.clone()],
+        )? {
+            Value::Bool(found) => Ok(found),
+            _ => unreachable!("intrinsic Reflect.has always returns a boolean"),
+        }
+    }
+
+    /// Perform the intrinsic `Reflect.getOwnPropertyDescriptor(target, key)` operation without
+    /// looking up the author-visible `Reflect` global. Returns `undefined` when the property is
+    /// absent and otherwise returns the ordinary descriptor object.
+    pub fn reflect_get_own_property_descriptor(
+        &mut self,
+        target: &Value,
+        key: &Value,
+    ) -> Result<Value, Value> {
+        crate::builtins::reflect::reflect_gopd(
+            self,
+            Value::Undefined,
+            &[target.clone(), key.clone()],
+        )
+    }
+
+    /// Create an ordinary ECMAScript Proxy using the engine's intrinsic Proxy implementation,
+    /// without reading the mutable `Proxy` binding from the current global object.
+    pub fn create_proxy(&mut self, target: Value, handler: Value) -> Result<Value, Value> {
+        crate::builtins::proxy::make_proxy(self, target, handler)
     }
 
     /// [[Set]] for embedders (see [`Self::member_get`]).
@@ -2162,9 +2459,15 @@ impl Interp {
     /// A host consuming a promise's settlement reports its rejection itself.
     pub fn observe_promise_for_host(&mut self, value: &Value) {
         if crate::eval::promise_fast::promise_state(value).is_some() {
-            self.perform_then(value.as_obj().unwrap(), crate::eval::promise_fast::Reaction::then(
-                Value::Undefined, Value::Undefined, Value::Undefined, self.async_context.clone(),
-            ));
+            self.perform_then(
+                value.as_obj().unwrap(),
+                crate::eval::promise_fast::Reaction::then(
+                    Value::Undefined,
+                    Value::Undefined,
+                    Value::Undefined,
+                    self.async_context.clone(),
+                ),
+            );
         }
     }
 
@@ -2420,6 +2723,41 @@ impl Interp {
         self.constructing
     }
 
+    /// The active `new.target`, or `undefined` outside constructor execution. Native platform
+    /// constructors use this to identify the derived constructor when a built-in superclass is
+    /// invoked through `super()`.
+    pub fn current_new_target(&self) -> Value {
+        self.new_target.clone()
+    }
+
+    /// Make the current native constructor used by `super()` return an existing object as the
+    /// derived constructor's `this`. This is opt-in; native built-ins retain the default behavior
+    /// of grafting their internal slots onto the allocated derived instance.
+    ///
+    /// Hosts should call this only from the corresponding native `CtorRet` builder and only when
+    /// the returned object is the actual platform instance represented by that constructor.
+    pub fn replace_current_native_super_result(&mut self, value: Value) -> Result<(), Value> {
+        if !matches!(value, Value::Obj(_)) {
+            return Err(self.make_error(
+                "TypeError",
+                "native super-constructor replacement must be an object",
+            ));
+        }
+        let Some(slot) = self.native_super_return_overrides.last_mut() else {
+            return Err(
+                self.make_error("InvalidStateError", "no native super-constructor is active")
+            );
+        };
+        if slot.is_some() {
+            return Err(self.make_error(
+                "InvalidStateError",
+                "native super-constructor replacement was already selected",
+            ));
+        }
+        *slot = Some(value);
+        Ok(())
+    }
+
     /// A fresh object with an explicit `[[Prototype]]` (`null` → no prototype). For host addons
     /// creating instances with a class's prototype.
     pub fn new_object_with_proto(&self, proto: &Value) -> Value {
@@ -2448,9 +2786,21 @@ impl Interp {
     /// Intrinsic property definition for host addons, preserving descriptors, symbols and
     /// ordinary/proxy invariants independently of mutable JavaScript Object methods.
     pub fn define_property_value(
-        &mut self, target: &Value, key: Value, descriptor: &Value,
+        &mut self,
+        target: &Value,
+        key: Value,
+        descriptor: &Value,
     ) -> Result<(), Value> {
-        crate::builtins::object_define_property(self, target.clone(), key, descriptor.clone()).map(|_| ())
+        crate::builtins::object_define_property(self, target.clone(), key, descriptor.clone())
+            .map(|_| ())
+    }
+
+    /// Delete a named property through the ordinary/proxy delete operation without
+    /// consulting author-modified Reflect methods. A non-configurable property returns false.
+    pub fn delete_member(&mut self, target: &Value, key: &str) -> Result<bool, Value> {
+        self.delete_prop_with(target.clone(), key, false)
+            .map(|value| matches!(value, Value::Bool(true)))
+            .map_err(abrupt_value)
     }
 
     /// Intrinsic own-property query, including symbol keys and proxy invariants.
@@ -2531,7 +2881,10 @@ impl Interp {
 
     /// Execute a thread-affine host call on the realm's owning native thread. Async
     /// coroutine workers hand off exclusively; nested workers forward through their drivers.
-    pub fn on_driver(&mut self, call: impl FnOnce(&mut Self) -> Result<Value, Value> + 'static) -> Result<Value, Value> {
+    pub fn on_driver(
+        &mut self,
+        call: impl FnOnce(&mut Self) -> Result<Value, Value> + 'static,
+    ) -> Result<Value, Value> {
         crate::coroutine::driver_call(self, Box::new(call))
     }
 
@@ -2736,7 +3089,11 @@ impl Interp {
             return Ok(None);
         };
         if matches!(
-            object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
+            object
+                .borrow()
+                .props
+                .get("\u{0}ab_resizable")
+                .map(|p| p.value()),
             Some(Value::Bool(true))
         ) {
             return Err(self.make_error(
@@ -2745,7 +3102,10 @@ impl Interp {
             ));
         }
         let backing = shared_mem_get(id).ok_or_else(|| {
-            self.make_error("DataCloneError", "SharedArrayBuffer backing store is unavailable")
+            self.make_error(
+                "DataCloneError",
+                "SharedArrayBuffer backing store is unavailable",
+            )
         })?;
         Ok(Some(SharedBufferHandle { id, backing }))
     }
@@ -2756,7 +3116,8 @@ impl Interp {
         let object = Object::new(self.extra_protos.get("SharedArrayBuffer").cloned());
         let pointer = Gc::as_ptr(&object) as usize;
         self.gc_pin(&object);
-        self.array_buffers.insert(pointer, ByteStore::zeroed(length).into());
+        self.array_buffers
+            .insert(pointer, ByteStore::zeroed(length).into());
         for (name, value) in [
             ("\u{0}ab_max_byte_length", Value::Num(length as f64)),
             ("\u{0}ab_resizable", Value::Bool(false)),
@@ -2828,7 +3189,11 @@ impl Interp {
             .is_some_and(|b| !b.is_readonly() && b.can_detach())
             && !self.shared_buffers.contains_key(&pointer)
             && !matches!(
-                object.borrow().props.get("\u{0}ab_resizable").map(|p| p.value()),
+                object
+                    .borrow()
+                    .props
+                    .get("\u{0}ab_resizable")
+                    .map(|p| p.value()),
                 Some(Value::Bool(true))
             )
     }
@@ -2901,7 +3266,10 @@ impl Interp {
             );
             // A sloppy ordinary function's own legacy `arguments` / `caller` (V8's order).
             if crate::bytecode::reflect::is_legacy(&func) {
-                for (k, prop) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
+                for (k, prop) in crate::bytecode::reflect::own_props(self)
+                    .into_iter()
+                    .flatten()
+                {
                     p.insert(k, prop);
                 }
             }
@@ -3006,18 +3374,32 @@ impl Interp {
             (_, true, false) => self.extra_protos.get("%AsyncFunction.prototype%"),
             (false, true, true) => self.extra_protos.get("%AsyncGeneratorFunction.prototype%"),
             _ => None,
-        }.cloned().unwrap_or_else(|| self.function_proto.clone());
+        }
+        .cloned()
+        .unwrap_or_else(|| self.function_proto.clone());
         let mut props = crate::value::Props::new();
-        props.insert(crate::value::fn_key(0), Property::data(Value::Num(function.length as f64), false, false, true));
-        props.insert(crate::value::fn_key(1), Property::data(Value::str(&function.name), false, false, true));
+        props.insert(
+            crate::value::fn_key(0),
+            Property::data(Value::Num(function.length as f64), false, false, true),
+        );
+        props.insert(
+            crate::value::fn_key(1),
+            Property::data(Value::str(&function.name), false, false, true),
+        );
         if function.flags & (1 | 2 | 4 | 8 | 16) == 0 {
-            for (key, property) in crate::bytecode::reflect::own_props(self).into_iter().flatten() {
+            for (key, property) in crate::bytecode::reflect::own_props(self)
+                .into_iter()
+                .flatten()
+            {
                 props.insert(key, property);
             }
         }
         let has_prototype = !arrow && (generator || (!asynchronous && !method));
         if has_prototype {
-            props.insert(crate::value::fn_key(2), Property::data(Value::Undefined, true, false, false));
+            props.insert(
+                crate::value::fn_key(2),
+                Property::data(Value::Undefined, true, false, false),
+            );
         }
         let object = Object::new_with_parts(Some(prototype), props, Exotic::None);
         if has_prototype {
@@ -3025,21 +3407,33 @@ impl Interp {
                 (true, false) => self.extra_protos.get("%GeneratorPrototype%"),
                 (true, true) => self.extra_protos.get("%AsyncGeneratorPrototype%"),
                 _ => None,
-            }.cloned().unwrap_or_else(|| self.object_proto.clone());
+            }
+            .cloned()
+            .unwrap_or_else(|| self.object_proto.clone());
             let mut prototype_props = crate::value::Props::new();
             if !generator {
-                prototype_props.insert(crate::value::fn_key(3), Property::builtin(Value::Undefined));
+                prototype_props
+                    .insert(crate::value::fn_key(3), Property::builtin(Value::Undefined));
             }
             Self::attach_fn_prototype(&object, Some(&prototype_props), parent, !generator);
         }
         object.borrow_mut().is_constructor = !arrow && !method && !asynchronous && !generator;
-        object.borrow_mut().call = Callable::Aot(Box::new(crate::value::AotCallable { program, function_index, env }));
+        object.borrow_mut().call = Callable::Aot(Box::new(crate::value::AotCallable {
+            program,
+            function_index,
+            env,
+        }));
         Value::Obj(object)
     }
 
     /// Give function `f`, whose map holds the `prototype` placeholder, a fresh `.prototype` on
     /// `parent` built from `proto_map`, whose `constructor` points back at `f` when `ctor`.
-    fn attach_fn_prototype(f: &Gc, proto_map: Option<&crate::value::Props>, parent: Gc, ctor: bool) {
+    fn attach_fn_prototype(
+        f: &Gc,
+        proto_map: Option<&crate::value::Props>,
+        parent: Gc,
+        ctor: bool,
+    ) {
         let proto = Object::new_bare(Some(parent));
         {
             let mut pb = proto.borrow_mut();
@@ -3274,7 +3668,11 @@ impl Interp {
     /// table ([`STR_KEY_IC`]) that holds the key alive, so its address can't be reused.
     pub(crate) fn fast_get_str(&self, o: &Gc, lkey: &crate::lstr::LStr) -> Option<Value> {
         let key = lkey.as_str();
-        if key.as_bytes().first().is_none_or(|b| b.is_ascii_digit() || *b == 0) {
+        if key
+            .as_bytes()
+            .first()
+            .is_none_or(|b| b.is_ascii_digit() || *b == 0)
+        {
             return None; // maybe an index (or an internal symbol key)
         }
         {
@@ -3296,7 +3694,8 @@ impl Interp {
                     let s = b.props.slot_of(key);
                     if let Some(s) = s {
                         // A non-index key's slot is a named one, pinned by the shape.
-                        STR_KEY_IC.with(|c| c.borrow_mut()[h] = Some((shape, lkey.clone(), s as u32)));
+                        STR_KEY_IC
+                            .with(|c| c.borrow_mut()[h] = Some((shape, lkey.clone(), s as u32)));
                     }
                     s
                 }
@@ -3367,8 +3766,14 @@ impl Interp {
             return None;
         }
         let store = self.array_buffers.get(&info.buffer)?;
-        let len = span_len(store.len(), info.offset, info.kind.elsize(), info.len, info.track)
-            .unwrap_or(0);
+        let len = span_len(
+            store.len(),
+            info.offset,
+            info.kind.elsize(),
+            info.len,
+            info.track,
+        )
+        .unwrap_or(0);
         Some((info, len, store))
     }
 
@@ -3382,7 +3787,9 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        Some(Value::Num(info.kind.read(&store.bytes()[start..start + es])))
+        Some(Value::Num(
+            info.kind.read(&store.bytes()[start..start + es]),
+        ))
     }
 
     /// `ta[idx] = v` for an integer index on a Number-kind TypedArray when `v` is already a
@@ -3404,7 +3811,8 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        info.kind.write(n, &mut store.bytes_mut()[start..start + es]);
+        info.kind
+            .write(n, &mut store.bytes_mut()[start..start + es]);
         Ok(())
     }
 
@@ -3795,7 +4203,8 @@ impl Interp {
         // Arrays and String wrappers answer only canonical indices (and a wrapper `length`)
         // outside their entries: for any other name, a level of theirs proves absence by shape
         // like an ordinary object.
-        let named = name != "length" && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
+        let named =
+            name != "length" && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
         let mut absent_exotic = false;
         unsafe {
             for depth in 0..=IC_MAX_DEPTH {
@@ -3816,7 +4225,11 @@ impl Interp {
                     if is_getter && !p.getter().is_some_and(|g| matches!(g, Value::Obj(_))) {
                         return None; // no getter: [[Get]] answers `undefined`
                     }
-                    let v = if is_getter { Value::Undefined } else { p.value() };
+                    let v = if is_getter {
+                        Value::Undefined
+                    } else {
+                        p.value()
+                    };
                     // An Array HOLDER's named slots are shape-pinned like any object's, but its
                     // exotic gate differs: flag the entry (`IC_ARR_KEYCHK`) so the probes admit
                     // an Array holder. Digit names stay uncached (element reads have their own
@@ -3857,10 +4270,14 @@ impl Interp {
                     }
                     // Mirror into the stub cache so OTHER shapes rotating through this
                     // site don't evict this resolution for good.
-                    self.stub_store(recv_shape, name, StubEntry {
-                        name: name.as_ptr() as usize,
-                        st,
-                    });
+                    self.stub_store(
+                        recv_shape,
+                        name,
+                        StubEntry {
+                            name: name.as_ptr() as usize,
+                            st,
+                        },
+                    );
                     return Some(v);
                 }
                 if depth == 1 && matches!(b.exotic, Exotic::None | Exotic::StrWrap) {
@@ -3891,10 +4308,14 @@ impl Interp {
                                 mid2_shape: absent_shapes[2],
                             };
                             self.ic_insert(cache, st);
-                            self.stub_store(recv_shape, name, StubEntry {
-                                name: name.as_ptr() as usize,
-                                st,
-                            });
+                            self.stub_store(
+                                recv_shape,
+                                name,
+                                StubEntry {
+                                    name: name.as_ptr() as usize,
+                                    st,
+                                },
+                            );
                             return Some(Value::Undefined);
                         }
                         return None;
@@ -3948,7 +4369,9 @@ impl Interp {
         };
         // Too long: the generic path raises the RangeError. A smuggled high surrogate meeting a
         // smuggled low must join canonically (`jstr::concat`), which a byte append would skip.
-        if size::sum(lv.len(), x.len(), MAX_STR_LEN).is_err() || crate::jstr::needs_join_fixup(lv, x) {
+        if size::sum(lv.len(), x.len(), MAX_STR_LEN).is_err()
+            || crate::jstr::needs_join_fixup(lv, x)
+        {
             return Err(lval);
         }
         let mut b = o.borrow_mut();
@@ -3987,7 +4410,7 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> bool {
         let mut b = o.borrow_mut();
-        if !matches!(b.exotic, Exotic::None) {
+        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) {
             return false;
         }
         if !b.ic_plain.get() {
@@ -4091,10 +4514,14 @@ impl Interp {
                 };
                 self.ic_insert(cache, st);
                 // Mirror into the stub cache (see the probe above).
-                self.stub_store(shape, name, StubEntry {
-                    name: name.as_ptr() as usize,
-                    st,
-                });
+                self.stub_store(
+                    shape,
+                    name,
+                    StubEntry {
+                        name: name.as_ptr() as usize,
+                        st,
+                    },
+                );
                 true
             }
             None => self.try_ic_create(o, b, name, v, cache),
@@ -4198,6 +4625,18 @@ impl Interp {
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
         (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
+            && {
+                #[cfg(feature = "embed")]
+                {
+                    self.host_state
+                        .get::<crate::embed_realms::WindowProxyRegistry>()
+                        .is_none_or(|registry| !registry.entries.contains_key(&ptr))
+                }
+                #[cfg(not(feature = "embed"))]
+                {
+                    true
+                }
+            }
             && (self.typed_arrays.is_empty() || !self.typed_arrays.contains_key(&ptr))
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
@@ -4245,6 +4684,61 @@ impl Interp {
         key: &str,
         receiver: Value,
     ) -> Result<Value, Abrupt> {
+        #[cfg(feature = "embed")]
+        if let Value::Obj(object) = base {
+            let proxy_key = Gc::as_ptr(object) as usize;
+            let key_value = self
+                .sym_from_key(key)
+                .unwrap_or_else(|| Value::from_string(key.to_owned()));
+            let operation = crate::embed_realms::WindowProxyOperation::Get {
+                key: key_value,
+                receiver: receiver.clone(),
+            };
+            if let Some(decision) = self.window_proxy_decision(object, operation)? {
+                return match decision {
+                    crate::embed_realms::WindowProxyDecision::Handled(
+                        crate::embed_realms::WindowProxyResult::Get(value),
+                    ) => Ok(value),
+                    crate::embed_realms::WindowProxyDecision::Handled(_) => Err(self.throw(
+                        "TypeError",
+                        "WindowProxy policy returned a result for the wrong operation",
+                    )),
+                    crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                        if let Some(index) = crate::value::canonical_index(key) {
+                            if let Some(child) = self.window_proxy_child_at(&forward, index)? {
+                                return Ok(child);
+                            }
+                            let target = forward.target.as_obj().ok_or_else(|| {
+                                self.throw("TypeError", "WindowProxy target is not an object")
+                            })?;
+                            let prototype = target.borrow().proto.clone();
+                            return match prototype {
+                                Some(prototype) => self.get_from_chain(&prototype, key, &receiver),
+                                None => Ok(Value::Undefined),
+                            };
+                        }
+                        let target_key = forward
+                            .target
+                            .as_obj()
+                            .map(|target| Gc::as_ptr(target) as usize)
+                            .ok_or_else(|| {
+                                self.throw("TypeError", "WindowProxy target is not an object")
+                            })?;
+                        if matches!(&receiver, Value::Obj(receiver) if Gc::as_ptr(receiver) as usize == proxy_key)
+                        {
+                            self.with_window_proxy_receiver(
+                                proxy_key,
+                                forward.target_realm.key(),
+                                target_key,
+                                |interp| interp.get_member_recv(&forward.target, key, receiver),
+                            )
+                        } else {
+                            self.get_member_recv(&forward.target, key, receiver)
+                        }
+                    }
+                };
+            }
+        }
         // An `import defer` namespace evaluates its module on string-keyed access.
         if let Value::Obj(o) = base {
             self.defer_trigger(o, Some(key))?;
@@ -4386,8 +4880,16 @@ impl Interp {
                         return Ok(match k {
                             0 => Value::Num(cur.unwrap_or(0) as f64),
                             1 => Value::Num((cur.unwrap_or(0) * info.kind.elsize()) as f64),
-                            2 => Value::Num(if cur.is_none() { 0.0 } else { info.offset as f64 }),
-                            _ => self.ta_buffer.get(&ptr).cloned().unwrap_or(Value::Undefined),
+                            2 => Value::Num(if cur.is_none() {
+                                0.0
+                            } else {
+                                info.offset as f64
+                            }),
+                            _ => self
+                                .ta_buffer
+                                .get(&ptr)
+                                .cloned()
+                                .unwrap_or(Value::Undefined),
                         });
                     }
                 }
@@ -4405,6 +4907,69 @@ impl Interp {
             self.materialize_fn(&obj);
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
             let ptr = Gc::as_ptr(&obj) as usize;
+            #[cfg(feature = "embed")]
+            if self.is_window_proxy(&obj) {
+                let key_value = self
+                    .sym_from_key(key)
+                    .unwrap_or_else(|| Value::from_string(key.to_owned()));
+                let operation = crate::embed_realms::WindowProxyOperation::Get {
+                    key: key_value,
+                    receiver: receiver.clone(),
+                };
+                if let Some(decision) = self.window_proxy_decision(&obj, operation)? {
+                    match decision {
+                        crate::embed_realms::WindowProxyDecision::Handled(
+                            crate::embed_realms::WindowProxyResult::Get(value),
+                        ) => return Ok(value),
+                        crate::embed_realms::WindowProxyDecision::Handled(_) => {
+                            return Err(self.throw(
+                                "TypeError",
+                                "WindowProxy policy returned a result for the wrong operation",
+                            ));
+                        }
+                        crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                            if let Some(index) = crate::value::canonical_index(key) {
+                                if let Some(child) = self.window_proxy_child_at(&forward, index)? {
+                                    return Ok(child);
+                                }
+                                let target = forward.target.as_obj().ok_or_else(|| {
+                                    self.throw("TypeError", "WindowProxy target is not an object")
+                                })?;
+                                let prototype = target.borrow().proto.clone();
+                                return match prototype {
+                                    Some(prototype) => {
+                                        self.get_from_chain(&prototype, key, receiver)
+                                    }
+                                    None => Ok(Value::Undefined),
+                                };
+                            }
+                            let target_key = forward
+                                .target
+                                .as_obj()
+                                .map(|target| Gc::as_ptr(target) as usize)
+                                .ok_or_else(|| {
+                                    self.throw("TypeError", "WindowProxy target is not an object")
+                                })?;
+                            if matches!(receiver, Value::Obj(receiver) if Gc::as_ptr(receiver) as usize == ptr)
+                            {
+                                return self.with_window_proxy_receiver(
+                                    ptr,
+                                    forward.target_realm.key(),
+                                    target_key,
+                                    |interp| {
+                                        interp.get_member_recv(
+                                            &forward.target,
+                                            key,
+                                            receiver.clone(),
+                                        )
+                                    },
+                                );
+                            }
+                            return self.get_member_recv(&forward.target, key, receiver.clone());
+                        }
+                    }
+                }
+            }
             if let Some((target, handler)) = self.proxy_at(ptr) {
                 if matches!(handler, Value::Null) {
                     return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
@@ -4608,6 +5173,54 @@ impl Interp {
     ) -> Result<bool, Abrupt> {
         #[cfg(feature = "embed")]
         crate::embed_convert::retain_identity_receiver(self, &receiver);
+        #[cfg(feature = "embed")]
+        if let Value::Obj(object) = base {
+            let proxy_key = Gc::as_ptr(object) as usize;
+            let key_value = self
+                .sym_from_key(key)
+                .unwrap_or_else(|| Value::from_string(key.to_owned()));
+            let operation = crate::embed_realms::WindowProxyOperation::Set {
+                key: key_value,
+                value: value.clone(),
+                receiver: receiver.clone(),
+            };
+            if let Some(decision) = self.window_proxy_decision(object, operation)? {
+                return match decision {
+                    crate::embed_realms::WindowProxyDecision::Handled(
+                        crate::embed_realms::WindowProxyResult::Set(success),
+                    ) => Ok(success),
+                    crate::embed_realms::WindowProxyDecision::Handled(_) => Err(self.throw(
+                        "TypeError",
+                        "WindowProxy policy returned a result for the wrong operation",
+                    )),
+                    crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                        if crate::value::canonical_index(key).is_some() {
+                            return Ok(false);
+                        }
+                        let target_key = forward
+                            .target
+                            .as_obj()
+                            .map(|target| Gc::as_ptr(target) as usize)
+                            .ok_or_else(|| {
+                                self.throw("TypeError", "WindowProxy target is not an object")
+                            })?;
+                        if matches!(&receiver, Value::Obj(receiver) if Gc::as_ptr(receiver) as usize == proxy_key)
+                        {
+                            self.with_window_proxy_receiver(
+                                proxy_key,
+                                forward.target_realm.key(),
+                                target_key,
+                                |interp| {
+                                    interp.set_member_recv(&forward.target, key, value, receiver)
+                                },
+                            )
+                        } else {
+                            self.set_member_recv(&forward.target, key, value, receiver)
+                        }
+                    }
+                };
+            }
+        }
         // A mapped `arguments` index aliases its parameter binding: writes update the parameter
         // (and the own property, so unmapped reads and enumeration stay consistent).
         if !self.mapped_arguments.is_empty() {
@@ -4901,7 +5514,11 @@ impl Interp {
                 }
                 // A proxy receiver gets the write as CreateDataProperty through its
                 // [[DefineOwnProperty]] trap.
-                if self.proxies.contains_key(&rptr) {
+                #[cfg(feature = "embed")]
+                let native_window_proxy = self.is_window_proxy(r);
+                #[cfg(not(feature = "embed"))]
+                let native_window_proxy = false;
+                if self.proxies.contains_key(&rptr) || native_window_proxy {
                     return match crate::builtins::reflect_define_on_receiver(
                         self, &receiver, key, value,
                     ) {
@@ -5078,7 +5695,13 @@ impl Interp {
     /// view recomputes its length from the buffer's current size.
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
         let buflen = self.array_buffers.get(&info.buffer)?.len();
-        span_len(buflen, info.offset, info.kind.elsize(), info.len, info.track)
+        span_len(
+            buflen,
+            info.offset,
+            info.kind.elsize(),
+            info.len,
+            info.track,
+        )
     }
 
     /// Classify a property key against a TypedArray's integer-index exotic behavior: a valid
@@ -5251,14 +5874,18 @@ impl Interp {
         let mut out = String::with_capacity(bb - ba + 8);
         let mut from = ba;
         if ma {
-            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(s, ba, true)));
+            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(
+                s, ba, true,
+            )));
             from = ba + 4;
         }
         if from < bb {
             out.push_str(&s[from..bb]);
         }
         if mb {
-            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(s, bb, false)));
+            out.push(crate::jstr::smuggle(crate::str_index::unit_at_pos(
+                s, bb, false,
+            )));
         }
         Value::from_string(out)
     }
@@ -5325,17 +5952,23 @@ impl Interp {
         // A pass that reclaimed under an eighth of the heap means the heap is growing with live
         // data (a long promise chain, a big build-up): collecting again at +25% would rescan the
         // same survivors every few allocations, so wait until live doubles instead.
-        let growth = if before - live < before / 8 { live } else { live / 4 };
+        let growth = if before - live < before / 8 {
+            live
+        } else {
+            live / 4
+        };
         self.gc_next = (live + growth.max(GC_TRIGGER)).min(self.live_limit);
         Ok(())
-
     }
 
     /// Call `hook` the first `times` times this realm crosses its live-object or heap ceiling,
     /// raising the ceiling by a twentieth after each so the realm can go on; once the runs are
     /// used up the ceiling applies as usual. `times == 0` removes the hook.
     pub fn set_near_limit_hook(&mut self, times: u32, hook: Box<dyn FnMut(&mut Interp)>) {
-        self.near_limit = (times > 0).then_some(NearLimit { remaining: times, hook });
+        self.near_limit = (times > 0).then_some(NearLimit {
+            remaining: times,
+            hook,
+        });
     }
 
     /// Run the near-limit hook if one has runs left; whether it ran. A hook out of runs is
@@ -5745,6 +6378,12 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
+        // Preserve the call-site realm before a cross-realm callee swaps active intrinsics.
+        // Native Window receiver branding must authorize the original invoker, not the target
+        // realm merely because the method's function belongs to that realm.
+        #[cfg(feature = "embed")]
+        let _host_invocation =
+            (self.has_window_proxies() && self.multi_realm()).then(|| self.enter_host_invocation());
         // A cross-realm callee runs with its own realm's intrinsics active (so a thrown TypeError,
         // a fresh object's prototype, or a global lookup lands in the right realm).
         if self.multi_realm() {
@@ -5907,14 +6546,36 @@ impl Interp {
             }
             #[cfg(feature = "aot-native")]
             Callable::Aot(native) => {
-                if self.native_classes.contains_key(&(Gc::as_ptr(&obj) as usize)) {
-                    return Err(self.throw("TypeError", "Class constructor cannot be invoked without 'new'"));
+                if self
+                    .native_classes
+                    .contains_key(&(Gc::as_ptr(&obj) as usize))
+                {
+                    return Err(self.throw(
+                        "TypeError",
+                        "Class constructor cannot be invoked without 'new'",
+                    ));
                 }
                 let depth = self.fn_frames.len();
                 let pointer = Gc::as_ptr(&obj) as usize;
-                self.fn_frames.push(FnFrame { fn_ptr: pointer, coro: self.cur_coro, caller_site: std::mem::replace(&mut self.cur_site, frames::NO_SITE), strict: native.program.metadata.functions[native.function_index as usize].flags & 2 != 0, construct: false, extra: None });
+                self.fn_frames.push(FnFrame {
+                    fn_ptr: pointer,
+                    coro: self.cur_coro,
+                    caller_site: std::mem::replace(&mut self.cur_site, frames::NO_SITE),
+                    strict: native.program.metadata.functions[native.function_index as usize].flags
+                        & 2
+                        != 0,
+                    construct: false,
+                    extra: None,
+                });
                 let saved_tail = std::mem::replace(&mut self.native_tail_call, true);
-                let result = crate::native_aot::call(self, &native.program, native.function_index, &native.env, this, args);
+                let result = crate::native_aot::call(
+                    self,
+                    &native.program,
+                    native.function_index,
+                    &native.env,
+                    this,
+                    args,
+                );
                 self.native_tail_call = saved_tail;
                 self.pop_pushed_frame(depth, pointer);
                 result
@@ -6355,7 +7016,10 @@ impl Interp {
     fn arguments_props(&self, args: &[Value], unmapped: bool, fn_obj: &Gc) -> crate::value::Props {
         let mut p = crate::value::Props::new();
         for (idx, v) in args.iter().enumerate() {
-            p.insert(idx.to_string().as_str(), Property::data(v.clone(), true, true, true));
+            p.insert(
+                idx.to_string().as_str(),
+                Property::data(v.clone(), true, true, true),
+            );
         }
         p.insert(
             "length",
@@ -6453,7 +7117,7 @@ impl Interp {
             return this;
         }
         match this {
-            Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
+            Value::Undefined | Value::Null => self.global_this_value(),
             other @ Value::Obj(_) => other,
             prim => crate::builtins::box_primitive_pub(self, prim),
         }
@@ -6502,7 +7166,10 @@ impl Interp {
         fn_obj: &Gc,
     ) -> Result<Value, Abrupt> {
         if !cfg!(feature = "compiler") {
-            return Err(self.throw("Error", "interpreted functions are unavailable in the Aot profile"));
+            return Err(self.throw(
+                "Error",
+                "interpreted functions are unavailable in the Aot profile",
+            ));
         }
         crate::bytecode::jit::sync_frames(self);
         self.fn_frames.push(FnFrame {
@@ -6567,7 +7234,6 @@ impl Interp {
         } else if func.is_async && !is_construct {
             // Likewise an async body: no activation scope, a coroutine seeded from `args`.
             if let Some(r) = self.call_compiled_async(func, &closure, &this, args, fn_obj) {
-
                 return r;
             }
         }
@@ -6750,7 +7416,7 @@ impl Interp {
                     this
                 } else {
                     match this {
-                        Value::Undefined | Value::Null => Value::Obj(self.name_global().clone()),
+                        Value::Undefined | Value::Null => self.global_this_value(),
                         other @ Value::Obj(_) => other,
                         // Sloppy mode: a primitive `this` is boxed to its wrapper (ToObject).
                         prim => crate::builtins::box_primitive_pub(self, prim),
@@ -7396,9 +8062,7 @@ impl Interp {
                 // PromiseResolve(%Promise%, v): v itself only when SameValue(v.constructor,
                 // %Promise%); otherwise a new promise resolved with v.
                 match self.get_member(&v, "constructor") {
-                    Ok(Value::Obj(c))
-                        if matches!(self.promise_intr(), Some(i) if Gc::ptr_eq(&c, &i.ctor)) =>
-                    {
+                    Ok(Value::Obj(c)) if matches!(self.promise_intr(), Some(i) if Gc::ptr_eq(&c, &i.ctor)) => {
                         return Ok(v)
                     }
                     Ok(_) => {}
@@ -7411,7 +8075,6 @@ impl Interp {
         self.resolve_promise(&p, v);
         Ok(p)
     }
-
 
     fn bind_params(&mut self, params: &[Param], args: &[Value], scope: &Env) -> Result<(), Abrupt> {
         // With parameter expressions, every parameter's binding is created (uninitialized) up front,
@@ -7585,7 +8248,10 @@ impl Interp {
             }
         }
         #[cfg(feature = "aot-native")]
-        if self.native_classes.contains_key(&(Gc::as_ptr(&obj) as usize)) {
+        if self
+            .native_classes
+            .contains_key(&(Gc::as_ptr(&obj) as usize))
+        {
             return crate::native_aot::classes::construct(self, callee, args, new_target);
         }
         let call = obj.borrow().call.clone();
@@ -7616,9 +8282,12 @@ impl Interp {
             }
             Callable::User(user) => {
                 // A constructor template (no code runs), else a compiled class body as a frame.
-                if let Some(r) =
-                    crate::bytecode::ctor_plan::construct_with_plan(self, &callee, &new_target, args)
-                {
+                if let Some(r) = crate::bytecode::ctor_plan::construct_with_plan(
+                    self,
+                    &callee,
+                    &new_target,
+                    args,
+                ) {
                     return r;
                 }
                 if let Some(r) =
@@ -7704,7 +8373,9 @@ impl Interp {
             | Callable::PropGet(_)
             | Callable::PropSet(_) => Err(self.throw("TypeError", "value is not a constructor")),
             #[cfg(feature = "aot-native")]
-            Callable::Aot(_) => crate::native_aot::classes::construct(self, callee, args, new_target),
+            Callable::Aot(_) => {
+                crate::native_aot::classes::construct(self, callee, args, new_target)
+            }
         }
     }
 
@@ -7719,10 +8390,8 @@ impl Interp {
         key: &str,
         result: &Value,
     ) -> Result<(), Abrupt> {
-        let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).map(|p| p.clone()),
-            _ => None,
-        };
+        let prop =
+            crate::builtins::proxy_target_property(self, target, key).map_err(Abrupt::Throw)?;
         if let Some(p) = prop {
             if !p.configurable() {
                 let bad = if p.accessor() {
@@ -7750,10 +8419,8 @@ impl Interp {
         key: &str,
         value: &Value,
     ) -> Result<(), Abrupt> {
-        let prop = match target {
-            Value::Obj(t) => t.borrow().props.get(key).map(|p| p.clone()),
-            _ => None,
-        };
+        let prop =
+            crate::builtins::proxy_target_property(self, target, key).map_err(Abrupt::Throw)?;
         if let Some(p) = prop {
             if !p.configurable() {
                 let bad = if p.accessor() {
@@ -7909,7 +8576,11 @@ impl Interp {
     fn global_own_attrs(&mut self, name: &str) -> Result<Option<(bool, bool, bool, bool)>, Value> {
         let attrs = |p: &Property| (p.configurable(), p.accessor(), p.writable(), p.enumerable());
         if self.global_proxy.is_some() {
-            return Ok(self.vm_global_own(name).map_err(abrupt_value)?.as_ref().map(attrs));
+            return Ok(self
+                .vm_global_own(name)
+                .map_err(abrupt_value)?
+                .as_ref()
+                .map(attrs));
         }
         Ok(self.global.borrow().props.get(name).map(|p| attrs(&p)))
     }

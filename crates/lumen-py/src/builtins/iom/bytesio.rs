@@ -21,7 +21,11 @@ impl BytesIO {
         let buf = self.buf.bytes();
         let start = self.pos.min(buf.len());
         let avail = buf.len() - start;
-        let n = if size < 0 { avail } else { (size as usize).min(avail) };
+        let n = if size < 0 {
+            avail
+        } else {
+            (size as usize).min(avail)
+        };
         self.pos = start + n;
         buf[start..start + n].to_vec()
     }
@@ -30,8 +34,15 @@ impl BytesIO {
         let buf = self.buf.bytes();
         let start = self.pos.min(buf.len());
         let rest = &buf[start..];
-        let limit = if size < 0 { rest.len() } else { (size as usize).min(rest.len()) };
-        let n = rest[..limit].iter().position(|&b| b == b'\n').map_or(limit, |p| p + 1);
+        let limit = if size < 0 {
+            rest.len()
+        } else {
+            (size as usize).min(rest.len())
+        };
+        let n = rest[..limit]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(limit, |p| p + 1);
         self.pos = start + n;
         buf[start..start + n].to_vec()
     }
@@ -62,7 +73,10 @@ fn new_store() -> Rc<ByteStore> {
 fn check_exports(it: &mut Interp, slf: &Py<BytesIO>) -> R<()> {
     let pinned = slf.with(it, |s| s.buf.is_pinned())?;
     if pinned {
-        return Err(it.new_exc_str("BufferError", "Existing exports of data: object cannot be re-sized"));
+        return Err(it.new_exc_str(
+            "BufferError",
+            "Existing exports of data: object cannot be re-sized",
+        ));
     }
     Ok(())
 }
@@ -78,7 +92,11 @@ impl BytesIO {
     #[constructor]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BytesIO {
         let _ = (args, kwargs);
-        BytesIO { buf: new_store(), pos: 0, closed: false }
+        BytesIO {
+            buf: new_store(),
+            pos: 0,
+            closed: false,
+        }
     }
 
     #[proto(init)]
@@ -175,9 +193,15 @@ impl BytesIO {
             0 => Some(pos),
             1 => pos.checked_add(cur),
             2 => pos.checked_add(len),
-            _ => return Err(it.value_error(&format!("invalid whence ({}, should be 0, 1 or 2)", whence))),
+            _ => {
+                return Err(
+                    it.value_error(&format!("invalid whence ({}, should be 0, 1 or 2)", whence))
+                )
+            }
         };
-        let Some(target) = target else { return Err(it.overflow_err("new position too large")) };
+        let Some(target) = target else {
+            return Err(it.overflow_err("new position too large"));
+        };
         let target = target.max(0);
         st(it, &slf.0, |s| s.pos = target as usize)?;
         Ok(target)
@@ -261,9 +285,18 @@ impl BytesIO {
 
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (buf, pos) = st(it, &slf.0, |s| (s.buf.to_vec(), s.pos))?;
-        let Value::Obj(o) = slf.0.value() else { unreachable!() };
-        let d = o.dict.borrow().clone().map_or(Value::None, |d| it.call_method(&Value::Obj(d), "copy", Vec::new()).unwrap_or(Value::None));
-        Ok(Value::tuple(vec![Value::bytes(buf), Value::Int(pos as i64), d]))
+        let Value::Obj(o) = slf.0.value() else {
+            unreachable!()
+        };
+        let d = o.dict.borrow().clone().map_or(Value::None, |d| {
+            it.call_method(&Value::Obj(d), "copy", Vec::new())
+                .unwrap_or(Value::None)
+        });
+        Ok(Value::tuple(vec![
+            Value::bytes(buf),
+            Value::Int(pos as i64),
+            d,
+        ]))
     }
 
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
@@ -271,7 +304,9 @@ impl BytesIO {
             Some(t) if t.len() >= 3 => t.to_vec(),
             _ => {
                 let t = it.type_name_of(slf.0.value());
-                return Err(it.type_error(&format!("{}.__setstate__ argument should be 3-tuple", t)));
+                return Err(
+                    it.type_error(&format!("{}.__setstate__ argument should be 3-tuple", t))
+                );
             }
         };
         let buf = it.bytes_of(&items[0])?;
@@ -285,7 +320,9 @@ impl BytesIO {
             s.pos = pos as usize;
         })?;
         if let Value::Obj(d) = &items[2] {
-            let Value::Obj(o) = slf.0.value() else { unreachable!() };
+            let Value::Obj(o) = slf.0.value() else {
+                unreachable!()
+            };
             let dd = it.instance_dict(o);
             it.call_method(&Value::Obj(dd), "update", vec![Value::Obj(d.clone())])?;
         }

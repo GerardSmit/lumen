@@ -9,10 +9,10 @@
 //! otherwise. Values are capped at [`MAX_BITS`]; the `checked_*` operations reject results past it
 //! before allocating them.
 
+use crate::limits::{Abort, StopFlags};
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::rc::Rc;
-use crate::limits::{Abort, StopFlags};
 
 const IDLE: u8 = 0;
 const ARMED: u8 = 1;
@@ -373,7 +373,11 @@ impl Mont {
         }
         let r = ((1u128 << 64) % p as u128) as u64;
         let r2 = ((r as u128 * r as u128) % p as u128) as u64;
-        Mont { p, pneg_inv: inv.wrapping_neg(), r2 }
+        Mont {
+            p,
+            pneg_inv: inv.wrapping_neg(),
+            r2,
+        }
     }
     /// `a·b·R⁻¹ mod p`; also correct for any `a < 2^64` when `b < p`.
     #[inline(always)]
@@ -642,7 +646,10 @@ impl Recip {
 fn div_small_in_place(a: &mut [u64], d: u64) -> u64 {
     if a.len() <= 2 {
         // Too short to amortize the reciprocal.
-        let n = a.iter().rev().fold(0u128, |acc, &x| (acc << 64) | x as u128);
+        let n = a
+            .iter()
+            .rev()
+            .fold(0u128, |acc, &x| (acc << 64) | x as u128);
         let q = n / d as u128;
         for (i, x) in a.iter_mut().enumerate() {
             *x = (q >> (64 * i)) as u64;
@@ -903,7 +910,12 @@ fn div2n1n(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
         return (Vec::new(), Vec::new());
     }
     let h = n / 2;
-    let (q1, r) = div3n2n(high_limbs(a, n), trimmed(&a[h.min(a.len())..n.min(a.len())]), b, h);
+    let (q1, r) = div3n2n(
+        high_limbs(a, n),
+        trimmed(&a[h.min(a.len())..n.min(a.len())]),
+        b,
+        h,
+    );
     let (q2, r) = div3n2n(&r, low_limbs(a, h), b, h);
     (join_limbs(&q1, h, &q2), r)
 }
@@ -950,7 +962,11 @@ fn knuth_divmod(a: &[u64], b: &[u64], want_q: bool) -> (Vec<u64>, Vec<u64>) {
     let s = b[n - 1].leading_zeros();
     let v = shl_bits(b, s, 0);
     let mut u = shl_bits(a, s, 1);
-    let mut q = if want_q { vec![0u64; m + 1] } else { Vec::new() };
+    let mut q = if want_q {
+        vec![0u64; m + 1]
+    } else {
+        Vec::new()
+    };
     let (vtop, vnext) = (v[n - 1], v[n - 2]);
     let vrecip = Recip::new(vtop);
     for j in (0..=m).rev() {
@@ -1081,7 +1097,10 @@ fn mag_to_radix(mag: &[u64], radix: u32, out: &mut Vec<u8>) {
     }
     // A reciprocal pays off from about four divisions by the same power, i.e. two levels below
     // the root's.
-    let root = (0..pows.len()).rev().find(|&l| 2 * pows[l].len() - 1 <= mag.len()).unwrap_or(0);
+    let root = (0..pows.len())
+        .rev()
+        .find(|&l| 2 * pows[l].len() - 1 <= mag.len())
+        .unwrap_or(0);
     let divs: Vec<Option<Barrett>> = pows
         .iter()
         .enumerate()
@@ -1090,7 +1109,13 @@ fn mag_to_radix(mag: &[u64], radix: u32, out: &mut Vec<u8>) {
     if aborted() {
         return;
     }
-    let ctx = RadixCtx { radix, k, recip, pows, divs };
+    let ctx = RadixCtx {
+        radix,
+        k,
+        recip,
+        pows,
+        divs,
+    };
     to_radix_dc(mag, None, &ctx, out);
 }
 
@@ -1137,7 +1162,10 @@ fn to_radix_dc(x: &[u64], width: Option<usize>, ctx: &RadixCtx, out: &mut Vec<u8
         out[start..].reverse();
         return;
     }
-    let l = (0..pows.len()).rev().find(|&l| 2 * pows[l].len() - 1 <= x.len()).unwrap_or(0);
+    let l = (0..pows.len())
+        .rev()
+        .find(|&l| 2 * pows[l].len() - 1 <= x.len())
+        .unwrap_or(0);
     let (q, r) = match &ctx.divs[l] {
         Some(div) => div.divmod(x),
         None => mag_divmod(x, &pows[l], true),
@@ -1235,7 +1263,10 @@ fn parse_dc(digits: &[u8], radix: u32, k: usize, pows: &[Vec<u64>]) -> Vec<u64> 
         }
         return trim(acc);
     }
-    let l = (0..pows.len()).rev().find(|&l| (k << l) < digits.len()).unwrap();
+    let l = (0..pows.len())
+        .rev()
+        .find(|&l| (k << l) < digits.len())
+        .unwrap();
     let split = digits.len() - (k << l);
     let hi = parse_dc(&digits[..split], radix, k, pows);
     let lo = parse_dc(&digits[split..], radix, k, pows);
@@ -1367,7 +1398,10 @@ impl BigInt {
         }
         let neg = self.0.neg != o.0.neg;
         let (q, r) = match (self.small_mag(), o.small_mag()) {
-            (Some(x), Some(y)) => (Self::from_parts(neg, x / y), Self::from_parts(self.0.neg, x % y)),
+            (Some(x), Some(y)) => (
+                Self::from_parts(neg, x / y),
+                Self::from_parts(self.0.neg, x % y),
+            ),
             _ => {
                 let (q, r) = mag_divmod(&self.0.mag, &o.0.mag, true);
                 (Self::make(neg, q), Self::make(self.0.neg, r))
@@ -1433,7 +1467,9 @@ impl BigInt {
         self.0.mag.is_empty()
     }
     #[inline]
-    pub fn words(&self) -> (bool, &[u64]) { (self.0.neg, &self.0.mag) }
+    pub fn words(&self) -> (bool, &[u64]) {
+        (self.0.neg, &self.0.mag)
+    }
     #[inline]
     pub fn is_negative(&self) -> bool {
         self.0.neg
@@ -1532,7 +1568,13 @@ impl BigInt {
         let odd = o.0.mag[0] & 1 == 1;
         match self.0.mag.as_slice() {
             [] => return Ok(Self::zero()),
-            [1] => return Ok(if self.0.neg && !odd { self.neg() } else { self.clone() }),
+            [1] => {
+                return Ok(if self.0.neg && !odd {
+                    self.neg()
+                } else {
+                    self.clone()
+                })
+            }
             _ => {}
         }
         let bits = self.bit_len() as u64;
@@ -1645,7 +1687,9 @@ impl BigInt {
         // Here bits ≤ bit_len ≤ MAX_BITS.
         let mut v = self.low_twos(bits);
         let top = bits - 1;
-        if v.get((top / 64) as usize).is_some_and(|&d| d >> (top % 64) & 1 == 1) {
+        if v.get((top / 64) as usize)
+            .is_some_and(|&d| d >> (top % 64) & 1 == 1)
+        {
             // Negative: the magnitude is the `bits`-wide two's complement of `v`.
             negate_twos(&mut v);
             mask_bits(&mut v, bits);
@@ -2061,7 +2105,10 @@ mod tests {
             "340282366920938463463374607431768211456"
         );
         assert_eq!(big("-3").pow(&big("3")).unwrap().to_string(), "-27");
-        assert_eq!(big("2").pow(&big("-1")), Err(super::BigIntError::NegativeExponent));
+        assert_eq!(
+            big("2").pow(&big("-1")),
+            Err(super::BigIntError::NegativeExponent)
+        );
         assert_eq!(big("7").pow(&BigInt::zero()).unwrap().to_string(), "1");
     }
 
@@ -2163,7 +2210,11 @@ mod tests {
             super::mul_school(&a, &b, &mut school);
             let school = super::trim(school);
             assert_eq!(super::mag_mul(&a, &b), school, "mul {la}x{lb}");
-            assert_eq!(super::mag_sqr(&a), super::mag_mul(&a, &a.clone()), "sqr {la}");
+            assert_eq!(
+                super::mag_sqr(&a),
+                super::mag_mul(&a, &a.clone()),
+                "sqr {la}"
+            );
             let (q, r) = super::mag_divmod(&a, &b, true);
             assert_eq!(super::mag_cmp(&r, &b), Ordering::Less);
             let back = super::mag_add(&super::mag_mul(&q, &b), &r);
@@ -2225,7 +2276,9 @@ mod tests {
     #[test]
     fn large_mul_div_and_radix_conversion_agree() {
         let mut next = xorshift(0xD1B5_4A32_D192_ED03);
-        let sizes = [1usize, 2, 3, 39, 40, 41, 79, 80, 81, 150, 333, 799, 800, 999, 1000, 2100, 3000, 6100];
+        let sizes = [
+            1usize, 2, 3, 39, 40, 41, 79, 80, 81, 150, 333, 799, 800, 999, 1000, 2100, 3000, 6100,
+        ];
         for (i, &la) in sizes.iter().enumerate() {
             for &lb in &sizes[..=i] {
                 let a = rand_mag(&mut next, la);
@@ -2236,7 +2289,11 @@ mod tests {
                     super::mul_school(&a, &b, &mut school);
                     assert_eq!(p, super::trim(school), "mul {la}x{lb}");
                 }
-                assert_eq!(super::mag_sqr(&a), super::mag_mul(&a, &a.clone()), "sqr {la}");
+                assert_eq!(
+                    super::mag_sqr(&a),
+                    super::mag_mul(&a, &a.clone()),
+                    "sqr {la}"
+                );
                 // (a·b + r) / b == a, remainder r, for r < b.
                 let r = super::mag_divmod(&rand_mag(&mut next, lb), &b, false).1;
                 let n = super::mag_add(&p, &r);
@@ -2245,7 +2302,10 @@ mod tests {
                 assert_eq!(rr, r, "rem {}/{lb}", n.len());
                 assert_eq!(super::mag_divmod(&n, &b, false).1, r);
                 let (q2, r2) = super::mag_divmod(&n, &a, true);
-                assert_eq!(super::trim(super::mag_add(&super::mag_mul(&q2, &a), &r2)), n);
+                assert_eq!(
+                    super::trim(super::mag_add(&super::mag_mul(&q2, &a), &r2)),
+                    n
+                );
                 assert_eq!(super::mag_cmp(&r2, &a), Ordering::Less);
             }
         }
@@ -2255,10 +2315,18 @@ mod tests {
                 let s = x.to_string_radix(radix);
                 let digits = s.trim_start_matches('-');
                 if n <= 120 {
-                    assert_eq!(digits, naive_to_string(&x.0.mag, radix), "to_string {n} r{radix}");
+                    assert_eq!(
+                        digits,
+                        naive_to_string(&x.0.mag, radix),
+                        "to_string {n} r{radix}"
+                    );
                 }
                 let back = BigInt::parse_radix(digits, radix).unwrap();
-                assert_eq!(back, BigInt::make(false, x.0.mag.clone()), "parse {n} r{radix}");
+                assert_eq!(
+                    back,
+                    BigInt::make(false, x.0.mag.clone()),
+                    "parse {n} r{radix}"
+                );
                 assert_eq!(x.to_string_radix_checked(radix, s.len()), Some(s.clone()));
                 assert_eq!(x.to_string_radix_checked(radix, s.len() - 1), None);
             }
@@ -2270,7 +2338,10 @@ mod tests {
         assert_eq!(s.len(), 5001);
         assert!(s.starts_with('1') && s[1..].bytes().all(|c| c == b'0'));
         assert_eq!(p.sub(&BigInt::from_u64(1)).to_string(), "9".repeat(5000));
-        assert_eq!(BigInt::parse_radix(&"9".repeat(5000), 10), Some(p.sub(&BigInt::from_u64(1))));
+        assert_eq!(
+            BigInt::parse_radix(&"9".repeat(5000), 10),
+            Some(p.sub(&BigInt::from_u64(1)))
+        );
         assert_eq!(BigInt::parse_radix(&format!("000{s}"), 10), Some(p));
         assert_eq!(BigInt::parse_radix("0000", 10), Some(BigInt::zero()));
     }
@@ -2299,22 +2370,46 @@ mod tests {
         assert_eq!(BigInt::from_u64(3).pow(&e(1 << 31)), Err(TooLarge));
         assert_eq!(BigInt::from_u64(3).pow(&e(700_000_000)), Err(TooLarge));
         assert_eq!(two.pow(&BigInt::from_u64(u64::MAX).shl(70)), Err(TooLarge));
-        assert_eq!(BigInt::from_i128(-1).pow(&e(u64::MAX)).unwrap().to_string(), "-1");
-        assert_eq!(BigInt::from_i128(-1).pow(&e(1 << 40)).unwrap().to_string(), "1");
+        assert_eq!(
+            BigInt::from_i128(-1).pow(&e(u64::MAX)).unwrap().to_string(),
+            "-1"
+        );
+        assert_eq!(
+            BigInt::from_i128(-1).pow(&e(1 << 40)).unwrap().to_string(),
+            "1"
+        );
         assert_eq!(BigInt::zero().pow(&e(1 << 40)).unwrap(), BigInt::zero());
         let top = two.pow(&e(MAX_BITS - 1)).unwrap();
         assert_eq!(top.bit_len() as u64, MAX_BITS);
         assert_eq!(top.checked_mul(&two), Err(TooLarge));
         assert_eq!(top.checked_add(&top), Err(TooLarge));
         assert_eq!(top.checked_shl(1), Err(TooLarge));
-        assert_eq!(BigInt::from_u64(1).checked_shl(MAX_BITS as u128), Err(TooLarge));
-        assert_eq!(two.pow(&e(1000)).unwrap().to_string_radix(16), format!("1{}", "0".repeat(250)));
-        assert_eq!(BigInt::from_i128(-8).pow(&e(3)).unwrap().to_string(), "-512");
-        assert_eq!(BigInt::from_u64(1).as_uint_n(MAX_BITS + 1).unwrap().to_string(), "1");
+        assert_eq!(
+            BigInt::from_u64(1).checked_shl(MAX_BITS as u128),
+            Err(TooLarge)
+        );
+        assert_eq!(
+            two.pow(&e(1000)).unwrap().to_string_radix(16),
+            format!("1{}", "0".repeat(250))
+        );
+        assert_eq!(
+            BigInt::from_i128(-8).pow(&e(3)).unwrap().to_string(),
+            "-512"
+        );
+        assert_eq!(
+            BigInt::from_u64(1)
+                .as_uint_n(MAX_BITS + 1)
+                .unwrap()
+                .to_string(),
+            "1"
+        );
         assert_eq!(BigInt::from_i128(-1).as_uint_n(MAX_BITS + 1), Err(TooLarge));
         assert_eq!(BigInt::from_i128(-1).as_int_n(1 << 40).to_string(), "-1");
         let digits = (MAX_BITS as f64 / 10f64.log2()) as usize + 2;
-        assert_eq!(BigInt::parse_radix_checked(&"9".repeat(digits), 10), Err(TooLarge));
+        assert_eq!(
+            BigInt::parse_radix_checked(&"9".repeat(digits), 10),
+            Err(TooLarge)
+        );
     }
 
     #[test]
@@ -2331,16 +2426,32 @@ mod tests {
         ];
         for (v, bits, u, s) in cases {
             let n = BigInt::from_i128(v);
-            assert_eq!(n.as_uint_n(bits).unwrap().to_string(), u, "asUintN({bits}, {v})");
+            assert_eq!(
+                n.as_uint_n(bits).unwrap().to_string(),
+                u,
+                "asUintN({bits}, {v})"
+            );
             assert_eq!(n.as_int_n(bits).to_string(), s, "asIntN({bits}, {v})");
         }
     }
 
     #[test]
     fn floored_division_matches_sign_rules() {
-        for (a, b, q, r) in [(7, 2, 3, 1), (-7, 2, -4, 1), (7, -2, -4, -1), (-7, -2, 3, -1), (6, -3, -2, 0)] {
-            let (gq, gr) = BigInt::from_i64(a).divmod_floor(&BigInt::from_i64(b)).unwrap();
-            assert_eq!((gq.to_i64(), gr.to_i64()), (Some(q), Some(r)), "{a} divmod {b}");
+        for (a, b, q, r) in [
+            (7, 2, 3, 1),
+            (-7, 2, -4, 1),
+            (7, -2, -4, -1),
+            (-7, -2, 3, -1),
+            (6, -3, -2, 0),
+        ] {
+            let (gq, gr) = BigInt::from_i64(a)
+                .divmod_floor(&BigInt::from_i64(b))
+                .unwrap();
+            assert_eq!(
+                (gq.to_i64(), gr.to_i64()),
+                (Some(q), Some(r)),
+                "{a} divmod {b}"
+            );
         }
         let n = big("-100000000000000000000000000000000000001");
         let d = big("12345678901234567890");
@@ -2355,21 +2466,41 @@ mod tests {
 
     #[test]
     fn pow_mod_gcd_isqrt() {
-        let (b, e, m) = (BigInt::from_i64(3), BigInt::from_i64(200), BigInt::from_i64(13));
+        let (b, e, m) = (
+            BigInt::from_i64(3),
+            BigInt::from_i64(200),
+            BigInt::from_i64(13),
+        );
         assert_eq!(b.pow_mod(&e, &m).unwrap().to_i64(), Some(9));
         assert_eq!(b.pow_mod(&e, &m.neg()).unwrap().to_i64(), Some(-4));
-        assert_eq!(b.pow_mod(&BigInt::zero(), &BigInt::from_i64(1)).unwrap().to_i64(), Some(0));
+        assert_eq!(
+            b.pow_mod(&BigInt::zero(), &BigInt::from_i64(1))
+                .unwrap()
+                .to_i64(),
+            Some(0)
+        );
         assert_eq!(b.pow_mod(&e.neg(), &m), None);
         assert_eq!(b.pow_mod(&e, &BigInt::zero()), None);
         let p = big("170141183460469231731687303715884105727");
         let a = big("123456789123456789123456789");
-        assert_eq!(a.pow_mod(&p.sub(&BigInt::from_i64(1)), &p).unwrap().to_i64(), Some(1));
-        assert_eq!(BigInt::from_i64(-12).gcd(&BigInt::from_i64(18)).to_i64(), Some(6));
+        assert_eq!(
+            a.pow_mod(&p.sub(&BigInt::from_i64(1)), &p)
+                .unwrap()
+                .to_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            BigInt::from_i64(-12).gcd(&BigInt::from_i64(18)).to_i64(),
+            Some(6)
+        );
         assert_eq!(BigInt::zero().gcd(&BigInt::zero()), BigInt::zero());
         let r = big("123456789012345678901234567890");
         assert_eq!(r.mul(&r).isqrt().unwrap(), r);
         assert_eq!(r.mul(&r).add(&r).isqrt().unwrap(), r);
-        assert_eq!(r.mul(&r).sub(&BigInt::from_i64(1)).isqrt().unwrap(), r.sub(&BigInt::from_i64(1)));
+        assert_eq!(
+            r.mul(&r).sub(&BigInt::from_i64(1)).isqrt().unwrap(),
+            r.sub(&BigInt::from_i64(1))
+        );
         assert_eq!(BigInt::from_i64(-1).isqrt(), None);
     }
 

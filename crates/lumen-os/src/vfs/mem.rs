@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use super::FileSystem;
 use crate::errno::FsError;
-use crate::fs::flags::{O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC, O_WRONLY};
+use crate::fs::flags::{
+    O_APPEND, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_RDWR, O_TRUNC, O_WRONLY,
+};
 use crate::fs::{DirentKind, Stat, StatFs, Timespec, S_IFDIR, S_IFLNK, S_IFREG};
 
 type R<T> = Result<T, FsError>;
@@ -69,8 +71,15 @@ fn timespec(ms: f64) -> Timespec {
 }
 
 enum Data {
-    File { bytes: Cow<'static, [u8]>, lazy: Option<String>, lazy_size: u64 },
-    Dir { entries: BTreeMap<String, u64>, unlisted: Option<String> },
+    File {
+        bytes: Cow<'static, [u8]>,
+        lazy: Option<String>,
+        lazy_size: u64,
+    },
+    Dir {
+        entries: BTreeMap<String, u64>,
+        unlisted: Option<String>,
+    },
     Link(String),
 }
 
@@ -89,7 +98,17 @@ struct Node {
 impl Node {
     fn new(data: Data, mode: u32) -> Node {
         let now = unix_ms();
-        Node { data, mode, nlink: 1, uid: 0, gid: 0, atime: now, mtime: now, ctime: now, birth: now }
+        Node {
+            data,
+            mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            birth: now,
+        }
     }
 
     fn is_dir(&self) -> bool {
@@ -114,11 +133,18 @@ impl Node {
 }
 
 fn empty_file() -> Data {
-    Data::File { bytes: Cow::Borrowed(&[]), lazy: None, lazy_size: 0 }
+    Data::File {
+        bytes: Cow::Borrowed(&[]),
+        lazy: None,
+        lazy_size: 0,
+    }
 }
 
 fn empty_dir() -> Data {
-    Data::Dir { entries: BTreeMap::new(), unlisted: None }
+    Data::Dir {
+        entries: BTreeMap::new(),
+        unlisted: None,
+    }
 }
 
 struct Open {
@@ -218,7 +244,11 @@ impl Fs {
         self.mounts
             .iter()
             .filter(|(prefix, _)| {
-                prefix == "/" || abs == prefix || abs.strip_prefix(prefix.as_str()).is_some_and(|r| r.starts_with('/'))
+                prefix == "/"
+                    || abs == prefix
+                    || abs
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|r| r.starts_with('/'))
             })
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, b)| Arc::clone(b))
@@ -232,9 +262,16 @@ impl Fs {
         let backend = self.mount_for(&abs)?;
         let rs = backend.stat(&abs)?;
         let data = if rs.is_dir {
-            Data::Dir { entries: BTreeMap::new(), unlisted: Some(abs.clone()) }
+            Data::Dir {
+                entries: BTreeMap::new(),
+                unlisted: Some(abs.clone()),
+            }
         } else {
-            Data::File { bytes: Cow::Borrowed(&[]), lazy: Some(abs.clone()), lazy_size: rs.size }
+            Data::File {
+                bytes: Cow::Borrowed(&[]),
+                lazy: Some(abs.clone()),
+                lazy_size: rs.size,
+            }
         };
         let mode = if rs.is_dir { 0o755 } else { 0o644 };
         let ino = self.alloc(Node::new(data, mode));
@@ -295,7 +332,10 @@ impl Fs {
             inos.push(child);
             cur.push(name);
         }
-        Ok(Resolved { ino: *inos.last().unwrap(), path: cur })
+        Ok(Resolved {
+            ino: *inos.last().unwrap(),
+            path: cur,
+        })
     }
 
     /// The directory that would hold `path`, and the final name.
@@ -320,7 +360,10 @@ impl Fs {
         };
         let backend = self.mount_for(&path).ok_or(EIO)?;
         let bytes = backend.read(&path).ok_or(EIO)?;
-        if let Data::File { bytes: slot, lazy, .. } = &mut self.node_mut(ino).data {
+        if let Data::File {
+            bytes: slot, lazy, ..
+        } = &mut self.node_mut(ino).data
+        {
             *slot = Cow::Owned(bytes);
             *lazy = None;
         }
@@ -335,18 +378,39 @@ impl Fs {
             },
             _ => return,
         };
-        let Some(backend) = self.mount_for(&path) else { return };
-        let Some(list) = backend.list(&path) else { return };
+        let Some(backend) = self.mount_for(&path) else {
+            return;
+        };
+        let Some(list) = backend.list(&path) else {
+            return;
+        };
         for e in list {
             let exists = matches!(&self.node(ino).data, Data::Dir { entries, .. } if entries.contains_key(&e.name));
             if exists {
                 continue;
             }
-            let child_path = if path == "/" { format!("/{}", e.name) } else { format!("{path}/{}", e.name) };
-            let (data, mode) = if e.is_dir {
-                (Data::Dir { entries: BTreeMap::new(), unlisted: Some(child_path) }, 0o755)
+            let child_path = if path == "/" {
+                format!("/{}", e.name)
             } else {
-                (Data::File { bytes: Cow::Borrowed(&[]), lazy: Some(child_path), lazy_size: e.size }, 0o644)
+                format!("{path}/{}", e.name)
+            };
+            let (data, mode) = if e.is_dir {
+                (
+                    Data::Dir {
+                        entries: BTreeMap::new(),
+                        unlisted: Some(child_path),
+                    },
+                    0o755,
+                )
+            } else {
+                (
+                    Data::File {
+                        bytes: Cow::Borrowed(&[]),
+                        lazy: Some(child_path),
+                        lazy_size: e.size,
+                    },
+                    0o644,
+                )
             };
             let child = self.alloc(Node::new(data, mode));
             if let Data::Dir { entries, .. } = &mut self.node_mut(ino).data {
@@ -358,7 +422,9 @@ impl Fs {
     fn stat_node(&self, ino: u64) -> Stat {
         let n = self.node(ino);
         let size = match &n.data {
-            Data::File { bytes, lazy: None, .. } => bytes.len() as u64,
+            Data::File {
+                bytes, lazy: None, ..
+            } => bytes.len() as u64,
             Data::File { lazy_size, .. } => *lazy_size,
             Data::Dir { entries, .. } => (entries.len() as u64 + 2) * 32,
             Data::Link(t) => t.len() as u64,
@@ -498,12 +564,22 @@ impl MemFs {
 
     /// Adds a file at absolute `path` holding `contents` (borrowed when `'static`), creating its
     /// missing parent directories with `dir_mode`; replaces an existing file.
-    pub fn insert(&self, path: &str, contents: impl Into<Cow<'static, [u8]>>, mode: u32, dir_mode: u32) {
+    pub fn insert(
+        &self,
+        path: &str,
+        contents: impl Into<Cow<'static, [u8]>>,
+        mode: u32,
+        dir_mode: u32,
+    ) {
         let mut fs = self.fs();
         let abs = normalize(&fs.cwd.clone(), path);
         let (parent, name) = abs.rsplit_once('/').unwrap_or(("", &abs));
         let dir = fs.mkdir_p(parent, dir_mode);
-        let data = Data::File { bytes: contents.into(), lazy: None, lazy_size: 0 };
+        let data = Data::File {
+            bytes: contents.into(),
+            lazy: None,
+            lazy_size: 0,
+        };
         let existing = match &fs.node(dir).data {
             Data::Dir { entries, .. } => entries.get(name).copied(),
             _ => None,
@@ -578,7 +654,9 @@ impl MemFs {
 
     fn close_in(fs: &mut Fs, fd: i32) -> R<()> {
         let open = fs.fds.remove(&fd).ok_or(EBADF)?;
-        if fs.nodes.get(&open.ino).is_some_and(|n| n.nlink == 0) && !fs.fds.values().any(|o| o.ino == open.ino) {
+        if fs.nodes.get(&open.ino).is_some_and(|n| n.nlink == 0)
+            && !fs.fds.values().any(|o| o.ino == open.ino)
+        {
             fs.nodes.remove(&open.ino);
         }
         Ok(())
@@ -693,7 +771,13 @@ impl FileSystem for MemFs {
     fn dup(&self, fd: i32) -> R<i32> {
         let mut fs = self.fs();
         let o = fs.open_of(fd)?;
-        let copy = Open { ino: o.ino, readable: o.readable, writable: o.writable, append: o.append, pos: o.pos };
+        let copy = Open {
+            ino: o.ino,
+            readable: o.readable,
+            writable: o.writable,
+            append: o.append,
+            pos: o.pos,
+        };
         let nfd = fs.lowest_free_fd();
         fs.fds.insert(nfd, copy);
         Ok(nfd)
@@ -704,9 +788,14 @@ impl FileSystem for MemFs {
         let fs = self.fs();
         match fs.fds.get(&fd) {
             Some(o) => Ok(fs.stat_node(o.ino)),
-            None if (0..=2).contains(&fd) => {
-                Ok(Stat { dev: 1, mode: 0o020000 | 0o600, nlink: 1, ino: fd as u64, blksize: 4096, ..Stat::default() })
-            }
+            None if (0..=2).contains(&fd) => Ok(Stat {
+                dev: 1,
+                mode: 0o020000 | 0o600,
+                nlink: 1,
+                ino: fd as u64,
+                blksize: 4096,
+                ..Stat::default()
+            }),
             None => Err(EBADF),
         }
     }
@@ -771,7 +860,14 @@ impl FileSystem for MemFs {
 
     fn statfs(&self, path: &str) -> R<StatFs> {
         self.stat(path, true)?;
-        Ok(StatFs { bsize: 4096, blocks: 1 << 20, bfree: 1 << 19, bavail: 1 << 19, files: 1 << 20, ffree: 1 << 19 })
+        Ok(StatFs {
+            bsize: 4096,
+            blocks: 1 << 20,
+            bfree: 1 << 19,
+            bavail: 1 << 19,
+            files: 1 << 20,
+            ffree: 1 << 19,
+        })
     }
 
     fn access(&self, path: &str, _mode: u32) -> R<()> {
@@ -830,7 +926,11 @@ impl FileSystem for MemFs {
                         n
                     };
                     if !fs.node(n).is_dir() {
-                        return Err(if cur.len() + 1 == total { EEXIST } else { ENOTDIR });
+                        return Err(if cur.len() + 1 == total {
+                            EEXIST
+                        } else {
+                            ENOTDIR
+                        });
                     }
                     n
                 }
@@ -934,7 +1034,8 @@ impl FileSystem for MemFs {
                 (false, true) => return Err(EISDIR),
                 (true, true) => {
                     fs.list_remote(existing);
-                    if matches!(&fs.node(existing).data, Data::Dir { entries, .. } if !entries.is_empty()) {
+                    if matches!(&fs.node(existing).data, Data::Dir { entries, .. } if !entries.is_empty())
+                    {
                         return Err(ENOTEMPTY);
                     }
                 }
@@ -1015,8 +1116,13 @@ impl FileSystem for MemFs {
             return Err(ENOTDIR);
         }
         fs.list_remote(r.ino);
-        let Data::Dir { entries, .. } = &fs.node(r.ino).data else { unreachable!() };
-        Ok(entries.iter().map(|(name, ino)| (name.clone(), fs.node(*ino).dirent())).collect())
+        let Data::Dir { entries, .. } = &fs.node(r.ino).data else {
+            unreachable!()
+        };
+        Ok(entries
+            .iter()
+            .map(|(name, ino)| (name.clone(), fs.node(*ino).dirent()))
+            .collect())
     }
 
     fn read_file(&self, path: &str, _flags: i32) -> R<Vec<u8>> {
@@ -1058,14 +1164,29 @@ mod tests {
     fn files_directories_and_links_round_trip() {
         let fs = MemFs::new();
         fs.mkdir("/t1/a/b", 0o755, true).unwrap();
-        fs.write_file("/t1/a/b/f.txt", b"hello", O_WRONLY | O_CREAT | O_TRUNC, 0o666).unwrap();
+        fs.write_file(
+            "/t1/a/b/f.txt",
+            b"hello",
+            O_WRONLY | O_CREAT | O_TRUNC,
+            0o666,
+        )
+        .unwrap();
         assert_eq!(fs.read_file("/t1/a/b/f.txt", 0).unwrap(), b"hello");
         assert_eq!(fs.stat("/t1/a/b/f.txt", true).unwrap().size, 5);
         fs.symlink("/t1/a/b", "/t1/link", 0).unwrap();
         assert_eq!(fs.read_file("/t1/link/f.txt", 0).unwrap(), b"hello");
-        assert_eq!(fs.realpath("/t1/a/../a/b/./f.txt").unwrap(), "/t1/a/b/f.txt");
-        assert_eq!(fs.stat("/t1/link", false).unwrap().mode & crate::fs::S_IFMT, S_IFLNK);
-        assert_eq!(fs.readdir("/t1/a/b").unwrap(), vec![("f.txt".to_string(), DirentKind::File)]);
+        assert_eq!(
+            fs.realpath("/t1/a/../a/b/./f.txt").unwrap(),
+            "/t1/a/b/f.txt"
+        );
+        assert_eq!(
+            fs.stat("/t1/link", false).unwrap().mode & crate::fs::S_IFMT,
+            S_IFLNK
+        );
+        assert_eq!(
+            fs.readdir("/t1/a/b").unwrap(),
+            vec![("f.txt".to_string(), DirentKind::File)]
+        );
         assert_eq!(fs.rmdir("/t1/a/b"), Err(ENOTEMPTY));
         fs.rename("/t1/a/b/f.txt", "/t1/g.txt").unwrap();
         assert_eq!(fs.read_file("/t1/a/b/f.txt", 0), Err(ENOENT));
@@ -1088,7 +1209,10 @@ mod tests {
         fs.write(fd, b"XY", None).unwrap();
         fs.close(fd).unwrap();
         assert_eq!(fs.read_file("/t2.txt", 0).unwrap(), b"abcXY");
-        assert_eq!(fs.open("/t2.txt", O_CREAT | O_EXCL | O_WRONLY, 0o644), Err(EEXIST));
+        assert_eq!(
+            fs.open("/t2.txt", O_CREAT | O_EXCL | O_WRONLY, 0o644),
+            Err(EEXIST)
+        );
     }
 
     #[test]
@@ -1096,7 +1220,10 @@ mod tests {
         static DATA: &[u8] = b"embedded";
         let fs = MemFs::with_fd_base(100);
         fs.insert("/lib/pkg/mod.py", DATA, 0o644, 0o755);
-        assert_eq!(fs.readdir("/lib").unwrap(), vec![("pkg".to_string(), DirentKind::Dir)]);
+        assert_eq!(
+            fs.readdir("/lib").unwrap(),
+            vec![("pkg".to_string(), DirentKind::Dir)]
+        );
         let fd = fs.open("/lib/pkg/mod.py", O_RDWR, 0).unwrap();
         assert_eq!(fd, 100);
         assert_eq!(fs.lseek(fd, 0, 2).unwrap(), 8);
@@ -1109,8 +1236,14 @@ mod tests {
     impl Backend for Remote {
         fn stat(&self, path: &str) -> Option<RemoteStat> {
             match path {
-                "/mnt/r/dir" => Some(RemoteStat { is_dir: true, size: 0 }),
-                "/mnt/r/dir/x.txt" => Some(RemoteStat { is_dir: false, size: 4 }),
+                "/mnt/r/dir" => Some(RemoteStat {
+                    is_dir: true,
+                    size: 0,
+                }),
+                "/mnt/r/dir/x.txt" => Some(RemoteStat {
+                    is_dir: false,
+                    size: 4,
+                }),
                 _ => None,
             }
         }
@@ -1118,7 +1251,13 @@ mod tests {
             (path == "/mnt/r/dir/x.txt").then(|| b"data".to_vec())
         }
         fn list(&self, path: &str) -> Option<Vec<RemoteEntry>> {
-            (path == "/mnt/r/dir").then(|| vec![RemoteEntry { name: "x.txt".into(), is_dir: false, size: 4 }])
+            (path == "/mnt/r/dir").then(|| {
+                vec![RemoteEntry {
+                    name: "x.txt".into(),
+                    is_dir: false,
+                    size: 4,
+                }]
+            })
         }
     }
 

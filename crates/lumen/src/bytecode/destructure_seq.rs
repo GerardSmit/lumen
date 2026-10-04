@@ -7,9 +7,9 @@
 //! step (a step's own throw leaves the iterator unclosed) and cleared when the step yields.
 //! The element code runs under a handler whose pad closes the iterator in throw mode unless it
 //! is done; a normal completion closes a not-done iterator in normal mode.
+use super::Op;
 #[cfg(feature = "compiler")]
 use super::{Bail, CResult, Compiler};
-use super::{Op};
 use crate::ast::{ArrayPatElem, DeclKind, Pattern};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;

@@ -11,31 +11,33 @@ pub(crate) fn extension() -> Extension {
         name: "console",
         modules: &[],
         globals: &[],
-        namespaces: &[(
-            "console",
-            ops![
-                "log" (0) => op_log,
-                "info" (0) => op_log,
-                "debug" (0) => op_log,
-                "warn" (0) => op_warn,
-                "error" (0) => op_error,
-                "__reportUncaught" (1) => op_report_uncaught,
-            ],
-        ),
-        // Glue-facing primitives; process.js moves them to `process._console` and deletes this.
-        (
-            "__console",
-            ops![
-                "write" (2) => op_write,
-                "format" (0) => op_format,
-                "live" (1) => op_live,
-                "setLive" (1) => op_set_live,
-                "indent" (1) => op_indent,
-                "slow" (1) => op_slow,
-                "watch" (3) => op_watch,
-                "disableNative" (0) => op_disable_native,
-            ],
-        )],
+        namespaces: &[
+            (
+                "console",
+                ops![
+                    "log" (0) => op_log,
+                    "info" (0) => op_log,
+                    "debug" (0) => op_log,
+                    "warn" (0) => op_warn,
+                    "error" (0) => op_error,
+                    "__reportUncaught" (1) => op_report_uncaught,
+                ],
+            ),
+            // Glue-facing primitives; process.js moves them to `process._console` and deletes this.
+            (
+                "__console",
+                ops![
+                    "write" (2) => op_write,
+                    "format" (0) => op_format,
+                    "live" (1) => op_live,
+                    "setLive" (1) => op_set_live,
+                    "indent" (1) => op_indent,
+                    "slow" (1) => op_slow,
+                    "watch" (3) => op_watch,
+                    "disableNative" (0) => op_disable_native,
+                ],
+            ),
+        ],
         state_init: Some(|state: &mut OpState| {
             state.put(ConsoleOut::default());
             state.put(ConsoleFlags::default());

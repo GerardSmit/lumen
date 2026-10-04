@@ -47,7 +47,9 @@ impl Slots {
             if let Kind::Range(r) = &o.kind {
                 // A range reverses to a range iterator, as in CPython (`__setstate__` counts items).
                 let n = crate::ops::slice_len(r.start, r.stop, r.step) as i64;
-                let last = (n - 1).checked_mul(r.step).and_then(|d| r.start.checked_add(d));
+                let last = (n - 1)
+                    .checked_mul(r.step)
+                    .and_then(|d| r.start.checked_add(d));
                 let stop = r.start.checked_sub(r.step);
                 if let (Some(cur), Some(stop), Some(step)) = (last, stop, r.step.checked_neg()) {
                     let cur = if n == 0 { stop } else { cur };
@@ -56,7 +58,10 @@ impl Slots {
             }
         }
         let n = it.native_len(seq)? as i64;
-        Ok(it.mk_iter(IterState::Reversed { seq: seq.clone(), idx: n - 1 }))
+        Ok(it.mk_iter(IterState::Reversed {
+            seq: seq.clone(),
+            idx: n - 1,
+        }))
     }
 }
 

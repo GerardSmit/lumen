@@ -11,7 +11,12 @@ pub trait Env {
     fn load(&mut self, addr: u64, bytes: u32) -> u64;
     fn store(&mut self, addr: u64, bytes: u32, value: u64);
     fn call(&mut self, func: &ExtFunc, sig: &Signature, args: &[u64]) -> Result<Vec<u64>, u32>;
-    fn call_indirect(&mut self, sig: &Signature, callee: u64, args: &[u64]) -> Result<Vec<u64>, u32>;
+    fn call_indirect(
+        &mut self,
+        sig: &Signature,
+        callee: u64,
+        args: &[u64],
+    ) -> Result<Vec<u64>, u32>;
 }
 
 /// An [`Env`] over a byte buffer addressed from 0, with no callable functions.
@@ -59,16 +64,18 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
             let d = func.inst(inst);
             let results = func.results(inst);
             match d {
-                InstData::Prefetch { .. } => {},
+                InstData::Prefetch { .. } => {}
                 InstData::Vzero => vals[results[0].index()] = 0,
                 InstData::VectorBinary { op, args } => {
-                    vals[results[0].index()] = eval::vector(*op, get(&vals, args[0]), get(&vals, args[1]));
+                    vals[results[0].index()] =
+                        eval::vector(*op, get(&vals, args[0]), get(&vals, args[1]));
                 }
                 InstData::Load { kind, addr, offset } => {
                     // An I32 address is held zero-extended, so both pointer widths work as is.
                     let a = (get(&vals, *addr) as u64).wrapping_add(*offset as i64 as u64);
                     if *kind == MemKind::V128 {
-                        vals[results[0].index()] = env.load(a, 8) as u128 | (env.load(a + 8, 8) as u128) << 64;
+                        vals[results[0].index()] =
+                            env.load(a, 8) as u128 | (env.load(a + 8, 8) as u128) << 64;
                         continue;
                     }
                     let raw = env.load(a, kind.bytes());
@@ -89,8 +96,11 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                     let a = (get(&vals, *addr) as u64).wrapping_add(*offset as i64 as u64);
                     let v = get(&vals, *value);
                     if *kind == MemKind::V128 {
-                        env.store(a, 8, v as u64); env.store(a + 8, 8, (v >> 64) as u64);
-                    } else { env.store(a, kind.bytes(), v as u64); }
+                        env.store(a, 8, v as u64);
+                        env.store(a + 8, 8, (v >> 64) as u64);
+                    } else {
+                        env.store(a, kind.bytes(), v as u64);
+                    }
                 }
                 InstData::Call { func: f, args } => {
                     let ext = &func.funcs[f.index()];
@@ -102,7 +112,8 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                 }
                 InstData::CallIndirect { sig, callee, args } => {
                     let a: Vec<u64> = args.iter().map(|&v| get(&vals, v) as u64).collect();
-                    let r = env.call_indirect(&func.sigs[sig.index()], get(&vals, *callee) as u64, &a)?;
+                    let r =
+                        env.call_indirect(&func.sigs[sig.index()], get(&vals, *callee) as u64, &a)?;
                     for (&res, v) in results.iter().zip(r) {
                         vals[res.index()] = eval::norm(func.value_type(res), v) as u128;
                     }
@@ -115,7 +126,11 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                 }
                 InstData::Jump { dest } => next = Some(dest),
                 InstData::Brif { cond, then, else_ } => {
-                    next = Some(if get(&vals, *cond) as u32 != 0 { then } else { else_ });
+                    next = Some(if get(&vals, *cond) as u32 != 0 {
+                        then
+                    } else {
+                        else_
+                    });
                 }
                 InstData::BrTable {
                     index,

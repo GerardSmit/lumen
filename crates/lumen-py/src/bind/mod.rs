@@ -21,24 +21,27 @@
 //! `BufferError`.
 
 pub mod args;
-pub mod path;
 mod class;
 mod convert;
+pub mod path;
 
 pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
-pub use class::{extend_type, install_into, is_instance, module_object, native_value, opaque_instance, owner_of, type_object, NativeIter, Py};
+pub use class::{
+    extend_type, install_into, is_instance, module_object, native_value, opaque_instance, owner_of,
+    type_object, NativeIter, Py,
+};
 pub use convert::{buffer_error, index, native_error};
-pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
+pub use path::{bytes_path, convert_path, fspath, wrap_path, FsPath, PathArg, PathOrFd};
 
 use crate::object::Kind;
 use args::takes_receiver;
 use class::{opaque_cell, reentrant};
 use lumen_bind::{
-    Class, CtorRet, Elem, FnDesc, FromArg, FromVarKw, Host, IntKind, IntoError, IntoRet, Methods, Module, Native,
-    NextRet, Role, Slot,
+    Class, CtorRet, Elem, FnDesc, FromArg, FromVarKw, Host, IntKind, IntoError, IntoRet, Methods,
+    Module, Native, NextRet, Role, Slot,
 };
 use lumen_common::buffer::{BufferError, Export, Lend};
 use std::any::{Any, TypeId};
@@ -121,7 +124,13 @@ impl Drop for ResetOnDrop<'_> {
 
 impl<'s> PyCx<'s> {
     #[inline(always)]
-    fn new(it: &'s mut Interp, recv: &'s Value, args: &'s [Value], kw: &'s [(Obj, Value)], desc: &'static FnDesc) -> PyCx<'s> {
+    fn new(
+        it: &'s mut Interp,
+        recv: &'s Value,
+        args: &'s [Value],
+        kw: &'s [(Obj, Value)],
+        desc: &'static FnDesc,
+    ) -> PyCx<'s> {
         PyCx {
             it,
             recv,
@@ -146,7 +155,10 @@ impl<'s> PyCx<'s> {
     #[inline(always)]
     #[allow(clippy::mut_from_ref)]
     fn it(&self) -> &mut Interp {
-        assert!(!self.in_ctx.get(), "PyCx used while its interpreter is lent out");
+        assert!(
+            !self.in_ctx.get(),
+            "PyCx used while its interpreter is lent out"
+        );
         // SAFETY: see above; `in_ctx` rules out the lent-out `&mut` of `with_ctx`.
         unsafe { &mut *self.it }
     }
@@ -190,16 +202,27 @@ impl<'s> PyCx<'s> {
         range: Option<std::ops::Range<usize>>,
         mutable: bool,
     ) -> Result<*mut [u8], Obj> {
-        let mut l = store.lend(mutable).map_err(|e| buffer_error(self.it(), e))?;
-        let all: *mut [u8] = if mutable { l.as_mut_slice() } else { l.as_slice() as *const [u8] as *mut [u8] };
+        let mut l = store
+            .lend(mutable)
+            .map_err(|e| buffer_error(self.it(), e))?;
+        let all: *mut [u8] = if mutable {
+            l.as_mut_slice()
+        } else {
+            l.as_slice() as *const [u8] as *mut [u8]
+        };
         // SAFETY: see `Guard`; the memory stays valid and unaliased while the lend lives.
-        self.hold(Guard::Lend(unsafe { std::mem::transmute::<Lend<'_>, Lend<'static>>(l) }));
+        self.hold(Guard::Lend(unsafe {
+            std::mem::transmute::<Lend<'_>, Lend<'static>>(l)
+        }));
         Ok(match range {
             // SAFETY: as above; `r` lies inside the view the caller checked against the store.
             Some(r) => {
                 assert!(r.start <= r.end && r.end <= all.len());
                 // SAFETY: `r` lies inside the lent range (asserted).
-                std::ptr::slice_from_raw_parts_mut(unsafe { all.cast::<u8>().add(r.start) }, r.len())
+                std::ptr::slice_from_raw_parts_mut(
+                    unsafe { all.cast::<u8>().add(r.start) },
+                    r.len(),
+                )
             }
             None => all,
         })
@@ -215,10 +238,20 @@ impl<'s> PyCx<'s> {
             let t = it.type_name_of(v);
             let owner = d.class().map(args::class_qualname).unwrap_or_default();
             if args::is_slot_wrapper(d) {
-                let msg = format!("descriptor '{}' requires a '{}' object but received a '{}'", args::py_name(d), owner, t);
+                let msg = format!(
+                    "descriptor '{}' requires a '{}' object but received a '{}'",
+                    args::py_name(d),
+                    owner,
+                    t
+                );
                 return it.type_error(&msg);
             }
-            let msg = format!("descriptor '{}' for '{}' objects doesn't apply to a '{}' object", args::py_name(d), owner, t);
+            let msg = format!(
+                "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
+                args::py_name(d),
+                owner,
+                t
+            );
             return it.type_error(&msg);
         }
         if at.element().is_some() {
@@ -234,7 +267,10 @@ impl<'s> PyCx<'s> {
 fn not_a_type(it: &mut Interp, d: &'static FnDesc, v: &Value) -> Obj {
     let name = args::class_name(d);
     let t = it.type_name_of(v);
-    it.type_error(&format!("{}.__new__(X): X is not a type object ({})", name, t))
+    it.type_error(&format!(
+        "{}.__new__(X): X is not a type object ({})",
+        name, t
+    ))
 }
 
 /// The engine entry of `N`: CPython's `(self, *args, **kwargs)` convention.
@@ -367,7 +403,11 @@ impl Host for PyHost {
                 return Ok(n);
             }
         }
-        if kind.size && kind.signed && at.index() == Some(0) && matches!(cx.desc.role, Role::Proto("getitem" | "setitem" | "delitem")) {
+        if kind.size
+            && kind.signed
+            && at.index() == Some(0)
+            && matches!(cx.desc.role, Role::Proto("getitem" | "setitem" | "delitem"))
+        {
             // A subscript: `PyNumber_AsSsize_t(key, PyExc_IndexError)`.
             return cx.it().index_or(v, "IndexError").map(i128::from);
         }
@@ -399,7 +439,9 @@ impl Host for PyHost {
         if let Value::Obj(o) = v {
             match &o.kind {
                 Kind::Bytes(b) => return Ok(b),
-                Kind::ByteArray(store) => return cx.lend(store, None, false).map(|p| unsafe { &*p }),
+                Kind::ByteArray(store) => {
+                    return cx.lend(store, None, false).map(|p| unsafe { &*p })
+                }
                 Kind::Opaque(_) => {
                     if let Some(part) = crate::builtins::memview::contiguous_part(cx.it(), v)? {
                         return Ok(match part {
@@ -411,7 +453,8 @@ impl Host for PyHost {
                             crate::builtins::memview::Part::Store(store, r) => {
                                 let s = cx.scratch();
                                 s.stores.push(store);
-                                let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
+                                let store: *const crate::object::ByteStore =
+                                    &**s.stores.last().unwrap();
                                 // SAFETY: the store lives in `Scratch::stores` until after the guard.
                                 unsafe { &*cx.lend(&*store, Some(r), false)? }
                             }
@@ -455,7 +498,9 @@ impl Host for PyHost {
                 let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
                 // SAFETY: the store lives in `Scratch::stores` until after the guard, and the lent
                 // range is unaliased until the guard drops with `cx`.
-                return cx.lend(unsafe { &*store }, None, true).map(|p| unsafe { &mut *p });
+                return cx
+                    .lend(unsafe { &*store }, None, true)
+                    .map(|p| unsafe { &mut *p });
             }
         }
         Err(cx.arg_error(at, "read-write bytes-like object", v))
@@ -486,7 +531,9 @@ impl Host for PyHost {
             if let Some(x) = r.downcast_ref::<T>() {
                 let p: *const T = x;
                 // SAFETY: see `Guard`; the boxed value does not move while borrowed.
-                cx.hold(Guard::Ref(unsafe { std::mem::transmute::<Ref<'_, Box<dyn Any>>, Ref<'static, Box<dyn Any>>>(r) }));
+                cx.hold(Guard::Ref(unsafe {
+                    std::mem::transmute::<Ref<'_, Box<dyn Any>>, Ref<'static, Box<dyn Any>>>(r)
+                }));
                 return Ok(unsafe { &*p });
             }
         }
@@ -499,7 +546,11 @@ impl Host for PyHost {
             if let Some(x) = r.downcast_mut::<T>() {
                 let p: *mut T = x;
                 // SAFETY: see `Guard`; the boxed value does not move while borrowed.
-                cx.hold(Guard::Mut(unsafe { std::mem::transmute::<RefMut<'_, Box<dyn Any>>, RefMut<'static, Box<dyn Any>>>(r) }));
+                cx.hold(Guard::Mut(unsafe {
+                    std::mem::transmute::<RefMut<'_, Box<dyn Any>>, RefMut<'static, Box<dyn Any>>>(
+                        r,
+                    )
+                }));
                 return Ok(unsafe { &mut *p });
             }
         }
@@ -567,7 +618,10 @@ impl Host for PyHost {
                 Ok(opaque_instance(&cls, value))
             }
             None => {
-                let msg = format!("native class '{}' is not registered with this interpreter", args::class_qualname(T::DESC));
+                let msg = format!(
+                    "native class '{}' is not registered with this interpreter",
+                    args::class_qualname(T::DESC)
+                );
                 Err(it.type_error(&msg))
             }
         }
@@ -684,7 +738,10 @@ pub struct KwArgs<'a> {
 impl<'a> KwArgs<'a> {
     pub fn iter(&self) -> impl Iterator<Item = (&'a str, &'a Value)> + '_ {
         let d = self.desc;
-        self.kw.iter().map(|(k, v)| (k.as_str_kind().unwrap_or(""), v)).filter(move |(k, _)| !args::is_named_keyword(d, k))
+        self.kw
+            .iter()
+            .map(|(k, v)| (k.as_str_kind().unwrap_or(""), v))
+            .filter(move |(k, _)| !args::is_named_keyword(d, k))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -702,14 +759,21 @@ impl<'a> KwArgs<'a> {
     /// The collected keywords as `(name, value)` pairs (e.g. to forward to `Interp::call`).
     pub fn to_vec(&self) -> Vec<(Obj, Value)> {
         let d = self.desc;
-        self.kw.iter().filter(|(k, _)| !args::is_named_keyword(d, k.as_str_kind().unwrap_or(""))).cloned().collect()
+        self.kw
+            .iter()
+            .filter(|(k, _)| !args::is_named_keyword(d, k.as_str_kind().unwrap_or("")))
+            .cloned()
+            .collect()
     }
 }
 
 impl<'a> FromVarKw<'a, PyHost> for KwArgs<'a> {
     #[inline]
     fn from_varkw(cx: &'a PyCx<'_>) -> Result<Self, Obj> {
-        Ok(KwArgs { kw: cx.kw, desc: cx.desc })
+        Ok(KwArgs {
+            kw: cx.kw,
+            desc: cx.desc,
+        })
     }
 }
 

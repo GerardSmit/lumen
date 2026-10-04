@@ -20,11 +20,23 @@ pub mod _json {
     /// CPython 3.12's C recursion limit, which bounds nesting in both directions.
     const DEPTH_LIMIT: usize = 10_000;
 
-    const ASCII: Quote = Quote { ascii_only: true, spelling: Spelling::CodePoints, ..Quote::JSON };
-    const UNICODE: Quote = Quote { spelling: Spelling::CodePoints, ..Quote::JSON };
+    const ASCII: Quote = Quote {
+        ascii_only: true,
+        spelling: Spelling::CodePoints,
+        ..Quote::JSON
+    };
+    const UNICODE: Quote = Quote {
+        spelling: Spelling::CodePoints,
+        ..Quote::JSON
+    };
 
     fn options(strict: bool) -> core::Options {
-        core::Options { strict, constants: true, jsonc: false, spelling: Spelling::CodePoints }
+        core::Options {
+            strict,
+            constants: true,
+            jsonc: false,
+            spelling: Spelling::CodePoints,
+        }
     }
 
     fn not_a_string(it: &mut Interp, v: &Value) -> Obj {
@@ -33,7 +45,10 @@ pub mod _json {
     }
 
     fn too_deep(it: &mut Interp, what: &str) -> Obj {
-        it.new_exc_str("RecursionError", &format!("maximum recursion depth exceeded{what}"))
+        it.new_exc_str(
+            "RecursionError",
+            &format!("maximum recursion depth exceeded{what}"),
+        )
     }
 
     fn deeper(it: &mut Interp, depth: &mut usize, what: &str) -> R<()> {
@@ -71,13 +86,23 @@ pub mod _json {
             }
             let made = it.import_module("json.decoder").and_then(|m| {
                 let cls = it.get_attr_str(&Value::Obj(m), "JSONDecodeError")?;
-                it.call(&cls, vec![Value::str(e.kind.message()), self.value.clone(), Value::Int(pos)], Vec::new())
+                it.call(
+                    &cls,
+                    vec![
+                        Value::str(e.kind.message()),
+                        self.value.clone(),
+                        Value::Int(pos),
+                    ],
+                    Vec::new(),
+                )
             });
             match made {
                 Ok(Value::Obj(exc)) => exc,
                 Ok(other) => {
                     let t = it.tp_name_of(&other);
-                    it.type_error(&format!("exceptions must derive from BaseException, not {t}"))
+                    it.type_error(&format!(
+                        "exceptions must derive from BaseException, not {t}"
+                    ))
                 }
                 Err(e) => e,
             }
@@ -102,7 +127,12 @@ pub mod _json {
     /// Returns a tuple of the decoded string and the index of the character in s
     /// after the end quote.
     #[op]
-    fn scanstring(it: &mut Interp, string: &Value, end: &Value, strict: Option<&Value>) -> R<Value> {
+    fn scanstring(
+        it: &mut Interp,
+        string: &Value,
+        end: &Value,
+        strict: Option<&Value>,
+    ) -> R<Value> {
         let end = it.index_of(end)?;
         let strict = match strict {
             Some(v) => it.truthy(v)?,
@@ -115,7 +145,11 @@ pub mod _json {
             return Err(it.value_error("end is out of bounds"));
         }
         let start = s.byte_offset(end as usize);
-        let doc = Doc { value: string, s, base: (start, end as usize) };
+        let doc = Doc {
+            value: string,
+            s,
+            base: (start, end as usize),
+        };
         let mut p = core::Parser::new(&s.s, options(strict));
         p.pos = start;
         match p.string_body() {
@@ -182,12 +216,29 @@ pub mod _json {
             let parse_float = it.get_attr_str(context, "parse_float")?;
             let parse_int = it.get_attr_str(context, "parse_int")?;
             let parse_constant = it.get_attr_str(context, "parse_constant")?;
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            Ok(opaque_instance(cls, Scanner { strict, object_hook, object_pairs_hook, parse_float, parse_int, parse_constant }))
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
+            Ok(opaque_instance(
+                cls,
+                Scanner {
+                    strict,
+                    object_hook,
+                    object_pairs_hook,
+                    parse_float,
+                    parse_int,
+                    parse_constant,
+                },
+            ))
         }
 
         #[proto(call)]
-        fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[kw] string: &Value, #[kw] idx: &Value) -> R<Value> {
+        fn __call__(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw] string: &Value,
+            #[kw] idx: &Value,
+        ) -> R<Value> {
             let cfg = slf.0.borrow(it)?.clone();
             let idx = it.index_of(idx)?;
             let Some(s) = string.as_pystr() else {
@@ -242,7 +293,11 @@ pub mod _json {
             int: (!is_type(&cfg.parse_int, &it.types.int)).then(|| cfg.parse_int.clone()),
             it,
             cfg,
-            doc: Doc { value: string, s, base: (start, idx as usize) },
+            doc: Doc {
+                value: string,
+                s,
+                base: (start, idx as usize),
+            },
             memo: HashMap::new(),
             depth: 0,
         };
@@ -312,8 +367,11 @@ pub mod _json {
             if let Some(i) = n.small_int() {
                 return Ok(Value::Int(i));
             }
-            self.it.check_parse_digits(n.text.trim_start_matches('-').len())?;
-            Ok(BigInt::parse_signed(n.text, 10).map(Value::big).unwrap_or(Value::Int(0)))
+            self.it
+                .check_parse_digits(n.text.trim_start_matches('-').len())?;
+            Ok(BigInt::parse_signed(n.text, 10)
+                .map(Value::big)
+                .unwrap_or(Value::Int(0)))
         }
 
         fn string(&mut self, s: core::Str<'a>) -> R<Value> {
@@ -400,7 +458,9 @@ pub mod _json {
     /// The quoting `f` does, when it is `encode_basestring(_ascii)` itself.
     fn own_quoting(f: &Value) -> Option<Quote> {
         let Value::Obj(o) = f else { return None };
-        let Kind::Native(nd) = &o.kind else { return None };
+        let Kind::Native(nd) = &o.kind else {
+            return None;
+        };
         let d = nd.desc?;
         if !matches!(d.owner, lumen_bind::Owner::Module("_json")) {
             return None;
@@ -445,7 +505,9 @@ pub mod _json {
             let is_dict = matches!(markers, Value::Obj(o) if matches!(o.kind, Kind::Dict(_)));
             if !markers.is_none() && !is_dict {
                 let t = it.tp_name_of(markers);
-                return Err(it.type_error(&format!("make_encoder() argument 1 must be dict or None, not {t}")));
+                return Err(it.type_error(&format!(
+                    "make_encoder() argument 1 must be dict or None, not {t}"
+                )));
             }
             let enc = Encoder {
                 markers: markers.clone(),
@@ -459,12 +521,19 @@ pub mod _json {
                 allow_nan,
                 fast: own_quoting(encoder),
             };
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
             Ok(opaque_instance(cls, enc))
         }
 
         #[proto(call)]
-        fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[kw] obj: &Value, #[kw] _current_indent_level: &Value) -> R<Value> {
+        fn __call__(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw] obj: &Value,
+            #[kw] _current_indent_level: &Value,
+        ) -> R<Value> {
             let cfg = slf.0.borrow(it)?.clone();
             it.index_of(_current_indent_level)?;
             let mut w = Writer {
@@ -581,7 +650,9 @@ pub mod _json {
             }
             if !self.cfg.allow_nan {
                 let r = it.repr_of(v)?;
-                return Err(it.value_error(&format!("Out of range float values are not JSON compliant: {r}")));
+                return Err(it.value_error(&format!(
+                    "Out of range float values are not JSON compliant: {r}"
+                )));
             }
             Ok(Cow::Borrowed(if f > 0.0 {
                 "Infinity"
@@ -663,7 +734,9 @@ pub mod _json {
         }
 
         fn dict(&mut self, it: &mut Interp, v: &Value, o: &Obj) -> R<()> {
-            let Kind::Dict(d) = &o.kind else { unreachable!() };
+            let Kind::Dict(d) = &o.kind else {
+                unreachable!()
+            };
             if d.borrow().is_empty() {
                 self.out.push_str("{}");
                 return Ok(());
@@ -695,7 +768,11 @@ pub mod _json {
                     self.member(it, &mut first, &key, &value)?;
                 }
             } else {
-                let entries: Vec<(Value, Value)> = d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect();
+                let entries: Vec<(Value, Value)> = d
+                    .borrow()
+                    .iter()
+                    .map(|e| (e.key.clone(), e.val.clone()))
+                    .collect();
                 for (key, value) in &entries {
                     self.member(it, &mut first, key, value)?;
                 }
@@ -705,12 +782,20 @@ pub mod _json {
             Ok(())
         }
 
-        fn member(&mut self, it: &mut Interp, first: &mut bool, key: &Value, value: &Value) -> R<()> {
+        fn member(
+            &mut self,
+            it: &mut Interp,
+            first: &mut bool,
+            key: &Value,
+            value: &Value,
+        ) -> R<()> {
             let key = match key {
                 Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => key.clone(),
                 Value::Float(f) => Value::str(&self.float_text(it, *f, key)?),
                 Value::Obj(o) if matches!(o.kind, Kind::Float(_)) => {
-                    let Kind::Float(f) = o.kind else { unreachable!() };
+                    let Kind::Float(f) = o.kind else {
+                        unreachable!()
+                    };
                     Value::str(&self.float_text(it, f, key)?)
                 }
                 Value::Bool(true) => Value::str("true"),
@@ -718,13 +803,17 @@ pub mod _json {
                 Value::None => Value::str("null"),
                 Value::Int(i) => Value::string(i.to_string()),
                 Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => {
-                    let Kind::Int(b) = &o.kind else { unreachable!() };
+                    let Kind::Int(b) = &o.kind else {
+                        unreachable!()
+                    };
                     Value::string(it.int_to_decimal(b)?)
                 }
                 _ if self.cfg.skipkeys => return Ok(()),
                 _ => {
                     let t = it.tp_name_of(key);
-                    return Err(it.type_error(&format!("keys must be str, int, float, bool or None, not {t}")));
+                    return Err(it.type_error(&format!(
+                        "keys must be str, int, float, bool or None, not {t}"
+                    )));
                 }
             };
             if *first {

@@ -104,7 +104,11 @@ fn lazy_names(file: &str, body: &str) -> [String; 3] {
             let end = rest
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
                 .unwrap_or(rest.len());
-            rest[end..].trim_start().strip_prefix('=').filter(|r| !r.starts_with('=')).map(|_| &rest[..end])
+            rest[end..]
+                .trim_start()
+                .strip_prefix('=')
+                .filter(|r| !r.starts_with('='))
+                .map(|_| &rest[..end])
         } else {
             None
         };

@@ -252,7 +252,12 @@ impl Regex {
             prog,
             options,
             ngroups,
-            nslots: 2 * (ngroups + 1) + if options.dialect == Dialect::Python { 2 } else { 0 },
+            nslots: 2 * (ngroups + 1)
+                + if options.dialect == Dialect::Python {
+                    2
+                } else {
+                    0
+                },
             names,
         };
         if let FirstFilter::Atoms(atoms) = &re.first {

@@ -53,7 +53,9 @@ impl ElemKind {
     #[inline(always)]
     pub const fn size(self) -> usize {
         match self {
-            ElemKind::I8 | ElemKind::U8 | ElemKind::U8Clamped | ElemKind::Bool | ElemKind::Char => 1,
+            ElemKind::I8 | ElemKind::U8 | ElemKind::U8Clamped | ElemKind::Bool | ElemKind::Char => {
+                1
+            }
             ElemKind::I16 | ElemKind::U16 | ElemKind::F16 => 2,
             ElemKind::I32 | ElemKind::U32 | ElemKind::F32 => 4,
             ElemKind::F64 | ElemKind::I64 | ElemKind::U64 => 8,
@@ -75,7 +77,13 @@ impl ElemKind {
     pub const fn is_signed(self) -> bool {
         matches!(
             self,
-            ElemKind::I8 | ElemKind::I16 | ElemKind::I32 | ElemKind::I64 | ElemKind::F16 | ElemKind::F32 | ElemKind::F64
+            ElemKind::I8
+                | ElemKind::I16
+                | ElemKind::I32
+                | ElemKind::I64
+                | ElemKind::F16
+                | ElemKind::F32
+                | ElemKind::F64
         )
     }
 
@@ -129,7 +137,11 @@ pub enum ByteOrder {
 }
 
 impl ByteOrder {
-    pub const NATIVE: ByteOrder = if cfg!(target_endian = "big") { ByteOrder::Big } else { ByteOrder::Little };
+    pub const NATIVE: ByteOrder = if cfg!(target_endian = "big") {
+        ByteOrder::Big
+    } else {
+        ByteOrder::Little
+    };
 
     #[inline(always)]
     pub const fn little_if(little: bool) -> ByteOrder {
@@ -191,7 +203,11 @@ pub struct StructCode {
     pub align: usize,
 }
 
-const C_LONG: usize = if cfg!(windows) { 4 } else { core::mem::size_of::<usize>() };
+const C_LONG: usize = if cfg!(windows) {
+    4
+} else {
+    core::mem::size_of::<usize>()
+};
 
 /// The integer kind of `size` bytes (8 for any larger size).
 pub const fn int_kind(size: usize, signed: bool) -> ElemKind {
@@ -236,7 +252,11 @@ pub const fn struct_code(c: u8, mode: StructMode) -> Option<StructCode> {
         b'd' => (Some(ElemKind::F64), 8),
         _ => return None,
     };
-    Some(StructCode { kind, size, align: if native { size } else { 1 } })
+    Some(StructCode {
+        kind,
+        size,
+        align: if native { size } else { 1 },
+    })
 }
 
 /// A decoded element, for consumers that need the exact value of any kind (Python).
@@ -429,7 +449,12 @@ pub fn store_int_wrapping(kind: ElemKind, n: i128, out: &mut [u8], order: ByteOr
 /// Store an integer, refusing values outside an integer kind's range (Python `struct` /
 /// `memoryview` semantics). `Bool` stores whether `n` is nonzero; a float kind is
 /// [`PackError::WrongType`].
-pub fn store_int_checked(kind: ElemKind, n: i128, out: &mut [u8], order: ByteOrder) -> Result<(), PackError> {
+pub fn store_int_checked(
+    kind: ElemKind,
+    n: i128,
+    out: &mut [u8],
+    order: ByteOrder,
+) -> Result<(), PackError> {
     if kind == ElemKind::Bool {
         out[0] = (n != 0) as u8;
         return Ok(());
@@ -446,9 +471,18 @@ pub fn store_int_checked(kind: ElemKind, n: i128, out: &mut [u8], order: ByteOrd
 
 /// Store a float into a float kind, refusing a finite value that overflows `F16` / `F32`
 /// (Python `struct` semantics); non-float kinds are [`PackError::WrongType`].
-pub fn store_float_checked(kind: ElemKind, x: f64, out: &mut [u8], order: ByteOrder) -> Result<(), PackError> {
+pub fn store_float_checked(
+    kind: ElemKind,
+    x: f64,
+    out: &mut [u8],
+    order: ByteOrder,
+) -> Result<(), PackError> {
     match kind {
-        ElemKind::F16 => put!(f64_to_f16_bits(x).ok_or(PackError::FloatOverflow)?, out, order),
+        ElemKind::F16 => put!(
+            f64_to_f16_bits(x).ok_or(PackError::FloatOverflow)?,
+            out,
+            order
+        ),
         ElemKind::F32 => {
             let y = x as f32;
             if y.is_infinite() && x.is_finite() {
@@ -469,7 +503,9 @@ pub fn store(kind: ElemKind, v: Scalar, out: &mut [u8], order: ByteOrder) -> Res
         (ElemKind::Bool, Scalar::Bool(b)) => out[0] = b as u8,
         (ElemKind::Char, Scalar::Char(c)) => out[0] = c,
         (k, Scalar::Int(n)) if k.is_float() => return store_float_checked(k, n as f64, out, order),
-        (k, Scalar::Int(n)) if k.is_int() || k == ElemKind::Bool => return store_int_checked(k, n, out, order),
+        (k, Scalar::Int(n)) if k.is_int() || k == ElemKind::Bool => {
+            return store_int_checked(k, n, out, order)
+        }
         (k, Scalar::Float(x)) if k.is_float() => return store_float_checked(k, x, out, order),
         _ => return Err(PackError::WrongType),
     }
@@ -506,9 +542,18 @@ mod tests {
     #[test]
     fn sizes_and_struct_chars() {
         for k in ElemKind::ALL {
-            assert_eq!(k.size(), struct_code(k.struct_char(), StructMode::Little).unwrap().size, "{k:?}");
+            assert_eq!(
+                k.size(),
+                struct_code(k.struct_char(), StructMode::Little)
+                    .unwrap()
+                    .size,
+                "{k:?}"
+            );
             if k != ElemKind::U8Clamped {
-                assert_eq!(struct_code(k.struct_char(), StructMode::Big).unwrap().kind, Some(k));
+                assert_eq!(
+                    struct_code(k.struct_char(), StructMode::Big).unwrap().kind,
+                    Some(k)
+                );
             }
         }
     }
@@ -527,7 +572,10 @@ mod tests {
         assert_eq!(struct_code(b'x', StructMode::Native).unwrap().kind, None);
         assert!(struct_code(b'z', StructMode::Native).is_none());
         assert_eq!(StructMode::from_prefix(b'!'), Some(StructMode::Big));
-        assert_eq!(StructMode::from_prefix(b'@').unwrap().order(), ByteOrder::NATIVE);
+        assert_eq!(
+            StructMode::from_prefix(b'@').unwrap().order(),
+            ByteOrder::NATIVE
+        );
     }
 
     #[test]
@@ -537,7 +585,10 @@ mod tests {
         assert_eq!(enc(ElemKind::U32, 0x01020304 as f64, Big), [1, 2, 3, 4]);
         assert_eq!(enc(ElemKind::U32, 0x01020304 as f64, Little), [4, 3, 2, 1]);
         assert_eq!(enc(ElemKind::F32, 1.0, Big), [0x3f, 0x80, 0, 0]);
-        assert_eq!(enc(ElemKind::F64, 1.0, Little), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
+        assert_eq!(
+            enc(ElemKind::F64, 1.0, Little),
+            [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]
+        );
         assert_eq!(enc(ElemKind::F16, 1.0, Big), [0x3c, 0x00]);
         assert_eq!(enc(ElemKind::F16, 1e6, Little), [0x00, 0x7c]);
         assert_eq!(enc(ElemKind::F16, -1e6, Little), [0x00, 0xfc]);
@@ -559,7 +610,18 @@ mod tests {
     #[test]
     fn clamped_rounds_half_to_even() {
         let c = |n| enc(ElemKind::U8Clamped, n, Little)[0];
-        assert_eq!([c(0.5), c(1.5), c(2.5), c(2.6), c(-3.0), c(300.0), c(f64::NAN)], [0, 2, 2, 3, 0, 255, 0]);
+        assert_eq!(
+            [
+                c(0.5),
+                c(1.5),
+                c(2.5),
+                c(2.6),
+                c(-3.0),
+                c(300.0),
+                c(f64::NAN)
+            ],
+            [0, 2, 2, 3, 0, 255, 0]
+        );
     }
 
     #[test]
@@ -587,10 +649,16 @@ mod tests {
         let b = [0xff; 8];
         assert_eq!(load_int(ElemKind::U64, &b, Little), u64::MAX as i128);
         assert_eq!(load_int(ElemKind::I64, &b, Big), -1);
-        assert_eq!(load(ElemKind::U32, &b, Little), Scalar::Int(u32::MAX as i128));
+        assert_eq!(
+            load(ElemKind::U32, &b, Little),
+            Scalar::Int(u32::MAX as i128)
+        );
         assert_eq!(load(ElemKind::Bool, &[2], Little), Scalar::Bool(true));
         assert_eq!(load(ElemKind::Char, b"z", Little), Scalar::Char(b'z'));
-        assert_eq!(load(ElemKind::F16, &[0x00, 0x3c], Little), Scalar::Float(1.0));
+        assert_eq!(
+            load(ElemKind::F16, &[0x00, 0x3c], Little),
+            Scalar::Float(1.0)
+        );
         let mut o = [0u8; 8];
         store_int_wrapping(ElemKind::U64, -1, &mut o, Big);
         assert_eq!(o, [0xff; 8]);
@@ -601,18 +669,45 @@ mod tests {
     #[test]
     fn checked_stores() {
         let mut o = [0u8; 8];
-        assert_eq!(store_int_checked(ElemKind::I8, 128, &mut o, Little), Err(PackError::OutOfRange { lo: -128, hi: 127 }));
-        assert_eq!(store_int_checked(ElemKind::U16, -1, &mut o, Little), Err(PackError::OutOfRange { lo: 0, hi: 65535 }));
-        assert_eq!(store_int_checked(ElemKind::U16, 0x1234, &mut o, Big), Ok(()));
+        assert_eq!(
+            store_int_checked(ElemKind::I8, 128, &mut o, Little),
+            Err(PackError::OutOfRange { lo: -128, hi: 127 })
+        );
+        assert_eq!(
+            store_int_checked(ElemKind::U16, -1, &mut o, Little),
+            Err(PackError::OutOfRange { lo: 0, hi: 65535 })
+        );
+        assert_eq!(
+            store_int_checked(ElemKind::U16, 0x1234, &mut o, Big),
+            Ok(())
+        );
         assert_eq!(&o[..2], [0x12, 0x34]);
-        assert_eq!(store_int_checked(ElemKind::F64, 1, &mut o, Big), Err(PackError::WrongType));
-        assert_eq!(store_float_checked(ElemKind::F16, 65520.0, &mut o, Little), Err(PackError::FloatOverflow));
-        assert_eq!(store_float_checked(ElemKind::F32, 1e300, &mut o, Little), Err(PackError::FloatOverflow));
-        assert_eq!(store_float_checked(ElemKind::F32, f64::INFINITY, &mut o, Little), Ok(()));
+        assert_eq!(
+            store_int_checked(ElemKind::F64, 1, &mut o, Big),
+            Err(PackError::WrongType)
+        );
+        assert_eq!(
+            store_float_checked(ElemKind::F16, 65520.0, &mut o, Little),
+            Err(PackError::FloatOverflow)
+        );
+        assert_eq!(
+            store_float_checked(ElemKind::F32, 1e300, &mut o, Little),
+            Err(PackError::FloatOverflow)
+        );
+        assert_eq!(
+            store_float_checked(ElemKind::F32, f64::INFINITY, &mut o, Little),
+            Ok(())
+        );
         assert_eq!(store(ElemKind::F64, Scalar::Int(3), &mut o, Little), Ok(()));
         assert_eq!(load(ElemKind::F64, &o, Little), Scalar::Float(3.0));
-        assert_eq!(store(ElemKind::I32, Scalar::Float(3.0), &mut o, Little), Err(PackError::WrongType));
-        assert_eq!(store(ElemKind::Char, Scalar::Char(7), &mut o, Little), Ok(()));
+        assert_eq!(
+            store(ElemKind::I32, Scalar::Float(3.0), &mut o, Little),
+            Err(PackError::WrongType)
+        );
+        assert_eq!(
+            store(ElemKind::Char, Scalar::Char(7), &mut o, Little),
+            Ok(())
+        );
         assert_eq!(o[0], 7);
     }
 

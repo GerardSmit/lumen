@@ -31,7 +31,11 @@ impl std::fmt::Debug for V {
 impl V {
     fn get(&self, k: &str) -> V {
         match self {
-            V::Map(m) => m.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or(V::Nil),
+            V::Map(m) => m
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or(V::Nil),
             _ => V::Nil,
         }
     }
@@ -66,8 +70,20 @@ struct Cx<'s> {
 
 struct Mock;
 
-fn call<N: Native<Mock>>(ctx: &mut MockCtx, this: &V, args: &[V], kw: &[(String, V)]) -> Result<V, String> {
-    let cx = Cx { ctx, this, args, kw, desc: N::DESC, guards: RefCell::new(Vec::new()) };
+fn call<N: Native<Mock>>(
+    ctx: &mut MockCtx,
+    this: &V,
+    args: &[V],
+    kw: &[(String, V)],
+) -> Result<V, String> {
+    let cx = Cx {
+        ctx,
+        this,
+        args,
+        kw,
+        desc: N::DESC,
+        guards: RefCell::new(Vec::new()),
+    };
     N::call(&cx)
 }
 
@@ -77,7 +93,9 @@ unsafe impl Sync for SyncV {}
 static NIL: SyncV = SyncV(V::Nil);
 
 fn instance<'c, T: Class>(cx: &'c Cx<'_>, v: &'c V, mutable: bool) -> Result<*mut T, String> {
-    let V::Obj(rc) = v else { return Err(format!("{}: expected {}", cx.desc.name, T::DESC.name)) };
+    let V::Obj(rc) = v else {
+        return Err(format!("{}: expected {}", cx.desc.name, T::DESC.name));
+    };
     if !rc.borrow().is::<T>() {
         return Err(format!("{}: expected {}", cx.desc.name, T::DESC.name));
     }
@@ -120,7 +138,10 @@ impl Host for Mock {
             out[i] = Some(a);
         }
         for (k, v) in cx.kw {
-            match d.named().position(|p| p.name == k && p.kind != ParamKind::PosOnly) {
+            match d
+                .named()
+                .position(|p| p.name == k && p.kind != ParamKind::PosOnly)
+            {
                 Some(i) if out[i].is_some() => return Err(format!("{}: duplicate {k}", d.name)),
                 Some(i) => out[i] = Some(v),
                 None if d.has_varkw() => {}
@@ -170,7 +191,11 @@ impl Host for Mock {
         match v {
             V::Num(x) => Ok(*x),
             V::Int(n) => Ok(*n as f64),
-            _ => Err(format!("{}: argument {:?} must be a number", cx.desc.name, at.index())),
+            _ => Err(format!(
+                "{}: argument {:?} must be a number",
+                cx.desc.name,
+                at.index()
+            )),
         }
     }
     fn to_int(cx: &Cx<'_>, v: &V, _: Slot, kind: IntKind) -> Result<i128, String> {
@@ -269,7 +294,12 @@ impl Host for Mock {
         let entries = ms
             .into_iter()
             .filter(|m| m.desc.exposed_to("mock"))
-            .map(|m| (m.desc.fixed_name("mock").unwrap_or(m.desc.name).to_string(), V::Fn(m.entry)))
+            .map(|m| {
+                (
+                    m.desc.fixed_name("mock").unwrap_or(m.desc.name).to_string(),
+                    V::Fn(m.entry),
+                )
+            })
             .collect();
         Ok(V::Map(entries))
     }
@@ -277,7 +307,10 @@ impl Host for Mock {
         let items = ModuleItems::<Mock>::of::<M>();
         let mut out = Vec::new();
         for f in items.functions.iter().filter(|f| f.desc.exposed_to("mock")) {
-            out.push((f.desc.fixed_name("mock").unwrap_or(f.desc.name).to_string(), V::Fn(f.entry)));
+            out.push((
+                f.desc.fixed_name("mock").unwrap_or(f.desc.name).to_string(),
+                V::Fn(f.entry),
+            ));
         }
         for c in &items.classes {
             out.push((c.desc.name_for("mock").to_string(), (c.object)(ctx)?));
@@ -310,7 +343,13 @@ mod geo {
     }
 
     #[op]
-    pub fn close(a: f64, b: f64, #[kwonly] #[default(1e-09)] rel_tol: f64) -> bool {
+    pub fn close(
+        a: f64,
+        b: f64,
+        #[kwonly]
+        #[default(1e-09)]
+        rel_tol: f64,
+    ) -> bool {
         (a - b).abs() <= rel_tol * a.abs().max(b.abs())
     }
 
@@ -402,15 +441,38 @@ fn functions() {
     let m = <Mock as Host>::module_object::<geo::Module>(&mut ctx).unwrap();
     assert_eq!(ctx.log, ["init"]);
     let n = |x: f64| V::Num(x);
-    assert_eq!(invoke(&mut ctx, &m.get("clamp"), &V::Nil, &[n(5.0), n(0.0), n(3.0)], &[]).unwrap().num(), 3.0);
+    assert_eq!(
+        invoke(
+            &mut ctx,
+            &m.get("clamp"),
+            &V::Nil,
+            &[n(5.0), n(0.0), n(3.0)],
+            &[]
+        )
+        .unwrap()
+        .num(),
+        3.0
+    );
     assert!(geo::clamp::DESC.scalar.is_some());
     assert_eq!(geo::clamp::DESC.doc, Some("Clamps."));
-    assert!(invoke(&mut ctx, &m.get("clamp"), &V::Nil, &[n(5.0)], &[]).unwrap_err().contains("missing lo"));
+    assert!(invoke(&mut ctx, &m.get("clamp"), &V::Nil, &[n(5.0)], &[])
+        .unwrap_err()
+        .contains("missing lo"));
 
     let close = m.get("close");
-    assert!(matches!(invoke(&mut ctx, &close, &V::Nil, &[n(1.0), n(1.0 + 1e-12)], &[]).unwrap(), V::Bool(true)));
     assert!(matches!(
-        invoke(&mut ctx, &close, &V::Nil, &[n(1.0), n(1.1)], &[("rel_tol", n(0.5))]).unwrap(),
+        invoke(&mut ctx, &close, &V::Nil, &[n(1.0), n(1.0 + 1e-12)], &[]).unwrap(),
+        V::Bool(true)
+    ));
+    assert!(matches!(
+        invoke(
+            &mut ctx,
+            &close,
+            &V::Nil,
+            &[n(1.0), n(1.1)],
+            &[("rel_tol", n(0.5))]
+        )
+        .unwrap(),
         V::Bool(true)
     ));
     assert!(invoke(&mut ctx, &close, &V::Nil, &[n(1.0), n(1.1), n(0.5)], &[]).is_err());
@@ -418,23 +480,67 @@ fn functions() {
     assert_eq!((p.kind, p.default), (ParamKind::KwOnly, Some("1e-09")));
 
     assert!(matches!(m.get("sum"), V::Nil));
-    let total = invoke(&mut ctx, &m.get("total"), &V::Nil, &[n(1.0), n(2.0)], &[("z", V::Int(4))]).unwrap();
+    let total = invoke(
+        &mut ctx,
+        &m.get("total"),
+        &V::Nil,
+        &[n(1.0), n(2.0)],
+        &[("z", V::Int(4))],
+    )
+    .unwrap();
     assert_eq!(total.num(), 7.0);
 
     let greet = m.get("greet");
-    assert_eq!(invoke(&mut ctx, &greet, &V::Nil, &[V::Str("bob".into())], &[]).unwrap().s(), "hello, bob");
-    let hi = invoke(&mut ctx, &greet, &V::Nil, &[V::Str("bob".into())], &[("greeting", V::Str("hi".into()))]);
+    assert_eq!(
+        invoke(&mut ctx, &greet, &V::Nil, &[V::Str("bob".into())], &[])
+            .unwrap()
+            .s(),
+        "hello, bob"
+    );
+    let hi = invoke(
+        &mut ctx,
+        &greet,
+        &V::Nil,
+        &[V::Str("bob".into())],
+        &[("greeting", V::Str("hi".into()))],
+    );
     assert_eq!(hi.unwrap().s(), "hi, bob");
     assert_eq!(geo::greet::DESC.min_pos, 1);
     assert_eq!(geo::greet::DESC.max_pos, 2);
 
     assert!(matches!(m.get("js_only"), V::Nil));
-    assert!(matches!(invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(2)], &[]).unwrap(), V::Int(4)));
-    assert_eq!(invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(5)], &[]).unwrap_err(), "too big");
-    assert!(invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(300)], &[]).unwrap_err().contains("range"));
-    assert!(matches!(invoke(&mut ctx, &m.get("logs"), &V::Nil, &[V::Str("a".into())], &[]).unwrap(), V::Int(2)));
+    assert!(matches!(
+        invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(2)], &[]).unwrap(),
+        V::Int(4)
+    ));
+    assert_eq!(
+        invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(5)], &[]).unwrap_err(),
+        "too big"
+    );
+    assert!(
+        invoke(&mut ctx, &m.get("fail"), &V::Nil, &[V::Int(300)], &[])
+            .unwrap_err()
+            .contains("range")
+    );
+    assert!(matches!(
+        invoke(
+            &mut ctx,
+            &m.get("logs"),
+            &V::Nil,
+            &[V::Str("a".into())],
+            &[]
+        )
+        .unwrap(),
+        V::Int(2)
+    ));
     assert!(geo::logs::DESC.has(flags::CTX));
-    let r = invoke(&mut ctx, &m.get("blen"), &V::Nil, &[V::Bytes(vec![1, 2, 3]), V::List(vec![V::Int(4), V::Int(5)])], &[]);
+    let r = invoke(
+        &mut ctx,
+        &m.get("blen"),
+        &V::Nil,
+        &[V::Bytes(vec![1, 2, 3]), V::List(vec![V::Int(4), V::Int(5)])],
+        &[],
+    );
     let V::List(r) = r.unwrap() else { panic!() };
     assert!(matches!(r[..], [V::Int(3), V::Int(9)]));
     assert_eq!(m.get("TAU").num(), std::f64::consts::TAU);
@@ -445,15 +551,49 @@ fn classes() {
     let mut ctx = MockCtx::default();
     let m = <Mock as Host>::module_object::<geo::Module>(&mut ctx).unwrap();
     let cls = m.get("Point");
-    let p = invoke(&mut ctx, &cls.get("new"), &V::Nil, &[V::Num(1.0), V::Num(2.0)], &[]).unwrap();
+    let p = invoke(
+        &mut ctx,
+        &cls.get("new"),
+        &V::Nil,
+        &[V::Num(1.0), V::Num(2.0)],
+        &[],
+    )
+    .unwrap();
     invoke(&mut ctx, &cls.get("scale"), &p, &[V::Num(3.0)], &[]).unwrap();
-    assert_eq!(invoke(&mut ctx, &cls.get("x"), &p, &[], &[]).unwrap().num(), 3.0);
+    assert_eq!(
+        invoke(&mut ctx, &cls.get("x"), &p, &[], &[]).unwrap().num(),
+        3.0
+    );
     invoke(&mut ctx, &cls.get("set_x"), &p, &[V::Num(10.0)], &[]).unwrap();
-    assert_eq!(invoke(&mut ctx, &cls.get("repr"), &p, &[], &[]).unwrap().s(), "Point(10, 6)");
+    assert_eq!(
+        invoke(&mut ctx, &cls.get("repr"), &p, &[], &[])
+            .unwrap()
+            .s(),
+        "Point(10, 6)"
+    );
     let o = invoke(&mut ctx, &cls.get("origin"), &V::Nil, &[], &[]).unwrap();
-    invoke(&mut ctx, &cls.get("add_from"), &o, std::slice::from_ref(&p), &[]).unwrap();
-    assert_eq!(invoke(&mut ctx, &cls.get("repr"), &o, &[], &[]).unwrap().s(), "Point(10, 6)");
-    let err = invoke(&mut ctx, &cls.get("add_from"), &p, std::slice::from_ref(&p), &[]).unwrap_err();
+    invoke(
+        &mut ctx,
+        &cls.get("add_from"),
+        &o,
+        std::slice::from_ref(&p),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        invoke(&mut ctx, &cls.get("repr"), &o, &[], &[])
+            .unwrap()
+            .s(),
+        "Point(10, 6)"
+    );
+    let err = invoke(
+        &mut ctx,
+        &cls.get("add_from"),
+        &p,
+        std::slice::from_ref(&p),
+        &[],
+    )
+    .unwrap_err();
     assert!(err.contains("already borrowed"), "{err}");
     assert!(matches!(cls.get("hidden"), V::Nil));
     assert_eq!(<geo::Point as Class>::DESC.module, Some("geo"));

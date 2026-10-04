@@ -406,7 +406,7 @@ pub(crate) fn prepare_frame(
         this
     } else {
         match this {
-            Value::Undefined | Value::Null => Value::Obj(interp.name_global().clone()),
+            Value::Undefined | Value::Null => interp.global_this_value(),
             object @ Value::Obj(_) => object,
             primitive => crate::builtins::box_primitive_pub(interp, primitive),
         }

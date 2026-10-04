@@ -7,20 +7,43 @@ use std::rc::Rc;
 
 impl Interp {
     #[cfg(feature = "aot-native")]
-    pub(crate) fn call_native_coroutine(&mut self, mut native: crate::native_aot::coroutines::NativeCoro, flags: u32) -> Result<Value, Abrupt> {
+    pub(crate) fn call_native_coroutine(
+        &mut self,
+        mut native: crate::native_aot::coroutines::NativeCoro,
+        flags: u32,
+    ) -> Result<Value, Abrupt> {
         use crate::coroutine::{Coroutine, Resume, Suspend};
-        let function = self.fn_frames.last().filter(|frame| frame.fn_ptr != 0).map(|frame| frame.callee());
-        let resume_frame = function.as_ref().map(|function| super::stack_trace::ResumeFrame::Fn { f: Gc::downgrade(function), skip_first: flags & 4 == 0 }).unwrap_or_default();
+        let function = self
+            .fn_frames
+            .last()
+            .filter(|frame| frame.fn_ptr != 0)
+            .map(|frame| frame.callee());
+        let resume_frame = function
+            .as_ref()
+            .map(|function| super::stack_trace::ResumeFrame::Fn {
+                f: Gc::downgrade(function),
+                skip_first: flags & 4 == 0,
+            })
+            .unwrap_or_default();
         if flags & 4 != 0 {
             native.prologue(self)?;
             let mut coroutine = Coroutine::Native(native);
             coroutine.set_frame(resume_frame);
-            let prototype = function.as_ref().and_then(|function| function.borrow().props.get("prototype").map(|property| property.value()));
+            let prototype = function.as_ref().and_then(|function| {
+                function
+                    .borrow()
+                    .props
+                    .get("prototype")
+                    .map(|property| property.value())
+            });
             let generator = self.make_generator(flags & 8 != 0, prototype);
             if let Value::Obj(object) = &generator {
                 self.gc_pin(object);
-                self.generators.insert(Gc::as_ptr(object) as usize, coroutine);
-                if flags & 8 != 0 { self.async_gens.insert(Gc::as_ptr(object) as usize); }
+                self.generators
+                    .insert(Gc::as_ptr(object) as usize, coroutine);
+                if flags & 8 != 0 {
+                    self.async_gens.insert(Gc::as_ptr(object) as usize);
+                }
             }
             return Ok(generator);
         }
@@ -32,7 +55,9 @@ impl Interp {
         match suspend {
             Suspend::Await(awaited) => {
                 self.park_async_coro(&promise, coroutine);
-                if let Err(error) = self.await_subscribe(awaited, &promise) { self.drive_async(promise.clone(), Resume::Throw(error)); }
+                if let Err(error) = self.await_subscribe(awaited, &promise) {
+                    self.drive_async(promise.clone(), Resume::Throw(error));
+                }
             }
             Suspend::Done(value) | Suspend::Yield(value) => self.resolve_promise(&promise, value),
             Suspend::Throw(error) => self.reject_promise(&promise, error),

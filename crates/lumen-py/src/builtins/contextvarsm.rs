@@ -25,11 +25,17 @@ pub mod _contextvars {
     type Vars = Rc<Vec<(Value, Value)>>;
 
     fn lookup(vars: &Vars, var: &Value) -> Option<Value> {
-        vars.iter().find(|(k, _)| same(k, var)).map(|(_, v)| v.clone())
+        vars.iter()
+            .find(|(k, _)| same(k, var))
+            .map(|(_, v)| v.clone())
     }
 
     fn with_set(vars: &Vars, var: &Value, val: Option<Value>) -> Vars {
-        let mut out: Vec<(Value, Value)> = vars.iter().filter(|(k, _)| !same(k, var)).cloned().collect();
+        let mut out: Vec<(Value, Value)> = vars
+            .iter()
+            .filter(|(k, _)| !same(k, var))
+            .cloned()
+            .collect();
         if let Some(v) = val {
             match vars.iter().position(|(k, _)| same(k, var)) {
                 Some(i) => out.insert(i, (var.clone(), v)),
@@ -61,7 +67,14 @@ pub mod _contextvars {
     }
 
     fn new_context(it: &mut Interp, vars: Vars) -> Py<Context> {
-        Py::new(it, Context { vars, entered: false, prev: None })
+        Py::new(
+            it,
+            Context {
+                vars,
+                entered: false,
+                prev: None,
+            },
+        )
     }
 
     /// The current context, created empty on first use.
@@ -101,12 +114,21 @@ pub mod _contextvars {
             if !args.is_empty() || !kwargs.is_empty() {
                 return Err(it.type_error("Context() does not accept any arguments"));
             }
-            Ok(Context { vars: Rc::new(Vec::new()), entered: false, prev: None })
+            Ok(Context {
+                vars: Rc::new(Vec::new()),
+                entered: false,
+                prev: None,
+            })
         }
 
         /// Call callable in the context, passing the remaining arguments.
         #[method(hint(py(text_signature = "")))]
-        fn run(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        fn run(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<Value> {
             // CPython checks this by hand, with its own wording.
             let Some((callable, args)) = args.split_first() else {
                 return Err(it.type_error("run() missing 1 required positional argument"));
@@ -114,7 +136,9 @@ pub mod _contextvars {
             let ctx = slf.0;
             if ctx.borrow(it)?.entered {
                 let r = it.repr_of(ctx.value())?;
-                return Err(it.runtime_error(&format!("cannot enter context: {r} is already entered")));
+                return Err(
+                    it.runtime_error(&format!("cannot enter context: {r} is already entered"))
+                );
             }
             let prev = it.context.replace(ctx.value().clone());
             ctx.with(it, |c| {
@@ -139,7 +163,12 @@ pub mod _contextvars {
         ///
         /// If `key` does not exist, return `default`. If `default` is not given,
         /// return None.
-        fn get(slf: This<Py<Self>>, it: &mut Interp, key: &Value, default: Option<&Value>) -> R<Value> {
+        fn get(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            key: &Value,
+            default: Option<&Value>,
+        ) -> R<Value> {
             let k = super::_contextvars::key(it, key)?;
             let vars = vars_of(it, &slf.0)?;
             Ok(lookup(&vars, k).unwrap_or_else(|| default.cloned().unwrap_or(Value::None)))
@@ -161,7 +190,11 @@ pub mod _contextvars {
         ///
         /// The result is returned as a list of 2-tuples (variable, value).
         fn items(&self, it: &mut Interp) -> Value {
-            let items = self.vars.iter().map(|(k, v)| Value::tuple(vec![k.clone(), v.clone()])).collect();
+            let items = self
+                .vars
+                .iter()
+                .map(|(k, v)| Value::tuple(vec![k.clone(), v.clone()]))
+                .collect();
             Py::new(it, super::Items { items, pos: 0 }).into_value()
         }
 
@@ -203,7 +236,9 @@ pub mod _contextvars {
                 return Ok(Value::Bool(false));
             }
             for (k, v) in a.iter() {
-                let Some(w) = lookup(&b, k) else { return Ok(Value::Bool(false)) };
+                let Some(w) = lookup(&b, k) else {
+                    return Ok(Value::Bool(false));
+                };
                 if !it.values_eq(v, &w)? {
                     return Ok(Value::Bool(false));
                 }
@@ -215,11 +250,18 @@ pub mod _contextvars {
     #[methods]
     impl ContextVar {
         #[constructor]
-        fn new(it: &mut Interp, #[kw] name: &Value, #[kwonly] default: Passed<&Value>) -> R<ContextVar> {
+        fn new(
+            it: &mut Interp,
+            #[kw] name: &Value,
+            #[kwonly] default: Passed<&Value>,
+        ) -> R<ContextVar> {
             if name.as_str().is_none() {
                 return Err(it.type_error("context variable name must be a str"));
             }
-            Ok(ContextVar { name: name.clone(), default: default.0.cloned() })
+            Ok(ContextVar {
+                name: name.clone(),
+                default: default.0.cloned(),
+            })
         }
 
         #[getter]
@@ -263,7 +305,12 @@ pub mod _contextvars {
                 c.vars = with_set(&c.vars, var, Some(value.clone()));
                 old
             })?;
-            let tok = Token { ctx: cur.into_value(), var: var.clone(), old, used: false };
+            let tok = Token {
+                ctx: cur.into_value(),
+                var: var.clone(),
+                old,
+                used: false,
+            };
             Ok(Py::new(it, tok).into_value())
         }
 
@@ -342,14 +389,18 @@ pub mod _contextvars {
             };
             let var = it.repr_of(&var)?;
             let used = if used { " used" } else { "" };
-            Ok(format!("<Token{used} var={var} at {:#x}>", it.id_of(slf.0.value())))
+            Ok(format!(
+                "<Token{used} var={var} at {:#x}>",
+                it.id_of(slf.0.value())
+            ))
         }
     }
 
     fn token_missing(it: &mut Interp) -> R<Value> {
         let t = type_object::<Token>(it);
         let d = t.dict.borrow().clone();
-        Ok(d.and_then(|d| crate::vm::dict_get_str(&d, "MISSING")).unwrap_or(Value::None))
+        Ok(d.and_then(|d| crate::vm::dict_get_str(&d, "MISSING"))
+            .unwrap_or(Value::None))
     }
 
     #[init]

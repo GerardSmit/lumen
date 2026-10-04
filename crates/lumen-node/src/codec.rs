@@ -132,10 +132,16 @@ pub fn utf8_decode(bytes: &[u8]) -> String {
         return canonical(s.to_owned());
     }
     let mut out = String::with_capacity(bytes.len() + 8);
-    let _ = utf::decode_utf8::<Infallible>(&mut Cow::Borrowed(bytes), true, Spelling::Utf16, &mut out, |_, m, out| {
-        out.push('\u{FFFD}');
-        Ok(m.end)
-    });
+    let _ = utf::decode_utf8::<Infallible>(
+        &mut Cow::Borrowed(bytes),
+        true,
+        Spelling::Utf16,
+        &mut out,
+        |_, m, out| {
+            out.push('\u{FFFD}');
+            Ok(m.end)
+        },
+    );
     out
 }
 
@@ -181,13 +187,24 @@ pub fn utf16le_encode(s: &str) -> Vec<u8> {
 /// Node's utf16le: lone surrogates are kept and an odd last byte is dropped.
 pub fn utf16le_decode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len());
-    let _ = utf::decode_utf16::<Infallible>(&mut Cow::Borrowed(bytes), 0, false, true, Spelling::Utf16, &mut out, |data, m, out| {
-        if m.end - m.start < 2 {
-            return Ok(m.end);
-        }
-        out.push(smuggle(u16::from_le_bytes([data[m.start], data[m.start + 1]])));
-        Ok(m.start + 2)
-    });
+    let _ = utf::decode_utf16::<Infallible>(
+        &mut Cow::Borrowed(bytes),
+        0,
+        false,
+        true,
+        Spelling::Utf16,
+        &mut out,
+        |data, m, out| {
+            if m.end - m.start < 2 {
+                return Ok(m.end);
+            }
+            out.push(smuggle(u16::from_le_bytes([
+                data[m.start],
+                data[m.start + 1],
+            ])));
+            Ok(m.start + 2)
+        },
+    );
     out
 }
 

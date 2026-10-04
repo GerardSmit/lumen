@@ -196,7 +196,10 @@ mod tests {
     #[test]
     fn local_tz_resolves_posix_spellings_and_keeps_aliases() {
         assert_eq!(resolve("Etc/UTC"), Some((0, 0)));
-        assert_eq!(resolve(":America/New_York").unwrap().0, key("America/New_York"));
+        assert_eq!(
+            resolve(":America/New_York").unwrap().0,
+            key("America/New_York")
+        );
         assert_eq!(
             resolve("/usr/share/zoneinfo/Europe/Paris").unwrap().0,
             key("Europe/Paris")
@@ -217,7 +220,10 @@ mod tests {
         // 2024-11-03 01:30 local happens twice: the earlier instant (EDT, -4h) wins.
         let overlap = 1_730_597_400_000.0;
         assert_eq!(local_to_utc_in(ny, overlap), overlap + 4.0 * h);
-        assert_eq!(local_to_utc_in(ny, 1_704_067_200_000.0), 1_704_067_200_000.0 + 5.0 * h);
+        assert_eq!(
+            local_to_utc_in(ny, 1_704_067_200_000.0),
+            1_704_067_200_000.0 + 5.0 * h
+        );
         assert!(local_to_utc_in(ny, f64::NAN).is_nan());
     }
 

@@ -5,6 +5,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut font = None;
     let mut script = None;
     let mut entry = None;
+    let mut dump = None;
     let mut size = (800u32, 600u32);
     let mut scale = 1.0f32;
     let mut i = 0;
@@ -38,6 +39,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--script" => {
                 i += 1;
                 script = Some(args.get(i).ok_or("--script needs a path")?.as_str());
+            }
+            "--dump" => {
+                i += 1;
+                dump = Some(args.get(i).ok_or("--dump needs a path")?.as_str());
             }
             "-o" | "--output" => {
                 i += 1;
@@ -124,19 +129,49 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let engine = runtime.engine();
         let global = engine.global_this();
         match engine.ctx().get_member(&global, "__lumenRenderImport") {
-            Ok(lumen::embed::Value::Bool(true)) if !runtime.is_interrupted() => image,
+            Ok(lumen::embed::Value::Bool(true)) if !runtime.is_interrupted() => {
+                if let Some(path) = dump {
+                    realm.with_session(|session| write_dump(session, path))?;
+                }
+                image
+            }
             Ok(lumen::embed::Value::Str(message)) => {
                 return Err(format!("{script_path}: {message}"))
             }
             _ => return Err(format!("{script_path}: app did not settle")),
         }
     } else {
+        if let Some(path) = dump {
+            let document = lumen_html::html::parse(&source, 100_000)
+                .map_err(|error| format!("HTML parse failed: {error:?}"))?;
+            let mut session = lumen_html::session::RenderSession::new(document);
+            session.display_list_with_images(size.0, size.1, &font, &assets)
+                .map_err(|error| format!("render failed: {error:?}"))?;
+            write_dump(&mut session, path)?;
+        }
         lumen_html_image::render_html_with_images(&source, size.0, size.1, scale, &font, &assets)
             .map_err(|error| format!("render failed: {error:?}"))?
     };
     let png = lumen_html_image::encode_png(&image);
     std::fs::write(output, png).map_err(|error| format!("{output}: {error}"))?;
     Ok(())
+}
+
+fn write_dump(session: &mut lumen_html::session::RenderSession, path: &str) -> Result<(), String> {
+    struct Buffer(String);
+    impl std::fmt::Write for Buffer {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.0.len().saturating_add(text.len()) > 16 * 1024 * 1024 {
+                return Err(std::fmt::Error);
+            }
+            self.0.push_str(text);
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer(String::new());
+    lumen_html::debug::write_session(session, &mut buffer)
+        .map_err(|error| format!("debug dump failed (16 MiB output limit): {error:?}"))?;
+    std::fs::write(path, buffer.0).map_err(|error| format!("{path}: {error}"))
 }
 
 #[cfg(test)]
@@ -150,16 +185,23 @@ mod tests {
             let font = directory.join("font.ttf");
             let app = directory.join("app.tsx");
             let output = directory.join("output.png");
+            let dump = directory.join("frame.txt");
             std::fs::write(&html, "<body style='margin:0'><main id=app></main></body>").unwrap();
             std::fs::write(&font, lumen_html_text::TEST_FONT_BYTES).unwrap();
             std::fs::write(directory.join("color.ts"), "export const color: string = 'blue';").unwrap();
             std::fs::write(&app, "import {color} from './color.ts'; import {jsx} from 'lumen/jsx-runtime'; const node = <div style={{width:4,height:4,background:'red'}}/>; document.getElementById('app').appendChild(node); Promise.resolve().then(()=>Promise.resolve()).then(()=>{node.style.backgroundColor=color;});").unwrap();
-            let args = vec![app.display().to_string(), "--html".into(), html.display().to_string(), "--font".into(), font.display().to_string(), "--size".into(), "8x8".into(), "--scale".into(), "2".into(), "-o".into(), output.display().to_string()];
+            let args = vec![app.display().to_string(), "--html".into(), html.display().to_string(), "--font".into(), font.display().to_string(), "--size".into(), "8x8".into(), "--scale".into(), "2".into(), "--dump".into(), dump.display().to_string(), "-o".into(), output.display().to_string()];
             super::run(&args).unwrap();
             let actual = lumen_html_image::decode_png(&std::fs::read(&output).unwrap()).unwrap();
             let font = lumen_html_text::FontFace::new(std::sync::Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap();
             let expected = lumen_html_image::render_html_with_font("<body style='margin:0'><main><div style='width:4px;height:4px;background:blue'></div></main></body>", 8, 8, 2.0, &font).unwrap();
             assert!(actual == expected, "first actual {:?}, expected {:?}", &actual.pixels[..4], &expected.pixels[..4]);
+            let first_dump = std::fs::read_to_string(&dump).unwrap();
+            assert!(first_dump.contains("DISPLAY LIST (CSS px)"));
+            assert!(first_dump.contains("Rgba { r: 0, g: 0, b: 255, a: 255 }"), "dump must reflect the settled promise mutation: {first_dump}");
+            super::run(&args).unwrap();
+            assert_eq!(std::fs::read_to_string(&dump).unwrap(), first_dump,
+                "fresh document identities must not change the dump");
             std::fs::write(&app, "import './missing.ts';").unwrap();
             assert!(super::run(&args).unwrap_err().contains("app.tsx"));
             std::fs::write(&app, "const broken = <div;").unwrap();

@@ -98,9 +98,9 @@
 pub use lumen::precompiled::Precompiled;
 pub use lumen_aot_macros::include_js;
 
+mod assets;
 #[path = "walk.rs"]
 mod walk;
-mod assets;
 
 /// Precompile from a build script (`[build-dependencies] lumen-aot = …`), writing the blob to
 /// a file — normally in `OUT_DIR` — and printing `cargo:rerun-if-changed` for every input.
@@ -121,8 +121,8 @@ pub mod native;
 pub mod build {
     use std::path::{Path, PathBuf};
 
-    pub use crate::walk::Spec;
     pub use crate::walk::Bundle;
+    pub use crate::walk::Spec;
 
     /// Compile a bundle without writing an output file.
     pub fn compile(base: impl AsRef<Path>, spec: &Spec) -> Result<Bundle, String> {
@@ -157,27 +157,52 @@ pub mod build {
         }
         for path in std::iter::once(out).chain(spec.trim_modules.then_some(report.as_path())) {
             if let Ok(output) = path.canonicalize() {
-                if bundle.inputs.iter().any(|p| p.canonicalize().is_ok_and(|p| p == output)) {
+                if bundle
+                    .inputs
+                    .iter()
+                    .any(|p| p.canonicalize().is_ok_and(|p| p == output))
+                {
                     return Err("output would overwrite a bundled source".into());
                 }
             }
         }
         if spec.trim_modules {
-            let paths = bundle.inputs.iter().map(|p| p.canonicalize()
-                .map_err(|e| format!("{}: {e}", p.display())))
+            let paths = bundle
+                .inputs
+                .iter()
+                .map(|p| {
+                    p.canonicalize()
+                        .map_err(|e| format!("{}: {e}", p.display()))
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            let mut root = paths.first().and_then(|p| p.parent()).unwrap_or(Path::new(".")).to_path_buf();
+            let mut root = paths
+                .first()
+                .and_then(|p| p.parent())
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
             while paths.iter().any(|path| !path.starts_with(&root)) {
-                if !root.pop() { return Err("bundle sources have no common root".into()); }
+                if !root.pop() {
+                    return Err("bundle sources have no common root".into());
+                }
             }
             let mut lines = vec!["trim: modules".to_owned(),
                 format!("output bytes: {}", bundle.blob.len()),
                 "Module roots and their transitive imports are kept; no member analysis is applied.".into()];
             for path in &paths {
-                lines.push(format!("kept input: {}", path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/")));
+                lines.push(format!(
+                    "kept input: {}",
+                    path.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                ));
             }
-            for name in &bundle.required_modules { lines.push(format!("required native: {name}")); }
-            for warning in &bundle.warnings { lines.push(format!("warning: {warning}")); }
+            for name in &bundle.required_modules {
+                lines.push(format!("required native: {name}"));
+            }
+            for warning in &bundle.warnings {
+                lines.push(format!("warning: {warning}"));
+            }
             std::fs::write(&report, format!("{}\n", lines.join("\n")))
                 .map_err(|e| format!("{}: {e}", report.display()))?;
         }

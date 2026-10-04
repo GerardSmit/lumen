@@ -10,8 +10,21 @@ use std::rc::Rc;
 fn weak_target(it: &mut Interp, v: &Value, what: &str) -> R<Obj> {
     let ok = match v {
         Value::Obj(o) => match &o.kind {
-            Kind::Str(_) | Kind::Int(_) | Kind::Float(_) | Kind::Complex(..) | Kind::Tuple(_) | Kind::List(_) | Kind::Dict(_) | Kind::Bytes(_) | Kind::ByteArray(_) => o.cls.is_some(),
-            Kind::Slice(..) | Kind::Range(_) | Kind::BigRange(_) | Kind::Iter(_) | Kind::Cell(_) | Kind::Code(_) => o.cls.is_some(),
+            Kind::Str(_)
+            | Kind::Int(_)
+            | Kind::Float(_)
+            | Kind::Complex(..)
+            | Kind::Tuple(_)
+            | Kind::List(_)
+            | Kind::Dict(_)
+            | Kind::Bytes(_)
+            | Kind::ByteArray(_) => o.cls.is_some(),
+            Kind::Slice(..)
+            | Kind::Range(_)
+            | Kind::BigRange(_)
+            | Kind::Iter(_)
+            | Kind::Cell(_)
+            | Kind::Code(_) => o.cls.is_some(),
             _ => true,
         },
         _ => false,
@@ -20,13 +33,22 @@ fn weak_target(it: &mut Interp, v: &Value, what: &str) -> R<Obj> {
         Value::Obj(o) if ok => Ok(o.clone()),
         _ => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("cannot create weak reference to '{}' object{}", t, what)))
+            Err(it.type_error(&format!(
+                "cannot create weak reference to '{}' object{}",
+                t, what
+            )))
         }
     }
 }
 
 fn ref_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("__new__", &a[1.min(a.len())..], kw, &["object", "callback"], 1)?;
+    let b = it.bind_args(
+        "__new__",
+        &a[1.min(a.len())..],
+        kw,
+        &["object", "callback"],
+        1,
+    )?;
     let cls = match &a[0] {
         Value::Obj(c) => c.clone(),
         _ => return Err(it.type_error("ref.__new__(X): X is not a type object")),
@@ -36,13 +58,21 @@ fn ref_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let exact = Rc::ptr_eq(&cls, &it.weak_types()[0]);
     if exact && callback.is_none() {
         for r in weak::live_refs(&target) {
-            let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, &cls)) && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| d.callback.is_none()).unwrap_or(false);
+            let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, &cls))
+                && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| {
+                    d.callback.is_none()
+                })
+                .unwrap_or(false);
             if reusable {
                 return Ok(Value::Obj(r));
             }
         }
     }
-    let data = WeakRefData { target: Rc::downgrade(&target), callback, hash: None };
+    let data = WeakRefData {
+        target: Rc::downgrade(&target),
+        callback,
+        hash: None,
+    };
     let v = new_opaque(&cls, data);
     if let Value::Obj(o) = &v {
         weak::register(&target, o);
@@ -113,7 +143,12 @@ fn ref_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     Ok(Value::string(match referent(&a[0]) {
         Some(Some(o)) => {
             let t = it.type_name_of(&Value::Obj(o.clone()));
-            format!("<weakref at {:#x}; to '{}' at {:#x}>", id, t, it.id_of(&Value::Obj(o)))
+            format!(
+                "<weakref at {:#x}; to '{}' at {:#x}>",
+                id,
+                t,
+                it.id_of(&Value::Obj(o))
+            )
         }
         _ => format!("<weakref at {:#x}; dead>", id),
     }))
@@ -130,7 +165,10 @@ fn class_getitem(_it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn proxy_target(it: &mut Interp, v: &Value) -> R<Value> {
     match with_opaque::<ProxyData, _>(v, |d| d.target.upgrade()) {
         Some(Some(o)) => Ok(Value::Obj(o)),
-        Some(None) => Err(it.new_exc_str("ReferenceError", "weakly-referenced object no longer exists")),
+        Some(None) => Err(it.new_exc_str(
+            "ReferenceError",
+            "weakly-referenced object no longer exists",
+        )),
         None => Err(it.self_state_err("weakproxy")),
     }
 }
@@ -141,8 +179,18 @@ fn proxy_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let target = weak_target(it, &a[0], "")?;
     let callback = a.get(1).cloned().unwrap_or(Value::None);
     let callable = it.is_callable(&a[0]);
-    let cls = if callable { it.weak_types()[2].clone() } else { it.weak_types()[1].clone() };
-    let v = new_opaque(&cls, ProxyData { target: Rc::downgrade(&target), callback });
+    let cls = if callable {
+        it.weak_types()[2].clone()
+    } else {
+        it.weak_types()[1].clone()
+    };
+    let v = new_opaque(
+        &cls,
+        ProxyData {
+            target: Rc::downgrade(&target),
+            callback,
+        },
+    );
     if let Value::Obj(o) = &v {
         weak::register(&target, o);
     }
@@ -181,7 +229,12 @@ fn proxy_delattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn proxy_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let id = it.id_of(&a[0]);
     Ok(Value::string(match proxy_target(it, &a[0]) {
-        Ok(t) => format!("<weakproxy at {:#x}; to '{}' at {:#x}>", id, it.type_name_of(&t), it.id_of(&t)),
+        Ok(t) => format!(
+            "<weakproxy at {:#x}; to '{}' at {:#x}>",
+            id,
+            it.type_name_of(&t),
+            it.id_of(&t)
+        ),
         Err(_) => format!("<weakproxy at {:#x}; dead>", id),
     }))
 }
@@ -317,7 +370,9 @@ fn getweakrefs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn remove_dead_weakref(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("_remove_dead_weakref", a, 2, 2)?;
-    let Value::Obj(d) = &a[0] else { return Err(it.type_error("_remove_dead_weakref() argument 1 must be dict")) };
+    let Value::Obj(d) = &a[0] else {
+        return Err(it.type_error("_remove_dead_weakref() argument 1 must be dict"));
+    };
     if !matches!(d.kind, Kind::Dict(_)) {
         return Err(it.type_error("_remove_dead_weakref() argument 1 must be dict"));
     }
@@ -343,7 +398,11 @@ impl Interp {
             },
         };
         let d = self.module_dict(&m);
-        ["ReferenceType", "ProxyType", "CallableProxyType"].iter().filter_map(|n| dict_get_str(&d, n)).filter_map(|v| v.as_obj().cloned()).collect()
+        ["ReferenceType", "ProxyType", "CallableProxyType"]
+            .iter()
+            .filter_map(|n| dict_get_str(&d, n))
+            .filter_map(|v| v.as_obj().cloned())
+            .collect()
     }
 
     /// Runs the callbacks of weak references whose referent has died since the last check.

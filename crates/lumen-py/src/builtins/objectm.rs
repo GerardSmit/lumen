@@ -10,7 +10,10 @@ fn name_obj(it: &mut Interp, v: &Value, what: &str) -> R<Obj> {
         Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => Ok(o.clone()),
         _ => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("{}(): attribute name must be string, not '{}'", what, t)))
+            Err(it.type_error(&format!(
+                "{}(): attribute name must be string, not '{}'",
+                what, t
+            )))
         }
     }
 }
@@ -20,7 +23,10 @@ fn obj_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
         Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => c.clone(),
         Some(v) => {
             let t = it.type_name_of(v);
-            return Err(it.type_error(&format!("object.__new__(X): X is not a type object ({})", t)));
+            return Err(it.type_error(&format!(
+                "object.__new__(X): X is not a type object ({})",
+                t
+            )));
         }
         None => return Err(it.type_error("object.__new__(): not enough arguments")),
     };
@@ -115,7 +121,10 @@ fn obj_format(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     let spec = it.str_arg(&a[1], "format_spec")?;
     if !spec.is_empty() {
         let t = it.type_name_of(&a[0]);
-        return Err(it.type_error(&format!("unsupported format string passed to {}.__format__", t)));
+        return Err(it.type_error(&format!(
+            "unsupported format string passed to {}.__format__",
+            t
+        )));
     }
     Ok(Value::string(it.str_of(&a[0])?))
 }
@@ -126,7 +135,10 @@ fn obj_init_subclass(it: &mut Interp, a: &[Value], kw: &[(Obj, Value)]) -> R<Val
             Some(Value::Obj(c)) => it.type_display(c),
             _ => "type".into(),
         };
-        return Err(it.type_error(&format!("{}.__init_subclass__() takes no keyword arguments", n)));
+        return Err(it.type_error(&format!(
+            "{}.__init_subclass__() takes no keyword arguments",
+            n
+        )));
     }
     Ok(Value::None)
 }
@@ -147,7 +159,9 @@ fn obj_subclasshook(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<V
 
 fn obj_getstate(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__getstate__", a, 1, 1)?;
-    let Value::Obj(o) = &a[0] else { return Ok(Value::None) };
+    let Value::Obj(o) = &a[0] else {
+        return Ok(Value::None);
+    };
     let d = match o.dict.borrow().as_ref() {
         Some(d) if matches!(&d.kind, Kind::Dict(p) if !p.borrow().is_empty()) => d.clone(),
         _ => return Ok(Value::None),
@@ -174,7 +188,9 @@ fn obj_reduce_ex(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value>
 
 /// `_common_reduce`: `copyreg._reduce_ex` below protocol 2, `reduce_newobj` from it on.
 fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value> {
-    if matches!(obj, Value::Obj(o) if matches!(o.kind, Kind::Type(_) | Kind::Function(_) | Kind::Native(_) | Kind::Method(..) | Kind::Module)) || !matches!(obj, Value::Obj(_)) {
+    if matches!(obj, Value::Obj(o) if matches!(o.kind, Kind::Type(_) | Kind::Function(_) | Kind::Native(_) | Kind::Method(..) | Kind::Module))
+        || !matches!(obj, Value::Obj(_))
+    {
         let t = it.tp_name(cls);
         return Err(it.type_error(&format!("cannot pickle '{t}' object")));
     }
@@ -194,7 +210,11 @@ fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value
     let layout = it.type_layout(&cls);
     if matches!(layout, Layout::Set | Layout::FrozenSet) {
         let items = it.iterate_to_vec(obj)?;
-        return Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(vec![Value::list(items)]), state]));
+        return Ok(Value::tuple(vec![
+            Value::Obj(cls),
+            Value::tuple(vec![Value::list(items)]),
+            state,
+        ]));
     }
     let base = match layout {
         Layout::Tuple => Some(it.types.tuple.clone()),
@@ -211,14 +231,24 @@ fn common_reduce(it: &mut Interp, obj: &Value, cls: &Obj, proto: i64) -> R<Value
     let newobj = it.get_attr_str(&Value::Obj(copyreg), "__newobj__")?;
     let is_list = it.isinstance_value(obj, &Value::Obj(it.types.list.clone()))?;
     let is_dict = it.isinstance_value(obj, &Value::Obj(it.types.dict.clone()))?;
-    let listitems = if is_list { it.get_iter(obj)? } else { Value::None };
+    let listitems = if is_list {
+        it.get_iter(obj)?
+    } else {
+        Value::None
+    };
     let dictitems = if is_dict {
         let items = it.call_method(obj, "items", Vec::new())?;
         it.get_iter(&items)?
     } else {
         Value::None
     };
-    Ok(Value::tuple(vec![newobj, Value::tuple(args), state, listitems, dictitems]))
+    Ok(Value::tuple(vec![
+        newobj,
+        Value::tuple(args),
+        state,
+        listitems,
+        dictitems,
+    ]))
 }
 
 fn obj_reduce(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
@@ -297,7 +327,9 @@ fn type_init(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
 
 fn type_call(it: &mut Interp, a: &[Value], kw: &[(Obj, Value)]) -> R<Value> {
     match a.first() {
-        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => it.type_call_default(c, a[1..].to_vec(), kw.to_vec()),
+        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => {
+            it.type_call_default(c, a[1..].to_vec(), kw.to_vec())
+        }
         _ => Err(it.type_error("descriptor '__call__' requires a 'type' object")),
     }
 }
@@ -318,7 +350,9 @@ fn type_instancecheck(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<V
 fn type_subclasscheck(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     it.check_args("__subclasscheck__", a, 2, 2)?;
     match (&a[0], &a[1]) {
-        (Value::Obj(c), Value::Obj(s)) if matches!(s.kind, Kind::Type(_)) => Ok(Value::Bool(it.is_subtype(s, c))),
+        (Value::Obj(c), Value::Obj(s)) if matches!(s.kind, Kind::Type(_)) => {
+            Ok(Value::Bool(it.is_subtype(s, c)))
+        }
         _ => Err(it.type_error("issubclass() arg 1 must be a class")),
     }
 }
@@ -326,7 +360,13 @@ fn type_subclasscheck(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<V
 fn type_mro(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     match a.first() {
         Some(Value::Obj(c)) => match &c.kind {
-            Kind::Type(td) => Ok(Value::list(td.mro.borrow().iter().map(|m| Value::Obj(m.clone())).collect())),
+            Kind::Type(td) => Ok(Value::list(
+                td.mro
+                    .borrow()
+                    .iter()
+                    .map(|m| Value::Obj(m.clone()))
+                    .collect(),
+            )),
             _ => Err(it.type_error("descriptor 'mro' requires a 'type' object")),
         },
         _ => Err(it.type_error("descriptor 'mro' requires a 'type' object")),
@@ -372,8 +412,17 @@ fn property_new(it: &mut Interp, a: &[Value], kw: &[(Obj, Value)]) -> R<Value> {
             }
         }
     }
-    let kind = Kind::Property(PropData { fget: get(0), fset: get(1), fdel: get(2), doc });
-    Ok(Value::Obj(if Rc::ptr_eq(&cls, &it.types.property) { Object::new(kind) } else { Object::with_cls(cls, kind) }))
+    let kind = Kind::Property(PropData {
+        fget: get(0),
+        fset: get(1),
+        fdel: get(2),
+        doc,
+    });
+    Ok(Value::Obj(if Rc::ptr_eq(&cls, &it.types.property) {
+        Object::new(kind)
+    } else {
+        Object::with_cls(cls, kind)
+    }))
 }
 
 fn property_init(_it: &mut Interp, _a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
@@ -390,7 +439,12 @@ fn prop_with(it: &mut Interp, a: &[Value], slot: usize) -> R<Value> {
         Kind::Property(p) => p,
         _ => return Err(it.type_error("not a property")),
     };
-    let mut np = PropData { fget: p.fget.clone(), fset: p.fset.clone(), fdel: p.fdel.clone(), doc: p.doc.clone() };
+    let mut np = PropData {
+        fget: p.fget.clone(),
+        fset: p.fset.clone(),
+        fdel: p.fdel.clone(),
+        doc: p.doc.clone(),
+    };
     match slot {
         0 => np.fget = a[1].clone(),
         1 => np.fset = a[1].clone(),
@@ -474,20 +528,26 @@ fn super_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
         };
         let code = fr.code.clone();
         let ci = code.freevars.iter().position(|n| &**n == "__class__");
-        let class_val = ci.and_then(|i| fr.cells.get(code.cellvars.len() + i)).and_then(|c| match &c.kind {
-            Kind::Cell(v) => v.borrow().clone(),
-            _ => None,
-        });
+        let class_val = ci
+            .and_then(|i| fr.cells.get(code.cellvars.len() + i))
+            .and_then(|c| match &c.kind {
+                Kind::Cell(v) => v.borrow().clone(),
+                _ => None,
+            });
         let first = if code.argcount > 0 {
             let local = fr.locals.first().cloned().flatten();
             match local {
                 Some(v) => Some(v),
                 None => {
                     let name = &code.varnames[0];
-                    code.cellvars.iter().position(|n| n == name).and_then(|i| fr.cells.get(i)).and_then(|c| match &c.kind {
-                        Kind::Cell(v) => v.borrow().clone(),
-                        _ => None,
-                    })
+                    code.cellvars
+                        .iter()
+                        .position(|n| n == name)
+                        .and_then(|i| fr.cells.get(i))
+                        .and_then(|c| match &c.kind {
+                            Kind::Cell(v) => v.borrow().clone(),
+                            _ => None,
+                        })
                 }
             }
         } else {
@@ -495,7 +555,9 @@ fn super_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
         };
         match (class_val, first) {
             (Some(c), Some(f)) => (c, f),
-            (None, _) => return Err(it.new_exc_str("RuntimeError", "super(): __class__ cell not found")),
+            (None, _) => {
+                return Err(it.new_exc_str("RuntimeError", "super(): __class__ cell not found"))
+            }
             (_, None) => return Err(it.new_exc_str("RuntimeError", "super(): no arguments")),
         }
     } else if args.len() == 1 {
@@ -503,7 +565,10 @@ fn super_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
     } else if args.len() == 2 {
         (args[0].clone(), args[1].clone())
     } else {
-        return Err(it.type_error(&format!("super() takes at most 2 arguments ({} given)", args.len())));
+        return Err(it.type_error(&format!(
+            "super() takes at most 2 arguments ({} given)",
+            args.len()
+        )));
     };
     let typ_obj = match &typ {
         Value::Obj(t) if matches!(t.kind, Kind::Type(_)) => t.clone(),
@@ -513,11 +578,15 @@ fn super_new(it: &mut Interp, a: &[Value], _kw: &[(Obj, Value)]) -> R<Value> {
         Value::None
     } else {
         match &inst {
-            Value::Obj(io) if matches!(io.kind, Kind::Type(_)) && it.is_subtype(io, &typ_obj) => inst.clone(),
+            Value::Obj(io) if matches!(io.kind, Kind::Type(_)) && it.is_subtype(io, &typ_obj) => {
+                inst.clone()
+            }
             _ => {
                 let t = it.type_of(&inst);
                 if !it.is_subtype(&t, &typ_obj) {
-                    return Err(it.type_error("super(type, obj): obj must be an instance or subtype of type"));
+                    return Err(it.type_error(
+                        "super(type, obj): obj must be an instance or subtype of type",
+                    ));
                 }
                 Value::Obj(t)
             }
@@ -536,13 +605,19 @@ fn type_getset(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
         Some(Value::Obj(o)) if matches!(o.kind, Kind::Type(_)) => o.clone(),
         _ => {
             let t = a.first().map(|v| it.tp_name_of(v)).unwrap_or_default();
-            return Err(it.type_error(&format!("descriptor '{name}' for 'type' objects doesn't apply to a '{t}' object")));
+            return Err(it.type_error(&format!(
+                "descriptor '{name}' for 'type' objects doesn't apply to a '{t}' object"
+            )));
         }
     };
     let is_type = Rc::ptr_eq(&cls, &it.types.type_);
     let own = match is_type {
         true => None,
-        false => cls.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name)),
+        false => cls
+            .dict
+            .borrow()
+            .as_ref()
+            .and_then(|d| dict_get_str(d, name)),
     };
     match (name, own) {
         ("__module__", Some(v)) => Ok(v),
@@ -551,13 +626,21 @@ fn type_getset(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
         ("__doc__", None) => Ok(Value::None),
         _ => match it.type_special_attr(&cls, name) {
             Some(v) => Ok(v),
-            None => Err(it.new_exc_str("AttributeError", &format!("type object '{}' has no attribute '{name}'", it.type_name(&cls)))),
+            None => Err(it.new_exc_str(
+                "AttributeError",
+                &format!(
+                    "type object '{}' has no attribute '{name}'",
+                    it.type_name(&cls)
+                ),
+            )),
         },
     }
 }
 
 fn type_getset_store(it: &mut Interp, a: &[Value], name: &str) -> R<Value> {
-    let (Some(Value::Obj(o)), Some(v)) = (a.first(), a.get(1)) else { return Ok(Value::None) };
+    let (Some(Value::Obj(o)), Some(v)) = (a.first(), a.get(1)) else {
+        return Ok(Value::None);
+    };
     if !matches!(o.kind, Kind::Type(_)) {
         return Ok(Value::None);
     }
@@ -597,8 +680,14 @@ type_getsets! {
 
 pub fn init(it: &mut Interp) {
     let t = &it.types;
-    let (object, type_, property, staticmethod, classmethod, super_) =
-        (t.object.clone(), t.type_.clone(), t.property.clone(), t.staticmethod.clone(), t.classmethod.clone(), t.super_.clone());
+    let (object, type_, property, staticmethod, classmethod, super_) = (
+        t.object.clone(),
+        t.type_.clone(),
+        t.property.clone(),
+        t.staticmethod.clone(),
+        t.classmethod.clone(),
+        t.super_.clone(),
+    );
     it.reg_new(&object, obj_new);
     it.reg(&object, "__init__", obj_init);
     it.reg(&object, "__setattr__", obj_setattr);

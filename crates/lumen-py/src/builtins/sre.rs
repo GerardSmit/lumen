@@ -109,7 +109,9 @@ fn wide_text(w: &[u32]) -> String {
 }
 
 fn wide_of(obj: &Obj) -> Rc<[u32]> {
-    let Kind::Str(s) = &obj.kind else { unreachable!() };
+    let Kind::Str(s) = &obj.kind else {
+        unreachable!()
+    };
     WIDE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(i) = cache.iter().position(|(o, _)| Rc::ptr_eq(o, obj)) {
@@ -141,12 +143,28 @@ impl Input {
     fn new(it: &mut Interp, pat: &PatInfo, string: &Value) -> R<Input> {
         let input = match string {
             Value::Obj(o) => match &o.kind {
-                Kind::Str(s) if s.ascii => Input { subj: Subj::Ascii(o.clone()), len: s.s.len(), isbytes: false },
-                Kind::Str(s) => Input { subj: Subj::Wide(wide_of(o)), len: s.nchars, isbytes: false },
-                Kind::Bytes(b) => Input { subj: Subj::Bytes(o.clone()), len: b.len(), isbytes: true },
+                Kind::Str(s) if s.ascii => Input {
+                    subj: Subj::Ascii(o.clone()),
+                    len: s.s.len(),
+                    isbytes: false,
+                },
+                Kind::Str(s) => Input {
+                    subj: Subj::Wide(wide_of(o)),
+                    len: s.nchars,
+                    isbytes: false,
+                },
+                Kind::Bytes(b) => Input {
+                    subj: Subj::Bytes(o.clone()),
+                    len: b.len(),
+                    isbytes: true,
+                },
                 Kind::ByteArray(b) => {
                     let copy: Rc<[u8]> = (&*b.bytes()).into();
-                    Input { len: copy.len(), subj: Subj::Owned(copy), isbytes: true }
+                    Input {
+                        len: copy.len(),
+                        subj: Subj::Owned(copy),
+                        isbytes: true,
+                    }
                 }
                 _ => return Err(not_a_string(it, string)),
             },
@@ -219,7 +237,10 @@ impl Input {
 
 fn not_a_string(it: &mut Interp, v: &Value) -> Obj {
     let t = it.type_name_of(v);
-    it.type_error(&format!("expected string or bytes-like object, got '{}'", t))
+    it.type_error(&format!(
+        "expected string or bytes-like object, got '{}'",
+        t
+    ))
 }
 
 /// Pieces of a `sub`/`expand` result, joined with the type rules of `str.join` / `bytes.join`.
@@ -232,7 +253,12 @@ struct Joiner {
 
 impl Joiner {
     fn new(isbytes: bool) -> Joiner {
-        Joiner { isbytes, text: String::new(), bytes: Vec::new(), count: 0 }
+        Joiner {
+            isbytes,
+            text: String::new(),
+            bytes: Vec::new(),
+            count: 0,
+        }
     }
 
     fn push_value(&mut self, it: &mut Interp, v: &Value) -> R<()> {
@@ -257,9 +283,15 @@ impl Joiner {
         }
         let t = it.type_name_of(v);
         Err(it.type_error(&if self.isbytes {
-            format!("sequence item {}: expected a bytes-like object, {} found", index, t)
+            format!(
+                "sequence item {}: expected a bytes-like object, {} found",
+                index, t
+            )
         } else {
-            format!("sequence item {}: expected str instance, {} found", index, t)
+            format!(
+                "sequence item {}: expected str instance, {} found",
+                index, t
+            )
         }))
     }
 
@@ -319,7 +351,14 @@ fn bounds((pos, endpos): (i64, i64), len: usize) -> (usize, usize) {
     (clamp(pos, len), clamp(endpos, len))
 }
 
-fn new_match(it: &mut Interp, pat: &PatInfo, string: &Value, caps: &Captures, pos: usize, endpos: usize) -> Value {
+fn new_match(
+    it: &mut Interp,
+    pat: &PatInfo,
+    string: &Value,
+    caps: &Captures,
+    pos: usize,
+    endpos: usize,
+) -> Value {
     let ty = types(it).matched;
     let mut marks = Vec::with_capacity(pat.groups + 1);
     for g in 0..=pat.groups {
@@ -329,7 +368,17 @@ fn new_match(it: &mut Interp, pat: &PatInfo, string: &Value, caps: &Captures, po
         });
     }
     let lastindex = caps.last_group().map_or(-1, |g| g as i64);
-    new_opaque(&ty, MatchData { pattern: pat.this.clone(), string: string.clone(), marks, pos, endpos, lastindex })
+    new_opaque(
+        &ty,
+        MatchData {
+            pattern: pat.this.clone(),
+            string: string.clone(),
+            marks,
+            pos,
+            endpos,
+            lastindex,
+        },
+    )
 }
 
 fn no_instances(it: &mut Interp, name: &str) -> Obj {
@@ -361,15 +410,26 @@ fn code_word(it: &mut Interp, v: &Value) -> R<u32> {
         _ => {
             if !it.has_index(v) {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+                return Err(it.type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    t
+                )));
             }
             it.index_of(v)?
         }
     };
     if n < 0 {
-        return Err(it.new_exc_str("OverflowError", "can't convert negative value to unsigned int"));
+        return Err(it.new_exc_str(
+            "OverflowError",
+            "can't convert negative value to unsigned int",
+        ));
     }
-    u32::try_from(n).map_err(|_| it.new_exc_str("OverflowError", "regular expression code size limit exceeded"))
+    u32::try_from(n).map_err(|_| {
+        it.new_exc_str(
+            "OverflowError",
+            "regular expression code size limit exceeded",
+        )
+    })
 }
 
 fn string_kind(it: &mut Interp, v: &Value) -> R<i8> {
@@ -385,13 +445,30 @@ fn string_kind(it: &mut Interp, v: &Value) -> R<i8> {
 }
 
 fn sre_compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("compile", a, kw, &["pattern", "flags", "code", "groups", "groupindex", "indexgroup"], 6)?;
+    let b = it.bind_args(
+        "compile",
+        a,
+        kw,
+        &[
+            "pattern",
+            "flags",
+            "code",
+            "groups",
+            "groupindex",
+            "indexgroup",
+        ],
+        6,
+    )?;
     let get = |i: usize| b[i].clone().unwrap();
-    let (pattern, flags_v, code_v, groups_v, groupindex, indexgroup) = (get(0), get(1), get(2), get(3), get(4), get(5));
+    let (pattern, flags_v, code_v, groups_v, groupindex, indexgroup) =
+        (get(0), get(1), get(2), get(3), get(4), get(5));
     let flags = it.index_of(&flags_v)?;
     let Some(list) = list_of(&code_v) else {
         let t = it.type_name_of(&code_v);
-        return Err(it.type_error(&format!("compile() argument 'code' must be list, not {}", t)));
+        return Err(it.type_error(&format!(
+            "compile() argument 'code' must be list, not {}",
+            t
+        )));
     };
     let items: Vec<Value> = list.borrow().clone();
     let mut code = Vec::with_capacity(items.len());
@@ -401,11 +478,17 @@ fn sre_compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let groups = it.index_of(&groups_v)?;
     if dict_of(&groupindex).is_none() {
         let t = it.type_name_of(&groupindex);
-        return Err(it.type_error(&format!("compile() argument 'groupindex' must be dict, not {}", t)));
+        return Err(it.type_error(&format!(
+            "compile() argument 'groupindex' must be dict, not {}",
+            t
+        )));
     }
     if indexgroup.tuple_items().is_none() {
         let t = it.type_name_of(&indexgroup);
-        return Err(it.type_error(&format!("compile() argument 'indexgroup' must be tuple, not {}", t)));
+        return Err(it.type_error(&format!(
+            "compile() argument 'indexgroup' must be tuple, not {}",
+            t
+        )));
     }
     let isbytes = string_kind(it, &pattern)?;
     if groups < 0 || groups as u64 > sre::MAXGROUPS as u64 {
@@ -413,7 +496,9 @@ fn sre_compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     }
     let regex = match sre::build(&code, groups as usize) {
         Ok(r) => r,
-        Err(sre::SreError::Invalid) => return Err(it.new_exc_str("RuntimeError", "invalid SRE code")),
+        Err(sre::SreError::Invalid) => {
+            return Err(it.new_exc_str("RuntimeError", "invalid SRE code"))
+        }
         Err(sre::SreError::Limit(msg)) => return Err(it.new_exc_str("OverflowError", &msg)),
     };
     let named = dict_of(&groupindex).map_or(0, |d| d.borrow().len());
@@ -426,7 +511,16 @@ fn sre_compile(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let ty = types(it).pattern;
     Ok(new_opaque(
         &ty,
-        PatternData { pattern, flags, groups: groups as usize, groupindex, indexgroup, isbytes, code, regex: Rc::new(regex) },
+        PatternData {
+            pattern,
+            flags,
+            groups: groups as usize,
+            groupindex,
+            indexgroup,
+            isbytes,
+            code,
+            regex: Rc::new(regex),
+        },
     ))
 }
 
@@ -434,7 +528,10 @@ fn sre_template(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("template", a, 2, 2)?;
     let Some(list) = list_of(&a[1]) else {
         let t = it.type_name_of(&a[1]);
-        return Err(it.type_error(&format!("template() argument 'template' must be list, not {}", t)));
+        return Err(it.type_error(&format!(
+            "template() argument 'template' must be list, not {}",
+            t
+        )));
     };
     let items: Vec<Value> = list.borrow().clone();
     if items.len() % 2 == 0 {
@@ -457,7 +554,13 @@ fn sre_template(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         out.push((index as usize, literal));
     }
     let ty = types(it).template;
-    Ok(new_opaque(&ty, TemplateData { literal: items[0].clone(), items: out }))
+    Ok(new_opaque(
+        &ty,
+        TemplateData {
+            literal: items[0].clone(),
+            items: out,
+        },
+    ))
 }
 
 fn sre_getcodesize(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -492,7 +595,11 @@ fn sre_unicode_iscased(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn sre_ascii_tolower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let c = char_arg(it, a, "ascii_tolower")?;
-    Ok(Value::Int(if c < 128 { (c as u8).to_ascii_lowercase() as i64 } else { c as i64 }))
+    Ok(Value::Int(if c < 128 {
+        (c as u8).to_ascii_lowercase() as i64
+    } else {
+        c as i64
+    }))
 }
 
 fn sre_unicode_tolower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -503,13 +610,24 @@ fn sre_unicode_tolower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 // ---- Pattern ------------------------------------------------------------------------------------
 
 fn match_like(it: &mut Interp, a: &[Value], kw: Kw, name: &str, mode: Mode) -> R<Value> {
-    let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
+    let b = it.bind_args(
+        name,
+        &a[1.min(a.len())..],
+        kw,
+        &["string", "pos", "endpos"],
+        1,
+    )?;
     let pat = pat_info(it, &a[0])?;
     let string = b[0].clone().unwrap();
     let at = indices(it, &b[1], &b[2])?;
     let input = Input::new(it, &pat, &string)?;
     let (start, end) = bounds(at, input.len);
-    let opts = ExecOptions { start, end: Some(end), mode, must_advance: false };
+    let opts = ExecOptions {
+        start,
+        end: Some(end),
+        mode,
+        must_advance: false,
+    };
     Ok(match run(it, &pat, &input, opts)? {
         Some(caps) => new_match(it, &pat, &string, &caps, start, end),
         None => Value::None,
@@ -538,7 +656,13 @@ fn group_text(input: &Input, string: &Value, caps: &Captures, g: usize, empty: b
 }
 
 fn pattern_findall(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("findall", &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
+    let b = it.bind_args(
+        "findall",
+        &a[1.min(a.len())..],
+        kw,
+        &["string", "pos", "endpos"],
+        1,
+    )?;
     let pat = pat_info(it, &a[0])?;
     let string = b[0].clone().unwrap();
     let at = indices(it, &b[1], &b[2])?;
@@ -548,13 +672,24 @@ fn pattern_findall(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let mut must_advance = false;
     while start <= end {
         it.poll()?;
-        let opts = ExecOptions { start, end: Some(end), mode: Mode::Search, must_advance };
-        let Some(caps) = run(it, &pat, &input, opts)? else { break };
+        let opts = ExecOptions {
+            start,
+            end: Some(end),
+            mode: Mode::Search,
+            must_advance,
+        };
+        let Some(caps) = run(it, &pat, &input, opts)? else {
+            break;
+        };
         let (ms, me) = caps[0].unwrap();
         out.push(match pat.groups {
             0 => input.slice(&string, ms, me),
             1 => group_text(&input, &string, &caps, 1, true),
-            n => Value::tuple((1..=n).map(|g| group_text(&input, &string, &caps, g, true)).collect()),
+            n => Value::tuple(
+                (1..=n)
+                    .map(|g| group_text(&input, &string, &caps, g, true))
+                    .collect(),
+            ),
         });
         must_advance = me == ms;
         start = me;
@@ -563,7 +698,13 @@ fn pattern_findall(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 }
 
 fn pattern_scanner(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("scanner", &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
+    let b = it.bind_args(
+        "scanner",
+        &a[1.min(a.len())..],
+        kw,
+        &["string", "pos", "endpos"],
+        1,
+    )?;
     new_scanner(it, &a[0], &b)
 }
 
@@ -574,18 +715,46 @@ fn new_scanner(it: &mut Interp, pattern: &Value, b: &[Option<Value>]) -> R<Value
     let input = Input::new(it, &pat, &string)?;
     let (pos, endpos) = bounds(at, input.len);
     let ty = types(it).scanner;
-    Ok(new_opaque(&ty, ScannerData { pat, string, input, pos, endpos, start: Some(pos), must_advance: false, executing: false }))
+    Ok(new_opaque(
+        &ty,
+        ScannerData {
+            pat,
+            string,
+            input,
+            pos,
+            endpos,
+            start: Some(pos),
+            must_advance: false,
+            executing: false,
+        },
+    ))
 }
 
 fn pattern_finditer(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("finditer", &a[1.min(a.len())..], kw, &["string", "pos", "endpos"], 1)?;
+    let b = it.bind_args(
+        "finditer",
+        &a[1.min(a.len())..],
+        kw,
+        &["string", "pos", "endpos"],
+        1,
+    )?;
     let scanner = new_scanner(it, &a[0], &b)?;
     let search = it.get_attr_str(&scanner, "search")?;
-    Ok(it.mk_iter(IterState::CallIter { f: search, sentinel: Value::None, done: false }))
+    Ok(it.mk_iter(IterState::CallIter {
+        f: search,
+        sentinel: Value::None,
+        done: false,
+    }))
 }
 
 fn pattern_split(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("split", &a[1.min(a.len())..], kw, &["string", "maxsplit"], 1)?;
+    let b = it.bind_args(
+        "split",
+        &a[1.min(a.len())..],
+        kw,
+        &["string", "maxsplit"],
+        1,
+    )?;
     let pat = pat_info(it, &a[0])?;
     let string = b[0].clone().unwrap();
     let maxsplit = match &b[1] {
@@ -598,8 +767,15 @@ fn pattern_split(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let (mut n, mut last, mut start, mut must_advance) = (0i64, 0usize, 0usize, false);
     while maxsplit == 0 || n < maxsplit {
         it.poll()?;
-        let opts = ExecOptions { start, end: None, mode: Mode::Search, must_advance };
-        let Some(caps) = run(it, &pat, &input, opts)? else { break };
+        let opts = ExecOptions {
+            start,
+            end: None,
+            mode: Mode::Search,
+            must_advance,
+        };
+        let Some(caps) = run(it, &pat, &input, opts)? else {
+            break;
+        };
         let (ms, me) = caps[0].unwrap();
         out.push(input.slice(&string, last, ms));
         for g in 1..=pat.groups {
@@ -645,7 +821,10 @@ fn compile_template(it: &mut Interp, pattern: &Value, template: &Value) -> R<Tem
         Some(t) => Ok(t),
         None => {
             let t = it.type_name_of(&result);
-            Err(it.new_exc_str("RuntimeError", &format!("the result of compiling a replacement string is {}", t)))
+            Err(it.new_exc_str(
+                "RuntimeError",
+                &format!("the result of compiling a replacement string is {}", t),
+            ))
         }
     }
 }
@@ -663,7 +842,14 @@ fn is_literal_template(v: &Value) -> bool {
 }
 
 /// The expansion of `template` for a match, joined into one str or bytes value.
-fn expand(it: &mut Interp, template: &TemplateData, groups: usize, input: &Input, string: &Value, caps: &Captures) -> R<Value> {
+fn expand(
+    it: &mut Interp,
+    template: &TemplateData,
+    groups: usize,
+    input: &Input,
+    string: &Value,
+    caps: &Captures,
+) -> R<Value> {
     if template.items.is_empty() {
         return Ok(template.literal.clone());
     }
@@ -686,7 +872,13 @@ fn expand(it: &mut Interp, template: &TemplateData, groups: usize, input: &Input
 }
 
 fn pattern_subx(it: &mut Interp, a: &[Value], kw: Kw, name: &str, subn: bool) -> R<Value> {
-    let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["repl", "string", "count"], 2)?;
+    let b = it.bind_args(
+        name,
+        &a[1.min(a.len())..],
+        kw,
+        &["repl", "string", "count"],
+        2,
+    )?;
     let pat = pat_info(it, &a[0])?;
     let (repl, string) = (b[0].clone().unwrap(), b[1].clone().unwrap());
     let count = match &b[2] {
@@ -698,7 +890,9 @@ fn pattern_subx(it: &mut Interp, a: &[Value], kw: Kw, name: &str, subn: bool) ->
     } else if is_literal_template(&repl) {
         Filter::Literal(match &repl {
             Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => {
-                let Kind::ByteArray(v) = &o.kind else { unreachable!() };
+                let Kind::ByteArray(v) = &o.kind else {
+                    unreachable!()
+                };
                 Value::bytes(v.to_vec())
             }
             _ => repl,
@@ -717,8 +911,15 @@ fn pattern_subx(it: &mut Interp, a: &[Value], kw: Kw, name: &str, subn: bool) ->
     let (mut n, mut copied, mut start, mut must_advance) = (0i64, 0usize, 0usize, false);
     while count == 0 || n < count {
         it.poll()?;
-        let opts = ExecOptions { start, end: None, mode: Mode::Search, must_advance };
-        let Some(caps) = run(it, &pat, &input, opts)? else { break };
+        let opts = ExecOptions {
+            start,
+            end: None,
+            mode: Mode::Search,
+            must_advance,
+        };
+        let Some(caps) = run(it, &pat, &input, opts)? else {
+            break;
+        };
         let (ms, me) = caps[0].unwrap();
         if copied < ms {
             input.push_slice(&mut out, copied, ms);
@@ -746,7 +947,11 @@ fn pattern_subx(it: &mut Interp, a: &[Value], kw: Kw, name: &str, subn: bool) ->
         input.push_slice(&mut out, copied, end);
     }
     let result = out.finish();
-    Ok(if subn { Value::tuple(vec![result, Value::Int(n)]) } else { result })
+    Ok(if subn {
+        Value::tuple(vec![result, Value::Int(n)])
+    } else {
+        result
+    })
 }
 
 fn pattern_sub(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
@@ -768,7 +973,9 @@ fn class_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn pattern_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some((pattern, mut flags, isbytes)) = with_opaque::<PatternData, _>(&a[0], |d| (d.pattern.clone(), d.flags, d.isbytes)) else {
+    let Some((pattern, mut flags, isbytes)) =
+        with_opaque::<PatternData, _>(&a[0], |d| (d.pattern.clone(), d.flags, d.isbytes))
+    else {
         return Err(it.self_state_err("re.Pattern"));
     };
     if isbytes == 0 && flags & (FLAG_LOCALE | FLAG_UNICODE | FLAG_ASCII) == FLAG_UNICODE {
@@ -804,9 +1011,9 @@ fn pattern_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn pattern_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let Some((pattern, flags, isbytes, code)) =
-        with_opaque::<PatternData, _>(&a[0], |d| (d.pattern.clone(), d.flags, d.isbytes, d.code.clone()))
-    else {
+    let Some((pattern, flags, isbytes, code)) = with_opaque::<PatternData, _>(&a[0], |d| {
+        (d.pattern.clone(), d.flags, d.isbytes, d.code.clone())
+    }) else {
         return Err(it.self_state_err("re.Pattern"));
     };
     let mut hash = it.hash_value(&pattern)?;
@@ -817,7 +1024,11 @@ fn pattern_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn pattern_eq_impl(it: &mut Interp, a: &[Value], ne: bool) -> R<Value> {
-    let key = |v: &Value| with_opaque::<PatternData, _>(v, |d| (d.pattern.clone(), d.flags, d.isbytes, d.code.clone()));
+    let key = |v: &Value| {
+        with_opaque::<PatternData, _>(v, |d| {
+            (d.pattern.clone(), d.flags, d.isbytes, d.code.clone())
+        })
+    };
     let (Some(l), Some(r)) = (key(&a[0]), key(&a[1])) else {
         return Ok(Value::NotImplemented);
     };
@@ -852,15 +1063,18 @@ fn pattern_groupindex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn pattern_pattern(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    with_opaque::<PatternData, _>(&a[0], |d| d.pattern.clone()).ok_or_else(|| it.self_state_err("re.Pattern"))
+    with_opaque::<PatternData, _>(&a[0], |d| d.pattern.clone())
+        .ok_or_else(|| it.self_state_err("re.Pattern"))
 }
 
 fn pattern_flags(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    with_opaque::<PatternData, _>(&a[0], |d| Value::Int(d.flags)).ok_or_else(|| it.self_state_err("re.Pattern"))
+    with_opaque::<PatternData, _>(&a[0], |d| Value::Int(d.flags))
+        .ok_or_else(|| it.self_state_err("re.Pattern"))
 }
 
 fn pattern_groups(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    with_opaque::<PatternData, _>(&a[0], |d| Value::Int(d.groups as i64)).ok_or_else(|| it.self_state_err("re.Pattern"))
+    with_opaque::<PatternData, _>(&a[0], |d| Value::Int(d.groups as i64))
+        .ok_or_else(|| it.self_state_err("re.Pattern"))
 }
 
 // ---- Match --------------------------------------------------------------------------------------
@@ -871,7 +1085,9 @@ fn md<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&MatchData) -> X) -> R<X> {
 
 /// A slice of the match's subject by character offsets, clamped to its current length.
 fn subject_slice(string: &Value, a: i64, b: i64) -> Value {
-    let Value::Obj(o) = string else { return Value::None };
+    let Value::Obj(o) = string else {
+        return Value::None;
+    };
     let (a, b) = (a.max(0) as usize, b.max(0) as usize);
     match &o.kind {
         Kind::Str(s) if s.ascii => {
@@ -911,7 +1127,8 @@ fn group_index(it: &mut Interp, m: &Value, index: Option<&Value>) -> R<usize> {
         None => Some(0),
         Some(v) if it.has_index(v) => Some(it.index_of(v)?),
         Some(v) => {
-            let gi = with_opaque::<PatternData, _>(&pattern, |d| d.groupindex.clone()).unwrap_or(Value::None);
+            let gi = with_opaque::<PatternData, _>(&pattern, |d| d.groupindex.clone())
+                .unwrap_or(Value::None);
             match &gi {
                 Value::Obj(d) => match it.dict_get(d, v)? {
                     Some(Value::Int(n)) => Some(n),
@@ -976,9 +1193,12 @@ fn match_groupdict(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let default = b[0].clone().unwrap_or(Value::None);
     let pattern = md(it, &a[0], |d| d.pattern.clone())?;
     let result = it.new_dict();
-    let gi = with_opaque::<PatternData, _>(&pattern, |d| d.groupindex.clone()).unwrap_or(Value::None);
+    let gi =
+        with_opaque::<PatternData, _>(&pattern, |d| d.groupindex.clone()).unwrap_or(Value::None);
     if let Value::Obj(d) = &gi {
-        let keys = crate::containers::pydict_of(d).map(|p| p.borrow().keys()).unwrap_or_default();
+        let keys = crate::containers::pydict_of(d)
+            .map(|p| p.borrow().keys())
+            .unwrap_or_default();
         for key in keys {
             let v = match_getslice(it, &a[0], Some(&key), &default)?;
             it.dict_set(&result, key, v)?;
@@ -1012,13 +1232,20 @@ fn match_span(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
 
 fn match_regs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let marks = md(it, &a[0], |d| d.marks.clone())?;
-    Ok(Value::tuple(marks.into_iter().map(|(s, e)| Value::tuple(vec![Value::Int(s), Value::Int(e)])).collect()))
+    Ok(Value::tuple(
+        marks
+            .into_iter()
+            .map(|(s, e)| Value::tuple(vec![Value::Int(s), Value::Int(e)]))
+            .collect(),
+    ))
 }
 
 fn match_expand(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let b = it.bind_args("expand", &a[1.min(a.len())..], kw, &["template"], 1)?;
     let template = b[0].clone().unwrap();
-    let (pattern, string, marks) = md(it, &a[0], |d| (d.pattern.clone(), d.string.clone(), d.marks.clone()))?;
+    let (pattern, string, marks) = md(it, &a[0], |d| {
+        (d.pattern.clone(), d.string.clone(), d.marks.clone())
+    })?;
     let t = compile_template(it, &pattern, &template)?;
     if t.items.is_empty() {
         return Ok(t.literal);
@@ -1049,7 +1276,8 @@ fn match_lastindex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn match_lastgroup(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let (pattern, i) = md(it, &a[0], |d| (d.pattern.clone(), d.lastindex))?;
-    let ig = with_opaque::<PatternData, _>(&pattern, |d| d.indexgroup.clone()).unwrap_or(Value::None);
+    let ig =
+        with_opaque::<PatternData, _>(&pattern, |d| d.indexgroup.clone()).unwrap_or(Value::None);
     Ok(match ig.tuple_items() {
         Some(t) if i >= 0 && (i as usize) < t.len() => t[i as usize].clone(),
         _ => Value::None,
@@ -1076,7 +1304,10 @@ fn match_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let span = md(it, &a[0], |d| d.marks[0])?;
     let group0 = group_slice(it, &a[0], 0, &Value::None)?;
     let shown: String = it.repr_of(&group0)?.chars().take(50).collect();
-    Ok(Value::string(format!("<re.Match object; span=({}, {}), match={}>", span.0, span.1, shown)))
+    Ok(Value::string(format!(
+        "<re.Match object; span=({}, {}), match={}>",
+        span.0, span.1, shown
+    )))
 }
 
 // ---- Scanner ------------------------------------------------------------------------------------
@@ -1087,7 +1318,15 @@ fn scanner_step(it: &mut Interp, a: &[Value], mode: Mode) -> R<Value> {
             return None;
         }
         s.executing = true;
-        Some((s.pat.clone(), s.string.clone(), s.input.clone(), s.pos, s.endpos, s.start, s.must_advance))
+        Some((
+            s.pat.clone(),
+            s.string.clone(),
+            s.input.clone(),
+            s.pos,
+            s.endpos,
+            s.start,
+            s.must_advance,
+        ))
     }) else {
         return Err(it.self_state_err("_sre.SRE_Scanner"));
     };
@@ -1117,7 +1356,12 @@ fn scanner_step(it: &mut Interp, a: &[Value], mode: Mode) -> R<Value> {
     let Some(start) = start else {
         return finish(it, Ok(None)).map(|_| Value::None);
     };
-    let opts = ExecOptions { start, end: Some(endpos), mode, must_advance };
+    let opts = ExecOptions {
+        start,
+        end: Some(endpos),
+        mode,
+        must_advance,
+    };
     let outcome = run(it, &pat, &input, opts);
     finish(it, outcome)
 }
@@ -1133,7 +1377,8 @@ fn scanner_search(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn scanner_pattern(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    with_opaque::<ScannerData, _>(&a[0], |s| s.pat.this.clone()).ok_or_else(|| it.self_state_err("_sre.SRE_Scanner"))
+    with_opaque::<ScannerData, _>(&a[0], |s| s.pat.this.clone())
+        .ok_or_else(|| it.self_state_err("_sre.SRE_Scanner"))
 }
 
 pub fn make(it: &mut Interp) -> Obj {
@@ -1145,7 +1390,11 @@ pub fn make(it: &mut Interp) -> Obj {
     dict_set_str(&d, "CODESIZE", Value::Int(4));
     dict_set_str(&d, "MAXREPEAT", Value::Int(sre::MAXREPEAT as i64));
     dict_set_str(&d, "MAXGROUPS", Value::Int(sre::MAXGROUPS as i64));
-    dict_set_str(&d, "copyright", Value::str(" SRE 2.2.2 Copyright (c) 1997-2002 by Secret Labs AB "));
+    dict_set_str(
+        &d,
+        "copyright",
+        Value::str(" SRE 2.2.2 Copyright (c) 1997-2002 by Secret Labs AB "),
+    );
     let funcs: &[(&'static str, NativeFn)] = &[
         ("compile", sre_compile),
         ("template", sre_template),

@@ -16,7 +16,7 @@ mod shapes;
 mod storage;
 #[cfg(test)]
 mod tests;
-pub(in crate::value) use shapes::{array_length_shape, Shape, ShapeTable};
+pub(in crate::value) use shapes::{Shape, ShapeTable, array_length_shape};
 pub(crate) use shapes::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census};
 pub(crate) use shapes::{jit_shared_shape, proto_epoch_addr};
 /// Sizes for a heap census (`LUMEN_HEAP_CENSUS`): entries used / reserved, how many of them are
@@ -438,10 +438,11 @@ impl Props {
     /// setter already live in a box every copy of the property shares, so the collector sees
     /// the same edges whether the entries are copied or shared.
     pub(crate) fn share_entries(&mut self) {
-        debug_assert!(self
-            .entries
-            .iter()
-            .all(|p| !p.writable() && !matches!(p.value(), Value::Obj(_))));
+        debug_assert!(
+            self.entries
+                .iter()
+                .all(|p| !p.writable() && !matches!(p.value(), Value::Obj(_)))
+        );
         self.entries.make_shared();
     }
 

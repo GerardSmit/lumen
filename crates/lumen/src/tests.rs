@@ -9080,6 +9080,71 @@ fn dynamic_import_top_level_await() {
     }
 }
 
+#[cfg(feature = "embed")]
+#[test]
+fn host_module_handle_polls_tla_and_separates_inline_keys_from_urls() {
+    let mut engine = Engine::new();
+    engine
+        .eval(
+            "globalThis.inlineUrls = []; globalThis.dependencyUrls = []",
+            false,
+        )
+        .expect("setup parses");
+    let module_url = "https://wpt.test/path/page.html?variant=one#document";
+    let expected_module_url = module_url.to_owned();
+    let first = engine
+        .eval_module_attrs_pending(
+            "import { url } from './dependency.mjs?dep=two#dependency'; globalThis.inlineUrls.push(import.meta.url); globalThis.dependencyUrls.push(url); export const answer = await Promise.resolve(42);",
+            "inline-record:first",
+            module_url,
+            move |specifier, referrer, attributes| {
+                assert_eq!(specifier, "./dependency.mjs?dep=two#dependency");
+                assert_eq!(referrer, expected_module_url);
+                assert_eq!(attributes, None);
+                Some((
+                    "https://wpt.test/path/dependency.mjs?dep=two#dependency".into(),
+                    "export const url = import.meta.url;".into(),
+                ))
+            },
+        )
+        .expect("module graph starts");
+    assert!(matches!(
+        engine.module_evaluation_status(&first),
+        crate::ModuleEvaluationStatus::Pending
+    ));
+    engine.run_microtasks();
+    assert!(matches!(
+        engine.module_evaluation_status(&first),
+        crate::ModuleEvaluationStatus::Fulfilled
+    ));
+
+    let second = engine
+        .eval_module_attrs_pending(
+            "globalThis.inlineUrls.push(import.meta.url); export const answer = 7;",
+            "inline-record:second",
+            module_url,
+            |_, _, _| None,
+        )
+        .expect("second inline record starts independently");
+    engine.run_microtasks();
+    assert!(matches!(
+        engine.module_evaluation_status(&second),
+        crate::ModuleEvaluationStatus::Fulfilled
+    ));
+    match engine.eval("JSON.stringify([inlineUrls, dependencyUrls])", false) {
+        Ok(crate::Completion::Value(value)) => {
+            assert_eq!(
+                value,
+                format!(
+                    "[[\"{module_url}\",\"{module_url}\"],[\"https://wpt.test/path/dependency.mjs?dep=two#dependency\"]]"
+                )
+            );
+        }
+        Ok(crate::Completion::Throw { name, message }) => panic!("{name}: {message}"),
+        Err(error) => panic!("script parse: {}", error.message),
+    }
+}
+
 #[test]
 fn small_area_conformance_fixes() {
     // U+FEFF is whitespace anywhere in the source.
@@ -11864,4 +11929,73 @@ fn global_declarations_define_properties_in_hoisting_order() {
         run(&src),
         format!("{};{}", expect(script, "g"), expect(evald, "e"))
     );
+}
+
+#[test]
+fn host_module_request_scan_uses_static_parser_edges_only() {
+    let requests = crate::module_requests(
+        r#"
+            import data from "./data.json" with { type: "json" };
+            export { value } from "./re-export.js?variant=one";
+            export * from "./all.js";
+            void import("./dynamic.js");
+        "#,
+    )
+    .expect("valid static module requests");
+    assert_eq!(
+        requests,
+        vec![
+            crate::ModuleRequest {
+                specifier: "./data.json".into(),
+                attribute_type: Some("json".into()),
+            },
+            crate::ModuleRequest {
+                specifier: "./re-export.js?variant=one".into(),
+                attribute_type: None,
+            },
+            crate::ModuleRequest {
+                specifier: "./all.js".into(),
+                attribute_type: None,
+            },
+        ]
+    );
+}
+
+#[cfg(feature = "embed")]
+#[test]
+fn host_inline_module_separates_import_base_from_import_meta_url() {
+    let mut engine = Engine::new();
+    let module_url = "https://wpt.test/page.html?doc=one";
+    let import_base = "https://wpt.test/assets/";
+    let expected_base = import_base.to_owned();
+    let handle = engine
+        .eval_module_attrs_pending_with_base(
+            "import { resolved } from './dep.js'; globalThis.inlineMetaUrl=import.meta.url; globalThis.dependencyBase=resolved;",
+            "inline-record:base-test",
+            module_url,
+            import_base,
+            move |specifier, referrer, attributes| {
+                assert_eq!(specifier, "./dep.js");
+                assert_eq!(referrer, expected_base);
+                assert_eq!(attributes, None);
+                Some((
+                    "https://wpt.test/assets/dep.js".into(),
+                    "export const resolved = import.meta.url;".into(),
+                ))
+            },
+        )
+        .expect("inline module graph starts");
+    engine.run_microtasks();
+    assert!(matches!(
+        engine.module_evaluation_status(&handle),
+        crate::ModuleEvaluationStatus::Fulfilled
+    ));
+    match engine.eval("JSON.stringify([inlineMetaUrl, dependencyBase])", false) {
+        Ok(crate::Completion::Value(value)) => assert_eq!(
+            value,
+            format!("[\"{module_url}\",\"https://wpt.test/assets/dep.js\"]")
+        ),
+        Ok(crate::Completion::Throw { name, message }) => panic!("{name}: {message}"),
+        Err(error) => panic!("script parse: {}", error.message),
+    }
 }

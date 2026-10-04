@@ -251,7 +251,11 @@ pub(crate) fn stack_region(
 pub(crate) fn native_stack_region(
     chunk: &Chunk,
 ) -> Result<(Vec<Option<usize>>, Vec<Vec<(usize, usize)>>, usize), String> {
-    let end = chunk.ops.len().checked_sub(1).ok_or("bytecode: empty chunk")?;
+    let end = chunk
+        .ops
+        .len()
+        .checked_sub(1)
+        .ok_or("bytecode: empty chunk")?;
     stack_region_inner(chunk, 0, end, true, false, true)
 }
 

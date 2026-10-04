@@ -23,11 +23,22 @@ fn success(out: Output) -> String {
 fn standalone_runs_without_sources_and_owns_its_arguments() {
     let dir = std::env::temp_dir().join(format!("lumen-standalone-cli-{}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    std::fs::write(dir.join("app.js"), "console.log(42); console.log(process.argv[2]);").unwrap();
+    std::fs::write(
+        dir.join("app.js"),
+        "console.log(42); console.log(process.argv[2]);",
+    )
+    .unwrap();
     let name = if cfg!(windows) { "app.exe" } else { "app" };
-    success(cli(&dir, &["compile", "app.js", "--script", "--exe", "-o", name]));
+    success(cli(
+        &dir,
+        &["compile", "app.js", "--script", "--exe", "-o", name],
+    ));
     std::fs::remove_file(dir.join("app.js")).unwrap();
-    let output = Command::new(dir.join(name)).current_dir(&dir).arg("compile").output().unwrap();
+    let output = Command::new(dir.join(name))
+        .current_dir(&dir)
+        .arg("compile")
+        .output()
+        .unwrap();
     assert_eq!(success(output).replace('\r', ""), "42\ncompile\n");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -64,11 +75,23 @@ fn compiles_and_runs_bundled_typescript_without_source_files() {
         std::fs::read(dir.join("second.lbc")).unwrap(),
         "non-deterministic blob"
     );
-    success(cli(&dir, &[
-        "compile", "app.mts", "--profile", "nojit", "--compression", "false",
-        "-o", "uncompressed.lbc",
-    ]));
-    assert_eq!(success(cli(&dir, &["run", "uncompressed.lbc"])).trim(), "42");
+    success(cli(
+        &dir,
+        &[
+            "compile",
+            "app.mts",
+            "--profile",
+            "nojit",
+            "--compression",
+            "false",
+            "-o",
+            "uncompressed.lbc",
+        ],
+    ));
+    assert_eq!(
+        success(cli(&dir, &["run", "uncompressed.lbc"])).trim(),
+        "42"
+    );
     assert!(!cli(&dir, &["compile", "app.mts", "-o", "app.mts"])
         .status
         .success());
@@ -88,17 +111,49 @@ fn compiles_and_runs_bundled_typescript_without_source_files() {
 
 #[test]
 fn runtime_import_union_deduplicates_and_rejects_abi_conflicts() {
-    use lumen_common::aot::{self, native_data::{FunctionEntry, Import}, Section};
+    use lumen_common::aot::{
+        self,
+        native_data::{FunctionEntry, Import},
+        Section,
+    };
     let dir = std::env::temp_dir().join(format!("lumen-runtime-imports-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let write = |name: &str, signature| {
-        let imports = [Import { module: "bitnest:net", name: "send", signature_hash: signature }];
-        let data = aot::native_data::encode_with_imports(&[FunctionEntry { offset: 0, len: 4 }], &imports, b"fixture", 4).unwrap();
-        let blob = aot::encode_native(aot::Language::JavaScript, 42, aot::version_bytes("0.1.0"), &[
-            Section { kind: aot::SEC_NATIVE_CODE, flags: 0, data: b"code" },
-            Section { kind: aot::SEC_NATIVE_DATA, flags: 0, data: &data },
-            Section { kind: aot::SEC_NATIVE_GOT_RELOCS, flags: 0, data: &[] },
-        ]).unwrap();
+        let imports = [Import {
+            module: "bitnest:net",
+            name: "send",
+            signature_hash: signature,
+        }];
+        let data = aot::native_data::encode_with_imports(
+            &[FunctionEntry { offset: 0, len: 4 }],
+            &imports,
+            b"fixture",
+            4,
+        )
+        .unwrap();
+        let blob = aot::encode_native(
+            aot::Language::JavaScript,
+            42,
+            aot::version_bytes("0.1.0"),
+            &[
+                Section {
+                    kind: aot::SEC_NATIVE_CODE,
+                    flags: 0,
+                    data: b"code",
+                },
+                Section {
+                    kind: aot::SEC_NATIVE_DATA,
+                    flags: 0,
+                    data: &data,
+                },
+                Section {
+                    kind: aot::SEC_NATIVE_GOT_RELOCS,
+                    flags: 0,
+                    data: &[],
+                },
+            ],
+        )
+        .unwrap();
         std::fs::write(dir.join(name), blob).unwrap();
     };
     write("first.lmc", 1);
@@ -109,7 +164,13 @@ fn runtime_import_union_deduplicates_and_rejects_abi_conflicts() {
     assert_eq!(json["imports"].as_array().unwrap().len(), 1);
     assert_eq!(json["imports"][0]["module"], "bitnest:net");
     assert_eq!(json["imports"][0]["signatureHash"], "0000000000000001");
-    assert!(!cli(&dir, &["runtime-imports", "first.lmc", "conflict.lmc"]).status.success());
-    for name in ["first.lmc", "second.lmc", "conflict.lmc"] { std::fs::remove_file(dir.join(name)).unwrap(); }
+    assert!(
+        !cli(&dir, &["runtime-imports", "first.lmc", "conflict.lmc"])
+            .status
+            .success()
+    );
+    for name in ["first.lmc", "second.lmc", "conflict.lmc"] {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
     std::fs::remove_dir(dir).unwrap();
 }

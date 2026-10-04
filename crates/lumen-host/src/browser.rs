@@ -37,7 +37,10 @@ pub struct Event {
 
 impl Event {
     pub fn new(kind: impl Into<String>, args: Vec<Arg>) -> Event {
-        Event { kind: kind.into(), args }
+        Event {
+            kind: kind.into(),
+            args,
+        }
     }
 }
 

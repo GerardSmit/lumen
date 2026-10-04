@@ -41,11 +41,23 @@ pub fn decode_utf8<E>(
         let bad = match err_len {
             Some(n) => {
                 let b = data[start];
-                let reason = if (0x80..0xC2).contains(&b) || b >= 0xF5 { "invalid start byte" } else { "invalid continuation byte" };
-                Malformed { start, end: start + n, reason }
+                let reason = if (0x80..0xC2).contains(&b) || b >= 0xF5 {
+                    "invalid start byte"
+                } else {
+                    "invalid continuation byte"
+                };
+                Malformed {
+                    start,
+                    end: start + n,
+                    reason,
+                }
             }
             None if !final_ => return Ok(start),
-            None => Malformed { start, end: data.len(), reason: "unexpected end of data" },
+            None => Malformed {
+                start,
+                end: data.len(),
+                reason: "unexpected end of data",
+            },
         };
         pos = on_error(data, bad, out)?;
     }
@@ -64,7 +76,11 @@ pub fn decode_utf16<E>(
 ) -> Result<usize, E> {
     let unit = |d: &[u8], i: usize| -> u32 {
         let b = [d[i], d[i + 1]];
-        (if big_endian { u16::from_be_bytes(b) } else { u16::from_le_bytes(b) }) as u32
+        (if big_endian {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        }) as u32
     };
     while pos < data.len() {
         let (start, end, reason) = if pos + 1 >= data.len() {
@@ -109,11 +125,17 @@ mod tests {
     fn utf8(b: &[u8], final_: bool) -> (String, usize, Vec<Malformed>) {
         let mut out = String::new();
         let mut bad = Vec::new();
-        let n = decode_utf8::<Infallible>(&mut Cow::Borrowed(b), final_, Spelling::Plain, &mut out, |_, m, out| {
-            bad.push(m);
-            out.push('\u{FFFD}');
-            Ok(m.end)
-        })
+        let n = decode_utf8::<Infallible>(
+            &mut Cow::Borrowed(b),
+            final_,
+            Spelling::Plain,
+            &mut out,
+            |_, m, out| {
+                bad.push(m);
+                out.push('\u{FFFD}');
+                Ok(m.end)
+            },
+        )
         .unwrap();
         (out, n, bad)
     }
@@ -123,24 +145,62 @@ mod tests {
         assert_eq!(utf8(b"a\xF0\x9F\x62", true).0, "a\u{FFFD}b");
         assert_eq!(utf8(b"\xC0\x80", true).0, "\u{FFFD}\u{FFFD}");
         let (_, _, bad) = utf8(b"\x80a\xE2\x28", true);
-        assert_eq!(bad[0], Malformed { start: 0, end: 1, reason: "invalid start byte" });
-        assert_eq!(bad[1], Malformed { start: 2, end: 3, reason: "invalid continuation byte" });
+        assert_eq!(
+            bad[0],
+            Malformed {
+                start: 0,
+                end: 1,
+                reason: "invalid start byte"
+            }
+        );
+        assert_eq!(
+            bad[1],
+            Malformed {
+                start: 2,
+                end: 3,
+                reason: "invalid continuation byte"
+            }
+        );
         assert_eq!(utf8(b"ab\xE2\x82", false), ("ab".to_string(), 2, vec![]));
-        assert_eq!(utf8(b"ab\xE2\x82", true).2[0], Malformed { start: 2, end: 4, reason: "unexpected end of data" });
+        assert_eq!(
+            utf8(b"ab\xE2\x82", true).2[0],
+            Malformed {
+                start: 2,
+                end: 4,
+                reason: "unexpected end of data"
+            }
+        );
     }
 
     #[test]
     fn utf16_pairs_and_errors() {
         let mut out = String::new();
         let mut bad = Vec::new();
-        let data = [0x61, 0, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0xDC, 0x00, 0xD8, 0x62, 0, 0x01];
-        let n = decode_utf16::<Infallible>(&mut Cow::Borrowed(&data[..]), 0, false, true, Spelling::Plain, &mut out, |_, m, _| {
-            bad.push(m.reason);
-            Ok(m.end.min(m.start + 2))
-        })
+        let data = [
+            0x61, 0, 0x3D, 0xD8, 0x00, 0xDE, 0x00, 0xDC, 0x00, 0xD8, 0x62, 0, 0x01,
+        ];
+        let n = decode_utf16::<Infallible>(
+            &mut Cow::Borrowed(&data[..]),
+            0,
+            false,
+            true,
+            Spelling::Plain,
+            &mut out,
+            |_, m, _| {
+                bad.push(m.reason);
+                Ok(m.end.min(m.start + 2))
+            },
+        )
         .unwrap();
         assert_eq!(out, "a\u{1F600}b");
         assert_eq!(n, 13);
-        assert_eq!(bad, ["illegal encoding", "illegal UTF-16 surrogate", "truncated data"]);
+        assert_eq!(
+            bad,
+            [
+                "illegal encoding",
+                "illegal UTF-16 surrogate",
+                "truncated data"
+            ]
+        );
     }
 }

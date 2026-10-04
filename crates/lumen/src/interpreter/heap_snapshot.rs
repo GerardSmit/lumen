@@ -477,9 +477,21 @@ impl Interp {
         }
         #[cfg(feature = "aot-native")]
         if let Some(class) = self.native_classes.get(&ptr) {
-            out.push(Edge { kind: E_INTERNAL, name: Name::Static("field_context"), target: Target::Scope(Rc::as_ptr(&class.env)), owned: true });
+            out.push(Edge {
+                kind: E_INTERNAL,
+                name: Name::Static("field_context"),
+                target: Target::Scope(Rc::as_ptr(&class.env)),
+                owned: true,
+            });
             class.visit_values(|value| {
-                if let Some(target) = value_target(value) { out.push(Edge { kind: E_INTERNAL, name: Name::Static("class_initializer"), target, owned: matches!(value, Value::Obj(_)) }); }
+                if let Some(target) = value_target(value) {
+                    out.push(Edge {
+                        kind: E_INTERNAL,
+                        name: Name::Static("class_initializer"),
+                        target,
+                        owned: matches!(value, Value::Obj(_)),
+                    });
+                }
             });
         }
     }
@@ -594,14 +606,18 @@ impl Interp {
         #[cfg(feature = "aot-native")]
         for unit in self.native_units.values().flatten() {
             if let Some(&node) = g.scope_index.get(&(Rc::as_ptr(&unit.env) as usize)) {
-                if !g.roots.contains(&node) { g.roots.push(node); }
+                if !g.roots.contains(&node) {
+                    g.roots.push(node);
+                }
             }
             for value in std::iter::once(&unit.namespace).chain(unit.evaluation.iter()) {
-              if let Value::Obj(namespace) = value {
-                if let Some(&node) = g.object_index.get(&(Gc::as_ptr(namespace) as usize)) {
-                    if !g.roots.contains(&node) { g.roots.push(node); }
+                if let Value::Obj(namespace) = value {
+                    if let Some(&node) = g.object_index.get(&(Gc::as_ptr(namespace) as usize)) {
+                        if !g.roots.contains(&node) {
+                            g.roots.push(node);
+                        }
+                    }
                 }
-              }
             }
         }
         edge_counts[GC_ROOTS as usize] = g.roots.len() as u32;

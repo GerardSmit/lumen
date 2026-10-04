@@ -325,8 +325,12 @@ impl Resolver {
             return Some(p.to_path_buf());
         }
         let exts: &[&str] = match mode {
-            Mode::Import => &[".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts", ".jsx", ".tsx"],
-            Mode::Require => &[".js", ".json", ".cjs", ".mjs", ".ts", ".cts", ".jsx", ".tsx"],
+            Mode::Import => &[
+                ".js", ".mjs", ".cjs", ".json", ".ts", ".mts", ".cts", ".jsx", ".tsx",
+            ],
+            Mode::Require => &[
+                ".js", ".json", ".cjs", ".mjs", ".ts", ".cts", ".jsx", ".tsx",
+            ],
         };
         exts.iter().map(|e| with_suffix(p, e)).find(|c| c.is_file())
     }
@@ -772,8 +776,12 @@ pub fn bundle_with(
             (SourceKind::Module, FileKind::Esm) => {
                 let src = read(&path).map_err(with_importer)?;
                 let extension = path.extension().and_then(|e| e.to_str());
-                let jsx_options = lumen::JsxOptions { filename: path.display().to_string(), ..Default::default() };
-                let jsx = matches!(extension, Some("jsx" | "tsx")).then_some((extension == Some("tsx"), &jsx_options));
+                let jsx_options = lumen::JsxOptions {
+                    filename: path.display().to_string(),
+                    ..Default::default()
+                };
+                let jsx = matches!(extension, Some("jsx" | "tsx"))
+                    .then_some((extension == Some("tsx"), &jsx_options));
                 CompiledUnit::compile_with_jsx_options(&src, SourceKind::Module, opts(&path), jsx)
                     .map_err(|e| format!("{}: {e}", path.display()))?
             }
@@ -924,18 +932,38 @@ pub fn bundle_with(
             }
         }
     }
-    let entry_index = entry.as_ref().and_then(|path| index.get(&(path.clone(), SourceKind::Module))).copied();
+    let entry_index = entry
+        .as_ref()
+        .and_then(|path| index.get(&(path.clone(), SourceKind::Module)))
+        .copied();
     if let Some(e) = entry_rel {
         out.set_entry(&e)?;
     }
     inputs.extend(res.pkg_inputs);
-    inputs.extend(spec.extra_inputs.iter().map(|path| base.join(path).canonicalize()
-        .map_err(|error| format!("{}: {error}", path.display()))).collect::<Result<Vec<_>, _>>()?);
-    let asset_root = spec.asset_root.as_ref().or(spec.root.as_ref()).map(|root| base.join(root)).unwrap_or_else(|| base.to_owned());
+    inputs.extend(
+        spec.extra_inputs
+            .iter()
+            .map(|path| {
+                base.join(path)
+                    .canonicalize()
+                    .map_err(|error| format!("{}: {error}", path.display()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    let asset_root = spec
+        .asset_root
+        .as_ref()
+        .or(spec.root.as_ref())
+        .map(|root| base.join(root))
+        .unwrap_or_else(|| base.to_owned());
     let (assets, asset_inputs) = crate::assets::collect(&asset_root, &spec.assets)?;
     inputs.extend(asset_inputs);
     let blob = out.finish();
-    let blob = if let Some(archive) = &assets { lumen_common::aot::assets::attach(&blob, archive, 1)? } else { blob };
+    let blob = if let Some(archive) = &assets {
+        lumen_common::aot::assets::attach(&blob, archive, 1)?
+    } else {
+        blob
+    };
     Ok(Bundle {
         blob,
         assets,

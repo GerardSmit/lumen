@@ -465,7 +465,9 @@ pub fn decompress_bounded(data: &[u8], max_len: usize) -> R<Vec<u8>> {
     let method = *data.first().ok_or_else(bad)?;
     let mut pos = 1;
     let len = usize::try_from(get_uv(data, &mut pos)?).map_err(|_| bad())?;
-    if len > max_len { return Err(bad()); }
+    if len > max_len {
+        return Err(bad());
+    }
     match method {
         0 => {
             let body = data.get(pos..).ok_or_else(bad)?;
@@ -475,7 +477,9 @@ pub fn decompress_bounded(data: &[u8], max_len: usize) -> R<Vec<u8>> {
             Ok(body.to_vec())
         }
         1 => {
-            let table = data.get(pos..pos + (NLIT + NDIST).div_ceil(2)).ok_or_else(bad)?;
+            let table = data
+                .get(pos..pos + (NLIT + NDIST).div_ceil(2))
+                .ok_or_else(bad)?;
             let mut lens = Vec::with_capacity(NLIT + NDIST + 1);
             for &b in table {
                 lens.push(b & 15);
@@ -579,7 +583,21 @@ mod tests {
 
     #[test]
     fn distance_codes_cover_the_window() {
-        for d in [1usize, 2, 4, 5, 6, 7, 8, 9, 100, 32768, 32769, 1 << 19, WINDOW] {
+        for d in [
+            1usize,
+            2,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            100,
+            32768,
+            32769,
+            1 << 19,
+            WINDOW,
+        ] {
             let (c, extra, rest) = dist_code(d);
             assert!(c < NDIST, "{d}");
             let (base, e2) = dist_base(c);

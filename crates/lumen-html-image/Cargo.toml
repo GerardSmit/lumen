@@ -6,9 +6,12 @@ license.workspace = true
 publish = false
 
 [dependencies]
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 lumen-html = { path = "../lumen-html" }
 lumen-html-text = { path = "../lumen-html-text" }
 lumen-common = { path = "../lumen-common", features = ["compress"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "webp", "gif", "png"] }
+moxcms = "0.8.1"
 
 [lints]
 workspace = true

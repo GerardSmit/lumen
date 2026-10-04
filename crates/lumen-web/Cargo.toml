@@ -12,6 +12,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+lumen = { path = "../lumen", default-features = false }
+lumen-bind = { path = "../lumen-bind" }
 lumen-host = { path = "../lumen-host", default-features = false }
 lumen-os = { path = "../lumen-os" }
 lumen-common = { path = "../lumen-common", features = ["hash"] }
@@ -28,6 +30,9 @@ js-sys = "0.3"
 [build-dependencies]
 lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [features]
 default = ["compiler", "jit", "aot-native", "intl", "typed"]

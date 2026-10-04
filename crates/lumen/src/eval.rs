@@ -2324,6 +2324,41 @@ impl Interp {
             Value::Obj(o) => o,
             _ => return Ok(false),
         };
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            let key_value = self
+                .sym_from_key(key)
+                .unwrap_or_else(|| Value::from_string(key.to_owned()));
+            let operation = crate::embed_realms::WindowProxyOperation::Has { key: key_value };
+            if let Some(decision) = self.window_proxy_decision(o, operation)? {
+                return match decision {
+                    crate::embed_realms::WindowProxyDecision::Handled(
+                        crate::embed_realms::WindowProxyResult::Has(present),
+                    ) => Ok(present),
+                    crate::embed_realms::WindowProxyDecision::Handled(_) => Err(self.throw(
+                        "TypeError",
+                        "WindowProxy policy returned a result for the wrong operation",
+                    )),
+                    crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                        if let Some(index) = crate::value::canonical_index(key) {
+                            if self.window_proxy_child_at(&forward, index)?.is_some() {
+                                return Ok(true);
+                            }
+                            let target = forward.target.as_obj().ok_or_else(|| {
+                                self.throw("TypeError", "WindowProxy target is not an object")
+                            })?;
+                            return match target.borrow().proto.clone() {
+                                Some(prototype) => {
+                                    self.js_has_property(&Value::Obj(prototype), key)
+                                }
+                                None => Ok(false),
+                            };
+                        }
+                        self.js_has_property(&forward.target, key)
+                    }
+                };
+            }
+        }
         // Ordinary objects and arrays all the way (no proxy, namespace, typed array, wrapper —
         // those clear `ic_plain` or are exotic): [[HasProperty]] is the entries walk alone.
         // Walked by raw pointer: every level is kept alive by `o` for the duration.
@@ -5008,12 +5043,27 @@ impl Interp {
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Value, Abrupt> {
-        self.decorate_callable_with(decorators, value, kind, key, is_static, is_private, inits, |i, d| i.eval(d, env))
+        self.decorate_callable_with(
+            decorators,
+            value,
+            kind,
+            key,
+            is_static,
+            is_private,
+            inits,
+            |i, d| i.eval(d, env),
+        )
     }
 
     pub(crate) fn decorate_callable_with<T>(
-        &mut self, decorators: &[T], mut value: Value, kind: &str, key: &str,
-        is_static: bool, is_private: bool, inits: &mut Vec<Value>,
+        &mut self,
+        decorators: &[T],
+        mut value: Value,
+        kind: &str,
+        key: &str,
+        is_static: bool,
+        is_private: bool,
+        inits: &mut Vec<Value>,
         mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
     ) -> Result<Value, Abrupt> {
         for d in decorators.iter().rev() {
@@ -5047,12 +5097,19 @@ impl Interp {
         is_private: bool,
         inits: &mut Vec<Value>,
     ) -> Result<Vec<Value>, Abrupt> {
-        self.decorate_field_with(decorators, key, is_static, is_private, inits, |i, d| i.eval(d, env))
+        self.decorate_field_with(decorators, key, is_static, is_private, inits, |i, d| {
+            i.eval(d, env)
+        })
     }
 
     pub(crate) fn decorate_field_with<T>(
-        &mut self, decorators: &[T], key: &str, is_static: bool, is_private: bool,
-        inits: &mut Vec<Value>, mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
+        &mut self,
+        decorators: &[T],
+        key: &str,
+        is_static: bool,
+        is_private: bool,
+        inits: &mut Vec<Value>,
+        mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
     ) -> Result<Vec<Value>, Abrupt> {
         let mut transforms = Vec::new();
         for d in decorators.iter().rev() {
@@ -5089,12 +5146,20 @@ impl Interp {
         set: Value,
         inits: &mut Vec<Value>,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
-        self.decorate_accessor_with(decorators, key, is_static, get, set, inits, |i, d| i.eval(d, env))
+        self.decorate_accessor_with(decorators, key, is_static, get, set, inits, |i, d| {
+            i.eval(d, env)
+        })
     }
 
     pub(crate) fn decorate_accessor_with<T>(
-        &mut self, decorators: &[T], key: &str, is_static: bool, mut get: Value, mut set: Value,
-        inits: &mut Vec<Value>, mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
+        &mut self,
+        decorators: &[T],
+        key: &str,
+        is_static: bool,
+        mut get: Value,
+        mut set: Value,
+        inits: &mut Vec<Value>,
+        mut evaluate: impl FnMut(&mut Self, &T) -> Result<Value, Abrupt>,
     ) -> Result<(Value, Value, Vec<Value>), Abrupt> {
         let is_private = Interp::is_private_key(key);
         let mut transforms = Vec::new();
@@ -5166,12 +5231,24 @@ impl Interp {
         #[cfg(feature = "aot-native")]
         if self.native_classes.contains_key(&ptr) || matches!(obj.borrow().call, Callable::Aot(_)) {
             let target = std::mem::replace(&mut self.pending_new_target, Value::Undefined);
-            let saved_target = std::mem::replace(&mut self.new_target, if matches!(target, Value::Undefined) { ctor.clone() } else { target });
+            let saved_target = std::mem::replace(
+                &mut self.new_target,
+                if matches!(target, Value::Undefined) {
+                    ctor.clone()
+                } else {
+                    target
+                },
+            );
             let saved_constructing = std::mem::replace(&mut self.constructing, true);
             let saved_super = self.super_call_ok;
-            self.super_call_ok = self.native_classes.get(&ptr).is_some_and(|class| class.derived);
+            self.super_call_ok = self
+                .native_classes
+                .get(&ptr)
+                .is_some_and(|class| class.derived);
             let result = crate::native_aot::classes::constructor_on(self, ctor, this, args);
-            self.new_target = saved_target; self.constructing = saved_constructing; self.super_call_ok = saved_super;
+            self.new_target = saved_target;
+            self.constructing = saved_constructing;
+            self.super_call_ok = saved_super;
             return result;
         }
         let is_class = self.class_info.contains_key(&ptr);
@@ -5222,11 +5299,21 @@ impl Interp {
                 // constructors that require `new`. Run it, then graft its own props onto `this`.
                 let saved = self.constructing;
                 self.constructing = true;
+                self.native_super_return_overrides.push(None);
                 let made = self
                     .dispatch_native(&call, this.clone(), args)
                     .map_err(Abrupt::Throw);
+                // Always pop this frame before propagating a constructor throw. A nested native
+                // super() has its own slot, so its opt-in replacement cannot leak into this call.
+                let replacement = self
+                    .native_super_return_overrides
+                    .pop()
+                    .expect("native super result frame");
                 self.constructing = saved;
                 let made = made?;
+                if let Some(replacement) = replacement {
+                    return Ok(replacement);
+                }
                 if let (Value::Obj(src), Value::Obj(dst)) = (&made, this) {
                     if !Gc::ptr_eq(src, dst) {
                         self.materialize_fn(src);
@@ -5393,7 +5480,11 @@ impl Interp {
         this: &Value,
     ) -> Result<(), Abrupt> {
         #[cfg(feature = "aot-native")]
-        if let Some(class) = ctor.as_obj().and_then(|object| self.native_classes.get(&(Gc::as_ptr(object) as usize))).cloned() {
+        if let Some(class) = ctor
+            .as_obj()
+            .and_then(|object| self.native_classes.get(&(Gc::as_ptr(object) as usize)))
+            .cloned()
+        {
             return crate::native_aot::classes::init_instance_fields(self, &class, this);
         }
         if let Some(r) = self.init_instance_fields_compiled(ctor, this) {
@@ -5815,6 +5906,49 @@ impl Interp {
                     self.defer_trigger(o, Some(prop))?;
                     self.materialize(o);
                     let ptr = Gc::as_ptr(o) as usize;
+                    #[cfg(feature = "embed")]
+                    if self.is_window_proxy(o) {
+                        let key_value = self
+                            .sym_from_key(prop)
+                            .unwrap_or_else(|| Value::from_string(prop.to_owned()));
+                        let operation = crate::embed_realms::WindowProxyOperation::Delete {
+                            key: key_value,
+                        };
+                        if let Some(decision) = self.window_proxy_decision(o, operation)? {
+                            let success = match decision {
+                                crate::embed_realms::WindowProxyDecision::Handled(
+                                    crate::embed_realms::WindowProxyResult::Delete(success),
+                                ) => success,
+                                crate::embed_realms::WindowProxyDecision::Handled(_) => {
+                                    return Err(self.throw(
+                                        "TypeError",
+                                        "WindowProxy policy returned a result for the wrong operation",
+                                    ));
+                                }
+                                crate::embed_realms::WindowProxyDecision::Forward(forward) => {
+                                    if let Some(index) = crate::value::canonical_index(prop) {
+                                        !self.window_proxy_child_at(&forward, index)?.is_some()
+                                    } else {
+                                        matches!(
+                                            self.delete_prop_with(
+                                                forward.target,
+                                                prop,
+                                                strict,
+                                            )?,
+                                            Value::Bool(true)
+                                        )
+                                    }
+                                }
+                            };
+                            if !success && strict {
+                                return Err(self.throw(
+                                    "TypeError",
+                                    format!("cannot delete property '{prop}'"),
+                                ));
+                            }
+                            return Ok(Value::Bool(success));
+                        }
+                    }
                     if let Some((target, handler)) = self.proxy_at(ptr) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {

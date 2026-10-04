@@ -2,7 +2,7 @@ use super::parcel::{Buffer, HeapGuard, Intrinsic};
 use super::{Limits, Parcel};
 use crate::{
     interpreter::Interp,
-    value::{set_data, Exotic, Gc, Object, Value},
+    value::{Exotic, Gc, Object, Value, set_data},
 };
 use std::collections::HashMap;
 
@@ -14,6 +14,10 @@ pub(super) struct Builder {
     pub(super) class_scopes: std::collections::HashSet<usize>,
     pub(super) environments: HashMap<usize, crate::interpreter::Env>,
     pub(super) private_keys: HashMap<String, String>,
+    /// Apply browser structured-clone restrictions rather than the broader
+    /// graph migration rules used by `Lumen.parallel`.
+    structured: bool,
+    host_attachment: Option<Box<dyn FnMut(&Value) -> Option<usize>>>,
     // Object and scope memo roots must drop before the heap on clone failure.
     pub(super) parcel: Parcel,
 }
@@ -31,11 +35,86 @@ impl Parcel {
     ) -> Result<Self, Value> {
         Self::build_checked(interp, value, transfer, limits, |_| Ok(()))
     }
+    /// Clone a browser message graph, optionally transferring attached buffers.
+    pub fn build_structured_with_transfer(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+    ) -> Result<Self, Value> {
+        Self::build_checked_mode(interp, value, transfer, limits, true, |_| Ok(()))
+    }
+    /// Clone a browser message graph and validate the sender's queue/channel
+    /// reservation after getters run but before transferables are detached.
+    pub fn build_structured_checked(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+        validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
+    ) -> Result<Self, Value> {
+        Self::build_checked_mode(interp, value, transfer, limits, true, validate)
+    }
+    /// Clone a structured message carrying host-owned transferable objects.
+    /// `attachment_index` must return an index only for an object present in
+    /// the validated transfer list. Attachment capability IDs are carried in
+    /// the parcel's side table and never become sender-controlled JS values.
+    pub fn build_structured_checked_with_attachments(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        attachments: Vec<(u64, u8)>,
+        limits: Limits,
+        attachment_index: Box<dyn FnMut(&Value) -> Option<usize>>,
+        validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
+    ) -> Result<Self, Value> {
+        Self::build_checked_mode_with_attachments(
+            interp,
+            value,
+            transfer,
+            limits,
+            true,
+            Some(attachment_index),
+            attachments,
+            validate,
+        )
+    }
     pub(crate) fn build_checked(
         interp: &mut Interp,
         value: &Value,
         transfer: &[Value],
         limits: Limits,
+        validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
+    ) -> Result<Self, Value> {
+        Self::build_checked_mode(interp, value, transfer, limits, false, validate)
+    }
+    fn build_checked_mode(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+        structured: bool,
+        validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
+    ) -> Result<Self, Value> {
+        Self::build_checked_mode_with_attachments(
+            interp,
+            value,
+            transfer,
+            limits,
+            structured,
+            None,
+            Vec::new(),
+            validate,
+        )
+    }
+    fn build_checked_mode_with_attachments(
+        interp: &mut Interp,
+        value: &Value,
+        transfer: &[Value],
+        limits: Limits,
+        structured: bool,
+        host_attachment: Option<Box<dyn FnMut(&Value) -> Option<usize>>>,
+        attachments: Vec<(u64, u8)>,
         validate: impl FnOnce(&mut Interp) -> Result<(), Value>,
     ) -> Result<Self, Value> {
         let mut pointers = std::collections::HashSet::new();
@@ -58,7 +137,17 @@ impl Parcel {
             class_scopes: Default::default(),
             environments: Default::default(),
             private_keys: Default::default(),
+            structured,
+            host_attachment,
         };
+        builder.parcel.attachments = attachments;
+        builder.parcel.bytes = builder
+            .parcel
+            .bytes
+            .saturating_add(builder.parcel.attachments.len() * std::mem::size_of::<(u64, u8)>());
+        if builder.parcel.bytes > builder.limits.bytes {
+            return Err(interp.make_error("RangeError", "parcel limit exceeded"));
+        }
         builder.parcel.root = builder.copy(interp, value, 0)?;
         // Getter code may have detached a buffer. Validate all entries before
         // detaching any; clone failure must leave the other buffers attached.
@@ -134,20 +223,57 @@ impl Builder {
                 if let Some(copied) = self.memo.get(&pointer) {
                     return Ok(Value::Obj(copied.clone()));
                 }
+                if let Some(index) = self
+                    .host_attachment
+                    .as_mut()
+                    .and_then(|identify| identify(value))
+                {
+                    if index >= self.parcel.attachments.len() {
+                        return Err(interp
+                            .make_error("DataCloneError", "invalid host transferable reference"));
+                    }
+                    let copied = {
+                        let _entered = HeapGuard::enter(&self.parcel.heap);
+                        Object::new(None)
+                    };
+                    self.memo.insert(pointer, copied.clone());
+                    self.parcel.protos.push((copied.clone(), Intrinsic::Object));
+                    crate::value::set_data(
+                        &copied,
+                        "__lumenHostAttachmentIndex",
+                        Value::Num(index as f64),
+                    );
+                    self.parcel.objects += 1;
+                    self.charge(interp, std::mem::size_of::<Object>())?;
+                    return Ok(Value::Obj(copied));
+                }
+                if self.structured
+                    && (!matches!(object.borrow().call, crate::value::Callable::None)
+                        || interp.class_info.contains_key(&pointer))
+                {
+                    return Err(interp.make_error("DataCloneError", "unsupported object"));
+                }
                 #[cfg(feature = "aot-native")]
-                let native_callable = matches!(object.borrow().call, crate::value::Callable::Aot(_)) || interp.native_classes.contains_key(&pointer);
+                if self.structured && interp.native_classes.contains_key(&pointer) {
+                    return Err(interp.make_error("DataCloneError", "unsupported object"));
+                }
+                #[cfg(feature = "aot-native")]
+                let native_callable =
+                    matches!(object.borrow().call, crate::value::Callable::Aot(_))
+                        || interp.native_classes.contains_key(&pointer);
                 #[cfg(not(feature = "aot-native"))]
                 let native_callable = false;
                 if interp.proxies.contains_key(&pointer)
                     || (!matches!(
                         object.borrow().call,
                         crate::value::Callable::None | crate::value::Callable::User(_)
-                    ) && !native_callable && !(self.class_objects.contains(&pointer)
-                        && matches!(
-                            object.borrow().call,
-                            crate::value::Callable::AccessorGet(_)
-                                | crate::value::Callable::AccessorSet(_)
-                        )))
+                    ) && !native_callable
+                        && !(self.class_objects.contains(&pointer)
+                            && matches!(
+                                object.borrow().call,
+                                crate::value::Callable::AccessorGet(_)
+                                    | crate::value::Callable::AccessorSet(_)
+                            )))
                 {
                     return Err(interp.make_error("DataCloneError", "unsupported object"));
                 }
@@ -212,24 +338,38 @@ impl Builder {
                 #[cfg(feature = "aot-native")]
                 {
                     let native = match &object.borrow().call {
-                        crate::value::Callable::Aot(native) => Some((native.program.clone(), native.function_index, native.env.clone())),
+                        crate::value::Callable::Aot(native) => Some((
+                            native.program.clone(),
+                            native.function_index,
+                            native.env.clone(),
+                        )),
                         _ => None,
                     };
                     if let Some((program, index, env)) = native {
-                        let env = if std::rc::Rc::ptr_eq(&env, &interp.global_env) { None } else {
+                        let env = if std::rc::Rc::ptr_eq(&env, &interp.global_env) {
+                            None
+                        } else {
                             let mut scope = Some(env.clone());
                             while let Some(current) = scope {
-                                if std::rc::Rc::ptr_eq(&current, &interp.global_env) { break; }
-                                self.class_scopes.insert(std::rc::Rc::as_ptr(&current) as usize);
+                                if std::rc::Rc::ptr_eq(&current, &interp.global_env) {
+                                    break;
+                                }
+                                self.class_scopes
+                                    .insert(std::rc::Rc::as_ptr(&current) as usize);
                                 scope = current.borrow().parent.clone();
                             }
                             Some(self.copy_environment(interp, &env, depth + 1)?)
                         };
-                        self.parcel.native_functions.push(super::parcel::NativeFunction {
-                            trusted_glue: program.trusted_glue,
-                            object: copied.clone(), bytes: program.bytes.clone(),
-                            hash: program.image.blob_hash(), index, env,
-                        });
+                        self.parcel
+                            .native_functions
+                            .push(super::parcel::NativeFunction {
+                                trusted_glue: program.trusted_glue,
+                                object: copied.clone(),
+                                bytes: program.bytes.clone(),
+                                hash: program.image.blob_hash(),
+                                index,
+                                env,
+                            });
                     }
                 }
                 self.copy_slots(interp, object, &copied, pointer, depth)?;
@@ -321,7 +461,9 @@ impl Builder {
     fn intrinsic(&self, interp: &Interp, object: &Gc, pointer: usize) -> Result<Intrinsic, Value> {
         #[cfg(feature = "aot-native")]
         {
-            if interp.native_classes.contains_key(&pointer) { return Ok(Intrinsic::Function); }
+            if interp.native_classes.contains_key(&pointer) {
+                return Ok(Intrinsic::Function);
+            }
             if let crate::value::Callable::Aot(native) = &object.borrow().call {
                 let flags = native.program.metadata.functions[native.function_index as usize].flags;
                 return Ok(match (flags & 8 != 0, flags & 4 != 0) {

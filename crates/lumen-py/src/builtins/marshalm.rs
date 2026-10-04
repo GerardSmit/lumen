@@ -56,7 +56,9 @@ pub mod marshal {
         }
 
         fn sized(&mut self, it: &mut Interp, code: u8, data: &[u8]) -> R<()> {
-            let Ok(n) = i32::try_from(data.len()) else { return Err(unmarshallable(it)) };
+            let Ok(n) = i32::try_from(data.len()) else {
+                return Err(unmarshallable(it));
+            };
             self.out.push(code);
             self.long(n);
             self.out.extend_from_slice(data);
@@ -102,7 +104,9 @@ pub mod marshal {
         }
 
         fn seq(&mut self, it: &mut Interp, code: u8, items: &[Value]) -> R<()> {
-            let Ok(n) = i32::try_from(items.len()) else { return Err(unmarshallable(it)) };
+            let Ok(n) = i32::try_from(items.len()) else {
+                return Err(unmarshallable(it));
+            };
             self.out.push(code);
             self.long(n);
             for v in items {
@@ -200,7 +204,11 @@ pub mod marshal {
                             self.seq(it, b'[', &items)?;
                         }
                         Kind::Dict(d) => {
-                            let pairs: Vec<(Value, Value)> = d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect();
+                            let pairs: Vec<(Value, Value)> = d
+                                .borrow()
+                                .iter()
+                                .map(|e| (e.key.clone(), e.val.clone()))
+                                .collect();
                             self.out.push(b'{');
                             for (k, x) in pairs {
                                 self.value(it, &k)?;
@@ -209,7 +217,11 @@ pub mod marshal {
                             self.out.push(b'0');
                         }
                         Kind::Set(d) | Kind::FrozenSet(d) => {
-                            let code = if matches!(o.kind, Kind::Set(_)) { b'<' } else { b'>' };
+                            let code = if matches!(o.kind, Kind::Set(_)) {
+                                b'<'
+                            } else {
+                                b'>'
+                            };
                             let items = d.borrow().keys();
                             self.seq(it, code, &items)?;
                         }
@@ -270,13 +282,17 @@ pub mod marshal {
 
         fn f64(&mut self, it: &mut Interp) -> R<f64> {
             let b = self.bytes(it, 8)?;
-            Ok(f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            Ok(f64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]))
         }
 
         fn text_float(&mut self, it: &mut Interp) -> R<f64> {
             let n = self.byte(it)? as usize;
             let s = String::from_utf8_lossy(self.bytes(it, n)?).into_owned();
-            s.trim().parse::<f64>().map_err(|_| it.value_error(&format!("could not convert string to float: '{s}'")))
+            s.trim()
+                .parse::<f64>()
+                .map_err(|_| it.value_error(&format!("could not convert string to float: '{s}'")))
         }
 
         fn text(&mut self, it: &mut Interp, n: usize) -> R<Value> {
@@ -319,7 +335,9 @@ pub mod marshal {
                 b'i' => Value::Int(self.long(it)? as i64),
                 b'I' => {
                     let b = self.bytes(it, 8)?;
-                    Value::Int(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                    Value::Int(i64::from_le_bytes([
+                        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                    ]))
                 }
                 b'l' => {
                     let n = self.long(it)?;
@@ -379,7 +397,8 @@ pub mod marshal {
                 }
                 b'[' => {
                     let n = self.size(it, "list")?;
-                    let list = Object::new(Kind::List(RefCell::new(Vec::with_capacity(n.min(1 << 16)))));
+                    let list =
+                        Object::new(Kind::List(RefCell::new(Vec::with_capacity(n.min(1 << 16)))));
                     if let Some(s) = slot {
                         self.refs[s] = Value::Obj(list.clone());
                     }
@@ -446,13 +465,22 @@ pub mod marshal {
     }
 
     fn dump_bytes(it: &mut Interp, value: &Value, version: i64) -> R<Vec<u8>> {
-        let mut w = Writer { out: Vec::new(), version, depth: 0 };
+        let mut w = Writer {
+            out: Vec::new(),
+            version,
+            depth: 0,
+        };
         w.value(it, value)?;
         Ok(w.out)
     }
 
     fn load_bytes(it: &mut Interp, data: &[u8]) -> R<(Value, usize)> {
-        let mut r = Reader { data, pos: 0, refs: Vec::new(), depth: 0 };
+        let mut r = Reader {
+            data,
+            pos: 0,
+            refs: Vec::new(),
+            depth: 0,
+        };
         let v = r.object(it)?;
         Ok((v, r.pos))
     }

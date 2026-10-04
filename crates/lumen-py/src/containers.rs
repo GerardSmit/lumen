@@ -41,7 +41,9 @@ impl Interp {
     pub fn call_user_special(&mut self, v: &Value, m: &Value, args: Vec<Value>) -> R<Value> {
         // A plain method binds to `v`: call it with `v` prepended, without a bound-method object.
         if let Value::Obj(f) = m {
-            if matches!(&f.kind, Kind::Function(_)) || matches!(&f.kind, Kind::Native(nd) if nd.method) {
+            if matches!(&f.kind, Kind::Function(_))
+                || matches!(&f.kind, Kind::Native(nd) if nd.method)
+            {
                 let mut a = Vec::with_capacity(args.len() + 1);
                 a.push(v.clone());
                 a.extend(args);
@@ -66,7 +68,9 @@ impl Interp {
                 return match r {
                     Value::Int(i) => Ok(if i == -1 { -2 } else { i }),
                     Value::Bool(b) => Ok(b as i64),
-                    Value::Obj(ro) if matches!(ro.kind, Kind::Int(_)) => self.native_hash(&Value::Obj(ro)),
+                    Value::Obj(ro) if matches!(ro.kind, Kind::Int(_)) => {
+                        self.native_hash(&Value::Obj(ro))
+                    }
                     _ => Err(self.type_error("__hash__ method should return an integer")),
                 };
             }
@@ -82,61 +86,67 @@ impl Interp {
             Value::None => 0x5f3a_b1c2,
             Value::NotImplemented => 0x4e49,
             Value::Ellipsis => 0x454c,
-            Value::Obj(o) => {
-                match &o.kind {
-                    Kind::Str(s) => s.hash(),
-                    Kind::Int(b) => b.py_hash(),
-                    Kind::Float(f) => hash_float(*f),
-                    Kind::Tuple(items) => {
-                        let items = items.clone();
-                        let mut acc: u64 = XXP5;
-                        for it in &items {
-                            let lane = self.hash_value(it)? as u64;
-                            acc = acc.wrapping_add(lane.wrapping_mul(XXP2));
-                            acc = acc.rotate_left(31);
-                            acc = acc.wrapping_mul(XXP1);
-                        }
-                        acc = acc.wrapping_add((items.len() as u64) ^ (XXP5 ^ 3527539));
-                        if acc as i64 == -1 {
-                            1546275796
-                        } else {
-                            acc as i64
-                        }
+            Value::Obj(o) => match &o.kind {
+                Kind::Str(s) => s.hash(),
+                Kind::Int(b) => b.py_hash(),
+                Kind::Float(f) => hash_float(*f),
+                Kind::Tuple(items) => {
+                    let items = items.clone();
+                    let mut acc: u64 = XXP5;
+                    for it in &items {
+                        let lane = self.hash_value(it)? as u64;
+                        acc = acc.wrapping_add(lane.wrapping_mul(XXP2));
+                        acc = acc.rotate_left(31);
+                        acc = acc.wrapping_mul(XXP1);
                     }
-                    Kind::Bytes(b) => hash_bytes(b),
-                    Kind::FrozenSet(d) => {
-                        let hashes: Vec<i64> = d.borrow().iter().map(|e| e.hash).collect();
-                        let mut h: u64 = 0;
-                        for x in hashes {
-                            let x = x as u64;
-                            h ^= ((x ^ 89869747) ^ (x << 16)).wrapping_mul(3644798167);
-                        }
-                        h ^= ((d.borrow().len() as u64) + 1).wrapping_mul(1927868237);
-                        h ^= (h >> 11) ^ (h >> 25);
-                        h = h.wrapping_mul(69069).wrapping_add(907133923);
-                        if h as i64 == -1 {
-                            590923713
-                        } else {
-                            h as i64
-                        }
+                    acc = acc.wrapping_add((items.len() as u64) ^ (XXP5 ^ 3527539));
+                    if acc as i64 == -1 {
+                        1546275796
+                    } else {
+                        acc as i64
                     }
-                    Kind::List(_) | Kind::Dict(_) | Kind::Set(_) | Kind::ByteArray(_) => {
-                        let t = self.type_name_of(v);
-                        return Err(self.type_error(&format!("unhashable type: '{}'", t)));
+                }
+                Kind::Bytes(b) => hash_bytes(b),
+                Kind::FrozenSet(d) => {
+                    let hashes: Vec<i64> = d.borrow().iter().map(|e| e.hash).collect();
+                    let mut h: u64 = 0;
+                    for x in hashes {
+                        let x = x as u64;
+                        h ^= ((x ^ 89869747) ^ (x << 16)).wrapping_mul(3644798167);
                     }
-                    Kind::Complex(re, im) => match hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)) {
+                    h ^= ((d.borrow().len() as u64) + 1).wrapping_mul(1927868237);
+                    h ^= (h >> 11) ^ (h >> 25);
+                    h = h.wrapping_mul(69069).wrapping_add(907133923);
+                    if h as i64 == -1 {
+                        590923713
+                    } else {
+                        h as i64
+                    }
+                }
+                Kind::List(_) | Kind::Dict(_) | Kind::Set(_) | Kind::ByteArray(_) => {
+                    let t = self.type_name_of(v);
+                    return Err(self.type_error(&format!("unhashable type: '{}'", t)));
+                }
+                Kind::Complex(re, im) => {
+                    match hash_float(*re).wrapping_add(hash_float(*im).wrapping_mul(1000003)) {
                         -1 => -2,
                         h => h,
-                    },
-                    Kind::Slice(..) => {
-                        let t = self.type_name_of(v);
-                        return Err(self.type_error(&format!("unhashable type: '{}'", t)));
                     }
-                    Kind::BigRange(r) => r[0].py_hash() ^ r[1].py_hash().rotate_left(7) ^ r[2].py_hash().rotate_left(13),
-                    Kind::Range(r) => hash_int(r.start) ^ hash_int(r.stop).rotate_left(7) ^ hash_int(r.step).rotate_left(13),
-                    _ => ((Rc::as_ptr(o) as usize) >> 4) as i64,
                 }
-            }
+                Kind::Slice(..) => {
+                    let t = self.type_name_of(v);
+                    return Err(self.type_error(&format!("unhashable type: '{}'", t)));
+                }
+                Kind::BigRange(r) => {
+                    r[0].py_hash() ^ r[1].py_hash().rotate_left(7) ^ r[2].py_hash().rotate_left(13)
+                }
+                Kind::Range(r) => {
+                    hash_int(r.start)
+                        ^ hash_int(r.stop).rotate_left(7)
+                        ^ hash_int(r.step).rotate_left(13)
+                }
+                _ => ((Rc::as_ptr(o) as usize) >> 4) as i64,
+            },
         })
     }
 
@@ -179,7 +189,13 @@ impl Interp {
             Ok(h) => Ok(h),
             Err(e) => {
                 let msg = match &e.kind {
-                    Kind::Exception(d) if self.exc_is(&e, "TypeError") => d.borrow().args.tuple_items().and_then(|t| t.first()).and_then(|m| m.as_str()).map(str::to_string),
+                    Kind::Exception(d) if self.exc_is(&e, "TypeError") => d
+                        .borrow()
+                        .args
+                        .tuple_items()
+                        .and_then(|t| t.first())
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string),
                     _ => None,
                 };
                 match msg {
@@ -194,7 +210,11 @@ impl Interp {
     }
 
     pub fn dict_get(&mut self, d: &Obj, key: &Value) -> R<Option<Value>> {
-        let what = if matches!(d.kind, Kind::Dict(_)) { "dict key" } else { "set element" };
+        let what = if matches!(d.kind, Kind::Dict(_)) {
+            "dict key"
+        } else {
+            "set element"
+        };
         let h = self.hash_key(key, what)?;
         match self.dict_find(d, h, key)? {
             Some(i) => Ok(pydict_of(d).and_then(|p| p.borrow().get(i).map(|e| e.val.clone()))),
@@ -220,10 +240,16 @@ impl Interp {
     }
 
     pub fn dict_remove(&mut self, d: &Obj, key: &Value) -> R<Option<Value>> {
-        let what = if matches!(d.kind, Kind::Dict(_)) { "dict key" } else { "set element" };
+        let what = if matches!(d.kind, Kind::Dict(_)) {
+            "dict key"
+        } else {
+            "set element"
+        };
         let h = self.hash_key(key, what)?;
         match self.dict_find(d, h, key)? {
-            Some(i) => Ok(pydict_of(d).and_then(|p| p.borrow_mut().remove(i)).map(|e| e.val)),
+            Some(i) => Ok(pydict_of(d)
+                .and_then(|p| p.borrow_mut().remove(i))
+                .map(|e| e.val)),
             None => Ok(None),
         }
     }
@@ -285,7 +311,11 @@ impl Interp {
         if let Value::Obj(so) = src {
             if let Kind::Dict(sd) = &so.kind {
                 if so.cls.is_none() || self.user_special(src, "keys").is_none() {
-                    let entries: Vec<(Value, Value)> = sd.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect();
+                    let entries: Vec<(Value, Value)> = sd
+                        .borrow()
+                        .iter()
+                        .map(|e| (e.key.clone(), e.val.clone()))
+                        .collect();
                     for (k, v) in entries {
                         self.dict_set(d, k, v)?;
                     }

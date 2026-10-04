@@ -79,13 +79,17 @@ impl Engine {
     }
 }
 pub fn install_with_limits(engine: &mut Engine, host: Arc<dyn ParallelHost>, limits: Limits) {
-    if !register(engine, host, limits) { return; }
+    if !register(engine, host, limits) {
+        return;
+    }
     match engine
         .eval_snapshot(include_bytes!("glue.bin"), include_str!("glue.js"), false)
         .expect("parallel glue snapshot decodes")
     {
         crate::Completion::Value(_) => {}
-        crate::Completion::Throw { name, message } => panic!("parallel installation: {name}: {message}"),
+        crate::Completion::Throw { name, message } => {
+            panic!("parallel installation: {name}: {message}")
+        }
     }
     #[cfg(feature = "aot-native")]
     register_namespace(engine).unwrap_or_else(|error| panic!("parallel namespace: {error}"));
@@ -94,29 +98,54 @@ pub fn install_with_limits(engine: &mut Engine, host: Arc<dyn ParallelHost>, lim
 #[cfg(feature = "aot-native")]
 fn register_namespace(engine: &mut Engine) -> Result<(), String> {
     let global = engine.interp.global_env.clone();
-    let lumen = engine.interp.get_var("Lumen", &global).map_err(|_| "parallel glue did not define Lumen".to_string())?;
-    let parallel = engine.interp.get_member(&lumen, "parallel").map_err(|_| "parallel glue did not define Lumen.parallel".to_string())?;
+    let lumen = engine
+        .interp
+        .get_var("Lumen", &global)
+        .map_err(|_| "parallel glue did not define Lumen".to_string())?;
+    let parallel = engine
+        .interp
+        .get_member(&lumen, "parallel")
+        .map_err(|_| "parallel glue did not define Lumen.parallel".to_string())?;
     let namespace = Object::new_bare(None);
     for name in ["run", "spawn"] {
-        let value = engine.interp.get_member(&parallel, name).map_err(|_| format!("parallel glue did not define {name}"))?;
-        namespace.borrow_mut().props.insert(name, crate::value::Property::data(value, false, true, false));
+        let value = engine
+            .interp
+            .get_member(&parallel, name)
+            .map_err(|_| format!("parallel glue did not define {name}"))?;
+        namespace.borrow_mut().props.insert(
+            name,
+            crate::value::Property::data(value, false, true, false),
+        );
     }
     namespace.borrow_mut().extensible = false;
-    engine.register_native_module("lumen:parallel", Value::Obj(namespace)).map_err(str::to_string)
+    engine
+        .register_native_module("lumen:parallel", Value::Obj(namespace))
+        .map_err(str::to_string)
 }
 
 /// Load firmware-authenticated native glue after registering its Rust operations.
 #[cfg(feature = "aot-native")]
-pub fn install_native_with_limits(engine: &mut Engine, host: Arc<dyn ParallelHost>, limits: Limits, bytes: &'static [u8]) -> Result<(), String> {
-    if !register(engine, host, limits) { return Ok(()); }
+pub fn install_native_with_limits(
+    engine: &mut Engine,
+    host: Arc<dyn ParallelHost>,
+    limits: Limits,
+    bytes: &'static [u8],
+) -> Result<(), String> {
+    if !register(engine, host, limits) {
+        return Ok(());
+    }
     engine.interp.host_mut::<Realm>().unwrap().native_glue = Some(bytes);
-    let result = engine.load_native_glue_value(bytes).map(|_| crate::Completion::Value(String::new()));
+    let result = engine
+        .load_native_glue_value(bytes)
+        .map(|_| crate::Completion::Value(String::new()));
     match result {
         Ok(crate::Completion::Value(_)) => {
-          let result = register_namespace(engine);
-          if result.is_err() { engine.interp.host_state.take::<Realm>(); }
-          result
-        },
+            let result = register_namespace(engine);
+            if result.is_err() {
+                engine.interp.host_state.take::<Realm>();
+            }
+            result
+        }
         Ok(crate::Completion::Throw { name, message }) => {
             engine.interp.host_state.take::<Realm>();
             Err(format!("parallel installation: {name}: {message}"))
@@ -272,7 +301,9 @@ fn start(interp: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Val
     let parcel = parcel?;
     let link = Link::new(host.clone(), limits);
     #[cfg(feature = "aot-native")]
-    { *link.native_glue.lock().unwrap() = interp.host_mut::<Realm>().unwrap().native_glue.clone(); }
+    {
+        *link.native_glue.lock().unwrap() = interp.host_mut::<Realm>().unwrap().native_glue.clone();
+    }
     let job = Job {
         jit_mode: interp.jit_mode,
         link: link.clone(),
@@ -525,14 +556,20 @@ pub(crate) fn drain(interp: &mut Interp, link: &Arc<Link>) {
     let mut terminal = false;
     for event in events {
         let (kind, value) = match event {
-            Event::Message(parcel) => match interp.try_adopt(parcel) { Ok(value) => (0, value), Err(error) => (2, error) },
+            Event::Message(parcel) => match interp.try_adopt(parcel) {
+                Ok(value) => (0, value),
+                Err(error) => (2, error),
+            },
             Event::Result(parcel, failed) => {
                 terminal = true;
                 if link.queues.lock().unwrap().cancelled {
                     drop(parcel);
                     (5, Value::Undefined)
                 } else {
-                    match interp.try_adopt(parcel) { Ok(value) => (if failed { 2 } else { 1 }, value), Err(error) => (2, error) }
+                    match interp.try_adopt(parcel) {
+                        Ok(value) => (if failed { 2 } else { 1 }, value),
+                        Err(error) => (2, error),
+                    }
                 }
             }
             Event::Cancel(reason) => {

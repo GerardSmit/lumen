@@ -19,35 +19,35 @@
 
 mod activation;
 pub(crate) mod array_destructure;
+pub(crate) mod array_iterator_step;
 pub(crate) mod class_fields;
 pub(crate) mod ctor_plan;
-pub(crate) mod array_iterator_step;
-pub(crate) mod iter_fast;
 pub(crate) mod derived;
+pub(crate) mod iter_fast;
+mod seed;
 #[cfg(feature = "compiler")]
 mod self_tail;
-mod seed;
 mod slots;
 pub(crate) use slots::op_slots;
 pub(crate) mod block_env;
-pub(crate) mod for_await;
 #[cfg(feature = "compiler")]
 mod destructure_assign;
 mod destructure_seq;
-pub(crate) mod reflect;
-pub(crate) mod inline_callback;
 pub(crate) mod ext_ops;
 #[cfg(feature = "compiler")]
 mod finally;
+pub(crate) mod for_await;
 pub(crate) mod for_in;
 pub(crate) mod generator;
+pub(crate) mod inline_callback;
 #[cfg(feature = "jit")]
 pub(crate) mod jit;
 #[cfg(not(feature = "jit"))]
 #[path = "bytecode/jit_stub.rs"]
 pub(crate) mod jit;
-mod name_path;
 mod memsize;
+mod name_path;
+pub(crate) mod reflect;
 pub(crate) use memsize::ChunkBytes;
 #[cfg(feature = "compiler")]
 mod object_literal;
@@ -57,12 +57,12 @@ pub(crate) mod positions;
 mod prepared_call;
 pub(crate) use prepared_call::{call_once_direct, PreparedCall};
 pub(crate) mod serialize;
-mod verify;
 #[cfg(feature = "compiler")]
 mod switch;
 mod switch_table;
 #[cfg(feature = "compiler")]
 mod this_binding;
+mod verify;
 mod vm_regs;
 #[cfg(test)]
 mod write_strictness;
@@ -77,7 +77,7 @@ use lumen_common::limits::size;
 use vm_regs::{PcReg, VmStack};
 
 #[cfg(feature = "jit")]
-pub use jit::aot::{Built as NativeFunction, BuildMode, OP_NAMES as NATIVE_OP_NAMES};
+pub use jit::aot::{BuildMode, Built as NativeFunction, OP_NAMES as NATIVE_OP_NAMES};
 
 #[cfg(feature = "jit")]
 pub enum NativeCaptureInit {
@@ -951,33 +951,66 @@ impl Chunk {
     #[cfg(feature = "compiler")]
     pub(crate) fn native_equivalent(&self, other: &Self) -> bool {
         let source_equal = |left: &crate::ast::FnSource, right: &crate::ast::FnSource| {
-            left.as_str().zip(right.as_str()).is_some_and(|(left, right)| left == right)
+            left.as_str()
+                .zip(right.as_str())
+                .is_some_and(|(left, right)| left == right)
         };
-        self.debug_name == other.debug_name && self.ops == other.ops && self.names == other.names
-            && self.n_slots == other.n_slots && self.slot_names == other.slot_names && self.n_params == other.n_params
-            && self.arguments_slot == other.arguments_slot && self.rest_slot == other.rest_slot && self.virt_base == other.virt_base
-            && self.var_force_resets == other.var_force_resets && self.cap_inits == other.cap_inits
-            && self.uses_this == other.uses_this && self.env_this == other.env_this && self.derived == other.derived && self.reflect_args == other.reflect_args
-            && self.positions == other.positions && self.caches.len() == other.caches.len()
-            && self.name_caches.len() == other.name_caches.len() && self.obj_maps.len() == other.obj_maps.len()
-            && self.consts.len() == other.consts.len() && self.consts.iter().zip(&other.consts).all(|(left, right)| match (left, right) {
-                (Value::Undefined, Value::Undefined) | (Value::Empty, Value::Empty) | (Value::Null, Value::Null) => true,
-                (Value::Bool(left), Value::Bool(right)) => left == right,
-                (Value::Num(left), Value::Num(right)) => left.to_bits() == right.to_bits(),
-                (Value::Str(left), Value::Str(right)) => left.as_str() == right.as_str(),
-                (Value::BigInt(left), Value::BigInt(right)) => left == right,
-                (Value::Sym(left), Value::Sym(right)) => Rc::ptr_eq(left, right),
-                (Value::Obj(left), Value::Obj(right)) => Gc::ptr_eq(left, right),
-                _ => false,
+        self.debug_name == other.debug_name
+            && self.ops == other.ops
+            && self.names == other.names
+            && self.n_slots == other.n_slots
+            && self.slot_names == other.slot_names
+            && self.n_params == other.n_params
+            && self.arguments_slot == other.arguments_slot
+            && self.rest_slot == other.rest_slot
+            && self.virt_base == other.virt_base
+            && self.var_force_resets == other.var_force_resets
+            && self.cap_inits == other.cap_inits
+            && self.uses_this == other.uses_this
+            && self.env_this == other.env_this
+            && self.derived == other.derived
+            && self.reflect_args == other.reflect_args
+            && self.positions == other.positions
+            && self.caches.len() == other.caches.len()
+            && self.name_caches.len() == other.name_caches.len()
+            && self.obj_maps.len() == other.obj_maps.len()
+            && self.consts.len() == other.consts.len()
+            && self
+                .consts
+                .iter()
+                .zip(&other.consts)
+                .all(|(left, right)| match (left, right) {
+                    (Value::Undefined, Value::Undefined)
+                    | (Value::Empty, Value::Empty)
+                    | (Value::Null, Value::Null) => true,
+                    (Value::Bool(left), Value::Bool(right)) => left == right,
+                    (Value::Num(left), Value::Num(right)) => left.to_bits() == right.to_bits(),
+                    (Value::Str(left), Value::Str(right)) => left.as_str() == right.as_str(),
+                    (Value::BigInt(left), Value::BigInt(right)) => left == right,
+                    (Value::Sym(left), Value::Sym(right)) => Rc::ptr_eq(left, right),
+                    (Value::Obj(left), Value::Obj(right)) => Gc::ptr_eq(left, right),
+                    _ => false,
+                })
+            && self.funcs.len() == other.funcs.len()
+            && self.funcs.iter().zip(&other.funcs).all(|(left, right)| {
+                Rc::ptr_eq(left, right)
+                    || (source_equal(&left.source, &right.source)
+                        && left.name == right.name
+                        && left.is_arrow == right.is_arrow
+                        && left.is_method == right.is_method
+                        && left.is_strict == right.is_strict
+                        && left.is_generator == right.is_generator
+                        && left.is_async == right.is_async
+                        && left.is_fn_expr == right.is_fn_expr)
             })
-            && self.funcs.len() == other.funcs.len() && self.funcs.iter().zip(&other.funcs).all(|(left, right)| {
-                Rc::ptr_eq(left, right) || (source_equal(&left.source, &right.source) && left.name == right.name
-                    && left.is_arrow == right.is_arrow && left.is_method == right.is_method && left.is_strict == right.is_strict
-                    && left.is_generator == right.is_generator && left.is_async == right.is_async && left.is_fn_expr == right.is_fn_expr)
-            })
-            && self.classes.len() == other.classes.len() && self.classes.iter().zip(&other.classes).all(|(left, right)| {
-                Rc::ptr_eq(left, right) || source_equal(&left.source, &right.source)
-            })
+            && self.classes.len() == other.classes.len()
+            && self
+                .classes
+                .iter()
+                .zip(&other.classes)
+                .all(|(left, right)| {
+                    Rc::ptr_eq(left, right) || source_equal(&left.source, &right.source)
+                })
     }
     /// Lower this host-side chunk to complete boxed native control flow.
     #[cfg(feature = "jit")]
@@ -986,52 +1019,81 @@ impl Chunk {
     }
 
     #[cfg(all(feature = "jit", feature = "compiler"))]
-    pub fn build_native_with_profile(&self, pointer_width: u8, profile: &crate::feedback::Profile) -> Result<NativeFunction, String> {
+    pub fn build_native_with_profile(
+        &self,
+        pointer_width: u8,
+        profile: &crate::feedback::Profile,
+    ) -> Result<NativeFunction, String> {
         jit::aot::build_with_profile(self, pointer_width, Some(profile))
     }
 
     #[cfg(feature = "compiler")]
     pub(crate) fn feedback_key(&self) -> u64 {
         *self.feedback_key.get_or_init(|| {
-        let mut key = crate::feedback::hash(self.debug_name.as_bytes(), 0xcbf29ce484222325);
-        key = crate::feedback::hash(format!("{:?}", self.ops).as_bytes(), key);
-        for name in &self.names { key = crate::feedback::hash(name.as_bytes(), key); }
-        for value in &self.consts {
-            key = crate::feedback::hash(&crate::native_ops::value_kind(value).to_le_bytes(), key);
-            match value {
-                Value::Num(n) => key = crate::feedback::hash(&n.to_bits().to_le_bytes(), key),
-                Value::Bool(b) => key = crate::feedback::hash(&[u8::from(*b)], key),
-                Value::Str(s) => key = crate::feedback::hash(s.to_string().as_bytes(), key),
-                Value::BigInt(b) => key = crate::feedback::hash(b.to_string_radix(10).as_bytes(), key),
-                _ => {}
+            let mut key = crate::feedback::hash(self.debug_name.as_bytes(), 0xcbf29ce484222325);
+            key = crate::feedback::hash(format!("{:?}", self.ops).as_bytes(), key);
+            for name in &self.names {
+                key = crate::feedback::hash(name.as_bytes(), key);
             }
-        }
-        key
+            for value in &self.consts {
+                key =
+                    crate::feedback::hash(&crate::native_ops::value_kind(value).to_le_bytes(), key);
+                match value {
+                    Value::Num(n) => key = crate::feedback::hash(&n.to_bits().to_le_bytes(), key),
+                    Value::Bool(b) => key = crate::feedback::hash(&[u8::from(*b)], key),
+                    Value::Str(s) => key = crate::feedback::hash(s.to_string().as_bytes(), key),
+                    Value::BigInt(b) => {
+                        key = crate::feedback::hash(b.to_string_radix(10).as_bytes(), key)
+                    }
+                    _ => {}
+                }
+            }
+            key
         })
     }
 
     /// Host compiler metadata. Never serialize the chunk itself in a native image.
     #[cfg(feature = "jit")]
-    pub fn native_constants(&self) -> &[Value] { &self.consts }
+    pub fn native_constants(&self) -> &[Value] {
+        &self.consts
+    }
     #[cfg(feature = "jit")]
-    pub fn native_names(&self) -> &[Rc<str>] { &self.names }
+    pub fn native_names(&self) -> &[Rc<str>] {
+        &self.names
+    }
     #[cfg(feature = "jit")]
-    pub fn native_slot_names(&self) -> &[Rc<str>] { &self.slot_names }
+    pub fn native_slot_names(&self) -> &[Rc<str>] {
+        &self.slot_names
+    }
     #[cfg(feature = "jit")]
-    pub fn native_slot_count(&self) -> usize { self.n_slots }
+    pub fn native_slot_count(&self) -> usize {
+        self.n_slots
+    }
     #[cfg(feature = "jit")]
-    pub fn native_parameter_count(&self) -> usize { self.n_params }
+    pub fn native_parameter_count(&self) -> usize {
+        self.n_params
+    }
     #[cfg(feature = "jit")]
-    pub fn native_child_functions(&self) -> &[Rc<Function>] { &self.funcs }
+    pub fn native_child_functions(&self) -> &[Rc<Function>] {
+        &self.funcs
+    }
     #[cfg(feature = "jit")]
-    pub fn native_classes(&self) -> &[Rc<Class>] { &self.classes }
+    pub fn native_classes(&self) -> &[Rc<Class>] {
+        &self.classes
+    }
     #[cfg(feature = "jit")]
     pub fn native_positions(&self) -> Vec<(u32, u32)> {
-        self.ops.iter().enumerate().filter_map(|(pc, op)| {
-            if !positions::is_site(op) { return None; }
-            let position = self.call_site_pos(pc);
-            (position != crate::ast::NO_POS).then_some((pc as u32, position))
-        }).collect()
+        self.ops
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, op)| {
+                if !positions::is_site(op) {
+                    return None;
+                }
+                let position = self.call_site_pos(pc);
+                (position != crate::ast::NO_POS).then_some((pc as u32, position))
+            })
+            .collect()
     }
     #[cfg(feature = "jit")]
     pub fn native_frame_layout(&self) -> NativeFrameLayout<'_> {
@@ -1040,12 +1102,18 @@ impl Chunk {
             rest_slot: self.rest_slot,
             virt_base: self.virt_base,
             var_force_resets: &self.var_force_resets,
-            cap_inits: self.cap_inits.iter().map(|init| match init {
-                CapInit::Param(slot, name) => NativeCaptureInit::Param(*slot, name.clone()),
-                CapInit::Var(name) => NativeCaptureInit::Var(name.clone()),
-                CapInit::Fn(index, name) => NativeCaptureInit::Function(*index, name.clone()),
-                CapInit::Lexical(name, immutable) => NativeCaptureInit::Lexical(name.clone(), *immutable),
-            }).collect(),
+            cap_inits: self
+                .cap_inits
+                .iter()
+                .map(|init| match init {
+                    CapInit::Param(slot, name) => NativeCaptureInit::Param(*slot, name.clone()),
+                    CapInit::Var(name) => NativeCaptureInit::Var(name.clone()),
+                    CapInit::Fn(index, name) => NativeCaptureInit::Function(*index, name.clone()),
+                    CapInit::Lexical(name, immutable) => {
+                        NativeCaptureInit::Lexical(name.clone(), *immutable)
+                    }
+                })
+                .collect(),
             uses_this: self.uses_this,
             env_this: self.env_this,
             derived: self.derived,
@@ -1075,7 +1143,10 @@ impl Chunk {
     #[inline]
     fn seed_rest(&self, i: &mut Interp, slots: &mut [Value], args: &[Value]) {
         if let Some(base) = self.virt_base {
-            let s = self.arguments_slot.or(self.rest_slot).expect("virtual object slot");
+            let s = self
+                .arguments_slot
+                .or(self.rest_slot)
+                .expect("virtual object slot");
             let p = self.n_params;
             slots[s as usize] = if args.len() <= p {
                 Value::Num(args.len().saturating_sub(base as usize) as f64)
@@ -1130,11 +1201,19 @@ impl std::fmt::Debug for Chunk {
 #[cfg(feature = "compiler")]
 include!("bytecode/compiler.rs");
 #[cfg(not(feature = "compiler"))]
-pub fn compile(_func: &Function) -> Option<Rc<Chunk>> { None }
+pub fn compile(_func: &Function) -> Option<Rc<Chunk>> {
+    None
+}
 #[cfg(not(feature = "compiler"))]
-pub fn compile_derived(_func: &Function) -> Option<Rc<Chunk>> { None }
+pub fn compile_derived(_func: &Function) -> Option<Rc<Chunk>> {
+    None
+}
 #[cfg(all(feature = "parallel", not(feature = "compiler")))]
-pub(crate) fn function_free_identifiers(_func: &Function) -> Option<std::collections::HashSet<String>> { None }
+pub(crate) fn function_free_identifiers(
+    _func: &Function,
+) -> Option<std::collections::HashSet<String>> {
+    None
+}
 // ---------------------------------------------------------------------------------------------
 // VM
 // ---------------------------------------------------------------------------------------------
@@ -1148,13 +1227,29 @@ pub enum VmStep {
 
 #[cfg(not(feature = "compiler"))]
 pub fn run(i: &mut Interp, _: &Chunk, _: &Env, _: Value, _: &[Value]) -> Result<Value, Abrupt> {
-    Err(i.throw("EvalError", "bytecode execution is not available in an AOT build"))
+    Err(i.throw(
+        "EvalError",
+        "bytecode execution is not available in an AOT build",
+    ))
 }
 
 #[cfg(not(feature = "compiler"))]
 #[allow(clippy::too_many_arguments)]
-fn drive_vm(i: &mut Interp, _: &Chunk, _: &Env, _: &mut [Value], _: &mut Vec<Value>, _: &mut usize, _: &Value, _: &mut Vec<Handler>, _: Option<Value>) -> Result<VmStep, Abrupt> {
-    Err(i.throw("EvalError", "bytecode execution is not available in an AOT build"))
+fn drive_vm(
+    i: &mut Interp,
+    _: &Chunk,
+    _: &Env,
+    _: &mut [Value],
+    _: &mut Vec<Value>,
+    _: &mut usize,
+    _: &Value,
+    _: &mut Vec<Handler>,
+    _: Option<Value>,
+) -> Result<VmStep, Abrupt> {
+    Err(i.throw(
+        "EvalError",
+        "bytecode execution is not available in an AOT build",
+    ))
 }
 
 /// Execute a compiled function body. `env` is the root for free-name resolution — the *definition*
@@ -1239,7 +1334,7 @@ fn drive_vm(
             Err(Abrupt::Throw(e)) => pending_throw = Some(e),
             Err(other) => return Err(other),
         }
-        } else if pending_throw.is_none() && handlers.is_empty() && jit::resume_due(i, chunk, *pc) {
+    } else if pending_throw.is_none() && handlers.is_empty() && jit::resume_due(i, chunk, *pc) {
         // An async body resumed after an `await`: its function code continues there.
         match jit::on_resume(i, chunk, env, slots, stack, pc, this_val) {
             Ok(Some(step)) => return Ok(step),
@@ -1791,7 +1886,11 @@ unsafe fn tail_leave(
 
 /// The call window on top of `stack` (callee, receiver when `has_this`, `argc` arguments),
 /// taken off as an `Interp::pending_tail` entry.
-fn tail_window(stack: &mut Vec<Value>, argc: usize, has_this: bool) -> Box<(Value, Value, Vec<Value>)> {
+fn tail_window(
+    stack: &mut Vec<Value>,
+    argc: usize,
+    has_this: bool,
+) -> Box<(Value, Value, Vec<Value>)> {
     let args = stack.split_off(stack.len() - argc);
     let callee = stack.pop().expect("tail call callee");
     let this = if has_this {
@@ -1931,7 +2030,13 @@ pub(crate) fn call_compiled(
 /// `chunk.names[name_n]` by NamedEvaluation unless `name_n` is `u32::MAX`. The whole op, for
 /// the interpreter loop and for native code's call-out (it reads no slot and moves no pc).
 #[inline]
-pub(crate) fn make_closure(i: &mut Interp, chunk: &Chunk, fidx: u32, name_n: u32, env: &Env) -> Value {
+pub(crate) fn make_closure(
+    i: &mut Interp,
+    chunk: &Chunk,
+    fidx: u32,
+    name_n: u32,
+    env: &Env,
+) -> Value {
     let func = chunk.funcs[fidx as usize].clone();
     if name_n == u32::MAX {
         return i.make_function(func, env.clone());
@@ -2012,7 +2117,10 @@ fn run_vm_frames<const ONE: bool>(
     _handlers: &mut Vec<Handler>,
     _frames: *mut InlineFrames,
 ) -> Result<VmStep, Abrupt> {
-    Err(i.throw("EvalError", "bytecode execution is not available in an AOT build"))
+    Err(i.throw(
+        "EvalError",
+        "bytecode execution is not available in an AOT build",
+    ))
 }
 
 /// [`run_vm`] plus inline frames: with a non-null `frames` (only [`drive_vm`] passes one), a
@@ -2174,12 +2282,18 @@ fn run_vm_frames<const ONE: bool>(
                     // left, and the call is made from the caller's call site — inline again when
                     // the callee qualifies, reusing the record: constant space.
                     stack.sync();
-                    unsafe { tail_leave(i, &mut *frames, root_stack, argc + 1 + has_this as usize) };
+                    unsafe {
+                        tail_leave(i, &mut *frames, root_stack, argc + 1 + has_this as usize)
+                    };
                     load_frame!();
                     let at = stack.len() - argc;
                     try_inline_call!(at, has_this);
                     let callee = stack[at - 1].clone();
-                    let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+                    let this = if has_this {
+                        stack[at - 2].clone()
+                    } else {
+                        Value::Undefined
+                    };
                     let v = i.call(callee, this, &stack[at..])?;
                     stack.truncate(at - 1 - has_this as usize);
                     stack.push(v);
@@ -2212,7 +2326,11 @@ fn run_vm_frames<const ONE: bool>(
                 try_inline_call!(at, has_this);
             }
             let callee = stack[at - 1].clone();
-            let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+            let this = if has_this {
+                stack[at - 2].clone()
+            } else {
+                Value::Undefined
+            };
             let v = i
                 .call(callee, this, &stack[at..])
                 .map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
@@ -2230,10 +2348,30 @@ fn run_vm_frames<const ONE: bool>(
             stepped = true;
         }
         let op = ops[*pc];
-        if matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::EqEq | Op::NotEq | Op::StrictEq | Op::StrictNotEq) {
+        if matches!(
+            op,
+            Op::Add
+                | Op::Sub
+                | Op::Mul
+                | Op::Div
+                | Op::Mod
+                | Op::Lt
+                | Op::Le
+                | Op::Gt
+                | Op::Ge
+                | Op::EqEq
+                | Op::NotEq
+                | Op::StrictEq
+                | Op::StrictNotEq
+        ) {
             let length = stack.len();
             if length >= 2 {
-                crate::feedback::observe(|| chunk.feedback_key(), *pc, &stack[length - 2], &stack[length - 1]);
+                crate::feedback::observe(
+                    || chunk.feedback_key(),
+                    *pc,
+                    &stack[length - 2],
+                    &stack[length - 1],
+                );
             }
         } else if matches!(op, Op::GetProp(..) | Op::GetMethod(..)) {
             if let Some(value) = stack.last() {
@@ -2375,11 +2513,15 @@ fn run_vm_frames<const ONE: bool>(
             Op::UpdateName(n, kind) => {
                 let name = &chunk.names[n as usize];
                 let old = i.get_var(name, env)?;
-                step_and_store(i, &mut stack, kind, old, |i, v| i.assign_free_name(name, v, env))?;
+                step_and_store(i, &mut stack, kind, old, |i, v| {
+                    i.assign_free_name(name, v, env)
+                })?;
             }
             Op::UpdateNameCached(n, c, kind) => {
                 let old = chunk.load_name_ic(i, env, n, c)?;
-                step_and_store(i, &mut stack, kind, old, |i, v| chunk.store_name_ic(i, env, n, c, v))?;
+                step_and_store(i, &mut stack, kind, old, |i, v| {
+                    chunk.store_name_ic(i, env, n, c, v)
+                })?;
             }
             Op::MakeClosure(fidx, name_n) => {
                 stack.push(make_closure(i, chunk, fidx, name_n, env));
@@ -2501,7 +2643,8 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::DeleteProp(n, strict) => {
                 let base = pop!();
-                let v = crate::native_ops::delete_property(i, base, &chunk.names[n as usize], strict)?;
+                let v =
+                    crate::native_ops::delete_property(i, base, &chunk.names[n as usize], strict)?;
                 stack.push(v);
             }
             Op::DeleteElem(strict) => {
@@ -2521,7 +2664,11 @@ fn run_vm_frames<const ONE: bool>(
                     let has_this = matches!(op, Op::CallSpreadThis(_));
                     try_inline_call!(at, has_this);
                     let callee = stack[at - 1].clone();
-                    let this = if has_this { stack[at - 2].clone() } else { Value::Undefined };
+                    let this = if has_this {
+                        stack[at - 2].clone()
+                    } else {
+                        Value::Undefined
+                    };
                     let v = i
                         .call(callee, this, &stack[at..])
                         .map_err(|e| call_error(i, chunk, *pc - 1, &stack[at - 1], e))?;
@@ -2572,8 +2719,7 @@ fn run_vm_frames<const ONE: bool>(
                         }
                     }
                     (Value::Str(s), Value::Num(n)) => {
-                        if let Some(v) =
-                            str_index_fast(s, *n).or_else(|| str_index_units(i, s, *n))
+                        if let Some(v) = str_index_fast(s, *n).or_else(|| str_index_units(i, s, *n))
                         {
                             stack.push(v);
                             continue;
@@ -2992,8 +3138,10 @@ fn run_vm_frames<const ONE: bool>(
             Op::JumpIfNotCmpLL(kind, a, b, t) => {
                 let yes = match (&slots[a as usize], &slots[b as usize]) {
                     (Value::Num(x), Value::Num(y)) => kind.num(*x, *y),
-                    (x, y) if kind.is_strict() && !matches!(x, Value::Empty)
-                        && !matches!(y, Value::Empty) =>
+                    (x, y)
+                        if kind.is_strict()
+                            && !matches!(x, Value::Empty)
+                            && !matches!(y, Value::Empty) =>
                     {
                         i.strict_equals(x, y) == matches!(kind, CmpKind::StrictEq)
                     }
@@ -3151,7 +3299,9 @@ fn run_vm_frames<const ONE: bool>(
                 let v = if tidx != u32::MAX {
                     // Values move straight from the stack into the new object (no temporary Vec).
                     let tmpl = &chunk.obj_maps[tidx as usize];
-                    stack.with_vec(|vals| i.make_plain_object_templated(tmpl, keys, vals.drain(at..)))
+                    stack.with_vec(|vals| {
+                        i.make_plain_object_templated(tmpl, keys, vals.drain(at..))
+                    })
                 } else {
                     let values: Vec<Value> = stack.split_off(at);
                     i.make_plain_object_vm(keys, values)
@@ -3267,20 +3417,26 @@ fn run_vm_frames<const ONE: bool>(
             Op::PopHandler => {
                 handlers.pop();
             }
-            Op::GetPrivate(n) => stack.with_vec(|s| ext_ops::get_private(i, env, &chunk.names[n as usize], s))?,
-            Op::SetPrivate(n) => stack.with_vec(|s| ext_ops::set_private(i, env, &chunk.names[n as usize], s))?,
-            Op::GetPrivateMethod(n) => {
-                stack.with_vec(|s| ext_ops::get_private_method(i, env, &chunk.names[n as usize], s))?
+            Op::GetPrivate(n) => {
+                stack.with_vec(|s| ext_ops::get_private(i, env, &chunk.names[n as usize], s))?
             }
-            Op::PrivateIn(n) => stack.with_vec(|s| ext_ops::private_in(i, env, &chunk.names[n as usize], s))?,
-            Op::UpdatePrivate(n, kind) => {
-                stack.with_vec(|s| ext_ops::update_private(i, env, &chunk.names[n as usize], kind, s))?
+            Op::SetPrivate(n) => {
+                stack.with_vec(|s| ext_ops::set_private(i, env, &chunk.names[n as usize], s))?
             }
+            Op::GetPrivateMethod(n) => stack
+                .with_vec(|s| ext_ops::get_private_method(i, env, &chunk.names[n as usize], s))?,
+            Op::PrivateIn(n) => {
+                stack.with_vec(|s| ext_ops::private_in(i, env, &chunk.names[n as usize], s))?
+            }
+            Op::UpdatePrivate(n, kind) => stack
+                .with_vec(|s| ext_ops::update_private(i, env, &chunk.names[n as usize], kind, s))?,
             Op::NewObject => stack.push(Value::Obj(i.new_object())),
             Op::InitProp(n, named) => {
                 stack.with_vec(|s| ext_ops::init_prop(i, &chunk.names[n as usize], named, s))?
             }
-            Op::InitPropComputed(named) => stack.with_vec(|s| ext_ops::init_prop_computed(i, named, s))?,
+            Op::InitPropComputed(named) => {
+                stack.with_vec(|s| ext_ops::init_prop_computed(i, named, s))?
+            }
             Op::DefineField(n, named) => {
                 let v = pop!();
                 let this = pop!();
@@ -3288,13 +3444,17 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::InitMethod(fidx, n, kind) => {
                 let key = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
-                stack.with_vec(|s| ext_ops::init_method(i, env, &chunk.funcs[fidx as usize], key, kind, s))?
+                stack.with_vec(|s| {
+                    ext_ops::init_method(i, env, &chunk.funcs[fidx as usize], key, kind, s)
+                })?
             }
             Op::CopyDataProps => stack.with_vec(|s| ext_ops::copy_data_props(i, s))?,
             Op::SetProtoLit => stack.with_vec(|s| ext_ops::set_proto_lit(s)),
             Op::MakeClass(cidx, n) => {
                 let name = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
-                stack.with_vec(|s| ext_ops::make_class(i, env, &chunk.classes[cidx as usize], name, s))?
+                stack.with_vec(|s| {
+                    ext_ops::make_class(i, env, &chunk.classes[cidx as usize], name, s)
+                })?
             }
             Op::Nip => {
                 let top = pop!();
@@ -3306,14 +3466,9 @@ fn run_vm_frames<const ONE: bool>(
             }
             Op::SuperGetElem => stack.with_vec(|s| ext_ops::super_get(i, env, None, s))?,
             Op::SuperBase => stack.with_vec(|s| ext_ops::super_base(i, env, s))?,
-            Op::SuperMethod(n, lexical) => stack.with_vec(|s| ext_ops::super_method(
-                i,
-                env,
-                this_val,
-                Some(&chunk.names[n as usize]),
-                lexical,
-                s,
-            ))?,
+            Op::SuperMethod(n, lexical) => stack.with_vec(|s| {
+                ext_ops::super_method(i, env, this_val, Some(&chunk.names[n as usize]), lexical, s)
+            })?,
             Op::SuperMethodElem(lexical) => {
                 stack.with_vec(|s| ext_ops::super_method(i, env, this_val, None, lexical, s))?
             }
@@ -3459,7 +3614,14 @@ fn run_vm_frames<const ONE: bool>(
                     Op::InitMethod(fidx, n, kind) => {
                         let key = (n != u32::MAX).then(|| &*chunk.names[n as usize]);
                         stack.with_vec(|s| {
-                            ext_ops::init_method(i, &benv, &chunk.funcs[fidx as usize], key, kind, s)
+                            ext_ops::init_method(
+                                i,
+                                &benv,
+                                &chunk.funcs[fidx as usize],
+                                key,
+                                kind,
+                                s,
+                            )
                         })?
                     }
                     Op::MakeClass(cidx, n) => {
@@ -4615,7 +4777,9 @@ pub(crate) fn str_index_fast(s: &crate::lstr::LStr, n: f64) -> Option<Value> {
     if !s.ascii_hint() || !(0.0..s.len() as f64).contains(&n) || n.fract() != 0.0 {
         return None;
     }
-    Some(Value::Str(crate::jstr::unit_lstr(u16::from(s.as_bytes()[n as usize]))))
+    Some(Value::Str(crate::jstr::unit_lstr(u16::from(
+        s.as_bytes()[n as usize],
+    ))))
 }
 
 /// `s[n]` for an in-range integer index of a string that may be non-ASCII (through the
@@ -5012,7 +5176,11 @@ fn template_chain<'a>(left: &'a Expr, right: &'a Expr) -> Option<Vec<&'a Expr>> 
     let mut cur = left;
     loop {
         match cur {
-            Expr::Binary { op: "+", left, right } if leaf(right) => {
+            Expr::Binary {
+                op: "+",
+                left,
+                right,
+            } if leaf(right) => {
                 rev.push(right);
                 cur = left;
             }
@@ -5040,7 +5208,9 @@ pub(crate) fn concat_strs_fast(parts: &[Value]) -> Option<Value> {
     }
     let total: usize = strs.iter().map(|s| s.len()).sum();
     if total > crate::interpreter::MAX_STR_LEN
-        || strs.windows(2).any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
+        || strs
+            .windows(2)
+            .any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
     {
         return None;
     }
@@ -5059,7 +5229,10 @@ pub(crate) fn concat_strs(i: &mut Interp, parts: &[Value]) -> Result<Value, Abru
     if total > crate::interpreter::MAX_STR_LEN {
         return Err(i.throw("RangeError", "Invalid string length"));
     }
-    if strs.windows(2).any(|w| crate::jstr::needs_join_fixup(w[0], w[1])) {
+    if strs
+        .windows(2)
+        .any(|w| crate::jstr::needs_join_fixup(w[0], w[1]))
+    {
         let mut acc = String::new();
         for s in strs {
             acc = crate::jstr::concat(&acc, s);

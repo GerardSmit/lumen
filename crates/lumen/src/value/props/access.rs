@@ -1,7 +1,7 @@
 //! Named lookup, slot access, and ordered reflection.
 use super::shapes::index_key;
-use super::{Props, NO_SLOT};
-use crate::value::{canonical_index, PackedValue, PropRef, Property};
+use super::{NO_SLOT, Props};
+use crate::value::{PackedValue, PropRef, Property, canonical_index};
 use std::rc::Rc;
 
 impl Props {

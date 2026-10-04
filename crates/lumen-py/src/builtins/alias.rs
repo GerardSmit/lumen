@@ -76,7 +76,11 @@ impl Interp {
         self.reg_prop(&generic, "__args__", generic_args);
         self.reg_prop(&generic, "__parameters__", generic_parameters);
         self.reg_prop(&generic, "__unpacked__", generic_unpacked);
-        self.reg_prop(&generic, "__typing_unpacked_tuple_args__", generic_unpacked_args);
+        self.reg_prop(
+            &generic,
+            "__typing_unpacked_tuple_args__",
+            generic_unpacked_args,
+        );
 
         let union = new_type(self, "types", "UnionType", None, Layout::Other);
         self.reg(&union, "__repr__", union_repr);
@@ -114,7 +118,8 @@ impl Interp {
             if matches!(o.kind, Kind::Type(_)) && Rc::ptr_eq(o, &self.types.none_type) {
                 return Ok("None".into());
             }
-            let has_origin = self.get_attr_str(v, "__origin__").is_ok() && self.get_attr_str(v, "__args__").is_ok();
+            let has_origin = self.get_attr_str(v, "__origin__").is_ok()
+                && self.get_attr_str(v, "__args__").is_ok();
             if !has_origin {
                 if matches!(o.kind, Kind::Type(_)) {
                     return Ok(self.type_display(o));
@@ -123,7 +128,11 @@ impl Interp {
                 let m = self.get_attr_str(v, "__module__");
                 if let (Ok(q), Ok(m)) = (q, m) {
                     if let (Some(q), Some(m)) = (q.as_str(), m.as_str()) {
-                        return Ok(if m == "builtins" { q.to_string() } else { format!("{}.{}", m, q) });
+                        return Ok(if m == "builtins" {
+                            q.to_string()
+                        } else {
+                            format!("{}.{}", m, q)
+                        });
                     }
                 }
             }
@@ -221,7 +230,11 @@ impl Interp {
             let inner = with_opaque::<UnionData, _>(&m, |u| u.args.clone());
             let items = match inner {
                 Some(args) => args,
-                None => vec![if m.is_none() { Value::Obj(self.types.none_type.clone()) } else { m }],
+                None => vec![if m.is_none() {
+                    Value::Obj(self.types.none_type.clone())
+                } else {
+                    m
+                }],
             };
             for x in items {
                 if !self.contains_value(&flat, &x)? {
@@ -258,7 +271,9 @@ fn generic_getattribute(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__getattribute__", a, 2, 2)?;
     let name = a[1].as_str().unwrap_or("").to_string();
     let origin = alias_of(it, &a[0], |d| d.origin.clone())?;
-    let Value::Obj(n) = &a[1] else { return Err(it.type_error("attribute name must be string")) };
+    let Value::Obj(n) = &a[1] else {
+        return Err(it.type_error("attribute name must be string"));
+    };
     if ALIAS_OWN.contains(&name.as_str()) {
         let cls = it.type_of(&a[0]);
         return it.generic_getattr(&a[0], &cls, n);
@@ -273,7 +288,9 @@ fn generic_setattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         return Err(it.new_exc_str("AttributeError", &format!("readonly attribute '{}'", name)));
     }
     let origin = alias_of(it, &a[0], |d| d.origin.clone())?;
-    let Value::Obj(n) = &a[1] else { return Err(it.type_error("attribute name must be string")) };
+    let Value::Obj(n) = &a[1] else {
+        return Err(it.type_error("attribute name must be string"));
+    };
     it.set_attr(&origin, n, a[2].clone())?;
     Ok(Value::None)
 }
@@ -315,8 +332,18 @@ fn generic_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     };
     if given.len() != params.len() {
         let r = it.repr_of(&a[0])?;
-        let word = if given.len() > params.len() { "many" } else { "few" };
-        return Err(it.type_error(&format!("Too {} arguments for {}; actual {}, expected {}", word, r, given.len(), params.len())));
+        let word = if given.len() > params.len() {
+            "many"
+        } else {
+            "few"
+        };
+        return Err(it.type_error(&format!(
+            "Too {} arguments for {}; actual {}, expected {}",
+            word,
+            r,
+            given.len(),
+            params.len()
+        )));
     }
     let mut new_args = Vec::new();
     for arg in &args {
@@ -331,7 +358,9 @@ fn generic_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
             Some(v) => new_args.push(v),
             None => {
                 if let Value::Obj(o) = arg {
-                    if !matches!(o.kind, Kind::Type(_)) && it.get_attr_str(arg, "__parameters__").is_ok() {
+                    if !matches!(o.kind, Kind::Type(_))
+                        && it.get_attr_str(arg, "__parameters__").is_ok()
+                    {
                         let sub = it.get_attr_str(arg, "__parameters__")?;
                         let sub_params = sub.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
                         if !sub_params.is_empty() {
@@ -354,12 +383,21 @@ fn generic_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
         }
     }
     let ty = it.alias_types().generic.clone();
-    Ok(new_opaque(&ty, AliasData { origin, args: new_args }))
+    Ok(new_opaque(
+        &ty,
+        AliasData {
+            origin,
+            args: new_args,
+        },
+    ))
 }
 
 fn generic_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__eq__", a, 2, 2)?;
-    let Some((o2, a2)) = with_opaque::<AliasData, _>(&a[1], |d| (d.origin.clone(), d.args.clone())) else { return Ok(Value::NotImplemented) };
+    let Some((o2, a2)) = with_opaque::<AliasData, _>(&a[1], |d| (d.origin.clone(), d.args.clone()))
+    else {
+        return Ok(Value::NotImplemented);
+    };
     let (o1, a1) = alias_of(it, &a[0], |d| (d.origin.clone(), d.args.clone()))?;
     if !it.values_eq(&o1, &o2)? {
         return Ok(Value::Bool(false));
@@ -386,18 +424,28 @@ fn generic_instancecheck(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
 
 fn generic_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__or__", a, 2, 2)?;
-    Ok(it.union_binop(&a[0], &a[1])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[0], &a[1])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn generic_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__ror__", a, 2, 2)?;
-    Ok(it.union_binop(&a[1], &a[0])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[1], &a[0])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn generic_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let ty = it.alias_types().generic.clone();
     let copy = alias_of(it, &a[0], |d| (d.origin.clone(), d.args.clone()))?;
-    let v = new_opaque(&ty, AliasData { origin: copy.0, args: copy.1 });
+    let v = new_opaque(
+        &ty,
+        AliasData {
+            origin: copy.0,
+            args: copy.1,
+        },
+    );
     let items = vec![v];
     it.native_get_iter(&Value::tuple(items))
 }
@@ -405,7 +453,10 @@ fn generic_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 fn generic_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     let (o, args) = alias_of(it, &a[0], |d| (d.origin.clone(), d.args.clone()))?;
     let ty = Value::Obj(it.alias_types().generic.clone());
-    Ok(Value::tuple(vec![ty, Value::tuple(vec![o, Value::tuple(args)])]))
+    Ok(Value::tuple(vec![
+        ty,
+        Value::tuple(vec![o, Value::tuple(args)]),
+    ]))
 }
 
 fn generic_origin(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -447,7 +498,9 @@ fn union_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn union_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__eq__", a, 2, 2)?;
-    let Some(b) = with_opaque::<UnionData, _>(&a[1], |d| d.args.clone()) else { return Ok(Value::NotImplemented) };
+    let Some(b) = with_opaque::<UnionData, _>(&a[1], |d| d.args.clone()) else {
+        return Ok(Value::NotImplemented);
+    };
     let x = union_of(it, &a[0], |d| d.args.clone())?;
     if x.len() != b.len() {
         return Ok(Value::Bool(false));
@@ -468,12 +521,16 @@ fn union_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn union_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__or__", a, 2, 2)?;
-    Ok(it.union_binop(&a[0], &a[1])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[0], &a[1])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn union_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__ror__", a, 2, 2)?;
-    Ok(it.union_binop(&a[1], &a[0])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[1], &a[0])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn union_args(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -515,11 +572,19 @@ fn union_members_check(it: &mut Interp, a: &[Value], subclass: bool) -> R<Value>
     let args = union_of(it, &a[0], |d| d.args.clone())?;
     for x in &args {
         if with_opaque::<AliasData, _>(x, |_| ()).is_some() {
-            return Err(it.type_error(if subclass { "issubclass() argument 2 cannot be a parameterized generic" } else { "isinstance() argument 2 cannot be a parameterized generic" }));
+            return Err(it.type_error(if subclass {
+                "issubclass() argument 2 cannot be a parameterized generic"
+            } else {
+                "isinstance() argument 2 cannot be a parameterized generic"
+            }));
         }
     }
     for x in &args {
-        let hit = if subclass { it.issubclass_value(&a[1], x)? } else { it.isinstance_value(&a[1], x)? };
+        let hit = if subclass {
+            it.issubclass_value(&a[1], x)?
+        } else {
+            it.isinstance_value(&a[1], x)?
+        };
         if hit {
             return Ok(Value::Bool(true));
         }

@@ -73,7 +73,12 @@ fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
     if arg.is_none() {
         return Ok(Value::Obj(it.types.none_type.clone()));
     }
-    call_typing(it, "_type_check", vec![arg.clone(), Value::str(msg)], Vec::new())
+    call_typing(
+        it,
+        "_type_check",
+        vec![arg.clone(), Value::str(msg)],
+        Vec::new(),
+    )
 }
 
 /// The `__name__` of the module whose code is running (CPython's `caller()`).
@@ -99,7 +104,12 @@ fn name_arg(it: &mut Interp, fname: &str, v: &Value) -> R<Value> {
     Ok(v.clone())
 }
 
-fn variance_checks(it: &mut Interp, covariant: bool, contravariant: bool, infer_variance: bool) -> R<()> {
+fn variance_checks(
+    it: &mut Interp,
+    covariant: bool,
+    contravariant: bool,
+    infer_variance: bool,
+) -> R<()> {
     if covariant && contravariant {
         return Err(it.value_error("Bivariant types are not supported."));
     }
@@ -109,7 +119,12 @@ fn variance_checks(it: &mut Interp, covariant: bool, contravariant: bool, infer_
     Ok(())
 }
 
-fn variance_repr(name: &Value, covariant: bool, contravariant: bool, infer_variance: bool) -> Value {
+fn variance_repr(
+    name: &Value,
+    covariant: bool,
+    contravariant: bool,
+    infer_variance: bool,
+) -> Value {
     let n = name.as_str().unwrap_or("");
     if infer_variance {
         return Value::str(n);
@@ -126,14 +141,20 @@ fn variance_repr(name: &Value, covariant: bool, contravariant: bool, infer_varia
 
 /// Replaces each `TypeVarTuple` in `params` with `Unpack[tvt]`.
 fn unpack_typevartuples(it: &mut Interp, params: &Value) -> R<Value> {
-    let Some(items) = params.tuple_items() else { return Ok(params.clone()) };
+    let Some(items) = params.tuple_items() else {
+        return Ok(params.clone());
+    };
     if !items.iter().any(is_typevartuple) {
         return Ok(params.clone());
     }
     let items = items.to_vec();
     let mut out = Vec::with_capacity(items.len());
     for p in items {
-        out.push(if is_typevartuple(&p) { unpack(it, &p)? } else { p });
+        out.push(if is_typevartuple(&p) {
+            unpack(it, &p)?
+        } else {
+            p
+        });
     }
     Ok(Value::tuple(out))
 }
@@ -196,7 +217,11 @@ fn typevar_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
         }
         match NAMES.iter().position(|n| *n == kn) {
             Some(i) => opts[i] = Some(v.clone()),
-            None => return Err(it.type_error(&format!("typevar() got an unexpected keyword argument '{kn}'"))),
+            None => {
+                return Err(it.type_error(&format!(
+                    "typevar() got an unexpected keyword argument '{kn}'"
+                )))
+            }
         }
     }
     let Some(name) = name else {
@@ -214,7 +239,9 @@ fn typevar_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let constraints = match constraints.len() {
         0 => None,
         1 => return Err(it.type_error("A single constraint is not allowed")),
-        _ if bound.is_some() => return Err(it.type_error("Constraints cannot be combined with bound=...")),
+        _ if bound.is_some() => {
+            return Err(it.type_error("Constraints cannot be combined with bound=..."))
+        }
         _ => Some(Value::tuple(constraints)),
     };
     let module = caller_module(it);
@@ -244,18 +271,24 @@ fn typevar_bound(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if let Some(b) = bound {
         return Ok(b);
     }
-    let Some(f) = eval else { return Ok(Value::None) };
+    let Some(f) = eval else {
+        return Ok(Value::None);
+    };
     let b = it.call(&f, Vec::new(), Vec::new())?;
     tv(it, &a[0], |d| d.bound = Some(b.clone()))?;
     Ok(b)
 }
 
 fn typevar_constraints(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (cons, eval) = tv(it, &a[0], |d| (d.constraints.clone(), d.evaluate_constraints.clone()))?;
+    let (cons, eval) = tv(it, &a[0], |d| {
+        (d.constraints.clone(), d.evaluate_constraints.clone())
+    })?;
     if let Some(c) = cons {
         return Ok(c);
     }
-    let Some(f) = eval else { return Ok(Value::tuple(Vec::new())) };
+    let Some(f) = eval else {
+        return Ok(Value::tuple(Vec::new()));
+    };
     let c = it.call(&f, Vec::new(), Vec::new())?;
     tv(it, &a[0], |d| d.constraints = Some(c.clone()))?;
     Ok(c)
@@ -274,7 +307,9 @@ fn typevar_infer_variance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn typevar_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance))
+    tv(it, &a[0], |d| {
+        variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance)
+    })
 }
 
 fn typevar_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -293,12 +328,22 @@ fn typevar_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
 
 fn make_union_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__or__", a, 2, 2)?;
-    call_typing(it, "_make_union", vec![a[0].clone(), a[1].clone()], Vec::new())
+    call_typing(
+        it,
+        "_make_union",
+        vec![a[0].clone(), a[1].clone()],
+        Vec::new(),
+    )
 }
 
 fn make_union_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__ror__", a, 2, 2)?;
-    call_typing(it, "_make_union", vec![a[1].clone(), a[0].clone()], Vec::new())
+    call_typing(
+        it,
+        "_make_union",
+        vec![a[1].clone(), a[0].clone()],
+        Vec::new(),
+    )
 }
 
 // ---- ParamSpec ----
@@ -313,18 +358,46 @@ fn new_paramspec(it: &mut Interp, data: ParamSpecData) -> R<Value> {
 }
 
 fn paramspec_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("paramspec", a.get(1..).unwrap_or(&[]), kw, &["name", "bound", "covariant", "contravariant", "infer_variance"], 1)?;
+    let b = it.bind_args(
+        "paramspec",
+        a.get(1..).unwrap_or(&[]),
+        kw,
+        &[
+            "name",
+            "bound",
+            "covariant",
+            "contravariant",
+            "infer_variance",
+        ],
+        1,
+    )?;
     if a.len() > 2 {
-        return Err(it.type_error(&format!("paramspec() takes exactly 1 positional argument ({} given)", a.len() - 1)));
+        return Err(it.type_error(&format!(
+            "paramspec() takes exactly 1 positional argument ({} given)",
+            a.len() - 1
+        )));
     }
     let name = name_arg(it, "paramspec", b[0].as_ref().unwrap_or(&Value::None))?;
     let covariant = bool_kw(it, &b[2])?;
     let contravariant = bool_kw(it, &b[3])?;
     let infer_variance = bool_kw(it, &b[4])?;
     variance_checks(it, covariant, contravariant, infer_variance)?;
-    let bound = type_check(it, b[1].as_ref().unwrap_or(&Value::None), "Bound must be a type.")?;
+    let bound = type_check(
+        it,
+        b[1].as_ref().unwrap_or(&Value::None),
+        "Bound must be a type.",
+    )?;
     let module = caller_module(it);
-    let v = new_paramspec(it, ParamSpecData { name, bound: Some(bound), covariant, contravariant, infer_variance })?;
+    let v = new_paramspec(
+        it,
+        ParamSpecData {
+            name,
+            bound: Some(bound),
+            covariant,
+            contravariant,
+            infer_variance,
+        },
+    )?;
     set_module(it, &v, module);
     Ok(v)
 }
@@ -350,19 +423,31 @@ fn paramspec_infer_variance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 }
 
 fn paramspec_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance))
+    ps(it, &a[0], |d| {
+        variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance)
+    })
 }
 
 fn paramspec_args(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     ps(it, &a[0], |_| ())?;
     let ty = typing_type(it, "ParamSpecArgs")?;
-    Ok(new_opaque(&ty, ParamSpecAttr { origin: a[0].clone() }))
+    Ok(new_opaque(
+        &ty,
+        ParamSpecAttr {
+            origin: a[0].clone(),
+        },
+    ))
 }
 
 fn paramspec_kwargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     ps(it, &a[0], |_| ())?;
     let ty = typing_type(it, "ParamSpecKwargs")?;
-    Ok(new_opaque(&ty, ParamSpecAttr { origin: a[0].clone() }))
+    Ok(new_opaque(
+        &ty,
+        ParamSpecAttr {
+            origin: a[0].clone(),
+        },
+    ))
 }
 
 fn paramspec_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -388,13 +473,27 @@ fn paramspec_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
 // ---- ParamSpecArgs / ParamSpecKwargs ----
 
 fn psattr_origin(it: &mut Interp, v: &Value) -> R<Value> {
-    with_opaque::<ParamSpecAttr, _>(v, |d| d.origin.clone()).ok_or_else(|| it.self_state_err("typing.ParamSpecArgs"))
+    with_opaque::<ParamSpecAttr, _>(v, |d| d.origin.clone())
+        .ok_or_else(|| it.self_state_err("typing.ParamSpecArgs"))
 }
 
 fn psattr_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("paramspecargs", a.get(1..).unwrap_or(&[]), kw, &["origin"], 1)?;
-    let Some(Value::Obj(cls)) = a.first() else { return Err(it.type_error("__new__ needs a type")) };
-    Ok(new_opaque(cls, ParamSpecAttr { origin: b[0].clone().unwrap_or(Value::None) }))
+    let b = it.bind_args(
+        "paramspecargs",
+        a.get(1..).unwrap_or(&[]),
+        kw,
+        &["origin"],
+        1,
+    )?;
+    let Some(Value::Obj(cls)) = a.first() else {
+        return Err(it.type_error("__new__ needs a type"));
+    };
+    Ok(new_opaque(
+        cls,
+        ParamSpecAttr {
+            origin: b[0].clone().unwrap_or(Value::None),
+        },
+    ))
 }
 
 fn psattr_origin_get(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -449,7 +548,8 @@ fn pskwargs_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
 // ---- TypeVarTuple ----
 
 fn tvt_name_of(it: &mut Interp, v: &Value) -> R<Value> {
-    with_opaque::<TypeVarTupleData, _>(v, |d| d.name.clone()).ok_or_else(|| it.self_state_err("typing.TypeVarTuple"))
+    with_opaque::<TypeVarTupleData, _>(v, |d| d.name.clone())
+        .ok_or_else(|| it.self_state_err("typing.TypeVarTuple"))
 }
 
 fn new_typevartuple(it: &mut Interp, name: Value) -> R<Value> {
@@ -513,7 +613,10 @@ fn new_typealias(it: &mut Interp, data: TypeAliasData) -> R<Value> {
 fn typealias_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
     let pos = a.get(1..).unwrap_or(&[]);
     if pos.len() > 2 {
-        return Err(it.type_error(&format!("typealias() takes exactly 2 positional arguments ({} given)", pos.len())));
+        return Err(it.type_error(&format!(
+            "typealias() takes exactly 2 positional arguments ({} given)",
+            pos.len()
+        )));
     }
     let b = it.bind_args("typealias", pos, kw, &["name", "value", "type_params"], 2)?;
     let name = name_arg(it, "typealias", b[0].as_ref().unwrap_or(&Value::None))?;
@@ -544,14 +647,20 @@ fn typealias_value(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     if let Some(v) = value {
         return Ok(v);
     }
-    let Some(f) = compute else { return Ok(Value::None) };
+    let Some(f) = compute else {
+        return Ok(Value::None);
+    };
     let v = it.call(&f, Vec::new(), Vec::new())?;
     ta(it, &a[0], |d| d.value = Some(v.clone()))?;
     Ok(v)
 }
 
 fn typealias_type_params(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ta(it, &a[0], |d| d.type_params.clone().unwrap_or_else(|| Value::tuple(Vec::new())))
+    ta(it, &a[0], |d| {
+        d.type_params
+            .clone()
+            .unwrap_or_else(|| Value::tuple(Vec::new()))
+    })
 }
 
 fn typealias_parameters(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -575,12 +684,16 @@ fn typealias_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
 
 fn typealias_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__or__", a, 2, 2)?;
-    Ok(it.union_binop(&a[0], &a[1])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[0], &a[1])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn typealias_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
     it.check_args("__ror__", a, 2, 2)?;
-    Ok(it.union_binop(&a[1], &a[0])?.unwrap_or(Value::NotImplemented))
+    Ok(it
+        .union_binop(&a[1], &a[0])?
+        .unwrap_or(Value::NotImplemented))
 }
 
 fn typealias_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
@@ -630,13 +743,24 @@ pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
         ),
         INTRINSIC1_PARAMSPEC => new_paramspec(
             it,
-            ParamSpecData { name: v, bound: None, covariant: false, contravariant: false, infer_variance: true },
+            ParamSpecData {
+                name: v,
+                bound: None,
+                covariant: false,
+                contravariant: false,
+                infer_variance: true,
+            },
         ),
         INTRINSIC1_TYPEVARTUPLE => new_typevartuple(it, v),
         INTRINSIC1_SUBSCRIPT_GENERIC => {
             let params = unpack_typevartuples(it, &v)?;
             let generic = typing_type(it, "Generic")?;
-            call_typing(it, "_GenericAlias", vec![Value::Obj(generic), params], Vec::new())
+            call_typing(
+                it,
+                "_GenericAlias",
+                vec![Value::Obj(generic), params],
+                Vec::new(),
+            )
         }
         INTRINSIC1_TYPEALIAS => {
             let items = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
@@ -766,7 +890,11 @@ pub fn make(it: &mut Interp) -> Obj {
     set_type(&d, "ParamSpec", &paramspec);
 
     for (name, repr, mro) in [
-        ("ParamSpecArgs", psargs_repr as NativeFn, psargs_mro_entries as NativeFn),
+        (
+            "ParamSpecArgs",
+            psargs_repr as NativeFn,
+            psargs_mro_entries as NativeFn,
+        ),
         ("ParamSpecKwargs", pskwargs_repr, pskwargs_mro_entries),
     ] {
         let ty = new_type(it, "typing", name, None, Layout::Other);

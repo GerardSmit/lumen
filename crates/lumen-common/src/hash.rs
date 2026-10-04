@@ -35,20 +35,31 @@ impl Algo {
         let lower = name.to_ascii_lowercase();
         Some(match lower.as_str() {
             "md5" | "rsa-md5" | "ssl3-md5" | "md5withrsaencryption" => Algo::Md5,
-            "sha1" | "sha-1" | "rsa-sha1" | "rsa-sha1-2" | "ssl3-sha1" | "sha1withrsaencryption" => Algo::Sha1,
+            "sha1"
+            | "sha-1"
+            | "rsa-sha1"
+            | "rsa-sha1-2"
+            | "ssl3-sha1"
+            | "sha1withrsaencryption" => Algo::Sha1,
             "sha224" | "sha-224" | "rsa-sha224" | "sha224withrsaencryption" => Algo::Sha224,
             "sha256" | "sha-256" | "rsa-sha256" | "sha256withrsaencryption" => Algo::Sha256,
             "sha384" | "sha-384" | "rsa-sha384" | "sha384withrsaencryption" => Algo::Sha384,
             "sha512" | "sha-512" | "rsa-sha512" | "sha512withrsaencryption" => Algo::Sha512,
-            "sha512-224" | "sha-512/224" | "rsa-sha512/224" | "sha512-224withrsaencryption" => Algo::Sha512_224,
-            "sha512-256" | "sha-512/256" | "rsa-sha512/256" | "sha512-256withrsaencryption" => Algo::Sha512_256,
+            "sha512-224" | "sha-512/224" | "rsa-sha512/224" | "sha512-224withrsaencryption" => {
+                Algo::Sha512_224
+            }
+            "sha512-256" | "sha-512/256" | "rsa-sha512/256" | "sha512-256withrsaencryption" => {
+                Algo::Sha512_256
+            }
             "sha3-224" | "rsa-sha3-224" | "id-rsassa-pkcs1-v1_5-with-sha3-224" => Algo::Sha3_224,
             "sha3-256" | "rsa-sha3-256" | "id-rsassa-pkcs1-v1_5-with-sha3-256" => Algo::Sha3_256,
             "sha3-384" | "rsa-sha3-384" | "id-rsassa-pkcs1-v1_5-with-sha3-384" => Algo::Sha3_384,
             "sha3-512" | "rsa-sha3-512" | "id-rsassa-pkcs1-v1_5-with-sha3-512" => Algo::Sha3_512,
             "shake128" | "shake-128" => Algo::Shake128,
             "shake256" | "shake-256" => Algo::Shake256,
-            "ripemd160" | "ripemd" | "rmd160" | "rsa-ripemd160" | "ripemd160withrsa" => Algo::Ripemd160,
+            "ripemd160" | "ripemd" | "rmd160" | "rsa-ripemd160" | "ripemd160withrsa" => {
+                Algo::Ripemd160
+            }
             "blake2b512" => Algo::Blake2b512,
             "blake2s256" => Algo::Blake2s256,
             "sm3" | "rsa-sm3" | "sm3withrsaencryption" => Algo::Sm3,
@@ -62,7 +73,12 @@ impl Algo {
             Algo::Md5 => 16,
             Algo::Sha1 | Algo::Ripemd160 => 20,
             Algo::Sha224 | Algo::Sha512_224 | Algo::Sha3_224 => 28,
-            Algo::Sha256 | Algo::Sha512_256 | Algo::Sha3_256 | Algo::Shake256 | Algo::Sm3 | Algo::Blake2s256 => 32,
+            Algo::Sha256
+            | Algo::Sha512_256
+            | Algo::Sha3_256
+            | Algo::Shake256
+            | Algo::Sm3
+            | Algo::Blake2s256 => 32,
             Algo::Sha384 | Algo::Sha3_384 => 48,
             Algo::Sha512 | Algo::Sha3_512 | Algo::Blake2b512 => 64,
             Algo::Shake128 => 16,
@@ -77,7 +93,13 @@ impl Algo {
     /// Compression block length in bytes (the HMAC block size).
     pub fn block_len(self) -> usize {
         match self {
-            Algo::Md5 | Algo::Sha1 | Algo::Sha224 | Algo::Sha256 | Algo::Ripemd160 | Algo::Sm3 | Algo::Md5Sha1 => 64,
+            Algo::Md5
+            | Algo::Sha1
+            | Algo::Sha224
+            | Algo::Sha256
+            | Algo::Ripemd160
+            | Algo::Sm3
+            | Algo::Md5Sha1 => 64,
             Algo::Sha3_224 => 144,
             Algo::Sha3_256 | Algo::Shake256 => 136,
             Algo::Sha3_384 => 104,
@@ -216,8 +238,16 @@ pub fn digest(algo: Algo, data: &[u8]) -> Vec<u8> {
 /// (RFC 7693; Python's `hashlib.blake2b` / `blake2s`).
 #[derive(Clone)]
 pub enum Blake2 {
-    B(blake2::Blake2bVarCore, Buffer<blake2::Blake2bVarCore>, usize),
-    S(blake2::Blake2sVarCore, Buffer<blake2::Blake2sVarCore>, usize),
+    B(
+        blake2::Blake2bVarCore,
+        Buffer<blake2::Blake2bVarCore>,
+        usize,
+    ),
+    S(
+        blake2::Blake2sVarCore,
+        Buffer<blake2::Blake2sVarCore>,
+        usize,
+    ),
 }
 
 impl Blake2 {
@@ -250,10 +280,12 @@ impl Blake2 {
             }};
         }
         if wide {
-            let core = blake2::Blake2bVarCore::new_with_params(salt, person, key.len(), digest_size);
+            let core =
+                blake2::Blake2bVarCore::new_with_params(salt, person, key.len(), digest_size);
             Blake2::B(core, keyed!(blake2::Blake2bVarCore), digest_size)
         } else {
-            let core = blake2::Blake2sVarCore::new_with_params(salt, person, key.len(), digest_size);
+            let core =
+                blake2::Blake2sVarCore::new_with_params(salt, person, key.len(), digest_size);
             Blake2::S(core, keyed!(blake2::Blake2sVarCore), digest_size)
         }
     }
@@ -390,11 +422,19 @@ pub fn supports_mac(algo: Algo) -> bool {
     !matches!(algo, Algo::Shake128 | Algo::Shake256 | Algo::Md5Sha1)
 }
 
-pub fn scrypt(password: &[u8], salt: &[u8], n: u64, r: u32, p: u32, keylen: usize) -> Result<Vec<u8>, String> {
+pub fn scrypt(
+    password: &[u8],
+    salt: &[u8],
+    n: u64,
+    r: u32,
+    p: u32,
+    keylen: usize,
+) -> Result<Vec<u8>, String> {
     if n < 2 || !n.is_power_of_two() {
         return Err("Invalid scrypt params".into());
     }
-    let params = scrypt::Params::new(n.trailing_zeros() as u8, r, p, keylen.max(10)).map_err(|e| e.to_string())?;
+    let params = scrypt::Params::new(n.trailing_zeros() as u8, r, p, keylen.max(10))
+        .map_err(|e| e.to_string())?;
     let mut out = vec![0u8; keylen];
     scrypt::scrypt(password, salt, &params, &mut out).map_err(|e| e.to_string())?;
     Ok(out)
@@ -410,13 +450,26 @@ mod tests {
 
     #[test]
     fn known_vectors() {
-        assert_eq!(hex(&digest(Algo::Sha256, b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex(&digest(Algo::Sha256, b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         let mut b = Blake2::new(true, 64, b"", b"", b"");
         b.update(b"abc");
         assert_eq!(hex(&b.finish()), hex(&digest(Algo::Blake2b512, b"abc")));
         let mut k = Blake2::new(false, 32, b"key", b"", b"");
         k.update(b"abc");
-        assert_eq!(hex(&k.finish()), "3f9723437b033bf0c1f4df43cafd0776068cb0a95912de13f3b2952a3aba764d");
-        assert_eq!(hex(&hmac(Algo::Sha1, b"key", b"The quick brown fox jumps over the lazy dog")), "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9");
+        assert_eq!(
+            hex(&k.finish()),
+            "3f9723437b033bf0c1f4df43cafd0776068cb0a95912de13f3b2952a3aba764d"
+        );
+        assert_eq!(
+            hex(&hmac(
+                Algo::Sha1,
+                b"key",
+                b"The quick brown fox jumps over the lazy dog"
+            )),
+            "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9"
+        );
     }
 }

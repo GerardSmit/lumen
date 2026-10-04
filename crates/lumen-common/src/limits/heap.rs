@@ -20,16 +20,28 @@ pub struct HeapBudget {
 }
 
 impl HeapBudget {
-    pub const NONE: HeapBudget = HeapBudget { limit: 0, base: 0, scope: HeapScope::Process };
+    pub const NONE: HeapBudget = HeapBudget {
+        limit: 0,
+        base: 0,
+        scope: HeapScope::Process,
+    };
 
     /// Caps the process-wide count at `limit` bytes (0 = no cap).
     pub fn process(limit: usize) -> HeapBudget {
-        HeapBudget { limit, base: 0, scope: HeapScope::Process }
+        HeapBudget {
+            limit,
+            base: 0,
+            scope: HeapScope::Process,
+        }
     }
 
     /// Caps what the calling thread allocates from now at `limit` bytes (0 = no cap).
     pub fn thread(limit: usize) -> HeapBudget {
-        HeapBudget { limit, base: thread_bytes(), scope: HeapScope::Thread }
+        HeapBudget {
+            limit,
+            base: thread_bytes(),
+            scope: HeapScope::Thread,
+        }
     }
 
     pub fn is_set(&self) -> bool {
@@ -50,7 +62,10 @@ impl HeapBudget {
 
     /// Whether `extra` more bytes would pass the cap.
     pub fn exceeded_by(&self, extra: usize) -> bool {
-        self.limit != 0 && self.used().is_some_and(|used| used.saturating_add(extra) > self.limit)
+        self.limit != 0
+            && self
+                .used()
+                .is_some_and(|used| used.saturating_add(extra) > self.limit)
     }
 }
 

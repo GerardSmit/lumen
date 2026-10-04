@@ -27,12 +27,54 @@ pub mod _tokenize {
 
     /// `token.EXACT_TOKEN_TYPES`.
     const EXACT: &[(&str, i64)] = &[
-        ("(", 7), (")", 8), ("[", 9), ("]", 10), (":", 11), (",", 12), (";", 13), ("+", 14), ("-", 15),
-        ("*", 16), ("/", 17), ("|", 18), ("&", 19), ("<", 20), (">", 21), ("=", 22), (".", 23), ("%", 24),
-        ("{", 25), ("}", 26), ("==", 27), ("!=", 28), ("<=", 29), (">=", 30), ("~", 31), ("^", 32),
-        ("<<", 33), (">>", 34), ("**", 35), ("+=", 36), ("-=", 37), ("*=", 38), ("/=", 39), ("%=", 40),
-        ("&=", 41), ("|=", 42), ("^=", 43), ("<<=", 44), (">>=", 45), ("**=", 46), ("//", 47),
-        ("//=", 48), ("@", 49), ("@=", 50), ("->", 51), ("...", 52), (":=", 53), ("!", 54),
+        ("(", 7),
+        (")", 8),
+        ("[", 9),
+        ("]", 10),
+        (":", 11),
+        (",", 12),
+        (";", 13),
+        ("+", 14),
+        ("-", 15),
+        ("*", 16),
+        ("/", 17),
+        ("|", 18),
+        ("&", 19),
+        ("<", 20),
+        (">", 21),
+        ("=", 22),
+        (".", 23),
+        ("%", 24),
+        ("{", 25),
+        ("}", 26),
+        ("==", 27),
+        ("!=", 28),
+        ("<=", 29),
+        (">=", 30),
+        ("~", 31),
+        ("^", 32),
+        ("<<", 33),
+        (">>", 34),
+        ("**", 35),
+        ("+=", 36),
+        ("-=", 37),
+        ("*=", 38),
+        ("/=", 39),
+        ("%=", 40),
+        ("&=", 41),
+        ("|=", 42),
+        ("^=", 43),
+        ("<<=", 44),
+        (">>=", 45),
+        ("**=", 46),
+        ("//", 47),
+        ("//=", 48),
+        ("@", 49),
+        ("@=", 50),
+        ("->", 51),
+        ("...", 52),
+        (":=", 53),
+        ("!", 54),
     ];
 
     fn token_type(t: &Tok, extra: bool) -> Option<i64> {
@@ -68,12 +110,19 @@ pub mod _tokenize {
 
     fn tuple(rt: &RawToken, ty: i64, lines: &[&str]) -> Value {
         let end = rt.end;
-        let pos = |(l, c): (u32, u32)| Value::tuple(vec![Value::Int(l as i64), Value::Int(c as i64)]);
+        let pos =
+            |(l, c): (u32, u32)| Value::tuple(vec![Value::Int(l as i64), Value::Int(c as i64)]);
         let line = match rt.tok {
             Tok::EndMarker => String::new(),
             _ => lines_of(lines, rt.start.0, end.0),
         };
-        Value::tuple(vec![Value::Int(ty), Value::str(&rt.text), pos(rt.start), pos(end), Value::string(line)])
+        Value::tuple(vec![
+            Value::Int(ty),
+            Value::str(&rt.text),
+            pos(rt.start),
+            pos(end),
+            Value::string(line),
+        ])
     }
 
     fn syntax_error(it: &mut Interp, e: &SyntaxError, lines: &[&str]) -> Obj {
@@ -136,7 +185,12 @@ pub mod _tokenize {
     #[methods]
     impl TokenizerIter {
         #[constructor]
-        fn new(it: &mut Interp, readline: &Value, #[kwonly] extra_tokens: bool, #[kwonly] encoding: Option<&str>) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            readline: &Value,
+            #[kwonly] extra_tokens: bool,
+            #[kwonly] encoding: Option<&str>,
+        ) -> R<NativeIter> {
             let src = read_source(it, readline, encoding)?;
             let (toks, err) = tokenize_extra(&src);
             let lines: Vec<String> = src.split_inclusive('\n').map(str::to_string).collect();

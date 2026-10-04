@@ -47,7 +47,12 @@ pub mod _thread {
     }
 
     impl Lock {
-        fn acquire_impl(&mut self, it: &mut Interp, blocking: bool, timeout: Option<&Value>) -> R<bool> {
+        fn acquire_impl(
+            &mut self,
+            it: &mut Interp,
+            blocking: bool,
+            timeout: Option<&Value>,
+        ) -> R<bool> {
             let (blocking, timeout) = acquire_args(it, blocking, timeout)?;
             if !self.locked {
                 self.locked = true;
@@ -61,7 +66,9 @@ pub mod _thread {
                 it.platform.borrow_mut().sleep(timeout);
                 return Ok(false);
             }
-            Err(it.runtime_error("deadlock: lock is already held and there is no other thread to release it"))
+            Err(it.runtime_error(
+                "deadlock: lock is already held and there is no other thread to release it",
+            ))
         }
 
         fn release_impl(&mut self, it: &mut Interp) -> R<()> {
@@ -81,7 +88,14 @@ pub mod _thread {
         /// and the return value reflects whether the lock is acquired.
         /// The blocking operation is interruptible.
         #[method(hint(py(aliases = "acquire_lock")))]
-        fn acquire(&mut self, it: &mut Interp, #[kw] #[default(true)] blocking: bool, #[kw] timeout: Option<&Value>) -> R<bool> {
+        fn acquire(
+            &mut self,
+            it: &mut Interp,
+            #[kw]
+            #[default(true)]
+            blocking: bool,
+            #[kw] timeout: Option<&Value>,
+        ) -> R<bool> {
             self.acquire_impl(it, blocking, timeout)
         }
 
@@ -118,7 +132,11 @@ pub mod _thread {
         fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let locked = slf.0.borrow(it)?.locked;
             let state = if locked { "locked" } else { "unlocked" };
-            Ok(format!("<{state} {} object at {:#x}>", it.tp_name_of(slf.0.value()), it.id_of(slf.0.value())))
+            Ok(format!(
+                "<{state} {} object at {:#x}>",
+                it.tp_name_of(slf.0.value()),
+                it.id_of(slf.0.value())
+            ))
         }
     }
 
@@ -157,7 +175,14 @@ pub mod _thread {
         /// Precisely, if the current thread already holds the lock, its
         /// internal counter is simply incremented. If nobody holds the lock,
         /// the lock is taken and its internal counter initialized to 1.
-        fn acquire(&mut self, it: &mut Interp, #[kw] #[default(true)] blocking: bool, #[kw] timeout: Option<&Value>) -> R<bool> {
+        fn acquire(
+            &mut self,
+            it: &mut Interp,
+            #[kw]
+            #[default(true)]
+            blocking: bool,
+            #[kw] timeout: Option<&Value>,
+        ) -> R<bool> {
             acquire_args(it, blocking, timeout)?;
             self.count += 1;
             Ok(true)
@@ -221,7 +246,9 @@ pub mod _thread {
             let state = if count > 0 { "locked" } else { "unlocked" };
             let owner = if count > 0 { MAIN_THREAD } else { 0 };
             let (name, id) = (it.tp_name_of(slf.0.value()), it.id_of(slf.0.value()));
-            Ok(format!("<{state} {name} object owner={owner} count={count} at {id:#x}>"))
+            Ok(format!(
+                "<{state} {name} object owner={owner} count={count} at {id:#x}>"
+            ))
         }
     }
 
@@ -238,7 +265,12 @@ pub mod _thread {
         }
 
         #[proto(init)]
-        fn init(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        fn init(
+            slf: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<()> {
             if (!args.is_empty() || !kwargs.is_empty()) && !it.is_heap(&it.type_of(&slf.0)) {
                 return Err(it.type_error("Initialization arguments are not supported"));
             }
@@ -297,7 +329,12 @@ pub mod _thread {
 
     /// Start a new thread and return its identifier.
     #[op(hint(py(aliases = "start_new")))]
-    fn start_new_thread(it: &mut Interp, function: &Value, args: &Value, kwargs: Option<&Value>) -> R<Value> {
+    fn start_new_thread(
+        it: &mut Interp,
+        function: &Value,
+        args: &Value,
+        kwargs: Option<&Value>,
+    ) -> R<Value> {
         let _ = (function, args, kwargs);
         Err(it.runtime_error("can't start new thread"))
     }

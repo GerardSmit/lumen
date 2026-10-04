@@ -15,6 +15,7 @@
 //! reactor (epoll/kqueue) would need raw syscalls and stays out unless explicitly authorized;
 //! threadpool + completions is libuv's own fs strategy and covers everything we host today.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,20 +30,26 @@ use lumen_host::{
 };
 
 mod child_realm;
+mod clone_transfer;
 mod console;
 mod esm;
-mod process;
-mod process_env;
 #[cfg(all(feature = "parallel", not(target_os = "none")))]
 mod parallel;
+mod ports;
+mod process;
+mod process_env;
 pub mod tsconfig;
 #[cfg(not(target_arch = "wasm32"))]
 mod worker;
 #[cfg(target_arch = "wasm32")]
 #[path = "worker_browser.rs"]
 mod worker;
-mod ports;
-mod clone_transfer;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use esm::fetch_network_module_resource;
+pub use esm::{
+    resolve_network_module_request, PrefetchedModuleResource, PrefetchedModuleResources,
+};
 
 /// js/error_shim.js, precompiled by build.rs.
 const ERROR_SHIM_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/error_shim.aot"));
@@ -58,6 +65,24 @@ pub(crate) fn run_aot(
     let result = lumen_host::load_glue(engine, blob);
     engine.set_tier(tier);
     result
+}
+
+fn install_queue_microtask(ctx: &mut Ctx) {
+    let Value::Obj(global) = ctx.global_object() else {
+        return;
+    };
+    ctx.def_method(
+        &global,
+        "queueMicrotask",
+        1,
+        |interp, _this, args| match args.first() {
+            Some(callback) if callback.is_callable() => {
+                interp.queue_microtask(callback.clone());
+                Ok(Value::Undefined)
+            }
+            _ => Err(interp.make_error("TypeError", "queueMicrotask expects a function")),
+        },
+    );
 }
 
 pub use console::{describe_error, render_value, ConsoleOut};
@@ -208,6 +233,11 @@ pub struct Runtime {
     fire_error: Value,
     fire_rejection: Value,
     fire_handled: Value,
+    /// Browser embedders collect these and dispatch real Window tasks. Node keeps its fatal
+    /// rejection policy unless this is explicitly enabled.
+    browser_rejection_events: bool,
+    pending_browser_rejections: Vec<BrowserRejectionEvent>,
+    browser_rejection_reasons: HashMap<usize, (Value, Value)>,
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
@@ -244,6 +274,12 @@ pub struct LoopStatus {
     pub halted: bool,
 }
 
+/// A promise rejection notification collected at a runtime checkpoint for a browser host.
+pub enum BrowserRejectionEvent {
+    Unhandled { promise: Value, reason: Value },
+    Handled { promise: Value, reason: Value },
+}
+
 /// Why the entry script did not start cleanly.
 enum StartError {
     /// The node glue is missing from this engine.
@@ -274,11 +310,19 @@ impl Runtime {
         {
             static CATALOG: std::sync::Once = std::sync::Once::new();
             CATALOG.call_once(|| {
-                let hash = lumen_common::aot::builtin_catalog::hash(lumen_common::aot::builtin_catalog::Features {
-                    node: true, parallel: cfg!(feature = "parallel"), http2: cfg!(feature = "http2"),
-                    cluster: cfg!(feature = "cluster"), dgram: cfg!(feature = "dgram"), wasi: cfg!(feature = "wasi"),bitnest_process:false,
-                });
-                lumen::target::set_builtin_modules_hash(hash).unwrap_or_else(|error| panic!("native runtime catalog: {error}"));
+                let hash = lumen_common::aot::builtin_catalog::hash(
+                    lumen_common::aot::builtin_catalog::Features {
+                        node: true,
+                        parallel: cfg!(feature = "parallel"),
+                        http2: cfg!(feature = "http2"),
+                        cluster: cfg!(feature = "cluster"),
+                        dgram: cfg!(feature = "dgram"),
+                        wasi: cfg!(feature = "wasi"),
+                        bitnest_process: false,
+                    },
+                );
+                lumen::target::set_builtin_modules_hash(hash)
+                    .unwrap_or_else(|error| panic!("native runtime catalog: {error}"));
             });
         }
     }
@@ -326,19 +370,25 @@ impl Runtime {
 
     /// A worker's runtime: embedded like its parent when the parent is, else process-backed.
     pub(crate) fn new_worker(parent: Option<WorkerEmbedding>) -> Runtime {
-        let owned_fds = parent.as_ref().map(|p| p.owned_fds.clone()).unwrap_or_default();
+        let owned_fds = parent
+            .as_ref()
+            .map(|p| p.owned_fds.clone())
+            .unwrap_or_default();
         let tree = parent.as_ref().map(|p| Arc::clone(&p.tree));
-        let mut runtime = Self::build(parent.map(|p| Embedding {
-            argv: vec![p.exec_path],
-            env: p.env,
-            cwd: p.cwd,
-            stdin: Box::new(std::io::empty()),
-            stdout: p.stdout,
-            stderr: p.stderr,
-            interrupt: p.interrupt,
-            live_object_limit: None,
-            spawner: p.spawner,
-        }), tree);
+        let mut runtime = Self::build(
+            parent.map(|p| Embedding {
+                argv: vec![p.exec_path],
+                env: p.env,
+                cwd: p.cwd,
+                stdin: Box::new(std::io::empty()),
+                stdout: p.stdout,
+                stderr: p.stderr,
+                interrupt: p.interrupt,
+                live_object_limit: None,
+                spawner: p.spawner,
+            }),
+            tree,
+        );
         // A worker shares its realm's descriptors: closing one there must not close the host's.
         if let Some(realm) = runtime.engine.ctx().host_mut::<RealmProcess>() {
             realm.owned_fds = owned_fds;
@@ -355,7 +405,9 @@ impl Runtime {
         let pool = ThreadPool::new(POOL_SIZE, tx.clone());
         lumen::set_tail_calls(false);
         let mut engine = Engine::new();
-        engine.set_jsx_options_loader(|filename, defaults| tsconfig::load_jsx_for(std::path::Path::new(filename), defaults));
+        engine.set_jsx_options_loader(|filename, defaults| {
+            tsconfig::load_jsx_for(std::path::Path::new(filename), defaults)
+        });
         lumen_host::perf::mark(lumen_host::perf::Milestone::V8Start);
         // Substrate first: fs's js_init runs during install and its ops need these.
         engine.ctx().op_state().put(pool.handle());
@@ -383,7 +435,11 @@ impl Runtime {
             if let Some(limit) = e.live_object_limit {
                 engine.set_live_object_limit(limit);
             }
-            let exec_path = e.argv.first().cloned().unwrap_or_else(|| "lumen".to_string());
+            let exec_path = e
+                .argv
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "lumen".to_string());
             let tree = tree.unwrap_or_default();
             let launcher = Arc::new(child_realm::ChildRealms::new(
                 e.spawner.clone(),
@@ -420,20 +476,7 @@ impl Runtime {
         }
         // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
         // unhandled rejection, not a reported exception.
-        {
-            let ctx = engine.ctx();
-            let f = ctx.make_native("queueMicrotask", 1, |i, _this, args| {
-                match args.first() {
-                    Some(cb) if cb.is_callable() => {
-                        i.queue_microtask(cb.clone());
-                        Ok(Value::Undefined)
-                    }
-                    _ => Err(i.make_error("TypeError", "queueMicrotask expects a function")),
-                }
-            });
-            let global = engine.global_this();
-            let _ = engine.ctx().set_member(&global, "queueMicrotask", Value::Obj(f));
-        }
+        install_queue_microtask(engine.ctx());
         install(
             &mut engine,
             &[
@@ -482,10 +525,26 @@ impl Runtime {
             .ctx()
             .get_member(&global, "__lumen_fire_rejection")
             .unwrap_or_else(|_| panic!("error-reporting shim installed"));
-        let reflect = engine.ctx().get_member(&global, "Reflect").unwrap_or_else(|_| panic!("Reflect installed"));
-        let delete = engine.ctx().get_member(&reflect, "deleteProperty").unwrap_or_else(|_| panic!("Reflect.deleteProperty installed"));
-        for name in ["__lumen_fire_error", "__lumen_fire_rejection", "__lumen_fire_handled"] {
-            engine.call_function(&delete, reflect.clone(), &[global.clone(), Value::str(name)]).unwrap_or_else(|_| panic!("error shim globals configurable"));
+        let reflect = engine
+            .ctx()
+            .get_member(&global, "Reflect")
+            .unwrap_or_else(|_| panic!("Reflect installed"));
+        let delete = engine
+            .ctx()
+            .get_member(&reflect, "deleteProperty")
+            .unwrap_or_else(|_| panic!("Reflect.deleteProperty installed"));
+        for name in [
+            "__lumen_fire_error",
+            "__lumen_fire_rejection",
+            "__lumen_fire_handled",
+        ] {
+            engine
+                .call_function(
+                    &delete,
+                    reflect.clone(),
+                    &[global.clone(), Value::str(name)],
+                )
+                .unwrap_or_else(|_| panic!("error shim globals configurable"));
         }
         if let Some(t0) = boot {
             eprintln!("[startup] runtime built    {:?}", t0.elapsed());
@@ -506,6 +565,9 @@ impl Runtime {
             fire_error,
             fire_rejection,
             fire_handled,
+            browser_rejection_events: false,
+            pending_browser_rejections: Vec::new(),
+            browser_rejection_reasons: HashMap::new(),
             fatal_exit: None,
             #[cfg(feature = "aot-native")]
             native_builtins_installed: false,
@@ -519,6 +581,135 @@ impl Runtime {
     /// The engine, for embedder access beyond script evaluation (defining globals, etc.).
     pub fn engine(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+
+    /// Install this runtime's browser-side host providers in another realm owned by its engine.
+    /// Native extension state and queues remain shared, while each realm gets its own globals,
+    /// namespaces, and wrapper functions. Node and process providers are intentionally excluded.
+    pub fn install_browser_realm(
+        &mut self,
+        realm: &lumen::embed::RealmHandle,
+    ) -> Result<(), String> {
+        lumen_host::install_realm(
+            &mut self.engine,
+            realm,
+            &[
+                lumen_timers::extension(),
+                console::extension(),
+                lumen_web::extension(),
+                clone_transfer::extension(),
+                ports::extension(),
+            ],
+        )?;
+        self.engine
+            .ctx()
+            .with_host_realm(realm, install_queue_microtask)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Cancel timers owned by a browser realm that is being navigated or discarded.
+    ///
+    /// The timer heap remains shared by the runtime; this removes only entries created while
+    /// `realm` was the active timer-global realm and drops their callback values immediately.
+    /// It deliberately does not cancel other async tasks or retained JavaScript callbacks.
+    pub fn cancel_timers_for_realm(&mut self, realm: &lumen::embed::RealmHandle) -> usize {
+        self.engine
+            .ctx()
+            .host_mut::<lumen_timers::Timers>()
+            .map(|timers| timers.cancel_realm(realm))
+            .unwrap_or(0)
+    }
+
+    /// Collect browser-style rejection notifications instead of applying Node's fatal rejection
+    /// policy. Notifications are returned by [`Self::take_browser_rejection_events`] after a
+    /// normal checkpoint so the embedder can enqueue actual `unhandledrejection` and
+    /// `rejectionhandled` events on its user-agent task queue.
+    pub fn enable_browser_rejection_events(&mut self) {
+        if !self.browser_rejection_events {
+            self.browser_rejection_events = true;
+            self.engine.track_late_handled_rejections();
+        }
+    }
+
+    /// Take browser rejection notifications accumulated at the latest checkpoints.
+    pub fn take_browser_rejection_events(&mut self) -> Vec<BrowserRejectionEvent> {
+        std::mem::take(&mut self.pending_browser_rejections)
+    }
+
+    /// Evaluate a module using this runtime's configured loader while leaving pending top-level
+    /// await work on the normal event loop. The returned handle is polled through
+    /// `Engine::module_evaluation_status`.
+    pub fn eval_module_pending(
+        &mut self,
+        source: &str,
+        record_key: &str,
+        module_url: &str,
+    ) -> Result<lumen::ModuleEvaluationHandle, lumen::ParseError> {
+        let (loader, cache) = self.make_cached_module_loader();
+        let result = self
+            .engine
+            .eval_module_attrs_pending(source, record_key, module_url, loader);
+        // The static graph is synchronously registered before the evaluation handle is returned.
+        cache.forget_sources();
+        result
+    }
+
+    /// Evaluate a browser-prepared module graph. The graph cache is consulted by the ordinary ESM
+    /// resolver, which still applies redirects, same-origin, MIME, and import-attribute rules.
+    /// Entries absent from the snapshot use this runtime's normal configured native loader.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn eval_module_pending_with_prefetched_resources(
+        &mut self,
+        source: &str,
+        record_key: &str,
+        module_url: &str,
+        prefetched: PrefetchedModuleResources,
+    ) -> Result<lumen::ModuleEvaluationHandle, lumen::ParseError> {
+        self.eval_module_pending_with_prefetched_resources_and_base(
+            source, record_key, module_url, module_url, prefetched,
+        )
+    }
+
+    /// Variant of [`Self::eval_module_pending_with_prefetched_resources`] for inline HTML modules
+    /// whose import-resolution base differs from their observable module URL.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn eval_module_pending_with_prefetched_resources_and_base(
+        &mut self,
+        source: &str,
+        record_key: &str,
+        module_url: &str,
+        resolution_url: &str,
+        prefetched: PrefetchedModuleResources,
+    ) -> Result<lumen::ModuleEvaluationHandle, lumen::ParseError> {
+        let builtins = self.builtin_modules();
+        let fetch_config = self
+            .engine
+            .ctx()
+            .op_state()
+            .get::<lumen_web::FetchConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let (loader, cache) = esm::make_cached_loader_with_fetch_config_and_prefetched(
+            builtins,
+            fetch_config,
+            prefetched,
+        );
+        let result = self.engine.eval_module_attrs_pending_with_base(
+            source,
+            record_key,
+            module_url,
+            resolution_url,
+            loader,
+        );
+        cache.forget_sources();
+        result
+    }
+
+    /// Schedule blocking resource work on this runtime's existing bounded host pool. The job
+    /// must return its result through a channel owned by the embedder; it never touches the
+    /// runtime's JavaScript engine from the worker thread.
+    pub fn spawn_blocking_detached(&self, job: impl FnOnce() + Send + 'static) {
+        self.pool.handle().spawn_detached(Box::new(job));
     }
 
     /// Node's `--trace-atomics-wait`: every `Atomics.wait` of this realm and of the workers it
@@ -557,6 +748,36 @@ impl Runtime {
         self.install_module_loader_with(path, has_source, |_| None);
     }
 
+    fn make_cached_module_loader(
+        &mut self,
+    ) -> (
+        impl Fn(&str, &str, Option<&str>) -> Option<(String, String)>,
+        std::rc::Rc<esm::LoaderCache>,
+    ) {
+        let builtins = self.builtin_modules();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let fetch_config = self
+                .engine
+                .ctx()
+                .op_state()
+                .get::<lumen_web::FetchConfig>()
+                .cloned()
+                .unwrap_or_default();
+            esm::make_cached_loader_with_fetch_config(builtins, fetch_config)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            esm::make_cached_loader(builtins)
+        }
+    }
+
+    fn make_module_loader(
+        &mut self,
+    ) -> impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> {
+        self.make_cached_module_loader().0
+    }
+
     /// Extend the runtime's module graph with host-provided source modules.
     pub fn install_module_loader_with(
         &mut self,
@@ -564,13 +785,14 @@ impl Runtime {
         has_source: bool,
         source: impl Fn(&str) -> Option<&'static str> + 'static,
     ) {
-        let loader = esm::make_loader(self.builtin_modules());
-        self.engine.set_module_loader_attrs(move |specifier, referrer, attributes| {
-            source(specifier)
-                .filter(|_| attributes.is_none())
-                .map(|text| (format!("host:{specifier}"), text.to_owned()))
-                .or_else(|| loader(specifier, referrer, attributes))
-        });
+        let loader = self.make_module_loader();
+        self.engine
+            .set_module_loader_attrs(move |specifier, referrer, attributes| {
+                source(specifier)
+                    .filter(|_| attributes.is_none())
+                    .map(|text| (format!("host:{specifier}"), text.to_owned()))
+                    .or_else(|| loader(specifier, referrer, attributes))
+            });
         match lumen_host::canonicalize(path) {
             Ok(abs) => self.engine.set_import_base(&abs.to_string_lossy()),
             Err(_) if has_source => self.engine.set_import_base(path),
@@ -607,8 +829,8 @@ impl Runtime {
     /// timers, and I/O settle. `Err` is the rendered uncaught error.
     pub fn run_module(&mut self, path: &str) -> Result<(), String> {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
-        let source =
-            lumen_host::sysfs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let source = lumen_host::sysfs::read_to_string(path)
+            .map_err(|e| format!("cannot read {path}: {e}"))?;
         let source = import_source_text(source);
         let key = lumen_host::canonicalize(path)
             .unwrap_or_else(|_| std::path::PathBuf::from(path))
@@ -625,7 +847,7 @@ impl Runtime {
     }
 
     fn run_module_text(&mut self, source: &str, key: &str) -> Result<(), String> {
-        let (loader, cache) = esm::make_cached_loader(self.builtin_modules());
+        let (loader, cache) = self.make_cached_module_loader();
         let t_eval = lumen_host::startup_timing().then(Instant::now);
         let result = self.engine.eval_module_attrs(source, key, loader);
         // The static graph has loaded: its sources live in the engine now.
@@ -664,7 +886,7 @@ impl Runtime {
     #[cfg(feature = "compiler")]
     pub fn run_precompiled(&mut self, blob: &lumen::Precompiled) -> Result<(), String> {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
-        let loader = esm::make_loader(self.builtin_modules());
+        let loader = self.make_module_loader();
         self.engine.set_module_loader_attrs(loader);
         let t_load = lumen_host::startup_timing().then(Instant::now);
         let loaded = self.engine.load_precompiled(blob);
@@ -707,7 +929,13 @@ impl Runtime {
     pub fn run_native_owned(&mut self, bytes: std::sync::Arc<[u8]>) -> Result<(), String> {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         self.install_native_builtins()?;
-        let entry = self.engine.load_native_value_owned(bytes, None, &[], true).map_err(|error| { self.fatal_exit = Some(1); error })?;
+        let entry = self
+            .engine
+            .load_native_value_owned(bytes, None, &[], true)
+            .map_err(|error| {
+                self.fatal_exit = Some(1);
+                error
+            })?;
         self.drive_native_entry(entry)
     }
 
@@ -718,42 +946,90 @@ impl Runtime {
     /// while any native callable exists. External users must not mutate the GOT.
     #[cfg(feature = "aot-native")]
     pub unsafe fn run_native_linked(
-        &mut self, bytes: std::sync::Arc<[u8]>, code: *const u8, code_len: usize,
-        got: *mut usize, got_len: usize,
+        &mut self,
+        bytes: std::sync::Arc<[u8]>,
+        code: *const u8,
+        code_len: usize,
+        got: *mut usize,
+        got_len: usize,
     ) -> Result<(), String> {
         static LINKED_ENTRY: Mutex<()> = Mutex::new(());
-        let _entry = LINKED_ENTRY.lock().map_err(|_| "linked native entry lock poisoned".to_string())?;
+        let _entry = LINKED_ENTRY
+            .lock()
+            .map_err(|_| "linked native entry lock poisoned".to_string())?;
         self.install_native_builtins()?;
-        let value = unsafe { self.engine.load_native_linked_value_owned(bytes, code, code_len, got, got_len) }
-            .map_err(|error| { self.fatal_exit = Some(1); error })?;
+        let value = unsafe {
+            self.engine
+                .load_native_linked_value_owned(bytes, code, code_len, got, got_len)
+        }
+        .map_err(|error| {
+            self.fatal_exit = Some(1);
+            error
+        })?;
         self.drive_native_entry(value)
     }
 
     #[cfg(feature = "aot-native")]
     pub fn install_native_builtins(&mut self) -> Result<(), String> {
-        if self.native_builtins_installed { return Ok(()); }
+        if self.native_builtins_installed {
+            return Ok(());
+        }
         let global = self.engine.global_this();
-        let getter = self.engine.ctx().get_member(&global, "__esmBuiltin").map_err(|_| "native Node builtin lookup is unavailable")?;
+        let getter = self
+            .engine
+            .ctx()
+            .get_member(&global, "__esmBuiltin")
+            .map_err(|_| "native Node builtin lookup is unavailable")?;
         let modules = self.builtin_modules();
         let mut modules: Vec<_> = modules.0.into_iter().collect();
         modules.sort_by(|a, b| a.0.cmp(&b.0));
         for (specifier, exports) in modules {
             let name = specifier.strip_prefix("node:").unwrap();
-            if matches!(name, "http2") && !cfg!(feature = "http2") || matches!(name, "cluster") && !cfg!(feature = "cluster")
-                || matches!(name, "dgram") && !cfg!(feature = "dgram") || matches!(name, "wasi") && !cfg!(feature = "wasi") { continue; }
-            let default = self.engine.call_function(&getter, global.clone(), &[Value::from_string(name.into())])
+            if matches!(name, "http2") && !cfg!(feature = "http2")
+                || matches!(name, "cluster") && !cfg!(feature = "cluster")
+                || matches!(name, "dgram") && !cfg!(feature = "dgram")
+                || matches!(name, "wasi") && !cfg!(feature = "wasi")
+            {
+                continue;
+            }
+            let default = self
+                .engine
+                .call_function(&getter, global.clone(), &[Value::from_string(name.into())])
                 .map_err(|error| describe_error(self.engine.ctx(), &error))?;
             let namespace = self.engine.ctx().new_object_with_proto(&Value::Null);
-            self.engine.ctx().set_member(&namespace, "default", default.clone()).map_err(|_| "cannot initialize native builtin namespace")?;
+            self.engine
+                .ctx()
+                .set_member(&namespace, "default", default.clone())
+                .map_err(|_| "cannot initialize native builtin namespace")?;
             for key in exports.split_whitespace() {
-                let value = self.engine.ctx().get_member(&default, key).map_err(|_| format!("cannot read native builtin export {specifier}:{key}"))?;
-                self.engine.ctx().set_member(&namespace, key, value).map_err(|_| "cannot initialize native builtin namespace")?;
+                let value =
+                    self.engine.ctx().get_member(&default, key).map_err(|_| {
+                        format!("cannot read native builtin export {specifier}:{key}")
+                    })?;
+                self.engine
+                    .ctx()
+                    .set_member(&namespace, key, value)
+                    .map_err(|_| "cannot initialize native builtin namespace")?;
             }
-            let object = self.engine.ctx().get_member(&global, "Object").map_err(|_| "Object intrinsic is unavailable")?;
-            let freeze = self.engine.ctx().get_member(&object, "freeze").map_err(|_| "Object.freeze intrinsic is unavailable")?;
-            self.engine.call_function(&freeze, object, &[namespace.clone()]).map_err(|error| describe_error(self.engine.ctx(), &error))?;
-            self.engine.register_native_module(name.to_owned(), namespace.clone()).map_err(str::to_owned)?;
-            self.engine.register_native_module(specifier, namespace).map_err(str::to_owned)?;
+            let object = self
+                .engine
+                .ctx()
+                .get_member(&global, "Object")
+                .map_err(|_| "Object intrinsic is unavailable")?;
+            let freeze = self
+                .engine
+                .ctx()
+                .get_member(&object, "freeze")
+                .map_err(|_| "Object.freeze intrinsic is unavailable")?;
+            self.engine
+                .call_function(&freeze, object, &[namespace.clone()])
+                .map_err(|error| describe_error(self.engine.ctx(), &error))?;
+            self.engine
+                .register_native_module(name.to_owned(), namespace.clone())
+                .map_err(str::to_owned)?;
+            self.engine
+                .register_native_module(specifier, namespace)
+                .map_err(str::to_owned)?;
         }
         self.native_builtins_installed = true;
         Ok(())
@@ -764,13 +1040,19 @@ impl Runtime {
         self.engine.ctx().observe_promise_for_host(&entry);
         self.run_entry_loop();
         match self.engine.ctx().promise_state_for_host(&entry) {
-            Some((2, error)) => { self.fatal_exit = Some(1); Err(describe_error(self.engine.ctx(), &error)) }
+            Some((2, error)) => {
+                self.fatal_exit = Some(1);
+                Err(describe_error(self.engine.ctx(), &error))
+            }
             Some((0, _)) => {
                 // A pending entry with no live timers/tasks cannot make further progress.
                 self.fatal_exit = Some(13);
                 Err("native top-level await did not settle".into())
             }
-            _ if self.fatal_exit.is_some() => Err(format!("native entry exited with status {}", self.fatal_exit.unwrap())),
+            _ if self.fatal_exit.is_some() => Err(format!(
+                "native entry exited with status {}",
+                self.fatal_exit.unwrap()
+            )),
             _ => Ok(()),
         }
     }
@@ -785,11 +1067,11 @@ impl Runtime {
         base: &str,
         is_module: bool,
     ) -> Result<(), String> {
-        let loader = esm::make_loader(self.builtin_modules());
+        let loader = self.make_module_loader();
         self.engine.set_module_loader_attrs(loader);
         self.engine.set_import_base(base);
         let result = if is_module {
-            let loader = esm::make_loader(self.builtin_modules());
+            let loader = self.make_module_loader();
             self.engine.eval_module_attrs(source, base, loader)
         } else {
             self.engine.eval(source, false)
@@ -1125,7 +1407,8 @@ impl Runtime {
         ctx.release_unused_memory_for_host();
         self.idle_gc_followup = busy;
         self.idle_gc = (Instant::now(), ctx.live_object_count());
-        self.idle_gc_followup.then_some(self.idle_gc.0 + MIN_INTERVAL)
+        self.idle_gc_followup
+            .then_some(self.idle_gc.0 + MIN_INTERVAL)
     }
 
     /// Set `process.argv` to `[argv0, ...script_argv]` and `process.execArgv` to the runtime
@@ -1157,27 +1440,46 @@ impl Runtime {
     /// JS side, which answers `getOptionValue` from them.
     pub fn set_cli_options(&mut self, json: &str) {
         let global = self.engine.global_this();
-        if let Ok(function) = self.engine.ctx().get_member(&global, "__lumenSetCliOptions") {
-            let _ = self.engine.call_function(&function, Value::Undefined, &[Value::from_string(json.into())]);
+        if let Ok(function) = self
+            .engine
+            .ctx()
+            .get_member(&global, "__lumenSetCliOptions")
+        {
+            let _ = self.engine.call_function(
+                &function,
+                Value::Undefined,
+                &[Value::from_string(json.into())],
+            );
         }
     }
 
     /// Node's `--expose-gc`: define `globalThis.gc`, which runs lumen's cycle collector.
     pub fn expose_gc(&mut self) {
-        self.engine.define_global("gc", 0, |ctx, _, _| { ctx.collect_garbage_for_host(); Ok(Value::Undefined) });
+        self.engine.define_global("gc", 0, |ctx, _, _| {
+            ctx.collect_garbage_for_host();
+            Ok(Value::Undefined)
+        });
     }
 
     /// V8's `--expose-externalize-string`: `externalizeString` (a no-op here, as lumen strings
     /// have no external representation) and `isOneByteString` (every code unit fits Latin-1).
     pub fn expose_externalize_string(&mut self) {
-        self.engine.define_global("externalizeString", 1, |ctx, _, args| {
-            if !matches!(args.first(), Some(Value::Str(_))) { return Err(ctx.make_error("TypeError", "First parameter is not a string")); }
-            Ok(Value::Undefined)
-        });
-        self.engine.define_global("isOneByteString", 1, |ctx, _, args| {
-            let Some(Value::Str(value)) = args.first() else { return Err(ctx.make_error("TypeError", "First parameter is not a string")); };
-            Ok(Value::Bool(value.chars().all(|character| character as u32 <= 0xff)))
-        });
+        self.engine
+            .define_global("externalizeString", 1, |ctx, _, args| {
+                if !matches!(args.first(), Some(Value::Str(_))) {
+                    return Err(ctx.make_error("TypeError", "First parameter is not a string"));
+                }
+                Ok(Value::Undefined)
+            });
+        self.engine
+            .define_global("isOneByteString", 1, |ctx, _, args| {
+                let Some(Value::Str(value)) = args.first() else {
+                    return Err(ctx.make_error("TypeError", "First parameter is not a string"));
+                };
+                Ok(Value::Bool(
+                    value.chars().all(|character| character as u32 <= 0xff),
+                ))
+            });
     }
 
     /// Node's end-of-program protocol, for a CLI that has run the loop to quiescence: emit
@@ -1200,10 +1502,16 @@ impl Runtime {
         };
         let code = |rt: &mut Runtime| exit_code(rt).unwrap_or(0);
         let exiting = |rt: &mut Runtime| {
-            matches!(rt.engine.ctx().get_member(&process, "_exiting"), Ok(Value::Bool(true)))
+            matches!(
+                rt.engine.ctx().get_member(&process, "_exiting"),
+                Ok(Value::Bool(true))
+            )
         };
         let emit_exit = |rt: &mut Runtime, c: i32| {
-            let _ = rt.engine.ctx().set_member(&process, "_exiting", Value::Bool(true));
+            let _ = rt
+                .engine
+                .ctx()
+                .set_member(&process, "_exiting", Value::Bool(true));
             if let Err(e) = rt.engine.call_function(
                 &emit,
                 process.clone(),
@@ -1226,7 +1534,10 @@ impl Runtime {
                     return fatal;
                 }
                 if !exiting(self) {
-                    let _ = self.engine.ctx().set_member(&process, "exitCode", Value::Num(1.0));
+                    let _ = self
+                        .engine
+                        .ctx()
+                        .set_member(&process, "exitCode", Value::Num(1.0));
                     emit_exit(self, 1);
                 }
                 return exit_code(self).unwrap_or(1);
@@ -1522,17 +1833,24 @@ impl Runtime {
                 if let Ok(report) = self.engine.ctx().get_member(&global, "__lumenFatalReport") {
                     if report.as_obj().is_some() {
                         if let Ok(Value::Str(s)) =
-                            self.engine.call_function(&report, Value::Undefined, &[error.clone()])
+                            self.engine
+                                .call_function(&report, Value::Undefined, &[error.clone()])
                         {
                             console::write_err_line(self.engine.ctx(), s.to_string());
                             return;
                         }
                     }
                 }
-                let describe = self.engine.ctx().get_member(&global, "__lumenDescribeError");
+                let describe = self
+                    .engine
+                    .ctx()
+                    .get_member(&global, "__lumenDescribeError");
                 let detailed = match describe {
                     Ok(f) if f.as_obj().is_some() => {
-                        match self.engine.call_function(&f, Value::Undefined, &[error.clone()]) {
+                        match self
+                            .engine
+                            .call_function(&f, Value::Undefined, &[error.clone()])
+                        {
                             Ok(Value::Str(s)) => Some(s.to_string()),
                             _ => None,
                         }
@@ -1541,7 +1859,10 @@ impl Runtime {
                 };
                 match detailed {
                     Some(text) => format!("{prefix} {text}"),
-                    None => format!("{prefix} {}", console::describe_error(self.engine.ctx(), error)),
+                    None => format!(
+                        "{prefix} {}",
+                        console::describe_error(self.engine.ctx(), error)
+                    ),
                 }
             }
         };
@@ -1554,6 +1875,33 @@ impl Runtime {
     /// otherwise it is raised as an uncaught exception — which an `'uncaughtException'` listener
     /// may still catch, and which is fatal if nothing does.
     fn report_unhandled_rejections(&mut self) {
+        if self.browser_rejection_events {
+            // The Window receives an actual UA task with the original Promise/reason values.
+            // Preserve the reason until a later checkpoint reports that same Promise handled.
+            for promise in self.engine.take_late_handled_rejections() {
+                let Some(identity) = self.engine.ctx().object_addr(&promise) else {
+                    continue;
+                };
+                if let Some((promise, reason)) = self.browser_rejection_reasons.remove(&identity) {
+                    self.pending_browser_rejections
+                        .push(BrowserRejectionEvent::Handled { promise, reason });
+                }
+            }
+            for (promise, reason) in self.engine.take_unhandled_rejections_full() {
+                let Some(identity) = self.engine.ctx().object_addr(&promise) else {
+                    continue;
+                };
+                if self
+                    .browser_rejection_reasons
+                    .insert(identity, (promise.clone(), reason.clone()))
+                    .is_none()
+                {
+                    self.pending_browser_rejections
+                        .push(BrowserRejectionEvent::Unhandled { promise, reason });
+                }
+            }
+            return;
+        }
         // Rejections reported earlier that have a handler now (Node's 'rejectionHandled').
         let handled = self.engine.take_late_handled_rejections();
         if !handled.is_empty() {
@@ -1562,7 +1910,10 @@ impl Runtime {
                 if self.halted() {
                     return;
                 }
-                if let Err(e) = self.engine.call_function(&fire, Value::Undefined, &[promise]) {
+                if let Err(e) = self
+                    .engine
+                    .call_function(&fire, Value::Undefined, &[promise])
+                {
                     self.report_uncaught(&e);
                 }
             }
@@ -1574,21 +1925,22 @@ impl Runtime {
             let fire = self.fire_rejection.clone();
             // The policy returns true when it dealt with the rejection, or `[error]` to raise
             // `error` (the reason, or Node's UnhandledPromiseRejection for a non-error).
-            let raised = match self
-                .engine
-                .call_function(&fire, Value::Undefined, &[promise, reason.clone()])
-            {
-                Ok(Value::Bool(true)) => continue,
-                Ok(list @ Value::Obj(_)) => {
-                    self.engine.ctx().get_member(&list, "0").unwrap_or(reason)
-                }
-                // A throwing 'unhandledRejection' listener is an uncaught exception itself.
-                Err(e) => {
-                    self.report_uncaught(&e);
-                    continue;
-                }
-                _ => reason,
-            };
+            let raised =
+                match self
+                    .engine
+                    .call_function(&fire, Value::Undefined, &[promise, reason.clone()])
+                {
+                    Ok(Value::Bool(true)) => continue,
+                    Ok(list @ Value::Obj(_)) => {
+                        self.engine.ctx().get_member(&list, "0").unwrap_or(reason)
+                    }
+                    // A throwing 'unhandledRejection' listener is an uncaught exception itself.
+                    Err(e) => {
+                        self.report_uncaught(&e);
+                        continue;
+                    }
+                    _ => reason,
+                };
             self.report_fatal(&raised, "Uncaught (in promise)", "unhandledRejection");
         }
     }
@@ -1650,9 +2002,11 @@ impl Runtime {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_deadline(&mut self, limit: Duration) {
         let handle = self.interrupt_handle();
-        self.deadline = Some(lumen::limits::Deadline::start("lumen-deadline", limit, move || {
-            handle.interrupt()
-        }));
+        self.deadline = Some(lumen::limits::Deadline::start(
+            "lumen-deadline",
+            limit,
+            move || handle.interrupt(),
+        ));
     }
 
     /// Run `f` so that SIGINT stops the JS it runs (as `vm`'s `breakOnSigint` does) instead of
@@ -1709,7 +2063,9 @@ impl Runtime {
     fn prepare_main(&mut self) {
         let global = self.engine.global_this();
         if let Ok(function) = self.engine.ctx().get_member(&global, "__lumenPrepareMain") {
-            if function.is_callable() { let _ = self.engine.call_function(&function, Value::Undefined, &[]); }
+            if function.is_callable() {
+                let _ = self.engine.call_function(&function, Value::Undefined, &[]);
+            }
         }
     }
 
@@ -1758,7 +2114,8 @@ fn report_load_stats(what: &str, t0: Instant) {
     );
 }
 
-static TRACE_ATOMICS_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TRACE_ATOMICS_WAIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Print each `Atomics.wait` step of `engine` the way Node's `--trace-atomics-wait` does; the
 /// thread id is Node's (0 for the main thread, a worker's `threadId` otherwise).

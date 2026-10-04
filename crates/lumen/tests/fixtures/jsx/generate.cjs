@@ -1,7 +1,7 @@
 // Regenerate with: node generate.cjs <directory containing Babel's node_modules>
 const { createRequire } = require('node:module');
 const { resolve } = require('node:path');
-const { writeFileSync } = require('node:fs');
+const { readFileSync, writeFileSync } = require('node:fs');
 const { runInNewContext } = require('node:vm');
 const dependency = createRequire(resolve(process.argv[2], 'package.json'));
 const babel = dependency('@babel/core');
@@ -48,9 +48,15 @@ const fixtures = cases.map(([name, typescript, runtimeMode, source]) => {
     }
     return { name, typescript, runtime: runtimeMode, source, expected: JSON.stringify(context.result) };
 });
-writeFileSync(resolve(__dirname, 'babel.json'), JSON.stringify({
+const output = JSON.stringify({
     generator: 'Babel plugin-transform-react-jsx (MIT)',
     typescript: typescriptCompiler.version,
     versions: Object.fromEntries(['@babel/core', '@babel/plugin-transform-react-jsx', '@babel/plugin-transform-typescript', '@babel/plugin-transform-modules-commonjs'].map(name => [name, dependency(`${name}/package.json`).version])),
     fixtures,
-}, null, 2) + '\n');
+}, null, 2) + '\n';
+const target = resolve(__dirname, 'babel.json');
+if (process.argv.includes('--verify')) {
+    if (readFileSync(target, 'utf8') !== output) throw new Error('babel.json is out of date');
+} else {
+    writeFileSync(target, output);
+}

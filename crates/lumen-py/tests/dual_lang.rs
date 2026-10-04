@@ -10,7 +10,15 @@ pub mod demo {
 
     /// Clamps `x` into `[lo, hi]`.
     #[op]
-    pub fn clamp(#[kw] x: f64, #[kw] #[default(0.0)] lo: f64, #[kw] #[default(1.0)] hi: f64) -> NativeResult<f64> {
+    pub fn clamp(
+        #[kw] x: f64,
+        #[kw]
+        #[default(0.0)]
+        lo: f64,
+        #[kw]
+        #[default(1.0)]
+        hi: f64,
+    ) -> NativeResult<f64> {
         if lo > hi {
             return Err(NativeError::value_error("lo must not exceed hi"));
         }
@@ -50,7 +58,12 @@ pub mod demo {
     #[methods]
     impl Counter {
         #[constructor]
-        fn new(#[default(0)] start: i64, #[kwonly] #[default(1)] step: i64) -> Counter {
+        fn new(
+            #[default(0)] start: i64,
+            #[kwonly]
+            #[default(1)]
+            step: i64,
+        ) -> Counter {
             Counter { n: start, step }
         }
 
@@ -82,7 +95,10 @@ fn js_side() {
     assert!(e.define_module::<demo::Module>().is_ok());
     js_true(&mut e, "demo.clamp(5, 0, 2) === 2");
     js_true(&mut e, "demo.clamp(-1) === 0");
-    js_true(&mut e, "demo.clamp.length === 1 && demo.hypot2.length === 2");
+    js_true(
+        &mut e,
+        "demo.clamp.length === 1 && demo.hypot2.length === 2",
+    );
     js_true(
         &mut e,
         "try { demo.clamp(1, 3, 2); false } catch (err) { err instanceof RangeError && err.message === 'lo must not exceed hi' }",
@@ -92,7 +108,10 @@ fn js_side() {
     js_true(&mut e, "demo.byte_sum(new Uint8Array([1, 2, 250])) === 253");
     js_true(&mut e, "demo.total(1, 2, 3.5) === 6.5");
     js_true(&mut e, "demo.VERSION === 2");
-    js_true(&mut e, "const c = new demo.Counter(5); c.bump(); c.bump() === 7 && c.value === 7");
+    js_true(
+        &mut e,
+        "const c = new demo.Counter(5); c.bump(); c.bump() === 7 && c.value === 7",
+    );
 }
 
 #[test]

@@ -160,7 +160,11 @@ fn run_yielding(
             if interrupt_after.is_some() || interrupt_first {
                 engine.set_interrupt(Arc::clone(&interrupt));
             }
-            let (f, c, i) = (Arc::clone(&flag), Arc::clone(&count), Arc::clone(&interrupt));
+            let (f, c, i) = (
+                Arc::clone(&flag),
+                Arc::clone(&count),
+                Arc::clone(&interrupt),
+            );
             engine.set_yield_hook(
                 Arc::clone(&flag),
                 Arc::new(move || {
@@ -204,7 +208,11 @@ fn yield_hook_resumes_a_counting_loop_on_every_tier() {
             "{tier:?}/{jit:?}: {:?}",
             describe(&out.completion)
         );
-        assert!(out.yields >= 10, "{tier:?}/{jit:?}: only {} yields", out.yields);
+        assert!(
+            out.yields >= 10,
+            "{tier:?}/{jit:?}: only {} yields",
+            out.yields
+        );
         if jit == crate::JitMode::Eager {
             eprintln!("jit units compiled: {}", out.jit_units);
         }
@@ -230,7 +238,10 @@ fn pending_interrupt_wins_over_a_yield() {
     let src = "function run() { while (true) {} } run()";
     for (tier, jit) in YIELD_TIERS {
         let out = run_yielding(src, tier, jit, None, true);
-        assert!(!matches!(out.completion, Completion::Value(_)), "{tier:?}/{jit:?}");
+        assert!(
+            !matches!(out.completion, Completion::Value(_)),
+            "{tier:?}/{jit:?}"
+        );
         assert_eq!(out.yields, 0, "{tier:?}/{jit:?}");
     }
 }
@@ -248,7 +259,10 @@ fn yield_hook_can_be_removed() {
         }),
     );
     engine.clear_yield_hook();
-    let out = engine.eval("var s = 0; for (var i = 0; i < 50000; i++) { s += i; } s", false);
+    let out = engine.eval(
+        "var s = 0; for (var i = 0; i < 50000; i++) { s += i; } s",
+        false,
+    );
     assert!(matches!(out, Ok(Completion::Value(_))));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }

@@ -118,7 +118,7 @@ use crate::value::Value;
 #[path = "precompiled/native_host.rs"]
 mod native_host;
 #[cfg(feature = "jit")]
-pub use native_host::{NativeUnit, NativeSnapshotBaseline, NativeSnapshotFunctions};
+pub use native_host::{NativeSnapshotBaseline, NativeSnapshotFunctions, NativeUnit};
 
 /// The container format version (header + section table + manifest). Bump on any change.
 pub use lumen_common::aot::FORMAT_VERSION;
@@ -387,33 +387,53 @@ impl CompiledUnit {
     /// A refused bytecode function is a build error, never a runtime fallback.
     #[cfg(feature = "jit")]
     pub fn native_chunks(&self) -> Result<Vec<std::rc::Rc<crate::bytecode::Chunk>>, String> {
-        self.native_funcs.iter().enumerate().map(|(index, function)| {
-            if let Some(cached) = function.code.get() {
-                return cached.clone().ok_or_else(|| format!("native compilation refused function {index}: {}", function.name.as_deref().unwrap_or("<anonymous>")));
-            }
-            let chunk = crate::bytecode::compile(function);
-            let _ = function.code.set(chunk.clone());
-            chunk.ok_or_else(|| {
-                let offset = match &function.source {
-                    crate::ast::FnSource::Range { start, .. } => *start,
-                    _ => 0,
-                };
-                format!("native compilation refused function {index} {} at source offset {offset}", function.name.as_deref().unwrap_or("<anonymous>"))
+        self.native_funcs
+            .iter()
+            .enumerate()
+            .map(|(index, function)| {
+                if let Some(cached) = function.code.get() {
+                    return cached.clone().ok_or_else(|| {
+                        format!(
+                            "native compilation refused function {index}: {}",
+                            function.name.as_deref().unwrap_or("<anonymous>")
+                        )
+                    });
+                }
+                let chunk = crate::bytecode::compile(function);
+                let _ = function.code.set(chunk.clone());
+                chunk.ok_or_else(|| {
+                    let offset = match &function.source {
+                        crate::ast::FnSource::Range { start, .. } => *start,
+                        _ => 0,
+                    };
+                    format!(
+                        "native compilation refused function {index} {} at source offset {offset}",
+                        function.name.as_deref().unwrap_or("<anonymous>")
+                    )
+                })
             })
-        }).collect()
+            .collect()
     }
 
     /// Compile the unit's top-level statements as host IR. Module binding and script
     /// global semantics must be supplied by the native runtime before this may launch.
     #[cfg(feature = "jit")]
     pub fn native_entry_chunk(&self) -> Result<std::rc::Rc<crate::bytecode::Chunk>, String> {
-        crate::bytecode::compile(self.snapshot_cjs_function()?.as_ref()).ok_or_else(|| "native compilation refused top-level statements".into())
+        crate::bytecode::compile(self.snapshot_cjs_function()?.as_ref())
+            .ok_or_else(|| "native compilation refused top-level statements".into())
     }
 
     #[cfg(feature = "jit")]
-    pub(crate) fn snapshot_cjs_function(&self) -> Result<std::rc::Rc<crate::ast::Function>, String> {
-        let mut function = native_host::synthetic(native_host::entry_body(&self.native_body, &self.native_source)?,
-            "<entry>", false, self.kind == SourceKind::Module, false);
+    pub(crate) fn snapshot_cjs_function(
+        &self,
+    ) -> Result<std::rc::Rc<crate::ast::Function>, String> {
+        let mut function = native_host::synthetic(
+            native_host::entry_body(&self.native_body, &self.native_source)?,
+            "<entry>",
+            false,
+            self.kind == SourceKind::Module,
+            false,
+        );
         std::rc::Rc::get_mut(&mut function).unwrap().is_async = self.native_entry_async();
         Ok(function)
     }
@@ -1266,7 +1286,9 @@ pub(crate) fn parse(bytes: &'static [u8]) -> Result<Parsed, String> {
 
 pub(crate) fn parse_blob(blob: &Precompiled) -> Result<Parsed, String> {
     if !cfg!(feature = "compiler") {
-        return Err("AOT bytecode is unavailable in the Aot profile; load an AOT native image".into());
+        return Err(
+            "AOT bytecode is unavailable in the Aot profile; load an AOT native image".into(),
+        );
     }
     parse_bytes(blob.bytes.clone())
 }

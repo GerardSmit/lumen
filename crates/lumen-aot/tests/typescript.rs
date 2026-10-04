@@ -42,7 +42,10 @@ fn bundles_and_runs_typescript() {
     });
     runtime.run_precompiled(&blob).expect("run");
     // Node prints `9:18:126` (126 = the length of `total`'s source text, types blanked).
-    assert_eq!(String::from_utf8(captured.0.borrow().clone()).unwrap(), "9:18:126\n");
+    assert_eq!(
+        String::from_utf8(captured.0.borrow().clone()).unwrap(),
+        "9:18:126\n"
+    );
 }
 
 #[test]

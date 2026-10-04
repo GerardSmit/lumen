@@ -206,18 +206,30 @@ pub fn value_kind(value: &Value) -> u32 {
 /// A zero result means the receiver cannot use this portable guard.
 pub(crate) fn shape_hash(value: &Value) -> u64 {
     let Value::Obj(object) = value else { return 0 };
-    let Ok(object) = object.try_borrow() else { return 0 };
-    if !object.ic_plain.get() { return 0; }
+    let Ok(object) = object.try_borrow() else {
+        return 0;
+    };
+    if !object.ic_plain.get() {
+        return 0;
+    }
     let mut hash = 0xcbf29ce484222325u64;
     let mut feed = |bytes: &[u8]| {
-        for &byte in bytes { hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3); }
+        for &byte in bytes {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
     };
     for (name, property) in object.props.iter_named() {
-        if Interp::is_sym_key(name) || Interp::is_private_key(name) { return 0; }
+        if Interp::is_sym_key(name) || Interp::is_private_key(name) {
+            return 0;
+        }
         feed(&(name.len() as u64).to_le_bytes());
         feed(name.as_bytes());
-        feed(&[property.accessor() as u8, property.writable() as u8,
-            property.enumerable() as u8, property.configurable() as u8]);
+        feed(&[
+            property.accessor() as u8,
+            property.writable() as u8,
+            property.enumerable() as u8,
+            property.configurable() as u8,
+        ]);
     }
     hash
 }
@@ -236,33 +248,63 @@ pub(crate) fn snapshot_intrinsics(i: &Interp) -> Vec<(String, Value)> {
     {
         let mut modules: Vec<_> = i.native_module_names.iter().collect();
         modules.sort();
-        for name in modules { if let Some(namespace) = i.modules.get(name) { queue.push_back((format!("native-module:{name}"), namespace.clone())); } }
+        for name in modules {
+            if let Some(namespace) = i.modules.get(name) {
+                queue.push_back((format!("native-module:{name}"), namespace.clone()));
+            }
+        }
     }
     let mut seen = BTreeSet::new();
     let mut seen_symbols = BTreeSet::new();
     let mut result = Vec::new();
-    for (name, symbol, _) in &i.wk_syms { result.push((format!("symbol.wellknown:{name}"), symbol.clone())); }
+    for (name, symbol, _) in &i.wk_syms {
+        result.push((format!("symbol.wellknown:{name}"), symbol.clone()));
+    }
     while let Some((path, value)) = queue.pop_front() {
         if let Value::Sym(symbol) = &value {
-            if seen_symbols.insert(symbol.id) { result.push((path, value)); }
+            if seen_symbols.insert(symbol.id) {
+                result.push((path, value));
+            }
             continue;
         }
         let Value::Obj(object) = &value else { continue };
-        if !seen.insert(crate::value::Gc::as_ptr(object) as usize) { continue; }
+        if !seen.insert(crate::value::Gc::as_ptr(object) as usize) {
+            continue;
+        }
         result.push((path.clone(), value.clone()));
         let object = object.borrow();
-        if let Some(proto) = &object.proto { queue.push_back((format!("{path}/prototype"), Value::Obj(proto.clone()))); }
+        if let Some(proto) = &object.proto {
+            queue.push_back((format!("{path}/prototype"), Value::Obj(proto.clone())));
+        }
         for name in object.props.keys() {
-            let Some(property) = object.props.get(&name) else { continue };
+            let Some(property) = object.props.get(&name) else {
+                continue;
+            };
             let name = if Interp::is_sym_key(&name) {
-                let Some(Value::Sym(symbol)) = i.sym_from_key(&name) else { continue };
-                let Some((name, _, _)) = i.wk_syms.iter().find(|(_, value, _)| matches!(value, Value::Sym(s) if s.id == symbol.id)) else { continue };
+                let Some(Value::Sym(symbol)) = i.sym_from_key(&name) else {
+                    continue;
+                };
+                let Some((name, _, _)) = i
+                    .wk_syms
+                    .iter()
+                    .find(|(_, value, _)| matches!(value, Value::Sym(s) if s.id == symbol.id))
+                else {
+                    continue;
+                };
                 format!("@symbol:{name}")
-            } else { name.to_string() };
+            } else {
+                name.to_string()
+            };
             let prefix = format!("{path}/{}:{name}", name.len());
-            if !property.accessor() { queue.push_back((format!("{prefix}/value"), property.value())); }
-            if let Some(getter) = property.getter() { queue.push_back((format!("{prefix}/get"), getter.clone())); }
-            if let Some(setter) = property.setter() { queue.push_back((format!("{prefix}/set"), setter.clone())); }
+            if !property.accessor() {
+                queue.push_back((format!("{prefix}/value"), property.value()));
+            }
+            if let Some(getter) = property.getter() {
+                queue.push_back((format!("{prefix}/get"), getter.clone()));
+            }
+            if let Some(setter) = property.setter() {
+                queue.push_back((format!("{prefix}/set"), setter.clone()));
+            }
         }
     }
     result
@@ -277,7 +319,9 @@ std::thread_local! {
 pub(crate) fn closed_world<R>(body: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
-        fn drop(&mut self) { CLOSED_WORLD_DEPTH.with(|depth| depth.set(self.0)); }
+        fn drop(&mut self) {
+            CLOSED_WORLD_DEPTH.with(|depth| depth.set(self.0));
+        }
     }
     let restore = Restore(CLOSED_WORLD_DEPTH.with(|depth| {
         let previous = depth.get();
@@ -305,14 +349,27 @@ pub(crate) fn unary(i: &mut Interp, operator: &str, value: Value) -> Result<Valu
     }
 }
 
-pub(crate) fn delete_property(i: &mut Interp, base: Value, key: &str, strict: bool) -> Result<Value, Abrupt> {
+pub(crate) fn delete_property(
+    i: &mut Interp,
+    base: Value,
+    key: &str,
+    strict: bool,
+) -> Result<Value, Abrupt> {
     if matches!(base, Value::Undefined | Value::Null) {
-        return Err(i.throw("TypeError", format!("cannot delete property '{key}' of null or undefined")));
+        return Err(i.throw(
+            "TypeError",
+            format!("cannot delete property '{key}' of null or undefined"),
+        ));
     }
     i.delete_prop_with(base, key, strict)
 }
 
-pub(crate) fn delete_element(i: &mut Interp, base: Value, key: Value, strict: bool) -> Result<Value, Abrupt> {
+pub(crate) fn delete_element(
+    i: &mut Interp,
+    base: Value,
+    key: Value,
+    strict: bool,
+) -> Result<Value, Abrupt> {
     let key = i.to_property_key(&key)?;
     delete_property(i, base, &key, strict)
 }
@@ -344,17 +401,37 @@ mod tests {
         let mut engine = crate::Engine::new();
         engine.eval("function custom() { let eval = x => x + 1; return eval(2); } function indirect() { const run = eval; return run('1'); } function direct() { return eval('1'); } function create() { return Function('return 1')(); } function bound() { return eval.bind(null)('1'); }", false).unwrap();
         let function = |engine: &crate::Engine, name: &str| {
-            engine.interp.global.borrow().props.get(name).unwrap().value()
+            engine
+                .interp
+                .global
+                .borrow()
+                .props
+                .get(name)
+                .unwrap()
+                .value()
         };
         let custom = function(&engine, "custom");
-        assert!(matches!(closed_world(|| engine.interp.call(custom, Value::Undefined, &[])), Ok(Value::Num(3.0))));
+        assert!(matches!(
+            closed_world(|| engine.interp.call(custom, Value::Undefined, &[])),
+            Ok(Value::Num(3.0))
+        ));
         for name in ["indirect", "direct", "create", "bound"] {
             let callable = function(&engine, name);
-            let Err(Abrupt::Throw(error)) = closed_world(|| engine.interp.call(callable, Value::Undefined, &[])) else { panic!("dynamic code must throw"); };
-            let error_name = engine.interp.get_member(&error, "name").unwrap_or_else(|_| panic!("throw has no name"));
+            let Err(Abrupt::Throw(error)) =
+                closed_world(|| engine.interp.call(callable, Value::Undefined, &[]))
+            else {
+                panic!("dynamic code must throw");
+            };
+            let error_name = engine
+                .interp
+                .get_member(&error, "name")
+                .unwrap_or_else(|_| panic!("throw has no name"));
             assert!(matches!(error_name, Value::Str(name) if &*name == "EvalError"));
         }
         let ordinary = function(&engine, "create");
-        assert!(matches!(engine.interp.call(ordinary, Value::Undefined, &[]), Ok(Value::Num(1.0))));
+        assert!(matches!(
+            engine.interp.call(ordinary, Value::Undefined, &[]),
+            Ok(Value::Num(1.0))
+        ));
     }
 }

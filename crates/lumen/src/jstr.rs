@@ -16,84 +16,18 @@ pub use lumen_common::smuggle::{
 
 /// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
 pub fn units(s: &str) -> Vec<u16> {
-    // ASCII fast path: units are exactly the bytes (no surrogates, no smuggling possible).
-    if s.is_ascii() {
-        return lumen_common::scan::latin1_to_utf16(s.as_bytes());
-    }
-    let mut out = Vec::with_capacity(s.len());
-    let mut at = 0;
-    while at < s.len() {
-        at += lumen_common::scan::utf8_bmp_prefix(&s[at..], &mut out);
-        if at == s.len() {
-            break;
-        }
-        let c = s[at..].chars().next().unwrap();
-        match smuggled(c) {
-            Some(u) => out.push(u),
-            None => {
-                let mut buf = [0u16; 2];
-                out.extend_from_slice(c.encode_utf16(&mut buf));
-            }
-        }
-        at += c.len_utf8();
-    }
-    out
+    lumen_common::smuggle::utf16_units(s)
 }
 
 /// The UTF-16 length of `s` without materializing the units.
 pub fn unit_len(s: &str) -> usize {
-    if s.is_ascii() {
-        return s.len();
-    }
-    s.chars()
-        .map(|c| {
-            if smuggled(c).is_some() {
-                1
-            } else {
-                c.len_utf16()
-            }
-        })
-        .sum()
+    lumen_common::smuggle::utf16_unit_len(s)
 }
 
 /// Rebuild a string from code units: valid surrogate pairs combine into their code point, lone
 /// surrogates are smuggled.
 pub fn from_units(units: &[u16]) -> String {
-    // ASCII fast path: no pairs or smuggling below 0x80.
-    if let Some(text) = lumen_common::scan::utf16_to_ascii(units) {
-        return text;
-    }
-    let mut out = String::with_capacity(units.len());
-    let mut i = 0;
-    while i < units.len() {
-        i += lumen_common::scan::utf16_bmp_prefix(&units[i..], &mut out);
-        if i == units.len() {
-            break;
-        }
-        let u = units[i] as u32;
-        if (0xD800..0xDC00).contains(&u)
-            && i + 1 < units.len()
-            && (0xDC00..0xE000).contains(&(units[i + 1] as u32))
-        {
-            let c = 0x10000 + ((u - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00);
-            if c < SMUGGLE_BASE {
-                out.push(char::from_u32(c).unwrap());
-            } else {
-                // A real character in the smuggle range is stored as its smuggled pair.
-                out.push(smuggle(units[i]));
-                out.push(smuggle(units[i + 1]));
-            }
-            i += 2;
-            continue;
-        }
-        if (0xD800..0xE000).contains(&u) {
-            out.push(smuggle(units[i]));
-        } else {
-            out.push(char::from_u32(u).unwrap());
-        }
-        i += 1;
-    }
-    out
+    lumen_common::smuggle::utf16_from_units(units)
 }
 
 /// The single-unit string for one code unit.

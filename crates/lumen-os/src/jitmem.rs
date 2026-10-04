@@ -59,7 +59,12 @@ pub fn last_failed_len() -> usize {
 /// keeps counting against it until freed, wherever it is freed.
 pub fn set_thread_exec_limit(bytes: Option<usize>) {
     THREAD_BUDGET.with(|b| {
-        *b.borrow_mut() = bytes.map(|limit| Arc::new(Budget { limit, used: AtomicUsize::new(0) }));
+        *b.borrow_mut() = bytes.map(|limit| {
+            Arc::new(Budget {
+                limit,
+                used: AtomicUsize::new(0),
+            })
+        });
     });
 }
 
@@ -497,9 +502,16 @@ mod tests {
         let trim = exec_trim_generation();
         let a = ExecMemory::new(&[0xc3; 200]).unwrap();
         let freed = exec_freed_generation();
-        assert_eq!(ExecMemory::new(&[0xc3; 200]).err().as_deref(), Some(EXEC_EXHAUSTED));
+        assert_eq!(
+            ExecMemory::new(&[0xc3; 200]).err().as_deref(),
+            Some(EXEC_EXHAUSTED)
+        );
         assert_eq!(last_failed_len(), 200);
-        assert_eq!(exec_trim_generation(), trim, "a thread budget is not arena pressure");
+        assert_eq!(
+            exec_trim_generation(),
+            trim,
+            "a thread budget is not arena pressure"
+        );
         drop(a);
         assert!(exec_freed_generation() > freed);
         let b = ExecMemory::new(&[0xc3; 200]).unwrap();

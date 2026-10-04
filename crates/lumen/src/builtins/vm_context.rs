@@ -314,7 +314,11 @@ impl Interp {
                 }
             };
         set_internal(&handler, PROXY_KEY, proxy.clone());
-        set_builtin(g, "globalThis", proxy.clone());
+        g.borrow_mut().props.insert(
+            "globalThis",
+            Property::data(proxy.clone(), true, false, true),
+        );
+        self.global_this = proxy.clone();
         if let Some(b) = self.global_env.borrow_mut().vars.get_mut("this") {
             b.value = proxy.clone();
         }

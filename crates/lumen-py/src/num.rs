@@ -2,8 +2,8 @@
 
 use crate::ast::BinOp;
 use crate::fmath;
-use crate::pyint::{BigInt, PyInt};
 use crate::object::*;
+use crate::pyint::{BigInt, PyInt};
 use crate::vm::Interp;
 use std::cmp::Ordering;
 
@@ -81,7 +81,11 @@ pub fn cmp_int_float(i: &Num, f: f64) -> Option<Ordering> {
         return None;
     }
     if f.is_infinite() {
-        return Some(if f > 0.0 { Ordering::Less } else { Ordering::Greater });
+        return Some(if f > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
     }
     if let Num::I(i) = i {
         if i.unsigned_abs() < (1 << 53) {
@@ -143,7 +147,11 @@ pub fn float_repr(f: f64) -> String {
         return if f > 0.0 { "inf".into() } else { "-inf".into() };
     }
     if f == 0.0 {
-        return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+        return if f.is_sign_negative() {
+            "-0.0".into()
+        } else {
+            "0.0".into()
+        };
     }
     let sign = if f < 0.0 { "-" } else { "" };
     let d = lumen_common::float::shortest(f);
@@ -157,10 +165,18 @@ pub fn float_repr(f: f64) -> String {
         } else if decpt >= n {
             format!("{}{}.0", digits, "0".repeat((decpt - n) as usize))
         } else {
-            format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
+            format!(
+                "{}.{}",
+                &digits[..decpt as usize],
+                &digits[decpt as usize..]
+            )
         }
     } else {
-        let m = if n > 1 { format!("{}.{}", &digits[..1], &digits[1..]) } else { digits.to_string() };
+        let m = if n > 1 {
+            format!("{}.{}", &digits[..1], &digits[1..])
+        } else {
+            digits.to_string()
+        };
         format!("{}e{}{:02}", m, if exp < 0 { '-' } else { '+' }, exp.abs())
     };
     format!("{}{}", sign, body)
@@ -193,7 +209,11 @@ pub fn hash_float(v: f64) -> i64 {
             x -= MODULUS;
         }
     }
-    let e = if e >= 0 { e % 61 } else { 61 - 1 - ((-1 - e) % 61) };
+    let e = if e >= 0 {
+        e % 61
+    } else {
+        61 - 1 - ((-1 - e) % 61)
+    };
     x = ((x << e) & MODULUS) | (x >> (61 - e));
     let r = (x as i64) * sign;
     if r == -1 {
@@ -387,7 +407,15 @@ impl Interp {
                     if b < 0 {
                         return Err(self.value_error("negative shift count"));
                     }
-                    return Ok(Value::Int(if b >= 64 { if a < 0 { -1 } else { 0 } } else { a >> b }));
+                    return Ok(Value::Int(if b >= 64 {
+                        if a < 0 {
+                            -1
+                        } else {
+                            0
+                        }
+                    } else {
+                        a >> b
+                    }));
                 }
                 BinOp::Pow => {
                     if b < 0 {
@@ -432,7 +460,11 @@ impl Interp {
                 }
                 match big_true_div(&a, &b) {
                     Some(f) => Value::Float(f),
-                    None => return Err(self.overflow_err("integer division result too large for a float")),
+                    None => {
+                        return Err(
+                            self.overflow_err("integer division result too large for a float")
+                        )
+                    }
                 }
             }
             BinOp::BitAnd => Value::big(a.bitand(&b)),
@@ -450,7 +482,9 @@ impl Interp {
                         self.check_int_bits(a.bit_len() as u128 + n as u128)?;
                         Value::big(a.shl(n))
                     }
-                    _ => return Err(self.new_exc_str("OverflowError", "too many digits in integer")),
+                    _ => {
+                        return Err(self.new_exc_str("OverflowError", "too many digits in integer"))
+                    }
                 }
             }
             BinOp::RShift => {
@@ -497,9 +531,14 @@ impl Interp {
             let Some(inv) = mod_inverse(a, m) else {
                 return Err(self.value_error("base is not invertible for the given modulus"));
             };
-            return Ok(Value::big(inv.pow_mod(&e.neg(), m).expect("modulus and exponent checked")));
+            return Ok(Value::big(
+                inv.pow_mod(&e.neg(), m)
+                    .expect("modulus and exponent checked"),
+            ));
         }
-        Ok(Value::big(a.pow_mod(e, m).expect("modulus and exponent checked")))
+        Ok(Value::big(
+            a.pow_mod(e, m).expect("modulus and exponent checked"),
+        ))
     }
 }
 

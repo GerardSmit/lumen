@@ -7,7 +7,11 @@ pub const ADD32: u32 = 0xffff_ff00;
 pub const COMPARE_EXCHANGE32: u32 = 0xffff_ff01;
 
 pub fn signature(id: u32) -> Option<Signature> {
-    let n = match id { ADD32 => 2, COMPARE_EXCHANGE32 => 3, _ => return None };
+    let n = match id {
+        ADD32 => 2,
+        COMPARE_EXCHANGE32 => 3,
+        _ => return None,
+    };
     let mut args = vec![Type::I32; n];
     args[0] = Type::I64;
     Some(Signature::new(args, vec![Type::I32]))
@@ -17,9 +21,16 @@ pub fn signature(id: u32) -> Option<Signature> {
 unsafe extern "C" fn add32(pointer: *mut AtomicU32, value: u32) -> u32 {
     unsafe { (*pointer).fetch_add(value, Ordering::SeqCst) }
 }
-unsafe extern "C" fn compare_exchange32(pointer: *mut AtomicU32, expected: u32, replacement: u32) -> u32 {
-    unsafe { (*pointer).compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst)
-        .unwrap_or_else(|old| old) }
+unsafe extern "C" fn compare_exchange32(
+    pointer: *mut AtomicU32,
+    expected: u32,
+    replacement: u32,
+) -> u32 {
+    unsafe {
+        (*pointer)
+            .compare_exchange(expected, replacement, Ordering::SeqCst, Ordering::SeqCst)
+            .unwrap_or_else(|old| old)
+    }
 }
 
 pub fn address(id: u32) -> Option<u64> {

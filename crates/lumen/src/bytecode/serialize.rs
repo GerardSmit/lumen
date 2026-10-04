@@ -139,8 +139,7 @@ impl<'a> Rd<'a> {
         Ok(v)
     }
     fn uv(&mut self) -> R<u64> {
-        lumen_common::aot::read_varint(self.b, &mut self.pos)
-            .map_err(|e| format!("bytecode: {e}"))
+        lumen_common::aot::read_varint(self.b, &mut self.pos).map_err(|e| format!("bytecode: {e}"))
     }
     fn usize(&mut self) -> R<usize> {
         usize::try_from(self.uv()?).map_err(|_| "bytecode: value exceeds pointer width".into())
@@ -565,7 +564,7 @@ fn enc_chunk(
         caches,
         jit: _, // runtime state
         #[cfg(feature = "bench")]
-        precompiled_origin: _, // measurement-only runtime state
+            precompiled_origin: _, // measurement-only runtime state
         obj_maps,
         name_caches,
         name_paths,
@@ -578,7 +577,7 @@ fn enc_chunk(
         positions,
         inline_cbs: _, // runtime state; rescanned from the ops
         #[cfg(feature = "compiler")]
-        feedback_key: _,
+            feedback_key: _,
     } = chunk;
     if !classes.is_empty() {
         return Err("class definitions are not carried by the codec".into());
@@ -815,7 +814,9 @@ fn dec_chunk(
         })
         .max()
         .unwrap_or(0);
-    if n_switch_tables > ops.len() { return Err("bytecode: bad switch table count".into()); }
+    if n_switch_tables > ops.len() {
+        return Err("bytecode: bad switch table count".into());
+    }
     let activation_layout = activation::ActivationLayout::new(&cap_inits, env_this, &names);
     Ok(Chunk {
         debug_name: "<precompiled>".into(),
@@ -947,7 +948,10 @@ pub(crate) fn encode_unit(funcs: &[Rc<Function>]) -> (Vec<u8>, SectionStats) {
     let mut total_len = Vec::new();
     loop {
         let mut next = Vec::new();
-        uv(&mut next, (counts.len() + total_len.len() + tables + chunk_bytes) as u64);
+        uv(
+            &mut next,
+            (counts.len() + total_len.len() + tables + chunk_bytes) as u64,
+        );
         let settled = next.len() == total_len.len();
         total_len = next;
         if settled {
@@ -999,7 +1003,10 @@ fn parse_section(section: &[u8], fn_count: usize) -> R<Section<'_>> {
         return Err("bytecode: section length does not match".into());
     }
     let bad = || "bytecode: truncated tables".to_string();
-    let offsets_end = r.pos.checked_add(strings.checked_mul(4).ok_or_else(bad)?).ok_or_else(bad)?;
+    let offsets_end = r
+        .pos
+        .checked_add(strings.checked_mul(4).ok_or_else(bad)?)
+        .ok_or_else(bad)?;
     let data_end = offsets_end.checked_add(data_len).ok_or_else(bad)?;
     let entries_at = data_end;
     let entries_end = entries_at
@@ -1059,12 +1066,20 @@ impl LazyUnit {
         if (start, len) == NO_ENTRY || (start, len) == REFUSED {
             return Ok(None);
         }
-        let end = (start as usize).checked_add(len as usize).ok_or("bytecode: bad chunk length")?;
-        let bytes = self.section.get(start as usize..end).ok_or("bytecode: bad chunk range")?;
+        let end = (start as usize)
+            .checked_add(len as usize)
+            .ok_or("bytecode: bad chunk length")?;
+        let bytes = self
+            .section
+            .get(start as usize..end)
+            .ok_or("bytecode: bad chunk range")?;
         let lookup = |i: usize| ast.function(i).ok();
         let mut chunk = dec_chunk_at(bytes, &mut self.strings.borrow_mut(), &lookup)?;
         if let Ok(function) = ast.function(idx) {
-            chunk.debug_name = function.name.clone().unwrap_or_else(|| "<anonymous>".into());
+            chunk.debug_name = function
+                .name
+                .clone()
+                .unwrap_or_else(|| "<anonymous>".into());
         }
         #[cfg(feature = "bench")]
         {
@@ -1112,7 +1127,9 @@ pub(crate) fn attach_unit(
     } = parse_section(&section, ast.fn_count())?;
     let offsets_start = offsets.as_ptr() as usize - section.as_ptr() as usize;
     let data_start = data.as_ptr() as usize - section.as_ptr() as usize;
-    let offsets = section.slice(offsets_start..offsets_start + offsets.len()).unwrap();
+    let offsets = section
+        .slice(offsets_start..offsets_start + offsets.len())
+        .unwrap();
     let data = section.slice(data_start..data_start + data.len()).unwrap();
     let unit = Rc::new(LazyUnit {
         section,
@@ -1264,7 +1281,10 @@ mod tests {
 
     /// Attach `section` to `unit` and decode all its functions: `(functions, chunks
     /// registered, refusals attached)`.
-    fn attach_all(section: &'static [u8], unit: &Rc<crate::snapshot::SplitUnit>) -> (Vec<Rc<Function>>, usize, usize) {
+    fn attach_all(
+        section: &'static [u8],
+        unit: &Rc<crate::snapshot::SplitUnit>,
+    ) -> (Vec<Rc<Function>>, usize, usize) {
         attach_unit(section, unit).unwrap();
         let funcs = unit.all_functions().unwrap();
         let chunks = funcs
@@ -1272,10 +1292,15 @@ mod tests {
             .enumerate()
             .filter(|(i, f)| {
                 f.code.get().is_none()
-                    && unit.chunks().is_some_and(|u| !matches!(u.entry(*i), NO_ENTRY | REFUSED))
+                    && unit
+                        .chunks()
+                        .is_some_and(|u| !matches!(u.entry(*i), NO_ENTRY | REFUSED))
             })
             .count();
-        let refusals = funcs.iter().filter(|f| matches!(f.code.get(), Some(None))).count();
+        let refusals = funcs
+            .iter()
+            .filter(|f| matches!(f.code.get(), Some(None)))
+            .count();
         (funcs, chunks, refusals)
     }
 
@@ -1358,7 +1383,10 @@ mod tests {
         let (mut section, _) = encode_unit(&funcs);
         let at = parse_section(&section, funcs.len()).unwrap().entries_at;
         let start = u32::from_le_bytes(section[at..at + 4].try_into().unwrap()) as usize;
-        let mut r = Rd { b: &section, pos: start };
+        let mut r = Rd {
+            b: &section,
+            pos: start,
+        };
         r.uv().unwrap(); // declared stack bound
         r.uv().unwrap(); // instruction count
         let op = r.pos;

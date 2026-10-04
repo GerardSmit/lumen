@@ -196,7 +196,7 @@ fn make_callback_fn(interp: &mut Ctx, name: &str, cb: napi_callback, data: *mut 
     // The raw C pointers are Copy and move into a 'static closure. They are not `Send`, but a
     // NativeClosure runs only on the engine's own `!Send` loop thread, so that is fine.
     let closure = move |ip: &mut Ctx, this: Value, args: &[Value]| -> Result<Value, Value> {
-        let args=args.to_vec();
+        let args = args.to_vec();
         ip.on_driver(move |ip| invoke_napi_callback(ip, cb, data, this, &args))
     };
     interp.new_native_fn(name, 0, Rc::new(closure) as Rc<NativeClosure>)
@@ -215,7 +215,7 @@ fn invoke_napi_callback(
         Some(f) => f,
         None => return Ok(Value::Undefined),
     };
-    let _loop_guard=tsfn::LoopGuard::enter();
+    let _loop_guard = tsfn::LoopGuard::enter();
     let call = EnvCall::new(ip);
     let mut info = CbInfo {
         this,
@@ -223,7 +223,7 @@ fn invoke_napi_callback(
         data,
     };
     let ret = unsafe { cb(call.env, &mut info as *mut CbInfo) };
-    if let Some(err) = unsafe {(*call.env).pending.take()} {
+    if let Some(err) = unsafe { (*call.env).pending.take() } {
         return Err(err);
     }
     Ok(unsafe { value_of(ret) })
@@ -242,7 +242,9 @@ pub struct AddonRegistry {
 impl Drop for AddonRegistry {
     fn drop(&mut self) {
         // Hooks execute in reverse registration order while every addon library is mapped.
-        while let Some((hook, data)) = self.cleanup_hooks.pop() { unsafe { hook(data) }; }
+        while let Some((hook, data)) = self.cleanup_hooks.pop() {
+            unsafe { hook(data) };
+        }
     }
 }
 
@@ -252,7 +254,7 @@ impl Drop for AddonRegistry {
 #[derive(Default)]
 struct NapiState {
     env: Option<Box<Env>>,
-    tsfns: std::collections::HashMap<usize,Rc<tsfn::Main>>,
+    tsfns: std::collections::HashMap<usize, Rc<tsfn::Main>>,
     shutting_down: bool,
     refs: Vec<Option<RefEntry>>,
     ref_free: Vec<usize>,
@@ -342,7 +344,7 @@ fn decode_slot(handle: *mut c_void) -> Option<usize> {
 /// `__node.loadNativeAddon(path)` — dlopen a `.node` addon, run its N-API registration, and
 /// return the exports object.
 pub fn op_load_addon(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let args=args.to_vec();
+    let args = args.to_vec();
     ctx.on_driver(move |ctx| load_addon_on_driver(ctx, &args))
 }
 fn load_addon_on_driver(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
@@ -366,11 +368,11 @@ fn load_addon_on_driver(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
 
     // Build the exports object and the call env, then hand control to the addon.
     let exports = Value::Obj(ctx.new_object());
-    let _loop_guard=tsfn::LoopGuard::enter();
+    let _loop_guard = tsfn::LoopGuard::enter();
     let call = EnvCall::new(ctx);
-    let exports_handle = unsafe {(*call.env).handle(exports.clone())};
+    let exports_handle = unsafe { (*call.env).handle(exports.clone()) };
     let ret = unsafe { register(call.env, exports_handle) };
-    let pending = unsafe {(*call.env).pending.take()};
+    let pending = unsafe { (*call.env).pending.take() };
     let result = if ret.is_null() {
         exports
     } else {
@@ -867,7 +869,9 @@ pub unsafe extern "C" fn napi_add_env_cleanup_hook(
     {
         return NAPI_INVALID_ARG;
     }
-    if hooks.len() >= 4096 { return 9; } // bounded per-realm cleanup registrations
+    if hooks.len() >= 4096 {
+        return 9;
+    } // bounded per-realm cleanup registrations
     hooks.push((hook, data));
     NAPI_OK
 }
@@ -1766,7 +1770,7 @@ pub unsafe extern "C" fn napi_queue_async_work(
     };
     // Run the two halves inline. `execute` must not touch JS (it normally runs off-thread);
     // `complete` runs on the loop thread with JS access, which is where we already are.
-    let call=EnvCall::new(env.interp());
+    let call = EnvCall::new(env.interp());
     if let Some(execute) = w.execute {
         execute(call.env, w.data);
     }
@@ -1800,14 +1804,28 @@ pub unsafe extern "C" fn napi_cancel_async_work(
 }
 
 mod tsfn;
-pub use tsfn::{napi_create_threadsafe_function,napi_call_threadsafe_function,napi_acquire_threadsafe_function,napi_release_threadsafe_function,napi_get_threadsafe_function_context,napi_unref_threadsafe_function,napi_ref_threadsafe_function};
+pub use tsfn::{
+    napi_acquire_threadsafe_function, napi_call_threadsafe_function,
+    napi_create_threadsafe_function, napi_get_threadsafe_function_context,
+    napi_ref_threadsafe_function, napi_release_threadsafe_function, napi_unref_threadsafe_function,
+};
 
 /// Stop native producers before destroying the realm's JS state or unloading addon libraries.
-pub fn shutdown(ctx:&mut Ctx) {
-    let _scope=ctx.host_mut::<NapiState>().is_some().then(||EnvCall::new(ctx));
-    let hooks=ctx.host_mut::<AddonRegistry>().map(|registry|std::mem::take(&mut registry.cleanup_hooks)).unwrap_or_default();
-    for (hook,data) in hooks.into_iter().rev() {unsafe {hook(data)};}
-    if ctx.host_mut::<NapiState>().is_some() {tsfn::shutdown(ctx);}
+pub fn shutdown(ctx: &mut Ctx) {
+    let _scope = ctx
+        .host_mut::<NapiState>()
+        .is_some()
+        .then(|| EnvCall::new(ctx));
+    let hooks = ctx
+        .host_mut::<AddonRegistry>()
+        .map(|registry| std::mem::take(&mut registry.cleanup_hooks))
+        .unwrap_or_default();
+    for (hook, data) in hooks.into_iter().rev() {
+        unsafe { hook(data) };
+    }
+    if ctx.host_mut::<NapiState>().is_some() {
+        tsfn::shutdown(ctx);
+    }
 }
 
 /// Take the address of every exported `napi_*` symbol so the linker cannot drop them from the
@@ -1954,26 +1972,50 @@ mod tests {
         }
     }
     unsafe extern "C" fn affinity_callback(env: napi_env, info: napi_callback_info) -> napi_value {
-        let log=&mut *((*info).data as *mut Vec<(std::thread::ThreadId, usize)>);
+        let log = &mut *((*info).data as *mut Vec<(std::thread::ThreadId, usize)>);
         log.push((std::thread::current().id(), env as usize));
-        if let Some(callback)=(*info).args.first().filter(|value|value.type_of()=="function") {
-            (*env).interp().invoke(callback.clone(),Value::Undefined,&[]).ok().expect("nested native callback");
+        if let Some(callback) = (*info)
+            .args
+            .first()
+            .filter(|value| value.type_of() == "function")
+        {
+            (*env)
+                .interp()
+                .invoke(callback.clone(), Value::Undefined, &[])
+                .ok()
+                .expect("nested native callback");
         }
         (*env).handle(Value::Num(42.0))
     }
     #[test]
     fn native_callbacks_keep_driver_thread_and_stable_env_across_nested_coroutines_and_moves() {
-        let owner=std::thread::current().id();let mut log=Vec::<(std::thread::ThreadId,usize)>::new();
-        let mut engine=lumen_host::Engine::new();
-        let function=make_callback_fn(engine.ctx(),"nativeAffinity",Some(affinity_callback),&mut log as *mut _ as *mut c_void);
-        let global=engine.ctx().global_this();engine.ctx().member_set(&global,"nativeAffinity",function).ok().unwrap();
-        eval_value(&mut engine,"nativeAffinity()");
-        let mut moved=Box::new(engine);
-        eval_value(&mut moved,r#"var done=false;async function run(){eval('');nativeAffinity();await Promise.resolve();function* nested(){nativeAffinity();yield nativeAffinity()}for(const value of nested()){}await (async()=>{eval('');nativeAffinity()})();nativeAffinity(()=>nativeAffinity());done=true}run();"#);
+        let owner = std::thread::current().id();
+        let mut log = Vec::<(std::thread::ThreadId, usize)>::new();
+        let mut engine = lumen_host::Engine::new();
+        let function = make_callback_fn(
+            engine.ctx(),
+            "nativeAffinity",
+            Some(affinity_callback),
+            &mut log as *mut _ as *mut c_void,
+        );
+        let global = engine.ctx().global_this();
+        engine
+            .ctx()
+            .member_set(&global, "nativeAffinity", function)
+            .ok()
+            .unwrap();
+        eval_value(&mut engine, "nativeAffinity()");
+        let mut moved = Box::new(engine);
+        eval_value(
+            &mut moved,
+            r#"var done=false;async function run(){eval('');nativeAffinity();await Promise.resolve();function* nested(){nativeAffinity();yield nativeAffinity()}for(const value of nested()){}await (async()=>{eval('');nativeAffinity()})();nativeAffinity(()=>nativeAffinity());done=true}run();"#,
+        );
         moved.run_microtasks();
-        assert_eq!(eval_value(&mut moved,"done"),"true");
-        assert_eq!(log.len(),7);
-        assert!(log.iter().all(|(thread,env)|*thread==owner&&*env==log[0].1));
+        assert_eq!(eval_value(&mut moved, "done"), "true");
+        assert_eq!(log.len(), 7);
+        assert!(log
+            .iter()
+            .all(|(thread, env)| *thread == owner && *env == log[0].1));
     }
 
     #[test]
@@ -2054,54 +2096,166 @@ mod tests {
     #[test]
     fn native_bigint_words_preserve_sign_zero_and_required_capacity() {
         let mut engine = lumen_host::Engine::new();
-        let number = engine.eval_value("-((1n << 130n) + 7n)").expect("parse").ok().expect("bigint");
+        let number = engine
+            .eval_value("-((1n << 130n) + 7n)")
+            .expect("parse")
+            .ok()
+            .expect("bigint");
         let mut env = Env::new(engine.ctx() as *mut Ctx);
-        let value = env.handle(number); let mut count=0;
-        assert_eq!(unsafe { napi_get_value_bigint_words(&mut env,value,std::ptr::null_mut(),&mut count,std::ptr::null_mut()) },NAPI_OK);
-        assert_eq!(count,3);
-        let mut sign=0; let mut words=[99u64;4]; count=1;
-        assert_eq!(unsafe { napi_get_value_bigint_words(&mut env,value,&mut sign,&mut count,words.as_mut_ptr()) },NAPI_OK);
-        assert_eq!((sign,count,words),(1,3,[7,99,99,99]));
-        count=4;
-        assert_eq!(unsafe { napi_get_value_bigint_words(&mut env,value,&mut sign,&mut count,words.as_mut_ptr()) },NAPI_OK);
-        assert_eq!(words,[7,0,4,99]);
-        let zero=env.handle(Value::bigint_from_i64(0)); count=4;
-        assert_eq!(unsafe { napi_get_value_bigint_words(&mut env,zero,&mut sign,&mut count,words.as_mut_ptr()) },NAPI_OK);
-        assert_eq!((sign,count),(0,0));
-        let ordinary=env.handle(Value::Num(1.0));
-        assert_eq!(unsafe { napi_get_value_bigint_words(&mut env,ordinary,&mut sign,&mut count,words.as_mut_ptr()) },17);
+        let value = env.handle(number);
+        let mut count = 0;
+        assert_eq!(
+            unsafe {
+                napi_get_value_bigint_words(
+                    &mut env,
+                    value,
+                    std::ptr::null_mut(),
+                    &mut count,
+                    std::ptr::null_mut(),
+                )
+            },
+            NAPI_OK
+        );
+        assert_eq!(count, 3);
+        let mut sign = 0;
+        let mut words = [99u64; 4];
+        count = 1;
+        assert_eq!(
+            unsafe {
+                napi_get_value_bigint_words(
+                    &mut env,
+                    value,
+                    &mut sign,
+                    &mut count,
+                    words.as_mut_ptr(),
+                )
+            },
+            NAPI_OK
+        );
+        assert_eq!((sign, count, words), (1, 3, [7, 99, 99, 99]));
+        count = 4;
+        assert_eq!(
+            unsafe {
+                napi_get_value_bigint_words(
+                    &mut env,
+                    value,
+                    &mut sign,
+                    &mut count,
+                    words.as_mut_ptr(),
+                )
+            },
+            NAPI_OK
+        );
+        assert_eq!(words, [7, 0, 4, 99]);
+        let zero = env.handle(Value::bigint_from_i64(0));
+        count = 4;
+        assert_eq!(
+            unsafe {
+                napi_get_value_bigint_words(
+                    &mut env,
+                    zero,
+                    &mut sign,
+                    &mut count,
+                    words.as_mut_ptr(),
+                )
+            },
+            NAPI_OK
+        );
+        assert_eq!((sign, count), (0, 0));
+        let ordinary = env.handle(Value::Num(1.0));
+        assert_eq!(
+            unsafe {
+                napi_get_value_bigint_words(
+                    &mut env,
+                    ordinary,
+                    &mut sign,
+                    &mut count,
+                    words.as_mut_ptr(),
+                )
+            },
+            17
+        );
     }
 
     #[test]
     fn native_array_and_own_property_queries_use_intrinsics() {
         let mut engine = lumen_host::Engine::new();
-        let array=engine.eval_value("new Proxy([1,2,3],{})").expect("parse").ok().expect("array");
-        let object=engine.eval_value("Object.create({inherited:true}, {own:{value:true}})").expect("parse").ok().expect("object");
-        eval_value(&mut engine,"Array.isArray=()=>false; Object.hasOwn=()=>false;");
-        let mut env=Env::new(engine.ctx() as *mut Ctx); let array=env.handle(array);let object=env.handle(object);
-        let mut length=0;
-        assert_eq!(unsafe {napi_get_array_length(&mut env,array,&mut length)},NAPI_OK);
-        assert_eq!(length,3);
-        assert_eq!(unsafe {napi_get_array_length(&mut env,object,&mut length)},8);
-        let mut own=false;let key=env.handle(Value::str("own"));
-        assert_eq!(unsafe {napi_has_own_property(&mut env,object,key,&mut own)},NAPI_OK);assert!(own);
-        let inherited=env.handle(Value::str("inherited"));
-        assert_eq!(unsafe {napi_has_own_property(&mut env,object,inherited,&mut own)},NAPI_OK);assert!(!own);
+        let array = engine
+            .eval_value("new Proxy([1,2,3],{})")
+            .expect("parse")
+            .ok()
+            .expect("array");
+        let object = engine
+            .eval_value("Object.create({inherited:true}, {own:{value:true}})")
+            .expect("parse")
+            .ok()
+            .expect("object");
+        eval_value(
+            &mut engine,
+            "Array.isArray=()=>false; Object.hasOwn=()=>false;",
+        );
+        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        let array = env.handle(array);
+        let object = env.handle(object);
+        let mut length = 0;
+        assert_eq!(
+            unsafe { napi_get_array_length(&mut env, array, &mut length) },
+            NAPI_OK
+        );
+        assert_eq!(length, 3);
+        assert_eq!(
+            unsafe { napi_get_array_length(&mut env, object, &mut length) },
+            8
+        );
+        let mut own = false;
+        let key = env.handle(Value::str("own"));
+        assert_eq!(
+            unsafe { napi_has_own_property(&mut env, object, key, &mut own) },
+            NAPI_OK
+        );
+        assert!(own);
+        let inherited = env.handle(Value::str("inherited"));
+        assert_eq!(
+            unsafe { napi_has_own_property(&mut env, object, inherited, &mut own) },
+            NAPI_OK
+        );
+        assert!(!own);
     }
 
-    unsafe extern "C" fn cleanup_record(data: *mut c_void) { (*(data as *mut Vec<usize>)).push(1); }
-    unsafe extern "C" fn cleanup_record_second(data: *mut c_void) { (*(data as *mut Vec<usize>)).push(2); }
+    unsafe extern "C" fn cleanup_record(data: *mut c_void) {
+        (*(data as *mut Vec<usize>)).push(1);
+    }
+    unsafe extern "C" fn cleanup_record_second(data: *mut c_void) {
+        (*(data as *mut Vec<usize>)).push(2);
+    }
     #[test]
     fn cleanup_hooks_run_once_in_reverse_order_and_removed_hooks_do_not_run() {
-        let mut engine=lumen_host::Engine::new(); let mut log=Vec::<usize>::new();
-        let data=&mut log as *mut _ as *mut c_void;
-        let mut env=Env::new(engine.ctx() as *mut Ctx);
-        assert_eq!(unsafe {napi_add_env_cleanup_hook(&mut env,Some(cleanup_record),data)},NAPI_OK);
-        assert_eq!(unsafe {napi_add_env_cleanup_hook(&mut env,Some(cleanup_record),data)},NAPI_INVALID_ARG);
-        assert_eq!(unsafe {napi_add_env_cleanup_hook(&mut env,Some(cleanup_record_second),data)},NAPI_OK);
-        assert_eq!(unsafe {napi_remove_env_cleanup_hook(&mut env,Some(cleanup_record),data)},NAPI_OK);
-        assert_eq!(unsafe {napi_add_env_cleanup_hook(&mut env,Some(cleanup_record),data)},NAPI_OK);
-        drop(env);drop(engine);assert_eq!(log,[1,2]);
+        let mut engine = lumen_host::Engine::new();
+        let mut log = Vec::<usize>::new();
+        let data = &mut log as *mut _ as *mut c_void;
+        let mut env = Env::new(engine.ctx() as *mut Ctx);
+        assert_eq!(
+            unsafe { napi_add_env_cleanup_hook(&mut env, Some(cleanup_record), data) },
+            NAPI_OK
+        );
+        assert_eq!(
+            unsafe { napi_add_env_cleanup_hook(&mut env, Some(cleanup_record), data) },
+            NAPI_INVALID_ARG
+        );
+        assert_eq!(
+            unsafe { napi_add_env_cleanup_hook(&mut env, Some(cleanup_record_second), data) },
+            NAPI_OK
+        );
+        assert_eq!(
+            unsafe { napi_remove_env_cleanup_hook(&mut env, Some(cleanup_record), data) },
+            NAPI_OK
+        );
+        assert_eq!(
+            unsafe { napi_add_env_cleanup_hook(&mut env, Some(cleanup_record), data) },
+            NAPI_OK
+        );
+        drop(env);
+        drop(engine);
+        assert_eq!(log, [1, 2]);
     }
-
 }

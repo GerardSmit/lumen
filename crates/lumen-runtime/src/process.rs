@@ -3,12 +3,12 @@
 //! Node ecosystem (morgan et al.) to log and time; the fuller `node:process` surface is layered
 //! on in lumen-node.
 
-use std::io::{Read, Write};
 use lumen_host::time::Instant;
+use std::io::{Read, Write};
 
 use lumen_host::{
-    ops, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
-    TaskRegistry, Value,
+    ops, CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId, TaskRegistry,
+    Value,
 };
 
 use crate::console::ConsoleOut;
@@ -97,7 +97,12 @@ pub(crate) fn install_data_props(
 
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (startup_args().to_vec(), std::env::vars().filter(|(key, _)| public_environment_key(key)).collect()),
+        None => (
+            startup_args().to_vec(),
+            std::env::vars()
+                .filter(|(key, _)| public_environment_key(key))
+                .collect(),
+        ),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -118,7 +123,9 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
 
-    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("invalid startup environment (invalid key/value or realm limit exceeded)"));
+    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| {
+        panic!("invalid startup environment (invalid key/value or realm limit exceeded)")
+    });
 
     #[cfg(target_arch = "wasm32")]
     let (os_name, arch_name) = ("linux", "wasm32");
@@ -132,7 +139,11 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "platform", Value::str(platform));
 
-    let _ = ctx.set_member(&process, "pid", Value::Num(lumen_host::sysfs::process_id() as f64));
+    let _ = ctx.set_member(
+        &process,
+        "pid",
+        Value::Num(lumen_host::sysfs::process_id() as f64),
+    );
     // Node's architecture names, not Rust's (native addons resolve their platform binary by these).
     let arch = match arch_name {
         "x86_64" => "x64",
@@ -330,7 +341,9 @@ fn write_raw(ctx: &mut Ctx, args: &[Value], to_err: bool) -> Result<Value, Value
     let bytes = match ctx.typed_array_bytes(arg) {
         Some(b) => b,
         // Lone surrogates as U+FFFD, like Node's utf8 (see `lumen_host::well_formed_utf8`).
-        None => lumen_host::well_formed_utf8(&ctx.coerce_string(arg)?).as_bytes().to_vec(),
+        None => lumen_host::well_formed_utf8(&ctx.coerce_string(arg)?)
+            .as_bytes()
+            .to_vec(),
     };
     let sinks = ctx
         .host_mut::<ConsoleOut>()
@@ -462,8 +475,12 @@ fn set_os_title(title: &str) {
 #[cfg(target_os = "linux")]
 fn set_os_title(title: &str) {
     // /proc/self/stat fields 48 and 49 (after the parenthesized comm): the argv area's bounds.
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return };
-    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return };
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return;
+    };
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return;
+    };
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let (Some(start), Some(end)) = (
         fields.get(45).and_then(|f| f.parse::<usize>().ok()),
@@ -670,9 +687,13 @@ fn op_signal_handler(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Valu
     if (1..64).contains(&signal) {
         let bit = 1u64 << signal;
         if listening {
-            realm.signal_handlers.fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
+            realm
+                .signal_handlers
+                .fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
         } else {
-            realm.signal_handlers.fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
+            realm
+                .signal_handlers
+                .fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
         }
     }
     Ok(Value::Bool(true))
@@ -752,7 +773,11 @@ fn op_kill(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> 
         _ => kill_error(ctx, "UNKNOWN", uv_errno("UNKNOWN")),
     };
     // pid 0 means this process, as in libuv.
-    let pid = if pid == 0 { lumen_host::sysfs::process_id() } else { pid as u32 };
+    let pid = if pid == 0 {
+        lumen_host::sysfs::process_id()
+    } else {
+        pid as u32
+    };
     let access = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE;
     // SAFETY: plain Win32 calls; the handle is closed on every path below.
     let handle = unsafe { OpenProcess(access, 0, pid) };
@@ -840,7 +865,9 @@ fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
 fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     refuse_in_realm(ctx, "process.execve")?;
     let mut text = |i: usize| -> Result<String, Value> {
-        Ok(ctx.coerce_string(args.get(i).unwrap_or(&Value::Undefined))?.to_string())
+        Ok(ctx
+            .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
+            .to_string())
     };
     let (path, argv, env) = (text(0)?, text(1)?, text(2)?);
     if path.contains('\0') {
@@ -849,13 +876,20 @@ fn op_execve(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let argv: Vec<&str> = argv.split('\0').filter(|value| !value.is_empty()).collect();
     let env: Vec<&str> = env.split('\0').filter(|value| !value.is_empty()).collect();
     let e = lumen_os::ident::execve(&path, &argv, &env);
-    Err(ctx.make_error("Error", format!("execve failed: {} (os error {})", e.message(), e.errno())))
+    Err(ctx.make_error(
+        "Error",
+        format!("execve failed: {} (os error {})", e.message(), e.errno()),
+    ))
 }
 
 /// Node's error for a failed identity change: `Error: EPERM, Operation not permitted` with
 /// `code`, `errno` and `syscall`.
 #[cfg(unix)]
-fn identity_result(ctx: &mut Ctx, result: Result<(), lumen_os::FsError>, syscall: &str) -> Result<Value, Value> {
+fn identity_result(
+    ctx: &mut Ctx,
+    result: Result<(), lumen_os::FsError>,
+    syscall: &str,
+) -> Result<Value, Value> {
     let Err(e) = result else {
         return Ok(Value::Undefined);
     };
@@ -867,12 +901,16 @@ fn identity_result(ctx: &mut Ctx, result: Result<(), lumen_os::FsError>, syscall
 }
 #[cfg(unix)]
 fn op_uid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
+    let name = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
     Ok(lumen_os::ident::uid_of(&name).map_or(Value::Undefined, |id| Value::Num(id as f64)))
 }
 #[cfg(unix)]
 fn op_gid_of(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let name = ctx.coerce_string(args.first().unwrap_or(&Value::Undefined))?.to_string();
+    let name = ctx
+        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
+        .to_string();
     Ok(lumen_os::ident::gid_of(&name).map_or(Value::Undefined, |id| Value::Num(id as f64)))
 }
 #[cfg(unix)]
@@ -1003,4 +1041,3 @@ fn op_getppid(_ctx: &mut Ctx, _t: Value, _a: &[Value]) -> Result<Value, Value> {
     // getppid is meaningless without the unix parent model; 0 is the honest "unknown".
     Ok(Value::Num(0.0))
 }
-

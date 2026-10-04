@@ -51,7 +51,12 @@ pub fn gc_pressure() -> bool {
 /// minimum budget above them).
 pub fn after_gc() {
     let live = TRACKED.with(Cell::get);
-    NEXT_GC.with(|n| n.set(live.saturating_mul(2).max(live.saturating_add(EXTERNAL_GC_MIN))));
+    NEXT_GC.with(|n| {
+        n.set(
+            live.saturating_mul(2)
+                .max(live.saturating_add(EXTERNAL_GC_MIN)),
+        )
+    });
     PRESSURE.with(|p| p.set(false));
 }
 
@@ -325,7 +330,13 @@ impl ByteStore {
         if mutable {
             self.mut_lends.set(self.mut_lends.get() + 1);
         }
-        Ok(Lend { store: self, ptr: self.ptr.get(), len: self.len.get(), gen: self.gen.get(), mutable })
+        Ok(Lend {
+            store: self,
+            ptr: self.ptr.get(),
+            len: self.len.get(),
+            gen: self.gen.get(),
+            mutable,
+        })
     }
 
     /// Move the current bytes to a fresh copy, retiring the lent allocation.
@@ -349,7 +360,14 @@ impl ByteStore {
         let old = std::mem::replace(backing, Backing::Heap(copy));
         // SAFETY: only this type touches `retired`, and never while a reference to it is live.
         let retired = unsafe { &mut *self.retired.get() };
-        retired.push(Retired { gen: self.gen.get(), backing: old, ptr, len, lends: self.lends.get(), snap });
+        retired.push(Retired {
+            gen: self.gen.get(),
+            backing: old,
+            ptr,
+            len,
+            lends: self.lends.get(),
+            snap,
+        });
         self.lends.set(0);
         self.mut_lends.set(0);
         self.gen.set(self.gen.get().wrapping_add(1));
@@ -368,7 +386,9 @@ impl ByteStore {
         }
         // SAFETY: as in `unshare`.
         let retired = unsafe { &mut *self.retired.get() };
-        let Some(i) = retired.iter().position(|r| r.gen == l.gen) else { return };
+        let Some(i) = retired.iter().position(|r| r.gen == l.gen) else {
+            return;
+        };
         if l.mutable {
             if let Some(snap) = retired[i].snap.take() {
                 // SAFETY: the retired allocation is alive and only this (ended) lend wrote it.
@@ -377,7 +397,9 @@ impl ByteStore {
                     // Writing the current bytes is a write like any other: unshare first if they
                     // are lent in turn.
                     if self.lends.get() == 0 || self.unshare().is_ok() {
-                        let cur = unsafe { std::slice::from_raw_parts_mut(self.ptr.get(), self.len.get()) };
+                        let cur = unsafe {
+                            std::slice::from_raw_parts_mut(self.ptr.get(), self.len.get())
+                        };
                         for ((c, o), s) in cur.iter_mut().zip(old).zip(&snap) {
                             if o != s {
                                 *c = *o;
@@ -544,7 +566,10 @@ impl ByteStore {
                 self.store.borrow.set(0);
             }
         }
-        let guard = EditGuard { store: self, before: v.capacity() };
+        let guard = EditGuard {
+            store: self,
+            before: v.capacity(),
+        };
         // Hold the exclusive borrow while `f` runs so a re-entrant access fails cleanly.
         self.borrow.set(-1);
         let r = f(v);
@@ -733,7 +758,8 @@ impl StoreSlot {
         if let StoreSlot::Shared(rc) = self {
             return rc.clone();
         }
-        let StoreSlot::Owned(store) = std::mem::replace(self, StoreSlot::Owned(ByteStore::new(Vec::new())))
+        let StoreSlot::Owned(store) =
+            std::mem::replace(self, StoreSlot::Owned(ByteStore::new(Vec::new())))
         else {
             unreachable!()
         };
@@ -841,7 +867,11 @@ mod tests {
         let s = ByteStore::new(vec![4, 5]);
         let p = s.as_ptr();
         let v = s.detach().unwrap();
-        assert_eq!(v.as_ptr(), p as *const u8, "detaching an owned store does not copy");
+        assert_eq!(
+            v.as_ptr(),
+            p as *const u8,
+            "detaching an owned store does not copy"
+        );
         assert!(s.is_detached());
         assert_eq!(s.len(), 0);
         assert!(s.bytes().is_empty());
@@ -878,7 +908,11 @@ mod tests {
         assert_eq!(&*s.bytes(), [1, 2, 3, 4], "reads share the lent bytes");
         assert_eq!(s.as_ptr() as *const u8, a.as_slice().as_ptr());
         s.bytes_mut()[0] = 9;
-        assert_eq!(a.as_slice(), [1, 2, 3, 4], "a write moves the store, not the lent bytes");
+        assert_eq!(
+            a.as_slice(),
+            [1, 2, 3, 4],
+            "a write moves the store, not the lent bytes"
+        );
         assert_eq!(&*s.bytes(), [9, 2, 3, 4]);
         let b = s.lend(false).unwrap();
         assert_eq!(b.as_slice(), [9, 2, 3, 4]);
@@ -925,13 +959,17 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(s.len(), 4098, "len follows the reallocated Vec");
         assert_eq!(s.bytes()[4097], 7);
-        assert!(s.try_bytes_mut().is_ok(), "the exclusive borrow was released");
+        assert!(
+            s.try_bytes_mut().is_ok(),
+            "the exclusive borrow was released"
+        );
         s.resize(1).unwrap();
     }
 
     #[test]
     fn external_bytes_alias_until_resized() {
-        let owner: Rc<std::cell::RefCell<Vec<u8>>> = Rc::new(std::cell::RefCell::new(vec![1, 2, 3]));
+        let owner: Rc<std::cell::RefCell<Vec<u8>>> =
+            Rc::new(std::cell::RefCell::new(vec![1, 2, 3]));
         let ptr = owner.borrow_mut().as_mut_ptr();
         let s = unsafe { ByteStore::external(ptr, 3, owner.clone()) }.with_max_len(8);
         assert!(s.is_external());
@@ -940,7 +978,11 @@ mod tests {
         s.resize(4).unwrap();
         assert!(!s.is_external());
         s.bytes_mut()[1] = 0;
-        assert_eq!(unsafe { *ptr.add(1) }, 2, "a resized external store is a heap copy");
+        assert_eq!(
+            unsafe { *ptr.add(1) },
+            2,
+            "a resized external store is a heap copy"
+        );
         assert_eq!(&*s.bytes(), [42, 0, 3, 0]);
     }
 

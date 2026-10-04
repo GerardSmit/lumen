@@ -43,14 +43,46 @@ macro_rules! signal_table {
 
 #[cfg(unix)]
 signal_table!(
-    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGIOT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1,
-    SIGSEGV, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCHLD, SIGCONT, SIGSTOP, SIGTSTP, SIGTTIN,
-    SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGSYS,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGSTKFLT,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPOLL,
-    #[cfg(any(target_os = "linux", target_os = "android"))] SIGPWR,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGEMT,
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))] SIGINFO,
+    SIGHUP,
+    SIGINT,
+    SIGQUIT,
+    SIGILL,
+    SIGTRAP,
+    SIGABRT,
+    SIGIOT,
+    SIGBUS,
+    SIGFPE,
+    SIGKILL,
+    SIGUSR1,
+    SIGSEGV,
+    SIGUSR2,
+    SIGPIPE,
+    SIGALRM,
+    SIGTERM,
+    SIGCHLD,
+    SIGCONT,
+    SIGSTOP,
+    SIGTSTP,
+    SIGTTIN,
+    SIGTTOU,
+    SIGURG,
+    SIGXCPU,
+    SIGXFSZ,
+    SIGVTALRM,
+    SIGPROF,
+    SIGWINCH,
+    SIGIO,
+    SIGSYS,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    SIGSTKFLT,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    SIGPOLL,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    SIGPWR,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    SIGEMT,
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    SIGINFO,
 );
 
 #[cfg(not(unix))]
@@ -137,8 +169,18 @@ pub fn constants() -> &'static [(&'static str, i32)] {
 pub fn block_on_this_thread() {
     #[cfg(unix)]
     {
-        let sync = [libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE, libc::SIGILL, libc::SIGTRAP, libc::SIGABRT];
-        let sigs: Vec<i32> = valid_signals().into_iter().filter(|s| !sync.contains(s)).collect();
+        let sync = [
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGTRAP,
+            libc::SIGABRT,
+        ];
+        let sigs: Vec<i32> = valid_signals()
+            .into_iter()
+            .filter(|s| !sync.contains(s))
+            .collect();
         let _ = sigmask(libc::SIG_BLOCK, &sigs);
     }
 }
@@ -262,7 +304,9 @@ mod imp {
 
     fn of_set(set: &libc::sigset_t) -> Vec<i32> {
         // SAFETY: sigismember reads an initialised set.
-        (1..NSIG).filter(|&s| unsafe { libc::sigismember(set, s) } == 1).collect()
+        (1..NSIG)
+            .filter(|&s| unsafe { libc::sigismember(set, s) } == 1)
+            .collect()
     }
 
     pub fn valid_signals() -> Vec<i32> {
@@ -343,7 +387,10 @@ mod imp {
         if s == 0 && usec == 0 && secs > 0.0 {
             usec = 1;
         }
-        libc::timeval { tv_sec: s as libc::time_t, tv_usec: usec as libc::suseconds_t }
+        libc::timeval {
+            tv_sec: s as libc::time_t,
+            tv_usec: usec as libc::suseconds_t,
+        }
     }
 
     fn of_tv(tv: &libc::timeval) -> f64 {
@@ -351,7 +398,10 @@ mod imp {
     }
 
     pub fn setitimer(which: i32, value: f64, interval: f64) -> R<(f64, f64)> {
-        let new = libc::itimerval { it_value: to_tv(value), it_interval: to_tv(interval) };
+        let new = libc::itimerval {
+            it_value: to_tv(value),
+            it_interval: to_tv(interval),
+        };
         // SAFETY: valid locals.
         unsafe {
             let mut old: libc::itimerval = std::mem::zeroed();

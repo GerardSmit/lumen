@@ -41,7 +41,11 @@ pub mod _socket {
         if e.code == net::EAI_SYSTEM {
             return it.os_error_errno(e.errno, None, None);
         }
-        let cls = it.native_state::<State>().gaierror.clone().expect("_socket initialised");
+        let cls = it
+            .native_state::<State>()
+            .gaierror
+            .clone()
+            .expect("_socket initialised");
         let msg = Value::string(net::gai_strerror(e.code));
         it.os_error_of(&cls, vec![Value::Int(e.code as i64), msg])
     }
@@ -53,7 +57,9 @@ pub mod _socket {
     /// The contents of a `bytes` or `bytearray`, else `None`.
     fn bytes_value(it: &mut Interp, v: &Value) -> R<Option<Vec<u8>>> {
         match v {
-            Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(v).map(Some),
+            Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                it.bytes_of(v).map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -95,7 +101,9 @@ pub mod _socket {
     /// `setipaddr`: resolves `name` for `family` (`AF_INET`, `AF_INET6` or `AF_UNSPEC`).
     fn resolve_ip(it: &mut Interp, name: &str, family: i32) -> R<std::net::IpAddr> {
         if name.is_empty() {
-            let list = net::getaddrinfo(None, Some("0"), family, net::SOCK_DGRAM, 0, net::AI_PASSIVE).map_err(|e| gai_error(it, e))?;
+            let list =
+                net::getaddrinfo(None, Some("0"), family, net::SOCK_DGRAM, 0, net::AI_PASSIVE)
+                    .map_err(|e| gai_error(it, e))?;
             if list.len() > 1 {
                 return Err(plain_os_error(it, "wildcard resolved to multiple address"));
             }
@@ -122,7 +130,8 @@ pub mod _socket {
                 return Ok(Ipv6Addr::from(a).into());
             }
         }
-        let list = net::getaddrinfo(Some(name), None, family, 0, 0, 0).map_err(|e| gai_error(it, e))?;
+        let list =
+            net::getaddrinfo(Some(name), None, family, 0, 0, 0).map_err(|e| gai_error(it, e))?;
         match list.first().map(|a| &a.addr) {
             Some(SockAddr::V4(a)) => Ok((*a.ip()).into()),
             Some(SockAddr::V6(a)) => Ok((*a.ip()).into()),
@@ -143,7 +152,10 @@ pub mod _socket {
         match family {
             AF_UNIX => {
                 let path = if v.as_str().is_some() {
-                    let args = vec![Value::string("utf-8".into()), Value::string("surrogateescape".into())];
+                    let args = vec![
+                        Value::string("utf-8".into()),
+                        Value::string("surrogateescape".into()),
+                    ];
                     let b = it.call_method(v, "encode", args)?;
                     it.bytes_of(&b)?
                 } else {
@@ -155,12 +167,22 @@ pub mod _socket {
                 Ok(SockAddr::Unix(path))
             }
             AF_INET | AF_INET6 => {
-                let fam_name = if family == AF_INET { "AF_INET" } else { "AF_INET6" };
+                let fam_name = if family == AF_INET {
+                    "AF_INET"
+                } else {
+                    "AF_INET6"
+                };
                 let Some(items) = tuple_items(v) else {
                     let n = it.tp_name_of(v);
-                    return Err(it.type_error(&format!("{caller}(): {fam_name} address must be tuple, not {n}")));
+                    return Err(it.type_error(&format!(
+                        "{caller}(): {fam_name} address must be tuple, not {n}"
+                    )));
                 };
-                let ok_len = if family == AF_INET { items.len() == 2 } else { (2..=4).contains(&items.len()) };
+                let ok_len = if family == AF_INET {
+                    items.len() == 2
+                } else {
+                    (2..=4).contains(&items.len())
+                };
                 if !ok_len {
                     let msg = if family == AF_INET {
                         "AF_INET address must be a pair (host, port)"
@@ -176,7 +198,9 @@ pub mod _socket {
                     return Err(it.overflow_err(&format!("{caller}(): port must be 0-65535.")));
                 }
                 match ip {
-                    std::net::IpAddr::V4(ip) => Ok(SockAddr::V4(SocketAddrV4::new(ip, port as u16))),
+                    std::net::IpAddr::V4(ip) => {
+                        Ok(SockAddr::V4(SocketAddrV4::new(ip, port as u16)))
+                    }
                     std::net::IpAddr::V6(ip) => {
                         let flowinfo = match items.get(2) {
                             Some(f) => int_arg(it, f)?,
@@ -187,9 +211,16 @@ pub mod _socket {
                             None => 0,
                         };
                         if !(0..=0xfffff).contains(&flowinfo) {
-                            return Err(it.overflow_err(&format!("{caller}(): flowinfo must be 0-1048575.")));
+                            return Err(it.overflow_err(&format!(
+                                "{caller}(): flowinfo must be 0-1048575."
+                            )));
                         }
-                        Ok(SockAddr::V6(SocketAddrV6::new(ip, port as u16, flowinfo as u32, scope_id as u32)))
+                        Ok(SockAddr::V6(SocketAddrV6::new(
+                            ip,
+                            port as u16,
+                            flowinfo as u32,
+                            scope_id as u32,
+                        )))
                     }
                 }
             }
@@ -201,14 +232,25 @@ pub mod _socket {
     fn sockaddr_value(it: &mut Interp, a: &SockAddr) -> Value {
         let _ = it;
         match a {
-            SockAddr::V4(a) => Value::tuple(vec![Value::string(a.ip().to_string()), Value::Int(a.port() as i64)]),
+            SockAddr::V4(a) => Value::tuple(vec![
+                Value::string(a.ip().to_string()),
+                Value::Int(a.port() as i64),
+            ]),
             SockAddr::V6(a) => {
-                let ip = net::ntop(AF_INET6, &a.ip().octets()).unwrap_or_else(|_| a.ip().to_string());
-                Value::tuple(vec![Value::string(ip), Value::Int(a.port() as i64), Value::Int(a.flowinfo() as i64), Value::Int(a.scope_id() as i64)])
+                let ip =
+                    net::ntop(AF_INET6, &a.ip().octets()).unwrap_or_else(|_| a.ip().to_string());
+                Value::tuple(vec![
+                    Value::string(ip),
+                    Value::Int(a.port() as i64),
+                    Value::Int(a.flowinfo() as i64),
+                    Value::Int(a.scope_id() as i64),
+                ])
             }
             SockAddr::Unix(p) if p.first() == Some(&0) => Value::bytes(p.clone()),
             SockAddr::Unix(p) => Value::string(crate::bind::path::bytes_path(p)),
-            SockAddr::Other(f) => Value::tuple(vec![Value::Int(*f as i64), Value::bytes(Vec::new())]),
+            SockAddr::Other(f) => {
+                Value::tuple(vec![Value::Int(*f as i64), Value::bytes(Vec::new())])
+            }
         }
     }
 
@@ -245,7 +287,13 @@ pub mod _socket {
 
     /// Waits until `fd` is ready (unless the socket is non-blocking) and runs `op`, retrying on
     /// `EINTR` and on spurious readiness, as CPython's `sock_call_ex`.
-    fn sock_call<T>(it: &mut Interp, fd: i32, writing: bool, timeout: Option<f64>, mut op: impl FnMut() -> lumen_os::net::R<T>) -> R<T> {
+    fn sock_call<T>(
+        it: &mut Interp,
+        fd: i32,
+        writing: bool,
+        timeout: Option<f64>,
+        mut op: impl FnMut() -> lumen_os::net::R<T>,
+    ) -> R<T> {
         if fd < 0 {
             return Err(it.os_error_errno(EBADF, None, None));
         }
@@ -318,7 +366,13 @@ pub mod _socket {
             timeout = Some(0.0);
         }
         let ty = ty & !(net::SOCK_NONBLOCK | net::SOCK_CLOEXEC);
-        let sock = Sock { fd, family, ty, proto, timeout };
+        let sock = Sock {
+            fd,
+            family,
+            ty,
+            proto,
+            timeout,
+        };
         if timeout.is_some() {
             set_blocking_fd(fd, timeout).map_err(|e| os_err(it, e))?;
         }
@@ -335,8 +389,19 @@ pub mod _socket {
         #[constructor]
         fn new(cls: This<Value>, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> Value {
             let _ = (args, kw);
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            opaque_instance(cls, Sock { fd: -1, family: AF_INET, ty: SOCK_STREAM, proto: 0, timeout: None })
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
+            opaque_instance(
+                cls,
+                Sock {
+                    fd: -1,
+                    family: AF_INET,
+                    ty: SOCK_STREAM,
+                    proto: 0,
+                    timeout: None,
+                },
+            )
         }
 
         #[method(name = "__init__")]
@@ -365,7 +430,12 @@ pub mod _socket {
                     Ok(info) => info,
                     Err(e) => return Err(os_err(it, e)),
                 };
-                (fd, if family == -1 { f } else { family }, if r#type == -1 { t } else { r#type }, if proto == -1 { p } else { proto })
+                (
+                    fd,
+                    if family == -1 { f } else { family },
+                    if r#type == -1 { t } else { r#type },
+                    if proto == -1 { p } else { proto },
+                )
             } else {
                 let family = if family == -1 { AF_INET } else { family };
                 let ty = if r#type == -1 { SOCK_STREAM } else { r#type };
@@ -379,7 +449,10 @@ pub mod _socket {
 
         #[method(name = "__repr__")]
         fn repr(&self) -> String {
-            format!("<socket object, fd={}, family={}, type={}, proto={}>", self.fd, self.family, self.ty, self.proto)
+            format!(
+                "<socket object, fd={}, family={}, type={}, proto={}>",
+                self.fd, self.family, self.ty, self.proto
+            )
         }
 
         /// the socket family
@@ -507,12 +580,24 @@ pub mod _socket {
         /// Get a socket option.  See the Unix manual for level and option.
         /// If a nonzero buffersize argument is given, the return value is a
         /// string of that length; otherwise it is an integer.
-        fn getsockopt(slf: This<Py<Self>>, it: &mut Interp, level: i32, option: i32, buflen: Option<i64>) -> R<Value> {
+        fn getsockopt(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            level: i32,
+            option: i32,
+            buflen: Option<i64>,
+        ) -> R<Value> {
             let (fd, _, _) = fields(it, &slf.0)?;
             match buflen {
-                None => net::getsockopt_int(fd, level, option).map(|v| Value::Int(v as i64)).map_err(|e| os_err(it, e)),
-                Some(n) if n <= 0 || n > 1024 => Err(plain_os_error(it, "getsockopt buflen out of range")),
-                Some(n) => net::getsockopt(fd, level, option, n as usize).map(Value::bytes).map_err(|e| os_err(it, e)),
+                None => net::getsockopt_int(fd, level, option)
+                    .map(|v| Value::Int(v as i64))
+                    .map_err(|e| os_err(it, e)),
+                Some(n) if n <= 0 || n > 1024 => {
+                    Err(plain_os_error(it, "getsockopt buflen out of range"))
+                }
+                Some(n) => net::getsockopt(fd, level, option, n as usize)
+                    .map(Value::bytes)
+                    .map_err(|e| os_err(it, e)),
             }
         }
 
@@ -523,7 +608,14 @@ pub mod _socket {
         /// Set a socket option.  See the Unix manual for level and option.
         /// The value argument can either be an integer, a string buffer, or
         /// None, optlen.
-        fn setsockopt(slf: This<Py<Self>>, it: &mut Interp, level: i32, option: i32, value: &Value, optlen: Option<u32>) -> R<()> {
+        fn setsockopt(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            level: i32,
+            option: i32,
+            value: &Value,
+            optlen: Option<u32>,
+        ) -> R<()> {
             let (fd, _, _) = fields(it, &slf.0)?;
             let r = match (value, optlen) {
                 (Value::None, Some(len)) => net::setsockopt_null(fd, level, option, len),
@@ -605,7 +697,12 @@ pub mod _socket {
         /// argument, see the Unix manual.  When no data is available, block until
         /// at least one byte is available or until the remote end is closed.  When
         /// the remote end is closed and all data is read, return the empty string.
-        fn recv(slf: This<Py<Self>>, it: &mut Interp, bufsize: i64, #[default(0)] flags: i32) -> R<Value> {
+        fn recv(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            bufsize: i64,
+            #[default(0)] flags: i32,
+        ) -> R<Value> {
             if bufsize < 0 {
                 return Err(it.value_error("negative buffersize in recv"));
             }
@@ -623,28 +720,47 @@ pub mod _socket {
         /// is not specified (or 0), receive up to the size available in the given buffer.
         ///
         /// See recv() for documentation about the flags.
-        fn recv_into(slf: This<Py<Self>>, it: &mut Interp, buffer: &mut [u8], #[default(0)] nbytes: i64, #[default(0)] flags: i32) -> R<usize> {
+        fn recv_into(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            buffer: &mut [u8],
+            #[default(0)] nbytes: i64,
+            #[default(0)] flags: i32,
+        ) -> R<usize> {
             if nbytes < 0 {
                 return Err(it.value_error("negative buffersize in recv_into"));
             }
-            let n = if nbytes == 0 { buffer.len() } else { nbytes as usize };
+            let n = if nbytes == 0 {
+                buffer.len()
+            } else {
+                nbytes as usize
+            };
             if n > buffer.len() {
                 return Err(it.value_error("buffer too small for requested bytes"));
             }
             let (fd, _, timeout) = fields(it, &slf.0)?;
-            sock_call(it, fd, false, timeout, || net::recv(fd, &mut buffer[..n], flags))
+            sock_call(it, fd, false, timeout, || {
+                net::recv(fd, &mut buffer[..n], flags)
+            })
         }
 
         /// recvfrom(buffersize[, flags]) -> (data, address info)
         ///
         /// Like recv(buffersize, flags) but also return the sender's address info.
-        fn recvfrom(slf: This<Py<Self>>, it: &mut Interp, bufsize: i64, #[default(0)] flags: i32) -> R<Value> {
+        fn recvfrom(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            bufsize: i64,
+            #[default(0)] flags: i32,
+        ) -> R<Value> {
             if bufsize < 0 {
                 return Err(it.value_error("negative buffersize in recvfrom"));
             }
             let (fd, _, timeout) = fields(it, &slf.0)?;
             let mut buf = vec![0u8; bufsize as usize];
-            let (n, addr) = sock_call(it, fd, false, timeout, || net::recvfrom(fd, &mut buf, flags))?;
+            let (n, addr) = sock_call(it, fd, false, timeout, || {
+                net::recvfrom(fd, &mut buf, flags)
+            })?;
             buf.truncate(n);
             let addr = addr.map_or(Value::None, |a| sockaddr_value(it, &a));
             Ok(Value::tuple(vec![Value::bytes(buf), addr]))
@@ -653,16 +769,28 @@ pub mod _socket {
         /// recvfrom_into(buffer[, nbytes[, flags]]) -> (nbytes, address info)
         ///
         /// Like recv_into(buffer[, nbytes[, flags]]) but also return the sender's address info.
-        fn recvfrom_into(slf: This<Py<Self>>, it: &mut Interp, buffer: &mut [u8], #[default(0)] nbytes: i64, #[default(0)] flags: i32) -> R<Value> {
+        fn recvfrom_into(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            buffer: &mut [u8],
+            #[default(0)] nbytes: i64,
+            #[default(0)] flags: i32,
+        ) -> R<Value> {
             if nbytes < 0 {
                 return Err(it.value_error("negative buffersize in recvfrom_into"));
             }
-            let n = if nbytes == 0 { buffer.len() } else { nbytes as usize };
+            let n = if nbytes == 0 {
+                buffer.len()
+            } else {
+                nbytes as usize
+            };
             if n > buffer.len() {
                 return Err(it.value_error("nbytes is greater than the length of the buffer"));
             }
             let (fd, _, timeout) = fields(it, &slf.0)?;
-            let (got, addr) = sock_call(it, fd, false, timeout, || net::recvfrom(fd, &mut buffer[..n], flags))?;
+            let (got, addr) = sock_call(it, fd, false, timeout, || {
+                net::recvfrom(fd, &mut buffer[..n], flags)
+            })?;
             let addr = addr.map_or(Value::None, |a| sockaddr_value(it, &a));
             Ok(Value::tuple(vec![Value::Int(got as i64), addr]))
         }
@@ -672,9 +800,16 @@ pub mod _socket {
         /// Send a data string to the socket.  For the optional flags
         /// argument, see the Unix manual.  Return the number of bytes
         /// sent; this may be less than len(data) if the network is busy.
-        fn send(slf: This<Py<Self>>, it: &mut Interp, data: &[u8], #[default(0)] flags: i32) -> R<usize> {
+        fn send(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            data: &[u8],
+            #[default(0)] flags: i32,
+        ) -> R<usize> {
             let (fd, _, timeout) = fields(it, &slf.0)?;
-            sock_call(it, fd, true, timeout, || net::send(fd, data, flags | nosignal()))
+            sock_call(it, fd, true, timeout, || {
+                net::send(fd, data, flags | nosignal())
+            })
         }
 
         /// sendall(data[, flags])
@@ -683,7 +818,12 @@ pub mod _socket {
         /// argument, see the Unix manual.  This calls send() repeatedly
         /// until all data is sent.  If an error occurs, it's impossible
         /// to tell how much data has been sent.
-        fn sendall(slf: This<Py<Self>>, it: &mut Interp, data: &[u8], #[default(0)] flags: i32) -> R<()> {
+        fn sendall(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            data: &[u8],
+            #[default(0)] flags: i32,
+        ) -> R<()> {
             let (fd, _, timeout) = fields(it, &slf.0)?;
             let deadline = timeout.filter(|&t| t > 0.0).map(|t| now(it) + t);
             let mut at = 0;
@@ -698,7 +838,9 @@ pub mod _socket {
                     }
                     None => timeout,
                 };
-                at += sock_call(it, fd, true, left, || net::send(fd, &data[at..], flags | nosignal()))?;
+                at += sock_call(it, fd, true, left, || {
+                    net::send(fd, &data[at..], flags | nosignal())
+                })?;
                 crate::builtins::signalm::check(it)?;
             }
             Ok(())
@@ -708,14 +850,22 @@ pub mod _socket {
         ///
         /// Like send(data, flags) but allows specifying the destination address.
         /// For IP sockets, the address is a pair (hostaddr, port).
-        fn sendto(slf: This<Py<Self>>, it: &mut Interp, data: &[u8], flags_or_address: &Value, address: Option<&Value>) -> R<usize> {
+        fn sendto(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            data: &[u8],
+            flags_or_address: &Value,
+            address: Option<&Value>,
+        ) -> R<usize> {
             let (flags, address) = match address {
                 Some(a) => (int_arg(it, flags_or_address)? as i32, a),
                 None => (0, flags_or_address),
             };
             let (fd, family, timeout) = fields(it, &slf.0)?;
             let addr = sockaddr_arg(it, family, address, "sendto")?;
-            sock_call(it, fd, true, timeout, || net::sendto(fd, data, flags | nosignal(), &addr))
+            sock_call(it, fd, true, timeout, || {
+                net::sendto(fd, data, flags | nosignal(), &addr)
+            })
         }
 
         /// shutdown(flag)
@@ -784,8 +934,19 @@ pub mod _socket {
     #[op]
     fn gethostbyname_ex(it: &mut Interp, hostname: &Value) -> R<Value> {
         let name = host_text(it, hostname)?;
-        let list = net::getaddrinfo(Some(&name), None, AF_INET, SOCK_STREAM, 0, net::AI_CANONNAME).map_err(|e| gai_error(it, e))?;
-        let canon = list.iter().find(|a| !a.canonname.is_empty()).map_or(name.clone(), |a| a.canonname.clone());
+        let list = net::getaddrinfo(
+            Some(&name),
+            None,
+            AF_INET,
+            SOCK_STREAM,
+            0,
+            net::AI_CANONNAME,
+        )
+        .map_err(|e| gai_error(it, e))?;
+        let canon = list
+            .iter()
+            .find(|a| !a.canonname.is_empty())
+            .map_or(name.clone(), |a| a.canonname.clone());
         let mut addrs: Vec<String> = Vec::new();
         for a in &list {
             if let SockAddr::V4(v) = &a.addr {
@@ -821,8 +982,15 @@ pub mod _socket {
                 Value::list(vec![Value::string(ip.to_string())]),
             ])),
             Err(_) => {
-                let cls = it.native_state::<State>().herror.clone().expect("_socket initialised");
-                Err(it.os_error_of(&cls, vec![Value::Int(1), Value::string("Unknown host".to_string())]))
+                let cls = it
+                    .native_state::<State>()
+                    .herror
+                    .clone()
+                    .expect("_socket initialised");
+                Err(it.os_error_of(
+                    &cls,
+                    vec![Value::Int(1), Value::string("Unknown host".to_string())],
+                ))
             }
         }
     }
@@ -910,7 +1078,12 @@ pub mod _socket {
     /// The arguments are the same as for socket() except the default family is
     /// AF_UNIX if defined on the platform; otherwise, the default is AF_INET.
     #[op]
-    fn socketpair(it: &mut Interp, family: Option<i32>, r#type: Option<i32>, #[default(0)] proto: i32) -> R<Value> {
+    fn socketpair(
+        it: &mut Interp,
+        family: Option<i32>,
+        r#type: Option<i32>,
+        #[default(0)] proto: i32,
+    ) -> R<Value> {
         let family = family.unwrap_or(AF_UNIX);
         let ty = r#type.unwrap_or(SOCK_STREAM);
         let (a, b) = net::socketpair(family, ty, proto).map_err(|e| os_err(it, e))?;
@@ -922,10 +1095,14 @@ pub mod _socket {
     fn u16_arg(it: &mut Interp, x: &Value, name: &str) -> R<u16> {
         let n = int_arg(it, x)?;
         if n < 0 {
-            return Err(it.overflow_err(&format!("{name}: can't convert negative Python int to C 16-bit unsigned integer")));
+            return Err(it.overflow_err(&format!(
+                "{name}: can't convert negative Python int to C 16-bit unsigned integer"
+            )));
         }
         if n > 0xffff {
-            return Err(it.overflow_err(&format!("{name}: Python int too large to convert to C 16-bit unsigned integer")));
+            return Err(it.overflow_err(&format!(
+                "{name}: Python int too large to convert to C 16-bit unsigned integer"
+            )));
         }
         Ok(n as u16)
     }
@@ -978,7 +1155,10 @@ pub mod _socket {
     fn inet_aton(it: &mut Interp, ip_addr: &str) -> R<Value> {
         match net::aton(ip_addr) {
             Some(b) => Ok(Value::bytes(b.to_vec())),
-            None => Err(plain_os_error(it, "illegal IP address string passed to inet_aton")),
+            None => Err(plain_os_error(
+                it,
+                "illegal IP address string passed to inet_aton",
+            )),
         }
     }
 
@@ -1001,7 +1181,10 @@ pub mod _socket {
     fn inet_pton(it: &mut Interp, address_family: i32, ip_string: &str) -> R<Value> {
         match net::pton(address_family, ip_string) {
             Ok(Some(b)) => Ok(Value::bytes(b)),
-            Ok(None) => Err(plain_os_error(it, "illegal IP address string passed to inet_pton")),
+            Ok(None) => Err(plain_os_error(
+                it,
+                "illegal IP address string passed to inet_pton",
+            )),
             Err(e) => Err(os_err(it, e)),
         }
     }
@@ -1050,14 +1233,24 @@ pub mod _socket {
         };
         let port = match port {
             Value::None => None,
-            v if v.is_int_like() && !matches!(v, Value::Bool(_)) => Some(it.index_of(v)?.to_string()),
+            v if v.is_int_like() && !matches!(v, Value::Bool(_)) => {
+                Some(it.index_of(v)?.to_string())
+            }
             v if v.as_str().is_some() => Some(v.as_str().unwrap_or_default().to_string()),
             v => match bytes_value(it, v)? {
                 Some(b) => Some(String::from_utf8_lossy(&b).into_owned()),
                 None => return Err(plain_os_error(it, "Int or String expected")),
             },
         };
-        let list = net::getaddrinfo(host.as_deref(), port.as_deref(), family, r#type, proto, flags).map_err(|e| gai_error(it, e))?;
+        let list = net::getaddrinfo(
+            host.as_deref(),
+            port.as_deref(),
+            family,
+            r#type,
+            proto,
+            flags,
+        )
+        .map_err(|e| gai_error(it, e))?;
         let mut out = Vec::with_capacity(list.len());
         for ai in list {
             let addr = sockaddr_value(it, &ai.addr);
@@ -1099,9 +1292,20 @@ pub mod _socket {
         if !(0..=0xfffff).contains(&flowinfo) {
             return Err(it.overflow_err("getnameinfo(): flowinfo must be 0-1048575."));
         }
-        let list = net::getaddrinfo(Some(&host), Some(&port.to_string()), net::AF_UNSPEC, net::SOCK_DGRAM, 0, net::AI_NUMERICHOST).map_err(|e| gai_error(it, e))?;
+        let list = net::getaddrinfo(
+            Some(&host),
+            Some(&port.to_string()),
+            net::AF_UNSPEC,
+            net::SOCK_DGRAM,
+            0,
+            net::AI_NUMERICHOST,
+        )
+        .map_err(|e| gai_error(it, e))?;
         if list.len() != 1 {
-            return Err(plain_os_error(it, "sockaddr resolved to multiple addresses"));
+            return Err(plain_os_error(
+                it,
+                "sockaddr resolved to multiple addresses",
+            ));
         }
         let addr = match &list[0].addr {
             SockAddr::V4(a) => {
@@ -1110,7 +1314,12 @@ pub mod _socket {
                 }
                 SockAddr::V4(*a)
             }
-            SockAddr::V6(a) => SockAddr::V6(SocketAddrV6::new(*a.ip(), a.port(), flowinfo as u32, scope_id as u32)),
+            SockAddr::V6(a) => SockAddr::V6(SocketAddrV6::new(
+                *a.ip(),
+                a.port(),
+                flowinfo as u32,
+                scope_id as u32,
+            )),
             _ => return Err(plain_os_error(it, "unknown family")),
         };
         let (h, s) = net::getnameinfo(&addr, flags).map_err(|e| gai_error(it, e))?;
@@ -1146,8 +1355,20 @@ pub mod _socket {
         let os_error = it.exc_type("OSError");
         dict_set_str(&d, "error", Value::Obj(os_error.clone()));
         dict_set_str(&d, "timeout", Value::Obj(it.exc_type("TimeoutError")));
-        let herror = crate::builtins::native::new_type(it, "socket", "herror", Some(&os_error), Layout::Exception);
-        let gaierror = crate::builtins::native::new_type(it, "socket", "gaierror", Some(&os_error), Layout::Exception);
+        let herror = crate::builtins::native::new_type(
+            it,
+            "socket",
+            "herror",
+            Some(&os_error),
+            Layout::Exception,
+        );
+        let gaierror = crate::builtins::native::new_type(
+            it,
+            "socket",
+            "gaierror",
+            Some(&os_error),
+            Layout::Exception,
+        );
         dict_set_str(&d, "herror", Value::Obj(herror.clone()));
         dict_set_str(&d, "gaierror", Value::Obj(gaierror.clone()));
         let sock = type_object::<Sock>(it);

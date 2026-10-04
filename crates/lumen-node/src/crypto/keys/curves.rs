@@ -40,7 +40,12 @@ macro_rules! with_ec_curve {
 }
 pub use with_ec_curve;
 
-pub const ALL: [EcCurve; 4] = [EcCurve::P256, EcCurve::P384, EcCurve::P521, EcCurve::Secp256k1];
+pub const ALL: [EcCurve; 4] = [
+    EcCurve::P256,
+    EcCurve::P384,
+    EcCurve::P521,
+    EcCurve::Secp256k1,
+];
 
 impl EcCurve {
     /// OpenSSL's short name (`keyDetail().namedCurve`, `getCurves()`).
@@ -112,7 +117,8 @@ impl EcCurve {
     /// seed is ignored; the field, coefficients, generator and order must match a known curve.
     pub fn from_explicit(params: &[u8]) -> Option<EcCurve> {
         let want = explicit_core(params)?;
-        ALL.into_iter().find(|c| explicit_core(&c.explicit_params()).as_ref() == Some(&want))
+        ALL.into_iter()
+            .find(|c| explicit_core(&c.explicit_params()).as_ref() == Some(&want))
     }
 
     /// Validates `point` (SEC1, compressed or not) and returns it uncompressed.

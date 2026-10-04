@@ -101,7 +101,10 @@ pub mod sys {
     fn set_int_max_str_digits(it: &mut Interp, #[kw] maxdigits: &Value) -> R<()> {
         let n = it.index_of(maxdigits)?;
         if n < 0 || !it.set_int_max_str_digits(n as usize) {
-            return Err(it.value_error(&format!("maxdigits must be >= {} or 0 for unlimited", crate::limits::INT_MAX_STR_DIGITS_THRESHOLD)));
+            return Err(it.value_error(&format!(
+                "maxdigits must be >= {} or 0 for unlimited",
+                crate::limits::INT_MAX_STR_DIGITS_THRESHOLD
+            )));
         }
         // sys.flags is built lazily and cached; drop it so it reflects the new limit, as CPython does.
         if let Some(m) = it.sys_module.clone() {
@@ -229,8 +232,17 @@ pub mod sys {
     #[op]
     fn get_asyncgen_hooks(it: &mut Interp) -> Value {
         let h = it.native_state::<AsyncGenHooks>();
-        let vals = vec![h.firstiter.clone().unwrap_or(Value::None), h.finalizer.clone().unwrap_or(Value::None)];
-        let ty = crate::builtins::sysextra::structseq_type::<AsyncGenHooks>(it, "builtins", "asyncgen_hooks", &["firstiter", "finalizer"], 2);
+        let vals = vec![
+            h.firstiter.clone().unwrap_or(Value::None),
+            h.finalizer.clone().unwrap_or(Value::None),
+        ];
+        let ty = crate::builtins::sysextra::structseq_type::<AsyncGenHooks>(
+            it,
+            "builtins",
+            "asyncgen_hooks",
+            &["firstiter", "finalizer"],
+            2,
+        );
         structseq(&ty, vals)
     }
 
@@ -238,7 +250,11 @@ pub mod sys {
     ///
     /// Set a finalizer for async generators objects.
     #[op]
-    fn set_asyncgen_hooks(it: &mut Interp, #[kw] firstiter: lumen_bind::Passed<&Value>, #[kw] finalizer: lumen_bind::Passed<&Value>) -> R<()> {
+    fn set_asyncgen_hooks(
+        it: &mut Interp,
+        #[kw] firstiter: lumen_bind::Passed<&Value>,
+        #[kw] finalizer: lumen_bind::Passed<&Value>,
+    ) -> R<()> {
         let check = |it: &mut Interp, name: &str, v: Option<&Value>| -> R<Option<Option<Value>>> {
             match v {
                 None => Ok(None),
@@ -308,7 +324,11 @@ pub mod sys {
         let builtins = it.builtins.clone();
         dict_set_str(&builtins, "_", Value::None);
         let text = it.repr_of(object)?;
-        let out = it.sys_module.clone().and_then(|m| dict_get_str(&it.module_dict(&m), "stdout")).unwrap_or(Value::None);
+        let out = it
+            .sys_module
+            .clone()
+            .and_then(|m| dict_get_str(&it.module_dict(&m), "stdout"))
+            .unwrap_or(Value::None);
         if out.is_none() {
             return Err(it.runtime_error("lost sys.stdout"));
         }
@@ -353,8 +373,22 @@ pub mod sys {
         let name = name.to_string();
         let v = match name.as_str() {
             "version_info" => {
-                let ty = new_structseq_type(it, "sys", "version_info", &["major", "minor", "micro", "releaselevel", "serial"]);
-                structseq(&ty, vec![Value::Int(3), Value::Int(12), Value::Int(15), Value::str("final"), Value::Int(0)])
+                let ty = new_structseq_type(
+                    it,
+                    "sys",
+                    "version_info",
+                    &["major", "minor", "micro", "releaselevel", "serial"],
+                );
+                structseq(
+                    &ty,
+                    vec![
+                        Value::Int(3),
+                        Value::Int(12),
+                        Value::Int(15),
+                        Value::str("final"),
+                        Value::Int(0),
+                    ],
+                )
             }
             "flags" => {
                 let names = [
@@ -394,7 +428,19 @@ pub mod sys {
                 structseq(&ty, vals)
             }
             "float_info" => {
-                let names = ["max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig", "epsilon", "radix", "rounds"];
+                let names = [
+                    "max",
+                    "max_exp",
+                    "max_10_exp",
+                    "min",
+                    "min_exp",
+                    "min_10_exp",
+                    "dig",
+                    "mant_dig",
+                    "epsilon",
+                    "radix",
+                    "rounds",
+                ];
                 let ty = new_structseq_type(it, "sys", "float_info", &names);
                 structseq(
                     &ty,
@@ -414,7 +460,17 @@ pub mod sys {
                 )
             }
             "int_info" => {
-                let ty = new_structseq_type(it, "sys", "int_info", &["bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold"]);
+                let ty = new_structseq_type(
+                    it,
+                    "sys",
+                    "int_info",
+                    &[
+                        "bits_per_digit",
+                        "sizeof_digit",
+                        "default_max_str_digits",
+                        "str_digits_check_threshold",
+                    ],
+                );
                 structseq(
                     &ty,
                     vec![
@@ -426,11 +482,31 @@ pub mod sys {
                 )
             }
             "hash_info" => {
-                let names = ["width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits", "seed_bits", "cutoff"];
+                let names = [
+                    "width",
+                    "modulus",
+                    "inf",
+                    "nan",
+                    "imag",
+                    "algorithm",
+                    "hash_bits",
+                    "seed_bits",
+                    "cutoff",
+                ];
                 let ty = new_structseq_type(it, "sys", "hash_info", &names);
                 structseq(
                     &ty,
-                    vec![Value::Int(64), Value::Int((1 << 61) - 1), Value::Int(314159), Value::Int(0), Value::Int(1000003), Value::str("siphash13"), Value::Int(64), Value::Int(128), Value::Int(0)],
+                    vec![
+                        Value::Int(64),
+                        Value::Int((1 << 61) - 1),
+                        Value::Int(314159),
+                        Value::Int(0),
+                        Value::Int(1000003),
+                        Value::str("siphash13"),
+                        Value::Int(64),
+                        Value::Int(128),
+                        Value::Int(0),
+                    ],
                 )
             }
             "implementation" => {
@@ -472,7 +548,11 @@ pub mod sys {
         it.sys_module = Some(m.clone());
         dict_set_str(&d, "modules", Value::Obj(it.modules.clone()));
         dict_set_str(&d, "argv", Value::list(vec![Value::str("")]));
-        dict_set_str(&d, "path", Value::list(vec![Value::str(crate::frozen::FROZEN_DIR)]));
+        dict_set_str(
+            &d,
+            "path",
+            Value::list(vec![Value::str(crate::frozen::FROZEN_DIR)]),
+        );
         dict_set_str(&d, "maxsize", Value::Int(i64::MAX));
         dict_set_str(&d, "maxunicode", Value::Int(0x10ffff));
         dict_set_str(&d, "byteorder", Value::str("little"));
@@ -488,18 +568,36 @@ pub mod sys {
         }
         dict_set_str(&d, "executable", Value::str(&executable));
         dict_set_str(&d, "_base_executable", Value::str(&executable));
-        dict_set_str(&d, "_git", Value::tuple(vec![Value::str("lumen-py"), Value::str(""), Value::str("")]));
+        dict_set_str(
+            &d,
+            "_git",
+            Value::tuple(vec![Value::str("lumen-py"), Value::str(""), Value::str("")]),
+        );
         if !argv.is_empty() {
-            dict_set_str(&d, "argv", Value::list(argv.iter().map(|a| Value::str(a)).collect()));
+            dict_set_str(
+                &d,
+                "argv",
+                Value::list(argv.iter().map(|a| Value::str(a)).collect()),
+            );
             it.argv = argv;
         }
         let names = crate::builtins::modules::builtin_module_names();
-        dict_set_str(&d, "builtin_module_names", Value::tuple(names.iter().map(|n| Value::str(n)).collect()));
-        let std_names = super::STDLIB_MODULE_NAMES.iter().map(|n| Value::str(n)).collect();
+        dict_set_str(
+            &d,
+            "builtin_module_names",
+            Value::tuple(names.iter().map(|n| Value::str(n)).collect()),
+        );
+        let std_names = super::STDLIB_MODULE_NAMES
+            .iter()
+            .map(|n| Value::str(n))
+            .collect();
         if let Ok(std_names) = it.new_frozenset_from(std_names) {
             dict_set_str(&d, "stdlib_module_names", std_names);
         }
-        for (alias, name) in [("__excepthook__", "excepthook"), ("__displayhook__", "displayhook")] {
+        for (alias, name) in [
+            ("__excepthook__", "excepthook"),
+            ("__displayhook__", "displayhook"),
+        ] {
             if let Some(f) = dict_get_str(&d, name) {
                 dict_set_str(&d, alias, f);
             }

@@ -38,7 +38,8 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         Some(n) if n >= 0.0 && n <= i32::MAX as f64 && n.fract() == 0.0 => n as RawFd,
         _ => return Err(ctx.make_error("TypeError", "adoptFd: fd must be a non-negative integer")),
     };
-    let sock_type = sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|e| fd_error(ctx, "open", &e))?;
+    let sock_type =
+        sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|e| fd_error(ctx, "open", &e))?;
     let family = socket_family(fd).map_err(|e| fd_error(ctx, "open", &e))?;
     let listening = sock_type == libc::SOCK_STREAM
         && sockopt_int(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN).unwrap_or(0) != 0;
@@ -59,7 +60,9 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         // SAFETY: the caller hands this descriptor over; it is a UDP socket (checked above).
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
         let _ = socket.set_read_timeout(Some(UDP_POLL));
-        let reg = ctx.host_mut::<DgramRegistry>().expect("dgram registry installed");
+        let reg = ctx
+            .host_mut::<DgramRegistry>()
+            .expect("dgram registry installed");
         let id = reg.next;
         reg.next += 1;
         reg.sockets.insert(
@@ -79,7 +82,9 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         let (listener, local_addr) = if kind == "tcp" {
             // SAFETY: a listening TCP socket handed over by the caller.
             let listener = unsafe { TcpListener::from_raw_fd(fd) };
-            let addr = listener.local_addr().map_err(|e| fd_error(ctx, "open", &e))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| fd_error(ctx, "open", &e))?;
             (NetListener::Tcp(listener), ServerAddress::Tcp(addr))
         } else {
             // SAFETY: a listening Unix socket handed over by the caller.
@@ -92,7 +97,9 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
             (NetListener::Unix(listener), ServerAddress::Unix(path))
         };
         listener.set_nonblocking();
-        let reg = ctx.host_mut::<NetRegistry>().expect("net registry installed");
+        let reg = ctx
+            .host_mut::<NetRegistry>()
+            .expect("net registry installed");
         let id = reg.next_server;
         reg.next_server += 1;
         reg.servers.insert(
@@ -109,7 +116,12 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         set_member(ctx, &o, "serverId", Value::Num(id as f64));
         match local_addr {
             ServerAddress::Tcp(addr) => {
-                set_member(ctx, &o, "address", Value::from_string(addr.ip().to_string()));
+                set_member(
+                    ctx,
+                    &o,
+                    "address",
+                    Value::from_string(addr.ip().to_string()),
+                );
                 set_member(ctx, &o, "port", Value::Num(addr.port() as f64));
                 set_member(ctx, &o, "family", Value::str(family_of(&addr)));
             }
@@ -172,10 +184,13 @@ pub(super) fn op_udp_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Valu
 /// the descriptor closed once it lets go.
 pub(super) fn op_release(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    let pending = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.remove(&sid)).and_then(|e| {
-        e.cancel.store(true, Ordering::SeqCst);
-        e.pending
-    });
+    let pending = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.remove(&sid))
+        .and_then(|e| {
+            e.cancel.store(true, Ordering::SeqCst);
+            e.pending
+        });
     wake::wake_all();
     if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
         tasks.take(id);
@@ -205,9 +220,14 @@ pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
     };
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_msg);
     if unref {
-        ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
-    if let Some(e) = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get_mut(&sid)) {
+    if let Some(e) = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get_mut(&sid))
+    {
         e.pending = Some(id);
     }
     completions(ctx).run_blocking(id, move || {
@@ -224,7 +244,11 @@ pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
                     buf.truncate(n);
                     break Ok((buf, fds));
                 }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => break Err(net_err("read", &e, None)),
             }
         };
@@ -265,8 +289,13 @@ fn pass_arg(args: &[Value], i: usize) -> RawFd {
 /// out iff it is positive.
 pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
     let sid = arg_u64(args, 0);
-    let stream = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get(&sid)).map(|e| e.stream.clone());
-    let Some(stream) = stream else { return Ok(Value::Num(0.0)) };
+    let stream = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get(&sid))
+        .map(|e| e.stream.clone());
+    let Some(stream) = stream else {
+        return Ok(Value::Num(0.0));
+    };
     let data = ctx
         .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
         .ok_or_else(|| ctx.make_error("TypeError", "trySendMsg expects bytes"))?;
@@ -282,7 +311,9 @@ pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
             sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF),
             sockopt_int(fd, libc::SOL_SOCKET, libc::SO_NWRITE),
         ) {
-            (Ok(buf), Ok(queued)) if buf >= 0 && queued >= 0 => (buf as usize).saturating_sub(queued as usize),
+            (Ok(buf), Ok(queued)) if buf >= 0 && queued >= 0 => {
+                (buf as usize).saturating_sub(queued as usize)
+            }
             _ => 0,
         };
         &data[..data.len().min(space)]
@@ -290,7 +321,9 @@ pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
     if data.is_empty() {
         return Ok(Value::Num(0.0));
     }
-    Ok(Value::Num(send_with_fd(fd, &data, pass, true).unwrap_or(0) as f64))
+    Ok(Value::Num(
+        send_with_fd(fd, &data, pass, true).unwrap_or(0) as f64
+    ))
 }
 
 /// `(socketId, bytes, fd, resolve, reject)` — write all bytes on a worker thread, `fd` (-1 for
@@ -302,7 +335,10 @@ pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<V
         .ok_or_else(|| ctx.make_error("TypeError", "writeMsg expects bytes"))?;
     let pass = pass_arg(args, 2);
     let (resolve, reject) = take_resolve_reject(ctx, args.get(3), args.get(4))?;
-    let stream = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get(&sid)).map(|e| e.stream.clone());
+    let stream = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get(&sid))
+        .map(|e| e.stream.clone());
     let Some(stream) = stream else {
         let e = std::io::Error::from_raw_os_error(libc::EPIPE);
         let err = net_error_value(ctx, &net_err("write", &e, None));

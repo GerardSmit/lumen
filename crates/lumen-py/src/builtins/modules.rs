@@ -3,7 +3,6 @@
 use crate::object::*;
 use crate::vm::*;
 
-
 type MakeModule = fn(&mut Interp) -> Option<Obj>;
 
 fn bound<M: lumen_bind::Module<crate::bind::PyHost>>(it: &mut Interp) -> Option<Obj> {
@@ -16,8 +15,14 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_bisect", bound::<super::bisectm::_bisect::Module>),
     ("_blake2", bound::<super::hashlibm::_blake2::Module>),
     ("_codecs", |it| Some(super::codecsm::make(it))),
-    ("_collections", bound::<super::collectionsm::_collections::Module>),
-    ("_contextvars", bound::<super::contextvarsm::_contextvars::Module>),
+    (
+        "_collections",
+        bound::<super::collectionsm::_collections::Module>,
+    ),
+    (
+        "_contextvars",
+        bound::<super::contextvarsm::_contextvars::Module>,
+    ),
     ("_csv", bound::<super::csvm::_csv::Module>),
     ("_functools", bound::<super::functoolsm::_functools::Module>),
     ("_hashlib", bound::<super::hashlibm::_hashlib::Module>),
@@ -27,7 +32,10 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_json", bound::<super::jsonm::_json::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
-    ("_posixsubprocess", bound::<super::posixsubprocessm::_posixsubprocess::Module>),
+    (
+        "_posixsubprocess",
+        bound::<super::posixsubprocessm::_posixsubprocess::Module>,
+    ),
     ("_random", bound::<super::randomm::_random::Module>),
     ("_scproxy", bound::<super::scproxym::_scproxy::Module>),
     ("_sha1", bound::<super::hashlibm::_sha1::Module>),
@@ -36,7 +44,10 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_signal", bound::<super::signalm::_signal::Module>),
     ("_socket", bound::<super::socketm::_socket::Module>),
     ("_sre", |it| Some(super::sre::make(it))),
-    ("_statistics", bound::<super::statisticsm::_statistics::Module>),
+    (
+        "_statistics",
+        bound::<super::statisticsm::_statistics::Module>,
+    ),
     ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),
     ("_thread", bound::<super::threadm::_thread::Module>),
@@ -59,7 +70,10 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
     ("time", bound::<super::timem::time::Module>),
-    ("unicodedata", bound::<super::unicodedatam::unicodedata::Module>),
+    (
+        "unicodedata",
+        bound::<super::unicodedatam::unicodedata::Module>,
+    ),
     ("zlib", bound::<super::zlibm::zlib::Module>),
 ];
 
@@ -72,7 +86,9 @@ pub fn builtin_module(it: &mut Interp, name: &str) -> Option<Obj> {
 }
 
 pub fn init(it: &mut Interp) {
-    let Ok(sys) = crate::bind::module_object::<super::sysm::sys::Module>(it) else { return };
+    let Ok(sys) = crate::bind::module_object::<super::sysm::sys::Module>(it) else {
+        return;
+    };
     super::iom::init_std_streams(it, &sys);
 }
 
@@ -89,7 +105,11 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
     let platform = it.platform.borrow().platform_name();
     let vars = it.new_dict();
     let strs = [
-        ("TZPATH", "/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo".to_string()),
+        (
+            "TZPATH",
+            "/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo"
+                .to_string(),
+        ),
         ("VERSION", "3.12".to_string()),
         ("ABIFLAGS", String::new()),
         ("MACHDEP", platform.clone()),
@@ -100,7 +120,12 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
     for (k, v) in strs {
         dict_set_str(&vars, k, Value::string(v));
     }
-    for (k, v) in [("Py_DEBUG", 0), ("Py_ENABLE_SHARED", 0), ("WITH_DOC_STRINGS", 1), ("SIZEOF_VOID_P", 8)] {
+    for (k, v) in [
+        ("Py_DEBUG", 0),
+        ("Py_ENABLE_SHARED", 0),
+        ("WITH_DOC_STRINGS", 1),
+        ("SIZEOF_VOID_P", 8),
+    ] {
         dict_set_str(&vars, k, Value::Int(v));
     }
     dict_set_str(&d, "build_time_vars", Value::Obj(vars));

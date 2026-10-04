@@ -28,18 +28,28 @@ struct Conv<'a> {
 pub fn module_to_py(it: &mut Interp, m: &Module, mode: Mode) -> R<Value> {
     it.import_module("_ast")?;
     let types = it.native_state::<AstTypes>().by_name.clone();
-    let mut c = Conv { it, types, singletons: HashMap::new() };
+    let mut c = Conv {
+        it,
+        types,
+        singletons: HashMap::new(),
+    };
     match mode {
         Mode::Exec => {
             let body = c.stmts(&m.body)?;
-            c.node("Module", vec![("body", body), ("type_ignores", Value::list(Vec::new()))])
+            c.node(
+                "Module",
+                vec![("body", body), ("type_ignores", Value::list(Vec::new()))],
+            )
         }
         Mode::Single => {
             let body = c.stmts(&m.body)?;
             c.node("Interactive", vec![("body", body)])
         }
         Mode::Eval => match m.body.as_slice() {
-            [Stmt { kind: StmtKind::Expr(e), .. }] => {
+            [Stmt {
+                kind: StmtKind::Expr(e),
+                ..
+            }] => {
                 let body = c.expr(e)?;
                 c.node("Expression", vec![("body", body)])
             }
@@ -178,26 +188,53 @@ impl Conv<'_> {
 
     fn arg(&mut self, a: &Arg) -> R<Value> {
         let annotation = self.opt_expr(a.annotation.as_ref())?;
-        self.at("arg", vec![("arg", Self::ident(&a.arg)), ("annotation", annotation), ("type_comment", Value::None)], a.pos)
+        self.at(
+            "arg",
+            vec![
+                ("arg", Self::ident(&a.arg)),
+                ("annotation", annotation),
+                ("type_comment", Value::None),
+            ],
+            a.pos,
+        )
     }
 
     fn keyword(&mut self, k: &Keyword) -> R<Value> {
         let value = self.expr(&k.value)?;
-        self.at("keyword", vec![("arg", Self::opt_ident(&k.arg)), ("value", value)], k.pos)
+        self.at(
+            "keyword",
+            vec![("arg", Self::opt_ident(&k.arg)), ("value", value)],
+            k.pos,
+        )
     }
 
     fn alias(&mut self, a: &Alias, pos: Pos) -> R<Value> {
-        self.at("alias", vec![("name", Self::ident(&a.name)), ("asname", Self::opt_ident(&a.asname))], pos)
+        self.at(
+            "alias",
+            vec![
+                ("name", Self::ident(&a.name)),
+                ("asname", Self::opt_ident(&a.asname)),
+            ],
+            pos,
+        )
     }
 
     fn type_param(&mut self, t: &TypeParam) -> R<Value> {
         match &t.kind {
             TypeParamKind::TypeVar { name, bound } => {
                 let bound = self.opt_expr(bound.as_ref())?;
-                self.at("TypeVar", vec![("name", Self::ident(name)), ("bound", bound)], t.pos)
+                self.at(
+                    "TypeVar",
+                    vec![("name", Self::ident(name)), ("bound", bound)],
+                    t.pos,
+                )
             }
-            TypeParamKind::ParamSpec { name } => self.at("ParamSpec", vec![("name", Self::ident(name))], t.pos),
-            TypeParamKind::TypeVarTuple { name } => self.at("TypeVarTuple", vec![("name", Self::ident(name))], t.pos),
+            TypeParamKind::ParamSpec { name } => {
+                self.at("ParamSpec", vec![("name", Self::ident(name))], t.pos)
+            }
+            TypeParamKind::TypeVarTuple { name } => {
+                self.at("TypeVarTuple", vec![("name", Self::ident(name))], t.pos)
+            }
         }
     }
 
@@ -214,7 +251,11 @@ impl Conv<'_> {
                 let decorator_list = self.exprs(&f.decorators)?;
                 let returns = self.opt_expr(f.returns.as_ref())?;
                 let type_params = self.type_params(&f.type_params)?;
-                let name = if f.is_async { "AsyncFunctionDef" } else { "FunctionDef" };
+                let name = if f.is_async {
+                    "AsyncFunctionDef"
+                } else {
+                    "FunctionDef"
+                };
                 self.at(
                     name,
                     vec![
@@ -259,25 +300,53 @@ impl Conv<'_> {
             StmtKind::Assign { targets, value } => {
                 let targets = self.exprs(targets)?;
                 let value = self.expr(value)?;
-                self.at("Assign", vec![("targets", targets), ("value", value), ("type_comment", Value::None)], pos)
+                self.at(
+                    "Assign",
+                    vec![
+                        ("targets", targets),
+                        ("value", value),
+                        ("type_comment", Value::None),
+                    ],
+                    pos,
+                )
             }
             StmtKind::AugAssign { target, op, value } => {
                 let target = self.expr(target)?;
                 let op = self.binop(*op)?;
                 let value = self.expr(value)?;
-                self.at("AugAssign", vec![("target", target), ("op", op), ("value", value)], pos)
+                self.at(
+                    "AugAssign",
+                    vec![("target", target), ("op", op), ("value", value)],
+                    pos,
+                )
             }
-            StmtKind::AnnAssign { target, annotation, value, simple } => {
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                simple,
+            } => {
                 let target = self.expr(target)?;
                 let annotation = self.expr(annotation)?;
                 let value = self.opt_expr(value.as_ref())?;
                 self.at(
                     "AnnAssign",
-                    vec![("target", target), ("annotation", annotation), ("value", value), ("simple", Value::Int(*simple as i64))],
+                    vec![
+                        ("target", target),
+                        ("annotation", annotation),
+                        ("value", value),
+                        ("simple", Value::Int(*simple as i64)),
+                    ],
                     pos,
                 )
             }
-            StmtKind::For { target, iter, body, orelse, is_async } => {
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+                is_async,
+            } => {
                 let target = self.expr(target)?;
                 let iter = self.expr(iter)?;
                 let body = self.stmts(body)?;
@@ -285,7 +354,13 @@ impl Conv<'_> {
                 let name = if *is_async { "AsyncFor" } else { "For" };
                 self.at(
                     name,
-                    vec![("target", target), ("iter", iter), ("body", body), ("orelse", orelse), ("type_comment", Value::None)],
+                    vec![
+                        ("target", target),
+                        ("iter", iter),
+                        ("body", body),
+                        ("orelse", orelse),
+                        ("type_comment", Value::None),
+                    ],
                     pos,
                 )
             }
@@ -293,23 +368,49 @@ impl Conv<'_> {
                 let test = self.expr(test)?;
                 let body = self.stmts(body)?;
                 let orelse = self.stmts(orelse)?;
-                self.at("While", vec![("test", test), ("body", body), ("orelse", orelse)], pos)
+                self.at(
+                    "While",
+                    vec![("test", test), ("body", body), ("orelse", orelse)],
+                    pos,
+                )
             }
             StmtKind::If { test, body, orelse } => {
                 let test = self.expr(test)?;
                 let body = self.stmts(body)?;
                 let orelse = self.stmts(orelse)?;
-                self.at("If", vec![("test", test), ("body", body), ("orelse", orelse)], pos)
+                self.at(
+                    "If",
+                    vec![("test", test), ("body", body), ("orelse", orelse)],
+                    pos,
+                )
             }
-            StmtKind::With { items, body, is_async } => {
+            StmtKind::With {
+                items,
+                body,
+                is_async,
+            } => {
                 let items = self.list(items, |c, w| {
                     let context_expr = c.expr(&w.context_expr)?;
                     let optional_vars = c.opt_expr(w.optional_vars.as_ref())?;
-                    c.node("withitem", vec![("context_expr", context_expr), ("optional_vars", optional_vars)])
+                    c.node(
+                        "withitem",
+                        vec![
+                            ("context_expr", context_expr),
+                            ("optional_vars", optional_vars),
+                        ],
+                    )
                 })?;
                 let body = self.stmts(body)?;
                 let name = if *is_async { "AsyncWith" } else { "With" };
-                self.at(name, vec![("items", items), ("body", body), ("type_comment", Value::None)], pos)
+                self.at(
+                    name,
+                    vec![
+                        ("items", items),
+                        ("body", body),
+                        ("type_comment", Value::None),
+                    ],
+                    pos,
+                )
             }
             StmtKind::Match { subject, cases } => {
                 let subject = self.expr(subject)?;
@@ -317,7 +418,10 @@ impl Conv<'_> {
                     let pattern = c.pattern(&mc.pattern, pos)?;
                     let guard = c.opt_expr(mc.guard.as_ref())?;
                     let body = c.stmts(&mc.body)?;
-                    c.node("match_case", vec![("pattern", pattern), ("guard", guard), ("body", body)])
+                    c.node(
+                        "match_case",
+                        vec![("pattern", pattern), ("guard", guard), ("body", body)],
+                    )
                 })?;
                 self.at("Match", vec![("subject", subject), ("cases", cases)], pos)
             }
@@ -326,17 +430,40 @@ impl Conv<'_> {
                 let cause = self.opt_expr(cause.as_ref())?;
                 self.at("Raise", vec![("exc", exc), ("cause", cause)], pos)
             }
-            StmtKind::Try { body, handlers, orelse, finalbody, is_star } => {
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                is_star,
+            } => {
                 let body = self.stmts(body)?;
                 let handlers = self.list(handlers, |c, h| {
                     let typ = c.opt_expr(h.typ.as_ref())?;
                     let body = c.stmts(&h.body)?;
-                    c.at("ExceptHandler", vec![("type", typ), ("name", Self::opt_ident(&h.name)), ("body", body)], h.pos)
+                    c.at(
+                        "ExceptHandler",
+                        vec![
+                            ("type", typ),
+                            ("name", Self::opt_ident(&h.name)),
+                            ("body", body),
+                        ],
+                        h.pos,
+                    )
                 })?;
                 let orelse = self.stmts(orelse)?;
                 let finalbody = self.stmts(finalbody)?;
                 let name = if *is_star { "TryStar" } else { "Try" };
-                self.at(name, vec![("body", body), ("handlers", handlers), ("orelse", orelse), ("finalbody", finalbody)], pos)
+                self.at(
+                    name,
+                    vec![
+                        ("body", body),
+                        ("handlers", handlers),
+                        ("orelse", orelse),
+                        ("finalbody", finalbody),
+                    ],
+                    pos,
+                )
             }
             StmtKind::Assert { test, msg } => {
                 let test = self.expr(test)?;
@@ -347,21 +474,43 @@ impl Conv<'_> {
                 let names = self.list(names, |c, a| c.alias(a, pos))?;
                 self.at("Import", vec![("names", names)], pos)
             }
-            StmtKind::ImportFrom { module, names, level } => {
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level,
+            } => {
                 let names = self.list(names, |c, a| c.alias(a, pos))?;
                 self.at(
                     "ImportFrom",
-                    vec![("module", Self::opt_ident(module)), ("names", names), ("level", Value::Int(*level as i64))],
+                    vec![
+                        ("module", Self::opt_ident(module)),
+                        ("names", names),
+                        ("level", Value::Int(*level as i64)),
+                    ],
                     pos,
                 )
             }
             StmtKind::Global(names) => self.at("Global", vec![("names", Self::idents(names))], pos),
-            StmtKind::Nonlocal(names) => self.at("Nonlocal", vec![("names", Self::idents(names))], pos),
-            StmtKind::TypeAlias { name, type_params, value } => {
+            StmtKind::Nonlocal(names) => {
+                self.at("Nonlocal", vec![("names", Self::idents(names))], pos)
+            }
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                value,
+            } => {
                 let name = self.expr(name)?;
                 let type_params = self.type_params(type_params)?;
                 let value = self.expr(value)?;
-                self.at("TypeAlias", vec![("name", name), ("type_params", type_params), ("value", value)], pos)
+                self.at(
+                    "TypeAlias",
+                    vec![
+                        ("name", name),
+                        ("type_params", type_params),
+                        ("value", value),
+                    ],
+                    pos,
+                )
             }
             StmtKind::Expr(e) => {
                 let value = self.expr(e)?;
@@ -378,13 +527,25 @@ impl Conv<'_> {
             let target = c.expr(&g.target)?;
             let iter = c.expr(&g.iter)?;
             let ifs = c.exprs(&g.ifs)?;
-            c.node("comprehension", vec![("target", target), ("iter", iter), ("ifs", ifs), ("is_async", Value::Int(g.is_async as i64))])
+            c.node(
+                "comprehension",
+                vec![
+                    ("target", target),
+                    ("iter", iter),
+                    ("ifs", ifs),
+                    ("is_async", Value::Int(g.is_async as i64)),
+                ],
+            )
         })
     }
 
     fn constant(&mut self, k: &Constant, pos: Pos) -> R<Value> {
         let value = crate::compile::const_value(k);
-        self.at("Constant", vec![("value", value), ("kind", Value::None)], pos)
+        self.at(
+            "Constant",
+            vec![("value", value), ("kind", Value::None)],
+            pos,
+        )
     }
 
     fn expr(&mut self, e: &Expr) -> R<Value> {
@@ -407,7 +568,11 @@ impl Conv<'_> {
                 let left = self.expr(left)?;
                 let op = self.binop(*op)?;
                 let right = self.expr(right)?;
-                self.at("BinOp", vec![("left", left), ("op", op), ("right", right)], pos)
+                self.at(
+                    "BinOp",
+                    vec![("left", left), ("op", op), ("right", right)],
+                    pos,
+                )
             }
             ExprKind::UnaryOp { op, operand } => {
                 let op = self.single(match op {
@@ -428,7 +593,11 @@ impl Conv<'_> {
                 let test = self.expr(test)?;
                 let body = self.expr(body)?;
                 let orelse = self.expr(orelse)?;
-                self.at("IfExp", vec![("test", test), ("body", body), ("orelse", orelse)], pos)
+                self.at(
+                    "IfExp",
+                    vec![("test", test), ("body", body), ("orelse", orelse)],
+                    pos,
+                )
             }
             ExprKind::Dict { keys, values } => {
                 let keys = self.list(keys, |c, k| c.opt_expr(k.as_ref()))?;
@@ -439,7 +608,9 @@ impl Conv<'_> {
                 let elts = self.exprs(elts)?;
                 self.at("Set", vec![("elts", elts)], pos)
             }
-            ExprKind::ListComp { elt, generators } | ExprKind::SetComp { elt, generators } | ExprKind::GeneratorExp { elt, generators } => {
+            ExprKind::ListComp { elt, generators }
+            | ExprKind::SetComp { elt, generators }
+            | ExprKind::GeneratorExp { elt, generators } => {
                 let name = match &e.kind {
                     ExprKind::ListComp { .. } => "ListComp",
                     ExprKind::SetComp { .. } => "SetComp",
@@ -449,11 +620,19 @@ impl Conv<'_> {
                 let generators = self.comprehensions(generators)?;
                 self.at(name, vec![("elt", elt), ("generators", generators)], pos)
             }
-            ExprKind::DictComp { key, value, generators } => {
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => {
                 let key = self.expr(key)?;
                 let value = self.expr(value)?;
                 let generators = self.comprehensions(generators)?;
-                self.at("DictComp", vec![("key", key), ("value", value), ("generators", generators)], pos)
+                self.at(
+                    "DictComp",
+                    vec![("key", key), ("value", value), ("generators", generators)],
+                    pos,
+                )
             }
             ExprKind::Await(v) => {
                 let value = self.expr(v)?;
@@ -467,39 +646,75 @@ impl Conv<'_> {
                 let value = self.expr(v)?;
                 self.at("YieldFrom", vec![("value", value)], pos)
             }
-            ExprKind::Compare { left, ops, comparators } => {
+            ExprKind::Compare {
+                left,
+                ops,
+                comparators,
+            } => {
                 let left = self.expr(left)?;
                 let ops = self.list(ops, |c, op| c.cmpop(op))?;
                 let comparators = self.exprs(comparators)?;
-                self.at("Compare", vec![("left", left), ("ops", ops), ("comparators", comparators)], pos)
+                self.at(
+                    "Compare",
+                    vec![("left", left), ("ops", ops), ("comparators", comparators)],
+                    pos,
+                )
             }
-            ExprKind::Call { func, args, keywords } => {
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
                 let func = self.expr(func)?;
                 let args = self.exprs(args)?;
                 let keywords = self.list(keywords, |c, k| c.keyword(k))?;
-                self.at("Call", vec![("func", func), ("args", args), ("keywords", keywords)], pos)
+                self.at(
+                    "Call",
+                    vec![("func", func), ("args", args), ("keywords", keywords)],
+                    pos,
+                )
             }
             ExprKind::JoinedStr(values) => {
                 let values = self.exprs(values)?;
                 self.at("JoinedStr", vec![("values", values)], pos)
             }
-            ExprKind::FormattedValue { value, conversion, format_spec } => {
+            ExprKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => {
                 let value = self.expr(value)?;
                 let conversion = Value::Int(conversion.map_or(-1, |c| c as i64));
                 let format_spec = self.opt_expr(format_spec.as_deref())?;
-                self.at("FormattedValue", vec![("value", value), ("conversion", conversion), ("format_spec", format_spec)], pos)
+                self.at(
+                    "FormattedValue",
+                    vec![
+                        ("value", value),
+                        ("conversion", conversion),
+                        ("format_spec", format_spec),
+                    ],
+                    pos,
+                )
             }
             ExprKind::Constant(k) => self.constant(k, pos),
             ExprKind::Attribute { value, attr, ctx } => {
                 let value = self.expr(value)?;
                 let ctx = self.ctx(*ctx)?;
-                self.at("Attribute", vec![("value", value), ("attr", Self::ident(attr)), ("ctx", ctx)], pos)
+                self.at(
+                    "Attribute",
+                    vec![("value", value), ("attr", Self::ident(attr)), ("ctx", ctx)],
+                    pos,
+                )
             }
             ExprKind::Subscript { value, slice, ctx } => {
                 let value = self.expr(value)?;
                 let slice = self.expr(slice)?;
                 let ctx = self.ctx(*ctx)?;
-                self.at("Subscript", vec![("value", value), ("slice", slice), ("ctx", ctx)], pos)
+                self.at(
+                    "Subscript",
+                    vec![("value", value), ("slice", slice), ("ctx", ctx)],
+                    pos,
+                )
             }
             ExprKind::Starred { value, ctx } => {
                 let value = self.expr(value)?;
@@ -511,7 +726,11 @@ impl Conv<'_> {
                 self.at("Name", vec![("id", Self::ident(id)), ("ctx", ctx)], pos)
             }
             ExprKind::List { elts, ctx } | ExprKind::Tuple { elts, ctx } => {
-                let name = if matches!(e.kind, ExprKind::List { .. }) { "List" } else { "Tuple" };
+                let name = if matches!(e.kind, ExprKind::List { .. }) {
+                    "List"
+                } else {
+                    "Tuple"
+                };
                 let elts = self.exprs(elts)?;
                 let ctx = self.ctx(*ctx)?;
                 self.at(name, vec![("elts", elts), ("ctx", ctx)], pos)
@@ -520,7 +739,11 @@ impl Conv<'_> {
                 let lower = self.opt_expr(lower.as_deref())?;
                 let upper = self.opt_expr(upper.as_deref())?;
                 let step = self.opt_expr(step.as_deref())?;
-                self.at("Slice", vec![("lower", lower), ("upper", upper), ("step", step)], pos)
+                self.at(
+                    "Slice",
+                    vec![("lower", lower), ("upper", upper), ("step", step)],
+                    pos,
+                )
             }
         }
     }
@@ -543,29 +766,57 @@ impl Conv<'_> {
                 let patterns = self.patterns(ps, pos)?;
                 self.at("MatchSequence", vec![("patterns", patterns)], pos)
             }
-            Pattern::MatchMapping { keys, patterns, rest } => {
+            Pattern::MatchMapping {
+                keys,
+                patterns,
+                rest,
+            } => {
                 let keys = self.exprs(keys)?;
                 let patterns = self.patterns(patterns, pos)?;
-                self.at("MatchMapping", vec![("keys", keys), ("patterns", patterns), ("rest", Self::opt_ident(rest))], pos)
+                self.at(
+                    "MatchMapping",
+                    vec![
+                        ("keys", keys),
+                        ("patterns", patterns),
+                        ("rest", Self::opt_ident(rest)),
+                    ],
+                    pos,
+                )
             }
-            Pattern::MatchClass { cls, patterns, kwd_attrs, kwd_patterns } => {
+            Pattern::MatchClass {
+                cls,
+                patterns,
+                kwd_attrs,
+                kwd_patterns,
+            } => {
                 let pos = cls.pos;
                 let cls = self.expr(cls)?;
                 let patterns = self.patterns(patterns, pos)?;
                 let kwd_patterns = self.patterns(kwd_patterns, pos)?;
                 self.at(
                     "MatchClass",
-                    vec![("cls", cls), ("patterns", patterns), ("kwd_attrs", Self::idents(kwd_attrs)), ("kwd_patterns", kwd_patterns)],
+                    vec![
+                        ("cls", cls),
+                        ("patterns", patterns),
+                        ("kwd_attrs", Self::idents(kwd_attrs)),
+                        ("kwd_patterns", kwd_patterns),
+                    ],
                     pos,
                 )
             }
-            Pattern::MatchStar(name) => self.at("MatchStar", vec![("name", Self::opt_ident(name))], pos),
+            Pattern::MatchStar(name) => {
+                self.at("MatchStar", vec![("name", Self::opt_ident(name))], pos)
+            }
             Pattern::MatchAs { pattern, name } => {
                 let pattern = match pattern {
                     Some(p) => self.pattern(p, pos)?,
                     None => Value::None,
                 };
-                self.at("MatchAs", vec![("pattern", pattern), ("name", Self::opt_ident(name))], pos)
+                self.at(
+                    "MatchAs",
+                    vec![("pattern", pattern), ("name", Self::opt_ident(name))],
+                    pos,
+                )
             }
             Pattern::MatchOr(ps) => {
                 let patterns = self.patterns(ps, pos)?;

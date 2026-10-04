@@ -3,9 +3,9 @@
 //! Every run-time helper here delegates to the tree-walker's own routine for the operation, in
 //! the tree-walker's evaluation order — the compiler only reorders nothing and interleaves the
 //! compiled sub-expressions exactly where the oracle evaluates them.
+use super::{step_and_store, Op, UpdKind};
 #[cfg(feature = "compiler")]
 use super::{Bail, CResult, Compiler, Home};
-use super::{step_and_store, Op, UpdKind};
 use crate::ast::{Class, Expr, PropDef, PropKey};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;

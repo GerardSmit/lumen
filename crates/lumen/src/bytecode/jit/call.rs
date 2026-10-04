@@ -1537,7 +1537,9 @@ impl Tr<'_, '_> {
                 let ok = self.fb.icmp(IntCC::Eq, bad, z);
                 self.guard_to(ok, norm);
                 i
-            } else { v };
+            } else {
+                v
+            };
             vals[k] = Some(v);
         }
         // ---- commit ----

@@ -16,9 +16,9 @@
 //! CreatePerIterationEnvironment (a sibling env with every binding copied); `BlkLoad`,
 //! `BlkStore`, `BlkInit` and `BlkUpdate` access one binding; `InEnv(slot)` runs the closure-,
 //! class- or method-creating op that follows it with the block env as the new function's scope.
+use super::{step_and_store, Op, PushValue};
 #[cfg(feature = "compiler")]
 use super::{Bail, Compiler, BLK_BIT};
-use super::{step_and_store, Op, PushValue};
 use crate::interpreter::{new_scope, Abrupt, Binding, Env, Interp};
 use crate::value::{Callable, Object, Value};
 use std::rc::Rc;

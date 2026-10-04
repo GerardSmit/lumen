@@ -20,7 +20,7 @@
 //! A normal-mode close (`break`/`return`) is `AsyncCloseCall(it, st) JumpIfFalse(L) Await
 //! AsyncCloseCheck(st) L:` — no `return` method means no await at all.
 #[cfg(feature = "compiler")]
-use super::{Compiler};
+use super::Compiler;
 use super::{Op, PushValue};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;

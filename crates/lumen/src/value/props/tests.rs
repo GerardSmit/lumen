@@ -1,5 +1,5 @@
-use super::shapes::{INDEX_THRESHOLD, OWNED_THRESHOLD};
 use super::Props;
+use super::shapes::{INDEX_THRESHOLD, OWNED_THRESHOLD};
 use crate::value::{Property, Value};
 
 fn num(n: f64) -> Property {
@@ -356,7 +356,7 @@ fn dictionary_sized_objects_index_every_key_through_growth_and_deletes() {
 
 #[test]
 fn keys_colliding_under_the_old_hash_keep_order_and_insert_in_linear_time() {
-    use crate::fasthash::tests::{old_colliding_keys, OldFx};
+    use crate::fasthash::tests::{OldFx, old_colliding_keys};
     use std::time::{Duration, Instant};
     let hostile = old_colliding_keys(&OldFx::default(), 20_000);
     let benign: Vec<String> = (0..hostile.len())

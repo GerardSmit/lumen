@@ -24,6 +24,10 @@ pub struct Param {
     /// The default as written (`#[default(1e-09)]` gives `1e-09`), or `None` for an optional
     /// `Option<T>` parameter; absent for a required parameter. Hosts show it in signatures.
     pub default: Option<&'static str>,
+    /// Whether an explicitly passed JavaScript `undefined` is a value for this parameter.
+    /// `Passed<T>` needs this distinction; ordinary optional/defaulted arguments still treat it
+    /// as omitted.
+    pub pass_undefined: bool,
 }
 
 impl Param {

@@ -27,8 +27,19 @@ const LANCZOS_NUM: [f64; LANCZOS_N] = [
     2.5066282746310002701649081771338373386264310793408,
 ];
 const LANCZOS_DEN: [f64; LANCZOS_N] = [
-    0.0, 39916800.0, 120543840.0, 150917976.0, 105258076.0, 45995730.0, 13339535.0, 2637558.0, 357423.0,
-    32670.0, 1925.0, 66.0, 1.0,
+    0.0,
+    39916800.0,
+    120543840.0,
+    150917976.0,
+    105258076.0,
+    45995730.0,
+    13339535.0,
+    2637558.0,
+    357423.0,
+    32670.0,
+    1925.0,
+    66.0,
+    1.0,
 ];
 const GAMMA_INTEGRAL: [f64; 23] = [
     1.0,
@@ -93,7 +104,11 @@ pub fn sinpi(x: f64) -> f64 {
 /// The gamma function; `Domain` at the poles and `-inf`, `Range` on overflow.
 pub fn tgamma(x: f64) -> Result<f64, MathError> {
     if !x.is_finite() {
-        return if x.is_nan() || x > 0.0 { Ok(x) } else { Err(MathError::Domain) };
+        return if x.is_nan() || x > 0.0 {
+            Ok(x)
+        } else {
+            Err(MathError::Domain)
+        };
     }
     if x == 0.0 {
         return Err(MathError::Domain);
@@ -109,10 +124,18 @@ pub fn tgamma(x: f64) -> Result<f64, MathError> {
     let absx = x.abs();
     if absx < 1e-20 {
         let r = 1.0 / x;
-        return if r.is_infinite() { Err(MathError::Range) } else { Ok(r) };
+        return if r.is_infinite() {
+            Err(MathError::Range)
+        } else {
+            Ok(r)
+        };
     }
     if absx > 200.0 {
-        return if x < 0.0 { Ok(0.0 / sinpi(x)) } else { Err(MathError::Range) };
+        return if x < 0.0 {
+            Ok(0.0 / sinpi(x))
+        } else {
+            Err(MathError::Range)
+        };
     }
     let y = absx + LANCZOS_G_MINUS_HALF;
     // The rounding error of `y`, recovered exactly.
@@ -156,7 +179,11 @@ pub fn lgamma(x: f64) -> Result<f64, MathError> {
         return Ok(if x.is_nan() { x } else { f64::INFINITY });
     }
     if x == x.floor() && x <= 2.0 {
-        return if x <= 0.0 { Err(MathError::Domain) } else { Ok(0.0) };
+        return if x <= 0.0 {
+            Err(MathError::Domain)
+        } else {
+            Ok(0.0)
+        };
     }
     let absx = x.abs();
     if absx < 1e-20 {

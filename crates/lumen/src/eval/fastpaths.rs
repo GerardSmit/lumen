@@ -486,6 +486,10 @@ impl Interp {
     /// non-enumerable). The result is then just the object's own enumerable string keys in
     /// [[OwnPropertyKeys]] order — no dedupe set, no prototype key lists. `None` = generic path.
     pub(crate) fn for_in_keys_fast(&self, o: &Gc) -> Option<Vec<Value>> {
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            return None;
+        }
         let b = o.borrow();
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None | Exotic::Array) {
             return None;
@@ -530,6 +534,10 @@ impl Interp {
     /// `Object.keys(o)` of a plain ordinary object without elements: its own enumerable string
     /// keys from the per-shape key list (no key strings built). `None` = generic path.
     pub(crate) fn object_keys_fast(&self, o: &Gc) -> Option<Vec<Value>> {
+        #[cfg(feature = "embed")]
+        if self.is_window_proxy(o) {
+            return None;
+        }
         let b = o.try_borrow().ok()?;
         if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) || has_elements(&b.props) {
             return None;

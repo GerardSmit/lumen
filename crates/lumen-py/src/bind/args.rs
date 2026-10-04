@@ -37,10 +37,10 @@ pub enum Conv {
 /// The protocols CPython reaches through a type slot (their argument errors come from the slot
 /// wrapper).
 const SLOT_PROTOS: &[&str] = &[
-    "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash", "bool", "eq", "ne", "lt",
-    "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub", "mul", "rmul", "imul", "and", "rand", "iand", "or",
-    "ror", "ior", "xor", "rxor", "ixor", "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext",
-    "call",
+    "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash",
+    "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub",
+    "mul", "rmul", "imul", "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor",
+    "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext", "call",
 ];
 
 /// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
@@ -77,7 +77,11 @@ pub fn py_name(d: &'static FnDesc) -> &'static str {
 
 /// Extra names bound to the same native (`hint(py(aliases = "__rmul__"))`).
 pub fn aliases(d: &'static FnDesc) -> impl Iterator<Item = &'static str> {
-    d.hint(HOST, "aliases").unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty())
+    d.hint(HOST, "aliases")
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// The name of the class a member belongs to (`deque`).
@@ -140,12 +144,19 @@ impl PySig {
 
     pub fn of(d: &'static FnDesc) -> PySig {
         let named: Vec<_> = d.named().collect();
-        let posonly = named.iter().filter(|p| p.kind == ParamKind::PosOnly).count();
+        let posonly = named
+            .iter()
+            .filter(|p| p.kind == ParamKind::PosOnly)
+            .count();
         let maxpos = d.max_pos as usize;
         let minpos = d.min_pos as usize;
         let varargs = d.has_varargs();
         let varkw = d.has_varkw();
-        let required = named.iter().enumerate().filter(|(_, p)| !p.optional()).fold(0u64, |m, (i, _)| m | (1u64 << i.min(63)));
+        let required = named
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.optional())
+            .fold(0u64, |m, (i, _)| m | (1u64 << i.min(63)));
         let n = named.len();
         let all_pos = posonly == n;
         let conv = match d.role {
@@ -155,7 +166,9 @@ impl PySig {
             Role::Setter => Conv::O,
             Role::Constructor if all_pos && !varkw => Conv::Positional,
             Role::Constructor => Conv::Keywords,
-            Role::Proto(p) if SLOT_PROTOS.contains(&p) && all_pos && !varargs && !varkw => Conv::Slot,
+            Role::Proto(p) if SLOT_PROTOS.contains(&p) && all_pos && !varargs && !varkw => {
+                Conv::Slot
+            }
             _ if n == 0 && !varargs && !varkw => Conv::NoArgs,
             _ if n == 1 && posonly == 1 && minpos == 1 && !varargs && !varkw => Conv::O,
             _ if all_pos && !varkw => Conv::Positional,
@@ -165,10 +178,24 @@ impl PySig {
         let (name, owner) = match d.role {
             Role::Constructor | Role::Proto("init") => (class_name(d).to_string(), String::new()),
             _ if d.class().is_some() => (pyname.to_string(), class_name(d).to_string()),
-            _ => (pyname.to_string(), d.module().unwrap_or("builtins").to_string()),
+            _ => (
+                pyname.to_string(),
+                d.module().unwrap_or("builtins").to_string(),
+            ),
         };
         let name = d.hint(HOST, "arg_name").map_or(name, str::to_string);
-        PySig { name, owner, conv, names: named.iter().map(|p| p.name).collect(), posonly, maxpos, minpos, required, varargs, varkw }
+        PySig {
+            name,
+            owner,
+            conv,
+            names: named.iter().map(|p| p.name).collect(),
+            posonly,
+            maxpos,
+            minpos,
+            required,
+            varargs,
+            varkw,
+        }
     }
 
     /// `math.floor` / `deque.append` / `count`.
@@ -199,27 +226,73 @@ fn plural(n: usize) -> &'static str {
 pub fn arity_error(it: &mut Interp, sig: &PySig, given: usize) -> Obj {
     let msg = match sig.conv {
         Conv::NoArgs => format!("{}() takes no arguments ({} given)", sig.qualname(), given),
-        Conv::O => format!("{}() takes exactly one argument ({} given)", sig.qualname(), given),
+        Conv::O => format!(
+            "{}() takes exactly one argument ({} given)",
+            sig.qualname(),
+            given
+        ),
         Conv::Positional => {
-            let (min, max) = (sig.minpos, if sig.varargs { usize::MAX } else { sig.maxpos });
+            let (min, max) = (
+                sig.minpos,
+                if sig.varargs { usize::MAX } else { sig.maxpos },
+            );
             if given < min {
                 let q = if min == max { "" } else { "at least " };
-                format!("{} expected {}{} argument{}, got {}", sig.name, q, min, plural(min), given)
+                format!(
+                    "{} expected {}{} argument{}, got {}",
+                    sig.name,
+                    q,
+                    min,
+                    plural(min),
+                    given
+                )
             } else {
                 let q = if min == max { "" } else { "at most " };
-                format!("{} expected {}{} argument{}, got {}", sig.name, q, max, plural(max), given)
+                format!(
+                    "{} expected {}{} argument{}, got {}",
+                    sig.name,
+                    q,
+                    max,
+                    plural(max),
+                    given
+                )
             }
         }
         Conv::Parse => {
-            let (min, max) = (sig.minpos, if sig.varargs { usize::MAX } else { sig.maxpos });
-            let q = if min == max { "exactly" } else if given < min { "at least" } else { "at most" };
+            let (min, max) = (
+                sig.minpos,
+                if sig.varargs { usize::MAX } else { sig.maxpos },
+            );
+            let q = if min == max {
+                "exactly"
+            } else if given < min {
+                "at least"
+            } else {
+                "at most"
+            };
             let n = if given < min { min } else { max };
-            format!("{}() takes {} {} argument{} ({} given)", sig.name, q, n, plural(n), given)
+            format!(
+                "{}() takes {} {} argument{} ({} given)",
+                sig.name,
+                q,
+                n,
+                plural(n),
+                given
+            )
         }
-        Conv::Keywords => return keywords_error(it, sig, given, 0).unwrap_or_else(|| it.type_error("invalid arguments")),
+        Conv::Keywords => {
+            return keywords_error(it, sig, given, 0)
+                .unwrap_or_else(|| it.type_error("invalid arguments"))
+        }
         Conv::Slot => {
             let (min, max) = (sig.minpos, sig.maxpos);
-            let q = if min == max { "" } else if given < min { "at least " } else { "at most " };
+            let q = if min == max {
+                ""
+            } else if given < min {
+                "at least "
+            } else {
+                "at most "
+            };
             let n = if given < min { min } else { max };
             format!("expected {}{} argument{}, got {}", q, n, plural(n), given)
         }
@@ -258,7 +331,11 @@ fn keywords_error(it: &mut Interp, sig: &PySig, nargs: usize, nkw: usize) -> Opt
             format!(
                 "{}() takes {} {} positional argument{} ({} given)",
                 sig.name,
-                if sig.minpos < sig.maxpos { "at most" } else { "exactly" },
+                if sig.minpos < sig.maxpos {
+                    "at most"
+                } else {
+                    "exactly"
+                },
                 sig.maxpos,
                 plural(sig.maxpos),
                 nargs
@@ -269,7 +346,11 @@ fn keywords_error(it: &mut Interp, sig: &PySig, nargs: usize, nkw: usize) -> Opt
         format!(
             "{}() takes {} {} positional argument{} ({} given)",
             sig.name,
-            if m < sig.maxpos { "at least" } else { "exactly" },
+            if m < sig.maxpos {
+                "at least"
+            } else {
+                "exactly"
+            },
             m,
             plural(m),
             nargs
@@ -283,7 +364,12 @@ fn keywords_error(it: &mut Interp, sig: &PySig, nargs: usize, nkw: usize) -> Opt
 #[cold]
 #[inline(never)]
 fn missing_error(it: &mut Interp, sig: &PySig, i: usize) -> Obj {
-    let msg = format!("{}() missing required argument '{}' (pos {})", sig.name, sig.names[i], i + 1);
+    let msg = format!(
+        "{}() missing required argument '{}' (pos {})",
+        sig.name,
+        sig.names[i],
+        i + 1
+    );
     it.type_error(&msg)
 }
 
@@ -322,7 +408,12 @@ pub fn bind_slow<'a>(
 #[cold]
 #[inline(never)]
 fn for_receiver(it: &Interp, sig: &PySig, d: &FnDesc, recv: &Value) -> PySig {
-    let mut s = PySig { name: sig.name.clone(), owner: sig.owner.clone(), names: sig.names.clone(), ..*sig };
+    let mut s = PySig {
+        name: sig.name.clone(),
+        owner: sig.owner.clone(),
+        names: sig.names.clone(),
+        ..*sig
+    };
     if d.class().is_some_and(|c| c.hint(HOST, "shared").is_some()) {
         s.owner = it.type_name_of(recv);
     }
@@ -346,7 +437,12 @@ fn bind_keywords<'a>(
     for (slot, a) in slots.iter_mut().zip(&args[..npos]) {
         *slot = Some(a);
     }
-    let find = |name: &str| sig.names[sig.posonly..].iter().position(|n| *n == name).map(|i| i + sig.posonly);
+    let find = |name: &str| {
+        sig.names[sig.posonly..]
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| i + sig.posonly)
+    };
     let mut leftover = false;
     for (k, v) in kw {
         match find(k.as_str_kind().unwrap_or("")) {
@@ -363,7 +459,12 @@ fn bind_keywords<'a>(
         for (k, _) in kw {
             let name = k.as_str_kind().unwrap_or("");
             if let Some(i) = find(name).filter(|&i| i < npos) {
-                let msg = format!("argument for {}() given by name ('{}') and position ({})", sig.name, name, i + 1);
+                let msg = format!(
+                    "argument for {}() given by name ('{}') and position ({})",
+                    sig.name,
+                    name,
+                    i + 1
+                );
                 return Err(it.type_error(&msg));
             }
         }
@@ -371,7 +472,10 @@ fn bind_keywords<'a>(
             for (k, _) in kw {
                 let name = k.as_str_kind().unwrap_or("");
                 if find(name).is_none() {
-                    let msg = format!("'{}' is an invalid keyword argument for {}()", name, sig.name);
+                    let msg = format!(
+                        "'{}' is an invalid keyword argument for {}()",
+                        name, sig.name
+                    );
                     return Err(it.type_error(&msg));
                 }
             }
@@ -382,7 +486,8 @@ fn bind_keywords<'a>(
 
 /// Whether keyword `name` binds a named parameter (so a `**kwargs` collector skips it).
 pub fn is_named_keyword(d: &FnDesc, name: &str) -> bool {
-    d.named().any(|p| p.kind != ParamKind::PosOnly && p.name == name)
+    d.named()
+        .any(|p| p.kind != ParamKind::PosOnly && p.name == name)
 }
 
 /// Argument `i` has the wrong type: `f() argument 'x' must be str, not int`.
@@ -401,7 +506,10 @@ pub fn bad_argument(it: &mut Interp, d: &'static FnDesc, i: usize, what: &str, v
         }
     };
     let t = it.type_name_of(v);
-    it.type_error(&format!("{}() {} must be {}, not {}", sig.name, display, what, t))
+    it.type_error(&format!(
+        "{}() {} must be {}, not {}",
+        sig.name, display, what, t
+    ))
 }
 
 /// `descriptor 'append' of 'collections.deque' object needs an argument`.
@@ -410,9 +518,20 @@ pub fn bad_argument(it: &mut Interp, d: &'static FnDesc, i: usize, what: &str, v
 pub fn needs_self(it: &mut Interp, d: &'static FnDesc) -> Obj {
     let owner = d.class().map(class_qualname).unwrap_or_default();
     match d.role {
-        Role::Constructor => it.type_error(&format!("{}.__new__(): not enough arguments", class_name(d))),
-        Role::Method => it.type_error(&format!("unbound method {}.{}() needs an argument", class_name(d), py_name(d))),
-        _ => it.type_error(&format!("descriptor '{}' of '{}' object needs an argument", py_name(d), owner)),
+        Role::Constructor => it.type_error(&format!(
+            "{}.__new__(): not enough arguments",
+            class_name(d)
+        )),
+        Role::Method => it.type_error(&format!(
+            "unbound method {}.{}() needs an argument",
+            class_name(d),
+            py_name(d)
+        )),
+        _ => it.type_error(&format!(
+            "descriptor '{}' of '{}' object needs an argument",
+            py_name(d),
+            owner
+        )),
     }
 }
 
@@ -423,8 +542,13 @@ fn py_default(text: &str) -> String {
         "true" => "True".into(),
         "false" => "False".into(),
         "None" | "Value::None" => "None".into(),
-        _ if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') => format!("'{}'", &t[1..t.len() - 1]),
-        _ => t.trim_end_matches("f64").trim_end_matches("_f64").replace(' ', ""),
+        _ if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') => {
+            format!("'{}'", &t[1..t.len() - 1])
+        }
+        _ => t
+            .trim_end_matches("f64")
+            .trim_end_matches("_f64")
+            .replace(' ', ""),
     }
 }
 
@@ -503,7 +627,9 @@ pub fn py_doc(d: &'static FnDesc, name: &str) -> Option<&'static str> {
         return d.doc;
     }
     match d.role {
-        Role::Constructor => Some("Create and return a new object.  See help(type) for accurate signature."),
+        Role::Constructor => {
+            Some("Create and return a new object.  See help(type) for accurate signature.")
+        }
         _ if is_slot_wrapper(d) => slot_doc(name),
         _ => None,
     }
@@ -541,7 +667,8 @@ pub fn text_signature(d: &'static FnDesc) -> Option<String> {
         _ => None,
     };
     let mut parts: Vec<String> = prefix.map(str::to_string).into_iter().collect();
-    if prefix.is_some() && sig.posonly == 0 && !(sig.names.is_empty() && sig.varargs && !sig.varkw) {
+    if prefix.is_some() && sig.posonly == 0 && !(sig.names.is_empty() && sig.varargs && !sig.varkw)
+    {
         parts.push("/".into());
     }
     let mut star = false;
@@ -564,7 +691,9 @@ pub fn text_signature(d: &'static FnDesc) -> Option<String> {
                 });
             }
         }
-        let next_posonly = params.get(n + 1).is_some_and(|x| x.kind == ParamKind::PosOnly);
+        let next_posonly = params
+            .get(n + 1)
+            .is_some_and(|x| x.kind == ParamKind::PosOnly);
         if p.kind == ParamKind::PosOnly && !next_posonly {
             parts.push("/".into());
         }

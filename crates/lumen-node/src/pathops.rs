@@ -42,7 +42,10 @@ fn normalize_string(path: &str, allow_above_root: bool) -> String {
                             }
                             Some(at) => {
                                 res.truncate(at);
-                                last_segment_length = (res.len() as isize - 1 - res.rfind('/').map_or(-1, |x| x as isize)) as usize;
+                                last_segment_length = (res.len() as isize
+                                    - 1
+                                    - res.rfind('/').map_or(-1, |x| x as isize))
+                                    as usize;
                             }
                         }
                         last_slash = i as isize;
@@ -87,7 +90,14 @@ fn normalize(path: &str) -> String {
     let trailing = path.ends_with('/');
     let mut out = normalize_string(path, !absolute);
     if out.is_empty() {
-        return if absolute { "/" } else if trailing { "./" } else { "." }.into();
+        return if absolute {
+            "/"
+        } else if trailing {
+            "./"
+        } else {
+            "."
+        }
+        .into();
     }
     if trailing {
         out.push('/');
@@ -125,7 +135,11 @@ pub(crate) fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let mut absolute = false;
     let mut i = args.len() as isize - 1;
     while i >= -1 && !absolute {
-        let p = if i >= 0 { arg(ctx, args, i as usize)? } else { cwd(ctx)? };
+        let p = if i >= 0 {
+            arg(ctx, args, i as usize)?
+        } else {
+            cwd(ctx)?
+        };
         i -= 1;
         if p.is_empty() {
             continue;
@@ -156,7 +170,9 @@ pub(crate) fn op_join(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Val
             Some(j) => format!("{j}/{p}"),
         });
     }
-    Ok(Value::from_string(joined.map_or_else(|| ".".into(), |j| normalize(&j))))
+    Ok(Value::from_string(
+        joined.map_or_else(|| ".".into(), |j| normalize(&j)),
+    ))
 }
 
 fn dirname(path: &str) -> &str {

@@ -1,0 +1,7 @@
+<style>
+html,body{margin:0;background:#fff}
+main{display:grid;width:120px;gap:5px;grid-template-columns:repeat(2,5px)[outer]repeat(auto-fill,[auto-line]20px[auto-end])repeat(2,5px)[last]}
+.subgrid{display:grid;grid-column:outer/last;grid-template-columns:subgrid;height:8px}
+.cell{grid-column:auto-line 2/auto-end 3;height:4px;background:#f00}
+</style>
+<main><section class="subgrid"><div class="cell"></div></section></main>

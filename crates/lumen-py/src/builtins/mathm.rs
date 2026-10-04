@@ -250,9 +250,13 @@ pub mod math {
 
     #[op]
     fn nextafter(x: f64, y: f64, #[kwonly] steps: Option<i64>) -> NativeResult<f64> {
-        let Some(steps) = steps else { return Ok(next_toward(x, y)) };
+        let Some(steps) = steps else {
+            return Ok(next_toward(x, y));
+        };
         if steps < 0 {
-            return Err(NativeError::value_error("steps must be a non-negative integer"));
+            return Err(NativeError::value_error(
+                "steps must be a non-negative integer",
+            ));
         }
         let mut x = x;
         for _ in 0..steps {
@@ -382,7 +386,9 @@ pub mod math {
     fn round_op(it: &mut Interp, x: &Value, dunder: &str, f: fn(f64) -> f64) -> R<Value> {
         match x {
             Value::Int(_) | Value::Bool(_) => {
-                return it.call_method(x, "__index__", Vec::new()).or_else(|_| Ok(x.clone()));
+                return it
+                    .call_method(x, "__index__", Vec::new())
+                    .or_else(|_| Ok(x.clone()));
             }
             Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => return Ok(x.clone()),
             Value::Float(v) => return f_to_int(it, f(*v)),
@@ -393,7 +399,9 @@ pub mod math {
                 }
                 if dunder == "__trunc__" {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("type {} doesn't define __trunc__ method", t)));
+                    return Err(
+                        it.type_error(&format!("type {} doesn't define __trunc__ method", t))
+                    );
                 }
             }
         }
@@ -432,7 +440,16 @@ pub mod math {
     }
 
     #[op]
-    fn isclose(#[kw] a: f64, #[kw] b: f64, #[kwonly] #[default(1e-09)] rel_tol: f64, #[kwonly] #[default(0.0)] abs_tol: f64) -> NativeResult<bool> {
+    fn isclose(
+        #[kw] a: f64,
+        #[kw] b: f64,
+        #[kwonly]
+        #[default(1e-09)]
+        rel_tol: f64,
+        #[kwonly]
+        #[default(0.0)]
+        abs_tol: f64,
+    ) -> NativeResult<bool> {
         if rel_tol < 0.0 || abs_tol < 0.0 {
             return Err(NativeError::value_error("tolerances must be non-negative"));
         }
@@ -491,7 +508,12 @@ pub mod math {
         let n = match crate::bind::index(it, n)? {
             Value::Int(n) => n,
             big if int_value(&big).is_negative() => -1,
-            _ => return Err(it.overflow_err(&format!("factorial() argument should not exceed {}", i64::MAX))),
+            _ => {
+                return Err(it.overflow_err(&format!(
+                    "factorial() argument should not exceed {}",
+                    i64::MAX
+                )))
+            }
         };
         if n < 0 {
             return Err(it.value_error("factorial() not defined for negative values"));
@@ -518,7 +540,9 @@ pub mod math {
     #[op]
     fn isqrt(n: BigInt) -> NativeResult<BigInt> {
         if n.is_negative() {
-            return Err(NativeError::value_error("isqrt() argument must be nonnegative"));
+            return Err(NativeError::value_error(
+                "isqrt() argument must be nonnegative",
+            ));
         }
         if n.is_zero() {
             return Ok(n);
@@ -552,14 +576,26 @@ pub mod math {
             k
         } else {
             let rest = n.sub(&k);
-            if rest.cmp(&k) == std::cmp::Ordering::Less { rest } else { k }
+            if rest.cmp(&k) == std::cmp::Ordering::Less {
+                rest
+            } else {
+                k
+            }
         };
         let Some(k) = k.to_i64() else {
-            let msg = if perm { "k must not exceed 9223372036854775807" } else { "min(n - k, k) must not exceed 9223372036854775807" };
+            let msg = if perm {
+                "k must not exceed 9223372036854775807"
+            } else {
+                "min(n - k, k) must not exceed 9223372036854775807"
+            };
             return Err(it.overflow_err(msg));
         };
         let (nbits, kf) = (n.bit_len() as f64, k as f64);
-        let bits = if perm { kf * nbits } else { kf * (nbits - kf.max(1.0).log2() + std::f64::consts::LOG2_E) };
+        let bits = if perm {
+            kf * nbits
+        } else {
+            kf * (nbits - kf.max(1.0).log2() + std::f64::consts::LOG2_E)
+        };
         it.check_int_bits(bits.max(0.0) as u128)?;
         let mut acc = BigInt::from_i64(1);
         for i in 0..k {
@@ -598,7 +634,13 @@ pub mod math {
     }
 
     #[op]
-    fn prod(it: &mut Interp, iterable: &Value, #[kwonly] #[default(1)] start: Value) -> R<Value> {
+    fn prod(
+        it: &mut Interp,
+        iterable: &Value,
+        #[kwonly]
+        #[default(1)]
+        start: Value,
+    ) -> R<Value> {
         let items = it.iterate_to_vec(iterable)?;
         let mut acc = start;
         for v in items {

@@ -57,6 +57,9 @@ mod tests {
         assert!(vec_with_capacity::<u64>(8, 8).is_ok());
         assert!(vec_with_capacity::<u64>(9, 8).is_err());
         assert!(vec_with_capacity::<u64>(usize::MAX / 8, usize::MAX).is_err());
-        assert_eq!(string_with_capacity(16, 16).map(|s| s.capacity() >= 16), Ok(true));
+        assert_eq!(
+            string_with_capacity(16, 16).map(|s| s.capacity() >= 16),
+            Ok(true)
+        );
     }
 }

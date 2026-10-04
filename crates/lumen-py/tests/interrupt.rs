@@ -51,7 +51,12 @@ fn interrupted_run(src: &str, after: Duration) -> (Finished, Duration) {
             it.flush_out();
             let interrupted = it.was_interrupted();
             let c = cap.borrow();
-            Finished { code, interrupted, out: String::from_utf8_lossy(&c.out).into_owned(), err: String::from_utf8_lossy(&c.err).into_owned() }
+            Finished {
+                code,
+                interrupted,
+                out: String::from_utf8_lossy(&c.out).into_owned(),
+                err: String::from_utf8_lossy(&c.err).into_owned(),
+            }
         })
         .unwrap();
     let handle = rx.recv().unwrap();
@@ -93,7 +98,9 @@ fn deep_recursive_computation_stops() {
 
 #[test]
 fn huge_sorted_stops() {
-    assert_stops("l = list(range(3 * 10**7, 0, -1))\nwhile True:\n    l = sorted(l)\n    l.reverse()\n");
+    assert_stops(
+        "l = list(range(3 * 10**7, 0, -1))\nwhile True:\n    l = sorted(l)\n    l.reverse()\n",
+    );
 }
 
 #[test]
@@ -118,7 +125,9 @@ fn huge_bigint_division_stops() {
 
 #[test]
 fn huge_bigint_to_string_stops() {
-    assert_stops("import sys\nsys.set_int_max_str_digits(0)\nx = 3 ** (20 * 10 ** 6)\ns = str(x)\n");
+    assert_stops(
+        "import sys\nsys.set_int_max_str_digits(0)\nx = 3 ** (20 * 10 ** 6)\ns = str(x)\n",
+    );
 }
 
 #[test]
@@ -228,7 +237,10 @@ fn interrupt_during_a_pending_exception_still_reports_keyboard_interrupt() {
 #[test]
 fn polling_adds_no_output_or_state() {
     let mut it = Interp::new();
-    assert_eq!(it.run_source("print(sum(i * 2 for i in range(100000)))\n", "<sum>"), 0);
+    assert_eq!(
+        it.run_source("print(sum(i * 2 for i in range(100000)))\n", "<sum>"),
+        0
+    );
 }
 
 #[test]
@@ -254,7 +266,10 @@ fn caught_interrupt_at_end_of_module_still_stops() {
         std::thread::sleep(std::time::Duration::from_millis(100));
         h.interrupt();
     });
-    let code = it.run_source("try:\n    while True:\n        pass\nexcept KeyboardInterrupt:\n    pass\n", "<s>");
+    let code = it.run_source(
+        "try:\n    while True:\n        pass\nexcept KeyboardInterrupt:\n    pass\n",
+        "<s>",
+    );
     t.join().unwrap();
     assert_eq!(code, 130);
     assert!(it.was_interrupted());

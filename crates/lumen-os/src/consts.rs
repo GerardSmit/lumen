@@ -80,7 +80,12 @@ mod system {
     libc_table!(pub(super) OPEN: O_SHLOCK, O_EXLOCK, O_EVTONLY, O_SYMLINK);
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 mod system {
     pub(super) static OPEN: &[(&str, i64)] = &[];
 }

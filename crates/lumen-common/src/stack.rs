@@ -154,7 +154,10 @@ fn bounds() -> Option<(usize, usize)> {
     unsafe {
         let t = pthread_self();
         let size = pthread_get_stacksize_np(t);
-        Some(((pthread_get_stackaddr_np(t) as usize).checked_sub(size)?, size))
+        Some((
+            (pthread_get_stackaddr_np(t) as usize).checked_sub(size)?,
+            size,
+        ))
     }
 }
 

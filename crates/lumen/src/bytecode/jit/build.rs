@@ -51,22 +51,22 @@ use super::helpers::{self, FastArg, Helper, MathFn};
 
 #[path = "call.rs"]
 mod call;
-#[path = "vector.rs"]
-mod vector;
 #[path = "inline.rs"]
 mod inline;
 #[path = "inline_this.rs"]
 mod inline_this;
 #[path = "new_plan.rs"]
 pub(super) mod new_plan;
+#[path = "vector.rs"]
+mod vector;
 use super::layout;
 use super::*;
+pub(crate) use crate::bytecode::op_slots;
 use crate::bytecode::verify::successors;
 use crate::bytecode::{ArithKind, CmpKind, Op, UpdKind};
-pub(crate) use crate::bytecode::op_slots;
 use lumen_codegen::{
-    BinaryOp, Block, CheckedOp, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC, MemKind,
-    Signature, Type, UnaryOp, Value as V, Variable,
+    BinaryOp, Block, CheckedOp, ConvOp, FloatCC, FuncRef, Function, FunctionBuilder, IntCC,
+    MemKind, Signature, Type, UnaryOp, Value as V, Variable,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -153,18 +153,7 @@ pub(crate) fn build(
         }
     }
     build_region(
-        interp,
-        env,
-        chunk,
-        header,
-        backedge,
-        slots,
-        an,
-        kinds,
-        fresh,
-        false,
-        this_val,
-        widen,
+        interp, env, chunk, header, backedge, slots, an, kinds, fresh, false, this_val, widen,
     )
 }
 
@@ -197,7 +186,20 @@ pub(crate) fn build_fn(
     }
     let an = analyze(chunk, 0, n - 1, true)?;
     let (kinds, fresh) = fn_kinds(chunk, &an, slots, widen, not_num, guess);
-    build_region(interp, env, chunk, 0, n - 1, slots, an, kinds, fresh, true, this_val, widen)
+    build_region(
+        interp,
+        env,
+        chunk,
+        0,
+        n - 1,
+        slots,
+        an,
+        kinds,
+        fresh,
+        true,
+        this_val,
+        widen,
+    )
 }
 
 /// Whether the method-lookup inline cache `cache` (a `GetMethod`'s ways) resolved the name on
@@ -404,7 +406,8 @@ fn build_region(
                 _ => None,
             }
         }).unwrap_or(false);
-        if kinds[s] == Kind::Num && widen.get(s).copied().unwrap_or_default() == Widen::None
+        if kinds[s] == Kind::Num
+            && widen.get(s).copied().unwrap_or_default() == Widen::None
             && ((!fresh[s] && slots.get(s).is_some_and(|v| Kind::Int32.accepts(v))) || integer_init)
         {
             kinds[s] = Kind::Int32;
@@ -1077,19 +1080,36 @@ fn plan(
     let reach = |pc: usize| an.depth[pc - header].is_some();
     let lead = |pc: usize| an.leader[pc - header];
     let num_slot = |s: u16| kinds[s as usize].is_num();
-    let is_len = |n: u32| chunk.names.get(n as usize).is_some_and(|x| &**x == "length");
+    let is_len = |n: u32| {
+        chunk
+            .names
+            .get(n as usize)
+            .is_some_and(|x| &**x == "length")
+    };
     let mut p = Plan::default();
     if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
         for pc in header + 1..=backedge {
-            let Op::GetMethod(name, _) = ops[pc] else { continue };
-            let argc = match &*chunk.names[name as usize] {
-                "add" => 3, "compareExchange" => 4, _ => continue,
+            let Op::GetMethod(name, _) = ops[pc] else {
+                continue;
             };
-            let Op::LoadName(object, _) = ops[pc - 1] else { continue };
-            if &*chunk.names[object as usize] != "Atomics" { continue; }
-            let Some(depth) = an.depth[pc - header] else { continue };
+            let argc = match &*chunk.names[name as usize] {
+                "add" => 3,
+                "compareExchange" => 4,
+                _ => continue,
+            };
+            let Op::LoadName(object, _) = ops[pc - 1] else {
+                continue;
+            };
+            if &*chunk.names[object as usize] != "Atomics" {
+                continue;
+            }
+            let Some(depth) = an.depth[pc - header] else {
+                continue;
+            };
             for q in pc + 1..=backedge {
-                if lead(q) { break; }
+                if lead(q) {
+                    break;
+                }
                 if matches!(ops[q], Op::CallWithThis(n) | Op::TailCall(n, true) if n == argc)
                     && an.depth[q - header] == Some(depth + 1 + argc as usize)
                 {
@@ -2048,15 +2068,26 @@ impl<'a, 'f> Tr<'a, 'f> {
         let callee = self.sptr(base + 1);
         let target = self.sptr(base + 2);
         let count = self.i32c(argc as i64);
-        let tagged = self.call(Helper::AtomicPrepare, &[self.frame, callee, target, numbers[0], count])
+        let tagged = self
+            .call(
+                Helper::AtomicPrepare,
+                &[self.frame, callee, target, numbers[0], count],
+            )
             .expect("AtomicPrepare returns a pointer");
         let zero = self.ptrc(0);
         let ok = self.fb.icmp(IntCC::Ne, tagged, zero);
         self.guard_to(ok, slow);
         let mask = self.ptrc(-4);
         let pointer = self.fb.binary(BinaryOp::Band, tagged, mask);
-        let id = if argc == 3 { lumen_codegen::atomics::ADD32 } else { lumen_codegen::atomics::COMPARE_EXCHANGE32 };
-        let function = self.fb.func.import_function(lumen_codegen::atomics::signature(id).unwrap(), id);
+        let id = if argc == 3 {
+            lumen_codegen::atomics::ADD32
+        } else {
+            lumen_codegen::atomics::COMPARE_EXCHANGE32
+        };
+        let function = self
+            .fb
+            .func
+            .import_function(lumen_codegen::atomics::signature(id).unwrap(), id);
         let mut args = vec![pointer];
         args.extend(operands);
         let old = self.fb.call_fn(function, &args)[0];
@@ -2068,7 +2099,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         let kind = self.fb.binary(BinaryOp::Band, tagged, one);
         let is_unsigned = self.fb.icmp(IntCC::Ne, kind, zero);
         let result = self.fb.select(is_unsigned, unsigned, signed);
-        for at in base..self.stack.len() { self.drop_at(at); }
+        for at in base..self.stack.len() {
+            self.drop_at(at);
+        }
         self.store_entry(base, Entry::Num(result));
         self.fb.jump(done, &[]);
         self.fb.seal_block(slow);
@@ -2883,7 +2916,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.seal_block(next);
                     self.fb.switch_to_block(next);
                     i
-                } else { v };
+                } else {
+                    v
+                };
                 self.fb.def_var(var, v);
                 let one = self.i32c(1);
                 let zero = self.i32c(0);
@@ -2893,7 +2928,11 @@ impl<'a, 'f> Tr<'a, 'f> {
             }
             if self.fresh[s] {
                 // `undefined` at every entry: nothing to load or guard.
-                let z = if self.kinds[s] == Kind::Int32 { self.i32c(0) } else { self.fb.f64const(0.0) };
+                let z = if self.kinds[s] == Kind::Int32 {
+                    self.i32c(0)
+                } else {
+                    self.fb.f64const(0.0)
+                };
                 self.fb.def_var(var, z);
                 let one = self.i32c(1);
                 self.fb.def_var(self.undef[s].expect("declared"), one);
@@ -2908,7 +2947,9 @@ impl<'a, 'f> Tr<'a, 'f> {
             self.fb.seal_block(next);
             self.fb.switch_to_block(next);
             let v = match self.kinds[s] {
-                Kind::Num | Kind::Int32 => self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD),
+                Kind::Num | Kind::Int32 => {
+                    self.fb.load(MemKind::F64, self.slots, off + VALUE_PAYLOAD)
+                }
                 _ => self.fb.load(MemKind::I32U8, self.slots, off + VALUE_BOOL),
             };
             let v = if self.kinds[s] == Kind::Int32 {
@@ -2918,7 +2959,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(next);
                 self.fb.switch_to_block(next);
                 i
-            } else { v };
+            } else {
+                v
+            };
             self.fb.def_var(var, v);
         }
         if let Some((_, join)) = resume {
@@ -3189,7 +3232,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.fb.seal_block(next);
                 self.fb.switch_to_block(next);
                 i
-            } else { v };
+            } else {
+                v
+            };
             self.fb.def_var(self.vars[s].expect("declared"), v);
             if let Some(f) = self.undef[s] {
                 self.fb.def_var(f, is_undef);
@@ -3261,7 +3306,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 "abstract depth at {pc}"
             );
             self.hs_cur.clone_from(&an.hs[i]);
-            if self.stack.is_empty() { self.vector_prefix(pc); }
+            if self.stack.is_empty() {
+                self.vector_prefix(pc);
+            }
             self.op(pc)?;
         }
         Ok(())
@@ -3991,7 +4038,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 self.box_from(base);
                 let atomic_done = if self.plan.atomic_calls.contains(&pc) {
                     Some(self.atomic_call_begin(base, argc as usize))
-                } else { None };
+                } else {
+                    None
+                };
                 let (bv, av, wv) = (
                     self.i32c(base as i64),
                     self.i32c(argc as i64),
@@ -4858,7 +4907,9 @@ impl<'a, 'f> Tr<'a, 'f> {
         if self.kinds[s].is_num() {
             let v = if self.kinds[s] == Kind::Int32 {
                 self.fb.convert(ConvOp::FromSint, Type::F64, v)
-            } else { v };
+            } else {
+                v
+            };
             Entry::Num(v)
         } else {
             Entry::Bool(v)
@@ -6797,7 +6848,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 } else {
                     self.stack_bool(d - 1)
                 };
-                let x = if self.kinds[s] == Kind::Int32 { self.int32_or_exit(x, pc) } else { x };
+                let x = if self.kinds[s] == Kind::Int32 {
+                    self.int32_or_exit(x, pc)
+                } else {
+                    x
+                };
                 self.fb.def_var(self.vars[s].expect("SSA slot"), x);
             }
             (Kind::Num | Kind::Int32 | Kind::Bool, _) => {
@@ -6837,7 +6892,11 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let var = self.vars[s].expect("SSA slot");
                 let old = self.fb.use_var(var);
                 let one = self.i32c(1);
-                let op = if inc { CheckedOp::IaddOv } else { CheckedOp::IsubOv };
+                let op = if inc {
+                    CheckedOp::IaddOv
+                } else {
+                    CheckedOp::IsubOv
+                };
                 let (new, bad) = self.fb.checked_binary(op, old, one);
                 let snap = self.stack.clone();
                 self.exit_if(bad, pc, EXIT_RESUME, &snap, snap.len());
@@ -6913,7 +6972,9 @@ impl<'a, 'f> Tr<'a, 'f> {
     fn opnd_static_i32(&self, o: Opnd) -> bool {
         match o {
             Opnd::Slot(s) => self.kinds[s as usize] == Kind::Int32,
-            Opnd::Const(k) => matches!(self.chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some()),
+            Opnd::Const(k) => {
+                matches!(self.chunk.consts[k as usize], Value::Num(n) if Kind::int32(n).is_some())
+            }
         }
     }
 
@@ -7011,7 +7072,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                 let v = self.fb.use_var(var);
                 Some(if self.kinds[s as usize] == Kind::Int32 {
                     self.fb.convert(ConvOp::FromSint, Type::F64, v)
-                } else { v })
+                } else {
+                    v
+                })
             }
             Opnd::Const(k) => match self.chunk.consts[k as usize] {
                 Value::Num(n) => Some(self.fb.f64const(n)),
@@ -7254,7 +7317,9 @@ impl<'a, 'f> Tr<'a, 'f> {
                     self.fb.seal_block(cont);
                     self.fb.switch_to_block(cont);
                     i
-                } else { x };
+                } else {
+                    x
+                };
                 self.fb.def_var(self.vars[dst].expect("SSA slot"), x);
                 self.clear_tdz(dst);
             }

@@ -42,7 +42,10 @@ pub mod gc {
 
     impl Default for GcState {
         fn default() -> GcState {
-            GcState { debug: 0, threshold: (700, 10, 10) }
+            GcState {
+                debug: 0,
+                threshold: (700, 10, 10),
+            }
         }
     }
 
@@ -72,7 +75,12 @@ pub mod gc {
     ///
     /// The number of unreachable objects is returned.
     #[op]
-    fn collect(it: &mut Interp, #[kw] #[default(2)] generation: i64) -> R<i64> {
+    fn collect(
+        it: &mut Interp,
+        #[kw]
+        #[default(2)]
+        generation: i64,
+    ) -> R<i64> {
         self::generation(it, generation)?;
         it.run_weak_callbacks();
         Ok(0)
@@ -114,7 +122,12 @@ pub mod gc {
     /// collection.
     ///
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
-    fn set_threshold(it: &mut Interp, threshold0: i32, threshold1: lumen_bind::Passed<i32>, threshold2: lumen_bind::Passed<i32>) {
+    fn set_threshold(
+        it: &mut Interp,
+        threshold0: i32,
+        threshold1: lumen_bind::Passed<i32>,
+        threshold2: lumen_bind::Passed<i32>,
+    ) {
         let st = it.native_state::<GcState>();
         st.threshold.0 = threshold0 as i64;
         if let Some(t) = threshold1.0 {
@@ -178,7 +191,9 @@ pub mod gc {
     #[op]
     fn get_objects(it: &mut Interp, #[kw] generation: Option<i64>) -> R<Vec<Value>> {
         match generation {
-            Some(g) if g >= 3 => Err(it.value_error("generation parameter must be less than the number of available generations (3)")),
+            Some(g) if g >= 3 => Err(it.value_error(
+                "generation parameter must be less than the number of available generations (3)",
+            )),
             Some(g) if g < 0 => Err(it.value_error("generation parameter cannot be negative")),
             _ => Ok(Vec::new()),
         }
@@ -261,11 +276,17 @@ pub mod atexit {
     ///
     ///     func is returned to facilitate usage as a decorator.
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
-    fn register(it: &mut Interp, func: &Value, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn register(
+        it: &mut Interp,
+        func: &Value,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         if !it.is_callable(func) {
             return Err(it.type_error("the first argument must be callable"));
         }
-        it.atexit.push((func.clone(), args.to_vec(), kwargs.to_vec()));
+        it.atexit
+            .push((func.clone(), args.to_vec(), kwargs.to_vec()));
         Ok(func.clone())
     }
 

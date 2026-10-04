@@ -12,8 +12,11 @@ use super::{KResult, SendError};
 const MR_ROUNDS: usize = 64;
 
 fn exponent_error() -> SendError {
-    SendError::new("Error", "error:1C80006F:Provider routines::invalid public exponent")
-        .with_code("ERR_OSSL_PUB_EXPONENT_OUT_OF_RANGE")
+    SendError::new(
+        "Error",
+        "error:1C80006F:Provider routines::invalid public exponent",
+    )
+    .with_code("ERR_OSSL_PUB_EXPONENT_OUT_OF_RANGE")
 }
 
 /// An RSA key of `bits` bits with public exponent `e`; `pss` makes it an RSASSA-PSS key (with
@@ -23,8 +26,11 @@ pub fn rsa(bits: u32, e: u32, pss: Option<Option<PssParams>>) -> KResult<AsymKey
         return Err(exponent_error());
     }
     if bits < 512 {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::key size too small")
-            .with_code("ERR_OSSL_KEY_SIZE_TOO_SMALL"));
+        return Err(SendError::new(
+            "Error",
+            "error:1C80006B:Provider routines::key size too small",
+        )
+        .with_code("ERR_OSSL_KEY_SIZE_TOO_SMALL"));
     }
     let k = rsa::RsaPrivateKey::new_with_exp(&mut OsRng, bits as usize, &BigUint::from(e))
         .map_err(|err| SendError::new("Error", format!("RSA key generation failed: {err}")))?;
@@ -47,8 +53,11 @@ fn dsa_params(l: u32, n: u32) -> KResult<(BigUint, BigUint, BigUint)> {
         return Ok((c.p().clone(), c.q().clone(), c.g().clone()));
     }
     if n < 2 || n >= l || l < 512 {
-        return Err(SendError::new("Error", "error:1C800069:Provider routines::invalid key length")
-            .with_code("ERR_OSSL_INVALID_KEY_LENGTH"));
+        return Err(SendError::new(
+            "Error",
+            "error:1C800069:Provider routines::invalid key length",
+        )
+        .with_code("ERR_OSSL_INVALID_KEY_LENGTH"));
     }
     let one = BigUint::from(1u8);
     let two = BigUint::from(2u8);
@@ -84,12 +93,23 @@ pub fn dsa(l: u32, divisor: Option<u32>) -> KResult<AsymKey> {
     let components = dsa::Components::from_components(p.clone(), q.clone(), g.clone())
         .map_err(|_| SendError::new("Error", "DSA parameter generation failed"))?;
     let sk = dsa::SigningKey::generate(&mut OsRng, components);
-    Ok(AsymKey::Dsa(DsaKey { p, q, g, y: sk.verifying_key().y().clone(), x: Some(sk.x().clone()) }))
+    Ok(AsymKey::Dsa(DsaKey {
+        p,
+        q,
+        g,
+        y: sk.verifying_key().y().clone(),
+        x: Some(sk.x().clone()),
+    }))
 }
 
 pub fn ec(curve: EcCurve, explicit: bool) -> AsymKey {
     let (d, point) = curve.generate();
-    AsymKey::Ec(EcKey { curve, point, d: Some(d), explicit })
+    AsymKey::Ec(EcKey {
+        curve,
+        point,
+        d: Some(d),
+        explicit,
+    })
 }
 
 /// An Ed25519 / Ed448 / X25519 / X448 key (`kind` as `asymmetricKeyType`).
@@ -104,14 +124,20 @@ pub fn okp(kind: &str) -> KResult<AsymKey> {
     let mut private = vec![0u8; len];
     lumen_os::proc::entropy(&mut private).map_err(|e| SendError::new("Error", e.to_string()))?;
     let public = okp_public(kind, &private)?;
-    Ok(ctor(OkpKey { public, private: Some(private) }))
+    Ok(ctor(OkpKey {
+        public,
+        private: Some(private),
+    }))
 }
 
 /// A safe prime `p = 2q + 1` of `bits` bits.
 pub fn safe_prime(bits: u32) -> KResult<BigUint> {
     if bits < 2 {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::modulus too small")
-            .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
+        return Err(SendError::new(
+            "Error",
+            "error:1C80006B:Provider routines::modulus too small",
+        )
+        .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
     }
     if bits < 3 {
         return Ok(BigUint::from(3u8));
@@ -169,7 +195,12 @@ pub fn safe_prime_congruent(bits: u32, add: u32, rem: u32) -> BigUint {
         }
         let residues: Vec<u32> = primes
             .iter()
-            .map(|&q| (&p0 % BigUint::from(q)).to_bytes_be().iter().fold(0u32, |acc, &b| (acc << 8) | b as u32))
+            .map(|&q| {
+                (&p0 % BigUint::from(q))
+                    .to_bytes_be()
+                    .iter()
+                    .fold(0u32, |acc, &b| (acc << 8) | b as u32)
+            })
             .collect();
         let steps: Vec<u32> = primes.iter().map(|&q| add % q).collect();
         let mut k: u64 = 0;
@@ -202,11 +233,20 @@ pub fn safe_prime_congruent(bits: u32, add: u32, rem: u32) -> BigUint {
 pub fn dh(p: BigUint, g: BigUint) -> KResult<AsymKey> {
     let two = BigUint::from(2u8);
     if p <= BigUint::from(3u8) {
-        return Err(SendError::new("Error", "error:1C80006B:Provider routines::modulus too small")
-            .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
+        return Err(SendError::new(
+            "Error",
+            "error:1C80006B:Provider routines::modulus too small",
+        )
+        .with_code("ERR_OSSL_MODULUS_TOO_SMALL"));
     }
     let upper = &p - &two;
     let x = OsRng.gen_biguint_range(&two, &upper);
     let y = g.modpow(&x, &p);
-    Ok(AsymKey::Dh(DhKey { p, g, q: None, y, x: Some(x) }))
+    Ok(AsymKey::Dh(DhKey {
+        p,
+        g,
+        q: None,
+        y,
+        x: Some(x),
+    }))
 }

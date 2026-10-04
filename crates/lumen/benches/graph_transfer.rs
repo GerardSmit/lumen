@@ -1,8 +1,8 @@
 //! Sender build, receiver adoption, structuredClone and real task latency.
 use lumen::{
-    Completion, Engine,
     embed::Value,
-    parallel::{Limits, Parcel, ThreadHost, install},
+    parallel::{install, Limits, Parcel, ThreadHost},
+    Completion, Engine,
 };
 use std::{
     hint::black_box,

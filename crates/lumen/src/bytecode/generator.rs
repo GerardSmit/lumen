@@ -24,9 +24,9 @@
 //! An async generator's `yield*` is an explicit loop of ordinary `Await`s and `Yield`s around
 //! a few `AsyncDelegate*` ops (see [`Compiler::async_yield_delegate`]), following the
 //! tree-walker's `Interp::yield_delegate_async` step for step.
+use super::PushValue;
 #[cfg(feature = "compiler")]
 use super::{CResult, Compiler, Op};
-use super::PushValue;
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 

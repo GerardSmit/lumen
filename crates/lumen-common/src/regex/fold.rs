@@ -62,7 +62,11 @@ pub fn canonicalize_legacy(c: char) -> char {
 /// lowers to `i` rather than its two-character full mapping.
 pub fn py_lower(u: u32) -> u32 {
     if u < 128 {
-        return if (0x41..=0x5A).contains(&u) { u + 32 } else { u };
+        return if (0x41..=0x5A).contains(&u) {
+            u + 32
+        } else {
+            u
+        };
     }
     let Some(c) = char::from_u32(u) else { return u };
     let mut lower = c.to_lowercase();
@@ -77,7 +81,11 @@ pub fn py_lower(u: u32) -> u32 {
 /// stay unchanged.
 pub fn py_upper(u: u32) -> u32 {
     if u < 128 {
-        return if (0x61..=0x7A).contains(&u) { u - 32 } else { u };
+        return if (0x61..=0x7A).contains(&u) {
+            u - 32
+        } else {
+            u
+        };
     }
     let Some(c) = char::from_u32(u) else { return u };
     let mut upper = c.to_uppercase();
@@ -165,10 +173,7 @@ pub fn py_any_variant(u: u32, mut hit: impl FnMut(u32) -> bool) -> bool {
     let extra = py_extra(lower);
     group[1..1 + extra.len()].copy_from_slice(extra);
     group[..1 + extra.len()].iter().any(|&g| {
-        hit(g)
-            || hit(py_upper(g))
-            || fold_orbit(g).any(&mut hit)
-            || (g == 0x69 && hit(0x130))
+        hit(g) || hit(py_upper(g)) || fold_orbit(g).any(&mut hit) || (g == 0x69 && hit(0x130))
     })
 }
 

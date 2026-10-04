@@ -748,20 +748,22 @@ impl Interp {
         let mut options = self.jsx_options.clone();
         if jsx_ts.is_some() {
             if let Some(loader) = self.jsx_options_loader.clone() {
-                options = loader(filename, &options).map_err(|message| self.make_error("SyntaxError", message))?;
+                options = loader(filename, &options)
+                    .map_err(|message| self.make_error("SyntaxError", message))?;
             }
         }
         options.filename = filename.to_string();
-        let f = crate::parser::parse_cjs_function_jsx(src, params, ts, jsx_ts.map(|_| &options)).map_err(|e| {
-            if ts {
-                match self.throw_ts_syntax(e, filename, src) {
-                    crate::interpreter::Abrupt::Throw(v) => v,
-                    _ => Value::Undefined,
+        let f = crate::parser::parse_cjs_function_jsx(src, params, ts, jsx_ts.map(|_| &options))
+            .map_err(|e| {
+                if ts {
+                    match self.throw_ts_syntax(e, filename, src) {
+                        crate::interpreter::Abrupt::Throw(v) => v,
+                        _ => Value::Undefined,
+                    }
+                } else {
+                    self.make_error("SyntaxError", e.message)
                 }
-            } else {
-                self.make_error("SyntaxError", e.message)
-            }
-        })?;
+            })?;
         let f = Rc::new(f);
         let env = self.global_env.clone();
         let func = self.make_function(f.clone(), env);
@@ -856,7 +858,10 @@ impl Interp {
                 let strict = match &g.borrow().call {
                     Callable::User(u) => u.func.is_strict,
                     #[cfg(feature = "aot-native")]
-                    Callable::Aot(native) => native.program.metadata.functions[native.function_index as usize].flags & 2 != 0,
+                    Callable::Aot(native) => {
+                        native.program.metadata.functions[native.function_index as usize].flags & 2
+                            != 0
+                    }
                     _ => return None,
                 };
                 crate::bytecode::jit::sync_frames(self);
