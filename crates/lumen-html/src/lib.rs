@@ -832,6 +832,15 @@ impl Document {
                     root: remap[tree.root.index()].expect("shadow root is in adoption subtree"),
                     mode: tree.mode,
                     options: tree.options,
+                    manual_assignments: tree
+                        .manual_assignments
+                        .iter()
+                        .filter_map(|(slot, nodes)| {
+                            let slot = remap[slot.index()]?;
+                            let nodes = nodes.iter().filter_map(|node| remap[node.index()]).collect();
+                            Some((slot, nodes))
+                        })
+                        .collect(),
                 });
             } else {
                 remaining_shadows.push(tree);
@@ -2295,6 +2304,7 @@ mod tests {
             clonable: true,
             serializable: true,
             declarative: true,
+            ..ShadowOptions::new(ShadowMode::Closed)
         };
         let root = source.attach_shadow_with_options(host, options).unwrap();
         let nested = source.create(element("span")).unwrap();

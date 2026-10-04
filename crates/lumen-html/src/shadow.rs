@@ -1,5 +1,5 @@
 //! Shadow trees keep ordinary DOM links intact; composition is derived on demand.
-use crate::{Dirty, Document, Error, MutationKind, Namespace, NodeId, NodeKind};
+use crate::{observe, Dirty, Document, Error, MutationKind, Namespace, NodeId, NodeKind};
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -586,6 +586,7 @@ mod tests {
                 clonable: true,
                 serializable: true,
                 declarative: true,
+                ..ShadowOptions::new(mode)
             };
             let root = document.attach_shadow_with_options(host, options).unwrap();
             let content =

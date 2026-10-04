@@ -389,7 +389,8 @@ impl CanvasRegistry {
                 }
             }
             lumen_html::observe::ObservedKind::Attribute { .. }
-            | lumen_html::observe::ObservedKind::CharacterData { .. } => {}
+            | lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::SlotAssignment => {}
         }
     }
 

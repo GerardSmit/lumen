@@ -284,7 +284,8 @@ fn mutation_contains_node(
             added.iter().chain(removed).any(|root| contains(*root))
         }
         lumen_html::observe::ObservedKind::Attribute { .. }
-        | lumen_html::observe::ObservedKind::CharacterData { .. } => false,
+        | lumen_html::observe::ObservedKind::CharacterData { .. }
+        | lumen_html::observe::ObservedKind::SlotAssignment => false,
     }
 }
 
@@ -806,7 +807,8 @@ impl DomRealm {
                 (relevant, refreeze)
             }
             lumen_html::observe::ObservedKind::Attribute { .. }
-            | lumen_html::observe::ObservedKind::CharacterData { .. } => (false, false),
+            | lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::SlotAssignment => (false, false),
         };
         if relevant {
             self.recompute_document_base_url(document, refreeze_selected_base);

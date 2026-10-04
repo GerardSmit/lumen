@@ -39,13 +39,12 @@ fn absorb_preserves_addresses_and_rehomes_free_lists() {
             kept.push(object);
         }
     }
-    assert_eq!(parcel.live.get(), 2000);
+    assert_eq!(parcel.counters.live().get(), 2000);
     let _entered = Enter::new(receiver.clone());
     let existing = Object::new(None);
-    receiver.heap.absorb(&parcel.heap, &receiver.live);
-    receiver
-        .live
-        .set(receiver.live.get() + parcel.live.replace(0));
+    receiver.heap.absorb(&parcel.heap, receiver.counters.live());
+    receiver.counters.live()
+        .set(receiver.counters.live().get() + parcel.counters.live().replace(0));
     assert_eq!(parcel.heap.chunk_count(), 0);
     assert_eq!(live_objects(), 2001);
     assert!(
@@ -130,10 +129,9 @@ fn remapped_shapes_survive_interpreter_bytecode_and_collection() {
         shared_again.borrow().props.shape
     );
     assert_ne!(shared.borrow().props.shape, owned.borrow().props.shape);
-    receiver.heap.absorb(&parcel.heap, &receiver.live);
-    receiver
-        .live
-        .set(receiver.live.get() + parcel.live.replace(0));
+    receiver.heap.absorb(&parcel.heap, receiver.counters.live());
+    receiver.counters.live()
+        .set(receiver.counters.live().get() + parcel.counters.live().replace(0));
     drop(parcel);
     let global = engine.interp.global.clone();
     set_data(&global, "parcel", Value::Obj(shared));
@@ -201,23 +199,23 @@ fn getters_run_in_sender_heap_and_partial_parcel_cleans_up() {
         let _entered = Enter::new(parcel.clone());
         Object::new(None)
     };
-    let before = sender.live.get();
+    let before = sender.counters.live().get();
     let copied = engine
         .interp
         .get_member(&graph, "value")
         .unwrap_or_else(|_| panic!("getter failed"));
     assert!(
-        sender.live.get() > before,
+        sender.counters.live().get() > before,
         "getter allocation stayed in sender"
     );
-    assert_eq!(parcel.live.get(), 1);
+    assert_eq!(parcel.counters.live().get(), 1);
     {
         let _entered = Enter::new(parcel.clone());
         set_data(&root, "value", copied);
     }
     assert!(engine.interp.get_member(&graph, "fail").is_err());
     assert_eq!(
-        parcel.live.get(),
+        parcel.counters.live().get(),
         1,
         "throwing getter did not allocate in parcel"
     );

@@ -413,7 +413,7 @@ impl ObjHeap {
     /// Both heaps must stay pinned, and no allocator or collector may run during
     /// the move. The caller transfers the live count and remaps object shapes.
     #[cfg(any(test, feature = "parallel"))]
-    pub(super) fn absorb(&self, other: &Self, live: &Cell<i64>) {
+    pub(super) fn absorb(&self, other: &Self, live: &super::LiveCount) {
         assert!(!std::ptr::eq(self, other), "cannot absorb the same heap");
         for (target, source) in self.classes.iter().zip(&other.classes) {
             let mut head = source.free.replace(std::ptr::null_mut());

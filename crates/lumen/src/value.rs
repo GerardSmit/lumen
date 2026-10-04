@@ -1778,8 +1778,11 @@ impl GcState {
         other.heap.for_each_live(|pointer| unsafe {
             (*(*pointer).value.get()).props.remap_shape(&mut shapes);
         });
-        self.heap.absorb(&other.heap, &self.live);
-        self.live.set(self.live.get() + other.live.replace(0));
+        let live = self.counters.live();
+        self.heap.absorb(&other.heap, live);
+        live.set(live.get() + other.counters.live().replace(0));
+        self.counters.note_chunks(self.heap.chunk_count());
+        other.counters.note_chunks(0);
         self.scopes
             .borrow_mut()
             .append(&mut other.scopes.borrow_mut());
@@ -1869,6 +1872,10 @@ impl LiveCount {
     #[inline(always)]
     pub(crate) fn set(&self, value: i64) {
         self.0.store(value, Relaxed)
+    }
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) fn replace(&self, value: i64) -> i64 {
+        self.0.swap(value, Relaxed)
     }
 }
 
