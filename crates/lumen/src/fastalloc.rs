@@ -185,6 +185,10 @@ struct Cache {
     guard: Cell<u8>,
     /// Bytes allocated (+) or freed (-) on this thread not yet folded into [`HEAP_BYTES`].
     pending: Cell<isize>,
+    /// Net bytes this thread allocated minus freed (a block freed on another thread counts
+    /// there), read by [`heap_bytes`] once the thread is [`scope_heap_to_thread`]-scoped.
+    net: Cell<isize>,
+    scoped: Cell<bool>,
 }
 
 const GUARD_NONE: u8 = 0;
@@ -214,6 +218,8 @@ thread_local! {
             bytes: Cell::new(0),
             guard: Cell::new(GUARD_NONE),
             pending: Cell::new(0),
+            net: Cell::new(0),
+            scoped: Cell::new(false),
         }
     };
     static GUARD: Guard = const { Guard };
@@ -231,6 +237,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[inline(always)]
 fn note(c: &Cache, delta: isize) {
+    c.net.set(c.net.get() + delta);
     let p = c.pending.get() + delta;
     c.pending.set(p);
     if (p + FLUSH_BYTES) as usize > 2 * FLUSH_BYTES as usize {
@@ -269,8 +276,19 @@ pub fn heap_bytes() -> Option<usize> {
     if !ACTIVE.load(Relaxed) {
         return None;
     }
+    if let Ok(Some(own)) = CACHE.try_with(|c| c.scoped.get().then(|| c.net.get())) {
+        return Some(own.max(0) as usize);
+    }
     let local = CACHE.try_with(|c| c.pending.get()).unwrap_or(0);
     Some((HEAP_BYTES.load(Relaxed) + local).max(0) as usize)
+}
+
+/// Make [`heap_bytes`] on the calling thread report only what this thread allocated, not the
+/// whole process. A worker realm's heap ceiling is its own, however large the rest of the
+/// process grows. Blocks the thread's coroutine threads allocate are not counted, so the figure
+/// can undercount, never include another realm's memory.
+pub fn scope_heap_to_thread() {
+    let _ = CACHE.try_with(|c| c.scoped.set(true));
 }
 
 /// Memory mapped outside the allocator (the object slab's chunks on Windows) that should still

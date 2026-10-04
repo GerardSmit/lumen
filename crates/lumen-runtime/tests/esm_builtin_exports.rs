@@ -1,7 +1,8 @@
 //! `lumen-node/src/js/esm_exports.js` lists each builtin's ESM named exports so startup does not
 //! have to load every builtin to enumerate its keys. This keeps that list in sync with the
 //! modules themselves: a builtin that gains or loses an export fails here until the list is
-//! regenerated.
+//! regenerated. A listed name may also be an own non-enumerable property (a later Node API such as
+//! `fs.globSync` that keeps Node 20's enumerable keys).
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -41,7 +42,8 @@ fn esm_export_lists_match_builtin_keys() {
         if (list === undefined) { console.log("unlisted", name); continue; }
         const expected = (list ? list.split(" ") : []).filter(ident).sort();
         const missing = actual.filter((k) => !expected.includes(k));
-        const extra = expected.filter((k) => !actual.includes(k));
+        // A later-Node API kept non-enumerable (fs.globSync) is still a named ESM export.
+        const extra = expected.filter((k) => !actual.includes(k) && !Object.prototype.hasOwnProperty.call(m, k));
         if (missing.length || extra.length)
           console.log("mismatch", name, "missing:", missing.join(" "), "extra:", extra.join(" "));
         checked++;

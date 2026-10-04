@@ -276,3 +276,36 @@ fn message_port_delivers_queued_receipt_before_peer_close() {
     "#).expect("parse");
     assert_eq!(out.lines(),["message receipt","close"]);
 }
+
+#[test]
+fn worker_ipc_properties_throw_only_when_the_parent_has_an_ipc_channel() {
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(Captured::default()),
+    });
+    let source = r#"
+        const { Worker } = require("node:worker_threads");
+        const code = `
+            const { parentPort } = require("node:worker_threads");
+            const probe = name => { try { const v = process[name]; return typeof v === 'function' ? 'stub' : String(v); } catch (e) { return e.code; } };
+            parentPort.postMessage(["channel", "connected", "send", "disconnect"].map(probe).join(","));
+        `;
+        const run = (label, env) => {
+            const worker = new Worker(code, { eval: true, env });
+            worker.on("message", message => console.log(label, message));
+        };
+        run("plain", {});
+        run("ipc", { NODE_CHANNEL_FD: "3" });
+    "#;
+    match runtime.eval(source).expect("source parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    let mut lines = out.lines();
+    lines.sort();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("ipc ERR_WORKER_UNSUPPORTED_OPERATION,ERR_WORKER_UNSUPPORTED_OPERATION,stub,stub"));
+    assert_eq!(lines[1], "plain undefined,undefined,undefined,undefined");
+}

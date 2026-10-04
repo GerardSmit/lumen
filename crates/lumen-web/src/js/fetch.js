@@ -69,8 +69,9 @@ class Headers {
 const kConsumed = Symbol("bodyConsumed");
 const kBodyStream = Symbol("bodyStream");
 // A user-supplied ReadableStream body, kept un-drained until the body is actually consumed or
-// sent. Draining at construction would break feature-detection code (e.g. ky) that builds — but
-// never sends — a `new Request(url, { body: new ReadableStream() })` just to probe support.
+// sent, and then read asynchronously. Draining at construction would break feature-detection
+// code (e.g. ky) that builds — but never sends — a `new Request(url, { body: new ReadableStream() })`
+// just to probe support.
 const kSourceStream = Symbol("bodySourceStream");
 
 // Set `owner`'s body from a BodyInit, and (per spec) a default Content-Type when the body implies
@@ -136,15 +137,16 @@ function bodyMixin(proto) {
   proto._consume = async function () {
     if (this[kConsumed]) throw new TypeError("body already consumed");
     this[kConsumed] = true;
-    this._materialize();
+    await this._materialize();
     return this._bodyBytes || new Uint8Array(0);
   };
-  // Drain a deferred ReadableStream body into bytes, on first consume/send.
-  proto._materialize = function () {
-    if (this[kSourceStream] !== undefined) {
-      this._bodyBytes = drainStreamSync(this[kSourceStream]);
-      this[kSourceStream] = undefined;
-    }
+  // Drain a deferred ReadableStream body into bytes, on first consume/send. `signal` stops the
+  // read when it aborts first.
+  proto._materialize = async function (signal) {
+    const stream = this[kSourceStream];
+    if (stream === undefined) return;
+    this[kSourceStream] = undefined;
+    this._bodyBytes = await drainStream(stream, signal);
   };
   Object.defineProperty(proto, "bodyUsed", {
     get() {
@@ -171,32 +173,39 @@ function toBodyBytes(body) {
   if (body instanceof Uint8Array) return body;
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
-  if (body instanceof globalThis.ReadableStream) return drainStreamSync(body);
   if (body instanceof URLSearchParams) return new TextEncoder().encode(body.toString());
   return new TextEncoder().encode(String(body));
 }
 
-// Read a whole ReadableStream into one Uint8Array *synchronously*. Bodies are buffered, so a stream
-// used as a request/response body must produce its data without awaiting (our own body streams do;
-// so does any source whose `start`/`pull` enqueues synchronously).
-function drainStreamSync(stream) {
+// Read a whole ReadableStream into one Uint8Array. Bodies are buffered before they are sent, but
+// the stream is read as the platform reads it: chunks may arrive any time later.
+async function drainStream(stream, signal) {
   if (stream.locked) throw new TypeError("cannot construct a body from a locked ReadableStream");
   const reader = stream.getReader();
+  const abort = signal
+    ? new Promise((_, reject) => {
+        const fail = () => reject(signal.reason || new DOMException("The operation was aborted", "AbortError"));
+        if (signal.aborted) fail();
+        else signal.addEventListener("abort", fail, { once: true });
+      })
+    : undefined;
   const parts = [];
   let total = 0;
-  for (;;) {
-    const r = reader[Symbol.for("lumen.readSync")]();
-    if (r.pending) {
-      throw new TypeError("a body ReadableStream must produce its data synchronously in this runtime");
+  try {
+    for (;;) {
+      const r = await (abort ? Promise.race([reader.read(), abort]) : reader.read());
+      if (r.done) break;
+      let chunk = r.value;
+      if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
+      else if (chunk instanceof ArrayBuffer) chunk = new Uint8Array(chunk);
+      else if (ArrayBuffer.isView(chunk)) chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      else if (!(chunk instanceof Uint8Array)) throw new TypeError("ReadableStream chunk is not binary data");
+      parts.push(chunk);
+      total += chunk.length;
     }
-    if (r.done) break;
-    let chunk = r.value;
-    if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-    else if (chunk instanceof ArrayBuffer) chunk = new Uint8Array(chunk);
-    else if (ArrayBuffer.isView(chunk)) chunk = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-    else if (!(chunk instanceof Uint8Array)) throw new TypeError("ReadableStream chunk is not binary data");
-    parts.push(chunk);
-    total += chunk.length;
+  } catch (e) {
+    reader.cancel(e).catch(() => {});
+    throw e;
   }
   reader.releaseLock();
   if (parts.length === 1) return parts[0];
@@ -227,6 +236,16 @@ function makeBodyStream(owner) {
   });
 }
 
+// A streaming request body needs `duplex: "half"` (the only value the Fetch standard defines).
+function requireDuplex(init) {
+  if (init.duplex !== undefined && init.duplex !== "half") {
+    throw new TypeError(`RequestInit: duplex option must be 'half', got '${init.duplex}'`);
+  }
+  if (init.body instanceof globalThis.ReadableStream && init.duplex !== "half") {
+    throw new TypeError("RequestInit: duplex option is required when sending a body.");
+  }
+}
+
 class Request {
   constructor(input, init = {}) {
     init = init && typeof init === "object" ? init : {};
@@ -235,6 +254,7 @@ class Request {
       this.method = init.method ? String(init.method).toUpperCase() : input.method;
       this.headers = new Headers(init.headers || input.headers);
       if ("body" in init) {
+        requireDuplex(init);
         initBody(this, init.body);
       } else {
         // Inherit the source request's body (its deferred stream, if any).
@@ -246,6 +266,7 @@ class Request {
       this.url = new URL(String(input)).href;
       this.method = init.method ? String(init.method).toUpperCase() : "GET";
       this.headers = new Headers(init.headers);
+      requireDuplex(init);
       initBody(this, init.body);
       this.signal = init.signal || null;
     }
@@ -257,14 +278,21 @@ class Request {
     }
     this[kConsumed] = false;
   }
+  get duplex() {
+    return "half";
+  }
   clone() {
-    this._materialize(); // can't tee a deferred stream; buffer it, then both share the bytes
-    return new Request(this.url, {
-      method: this.method,
-      headers: this.headers,
-      body: this._bodyBytes,
-      signal: this.signal,
-    });
+    if (this[kConsumed]) throw new TypeError("cannot clone a used Request");
+    const init = { method: this.method, headers: this.headers, signal: this.signal };
+    if (this[kSourceStream] !== undefined) {
+      const [mine, theirs] = this[kSourceStream].tee();
+      this[kSourceStream] = mine;
+      init.body = theirs;
+      init.duplex = "half";
+    } else {
+      init.body = this._bodyBytes;
+    }
+    return new Request(this.url, init);
   }
 }
 bodyMixin(Request.prototype);
@@ -290,8 +318,13 @@ class Response {
   }
   clone() {
     if (this[kConsumed]) throw new TypeError("cannot clone a used Response");
-    this._materialize();
-    const r = new Response(this._bodyBytes, {
+    let body = this._bodyBytes;
+    if (this[kSourceStream] !== undefined) {
+      const [mine, theirs] = this[kSourceStream].tee();
+      this[kSourceStream] = mine;
+      body = theirs;
+    }
+    const r = new Response(body, {
       status: this.status,
       statusText: this.statusText,
       headers: this.headers,
@@ -329,14 +362,6 @@ function fetch(input, init = {}) {
       return;
     }
     const headerPairs = request.headers._pairs();
-    let bodyBytes;
-    try {
-      request._materialize(); // drain a deferred stream body now that we're actually sending
-      bodyBytes = request._bodyBytes;
-    } catch (e) {
-      reject(e);
-      return;
-    }
     let settled = false;
     const onAbort = () => {
       if (settled) return;
@@ -344,32 +369,48 @@ function fetch(input, init = {}) {
       reject(signal.reason || new DOMException("The operation was aborted", "AbortError"));
     };
     if (signal) signal.addEventListener("abort", onAbort);
+    const fail = (e) => {
+      if (settled) return;
+      settled = true;
+      if (signal) signal.removeEventListener("abort", onAbort);
+      reject(e);
+    };
+    // A deferred stream body is read now that we are actually sending.
+    if (request[kSourceStream] !== undefined) {
+      request[kConsumed] = true;
+      request._materialize(signal).then(() => send(request._bodyBytes), fail);
+    } else {
+      send(request._bodyBytes);
+    }
 
-    __http.request(
-      request.method,
-      request.url,
-      headerPairs,
-      bodyBytes,
-      (raw) => {
-        if (settled) return; // aborted first
-        settled = true;
-        if (signal) signal.removeEventListener("abort", onAbort);
-        const response = new Response(raw.body, {
-          status: raw.status,
-          statusText: raw.statusText,
-          headers: raw.headers,
-        });
-        response.url = raw.url;
-        response.redirected = raw.url !== request.url;
-        resolve(response);
-      },
-      (err) => {
-        if (settled) return;
-        settled = true;
-        if (signal) signal.removeEventListener("abort", onAbort);
-        reject(err instanceof Error ? err : new TypeError(String(err)));
-      }
-    );
+    function send(bodyBytes) {
+      if (settled) return;
+      __http.request(
+        request.method,
+        request.url,
+        headerPairs,
+        bodyBytes,
+        (raw) => {
+          if (settled) return; // aborted first
+          settled = true;
+          if (signal) signal.removeEventListener("abort", onAbort);
+          const response = new Response(raw.body, {
+            status: raw.status,
+            statusText: raw.statusText,
+            headers: raw.headers,
+          });
+          response.url = raw.url;
+          response.redirected = raw.url !== request.url;
+          resolve(response);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          if (signal) signal.removeEventListener("abort", onAbort);
+          reject(err instanceof Error ? err : new TypeError(String(err)));
+        }
+      );
+    }
   });
 }
 

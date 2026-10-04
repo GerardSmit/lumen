@@ -6,6 +6,8 @@ use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 /// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
@@ -213,7 +215,7 @@ impl Gc {
     /// slots, which the object's map adopts as its entry storage when its entries fit.
     #[inline(always)]
     fn alloc(state: &GcState, obj: Object, class: heap::SlotClass) -> Gc {
-        let p = state.heap.alloc(&state.live, class);
+        let p = state.heap.alloc(&state.counters, class);
         unsafe {
             p.write(ObjCell::new(obj));
             if class != heap::SlotClass::Plain {
@@ -1419,7 +1421,7 @@ impl Object {
         assert!(template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == n);
         let class = heap::SlotClass::inline_for(n);
         with_gc_state(|state| unsafe {
-            let p = state.heap.alloc(&state.live, class);
+            let p = state.heap.alloc(&state.counters, class);
             let slots = heap::inline_props(p);
             // Values first (moved in, no refcount traffic), then the header over them. A
             // panicking iterator could only leak the slot, never expose a half-built box: the
@@ -1471,7 +1473,7 @@ impl Object {
         let shape = props::array_length_shape();
         with_gc_state(|state| unsafe {
             let class = heap::SlotClass::array_for(len);
-            let p = state.heap.alloc(&state.live, class);
+            let p = state.heap.alloc(&state.counters, class);
             let named = heap::inline_props(p);
             named.write(array_length(len));
             let elems =
@@ -1657,7 +1659,8 @@ impl Object {
 /// instant exactly one of the threads that can reach this state is running.
 pub(crate) struct GcState {
     heap: heap::ObjHeap,
-    live: Cell<i64>,
+    /// The live count, slab size and coroutine time, shared with [`HeapStats`] handles.
+    counters: Arc<RealmCounters>,
     scopes: RefCell<Vec<std::rc::Weak<RefCell<crate::interpreter::Scope>>>>,
     /// Every function the parser gave a lazy body, weakly: the collector's flush pass releases
     /// the bodies that went cold (see `Function::release_cold_body`). Dead entries are pruned by
@@ -1683,7 +1686,7 @@ impl GcState {
     fn new() -> Arc<GcState> {
         Arc::new(GcState {
             heap: heap::ObjHeap::new(),
-            live: Cell::new(0),
+            counters: Arc::new(RealmCounters::default()),
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
             lazy_fns_next: Cell::new(LAZY_FNS_PRUNE_MIN),
@@ -1758,9 +1761,96 @@ pub(crate) fn enter_gc_state(state: Arc<GcState>) -> Arc<GcState> {
     })
 }
 
+/// The live-object count of one heap. Only the thread currently running on the heap (see
+/// [`GcState`]) writes it, so a relaxed load and store (no read-modify-write) keep the
+/// allocation path as cheap as a plain cell while another thread may read it.
+pub(crate) struct LiveCount(AtomicI64);
+
+impl LiveCount {
+    pub(crate) const fn new(value: i64) -> Self {
+        Self(AtomicI64::new(value))
+    }
+    #[inline(always)]
+    pub(crate) fn get(&self) -> i64 {
+        self.0.load(Relaxed)
+    }
+    #[inline(always)]
+    pub(crate) fn set(&self, value: i64) {
+        self.0.store(value, Relaxed)
+    }
+}
+
+/// O(1) counters of one heap state, written by the thread running on it and readable from any
+/// thread through [`HeapStats`]. Kept apart from [`GcState`] so a handle outliving the realm
+/// pins these few words, not the heap.
+#[derive(Default)]
+pub(crate) struct RealmCounters {
+    live: LiveCount,
+    /// Slab chunks mapped for this heap (each [`heap::CHUNK_BYTES`] of address space).
+    chunks: AtomicUsize,
+    /// Wall time coroutine bodies ran on pooled workers while the heap's own thread waited for
+    /// them (see `coroutine::ThreadCoro::resume`).
+    coroutine_nanos: AtomicU64,
+}
+
+impl Default for LiveCount {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl RealmCounters {
+    pub(crate) fn live(&self) -> &LiveCount {
+        &self.live
+    }
+    #[inline]
+    pub(crate) fn chunk_added(&self) {
+        self.chunks.fetch_add(1, Relaxed);
+    }
+    fn note_chunks(&self, chunks: usize) {
+        self.chunks.store(chunks, Relaxed);
+    }
+}
+
+/// Counts `elapsed` as coroutine time of the heap the calling thread runs on.
+pub(crate) fn note_coroutine_time(elapsed: std::time::Duration) {
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    with_gc_state(|state| state.counters.coroutine_nanos.fetch_add(nanos, Relaxed));
+}
+
+/// A cheap, thread-safe view of one realm's heap: take it on the realm's own thread with
+/// [`HeapStats::current`], then read it from anywhere. Every read is a few relaxed atomic loads.
+///
+/// What it counts: objects in the realm's slab (including those allocated by its coroutine
+/// bodies, which run on the realm's heap) and the slab chunks holding them. Not counted: strings,
+/// element and property buffers past a box's inline slots, bytecode and native buffers, which
+/// come from the process allocator, and the heaps of worker threads and child realms.
+#[derive(Clone)]
+pub struct HeapStats(Arc<RealmCounters>);
+
+impl HeapStats {
+    /// The heap the calling thread allocates into.
+    pub fn current() -> HeapStats {
+        HeapStats(with_gc_state(|state| state.counters.clone()))
+    }
+    /// Live objects right now (may lag one allocation behind on another thread).
+    pub fn live_objects(&self) -> i64 {
+        self.0.live.get()
+    }
+    /// Bytes of address space the object slab holds (whole chunks, used or spare).
+    pub fn slab_bytes(&self) -> u64 {
+        (self.0.chunks.load(Relaxed) as u64).saturating_mul(heap::CHUNK_BYTES as u64)
+    }
+    /// Total time coroutine bodies (generators, async functions) ran on pooled worker threads
+    /// for this heap, measured as wall time between handoffs: CPU time unless a body blocked.
+    pub fn coroutine_time(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.0.coroutine_nanos.load(Relaxed))
+    }
+}
+
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
-    with_gc_state(|state| state.live.get())
+    with_gc_state(|state| state.counters.live.get())
 }
 
 /// Visit every currently-live heap object in place. `f` must not allocate, free or drop a
@@ -1781,7 +1871,7 @@ pub(crate) fn gc_for_each_live(mut f: impl FnMut(&Gc)) {
 /// and taking a handle only increments counts, so no object can disappear mid-walk.
 pub fn gc_snapshot() -> Vec<Gc> {
     with_gc_state(|state| {
-        let mut live = Vec::with_capacity(state.live.get().max(0) as usize);
+        let mut live = Vec::with_capacity(state.counters.live.get().max(0) as usize);
         state.heap.for_each_live(|b| unsafe {
             strong_bump(&*b);
             live.push(Gc(std::ptr::NonNull::new_unchecked(b)));
@@ -1821,7 +1911,10 @@ pub(crate) fn gc_trim_heap() {
         static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     }
     let keep = if once_a_second(&LAST) { 1 } else { SPARE_CHUNKS };
-    with_gc_state(|state| state.heap.trim(keep));
+    with_gc_state(|state| {
+        state.heap.trim(keep);
+        state.counters.note_chunks(state.heap.chunk_count());
+    });
 }
 
 /// Return empty slab chunks to the system once objects dying by reference count (no sweep,
@@ -1829,7 +1922,13 @@ pub(crate) fn gc_trim_heap() {
 /// (see `ObjHeap::trim_if_emptied`). Polled from the interpreter's safe points.
 #[inline]
 pub(crate) fn gc_trim_emptied() {
-    if with_gc_state(|state| state.heap.trim_if_emptied(SPARE_CHUNKS)) {
+    if with_gc_state(|state| {
+        let trimmed = state.heap.trim_if_emptied(SPARE_CHUNKS);
+        if trimmed {
+            state.counters.note_chunks(state.heap.chunk_count());
+        }
+        trimmed
+    }) {
         #[cfg(not(target_arch = "wasm32"))]
         crate::fastalloc::release_free_pages();
     }

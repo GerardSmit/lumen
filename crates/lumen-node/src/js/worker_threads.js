@@ -1326,12 +1326,15 @@
       fn.disabled = true;
       return fn;
     };
-    const stubs = ["abort", "chdir", "send", "disconnect"];
+    const hasIpc = Boolean(process.env.NODE_CHANNEL_FD);
+    const stubs = ["abort", "chdir"];
+    if (hasIpc) stubs.push("send", "disconnect");
+    else for (const name of ["send", "disconnect", "channel", "connected"]) delete process[name];
     if (process.platform !== "win32") stubs.push("setuid", "seteuid", "setgid", "setegid", "setgroups", "initgroups");
     for (const name of stubs) {
       Object.defineProperty(process, name, { value: unsupported(name), writable: true, configurable: true, enumerable: true });
     }
-    for (const name of ["channel", "connected"]) {
+    for (const name of hasIpc ? ["channel", "connected"] : []) {
       Object.defineProperty(process, name, {
         configurable: true,
         enumerable: true,

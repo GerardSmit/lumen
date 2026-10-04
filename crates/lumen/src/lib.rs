@@ -181,6 +181,7 @@ pub fn compile_snapshot(src: &str) -> Result<Vec<u8>, String> {
 
 pub use parser::with_eager_bodies;
 pub use stack::{set_thread_stack_size, THREAD_STACK_SIZE};
+pub use value::HeapStats;
 
 /// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
 /// module body (where a top-level `return` is legal). Node's `--check`.
@@ -560,6 +561,13 @@ impl Engine {
     /// instead of throwing a catchable error first. Needs an interrupt flag on the realm.
     pub fn set_heap_limit_fatal(&mut self, fatal: bool) {
         self.interp.heap_fatal = fatal;
+    }
+
+    /// Count only the calling thread's own allocations in [`Engine::heap_bytes`] (and so in this
+    /// thread's heap limit) from now on; see [`fastalloc::scope_heap_to_thread`].
+    pub fn scope_heap_bytes_to_thread() {
+        #[cfg(not(target_arch = "wasm32"))]
+        fastalloc::scope_heap_to_thread();
     }
 
     /// Bytes currently allocated through [`fastalloc::ClassAlloc`] by the whole process, or
