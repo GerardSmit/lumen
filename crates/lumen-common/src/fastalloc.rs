@@ -379,6 +379,9 @@ struct Cache {
     pending: Cell<isize>,
     /// Requested bytes this thread allocated minus the ones it freed (see [`thread_live_bytes`]).
     live: Cell<isize>,
+    /// Whether [`heap_bytes`] reports only this thread's [`thread_live_bytes`] (see
+    /// [`scope_heap_to_thread`]).
+    scoped: Cell<bool>,
 }
 
 const GUARD_NONE: u8 = 0;
@@ -409,6 +412,7 @@ thread_local! {
             guard: Cell::new(GUARD_NONE),
             pending: Cell::new(0),
             live: Cell::new(0),
+            scoped: Cell::new(false),
         }
     };
     static GUARD: Guard = const { Guard };
@@ -464,8 +468,19 @@ pub fn heap_bytes() -> Option<usize> {
     if !ACTIVE.load(Relaxed) {
         return None;
     }
+    if let Ok(Some(own)) = CACHE.try_with(|c| c.scoped.get().then(|| c.live.get())) {
+        return Some(own.max(0) as usize);
+    }
     let local = CACHE.try_with(|c| c.pending.get()).unwrap_or(0);
     Some((HEAP_BYTES.load(Relaxed) + local).max(0) as usize)
+}
+
+/// Make [`heap_bytes`] on the calling thread report only what this thread allocated, not the
+/// whole process. A worker realm's heap ceiling is its own, however large the rest of the
+/// process grows. Blocks the thread's coroutine threads allocate are not counted, so the figure
+/// can undercount, never include another realm's memory.
+pub fn scope_heap_to_thread() {
+    let _ = CACHE.try_with(|c| c.scoped.set(true));
 }
 
 /// Bytes the calling thread has allocated through [`ClassAlloc`] and not freed, counted at the

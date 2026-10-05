@@ -32,7 +32,7 @@ use std::cell::{Cell, UnsafeCell};
 use std::ptr::NonNull;
 
 /// Chunk size and alignment: a box's chunk header is at `ptr & !(CHUNK_BYTES - 1)`.
-const CHUNK_BYTES: usize = 256 << 10;
+pub(crate) const CHUNK_BYTES: usize = 256 << 10;
 /// Slots start at a cache-line boundary after the header.
 const SLOTS_OFF: usize = 64;
 /// Property slots trailing a [`SlotClass::Inline2`] box.
@@ -198,9 +198,9 @@ struct ChunkHdr {
     /// owning heap (which lives, pinned, inside its `Arc`ed `GcState`). Repointed at a leaked
     /// sink when the heap is dropped with this chunk still in use.
     free_head: *const Cell<*mut GcBox>,
-    /// The owning state's live-object count (`GcState::live`): a dying object decrements it
+    /// The owning state's live-object count (`RealmCounters::live`): a dying object decrements it
     /// through its chunk, with no thread-local lookup. Repointed like `free_head`.
-    live: *const Cell<i64>,
+    live: *const super::LiveCount,
     /// The owning heap's [`ObjHeap::emptied`] counter. Repointed like `free_head`.
     emptied: *const Cell<u32>,
     /// Slots `[0, bump)` have been handed out at least once (the rest were never touched).
@@ -413,7 +413,7 @@ impl ObjHeap {
     /// Both heaps must stay pinned, and no allocator or collector may run during
     /// the move. The caller transfers the live count and remaps object shapes.
     #[cfg(any(test, feature = "parallel"))]
-    pub(super) fn absorb(&self, other: &Self, live: &Cell<i64>) {
+    pub(super) fn absorb(&self, other: &Self, live: &super::LiveCount) {
         assert!(!std::ptr::eq(self, other), "cannot absorb the same heap");
         for (target, source) in self.classes.iter().zip(&other.classes) {
             let mut head = source.free.replace(std::ptr::null_mut());
@@ -458,7 +458,8 @@ impl ObjHeap {
     /// `live` is the owning state's live count; it is bumped here (and decremented through the
     /// chunk by [`note_dead`]).
     #[inline(always)]
-    pub(super) fn alloc(&self, live: &Cell<i64>, class: SlotClass) -> *mut GcBox {
+    pub(super) fn alloc(&self, counters: &super::RealmCounters, class: SlotClass) -> *mut GcBox {
+        let live = counters.live();
         live.set(live.get() + 1);
         let h = &self.classes[class as usize];
         let p = h.free.get();
@@ -469,14 +470,15 @@ impl ObjHeap {
             }
             return p;
         }
-        self.alloc_slow(live, class)
+        self.alloc_slow(counters, class)
     }
 
     /// The free list is empty: bump-allocate from the current chunk, switching to another
     /// chunk with untouched slots (or a new one) when it is full.
     #[cold]
     #[inline(never)]
-    fn alloc_slow(&self, live: &Cell<i64>, class: SlotClass) -> *mut GcBox {
+    fn alloc_slow(&self, counters: &super::RealmCounters, class: SlotClass) -> *mut GcBox {
+        let live = counters.live();
         let emptied = &self.emptied;
         let h = &self.classes[class as usize];
         let mut c = h.cur.get();
@@ -505,6 +507,7 @@ impl ObjHeap {
                         })
                     };
                     chunks.push(c);
+                    counters.chunk_added();
                     c.as_ptr()
                 }
             };
@@ -671,7 +674,6 @@ impl ObjHeap {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn chunk_count(&self) -> usize {
         self.classes.iter().map(|h| h.chunks().len()).sum()
     }
@@ -684,7 +686,7 @@ impl Drop for ObjHeap {
         // them. Empty chunks go back to the system. A leaked chunk's live-count and free-list
         // pointers would dangle once the owning state is gone, so they are repointed at
         // leaked sinks (slots freed into the sink list are simply never reused).
-        let mut sink: Option<&'static Cell<i64>> = None;
+        let mut sink: Option<&'static super::LiveCount> = None;
         let mut free_sink: Option<&'static Cell<*mut GcBox>> = None;
         let mut emptied_sink: Option<&'static Cell<u32>> = None;
         for h in &self.classes {
@@ -693,7 +695,7 @@ impl Drop for ObjHeap {
                 if hdr.used == 0 {
                     unsafe { chunk_free(c.as_ptr()) };
                 } else {
-                    hdr.live = *sink.get_or_insert_with(|| Box::leak(Box::new(Cell::new(0))));
+                    hdr.live = *sink.get_or_insert_with(|| Box::leak(Box::new(super::LiveCount::new(0))));
                     hdr.free_head = *free_sink.get_or_insert_with(|| {
                         Box::leak(Box::new(Cell::new(std::ptr::null_mut())))
                     });

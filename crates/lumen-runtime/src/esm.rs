@@ -1118,17 +1118,21 @@ fn resolve_relative_cjs(base: &Path) -> Option<PathBuf> {
     index.fs_is_file().then_some(index)
 }
 
-/// The relative specifiers a module re-exports wholesale: `module.exports = require('X')` and
-/// `Object.assign(module.exports, require('X'))`.
+/// The relative specifiers a module re-exports wholesale: `module.exports = require('X')`,
+/// `Object.assign(module.exports, require('X'))` and TypeScript's `__exportStar(require('X'),
+/// exports)` / `__export(require('X'))` (also through `tslib`), as cjs-module-lexer detects them.
 fn reexport_requires(src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (i, _) in src.match_indices("require(") {
-        // Look back for a `module.exports =` or `Object.assign(module.exports,` just before.
+        // Look back for a `module.exports =`, `Object.assign(module.exports,` or a TypeScript
+        // star-export helper call just before.
         let before = src[..i].trim_end();
         let is_reexport = before.ends_with("module.exports =")
             || before.ends_with("module.exports=")
             || before.ends_with("Object.assign(module.exports,")
-            || before.ends_with("Object.assign(exports,");
+            || before.ends_with("Object.assign(exports,")
+            || before.ends_with("__exportStar(")
+            || before.ends_with("__export(");
         if !is_reexport {
             continue;
         }
@@ -1534,6 +1538,19 @@ fn normalize(p: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typescript_star_exports_are_followed_as_reexports() {
+        use super::*;
+        let src = r#"__exportStar(require("./convenience/constants.js"), exports);
+tslib_1.__exportStar(require('./b'), exports);
+__export(require("./c"));
+const x = require("./not-a-reexport");"#;
+        assert_eq!(
+            reexport_requires(src),
+            ["./convenience/constants.js", "./b", "./c"]
+        );
+    }
+
     #[test]
     fn network_request_resolution_preserves_query_and_drops_fragment() {
         assert_eq!(

@@ -1172,6 +1172,9 @@ fn run_worker(
         if let Some(limit) = spec.limits.live_object_limit() {
             rt.engine().set_live_object_limit(limit);
         }
+        if spec.limits.max_old_mb.is_some() {
+            lumen::Engine::scope_heap_bytes_to_thread();
+        }
         if let (Some(mb), Some(used)) = (spec.limits.max_old_mb, lumen::Engine::heap_bytes()) {
             rt.engine().set_heap_limit_fatal(true);
             rt.engine()

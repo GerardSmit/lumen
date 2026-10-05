@@ -328,9 +328,8 @@ fn records(ctx: &mut Ctx, observer: &ObserverData) -> OpResult<Vec<Value>> {
                 ObservedKind::ChildListMany { added, removed } => {
                     ("childList", None, None, None, added, removed, None, None)
                 }
-                ObservedKind::SlotAssignment => {
-                    ("childList", None, None, None, Vec::new(), Vec::new(), None, None)
-                }
+                // Never selected for an observer above.
+                ObservedKind::SlotAssignment => continue,
             };
         property(ctx, &object, "type", Value::str(kind))?;
         property(

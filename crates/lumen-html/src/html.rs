@@ -5315,6 +5315,7 @@ impl<'a> Parser<'a, '_> {
                         clonable: has("shadowrootclonable"),
                         serializable: has("shadowrootserializable"),
                         declarative: true,
+                        ..crate::shadow::ShadowOptions::new(mode)
                     })
                 })
         } else {

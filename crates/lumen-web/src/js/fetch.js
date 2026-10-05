@@ -334,6 +334,16 @@ function cloneBody(owner) {
   return branches[1];
 }
 
+// A streaming request body needs `duplex: "half"` (the only value the Fetch standard defines).
+function requireDuplex(init) {
+  if (init.duplex !== undefined && init.duplex !== "half") {
+    throw new TypeError(`RequestInit: duplex option must be 'half', got '${init.duplex}'`);
+  }
+  if (init.body instanceof globalThis.ReadableStream && init.duplex !== "half") {
+    throw new TypeError("RequestInit: duplex option is required when sending a body.");
+  }
+}
+
 class Request {
   constructor(input, init = {}) {
     init = init && typeof init === "object" ? init : {};
@@ -345,6 +355,7 @@ class Request {
       this.credentials = init.credentials === undefined ? input.credentials : String(init.credentials);
       this.redirect = init.redirect === undefined ? input.redirect : String(init.redirect);
       if ("body" in init) {
+        requireDuplex(init);
         initBody(this, init.body);
       } else {
         const source = input.body;
@@ -361,6 +372,7 @@ class Request {
       this.mode = init.mode === undefined ? (browserPolicyAvailable() ? "cors" : "cors") : String(init.mode);
       this.credentials = init.credentials === undefined ? "same-origin" : String(init.credentials);
       this.redirect = init.redirect === undefined ? "follow" : String(init.redirect);
+      requireDuplex(init);
       initBody(this, init.body);
       this.signal = init.signal || null;
     }
@@ -377,6 +389,9 @@ class Request {
     }
     this[kConsumed] = false;
   }
+  get duplex() {
+    return "half";
+  }
   clone() {
     return new Request(this.url, {
       method: this.method,
@@ -386,6 +401,7 @@ class Request {
       mode: this.mode,
       credentials: this.credentials,
       redirect: this.redirect,
+      duplex: "half",
     });
   }
 }

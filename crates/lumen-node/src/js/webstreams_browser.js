@@ -332,7 +332,10 @@ function builtinModule(id) {
 
 function internalBinding(name) {
   switch (name) {
-    case 'messaging': return { DOMException: globalThis.DOMException ?? Error };
+    case 'messaging': return {
+      DOMException: globalThis.DOMException ?? Error,
+      structuredClone: (value, options) => globalThis.structuredClone(value, options),
+    };
     case 'buffer':
       return {
         copyArrayBuffer(destination, destinationOffset, source, sourceOffset, bytesToCopy) {

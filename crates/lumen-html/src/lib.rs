@@ -4414,6 +4414,7 @@ mod tests {
             clonable: true,
             serializable: true,
             declarative: true,
+            ..ShadowOptions::new(ShadowMode::Closed)
         };
         let root = source.attach_shadow_with_options(host, options).unwrap();
         let nested = source.create(element("span")).unwrap();

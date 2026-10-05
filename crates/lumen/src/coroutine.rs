@@ -226,17 +226,26 @@ impl ThreadCoro {
         let saved_coro = std::mem::replace(&mut i.cur_coro, self.id);
         // The body mutates `*i` from its worker thread while we block (see `park_message`).
         std::hint::black_box(&mut *i as *mut Interp);
+        // Only the realm's own thread times the body: a nested driver runs inside an outer
+        // body's slice, which is already counted. Driver calls run on this thread, whose own
+        // clock counts them, so they are taken out.
+        let timed = (saved_coro == 0).then(std::time::Instant::now);
+        let mut on_driver = std::time::Duration::ZERO;
         let _ = self.resume_tx.send(signal);
         let s = loop {
             match self.suspend_rx.recv() {
                 Ok(WorkerMessage::DriverCall(call)) => {
                     i.depth_limit = 0;
+                    let call_started = timed.map(|_| std::time::Instant::now());
                     // A nested coroutine may have another coroutine as its driver. Forward
                     // until the realm's owning native thread executes the call.
                     let reply = match driver_call(i, call) {
                         Ok(value) => Resume::Next(value),
                         Err(error) => Resume::Throw(error),
                     };
+                    if let Some(started) = call_started {
+                        on_driver += started.elapsed();
+                    }
                     if self.resume_tx.send(reply).is_err() {
                         break Err(std::sync::mpsc::RecvError);
                     }
@@ -245,6 +254,9 @@ impl ThreadCoro {
                 Err(error) => break Err(error),
             }
         };
+        if let Some(started) = timed {
+            crate::value::note_coroutine_time(started.elapsed().saturating_sub(on_driver));
+        }
         i.cur_coro = saved_coro;
         i.strict = saved_strict;
         i.depth = saved_depth;

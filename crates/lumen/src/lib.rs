@@ -271,6 +271,7 @@ pub use parser::transpile_jsx;
 pub use parser::with_eager_bodies;
 pub use parser::{JsxOptions, JsxRuntime};
 pub use stack::{set_thread_stack_bounds, set_thread_stack_size, THREAD_STACK_SIZE};
+pub use value::HeapStats;
 
 /// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
 /// module body (where a top-level `return` is legal). Node's `--check`.
@@ -1032,11 +1033,18 @@ impl Engine {
         self.interp.heap_fatal = fatal;
     }
 
-    /// Process-wide bytes held from the system by [`fastalloc::ClassAlloc`]: rounded
-    /// live blocks plus cached free-list blocks, including this thread's pending delta.
-    /// This is neither requested payload nor an isolated engine/JS heap or RSS measurement.
-    /// Returns `None` before allocator accounting becomes active (and when it is not
-    /// the global allocator; a heap limit then has no effect).
+    /// Count only the calling thread's own allocations in [`Engine::heap_bytes`] (and so in this
+    /// thread's heap limit) from now on; see [`fastalloc::scope_heap_to_thread`].
+    pub fn scope_heap_bytes_to_thread() {
+        #[cfg(not(target_arch = "wasm32"))]
+        fastalloc::scope_heap_to_thread();
+    }
+
+    /// Bytes held from the system by [`fastalloc::ClassAlloc`]: process-wide (this thread's
+    /// pending delta included), or only this thread's own allocations after
+    /// [`Engine::scope_heap_bytes_to_thread`]. This is neither requested payload nor an RSS
+    /// measurement. Returns `None` before allocator accounting becomes active (and when it is
+    /// not the global allocator; a heap limit then has no effect).
     pub fn heap_bytes() -> Option<usize> {
         #[cfg(not(target_arch = "wasm32"))]
         return fastalloc::heap_bytes();

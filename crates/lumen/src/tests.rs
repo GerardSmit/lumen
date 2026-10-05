@@ -11932,6 +11932,36 @@ fn global_declarations_define_properties_in_hoisting_order() {
 }
 
 #[test]
+fn heap_stats_count_this_heap_from_another_thread() {
+    let stats = crate::HeapStats::current();
+    let base = stats.live_objects();
+    let mut e = Engine::new();
+    let mut eval = |src: &str| match e.eval(src, false).expect("parse") {
+        Completion::Value(v) => v,
+        Completion::Throw { name, message } => panic!("threw {name}: {message}"),
+    };
+    eval("var keep = []; for (var i = 0; i < 20000; i++) keep.push({ i }); keep.length");
+    let remote = stats.clone();
+    let (live, slab) = std::thread::spawn(move || (remote.live_objects(), remote.slab_bytes()))
+        .join()
+        .unwrap();
+    assert!(live - base >= 20_000, "live objects grew by {}", live - base);
+    assert!(slab > 0);
+    assert_eq!(crate::HeapStats::current().live_objects(), stats.live_objects());
+    // A body on a pooled worker counts toward this heap; the realm's thread is parked meanwhile.
+    let before = stats.coroutine_time();
+    let body: Box<dyn FnOnce(&mut crate::interpreter::Interp) -> crate::coroutine::Suspend> =
+        Box::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            crate::coroutine::Suspend::Done(crate::value::Value::Undefined)
+        });
+    let ptr = &mut e.interp as *mut crate::interpreter::Interp;
+    let mut coro = crate::coroutine::spawn_coroutine(ptr, crate::coroutine::SendBody(body)).unwrap();
+    coro.resume(&mut e.interp, crate::coroutine::Resume::Next(crate::value::Value::Undefined));
+    assert!(stats.coroutine_time() - before >= std::time::Duration::from_millis(20));
+}
+
+#[test]
 fn host_module_request_scan_uses_static_parser_edges_only() {
     let requests = crate::module_requests(
         r#"
