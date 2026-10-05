@@ -359,7 +359,7 @@ pub(crate) mod bindings {
                 if hash.is_some() {
                     return Err(invalid_digest());
                 }
-                let Ok(sig) = ed25519_dalek::Signature::from_slice(sig) else {
+                let Ok(sig) = lumen_crypto::ed25519::Signature::from_slice(sig) else {
                     return Ok(false);
                 };
                 Ok(k.ed25519_verifying()?.verify_strict(data, &sig).is_ok())

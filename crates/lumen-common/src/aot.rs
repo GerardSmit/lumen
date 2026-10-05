@@ -26,8 +26,6 @@ pub mod native_lines;
 pub mod native_unwind;
 #[cfg(feature = "native-sidecar")]
 pub mod sidecar;
-#[cfg(feature = "native-signing")]
-pub mod signature;
 
 /// A stable, host-independent name inside an app's source tree.
 pub fn normalized_source_path(name: &str) -> bool {

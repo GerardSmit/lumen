@@ -10,10 +10,9 @@ rust-version.workspace = true
 publish = false
 
 [features]
-native-signing = ["lumen-common/native-signing"]
 
 [dependencies]
-lumen-common = { path = "../lumen-common", features = ["native-sidecar"] }
+lumen-common = { path = "../lumen-common", features = ["native-sidecar", "executable"] }
 web-time = "1"
 
 [target.'cfg(unix)'.dependencies]

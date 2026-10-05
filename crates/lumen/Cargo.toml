@@ -13,6 +13,8 @@ license.workspace = true
 lumen-codegen = { path = "../lumen-codegen", optional = true }
 lumen-common = { path = "../lumen-common" }
 lumen-os = { path = "../lumen-os" }
+# Ed25519 verification of signed native images (`aot-native`); no asymmetric backends needed.
+lumen-crypto = { path = "../lumen-crypto", default-features = false, features = ["signatures-only"], optional = true }
 # The language-neutral binding framework (`#[lumen_bind::op]`, `#[class]`, `#[module]`); the
 # JS host lives in `embed_convert`. Only pulled in by the `embed` feature.
 lumen-bind = { path = "../lumen-bind", optional = true }
@@ -25,7 +27,7 @@ lumen-bind = { path = "../lumen-bind" }
 default = ["compiler", "intl", "typed", "jit", "aot-native"]
 compiler = []
 jit = ["compiler", "dep:lumen-codegen"]
-aot-native = ["lumen-os/native-signing"]
+aot-native = ["dep:lumen-crypto"]
 # The typed tier's TypeScript/JSDoc analysis (`lumen::typescript::analyze`, the checker behind
 # `lumen typed`). TypeScript *syntax* is always parsed; this adds the type checker. Off for a
 # small build (release-small, mobile).

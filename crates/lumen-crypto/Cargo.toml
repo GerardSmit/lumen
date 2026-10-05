@@ -39,10 +39,16 @@ rustcrypto = [
     "dep:rand_core10",
 ]
 
+# Only the Ed25519 module and the native-image signatures; no RSA/DSA/DH backend is built, so
+# `backend()` has nothing to return. For consumers that only sign or verify (the engine, the CLI).
+signatures-only = []
+
 [dependencies]
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-os = { path = "../lumen-os" }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Ed25519 (Node crypto, X.509 and the AOT native-image signatures): the one dalek feature set in the workspace.
+ed25519-dalek = { version = "2", features = ["pkcs8", "pem", "rand_core"] }
 rsa = { version = "0.9", features = ["sha2", "sha1", "hazmat"], optional = true }
 dsa = { version = "0.6", optional = true }
 signature = { version = "2", optional = true }

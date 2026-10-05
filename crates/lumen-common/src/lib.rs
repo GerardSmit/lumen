@@ -24,6 +24,7 @@ pub mod cycle;
 pub mod decimal;
 pub mod dedent;
 pub mod editdist;
+#[cfg(feature = "executable")]
 pub mod executable;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;

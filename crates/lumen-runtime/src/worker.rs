@@ -251,10 +251,10 @@ fn prepare_web_worker_entry(
                     ctx.make_error("SecurityError", "Worker URL cannot contain credentials")
                 );
             }
-            let worker_origin = shared_url_origin(&url);
+            let worker_origin = url.origin();
             let owner = lumen_common::url::parse(owner_origin, None)
                 .ok()
-                .map(|url| shared_url_origin(&url));
+                .map(|url| url.origin());
             if owner.as_deref() != Some(worker_origin.as_str()) {
                 return Err(ctx.make_error("SecurityError", "Worker script must be same-origin"));
             }
@@ -400,13 +400,13 @@ fn resolve_shared_worker(
             "shared worker scripts require file, http, or https URLs",
         ));
     }
-    let script_origin = shared_url_origin(&parsed);
+    let script_origin = parsed.origin();
     let caller_origin = if requested_origin.is_empty() || requested_origin == "null" {
         "null".to_owned()
     } else {
         let caller = lumen_common::url::parse(&requested_origin, None)
             .map_err(|_| ctx.make_error("SecurityError", "invalid SharedWorker origin"))?;
-        shared_url_origin(&caller)
+        caller.origin()
     };
     if caller_origin != script_origin {
         return Err(ctx.make_error("SecurityError", "SharedWorker script must be same-origin"));
@@ -446,52 +446,8 @@ fn resolve_shared_worker(
     ))
 }
 
-fn shared_url_origin(url: &lumen_common::url::Url) -> String {
-    if url.scheme == "file" || url.opaque {
-        return "null".to_owned();
-    }
-    let Some(host) = url.host.as_deref() else {
-        return "null".to_owned();
-    };
-    let default_port = match url.scheme.as_str() {
-        "http" | "ws" => Some(80),
-        "https" | "wss" => Some(443),
-        "ftp" => Some(21),
-        _ => None,
-    };
-    let mut origin = format!("{}://{host}", url.scheme);
-    if let Some(port) = url.port.filter(|port| Some(*port) != default_port) {
-        origin.push(':');
-        origin.push_str(&port.to_string());
-    }
-    origin
-}
-
 fn percent_decode_path(path: &str) -> Option<String> {
-    let bytes = path.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hi = *bytes.get(index + 1)?;
-            let lo = *bytes.get(index + 2)?;
-            output.push((hex_digit(hi)? << 4) | hex_digit(lo)?);
-            index += 3;
-        } else {
-            output.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+    String::from_utf8(lumen_common::codec::percent_decode_strict(path.as_bytes())?).ok()
 }
 
 fn get_or_start_shared_worker(
@@ -664,7 +620,7 @@ fn publish_shared_worker_final_url(spec: &WorkerSpec, final_url: &str) {
     }
     let Some(final_origin) = lumen_common::url::parse(final_url, None)
         .ok()
-        .map(|url| shared_url_origin(&url))
+        .map(|url| url.origin())
     else {
         return;
     };
@@ -960,7 +916,7 @@ fn run_worker(
         };
         let response_origin = lumen_common::url::parse(&resource.url, None)
             .ok()
-            .map(|url| shared_url_origin(&url));
+            .map(|url| url.origin());
         if spec.origin.as_deref() != response_origin.as_deref() {
             let _ = to_main_tx.send(ToMain::Error(format!(
                 "worker redirect left its origin: {}",
