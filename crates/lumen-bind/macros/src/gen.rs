@@ -292,11 +292,17 @@ pub fn gen(s: &Spec) -> Res<String> {
         _ => {}
     }
 
-    // Optional parameters: a default, or an `Option<T>` / `Passed<T>` with nothing required
-    // after it among the positional ones (a keyword-only one is always optional).
-    let is_option = |k: usize| matches!(base_name(&sig.params[k].ts), "Option" | "Passed");
+    // Optional parameters: a default, or an `Option<T>` / `Passed<T>` / `Lenient<T>` (missing
+    // becomes `T::default()`) with nothing required after it among the positional ones (a
+    // keyword-only one is always optional).
+    let is_option = |k: usize| {
+        matches!(
+            base_name(&sig.params[k].ts),
+            "Option" | "Passed" | "Lenient"
+        )
+    };
     let none_text = |k: usize| {
-        if base_name(&sig.params[k].ts) == "Passed" {
+        if matches!(base_name(&sig.params[k].ts), "Passed" | "Lenient") {
             "<unrepresentable>"
         } else {
             "None"
