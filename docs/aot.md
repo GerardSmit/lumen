@@ -158,7 +158,7 @@ backend rejects a mismatch. Empty/parallel and versioned host Node catalogs
 have explicit table hashes; embedders freeze their ordered custom hash through
 `lumen::target::set_builtin_modules_hash` before the first target query.
 
-`lumen-common::aot::signature` (behind `native-signing`) signs exact native
+`lumen-crypto::native_signature` signs exact native
 blob bytes with Ed25519 and verifies detached signatures against an allow-list.
 `lumen-common::aot::install` defines length-bounded HELLO, TARGET, INSTALL and
 RESULT frames, with a CRC covering each header and payload. INSTALL carries a
@@ -187,7 +187,7 @@ also rechecks the signature policy. Inventory reports the highest accepted gener
 for each app as current or stale against the running target; it does not launch
 an app. An otherwise compatible blob is stale if its code/GOT mapping exceeds
 the device's current AOT reservation or violates page placement.
-The optional `native-sidecar` codec stores sorted function/code-offset line
+The sidecar codec (`lumen-common`'s `hash` feature) stores sorted function/code-offset line
 entries and source names under the SHA-256 hash of the exact blob.
 `symbolize-native` verifies that hash, validates function offsets against the
 blob, then resolves a function index and code offset. Generating sidecars and

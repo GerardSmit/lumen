@@ -443,20 +443,13 @@ const CHUNK_SIG: &str = "max_stack ops consts(undef null false true num str bigi
     n_params flags(uses_this env_this arguments_slot rest_slot derived reflect_args virt_base) var_force_resets funcs \
     cap_inits(param var fn lexical) caches obj_maps name_caches positions";
 
-const fn fnv(mut h: u64, s: &[u8]) -> u64 {
-    let mut i = 0;
-    while i < s.len() {
-        h = (h ^ s[i] as u64).wrapping_mul(0x0100_0000_01b3);
-        i += 1;
-    }
-    h
-}
+use lumen_common::fasthash::{fnv1a64 as fnv, FNV1A64_OFFSET};
 
 /// The bytecode encoding's identity: codec version, the op table, the operand enum tables and
 /// the chunk field list, hashed. Recorded in a blob's header (`layout_fp`); a blob whose value
 /// differs from the loading lumen's is rejected. Never 0 (0 means "no bytecode").
 pub(crate) const FINGERPRINT: u64 = {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut h = FNV1A64_OFFSET;
     h = fnv(h, &CODEC_VERSION.to_le_bytes());
     h = fnv(h, OP_SIG.as_bytes());
     h = fnv(h, UPD_SIG.as_bytes());

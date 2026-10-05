@@ -26,17 +26,7 @@ pub struct NativeAbi<'a> {
     pub code_version: u32,
 }
 
-const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const PRIME: u64 = 0x0100_0000_01b3;
-
-const fn bytes(mut hash: u64, data: &[u8]) -> u64 {
-    let mut i = 0;
-    while i < data.len() {
-        hash = (hash ^ data[i] as u64).wrapping_mul(PRIME);
-        i += 1;
-    }
-    hash
-}
+use crate::fasthash::{fnv1a64 as bytes, FNV1A64_OFFSET as OFFSET};
 
 const fn u32_field(hash: u64, value: u32) -> u64 {
     bytes(hash, &value.to_le_bytes())

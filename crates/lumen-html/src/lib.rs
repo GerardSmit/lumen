@@ -7,7 +7,6 @@ pub mod animation;
 pub mod css;
 pub mod debug;
 pub mod details;
-mod entities;
 pub mod directionality;
 pub mod font_display;
 pub mod forms;

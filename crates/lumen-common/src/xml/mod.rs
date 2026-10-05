@@ -11,6 +11,7 @@ mod dtd;
 mod parser;
 mod scan;
 
+pub use chars::{is_name, is_name_char, is_name_start, is_xml_char};
 pub use parser::{Parser, ParserKind};
 
 use std::cell::{Cell, RefCell};
@@ -230,6 +231,7 @@ pub struct Shared {
     pub(crate) opts: Options,
     pub(crate) triplet: Cell<bool>,
     pub(crate) external: bool,
+    pub(crate) entity_catalog: Cell<Option<fn(&str) -> Option<&'static str>>>,
 }
 
 /// Amplification accounting shared by a root parser and its external entity parsers.
@@ -257,6 +259,7 @@ impl Shared {
             error_code: Cell::new(0),
             triplet: Cell::new(opts.namespace_prefixes),
             external,
+            entity_catalog: Cell::new(None),
             opts,
         }
     }
@@ -281,6 +284,12 @@ impl Shared {
 
     pub fn set_base(&self, base: Option<String>) {
         *self.base.borrow_mut() = base;
+    }
+
+    /// Replacement text for general entities the document does not declare (an external-subset
+    /// catalog such as XHTML's character entities); consulted before reporting an undefined entity.
+    pub fn set_entity_catalog(&self, lookup: Option<fn(&str) -> Option<&'static str>>) {
+        self.entity_catalog.set(lookup);
     }
 
     /// `XML_SetParamEntityParsing`; refused once parsing began.

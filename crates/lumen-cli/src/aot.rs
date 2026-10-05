@@ -190,9 +190,9 @@ pub fn sign_native(args: &[String]) -> Result<(), String> {
     }
     let blob = std::fs::read(blob_path).map_err(|e| format!("{blob_path}: {e}"))?;
     let seed = signing_seed(key_path)?;
-    let signature = lumen_common::aot::signature::sign(&blob, &seed)?;
+    let signature = lumen_crypto::native_signature::sign(&blob, &seed)?;
     if let Some(path) = public_key_output {
-        let public_key = lumen_common::aot::signature::public_key(&seed);
+        let public_key = lumen_crypto::native_signature::public_key(&seed);
         std::fs::write(path, public_key).map_err(|e| format!("{path}: {e}"))?;
     }
     std::fs::write(output, signature).map_err(|e| format!("{output}: {e}"))
@@ -1073,7 +1073,7 @@ pub fn compile(args: &[String]) -> Result<(), String> {
                 .map_err(|e| format!("{}: {e}", trim_path.display()))?;
         }
         if let Some(seed) = seed {
-            let signature = lumen_common::aot::signature::sign(&blob, &seed)?;
+            let signature = lumen_crypto::native_signature::sign(&blob, &seed)?;
             std::fs::write(&signature_path, signature)
                 .map_err(|e| format!("{}: {e}", signature_path.display()))?;
         }

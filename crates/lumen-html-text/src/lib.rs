@@ -11,7 +11,7 @@ pub use manual_font_registry::{
 };
 
 pub use lumen_common::ucd::{
-    BreakOpportunity, graphemes, line_breaks, next_grapheme_boundary, previous_grapheme_boundary,
+    graphemes, line_breaks, next_grapheme_boundary, previous_grapheme_boundary, BreakOpportunity,
 };
 
 #[cfg(test)]
@@ -22,8 +22,8 @@ use core::cmp::Ordering as CmpOrdering;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use lumen_common::bidi::{self, Script, UnicodeScript};
 use lumen_html::paint::{
-    FontMetric, FontRelativeMetrics, FontSizeAdjust, FontSizeAdjustValue, FontSpec, FontStyle,
-    Glyph, ShapedRun, TextShaper, font_match_range_rank,
+    font_match_range_rank, FontMetric, FontRelativeMetrics, FontSizeAdjust, FontSizeAdjustValue,
+    FontSpec, FontStyle, Glyph, ShapedRun, TextShaper,
 };
 
 static NEXT_FACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -267,7 +267,7 @@ pub trait FontProvider: TextShaper {
         None
     }
     fn rasterize_glyph(&self, face: u64, id: u16, size: f32)
-    -> Result<GlyphCoverage, &'static str>;
+        -> Result<GlyphCoverage, &'static str>;
 
     fn shape_canvas_text(
         &self,
@@ -1256,34 +1256,19 @@ impl<V: CachedValue> RunCache<V> {
             Some(false) => 1,
             Some(true) => 2,
         };
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        let mut byte = |v: u8| {
-            hash = (hash ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3);
-        };
-        for v in text.bytes() {
-            byte(v);
-        }
-        for v in size.to_le_bytes() {
-            byte(v);
-        }
-        byte(dir);
-        byte(mode);
+        let mut hash = lumen_common::fasthash::FNV1A64_OFFSET;
+        let mut feed = |bytes: &[u8]| hash = lumen_common::fasthash::fnv1a64(hash, bytes);
+        feed(text.as_bytes());
+        feed(&size.to_le_bytes());
+        feed(&[dir, mode]);
         if let Some(spec) = spec {
-            for v in spec.weight.to_le_bytes() {
-                byte(v);
-            }
-            for v in spec.stretch.to_bits().to_le_bytes() {
-                byte(v);
-            }
-            byte(spec.style as u8);
+            feed(&spec.weight.to_le_bytes());
+            feed(&spec.stretch.to_bits().to_le_bytes());
+            feed(&[spec.style as u8]);
             if let Some(families) = &spec.families {
                 for family in families.iter() {
-                    for v in family.len().to_le_bytes() {
-                        byte(v);
-                    }
-                    for v in family.bytes() {
-                        byte(v);
-                    }
+                    feed(&family.len().to_le_bytes());
+                    feed(family.as_bytes());
                 }
             }
         }
@@ -1710,7 +1695,9 @@ impl FontFace {
                     })
                     .is_ok()
                 || (ranges.is_none_or(|ranges| {
-                    ranges.iter().any(|&(first, last)| first <= codepoint && codepoint <= last)
+                    ranges
+                        .iter()
+                        .any(|&(first, last)| first <= codepoint && codepoint <= last)
                 }) && cmap.glyph_index(ch).is_some_and(|glyph| glyph.0 != 0))
         })
     }
@@ -2657,12 +2644,10 @@ mod tests {
         assert_eq!(face.line_height(20.0), 20.0);
         assert_eq!(face.shape("metrics", 20.0).unwrap(), before);
         assert_eq!(face.outline(before.glyphs[0].id, 20.0).unwrap(), outline);
-        assert!(
-            FontFace::new(Arc::from(DEFAULT_FONT_BYTES))
-                .unwrap()
-                .with_metric_overrides(Some(f32::NAN), None)
-                .is_err()
-        );
+        assert!(FontFace::new(Arc::from(DEFAULT_FONT_BYTES))
+            .unwrap()
+            .with_metric_overrides(Some(f32::NAN), None)
+            .is_err());
     }
 
     #[test]
@@ -2680,12 +2665,10 @@ mod tests {
         };
         let adjusted = face.shape_styled("Aa", size, false, &spec).unwrap();
         assert!((adjusted.width - base.width * 1.5).abs() < 0.001);
-        assert!(
-            adjusted
-                .glyphs
-                .iter()
-                .all(|glyph| (glyph.size_scale - 1.5).abs() < 0.001)
-        );
+        assert!(adjusted
+            .glyphs
+            .iter()
+            .all(|glyph| (glyph.size_scale - 1.5).abs() < 0.001));
         assert!((face.ascent_styled(size, &spec) - face.ascent(size * 1.5)).abs() < 0.001);
         assert!(
             (face.line_height_styled(size, &spec) - face.line_height(size * 1.5)).abs() < 0.001
@@ -2739,11 +2722,10 @@ mod tests {
         let run = fonts.shape_resolved("B", 24.0, false, &spec).unwrap();
         assert!(!run.glyphs.is_empty());
         assert!(run.glyphs.iter().all(|glyph| glyph.face == fallback_id));
-        assert!(
-            run.glyphs
-                .iter()
-                .all(|glyph| (glyph.size_scale - scale).abs() < 0.001)
-        );
+        assert!(run
+            .glyphs
+            .iter()
+            .all(|glyph| (glyph.size_scale - scale).abs() < 0.001));
         assert!((run.width - fallback_face.shape("B", 24.0 * scale).unwrap().width).abs() < 0.001);
         let metrics = fonts.font_relative_metrics_styled(24.0, &spec);
         assert!((metrics.ex - 24.0 * primary_metric).abs() < 0.001);
@@ -2796,12 +2778,10 @@ mod tests {
         );
 
         let primary_run = fonts.shape_resolved("A", 20.0, false, &spec).unwrap();
-        assert!(
-            primary_run
-                .glyphs
-                .iter()
-                .all(|glyph| glyph.face == primary_id && (glyph.size_scale - 1.5).abs() < 0.001)
-        );
+        assert!(primary_run
+            .glyphs
+            .iter()
+            .all(|glyph| glyph.face == primary_id && (glyph.size_scale - 1.5).abs() < 0.001));
         let fallback_run = fonts.shape_resolved("B", 20.0, false, &spec).unwrap();
         let expected = primary_metric * 1.5 / fallback_face.metric(FontMetric::ExHeight).unwrap();
         assert!(fallback_run.glyphs.iter().all(|glyph| {
@@ -3195,12 +3175,10 @@ mod tests {
         assert!(hebrew.glyphs.iter().all(|glyph| glyph.face == fallback_id));
 
         let variation_selector = set.shape_resolved("a\u{fe0f}", 18.0, false, &font).unwrap();
-        assert!(
-            variation_selector
-                .glyphs
-                .iter()
-                .all(|glyph| glyph.face == primary_id)
-        );
+        assert!(variation_selector
+            .glyphs
+            .iter()
+            .all(|glyph| glyph.face == primary_id));
 
         let liberation = FontSpec {
             families: Some(vec![Arc::<str>::from("Liberation Sans")].into()),
@@ -3324,14 +3302,13 @@ mod tests {
             ..FontSpec::default()
         };
         assert!(set.shape_styled("text", 18.0, false, &spec).is_err());
-        assert!(
-            set.shape_resolved(
+        assert!(set
+            .shape_resolved(
                 &"a".repeat(MAX_SHAPE_TEXT_BYTES + 1),
                 18.0,
                 false,
                 &FontSpec::default()
             )
-            .is_err()
-        );
+            .is_err());
     }
 }

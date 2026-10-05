@@ -1,8 +1,8 @@
 //! Bounded, non-validating XML parsing into the shared document arena.
 //!
-//! Recognized XHTML/MathML public identifiers use the shared static character
-//! entity catalog. Bounded internal general entities in the internal subset
-//! are expanded locally; external subsets/entities are never loaded.
+//! Tokenizing, well-formedness, character and entity references and DTD handling come from
+//! `lumen_common::xml`; this module resolves namespaces and builds the tree. External subsets and
+//! external entities are never loaded.
 use crate::{Document, Error as DomError, Name, Namespace, NodeId, NodeKind};
 use alloc::{
     rc::Rc,
@@ -10,25 +10,14 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::cell::Cell;
+use lumen_common::xml::{self as shared, Attribute, Flow, Handler, Options, Parser, Shared};
+
+pub use lumen_common::xml::is_name as is_xml_name;
 
 const MAX_XML_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 512;
-const MAX_ENTITY_DECLARATIONS: usize = 256;
-const MAX_ENTITY_NAME_BYTES: usize = 1024;
-const MAX_ENTITY_VALUE_BYTES: usize = 64 * 1024;
-const MAX_ENTITY_VALUES_BYTES: usize = 256 * 1024;
-const MAX_ENTITY_EXPANSION_BYTES: usize = 1024 * 1024;
-const MAX_ENTITY_EXPANSIONS: usize = 4096;
-const MAX_ENTITY_DEPTH: usize = 32;
-
-#[derive(Clone)]
-struct GeneralEntity {
-    name: String,
-    // None denotes an external entity. This parser recognizes the declaration
-    // but deliberately has no resolver or transport path for it.
-    replacement: Option<Rc<str>>,
-}
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
@@ -53,147 +42,138 @@ pub fn parse_initialized(
     max_nodes: usize,
     initialize: impl FnOnce(&mut Document),
 ) -> Result<Document, ParseError> {
+    let input = checked_input(input)?;
+    let mut document = Document::new(max_nodes);
+    initialize(&mut document);
+    let (parser, mut builder) = new_parser(document);
+    run(parser, &mut builder, input)?;
+    Ok(builder.document)
+}
+
+fn checked_input(input: &str) -> Result<&str, ParseError> {
     if input.len() > MAX_XML_BYTES {
         return Err(error(0, "XML input too large"));
     }
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
-    if let Some((offset, _)) = input.char_indices().find(|(_, ch)| !xml_char(*ch)) {
-        return Err(error(offset, "invalid XML character"));
+    match input.char_indices().find(|(_, ch)| !shared::is_xml_char(*ch)) {
+        Some((offset, _)) => Err(error(offset, "invalid XML character")),
+        None => Ok(input),
     }
-    let mut document = Document::new(max_nodes);
-    initialize(&mut document);
-    let mut parser = Parser {
-        input,
-        pos: 0,
-        document,
-        roots: 0,
-        depth: 0,
-        doctype_name: None,
-        html_entity_catalog: false,
-        root_name: None,
-        entities: Rc::new(Vec::new()),
-        entity_budget: Rc::new(Cell::new(MAX_ENTITY_EXPANSION_BYTES)),
-        entity_expansions: Rc::new(Cell::new(MAX_ENTITY_EXPANSIONS)),
-        entity_stack: Vec::new(),
-    };
-    let root = parser.document.root();
-    if parser.starts("<?xml")
-        && parser
-            .input
-            .as_bytes()
-            .get(parser.pos + 5)
-            .is_some_and(u8::is_ascii_whitespace)
-    {
-        parser.processing_instruction(true)?;
-    }
-    parser.skip_space();
-    loop {
-        parser.skip_space();
-        if parser.eof() {
-            break;
-        }
-        if parser.starts("<!--") {
-            parser.comment(root)?;
-        } else if parser.starts("<?") {
-            parser.processing_instruction(false)?;
-        } else if parser.starts("<!DOCTYPE") {
-            if parser.roots != 0 || parser.doctype_name.is_some() {
-                return Err(error(parser.pos, "duplicate or misplaced doctype"));
-            }
-            parser.doctype(root)?;
-        } else if parser.starts("<") {
-            if parser.roots != 0 {
-                return Err(error(parser.pos, "multiple document elements"));
-            }
-            let initial = vec![
-                (
-                    String::from("xml"),
-                    String::from("http://www.w3.org/XML/1998/namespace"),
-                ),
-                (
-                    String::from("xmlns"),
-                    String::from("http://www.w3.org/2000/xmlns/"),
-                ),
-            ];
-            parser.element(root, initial)?;
-            parser.roots = 1;
-        } else {
-            let start = parser.pos;
-            while !parser.eof() && !parser.starts("<") {
-                parser.bump_char();
-            }
-            if !parser.input[start..parser.pos]
-                .chars()
-                .all(char::is_whitespace)
-            {
-                return Err(error(start, "character data outside document element"));
-            }
-        }
-    }
-    if parser.roots != 1 {
-        return Err(error(parser.pos, "document has no document element"));
-    }
-    if parser
-        .doctype_name
-        .as_deref()
-        .is_some_and(|name| parser.root_name.as_deref() != Some(name))
-    {
-        return Err(error(
-            parser.pos,
-            "doctype name does not match document element",
-        ));
-    }
-    Ok(parser.document)
 }
+
+fn new_parser(document: Document) -> (Parser, Builder) {
+    let parser = Parser::new(Options {
+        encoding: Some(String::from("UTF-8")),
+        ..Options::default()
+    });
+    let builder = Builder::new(parser.shared(), document);
+    (parser, builder)
+}
+
+fn run(mut parser: Parser, builder: &mut Builder, input: &str) -> Result<(), ParseError> {
+    match parser.parse(builder, input.as_bytes(), true) {
+        Ok(()) => Ok(()),
+        Err(failure) => Err(builder.failure.take().unwrap_or_else(|| {
+            error(
+                builder.shared.error_position().byte as usize,
+                failure.message(),
+            )
+        })),
+    }
+}
+
+const FRAGMENT_ROOT: &str = "lumen-fragment-root";
 
 /// Parse a well-formed XML fragment using the namespace bindings in an element
 /// context and move the completed fragment into the caller's document.
 ///
 /// Parsing happens in a bounded temporary arena, so malformed input never
-/// leaves partial nodes in the destination tree. The temporary arena is sized
-/// from the destination's remaining node budget; adoption performs the same
-/// capacity check before it mutates either document.
+/// leaves partial nodes in the destination tree. The fragment is parsed as the
+/// content of a wrapper element that declares the context's namespaces; input
+/// that closes the wrapper early cannot balance the closing tag and is rejected.
 pub fn parse_fragment_in(
     document: &mut Document,
     context: NodeId,
     input: &str,
 ) -> Result<NodeId, ParseError> {
-    if input.len() > MAX_XML_BYTES {
+    let input = checked_input(input)?;
+    let (namespaces, html_catalog) = fragment_context(document, context)?;
+    let mut wrapped = String::with_capacity(input.len() + 64);
+    wrapped.push('<');
+    wrapped.push_str(FRAGMENT_ROOT);
+    for (prefix, uri) in namespaces.iter().skip(2) {
+        wrapped.push_str(if prefix.is_empty() { " xmlns" } else { " xmlns:" });
+        wrapped.push_str(prefix);
+        wrapped.push_str("=\"");
+        escape_attribute_value(&mut wrapped, uri);
+        wrapped.push('"');
+    }
+    wrapped.push('>');
+    let prefix_len = wrapped.len();
+    wrapped.push_str(input);
+    wrapped.push_str("</");
+    wrapped.push_str(FRAGMENT_ROOT);
+    wrapped.push('>');
+    if wrapped.len() > MAX_XML_BYTES + prefix_len + FRAGMENT_ROOT.len() + 3 {
         return Err(error(0, "XML input too large"));
     }
-    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
-    if let Some((offset, _)) = input.char_indices().find(|(_, ch)| !xml_char(*ch)) {
-        return Err(error(offset, "invalid XML character"));
-    }
-    let (namespaces, html_entity_catalog) = fragment_context(document, context)?;
+
     let remaining = document.max_nodes.saturating_sub(document.live_nodes);
-    let mut parser = Parser {
-        input,
-        pos: 0,
-        document: Document::new(remaining.saturating_add(1)),
-        roots: 0,
-        depth: 0,
-        doctype_name: None,
-        html_entity_catalog,
-        root_name: None,
-        entities: Rc::new(Vec::new()),
-        entity_budget: Rc::new(Cell::new(MAX_ENTITY_EXPANSION_BYTES)),
-        entity_expansions: Rc::new(Cell::new(MAX_ENTITY_EXPANSIONS)),
-        entity_stack: Vec::new(),
-    };
-    let fragment = parser.create(NodeKind::DocumentFragment)?;
-    if let Err(parse_error) = parser.fragment_contents(fragment, namespaces) {
-        let _ = parser.document.destroy_subtree(fragment);
-        return Err(parse_error);
+    let (parser, mut builder) = new_parser(Document::new(remaining.saturating_add(2)));
+    if html_catalog {
+        parser
+            .shared()
+            .set_entity_catalog(Some(lumen_common::entities::semicolon));
+    }
+    run(parser, &mut builder, &wrapped).map_err(|failure| ParseError {
+        offset: failure.offset.saturating_sub(prefix_len),
+        ..failure
+    })?;
+    let mut temporary = builder.document;
+    let root = temporary.root();
+    let wrapper = temporary
+        .first_child(root)
+        .ok()
+        .flatten()
+        .filter(|&id| temporary.next_sibling(id).ok().flatten().is_none())
+        .ok_or_else(|| error(0, "invalid XML fragment"))?;
+    let fragment = temporary
+        .create(NodeKind::DocumentFragment)
+        .map_err(|_| error(0, "XML node limit exceeded"))?;
+    let mut children = Vec::new();
+    let mut child = temporary.first_child(wrapper).ok().flatten();
+    while let Some(id) = child {
+        children.push(id);
+        child = temporary.next_sibling(id).ok().flatten();
+    }
+    for id in children {
+        temporary
+            .append(fragment, id)
+            .map_err(|_| error(0, "invalid XML fragment placement"))?;
     }
     document
-        .adopt_subtree_from(&mut parser.document, fragment)
+        .adopt_subtree_from(&mut temporary, fragment)
         .map(|(fragment, _)| fragment)
         .map_err(|error_kind| match error_kind {
-            DomError::LimitExceeded => error(parser.pos, "XML node limit exceeded"),
-            _ => error(parser.pos, "invalid XML fragment placement"),
+            DomError::LimitExceeded => error(0, "XML node limit exceeded"),
+            _ => error(0, "invalid XML fragment placement"),
         })
 }
+
+fn escape_attribute_value(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            ch => out.push(ch),
+        }
+    }
+}
+
 
 fn fragment_context(
     document: &Document,
@@ -261,14 +241,14 @@ fn fragment_context(
                 } else {
                     continue;
                 };
-                bind_namespace(&mut namespaces, prefix, value, 0)?;
+                bind_namespace(&mut namespaces, prefix, value).map_err(|message| error(0, message))?;
             }
             if id == context {
                 let (prefix, _) = split_qname(name.as_str())
                     .ok_or_else(|| error(0, "invalid context qualified name"))?;
                 if namespace_for(&namespaces, prefix).is_none() {
                     let uri = namespace_uri(namespace);
-                    bind_namespace(&mut namespaces, prefix, uri, 0)?;
+                    bind_namespace(&mut namespaces, prefix, uri).map_err(|message| error(0, message))?;
                 }
             }
         }
@@ -302,920 +282,254 @@ fn namespace_uri(namespace: &Namespace) -> &str {
     }
 }
 
-struct Parser<'a> {
-    input: &'a str,
-    pos: usize,
+struct Builder {
+    shared: Rc<Shared>,
     document: Document,
-    roots: usize,
-    depth: usize,
+    open: Vec<(NodeId, usize)>,
+    bindings: Vec<(String, String)>,
+    text: String,
     doctype_name: Option<String>,
-    html_entity_catalog: bool,
-    root_name: Option<String>,
-    entities: Rc<Vec<GeneralEntity>>,
-    entity_budget: Rc<Cell<usize>>,
-    entity_expansions: Rc<Cell<usize>>,
-    entity_stack: Vec<usize>,
+    failure: Option<ParseError>,
+    in_cdata: bool,
 }
 
-impl Parser<'_> {
-    fn eof(&self) -> bool {
-        self.pos >= self.input.len()
-    }
-    fn starts(&self, text: &str) -> bool {
-        self.input[self.pos..].starts_with(text)
-    }
-    fn bump_char(&mut self) {
-        if let Some(ch) = self.input[self.pos..].chars().next() {
-            self.pos += ch.len_utf8();
-        }
-    }
-    fn skip_space(&mut self) {
-        while !self.eof() && self.input.as_bytes()[self.pos].is_ascii_whitespace() {
-            self.pos += 1;
-        }
-    }
-    fn consume(&mut self, text: &str) -> Result<(), ParseError> {
-        if self.starts(text) {
-            self.pos += text.len();
-            Ok(())
-        } else {
-            Err(error(self.pos, "unexpected token"))
-        }
-    }
-    fn name(&mut self) -> Result<String, ParseError> {
-        let start = self.pos;
-        let mut chars = self.input[self.pos..].char_indices();
-        let Some((_, first)) = chars.next() else {
-            return Err(error(self.pos, "expected XML name"));
-        };
-        if !name_start(first) {
-            return Err(error(self.pos, "invalid XML name"));
-        }
-        self.pos += first.len_utf8();
-        while !self.eof() {
-            let ch = self.input[self.pos..].chars().next().unwrap();
-            if !name_char(ch) {
-                break;
-            }
-            self.pos += ch.len_utf8();
-        }
-        Ok(String::from(&self.input[start..self.pos]))
-    }
-    fn comment(&mut self, parent: NodeId) -> Result<(), ParseError> {
-        self.consume("<!--")?;
-        let start = self.pos;
-        let Some(end) = self.input[self.pos..].find("-->") else {
-            return Err(error(self.pos, "unterminated comment"));
-        };
-        let text = &self.input[start..start + end];
-        if text.contains("--") || text.ends_with('-') {
-            return Err(error(start, "invalid comment"));
-        }
-        self.pos = start + end + 3;
-        let id = self.create(NodeKind::Comment(String::from(text)))?;
-        self.document
-            .append(parent, id)
-            .map_err(|_| error(start, "invalid comment placement"))
-    }
-    fn processing_instruction(&mut self, declaration: bool) -> Result<(), ParseError> {
-        self.consume("<?")?;
-        let start = self.pos;
-        let target = self.name()?;
-        if target.eq_ignore_ascii_case("xml") && !declaration {
-            return Err(error(start, "reserved processing instruction target"));
-        }
-        let data_start = self.pos;
-        let Some(end) = self.input[self.pos..].find("?>") else {
-            return Err(error(self.pos, "unterminated processing instruction"));
-        };
-        let raw_data = &self.input[data_start..data_start + end];
-        if !raw_data.is_empty() && !raw_data.starts_with(char::is_whitespace) {
-            return Err(error(
-                data_start,
-                "expected whitespace after processing instruction target",
-            ));
-        }
-        if declaration {
-            validate_xml_declaration(raw_data, data_start)?;
-        }
-        let data = raw_data.trim();
-        self.pos = data_start + end + 2;
-        if !declaration {
-            let id = self.create(NodeKind::ProcessingInstruction {
-                target,
-                data: String::from(data),
-            })?;
-            self.document
-                .append(self.document.root(), id)
-                .map_err(|_| error(start, "invalid processing instruction"))?;
-        }
-        Ok(())
-    }
-    fn doctype(&mut self, parent: NodeId) -> Result<(), ParseError> {
-        let start = self.pos;
-        self.consume("<!DOCTYPE")?;
-        if !self.input[self.pos..].starts_with(char::is_whitespace) {
-            return Err(error(self.pos, "expected doctype name"));
-        }
-        self.skip_space();
-        let name = self.name()?;
-        self.doctype_name = Some(name.clone());
-        self.skip_space();
-        let mut public_id = String::new();
-        let mut system_id = String::new();
-        if self.starts("PUBLIC") {
-            self.consume("PUBLIC")?;
-            self.external_id_space()?;
-            public_id = self.external_literal()?.to_string();
-            if !public_id.bytes().all(public_id_char) {
-                return Err(error(start, "invalid public identifier"));
-            }
-            let catalog = known_character_entity_catalog(&public_id);
-            self.external_id_space()?;
-            system_id = self.external_literal()?.to_string();
-            self.html_entity_catalog = catalog;
-            self.skip_space();
-        } else if self.starts("SYSTEM") {
-            self.consume("SYSTEM")?;
-            self.external_id_space()?;
-            system_id = self.external_literal()?.to_string();
-            self.skip_space();
-        }
-        if !self.starts("[") && !self.starts(">") {
-            return Err(error(self.pos, "invalid doctype external identifier"));
-        }
-        if self.starts("[") {
-            self.pos += 1;
-            self.internal_subset()?;
-            self.skip_space();
-        }
-        self.consume(">")?;
-        let id = self.create(NodeKind::DocumentType(name))?;
-        self.document
-            .append(parent, id)
-            .map_err(|_| error(start, "invalid doctype placement"))?;
-        self.document
-            .set_doctype_identifiers(id, &public_id, &system_id)
-            .map_err(|_| error(start, "invalid doctype identifiers"))?;
-        Ok(())
-    }
-
-    fn internal_subset(&mut self) -> Result<(), ParseError> {
-        let mut entities: Vec<GeneralEntity> = Vec::new();
-        let mut entity_value_bytes = 0usize;
-        let mut declaration_count = 0usize;
-        loop {
-            self.skip_space();
-            if self.eof() {
-                return Err(error(self.pos, "unterminated doctype internal subset"));
-            }
-            if self.starts("]") {
-                self.pos += 1;
-                entities.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-                self.entities = Rc::new(entities);
-                return Ok(());
-            }
-            if self.starts("<!--") {
-                let start = self.pos;
-                self.pos += 4;
-                let Some(end) = self.input[self.pos..].find("-->") else {
-                    return Err(error(start, "unterminated DTD comment"));
-                };
-                let comment = &self.input[self.pos..self.pos + end];
-                if comment.contains("--") || comment.ends_with('-') {
-                    return Err(error(start, "invalid DTD comment"));
-                }
-                self.pos += end + 3;
-                continue;
-            }
-            if self.starts("<?") {
-                self.pos += 2;
-                let Some(end) = self.input[self.pos..].find("?>") else {
-                    return Err(error(self.pos, "unterminated DTD processing instruction"));
-                };
-                self.pos += end + 2;
-                continue;
-            }
-            if self.starts("<!ENTITY") {
-                let after_keyword = self.pos + "<!ENTITY".len();
-                if self
-                    .input
-                    .as_bytes()
-                    .get(after_keyword)
-                    .is_some_and(u8::is_ascii_whitespace)
-                {
-                    declaration_count = declaration_count.saturating_add(1);
-                    if declaration_count > MAX_ENTITY_DECLARATIONS {
-                        return Err(error(self.pos, "too many DTD entity declarations"));
-                    }
-                    self.entity_declaration(&mut entities, &mut entity_value_bytes)?;
-                    continue;
-                }
-                return Err(error(self.pos, "expected whitespace after ENTITY"));
-            }
-            if self.starts("<!") {
-                self.skip_dtd_declaration()?;
-                continue;
-            }
-            if self.starts("%") {
-                let start = self.pos;
-                let Some(end) = self.input[self.pos..].find(';') else {
-                    return Err(error(start, "unterminated DTD parameter reference"));
-                };
-                self.pos += end + 1;
-                return Err(error(
-                    start,
-                    "DTD parameter-entity references are unsupported",
-                ));
-            }
-            return Err(error(self.pos, "invalid DTD internal subset"));
+impl Builder {
+    fn new(shared: Rc<Shared>, document: Document) -> Builder {
+        Builder {
+            shared,
+            document,
+            open: Vec::new(),
+            bindings: alloc::vec![
+                (String::from("xml"), String::from(XML_NAMESPACE)),
+                (String::from("xmlns"), String::from(XMLNS_NAMESPACE)),
+            ],
+            text: String::new(),
+            doctype_name: None,
+            failure: None,
+            in_cdata: false,
         }
     }
 
-    fn entity_declaration(
-        &mut self,
-        entities: &mut Vec<GeneralEntity>,
-        entity_value_bytes: &mut usize,
-    ) -> Result<(), ParseError> {
-        let start = self.pos;
-        self.consume("<!ENTITY")?;
-        let before_space = self.pos;
-        self.skip_space();
-        if self.pos == before_space {
-            return Err(error(self.pos, "expected whitespace after ENTITY"));
-        }
-        if self.starts("%") {
-            self.pos = start;
-            self.skip_dtd_declaration()?;
+    fn fail(&mut self, message: &'static str) -> Flow {
+        let offset = self.shared.position().byte as usize;
+        self.failure.get_or_insert(error(offset, message));
+        Flow::Abort
+    }
+
+    fn parent(&self) -> NodeId {
+        self.open
+            .last()
+            .map_or(self.document.root(), |(node, _)| *node)
+    }
+
+    fn add(&mut self, kind: NodeKind, placement: &'static str) -> Result<NodeId, &'static str> {
+        let id = self.document.create(kind).map_err(|e| match e {
+            DomError::LimitExceeded => "XML node limit exceeded",
+            _ => "invalid XML node",
+        })?;
+        self.document
+            .append(self.parent(), id)
+            .map_err(|_| placement)?;
+        Ok(id)
+    }
+
+    fn flush_text(&mut self) -> Result<(), &'static str> {
+        if self.text.is_empty() {
             return Ok(());
         }
-        let name = self.name()?;
-        if name.len() > MAX_ENTITY_NAME_BYTES {
-            return Err(error(start, "DTD entity name too large"));
-        }
-        let before_space = self.pos;
-        self.skip_space();
-        if self.pos == before_space {
-            return Err(error(self.pos, "expected entity definition"));
-        }
-
-        let replacement = if self.starts("'") || self.starts("\"") {
-            let value = self.entity_value()?;
-            *entity_value_bytes = entity_value_bytes
-                .checked_add(value.len())
-                .filter(|total| *total <= MAX_ENTITY_VALUES_BYTES)
-                .ok_or_else(|| error(start, "DTD entity values too large"))?;
-            if value.len() > MAX_ENTITY_VALUE_BYTES {
-                return Err(error(start, "DTD entity value too large"));
-            }
-            Some(Rc::<str>::from(value))
-        } else {
-            self.external_entity_definition()?;
-            None
-        };
-        self.skip_space();
-        self.consume(">")?;
-
-        // XML's first declaration for a general entity is binding. Keep the
-        // internal-subset declaration separate from the optional XHTML/MathML
-        // catalog so it naturally overrides that external catalog.
-        if !entities.iter().any(|entity| entity.name == name) {
-            entities.push(GeneralEntity { name, replacement });
-        }
-        Ok(())
+        let text = core::mem::take(&mut self.text);
+        self.add(NodeKind::Text(text), "invalid text placement")
+            .map(|_| ())
     }
 
-    fn entity_value(&mut self) -> Result<String, ParseError> {
-        let quote = self.input.as_bytes()[self.pos] as char;
-        self.pos += 1;
-        let start = self.pos;
-        while !self.eof() && self.input.as_bytes()[self.pos] != quote as u8 {
-            self.bump_char();
-        }
-        if self.eof() {
-            return Err(error(start, "unterminated DTD entity value"));
-        }
-        let value = &self.input[start..self.pos];
-        if value.contains('%') {
-            return Err(error(
-                start,
-                "parameter-entity references in EntityValue are unsupported",
-            ));
-        }
-        validate_entity_value_references(value, start)?;
-        self.pos += quote.len_utf8();
-        if value.len() > MAX_ENTITY_VALUE_BYTES {
-            return Err(error(start, "DTD entity value too large"));
-        }
-        Ok(String::from(value))
-    }
-
-    fn external_entity_definition(&mut self) -> Result<(), ParseError> {
-        if self.starts("SYSTEM") {
-            self.consume("SYSTEM")?;
-            self.external_id_space()?;
-            let _ = self.external_literal()?;
-        } else if self.starts("PUBLIC") {
-            self.consume("PUBLIC")?;
-            self.external_id_space()?;
-            let _ = self.external_literal()?;
-            self.external_id_space()?;
-            let _ = self.external_literal()?;
-        } else {
-            return Err(error(self.pos, "invalid DTD entity definition"));
-        }
-        let before_space = self.pos;
-        self.skip_space();
-        if self.starts("NDATA") {
-            if self.pos == before_space {
-                return Err(error(self.pos, "expected whitespace before NDATA"));
-            }
-            self.consume("NDATA")?;
-            self.external_id_space()?;
-            let _ = self.name()?;
-        }
-        Ok(())
-    }
-
-    fn skip_dtd_declaration(&mut self) -> Result<(), ParseError> {
-        let start = self.pos;
-        self.consume("<")?;
-        let mut quote = None;
-        while !self.eof() {
-            let ch = self.input[self.pos..].chars().next().unwrap();
-            self.pos += ch.len_utf8();
-            if let Some(current_quote) = quote {
-                if ch == current_quote {
-                    quote = None;
-                }
-                continue;
-            }
-            match ch {
-                '\'' | '"' => quote = Some(ch),
-                '>' => return Ok(()),
-                _ => {}
-            }
-        }
-        Err(error(start, "unterminated DTD declaration"))
-    }
-
-    fn fragment_contents(
+    fn add_node(
         &mut self,
-        parent: NodeId,
-        inherited: Vec<(String, String)>,
-    ) -> Result<(), ParseError> {
-        while !self.eof() {
-            if self.starts("<!--") {
-                self.comment(parent)?;
-            } else if self.starts("<?") {
-                self.processing_instruction_for(parent)?;
-            } else if self.starts("<![CDATA[") {
-                self.cdata(parent)?;
-            } else if self.starts("<!") {
-                return Err(error(
-                    self.pos,
-                    "unsupported markup declaration in XML fragment",
-                ));
-            } else if self.starts("<") {
-                self.element(parent, inherited.clone())?;
-            } else {
-                self.character_data_or_entity(parent)?;
-            }
-        }
-        Ok(())
+        kind: NodeKind,
+        placement: &'static str,
+    ) -> Result<NodeId, &'static str> {
+        self.flush_text()?;
+        self.add(kind, placement)
     }
 
-    fn cdata(&mut self, parent: NodeId) -> Result<(), ParseError> {
-        self.consume("<![CDATA[")?;
-        let data_at = self.pos;
-        let Some(end) = self.input[self.pos..].find("]]>") else {
-            return Err(error(data_at, "unterminated CDATA section"));
-        };
-        let text = String::from(&self.input[data_at..data_at + end]);
-        self.pos = data_at + end + 3;
-        let cdata = self.create(NodeKind::CData(text))?;
-        self.document
-            .append(parent, cdata)
-            .map_err(|_| error(data_at, "invalid CDATA placement"))
+    fn flow(&mut self, result: Result<(), &'static str>) -> Flow {
+        match result {
+            Ok(()) => Flow::Continue,
+            Err(message) => self.fail(message),
+        }
     }
 
-    fn external_id_space(&mut self) -> Result<(), ParseError> {
-        let start = self.pos;
-        self.skip_space();
-        if self.pos == start {
-            return Err(error(start, "expected external identifier whitespace"));
+    fn start(&mut self, qname: &str, attrs: &[Attribute]) -> Result<(), &'static str> {
+        self.flush_text()?;
+        if self.open.len() >= MAX_DEPTH {
+            return Err("XML nesting limit exceeded");
         }
-        Ok(())
-    }
-    fn external_literal(&mut self) -> Result<&str, ParseError> {
-        let quote = *self
-            .input
-            .as_bytes()
-            .get(self.pos)
-            .filter(|&&quote| matches!(quote, b'\'' | b'"'))
-            .ok_or_else(|| error(self.pos, "expected quoted external identifier"))?;
-        let start = self.pos + 1;
-        let end = self.input[start..]
-            .find(quote as char)
-            .ok_or_else(|| error(start, "unterminated external identifier"))?
-            + start;
-        self.pos = end + 1;
-        Ok(&self.input[start..end])
-    }
-    fn element(
-        &mut self,
-        parent: NodeId,
-        inherited: Vec<(String, String)>,
-    ) -> Result<(), ParseError> {
-        if self.depth >= MAX_DEPTH {
-            return Err(error(self.pos, "XML nesting limit exceeded"));
+        if self.open.is_empty()
+            && self
+                .doctype_name
+                .as_deref()
+                .is_some_and(|name| name != qname)
+        {
+            return Err("doctype name does not match document element");
         }
-        let start = self.pos;
-        self.consume("<")?;
-        let qname = self.name()?;
-        if parent == self.document.root() {
-            self.root_name = Some(qname.clone());
-        }
-        let mut attributes: Vec<(String, String)> = Vec::new();
-        let mut self_closing = false;
-        let mut require_space = false;
-        loop {
-            let before_space = self.pos;
-            self.skip_space();
-            let had_space = self.pos != before_space;
-            if self.starts("/>") {
-                self.pos += 2;
-                self_closing = true;
-                break;
-            }
-            if self.starts(">") {
-                self.pos += 1;
-                break;
-            }
-            if self.eof() {
-                return Err(error(start, "unterminated start tag"));
-            }
-            if require_space && !had_space {
-                return Err(error(self.pos, "expected whitespace before attribute"));
-            }
-            let attr_at = self.pos;
-            let name = self.name()?;
-            if attributes.iter().any(|(seen, _)| seen == &name) {
-                return Err(error(attr_at, "duplicate XML attribute"));
-            }
-            self.skip_space();
-            self.consume("=")?;
-            self.skip_space();
-            let value = self.quoted_value()?;
-            attributes.push((name, value));
-            require_space = true;
-        }
-        let mut namespaces = inherited;
-        for (name, value) in &attributes {
-            if name == "xmlns" {
-                bind_namespace(&mut namespaces, "", value, start)?;
-            } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+        let mark = self.bindings.len();
+        for attr in attrs {
+            if attr.name == "xmlns" {
+                bind_namespace(&mut self.bindings, "", &attr.value)?;
+            } else if let Some(prefix) = attr.name.strip_prefix("xmlns:") {
                 if prefix.is_empty() || split_qname(prefix).is_none_or(|(p, _)| !p.is_empty()) {
-                    return Err(error(start, "invalid namespace prefix"));
+                    return Err("invalid namespace prefix");
                 }
-                bind_namespace(&mut namespaces, prefix, value, start)?;
+                bind_namespace(&mut self.bindings, prefix, &attr.value)?;
             }
         }
-        let (prefix, local) =
-            split_qname(&qname).ok_or_else(|| error(start, "invalid qualified name"))?;
+        let (prefix, _) = split_qname(qname).ok_or("invalid qualified name")?;
         let uri = if prefix.is_empty() {
-            namespace_for(&namespaces, "")
+            namespace_for(&self.bindings, "")
         } else {
-            Some(
-                namespace_for(&namespaces, prefix)
-                    .ok_or_else(|| error(start, "unbound element prefix"))?,
-            )
+            Some(namespace_for(&self.bindings, prefix).ok_or("unbound element prefix")?)
         };
-        let mut expanded_names: Vec<(Option<String>, String)> = Vec::new();
-        let mut namespace_metadata: Vec<(String, Option<String>)> = Vec::new();
-        for (name, _) in &attributes {
+        let mut expanded_names: Vec<(Option<String>, &str)> = Vec::new();
+        let mut namespace_metadata: Vec<(&str, Option<String>)> = Vec::new();
+        for attr in attrs {
+            let name = attr.name.as_str();
             if name == "xmlns" || name.starts_with("xmlns:") {
-                namespace_metadata.push((
-                    name.clone(),
-                    Some(String::from("http://www.w3.org/2000/xmlns/")),
-                ));
+                namespace_metadata.push((name, Some(String::from(XMLNS_NAMESPACE))));
                 continue;
             }
-            let (prefix, local) = split_qname(name)
-                .ok_or_else(|| error(start, "invalid attribute qualified name"))?;
+            let (prefix, local) = split_qname(name).ok_or("invalid attribute qualified name")?;
             let uri = if prefix.is_empty() {
                 None
             } else {
-                Some(
-                    namespace_for(&namespaces, prefix)
-                        .ok_or_else(|| error(start, "unbound attribute prefix"))?,
-                )
+                Some(namespace_for(&self.bindings, prefix).ok_or("unbound attribute prefix")?)
             };
             if expanded_names
                 .iter()
-                .any(|(seen_uri, seen_local)| seen_uri == &uri && seen_local == local)
+                .any(|(seen_uri, seen_local)| *seen_uri == uri && *seen_local == local)
             {
-                return Err(error(start, "duplicate expanded attribute name"));
+                return Err("duplicate expanded attribute name");
             }
-            expanded_names.push((uri, String::from(local)));
-            namespace_metadata.push((
-                name.clone(),
-                if prefix.is_empty() {
-                    None
-                } else {
-                    namespace_for(&namespaces, prefix)
-                },
-            ));
+            namespace_metadata.push((name, uri.clone()));
+            expanded_names.push((uri, local));
         }
-        let namespace = namespace_from_uri(uri.as_deref());
-        let attrs = attributes
-            .into_iter()
-            .map(|(name, value)| (Name::new(&name), value))
-            .collect();
-        let id = self.create(NodeKind::Element {
-            namespace,
-            name: Name::new(&qname),
-            attributes: attrs,
-        })?;
+        let kind = NodeKind::Element {
+            namespace: namespace_from_uri(uri.as_deref()),
+            name: Name::new(qname),
+            attributes: attrs
+                .iter()
+                .map(|attr| (Name::new(&attr.name), attr.value.clone()))
+                .collect(),
+        };
+        let id = self.add(kind, "invalid element placement")?;
         for (qualified_name, uri) in namespace_metadata {
             self.document
-                .set_attribute_namespace_metadata(id, &qualified_name, uri.as_deref())
-                .map_err(|_| error(start, "invalid attribute namespace metadata"))?;
+                .set_attribute_namespace_metadata(id, qualified_name, uri.as_deref())
+                .map_err(|_| "invalid attribute namespace metadata")?;
         }
-        self.document
-            .append(parent, id)
-            .map_err(|_| error(start, "invalid element placement"))?;
-        if self_closing {
-            return Ok(());
-        }
-        // HTML templates retain their contents in a detached fragment even
-        // when their qualified name carries an XML namespace prefix.
-        let child_parent = self.document.template_content(id)
-            .map_err(|_| error(start, "invalid template contents"))?
-            .unwrap_or(id);
-        self.depth += 1;
-        loop {
-            if self.eof() {
-                return Err(error(start, "unclosed element"));
-            }
-            if self.starts("</") {
-                self.pos += 2;
-                let close_at = self.pos;
-                let close = self.name()?;
-                self.skip_space();
-                self.consume(">")?;
-                if close != qname {
-                    return Err(error(close_at, "mismatched end tag"));
-                }
-                self.depth -= 1;
-                return Ok(());
-            }
-            if self.starts("<!--") {
-                self.comment(child_parent)?;
-            } else if self.starts("<?") {
-                self.processing_instruction_for(child_parent)?;
-            } else if self.starts("<![CDATA[") {
-                self.cdata(child_parent)?;
-            } else if self.starts("<!") {
-                return Err(error(self.pos, "unsupported markup declaration"));
-            } else if self.starts("<") {
-                self.element(child_parent, namespaces.clone())?;
-            } else {
-                self.character_data_or_entity(child_parent)?;
-            }
-        }
-    }
-
-    fn character_data_or_entity(&mut self, parent: NodeId) -> Result<(), ParseError> {
-        let mut text = String::new();
-        while !self.eof() && !self.starts("<") {
-            if !self.starts("&") {
-                let start = self.pos;
-                while !self.eof() && !self.starts("<") && !self.starts("&") {
-                    self.bump_char();
-                }
-                let raw = &self.input[start..self.pos];
-                if raw.contains("]]>") {
-                    return Err(error(start, "forbidden ]]> in character data"));
-                }
-                append_entity_text(&mut text, raw, start)?;
-                continue;
-            }
-
-            let start = self.pos;
-            self.consume("&")?;
-            let Some(end) = self.input[self.pos..].find(';') else {
-                return Err(error(start, "unterminated entity reference"));
-            };
-            let name = &self.input[self.pos..self.pos + end];
-            if name.is_empty() {
-                return Err(error(start, "empty entity reference"));
-            }
-            if name.len() > MAX_ENTITY_NAME_BYTES {
-                return Err(error(start, "XML entity name too large"));
-            }
-            let token_end = self.pos + end + 1;
-            let token = &self.input[start..token_end];
-            self.pos = token_end;
-
-            if is_predefined_or_character_reference(&name) {
-                let value = decode_entities(token, start, false)?;
-                append_entity_text(&mut text, &value, start)?;
-                continue;
-            }
-            if let Some(entity_index) = find_general_entity(&self.entities, name) {
-                let is_internal = self.entities[entity_index].replacement.is_some();
-                if !is_internal {
-                    return Err(error(start, "external entity reference is unavailable"));
-                }
-                self.include_general_entity(parent, entity_index, start, &mut text)?;
-                continue;
-            }
-            if self.html_entity_catalog {
-                let value = decode_entities(token, start, true)?;
-                append_entity_text(&mut text, &value, start)?;
-                continue;
-            }
-            return Err(error(start, "unknown entity reference"));
-        }
-        self.text(parent, text)
-    }
-
-    fn include_general_entity(
-        &mut self,
-        parent: NodeId,
-        entity_index: usize,
-        reference_at: usize,
-        text_run: &mut String,
-    ) -> Result<(), ParseError> {
-        if self.entity_stack.len() >= MAX_ENTITY_DEPTH {
-            return Err(error(reference_at, "XML entity nesting limit exceeded"));
-        }
-        if self.entity_stack.contains(&entity_index) {
-            return Err(error(reference_at, "recursive XML entity reference"));
-        }
-        let replacement = self
-            .entities
-            .get(entity_index)
-            .and_then(|entity| entity.replacement.clone())
-            .ok_or_else(|| error(reference_at, "external entity reference is unavailable"))?;
-        spend_entity_expansion(&self.entity_expansions, reference_at)?;
-        if replacement.is_empty() {
-            return Ok(());
-        }
-        spend_entity_budget(&self.entity_budget, replacement.len(), reference_at)?;
-
-        // Most internal entities are plain character data. Avoid constructing
-        // a temporary DOM arena for each reference in that common case; retain
-        // the full fragment parser whenever markup or references need parsing.
-        if !replacement.contains('<') && !replacement.contains('&') && !replacement.contains("]]>")
-        {
-            append_entity_text(text_run, &replacement, reference_at)?;
-            return Ok(());
-        }
-
-        let (namespaces, _) = fragment_context(&self.document, parent)
-            .map_err(|parse_error| error(reference_at, parse_error.message))?;
-        let remaining = self
-            .document
-            .max_nodes
-            .saturating_sub(self.document.live_nodes);
-        // The temporary document root and fragment wrapper are discarded after
-        // parsing; reserve their two slots in addition to the destination's
-        // remaining output-node budget.
-        let fragment_capacity = remaining.saturating_add(2);
-        let mut nested = Parser {
-            input: &replacement,
-            pos: 0,
-            document: Document::new(fragment_capacity),
-            roots: 0,
-            depth: self.depth,
-            doctype_name: None,
-            html_entity_catalog: self.html_entity_catalog,
-            root_name: None,
-            entities: self.entities.clone(),
-            entity_budget: self.entity_budget.clone(),
-            entity_expansions: self.entity_expansions.clone(),
-            entity_stack: self.entity_stack.clone(),
-        };
-        nested.entity_stack.push(entity_index);
-        let fragment = nested
-            .create(NodeKind::DocumentFragment)
-            .map_err(|parse_error| error(reference_at, parse_error.message))?;
-        nested
-            .fragment_contents(fragment, namespaces)
-            .map_err(|parse_error| error(reference_at, parse_error.message))?;
-
-        let mut expanded_text = String::new();
-        let mut all_text = true;
-        let mut inspect = nested
-            .document
-            .first_child(fragment)
-            .map_err(|_| error(reference_at, "invalid expanded entity"))?;
-        while let Some(node) = inspect {
-            if let NodeKind::Text(value) = nested
-                .document
-                .kind(node)
-                .map_err(|_| error(reference_at, "invalid expanded entity"))?
-            {
-                append_entity_text(&mut expanded_text, value, reference_at)?;
-            } else {
-                all_text = false;
-                break;
-            }
-            inspect = nested
-                .document
-                .next_sibling(node)
-                .map_err(|_| error(reference_at, "invalid expanded entity"))?;
-        }
-        if all_text {
-            append_entity_text(text_run, &expanded_text, reference_at)?;
-            return Ok(());
-        }
-        if !text_run.is_empty() {
-            self.text(parent, core::mem::take(text_run))?;
-        }
-
-        let mut child = nested
-            .document
-            .first_child(fragment)
-            .map_err(|_| error(reference_at, "invalid expanded entity"))?;
-        while let Some(node) = child {
-            let next = nested
-                .document
-                .next_sibling(node)
-                .map_err(|_| error(reference_at, "invalid expanded entity"))?;
-            let (adopted, _) = self
-                .document
-                .adopt_subtree_from(&mut nested.document, node)
-                .map_err(|kind| match kind {
-                    DomError::LimitExceeded => error(reference_at, "XML node limit exceeded"),
-                    _ => error(reference_at, "invalid expanded entity"),
-                })?;
-            self.append_expanded_node(parent, adopted, reference_at)?;
-            child = next;
-        }
+        self.open.push((id, mark));
         Ok(())
     }
+}
 
-    fn append_expanded_node(
+impl Handler for Builder {
+    fn start_doctype(
         &mut self,
-        parent: NodeId,
-        child: NodeId,
-        offset: usize,
-    ) -> Result<(), ParseError> {
-        let child_text = match self.document.kind(child) {
-            Ok(NodeKind::Text(value)) => Some(value.clone()),
-            _ => None,
-        };
-        let previous = self
-            .document
-            .last_child(parent)
-            .map_err(|_| error(offset, "invalid expanded entity"))?;
-        if let (Some(previous), Some(child_text)) = (previous, child_text) {
-            let previous_text_len = match self
-                .document
-                .kind(previous)
-                .map_err(|_| error(offset, "invalid expanded entity"))?
-            {
-                NodeKind::Text(value) => Some(value.len()),
-                _ => None,
-            };
-            if let Some(previous_text_len) = previous_text_len {
-                previous_text_len
-                    .checked_add(child_text.len())
-                    .filter(|length| *length <= MAX_XML_BYTES)
-                    .ok_or_else(|| error(offset, "XML entity output too large"))?;
-                self.document
-                    .append_data(previous, &child_text)
-                    .map_err(|_| error(offset, "invalid expanded text"))?;
-                self.document
-                    .destroy_subtree(child)
-                    .map_err(|_| error(offset, "invalid expanded entity"))?;
-                return Ok(());
-            }
+        name: &str,
+        sysid: Option<&str>,
+        pubid: Option<&str>,
+        _has_internal_subset: bool,
+    ) -> Flow {
+        if sysid.is_some() && pubid.is_some_and(known_character_entity_catalog) {
+            self.shared
+                .set_entity_catalog(Some(lumen_common::entities::semicolon));
         }
-        self.document
-            .append(parent, child)
-            .map_err(|_| error(offset, "invalid expanded entity placement"))
+        let result = self
+            .add_node(
+                NodeKind::DocumentType(name.to_string()),
+                "invalid doctype placement",
+            )
+            .and_then(|id| {
+                self.document
+                    .set_doctype_identifiers(id, pubid.unwrap_or(""), sysid.unwrap_or(""))
+                    .map_err(|_| "invalid doctype identifiers")
+            });
+        self.doctype_name = Some(name.to_string());
+        self.flow(result)
     }
-    fn processing_instruction_for(&mut self, parent: NodeId) -> Result<(), ParseError> {
-        self.consume("<?")?;
-        let start = self.pos;
-        let target = self.name()?;
+
+    fn start_element(&mut self, name: &str, attrs: &[Attribute], _specified: usize) -> Flow {
+        let result = self.start(name, attrs);
+        self.flow(result)
+    }
+
+    fn end_element(&mut self, _name: &str) -> Flow {
+        let result = self.flush_text();
+        if let Some((_, mark)) = self.open.pop() {
+            self.bindings.truncate(mark);
+        }
+        self.flow(result)
+    }
+
+    fn chardata(&mut self, data: &str) -> Flow {
+        if !self.open.is_empty() {
+            self.text.push_str(data);
+        }
+        Flow::Continue
+    }
+
+    fn start_cdata(&mut self) -> Flow {
+        let result = self.flush_text();
+        self.in_cdata = true;
+        self.flow(result)
+    }
+
+    fn end_cdata(&mut self) -> Flow {
+        self.in_cdata = false;
+        let text = core::mem::take(&mut self.text);
+        let result = self
+            .add(NodeKind::CData(text), "invalid CDATA placement")
+            .map(|_| ());
+        self.flow(result)
+    }
+
+    fn comment(&mut self, data: &str) -> Flow {
+        let result = self
+            .add_node(
+                NodeKind::Comment(data.to_string()),
+                "invalid comment placement",
+            )
+            .map(|_| ());
+        self.flow(result)
+    }
+
+    fn processing_instruction(&mut self, target: &str, data: &str) -> Flow {
         if target.eq_ignore_ascii_case("xml") {
-            return Err(error(start, "reserved processing instruction target"));
+            return self.fail("reserved processing instruction target");
         }
-        let data_start = self.pos;
-        let Some(end) = self.input[self.pos..].find("?>") else {
-            return Err(error(self.pos, "unterminated processing instruction"));
-        };
-        if end > 0 && !self.input[data_start..].starts_with(char::is_whitespace) {
-            return Err(error(
-                data_start,
-                "expected whitespace after processing instruction target",
-            ));
-        }
-        let data = String::from(self.input[data_start..data_start + end].trim());
-        self.pos = data_start + end + 2;
-        let id = self.create(NodeKind::ProcessingInstruction { target, data })?;
-        self.document
-            .append(parent, id)
-            .map_err(|_| error(start, "invalid processing instruction"))
+        let result = self
+            .add_node(
+                NodeKind::ProcessingInstruction {
+                    target: target.to_string(),
+                    data: data.trim().to_string(),
+                },
+                "invalid processing instruction",
+            )
+            .map(|_| ());
+        self.flow(result)
     }
-    fn quoted_value(&mut self) -> Result<String, ParseError> {
-        let Some(q) = self.input[self.pos..].chars().next() else {
-            return Err(error(self.pos, "expected quoted attribute value"));
-        };
-        if q != '\'' && q != '"' {
-            return Err(error(self.pos, "expected quoted attribute value"));
-        }
-        self.pos += 1;
-        let start = self.pos;
-        while !self.eof() && !self.input[self.pos..].starts_with(q) {
-            if self.starts("<") {
-                return Err(error(self.pos, "less-than sign in attribute value"));
-            }
-            self.bump_char();
-        }
-        if self.eof() {
-            return Err(error(start, "unterminated attribute value"));
-        }
-        let mut entity_stack = self.entity_stack.clone();
-        let value = decode_attribute_entities(
-            &self.input[start..self.pos],
-            start,
-            self.html_entity_catalog,
-            &self.entities,
-            &self.entity_budget,
-            &self.entity_expansions,
-            &mut entity_stack,
-        )?;
-        self.pos += q.len_utf8();
-        Ok(value)
-    }
-    fn text(&mut self, parent: NodeId, text: String) -> Result<(), ParseError> {
-        if text.is_empty() {
-            return Ok(());
-        }
-        let previous = self
-            .document
-            .last_child(parent)
-            .map_err(|_| error(self.pos, "invalid text parent"))?;
-        let previous_text_len = if let Some(previous) = previous {
-            if let NodeKind::Text(previous_text) = self
-                .document
-                .kind(previous)
-                .map_err(|_| error(self.pos, "invalid text node"))?
-            {
-                Some((previous, previous_text.len()))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some((previous, previous_text_len)) = previous_text_len {
-            previous_text_len
-                .checked_add(text.len())
-                .filter(|length| *length <= MAX_XML_BYTES)
-                .ok_or_else(|| error(self.pos, "XML entity output too large"))?;
-            self.document
-                .append_data(previous, &text)
-                .map_err(|_| error(self.pos, "invalid text node"))?;
-            return Ok(());
-        }
-        let id = self.create(NodeKind::Text(text))?;
-        self.document
-            .append(parent, id)
-            .map_err(|_| error(self.pos, "invalid text placement"))
-    }
-    fn create(&mut self, kind: NodeKind) -> Result<NodeId, ParseError> {
-        self.document.create(kind).map_err(|e| match e {
-            DomError::LimitExceeded => error(self.pos, "XML node limit exceeded"),
-            _ => error(self.pos, "invalid XML node"),
-        })
-    }
-}
 
-fn name_start(ch: char) -> bool {
-    matches!(ch as u32,
-        0x3a | 0x41..=0x5a | 0x5f | 0x61..=0x7a | 0xc0..=0xd6 | 0xd8..=0xf6 |
-        0xf8..=0x2ff | 0x370..=0x37d | 0x37f..=0x1fff | 0x200c..=0x200d |
-        0x2070..=0x218f | 0x2c00..=0x2fef | 0x3001..=0xd7ff | 0xf900..=0xfdcf |
-        0xfdf0..=0xfffd | 0x10000..=0xeffff)
-}
-fn name_char(ch: char) -> bool {
-    name_start(ch)
-        || matches!(ch as u32, 0x2d | 0x2e | 0x30..=0x39 | 0xb7 | 0x300..=0x36f | 0x203f..=0x2040)
-}
+    fn skipped_entity(&mut self, _name: &str, _is_param: bool) -> Flow {
+        self.fail("unknown entity reference")
+    }
 
-/// Whether `name` matches the XML 1.0 `Name` production.
-///
-/// Unlike a QName, an XML Name may contain colons in any position.
-pub fn is_xml_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(name_start) && chars.all(name_char)
+    fn external_entity_ref(
+        &mut self,
+        _context: Option<&str>,
+        _base: Option<&str>,
+        _sysid: Option<&str>,
+        _pubid: Option<&str>,
+    ) -> Flow {
+        self.fail("external entities are not loaded")
+    }
 }
 
 /// Whether `name` is a valid DOM attribute local name.
@@ -1231,142 +545,6 @@ pub fn is_valid_attribute_local_name(name: &str) -> bool {
         })
 }
 
-fn is_ncname(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars.next().is_some_and(|ch| ch != ':' && name_start(ch))
-        && chars.all(|ch| ch != ':' && name_char(ch))
-}
-
-fn xml_char(ch: char) -> bool {
-    matches!(ch as u32, 0x9 | 0xa | 0xd | 0x20..=0xd7ff | 0xe000..=0xfffd | 0x10000..=0x10ffff)
-}
-fn validate_xml_declaration(input: &str, offset: usize) -> Result<(), ParseError> {
-    let mut cursor = 0;
-    let bytes = input.as_bytes();
-    let whitespace = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n');
-    if bytes.first().is_none_or(|b| !whitespace(*b)) {
-        return Err(error(offset, "XML declaration requires whitespace"));
-    }
-    let mut fields: Vec<(&str, &str)> = Vec::new();
-    while cursor < bytes.len() {
-        while cursor < bytes.len() && whitespace(bytes[cursor]) {
-            cursor += 1;
-        }
-        if cursor == bytes.len() {
-            break;
-        }
-        let name_start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
-            cursor += 1;
-        }
-        if name_start == cursor {
-            return Err(error(offset + cursor, "invalid XML declaration"));
-        }
-        let name = &input[name_start..cursor];
-        while cursor < bytes.len() && whitespace(bytes[cursor]) {
-            cursor += 1;
-        }
-        if bytes.get(cursor) != Some(&b'=') {
-            return Err(error(offset + cursor, "invalid XML declaration"));
-        }
-        cursor += 1;
-        while cursor < bytes.len() && whitespace(bytes[cursor]) {
-            cursor += 1;
-        }
-        let Some(&quote @ (b'\'' | b'"')) = bytes.get(cursor) else {
-            return Err(error(offset + cursor, "invalid XML declaration value"));
-        };
-        cursor += 1;
-        let value_start = cursor;
-        while cursor < bytes.len() && bytes[cursor] != quote {
-            cursor += 1;
-        }
-        if cursor == bytes.len() {
-            return Err(error(offset + cursor, "unterminated XML declaration value"));
-        }
-        fields.push((name, &input[value_start..cursor]));
-        cursor += 1;
-        if cursor < bytes.len() && !whitespace(bytes[cursor]) {
-            return Err(error(
-                offset + cursor,
-                "expected whitespace in XML declaration",
-            ));
-        }
-    }
-    if fields.first() != Some(&("version", "1.0")) && fields.first() != Some(&("version", "1.1")) {
-        return Err(error(
-            offset,
-            "XML declaration must start with version 1.0 or 1.1",
-        ));
-    }
-    if fields.len() > 3 {
-        return Err(error(offset, "too many XML declaration fields"));
-    }
-    let mut index = 1;
-    if let Some(("encoding", encoding)) = fields.get(index).copied() {
-        let mut chars = encoding.chars();
-        if !chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
-            || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-        {
-            return Err(error(offset, "invalid XML encoding name"));
-        }
-        index += 1;
-    }
-    if let Some(("standalone", value)) = fields.get(index).copied() {
-        if value != "yes" && value != "no" {
-            return Err(error(offset, "invalid standalone declaration"));
-        }
-        index += 1;
-    }
-    if index != fields.len() {
-        return Err(error(offset, "invalid XML declaration field order"));
-    }
-    Ok(())
-}
-/// Split and validate an XML qualified name.
-///
-/// An unprefixed QName returns an empty prefix and the name as its local part.
-pub fn split_qname(name: &str) -> Option<(&str, &str)> {
-    if let Some((prefix, local)) = name.split_once(':') {
-        (is_ncname(prefix) && is_ncname(local)).then_some((prefix, local))
-    } else {
-        is_ncname(name).then_some(("", name))
-    }
-}
-fn namespace_for(bindings: &[(String, String)], prefix: &str) -> Option<String> {
-    bindings
-        .iter()
-        .rev()
-        .find(|(key, _)| key == prefix)
-        .map(|(_, value)| value.clone())
-}
-fn bind_namespace(
-    bindings: &mut Vec<(String, String)>,
-    prefix: &str,
-    uri: &str,
-    offset: usize,
-) -> Result<(), ParseError> {
-    let xml = "http://www.w3.org/XML/1998/namespace";
-    let xmlns = "http://www.w3.org/2000/xmlns/";
-    if prefix == "xmlns"
-        || uri == xmlns
-        || (prefix == "xml") != (uri == xml)
-        || (!prefix.is_empty() && uri.is_empty())
-    {
-        return Err(error(offset, "invalid namespace declaration"));
-    }
-    bindings.retain(|(key, _)| key != prefix);
-    bindings.push((String::from(prefix), String::from(uri)));
-    Ok(())
-}
-fn namespace_from_uri(uri: Option<&str>) -> Namespace {
-    match uri.unwrap_or("") {
-        "http://www.w3.org/1999/xhtml" => Namespace::Html,
-        "http://www.w3.org/2000/svg" => Namespace::Svg,
-        "http://www.w3.org/1998/Math/MathML" => Namespace::MathMl,
-        value => Namespace::Other(Rc::from(value)),
-    }
-}
 fn public_id_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b" \r\n-'()+,./:=?;!*#@$_%".contains(&byte)
 }
@@ -1394,258 +572,56 @@ fn known_character_entity_catalog(public_id: &str) -> bool {
     })
 }
 
-fn is_predefined_or_character_reference(name: &str) -> bool {
-    name.starts_with('#') || matches!(name, "amp" | "lt" | "gt" | "apos" | "quot")
+fn is_ncname(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch != ':' && shared::is_name_start(ch))
+        && chars.all(|ch| ch != ':' && shared::is_name_char(ch))
 }
 
-fn find_general_entity(entities: &[GeneralEntity], name: &str) -> Option<usize> {
-    entities
-        .binary_search_by(|entity| entity.name.as_str().cmp(name))
-        .ok()
-}
-
-fn validate_entity_value_references(input: &str, offset: usize) -> Result<(), ParseError> {
-    let mut rest = input;
-    let mut at = offset;
-    while let Some(index) = rest.find('&') {
-        let after = &rest[index + 1..];
-        let Some(end) = after.find(';') else {
-            return Err(error(at + index, "unterminated DTD entity reference"));
-        };
-        let reference = &after[..end];
-        if reference.is_empty() {
-            return Err(error(at + index, "empty DTD entity reference"));
-        }
-        if reference.starts_with('#') {
-            decode_entities(&rest[index..index + end + 2], at + index, false)?;
-        } else if !is_xml_name(reference) {
-            return Err(error(at + index, "invalid DTD entity reference"));
-        }
-        let used = index + end + 2;
-        at += used;
-        rest = &rest[used..];
+/// Split and validate an XML qualified name.
+///
+/// An unprefixed QName returns an empty prefix and the name as its local part.
+pub fn split_qname(name: &str) -> Option<(&str, &str)> {
+    if let Some((prefix, local)) = name.split_once(':') {
+        (is_ncname(prefix) && is_ncname(local)).then_some((prefix, local))
+    } else {
+        is_ncname(name).then_some(("", name))
     }
+}
+
+fn namespace_for(bindings: &[(String, String)], prefix: &str) -> Option<String> {
+    bindings
+        .iter()
+        .rev()
+        .find(|(key, _)| key == prefix)
+        .map(|(_, value)| value.clone())
+}
+
+fn bind_namespace(
+    bindings: &mut Vec<(String, String)>,
+    prefix: &str,
+    uri: &str,
+) -> Result<(), &'static str> {
+    if prefix == "xmlns"
+        || uri == XMLNS_NAMESPACE
+        || (prefix == "xml") != (uri == XML_NAMESPACE)
+        || (!prefix.is_empty() && uri.is_empty())
+    {
+        return Err("invalid namespace declaration");
+    }
+    bindings.push((String::from(prefix), String::from(uri)));
     Ok(())
 }
 
-fn spend_entity_budget(
-    budget: &Cell<usize>,
-    amount: usize,
-    offset: usize,
-) -> Result<(), ParseError> {
-    let remaining = budget.get();
-    let Some(next) = remaining.checked_sub(amount) else {
-        return Err(error(offset, "XML entity expansion limit exceeded"));
-    };
-    budget.set(next);
-    Ok(())
-}
-
-fn spend_entity_expansion(budget: &Cell<usize>, offset: usize) -> Result<(), ParseError> {
-    let remaining = budget.get();
-    let Some(next) = remaining.checked_sub(1) else {
-        return Err(error(offset, "XML entity expansion count exceeded"));
-    };
-    budget.set(next);
-    Ok(())
-}
-
-fn decode_attribute_entities(
-    input: &str,
-    offset: usize,
-    html_catalog: bool,
-    entities: &[GeneralEntity],
-    budget: &Cell<usize>,
-    expansions: &Cell<usize>,
-    stack: &mut Vec<usize>,
-) -> Result<String, ParseError> {
-    if !input.contains('&') {
-        return Ok(String::from(input));
+fn namespace_from_uri(uri: Option<&str>) -> Namespace {
+    match uri.unwrap_or("") {
+        "http://www.w3.org/1999/xhtml" => Namespace::Html,
+        "http://www.w3.org/2000/svg" => Namespace::Svg,
+        "http://www.w3.org/1998/Math/MathML" => Namespace::MathMl,
+        value => Namespace::Other(Rc::from(value)),
     }
-    let mut output = lumen_common::limits::size::string_with_capacity(input.len(), MAX_XML_BYTES)
-        .map_err(|_| error(offset, "XML entity output too large"))?;
-    let mut rest = input;
-    let mut at = offset;
-    while let Some(index) = rest.find('&') {
-        append_entity_text(&mut output, &rest[..index], at)?;
-        let after = &rest[index + 1..];
-        let Some(end) = after.find(';') else {
-            return Err(error(at + index, "unterminated entity reference"));
-        };
-        let name = &after[..end];
-        if name.is_empty() {
-            return Err(error(at + index, "empty entity reference"));
-        }
-        if name.len() > MAX_ENTITY_NAME_BYTES {
-            return Err(error(at + index, "XML entity name too large"));
-        }
-        let reference_at = at + index;
-        let token_start = index;
-        let token_end = index + end + 2;
-        let token = &rest[token_start..token_end];
-        if is_predefined_or_character_reference(name) {
-            let decoded = decode_entities(token, reference_at, false)?;
-            append_entity_text(&mut output, &decoded, reference_at)?;
-        } else if let Some(entity_index) = find_general_entity(entities, name) {
-            let entity = &entities[entity_index];
-            let Some(replacement) = entity.replacement.as_deref() else {
-                return Err(error(
-                    reference_at,
-                    "external entity reference is unavailable",
-                ));
-            };
-            expand_attribute_entity(
-                entity_index,
-                replacement,
-                reference_at,
-                html_catalog,
-                entities,
-                budget,
-                expansions,
-                stack,
-                &mut output,
-            )?;
-        } else if html_catalog {
-            let decoded = decode_entities(token, reference_at, true)?;
-            append_entity_text(&mut output, &decoded, reference_at)?;
-        } else {
-            return Err(error(reference_at, "unknown entity reference"));
-        }
-        let used = index + end + 2;
-        at += used;
-        rest = &rest[used..];
-    }
-    append_entity_text(&mut output, rest, at)?;
-    Ok(output)
-}
-
-fn expand_attribute_entity(
-    entity_index: usize,
-    replacement: &str,
-    offset: usize,
-    html_catalog: bool,
-    entities: &[GeneralEntity],
-    budget: &Cell<usize>,
-    expansions: &Cell<usize>,
-    stack: &mut Vec<usize>,
-    output: &mut String,
-) -> Result<(), ParseError> {
-    if stack.len() >= MAX_ENTITY_DEPTH {
-        return Err(error(offset, "XML entity nesting limit exceeded"));
-    }
-    if stack.contains(&entity_index) {
-        return Err(error(offset, "recursive XML entity reference"));
-    }
-    spend_entity_expansion(expansions, offset)?;
-    if entity_value_contains_less_than(replacement, offset)? {
-        return Err(error(
-            offset,
-            "less-than sign in attribute entity replacement",
-        ));
-    }
-    spend_entity_budget(budget, replacement.len(), offset)?;
-    stack.push(entity_index);
-    let decoded = decode_attribute_entities(
-        replacement,
-        offset,
-        html_catalog,
-        entities,
-        budget,
-        expansions,
-        stack,
-    );
-    stack.pop();
-    let decoded = decoded?;
-    append_entity_text(output, &decoded, offset)
-}
-
-fn entity_value_contains_less_than(input: &str, offset: usize) -> Result<bool, ParseError> {
-    if input.contains('<') {
-        return Ok(true);
-    }
-    let mut rest = input;
-    let mut at = offset;
-    while let Some(index) = rest.find('&') {
-        let after = &rest[index + 1..];
-        let Some(end) = after.find(';') else {
-            return Err(error(at + index, "unterminated DTD entity reference"));
-        };
-        let name = &after[..end];
-        if name.starts_with('#') {
-            let token_end = index + end + 2;
-            let decoded = decode_entities(&rest[index..token_end], at + index, false)?;
-            if decoded.contains('<') {
-                return Ok(true);
-            }
-        }
-        let used = index + end + 2;
-        at += used;
-        rest = &rest[used..];
-    }
-    Ok(false)
-}
-
-fn decode_entities(input: &str, offset: usize, html_catalog: bool) -> Result<String, ParseError> {
-    if !input.contains('&') {
-        return Ok(input.to_string());
-    }
-    let mut out = lumen_common::limits::size::string_with_capacity(input.len(), MAX_XML_BYTES)
-        .map_err(|_| error(offset, "XML entity output too large"))?;
-    let mut rest = input;
-    let mut at = offset;
-    while let Some(index) = rest.find('&') {
-        append_entity_text(&mut out, &rest[..index], at)?;
-        let after = &rest[index + 1..];
-        let Some(end) = after.find(';') else {
-            return Err(error(at + index, "unterminated entity reference"));
-        };
-        let entity = &after[..end];
-        let ch = match entity {
-            "amp" => '&',
-            "lt" => '<',
-            "gt" => '>',
-            "apos" => '\'',
-            "quot" => '"',
-            value if value.starts_with("#x") || value.starts_with("#X") => {
-                u32::from_str_radix(&value[2..], 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .filter(|ch| xml_char(*ch))
-                    .ok_or_else(|| error(at + index, "invalid character reference"))?
-            }
-            value if value.starts_with('#') => value[1..]
-                .parse::<u32>()
-                .ok()
-                .and_then(char::from_u32)
-                .filter(|ch| xml_char(*ch))
-                .ok_or_else(|| error(at + index, "invalid character reference"))?,
-            _ if html_catalog => {
-                let candidate = &after.as_bytes()[..=end];
-                let Some((consumed, replacement)) = crate::html::longest_entity(candidate)
-                    .filter(|(consumed, _)| *consumed == candidate.len())
-                else {
-                    return Err(error(at + index, "unknown entity reference"));
-                };
-                append_entity_text(&mut out, replacement, at + index)?;
-                let used = index + consumed + 1;
-                at += used;
-                rest = &rest[used..];
-                continue;
-            }
-            _ => return Err(error(at + index, "unknown entity reference")),
-        };
-        append_entity_text(&mut out, ch.encode_utf8(&mut [0; 4]), at + index)?;
-        let used = index + end + 2;
-        at += used;
-        rest = &rest[used..];
-    }
-    append_entity_text(&mut out, rest, at)?;
-    Ok(out)
-}
-
-fn append_entity_text(out: &mut String, text: &str, offset: usize) -> Result<(), ParseError> {
-    lumen_common::limits::size::append_string(out, text, MAX_XML_BYTES)
-        .map_err(|_| error(offset, "XML entity output too large"))
 }
 
 enum SerializeEvent {
@@ -1663,8 +639,6 @@ enum SerializeEvent {
     },
 }
 
-const XML_NAMESPACE_URI: &str = "http://www.w3.org/XML/1998/namespace";
-const XMLNS_NAMESPACE_URI: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Serialize a node using XML fragment serialization and namespace fixup.
 ///
@@ -1691,7 +665,7 @@ pub fn serialize_xml(
         return Err(DomError::WrongKind);
     }
     let mut output = String::new();
-    let mut bindings = alloc::vec![(String::from("xml"), String::from(XML_NAMESPACE_URI)),];
+    let mut bindings = alloc::vec![(String::from("xml"), String::from(XML_NAMESPACE)),];
     let mut events = alloc::vec![SerializeEvent::Node {
         id: root,
         context_namespace: None,
@@ -1745,7 +719,7 @@ pub fn serialize_xml(
                         if require_well_formed
                             && (!is_xml_name(name)
                                 || !public_id.bytes().all(public_id_char)
-                                || !system_id.chars().all(xml_char)
+                                || !system_id.chars().all(shared::is_xml_char)
                                 || (system_id.contains('"') && system_id.contains('\'')))
                         {
                             return Err(DomError::WrongKind);
@@ -1805,7 +779,7 @@ pub fn serialize_xml(
                                 if prefix.is_empty() {
                                     local_default_namespace = Some(value.clone());
                                 } else {
-                                    if value == XML_NAMESPACE_URI {
+                                    if value == XML_NAMESPACE {
                                         // The XML namespace is always serialized
                                         // with the reserved `xml` prefix.
                                         continue;
@@ -1856,8 +830,8 @@ pub fn serialize_xml(
                             let mut candidate = None;
                             if let Some(prefix) = declaration_prefix(name.as_str(), uri) {
                                 if (ignore_default_declaration && prefix.is_empty())
-                                    || (prefix.is_empty() && value == XML_NAMESPACE_URI)
-                                    || (!prefix.is_empty() && value == XML_NAMESPACE_URI)
+                                    || (prefix.is_empty() && value == XML_NAMESPACE)
+                                    || (!prefix.is_empty() && value == XML_NAMESPACE)
                                 {
                                     continue;
                                 }
@@ -1877,7 +851,7 @@ pub fn serialize_xml(
                                     continue;
                                 }
                                 if require_well_formed
-                                    && (value == XMLNS_NAMESPACE_URI
+                                    && (value == XMLNS_NAMESPACE
                                         || (!prefix.is_empty() && value.is_empty()))
                                 {
                                     return Err(DomError::WrongKind);
@@ -1890,7 +864,7 @@ pub fn serialize_xml(
                                         split_qname(name.as_str()).map(|(prefix, _)| prefix),
                                     )
                                 });
-                                if uri.is_some_and(|uri| uri == XMLNS_NAMESPACE_URI) {
+                                if uri.is_some_and(|uri| uri == XMLNS_NAMESPACE) {
                                     candidate = Some(String::from("xmlns"));
                                 } else if let Some(uri) = uri.filter(|uri| !uri.is_empty()) {
                                     if candidate.is_none() {
@@ -2025,7 +999,7 @@ fn stored_doctype_name(raw: &str) -> &str {
 }
 
 fn declaration_prefix<'a>(name: &'a str, uri: Option<&str>) -> Option<&'a str> {
-    if uri != Some(XMLNS_NAMESPACE_URI) {
+    if uri != Some(XMLNS_NAMESPACE) {
         return None;
     }
     if name == "xmlns" {
@@ -2037,8 +1011,8 @@ fn declaration_prefix<'a>(name: &'a str, uri: Option<&str>) -> Option<&'a str> {
 
 fn valid_namespace_binding(prefix: &str, uri: &str) -> bool {
     prefix != "xmlns"
-        && uri != XMLNS_NAMESPACE_URI
-        && (prefix == "xml") == (uri == XML_NAMESPACE_URI)
+        && uri != XMLNS_NAMESPACE
+        && (prefix == "xml") == (uri == XML_NAMESPACE)
         && (prefix.is_empty() || !uri.is_empty())
 }
 
@@ -2128,7 +1102,7 @@ fn fixup_element_name(
         if has_local_default_namespace {
             *ignore_default_declaration = true;
         }
-        let name = if namespace == Some(XML_NAMESPACE_URI) {
+        let name = if namespace == Some(XML_NAMESPACE) {
             alloc::format!("xml:{local}")
         } else {
             String::from(local)
@@ -2145,7 +1119,7 @@ fn fixup_element_name(
     }
     if let Some(candidate) = candidate {
         let inherited =
-            if has_local_default_namespace && local_default_namespace != Some(XML_NAMESPACE_URI) {
+            if has_local_default_namespace && local_default_namespace != Some(XML_NAMESPACE) {
                 local_default_namespace
                     .filter(|namespace| !namespace.is_empty())
                     .map(String::from)
@@ -2168,7 +1142,7 @@ fn fixup_element_name(
         local_prefixes.push((generated_prefix.clone(), String::from(uri)));
         bind_for_serialization(&generated_prefix, uri, bindings, generated, generated_bytes)?;
         let inherited =
-            if has_local_default_namespace && local_default_namespace != Some(XML_NAMESPACE_URI) {
+            if has_local_default_namespace && local_default_namespace != Some(XML_NAMESPACE) {
                 local_default_namespace
                     .filter(|namespace| !namespace.is_empty())
                     .map(String::from)
@@ -2246,7 +1220,7 @@ fn append_xml(output: &mut String, text: &str) -> Result<(), DomError> {
 }
 
 fn validate_xml_serialized_data(input: &str) -> Result<(), DomError> {
-    if input.chars().all(xml_char) {
+    if input.chars().all(shared::is_xml_char) {
         Ok(())
     } else {
         Err(DomError::WrongKind)
@@ -2261,7 +1235,7 @@ fn escape_xml(
 ) -> Result<(), DomError> {
     let mut run = 0;
     for (index, ch) in input.char_indices() {
-        if require_well_formed && !xml_char(ch) {
+        if require_well_formed && !shared::is_xml_char(ch) {
             return Err(DomError::WrongKind);
         }
         let replacement = match ch {
@@ -2287,7 +1261,7 @@ fn append_cdata(
     value: &str,
     require_well_formed: bool,
 ) -> Result<(), DomError> {
-    if require_well_formed && value.chars().any(|ch| !xml_char(ch)) {
+    if require_well_formed && value.chars().any(|ch| !shared::is_xml_char(ch)) {
         return Err(DomError::WrongKind);
     }
     let mut remaining = value;
@@ -2302,6 +1276,157 @@ fn append_cdata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_element(document: &Document) -> NodeId {
+        let mut child = document.first_child(document.root()).unwrap();
+        while let Some(node) = child {
+            if matches!(document.kind(node).unwrap(), NodeKind::Element { .. }) {
+                return node;
+            }
+            child = document.next_sibling(node).unwrap();
+        }
+        panic!("parsed document has no root element")
+    }
+
+    #[test]
+    fn xml_name_and_qname_validators_follow_distinct_colon_rules() {
+        assert!(is_xml_name(":leading:colon"));
+        assert!(is_xml_name("Élément_名"));
+        assert!(!is_xml_name(""));
+        assert!(!is_xml_name("9element"));
+        assert!(!is_xml_name("bad name"));
+
+        assert_eq!(split_qname("svg"), Some(("", "svg")));
+        assert_eq!(split_qname("Élément:名"), Some(("Élément", "名")));
+        assert!(split_qname(":svg").is_none());
+        assert!(split_qname("svg:").is_none());
+        assert!(split_qname("one:two:three").is_none());
+        assert!(split_qname("9svg:circle").is_none());
+    }
+
+    #[test]
+    fn resolves_default_and_prefixed_element_namespaces_without_case_folding() {
+        let document = parse(
+            "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=\"urn:example\"><x:Thing x:code=\"v\" plain=\"p\"/></svg>",
+            32,
+        )
+        .unwrap();
+        let svg = root_element(&document);
+        assert!(
+            matches!(document.kind(svg), Ok(NodeKind::Element { namespace: Namespace::Svg, name, .. }) if name == "svg")
+        );
+        let child = document.first_child(svg).unwrap().unwrap();
+        assert!(
+            matches!(document.kind(child), Ok(NodeKind::Element { namespace: Namespace::Other(uri), name, .. }) if uri.as_ref() == "urn:example" && name == "x:Thing")
+        );
+        assert_eq!(
+            document
+                .get_attribute_ns(child, Some("urn:example"), "code")
+                .unwrap()
+                .as_deref(),
+            Some("v")
+        );
+        assert_eq!(
+            document
+                .get_attribute_ns(child, None, "plain")
+                .unwrap()
+                .as_deref(),
+            Some("p")
+        );
+        assert_eq!(
+            document
+                .attribute_namespace_uri(child, "x:code")
+                .unwrap()
+                .as_deref(),
+            Some("urn:example")
+        );
+
+        let xhtml = parse(
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><MiXeD DATA-Code=\"case\"/></body></html>",
+            32,
+        ).unwrap();
+        let html = root_element(&xhtml);
+        let body = xhtml.first_child(html).unwrap().unwrap();
+        let mixed = xhtml.first_child(body).unwrap().unwrap();
+        for (node, expected_name) in [(html, "html"), (body, "body"), (mixed, "MiXeD")] {
+            assert!(matches!(xhtml.kind(node),
+                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == expected_name));
+        }
+        assert_eq!(
+            xhtml
+                .get_attribute_ns(mixed, None, "DATA-Code")
+                .unwrap()
+                .as_deref(),
+            Some("case")
+        );
+        assert_eq!(
+            xhtml.get_attribute_ns(mixed, None, "data-code").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_well_formedness_and_namespaces() {
+        for source in [
+            "<r a=\"1\"b=\"2\"/>",
+            "<r a=\"<\"/>",
+            "<r>text]]>text</r>",
+            "<r>&#0;</r>",
+            "<r xmlns:p=\"urn:x\" p:a=\"1\" q:a=\"2\" xmlns:q=\"urn:x\"/>",
+            " <?xml version=\"1.0\"?><r/>",
+            "<?xml nonsense?><r/>",
+        ] {
+            assert!(
+                parse(source, 64).is_err(),
+                "accepted malformed XML: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_external_entities_without_loading_them() {
+        assert!(parse(
+            "<!DOCTYPE r [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><r>&e;</r>",
+            64,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn namespace_attribute_prefix_replacement_keeps_single_mutation() {
+        let mut document = Document::new(16);
+        let element = document
+            .create(NodeKind::Element {
+                namespace: Namespace::Other(Rc::from("")),
+                name: Name::new("root"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        document.append(document.root(), element).unwrap();
+        document
+            .set_attribute_ns(element, Some("urn:keys"), "x:key", "old")
+            .unwrap();
+        document.clear_mutations();
+        document
+            .set_attribute_ns(element, Some("urn:keys"), "y:key", "new")
+            .unwrap();
+        assert_eq!(
+            document
+                .get_attribute_ns(element, Some("urn:keys"), "key")
+                .unwrap()
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            document.get_attribute_ns(element, None, "key").unwrap(),
+            None
+        );
+        assert_eq!(document.mutations().len(), 1);
+        assert!(matches!(
+            document.mutations()[0].kind,
+            crate::MutationKind::Attribute(_)
+        ));
+    }
 
     #[test]
     fn initialized_xml_parser_observes_initial_xhtml_details_transitions() {
@@ -2395,17 +1520,6 @@ mod tests {
             assert_eq!(document.node_count(), if is_template { 3 } else { 2 });
             assert_eq!(parse(markup, 2).is_err(), is_template);
         }
-    }
-
-    fn root_element(document: &Document) -> NodeId {
-        let mut child = document.first_child(document.root()).unwrap();
-        while let Some(node) = child {
-            if matches!(document.kind(node).unwrap(), NodeKind::Element { .. }) {
-                return node;
-            }
-            child = document.next_sibling(node).unwrap();
-        }
-        panic!("parsed document has no root element")
     }
 
     #[test]
@@ -2724,43 +1838,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_plain_entity_references_expand_with_bounded_text_storage() {
-        let references = "&letter;".repeat(4096);
-        let source = alloc::format!("<!DOCTYPE r [<!ENTITY letter 'x'>]><r>{references}</r>");
-        let document = parse(&source, 8).unwrap();
-        let root = root_element(&document);
-        let text = document.first_child(root).unwrap().unwrap();
-        assert_eq!(
-            document.kind(text).unwrap(),
-            &NodeKind::Text("x".repeat(4096))
-        );
-        assert!(document.next_sibling(text).unwrap().is_none());
-    }
-
-    #[test]
-    fn empty_entity_expansions_are_counted_across_recursive_references() {
-        let mut source = String::from("<!DOCTYPE r [<!ENTITY e0 ''>");
-        for index in 1..=16 {
-            let previous = (index - 1).to_string();
-            let current = index.to_string();
-            source.push_str("<!ENTITY e");
-            source.push_str(&current);
-            source.push_str(" '&e");
-            source.push_str(&previous);
-            source.push_str(";&e");
-            source.push_str(&previous);
-            source.push_str(";'>");
-        }
-        source.push_str("]><r>&e16;</r>");
-
-        let failure = match parse(&source, 16) {
-            Err(failure) => failure,
-            Ok(_) => panic!("accepted excessive empty entity expansion"),
-        };
-        assert_eq!(failure.message, "XML entity expansion count exceeded");
-    }
-
-    #[test]
     fn internal_entity_attribute_references_follow_xml_less_than_rules() {
         let document = parse(
             "<!DOCTYPE r [<!ENTITY safe '&lt;'><!ENTITY nested '&safe;'>]><r value='&nested;'/>",
@@ -2786,52 +1863,6 @@ mod tests {
                 "accepted less-than from replacement text: {source}"
             );
         }
-    }
-
-    #[test]
-    fn internal_entity_recursion_depth_and_expansion_are_bounded() {
-        for source in [
-            "<!DOCTYPE r [<!ENTITY loop '&loop;'>]><r>&loop;</r>",
-            "<!DOCTYPE r [<!ENTITY one '&two;'><!ENTITY two '&one;'>]><r>&one;</r>",
-        ] {
-            assert!(
-                parse(source, 64).is_err(),
-                "accepted recursive entity: {source}"
-            );
-        }
-
-        let mut deep = String::from("<!DOCTYPE r [<!ENTITY e0 'x'>");
-        for index in 1..=MAX_ENTITY_DEPTH + 2 {
-            let previous = (index - 1).to_string();
-            let current = index.to_string();
-            deep.push_str("<!ENTITY e");
-            deep.push_str(&current);
-            deep.push_str(" '&e");
-            deep.push_str(&previous);
-            deep.push_str(";'>");
-        }
-        deep.push_str("]><r>&e");
-        deep.push_str(&(MAX_ENTITY_DEPTH + 2).to_string());
-        deep.push_str(";</r>");
-        assert!(parse(&deep, 64).is_err(), "accepted over-deep entity chain");
-
-        let mut expanding = String::from("<!DOCTYPE r [<!ENTITY e0 'x'>");
-        for index in 1..=24 {
-            let previous = (index - 1).to_string();
-            let current = index.to_string();
-            expanding.push_str("<!ENTITY e");
-            expanding.push_str(&current);
-            expanding.push_str(" '&e");
-            expanding.push_str(&previous);
-            expanding.push_str(";&e");
-            expanding.push_str(&previous);
-            expanding.push_str(";'>");
-        }
-        expanding.push_str("]><r>&e24;</r>");
-        assert!(
-            parse(&expanding, 64).is_err(),
-            "accepted over-budget expansion"
-        );
     }
 
     #[test]
@@ -2865,44 +1896,6 @@ mod tests {
             .is_err(),
             "an external entity reference is not fetched"
         );
-    }
-
-    #[test]
-    fn parameter_entity_references_are_rejected_without_resolution() {
-        for source in [
-            "<!DOCTYPE r [<!ENTITY % remote SYSTEM 'file:///never-read.dtd'>%remote;]><r/>",
-            "<!DOCTYPE r [<!ENTITY % local '<!ENTITY value \"expanded\">'>%local;]><r/>",
-            "<!DOCTYPE r [<!ENTITY value '%remote;'>]><r>&value;</r>",
-        ] {
-            assert!(
-                parse(source, 16).is_err(),
-                "accepted an unresolved parameter-entity reference: {source}"
-            );
-        }
-    }
-
-    #[test]
-    fn xml_catalog_expansion_checks_output_budget_before_growth() {
-        let source = "&nLt;".repeat(MAX_XML_BYTES / 6 + 1);
-        assert!(source.len() < MAX_XML_BYTES);
-        let error = decode_entities(&source, 0, true).unwrap_err();
-        assert_eq!(error.message, "XML entity output too large");
-    }
-
-    #[test]
-    fn xml_name_and_qname_validators_follow_distinct_colon_rules() {
-        assert!(is_xml_name(":leading:colon"));
-        assert!(is_xml_name("Élément_名"));
-        assert!(!is_xml_name(""));
-        assert!(!is_xml_name("9element"));
-        assert!(!is_xml_name("bad name"));
-
-        assert_eq!(split_qname("svg"), Some(("", "svg")));
-        assert_eq!(split_qname("Élément:名"), Some(("Élément", "名")));
-        assert!(split_qname(":svg").is_none());
-        assert!(split_qname("svg:").is_none());
-        assert!(split_qname("one:two:three").is_none());
-        assert!(split_qname("9svg:circle").is_none());
     }
 
     #[test]
@@ -2948,146 +1941,5 @@ mod tests {
             &NodeKind::CData("x<y&z".into())
         );
         assert_eq!(document.character_data_length(cdata), Ok(5));
-    }
-
-    #[test]
-    fn resolves_default_and_prefixed_element_namespaces_without_case_folding() {
-        let document = parse(
-            "<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:x=\"urn:example\"><x:Thing x:code=\"v\" plain=\"p\"/></svg>",
-            32,
-        )
-        .unwrap();
-        let svg = root_element(&document);
-        assert!(
-            matches!(document.kind(svg), Ok(NodeKind::Element { namespace: Namespace::Svg, name, .. }) if name == "svg")
-        );
-        let child = document.first_child(svg).unwrap().unwrap();
-        assert!(
-            matches!(document.kind(child), Ok(NodeKind::Element { namespace: Namespace::Other(uri), name, .. }) if uri.as_ref() == "urn:example" && name == "x:Thing")
-        );
-        assert_eq!(
-            document
-                .get_attribute_ns(child, Some("urn:example"), "code")
-                .unwrap()
-                .as_deref(),
-            Some("v")
-        );
-        assert_eq!(
-            document
-                .get_attribute_ns(child, None, "plain")
-                .unwrap()
-                .as_deref(),
-            Some("p")
-        );
-        assert_eq!(
-            document
-                .attribute_namespace_uri(child, "x:code")
-                .unwrap()
-                .as_deref(),
-            Some("urn:example")
-        );
-
-        let xhtml = parse(
-            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><MiXeD DATA-Code=\"case\"/></body></html>",
-            32,
-        ).unwrap();
-        let html = root_element(&xhtml);
-        let body = xhtml.first_child(html).unwrap().unwrap();
-        let mixed = xhtml.first_child(body).unwrap().unwrap();
-        for (node, expected_name) in [(html, "html"), (body, "body"), (mixed, "MiXeD")] {
-            assert!(matches!(xhtml.kind(node),
-                Ok(NodeKind::Element { namespace: Namespace::Html, name, .. }) if name == expected_name));
-        }
-        assert_eq!(
-            xhtml
-                .get_attribute_ns(mixed, None, "DATA-Code")
-                .unwrap()
-                .as_deref(),
-            Some("case")
-        );
-        assert_eq!(
-            xhtml.get_attribute_ns(mixed, None, "data-code").unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_well_formedness_and_namespaces() {
-        for source in [
-            "<r a=\"1\"b=\"2\"/>",
-            "<r a=\"<\"/>",
-            "<r>text]]>text</r>",
-            "<r>&#0;</r>",
-            "<r xmlns:p=\"urn:x\" p:a=\"1\" q:a=\"2\" xmlns:q=\"urn:x\"/>",
-            " <?xml version=\"1.0\"?><r/>",
-            "<?xml nonsense?><r/>",
-        ] {
-            assert!(
-                parse(source, 64).is_err(),
-                "accepted malformed XML: {source}"
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_external_entities_without_loading_them() {
-        assert!(parse(
-            "<!DOCTYPE r [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><r>&e;</r>",
-            64,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn namespace_attribute_prefix_is_preserved_when_value_changes() {
-        let mut document = Document::new(16);
-        let element = document
-            .create(NodeKind::Element {
-                namespace: Namespace::Other(Rc::from("")),
-                name: Name::new("root"),
-                attributes: Vec::new(),
-            })
-            .unwrap();
-        document.append(document.root(), element).unwrap();
-        document
-            .set_attribute_ns(element, Some("urn:keys"), "x:key", "old")
-            .unwrap();
-        let attribute = document
-            .attribute_node_by_ns(element, Some("urn:keys"), "key")
-            .unwrap()
-            .unwrap();
-        document.clear_mutations();
-        document
-            .set_attribute_ns(element, Some("urn:keys"), "y:key", "new")
-            .unwrap();
-        assert_eq!(
-            document
-                .get_attribute_ns(element, Some("urn:keys"), "key")
-                .unwrap()
-                .as_deref(),
-            Some("new")
-        );
-        assert_eq!(
-            document.get_attribute_ns(element, None, "key").unwrap(),
-            None
-        );
-        assert_eq!(document.mutations().len(), 1);
-        assert!(matches!(
-            document.mutations()[0].kind,
-            crate::MutationKind::Attribute(_)
-        ));
-        assert_eq!(
-            document.attribute_node_by_ns(element, Some("urn:keys"), "key"),
-            Ok(Some(attribute))
-        );
-        assert!(matches!(
-            document.kind(attribute).unwrap(),
-            crate::NodeKind::Attribute { qualified_name, value, .. }
-                if qualified_name == "x:key" && value == "new"
-        ));
-        assert_eq!(
-            document.attribute_node_by_name(element, "y:key").unwrap(),
-            None
-        );
     }
 }

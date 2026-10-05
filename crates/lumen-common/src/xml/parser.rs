@@ -1529,6 +1529,10 @@ impl Parser {
         let ent = match ent {
             Some(e) => e,
             None => {
+                if let Some(text) = self.shared.entity_catalog.get().and_then(|lookup| lookup(name)) {
+                    emit!(h, raw, h.chardata(text));
+                    return Ok(());
+                }
                 let (hp, sa) = {
                     let d = self.shared.dtd.borrow();
                     (d.has_param_entity_refs, d.standalone)
@@ -1641,6 +1645,10 @@ impl Parser {
                         let ent = self.shared.dtd.borrow().general.get(name).cloned();
                         match ent {
                             None => {
+                                if let Some(text) = self.shared.entity_catalog.get().and_then(|lookup| lookup(name)) {
+                                    out.push_str(text);
+                                    continue;
+                                }
                                 let (hp, sa) = {
                                     let d = self.shared.dtd.borrow();
                                     (d.has_param_entity_refs, d.standalone)

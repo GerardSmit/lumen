@@ -2104,53 +2104,7 @@ pub fn encode_canvas_image(
     }
 }
 
-fn unfilter(row: &mut [u8], previous: Option<&[u8]>, channels: usize) -> Result<(), ImageError> {
-    let (filter, bytes) = row
-        .split_first_mut()
-        .ok_or(ImageError::Png("empty scanline"))?;
-    if *filter > 4 {
-        return Err(ImageError::Png("unsupported PNG filter"));
-    }
-    for i in 0..bytes.len() {
-        let left = if i >= channels {
-            bytes[i - channels]
-        } else {
-            0
-        };
-        let previous_index = i / channels * 4 + i % channels;
-        let above = previous.map_or(0, |row| row[previous_index]);
-        let upper_left = if i >= channels {
-            previous.map_or(0, |row| row[previous_index - 4])
-        } else {
-            0
-        };
-        let predictor = match *filter {
-            0 => 0,
-            1 => left,
-            2 => above,
-            3 => ((left as u16 + above as u16) / 2) as u8,
-            _ => {
-                let p = left as i32 + above as i32 - upper_left as i32;
-                let (a, b, c) = (
-                    (p - left as i32).abs(),
-                    (p - above as i32).abs(),
-                    (p - upper_left as i32).abs(),
-                );
-                if a <= b && a <= c {
-                    left
-                } else if b <= c {
-                    above
-                } else {
-                    upper_left
-                }
-            }
-        };
-        bytes[i] = bytes[i].wrapping_add(predictor);
-    }
-    Ok(())
-}
-
-/// Decode a non-interlaced 8-bit RGB/RGBA PNG with bounded pixel storage.
+/// Decode a PNG with bounded pixel storage.
 pub fn decode_png(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
     if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Err(ImageError::Png("invalid PNG signature"));
@@ -2158,150 +2112,8 @@ pub fn decode_png(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
     decode_raster_image_bounded(bytes, true, MAX_IMAGE_BYTES)
 }
 
-fn decode_png_basic(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Err(ImageError::Png("invalid PNG signature"));
-    }
-    let mut offset = 8usize;
-    let mut image = None;
-    let mut scanline = Vec::new();
-    let mut inflater = None;
-    let mut filled = 0usize;
-    let mut rows = 0usize;
-    let mut ended = false;
-    let mut channels = 4;
-    while offset < bytes.len() {
-        let header_end = offset
-            .checked_add(8)
-            .ok_or(ImageError::Png("chunk too large"))?;
-        let header = bytes
-            .get(offset..header_end)
-            .ok_or(ImageError::Png("truncated chunk"))?;
-        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        let end = offset
-            .checked_add(len)
-            .and_then(|n| n.checked_add(12))
-            .ok_or(ImageError::Png("chunk too large"))?;
-        if end > bytes.len() {
-            return Err(ImageError::Png("truncated chunk"));
-        }
-        let kind = &bytes[offset + 4..offset + 8];
-        let data = &bytes[offset + 8..offset + 8 + len];
-        let expected_crc = u32::from_be_bytes(bytes[end - 4..end].try_into().unwrap());
-        if lumen_common::compress::crc32_from(0, &bytes[offset + 4..end - 4]) != expected_crc {
-            return Err(ImageError::Png("PNG CRC mismatch"));
-        }
-        offset = end;
-        match kind {
-            b"IHDR" if image.is_none() && len == 13 => {
-                let width = u32::from_be_bytes(data[0..4].try_into().unwrap());
-                let height = u32::from_be_bytes(data[4..8].try_into().unwrap());
-                if width == 0
-                    || height == 0
-                    || data[8] != 8
-                    || !matches!(data[9], 2 | 6)
-                    || data[10..] != [0, 0, 0]
-                {
-                    return Err(ImageError::Png("unsupported PNG format"));
-                }
-                channels = if data[9] == 2 { 3 } else { 4 };
-                let pixels = lumen_common::limits::size::repeat(
-                    width as usize,
-                    height as usize,
-                    MAX_IMAGE_BYTES / 4,
-                )
-                .map_err(|_| ImageError::TooLarge)?;
-                let len = lumen_common::limits::size::repeat(pixels, 4, MAX_IMAGE_BYTES)
-                    .map_err(|_| ImageError::TooLarge)?;
-                let mut data = Vec::new();
-                data.try_reserve_exact(len)
-                    .map_err(|_| ImageError::TooLarge)?;
-                data.resize(len, 0);
-                scanline
-                    .try_reserve_exact(width as usize * channels + 1)
-                    .map_err(|_| ImageError::TooLarge)?;
-                scanline.resize(width as usize * channels + 1, 0);
-                image = Some(Rgba8Image {
-                    width,
-                    height,
-                    pixels: data,
-                });
-            }
-            b"IDAT" => {
-                let picture = image.as_mut().ok_or(ImageError::Png("IDAT before IHDR"))?;
-                if inflater.is_none() {
-                    inflater = Some(
-                        lumen_common::compress::ZStream::inflate(15)
-                            .map_err(|_| ImageError::Png("zlib inflater initialization failed"))?,
-                    );
-                }
-                let stream = inflater.as_mut().unwrap();
-                let mut input = data;
-                while !input.is_empty() {
-                    if ended {
-                        return Err(ImageError::Png("extra compressed data"));
-                    }
-                    let step = stream.run(0, input, &mut scanline[filled..]);
-                    if step.code != lumen_common::compress::Z_OK
-                        && step.code != lumen_common::compress::Z_STREAM_END
-                    {
-                        return Err(ImageError::Png("invalid zlib stream"));
-                    }
-                    if step.consumed == 0 && step.produced == 0 {
-                        return Err(ImageError::Png("stalled zlib stream"));
-                    }
-                    input = &input[step.consumed..];
-                    filled += step.produced;
-                    if filled == scanline.len() {
-                        if rows >= picture.height as usize {
-                            return Err(ImageError::Png("too many scanlines"));
-                        }
-                        let stride = picture.width as usize * 4;
-                        let previous = if rows == 0 {
-                            None
-                        } else {
-                            Some(&picture.pixels[(rows - 1) * stride..rows * stride])
-                        };
-                        unfilter(&mut scanline, previous, channels)?;
-                        let destination = &mut picture.pixels[rows * stride..(rows + 1) * stride];
-                        if channels == 4 {
-                            destination.copy_from_slice(&scanline[1..]);
-                        } else {
-                            for (source, target) in scanline[1..]
-                                .chunks_exact(3)
-                                .zip(destination.chunks_exact_mut(4))
-                            {
-                                target[..3].copy_from_slice(source);
-                                target[3] = 255;
-                            }
-                        }
-                        rows += 1;
-                        filled = 0;
-                    }
-                    if step.code == lumen_common::compress::Z_STREAM_END {
-                        ended = true;
-                    }
-                }
-            }
-            b"IEND" if len == 0 => {
-                let picture = image.ok_or(ImageError::Png("missing IHDR"))?;
-                if !ended || filled != 0 || rows != picture.height as usize || offset != bytes.len()
-                {
-                    return Err(ImageError::Png("incomplete PNG data"));
-                }
-                return Ok(picture);
-            }
-            b"tRNS" => return Err(ImageError::Png("unsupported PNG transparency")),
-            _ if kind[0] & 0x20 != 0 => {}
-            _ => return Err(ImageError::Png("unsupported PNG chunk")),
-        }
-    }
-    Err(ImageError::Png("missing IEND"))
-}
-
-/// Decode one still raster image through the shared image crate. PNG keeps the
-/// bounded decoder used by the existing HTML image path; JPEG, WebP, GIF and BMP
-/// are decoded by their upstream image codecs. Animated formats yield their
+/// Decode one still raster image through the shared image crate. PNG, JPEG, WebP, GIF and BMP
+/// are decoded by their upstream image codecs under size limits. Animated formats yield their
 /// first frame because this API returns a static raster.
 pub fn decode_raster_image(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
     decode_raster_image_with_orientation(bytes, true)
@@ -2546,15 +2358,6 @@ fn decode_raster_image_bounded(
         let height = u32::from_be_bytes(dimensions[4..].try_into().unwrap()) as usize;
         lumen_common::limits::size::repeat(width, height, max_bytes / 4)
             .map_err(|_| ImageError::TooLarge)?;
-        // Retain the streaming common-zlib path for its supported PNG subset.
-        // Palette, packed/16-bit samples, transparency and Adam7 use the same
-        // bounded maintained codec path as the other raster formats.
-        if bytes.get(24..29).is_some_and(|header| {
-            header[0] == 8 && matches!(header[1], 2 | 6) && header[2..] == [0, 0, 0]
-        }) && !bytes.windows(4).any(|window| window == b"tRNS")
-        {
-            return decode_png_basic(bytes);
-        }
     }
     if !matches!(
         format,
@@ -3427,10 +3230,7 @@ mod tests {
         assert_eq!(decode_png(&png).unwrap(), image);
         let mut corrupt = png.clone();
         corrupt[29] ^= 1;
-        assert_eq!(
-            decode_png(&corrupt),
-            Err(ImageError::Png("PNG CRC mismatch"))
-        );
+        assert!(decode_png(&corrupt).is_err());
         let mut offset = 8;
         let mut packed = Vec::new();
         while offset < png.len() {

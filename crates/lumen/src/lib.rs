@@ -68,7 +68,6 @@ pub mod parallel;
 pub use modules::load_stats;
 #[cfg(feature = "intl")]
 mod numbering;
-use lumen_common::lzh;
 /// Opt-in memory accounting (`LUMEN_MEM_STATS=1`).
 pub mod memstats;
 #[cfg(feature = "aot-native")]

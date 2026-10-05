@@ -16,11 +16,12 @@ pub mod civil;
 pub mod codec;
 #[cfg(feature = "web-encoding")]
 pub mod encoding;
-#[cfg(feature = "compress")]
+#[cfg(feature = "deflate")]
 pub mod compress;
 #[cfg(feature = "cookies")]
 pub mod cookies;
 pub mod cors;
+pub mod crc32;
 #[cfg(feature = "crypt")]
 pub mod crypt;
 pub mod csv;
@@ -28,6 +29,8 @@ pub mod cycle;
 pub mod decimal;
 pub mod dedent;
 pub mod editdist;
+pub mod entities;
+#[cfg(feature = "executable")]
 pub mod executable;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;
@@ -46,7 +49,6 @@ pub mod limits;
 mod linebreak;
 pub mod lineno;
 pub mod local_tz;
-pub mod lzh;
 pub mod memcat;
 pub mod mime;
 pub mod mt19937;

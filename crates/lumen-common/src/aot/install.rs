@@ -5,7 +5,7 @@ pub const VERSION: u8 = 1;
 pub const HEADER_LEN: usize = 20;
 /// Current device install limit; transports can impose a smaller cap.
 pub const MAX_DEVICE_PAYLOAD: usize = 16 << 20;
-const SIGNATURE_LEN: usize = 64;
+pub const SIGNATURE_LEN: usize = 64;
 const APP_MAGIC: &[u8; 8] = b"LUMAPP01";
 const APP_HEADER_LEN: usize = 48;
 pub const MAX_APP_NAME_LEN: usize = 64;
@@ -228,29 +228,28 @@ pub fn decode_install_payload(payload: &[u8]) -> Result<InstallPayload<'_>, &'st
 }
 
 /// Validate one complete INSTALL frame for the running native target before
-/// storing or mapping its blob. Release callers pass `allow_unsigned = false`
-/// and their configured Ed25519 public-key allow-list.
-#[cfg(feature = "native-signing")]
+/// storing or mapping its blob. `verify` checks a detached signature over the
+/// blob (Ed25519 against a key allow-list in release builds); an unsigned frame
+/// is accepted only when `allow_unsigned` is set.
 pub fn authorize_install<'a>(
     bytes: &'a [u8],
     max_payload: usize,
     target: &crate::target::TargetSpec,
-    allowed_keys: &[[u8; super::signature::PUBLIC_KEY_LEN]],
     allow_unsigned: bool,
+    verify: impl FnOnce(&[u8], &[u8; SIGNATURE_LEN]) -> Result<(), &'static str>,
 ) -> Result<InstallPayload<'a>, &'static str> {
-    let app = authenticate_install(bytes, max_payload, allowed_keys, allow_unsigned)?;
+    let app = authenticate_install(bytes, max_payload, allow_unsigned, verify)?;
     super::NativeContainer::parse(app.blob)?.mapping_len(target)?;
     Ok(app)
 }
 
 /// Authenticate a stored INSTALL frame without requiring the old target to
 /// match the current firmware. Used to report apps requiring a host rebuild.
-#[cfg(feature = "native-signing")]
 pub fn authenticate_install<'a>(
     bytes: &'a [u8],
     max_payload: usize,
-    allowed_keys: &[[u8; super::signature::PUBLIC_KEY_LEN]],
     allow_unsigned: bool,
+    verify: impl FnOnce(&[u8], &[u8; SIGNATURE_LEN]) -> Result<(), &'static str>,
 ) -> Result<InstallPayload<'a>, &'static str> {
     let frame = decode(bytes, max_payload)?;
     if frame.kind != Kind::Install {
@@ -258,7 +257,7 @@ pub fn authenticate_install<'a>(
     }
     let app = decode_install_payload(frame.payload)?;
     match frame.signature {
-        Some(signature) => super::signature::verify(app.blob, signature, allowed_keys)?,
+        Some(signature) => verify(app.blob, signature)?,
         None if !allow_unsigned => return Err("native app signature required"),
         None => (),
     }
@@ -462,12 +461,5 @@ fn validate_shape(kind: Kind, payload: &[u8], signed: bool) -> Result<(), &'stat
 }
 
 fn crc32(header: &[u8], body: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in header.iter().chain(body) {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    crate::crc32::crc32_from(crate::crc32::crc32_from(0, header), body)
 }

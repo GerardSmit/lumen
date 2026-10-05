@@ -838,6 +838,22 @@ pub fn percent_decode(src: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Like [`percent_decode`], but a `%` that does not start a valid `%XX` escape is an error.
+pub fn percent_decode_strict(src: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        if src[i] == b'%' {
+            out.push(percent_escape_at(src, i)?);
+            i += 3;
+        } else {
+            out.push(src[i]);
+            i += 1;
+        }
+    }
+    Some(out)
+}
+
 /// Appends `%XX` (upper-case hex) for `b`.
 #[inline]
 pub fn push_percent_escape(out: &mut String, b: u8) {

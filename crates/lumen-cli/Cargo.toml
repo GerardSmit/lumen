@@ -12,10 +12,11 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
-lumen-common = { path = "../lumen-common", features = ["native-sidecar", "native-signing"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "executable"] }
 lumen-codegen = { path = "../lumen-codegen", features = ["standalone-object"] }
 lumen-host = { path = "../lumen-host" }
 lumen-os = { path = "../lumen-os" }
+lumen-crypto = { path = "../lumen-crypto", default-features = false, features = ["signatures-only"] }
 lumen-html-image = { path = "../lumen-html-image" }
 lumen-html = { path = "../lumen-html" }
 lumen-html-js = { path = "../lumen-html-js" }

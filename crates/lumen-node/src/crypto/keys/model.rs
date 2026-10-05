@@ -532,14 +532,14 @@ impl OkpKey {
             .map_err(|_| decoder_unsupported())
     }
 
-    pub fn ed25519_signing(&self) -> KResult<ed25519_dalek::SigningKey> {
-        Ok(ed25519_dalek::SigningKey::from_bytes(
+    pub fn ed25519_signing(&self) -> KResult<lumen_crypto::ed25519::SigningKey> {
+        Ok(lumen_crypto::ed25519::SigningKey::from_bytes(
             &self.private_array::<32>()?,
         ))
     }
 
-    pub fn ed25519_verifying(&self) -> KResult<ed25519_dalek::VerifyingKey> {
-        ed25519_dalek::VerifyingKey::from_bytes(&self.public_array::<32>()?)
+    pub fn ed25519_verifying(&self) -> KResult<lumen_crypto::ed25519::VerifyingKey> {
+        lumen_crypto::ed25519::VerifyingKey::from_bytes(&self.public_array::<32>()?)
             .map_err(|_| decoder_unsupported())
     }
 
@@ -585,7 +585,7 @@ pub fn okp_public(kind: &str, private: &[u8]) -> KResult<Vec<u8>> {
     match kind {
         "ed25519" => {
             let seed: [u8; 32] = private.try_into().map_err(|_| invalid_private())?;
-            Ok(ed25519_dalek::SigningKey::from_bytes(&seed)
+            Ok(lumen_crypto::ed25519::SigningKey::from_bytes(&seed)
                 .verifying_key()
                 .to_bytes()
                 .to_vec())
@@ -898,7 +898,7 @@ fn parse_spki(der: &[u8]) -> Option<KResult<AsymKey>> {
         }
         if kind == "ed25519" || kind == "ed448" {
             let ok = if kind == "ed25519" {
-                ed25519_dalek::VerifyingKey::from_bytes(key.try_into().ok()?).is_ok()
+                lumen_crypto::ed25519::VerifyingKey::from_bytes(key.try_into().ok()?).is_ok()
             } else {
                 let arr: [u8; 57] = key.try_into().ok()?;
                 ed448_goldilocks_plus::VerifyingKey::from_bytes(&arr).is_ok()
