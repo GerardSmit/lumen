@@ -109,7 +109,12 @@ macro_rules! ctors {
 
 impl NativeError {
     pub fn new(kind: ErrorKind, message: impl Into<Cow<'static, str>>) -> NativeError {
-        NativeError { kind, message: message.into(), code: None, props: Vec::new() }
+        NativeError {
+            kind,
+            message: message.into(),
+            code: None,
+            props: Vec::new(),
+        }
     }
 
     ctors! {
@@ -140,7 +145,11 @@ impl NativeError {
     }
 
     /// Attach a property (`err.errno`, `err.syscall`, ...).
-    pub fn with_prop(mut self, name: impl Into<Cow<'static, str>>, value: impl Into<Data>) -> NativeError {
+    pub fn with_prop(
+        mut self,
+        name: impl Into<Cow<'static, str>>,
+        value: impl Into<Data>,
+    ) -> NativeError {
         self.props.push((name.into(), value.into()));
         self
     }

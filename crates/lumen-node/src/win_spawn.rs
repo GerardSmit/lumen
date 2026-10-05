@@ -122,7 +122,12 @@ extern "system" {
         si: *mut STARTUPINFOW,
         pi: *mut PROCESS_INFORMATION,
     ) -> BOOL;
-    fn CreatePipe(r: *mut HANDLE, w: *mut HANDLE, sa: *mut SECURITY_ATTRIBUTES, size: DWORD) -> BOOL;
+    fn CreatePipe(
+        r: *mut HANDLE,
+        w: *mut HANDLE,
+        sa: *mut SECURITY_ATTRIBUTES,
+        size: DWORD,
+    ) -> BOOL;
     fn CreateNamedPipeW(
         name: *const u16,
         open_mode: DWORD,
@@ -143,9 +148,20 @@ extern "system" {
         template: HANDLE,
     ) -> HANDLE;
     fn ReadFile(h: HANDLE, buf: *mut u8, n: DWORD, read: *mut DWORD, ov: *mut OVERLAPPED) -> BOOL;
-    fn WriteFile(h: HANDLE, buf: *const u8, n: DWORD, written: *mut DWORD, ov: *mut OVERLAPPED) -> BOOL;
+    fn WriteFile(
+        h: HANDLE,
+        buf: *const u8,
+        n: DWORD,
+        written: *mut DWORD,
+        ov: *mut OVERLAPPED,
+    ) -> BOOL;
     fn GetOverlappedResult(h: HANDLE, ov: *mut OVERLAPPED, n: *mut DWORD, wait: BOOL) -> BOOL;
-    fn CreateEventW(sa: *mut SECURITY_ATTRIBUTES, manual: BOOL, initial: BOOL, name: *const u16) -> HANDLE;
+    fn CreateEventW(
+        sa: *mut SECURITY_ATTRIBUTES,
+        manual: BOOL,
+        initial: BOOL,
+        name: *const u16,
+    ) -> HANDLE;
     fn CloseHandle(h: HANDLE) -> BOOL;
     fn GetStdHandle(which: DWORD) -> HANDLE;
     fn GetCurrentProcess() -> HANDLE;
@@ -224,7 +240,10 @@ impl OvHalf {
         if ev.is_null() {
             return Err(last_error());
         }
-        Ok(OvHalf { pipe, event: Owned(ev) })
+        Ok(OvHalf {
+            pipe,
+            event: Owned(ev),
+        })
     }
 
     /// Issue one overlapped transfer and wait for it. Broken/disconnected pipe reads as EOF.
@@ -439,7 +458,11 @@ fn append_arg(cmd: &mut String, arg: &str, force_quotes: bool) {
 
 /// Resolve the program like `CreateProcess` users expect: a path is taken as given (with `.exe`
 /// appended when that is what exists); a bare name is searched on the child's `PATH`.
-fn resolve_program(program: &str, env: &Option<Vec<(String, String)>>, cwd: &Option<PathBuf>) -> PathBuf {
+fn resolve_program(
+    program: &str,
+    env: &Option<Vec<(String, String)>>,
+    cwd: &Option<PathBuf>,
+) -> PathBuf {
     let with_exe = |p: &Path| -> Option<PathBuf> {
         if p.is_file() {
             return Some(p.to_path_buf());
@@ -495,7 +518,16 @@ fn std_slot(kind: &str, fd: u32) -> io::Result<StdSlot> {
                     return Ok(StdSlot::None);
                 }
                 let mut dup: HANDLE = std::ptr::null_mut();
-                if DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut dup, 0, 1, DUPLICATE_SAME_ACCESS) == 0 {
+                if DuplicateHandle(
+                    GetCurrentProcess(),
+                    h,
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    1,
+                    DUPLICATE_SAME_ACCESS,
+                ) == 0
+                {
                     return Ok(StdSlot::None);
                 }
                 Ok(StdSlot::Child(Owned(dup)))
@@ -591,7 +623,10 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
     // Standard slots, then the extra ones.
     let mut slots = Vec::new();
     for fd in 0..3u32 {
-        slots.push(std_slot(spec.stdio.get(fd as usize).map_or("pipe", String::as_str), fd)?);
+        slots.push(std_slot(
+            spec.stdio.get(fd as usize).map_or("pipe", String::as_str),
+            fd,
+        )?);
     }
     let mut extra_parent = Vec::new();
     let mut extra_child: Vec<(u32, Owned)> = Vec::new();
@@ -691,7 +726,8 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
             std::ptr::null_mut(),
             1,
             CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
-            wenv.as_mut().map_or(std::ptr::null_mut(), |e| e.as_mut_ptr() as *mut c_void),
+            wenv.as_mut()
+                .map_or(std::ptr::null_mut(), |e| e.as_mut_ptr() as *mut c_void),
             wcwd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             &mut si.StartupInfo,
             &mut pi,
@@ -711,9 +747,18 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
         StdSlot::Pipe { parent, .. } => Some(parent),
         _ => None,
     });
-    let stdin = parents.next().flatten().map(|f| Box::new(f) as Box<dyn Write + Send>);
-    let stdout = parents.next().flatten().map(|f| Box::new(f) as Box<dyn Read + Send>);
-    let stderr = parents.next().flatten().map(|f| Box::new(f) as Box<dyn Read + Send>);
+    let stdin = parents
+        .next()
+        .flatten()
+        .map(|f| Box::new(f) as Box<dyn Write + Send>);
+    let stdout = parents
+        .next()
+        .flatten()
+        .map(|f| Box::new(f) as Box<dyn Read + Send>);
+    let stderr = parents
+        .next()
+        .flatten()
+        .map(|f| Box::new(f) as Box<dyn Read + Send>);
     Ok(Spawned {
         child: RawChild {
             process: Owned(pi.hProcess),
@@ -724,7 +769,13 @@ pub fn spawn(spec: &SpawnSpec) -> io::Result<Spawned> {
         stderr,
         extra: extra_parent
             .into_iter()
-            .map(|(fd, r, w)| (fd, Box::new(r) as Box<dyn Read + Send>, Box::new(w) as Box<dyn Write + Send>))
+            .map(|(fd, r, w)| {
+                (
+                    fd,
+                    Box::new(r) as Box<dyn Read + Send>,
+                    Box::new(w) as Box<dyn Write + Send>,
+                )
+            })
             .collect(),
     })
 }

@@ -128,4 +128,15 @@
     rawKill(pid | 0, n);
     return true;
   };
+  globalThis.__lumenSetCliOptions = (json) => {
+    const options = JSON.parse(json);
+    Object.defineProperty(process, Symbol.for("lumen.options"), { value: options, configurable: true });
+    if (options["--experimental-fetch"] === false) {
+      for (const key of ["fetch", "FormData", "Headers", "Request", "Response"]) delete globalThis[key];
+      if (globalThis.WebAssembly) { delete WebAssembly.compileStreaming; delete WebAssembly.instantiateStreaming; }
+    }
+    const apply = globalThis.__lumenApplyOptions;
+    delete globalThis.__lumenApplyOptions;
+    if (apply) apply();
+  };
 })();

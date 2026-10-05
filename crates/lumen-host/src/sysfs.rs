@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
-    std::fs::read_to_string(path)
+    let bytes = read(path)?;
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -18,13 +19,17 @@ pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
-    std::fs::read(path)
+    lumen_os::vfs::host()
+        .read_file(&path.as_ref().to_string_lossy(), 0)
+        .map_err(io::Error::from)
 }
 
 #[cfg(target_arch = "wasm32")]
 pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     use lumen_os::vfs::FileSystem;
-    lumen_os::vfs::mem().read_file(&path.as_ref().to_string_lossy(), 0).map_err(io::Error::from)
+    lumen_os::vfs::mem()
+        .read_file(&path.as_ref().to_string_lossy(), 0)
+        .map_err(io::Error::from)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -35,7 +40,10 @@ pub fn current_dir() -> io::Result<PathBuf> {
 #[cfg(target_arch = "wasm32")]
 pub fn current_dir() -> io::Result<PathBuf> {
     use lumen_os::vfs::FileSystem;
-    lumen_os::vfs::mem().cwd().map(PathBuf::from).map_err(io::Error::from)
+    lumen_os::vfs::mem()
+        .cwd()
+        .map(PathBuf::from)
+        .map_err(io::Error::from)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

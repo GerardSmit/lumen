@@ -28,8 +28,8 @@ use std::time::Duration;
 use lumen_bind::NativeError;
 use lumen_host::{Ctx, OpError, SpawnHandle, Value};
 
-use lumen_common::hash::{digest, Algo};
 use crate::url;
+use lumen_common::hash::{digest, Algo};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Bound reads/writes so a dead peer can't pin a pool worker (reads) or the loop (writes).

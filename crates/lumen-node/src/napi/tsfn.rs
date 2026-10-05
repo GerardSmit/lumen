@@ -563,24 +563,20 @@ mod tests {
             unsafe { napi_unref_threadsafe_function(&mut env, handle) },
             NAPI_OK
         );
-        assert!(
-            !engine
-                .ctx()
-                .host_mut::<TaskRegistry>()
-                .unwrap()
-                .has_ref_pending()
-        );
+        assert!(!engine
+            .ctx()
+            .host_mut::<TaskRegistry>()
+            .unwrap()
+            .has_ref_pending());
         assert_eq!(
             unsafe { napi_ref_threadsafe_function(&mut env, handle) },
             NAPI_OK
         );
-        assert!(
-            engine
-                .ctx()
-                .host_mut::<TaskRegistry>()
-                .unwrap()
-                .has_ref_pending()
-        );
+        assert!(engine
+            .ctx()
+            .host_mut::<TaskRegistry>()
+            .unwrap()
+            .has_ref_pending());
         tick(&mut engine, &rx);
         assert_eq!(log, [1]);
         assert_eq!(

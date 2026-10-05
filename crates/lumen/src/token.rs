@@ -36,6 +36,8 @@ pub enum Tok {
     /// `` `a${x}b` `` lexes to `[Str("a"), Sub([x, Eof]), Str("b")]`. The parser desugars it to a
     /// string concatenation, sub-parsing each `Sub`.
     Template(Box<Vec<TplPart>>),
+    /// Native JSX syntax, with expression containers tokenized in the enclosing source.
+    Jsx(Rc<crate::ast::JsxElement>),
     /// An identifier, interned per lexed source: every occurrence of a name shares one string.
     Ident(Name),
     /// A reserved word. The text is interned to a `&'static str` so the parser can match by value.
@@ -110,10 +112,7 @@ pub struct RegexTok {
 pub enum TplPart {
     /// A literal chunk. `cooked` is None when the chunk contains an invalid escape sequence —
     /// legal only in a *tagged* template (the cooked value is undefined there).
-    Str {
-        cooked: Option<String>,
-        raw: String,
-    },
+    Str { cooked: Option<String>, raw: String },
     /// The hole's tokens, lexed in place (offsets and lines in the enclosing source's
     /// coordinates), ending with an `Eof` at the closing `}`. Shared so a nested template is
     /// never copied per nesting level.

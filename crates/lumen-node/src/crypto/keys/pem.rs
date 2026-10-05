@@ -2,15 +2,18 @@
 //! including passphrase protection: PKCS#8 PBES2 (via `pkcs8` / `pkcs5`) and the legacy OpenSSL
 //! `Proc-Type: 4,ENCRYPTED` PEM headers (EVP_BytesToKey over MD5, CBC ciphers).
 
-use lumen_common::codec;
-use lumen_common::pem::{self, PemBlock};
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use der::{Decode, Encode};
+use lumen_common::codec;
+use lumen_common::pem::{self, PemBlock};
 
 use super::asn1::{self, Reader};
-use crate::crypto::cipher::bindings::bytes_to_key;
 use super::model::{self, AsymKey, EcKey};
-use super::{bad_decrypt, decoder_unsupported, interrupted, missing_passphrase, unknown_cipher, KResult, SendError};
+use super::{
+    bad_decrypt, decoder_unsupported, interrupted, missing_passphrase, unknown_cipher, KResult,
+    SendError,
+};
+use crate::crypto::cipher::bindings::bytes_to_key;
 
 pub const FORMAT_DER: u32 = 0;
 pub const FORMAT_PEM: u32 = 1;
@@ -94,7 +97,10 @@ impl KeyCipher {
         use cipher::block_padding::Pkcs7;
         macro_rules! dec {
             ($c:ty) => {
-                cbc::Decryptor::<$c>::new_from_slices(key, iv).ok()?.decrypt_padded_vec_mut::<Pkcs7>(data).ok()
+                cbc::Decryptor::<$c>::new_from_slices(key, iv)
+                    .ok()?
+                    .decrypt_padded_vec_mut::<Pkcs7>(data)
+                    .ok()
             };
         }
         match self {
@@ -113,7 +119,6 @@ fn random(len: usize) -> Vec<u8> {
     v
 }
 
-
 fn check_passphrase(passphrase: Option<&[u8]>) -> KResult<&[u8]> {
     match passphrase {
         Some(p) if p.len() <= MAX_PASSPHRASE => Ok(p),
@@ -123,20 +128,32 @@ fn check_passphrase(passphrase: Option<&[u8]>) -> KResult<&[u8]> {
 
 /// Decrypts a legacy encrypted PEM body (headers `Proc-Type: 4,ENCRYPTED` + `DEK-Info`).
 fn legacy_decrypt(block: &PemBlock, passphrase: Option<&[u8]>) -> KResult<Option<Vec<u8>>> {
-    let encrypted = block.headers.iter().any(|(k, v)| k == "Proc-Type" && v.contains("ENCRYPTED"));
+    let encrypted = block
+        .headers
+        .iter()
+        .any(|(k, v)| k == "Proc-Type" && v.contains("ENCRYPTED"));
     if !encrypted {
         return Ok(None);
     }
-    let dek = block.headers.iter().find(|(k, _)| k == "DEK-Info").map(|(_, v)| v.as_str()).ok_or_else(decoder_unsupported)?;
+    let dek = block
+        .headers
+        .iter()
+        .find(|(k, _)| k == "DEK-Info")
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(decoder_unsupported)?;
     let (name, iv_hex) = dek.split_once(',').ok_or_else(decoder_unsupported)?;
     let cipher = KeyCipher::from_name(name.trim()).ok_or_else(decoder_unsupported)?;
-    let iv = codec::hex_decode_strict(iv_hex.trim().as_bytes()).map_err(|_| decoder_unsupported())?;
+    let iv =
+        codec::hex_decode_strict(iv_hex.trim().as_bytes()).map_err(|_| decoder_unsupported())?;
     if iv.len() != cipher.iv_len() {
         return Err(decoder_unsupported());
     }
     let pass = check_passphrase(passphrase)?;
     let key = bytes_to_key(pass, &iv[..8], cipher.key_len());
-    cipher.decrypt(&key, &iv, &block.data).map(Some).ok_or_else(bad_decrypt)
+    cipher
+        .decrypt(&key, &iv, &block.data)
+        .map(Some)
+        .ok_or_else(bad_decrypt)
 }
 
 /// Decrypts a DER `EncryptedPrivateKeyInfo`.
@@ -152,9 +169,14 @@ fn pkcs8_encrypt(der: &[u8], cipher: KeyCipher, pass: &[u8]) -> KResult<Vec<u8>>
     use pkcs5::pbes2;
     let salt = random(16);
     let iv = random(cipher.iv_len());
-    let kdf = pbes2::Pbkdf2Params::hmac_with_sha256(2048, &salt).map_err(|e| SendError::new("Error", e.to_string()))?;
+    let kdf = pbes2::Pbkdf2Params::hmac_with_sha256(2048, &salt)
+        .map_err(|e| SendError::new("Error", e.to_string()))?;
     let iv8: [u8; 8] = iv[..8].try_into().unwrap_or_default();
-    let iv16: [u8; 16] = if iv.len() == 16 { iv[..].try_into().unwrap_or_default() } else { [0; 16] };
+    let iv16: [u8; 16] = if iv.len() == 16 {
+        iv[..].try_into().unwrap_or_default()
+    } else {
+        [0; 16]
+    };
     let encryption = match cipher {
         KeyCipher::Aes128Cbc => pbes2::EncryptionScheme::Aes128Cbc { iv: &iv16 },
         KeyCipher::Aes192Cbc => pbes2::EncryptionScheme::Aes192Cbc { iv: &iv16 },
@@ -162,17 +184,28 @@ fn pkcs8_encrypt(der: &[u8], cipher: KeyCipher, pass: &[u8]) -> KResult<Vec<u8>>
         KeyCipher::DesEde3Cbc => pbes2::EncryptionScheme::DesEde3Cbc { iv: &iv8 },
         KeyCipher::DesCbc => pbes2::EncryptionScheme::DesCbc { iv: &iv8 },
     };
-    let scheme = pkcs5::EncryptionScheme::from(pbes2::Parameters { kdf: kdf.into(), encryption });
-    let encrypted = scheme.encrypt(pass, der).map_err(|e| SendError::new("Error", e.to_string()))?;
-    let info = pkcs8::EncryptedPrivateKeyInfo { encryption_algorithm: scheme, encrypted_data: &encrypted };
-    info.to_der().map_err(|e| SendError::new("Error", e.to_string()))
+    let scheme = pkcs5::EncryptionScheme::from(pbes2::Parameters {
+        kdf: kdf.into(),
+        encryption,
+    });
+    let encrypted = scheme
+        .encrypt(pass, der)
+        .map_err(|e| SendError::new("Error", e.to_string()))?;
+    let info = pkcs8::EncryptedPrivateKeyInfo {
+        encryption_algorithm: scheme,
+        encrypted_data: &encrypted,
+    };
+    info.to_der()
+        .map_err(|e| SendError::new("Error", e.to_string()))
 }
 
 /// Whether DER bytes are a PKCS#1 `RSAPrivateKey` (as opposed to an `RSAPublicKey`): Node's
 /// `IsRSAPrivateKey` heuristic (a leading one-byte version 0 or 1).
 pub fn is_rsa_private_der(der: &[u8]) -> bool {
     match asn1::single(der).or_else(|| first_element(der)) {
-        Some((asn1::TAG_SEQUENCE, body)) => body.len() >= 3 && body[0] == 2 && body[1] == 1 && body[2] & 0xfe == 0,
+        Some((asn1::TAG_SEQUENCE, body)) => {
+            body.len() >= 3 && body[0] == 2 && body[1] == 1 && body[2] & 0xfe == 0
+        }
         _ => false,
     }
 }
@@ -192,17 +225,28 @@ fn first_element(der: &[u8]) -> Option<(u8, &[u8])> {
 
 fn certificate_spki(der: &[u8]) -> KResult<AsymKey> {
     let cert = x509_cert::Certificate::from_der(der).map_err(|_| decoder_unsupported())?;
-    let spki = cert.tbs_certificate.subject_public_key_info.to_der().map_err(|_| decoder_unsupported())?;
+    let spki = cert
+        .tbs_certificate
+        .subject_public_key_info
+        .to_der()
+        .map_err(|_| decoder_unsupported())?;
     AsymKey::from_spki_der(&spki)
 }
 
 fn rsa_public_from_pkcs1(der: &[u8]) -> KResult<AsymKey> {
     let (n, e) = model::parse_pkcs1_public(der).ok_or_else(decoder_unsupported)?;
-    Ok(AsymKey::Rsa(model::RsaKey { n, e, private: None, pss: None }))
+    Ok(AsymKey::Rsa(model::RsaKey {
+        n,
+        e,
+        private: None,
+        pss: None,
+    }))
 }
 
 fn rsa_private_from_pkcs1(der: &[u8]) -> KResult<AsymKey> {
-    model::parse_pkcs1_private(der, None).map(AsymKey::Rsa).ok_or_else(decoder_unsupported)
+    model::parse_pkcs1_private(der, None)
+        .map(AsymKey::Rsa)
+        .ok_or_else(decoder_unsupported)
 }
 
 /// Parses a private key from a decrypted PEM block body.
@@ -211,18 +255,34 @@ fn private_from_block(label: &str, data: &[u8]) -> KResult<AsymKey> {
         "PRIVATE KEY" => AsymKey::from_pkcs8_der(data),
         "RSA PRIVATE KEY" => rsa_private_from_pkcs1(data),
         "EC PRIVATE KEY" => model::parse_sec1(data, None).map(AsymKey::Ec),
-        "DSA PRIVATE KEY" => model::parse_dsa_legacy(data).map(AsymKey::Dsa).ok_or_else(decoder_unsupported),
+        "DSA PRIVATE KEY" => model::parse_dsa_legacy(data)
+            .map(AsymKey::Dsa)
+            .ok_or_else(decoder_unsupported),
         _ => Err(decoder_unsupported()),
     }
 }
 
-const PRIVATE_LABELS: &[&str] = &["PRIVATE KEY", "ENCRYPTED PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY"];
+const PRIVATE_LABELS: &[&str] = &[
+    "PRIVATE KEY",
+    "ENCRYPTED PRIVATE KEY",
+    "RSA PRIVATE KEY",
+    "EC PRIVATE KEY",
+    "DSA PRIVATE KEY",
+];
 
 /// `ParsePrivateKey`: a private key from user input. `enc` is the `type` option (required for DER).
-pub fn import_private(data: &[u8], format: u32, enc: Option<u32>, passphrase: Option<&[u8]>) -> KResult<AsymKey> {
+pub fn import_private(
+    data: &[u8],
+    format: u32,
+    enc: Option<u32>,
+    passphrase: Option<&[u8]>,
+) -> KResult<AsymKey> {
     if format == FORMAT_PEM {
         let blocks = pem::well_formed(data);
-        let block = blocks.iter().find(|b| PRIVATE_LABELS.contains(&b.label.as_str())).ok_or_else(decoder_unsupported)?;
+        let block = blocks
+            .iter()
+            .find(|b| PRIVATE_LABELS.contains(&b.label.as_str()))
+            .ok_or_else(decoder_unsupported)?;
         if block.label == "ENCRYPTED PRIVATE KEY" {
             let pass = check_passphrase(passphrase)?;
             return AsymKey::from_pkcs8_der(&pkcs8_decrypt(&block.data, pass)?);
@@ -237,7 +297,9 @@ pub fn import_private(data: &[u8], format: u32, enc: Option<u32>, passphrase: Op
         Some(ENC_SEC1) => model::parse_sec1(data, None).map(AsymKey::Ec),
         _ => {
             if is_encrypted_pkcs8_der(data) {
-                let Some(pass) = passphrase else { return Err(missing_passphrase()) };
+                let Some(pass) = passphrase else {
+                    return Err(missing_passphrase());
+                };
                 return AsymKey::from_pkcs8_der(&pkcs8_decrypt(data, pass)?);
             }
             AsymKey::from_pkcs8_der(data)
@@ -247,7 +309,12 @@ pub fn import_private(data: &[u8], format: u32, enc: Option<u32>, passphrase: Op
 
 /// `ParsePublicKeyPEM` / `ParsePublicKey`: a public key, from public or private input (a private
 /// key yields its public half).
-pub fn import_public(data: &[u8], format: u32, enc: Option<u32>, passphrase: Option<&[u8]>) -> KResult<AsymKey> {
+pub fn import_public(
+    data: &[u8],
+    format: u32,
+    enc: Option<u32>,
+    passphrase: Option<&[u8]>,
+) -> KResult<AsymKey> {
     if format == FORMAT_PEM {
         let blocks = pem::well_formed(data);
         if let Some(b) = blocks.iter().find(|b| b.label == "PUBLIC KEY") {
@@ -256,7 +323,12 @@ pub fn import_public(data: &[u8], format: u32, enc: Option<u32>, passphrase: Opt
         if let Some(b) = blocks.iter().find(|b| b.label == "RSA PUBLIC KEY") {
             return rsa_public_from_pkcs1(&b.data);
         }
-        if let Some(b) = blocks.iter().find(|b| matches!(b.label.as_str(), "CERTIFICATE" | "X509 CERTIFICATE" | "TRUSTED CERTIFICATE")) {
+        if let Some(b) = blocks.iter().find(|b| {
+            matches!(
+                b.label.as_str(),
+                "CERTIFICATE" | "X509 CERTIFICATE" | "TRUSTED CERTIFICATE"
+            )
+        }) {
             return certificate_spki(&b.data);
         }
         return import_private(data, format, enc, passphrase).map(|k| k.to_public());
@@ -310,7 +382,12 @@ pub fn export_cipher(name: Option<&str>) -> KResult<Option<KeyCipher>> {
     }
 }
 
-fn legacy_pem(label: &str, der: &[u8], cipher: Option<KeyCipher>, pass: Option<&[u8]>) -> KResult<Exported> {
+fn legacy_pem(
+    label: &str,
+    der: &[u8],
+    cipher: Option<KeyCipher>,
+    pass: Option<&[u8]>,
+) -> KResult<Exported> {
     let Some(cipher) = cipher else {
         return Ok(Exported::Pem(pem::encode(label, &[], der)));
     };
@@ -320,18 +397,29 @@ fn legacy_pem(label: &str, der: &[u8], cipher: Option<KeyCipher>, pass: Option<&
     let body = cipher.encrypt(&key, &iv, der);
     let headers = [
         ("Proc-Type", "4,ENCRYPTED".to_string()),
-        ("DEK-Info", format!("{},{}", cipher.pem_name(), codec::hex_encode_upper(&iv))),
+        (
+            "DEK-Info",
+            format!("{},{}", cipher.pem_name(), codec::hex_encode_upper(&iv)),
+        ),
     ];
     Ok(Exported::Pem(pem::encode(label, &headers, &body)))
 }
 
 /// `WritePrivateKey`: `enc` is `ENC_PKCS1` (RSA), `ENC_PKCS8` or `ENC_SEC1` (EC).
-pub fn export_private(key: &AsymKey, format: u32, enc: u32, cipher: Option<&str>, pass: Option<&[u8]>) -> KResult<Exported> {
+pub fn export_private(
+    key: &AsymKey,
+    format: u32,
+    enc: u32,
+    cipher: Option<&str>,
+    pass: Option<&[u8]>,
+) -> KResult<Exported> {
     let cipher = export_cipher(cipher)?;
     let fail = || SendError::new("Error", "Failed to encode private key");
     match enc {
         ENC_PKCS1 => {
-            let AsymKey::Rsa(k) = key else { return Err(fail()) };
+            let AsymKey::Rsa(k) = key else {
+                return Err(fail());
+            };
             let der = k.pkcs1_private_der().ok_or_else(fail)?;
             if format == FORMAT_PEM {
                 legacy_pem("RSA PRIVATE KEY", &der, cipher, pass)
@@ -340,7 +428,9 @@ pub fn export_private(key: &AsymKey, format: u32, enc: u32, cipher: Option<&str>
             }
         }
         ENC_SEC1 => {
-            let AsymKey::Ec(k) = key else { return Err(fail()) };
+            let AsymKey::Ec(k) = key else {
+                return Err(fail());
+            };
             let der = sec1_der(k).ok_or_else(fail)?;
             if format == FORMAT_PEM {
                 legacy_pem("EC PRIVATE KEY", &der, cipher, pass)
@@ -357,7 +447,11 @@ pub fn export_private(key: &AsymKey, format: u32, enc: u32, cipher: Option<&str>
                     if pass.len() > MAX_PASSPHRASE {
                         return Err(interrupted());
                     }
-                    Ok(wrap(format, "ENCRYPTED PRIVATE KEY", pkcs8_encrypt(&der, c, pass)?))
+                    Ok(wrap(
+                        format,
+                        "ENCRYPTED PRIVATE KEY",
+                        pkcs8_encrypt(&der, c, pass)?,
+                    ))
                 }
             }
         }

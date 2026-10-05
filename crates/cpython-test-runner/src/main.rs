@@ -52,7 +52,9 @@ fn parse_args() -> Result<Options, String> {
     let mut o = Options {
         root: PathBuf::from("cpython"),
         bin: PathBuf::from("target/release/lumen-py"),
-        jobs: thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        jobs: thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4),
         timeout: Duration::from_secs(60),
         report: PathBuf::from("cpython-test-report"),
         skip: PathBuf::from("crates/cpython-test-runner/skip.txt"),
@@ -67,8 +69,18 @@ fn parse_args() -> Result<Options, String> {
         match a.as_str() {
             "--root" => o.root = PathBuf::from(value("--root")?),
             "--bin" => o.bin = PathBuf::from(value("--bin")?),
-            "--jobs" => o.jobs = value("--jobs")?.parse().map_err(|_| "--jobs needs a number".to_string())?,
-            "--timeout" => o.timeout = Duration::from_secs(value("--timeout")?.parse().map_err(|_| "--timeout needs a number".to_string())?),
+            "--jobs" => {
+                o.jobs = value("--jobs")?
+                    .parse()
+                    .map_err(|_| "--jobs needs a number".to_string())?
+            }
+            "--timeout" => {
+                o.timeout = Duration::from_secs(
+                    value("--timeout")?
+                        .parse()
+                        .map_err(|_| "--timeout needs a number".to_string())?,
+                )
+            }
             "--report" => o.report = PathBuf::from(value("--report")?),
             "--skip" => o.skip = PathBuf::from(value("--skip")?),
             "--baseline" => o.baseline = PathBuf::from(value("--baseline")?),
@@ -128,7 +140,13 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
     let started = Instant::now();
     let log = match fs::File::create(&log_path).and_then(|f| f.try_clone().map(|g| (f, g))) {
         Ok(pair) => pair,
-        Err(e) => return failure(name, Status::Crash(format!("cannot create log: {e}")), started),
+        Err(e) => {
+            return failure(
+                name,
+                Status::Crash(format!("cannot create log: {e}")),
+                started,
+            )
+        }
     };
     let lib = fs::canonicalize(o.root.join("Lib")).unwrap_or_else(|_| o.root.join("Lib"));
     let mut cmd = Command::new(&o.bin);
@@ -149,23 +167,41 @@ fn run_one(o: &Options, name: &str, log_dir: &Path) -> FileResult {
         .spawn();
     let mut child = match spawned {
         Ok(c) => c,
-        Err(e) => return failure(name, Status::Crash(format!("cannot spawn {}: {e}", o.bin.display())), started),
+        Err(e) => {
+            return failure(
+                name,
+                Status::Crash(format!("cannot spawn {}: {e}", o.bin.display())),
+                started,
+            )
+        }
     };
-    let exit = match lumen_os::child::wait_timeout_group(&mut child, o.timeout, Duration::from_millis(10)) {
-        Ok(Some(status)) => Some(status),
-        Ok(None) => return failure(name, Status::Timeout, started),
-        Err(_) => None,
-    };
+    let exit =
+        match lumen_os::child::wait_timeout_group(&mut child, o.timeout, Duration::from_millis(10))
+        {
+            Ok(Some(status)) => Some(status),
+            Ok(None) => return failure(name, Status::Timeout, started),
+            Err(_) => None,
+        };
     let bytes = fs::read(&log_path).unwrap_or_default();
     let output = String::from_utf8_lossy(&bytes).into_owned();
     let code = exit.and_then(|s| s.code());
     let counts = parse_counts(&output);
     let status = classify(counts, code, &output);
-    FileResult { name: name.to_string(), status, counts, secs: started.elapsed().as_secs_f64() }
+    FileResult {
+        name: name.to_string(),
+        status,
+        counts,
+        secs: started.elapsed().as_secs_f64(),
+    }
 }
 
 fn failure(name: &str, status: Status, started: Instant) -> FileResult {
-    FileResult { name: name.to_string(), status, counts: Counts::default(), secs: started.elapsed().as_secs_f64() }
+    FileResult {
+        name: name.to_string(),
+        status,
+        counts: Counts::default(),
+        secs: started.elapsed().as_secs_f64(),
+    }
 }
 
 fn run_all(o: &Arc<Options>, names: Vec<String>, log_dir: &Path) -> Vec<FileResult> {
@@ -202,7 +238,11 @@ fn status_detail(s: &Status) -> String {
     }
 }
 
-fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std::io::Result<String> {
+fn write_report(
+    o: &Options,
+    results: &[FileResult],
+    skipped: &[String],
+) -> std::io::Result<String> {
     let mut totals = Counts::default();
     let mut by_status: BTreeMap<&'static str, u32> = BTreeMap::new();
     let mut reasons: BTreeMap<String, u32> = BTreeMap::new();
@@ -216,12 +256,30 @@ fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std:
             *reasons.entry(reason.clone()).or_default() += 1;
         }
     }
-    let file_errors = results.iter().filter(|r| matches!(r.status, Status::ImportError(_) | Status::Timeout | Status::Crash(_))).count();
+    let file_errors = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status,
+                Status::ImportError(_) | Status::Timeout | Status::Crash(_)
+            )
+        })
+        .count();
 
     let mut tsv = String::from("file\tstatus\tpass\tfail\terror\tskip\tseconds\tdetail\n");
     let mut json_files = Vec::new();
     for r in results {
-        tsv.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\n", r.name, r.status.label(), r.counts.pass, r.counts.fail, r.counts.error, r.counts.skip, r.secs, status_detail(&r.status)));
+        tsv.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{:.2}\t{}\n",
+            r.name,
+            r.status.label(),
+            r.counts.pass,
+            r.counts.fail,
+            r.counts.error,
+            r.counts.skip,
+            r.secs,
+            status_detail(&r.status)
+        ));
         json_files.push(format!(
             "    {}: {{ \"status\": {}, \"pass\": {}, \"fail\": {}, \"error\": {}, \"skip\": {}, \"seconds\": {:.2}, \"detail\": {} }}",
             lumen_common::json::json_string(&r.name),
@@ -237,12 +295,19 @@ fn write_report(o: &Options, results: &[FileResult], skipped: &[String]) -> std:
     fs::write(o.report.join("files.tsv"), tsv)?;
 
     let mut text = String::new();
-    text.push_str(&format!("files run: {}  skipped (skip.txt): {}\n", results.len(), skipped.len()));
+    text.push_str(&format!(
+        "files run: {}  skipped (skip.txt): {}\n",
+        results.len(),
+        skipped.len()
+    ));
     for (label, n) in &by_status {
         text.push_str(&format!("  {label:<13} {n}\n"));
     }
     text.push_str(&format!("file-level errors: {file_errors}\n"));
-    text.push_str(&format!("tests: pass {}  fail {}  error {}  skip {}\n", totals.pass, totals.fail, totals.error, totals.skip));
+    text.push_str(&format!(
+        "tests: pass {}  fail {}  error {}  skip {}\n",
+        totals.pass, totals.fail, totals.error, totals.skip
+    ));
     let mut ranked: Vec<(&String, &u32)> = reasons.iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     if !ranked.is_empty() {
@@ -274,7 +339,10 @@ fn read_baseline(path: &Path) -> BTreeMap<String, (String, u32)> {
     for line in fs::read_to_string(path).unwrap_or_default().lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 3 && !line.starts_with('#') {
-            map.insert(parts[0].to_string(), (parts[1].to_string(), parts[2].parse().unwrap_or(0)));
+            map.insert(
+                parts[0].to_string(),
+                (parts[1].to_string(), parts[2].parse().unwrap_or(0)),
+            );
         }
     }
     map
@@ -283,10 +351,20 @@ fn read_baseline(path: &Path) -> BTreeMap<String, (String, u32)> {
 /// Writes the per-file baseline and, next to it, `summary.txt` (the run's totals), so the
 /// committed files show the score without a local report directory.
 fn write_baseline(path: &Path, results: &[FileResult], summary: &str) -> std::io::Result<()> {
-    let mut out = String::from("# file\tstatus\tpass\tfail\terror\tskip  (regenerate with cpython-test-runner --bless)\n");
+    let mut out = String::from(
+        "# file\tstatus\tpass\tfail\terror\tskip  (regenerate with cpython-test-runner --bless)\n",
+    );
     for r in results {
         let c = &r.counts;
-        out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", r.name, r.status.label(), c.pass, c.fail, c.error, c.skip));
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            r.name,
+            r.status.label(),
+            c.pass,
+            c.fail,
+            c.error,
+            c.skip
+        ));
     }
     fs::write(path, out)?;
     fs::write(path.with_file_name("summary.txt"), summary)
@@ -295,16 +373,29 @@ fn write_baseline(path: &Path, results: &[FileResult], summary: &str) -> std::io
 fn regressions(baseline: &BTreeMap<String, (String, u32)>, results: &[FileResult]) -> Vec<String> {
     let mut out = Vec::new();
     for r in results {
-        let Some((status, pass)) = baseline.get(&r.name) else { continue };
+        let Some((status, pass)) = baseline.get(&r.name) else {
+            continue;
+        };
         let was_clean = status == "ok" || status == "failed";
         if !was_clean {
             continue;
         }
-        let broke = matches!(r.status, Status::ImportError(_) | Status::Timeout | Status::Crash(_));
+        let broke = matches!(
+            r.status,
+            Status::ImportError(_) | Status::Timeout | Status::Crash(_)
+        );
         if broke {
-            out.push(format!("{}: was {status} ({pass} passing), now {} {}", r.name, r.status.label(), status_detail(&r.status)));
+            out.push(format!(
+                "{}: was {status} ({pass} passing), now {} {}",
+                r.name,
+                r.status.label(),
+                status_detail(&r.status)
+            ));
         } else if r.counts.pass < *pass {
-            out.push(format!("{}: passing tests dropped {pass} -> {}", r.name, r.counts.pass));
+            out.push(format!(
+                "{}: passing tests dropped {pass} -> {}",
+                r.name, r.counts.pass
+            ));
         } else if status == "ok" && r.status == Status::Failed {
             out.push(format!("{}: was ok, now failing", r.name));
         }
@@ -325,7 +416,10 @@ fn main() {
     };
     let test_dir = o.root.join("Lib").join("test");
     if !test_dir.is_dir() {
-        eprintln!("cpython-test-runner: {} not found; run scripts/cpython-fetch.sh first", test_dir.display());
+        eprintln!(
+            "cpython-test-runner: {} not found; run scripts/cpython-fetch.sh first",
+            test_dir.display()
+        );
         std::process::exit(2);
     }
     if !o.bin.is_file() {
@@ -334,11 +428,16 @@ fn main() {
     }
     let log_dir = o.report.join("logs");
     if let Err(e) = fs::create_dir_all(&log_dir) {
-        eprintln!("cpython-test-runner: cannot create {}: {e}", log_dir.display());
+        eprintln!(
+            "cpython-test-runner: cannot create {}: {e}",
+            log_dir.display()
+        );
         std::process::exit(2);
     }
     let skip = read_names(&o.skip);
-    let (names, skipped): (Vec<String>, Vec<String>) = discover(&test_dir, &o.filters).into_iter().partition(|n| !skip.contains(n));
+    let (names, skipped): (Vec<String>, Vec<String>) = discover(&test_dir, &o.filters)
+        .into_iter()
+        .partition(|n| !skip.contains(n));
     let bin = match fs::canonicalize(&o.bin) {
         Ok(b) => b,
         Err(_) => o.bin.clone(),
@@ -355,7 +454,12 @@ fn main() {
         bless: o.bless,
         filters: o.filters.clone(),
     });
-    eprintln!("running {} files with {} jobs ({} skipped)", names.len(), o.jobs, skipped.len());
+    eprintln!(
+        "running {} files with {} jobs ({} skipped)",
+        names.len(),
+        o.jobs,
+        skipped.len()
+    );
     let results = run_all(&o, names, &log_dir);
     let summary = match write_report(&o, &results, &skipped) {
         Ok(text) => {

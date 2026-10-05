@@ -1,9 +1,9 @@
 //! AST to bytecode compiler.
 
 use crate::ast::*;
-use crate::pyint::{BigInt, PyInt};
 use crate::bytecode::*;
 use crate::object::*;
+use crate::pyint::{BigInt, PyInt};
 use crate::symtable::{self, mangle, type_params_key, AnnKind, Sc, SymTable};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -36,12 +36,18 @@ enum ConstKey {
 }
 
 enum FBlock<'a> {
-    Loop { top: Label, end: Label, has_iter: bool },
+    Loop {
+        top: Label,
+        end: Label,
+        has_iter: bool,
+    },
     TryExcept,
     FinallyBody(&'a [Stmt]),
     FinallyHandler,
     ExceptHandler(Option<Rc<str>>),
-    With { is_async: bool },
+    With {
+        is_async: bool,
+    },
     SavedValue,
 }
 
@@ -93,10 +99,23 @@ type CResult<T> = Result<T, CompileError>;
 
 /// Compiles a module; the syntax warnings found on the way are appended to `warnings` (also when
 /// compiling fails).
-pub fn compile_module(m: &Module, filename: &str, interactive: bool, warnings: &mut Vec<CompileWarning>) -> CResult<Rc<Code>> {
+pub fn compile_module(
+    m: &Module,
+    filename: &str,
+    interactive: bool,
+    warnings: &mut Vec<CompileWarning>,
+) -> CResult<Rc<Code>> {
     finally_flow::check(&m.body, warnings);
-    let st = symtable::build(m).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive };
+    let st = symtable::build(m).map_err(|e| CompileError {
+        msg: e.msg,
+        line: e.line,
+    })?;
+    let mut c = Compiler {
+        st,
+        units: Vec::new(),
+        filename: filename.into(),
+        interactive,
+    };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     if let Some(d) = docstring(&m.body) {
         c.load_const(Value::str(&d));
@@ -112,8 +131,16 @@ pub fn compile_module(m: &Module, filename: &str, interactive: bool, warnings: &
 }
 
 pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
-    let st = symtable::build_expr(e).map_err(|e| CompileError { msg: e.msg, line: e.line })?;
-    let mut c = Compiler { st, units: Vec::new(), filename: filename.into(), interactive: false };
+    let st = symtable::build_expr(e).map_err(|e| CompileError {
+        msg: e.msg,
+        line: e.line,
+    })?;
+    let mut c = Compiler {
+        st,
+        units: Vec::new(),
+        filename: filename.into(),
+        interactive: false,
+    };
     c.push_unit(0, UnitKind::Module, "<module>".into(), "<module>".into());
     c.expr(e)?;
     c.emit(Op::ReturnValue);
@@ -160,11 +187,17 @@ pub(crate) fn const_value(c: &Constant) -> Value {
 fn has_annassign(body: &[Stmt]) -> bool {
     body.iter().any(|s| match &s.kind {
         StmtKind::AnnAssign { .. } => true,
-        StmtKind::If { body, orelse, .. } | StmtKind::While { body, orelse, .. } | StmtKind::For { body, orelse, .. } => {
-            has_annassign(body) || has_annassign(orelse)
-        }
+        StmtKind::If { body, orelse, .. }
+        | StmtKind::While { body, orelse, .. }
+        | StmtKind::For { body, orelse, .. } => has_annassign(body) || has_annassign(orelse),
         StmtKind::With { body, .. } => has_annassign(body),
-        StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+        StmtKind::Try {
+            body,
+            handlers,
+            orelse,
+            finalbody,
+            ..
+        } => {
             has_annassign(body)
                 || handlers.iter().any(|h| has_annassign(&h.body))
                 || has_annassign(orelse)
@@ -176,9 +209,14 @@ fn has_annassign(body: &[Stmt]) -> bool {
 
 fn docstring(body: &[Stmt]) -> Option<Rc<str>> {
     match body.first() {
-        Some(Stmt { kind: StmtKind::Expr(Expr { kind: ExprKind::Constant(Constant::Str(s)), .. }), .. }) => {
-            Some(clean_doc(s).into())
-        }
+        Some(Stmt {
+            kind:
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::Constant(Constant::Str(s)),
+                    ..
+                }),
+            ..
+        }) => Some(clean_doc(s).into()),
         _ => None,
     }
 }
@@ -216,7 +254,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn err<T>(&self, msg: &str, line: u32) -> CResult<T> {
-        Err(CompileError { msg: msg.into(), line })
+        Err(CompileError {
+            msg: msg.into(),
+            line,
+        })
     }
 
     fn push_unit(&mut self, scope: usize, kind: UnitKind, name: Rc<str>, qualname: Rc<str>) {
@@ -256,8 +297,16 @@ impl<'a> Compiler<'a> {
                 cells.push(n.clone());
             }
         }
-        let var_idx = varnames.iter().enumerate().map(|(i, n)| (n.clone(), i as u32)).collect();
-        let cell_idx = cells.iter().enumerate().map(|(i, n)| (n.clone(), i as u32)).collect();
+        let var_idx = varnames
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
+        let cell_idx = cells
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as u32))
+            .collect();
         let private = sc.private.clone();
         let is_async = sc.is_async;
         let is_gen = sc.is_gen;
@@ -546,7 +595,12 @@ impl<'a> Compiler<'a> {
                 }
             }
             StmtKind::AugAssign { target, op, value } => self.aug_assign(target, *op, value)?,
-            StmtKind::AnnAssign { target, annotation, value, simple } => {
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                simple,
+            } => {
                 if let Some(v) = value {
                     self.expr(v)?;
                     self.store_target(target)?;
@@ -564,7 +618,9 @@ impl<'a> Compiler<'a> {
                         }
                     }
                 } else if value.is_none() {
-                    if let ExprKind::Attribute { value, .. } | ExprKind::Subscript { value, .. } = &target.kind {
+                    if let ExprKind::Attribute { value, .. } | ExprKind::Subscript { value, .. } =
+                        &target.kind
+                    {
                         self.expr(value)?;
                         self.emit(Op::Pop);
                     }
@@ -608,7 +664,11 @@ impl<'a> Compiler<'a> {
                 if !always {
                     self.jump_if(test, l_else, false)?;
                 }
-                self.u().fblocks.push(FBlock::Loop { top: l_top, end: l_end, has_iter: false });
+                self.u().fblocks.push(FBlock::Loop {
+                    top: l_top,
+                    end: l_end,
+                    has_iter: false,
+                });
                 self.stmts(body)?;
                 self.u().fblocks.pop();
                 self.u().line = s.pos.line;
@@ -617,7 +677,13 @@ impl<'a> Compiler<'a> {
                 self.stmts(orelse)?;
                 self.bind(l_end);
             }
-            StmtKind::For { target, iter, body, orelse, is_async } => {
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+                is_async,
+            } => {
                 self.for_stmt(target, iter, body, orelse, *is_async)?;
             }
             StmtKind::Break => {
@@ -679,7 +745,11 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
-            StmtKind::ImportFrom { module, names, level } => {
+            StmtKind::ImportFrom {
+                module,
+                names,
+                level,
+            } => {
                 self.load_const(Value::Int(*level as i64));
                 let fl: Vec<Value> = names.iter().map(|a| Value::str(&a.name)).collect();
                 self.load_const(Value::tuple(fl));
@@ -698,10 +768,24 @@ impl<'a> Compiler<'a> {
                 }
             }
             StmtKind::FunctionDef(f) => self.function_def(f, s.pos.line)?,
-            StmtKind::TypeAlias { name, type_params, value } => self.type_alias(s, name, type_params, value)?,
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                value,
+            } => self.type_alias(s, name, type_params, value)?,
             StmtKind::ClassDef(c) => self.class_def(c, s.pos.line)?,
-            StmtKind::With { items, body, is_async } => self.with_stmt(items, body, *is_async)?,
-            StmtKind::Try { body, handlers, orelse, finalbody, is_star } => {
+            StmtKind::With {
+                items,
+                body,
+                is_async,
+            } => self.with_stmt(items, body, *is_async)?,
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                is_star,
+            } => {
                 if finalbody.is_empty() {
                     self.try_except(body, handlers, orelse, *is_star)?;
                 } else {
@@ -720,7 +804,10 @@ impl<'a> Compiler<'a> {
                 return Ok(i);
             }
         }
-        Err(CompileError { msg: msg.into(), line })
+        Err(CompileError {
+            msg: msg.into(),
+            line,
+        })
     }
 
     /// Emits the cleanup code for leaving every block above index `down_to`.
@@ -790,7 +877,14 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn for_stmt(&mut self, target: &'a Expr, iter: &'a Expr, body: &'a [Stmt], orelse: &'a [Stmt], is_async: bool) -> CResult<()> {
+    fn for_stmt(
+        &mut self,
+        target: &'a Expr,
+        iter: &'a Expr,
+        body: &'a [Stmt],
+        orelse: &'a [Stmt],
+        is_async: bool,
+    ) -> CResult<()> {
         let l_top = self.new_label();
         let l_else = self.new_label();
         let l_end = self.new_label();
@@ -805,7 +899,11 @@ impl<'a> Compiler<'a> {
             self.emit(Op::YieldFrom);
             self.emit(Op::PopBlock);
             self.store_target(target)?;
-            self.u().fblocks.push(FBlock::Loop { top: l_top, end: l_end, has_iter: true });
+            self.u().fblocks.push(FBlock::Loop {
+                top: l_top,
+                end: l_end,
+                has_iter: true,
+            });
             self.stmts(body)?;
             self.u().fblocks.pop();
             self.emit(Op::Jump(l_top));
@@ -816,7 +914,11 @@ impl<'a> Compiler<'a> {
             self.bind(l_top);
             self.emit(Op::ForIter(l_else));
             self.store_target(target)?;
-            self.u().fblocks.push(FBlock::Loop { top: l_top, end: l_end, has_iter: true });
+            self.u().fblocks.push(FBlock::Loop {
+                top: l_top,
+                end: l_end,
+                has_iter: true,
+            });
             self.stmts(body)?;
             self.u().fblocks.pop();
             self.emit(Op::Jump(l_top));
@@ -827,7 +929,13 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn try_except(&mut self, body: &'a [Stmt], handlers: &'a [ExceptHandler], orelse: &'a [Stmt], is_star: bool) -> CResult<()> {
+    fn try_except(
+        &mut self,
+        body: &'a [Stmt],
+        handlers: &'a [ExceptHandler],
+        orelse: &'a [Stmt],
+        is_star: bool,
+    ) -> CResult<()> {
         if is_star {
             return self.try_star(body, handlers, orelse);
         }
@@ -880,7 +988,12 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn try_star(&mut self, body: &'a [Stmt], handlers: &'a [ExceptHandler], orelse: &'a [Stmt]) -> CResult<()> {
+    fn try_star(
+        &mut self,
+        body: &'a [Stmt],
+        handlers: &'a [ExceptHandler],
+        orelse: &'a [Stmt],
+    ) -> CResult<()> {
         let l_handler = self.new_label();
         let l_else = self.new_label();
         let l_end = self.new_label();
@@ -974,7 +1087,12 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn with_stmt(&mut self, items: &'a [WithItem], body: &'a [Stmt], is_async: bool) -> CResult<()> {
+    fn with_stmt(
+        &mut self,
+        items: &'a [WithItem],
+        body: &'a [Stmt],
+        is_async: bool,
+    ) -> CResult<()> {
         let item = &items[0];
         let l_exc = self.new_label();
         let l_end = self.new_label();
@@ -1037,7 +1155,9 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Inplace(op));
                 self.name_store(id);
             }
-            ExprKind::Attribute { value: obj, attr, .. } => {
+            ExprKind::Attribute {
+                value: obj, attr, ..
+            } => {
                 self.expr(obj)?;
                 self.emit(Op::Dup);
                 let ai = self.attr_idx(attr);
@@ -1048,7 +1168,9 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Swap(2));
                 self.emit(Op::StoreAttr(ai));
             }
-            ExprKind::Subscript { value: obj, slice, .. } => {
+            ExprKind::Subscript {
+                value: obj, slice, ..
+            } => {
                 self.expr(obj)?;
                 self.expr(slice)?;
                 self.emit(Op::DupTwo);
@@ -1059,7 +1181,12 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Rot3);
                 self.emit(Op::StoreSubscr);
             }
-            _ => return self.err("illegal expression for augmented assignment", target.pos.line),
+            _ => {
+                return self.err(
+                    "illegal expression for augmented assignment",
+                    target.pos.line,
+                );
+            }
         }
         Ok(())
     }
@@ -1069,7 +1196,12 @@ impl<'a> Compiler<'a> {
         if !matches!(&value.kind, ExprKind::Name { id, .. } if &**id == "self") {
             return;
         }
-        if let Some(u) = self.units.iter_mut().rev().find(|u| u.kind == UnitKind::Class) {
+        if let Some(u) = self
+            .units
+            .iter_mut()
+            .rev()
+            .find(|u| u.kind == UnitKind::Class)
+        {
             u.static_attrs.insert(attr.clone());
         }
     }
@@ -1090,7 +1222,9 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::StoreSubscr);
             }
             ExprKind::Tuple { elts, .. } | ExprKind::List { elts, .. } => {
-                let star = elts.iter().position(|e| matches!(e.kind, ExprKind::Starred { .. }));
+                let star = elts
+                    .iter()
+                    .position(|e| matches!(e.kind, ExprKind::Starred { .. }));
                 match star {
                     None => {
                         self.emit(Op::UnpackSequence(elts.len() as u32));
@@ -1139,7 +1273,10 @@ impl<'a> Compiler<'a> {
     /// Jumps to `label` when the truth value of `e` equals `sense`; falls through otherwise.
     fn jump_if(&mut self, e: &'a Expr, label: Label, sense: bool) -> CResult<()> {
         match &e.kind {
-            ExprKind::UnaryOp { op: UnaryOp::Not, operand } => return self.jump_if(operand, label, !sense),
+            ExprKind::UnaryOp {
+                op: UnaryOp::Not,
+                operand,
+            } => return self.jump_if(operand, label, !sense),
             ExprKind::BoolOp { op, values } => {
                 let is_and = *op == BoolOp::And;
                 if is_and != sense {
@@ -1161,7 +1298,11 @@ impl<'a> Compiler<'a> {
         }
         self.expr(e)?;
         self.u().line = e.pos.line;
-        self.emit(if sense { Op::JumpIfTrue(label) } else { Op::JumpIfFalse(label) });
+        self.emit(if sense {
+            Op::JumpIfTrue(label)
+        } else {
+            Op::JumpIfFalse(label)
+        });
         Ok(())
     }
 
@@ -1182,7 +1323,11 @@ impl<'a> Compiler<'a> {
                 for (i, v) in values.iter().enumerate() {
                     self.expr(v)?;
                     if i + 1 < values.len() {
-                        self.emit(if *op == BoolOp::And { Op::JumpIfFalseKeep(end) } else { Op::JumpIfTrueKeep(end) });
+                        self.emit(if *op == BoolOp::And {
+                            Op::JumpIfFalseKeep(end)
+                        } else {
+                            Op::JumpIfTrueKeep(end)
+                        });
                     }
                 }
                 self.bind(end);
@@ -1205,7 +1350,9 @@ impl<'a> Compiler<'a> {
                             let s2: String = format!("-{}", s);
                             let v = match s2.parse::<i64>() {
                                 Ok(i) => Value::Int(i),
-                                Err(_) => Value::big(BigInt::parse_signed(&s2, 10).unwrap_or_else(BigInt::zero)),
+                                Err(_) => Value::big(
+                                    BigInt::parse_signed(&s2, 10).unwrap_or_else(BigInt::zero),
+                                ),
                             };
                             self.load_const(v);
                             return Ok(());
@@ -1228,7 +1375,15 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::Lambda { args, body } => {
                 let key = e as *const Expr as usize;
-                self.make_function("<lambda>".into(), args, None, FnBody::Expr(body), key, None, e.pos.line)?;
+                self.make_function(
+                    "<lambda>".into(),
+                    args,
+                    None,
+                    FnBody::Expr(body),
+                    key,
+                    None,
+                    e.pos.line,
+                )?;
             }
             ExprKind::IfExp { test, body, orelse } => {
                 let l_else = self.new_label();
@@ -1242,7 +1397,10 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::Dict { keys, values } => self.dict_display(keys, values)?,
             ExprKind::Set(elts) => {
-                if elts.iter().any(|x| matches!(x.kind, ExprKind::Starred { .. })) {
+                if elts
+                    .iter()
+                    .any(|x| matches!(x.kind, ExprKind::Starred { .. }))
+                {
                     self.emit(Op::BuildSet(0));
                     for x in elts {
                         match &x.kind {
@@ -1262,8 +1420,14 @@ impl<'a> Compiler<'a> {
                     }
                     let is_const = |x: &Expr| match &x.kind {
                         ExprKind::Constant(_) => true,
-                        ExprKind::UnaryOp { op: UnaryOp::USub, operand } => {
-                            matches!(operand.kind, ExprKind::Constant(Constant::Int(_) | Constant::Float(_)))
+                        ExprKind::UnaryOp {
+                            op: UnaryOp::USub,
+                            operand,
+                        } => {
+                            matches!(
+                                operand.kind,
+                                ExprKind::Constant(Constant::Int(_) | Constant::Float(_))
+                            )
                         }
                         _ => false,
                     };
@@ -1276,12 +1440,20 @@ impl<'a> Compiler<'a> {
             }
             ExprKind::List { elts, .. } => self.seq_display(elts, false)?,
             ExprKind::Tuple { elts, .. } => self.seq_display(elts, true)?,
-            ExprKind::ListComp { elt, generators } => self.comprehension(e, generators, &[elt], CompKind::List)?,
-            ExprKind::SetComp { elt, generators } => self.comprehension(e, generators, &[elt], CompKind::Set)?,
-            ExprKind::DictComp { key, value, generators } => {
-                self.comprehension(e, generators, &[key, value], CompKind::Dict)?
+            ExprKind::ListComp { elt, generators } => {
+                self.comprehension(e, generators, &[elt], CompKind::List)?
             }
-            ExprKind::GeneratorExp { elt, generators } => self.comprehension(e, generators, &[elt], CompKind::Gen)?,
+            ExprKind::SetComp { elt, generators } => {
+                self.comprehension(e, generators, &[elt], CompKind::Set)?
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => self.comprehension(e, generators, &[key, value], CompKind::Dict)?,
+            ExprKind::GeneratorExp { elt, generators } => {
+                self.comprehension(e, generators, &[elt], CompKind::Gen)?
+            }
             ExprKind::Await(v) => {
                 self.expr(v)?;
                 self.u().line = e.pos.line;
@@ -1311,7 +1483,11 @@ impl<'a> Compiler<'a> {
                 self.load_const(Value::None);
                 self.emit(Op::YieldFrom);
             }
-            ExprKind::Compare { left, ops, comparators } => {
+            ExprKind::Compare {
+                left,
+                ops,
+                comparators,
+            } => {
                 self.expr(left)?;
                 if ops.len() == 1 {
                     self.expr(&comparators[0])?;
@@ -1339,7 +1515,11 @@ impl<'a> Compiler<'a> {
                     self.bind(end);
                 }
             }
-            ExprKind::Call { func, args, keywords } => self.call(e, func, args, keywords)?,
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => self.call(e, func, args, keywords)?,
             ExprKind::JoinedStr(parts) => {
                 for p in parts {
                     self.expr(p)?;
@@ -1353,7 +1533,11 @@ impl<'a> Compiler<'a> {
                     self.emit(Op::BuildString(1));
                 }
             }
-            ExprKind::FormattedValue { value, conversion, format_spec } => {
+            ExprKind::FormattedValue {
+                value,
+                conversion,
+                format_spec,
+            } => {
                 self.expr(value)?;
                 if let Some(spec) = format_spec {
                     self.expr(spec)?;
@@ -1411,7 +1595,10 @@ impl<'a> Compiler<'a> {
     }
 
     fn seq_display(&mut self, elts: &'a [Expr], tuple: bool) -> CResult<()> {
-        if elts.iter().any(|x| matches!(x.kind, ExprKind::Starred { .. })) {
+        if elts
+            .iter()
+            .any(|x| matches!(x.kind, ExprKind::Starred { .. }))
+        {
             self.emit(Op::BuildList(0));
             for x in elts {
                 match &x.kind {
@@ -1432,7 +1619,11 @@ impl<'a> Compiler<'a> {
             for x in elts {
                 self.expr(x)?;
             }
-            self.emit(if tuple { Op::BuildTuple(elts.len() as u32) } else { Op::BuildList(elts.len() as u32) });
+            self.emit(if tuple {
+                Op::BuildTuple(elts.len() as u32)
+            } else {
+                Op::BuildList(elts.len() as u32)
+            });
         }
         Ok(())
     }
@@ -1473,9 +1664,17 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn call(&mut self, e: &'a Expr, func: &'a Expr, args: &'a [Expr], keywords: &'a [Keyword]) -> CResult<()> {
+    fn call(
+        &mut self,
+        e: &'a Expr,
+        func: &'a Expr,
+        args: &'a [Expr],
+        keywords: &'a [Keyword],
+    ) -> CResult<()> {
         self.expr(func)?;
-        let has_star = args.iter().any(|a| matches!(a.kind, ExprKind::Starred { .. }));
+        let has_star = args
+            .iter()
+            .any(|a| matches!(a.kind, ExprKind::Starred { .. }));
         let has_dstar = keywords.iter().any(|k| k.arg.is_none());
         if !has_star && !has_dstar {
             for a in args {
@@ -1488,7 +1687,10 @@ impl<'a> Compiler<'a> {
                 for k in keywords {
                     self.expr(&k.value)?;
                 }
-                let names: Vec<Value> = keywords.iter().map(|k| Value::str(k.arg.as_ref().unwrap())).collect();
+                let names: Vec<Value> = keywords
+                    .iter()
+                    .map(|k| Value::str(k.arg.as_ref().unwrap()))
+                    .collect();
                 self.load_const(Value::tuple(names));
                 self.u().line = e.pos.line;
                 self.emit(Op::CallKw((args.len() + keywords.len()) as u32));
@@ -1533,7 +1735,13 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn comprehension(&mut self, e: &'a Expr, gens: &'a [Comprehension], elts: &[&'a Expr], kind: CompKind) -> CResult<()> {
+    fn comprehension(
+        &mut self,
+        e: &'a Expr,
+        gens: &'a [Comprehension],
+        elts: &[&'a Expr],
+        kind: CompKind,
+    ) -> CResult<()> {
         let key = e as *const Expr as usize;
         let sid = self.st.ids[&key];
         let name: Rc<str> = match kind {
@@ -1565,7 +1773,11 @@ impl<'a> Compiler<'a> {
         }
         self.emit(Op::ReturnValue);
         let args = Arguments {
-            args: vec![Arg { pos: e.pos, arg: ".0".into(), annotation: None }],
+            args: vec![Arg {
+                pos: e.pos,
+                arg: ".0".into(),
+                annotation: None,
+            }],
             ..Default::default()
         };
         let code = self.pop_unit(&args, line);
@@ -1578,7 +1790,9 @@ impl<'a> Compiler<'a> {
             self.emit(Op::GetIter);
         }
         self.emit(Op::Call(1));
-        if gens[0].is_async && kind != CompKind::Gen || self.st.scopes[sid].is_async && kind != CompKind::Gen {
+        if gens[0].is_async && kind != CompKind::Gen
+            || self.st.scopes[sid].is_async && kind != CompKind::Gen
+        {
             self.emit(Op::GetAwaitable);
             self.load_const(Value::None);
             self.emit(Op::YieldFrom);
@@ -1586,7 +1800,13 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn comp_loops(&mut self, gens: &'a [Comprehension], i: usize, elts: &[&'a Expr], kind: CompKind) -> CResult<()> {
+    fn comp_loops(
+        &mut self,
+        gens: &'a [Comprehension],
+        i: usize,
+        elts: &[&'a Expr],
+        kind: CompKind,
+    ) -> CResult<()> {
         let g = &gens[i];
         let l_top = self.new_label();
         let l_end = self.new_label();
@@ -1594,7 +1814,11 @@ impl<'a> Compiler<'a> {
             self.emit(Op::LoadFast(0));
         } else {
             self.expr(&g.iter)?;
-            self.emit(if g.is_async { Op::GetAIter } else { Op::GetIter });
+            self.emit(if g.is_async {
+                Op::GetAIter
+            } else {
+                Op::GetIter
+            });
         }
         if g.is_async {
             let l_stop = self.new_label();
@@ -1627,7 +1851,13 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn comp_inner(&mut self, gens: &'a [Comprehension], i: usize, elts: &[&'a Expr], kind: CompKind) -> CResult<()> {
+    fn comp_inner(
+        &mut self,
+        gens: &'a [Comprehension],
+        i: usize,
+        elts: &[&'a Expr],
+        kind: CompKind,
+    ) -> CResult<()> {
         if i + 1 < gens.len() {
             return self.comp_loops(gens, i + 1, elts, kind);
         }
@@ -1667,7 +1897,9 @@ impl<'a> Compiler<'a> {
         if self.st.scopes[p.scope].ann == Some(AnnKind::TypeParams) && self.units.len() >= 2 {
             p = &self.units[self.units.len() - 2];
         }
-        if p.kind != UnitKind::Module && self.st.scopes[p.scope].sym_scope(&mangle(&p.private, name)) == Sc::GlobalExplicit {
+        if p.kind != UnitKind::Module
+            && self.st.scopes[p.scope].sym_scope(&mangle(&p.private, name)) == Sc::GlobalExplicit
+        {
             return name.into();
         }
         match p.kind {
@@ -1703,7 +1935,15 @@ impl<'a> Compiler<'a> {
         let key = f as *const FunctionDef as usize;
         let first_line = f.decorators.first().map_or(line, |d| d.pos.line);
         if f.type_params.is_empty() {
-            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, None, first_line)?;
+            self.make_function(
+                f.name.clone(),
+                &f.args,
+                f.returns.as_ref(),
+                FnBody::Stmts(&f.body),
+                key,
+                None,
+                first_line,
+            )?;
         } else {
             let flags = self.function_defaults(&f.args)?;
             let names: Vec<&str> = [(MF_DEFAULTS, ".defaults"), (MF_KWDEFAULTS, ".kwdefaults")]
@@ -1716,11 +1956,32 @@ impl<'a> Compiler<'a> {
                 let vi = self.u().var_idx[*n];
                 self.emit(Op::LoadFast(vi));
             }
-            self.make_function(f.name.clone(), &f.args, f.returns.as_ref(), FnBody::Stmts(&f.body), key, Some(flags), first_line)?;
+            self.make_function(
+                f.name.clone(),
+                &f.args,
+                f.returns.as_ref(),
+                FnBody::Stmts(&f.body),
+                key,
+                Some(flags),
+                first_line,
+            )?;
             self.emit(Op::Swap(2));
             self.emit(Op::CallIntrinsic2(INTRINSIC2_SET_FUNCTION_TYPE_PARAMS));
-            let args: Vec<Arg> = names.iter().map(|n| Arg { pos: Pos::default(), arg: (*n).into(), annotation: None }).collect();
-            self.exit_type_params(Arguments { args, ..Default::default() }, line)?;
+            let args: Vec<Arg> = names
+                .iter()
+                .map(|n| Arg {
+                    pos: Pos::default(),
+                    arg: (*n).into(),
+                    annotation: None,
+                })
+                .collect();
+            self.exit_type_params(
+                Arguments {
+                    args,
+                    ..Default::default()
+                },
+                line,
+            )?;
             match names.len() {
                 1 => {
                     self.emit(Op::Swap(2));
@@ -1866,8 +2127,12 @@ impl<'a> Compiler<'a> {
             }
             flags |= MF_DEFAULTS;
         }
-        let kwd: Vec<(&Arg, &Expr)> =
-            args.kwonlyargs.iter().zip(args.kw_defaults.iter()).filter_map(|(a, d)| d.as_ref().map(|d| (a, d))).collect();
+        let kwd: Vec<(&Arg, &Expr)> = args
+            .kwonlyargs
+            .iter()
+            .zip(args.kw_defaults.iter())
+            .filter_map(|(a, d)| d.as_ref().map(|d| (a, d)))
+            .collect();
         if !kwd.is_empty() {
             for (a, d) in &kwd {
                 let m = self.mangled(&a.arg);
@@ -1892,8 +2157,16 @@ impl<'a> Compiler<'a> {
             self.u().line = tp.pos.line;
             self.load_const(Value::str(tp.name()));
             match &tp.kind {
-                TypeParamKind::TypeVar { name, bound: Some(b) } => {
-                    self.annotation_function(tp as *const TypeParam as usize, name.clone(), b, tp.pos.line)?;
+                TypeParamKind::TypeVar {
+                    name,
+                    bound: Some(b),
+                } => {
+                    self.annotation_function(
+                        tp as *const TypeParam as usize,
+                        name.clone(),
+                        b,
+                        tp.pos.line,
+                    )?;
                     let k = if matches!(b.kind, ExprKind::Tuple { .. }) {
                         INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS
                     } else {
@@ -1927,7 +2200,13 @@ impl<'a> Compiler<'a> {
     }
 
     /// Pushes a function (an annotation scope) that evaluates and returns `body`.
-    fn annotation_function(&mut self, key: usize, name: Rc<str>, body: &'a Expr, line: u32) -> CResult<()> {
+    fn annotation_function(
+        &mut self,
+        key: usize,
+        name: Rc<str>,
+        body: &'a Expr,
+        line: u32,
+    ) -> CResult<()> {
         let sid = self.st.ids[&key];
         let qual = self.qualname_for(&name);
         self.push_unit(sid, UnitKind::Function, name, qual);
@@ -1938,7 +2217,13 @@ impl<'a> Compiler<'a> {
         self.emit_closure_function(code, 0)
     }
 
-    fn type_alias(&mut self, s: &'a Stmt, name: &'a Expr, params: &'a [TypeParam], value: &'a Expr) -> CResult<()> {
+    fn type_alias(
+        &mut self,
+        s: &'a Stmt,
+        name: &'a Expr,
+        params: &'a [TypeParam],
+        value: &'a Expr,
+    ) -> CResult<()> {
         let line = s.pos.line;
         let ExprKind::Name { id, .. } = &name.kind else {
             return self.err("invalid type alias name", line);
@@ -2008,7 +2293,12 @@ impl<'a> Compiler<'a> {
             self.emit(Op::SetupAnnotations);
         }
         self.stmts(&c.body)?;
-        let attrs: Vec<Value> = self.u().static_attrs.iter().map(|a| Value::str(a)).collect();
+        let attrs: Vec<Value> = self
+            .u()
+            .static_attrs
+            .iter()
+            .map(|a| Value::str(a))
+            .collect();
         self.load_const(Value::tuple(attrs));
         let si = self.name_idx("__static_attributes__");
         self.emit(Op::StoreName(si));
@@ -2036,7 +2326,10 @@ impl<'a> Compiler<'a> {
             self.name_store(".generic_base");
         }
         let extra_base = generic.then_some(".generic_base");
-        let has_star = c.bases.iter().any(|b| matches!(b.kind, ExprKind::Starred { .. }));
+        let has_star = c
+            .bases
+            .iter()
+            .any(|b| matches!(b.kind, ExprKind::Starred { .. }));
         let has_dstar = c.keywords.iter().any(|k| k.arg.is_none());
         let nbases = c.bases.len() + extra_base.is_some() as usize;
         if !has_star && !has_dstar {
@@ -2053,7 +2346,11 @@ impl<'a> Compiler<'a> {
                 for k in &c.keywords {
                     self.expr(&k.value)?;
                 }
-                let names: Vec<Value> = c.keywords.iter().map(|k| Value::str(k.arg.as_ref().unwrap())).collect();
+                let names: Vec<Value> = c
+                    .keywords
+                    .iter()
+                    .map(|k| Value::str(k.arg.as_ref().unwrap()))
+                    .collect();
                 self.load_const(Value::tuple(names));
                 self.emit(Op::CallKw(2 + (nbases + c.keywords.len()) as u32));
             }
@@ -2195,7 +2492,11 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Jump(fail));
                 self.bind(l_done);
             }
-            Pattern::MatchMapping { keys, patterns, rest } => {
+            Pattern::MatchMapping {
+                keys,
+                patterns,
+                rest,
+            } => {
                 let l_f = self.new_label();
                 let l_f2 = self.new_label();
                 let l_done = self.new_label();
@@ -2231,14 +2532,22 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Jump(fail));
                 self.bind(l_done);
             }
-            Pattern::MatchClass { cls, patterns, kwd_attrs, kwd_patterns } => {
+            Pattern::MatchClass {
+                cls,
+                patterns,
+                kwd_attrs,
+                kwd_patterns,
+            } => {
                 let l_f = self.new_label();
                 let l_f2 = self.new_label();
                 let l_done = self.new_label();
                 self.expr(cls)?;
                 let names: Vec<Value> = kwd_attrs.iter().map(|k| Value::str(k)).collect();
                 self.load_const(Value::tuple(names));
-                self.emit(Op::MatchClass(patterns.len() as u32, kwd_attrs.len() as u32));
+                self.emit(Op::MatchClass(
+                    patterns.len() as u32,
+                    kwd_attrs.len() as u32,
+                ));
                 self.emit(Op::Dup);
                 self.load_const(Value::None);
                 self.emit(Op::Compare(CmpOp::Is));
@@ -2307,7 +2616,11 @@ mod finally_flow {
     }
 
     fn warn(kw: &str, s: &Stmt, out: &mut Vec<CompileWarning>) {
-        out.push(CompileWarning { msg: format!("'{kw}' in a 'finally' block"), line: s.pos.line, col: s.pos.col });
+        out.push(CompileWarning {
+            msg: format!("'{kw}' in a 'finally' block"),
+            line: s.pos.line,
+            col: s.pos.col,
+        });
     }
 
     fn stmt(s: &Stmt, stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
@@ -2327,7 +2640,13 @@ mod finally_flow {
                 stmts(orelse, stack, out);
             }
             StmtKind::With { body, .. } => stmts(body, stack, out),
-            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                ..
+            } => {
                 stmts(body, stack, out);
                 for h in handlers {
                     stmts(&h.body, stack, out);

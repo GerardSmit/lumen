@@ -19,7 +19,9 @@
 //!
 //! A normal-mode close (`break`/`return`) is `AsyncCloseCall(it, st) JumpIfFalse(L) Await
 //! AsyncCloseCheck(st) L:` — no `return` method means no await at all.
-use super::{Compiler, Op, PushValue};
+#[cfg(feature = "compiler")]
+use super::Compiler;
+use super::{Op, PushValue};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 
@@ -36,7 +38,11 @@ fn state(v: &Value) -> f64 {
 }
 
 /// `GetAsyncIter`: pops the iterable, pushes the iterator, its `next` and the initial state.
-pub(super) fn get_async_iter(i: &mut Interp, stack: &mut impl PushValue, rhs: Value) -> Result<(), Abrupt> {
+pub(crate) fn get_async_iter(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    rhs: Value,
+) -> Result<(), Abrupt> {
     let akey = crate::builtins::async_iterator_key(i);
     let method = match &akey {
         Some(k) => i.get_member(&rhs, k)?,
@@ -66,7 +72,13 @@ pub(super) fn get_async_iter(i: &mut Interp, stack: &mut impl PushValue, rhs: Va
 }
 
 /// `AsyncIterNext(it, next, st)`: call `next()`; pushes the value the loop awaits next.
-pub(super) fn next(i: &mut Interp, slots: &mut [Value], it: u16, nx: u16, st: u16) -> Result<Value, Abrupt> {
+pub(crate) fn next(
+    i: &mut Interp,
+    slots: &mut [Value],
+    it: u16,
+    nx: u16,
+    st: u16,
+) -> Result<Value, Abrupt> {
     let sync = state(&slots[st as usize]) != ASYNC;
     if sync {
         slots[st as usize] = Value::Num(SYNC_STEP);
@@ -93,7 +105,11 @@ pub(super) fn next(i: &mut Interp, slots: &mut [Value], it: u16, nx: u16, st: u1
 /// settles via its own reaction job (one tick; the loop's `Await` adds another). With
 /// `close_on_rejection` (a `next` step that is not done), a rejection closes the sync iterator
 /// inside that reaction job, and an abrupt PromiseResolve closes it at once.
-fn continuation(i: &mut Interp, raw: Value, close_on_rejection: Option<&Value>) -> Result<Value, Abrupt> {
+fn continuation(
+    i: &mut Interp,
+    raw: Value,
+    close_on_rejection: Option<&Value>,
+) -> Result<Value, Abrupt> {
     match i.promise_resolve_checked(raw) {
         Ok(p) => {
             let on_r = match close_on_rejection {
@@ -124,7 +140,13 @@ fn continuation(i: &mut Interp, raw: Value, close_on_rejection: Option<&Value>) 
 }
 
 /// `AsyncIterResult(st)`: unpack the awaited step into (value, has-value), like `IterStepL`.
-pub(super) fn result(i: &mut Interp, stack: &mut impl PushValue, slots: &[Value], st: u16, v: Value) -> Result<(), Abrupt> {
+pub(crate) fn result(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    slots: &[Value],
+    st: u16,
+    v: Value,
+) -> Result<(), Abrupt> {
     let s = state(&slots[st as usize]);
     let (value, more) = if s == ASYNC {
         if !matches!(v, Value::Obj(_)) {
@@ -148,7 +170,13 @@ pub(super) fn result(i: &mut Interp, stack: &mut impl PushValue, slots: &[Value]
 
 /// `AsyncCloseCall(it, st)`: AsyncIteratorClose's call half. Pushes `false` when there is no
 /// `return` method, else the value to await and `true`.
-pub(super) fn close_call(i: &mut Interp, stack: &mut impl PushValue, slots: &[Value], it: u16, st: u16) -> Result<(), Abrupt> {
+pub(crate) fn close_call(
+    i: &mut Interp,
+    stack: &mut impl PushValue,
+    slots: &[Value],
+    it: u16,
+    st: u16,
+) -> Result<(), Abrupt> {
     let iter = slots[it as usize].clone();
     let ret = i.get_member(&iter, "return")?;
     if matches!(ret, Value::Undefined | Value::Null) {
@@ -176,16 +204,22 @@ pub(super) fn close_call(i: &mut Interp, stack: &mut impl PushValue, slots: &[Va
 }
 
 /// `AsyncCloseCheck(st)`: the awaited `return()` result of an async iterator must be an object.
-pub(super) fn close_check(i: &mut Interp, slots: &[Value], st: u16, v: Value) -> Result<(), Abrupt> {
+pub(crate) fn close_check(
+    i: &mut Interp,
+    slots: &[Value],
+    st: u16,
+    v: Value,
+) -> Result<(), Abrupt> {
     if state(&slots[st as usize]) == ASYNC && !matches!(v, Value::Obj(_)) {
         return Err(i.throw("TypeError", "iterator result is not an object"));
     }
     Ok(())
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// A normal-mode AsyncIteratorClose (a `break`/`return` leaving a `for await`).
-    pub(super) fn emit_async_close(&mut self, it: u16, st: u16) {
+    pub(crate) fn emit_async_close(&mut self, it: u16, st: u16) {
         self.emit(Op::AsyncCloseCall(it, st));
         let jf = self.emit(Op::JumpIfFalse(0));
         self.emit(Op::Await);
@@ -194,7 +228,7 @@ impl Compiler {
     }
 
     /// Close the for-of iterator in slot `it` in normal mode (sync or async loop).
-    pub(super) fn emit_iter_close(&mut self, it: u16) {
+    pub(crate) fn emit_iter_close(&mut self, it: u16) {
         let st = self
             .loops
             .iter()
@@ -211,7 +245,7 @@ impl Compiler {
 
     /// The body's throw pad of a `for await`: the exception is on the stack. Close in throw
     /// mode (the close's own errors are swallowed, but its awaits still happen) and rethrow.
-    pub(super) fn emit_async_abort(&mut self, it: u16, st: u16) {
+    pub(crate) fn emit_async_abort(&mut self, it: u16, st: u16) {
         let exc = self.fresh_slot("%exc%");
         self.emit(Op::StoreLocal(exc));
         let push = self.emit(Op::PushHandler(0));

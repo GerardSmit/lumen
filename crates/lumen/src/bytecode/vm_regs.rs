@@ -326,10 +326,7 @@ pub(super) unsafe fn write_num(dst: *mut Value, x: f64) {
     {
         use std::arch::x86_64::*;
         // Value layout (`repr(u8)`): tag byte at 0 (Num = 4), f64 payload at 8.
-        _mm_storeu_si128(
-            dst as *mut __m128i,
-            _mm_set_epi64x(x.to_bits() as i64, 4),
-        );
+        _mm_storeu_si128(dst as *mut __m128i, _mm_set_epi64x(x.to_bits() as i64, 4));
     }
     #[cfg(not(target_arch = "x86_64"))]
     std::ptr::write(dst, Value::Num(x));
@@ -341,7 +338,10 @@ pub(super) unsafe fn write_bool(dst: *mut Value, b: bool) {
     #[cfg(target_arch = "x86_64")]
     {
         use std::arch::x86_64::*;
-        _mm_storeu_si128(dst as *mut __m128i, _mm_set_epi64x(0, 3 | ((b as i64) << 8)));
+        _mm_storeu_si128(
+            dst as *mut __m128i,
+            _mm_set_epi64x(0, 3 | ((b as i64) << 8)),
+        );
     }
     #[cfg(not(target_arch = "x86_64"))]
     std::ptr::write(dst, Value::Bool(b));

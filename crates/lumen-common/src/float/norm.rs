@@ -83,7 +83,10 @@ pub fn frexp(x: f64) -> (f64, i32) {
         let (m, e) = frexp(x * pow2(64));
         return (m, e - 64);
     }
-    (f64::from_bits((bits & !(0x7ffu64 << 52)) | (1022u64 << 52)), exp - 1022)
+    (
+        f64::from_bits((bits & !(0x7ffu64 << 52)) | (1022u64 << 52)),
+        exp - 1022,
+    )
 }
 
 /// C's `ldexp`: `x * 2^e` rounded once, for any exponent.

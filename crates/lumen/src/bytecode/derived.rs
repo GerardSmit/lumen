@@ -12,13 +12,15 @@
 //!
 //! The runtime only runs a derived-mode chunk for a derived class construct (and never runs a
 //! non-derived chunk for one); see `Interp::call_user_inner`.
+#[cfg(feature = "compiler")]
 use super::{ArrayElem, CResult, Compiler, Op};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// `super(args)`: only in a derived-mode body (an arrow's `super()` stays in the oracle).
-    pub(super) fn super_call(&mut self, args: &[ArrayElem]) -> CResult {
+    pub(crate) fn super_call(&mut self, args: &[ArrayElem]) -> CResult {
         if !self.derived {
             return Err(super::Bail);
         }
@@ -34,7 +36,7 @@ impl Compiler {
 }
 
 /// `Op::SuperCtor`: push the parent constructor, then the `this` value it will run on.
-pub(super) fn super_ctor(i: &mut Interp, env: &Env, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
+pub(crate) fn super_ctor(i: &mut Interp, env: &Env, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
     let (parent, this) = i.super_call_prepare(env)?;
     stack.push(parent);
     stack.push(this);
@@ -44,7 +46,7 @@ pub(super) fn super_ctor(i: &mut Interp, env: &Env, stack: &mut Vec<Value>) -> R
 /// `Op::SuperCall` / `Op::SuperCallSpread`: pops `argc` arguments (the last one an iterable to
 /// expand when `spread`), the `this` and the parent pushed by `SuperCtor`; pushes the bound
 /// `this`.
-pub(super) fn super_call(
+pub(crate) fn super_call(
     i: &mut Interp,
     env: &Env,
     stack: &mut Vec<Value>,

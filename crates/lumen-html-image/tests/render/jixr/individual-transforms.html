@@ -1,0 +1,19 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+main{position:relative;width:220px;height:140px;background:#e8eef8}
+.t{position:absolute;left:0;top:0;width:40px;height:30px;background:#e8710a;translate:20px 10px}
+.s{position:absolute;left:60px;top:0;width:30px;height:30px;background:#174ea6;scale:1.5}
+.r{position:absolute;left:110px;top:0;width:40px;height:30px;background:#fbbc04;rotate:15deg}
+.combo{position:absolute;left:160px;top:0;width:30px;height:30px;background:#188448;
+translate:5px 5px;rotate:10deg;scale:1.2}
+</style>
+<!-- jixr-compare: threshold=16 max-diff-ratio=0.02
+  The combo box (translate+rotate+scale together) differs slightly from Chromium in how the
+  composed transform interacts with antialiasing at rotated edges; the single-property boxes
+  match exactly.
+--><main>
+<div class=t></div>
+<div class=s></div>
+<div class=r></div>
+<div class=combo></div>
+</main>

@@ -59,7 +59,11 @@ pub fn simulate(it: &mut Interp, sig: i64) -> R<()> {
     if !(1..lumen_os::signal::NSIG as i64).contains(&sig) {
         return Err(it.value_error("signal number out of range"));
     }
-    let handler = it.native_state::<_signal::State>().handlers.get(sig as usize).cloned();
+    let handler = it
+        .native_state::<_signal::State>()
+        .handlers
+        .get(sig as usize)
+        .cloned();
     if matches!(handler, Some(Value::Int(_))) {
         return Ok(());
     }
@@ -71,7 +75,11 @@ pub fn simulate(it: &mut Interp, sig: i64) -> R<()> {
 }
 
 fn run_handler(it: &mut Interp, sig: i32) -> R<()> {
-    let handler = it.native_state::<_signal::State>().handlers.get(sig as usize).cloned();
+    let handler = it
+        .native_state::<_signal::State>()
+        .handlers
+        .get(sig as usize)
+        .cloned();
     match handler {
         None if sig == 2 => Err(it.interrupt_exc()),
         Some(h) if !matches!(h, Value::Int(_) | Value::None) => {
@@ -79,7 +87,8 @@ fn run_handler(it: &mut Interp, sig: i32) -> R<()> {
                 0 => Value::None,
                 n => it.frame_object(n - 1),
             };
-            it.call(&h, vec![Value::Int(sig as i64), frame], Vec::new()).map(|_| ())
+            it.call(&h, vec![Value::Int(sig as i64), frame], Vec::new())
+                .map(|_| ())
         }
         _ => Ok(()),
     }
@@ -155,7 +164,9 @@ pub mod _signal {
         for i in items {
             let n = it.index_of(&i)?;
             if !(1..NSIG as i64).contains(&n) {
-                return Err(it.value_error(&format!("signal number {n} out of range [1; {}]", NSIG - 1)));
+                return Err(
+                    it.value_error(&format!("signal number {n} out of range [1; {}]", NSIG - 1))
+                );
             }
             out.push(n as i32);
         }
@@ -172,7 +183,9 @@ pub mod _signal {
         if super::claim(it) {
             return Ok(());
         }
-        Err(it.value_error(&format!("{what} only works in main thread of the main interpreter")))
+        Err(it.value_error(&format!(
+            "{what} only works in main thread of the main interpreter"
+        )))
     }
 
     /// The default handler for SIGINT installed by Python.
@@ -231,7 +244,9 @@ pub mod _signal {
         } else if is_int(handler, SIG_DFL) {
             Disposition::Default
         } else {
-            return Err(it.type_error("signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object"));
+            return Err(it.type_error(
+                "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object",
+            ));
         };
         if os::any_pending() {
             super::run_pending(it)?;
@@ -262,7 +277,12 @@ pub mod _signal {
     #[op]
     fn getsignal(it: &mut Interp, signalnum: i64) -> R<Value> {
         let sig = check_signum(it, signalnum)?;
-        Ok(it.native_state::<State>().handlers.get(sig as usize).cloned().unwrap_or(Value::None))
+        Ok(it
+            .native_state::<State>()
+            .handlers
+            .get(sig as usize)
+            .cloned()
+            .unwrap_or(Value::None))
     }
 
     /// Return the system description of the given signal.
@@ -297,7 +317,9 @@ pub mod _signal {
     fn set_wakeup_fd(it: &mut Interp, fd: i64, #[varkw] kw: KwArgs) -> R<i64> {
         for (k, _) in kw.iter() {
             if k != "warn_on_full_buffer" {
-                return Err(it.type_error(&format!("'{k}' is an invalid keyword argument for set_wakeup_fd()")));
+                return Err(it.type_error(&format!(
+                    "'{k}' is an invalid keyword argument for set_wakeup_fd()"
+                )));
             }
         }
         main_thread_only(it, "set_wakeup_fd")?;
@@ -320,7 +342,12 @@ pub mod _signal {
     ///
     /// Returns old values as a tuple: (delay, interval).
     #[op]
-    fn setitimer(it: &mut Interp, which: i64, seconds: &Value, interval: Option<&Value>) -> R<(f64, f64)> {
+    fn setitimer(
+        it: &mut Interp,
+        which: i64,
+        seconds: &Value,
+        interval: Option<&Value>,
+    ) -> R<(f64, f64)> {
         let value = it.float_arg(seconds)?;
         let interval = match interval {
             Some(v) => it.float_arg(v)?,
@@ -388,7 +415,9 @@ pub mod _signal {
     fn sigwait(it: &mut Interp, sigset: &Value) -> R<i64> {
         let sigs = signal_set(it, sigset)?;
         it.flush_out();
-        os::sigwait(&sigs).map(i64::from).map_err(|e| os_error(it, e))
+        os::sigwait(&sigs)
+            .map(i64::from)
+            .map_err(|e| os_error(it, e))
     }
 
     /// Return a set of valid signal numbers on this platform.
@@ -404,14 +433,24 @@ pub mod _signal {
     fn init(it: &mut Interp, m: &Value) {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
-        for (name, v) in [("SIG_DFL", SIG_DFL), ("SIG_IGN", SIG_IGN), ("NSIG", NSIG as i64)] {
+        for (name, v) in [
+            ("SIG_DFL", SIG_DFL),
+            ("SIG_IGN", SIG_IGN),
+            ("NSIG", NSIG as i64),
+        ] {
             dict_set_str(&d, name, Value::Int(v));
         }
         for &(name, v) in os::names().iter().chain(os::constants()) {
             dict_set_str(&d, name, Value::Int(v as i64));
         }
         let os_error = it.exc_type("OSError");
-        let itimer = crate::builtins::native::new_type(it, "signal", "itimer_error", Some(&os_error), Layout::Exception);
+        let itimer = crate::builtins::native::new_type(
+            it,
+            "signal",
+            "itimer_error",
+            Some(&os_error),
+            Layout::Exception,
+        );
         dict_set_str(&d, "ItimerError", Value::Obj(itimer.clone()));
         let int_handler = dict_get_str(&d, "default_int_handler").unwrap_or(Value::None);
         let mut handlers = vec![Value::None; NSIG as usize];

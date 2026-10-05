@@ -1,0 +1,1536 @@
+//! CSS-pixel display list shared by the image and window backends.
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+
+/// Maximum encoded SVG path data retained by one paint command. The image
+/// backend applies the segment-count limit while parsing this bounded input.
+pub const MAX_SVG_PATH_BYTES: usize = 1024 * 1024;
+pub const MAX_SVG_CLIP_PATHS: usize = 256;
+pub const MAX_SVG_GRADIENT_STOPS: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SvgGradientUnits {
+    ObjectBoundingBox,
+    UserSpaceOnUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SvgGradientStop {
+    pub offset: f32,
+    pub color: Rgba,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SvgGradientKind {
+    Linear {
+        start: [f32; 2],
+        end: [f32; 2],
+    },
+    Radial {
+        start: [f32; 2],
+        end: [f32; 2],
+        start_radius: f32,
+        end_radius: f32,
+    },
+}
+
+/// A resolved local SVG paint server. Coordinates are in object-bounding-box
+/// space or the referencing element's current user space, as selected by
+/// `units`; `transform` is the SVG gradientTransform matrix.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgGradient {
+    pub units: SvgGradientUnits,
+    pub transform: Affine,
+    pub kind: SvgGradientKind,
+    pub stops: Arc<[SvgGradientStop]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum SvgPaint {
+    Color(Rgba),
+    Gradient(Arc<SvgGradient>),
+}
+
+pub fn valid_svg_paint(paint: Option<&SvgPaint>) -> bool {
+    let Some(SvgPaint::Gradient(gradient)) = paint else {
+        return true;
+    };
+    let finite_point = |point: [f32; 2]| point.into_iter().all(f32::is_finite);
+    let valid_kind = match gradient.kind {
+        SvgGradientKind::Linear { start, end } => finite_point(start) && finite_point(end),
+        SvgGradientKind::Radial {
+            start,
+            end,
+            start_radius,
+            end_radius,
+        } => {
+            finite_point(start)
+                && finite_point(end)
+                && start_radius.is_finite()
+                && end_radius.is_finite()
+                && start_radius >= 0.0
+                && end_radius >= 0.0
+        }
+    };
+    gradient.transform.is_finite()
+        && valid_kind
+        && gradient.stops.len() <= MAX_SVG_GRADIENT_STOPS
+        && gradient.stops.iter().all(|stop| {
+            stop.offset.is_finite() && (0.0..=1.0).contains(&stop.offset)
+        })
+}
+
+pub fn svg_paint_has_ink(paint: Option<&SvgPaint>) -> bool {
+    match paint {
+        Some(SvgPaint::Color(color)) => color.a != 0,
+        Some(SvgPaint::Gradient(gradient)) => gradient.stops.iter().any(|stop| stop.color.a != 0),
+        None => false,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgClipShape {
+    pub data: Arc<str>,
+    /// Element transform within the clipPath coordinate system.
+    pub transform: Affine,
+    pub fill_rule: SvgFillRule,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SvgClip {
+    pub units: SvgGradientUnits,
+    pub transform: Affine,
+    pub shapes: Arc<[SvgClipShape]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glyph {
+    pub id: u16,
+    /// Stable face identity; zero selects a legacy provider's default face.
+    pub face: u64,
+    /// UTF-8 byte offset of the grapheme cluster that produced this glyph.
+    pub cluster: u32,
+    pub x: f32,
+    pub y: f32,
+    /// Raster scale relative to the computed CSS font size. CSS font fallback
+    /// can adjust each selected face independently while shaped advances and
+    /// offsets are already expressed at that face's used size.
+    pub size_scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+    Oblique,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FontMetric {
+    ExHeight,
+    CapHeight,
+    ChWidth,
+    IcWidth,
+    IcHeight,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FontSizeAdjustValue {
+    Number(f32),
+    FromFont,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FontSizeAdjust {
+    pub metric: FontMetric,
+    pub value: FontSizeAdjustValue,
+}
+
+/// The `ex` and `ch` unit bases for one computed font selection.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FontRelativeMetrics {
+    pub ex: f32,
+    pub ch: f32,
+}
+
+/// Descriptor match order from CSS Fonts §5. Equal ranks are resolved by the
+/// caller using the source ordering that applies to its font-face collection.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FontMatchRank {
+    stretch_group: u8,
+    stretch_order: u32,
+    style: u8,
+    weight_group: u8,
+    weight_order: u16,
+}
+
+fn font_style_rank(wanted: FontStyle, actual: FontStyle) -> u8 {
+    match (wanted, actual) {
+        (FontStyle::Normal, FontStyle::Normal)
+        | (FontStyle::Italic, FontStyle::Italic)
+        | (FontStyle::Oblique, FontStyle::Oblique) => 0,
+        (FontStyle::Normal, FontStyle::Oblique)
+        | (FontStyle::Italic, FontStyle::Oblique)
+        | (FontStyle::Oblique, FontStyle::Italic) => 1,
+        _ => 2,
+    }
+}
+
+fn font_weight_rank(wanted: u16, actual: u16) -> (u8, u16) {
+    if (400..=500).contains(&wanted) {
+        if (wanted..=500).contains(&actual) {
+            (0, actual)
+        } else if actual < wanted {
+            (1, u16::MAX - actual)
+        } else {
+            (2, actual)
+        }
+    } else if wanted < 400 {
+        if actual <= wanted {
+            (0, u16::MAX - actual)
+        } else {
+            (1, actual)
+        }
+    } else if actual >= wanted {
+        (0, actual)
+    } else {
+        (1, u16::MAX - actual)
+    }
+}
+
+/// Rank one available face against a requested CSS font selection. Family and
+/// Unicode coverage filtering remain with the caller because they depend on
+/// its source records and the requested text.
+pub fn font_match_rank(
+    requested: &FontSpec,
+    actual_style: FontStyle,
+    actual_weight: u16,
+    actual_stretch: f32,
+) -> Option<FontMatchRank> {
+    if !(1..=1000).contains(&requested.weight)
+        || !(1..=1000).contains(&actual_weight)
+        || !requested.stretch.is_finite()
+        || requested.stretch < 0.0
+        || !actual_stretch.is_finite()
+        || actual_stretch < 0.0
+    {
+        return None;
+    }
+    let bits = if actual_stretch == 0.0 {
+        0
+    } else {
+        actual_stretch.to_bits()
+    };
+    let (stretch_group, stretch_order) = if requested.stretch <= 100.0 {
+        if actual_stretch <= requested.stretch {
+            (0, u32::MAX - bits)
+        } else {
+            (1, bits)
+        }
+    } else if actual_stretch >= requested.stretch {
+        (0, bits)
+    } else {
+        (1, u32::MAX - bits)
+    };
+    let (weight_group, weight_order) = font_weight_rank(requested.weight, actual_weight);
+    Some(FontMatchRank {
+        stretch_group,
+        stretch_order,
+        style: font_style_rank(requested.style, actual_style),
+        weight_group,
+        weight_order,
+    })
+}
+
+/// Rank variable-font descriptors that advertise weight and stretch ranges.
+/// When the requested value falls inside a range, that face matches at the
+/// exact requested value; otherwise the same endpoint preference as ordinary
+/// font matching chooses its nearest available descriptor.
+pub fn font_match_range_rank(
+    requested: &FontSpec,
+    actual_style: FontStyle,
+    weight_range: [u16; 2],
+    stretch_range: [f32; 2],
+) -> Option<(FontMatchRank, u16, f32)> {
+    if weight_range[0] == 0
+        || weight_range[0] > weight_range[1]
+        || weight_range[1] > 1000
+        || stretch_range.iter().any(|value| !value.is_finite() || *value < 0.0)
+        || stretch_range[0] > stretch_range[1]
+    {
+        return None;
+    }
+    let weights = if (weight_range[0]..=weight_range[1]).contains(&requested.weight) {
+        [Some(requested.weight), None]
+    } else {
+        [Some(weight_range[0]), Some(weight_range[1])]
+    };
+    let stretches = if (stretch_range[0]..=stretch_range[1]).contains(&requested.stretch) {
+        [Some(requested.stretch), None]
+    } else {
+        [Some(stretch_range[0]), Some(stretch_range[1])]
+    };
+    let mut best = None;
+    for weight in weights.into_iter().flatten() {
+        for stretch in stretches.into_iter().flatten() {
+            let rank = font_match_rank(requested, actual_style, weight, stretch)?;
+            if best.is_none_or(|(prior, _, _)| rank < prior) {
+                best = Some((rank, weight, stretch));
+            }
+        }
+    }
+    best
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontSpec {
+    pub families: Option<Arc<[Arc<str>]>>,
+    pub weight: u16,
+    pub style: FontStyle,
+    /// Requested face width as a percentage; 100 is normal.
+    pub stretch: f32,
+    pub size_adjust: Option<FontSizeAdjust>,
+}
+impl Default for FontSpec {
+    fn default() -> Self {
+        Self {
+            families: None,
+            weight: 400,
+            style: FontStyle::Normal,
+            stretch: 100.0,
+            size_adjust: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapedRun {
+    pub glyphs: Arc<[Glyph]>,
+    pub width: f32,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ImageData {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+impl ImageData {
+    pub fn is_valid(&self) -> bool {
+        self.width != 0
+            && self.height != 0
+            && (self.width as usize)
+                .checked_mul(self.height as usize)
+                .and_then(|size| size.checked_mul(4))
+                == Some(self.pixels.len())
+    }
+}
+
+pub trait TextShaper {
+    /// Identity/generation of the immutable font configuration used for layout.
+    fn generation(&self) -> u64 {
+        0
+    }
+    fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()>;
+    fn shape_directional(&self, text: &str, size: f32, _rtl: bool) -> Result<ShapedRun, ()> {
+        self.shape(text, size)
+    }
+    fn measure(&self, text: &str, size: f32) -> Result<f32, ()> {
+        self.shape(text, size).map(|run| run.width)
+    }
+    fn shape_styled(
+        &self,
+        text: &str,
+        size: f32,
+        rtl: bool,
+        _font: &FontSpec,
+    ) -> Result<ShapedRun, ()> {
+        self.shape_directional(text, size, rtl)
+    }
+    /// Shape an item whose bidi direction has already been resolved by layout.
+    fn shape_resolved(
+        &self,
+        text: &str,
+        size: f32,
+        rtl: bool,
+        font: &FontSpec,
+    ) -> Result<ShapedRun, ()> {
+        self.shape_styled(text, size, rtl, font)
+    }
+    fn measure_styled(&self, text: &str, size: f32, font: &FontSpec) -> Result<f32, ()> {
+        self.shape_styled(text, size, false, font)
+            .map(|run| run.width)
+    }
+    fn ascent_styled(&self, size: f32, _font: &FontSpec) -> f32 {
+        self.ascent(size)
+    }
+    fn line_height_styled(&self, size: f32, _font: &FontSpec) -> f32 {
+        self.line_height(size)
+    }
+    fn underline_metrics_styled(&self, size: f32, _font: &FontSpec) -> (f32, f32) {
+        self.underline_metrics(size)
+    }
+    fn strike_metrics_styled(&self, size: f32, _font: &FontSpec) -> (f32, f32) {
+        self.strike_metrics(size)
+    }
+    fn font_relative_metrics_styled(&self, size: f32, _font: &FontSpec) -> FontRelativeMetrics {
+        FontRelativeMetrics {
+            ex: size * 0.5,
+            ch: size * 0.5,
+        }
+    }
+    fn ascent(&self, size: f32) -> f32;
+    fn line_height(&self, size: f32) -> f32;
+    fn underline_metrics(&self, size: f32) -> (f32, f32) {
+        (size * 0.1, size / 16.0)
+    }
+    fn strike_metrics(&self, size: f32) -> (f32, f32) {
+        (-size * 0.3, size / 16.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rect {
+    pub fn is_valid(self) -> bool {
+        [self.x, self.y, self.width, self.height]
+            .iter()
+            .all(|n| n.is_finite())
+            && self.width >= 0.0
+            && self.height >= 0.0
+    }
+
+    /// Physical TL, TR, BR, BL elliptical corners, already overlap-normalized.
+    pub fn contains_corners(self, x: f32, y: f32, corners: &[[f32; 2]; 4]) -> bool {
+        if !self.contains_rounded(x, y, 0.0) {
+            return false;
+        }
+        for (i, r) in corners.iter().enumerate() {
+            if r[0] <= 0.0 || r[1] <= 0.0 {
+                continue;
+            }
+            let left = i == 0 || i == 3;
+            let top = i < 2;
+            let cx = if left {
+                self.x + r[0]
+            } else {
+                self.x + self.width - r[0]
+            };
+            let cy = if top {
+                self.y + r[1]
+            } else {
+                self.y + self.height - r[1]
+            };
+            if (if left { x < cx } else { x > cx }) && (if top { y < cy } else { y > cy }) {
+                let dx = (x - cx) / r[0];
+                let dy = (y - cy) / r[1];
+                if dx * dx + dy * dy > 1.0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    pub fn contains_rounded(self, x: f32, y: f32, radius: f32) -> bool {
+        if x < self.x || y < self.y || x >= self.x + self.width || y >= self.y + self.height {
+            return false;
+        }
+        let radius = radius.min(self.width * 0.5).min(self.height * 0.5);
+        if radius <= 0.0 {
+            return true;
+        }
+        let dx = x - x.clamp(self.x + radius, self.x + self.width - radius);
+        let dy = y - y.clamp(self.y + radius, self.y + self.height - radius);
+        dx * dx + dy * dy <= radius * radius
+    }
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let x = self.x.max(other.x);
+        let y = self.y.max(other.y);
+        let right = (self.x + self.width).min(other.x + other.width);
+        let bottom = (self.y + self.height).min(other.y + other.height);
+        (right > x && bottom > y).then_some(Self {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rgba {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gradient {
+    pub kind: GradientKind,
+    pub repeating: bool,
+    pub stops: Arc<[GradientStop]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientKind {
+    /// CSS degrees: zero points up; corner directions use box-dependent angles.
+    Linear {
+        angle: f32,
+        corner: Option<(i8, i8)>,
+    },
+    Radial {
+        shape: RadialShape,
+        size: RadialSize,
+        center: [LengthPercentage; 2],
+    },
+    /// CSS Images §3.4: `from <angle>` in CSS degrees (zero points up,
+    /// clockwise) around a center point; angles sweep clockwise.
+    Conic {
+        from: f32,
+        center: [LengthPercentage; 2],
+    },
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RadialShape {
+    Circle,
+    Ellipse,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadialSize {
+    ClosestSide,
+    FarthestSide,
+    ClosestCorner,
+    FarthestCorner,
+    Radii([LengthPercentage; 2]),
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LengthPercentage {
+    pub pixels: f32,
+    pub fraction: f32,
+}
+impl LengthPercentage {
+    pub fn resolve(self, basis: f32) -> f32 {
+        self.pixels + self.fraction * basis
+    }
+    fn is_finite(self) -> bool {
+        self.pixels.is_finite() && self.fraction.is_finite()
+    }
+}
+impl Gradient {
+    pub fn is_valid(&self) -> bool {
+        let valid_kind = match self.kind {
+            GradientKind::Linear { angle, corner } => {
+                angle.is_finite()
+                    && !corner.is_some_and(|(x, y)| !matches!(x, -1 | 1) || !matches!(y, -1 | 1))
+            }
+            GradientKind::Radial {
+                shape,
+                size,
+                center,
+            } => {
+                center.iter().all(|v| v.is_finite())
+                    && match size {
+                        RadialSize::Radii(radii) => {
+                            radii
+                                .iter()
+                                .all(|v| v.is_finite() && (v.fraction != 0.0 || v.pixels >= 0.0))
+                                && (shape != RadialShape::Circle
+                                    || radii[0] == radii[1] && radii[0].fraction == 0.0)
+                        }
+                        _ => true,
+                    }
+            }
+            GradientKind::Conic { from, center } => {
+                from.is_finite() && center.iter().all(|v| v.is_finite())
+            }
+        };
+        valid_kind
+            && (2..=32).contains(&self.stops.len())
+            && self.stops.iter().all(|stop| match stop.position {
+                Some(GradientPosition::Fraction(v) | GradientPosition::Pixels(v)) => v.is_finite(),
+                Some(GradientPosition::Mixed(v)) => v.is_finite(),
+                None => true,
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundRepeat {
+    Repeat,
+    NoRepeat,
+    Space,
+    Round,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackgroundPaint {
+    Solid(Rgba),
+    CrossFade(Arc<[(BackgroundPaint, f32)]>),
+    Gradient(Arc<Gradient>),
+    Image(Arc<ImageData>),
+}
+
+impl BackgroundPaint {
+    pub fn natural_size(&self) -> Option<(f32, f32)> {
+        match self {
+            Self::Image(image) if image.is_valid() => {
+                Some((image.width as f32, image.height as f32))
+            }
+            Self::CrossFade(items) => {
+                let mut width = 0.0;
+                let mut height = 0.0;
+                let mut weight = 0.0;
+                for (image, fraction) in items.iter() {
+                    if let Some((w, h)) = image.natural_size() {
+                        width += w * fraction;
+                        height += h * fraction;
+                        weight += fraction;
+                    }
+                }
+                (weight > 0.0).then(|| (width / weight, height / weight))
+            }
+            _ => None,
+        }
+    }
+    fn valid_at(&self, depth: usize) -> bool {
+        if depth > 16 {
+            return false;
+        }
+        match self {
+            Self::Solid(_) => true,
+            Self::Gradient(g) => g.is_valid(),
+            Self::Image(i) => {
+                i.is_valid() || (i.width == 0 && i.height == 0 && i.pixels.is_empty())
+            }
+            Self::CrossFade(items) => {
+                !items.is_empty()
+                    && items.len() <= 16
+                    && items.iter().all(|(i, w)| {
+                        w.is_finite() && *w >= 0.0 && *w <= 1.0 && i.valid_at(depth + 1)
+                    })
+            }
+        }
+    }
+    pub fn is_valid(&self) -> bool {
+        self.valid_at(0)
+    }
+    fn payload_bytes(&self) -> usize {
+        let header = 2 * core::mem::size_of::<usize>();
+        match self {
+            Self::Solid(_) => 0,
+            Self::Image(i) => core::mem::size_of::<ImageData>() + i.pixels.capacity() + header,
+            Self::Gradient(g) => {
+                core::mem::size_of::<Gradient>()
+                    + g.stops.len() * core::mem::size_of::<GradientStop>()
+                    + 2 * header
+            }
+            Self::CrossFade(items) => {
+                items.len() * core::mem::size_of::<(BackgroundPaint, f32)>()
+                    + header
+                    + items.iter().map(|(i, _)| i.payload_bytes()).sum::<usize>()
+            }
+        }
+    }
+}
+
+/// Box a background layer clips to (`background-clip`) or is positioned within
+/// (`background-origin`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundBox {
+    Text,
+    BorderArea,
+    BorderAreaText,
+    Border,
+    Padding,
+    Content,
+}
+
+/// One `background-image` layer value. `None` layers paint nothing but still
+/// take part in layer cycling.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BackgroundImage {
+    Solid(Rgba),
+    CrossFade(Arc<[(BackgroundImage, f32)]>),
+    None,
+    Url(Arc<str>),
+    /// The selected image-set candidate; natural CSS dimensions divide the
+    /// decoded pixel dimensions by this positive resolution in dppx.
+    UrlResolution {
+        url: Arc<str>,
+        density: f32,
+    },
+    Gradient(Arc<Gradient>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackgroundSizeKind {
+    Explicit,
+    Contain,
+    Cover,
+}
+
+/// `background-size`: `cover`/`contain` or per-axis `auto`/length-percentage.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackgroundSize {
+    pub kind: BackgroundSizeKind,
+    pub width: Option<LengthPercentage>,
+    pub height: Option<LengthPercentage>,
+}
+
+impl BackgroundSize {
+    pub const AUTO: Self = Self {
+        kind: BackgroundSizeKind::Explicit,
+        width: None,
+        height: None,
+    };
+}
+
+/// One resolved background layer with the geometry properties CSS Backgrounds
+/// defines per layer. At most [`MAX_BACKGROUND_LAYERS`] exist per element.
+pub const MAX_BACKGROUND_LAYERS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundLayer {
+    pub image: BackgroundImage,
+    pub position: [LengthPercentage; 2],
+    pub size: BackgroundSize,
+    pub repeat: [BackgroundRepeat; 2],
+    pub clip: BackgroundBox,
+    pub origin: BackgroundBox,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GradientPosition {
+    Fraction(f32),
+    Pixels(f32),
+    Mixed(LengthPercentage),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientStop {
+    pub color: Rgba,
+    pub position: Option<GradientPosition>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxShadow {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
+    pub inset: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BorderPattern {
+    Groove,
+    Ridge,
+    Inset,
+    Outset,
+    Double,
+    Dashed,
+    Dotted,
+}
+
+impl BoxShadow {
+    pub fn bounds(self, rect: Rect) -> Rect {
+        if self.inset {
+            return rect;
+        }
+        let extent = self.spread + self.blur * 1.5 + 1.0;
+        Rect {
+            x: rect.x + self.offset_x - extent,
+            y: rect.y + self.offset_y - extent,
+            width: (rect.width + extent * 2.0).max(0.0),
+            height: (rect.height + extent * 2.0).max(0.0),
+        }
+    }
+}
+
+/// CSS two-dimensional affine matrix, in column-vector order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+impl Default for Affine {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+impl Affine {
+    pub const IDENTITY: Self = Self {
+        a: 1.0,
+        b: 0.0,
+        c: 0.0,
+        d: 1.0,
+        e: 0.0,
+        f: 0.0,
+    };
+    pub fn apply(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+    pub fn then(self, rhs: Self) -> Self {
+        Self {
+            a: self.a * rhs.a + self.c * rhs.b,
+            b: self.b * rhs.a + self.d * rhs.b,
+            c: self.a * rhs.c + self.c * rhs.d,
+            d: self.b * rhs.c + self.d * rhs.d,
+            e: self.a * rhs.e + self.c * rhs.f + self.e,
+            f: self.b * rhs.e + self.d * rhs.f + self.f,
+        }
+    }
+    pub fn inverse(self) -> Option<Self> {
+        let det = self.a * self.d - self.b * self.c;
+        if det == 0.0 || !det.is_finite() {
+            return None;
+        }
+        let result = Self {
+            a: self.d / det,
+            b: -self.b / det,
+            c: -self.c / det,
+            d: self.a / det,
+            e: (self.c * self.f - self.d * self.e) / det,
+            f: (self.b * self.e - self.a * self.f) / det,
+        };
+        result.is_finite().then_some(result)
+    }
+    pub fn is_finite(self) -> bool {
+        [self.a, self.b, self.c, self.d, self.e, self.f]
+            .iter()
+            .all(|v| v.is_finite())
+    }
+    pub fn translated_space(self, x: f32, y: f32) -> Self {
+        Self {
+            e: self.e + x - self.a * x - self.c * y,
+            f: self.f + y - self.b * x - self.d * y,
+            ..self
+        }
+    }
+    pub fn bounds(self, rect: Rect) -> Rect {
+        let points = [
+            self.apply(rect.x, rect.y),
+            self.apply(rect.x + rect.width, rect.y),
+            self.apply(rect.x, rect.y + rect.height),
+            self.apply(rect.x + rect.width, rect.y + rect.height),
+        ];
+        let (mut x, mut y, mut right, mut bottom) =
+            (points[0].0, points[0].1, points[0].0, points[0].1);
+        for (px, py) in points {
+            x = x.min(px);
+            y = y.min(py);
+            right = right.max(px);
+            bottom = bottom.max(py);
+        }
+        Rect {
+            x,
+            y,
+            width: right - x,
+            height: bottom - y,
+        }
+    }
+}
+
+#[cfg(test)]
+mod affine_tests {
+    use super::*;
+    #[test]
+    fn inverse_and_coordinate_translation_preserve_geometry() {
+        let matrix = Affine {
+            a: 0.0,
+            b: 2.0,
+            c: -3.0,
+            d: 0.0,
+            e: 12.0,
+            f: 4.0,
+        };
+        let point = matrix.apply(5.0, 7.0);
+        assert_eq!(
+            matrix.inverse().unwrap().apply(point.0, point.1),
+            (5.0, 7.0)
+        );
+        let shifted = matrix.translated_space(20.0, -6.0).apply(25.0, 1.0);
+        assert_eq!(shifted, (point.0 + 20.0, point.1 - 6.0));
+        assert_eq!(matrix.then(matrix.inverse().unwrap()), Affine::IDENTITY);
+        assert!(
+            Affine {
+                a: 0.0,
+                b: 0.0,
+                ..Affine::IDENTITY
+            }
+            .inverse()
+            .is_none()
+        );
+    }
+    #[test]
+    fn transform_scope_requires_matching_pop() {
+        assert_eq!(
+            DisplayList(alloc::vec![
+                Command::PushTransform(Affine::IDENTITY),
+                Command::PopClip
+            ])
+            .validate(),
+            Err(ReplayError::UnbalancedClip)
+        );
+        assert!(
+            DisplayList(alloc::vec![
+                Command::PushTransform(Affine::IDENTITY),
+                Command::PushClip(Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0
+                }),
+                Command::PopClip,
+                Command::PopTransform
+            ])
+            .validate()
+            .is_ok()
+        );
+        assert_eq!(
+            DisplayList(alloc::vec![
+                Command::PushTransform(Affine {
+                    e: f32::NAN,
+                    ..Affine::IDENTITY
+                }),
+                Command::PopTransform
+            ])
+            .validate(),
+            Err(ReplayError::InvalidGeometry)
+        );
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BackgroundFill {
+    pub corners: Option<Arc<[[f32; 2]; 4]>>,
+    pub rect: Rect,
+    pub radius: f32,
+    pub positioning_rect: Rect,
+    pub image_rect: Rect,
+    pub repeat: [BackgroundRepeat; 2],
+    pub image: BackgroundPaint,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Command {
+    PushTransform(Affine),
+    PopTransform,
+    PushClip(Rect),
+    PopClip,
+    PushLayer {
+        corners: Option<Arc<[[f32; 2]; 4]>>,
+        rect: Rect,
+        radius: f32,
+        opacity: f32,
+        clip: bool,
+    },
+    PopLayer,
+    FillRect {
+        rect: Rect,
+        color: Rgba,
+    },
+    FillRoundedRect {
+        corners: Option<Arc<[[f32; 2]; 4]>>,
+        rect: Rect,
+        radius: f32,
+        color: Rgba,
+    },
+    FillGradient {
+        rect: Rect,
+        radius: f32,
+        gradient: Arc<Gradient>,
+    },
+    FillBackground(Box<BackgroundFill>),
+    MaskedBackground(Box<MaskedBackground>),
+    BoxShadow {
+        corners: Option<Arc<[[f32; 2]; 4]>>,
+        rect: Rect,
+        radius: f32,
+        shadow: BoxShadow,
+    },
+    StrokeBorder {
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        color: Rgba,
+    },
+    StrokeBoxBorder(Box<BoxBorder>),
+    StrokePatternBorder {
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        color: Rgba,
+        pattern: BorderPattern,
+    },
+    GlyphRun {
+        origin_x: f32,
+        baseline_y: f32,
+        size: f32,
+        color: Rgba,
+        glyphs: Arc<[Glyph]>,
+    },
+    Image {
+        rect: Rect,
+        image: Arc<ImageData>,
+    },
+    /// A renderer-neutral SVG path command. `data` uses the SVG path-data
+    /// grammar and is parsed by the shared vector raster backend; `transform`
+    /// maps user-space coordinates into CSS pixels.
+    SvgPath {
+        bounds: Rect,
+        data: Arc<str>,
+        transform: Affine,
+        fill: Option<SvgPaint>,
+        stroke: Option<SvgPaint>,
+        stroke_width: f32,
+        fill_rule: SvgFillRule,
+        clips: Arc<[SvgClip]>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SvgFillRule {
+    #[default]
+    NonZero,
+    EvenOdd,
+}
+
+/// Immutable ink/border coverage shared by background layers. Offset tracks
+/// retained scroll movement without cloning the mask's commands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaskedBackground {
+    pub text_clipped: bool,
+    pub rect: Rect,
+    pub paint: Box<Command>,
+    pub mask: Arc<DisplayList>,
+    pub offset: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoxBorder {
+    pub rect: Rect,
+    pub radius: f32,
+    /// Physical top, right, bottom, left edges.
+    pub widths: [f32; 4],
+    pub colors: [Rgba; 4],
+    pub pattern: Option<BorderPattern>,
+    pub side_patterns: Option<[Option<BorderPattern>; 4]>,
+    /// Optional physical top-left, top-right, bottom-right, bottom-left radii.
+    pub corners: Option<[[f32; 2]; 4]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DisplayList(pub Vec<Command>);
+
+/// Conservatively counted bytes referenced by a command. Shared Arc payloads
+/// are charged once per reference, so this is an upper bound, not heap usage.
+impl Command {
+    pub fn referenced_bytes(&self) -> usize {
+        let arc_header = 2 * core::mem::size_of::<usize>();
+        let gradient_bytes = |gradient: &Gradient| {
+            core::mem::size_of::<Gradient>()
+                + gradient.stops.len() * core::mem::size_of::<GradientStop>()
+                + 2 * arc_header
+        };
+        let image_bytes = |image: &ImageData| {
+            core::mem::size_of::<ImageData>()
+                .saturating_add(image.pixels.capacity())
+                .saturating_add(arc_header)
+        };
+        let payload = match self {
+            Self::GlyphRun { glyphs, .. } => {
+                glyphs.len() * core::mem::size_of::<Glyph>() + arc_header
+            }
+            Self::Image { image, .. } => image_bytes(image),
+            Self::FillGradient { gradient, .. } => gradient_bytes(gradient),
+            Self::FillBackground(fill) => {
+                core::mem::size_of::<BackgroundFill>() + fill.image.payload_bytes()
+            }
+            Self::StrokeBoxBorder(_) => core::mem::size_of::<BoxBorder>(),
+            Self::SvgPath {
+                data,
+                fill,
+                stroke,
+                clips,
+                ..
+            } => {
+                let paint_bytes = |paint: &Option<SvgPaint>| match paint {
+                    Some(SvgPaint::Gradient(gradient)) => {
+                        gradient.stops.len() * core::mem::size_of::<SvgGradientStop>() + arc_header
+                    }
+                    _ => 0,
+                };
+                data.len()
+                    + arc_header
+                    + paint_bytes(fill)
+                    + paint_bytes(stroke)
+                    + clips
+                        .iter()
+                        .map(|clip| {
+                            clip.shapes
+                                .iter()
+                                .map(|shape| shape.data.len() + arc_header)
+                                .sum::<usize>()
+                                + core::mem::size_of::<SvgClip>()
+                        })
+                        .sum::<usize>()
+            }
+            Self::MaskedBackground(mask) => {
+                core::mem::size_of::<MaskedBackground>()
+                    + mask.paint.referenced_bytes()
+                    + mask.mask.referenced_bytes()
+                    + arc_header
+            }
+            _ => 0,
+        };
+        let corners = match self {
+            Self::PushLayer { corners, .. }
+            | Self::BoxShadow { corners, .. }
+            | Self::FillRoundedRect { corners, .. } => corners.as_ref(),
+            Self::FillBackground(fill) => fill.corners.as_ref(),
+            _ => None,
+        };
+        core::mem::size_of::<Command>()
+            .saturating_add(payload)
+            .saturating_add(if corners.is_some() {
+                core::mem::size_of::<[[f32; 2]; 4]>() + arc_header
+            } else {
+                0
+            })
+    }
+}
+impl DisplayList {
+    pub fn referenced_bytes(&self) -> usize {
+        self.0
+            .iter()
+            .fold(0usize, |bytes, command| {
+                bytes.saturating_add(command.referenced_bytes())
+            })
+            .saturating_add((self.0.capacity() - self.0.len()) * core::mem::size_of::<Command>())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplayError {
+    UnbalancedClip,
+    InvalidGeometry,
+    ClipLimit,
+    InvalidImage,
+    UnsupportedLayer,
+}
+
+pub trait ReplaySink {
+    fn push_clip(&mut self, rect: Rect);
+    fn pop_clip(&mut self);
+    fn fill_rect(&mut self, rect: Rect, color: Rgba);
+    fn fill_rounded_rect(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        corners: Option<&[[f32; 2]; 4]>,
+        color: Rgba,
+    );
+    fn fill_gradient(&mut self, rect: Rect, radius: f32, gradient: &Gradient);
+    fn fill_background(
+        &mut self,
+        corners: Option<&[[f32; 2]; 4]>,
+        rect: Rect,
+        radius: f32,
+        positioning_rect: Rect,
+        image_rect: Rect,
+        repeat: [BackgroundRepeat; 2],
+        image: &BackgroundPaint,
+    );
+    fn draw_shadow(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        corners: Option<&[[f32; 2]; 4]>,
+        shadow: BoxShadow,
+    );
+    fn stroke_border(&mut self, rect: Rect, radius: f32, width: f32, color: Rgba);
+    fn stroke_box_border(&mut self, border: &BoxBorder);
+    fn stroke_pattern_border(
+        &mut self,
+        rect: Rect,
+        radius: f32,
+        width: f32,
+        color: Rgba,
+        pattern: BorderPattern,
+    );
+    fn draw_glyphs(
+        &mut self,
+        origin_x: f32,
+        baseline_y: f32,
+        size: f32,
+        color: Rgba,
+        glyphs: &[Glyph],
+    );
+    fn draw_image(&mut self, rect: Rect, image: &ImageData);
+    fn draw_svg_path(
+        &mut self,
+        bounds: Rect,
+        data: &str,
+        transform: Affine,
+        fill: Option<&SvgPaint>,
+        stroke: Option<&SvgPaint>,
+        stroke_width: f32,
+        fill_rule: SvgFillRule,
+        clips: &[SvgClip],
+    );
+}
+
+impl DisplayList {
+    /// Validate the complete list before forwarding paint to a backend.
+    pub fn validate(&self) -> Result<(), ReplayError> {
+        self.check().map(|_| ())
+    }
+
+    /// Validates the list and reports whether it holds layers or transforms.
+    fn check(&self) -> Result<bool, ReplayError> {
+        let mut depth = 0usize;
+        let mut scoped = false;
+        let mut scopes = [0u8; 256];
+        for command in &self.0 {
+            match command {
+                Command::PushTransform(matrix) => {
+                    if !matrix.is_finite() {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    if depth == scopes.len() {
+                        return Err(ReplayError::ClipLimit);
+                    }
+                    scoped = true;
+                    scopes[depth] = 2;
+                    depth += 1;
+                }
+                Command::PushClip(rect)
+                | Command::PushLayer { rect, .. }
+                | Command::FillRect { rect, .. }
+                | Command::FillRoundedRect { rect, .. }
+                | Command::FillGradient { rect, .. }
+                | Command::BoxShadow { rect, .. }
+                | Command::StrokeBorder { rect, .. }
+                | Command::StrokePatternBorder { rect, .. }
+                | Command::Image { rect, .. } => {
+                    if !rect.is_valid() {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    if matches!(command, Command::PushClip(_) | Command::PushLayer { .. }) {
+                        if depth == scopes.len() {
+                            return Err(ReplayError::ClipLimit);
+                        }
+                        scoped |= matches!(command, Command::PushLayer { .. });
+                        scopes[depth] = u8::from(matches!(command, Command::PushLayer { .. }));
+                        depth += 1;
+                        if depth > 256 {
+                            return Err(ReplayError::ClipLimit);
+                        }
+                    }
+                    if let Command::PushLayer {
+                        radius, opacity, ..
+                    } = command
+                    {
+                        if !radius.is_finite()
+                            || *radius < 0.0
+                            || !opacity.is_finite()
+                            || !(0.0..=1.0).contains(opacity)
+                        {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::Image { image, .. } = command {
+                        if !image.is_valid() {
+                            return Err(ReplayError::InvalidImage);
+                        }
+                    }
+                    if let Command::PushLayer { corners, .. }
+                    | Command::BoxShadow { corners, .. }
+                    | Command::FillRoundedRect { corners, .. } = command
+                    {
+                        if corners
+                            .as_ref()
+                            .is_some_and(|r| r.iter().flatten().any(|v| !v.is_finite() || *v < 0.0))
+                        {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::FillRoundedRect { radius, .. } = command {
+                        if !radius.is_finite() || *radius < 0.0 {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::FillGradient {
+                        radius, gradient, ..
+                    } = command
+                    {
+                        if !radius.is_finite() || *radius < 0.0 || !gradient.is_valid() {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::StrokeBorder { radius, width, .. }
+                    | Command::StrokePatternBorder { radius, width, .. } = command
+                    {
+                        if !radius.is_finite()
+                            || *radius < 0.0
+                            || !width.is_finite()
+                            || *width < 0.0
+                        {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                    if let Command::BoxShadow { radius, shadow, .. } = command {
+                        if !radius.is_finite()
+                            || *radius < 0.0
+                            || !shadow.blur.is_finite()
+                            || shadow.blur < 0.0
+                            || ![shadow.offset_x, shadow.offset_y, shadow.spread]
+                                .iter()
+                                .all(|value| value.is_finite())
+                        {
+                            return Err(ReplayError::InvalidGeometry);
+                        }
+                    }
+                }
+                Command::MaskedBackground(mask) => {
+                    scoped = true;
+                    if !mask.rect.is_valid()
+                        || mask.offset.iter().any(|v| !v.is_finite())
+                        || !matches!(
+                            *mask.paint,
+                            Command::FillRect { .. }
+                                | Command::FillRoundedRect { .. }
+                                | Command::FillGradient { .. }
+                                | Command::FillBackground(_)
+                        )
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    DisplayList(alloc::vec![(*mask.paint).clone()]).validate()?;
+                    if mask
+                        .mask
+                        .0
+                        .iter()
+                        .any(|c| matches!(c, Command::MaskedBackground(_)))
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    mask.mask.validate()?;
+                }
+                Command::StrokeBoxBorder(border) => {
+                    if !border.rect.is_valid()
+                        || !border.radius.is_finite()
+                        || border.radius < 0.0
+                        || border
+                            .widths
+                            .iter()
+                            .any(|width| !width.is_finite() || *width < 0.0)
+                        || border.corners.is_some_and(|corners| {
+                            corners.iter().flatten().any(|v| !v.is_finite() || *v < 0.0)
+                        })
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                }
+                Command::FillBackground(fill) => {
+                    if fill
+                        .corners
+                        .as_ref()
+                        .is_some_and(|r| r.iter().flatten().any(|v| !v.is_finite() || *v < 0.0))
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    if !fill.rect.is_valid()
+                        || !fill.radius.is_finite()
+                        || fill.radius < 0.0
+                        || !fill.positioning_rect.is_valid()
+                        || !fill.image_rect.is_valid()
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                    if !fill.image.is_valid() {
+                        return Err(ReplayError::InvalidImage);
+                    }
+                }
+                Command::PopClip | Command::PopLayer | Command::PopTransform => {
+                    depth = depth.checked_sub(1).ok_or(ReplayError::UnbalancedClip)?;
+                    let kind = match command {
+                        Command::PopTransform => 2,
+                        Command::PopLayer => 1,
+                        _ => 0,
+                    };
+                    if scopes[depth] != kind {
+                        return Err(ReplayError::UnbalancedClip);
+                    }
+                }
+                Command::GlyphRun {
+                    origin_x,
+                    baseline_y,
+                    size,
+                    glyphs,
+                    ..
+                } => {
+                    if !origin_x.is_finite()
+                        || !baseline_y.is_finite()
+                        || !size.is_finite()
+                        || *size <= 0.0
+                        || glyphs
+                            .iter()
+                            .any(|glyph| !glyph.x.is_finite() || !glyph.y.is_finite())
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                }
+                Command::SvgPath {
+                    bounds,
+                    data,
+                    transform,
+                    stroke_width,
+                    ref fill,
+                    ref stroke,
+                    ref clips,
+                    ..
+                } => {
+                    if !bounds.is_valid()
+                        || data.len() > MAX_SVG_PATH_BYTES
+                        || !transform.is_finite()
+                        || !stroke_width.is_finite()
+                        || *stroke_width < 0.0
+                        || !valid_svg_paint(fill.as_ref())
+                        || !valid_svg_paint(stroke.as_ref())
+                        || clips.len() > 32
+                        || clips.iter().any(|clip| {
+                            !clip.transform.is_finite()
+                                || clip.shapes.len() > MAX_SVG_CLIP_PATHS
+                                || clip.shapes.iter().any(|shape| {
+                                    shape.data.len() > MAX_SVG_PATH_BYTES
+                                        || !shape.transform.is_finite()
+                                })
+                        })
+                    {
+                        return Err(ReplayError::InvalidGeometry);
+                    }
+                }
+            }
+        }
+        if depth != 0 {
+            return Err(ReplayError::UnbalancedClip);
+        }
+        Ok(scoped)
+    }
+
+    pub fn replay(&self, sink: &mut impl ReplaySink) -> Result<(), ReplayError> {
+        if self.check()? {
+            return Err(ReplayError::UnsupportedLayer);
+        }
+        for command in &self.0 {
+            match *command {
+                Command::PushClip(rect) => sink.push_clip(rect),
+                Command::PopClip => sink.pop_clip(),
+                Command::MaskedBackground(_)
+                | Command::PushLayer { .. }
+                | Command::PopLayer
+                | Command::PushTransform(_)
+                | Command::PopTransform => {
+                    return Err(ReplayError::UnsupportedLayer);
+                }
+                Command::FillRect { rect, color }
+                    if rect.width > 0.0 && rect.height > 0.0 && color.a > 0 =>
+                {
+                    sink.fill_rect(rect, color)
+                }
+                Command::FillRect { .. } => {}
+                Command::FillRoundedRect {
+                    ref corners,
+                    rect,
+                    radius,
+                    color,
+                } if rect.width > 0.0 && rect.height > 0.0 && color.a > 0 => {
+                    sink.fill_rounded_rect(rect, radius, corners.as_deref(), color)
+                }
+                Command::FillRoundedRect { .. } => {}
+                Command::FillGradient {
+                    rect,
+                    radius,
+                    ref gradient,
+                } => sink.fill_gradient(rect, radius, gradient),
+                Command::FillBackground(ref fill) => sink.fill_background(
+                    fill.corners.as_deref(),
+                    fill.rect,
+                    fill.radius,
+                    fill.positioning_rect,
+                    fill.image_rect,
+                    fill.repeat,
+                    &fill.image,
+                ),
+                Command::BoxShadow {
+                    ref corners,
+                    rect,
+                    radius,
+                    shadow,
+                } => sink.draw_shadow(rect, radius, corners.as_deref(), shadow),
+                Command::StrokeBorder {
+                    rect,
+                    radius,
+                    width,
+                    color,
+                } if rect.width > 0.0 && rect.height > 0.0 && width > 0.0 && color.a > 0 => {
+                    sink.stroke_border(rect, radius, width, color)
+                }
+                Command::StrokeBorder { .. } => {}
+                Command::StrokeBoxBorder(ref border) => sink.stroke_box_border(border),
+                Command::StrokePatternBorder {
+                    rect,
+                    radius,
+                    width,
+                    color,
+                    pattern,
+                } => sink.stroke_pattern_border(rect, radius, width, color, pattern),
+                Command::GlyphRun {
+                    origin_x,
+                    baseline_y,
+                    size,
+                    color,
+                    ref glyphs,
+                } => sink.draw_glyphs(origin_x, baseline_y, size, color, glyphs),
+                Command::Image { rect, ref image } => sink.draw_image(rect, image),
+                Command::SvgPath {
+                    bounds,
+                    ref data,
+                    transform,
+                    ref fill,
+                    ref stroke,
+                    stroke_width,
+                    fill_rule,
+                    ref clips,
+                } => sink.draw_svg_path(
+                    bounds,
+                    data,
+                    transform,
+                    fill.as_ref(),
+                    stroke.as_ref(),
+                    stroke_width,
+                    fill_rule,
+                    clips,
+                ),
+            }
+        }
+        Ok(())
+    }
+}

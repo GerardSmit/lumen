@@ -40,11 +40,22 @@ pub mod time {
     const STRUCT_TIME_DOC: &str = "The time value as returned by gmtime(), localtime(), and strptime(), and\n accepted by asctime(), mktime() and strftime().  May be considered as a\n sequence of 9 integers.\n\n Note that several fields' values are not the same as those defined by\n the C language standard for struct tm.  For example, the value of the\n field tm_year is the actual year, not year - 1900.  See individual\n fields' descriptions for details.";
 
     const FIELDS: [&str; 11] = [
-        "tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday", "tm_isdst", "tm_zone",
+        "tm_year",
+        "tm_mon",
+        "tm_mday",
+        "tm_hour",
+        "tm_min",
+        "tm_sec",
+        "tm_wday",
+        "tm_yday",
+        "tm_isdst",
+        "tm_zone",
         "tm_gmtoff",
     ];
     const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
 
     fn struct_time_type(it: &mut Interp) -> Obj {
         let ty = structseq_type::<StructTime>(it, "time", "struct_time", &FIELDS, 9);
@@ -58,9 +69,20 @@ pub mod time {
 
     fn struct_time(it: &mut Interp, tm: Tm) -> Value {
         let ty = struct_time_type(it);
-        let ints = [tm.year, tm.mon as i64, tm.mday as i64, tm.hour as i64, tm.min as i64, tm.sec as i64];
+        let ints = [
+            tm.year,
+            tm.mon as i64,
+            tm.mday as i64,
+            tm.hour as i64,
+            tm.min as i64,
+            tm.sec as i64,
+        ];
         let mut vals: Vec<Value> = ints.iter().map(|&n| Value::Int(n)).collect();
-        vals.extend([Value::Int(tm.wday as i64), Value::Int(tm.yday as i64), Value::Int(tm.isdst as i64)]);
+        vals.extend([
+            Value::Int(tm.wday as i64),
+            Value::Int(tm.yday as i64),
+            Value::Int(tm.isdst as i64),
+        ]);
         vals.push(tm.zone.map_or(Value::None, Value::string));
         vals.push(Value::Int(tm.gmtoff));
         structseq_full(&ty, vals)
@@ -102,7 +124,11 @@ pub mod time {
     }
 
     fn elapsed_ns(it: &Interp) -> i128 {
-        it.platform.borrow().monotonic_ns().saturating_sub(it.start_ns) as i128 + 1_000_000_000_000
+        it.platform
+            .borrow()
+            .monotonic_ns()
+            .saturating_sub(it.start_ns) as i128
+            + 1_000_000_000_000
     }
 
     fn os_err(it: &mut Interp, e: crate::platform::IoError) -> Obj {
@@ -148,7 +174,9 @@ pub mod time {
         }
         match it.index_of(v) {
             Ok(n) => Ok(n as f64),
-            Err(e) if it.is_exc_instance(&e, "OverflowError") => Err(it.overflow_err("timestamp too large to convert to C _PyTime_t")),
+            Err(e) if it.is_exc_instance(&e, "OverflowError") => {
+                Err(it.overflow_err("timestamp too large to convert to C _PyTime_t"))
+            }
             Err(e) => Err(e),
         }
     }
@@ -159,7 +187,10 @@ pub mod time {
             let errno = lumen_os::errno::errno_of_code("EOVERFLOW").unwrap_or(84);
             return Err(it.os_error_errno(errno, None, None));
         }
-        Ok(Tm { zone: Some("UTC".to_string()), ..tm })
+        Ok(Tm {
+            zone: Some("UTC".to_string()),
+            ..tm
+        })
     }
 
     fn localtime_tm(it: &mut Interp, t: i64) -> R<Tm> {
@@ -171,7 +202,11 @@ pub mod time {
     fn c_int(it: &mut Interp, v: &Value) -> R<i32> {
         let n = it.index_of(v)?;
         i32::try_from(n).map_err(|_| {
-            let msg = if n > 0 { "signed integer is greater than maximum" } else { "signed integer is less than minimum" };
+            let msg = if n > 0 {
+                "signed integer is greater than maximum"
+            } else {
+                "signed integer is less than minimum"
+            };
             it.overflow_err(msg)
         })
     }
@@ -276,7 +311,11 @@ pub mod time {
         };
         let (jan, jan_name) = probe(it, t);
         let (jul, jul_name) = probe(it, t + YEAR / 2);
-        let (std, dst, names) = if jan < jul { (jul, jan, [jul_name, jan_name]) } else { (jan, jul, [jan_name, jul_name]) };
+        let (std, dst, names) = if jan < jul {
+            (jul, jan, [jul_name, jan_name])
+        } else {
+            (jan, jul, [jan_name, jul_name])
+        };
         (std, dst, jan != jul, names)
     }
 
@@ -285,7 +324,11 @@ pub mod time {
         dict_set_str(d, "timezone", Value::Int(tz));
         dict_set_str(d, "altzone", Value::Int(alt));
         dict_set_str(d, "daylight", Value::Int(daylight as i64));
-        dict_set_str(d, "tzname", Value::tuple(vec![Value::string(std), Value::string(dst)]));
+        dict_set_str(
+            d,
+            "tzname",
+            Value::tuple(vec![Value::string(std), Value::string(dst)]),
+        );
     }
 
     /// time() -> floating-point number
@@ -436,10 +479,27 @@ pub mod time {
     #[op(hint(py(text_signature = "")))]
     fn get_clock_info(it: &mut Interp, name: &str) -> R<Value> {
         let (implementation, monotonic, adjustable, resolution) = match name {
-            "time" => ("clock_gettime(CLOCK_REALTIME)", false, true, 1.0000000000000002e-06),
-            "monotonic" | "perf_counter" => ("mach_absolute_time()", true, false, 4.166666666666667e-08),
-            "process_time" => ("clock_gettime(CLOCK_PROCESS_CPUTIME_ID)", true, false, 1.0000000000000002e-06),
-            "thread_time" => ("clock_gettime(CLOCK_THREAD_CPUTIME_ID)", true, false, 4.2000000000000006e-08),
+            "time" => (
+                "clock_gettime(CLOCK_REALTIME)",
+                false,
+                true,
+                1.0000000000000002e-06,
+            ),
+            "monotonic" | "perf_counter" => {
+                ("mach_absolute_time()", true, false, 4.166666666666667e-08)
+            }
+            "process_time" => (
+                "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
+                true,
+                false,
+                1.0000000000000002e-06,
+            ),
+            "thread_time" => (
+                "clock_gettime(CLOCK_THREAD_CPUTIME_ID)",
+                true,
+                false,
+                4.2000000000000006e-08,
+            ),
             _ => return Err(it.value_error("unknown clock")),
         };
         Ok(it.new_namespace(vec![
@@ -464,7 +524,11 @@ pub mod time {
         if s == 0.0 {
             it.yield_gil();
         }
-        let deadline = it.platform.borrow().monotonic_ns().saturating_add((s.min(1e9) * 1e9) as u64);
+        let deadline = it
+            .platform
+            .borrow()
+            .monotonic_ns()
+            .saturating_add((s.min(1e9) * 1e9) as u64);
         loop {
             it.poll()?;
             let left = deadline.saturating_sub(it.platform.borrow().monotonic_ns());
@@ -601,8 +665,20 @@ pub mod time {
         } else {
             Some(tm.gmtoff)
         };
-        let epoch = if format.contains("%s") { it.platform.borrow().mktime(&tm).unwrap_or(-1) } else { 0 };
-        Ok(format_tm(format, &tm, &ZoneFields { name, offset, epoch }))
+        let epoch = if format.contains("%s") {
+            it.platform.borrow().mktime(&tm).unwrap_or(-1)
+        } else {
+            0
+        };
+        Ok(format_tm(
+            format,
+            &tm,
+            &ZoneFields {
+                name,
+                offset,
+                epoch,
+            },
+        ))
     }
 
     /// strptime(string, format) -> struct_time

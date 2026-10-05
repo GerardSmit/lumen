@@ -19,14 +19,20 @@ pub mod _random {
         if arg.is_none() {
             let mut buf = [0u8; N * 4];
             it.platform.borrow_mut().entropy(&mut buf);
-            return Ok(buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect());
+            return Ok(buf
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect());
         }
         let magnitude = match arg.as_bigint() {
             Some(b) => b.abs(),
             None => BigInt::from_u64(it.hash_value(arg)? as u64),
         };
         let words = magnitude.words().1;
-        let mut key: Vec<u32> = words.iter().flat_map(|w| [*w as u32, (*w >> 32) as u32]).collect();
+        let mut key: Vec<u32> = words
+            .iter()
+            .flat_map(|w| [*w as u32, (*w >> 32) as u32])
+            .collect();
         while key.len() > 1 && key.last() == Some(&0) {
             key.pop();
         }
@@ -51,7 +57,12 @@ pub mod _random {
         }
 
         #[proto(init)]
-        fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        fn __init__(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<()> {
             let exact = {
                 let base = type_object::<Random>(it);
                 let t = it.type_of(slf.0.value());
@@ -91,14 +102,23 @@ pub mod _random {
             if words.len() == 1 {
                 return Ok(Value::Int(words[0] as i64));
             }
-            let wide: Vec<u64> = words.chunks(2).map(|c| c[0] as u64 | (c.get(1).copied().unwrap_or(0) as u64) << 32).collect();
+            let wide: Vec<u64> = words
+                .chunks(2)
+                .map(|c| c[0] as u64 | (c.get(1).copied().unwrap_or(0) as u64) << 32)
+                .collect();
             Ok(Value::big(BigInt::from_words(false, wide)))
         }
 
         /// getstate() -> tuple containing the current state.
         fn getstate(&self) -> Value {
             let (state, index) = self.mt.state();
-            Value::tuple(state.iter().map(|w| Value::Int(*w as i64)).chain(std::iter::once(Value::Int(index as i64))).collect())
+            Value::tuple(
+                state
+                    .iter()
+                    .map(|w| Value::Int(*w as i64))
+                    .chain(std::iter::once(Value::Int(index as i64)))
+                    .collect(),
+            )
         }
 
         /// setstate(state) -> None.  Restores generator state.
@@ -120,7 +140,11 @@ pub mod _random {
                 match b.words().1 {
                     [] => *slot = 0,
                     [w] if *w <= u32::MAX as u64 => *slot = *w as u32,
-                    _ => return Err(it.overflow_err("Python int too large to convert to C unsigned long")),
+                    _ => {
+                        return Err(
+                            it.overflow_err("Python int too large to convert to C unsigned long")
+                        )
+                    }
                 }
             }
             let Some(index) = items[N].as_bigint() else {

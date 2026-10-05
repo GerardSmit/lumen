@@ -23,12 +23,31 @@ mod bindings {
     fn op_set_ref(#[varargs] _args: &[Value]) {}
 }
 
+#[lumen_bind::module(name = "__lumenSharedWorker")]
+mod shared_bindings {
+    use super::*;
+
+    #[op]
+    fn connect(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
+        Err(NativeError::named(
+            "NotSupportedError",
+            "SharedWorker requires a separate Lumen realm and transferable MessagePort bridge, which this browser runtime does not provide",
+        ))
+    }
+
+    #[op]
+    fn disconnect(#[varargs] _args: &[Value]) {}
+}
+
 pub(crate) fn terminate_all(_ctx: &mut Ctx) {}
 
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
-        modules: &[lumen_host::namespace::<bindings::Module>],
+        modules: &[
+            lumen_host::namespace::<bindings::Module>,
+            lumen_host::namespace::<shared_bindings::Module>,
+        ],
         state_init: None,
         js_init: Some(
             r#"Object.defineProperty(globalThis, "__lumenWorkerOps", { value: globalThis.__worker, configurable: true, enumerable: false, writable: false }); delete globalThis.__worker;"#,

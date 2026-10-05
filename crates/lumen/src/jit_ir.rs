@@ -1085,11 +1085,11 @@ fn analyze_stack(
                 work.push((pc + 1, next));
             }
             Op::Return
-        | Op::ReturnUndef
-        | Op::Throw
-        | Op::IterAbortL(_)
-        | Op::Await
-        | Op::DerivedReturn => {}
+            | Op::ReturnUndef
+            | Op::Throw
+            | Op::IterAbortL(_)
+            | Op::Await
+            | Op::DerivedReturn => {}
             Op::PushHandler(t) => {
                 let target = *t as usize;
                 validate_target(ops.len(), pc, target)?;

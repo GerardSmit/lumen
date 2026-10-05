@@ -37,22 +37,34 @@ use crate::fasthash::FastMap;
 use crate::interpreter::{abrupt_value, Interp};
 use crate::lstr::LStr;
 use crate::value::{Callable, Gc, NativeFn, Object, Property, TaInfo, TaKind, Value, WeakGc};
+pub use lumen_bind::Slot;
 use lumen_bind::{
     flags, BigInt, Class, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet,
-    Methods, Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State, StateHost,
+    Methods, Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State,
+    StateHost,
 };
-pub use lumen_bind::Slot;
 use lumen_common::buffer::StoreSlot;
 use lumen_common::native::{Data, NativeError};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
 /// The JS engine as a `lumen-bind` host.
 pub struct JsHost;
+
+/// A JS object handle that does not keep the object alive.
+#[derive(Clone)]
+pub struct WeakValue(WeakGc);
+
+impl WeakValue {
+    pub fn upgrade(&self) -> Option<Value> {
+        self.0.upgrade().map(Value::Obj)
+    }
+}
 
 /// The JS name of a bound fn (see the module docs).
 pub fn js_name(d: &FnDesc) -> Cow<'static, str> {
@@ -211,7 +223,10 @@ impl<'s> ArgCx<'s> {
 
     /// Run `f` with the host state slot `T` (see [`State`]). Throws when the embedder never
     /// installed a `T` with `OpState::put`.
-    pub fn with_state<T: 'static, R>(&self, f: impl FnOnce(&mut State<T>) -> R) -> Result<R, Value> {
+    pub fn with_state<T: 'static, R>(
+        &self,
+        f: impl FnOnce(&mut State<T>) -> R,
+    ) -> Result<R, Value> {
         let ctx = unsafe { self.interp_mut() };
         let Some(slot) = ctx.host_state.get_mut::<T>() else {
             let msg = format!(
@@ -300,12 +315,18 @@ impl<'s> ArgCx<'s> {
 
     /// Borrow the bytes a view covers: `(pointer, length)`. The pointer is valid until the
     /// wrapper returns. This is the zero-copy path behind `&[u8]` / `&mut [u8]`.
-    pub fn view_bytes(&self, v: &Value, at: Slot, mutable: bool) -> Result<(*mut u8, usize), Value> {
+    pub fn view_bytes(
+        &self,
+        v: &Value,
+        at: Slot,
+        mutable: bool,
+    ) -> Result<(*mut u8, usize), Value> {
         let (key, off, len) = match resolve_view(self.interp(), v) {
             Ok(r) => r,
             Err(ViewErr::Detached) if self.scratch_ref().is_some_and(|s| !s.lent.is_empty()) => {
                 // Possibly a buffer this call already lent out (a second view of it).
-                self.resolve_with_lent(v).map_err(|e| self.view_error(e, at))?
+                self.resolve_with_lent(v)
+                    .map_err(|e| self.view_error(e, at))?
             }
             Err(e) => return Err(self.view_error(e, at)),
         };
@@ -316,7 +337,9 @@ impl<'s> ArgCx<'s> {
                     .ok_or_else(|| self.type_error(at, "SharedArrayBuffer memory is gone"))?;
                 let mut m = mem.lock().unwrap();
                 let Some(window) = m.get_mut(off..off + len) else {
-                    return Err(self.type_error(at, "view is out of range of its SharedArrayBuffer"));
+                    return Err(
+                        self.type_error(at, "view is out of range of its SharedArrayBuffer")
+                    );
                 };
                 return Ok((window.as_mut_ptr(), window.len()));
             }
@@ -334,7 +357,12 @@ impl<'s> ArgCx<'s> {
         // A buffer this call already lent out is absent from the table; ask its store directly.
         let lent_readonly = || {
             self.scratch_ref()
-                .and_then(|s| s.lent.iter().find(|(k, _)| *k == key).map(|(_, b)| b.is_readonly()))
+                .and_then(|s| {
+                    s.lent
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, b)| b.is_readonly())
+                })
                 .unwrap_or(false)
         };
         if mutable && (i.buffer_immutable(key) || lent_readonly()) {
@@ -394,14 +422,21 @@ impl<'s> ArgCx<'s> {
             Ok(r) => r,
             Err(ViewErr::Detached) if self.scratch_ref().is_some_and(|s| !s.lent.is_empty()) => {
                 // Possibly a buffer this call already lent out (a second view of it).
-                self.resolve_with_lent(v).map_err(|e| self.view_error(e, at))?
+                self.resolve_with_lent(v)
+                    .map_err(|e| self.view_error(e, at))?
             }
             Err(e) => return Err(self.view_error(e, at)),
         };
         let i = self.interp();
         if let Some(&id) = i.shared_buffers.get(&key) {
             return Ok(crate::interpreter::shared_mem_get(id)
-                .map(|m| m.lock().unwrap().get(off..off + len).unwrap_or_default().to_vec())
+                .map(|m| {
+                    m.lock()
+                        .unwrap()
+                        .get(off..off + len)
+                        .unwrap_or_default()
+                        .to_vec()
+                })
                 .unwrap_or_default());
         }
         if let Some(b) = i.array_buffers.get(&key) {
@@ -418,9 +453,10 @@ impl<'s> ArgCx<'s> {
 
     fn view_error(&self, e: ViewErr, at: Slot) -> Value {
         match e {
-            ViewErr::NotView => {
-                self.type_error(at, "must be an ArrayBuffer, a TypedArray (Uint8Array, Buffer, ...) or a DataView")
-            }
+            ViewErr::NotView => self.type_error(
+                at,
+                "must be an ArrayBuffer, a TypedArray (Uint8Array, Buffer, ...) or a DataView",
+            ),
             ViewErr::Detached => self.type_error(at, "is backed by a detached ArrayBuffer"),
         }
     }
@@ -512,7 +548,10 @@ impl<'s> ArgCx<'s> {
     /// from `new.target` (so JS subclasses get their own prototype and still pass brand checks).
     fn construct<T: Class>(&self, value: T) -> Result<Value, Value> {
         self.before_js();
-        let nt = self.scratch_ref().and_then(|s| s.new_target.clone()).unwrap_or(Value::Undefined);
+        let nt = self
+            .scratch_ref()
+            .and_then(|s| s.new_target.clone())
+            .unwrap_or(Value::Undefined);
         let ctx = unsafe { self.interp_mut() };
         // `super(...)` from a JS subclass runs a native parent constructor with the derived
         // instance already allocated as `this`: attach the Rust value to it directly (returning
@@ -551,6 +590,16 @@ impl<'s> ArgCx<'s> {
 
     /// Borrow a class instance shared (`&self` receivers, `&T` arguments).
     pub fn class_ref<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a T, Value> {
+        if let Some(entry) = host_entry(self.interp(), v) {
+            if let Ok((ptr, guard)) = (entry.view_ref)(&entry.data, TypeId::of::<T>()) {
+                // The erased guard retains the allocation and its shared borrow.
+                let value = unsafe { &*ptr }
+                    .downcast_ref::<T>()
+                    .expect("matching class view");
+                self.scratch().guards.push(guard);
+                return Ok(value);
+            }
+        }
         let rc = self.class_rc::<T>(v, at)?;
         let r = match rc.try_borrow() {
             Ok(r) => r,
@@ -559,7 +608,10 @@ impl<'s> ArgCx<'s> {
         // SAFETY: the guard keeps `rc` (and so the RefCell) alive, and drops the `Ref` first.
         let r: std::cell::Ref<'static, T> = unsafe { std::mem::transmute(r) };
         let p: *const T = &*r;
-        self.scratch().guards.push(Box::new(RefGuard { g: Some(r), _rc: rc }));
+        self.scratch().guards.push(Box::new(RefGuard {
+            g: Some(r),
+            _rc: rc,
+        }));
         Ok(unsafe { &*p })
     }
 
@@ -567,6 +619,15 @@ impl<'s> ArgCx<'s> {
     /// conflicting borrow (re-entrant call on the same instance) throws a TypeError.
     #[allow(clippy::mut_from_ref)]
     pub fn class_mut<'a, T: Class>(&'a self, v: &Value, at: Slot) -> Result<&'a mut T, Value> {
+        if let Some(entry) = host_entry(self.interp(), v) {
+            if let Ok((ptr, guard)) = (entry.view_mut)(&entry.data, TypeId::of::<T>()) {
+                let value = unsafe { &mut *ptr }
+                    .downcast_mut::<T>()
+                    .expect("matching class view");
+                self.scratch().guards.push(guard);
+                return Ok(value);
+            }
+        }
         let rc = self.class_rc::<T>(v, at)?;
         let r = match rc.try_borrow_mut() {
             Ok(r) => r,
@@ -575,7 +636,10 @@ impl<'s> ArgCx<'s> {
         // SAFETY: as in `class_ref`.
         let mut r: std::cell::RefMut<'static, T> = unsafe { std::mem::transmute(r) };
         let p: *mut T = &mut *r;
-        self.scratch().guards.push(Box::new(MutGuard { g: Some(r), _rc: rc }));
+        self.scratch().guards.push(Box::new(MutGuard {
+            g: Some(r),
+            _rc: rc,
+        }));
         Ok(unsafe { &mut *p })
     }
 
@@ -583,7 +647,10 @@ impl<'s> ArgCx<'s> {
     fn borrow_conflict<T: Class>(&self, at: Slot) -> Value {
         self.type_error(
             at,
-            &format!("is a {} already in use by an enclosing call (re-entrant borrow)", class_name::<T>()),
+            &format!(
+                "is a {} already in use by an enclosing call (re-entrant borrow)",
+                class_name::<T>()
+            ),
         )
     }
 }
@@ -685,21 +752,101 @@ fn resolve_view(i: &Interp, v: &Value) -> Result<(usize, usize, usize), ViewErr>
     Err(ViewErr::NotView)
 }
 
+impl Interp {
+    /// Convert an iterable through the engine's iterator protocol. Each item is
+    /// converted before advancing; abrupt conversion closes the iterator while
+    /// preserving the original exception. Non-iterable array-like objects fail.
+    pub fn convert_iterable<T>(
+        &mut self,
+        value: &Value,
+        max_items: usize,
+        mut convert: impl FnMut(&mut Self, Value) -> OpResult<T>,
+    ) -> OpResult<Vec<T>> {
+        let (iterator, next) = self
+            .get_iterator(value)
+            .map_err(|error| OpError::thrown(abrupt_value(error)))?;
+        let mut values = Vec::new();
+        loop {
+            self.poll_native(values.len())
+                .map_err(|error| OpError::thrown(abrupt_value(error)))?;
+            let Some(value) = self
+                .iterator_step(&iterator, &next)
+                .map_err(|error| OpError::thrown(abrupt_value(error)))?
+            else {
+                return Ok(values);
+            };
+            let step = (|| {
+                if values.len() >= max_items {
+                    return Err(OpError::new(
+                        "RangeError",
+                        "iterable exceeds the host limit",
+                    ));
+                }
+                self.check_grow(&values)
+                    .map_err(|error| OpError::thrown(abrupt_value(error)))?;
+                convert(self, value)
+            })();
+            match step {
+                Ok(value) => values.push(value),
+                Err(error) => {
+                    self.iterator_close(&iterator);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Collect genuine iterable values without consulting an author-modified
+    /// Array constructor or accepting the array-like fallback of Array.from.
+    pub fn iterable_to_list(&mut self, value: &Value, max_items: usize) -> OpResult<Vec<Value>> {
+        self.convert_iterable(value, max_items, |_, value| Ok(value))
+    }
+
+    /// PromiseResolve with this realm's intrinsic Promise constructor.
+    /// Preserves a genuine promise's identity and observable constructor errors.
+    pub fn coerce_promise(&mut self, value: Value) -> OpResult<Value> {
+        self.promise_resolve_checked(value).map_err(OpError::thrown)
+    }
+
+    /// Copy the current bytes of a genuine, non-shared BufferSource.
+    /// Uses internal view brands and ranges, without reading author properties.
+    /// Detached, out-of-bounds, shared and non-buffer objects return `None`.
+    pub fn buffer_source_bytes(&self, value: &Value) -> Option<Vec<u8>> {
+        let (buffer, offset, length) = resolve_view(self, value).ok()?;
+        if self.shared_buffers.contains_key(&buffer) {
+            return None;
+        }
+        let end = offset.checked_add(length)?;
+        self.with_buffer_bytes(buffer, |bytes| bytes.get(offset..end).map(<[u8]>::to_vec))?
+    }
+}
+
 // =============================================================================================
 // The host
 // =============================================================================================
 
 #[inline(always)]
-fn js_entry<N: Native<JsHost>>(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn js_entry<N: Native<JsHost>>(
+    ctx: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if matches!(N::DESC.role, Role::Constructor) {
         return js_construct::<N>(ctx, this, args);
     }
     let cx = ArgCx::new(ctx, &this, args, N::DESC);
-    N::call(&cx)
+    let result = N::call(&cx);
+    drop(cx);
+    flush_deferred_microtasks(ctx);
+    result
 }
 
 #[inline(never)]
-fn js_construct<N: Native<JsHost>>(ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+fn js_construct<N: Native<JsHost>>(
+    ctx: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, Value> {
     if !ctx.constructing {
         let name = match N::DESC.owner {
             Owner::Class(c) => c.name_for("js"),
@@ -711,7 +858,10 @@ fn js_construct<N: Native<JsHost>>(ctx: &mut Interp, this: Value, args: &[Value]
     let nt = ctx.new_target.clone();
     let cx = ArgCx::new(ctx, &this, args, N::DESC);
     cx.scratch().new_target = Some(nt);
-    N::call(&cx)
+    let result = N::call(&cx);
+    drop(cx);
+    flush_deferred_microtasks(ctx);
+    result
 }
 
 impl ArgCx<'_> {
@@ -781,15 +931,32 @@ impl Host for JsHost {
         js_entry::<N>
     }
 
-    /// JS has no keywords: named parameters are the arguments in declaration order, and
-    /// `undefined` is a missing argument (so it takes the default).
+    /// JS has no keywords: named parameters are the arguments in declaration order. For optional
+    /// parameters, `undefined` means omitted so defaults apply. Required parameters preserve it
+    /// as a supplied value for Web IDL coercion; `Passed<T>` also distinguishes it from omission.
     #[inline(always)]
     fn bind<'c, const N: usize>(cx: &'c ArgCx<'_>) -> Result<[Option<&'c Value>; N], Value> {
         let args: &'c [Value] = cx.args;
         let max = cx.desc.max_pos as usize;
+        let min = cx.desc.min_pos as usize;
+        if args.len() < min {
+            return Err(cx.type_error(Slot::arg(args.len() as u32), "is required"));
+        }
         // Keyword-only parameters after `*args` cannot be passed positionally.
-        let positional = if N > max && cx.desc.has_varargs() { max } else { N };
+        let positional = if N > max && cx.desc.has_varargs() {
+            max
+        } else {
+            N
+        };
         Ok(std::array::from_fn(|i| match args.get(i) {
+            Some(value @ Value::Undefined)
+                if i < positional
+                    && cx.desc.params.get(i).is_some_and(|parameter| {
+                        parameter.pass_undefined || !parameter.optional()
+                    }) =>
+            {
+                Some(value)
+            }
             Some(Value::Undefined) | None => None,
             Some(v) if i < positional => Some(v),
             Some(_) => None,
@@ -889,7 +1056,9 @@ impl Host for JsHost {
             Value::Str(s) => Ok(s.as_str()),
             _ if cx.coerce() => {
                 cx.before_js();
-                let s = unsafe { cx.interp_mut() }.to_string(v).map_err(abrupt_value)?;
+                let s = unsafe { cx.interp_mut() }
+                    .to_string(v)
+                    .map_err(abrupt_value)?;
                 Ok(cx.hold_str(s))
             }
             _ => Err(cx.type_error(at, "must be a string")),
@@ -924,7 +1093,11 @@ impl Host for JsHost {
         cx.class_ref(v, at)
     }
 
-    fn class_mut<'c, T: Class>(cx: &'c ArgCx<'_>, v: &'c Value, at: Slot) -> Result<&'c mut T, Value> {
+    fn class_mut<'c, T: Class>(
+        cx: &'c ArgCx<'_>,
+        v: &'c Value,
+        at: Slot,
+    ) -> Result<&'c mut T, Value> {
         cx.class_mut(v, at)
     }
 
@@ -1002,7 +1175,8 @@ impl Host for JsHost {
         {
             let mut b = o.borrow_mut();
             let done = item.is_none();
-            b.props.insert("value", Property::plain(item.unwrap_or(Value::Undefined)));
+            b.props
+                .insert("value", Property::plain(item.unwrap_or(Value::Undefined)));
             b.props.insert("done", Property::plain(Value::Bool(done)));
         }
         Ok(Value::Obj(o))
@@ -1024,7 +1198,10 @@ impl Host for JsHost {
 }
 
 impl StateHost for JsHost {
-    fn with_state<T: 'static, R>(cx: &ArgCx<'_>, f: impl FnOnce(&mut State<T>) -> R) -> Result<R, Value> {
+    fn with_state<T: 'static, R>(
+        cx: &ArgCx<'_>,
+        f: impl FnOnce(&mut State<T>) -> R,
+    ) -> Result<R, Value> {
         cx.with_state(f)
     }
 }
@@ -1057,15 +1234,24 @@ impl SpawnHost for JsHost {
 fn install_items(ctx: &mut Interp, target: &Gc, items: ModuleItems<JsHost>) -> Result<(), Value> {
     for f in items.functions.iter().filter(|f| f.desc.exposed_to("js")) {
         let v = ctx.bound_function(f);
-        target.borrow_mut().props.insert(&*js_name(f.desc), Property::builtin(v));
+        target
+            .borrow_mut()
+            .props
+            .insert(&*js_name(f.desc), Property::builtin(v));
     }
     for c in items.classes.iter().filter(|c| c.desc.exposed_to("js")) {
         let v = (c.object)(ctx)?;
-        target.borrow_mut().props.insert(c.desc.name_for("js"), Property::builtin(v));
+        target
+            .borrow_mut()
+            .props
+            .insert(c.desc.name_for("js"), Property::builtin(v));
     }
     for k in &items.constants {
         let v = (k.value)(ctx)?;
-        target.borrow_mut().props.insert(k.name, Property::builtin(v));
+        target
+            .borrow_mut()
+            .props
+            .insert(k.name, Property::builtin(v));
     }
     if let Some(init) = items.init {
         init(ctx, &Value::Obj(target.clone()))?;
@@ -1099,12 +1285,14 @@ pub struct BigU64(pub u64);
 
 impl<'a> FromArg<'a, JsHost> for BigI64 {
     fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.int64(v, at, i64::MIN as i128, i64::MAX as i128).map(|n| BigI64(n as i64))
+        cx.int64(v, at, i64::MIN as i128, i64::MAX as i128)
+            .map(|n| BigI64(n as i64))
     }
 }
 impl<'a> FromArg<'a, JsHost> for BigU64 {
     fn from_arg(cx: &'a ArgCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Value> {
-        cx.int64(v, at, 0, u64::MAX as i128).map(|n| BigU64(n as u64))
+        cx.int64(v, at, 0, u64::MAX as i128)
+            .map(|n| BigU64(n as u64))
     }
 }
 
@@ -1137,7 +1325,8 @@ impl JsObject {
     }
     /// `obj[key]` (runs getters).
     pub fn get(&self, ctx: &mut Interp, key: &str) -> Result<Value, OpError> {
-        ctx.get_member(&self.0, key).map_err(|a| OpError::thrown(abrupt_value(a)))
+        ctx.get_member(&self.0, key)
+            .map_err(|a| OpError::thrown(abrupt_value(a)))
     }
     pub fn from_value(v: Value) -> Option<JsObject> {
         matches!(v, Value::Obj(_)).then_some(JsObject(v))
@@ -1153,7 +1342,8 @@ impl JsFunction {
     }
     /// Call it; a JS exception comes back as `OpError::thrown`, so `?` rethrows it unchanged.
     pub fn call(&self, ctx: &mut Interp, this: Value, args: &[Value]) -> Result<Value, OpError> {
-        ctx.invoke(self.0.clone(), this, args).map_err(OpError::thrown)
+        ctx.invoke(self.0.clone(), this, args)
+            .map_err(OpError::thrown)
     }
     pub fn from_value(v: Value) -> Option<JsFunction> {
         v.is_callable().then_some(JsFunction(v))
@@ -1306,7 +1496,11 @@ impl OpError {
         self
     }
     /// Attach an own property to the error object (`err.errno`, `err.syscall`, ...).
-    pub fn with_prop(mut self, name: impl Into<Cow<'static, str>>, value: impl Into<Data>) -> OpError {
+    pub fn with_prop(
+        mut self,
+        name: impl Into<Cow<'static, str>>,
+        value: impl Into<Data>,
+    ) -> OpError {
         if let OpErrorRepr::New { props, .. } = &mut *self.0 {
             props.push((name.into(), value.into()));
         }
@@ -1336,10 +1530,59 @@ impl OpError {
                 code,
                 props,
             } => {
-                let e = ctx.make_error(class, message.into_owned());
+                let message = message.into_owned();
+                let dom = matches!(
+                    class,
+                    "InvalidStateError"
+                        | "NotFoundError"
+                        | "HierarchyRequestError"
+                        | "QuotaExceededError"
+                        | "NotSupportedError"
+                        | "WrongDocumentError"
+                        | "InvalidCharacterError"
+                        | "NoModificationAllowedError"
+                        | "NamespaceError"
+                        | "NotAllowedError"
+                        | "AbortError"
+                        | "SecurityError"
+                        | "NetworkError"
+                        | "TimeoutError"
+                        | "UnknownError"
+                        | "IndexSizeError"
+                        | "InvalidAccessError"
+                        | "DataError"
+                        | "OperationError"
+                        | "InvalidNodeTypeError"
+                        | "DataCloneError"
+                );
+                let e = if dom {
+                    let global = ctx.global_object();
+                    match ctx.get_member(&global, "DOMException") {
+                        Ok(constructor) if constructor.is_callable() => ctx
+                            .construct_value(
+                                constructor,
+                                &[Value::str(&message), Value::str(class)],
+                            )
+                            .unwrap_or_else(|error| error),
+                        _ => {
+                            let error = ctx.make_error(class, message);
+                            if let Value::Obj(object) = &error {
+                                object
+                                    .borrow_mut()
+                                    .props
+                                    .insert("name", Property::builtin(Value::str(class)));
+                            }
+                            error
+                        }
+                    }
+                } else {
+                    ctx.make_error(class, message)
+                };
                 if let Value::Obj(o) = &e {
                     if let Some(code) = code {
-                        o.borrow_mut().props.insert("code", Property::plain(Value::str(&*code)));
+                        o.borrow_mut()
+                            .props
+                            .insert("code", Property::plain(Value::str(&*code)));
                     }
                     for (name, data) in props {
                         if let Ok(v) = <Data as IntoRet<JsHost>>::into_ret(data, ctx) {
@@ -1350,6 +1593,34 @@ impl OpError {
                 e
             }
         }
+    }
+}
+
+struct DeferredMicrotasks(Rc<RefCell<Vec<Value>>>);
+
+pub(crate) fn flush_deferred_microtasks(ctx: &mut Interp) {
+    let pending = ctx
+        .host_state
+        .get::<DeferredMicrotasks>()
+        .map(|queue| std::mem::take(&mut *queue.0.borrow_mut()))
+        .unwrap_or_default();
+    for callback in pending {
+        ctx.queue_microtask(callback);
+    }
+}
+
+impl Interp {
+    /// Native mutation sinks can enqueue jobs without borrowing the interpreter.
+    pub fn deferred_microtasks(&mut self) -> Rc<RefCell<Vec<Value>>> {
+        if !self.host_state.has::<DeferredMicrotasks>() {
+            self.host_state
+                .put(DeferredMicrotasks(Rc::new(RefCell::new(Vec::new()))));
+        }
+        self.host_state
+            .get::<DeferredMicrotasks>()
+            .unwrap()
+            .0
+            .clone()
     }
 }
 
@@ -1466,6 +1737,13 @@ impl Deferred {
     pub fn resolving_functions(&self, ctx: &mut Interp) -> (Value, Value) {
         ctx.make_resolver_pair(&self.promise)
     }
+    /// Observe a native promise's rejection as part of this deferred
+    /// operation. Uses the pristine engine reaction machinery, so replacing
+    /// Promise.prototype.then cannot intercept the host's internal observer.
+    pub fn reject_on(&self, ctx: &mut Interp, source: &Value) {
+        let (_, reject) = self.resolving_functions(ctx);
+        ctx.promise_then(source, Value::Undefined, reject);
+    }
 }
 
 enum PromiseRepr<T> {
@@ -1565,7 +1843,10 @@ impl Completer {
         }
     }
     /// Settle with a hand-written conversion (runs on the JS thread).
-    pub fn settle_with(mut self, f: impl FnOnce(&mut Interp) -> Result<Value, Value> + Send + 'static) {
+    pub fn settle_with(
+        mut self,
+        f: impl FnOnce(&mut Interp) -> Result<Value, Value> + Send + 'static,
+    ) {
         if let Some(send) = self.send.take() {
             send(Box::new(f));
         }
@@ -1588,6 +1869,7 @@ struct AsyncInbox {
     next: u64,
     pending: FastMap<u64, Deferred>,
     ready: std::sync::Arc<std::sync::Mutex<Vec<(u64, Settle)>>>,
+    wake: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// An `OpError` that crosses threads: the class/message/code of an error built off the JS thread.
@@ -1642,7 +1924,12 @@ fn native_error_class(kind: lumen_common::native::ErrorKind) -> &'static str {
 
 impl From<NativeError> for SendError {
     fn from(e: NativeError) -> SendError {
-        SendError { class: native_error_class(e.kind), message: e.message.into_owned(), code: e.code, props: e.props }
+        SendError {
+            class: native_error_class(e.kind),
+            message: e.message.into_owned(),
+            code: e.code,
+            props: e.props,
+        }
     }
 }
 
@@ -1653,6 +1940,14 @@ impl From<NativeError> for OpError {
 }
 
 impl Interp {
+    /// Wake an owner event loop when a fallback completer delivers a settlement.
+    pub fn set_async_waker(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        if !self.host_state.has::<AsyncInbox>() {
+            self.host_state.put(AsyncInbox::default());
+        }
+        self.host_state.get_mut::<AsyncInbox>().unwrap().wake = Some(wake);
+    }
+
     /// Install the realm's event loop hooks (see [`AsyncHost`]).
     pub fn set_async_host(&mut self, host: impl AsyncHost) {
         self.host_state.put(AsyncHostSlot(Rc::new(host)));
@@ -1672,16 +1967,23 @@ impl Interp {
         if !self.host_state.has::<AsyncInbox>() {
             self.host_state.put(AsyncInbox::default());
         }
-        let inbox = self.host_state.get_mut::<AsyncInbox>().expect("just installed");
+        let inbox = self
+            .host_state
+            .get_mut::<AsyncInbox>()
+            .expect("just installed");
         let id = inbox.next;
         inbox.next += 1;
         inbox.pending.insert(id, deferred);
         let ready = std::sync::Arc::clone(&inbox.ready);
+        let wake = inbox.wake.clone();
         Completer::new(move |settle| {
             ready
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((id, settle));
+            if let Some(wake) = wake {
+                wake();
+            }
         })
     }
 
@@ -1763,10 +2065,30 @@ impl Interp {
 // Classes
 // =============================================================================================
 
-/// Per-interpreter class table: TypeId -> (constructor, prototype).
+/// Per-interpreter class table keyed by active realm and Rust class type.
 #[derive(Default)]
 struct ClassRegistry {
-    map: HashMap<TypeId, (Value, Gc)>,
+    map: HashMap<(RealmKey, TypeId), (Value, Gc)>,
+}
+
+/// A realm cache key owns the global whose address identifies that realm. Keeping a strong
+/// handle in every cache key prevents address reuse from aliasing a later realm if realm-table
+/// retention changes independently of these host caches.
+#[derive(Clone)]
+struct RealmKey(Gc);
+
+impl PartialEq for RealmKey {
+    fn eq(&self, other: &Self) -> bool {
+        Gc::as_ptr(&self.0) == Gc::as_ptr(&other.0)
+    }
+}
+
+impl Eq for RealmKey {}
+
+impl Hash for RealmKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Gc::as_ptr(&self.0).hash(state);
+    }
 }
 
 /// Instance data side table: object address -> Rust value. The entry holds a *weak* handle, so
@@ -1782,6 +2104,128 @@ struct HostObjects {
 struct HostEntry {
     _weak: WeakGc,
     data: Rc<dyn Any>,
+    /// The exact engine-created Proxy identity used for this instance's indexed wrapper, if any.
+    /// It grants native receiver branding only to that wrapper, never to author Proxies. The weak
+    /// handle avoids retaining the wrapper or allowing a stale pointer key to alias a new object.
+    indexed_wrapper: Option<WeakGc>,
+    retained: Option<Value>,
+    identity: bool,
+    callbacks_retained: bool,
+    view_ref: fn(&Rc<dyn Any>, TypeId) -> Result<(*const dyn Any, Box<dyn Any>), ()>,
+    view_mut: fn(&Rc<dyn Any>, TypeId) -> Result<(*mut dyn Any, Box<dyn Any>), ()>,
+}
+
+fn host_entry_key(i: &Interp, v: &Value) -> Option<usize> {
+    let object = v.as_obj()?;
+    let key = Gc::as_ptr(object) as usize;
+    let objects = i.host_state.get::<HostObjects>()?;
+
+    // A Proxy receiver inherits native data only when this exact identity was created by the
+    // indexed-class adapter. Looking through arbitrary Proxy targets would let author code bypass
+    // native/Web IDL receiver brand checks with `new Proxy(native, {})`.
+    if let Some((target, _)) = i.proxies.get(&key) {
+        let target = target.as_obj()?;
+        let target_key = Gc::as_ptr(target) as usize;
+        let entry = objects.map.get(&target_key)?;
+        let trusted_wrapper = entry
+            .indexed_wrapper
+            .as_ref()
+            .and_then(WeakGc::upgrade)
+            .is_some_and(|registered| Gc::ptr_eq(&registered, object));
+        return trusted_wrapper.then_some(target_key);
+    }
+
+    // A native Window receiver may be a WindowProxy only during the exact same-origin internal
+    // Get/Set operation that authorized it. The operation scope carries a trusted caller/holder/
+    // target tuple; arbitrary Proxies (including a Proxy around a WindowProxy) never enter here.
+    #[cfg(feature = "embed")]
+    if let Some(target_key) = crate::embed_realms::authorized_window_target(i, key) {
+        return objects.map.contains_key(&target_key).then_some(target_key);
+    }
+
+    objects.map.contains_key(&key).then_some(key)
+}
+
+/// The checked projection path used by native accessors. Unlike identity caches and GC retention,
+/// an actual native binding can preserve the host's thrown cross-origin error value.
+fn host_entry_key_checked(i: &mut Interp, v: &Value) -> Result<Option<usize>, Value> {
+    let Some(object) = v.as_obj() else {
+        return Ok(None);
+    };
+    let key = Gc::as_ptr(object) as usize;
+    if let Some((target, _)) = i.proxies.get(&key) {
+        let Some(target) = target.as_obj() else {
+            return Ok(None);
+        };
+        let target_key = Gc::as_ptr(target) as usize;
+        let Some(entry) = i
+            .host_state
+            .get::<HostObjects>()
+            .and_then(|objects| objects.map.get(&target_key))
+        else {
+            return Ok(None);
+        };
+        let trusted_wrapper = entry
+            .indexed_wrapper
+            .as_ref()
+            .and_then(WeakGc::upgrade)
+            .is_some_and(|registered| Gc::ptr_eq(&registered, object));
+        return Ok(trusted_wrapper.then_some(target_key));
+    }
+
+    #[cfg(feature = "embed")]
+    if let Some(target_key) = i.window_proxy_native_target(key)? {
+        return Ok(i
+            .host_state
+            .get::<HostObjects>()
+            .is_some_and(|objects| objects.map.contains_key(&target_key))
+            .then_some(target_key));
+    }
+
+    Ok(i.host_state
+        .get::<HostObjects>()
+        .is_some_and(|objects| objects.map.contains_key(&key))
+        .then_some(key))
+}
+
+fn host_entry<'a>(i: &'a Interp, v: &Value) -> Option<&'a HostEntry> {
+    let key = host_entry_key(i, v)?;
+    i.host_state.get::<HostObjects>()?.map.get(&key)
+}
+
+fn view_ref<T: Class>(
+    data: &Rc<dyn Any>,
+    ty: TypeId,
+) -> Result<(*const dyn Any, Box<dyn Any>), ()> {
+    let rc = data.clone().downcast::<RefCell<T>>().map_err(|_| ())?;
+    let borrow = rc.try_borrow().map_err(|_| ())?;
+    let ptr = borrow.view(ty).ok_or(())? as *const dyn Any;
+    // The guard owns rc and releases the borrow before that allocation.
+    let borrow =
+        unsafe { std::mem::transmute::<std::cell::Ref<'_, T>, std::cell::Ref<'static, T>>(borrow) };
+    Ok((
+        ptr,
+        Box::new(RefGuard {
+            g: Some(borrow),
+            _rc: rc,
+        }),
+    ))
+}
+
+fn view_mut<T: Class>(data: &Rc<dyn Any>, ty: TypeId) -> Result<(*mut dyn Any, Box<dyn Any>), ()> {
+    let rc = data.clone().downcast::<RefCell<T>>().map_err(|_| ())?;
+    let mut borrow = rc.try_borrow_mut().map_err(|_| ())?;
+    let ptr = borrow.view_mut(ty).ok_or(())? as *mut dyn Any;
+    let borrow = unsafe {
+        std::mem::transmute::<std::cell::RefMut<'_, T>, std::cell::RefMut<'static, T>>(borrow)
+    };
+    Ok((
+        ptr,
+        Box::new(MutGuard {
+            g: Some(borrow),
+            _rc: rc,
+        }),
+    ))
 }
 
 /// A bound fn registered with an interpreter (see [`Interp::op_info_of`]).
@@ -1800,9 +2244,7 @@ struct OpRegistry {
 }
 
 fn host_data(i: &Interp, v: &Value) -> Option<Rc<dyn Any>> {
-    let o = v.as_obj()?;
-    let t = i.host_state.get::<HostObjects>()?;
-    t.map.get(&(Gc::as_ptr(o) as usize)).map(|e| e.data.clone())
+    host_entry(i, v).map(|e| e.data.clone())
 }
 
 fn host_objects(i: &mut Interp) -> &mut HostObjects {
@@ -1812,10 +2254,255 @@ fn host_objects(i: &mut Interp) -> &mut HostObjects {
     i.host_state.get_mut::<HostObjects>().unwrap()
 }
 
+#[inline]
+fn active_realm_key(i: &Interp) -> RealmKey {
+    RealmKey(i.global.clone())
+}
+
 fn new_instance<T: Class>(i: &mut Interp, value: T, proto: Gc) -> Value {
     let obj = Object::new(Some(proto));
     attach_instance(i, &obj, value);
-    Value::Obj(obj)
+    let target = Value::Obj(obj);
+    let key = (active_realm_key(i), TypeId::of::<T>());
+    let indexed = i
+        .host_state
+        .get::<IndexedClasses>()
+        .and_then(|r| r.0.get(&key))
+        .cloned();
+    if let Some(handler) = indexed {
+        let wrapper = crate::builtins::proxy::make_proxy(i, target.clone(), handler)
+            .unwrap_or_else(|_| panic!("native indexed wrapper"));
+        register_indexed_wrapper(i, &target, &wrapper);
+        wrapper
+    } else {
+        target
+    }
+}
+
+fn register_indexed_wrapper(i: &mut Interp, target: &Value, wrapper: &Value) {
+    let (Some(target), Some(wrapper)) = (target.as_obj(), wrapper.as_obj()) else {
+        panic!("indexed native wrapper must be an object");
+    };
+    let target_key = Gc::as_ptr(target) as usize;
+    let wrapper_key = Gc::as_ptr(wrapper) as usize;
+    let Some((proxy_target, _)) = i.proxies.get(&wrapper_key) else {
+        panic!("indexed native wrapper must be an engine Proxy");
+    };
+    if !matches!(proxy_target.as_obj(), Some(proxy_target) if Gc::ptr_eq(proxy_target, target)) {
+        panic!("indexed native wrapper target mismatch");
+    }
+    let entry = host_objects(i)
+        .map
+        .get_mut(&target_key)
+        .expect("indexed native target has a host entry");
+    assert!(
+        entry.indexed_wrapper.is_none(),
+        "native instance already has its indexed wrapper"
+    );
+    entry.indexed_wrapper = Some(Gc::downgrade(wrapper));
+}
+
+#[derive(Default)]
+struct IndexedClasses(FastMap<(RealmKey, TypeId), Value>);
+
+fn indexed_handler(i: &mut Interp, item: NativeFn, length: NativeFn) -> Value {
+    let handler = i.new_object();
+    let item = Value::Obj(i.make_native("getitem", 1, item));
+    let length = Value::Obj(i.make_native("length", 0, length));
+    for (name, entry) in [
+        ("get", indexed_get as NativeFn),
+        ("has", indexed_has),
+        ("ownKeys", indexed_keys),
+        ("getOwnPropertyDescriptor", indexed_descriptor),
+        ("set", indexed_set),
+        ("defineProperty", indexed_define),
+        ("deleteProperty", indexed_delete),
+    ] {
+        let function =
+            crate::builtins::make_bound_len(i, entry, vec![item.clone(), length.clone()], 0.0);
+        handler
+            .borrow_mut()
+            .props
+            .insert(name, Property::builtin(function));
+    }
+    Value::Obj(handler)
+}
+
+struct IdentityCache<T: 'static, K: 'static> {
+    map: std::collections::HashMap<K, WeakValue>,
+    sweep_at: usize,
+    _class: std::marker::PhantomData<T>,
+}
+
+/// Promote identity wrappers with expandos before the cycle collector runs.
+pub(crate) fn retain_host_identities(i: &mut Interp) {
+    let Some(objects) = i.host_state.get_mut::<HostObjects>() else {
+        return;
+    };
+    for entry in objects.map.values_mut() {
+        if entry
+            .indexed_wrapper
+            .as_ref()
+            .is_some_and(|wrapper| wrapper.strong_count() == 0)
+        {
+            entry.indexed_wrapper = None;
+        }
+        if entry.identity || entry.callbacks_retained {
+            let value = entry._weak.upgrade().map(Value::Obj);
+            let expando = value.as_ref().is_some_and(|value| {
+                value
+                    .as_obj()
+                    .is_some_and(|obj| obj.borrow().props.iter().next().is_some())
+            });
+            entry.retained = if entry.callbacks_retained || expando {
+                value
+            } else {
+                None
+            };
+        }
+    }
+}
+
+pub(crate) fn retain_identity_receiver(i: &mut Interp, value: &Value) {
+    let Some(key) = host_entry_key(i, value) else {
+        return;
+    };
+    if let Some(entry) = i
+        .host_state
+        .get_mut::<HostObjects>()
+        .and_then(|objects| objects.map.get_mut(&key))
+    {
+        if entry.identity {
+            entry.retained = Some(value.clone());
+        }
+    }
+}
+
+fn index_key(value: &Value) -> Option<usize> {
+    let Value::Str(key) = value else {
+        return None;
+    };
+    let key = key.as_str();
+    let index = key.parse::<usize>().ok()?;
+    (index.to_string() == key).then_some(index)
+}
+
+fn indexed_length(i: &mut Interp, args: &[Value]) -> Result<usize, Value> {
+    match i.invoke(args[1].clone(), args[2].clone(), &[])? {
+        Value::Num(n) => Ok(n as usize),
+        _ => Err(i.make_error("TypeError", "indexed length must be a number")),
+    }
+}
+
+fn reflect(i: &mut Interp, name: &str, args: &[Value]) -> Result<Value, Value> {
+    // Native indexed wrappers are engine-owned Proxies. Their behavior must use the actual
+    // internal Reflect algorithms, not mutable `globalThis.Reflect` properties that author code
+    // can replace between wrapper creation and trap invocation.
+    let this = Value::Undefined;
+    match name {
+        "get" => crate::builtins::reflect::reflect_get(i, this, args),
+        "has" => crate::builtins::reflect::reflect_has(i, this, args),
+        "set" => crate::builtins::reflect::reflect_set(i, this, args),
+        "defineProperty" => crate::builtins::reflect::reflect_define(i, this, args),
+        "deleteProperty" => crate::builtins::reflect::reflect_delete(i, this, args),
+        "ownKeys" => crate::builtins::reflect::reflect_own_keys(i, this, args),
+        "getOwnPropertyDescriptor" => crate::builtins::reflect::reflect_gopd(i, this, args),
+        _ => unreachable!("only native indexed wrapper traps call the Reflect helper"),
+    }
+}
+
+fn indexed_get(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(index) = args.get(3).and_then(index_key) {
+        if index < indexed_length(i, args)? {
+            i.invoke(
+                args[0].clone(),
+                args[2].clone(),
+                &[Value::Num(index as f64)],
+            )
+        } else {
+            Ok(Value::Undefined)
+        }
+    } else {
+        reflect(i, "get", &args[2..])
+    }
+}
+
+fn indexed_has(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(index) = args.get(3).and_then(index_key) {
+        Ok(Value::Bool(index < indexed_length(i, args)?))
+    } else {
+        reflect(i, "has", &args[2..])
+    }
+}
+
+fn indexed_set(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if args.get(3).and_then(index_key).is_some() {
+        Ok(Value::Bool(false))
+    } else {
+        reflect(i, "set", &args[2..])
+    }
+}
+
+fn indexed_define(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if args.get(3).and_then(index_key).is_some() {
+        Ok(Value::Bool(false))
+    } else {
+        reflect(i, "defineProperty", &args[2..])
+    }
+}
+
+fn indexed_delete(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if args.get(3).and_then(index_key).is_some() {
+        Ok(Value::Bool(false))
+    } else {
+        reflect(i, "deleteProperty", &args[2..])
+    }
+}
+
+fn indexed_keys(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    let length = indexed_length(i, args)?;
+    let own = reflect(i, "ownKeys", &args[2..])?;
+    let count = i.get_member(&own, "length").map_err(abrupt_value)?;
+    let mut keys: Vec<Value> = (0..length)
+        .map(|index| Value::str(index.to_string()))
+        .collect();
+    if let Value::Num(count) = count {
+        for index in 0..count as usize {
+            keys.push(
+                i.get_member(&own, &index.to_string())
+                    .map_err(abrupt_value)?,
+            );
+        }
+    }
+    Ok(JsHost::from_list(i, keys))
+}
+
+fn indexed_descriptor(i: &mut Interp, _: Value, args: &[Value]) -> Result<Value, Value> {
+    if let Some(index) = args.get(3).and_then(index_key) {
+        if index >= indexed_length(i, args)? {
+            return Ok(Value::Undefined);
+        }
+        let value = i.invoke(
+            args[0].clone(),
+            args[2].clone(),
+            &[Value::Num(index as f64)],
+        )?;
+        let descriptor = i.new_object();
+        for (name, value) in [
+            ("value", value),
+            ("writable", Value::Bool(false)),
+            ("enumerable", Value::Bool(true)),
+            ("configurable", Value::Bool(true)),
+        ] {
+            descriptor
+                .borrow_mut()
+                .props
+                .insert(name, Property::builtin(value));
+        }
+        Ok(Value::Obj(descriptor))
+    } else {
+        reflect(i, "getOwnPropertyDescriptor", &args[2..])
+    }
 }
 
 fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
@@ -1829,12 +2516,27 @@ fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
         HostEntry {
             _weak: Gc::downgrade(obj),
             data: Rc::new(RefCell::new(value)),
+            indexed_wrapper: None,
+            retained: None,
+            identity: false,
+            callbacks_retained: false,
+            view_ref: view_ref::<T>,
+            view_mut: view_mut::<T>,
         },
     );
 }
 
 fn sweep(i: &mut Interp) -> usize {
     let t = host_objects(i);
+    for entry in t.map.values_mut() {
+        if entry
+            .indexed_wrapper
+            .as_ref()
+            .is_some_and(|wrapper| wrapper.strong_count() == 0)
+        {
+            entry.indexed_wrapper = None;
+        }
+    }
     let dead: Vec<usize> = t
         .map
         .iter()
@@ -1856,7 +2558,11 @@ fn illegal_constructor(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, V
 }
 
 fn registered_class<T: Class>(i: &Interp) -> Option<(Value, Gc)> {
-    i.host_state.get::<ClassRegistry>().and_then(|r| r.map.get(&TypeId::of::<T>())).cloned()
+    let key = (active_realm_key(i), TypeId::of::<T>());
+    i.host_state
+        .get::<ClassRegistry>()
+        .and_then(|r| r.map.get(&key))
+        .cloned()
 }
 
 #[cold]
@@ -1868,7 +2574,7 @@ fn unregistered<T: Class>(i: &mut Interp) -> Value {
     i.make_error("TypeError", msg)
 }
 
-/// This interpreter's constructor + prototype for `T`, created on first use.
+/// This realm's constructor + prototype for `T`, created on first use.
 fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
     if let Some(e) = registered_class::<T>(i) {
         return e;
@@ -1876,8 +2582,38 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
     let mut members = Vec::new();
     T::members(&mut members);
     members.retain(|m| m.desc.exposed_to("js"));
+    // Web IDL has enumerable named operations and attributes. Ordinary native
+    // classes retain JavaScript class/builtin descriptor conventions.
+    let webidl = T::DESC.hint("js", "webidl").is_some();
+    let realm_key = active_realm_key(i);
+    if let (Some(item), Some(length)) = (
+        members
+            .iter()
+            .find(|m| m.desc.role == Role::Proto("getitem")),
+        members.iter().find(|m| m.desc.role == Role::Proto("len")),
+    ) {
+        if !i.host_state.has::<IndexedClasses>() {
+            i.host_state.put(IndexedClasses::default());
+        }
+        let handler = indexed_handler(i, item.entry, length.entry);
+        i.host_state
+            .get_mut::<IndexedClasses>()
+            .unwrap()
+            .0
+            .insert((realm_key.clone(), TypeId::of::<T>()), handler);
+    }
     let name = class_name::<T>();
-    let proto = Object::new(Some(i.object_proto.clone()));
+    let base = T::base_class(i).unwrap_or_else(|_| panic!("native base class registration"));
+    let base_proto = base
+        .as_ref()
+        .and_then(|base| base.as_obj())
+        .and_then(|base| {
+            base.borrow()
+                .props
+                .get("prototype")
+                .and_then(|p| p.value().as_obj().cloned())
+        });
+    let proto = Object::new(Some(base_proto.unwrap_or_else(|| i.object_proto.clone())));
     let ctor_fn = match members.iter().find(|m| m.desc.role == Role::Constructor) {
         Some(m) => {
             register_op(i, m);
@@ -1889,12 +2625,18 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
     {
         let mut c = ctor.borrow_mut();
         c.is_constructor = true;
-        c.props.insert("prototype", Property::data(Value::Obj(proto.clone()), false, false, false));
+        if let Some(base) = base.and_then(|base| base.as_obj().cloned()) {
+            c.proto = Some(base);
+        }
+        c.props.insert(
+            "prototype",
+            Property::data(Value::Obj(proto.clone()), false, false, false),
+        );
     }
-    proto
-        .borrow_mut()
-        .props
-        .insert("constructor", Property::data(Value::Obj(ctor.clone()), true, false, true));
+    proto.borrow_mut().props.insert(
+        "constructor",
+        Property::data(Value::Obj(ctor.clone()), true, false, true),
+    );
     crate::builtins::set_to_string_tag(i, &proto, name);
     // Accessors: pair getters and setters by name.
     let mut accessors: Vec<(Cow<'static, str>, Option<Value>, Option<Value>)> = Vec::new();
@@ -1911,12 +2653,29 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         }
         register_op(i, m);
         match d.role {
-            Role::Method | Role::Proto("next" | "str") => i.def_method(&proto, &js, d.min_pos as usize, m.entry),
-            Role::Static => i.def_method(&ctor, &js, d.min_pos as usize, m.entry),
+            Role::Method | Role::Proto("next" | "str") => {
+                i.def_method(&proto, &js, d.min_pos as usize, m.entry);
+                if webidl {
+                    if let Some(property) = proto.borrow_mut().props.get_mut(&*js) {
+                        property.set_enumerable(true);
+                    }
+                }
+            }
+            Role::Static => {
+                i.def_method(&ctor, &js, d.min_pos as usize, m.entry);
+                if webidl {
+                    if let Some(property) = ctor.borrow_mut().props.get_mut(&*js) {
+                        property.set_enumerable(true);
+                    }
+                }
+            }
             Role::Proto("iter") => {
                 let f = i.make_native("[Symbol.iterator]", 0, m.entry);
                 if let Some(key) = crate::builtins::well_known_key(i, "iterator") {
-                    proto.borrow_mut().props.insert(key, Property::builtin(Value::Obj(f)));
+                    proto
+                        .borrow_mut()
+                        .props
+                        .insert(key, Property::builtin(Value::Obj(f)));
                 }
             }
             Role::Getter | Role::Proto("len") => {
@@ -1937,13 +2696,20 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         }
     }
     for (name, get, set) in accessors {
-        proto.borrow_mut().props.insert(&*name, Property::accessor_prop(get, set, false, true));
+        proto
+            .borrow_mut()
+            .props
+            .insert(&*name, Property::accessor_prop(get, set, webidl, true));
     }
     let entry = (Value::Obj(ctor), proto);
     if !i.host_state.has::<ClassRegistry>() {
         i.host_state.put(ClassRegistry::default());
     }
-    i.host_state.get_mut::<ClassRegistry>().unwrap().map.insert(TypeId::of::<T>(), entry.clone());
+    i.host_state
+        .get_mut::<ClassRegistry>()
+        .unwrap()
+        .map
+        .insert((realm_key, TypeId::of::<T>()), entry.clone());
     entry
 }
 
@@ -1951,8 +2717,15 @@ fn register_op(i: &mut Interp, f: &FnItem<JsHost>) {
     if !i.host_state.has::<OpRegistry>() {
         i.host_state.put(OpRegistry::default());
     }
-    let info = OpInfo { desc: f.desc, callbacks: f.callbacks };
-    i.host_state.get_mut::<OpRegistry>().unwrap().by_fn.insert(f.entry as usize, info);
+    let info = OpInfo {
+        desc: f.desc,
+        callbacks: f.callbacks,
+    };
+    i.host_state
+        .get_mut::<OpRegistry>()
+        .unwrap()
+        .by_fn
+        .insert(f.entry as usize, info);
 }
 
 // =============================================================================================
@@ -1961,6 +2734,13 @@ fn register_op(i: &mut Interp, f: &FnItem<JsHost>) {
 
 /// Binding-layer methods on the native-function context.
 impl Interp {
+    pub fn weak_value(&self, value: &Value) -> Option<WeakValue> {
+        match value {
+            Value::Obj(object) => Some(WeakValue(Gc::downgrade(object))),
+            _ => None,
+        }
+    }
+
     /// A JS function for a bound fn (registered for [`Interp::op_info_of`]).
     pub fn bound_function(&mut self, f: &FnItem<JsHost>) -> Value {
         register_op(self, f);
@@ -1994,7 +2774,11 @@ impl Interp {
             Callable::Native(f) => *f,
             _ => return None,
         };
-        self.host_state.get::<OpRegistry>()?.by_fn.get(&(f as usize)).copied()
+        self.host_state
+            .get::<OpRegistry>()?
+            .by_fn
+            .get(&(f as usize))
+            .copied()
     }
 
     /// The unboxed entry of `callee`, if it is a scalar op.
@@ -2013,10 +2797,140 @@ impl Interp {
         new_instance(self, value, proto)
     }
 
+    /// Give an existing host object a native class and its prototype.
+    pub fn attach_instance<T: Methods<JsHost>>(
+        &mut self,
+        object: &Value,
+        value: T,
+    ) -> OpResult<()> {
+        let Some(object) = object.as_obj() else {
+            return Err(OpError::new(
+                "TypeError",
+                "native instance requires an object",
+            ));
+        };
+        let (_, prototype) = class_entry::<T>(self);
+        object.borrow_mut().proto = Some(prototype);
+        attach_instance(self, object, value);
+        Ok(())
+    }
+
     /// The Rust value behind a class instance (shared handle; borrow it with the `RefCell`
     /// API). `None` when `v` is not a `T` instance.
     pub fn instance_data<T: Class>(&self, v: &Value) -> Option<Rc<RefCell<T>>> {
         host_data(self, v)?.downcast::<RefCell<T>>().ok()
+    }
+
+    /// Read a native instance or one of its embedded base classes.
+    pub fn with_instance<T: Class, R>(
+        &mut self,
+        value: &Value,
+        read: impl FnOnce(&T) -> R,
+    ) -> OpResult<R> {
+        let key = host_entry_key_checked(self, value)
+            .map_err(OpError::thrown)?
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
+        let entry = self
+            .host_state
+            .get::<HostObjects>()
+            .and_then(|objects| objects.map.get(&key))
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
+        let (pointer, guard) = (entry.view_ref)(&entry.data, TypeId::of::<T>()).map_err(|_| {
+            OpError::new(
+                "TypeError",
+                "native instance has the wrong class or is already in use",
+            )
+        })?;
+        let data = unsafe { &*pointer }
+            .downcast_ref::<T>()
+            .expect("matching native projection");
+        let result = read(data);
+        drop(guard);
+        Ok(result)
+    }
+
+    /// Mutably access a native instance or one of its embedded base classes.
+    pub fn with_instance_mut<T: Class, R>(
+        &mut self,
+        value: &Value,
+        update: impl FnOnce(&mut T) -> R,
+    ) -> OpResult<R> {
+        let key = host_entry_key_checked(self, value)
+            .map_err(OpError::thrown)?
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
+        let entry = self
+            .host_state
+            .get::<HostObjects>()
+            .and_then(|objects| objects.map.get(&key))
+            .ok_or_else(|| OpError::new("TypeError", "value is not a native instance"))?;
+        let (pointer, guard) = (entry.view_mut)(&entry.data, TypeId::of::<T>()).map_err(|_| {
+            OpError::new(
+                "TypeError",
+                "native instance has the wrong class or is already in use",
+            )
+        })?;
+        let data = unsafe { &mut *pointer }
+            .downcast_mut::<T>()
+            .expect("matching mutable native projection");
+        let result = update(data);
+        drop(guard);
+        Ok(result)
+    }
+
+    /// Keep a host wrapper alive while its native owner retains callbacks.
+    pub fn retain_instance(&mut self, v: &Value, retained: bool) {
+        let Some(key) = host_entry_key(self, v) else {
+            return;
+        };
+        if let Some(entry) = host_objects(self).map.get_mut(&key) {
+            entry.callbacks_retained = retained;
+            entry.retained = retained.then(|| v.clone());
+        }
+    }
+
+    /// One lazy native wrapper per identity key in this realm.
+    pub fn cached_instance<T: Methods<JsHost>, K: Eq + std::hash::Hash + Clone + 'static>(
+        &mut self,
+        key: K,
+        make: impl FnOnce() -> T,
+    ) -> Value {
+        if let Some(value) = self
+            .host_state
+            .get::<IdentityCache<T, K>>()
+            .and_then(|cache| cache.map.get(&key))
+            .and_then(WeakValue::upgrade)
+        {
+            return value;
+        }
+        let value = self.new_instance(make());
+        if let Some(object) = value.as_obj() {
+            let target = self
+                .proxies
+                .get(&(Gc::as_ptr(object) as usize))
+                .and_then(|(target, _)| target.as_obj())
+                .unwrap_or(object);
+            let ptr = Gc::as_ptr(target) as usize;
+            if let Some(entry) = host_objects(self).map.get_mut(&ptr) {
+                entry.identity = true;
+            }
+            object.borrow().ic_plain.set(false);
+            self.inline_ic_safe.set(false);
+        }
+        if !self.host_state.has::<IdentityCache<T, K>>() {
+            self.host_state.put(IdentityCache::<T, K> {
+                map: std::collections::HashMap::new(),
+                sweep_at: 256,
+                _class: std::marker::PhantomData,
+            });
+        }
+        let weak = self.weak_value(&value).expect("native identity wrapper");
+        let cache = self.host_state.get_mut::<IdentityCache<T, K>>().unwrap();
+        if cache.map.len() >= cache.sweep_at {
+            cache.map.retain(|_, value| value.upgrade().is_some());
+            cache.sweep_at = cache.map.len().saturating_mul(2).max(256);
+        }
+        cache.map.insert(key, weak);
+        value
     }
 
     /// Drop the Rust values of class instances whose JS objects died. Runs automatically as
@@ -2045,6 +2959,11 @@ impl Interp {
         Value::Obj(self.global.clone())
     }
 
+    /// Native-code compilation and execution counters for this realm.
+    pub fn jit_stats(&self) -> crate::JitStats {
+        self.jit_stats.get()
+    }
+
     /// `JSON.parse(text)` through the realm's `JSON` object.
     pub fn json_parse(&mut self, text: &str) -> Result<Value, Value> {
         let g = self.global_object();
@@ -2064,7 +2983,10 @@ impl Interp {
             return o;
         }
         let o = self.new_object();
-        self.global.borrow_mut().props.insert(name, Property::builtin(Value::Obj(o.clone())));
+        self.global
+            .borrow_mut()
+            .props
+            .insert(name, Property::builtin(Value::Obj(o.clone())));
         o
     }
 }
@@ -2074,7 +2996,11 @@ impl crate::Engine {
     pub fn define_fn<N: Native<JsHost>>(&mut self) {
         let f = self.interp.op_function::<N>();
         let name = js_name(N::DESC);
-        self.interp.global.borrow_mut().props.insert(&*name, Property::builtin(f));
+        self.interp
+            .global
+            .borrow_mut()
+            .props
+            .insert(&*name, Property::builtin(f));
     }
 
     /// Define `globalThis.<module name>` holding everything `#[module]` `M` declares (an
@@ -2093,13 +3019,372 @@ impl crate::Engine {
     /// Define `globalThis.<class name>` as class `T`'s constructor.
     pub fn define_class<T: Methods<JsHost>>(&mut self) {
         let ctor = self.interp.class_constructor::<T>();
-        self.interp.global.borrow_mut().props.insert(class_name::<T>(), Property::builtin(ctor));
+        self.interp
+            .global
+            .borrow_mut()
+            .props
+            .insert(class_name::<T>(), Property::builtin(ctor));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[lumen_bind::class(name = "WebIdlDescriptor", hint(js(webidl)))]
+    struct WebIdlDescriptor {
+        value: i32,
+    }
+
+    #[lumen_bind::methods]
+    impl WebIdlDescriptor {
+        #[constructor]
+        fn new(value: i32) -> Self {
+            Self { value }
+        }
+
+        #[getter]
+        fn value(&self) -> i32 {
+            self.value
+        }
+
+        #[setter]
+        fn set_value(&mut self, value: i32) {
+            self.value = value;
+        }
+
+        #[method]
+        fn operation(&self) -> i32 {
+            self.value
+        }
+
+        #[method]
+        fn static_operation() -> i32 {
+            42
+        }
+    }
+
+    #[lumen_bind::class(name = "OrdinaryDescriptor")]
+    struct OrdinaryDescriptor;
+
+    #[lumen_bind::methods]
+    impl OrdinaryDescriptor {
+        #[constructor]
+        fn new() -> Self {
+            Self
+        }
+
+        #[getter]
+        fn value(&self) -> i32 {
+            1
+        }
+
+        #[method]
+        fn operation(&self) -> i32 {
+            1
+        }
+    }
+
+    #[lumen_bind::class(name = "NativeReceiverBase", hint(js(webidl)))]
+    struct NativeReceiverBase {
+        marker: i32,
+    }
+
+    #[lumen_bind::methods]
+    impl NativeReceiverBase {
+        #[constructor]
+        fn new(marker: i32) -> Self {
+            Self { marker }
+        }
+
+        #[getter]
+        fn marker(&self) -> i32 {
+            self.marker
+        }
+    }
+
+    #[lumen_bind::class(
+        name = "NativeReceiverDerived",
+        extends = NativeReceiverBase,
+        hint(js(webidl))
+    )]
+    struct NativeReceiverDerived {
+        base: NativeReceiverBase,
+    }
+
+    #[lumen_bind::methods]
+    impl NativeReceiverDerived {
+        #[constructor]
+        fn new(marker: i32) -> Self {
+            Self {
+                base: NativeReceiverBase { marker },
+            }
+        }
+    }
+
+    #[lumen_bind::class(name = "NativeIndexedWrapper", hint(js(webidl)))]
+    struct NativeIndexedWrapper {
+        values: Vec<i32>,
+    }
+
+    #[lumen_bind::methods]
+    impl NativeIndexedWrapper {
+        #[constructor]
+        fn new() -> Self {
+            Self {
+                values: vec![5, 8, 13],
+            }
+        }
+
+        #[proto(getitem)]
+        fn item(&self, index: usize) -> i32 {
+            self.values.get(index).copied().unwrap_or(-1)
+        }
+
+        #[proto(len)]
+        fn length(&self) -> usize {
+            self.values.len()
+        }
+
+        #[method]
+        fn sum(&self) -> i32 {
+            self.values.iter().sum()
+        }
+    }
+
+    fn native_eval(engine: &mut crate::Engine, source: &str) -> Result<Value, Value> {
+        engine
+            .eval_value(source)
+            .expect("valid native regression source")
+    }
+
+    #[test]
+    fn native_webidl_descriptor_policy_is_explicit_and_preserves_ordinary_classes() {
+        let mut engine = crate::Engine::new();
+        engine.define_class::<WebIdlDescriptor>();
+        engine.define_class::<OrdinaryDescriptor>();
+        let result = native_eval(&mut engine, r#"
+            const idl = WebIdlDescriptor.prototype;
+            const ordinary = OrdinaryDescriptor.prototype;
+            const idlAttribute = Object.getOwnPropertyDescriptor(idl, 'value');
+            const idlOperation = Object.getOwnPropertyDescriptor(idl, 'operation');
+            const idlStatic = Object.getOwnPropertyDescriptor(WebIdlDescriptor, 'staticOperation');
+            const ordinaryAttribute = Object.getOwnPropertyDescriptor(ordinary, 'value');
+            const ordinaryOperation = Object.getOwnPropertyDescriptor(ordinary, 'operation');
+            const object = new WebIdlDescriptor(4);
+            object.value = 9;
+            idlAttribute.enumerable && idlAttribute.configurable &&
+            typeof idlAttribute.get === 'function' && typeof idlAttribute.set === 'function' &&
+            idlOperation.enumerable && idlOperation.configurable && idlOperation.writable &&
+            idlStatic.enumerable && idlStatic.configurable && idlStatic.writable &&
+            !ordinaryAttribute.enumerable && ordinaryAttribute.configurable &&
+            !ordinaryOperation.enumerable && ordinaryOperation.configurable && ordinaryOperation.writable &&
+            !Object.getOwnPropertyDescriptor(idl, 'constructor').enumerable &&
+            !Object.getOwnPropertyDescriptor(WebIdlDescriptor, 'prototype').enumerable &&
+            !Object.getOwnPropertyDescriptor(globalThis, 'WebIdlDescriptor').enumerable &&
+            object.operation() === 9 && WebIdlDescriptor.staticOperation() === 42
+        "#).ok().expect("descriptor checks execute");
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn author_proxies_do_not_inherit_native_receiver_brands() {
+        let mut engine = crate::Engine::new();
+        engine.define_class::<NativeReceiverBase>();
+        engine.define_class::<NativeReceiverDerived>();
+        let result = native_eval(
+            &mut engine,
+            r#"
+                const base = new NativeReceiverBase(11);
+                const baseProxy = new Proxy(base, {});
+                let baseProxyRejected = false;
+                try { void baseProxy.marker; }
+                catch (error) { baseProxyRejected = error instanceof TypeError; }
+
+                const derived = new NativeReceiverDerived(17);
+                const derivedWorks = derived.marker === 17;
+                const derivedProxy = new Proxy(derived, {});
+                let derivedProxyRejected = false;
+                try { void derivedProxy.marker; }
+                catch (error) { derivedProxyRejected = error instanceof TypeError; }
+
+                baseProxyRejected && derivedWorks && derivedProxyRejected
+            "#,
+        )
+        .ok()
+        .expect("native brand checks execute");
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn indexed_native_wrappers_keep_their_brand_but_nested_author_proxies_do_not() {
+        let mut engine = crate::Engine::new();
+        engine.define_class::<NativeIndexedWrapper>();
+        let result = native_eval(
+            &mut engine,
+            r#"
+                const authorTarget = new NativeIndexedWrapper();
+                const authorProxy = new Proxy(authorTarget, {});
+                globalThis.Reflect = {
+                    get() { throw new Error('mutable Reflect.get used'); },
+                    has() { throw new Error('mutable Reflect.has used'); },
+                    set() { throw new Error('mutable Reflect.set used'); },
+                    defineProperty() { throw new Error('mutable Reflect.defineProperty used'); },
+                    deleteProperty() { throw new Error('mutable Reflect.deleteProperty used'); },
+                    ownKeys() { throw new Error('mutable Reflect.ownKeys used'); },
+                    getOwnPropertyDescriptor() { throw new Error('mutable Reflect descriptor used'); }
+                };
+                globalThis.Proxy = function() { throw new Error('mutable Proxy used'); };
+                const indexed = new NativeIndexedWrapper();
+                let authorProxyRejected = false;
+                try { authorProxy.sum(); }
+                catch (error) { authorProxyRejected = error instanceof TypeError; }
+
+                // Native wrapper creation after poisoning still uses the engine intrinsic.
+                let mutableProxyRejected = false;
+                try { new Proxy({}, {}); }
+                catch (error) { mutableProxyRejected = /mutable Proxy/.test(error.message); }
+
+                const ownKeysWork = Object.keys(indexed).join(',') === '0,1,2';
+                const descriptor = Object.getOwnPropertyDescriptor(indexed, '0');
+                const trapsWork = 0 in indexed && !(9 in indexed) &&
+                    descriptor.value === 5 && descriptor.enumerable;
+                indexed.extra = 7;
+                const setWorks = indexed.extra === 7;
+                const defineWorks = Object.defineProperty(indexed, 'defined', {
+                    value: 11, configurable: true, enumerable: true
+                }) === indexed && indexed.defined === 11;
+                const deleteWorks = delete indexed.extra && !('extra' in indexed);
+
+                indexed instanceof NativeIndexedWrapper &&
+                indexed.constructor === NativeIndexedWrapper &&
+                Object.getPrototypeOf(indexed) === NativeIndexedWrapper.prototype &&
+                indexed.length === 3 && indexed[0] === 5 && indexed[2] === 13 &&
+                indexed.sum() === 26 && authorProxyRejected && mutableProxyRejected &&
+                ownKeysWork && trapsWork && setWorks && defineWorks && deleteWorks
+            "#,
+        )
+        .ok()
+        .expect("indexed native wrapper checks execute");
+        assert!(matches!(result, Value::Bool(true)));
+
+        let indexed = native_eval(&mut engine, "new NativeIndexedWrapper()")
+            .ok()
+            .expect("construct another indexed wrapper");
+        assert_eq!(
+            engine
+                .ctx()
+                .with_instance::<NativeIndexedWrapper, _>(&indexed, |value| value.values.clone())
+                .expect("trusted indexed proxy projects to its native value"),
+            vec![5, 8, 13]
+        );
+    }
+
+    #[test]
+    fn native_iterable_conversion_uses_protocol_and_closes_abrupt_conversions() {
+        let mut engine = crate::Engine::new();
+        let set = native_eval(
+            &mut engine,
+            "Array.from = () => { throw new Error('author Array.from'); }; new Set([1, 2])",
+        )
+        .ok()
+        .expect("Set source");
+        let values = engine
+            .ctx()
+            .iterable_to_list(&set, 2)
+            .ok()
+            .expect("native Set iteration");
+        assert!(matches!(
+            values.as_slice(),
+            [Value::Num(1.0), Value::Num(2.0)]
+        ));
+        let array_like = native_eval(&mut engine, "({0: 1, length: 1})")
+            .ok()
+            .expect("array-like source");
+        assert!(engine.ctx().iterable_to_list(&array_like, 2).is_err());
+        let generator = native_eval(&mut engine, "globalThis.closed = false; globalThis.visited = []; (function*() { try { visited.push(1); yield 1; visited.push(2); yield 'bad'; visited.push(3); yield 3; } finally { closed = true; } })()")
+            .ok().expect("generator source");
+        let result = engine.ctx().convert_iterable(&generator, 8, |_, value| {
+            if matches!(value, Value::Num(_)) {
+                Ok(value)
+            } else {
+                Err(OpError::type_error("numeric item required"))
+            }
+        });
+        assert!(result.is_err());
+        assert!(matches!(
+            native_eval(&mut engine, "closed && visited.join(',') === '1,2'").ok(),
+            Some(Value::Bool(true))
+        ));
+        let throwing = native_eval(&mut engine, "globalThis.iteratorFailure = {}; ({[Symbol.iterator]() { return this; }, next() { throw iteratorFailure; }, return() { throw new Error('close failure'); }})")
+            .ok().expect("throwing iterator source");
+        let failure = engine
+            .ctx()
+            .iterable_to_list(&throwing, 8)
+            .err()
+            .expect("iteration must reject");
+        let failure = failure.to_value(engine.ctx());
+        let global = engine.ctx().global_object();
+        engine
+            .ctx()
+            .member_set(&global, "actualFailure", failure)
+            .ok()
+            .expect("record exception");
+        assert!(matches!(
+            native_eval(&mut engine, "actualFailure === iteratorFailure").ok(),
+            Some(Value::Bool(true))
+        ));
+        let unbounded = native_eval(&mut engine, "globalThis.limitClosed = false; (function*() { try { while (true) yield 1; } finally { limitClosed = true; } })()")
+            .ok().expect("unbounded generator source");
+        assert!(engine.ctx().iterable_to_list(&unbounded, 2).is_err());
+        assert!(matches!(
+            native_eval(&mut engine, "limitClosed").ok(),
+            Some(Value::Bool(true))
+        ));
+    }
+
+    #[test]
+    fn native_promise_coercion_reuses_intrinsics_and_preserves_constructor_errors() {
+        let mut engine = crate::Engine::new();
+        let promise = native_eval(&mut engine, "globalThis.savedPromise = Promise; globalThis.p = Promise.resolve(1); globalThis.Promise = function() { throw new Error('author Promise'); }; p")
+            .ok().expect("promise source");
+        let coerced = engine
+            .ctx()
+            .coerce_promise(promise)
+            .ok()
+            .expect("intrinsic promise coercion");
+        let global = engine.ctx().global_object();
+        engine
+            .ctx()
+            .member_set(&global, "coerced", coerced)
+            .ok()
+            .expect("record promise");
+        assert!(matches!(
+            native_eval(
+                &mut engine,
+                "coerced === p && coerced instanceof savedPromise"
+            )
+            .ok(),
+            Some(Value::Bool(true))
+        ));
+        let poisoned = native_eval(&mut engine, "globalThis.constructorFailure = {}; Object.defineProperty(p, 'constructor', {get() { throw constructorFailure; }}); p")
+            .ok().expect("poisoned promise source");
+        let failure = engine
+            .ctx()
+            .coerce_promise(poisoned)
+            .err()
+            .expect("constructor getter must reject");
+        let failure = failure.to_value(engine.ctx());
+        engine
+            .ctx()
+            .member_set(&global, "coercionFailure", failure)
+            .ok()
+            .expect("record exception");
+        assert!(matches!(
+            native_eval(&mut engine, "coercionFailure === constructorFailure").ok(),
+            Some(Value::Bool(true))
+        ));
+    }
 
     #[lumen_bind::module(name = "t")]
     mod t {
@@ -2146,20 +3431,56 @@ mod tests {
     }
 
     #[test]
+    fn buffer_source_copy_checks_brands_ranges_and_detachment() {
+        let mut engine = crate::Engine::new();
+        for (source, expected) in [
+            ("new Uint8Array([1,2,3,4]).buffer", Some(vec![1,2,3,4])),
+            ("new Uint8Array([1,2,3,4]).subarray(1,3)", Some(vec![2,3])),
+            ("new DataView(new Uint8Array([1,2,3,4]).buffer,1,2)", Some(vec![2,3])),
+            ("({get buffer(){throw 1},byteOffset:0,byteLength:4})", None),
+            ("Object.create(DataView.prototype)", None),
+            ("(()=>{let b=new ArrayBuffer(4);let v=new DataView(b);b.transfer();return v})()", None),
+            ("(()=>{let b=new ArrayBuffer(4,{maxByteLength:8});let v=new DataView(b,2,2);b.resize(1);return v})()", None),
+            ("new Uint8Array(new SharedArrayBuffer(4))", None),
+        ] {
+            let value = engine.eval_value(source).expect("valid source").ok().expect("source completes");
+            assert_eq!(engine.ctx().buffer_source_bytes(&value), expected, "{source}");
+        }
+    }
+
+    #[test]
     fn byte_views_borrow_alias_and_lend() {
         let mut e = crate::Engine::new();
         assert!(e.define_globals::<t::Module>().is_ok());
         assert_eq!(run(&mut e, "sum(new Uint8Array([1,2,3]))"), "6");
-        assert_eq!(run(&mut e, "sum(new Uint8Array([1,2,3,4]).subarray(1,3))"), "5");
+        assert_eq!(
+            run(&mut e, "sum(new Uint8Array([1,2,3,4]).subarray(1,3))"),
+            "5"
+        );
         assert_eq!(run(&mut e, "sum(new Uint16Array([257]).buffer)"), "2");
-        assert_eq!(run(&mut e, "sum(new DataView(new Uint8Array([9,9,9]).buffer, 1))"), "18");
+        assert_eq!(
+            run(
+                &mut e,
+                "sum(new DataView(new Uint8Array([9,9,9]).buffer, 1))"
+            ),
+            "18"
+        );
         let r = run(&mut e, "sum(5)");
-        assert!(r.contains("sum: argument 1 (bytes) must be an ArrayBuffer"), "{r}");
-        let r = run(&mut e, "var u = new Uint8Array(4); u.buffer.transfer(); sum(u)");
+        assert!(
+            r.contains("sum: argument 1 (bytes) must be an ArrayBuffer"),
+            "{r}"
+        );
+        let r = run(
+            &mut e,
+            "var u = new Uint8Array(4); u.buffer.transfer(); sum(u)",
+        );
         assert!(r.contains("detached"), "{r}");
         // Aliasing: dst overlaps src.
         let r = run(&mut e, "var q = new Uint8Array(8); fill(q, q.subarray(2))");
-        assert!(r.contains("argument 2 (src) overlaps argument 1 (dst)"), "{r}");
+        assert!(
+            r.contains("argument 2 (src) overlaps argument 1 (dst)"),
+            "{r}"
+        );
         // Disjoint halves of one buffer are fine; re-entrant JS sees them detached.
         let r = run(
             &mut e,
@@ -2168,11 +3489,32 @@ mod tests {
              fill(w.subarray(0,2), w.subarray(2)); `${seen} ${w.length} ${w[0]} ${w[1]}`",
         );
         assert_eq!(r, "0 4 7 8");
-        let r = run(&mut e, "Array.from(new Uint8Array([1,2,3]).map(x => x)).join()");
+        let r = run(
+            &mut e,
+            "Array.from(new Uint8Array([1,2,3]).map(x => x)).join()",
+        );
         assert_eq!(r, "1,2,3");
         // Vec<u8> results adopt the vector.
         let v = uint8array_from_vec(e.ctx(), vec![4, 5, 6]);
-        e.ctx().global.borrow_mut().props.insert("made", Property::builtin(v));
-        assert_eq!(run(&mut e, "made instanceof Uint8Array && made.join()"), "4,5,6");
+        e.ctx()
+            .global
+            .borrow_mut()
+            .props
+            .insert("made", Property::builtin(v));
+        assert_eq!(
+            run(&mut e, "made instanceof Uint8Array && made.join()"),
+            "4,5,6"
+        );
+    }
+
+    #[test]
+    fn weak_value_preserves_live_identity_without_rooting_dead_objects() {
+        let mut engine = crate::Engine::new();
+        let value = Value::Obj(engine.ctx().new_object());
+        let weak = engine.ctx().weak_value(&value).unwrap();
+        assert!(matches!(weak.upgrade(), Some(Value::Obj(_))));
+        drop(value);
+        engine.ctx().collect_garbage();
+        assert!(weak.upgrade().is_none());
     }
 }

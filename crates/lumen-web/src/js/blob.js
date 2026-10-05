@@ -109,6 +109,22 @@ class Blob {
   }
 }
 
+// Typed browser-host bridge. It is intentionally an internal symbol rather
+// than a public Blob method; URL.createObjectURL snapshots these immutable
+// bytes into the per-interpreter managed-resource registry.
+Object.defineProperty(Blob, Symbol.for("lumen.blob.internals"), {
+  value: Object.freeze({
+    snapshot(blob) {
+      if (!(blob instanceof Blob)) throw new TypeError("expected Blob");
+      const bytes = blob[kBlobBytes];
+      return {
+        bytes: bytes.slice(),
+        type: blob[kBlobType],
+      };
+    },
+  }),
+});
+
 // A Blob whose bytes stay on disk: `read(from, to)` fetches a range and throws
 // NotReadableError once the file no longer matches what was opened.
 function makeFileBacked(blob, source) {
@@ -161,8 +177,15 @@ function toEntryValue(value, filename) {
 }
 
 class FormData {
-  constructor() {
+  constructor(...args) {
     this[kEntries] = [];
+    const [form, submitter] = args;
+    if (form !== undefined) {
+      if (typeof globalThis.__lumenPopulateFormData !== 'function') {
+        throw new TypeError('FormData(form) requires a DOM form');
+      }
+      globalThis.__lumenPopulateFormData(this, form, submitter);
+    }
   }
   append(name, value, filename) {
     this[kEntries].push([String(name), toEntryValue(value, filename)]);
@@ -224,7 +247,9 @@ class FormData {
 
 // Serialize FormData to multipart/form-data bytes + the matching Content-Type (with boundary).
 function encodeFormData(form) {
-  const boundary = "----lumenFormBoundary" + crypto.randomUUID().replace(/-/g, "");
+  const token = typeof __multipartBoundary === "function"
+    ? __multipartBoundary() : crypto.randomUUID().replace(/-/g, "");
+  const boundary = "----lumenFormBoundary" + token;
   const enc = new TextEncoder();
   const chunks = [];
   const push = (s) => chunks.push(typeof s === "string" ? enc.encode(s) : s);
@@ -311,3 +336,29 @@ function decodeMultipart(bytes, boundary) {
 globalThis.Blob = Blob;
 globalThis.File = File;
 globalThis.FormData = FormData;
+
+// Private native bridge used by the browser's HTML form-navigation service.
+// It snapshots the actual post-`formdata` entry list, including File bytes,
+// without exposing or replacing FormData's private entry storage.
+Object.defineProperty(globalThis, "__lumenSnapshotFormData", {
+  configurable: false,
+  enumerable: false,
+  writable: false,
+  value(form) {
+    if (!(form instanceof FormData)) throw new TypeError("expected FormData");
+    return form[kEntries].map(([name, value]) => {
+      if (value instanceof Blob) {
+        const file = value instanceof File ? value : new File([value], "blob", { type: value.type });
+        return {
+          name,
+          kind: "file",
+          fileName: file.name,
+          type: file.type,
+          lastModified: file.lastModified,
+          bytes: Array.from(file[kBlobBytes]),
+        };
+      }
+      return { name, kind: "text", value: String(value) };
+    });
+  },
+});

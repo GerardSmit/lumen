@@ -4,10 +4,10 @@ use crate::ast::{BinOp, CmpOp};
 use crate::bytecode::*;
 use crate::dict::PyDict;
 use crate::object::*;
-use std::cell::RefCell;
 use crate::platform::{Platform, PlatformRef, StdPlatform};
-use std::collections::BTreeMap;
 use lumen_common::limits::{HeapBudget, InterruptHandle};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 pub struct Block {
@@ -246,8 +246,12 @@ pub enum GenResult {
 impl Interp {
     /// The native-module state `T`, created on first use.
     pub fn native_state<T: Default + 'static>(&mut self) -> &mut T {
-        let slot = self.native_state.entry(std::any::TypeId::of::<T>()).or_insert_with(|| Box::new(T::default()));
-        slot.downcast_mut::<T>().expect("native state keyed by its own type")
+        let slot = self
+            .native_state
+            .entry(std::any::TypeId::of::<T>())
+            .or_insert_with(|| Box::new(T::default()));
+        slot.downcast_mut::<T>()
+            .expect("native state keyed by its own type")
     }
 
     #[allow(clippy::new_without_default)]
@@ -256,7 +260,10 @@ impl Interp {
     }
 
     pub fn with_platform(platform: Box<dyn Platform>) -> Interp {
-        let platform: Box<dyn Platform> = Box::new(crate::platform::MemPlatform::new(platform, crate::frozen::fs()));
+        let platform: Box<dyn Platform> = Box::new(crate::platform::MemPlatform::new(
+            platform,
+            crate::frozen::fs(),
+        ));
         let start_ns = platform.monotonic_ns();
         let types = Types::create();
         let builtins = Object::new(Kind::Dict(RefCell::new(PyDict::new())));
@@ -335,7 +342,8 @@ impl Interp {
     }
 
     pub fn write_stdout(&mut self, s: &str) {
-        self.out.extend_from_slice(lumen_common::smuggle::unescape_text(s).as_bytes());
+        self.out
+            .extend_from_slice(lumen_common::smuggle::unescape_text(s).as_bytes());
         if self.out.len() > 1 << 16 {
             self.flush_out();
         }
@@ -376,7 +384,14 @@ impl Interp {
 
     // ---- frames ----------------------------------------------------------------------------
 
-    pub fn new_frame(&self, code: Rc<Code>, globals: Obj, names: Option<Obj>, func: Option<Obj>, closure: &[Obj]) -> Frame {
+    pub fn new_frame(
+        &self,
+        code: Rc<Code>,
+        globals: Obj,
+        names: Option<Obj>,
+        func: Option<Obj>,
+        closure: &[Obj],
+    ) -> Frame {
         let mut cells: Vec<Obj> = Vec::with_capacity(code.cellvars.len() + closure.len());
         for _ in 0..code.cellvars.len() {
             cells.push(Object::new(Kind::Cell(RefCell::new(None))));
@@ -788,7 +803,14 @@ impl Interp {
                             } else {
                                 format!("cannot access local variable '{}' where it is not associated with a value", n)
                             };
-                            return Err(self.new_exc_str(if free { "NameError" } else { "UnboundLocalError" }, &msg));
+                            return Err(self.new_exc_str(
+                                if free {
+                                    "NameError"
+                                } else {
+                                    "UnboundLocalError"
+                                },
+                                &msg,
+                            ));
                         }
                     }
                 }
@@ -1045,10 +1067,15 @@ impl Interp {
                 }
                 Op::BuildSlice(n) => {
                     let fr = fr!();
-                    let step = if n == 3 { fr.stack.pop().unwrap() } else { Value::None };
+                    let step = if n == 3 {
+                        fr.stack.pop().unwrap()
+                    } else {
+                        Value::None
+                    };
                     let stop = fr.stack.pop().unwrap();
                     let start = fr.stack.pop().unwrap();
-                    fr.stack.push(Value::Obj(Object::new(Kind::Slice(start, stop, step))));
+                    fr.stack
+                        .push(Value::Obj(Object::new(Kind::Slice(start, stop, step))));
                 }
                 Op::BuildString(n) => {
                     let at = fr!().stack.len() - n as usize;
@@ -1157,7 +1184,10 @@ impl Interp {
                         Some(s) => s.as_str().unwrap_or("").to_string(),
                         None => String::new(),
                     };
-                    let out = if spec_s.is_empty() && v.as_str().is_some() && matches!(&v, Value::Obj(o) if o.cls.is_none()) {
+                    let out = if spec_s.is_empty()
+                        && v.as_str().is_some()
+                        && matches!(&v, Value::Obj(o) if o.cls.is_none())
+                    {
                         v
                     } else {
                         Value::string(self.format_value(&v, &spec_s)?)
@@ -1166,10 +1196,26 @@ impl Interp {
                 }
                 Op::MakeFunction(flags) => {
                     let code = pop!();
-                    let closure = if flags & MF_CLOSURE != 0 { Some(pop!()) } else { None };
-                    let ann = if flags & MF_ANNOTATIONS != 0 { Some(pop!()) } else { None };
-                    let kwd = if flags & MF_KWDEFAULTS != 0 { Some(pop!()) } else { None };
-                    let defaults = if flags & MF_DEFAULTS != 0 { Some(pop!()) } else { None };
+                    let closure = if flags & MF_CLOSURE != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let ann = if flags & MF_ANNOTATIONS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let kwd = if flags & MF_KWDEFAULTS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
+                    let defaults = if flags & MF_DEFAULTS != 0 {
+                        Some(pop!())
+                    } else {
+                        None
+                    };
                     let f = self.make_function(code, closure, ann, kwd, defaults)?;
                     if let Value::Obj(fo) = &f {
                         self.func_created(fo);
@@ -1282,7 +1328,9 @@ impl Interp {
                             if self.frames.len() == entry {
                                 return Ok(y);
                             }
-                            return Err(self.new_exc_str("RuntimeError", "yield outside generator context"));
+                            return Err(
+                                self.new_exc_str("RuntimeError", "yield outside generator context")
+                            );
                         }
                         GenResult::Return(r) => {
                             let fr = fr!();
@@ -1298,7 +1346,8 @@ impl Interp {
                 }
                 Op::GetYieldFromIter => {
                     let v = pop!();
-                    let is_gen = matches!(&v, Value::Obj(o) if matches!(o.kind, Kind::Generator(_)));
+                    let is_gen =
+                        matches!(&v, Value::Obj(o) if matches!(o.kind, Kind::Generator(_)));
                     let it = if is_gen { v } else { self.get_iter(&v)? };
                     push!(it);
                 }
@@ -1388,7 +1437,11 @@ impl Interp {
                 }
                 Op::ExcStarEnd => {
                     let rest = pop!();
-                    let rest = if rest.is_none() { rest } else { crate::builtins::excgroup::star_unwrap(rest) };
+                    let rest = if rest.is_none() {
+                        rest
+                    } else {
+                        crate::builtins::excgroup::star_unwrap(rest)
+                    };
                     push!(rest);
                 }
                 Op::Reraise => {
@@ -1436,7 +1489,11 @@ impl Interp {
                 }
                 Op::WithCallExit => {
                     let exit = pop!();
-                    let r = self.call(&exit, vec![Value::None, Value::None, Value::None], Vec::new())?;
+                    let r = self.call(
+                        &exit,
+                        vec![Value::None, Value::None, Value::None],
+                        Vec::new(),
+                    )?;
                     push!(r);
                 }
                 Op::WithExceptStart => {
@@ -1476,8 +1533,12 @@ impl Interp {
                 Op::ImportName(i) => {
                     let fromlist = pop!();
                     let level = pop!();
-                    let name = fr!().code.names[i as usize].as_str_kind().unwrap_or("").to_string();
-                    let m = self.import_name(&name, level.as_i64().unwrap_or(0) as usize, &fromlist)?;
+                    let name = fr!().code.names[i as usize]
+                        .as_str_kind()
+                        .unwrap_or("")
+                        .to_string();
+                    let m =
+                        self.import_name(&name, level.as_i64().unwrap_or(0) as usize, &fromlist)?;
                     push!(m);
                 }
                 Op::ImportFrom(i) => {
@@ -1570,13 +1631,21 @@ impl Interp {
                 Op::MatchLen(n, star) => {
                     let v = fr!().stack.last().unwrap().clone();
                     let l = self.len_of(&v)?;
-                    let ok = if star { l >= n as usize } else { l == n as usize };
+                    let ok = if star {
+                        l >= n as usize
+                    } else {
+                        l == n as usize
+                    };
                     push!(Value::Bool(ok));
                 }
                 Op::MatchSeqItem(i) => {
                     let v = pop!();
                     let items = self.iterate_to_vec(&v)?;
-                    let idx = if i < 0 { (items.len() as i32 + i) as usize } else { i as usize };
+                    let idx = if i < 0 {
+                        (items.len() as i32 + i) as usize
+                    } else {
+                        i as usize
+                    };
                     push!(items.get(idx).cloned().unwrap_or(Value::None));
                 }
                 Op::MatchStarSlice(before, after) => {
@@ -1628,7 +1697,10 @@ impl Interp {
         match ty {
             Value::Obj(c) if matches!(c.kind, Kind::Type(_)) => {
                 if !self.is_subtype(c, &self.exc_type("BaseException")) {
-                    return Err(self.new_exc_str("TypeError", "catching classes that do not inherit from BaseException is not allowed"));
+                    return Err(self.new_exc_str(
+                        "TypeError",
+                        "catching classes that do not inherit from BaseException is not allowed",
+                    ));
                 }
                 match exc {
                     Value::Obj(e) => {
@@ -1638,7 +1710,10 @@ impl Interp {
                     _ => Ok(false),
                 }
             }
-            _ => Err(self.new_exc_str("TypeError", "catching classes that do not inherit from BaseException is not allowed")),
+            _ => Err(self.new_exc_str(
+                "TypeError",
+                "catching classes that do not inherit from BaseException is not allowed",
+            )),
         }
     }
 
@@ -1655,7 +1730,9 @@ impl Interp {
                     self.no_tb = true;
                     return Ok(h.clone());
                 }
-                None => return Err(self.new_exc_str("RuntimeError", "No active exception to reraise")),
+                None => {
+                    return Err(self.new_exc_str("RuntimeError", "No active exception to reraise"))
+                }
             },
             Some(e) => e,
         };
@@ -1677,11 +1754,17 @@ impl Interp {
     fn exc_from_value(&mut self, v: Value) -> R<Obj> {
         match &v {
             Value::Obj(o) if matches!(o.kind, Kind::Exception(_)) => Ok(o.clone()),
-            Value::Obj(o) if matches!(o.kind, Kind::Type(_)) && self.is_subtype(o, &self.exc_type("BaseException")) => {
+            Value::Obj(o)
+                if matches!(o.kind, Kind::Type(_))
+                    && self.is_subtype(o, &self.exc_type("BaseException")) =>
+            {
                 let r = self.call(&v, Vec::new(), Vec::new())?;
                 match r {
                     Value::Obj(e) if matches!(e.kind, Kind::Exception(_)) => Ok(e),
-                    _ => Err(self.new_exc_str("TypeError", "calling exception class did not return an exception instance")),
+                    _ => Err(self.new_exc_str(
+                        "TypeError",
+                        "calling exception class did not return an exception instance",
+                    )),
                 }
             }
             _ => Err(self.new_exc_str("TypeError", "exceptions must derive from BaseException")),
@@ -1714,14 +1797,19 @@ fn cell_name(code: &Code, i: usize) -> String {
     if i < code.cellvars.len() {
         code.cellvars[i].to_string()
     } else {
-        code.freevars.get(i - code.cellvars.len()).map(|s| s.to_string()).unwrap_or_default()
+        code.freevars
+            .get(i - code.cellvars.len())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
     }
 }
 
 pub fn dict_get_name(d: &Obj, name: &Obj) -> Option<Value> {
     if let (Kind::Dict(dd), Kind::Str(s)) = (&d.kind, &name.kind) {
         let dd = dd.borrow();
-        return dd.find_str(s.hash(), &s.s).and_then(|i| dd.get(i).map(|e| e.val.clone()));
+        return dd
+            .find_str(s.hash(), &s.s)
+            .and_then(|i| dd.get(i).map(|e| e.val.clone()));
     }
     None
 }
@@ -1750,7 +1838,9 @@ pub fn dict_del_name(d: &Obj, name: &Obj) -> Option<Value> {
 pub fn dict_get_str(d: &Obj, name: &str) -> Option<Value> {
     if let Kind::Dict(dd) = &d.kind {
         let dd = dd.borrow();
-        return dd.find_str(hash_str(name), name).and_then(|i| dd.get(i).map(|e| e.val.clone()));
+        return dd
+            .find_str(hash_str(name), name)
+            .and_then(|i| dd.get(i).map(|e| e.val.clone()));
     }
     None
 }

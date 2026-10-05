@@ -16,74 +16,18 @@ pub use lumen_common::smuggle::{
 
 /// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
 pub fn units(s: &str) -> Vec<u16> {
-    // ASCII fast path: units are exactly the bytes (no surrogates, no smuggling possible).
-    if s.is_ascii() {
-        return s.as_bytes().iter().map(|&b| b as u16).collect();
-    }
-    let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        match smuggled(c) {
-            Some(u) => out.push(u),
-            None => {
-                let mut buf = [0u16; 2];
-                out.extend_from_slice(c.encode_utf16(&mut buf));
-            }
-        }
-    }
-    out
+    lumen_common::smuggle::utf16_units(s)
 }
 
 /// The UTF-16 length of `s` without materializing the units.
 pub fn unit_len(s: &str) -> usize {
-    if s.is_ascii() {
-        return s.len();
-    }
-    s.chars()
-        .map(|c| {
-            if smuggled(c).is_some() {
-                1
-            } else {
-                c.len_utf16()
-            }
-        })
-        .sum()
+    lumen_common::smuggle::utf16_unit_len(s)
 }
 
 /// Rebuild a string from code units: valid surrogate pairs combine into their code point, lone
 /// surrogates are smuggled.
 pub fn from_units(units: &[u16]) -> String {
-    // ASCII fast path: no pairs or smuggling below 0x80.
-    if units.iter().all(|&u| u < 0x80) {
-        let bytes: Vec<u8> = units.iter().map(|&u| u as u8).collect();
-        return String::from_utf8(bytes).unwrap();
-    }
-    let mut out = String::with_capacity(units.len());
-    let mut i = 0;
-    while i < units.len() {
-        let u = units[i] as u32;
-        if (0xD800..0xDC00).contains(&u)
-            && i + 1 < units.len()
-            && (0xDC00..0xE000).contains(&(units[i + 1] as u32))
-        {
-            let c = 0x10000 + ((u - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00);
-            if c < SMUGGLE_BASE {
-                out.push(char::from_u32(c).unwrap());
-            } else {
-                // A real character in the smuggle range is stored as its smuggled pair.
-                out.push(smuggle(units[i]));
-                out.push(smuggle(units[i + 1]));
-            }
-            i += 2;
-            continue;
-        }
-        if (0xD800..0xE000).contains(&u) {
-            out.push(smuggle(units[i]));
-        } else {
-            out.push(char::from_u32(u).unwrap());
-        }
-        i += 1;
-    }
-    out
+    lumen_common::smuggle::utf16_from_units(units)
 }
 
 /// The single-unit string for one code unit.
@@ -115,10 +59,12 @@ pub fn cmp_units(a: &str, b: &str) -> std::cmp::Ordering {
     // two ASCII bytes, or when one string is a prefix of the other (it ends on a character
     // boundary, so its units are a prefix too).
     let (x, y) = (a.as_bytes(), b.as_bytes());
-    match x.iter().zip(y).position(|(p, q)| p != q) {
-        None => return x.len().cmp(&y.len()),
-        Some(k) if x[k] < 0x80 && y[k] < 0x80 => return x[k].cmp(&y[k]),
-        Some(_) => {}
+    let k = lumen_common::scan::common_prefix(x, y);
+    if k == x.len().min(y.len()) {
+        return x.len().cmp(&y.len());
+    }
+    if x[k] < 0x80 && y[k] < 0x80 {
+        return x[k].cmp(&y[k]);
     }
     let mut ia = UnitIter::new(a);
     let mut ib = UnitIter::new(b);
@@ -304,7 +250,13 @@ mod tests {
     fn well_formed_undoes_smuggling() {
         // U+10FFFF and U+10F800 (stored as smuggled pairs), a lone low and a lone high surrogate.
         let s = super::from_units(&[0x78, 0xDBFF, 0xDFFF, 0xDBFE, 0xDC00, 0xDC00, 0xD800, 0x79]);
-        assert_eq!(super::well_formed(&s), "x\u{10FFFF}\u{10F800}\u{FFFD}\u{FFFD}y");
-        assert!(matches!(super::well_formed("plain é"), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            super::well_formed(&s),
+            "x\u{10FFFF}\u{10F800}\u{FFFD}\u{FFFD}y"
+        );
+        assert!(matches!(
+            super::well_formed("plain é"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

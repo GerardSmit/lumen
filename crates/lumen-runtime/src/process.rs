@@ -3,14 +3,13 @@
 //! Node ecosystem (morgan et al.) to log and time; the fuller `node:process` surface is layered
 //! on in lumen-node.
 
-use std::io::{Read, Write};
 use lumen_host::time::Instant;
+use std::io::{Read, Write};
 
 use lumen::embed::{JsFunction, OpError};
 use lumen_bind::NativeError;
 use lumen_host::{
-    CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId,
-    TaskRegistry, Value,
+    CompletionSender, Ctx, Engine, Extension, OpState, RealmProcess, TaskId, TaskRegistry, Value,
 };
 
 use crate::console::ConsoleOut;
@@ -52,7 +51,12 @@ pub(crate) fn install_data_props(
 
     let (args, vars): (Vec<String>, Vec<(String, String)>) = match embedded {
         Some((argv, env)) => (argv.to_vec(), env.to_vec()),
-        None => (startup_args().to_vec(), std::env::vars().collect()),
+        None => (
+            startup_args().to_vec(),
+            std::env::vars()
+                .filter(|(key, _)| public_environment_key(key))
+                .collect(),
+        ),
     };
     let argv0_str = args.first().cloned().unwrap_or_else(|| "lumen".to_string());
     let argv: Vec<Value> = args.into_iter().map(Value::from_string).collect();
@@ -73,7 +77,9 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "execPath", Value::from_string(exec_path));
 
-    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| panic!("startup environment exceeds realm limits"));
+    crate::process_env::replace(ctx, vars, cfg!(windows)).unwrap_or_else(|_| {
+        panic!("invalid startup environment (invalid key/value or realm limit exceeded)")
+    });
 
     #[cfg(target_arch = "wasm32")]
     let (os_name, arch_name) = ("linux", "wasm32");
@@ -87,7 +93,11 @@ pub(crate) fn install_data_props(
     };
     let _ = ctx.set_member(&process, "platform", Value::str(platform));
 
-    let _ = ctx.set_member(&process, "pid", Value::Num(lumen_host::sysfs::process_id() as f64));
+    let _ = ctx.set_member(
+        &process,
+        "pid",
+        Value::Num(lumen_host::sysfs::process_id() as f64),
+    );
     // Node's architecture names, not Rust's (native addons resolve their platform binary by these).
     let arch = match arch_name {
         "x86_64" => "x64",
@@ -105,8 +115,21 @@ pub(crate) fn install_data_props(
 /// js/env_proxy.js, precompiled by build.rs.
 const ENV_PROXY_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/env_proxy.aot"));
 
+fn public_environment_key(key: &str) -> bool {
+    // Windows stores per-drive working directories under hidden names such as
+    // `=C:`. These are OS bookkeeping, not process.env keys.
+    !cfg!(windows) || !key.starts_with('=')
+}
 
-
+#[cfg(test)]
+mod startup_environment_tests {
+    #[test]
+    fn windows_drive_state_is_not_a_public_environment_variable() {
+        assert!(super::public_environment_key("PATH"));
+        assert!(super::public_environment_key("LUMEN_TEST"));
+        assert_eq!(super::public_environment_key("=C:"), !cfg!(windows));
+    }
+}
 
 fn decode_stdin_read(
     ctx: &mut Ctx,
@@ -121,8 +144,6 @@ fn decode_stdin_read(
         Err(message) => Err(OpError::from(NativeError::runtime(message)).to_value(ctx)),
     }
 }
-
-
 
 #[cfg(windows)]
 fn terminal_size(fd: i32) -> Option<(u16, u16)> {
@@ -173,7 +194,9 @@ fn write_raw(ctx: &mut Ctx, arg: &Value, to_err: bool) -> Result<(), OpError> {
     let bytes = match ctx.typed_array_bytes(arg) {
         Some(b) => b,
         // Lone surrogates as U+FFFD, like Node's utf8 (see `lumen_host::well_formed_utf8`).
-        None => lumen_host::well_formed_utf8(&ctx.coerce_string(arg)?).as_bytes().to_vec(),
+        None => lumen_host::well_formed_utf8(&ctx.coerce_string(arg)?)
+            .as_bytes()
+            .to_vec(),
     };
     let sinks = ctx
         .host_mut::<ConsoleOut>()
@@ -189,13 +212,14 @@ fn write_raw(ctx: &mut Ctx, arg: &Value, to_err: bool) -> Result<(), OpError> {
     // failures stay silent, as console's do.
     if let Err(e) = written {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
-            return Err(NativeError::runtime("write EPIPE").with_prop("code", "EPIPE").with_prop("syscall", "write").into());
+            return Err(NativeError::runtime("write EPIPE")
+                .with_prop("code", "EPIPE")
+                .with_prop("syscall", "write")
+                .into());
         }
     }
     Ok(())
 }
-
-
 
 /// The OS process's argv as it was at startup. Setting `process.title` reuses argv's memory (as
 /// libuv does), after which the live argv no longer reads back the arguments.
@@ -203,8 +227,6 @@ fn startup_args() -> &'static [String] {
     static ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     ARGS.get_or_init(|| std::env::args().collect())
 }
-
-
 
 #[cfg(target_os = "macos")]
 fn set_os_title(title: &str) {
@@ -237,8 +259,12 @@ fn set_os_title(title: &str) {
 #[cfg(target_os = "linux")]
 fn set_os_title(title: &str) {
     // /proc/self/stat fields 48 and 49 (after the parenthesized comm): the argv area's bounds.
-    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else { return };
-    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else { return };
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return;
+    };
+    let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return;
+    };
     let fields: Vec<&str> = rest.split_whitespace().collect();
     let (Some(start), Some(end)) = (
         fields.get(45).and_then(|f| f.parse::<usize>().ok()),
@@ -274,8 +300,6 @@ unsafe fn overwrite_args(start: *mut u8, cap: usize, title: &str) {
     std::ptr::write_bytes(start.add(n), 0, cap - n + 1);
 }
 
-
-
 /// In an embedded realm, `process.exit` / `process.abort` end the realm, not the host: record the
 /// code, raise the interrupt, and throw so the calling code unwinds now — the engine rethrows at
 /// every safe point after this, so a `catch` around the call cannot keep the program running.
@@ -298,8 +322,10 @@ fn end_realm_or_process(ctx: &mut Ctx, code: i32) -> Result<(), NativeError> {
 /// cannot be granted to a realm that shares a process with its host.
 fn refuse_in_realm(ctx: &mut Ctx, what: &str) -> Result<(), NativeError> {
     if ctx.op_state().get::<RealmProcess>().is_some() {
-        return Err(NativeError::runtime(format!("{what} is not available to a program embedded in a host process"))
-            .with_code("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"));
+        return Err(NativeError::runtime(format!(
+            "{what} is not available to a program embedded in a host process"
+        ))
+        .with_code("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"));
     }
     Ok(())
 }
@@ -311,10 +337,6 @@ fn refuse_in_realm(ctx: &mut Ctx, what: &str) -> Result<(), NativeError> {
 pub(crate) struct TickQueue {
     pub(crate) queue: std::collections::VecDeque<(Value, Vec<Value>)>,
 }
-
-
-
-
 
 /// libuv's errno for `code` on this platform.
 fn uv_errno(code: &str) -> i32 {
@@ -328,7 +350,6 @@ fn kill_error(code: &str, errno: i32) -> NativeError {
         .with_prop("errno", errno)
         .with_prop("syscall", "kill")
 }
-
 
 /// `process.kill` of a child realm's stand-in pid: delivered by the realm that launched it.
 /// `None` for any other pid.
@@ -346,12 +367,6 @@ fn kill_child_realm(ctx: &mut Ctx, pid: i32, signal: i32) -> Option<Result<(), N
         Err(kill_error("ESRCH", uv_errno("ESRCH")))
     })
 }
-
-
-
-
-
-
 
 /// Node's error for a failed identity change: `Error: EPERM, Operation not permitted` with
 /// `code`, `errno` and `syscall`.
@@ -570,9 +585,13 @@ mod proc_internal {
         if (1..64).contains(&signal) {
             let bit = 1u64 << signal;
             if listening {
-                realm.signal_handlers.fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
+                realm
+                    .signal_handlers
+                    .fetch_or(bit, std::sync::atomic::Ordering::SeqCst);
             } else {
-                realm.signal_handlers.fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
+                realm
+                    .signal_handlers
+                    .fetch_and(!bit, std::sync::atomic::Ordering::SeqCst);
             }
         }
         true
@@ -613,7 +632,12 @@ mod proc_internal {
     }
 
     #[op(name = "execve", coerce)]
-    fn op_execve(ctx: &mut Ctx, path: String, argv: String, env: String) -> Result<(), NativeError> {
+    fn op_execve(
+        ctx: &mut Ctx,
+        path: String,
+        argv: String,
+        env: String,
+    ) -> Result<(), NativeError> {
         os::execve(ctx, &path, &argv, &env)
     }
 
@@ -778,7 +802,11 @@ fn os_kill(ctx: &mut Ctx, pid: i32, sig: i32) -> Result<(), NativeError> {
         _ => kill_error("UNKNOWN", uv_errno("UNKNOWN")),
     };
     // pid 0 means this process, as in libuv.
-    let pid = if pid == 0 { lumen_host::sysfs::process_id() } else { pid as u32 };
+    let pid = if pid == 0 {
+        lumen_host::sysfs::process_id()
+    } else {
+        pid as u32
+    };
     let access = PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION | SYNCHRONIZE;
     // SAFETY: plain Win32 calls; the handle is closed on every path below.
     let handle = unsafe { OpenProcess(access, 0, pid) };
@@ -811,7 +839,9 @@ fn os_kill(ctx: &mut Ctx, pid: i32, sig: i32) -> Result<(), NativeError> {
 
 #[cfg(not(any(unix, windows)))]
 fn os_kill(ctx: &mut Ctx, _pid: i32, _sig: i32) -> Result<(), NativeError> {
-    Err(NativeError::runtime("process.kill is not supported on this platform"))
+    Err(NativeError::runtime(
+        "process.kill is not supported on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -851,7 +881,12 @@ mod os {
         lumen_os::proc::getppid() as f64
     }
 
-    pub(super) fn execve(ctx: &mut Ctx, path: &str, argv: &str, env: &str) -> Result<(), NativeError> {
+    pub(super) fn execve(
+        ctx: &mut Ctx,
+        path: &str,
+        argv: &str,
+        env: &str,
+    ) -> Result<(), NativeError> {
         refuse_in_realm(ctx, "process.execve")?;
         if path.contains('\0') {
             return Err(NativeError::type_error("execve path contains a null byte"));
@@ -859,19 +894,28 @@ mod os {
         let argv: Vec<&str> = argv.split('\0').filter(|value| !value.is_empty()).collect();
         let env: Vec<&str> = env.split('\0').filter(|value| !value.is_empty()).collect();
         let e = lumen_os::ident::execve(path, &argv, &env);
-        Err(NativeError::runtime(format!("execve failed: {} (os error {})", e.message(), e.errno())))
+        Err(NativeError::runtime(format!(
+            "execve failed: {} (os error {})",
+            e.message(),
+            e.errno()
+        )))
     }
 
     /// Node's error for a failed identity change: `Error: EPERM, Operation not permitted` with
     /// `code`, `errno` and `syscall`.
-    fn identity_result(result: Result<(), lumen_os::FsError>, syscall: &str) -> Result<(), NativeError> {
+    fn identity_result(
+        result: Result<(), lumen_os::FsError>,
+        syscall: &str,
+    ) -> Result<(), NativeError> {
         let Err(e) = result else {
             return Ok(());
         };
-        Err(NativeError::runtime(format!("{}, {}", e.code(), e.message()))
-            .with_prop("code", e.code())
-            .with_prop("errno", -e.errno())
-            .with_prop("syscall", syscall.to_string()))
+        Err(
+            NativeError::runtime(format!("{}, {}", e.code(), e.message()))
+                .with_prop("code", e.code())
+                .with_prop("errno", -e.errno())
+                .with_prop("syscall", syscall.to_string()),
+        )
     }
 
     pub(super) fn uid_of(name: &str) -> Option<f64> {
@@ -952,8 +996,15 @@ mod os {
         // getppid is meaningless without the unix parent model; 0 is the honest "unknown".
         0.0
     }
-    pub(super) fn execve(ctx: &mut Ctx, _path: &str, _argv: &str, _env: &str) -> Result<(), NativeError> {
-        Err(NativeError::runtime("process.execve is not supported on this platform"))
+    pub(super) fn execve(
+        ctx: &mut Ctx,
+        _path: &str,
+        _argv: &str,
+        _env: &str,
+    ) -> Result<(), NativeError> {
+        Err(NativeError::runtime(
+            "process.execve is not supported on this platform",
+        ))
     }
     pub(super) fn uid_of(_name: &str) -> Option<f64> {
         None
@@ -965,24 +1016,36 @@ mod os {
         None
     }
     pub(super) fn setuid(ctx: &mut Ctx, _id: u32) -> Result<(), NativeError> {
-        Err(NativeError::runtime("setuid is not supported on this platform"))
+        Err(NativeError::runtime(
+            "setuid is not supported on this platform",
+        ))
     }
     pub(super) fn seteuid(ctx: &mut Ctx, _id: u32) -> Result<(), NativeError> {
-        Err(NativeError::runtime("seteuid is not supported on this platform"))
+        Err(NativeError::runtime(
+            "seteuid is not supported on this platform",
+        ))
     }
     pub(super) fn setgid(ctx: &mut Ctx, _id: u32) -> Result<(), NativeError> {
-        Err(NativeError::runtime("setgid is not supported on this platform"))
+        Err(NativeError::runtime(
+            "setgid is not supported on this platform",
+        ))
     }
     pub(super) fn setegid(ctx: &mut Ctx, _id: u32) -> Result<(), NativeError> {
-        Err(NativeError::runtime("setegid is not supported on this platform"))
+        Err(NativeError::runtime(
+            "setegid is not supported on this platform",
+        ))
     }
     pub(super) fn getgroups(_ctx: &mut Ctx) -> Result<Vec<f64>, NativeError> {
         Ok(Vec::new())
     }
     pub(super) fn setgroups(ctx: &mut Ctx, _text: &str) -> Result<(), NativeError> {
-        Err(NativeError::runtime("setgroups is not supported on this platform"))
+        Err(NativeError::runtime(
+            "setgroups is not supported on this platform",
+        ))
     }
     pub(super) fn initgroups(ctx: &mut Ctx, _user: &str, _group: u32) -> Result<(), NativeError> {
-        Err(NativeError::runtime("initgroups is not supported on this platform"))
+        Err(NativeError::runtime(
+            "initgroups is not supported on this platform",
+        ))
     }
 }

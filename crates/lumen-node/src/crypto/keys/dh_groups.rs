@@ -95,5 +95,8 @@ pub fn dh_group(name: &str) -> Option<(BigUint, BigUint)> {
         ),
         _ => return None,
     };
-    Some((BigUint::parse_bytes(hex.as_bytes(), 16)?, BigUint::from(2u8)))
+    Some((
+        BigUint::parse_bytes(hex.as_bytes(), 16)?,
+        BigUint::from(2u8),
+    ))
 }

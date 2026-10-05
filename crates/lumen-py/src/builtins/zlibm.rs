@@ -22,7 +22,9 @@ pub mod zlib {
     use crate::builtins::decompressor::{Chunk, Codec, Decompressor, Failure};
     use crate::object::*;
     use crate::vm::{dict_set_str, Interp};
-    use lumen_common::compress::{self as zc, ZStream, Z_BUF_ERROR, Z_FINISH, Z_NEED_DICT, Z_OK, Z_STREAM_END, Z_STREAM_ERROR};
+    use lumen_common::compress::{
+        self as zc, ZStream, Z_BUF_ERROR, Z_FINISH, Z_NEED_DICT, Z_OK, Z_STREAM_END, Z_STREAM_ERROR,
+    };
 
     const Z_NO_FLUSH: i32 = 0;
     const Z_SYNC_FLUSH: i32 = 2;
@@ -69,7 +71,11 @@ pub mod zlib {
 
     fn c_int(it: &mut Interp, v: i64) -> R<i32> {
         i32::try_from(v).map_err(|_| {
-            let msg = if v < 0 { "signed integer is less than minimum" } else { "signed integer is greater than maximum" };
+            let msg = if v < 0 {
+                "signed integer is less than minimum"
+            } else {
+                "signed integer is greater than maximum"
+            };
             it.new_exc_str("OverflowError", msg)
         })
     }
@@ -90,7 +96,14 @@ pub mod zlib {
     /// Runs `z` over `input` until it stops filling the output window (all input consumed or
     /// the stream ended), the output reaches `max`, or zlib reports an error. A `Z_NEED_DICT`
     /// is answered with `zdict` when one is given.
-    fn drive(z: &mut ZStream, input: &[u8], flush: i32, first: usize, max: Option<usize>, zdict: Option<&[u8]>) -> Run {
+    fn drive(
+        z: &mut ZStream,
+        input: &[u8],
+        flush: i32,
+        first: usize,
+        max: Option<usize>,
+        zdict: Option<&[u8]>,
+    ) -> Run {
         let mut out: Vec<u8> = Vec::new();
         let (mut produced, mut consumed, mut code) = (0, 0, Z_OK);
         loop {
@@ -98,7 +111,11 @@ pub mod zlib {
                 if max.is_some_and(|m| produced >= m) {
                     break;
                 }
-                let grow = if out.is_empty() { first.max(1) } else { out.len() };
+                let grow = if out.is_empty() {
+                    first.max(1)
+                } else {
+                    out.len()
+                };
                 let len = max.map_or(out.len() + grow, |m| (out.len() + grow).min(m));
                 out.resize(len, 0);
             }
@@ -118,12 +135,19 @@ pub mod zlib {
                     None => break,
                 }
             }
-            if !matches!(code, Z_OK | Z_BUF_ERROR | Z_STREAM_END) || code == Z_STREAM_END || produced < out.len() {
+            if !matches!(code, Z_OK | Z_BUF_ERROR | Z_STREAM_END)
+                || code == Z_STREAM_END
+                || produced < out.len()
+            {
                 break;
             }
         }
         out.truncate(produced);
-        Run { out, consumed, code }
+        Run {
+            out,
+            consumed,
+            code,
+        }
     }
 
     /// Returns a bytes object containing compressed data.
@@ -134,8 +158,19 @@ pub mod zlib {
     ///     Compression level, in 0-9 or -1.
     ///   wbits
     ///     The window buffer size and container format.
-    #[op(hint(py(text_signature = "($module, data, /, level=Z_DEFAULT_COMPRESSION, wbits=MAX_WBITS)")))]
-    fn compress(it: &mut Interp, data: &Value, #[kw] #[default(-1)] level: i64, #[kw] #[default(15)] wbits: i64) -> R<Vec<u8>> {
+    #[op(hint(py(
+        text_signature = "($module, data, /, level=Z_DEFAULT_COMPRESSION, wbits=MAX_WBITS)"
+    )))]
+    fn compress(
+        it: &mut Interp,
+        data: &Value,
+        #[kw]
+        #[default(-1)]
+        level: i64,
+        #[kw]
+        #[default(15)]
+        wbits: i64,
+    ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let (level, wbits) = (c_int(it, level)?, c_int(it, wbits)?);
         let mut z = match ZStream::deflate(level, wbits, DEF_MEM_LEVEL, 0) {
@@ -159,14 +194,31 @@ pub mod zlib {
     ///   bufsize
     ///     The initial output buffer size.
     #[op(hint(py(text_signature = "($module, data, /, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)")))]
-    fn decompress(it: &mut Interp, data: &Value, #[kw] #[default(15)] wbits: i64, #[kw] #[default(16384)] bufsize: i64) -> R<Vec<u8>> {
+    fn decompress(
+        it: &mut Interp,
+        data: &Value,
+        #[kw]
+        #[default(15)]
+        wbits: i64,
+        #[kw]
+        #[default(16384)]
+        bufsize: i64,
+    ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let wbits = c_int(it, wbits)?;
         if bufsize < 0 {
             return Err(it.value_error("bufsize must be non-negative"));
         }
-        let mut z = ZStream::inflate(wbits).map_err(|code| zlib_error(it, None, code, "while preparing to decompress data"))?;
-        let r = drive(&mut z, &data, Z_FINISH, (bufsize as usize).max(1), None, None);
+        let mut z = ZStream::inflate(wbits)
+            .map_err(|code| zlib_error(it, None, code, "while preparing to decompress data"))?;
+        let r = drive(
+            &mut z,
+            &data,
+            Z_FINISH,
+            (bufsize as usize).max(1),
+            None,
+            None,
+        );
         if r.code != Z_STREAM_END {
             return Err(zlib_error(it, Some(&z), r.code, "while decompressing data"));
         }
@@ -196,18 +248,35 @@ pub mod zlib {
     ///   zdict
     ///     The predefined compression dictionary - a sequence of bytes
     ///     containing subsequences that are likely to occur in the input data.
-    #[op(hint(py(text_signature = "($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED,\n            wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,\n            strategy=Z_DEFAULT_STRATEGY, zdict=None)")))]
+    #[op(hint(py(
+        text_signature = "($module, /, level=Z_DEFAULT_COMPRESSION, method=DEFLATED,\n            wbits=MAX_WBITS, memLevel=DEF_MEM_LEVEL,\n            strategy=Z_DEFAULT_STRATEGY, zdict=None)"
+    )))]
     #[allow(non_snake_case)]
     fn compressobj(
         it: &mut Interp,
-        #[kw] #[default(-1)] level: i64,
-        #[kw] #[default(8)] method: i64,
-        #[kw] #[default(15)] wbits: i64,
-        #[kw] #[default(8)] memLevel: i64,
-        #[kw] #[default(0)] strategy: i64,
+        #[kw]
+        #[default(-1)]
+        level: i64,
+        #[kw]
+        #[default(8)]
+        method: i64,
+        #[kw]
+        #[default(15)]
+        wbits: i64,
+        #[kw]
+        #[default(8)]
+        memLevel: i64,
+        #[kw]
+        #[default(0)]
+        strategy: i64,
         #[kw] zdict: Option<&Value>,
     ) -> R<Value> {
-        let (level, wbits, mem_level, strategy) = (c_int(it, level)?, c_int(it, wbits)?, c_int(it, memLevel)?, c_int(it, strategy)?);
+        let (level, wbits, mem_level, strategy) = (
+            c_int(it, level)?,
+            c_int(it, wbits)?,
+            c_int(it, memLevel)?,
+            c_int(it, strategy)?,
+        );
         let zdict = match zdict {
             Some(v) => Some(buffer(it, v)?),
             None => None,
@@ -218,7 +287,14 @@ pub mod zlib {
         let mut z = match ZStream::deflate(level, wbits, mem_level, strategy) {
             Ok(z) => z,
             Err(Z_STREAM_ERROR) => return Err(it.value_error("Invalid initialization option")),
-            Err(code) => return Err(zlib_error(it, None, code, "while creating compression object")),
+            Err(code) => {
+                return Err(zlib_error(
+                    it,
+                    None,
+                    code,
+                    "while creating compression object",
+                ));
+            }
         };
         if let Some(d) = zdict {
             match z.set_dictionary(&d) {
@@ -238,18 +314,32 @@ pub mod zlib {
     ///     The predefined compression dictionary.  This must be the same
     ///     dictionary as used by the compressor that produced the input data.
     #[op(hint(py(text_signature = "($module, /, wbits=MAX_WBITS, zdict=b'')")))]
-    fn decompressobj(it: &mut Interp, #[kw] #[default(15)] wbits: i64, #[kw] zdict: Option<&Value>) -> R<Value> {
+    fn decompressobj(
+        it: &mut Interp,
+        #[kw]
+        #[default(15)]
+        wbits: i64,
+        #[kw] zdict: Option<&Value>,
+    ) -> R<Value> {
         let wbits = c_int(it, wbits)?;
         let zdict = zdict_arg(it, zdict)?;
         let z = new_inflate(it, wbits, zdict.as_deref())?;
-        let d = Decompress { z: Some(z), zdict, unused_data: Vec::new(), unconsumed_tail: Vec::new(), eof: false };
+        let d = Decompress {
+            z: Some(z),
+            zdict,
+            unused_data: Vec::new(),
+            unconsumed_tail: Vec::new(),
+            eof: false,
+        };
         Ok(Py::new(it, d).value().clone())
     }
 
     fn zdict_arg(it: &mut Interp, zdict: Option<&Value>) -> R<Option<Vec<u8>>> {
         match zdict {
             None => Ok(None),
-            Some(v) => buffer(it, v).map(Some).map_err(|_| it.type_error("zdict argument must support the buffer protocol")),
+            Some(v) => buffer(it, v)
+                .map(Some)
+                .map_err(|_| it.type_error("zdict argument must support the buffer protocol")),
         }
     }
 
@@ -257,7 +347,14 @@ pub mod zlib {
         let mut z = match ZStream::inflate(wbits) {
             Ok(z) => z,
             Err(Z_STREAM_ERROR) => return Err(it.value_error("Invalid initialization option")),
-            Err(code) => return Err(zlib_error(it, None, code, "while creating decompression object")),
+            Err(code) => {
+                return Err(zlib_error(
+                    it,
+                    None,
+                    code,
+                    "while creating decompression object",
+                ));
+            }
         };
         if let (Some(d), true) = (zdict, wbits < 0) {
             let code = z.set_dictionary(d);
@@ -321,7 +418,12 @@ pub mod zlib {
             let mut s = slf.0.borrow_mut(it)?;
             let Some(z) = s.z.as_mut() else {
                 drop(s);
-                return Err(zlib_error(it, None, Z_STREAM_ERROR, "while compressing data"));
+                return Err(zlib_error(
+                    it,
+                    None,
+                    Z_STREAM_ERROR,
+                    "while compressing data",
+                ));
             };
             let r = drive(z, &data, Z_NO_FLUSH, FIRST_BLOCK, None, None);
             if r.code == Z_STREAM_ERROR {
@@ -364,8 +466,15 @@ pub mod zlib {
             let copied = slf.0.borrow_mut(it)?.z.as_mut().map(|z| z.try_clone());
             match copied {
                 Some(Ok(z)) => Ok(Py::new(it, Compress { z: Some(z) }).value().clone()),
-                None | Some(Err(Z_STREAM_ERROR)) => Err(it.value_error("Inconsistent stream state")),
-                Some(Err(code)) => Err(zlib_error(it, None, code, "while copying compression object")),
+                None | Some(Err(Z_STREAM_ERROR)) => {
+                    Err(it.value_error("Inconsistent stream state"))
+                }
+                Some(Err(code)) => Err(zlib_error(
+                    it,
+                    None,
+                    code,
+                    "while copying compression object",
+                )),
             }
         }
 
@@ -421,7 +530,14 @@ pub mod zlib {
         /// After calling this function, some of the input data may still be stored in
         /// internal buffers for later processing.
         /// Call the flush() method to clear these buffers.
-        fn decompress(slf: This<Py<Self>>, it: &mut Interp, data: &Value, #[kw] #[default(0)] max_length: i64) -> R<Vec<u8>> {
+        fn decompress(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            data: &Value,
+            #[kw]
+            #[default(0)]
+            max_length: i64,
+        ) -> R<Vec<u8>> {
             let data = buffer(it, data)?;
             if max_length < 0 {
                 return Err(it.value_error("max_length must be non-negative"));
@@ -431,7 +547,12 @@ pub mod zlib {
             let s = &mut *guard;
             let Some(z) = s.z.as_mut() else {
                 drop(guard);
-                return Err(zlib_error(it, None, Z_STREAM_ERROR, "while decompressing data"));
+                return Err(zlib_error(
+                    it,
+                    None,
+                    Z_STREAM_ERROR,
+                    "while decompressing data",
+                ));
             };
             let first = max.map_or(FIRST_BLOCK, |m| m.min(FIRST_BLOCK));
             let r = drive(z, &data, Z_SYNC_FLUSH, first, max, s.zdict.as_deref());
@@ -451,15 +572,28 @@ pub mod zlib {
         ///
         ///   length
         ///     the initial size of the output buffer.
-        fn flush(slf: This<Py<Self>>, it: &mut Interp, #[default(16384)] length: i64) -> R<Vec<u8>> {
+        fn flush(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[default(16384)] length: i64,
+        ) -> R<Vec<u8>> {
             if length <= 0 {
                 return Err(it.value_error("length must be greater than zero"));
             }
             let mut guard = slf.0.borrow_mut(it)?;
             let s = &mut *guard;
-            let Some(z) = s.z.as_mut() else { return Ok(Vec::new()) };
+            let Some(z) = s.z.as_mut() else {
+                return Ok(Vec::new());
+            };
             let tail = s.unconsumed_tail.clone();
-            let r = drive(z, &tail, Z_FINISH, length as usize, None, s.zdict.as_deref());
+            let r = drive(
+                z,
+                &tail,
+                Z_FINISH,
+                length as usize,
+                None,
+                s.zdict.as_deref(),
+            );
             s.save_unconsumed(&tail, r.consumed, r.code);
             if r.code == Z_STREAM_END {
                 s.eof = true;
@@ -485,8 +619,15 @@ pub mod zlib {
             };
             match copied {
                 Some(Ok(d)) => Ok(Py::new(it, d).value().clone()),
-                None | Some(Err(Z_STREAM_ERROR)) => Err(it.value_error("Inconsistent stream state")),
-                Some(Err(code)) => Err(zlib_error(it, None, code, "while copying decompression object")),
+                None | Some(Err(Z_STREAM_ERROR)) => {
+                    Err(it.value_error("Inconsistent stream state"))
+                }
+                Some(Err(code)) => Err(zlib_error(
+                    it,
+                    None,
+                    code,
+                    "while copying decompression object",
+                )),
             }
         }
 
@@ -543,7 +684,12 @@ pub mod zlib {
 
         fn run(&mut self, input: &[u8], max: Option<usize>) -> Result<Chunk, i32> {
             let Some(z) = self.z.as_mut() else {
-                return Ok(Chunk { out: Vec::new(), consumed: 0, eof: false, room: true });
+                return Ok(Chunk {
+                    out: Vec::new(),
+                    consumed: 0,
+                    eof: false,
+                    room: true,
+                });
             };
             let first = max.map_or(DEF_BUF_SIZE, |m| m.min(MAX_INITIAL_BUF));
             let r = drive(z, input, Z_SYNC_FLUSH, first, max, self.zdict.as_deref());
@@ -554,22 +700,41 @@ pub mod zlib {
             if eof {
                 self.z = None;
             }
-            Ok(Chunk { out: r.out, consumed: r.consumed, eof, room: true })
+            Ok(Chunk {
+                out: r.out,
+                consumed: r.consumed,
+                eof,
+                room: true,
+            })
         }
     }
 
     #[methods]
     impl ZlibDecompressor {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[kw] #[default(15)] wbits: i64, #[kw] zdict: Option<&Value>) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[kw]
+            #[default(15)]
+            wbits: i64,
+            #[kw] zdict: Option<&Value>,
+        ) -> R<Value> {
             let wbits = c_int(it, wbits)?;
             let zdict = match zdict {
                 Some(v) => Some(buffer(it, v)?),
                 None => None,
             };
             let z = new_inflate(it, wbits, zdict.as_deref())?;
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
-            Ok(opaque_instance(cls, ZlibDecompressor { core: Decompressor::new(Inflate { z: Some(z), zdict }) }))
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
+            Ok(opaque_instance(
+                cls,
+                ZlibDecompressor {
+                    core: Decompressor::new(Inflate { z: Some(z), zdict }),
+                },
+            ))
         }
 
         /// Decompress *data*, returning uncompressed data as bytes.
@@ -586,14 +751,28 @@ pub mod zlib {
         /// Attempting to decompress data after the end of stream is reached raises an
         /// EOFError.  Any data found after the end of the stream is ignored and saved in
         /// the unused_data attribute.
-        fn decompress(slf: This<Py<Self>>, it: &mut Interp, #[kw] data: &Value, #[kw] #[default(-1)] max_length: i64) -> R<Vec<u8>> {
+        fn decompress(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw] data: &Value,
+            #[kw]
+            #[default(-1)]
+            max_length: i64,
+        ) -> R<Vec<u8>> {
             let data = buffer(it, data)?;
-            let max = (0..i64::MAX).contains(&max_length).then_some(max_length as usize);
+            let max = (0..i64::MAX)
+                .contains(&max_length)
+                .then_some(max_length as usize);
             let mut guard = slf.0.borrow_mut(it)?;
             let s = &mut *guard;
             s.core.decompress(&data, max).map_err(|e| match e {
                 Failure::AtEof => it.new_exc_str("EOFError", "End of stream already reached"),
-                Failure::Codec(code) => zlib_error(it, s.core.codec.z.as_ref(), code, "while decompressing data"),
+                Failure::Codec(code) => zlib_error(
+                    it,
+                    s.core.codec.z.as_ref(),
+                    code,
+                    "while decompressing data",
+                ),
             })
         }
 
@@ -621,7 +800,8 @@ pub mod zlib {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let exc = it.exc_type("Exception");
-        let err = crate::builtins::native::new_type(it, "zlib", "error", Some(&exc), Layout::Exception);
+        let err =
+            crate::builtins::native::new_type(it, "zlib", "error", Some(&exc), Layout::Exception);
         dict_set_str(&d, "error", Value::Obj(err.clone()));
         it.native_state::<State>().error = Some(err);
         let ints: [(&str, i64); 20] = [

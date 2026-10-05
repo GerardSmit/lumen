@@ -1,0 +1,28 @@
+[package]
+name = "lumen-html-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
+lumen-bind = { path = "../lumen-bind" }
+lumen-host = { path = "../lumen-host", default-features = false }
+lumen-html = { path = "../lumen-html" }
+lumen-html-image = { path = "../lumen-html-image" }
+lumen-html-text = { path = "../lumen-html-text" }
+lumen-common = { path = "../lumen-common", features = ["cookies"] }
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+
+[dev-dependencies]
+lumen = { path = "../lumen", default-features = false, features = ["embed", "compiler"] }
+lumen-runtime = { path = "../lumen-runtime" }
+lumen-os = { path = "../lumen-os" }
+
+[[test]]
+name = "frameworks"
+path = "tests/frameworks/main.rs"
+
+[lints]
+workspace = true

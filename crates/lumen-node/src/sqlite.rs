@@ -16,9 +16,9 @@
 //! first), and text/blob bindings must outlive the `bind` call — we pass `SQLITE_TRANSIENT`, so
 //! SQLite copies the bytes before `bind_*` returns and our Rust buffer can drop immediately.
 
+use std::cell::{Cell as ActiveCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::cell::{Cell as ActiveCell, RefCell};
 mod functions;
 mod library;
 use library::Library;
@@ -263,7 +263,7 @@ impl Api {
 struct Db {
     active: Rc<ActiveCell<usize>>,
     pending: Rc<RefCell<Option<Value>>>,
-    functions: std::collections::HashSet<(String,i32)>,
+    functions: std::collections::HashSet<(String, i32)>,
     ptr: *mut c_void,
 }
 
@@ -287,9 +287,13 @@ struct SqliteState {
 
 impl Drop for SqliteState {
     fn drop(&mut self) {
-        if let Some(api)=self.api.as_ref() {
-            for (_,statement) in self.stmts.drain() {unsafe {(api.finalize)(statement.ptr)};}
-            for (_,database) in self.dbs.drain() {unsafe {(api.close_v2)(database.ptr)};}
+        if let Some(api) = self.api.as_ref() {
+            for (_, statement) in self.stmts.drain() {
+                unsafe { (api.finalize)(statement.ptr) };
+            }
+            for (_, database) in self.dbs.drain() {
+                unsafe { (api.close_v2)(database.ptr) };
+            }
         }
     }
 }
@@ -343,7 +347,9 @@ unsafe fn cstr(p: *const c_char) -> String {
 /// as a real `SQLiteError`), the `errno` (SQLite's extended result code), and, for every code
 /// except the generic `SQLITE_ERROR` (1), the `code` name string, matching Bun.
 fn sqlite_err(errno: i32, message: String) -> NativeError {
-    let err = NativeError::runtime(message).with_prop("__sqlite", true).with_prop("errno", errno);
+    let err = NativeError::runtime(message)
+        .with_prop("__sqlite", true)
+        .with_prop("errno", errno);
     match result_code_name(errno) {
         Some(code) => err.with_prop("code", code),
         None => err,
@@ -375,7 +381,7 @@ fn db_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, NativeError> {
 
 fn stmt_ptr(ctx: &mut Ctx, id: u32) -> Result<*mut c_void, NativeError> {
     match state(ctx).stmts.get(&id) {
-        Some(s) if s.active.get()==0 => Ok(s.ptr),
+        Some(s) if s.active.get() == 0 => Ok(s.ptr),
         Some(_) => Err(functions::busy_error()),
         // Bun's exact message for a use-after-finalize.
         None => Err(NativeError::runtime("Statement has finalized")),
@@ -388,845 +394,921 @@ pub(crate) use bindings::Module;
 
 #[lumen_bind::module(name = "__sqlite")]
 pub(crate) mod bindings {
-use super::*;
+    use super::*;
 
-/// `open(path, flags) -> dbId`. Lazily loads libsqlite3; an absent/too-old library is the honest
-/// error the `Database` constructor throws.
-#[op(coerce)]
-pub fn open(ctx: &mut Ctx, path: String, flags: i32) -> Result<Value, OpError> {
-    let path = if !path.is_empty() && path != ":memory:" && !path.starts_with("file:") {
-        ctx.op_state()
-            .get::<lumen_host::RealmProcess>()
-            .map(|realm| realm.resolve(&path).to_string_lossy().into_owned())
-            .unwrap_or(path)
-    } else {
-        path
-    };
-    ensure_api(ctx)?;
-
-    let c_path = std::ffi::CString::new(path.clone())
-        .map_err(|_| NativeError::runtime("database path contains a NUL byte"))?;
-
-    let mut db: *mut c_void = std::ptr::null_mut();
-    let rc = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        // SAFETY: valid NUL-terminated path; `&mut db` receives the handle.
-        unsafe { (api.open_v2)(c_path.as_ptr(), &mut db, flags, std::ptr::null()) }
-    };
-    if rc != SQLITE_OK {
-        // On failure SQLite may still allocate the handle; read its error, then close it.
-        let err = if db.is_null() {
-            sqlite_err(rc, format!("unable to open database file: {path}"))
+    /// `open(path, flags) -> dbId`. Lazily loads libsqlite3; an absent/too-old library is the honest
+    /// error the `Database` constructor throws.
+    #[op(coerce)]
+    pub fn open(ctx: &mut Ctx, path: String, flags: i32) -> Result<Value, OpError> {
+        let path = if !path.is_empty() && path != ":memory:" && !path.starts_with("file:") {
+            ctx.op_state()
+                .get::<lumen_host::RealmProcess>()
+                .map(|realm| realm.resolve(&path).to_string_lossy().into_owned())
+                .unwrap_or(path)
         } else {
-            let e = db_error(ctx, db, "unable to open database file");
+            path
+        };
+        ensure_api(ctx)?;
+
+        let c_path = std::ffi::CString::new(path.clone())
+            .map_err(|_| NativeError::runtime("database path contains a NUL byte"))?;
+
+        let mut db: *mut c_void = std::ptr::null_mut();
+        let rc = {
             let api = state(ctx).api.as_ref().unwrap().clone();
-            unsafe { (api.close_v2)(db) };
-            e
+            // SAFETY: valid NUL-terminated path; `&mut db` receives the handle.
+            unsafe { (api.open_v2)(c_path.as_ptr(), &mut db, flags, std::ptr::null()) }
         };
-        return Err(err.into());
-    }
-
-    let st = state(ctx);
-    let id = st.next_id();
-    st.dbs.insert(id, Db { ptr: db, active: Rc::new(ActiveCell::new(0)), pending:Rc::new(RefCell::new(None)), functions:Default::default() });
-    Ok(Value::Num(id as f64))
-}
-
-#[op(coerce)]
-pub fn function(
-    ctx: &mut Ctx,
-    id: u32,
-    name: String,
-    callback: Value,
-    count: i32,
-    flags: i32,
-    bigints: Option<bool>,
-) -> Result<Value, OpError> {
-    functions::register(ctx, id, name, callback, count, flags, bigints.unwrap_or(false))
-}
-
-/// `close(dbId)`. Finalizes every live statement owned by this db first (SQLite requires it),
-/// then closes the connection.
-#[op]
-pub fn close(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
-    if state(ctx).dbs.get(&id).is_some_and(|db|db.active.get()!=0) {return Err(functions::busy_error().into());}
-    let st = state(ctx);
-    if st.api.is_none() {
-        return Ok(Value::Undefined);
-    }
-    let owned: Vec<u32> = st
-        .stmts
-        .iter()
-        .filter(|(_, s)| s.db_id == id)
-        .map(|(k, _)| *k)
-        .collect();
-    for sid in owned {
-        if let Some(s) = st.stmts.remove(&sid) {
-            let api = st.api.as_ref().unwrap();
-            unsafe { (api.finalize)(s.ptr) };
-        }
-    }
-    if let Some(db) = st.dbs.remove(&id) {
-        let api = st.api.as_ref().unwrap();
-        unsafe { (api.close_v2)(db.ptr) };
-    }
-    Ok(Value::Undefined)
-}
-
-/// `prepare(dbId, sql) -> stmtId`. Compiles the first statement in `sql`.
-#[op(coerce)]
-pub fn prepare(ctx: &mut Ctx, id: u32, sql: String) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-
-    let mut stmt: *mut c_void = std::ptr::null_mut();
-    let rc = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        // SAFETY: `db` is a live connection; the SQL slice is passed with an explicit byte length
-        // (need not be NUL-terminated); `&mut stmt` receives the compiled statement.
-        unsafe {
-            (api.prepare_v2)(
-                db,
-                sql.as_ptr() as *const c_char,
-                sql.len() as c_int,
-                &mut stmt,
-                std::ptr::null_mut(),
-            )
-        }
-    };
-    if rc != SQLITE_OK {
-        return Err(db_error(ctx, db, "prepare failed").into());
-    }
-    if stmt.is_null() {
-        // Empty statement (whitespace/comment only): nothing to run.
-        return Err(NativeError::runtime("no SQL statement to prepare").into());
-    }
-    let st = state(ctx);
-    let sid = st.next_id();
-    st.stmts.insert(
-        sid,
-        Stmt {
-            active: Rc::new(ActiveCell::new(0)),
-            ptr: stmt,
-            db_id: id,
-        },
-    );
-    Ok(Value::Num(sid as f64))
-}
-
-#[op]
-pub fn finalize(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    if state(ctx).stmts.get(&sid).is_some_and(|s|s.active.get()!=0) {return Err(functions::busy_error().into());}
-    let st = state(ctx);
-    if let Some(s) = st.stmts.remove(&sid) {
-        if let Some(api) = st.api.as_ref() {
-            unsafe { (api.finalize)(s.ptr) };
-        }
-    }
-    Ok(Value::Undefined)
-}
-
-/// `reset(stmtId, clearBindings)` — rewind the statement so it can run again. Bindings are
-/// cleared only when `clearBindings` is true (before a fresh parameter set is bound); a plain
-/// post-run reset keeps them so a later no-argument call reuses them and `toString()` shows the
-/// last-bound SQL — both verified Bun behaviors.
-#[op]
-pub fn reset(ctx: &mut Ctx, sid: u32, clear: Option<bool>) -> Result<Value, OpError> {
-    let clear = clear.unwrap_or(false);
-    let stmt = stmt_ptr(ctx, sid)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    unsafe {
-        (api.reset)(stmt);
-        if clear {
-            (api.clear_bindings)(stmt);
-        }
-    }
-    Ok(Value::Undefined)
-}
-
-/// `bind(stmtId, index, value)` — bind one value at the 1-based parameter index, dispatching on
-/// the JS value's type to the matching `sqlite3_bind_*`.
-#[op]
-pub fn bind(ctx: &mut Ctx, sid: u32, index: i32, value: Value) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-
-    // For an object argument, the only bindable shape is a TypedArray (→ BLOB). Extract its bytes
-    // now, while we still hold `&mut ctx`; reject any other object before borrowing the api.
-    let blob: Option<Vec<u8>> = if matches!(value, Value::Obj(_)) {
-        match ctx.typed_array_raw(&value) {
-            Some((_, len, ptr)) => Some(if ptr.is_null() || len == 0 {
-                Vec::new()
-            } else {
-                unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
-            }),
-            None => {
-                // Bun's exact TypeError message for an unbindable value.
-                return Err(NativeError::type_error("Binding expected string, TypedArray, boolean, number, bigint or null",
-                ).into());
-            }
-        }
-    } else {
-        None
-    };
-
-    let rc = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        unsafe {
-            match &value {
-                Value::Undefined | Value::Null => (api.bind_null)(stmt, index),
-                Value::Bool(b) => (api.bind_int64)(stmt, index, if *b { 1 } else { 0 }),
-                Value::Num(n) => {
-                    // Bun (JSC) binds an integral number as INTEGER only within the int52 range
-                    // [-2^51, 2^51); anything outside — and every fractional/NaN/±Inf value —
-                    // goes through bind_double (verified against bun v1.2.21: 2^50 → integer,
-                    // 2^51 → real, -2^51 → integer). SQLite itself stores a NaN double as NULL.
-                    // (-0.0 is REAL in Bun — JSC boxes it as a double — hence the sign check.)
-                    const INT52: f64 = 2251799813685248.0; // 2^51
-                    if n.fract() == 0.0
-                        && *n >= -INT52
-                        && *n < INT52
-                        && !(*n == 0.0 && n.is_sign_negative())
-                    {
-                        (api.bind_int64)(stmt, index, *n as i64)
-                    } else {
-                        (api.bind_double)(stmt, index, *n)
-                    }
-                }
-                Value::BigInt(_) => {
-                    (api.bind_int64)(stmt, index, value.bigint_as_i64().unwrap_or(0))
-                }
-                Value::Str(s) => {
-                    let text = s.to_string();
-                    (api.bind_text)(
-                        stmt,
-                        index,
-                        text.as_ptr() as *const c_char,
-                        text.len() as c_int,
-                        SQLITE_TRANSIENT,
-                    )
-                }
-                Value::Obj(_) => {
-                    let bytes = blob.as_deref().unwrap_or(&[]);
-                    (api.bind_blob)(
-                        stmt,
-                        index,
-                        bytes.as_ptr() as *const c_void,
-                        bytes.len() as c_int,
-                        SQLITE_TRANSIENT,
-                    )
-                }
-                // Symbols (and any other engine-internal variant) are not bindable — Bun's
-                // exact TypeError. Break out of the api borrow to build the error.
-                _ => -1,
-            }
-        }
-    };
-    if rc == -1 {
-        return Err(NativeError::type_error("Binding expected string, TypedArray, boolean, number, bigint or null",
-        ).into());
-    }
-    if rc != SQLITE_OK {
-        let db_id = state(ctx).stmts.get(&sid).map(|s| s.db_id).unwrap_or(0);
-        let db = db_ptr(ctx, db_id)?;
-        return Err(db_error(ctx, db, "bind failed").into());
-    }
-    Ok(Value::Undefined)
-}
-
-/// `step(stmtId) -> 1 (a row is available) | 0 (done)`. Any other result is a run-time error.
-#[op]
-pub fn step(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let db_id=state(ctx).stmts.get(&sid).unwrap().db_id;
-    let pending=state(ctx).dbs.get(&db_id).unwrap().pending.clone();
-    let rc = {
-        let _db_guard=functions::Active::new(state(ctx).dbs.get(&db_id).unwrap().active.clone());
-        let _statement_guard=functions::Active::new(state(ctx).stmts.get(&sid).unwrap().active.clone());
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let _library=functions::Enter::new(&api, ctx);
-        unsafe { (api.step)(stmt) }
-    };
-    if let Some(error)=pending.borrow_mut().take() {return Err(error.into());}
-    match rc {
-        SQLITE_ROW => Ok(Value::Num(1.0)),
-        SQLITE_DONE => Ok(Value::Num(0.0)),
-        _ => {
-            let db_id = state(ctx).stmts.get(&sid).map(|s| s.db_id).unwrap_or(0);
-            let db = db_ptr(ctx, db_id)?;
-            Err(db_error(ctx, db, "step failed").into())
-        }
-    }
-}
-
-#[op(name = "columnCount")]
-pub fn column_count(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let n = unsafe { (api.column_count)(stmt) };
-    Ok(Value::Num(n as f64))
-}
-
-/// `columnNames(stmtId) -> [name, ...]` — the result columns' names, in order.
-#[op(name = "columnNames")]
-pub fn column_names(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let names = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let n = unsafe { (api.column_count)(stmt) };
-        let mut names = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            names.push(Value::from_string(unsafe {
-                cstr((api.column_name)(stmt, i))
-            }));
-        }
-        names
-    };
-    Ok(ctx.make_array(names))
-}
-
-/// Result metadata copied from the live prepared statement; origin fields are optional.
-#[op]
-pub fn columns(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let metadata = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        // SAFETY: the statement is live. Copy all SQLite-owned strings before allocating JS
-        // objects; optional origin functions are absent in builds without column metadata.
-        (0..unsafe { (api.column_count)(stmt) })
-            .map(|index| {
-                [
-                    ("name", Some(api.column_name)),
-                    ("type", Some(api.column_decltype)),
-                    ("database", api.column_database_name),
-                    ("table", api.column_table_name),
-                    ("column", api.column_origin_name),
-                ]
-                .map(|(name, function)| {
-                    let text = function.and_then(|function| {
-                        let ptr = unsafe { function(stmt, index) };
-                        (!ptr.is_null()).then(|| {
-                            unsafe { CStr::from_ptr(ptr) }
-                                .to_string_lossy()
-                                .into_owned()
-                        })
-                    });
-                    (name, text)
-                })
-            })
-            .collect::<Vec<_>>()
-    };
-    let rows = metadata
-        .into_iter()
-        .map(|fields| {
-            let row = Value::Obj(ctx.new_object());
-            for (name, text) in fields {
-                let value = text.map(Value::from_string).unwrap_or(Value::Null);
-                let _ = ctx.set_member(&row, name, value);
-            }
-            row
-        })
-        .collect();
-    Ok(ctx.make_array(rows))
-}
-
-/// A column's value read out of SQLite, before it becomes a `Value` (BLOB needs `&mut ctx` to
-/// allocate a Uint8Array, which we can't do while the api is borrowed — so read raw first).
-enum Cell {
-    Int(i64),
-    Float(f64),
-    Text(String),
-    Blob(Vec<u8>),
-    Null,
-}
-
-/// `row(stmtId, safeIntegers) -> [value, ...]` — the current row's column values, typed per Bun:
-/// INTEGER → number (bigint when `safeIntegers`), REAL → number, TEXT → string, BLOB → Uint8Array,
-/// NULL → null. Assumes the last `step` returned a row.
-#[op]
-pub fn row(ctx: &mut Ctx, sid: u32, safe_integers: Option<bool>) -> Result<Value, OpError> {
-    let safe = safe_integers.unwrap_or(false);
-    let stmt = stmt_ptr(ctx, sid)?;
-
-    // Read every column into owned `Cell`s while the api is borrowed; the borrow ends with this
-    // block, freeing `ctx` for the Uint8Array allocations below.
-    let cells: Vec<Cell> = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let n = unsafe { (api.column_count)(stmt) };
-        let mut cells = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            let ty = unsafe { (api.column_type)(stmt, i) };
-            let cell = match ty {
-                SQLITE_INTEGER => Cell::Int(unsafe { (api.column_int64)(stmt, i) }),
-                SQLITE_FLOAT => Cell::Float(unsafe { (api.column_double)(stmt, i) }),
-                SQLITE_TEXT => {
-                    let len = unsafe { (api.column_bytes)(stmt, i) } as usize;
-                    let ptr = unsafe { (api.column_text)(stmt, i) };
-                    let s = if ptr.is_null() || len == 0 {
-                        String::new()
-                    } else {
-                        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
-                            .into_owned()
-                    };
-                    Cell::Text(s)
-                }
-                SQLITE_BLOB => {
-                    let len = unsafe { (api.column_bytes)(stmt, i) } as usize;
-                    let ptr = unsafe { (api.column_blob)(stmt, i) };
-                    let bytes = if ptr.is_null() || len == 0 {
-                        Vec::new()
-                    } else {
-                        unsafe { std::slice::from_raw_parts(ptr as *const u8, len).to_vec() }
-                    };
-                    Cell::Blob(bytes)
-                }
-                _ => Cell::Null,
-            };
-            cells.push(cell);
-        }
-        cells
-    };
-
-    let mut values = Vec::with_capacity(cells.len());
-    for cell in cells {
-        let v = match cell {
-            Cell::Int(n) => {
-                if safe {
-                    Value::bigint_from_i64(n)
-                } else {
-                    Value::Num(n as f64)
-                }
-            }
-            Cell::Float(f) => Value::Num(f),
-            Cell::Text(s) => Value::from_string(s),
-            Cell::Blob(b) => ctx.make_uint8array(&b)?,
-            Cell::Null => Value::Null,
-        };
-        values.push(v);
-    }
-    Ok(ctx.make_array(values))
-}
-
-#[op(name = "bindParameterCount")]
-pub fn bind_parameter_count(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let n = unsafe { (api.bind_parameter_count)(stmt) };
-    Ok(Value::Num(n as f64))
-}
-
-/// `bindParameterName(stmtId, index) -> name | null` — the source name of the 1-based parameter
-/// (`$a`/`:a`/`@a`), or null for a positional `?`.
-#[op(name = "bindParameterName")]
-pub fn bind_parameter_name(ctx: &mut Ctx, sid: u32, index: i32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let p = unsafe { (api.bind_parameter_name)(stmt, index) };
-    if p.is_null() {
-        Ok(Value::Null)
-    } else {
-        Ok(Value::from_string(unsafe { cstr(p) }))
-    }
-}
-
-/// `bindParameterIndex(stmtId, name) -> index` — the 1-based index of a named parameter, or 0 if
-/// there is no such parameter.
-#[op(coerce, name = "bindParameterIndex")]
-pub fn bind_parameter_index(ctx: &mut Ctx, sid: u32, name: String) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let c_name = match std::ffi::CString::new(name) {
-        Ok(c) => c,
-        Err(_) => return Ok(Value::Num(0.0)),
-    };
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let idx = unsafe { (api.bind_parameter_index)(stmt, c_name.as_ptr()) };
-    Ok(Value::Num(idx as f64))
-}
-
-/// `exec(dbId, sql) -> { changes, lastInsertRowid }` — run one or more statements with no
-/// bindings (Bun's `db.exec` / the no-parameter `db.run`). `changes` is the delta in the
-/// connection's total change count across the whole batch.
-#[op(coerce)]
-pub fn exec(ctx: &mut Ctx, id: u32, sql: String) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let c_sql = std::ffi::CString::new(sql)
-        .map_err(|_| NativeError::runtime("SQL contains a NUL byte"))?;
-
-    let pending=state(ctx).dbs.get(&id).unwrap().pending.clone();
-    let (rc, errmsg, before) = {
-        let _db_guard=functions::Active::new(state(ctx).dbs.get(&id).unwrap().active.clone());
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let _library=functions::Enter::new(&api, ctx);
-        let before = unsafe { (api.total_changes)(db) };
-        let mut errmsg: *mut c_char = std::ptr::null_mut();
-        // SAFETY: `db` is live; `c_sql` is NUL-terminated; no callback. `errmsg`, if set, is
-        // SQLite-allocated and must be freed with `sqlite3_free`.
-        let rc = unsafe {
-            (api.exec)(
-                db,
-                c_sql.as_ptr(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &mut errmsg,
-            )
-        };
-        (rc, errmsg, before)
-    };
-    if let Some(error)=pending.borrow_mut().take() {
-        if !errmsg.is_null() {unsafe {(state(ctx).api.as_ref().unwrap().free)(errmsg.cast())};}
-        return Err(error.into());
-    }
-    if rc != SQLITE_OK {
-        let (msg, errno) = {
-            let api = state(ctx).api.as_ref().unwrap().clone();
-            let msg = unsafe { cstr(errmsg) };
-            let errno = unsafe { (api.extended_errcode)(db) };
-            if !errmsg.is_null() {
-                unsafe { (api.free)(errmsg as *mut c_void) };
-            }
-            (msg, errno)
-        };
-        return Err(sqlite_err(errno, msg).into());
-    }
-    let (changes, rowid) = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let changes = unsafe { (api.total_changes)(db) } - before;
-        let rowid = unsafe { (api.last_insert_rowid)(db) };
-        (changes, rowid)
-    };
-    let obj = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&obj, "changes", Value::Num(changes as f64));
-    let _ = ctx.set_member(&obj, "lastInsertRowid", Value::Num(rowid as f64));
-    Ok(obj)
-}
-
-#[op(name = "isTransaction")]
-pub fn is_transaction(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    // SAFETY: db_ptr validated the live connection; SQLite owns its transaction state.
-    Ok(Value::Bool(unsafe { (api.get_autocommit)(db) } == 0))
-}
-
-#[op(coerce)]
-pub fn location(ctx: &mut Ctx, id: u32, schema: String) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let schema = std::ffi::CString::new(schema)
-        .map_err(|_| NativeError::type_error("schema name contains a NUL byte"))?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    // SAFETY: the connection and NUL-terminated schema are live; copy SQLite's borrowed
-    // result before another operation can alter an attachment.
-    let filename = unsafe { (api.db_filename)(db, schema.as_ptr()) };
-    if filename.is_null() {
-        return Ok(Value::Null);
-    }
-    let filename = unsafe { CStr::from_ptr(filename) }.to_string_lossy();
-    Ok(if filename.is_empty() {
-        Value::Null
-    } else {
-        Value::from_string(filename.into_owned())
-    })
-}
-
-#[op(name = "doubleQuotedStringLiterals")]
-pub fn double_quoted_string_literals(ctx: &mut Ctx, id: u32, enabled: Value) -> Result<Value, OpError> {
-    configure_db_flags(ctx, id, &enabled, &[1013, 1014]) // DQS_DML / DQS_DDL
-}
-
-#[op]
-pub fn defensive(ctx: &mut Ctx, id: u32, enabled: Value) -> Result<Value, OpError> {
-    configure_db_flags(ctx, id, &enabled, &[1010]) // SQLITE_DBCONFIG_DEFENSIVE
-}
-
-fn configure_db_flags(ctx: &mut Ctx, id: u32, enabled: &Value, operations: &[c_int]) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let enabled: c_int = i32::from(matches!(enabled, Value::Bool(true)));
-    for &operation in operations {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let mut actual: c_int = 0;
-        // SAFETY: SQLite documents this variadic configuration as (int, int*); the
-        // function pointer keeps the C variadic ABI, including arm64 argument placement.
-        let rc = unsafe { (api.db_config)(db, operation, enabled, &mut actual as *mut c_int) };
         if rc != SQLITE_OK {
-            return Err(db_error(ctx, db, "could not configure SQLite connection").into());
+            // On failure SQLite may still allocate the handle; read its error, then close it.
+            let err = if db.is_null() {
+                sqlite_err(rc, format!("unable to open database file: {path}"))
+            } else {
+                let e = db_error(ctx, db, "unable to open database file");
+                let api = state(ctx).api.as_ref().unwrap().clone();
+                unsafe { (api.close_v2)(db) };
+                e
+            };
+            return Err(err.into());
         }
+
+        let st = state(ctx);
+        let id = st.next_id();
+        st.dbs.insert(
+            id,
+            Db {
+                ptr: db,
+                active: Rc::new(ActiveCell::new(0)),
+                pending: Rc::new(RefCell::new(None)),
+                functions: Default::default(),
+            },
+        );
+        Ok(Value::Num(id as f64))
     }
-    Ok(Value::Undefined)
-}
 
-#[op]
-pub fn changes(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let n = unsafe { (api.changes)(db) };
-    Ok(Value::Num(n as f64))
-}
-
-/// `totalChanges(dbId)` — the connection's cumulative change count. The JS glue diffs it around a
-/// statement execution so a read-only statement reports `changes: 0` (Bun's semantics), which
-/// plain `sqlite3_changes` (last write, however long ago) cannot express.
-#[op(name = "totalChanges")]
-pub fn total_changes(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let n = unsafe { (api.total_changes)(db) };
-    Ok(Value::Num(n as f64))
-}
-
-/// `lastInsertRowid(dbId, safeIntegers) -> number | bigint`.
-#[op(name = "lastInsertRowid")]
-pub fn last_insert_rowid(ctx: &mut Ctx, id: u32, safe_integers: Option<bool>) -> Result<Value, OpError> {
-    let safe = safe_integers.unwrap_or(false);
-    let db = db_ptr(ctx, id)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let n = unsafe { (api.last_insert_rowid)(db) };
-    if safe {
-        Ok(Value::bigint_from_i64(n))
-    } else {
-        Ok(Value::Num(n as f64))
-    }
-}
-
-/// `expandedSql(stmtId) -> string` — the SQL with its current bindings inlined (Bun's
-/// `Statement.toString()`).
-#[op(name = "expandedSql")]
-pub fn expanded_sql(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
-    let stmt = stmt_ptr(ctx, sid)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let p = unsafe { (api.expanded_sql)(stmt) };
-    if p.is_null() {
-        return Ok(Value::from_string(String::new()));
-    }
-    let s = unsafe { cstr(p) };
-    unsafe { (api.free)(p as *mut c_void) };
-    Ok(Value::from_string(s))
-}
-
-#[op]
-pub fn libversion(ctx: &mut Ctx) -> Result<Value, OpError> {
-    ensure_api(ctx)?;
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let v = unsafe { cstr((api.libversion)()) };
-    Ok(Value::from_string(v))
-}
-
-#[op(coerce, name = "setCustomSQLite")]
-pub fn set_custom_sqlite(ctx: &mut Ctx, path: String) -> Result<Value, OpError> {
-    if !std::path::Path::new(&path).is_file() {
-        return Err(NativeError::runtime(format!("Database.setCustomSQLite library not found: {path}"),
-        ).into());
-    }
-    let sqlite = state(ctx);
-    if sqlite.api.is_some() || !sqlite.dbs.is_empty() {
-        return Err(NativeError::runtime("Database.setCustomSQLite must be called before opening a database",
-        ).into());
-    }
-    sqlite.custom_path = Some(path);
-    Ok(Value::Undefined)
-}
-
-/// `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION`: allows only the C `sqlite3_load_extension` interface,
-/// as Node does. `sqlite3_enable_load_extension` would also switch on the SQL `load_extension()`
-/// function, which lets any SQL text load native code.
-const SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION: c_int = 1005;
-
-#[op(name = "enableLoadExtension")]
-pub fn enable_load_extension(ctx: &mut Ctx, id: u32, allow: Value) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let enabled = match allow {
-        Value::Bool(value) => value,
-        _ => return Err(NativeError::type_error("allow must be a boolean").into()),
-    };
-    let api = state(ctx).api.as_ref().unwrap().clone();
-    let mut actual: c_int = 0;
-    // SAFETY: the documented (int, int*) shape of the variadic configuration call.
-    let rc = unsafe {
-        (api.db_config)(
-            db,
-            SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION,
-            i32::from(enabled),
-            &mut actual as *mut c_int,
+    #[op(coerce)]
+    pub fn function(
+        ctx: &mut Ctx,
+        id: u32,
+        name: String,
+        callback: Value,
+        count: i32,
+        flags: i32,
+        bigints: Option<bool>,
+    ) -> Result<Value, OpError> {
+        functions::register(
+            ctx,
+            id,
+            name,
+            callback,
+            count,
+            flags,
+            bigints.unwrap_or(false),
         )
-    };
-    if rc != SQLITE_OK {
-        // A library built without extension loading has nothing to disable.
-        let omitted = api
-            .compileoption_used
-            .is_some_and(|used| unsafe { used(c"OMIT_LOAD_EXTENSION".as_ptr()) != 0 });
-        if omitted && !enabled {
+    }
+
+    /// `close(dbId)`. Finalizes every live statement owned by this db first (SQLite requires it),
+    /// then closes the connection.
+    #[op]
+    pub fn close(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
+        if state(ctx)
+            .dbs
+            .get(&id)
+            .is_some_and(|db| db.active.get() != 0)
+        {
+            return Err(functions::busy_error().into());
+        }
+        let st = state(ctx);
+        if st.api.is_none() {
             return Ok(Value::Undefined);
         }
-        return Err(NativeError::runtime(if omitted {
+        let owned: Vec<u32> = st
+            .stmts
+            .iter()
+            .filter(|(_, s)| s.db_id == id)
+            .map(|(k, _)| *k)
+            .collect();
+        for sid in owned {
+            if let Some(s) = st.stmts.remove(&sid) {
+                let api = st.api.as_ref().unwrap();
+                unsafe { (api.finalize)(s.ptr) };
+            }
+        }
+        if let Some(db) = st.dbs.remove(&id) {
+            let api = st.api.as_ref().unwrap();
+            unsafe { (api.close_v2)(db.ptr) };
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `prepare(dbId, sql) -> stmtId`. Compiles the first statement in `sql`.
+    #[op(coerce)]
+    pub fn prepare(ctx: &mut Ctx, id: u32, sql: String) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+
+        let mut stmt: *mut c_void = std::ptr::null_mut();
+        let rc = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            // SAFETY: `db` is a live connection; the SQL slice is passed with an explicit byte length
+            // (need not be NUL-terminated); `&mut stmt` receives the compiled statement.
+            unsafe {
+                (api.prepare_v2)(
+                    db,
+                    sql.as_ptr() as *const c_char,
+                    sql.len() as c_int,
+                    &mut stmt,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        if rc != SQLITE_OK {
+            return Err(db_error(ctx, db, "prepare failed").into());
+        }
+        if stmt.is_null() {
+            // Empty statement (whitespace/comment only): nothing to run.
+            return Err(NativeError::runtime("no SQL statement to prepare").into());
+        }
+        let st = state(ctx);
+        let sid = st.next_id();
+        st.stmts.insert(
+            sid,
+            Stmt {
+                active: Rc::new(ActiveCell::new(0)),
+                ptr: stmt,
+                db_id: id,
+            },
+        );
+        Ok(Value::Num(sid as f64))
+    }
+
+    #[op]
+    pub fn finalize(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        if state(ctx)
+            .stmts
+            .get(&sid)
+            .is_some_and(|s| s.active.get() != 0)
+        {
+            return Err(functions::busy_error().into());
+        }
+        let st = state(ctx);
+        if let Some(s) = st.stmts.remove(&sid) {
+            if let Some(api) = st.api.as_ref() {
+                unsafe { (api.finalize)(s.ptr) };
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `reset(stmtId, clearBindings)` — rewind the statement so it can run again. Bindings are
+    /// cleared only when `clearBindings` is true (before a fresh parameter set is bound); a plain
+    /// post-run reset keeps them so a later no-argument call reuses them and `toString()` shows the
+    /// last-bound SQL — both verified Bun behaviors.
+    #[op]
+    pub fn reset(ctx: &mut Ctx, sid: u32, clear: Option<bool>) -> Result<Value, OpError> {
+        let clear = clear.unwrap_or(false);
+        let stmt = stmt_ptr(ctx, sid)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        unsafe {
+            (api.reset)(stmt);
+            if clear {
+                (api.clear_bindings)(stmt);
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `bind(stmtId, index, value)` — bind one value at the 1-based parameter index, dispatching on
+    /// the JS value's type to the matching `sqlite3_bind_*`.
+    #[op]
+    pub fn bind(ctx: &mut Ctx, sid: u32, index: i32, value: Value) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+
+        // For an object argument, the only bindable shape is a TypedArray (→ BLOB). Extract its bytes
+        // now, while we still hold `&mut ctx`; reject any other object before borrowing the api.
+        let blob: Option<Vec<u8>> = if matches!(value, Value::Obj(_)) {
+            match ctx.typed_array_raw(&value) {
+                Some((_, len, ptr)) => Some(if ptr.is_null() || len == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+                }),
+                None => {
+                    // Bun's exact TypeError message for an unbindable value.
+                    return Err(NativeError::type_error(
+                        "Binding expected string, TypedArray, boolean, number, bigint or null",
+                    )
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+
+        let rc = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            unsafe {
+                match &value {
+                    Value::Undefined | Value::Null => (api.bind_null)(stmt, index),
+                    Value::Bool(b) => (api.bind_int64)(stmt, index, if *b { 1 } else { 0 }),
+                    Value::Num(n) => {
+                        // Bun (JSC) binds an integral number as INTEGER only within the int52 range
+                        // [-2^51, 2^51); anything outside — and every fractional/NaN/±Inf value —
+                        // goes through bind_double (verified against bun v1.2.21: 2^50 → integer,
+                        // 2^51 → real, -2^51 → integer). SQLite itself stores a NaN double as NULL.
+                        // (-0.0 is REAL in Bun — JSC boxes it as a double — hence the sign check.)
+                        const INT52: f64 = 2251799813685248.0; // 2^51
+                        if n.fract() == 0.0
+                            && *n >= -INT52
+                            && *n < INT52
+                            && !(*n == 0.0 && n.is_sign_negative())
+                        {
+                            (api.bind_int64)(stmt, index, *n as i64)
+                        } else {
+                            (api.bind_double)(stmt, index, *n)
+                        }
+                    }
+                    Value::BigInt(_) => {
+                        (api.bind_int64)(stmt, index, value.bigint_as_i64().unwrap_or(0))
+                    }
+                    Value::Str(s) => {
+                        let text = s.to_string();
+                        (api.bind_text)(
+                            stmt,
+                            index,
+                            text.as_ptr() as *const c_char,
+                            text.len() as c_int,
+                            SQLITE_TRANSIENT,
+                        )
+                    }
+                    Value::Obj(_) => {
+                        let bytes = blob.as_deref().unwrap_or(&[]);
+                        (api.bind_blob)(
+                            stmt,
+                            index,
+                            bytes.as_ptr() as *const c_void,
+                            bytes.len() as c_int,
+                            SQLITE_TRANSIENT,
+                        )
+                    }
+                    // Symbols (and any other engine-internal variant) are not bindable — Bun's
+                    // exact TypeError. Break out of the api borrow to build the error.
+                    _ => -1,
+                }
+            }
+        };
+        if rc == -1 {
+            return Err(NativeError::type_error(
+                "Binding expected string, TypedArray, boolean, number, bigint or null",
+            )
+            .into());
+        }
+        if rc != SQLITE_OK {
+            let db_id = state(ctx).stmts.get(&sid).map(|s| s.db_id).unwrap_or(0);
+            let db = db_ptr(ctx, db_id)?;
+            return Err(db_error(ctx, db, "bind failed").into());
+        }
+        Ok(Value::Undefined)
+    }
+
+    /// `step(stmtId) -> 1 (a row is available) | 0 (done)`. Any other result is a run-time error.
+    #[op]
+    pub fn step(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let db_id = state(ctx).stmts.get(&sid).unwrap().db_id;
+        let pending = state(ctx).dbs.get(&db_id).unwrap().pending.clone();
+        let rc = {
+            let _db_guard =
+                functions::Active::new(state(ctx).dbs.get(&db_id).unwrap().active.clone());
+            let _statement_guard =
+                functions::Active::new(state(ctx).stmts.get(&sid).unwrap().active.clone());
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let _library = functions::Enter::new(&api, ctx);
+            unsafe { (api.step)(stmt) }
+        };
+        if let Some(error) = pending.borrow_mut().take() {
+            return Err(error.into());
+        }
+        match rc {
+            SQLITE_ROW => Ok(Value::Num(1.0)),
+            SQLITE_DONE => Ok(Value::Num(0.0)),
+            _ => {
+                let db_id = state(ctx).stmts.get(&sid).map(|s| s.db_id).unwrap_or(0);
+                let db = db_ptr(ctx, db_id)?;
+                Err(db_error(ctx, db, "step failed").into())
+            }
+        }
+    }
+
+    #[op(name = "columnCount")]
+    pub fn column_count(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let n = unsafe { (api.column_count)(stmt) };
+        Ok(Value::Num(n as f64))
+    }
+
+    /// `columnNames(stmtId) -> [name, ...]` — the result columns' names, in order.
+    #[op(name = "columnNames")]
+    pub fn column_names(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let names = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let n = unsafe { (api.column_count)(stmt) };
+            let mut names = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                names.push(Value::from_string(unsafe {
+                    cstr((api.column_name)(stmt, i))
+                }));
+            }
+            names
+        };
+        Ok(ctx.make_array(names))
+    }
+
+    /// Result metadata copied from the live prepared statement; origin fields are optional.
+    #[op]
+    pub fn columns(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let metadata = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            // SAFETY: the statement is live. Copy all SQLite-owned strings before allocating JS
+            // objects; optional origin functions are absent in builds without column metadata.
+            (0..unsafe { (api.column_count)(stmt) })
+                .map(|index| {
+                    [
+                        ("name", Some(api.column_name)),
+                        ("type", Some(api.column_decltype)),
+                        ("database", api.column_database_name),
+                        ("table", api.column_table_name),
+                        ("column", api.column_origin_name),
+                    ]
+                    .map(|(name, function)| {
+                        let text = function.and_then(|function| {
+                            let ptr = unsafe { function(stmt, index) };
+                            (!ptr.is_null()).then(|| {
+                                unsafe { CStr::from_ptr(ptr) }
+                                    .to_string_lossy()
+                                    .into_owned()
+                            })
+                        });
+                        (name, text)
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = metadata
+            .into_iter()
+            .map(|fields| {
+                let row = Value::Obj(ctx.new_object());
+                for (name, text) in fields {
+                    let value = text.map(Value::from_string).unwrap_or(Value::Null);
+                    let _ = ctx.set_member(&row, name, value);
+                }
+                row
+            })
+            .collect();
+        Ok(ctx.make_array(rows))
+    }
+
+    /// A column's value read out of SQLite, before it becomes a `Value` (BLOB needs `&mut ctx` to
+    /// allocate a Uint8Array, which we can't do while the api is borrowed — so read raw first).
+    enum Cell {
+        Int(i64),
+        Float(f64),
+        Text(String),
+        Blob(Vec<u8>),
+        Null,
+    }
+
+    /// `row(stmtId, safeIntegers) -> [value, ...]` — the current row's column values, typed per Bun:
+    /// INTEGER → number (bigint when `safeIntegers`), REAL → number, TEXT → string, BLOB → Uint8Array,
+    /// NULL → null. Assumes the last `step` returned a row.
+    #[op]
+    pub fn row(ctx: &mut Ctx, sid: u32, safe_integers: Option<bool>) -> Result<Value, OpError> {
+        let safe = safe_integers.unwrap_or(false);
+        let stmt = stmt_ptr(ctx, sid)?;
+
+        // Read every column into owned `Cell`s while the api is borrowed; the borrow ends with this
+        // block, freeing `ctx` for the Uint8Array allocations below.
+        let cells: Vec<Cell> = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let n = unsafe { (api.column_count)(stmt) };
+            let mut cells = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let ty = unsafe { (api.column_type)(stmt, i) };
+                let cell = match ty {
+                    SQLITE_INTEGER => Cell::Int(unsafe { (api.column_int64)(stmt, i) }),
+                    SQLITE_FLOAT => Cell::Float(unsafe { (api.column_double)(stmt, i) }),
+                    SQLITE_TEXT => {
+                        let len = unsafe { (api.column_bytes)(stmt, i) } as usize;
+                        let ptr = unsafe { (api.column_text)(stmt, i) };
+                        let s = if ptr.is_null() || len == 0 {
+                            String::new()
+                        } else {
+                            String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+                                .into_owned()
+                        };
+                        Cell::Text(s)
+                    }
+                    SQLITE_BLOB => {
+                        let len = unsafe { (api.column_bytes)(stmt, i) } as usize;
+                        let ptr = unsafe { (api.column_blob)(stmt, i) };
+                        let bytes = if ptr.is_null() || len == 0 {
+                            Vec::new()
+                        } else {
+                            unsafe { std::slice::from_raw_parts(ptr as *const u8, len).to_vec() }
+                        };
+                        Cell::Blob(bytes)
+                    }
+                    _ => Cell::Null,
+                };
+                cells.push(cell);
+            }
+            cells
+        };
+
+        let mut values = Vec::with_capacity(cells.len());
+        for cell in cells {
+            let v = match cell {
+                Cell::Int(n) => {
+                    if safe {
+                        Value::bigint_from_i64(n)
+                    } else {
+                        Value::Num(n as f64)
+                    }
+                }
+                Cell::Float(f) => Value::Num(f),
+                Cell::Text(s) => Value::from_string(s),
+                Cell::Blob(b) => ctx.make_uint8array(&b)?,
+                Cell::Null => Value::Null,
+            };
+            values.push(v);
+        }
+        Ok(ctx.make_array(values))
+    }
+
+    #[op(name = "bindParameterCount")]
+    pub fn bind_parameter_count(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let n = unsafe { (api.bind_parameter_count)(stmt) };
+        Ok(Value::Num(n as f64))
+    }
+
+    /// `bindParameterName(stmtId, index) -> name | null` — the source name of the 1-based parameter
+    /// (`$a`/`:a`/`@a`), or null for a positional `?`.
+    #[op(name = "bindParameterName")]
+    pub fn bind_parameter_name(ctx: &mut Ctx, sid: u32, index: i32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let p = unsafe { (api.bind_parameter_name)(stmt, index) };
+        if p.is_null() {
+            Ok(Value::Null)
+        } else {
+            Ok(Value::from_string(unsafe { cstr(p) }))
+        }
+    }
+
+    /// `bindParameterIndex(stmtId, name) -> index` — the 1-based index of a named parameter, or 0 if
+    /// there is no such parameter.
+    #[op(coerce, name = "bindParameterIndex")]
+    pub fn bind_parameter_index(ctx: &mut Ctx, sid: u32, name: String) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let c_name = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return Ok(Value::Num(0.0)),
+        };
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let idx = unsafe { (api.bind_parameter_index)(stmt, c_name.as_ptr()) };
+        Ok(Value::Num(idx as f64))
+    }
+
+    /// `exec(dbId, sql) -> { changes, lastInsertRowid }` — run one or more statements with no
+    /// bindings (Bun's `db.exec` / the no-parameter `db.run`). `changes` is the delta in the
+    /// connection's total change count across the whole batch.
+    #[op(coerce)]
+    pub fn exec(ctx: &mut Ctx, id: u32, sql: String) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let c_sql = std::ffi::CString::new(sql)
+            .map_err(|_| NativeError::runtime("SQL contains a NUL byte"))?;
+
+        let pending = state(ctx).dbs.get(&id).unwrap().pending.clone();
+        let (rc, errmsg, before) = {
+            let _db_guard = functions::Active::new(state(ctx).dbs.get(&id).unwrap().active.clone());
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let _library = functions::Enter::new(&api, ctx);
+            let before = unsafe { (api.total_changes)(db) };
+            let mut errmsg: *mut c_char = std::ptr::null_mut();
+            // SAFETY: `db` is live; `c_sql` is NUL-terminated; no callback. `errmsg`, if set, is
+            // SQLite-allocated and must be freed with `sqlite3_free`.
+            let rc = unsafe {
+                (api.exec)(
+                    db,
+                    c_sql.as_ptr(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut errmsg,
+                )
+            };
+            (rc, errmsg, before)
+        };
+        if let Some(error) = pending.borrow_mut().take() {
+            if !errmsg.is_null() {
+                unsafe { (state(ctx).api.as_ref().unwrap().free)(errmsg.cast()) };
+            }
+            return Err(error.into());
+        }
+        if rc != SQLITE_OK {
+            let (msg, errno) = {
+                let api = state(ctx).api.as_ref().unwrap().clone();
+                let msg = unsafe { cstr(errmsg) };
+                let errno = unsafe { (api.extended_errcode)(db) };
+                if !errmsg.is_null() {
+                    unsafe { (api.free)(errmsg as *mut c_void) };
+                }
+                (msg, errno)
+            };
+            return Err(sqlite_err(errno, msg).into());
+        }
+        let (changes, rowid) = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let changes = unsafe { (api.total_changes)(db) } - before;
+            let rowid = unsafe { (api.last_insert_rowid)(db) };
+            (changes, rowid)
+        };
+        let obj = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&obj, "changes", Value::Num(changes as f64));
+        let _ = ctx.set_member(&obj, "lastInsertRowid", Value::Num(rowid as f64));
+        Ok(obj)
+    }
+
+    #[op(name = "isTransaction")]
+    pub fn is_transaction(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        // SAFETY: db_ptr validated the live connection; SQLite owns its transaction state.
+        Ok(Value::Bool(unsafe { (api.get_autocommit)(db) } == 0))
+    }
+
+    #[op(coerce)]
+    pub fn location(ctx: &mut Ctx, id: u32, schema: String) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let schema = std::ffi::CString::new(schema)
+            .map_err(|_| NativeError::type_error("schema name contains a NUL byte"))?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        // SAFETY: the connection and NUL-terminated schema are live; copy SQLite's borrowed
+        // result before another operation can alter an attachment.
+        let filename = unsafe { (api.db_filename)(db, schema.as_ptr()) };
+        if filename.is_null() {
+            return Ok(Value::Null);
+        }
+        let filename = unsafe { CStr::from_ptr(filename) }.to_string_lossy();
+        Ok(if filename.is_empty() {
+            Value::Null
+        } else {
+            Value::from_string(filename.into_owned())
+        })
+    }
+
+    #[op(name = "doubleQuotedStringLiterals")]
+    pub fn double_quoted_string_literals(
+        ctx: &mut Ctx,
+        id: u32,
+        enabled: Value,
+    ) -> Result<Value, OpError> {
+        configure_db_flags(ctx, id, &enabled, &[1013, 1014]) // DQS_DML / DQS_DDL
+    }
+
+    #[op]
+    pub fn defensive(ctx: &mut Ctx, id: u32, enabled: Value) -> Result<Value, OpError> {
+        configure_db_flags(ctx, id, &enabled, &[1010]) // SQLITE_DBCONFIG_DEFENSIVE
+    }
+
+    fn configure_db_flags(
+        ctx: &mut Ctx,
+        id: u32,
+        enabled: &Value,
+        operations: &[c_int],
+    ) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let enabled: c_int = i32::from(matches!(enabled, Value::Bool(true)));
+        for &operation in operations {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let mut actual: c_int = 0;
+            // SAFETY: SQLite documents this variadic configuration as (int, int*); the
+            // function pointer keeps the C variadic ABI, including arm64 argument placement.
+            let rc = unsafe { (api.db_config)(db, operation, enabled, &mut actual as *mut c_int) };
+            if rc != SQLITE_OK {
+                return Err(db_error(ctx, db, "could not configure SQLite connection").into());
+            }
+        }
+        Ok(Value::Undefined)
+    }
+
+    #[op]
+    pub fn changes(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let n = unsafe { (api.changes)(db) };
+        Ok(Value::Num(n as f64))
+    }
+
+    /// `totalChanges(dbId)` — the connection's cumulative change count. The JS glue diffs it around a
+    /// statement execution so a read-only statement reports `changes: 0` (Bun's semantics), which
+    /// plain `sqlite3_changes` (last write, however long ago) cannot express.
+    #[op(name = "totalChanges")]
+    pub fn total_changes(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let n = unsafe { (api.total_changes)(db) };
+        Ok(Value::Num(n as f64))
+    }
+
+    /// `lastInsertRowid(dbId, safeIntegers) -> number | bigint`.
+    #[op(name = "lastInsertRowid")]
+    pub fn last_insert_rowid(
+        ctx: &mut Ctx,
+        id: u32,
+        safe_integers: Option<bool>,
+    ) -> Result<Value, OpError> {
+        let safe = safe_integers.unwrap_or(false);
+        let db = db_ptr(ctx, id)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let n = unsafe { (api.last_insert_rowid)(db) };
+        if safe {
+            Ok(Value::bigint_from_i64(n))
+        } else {
+            Ok(Value::Num(n as f64))
+        }
+    }
+
+    /// `expandedSql(stmtId) -> string` — the SQL with its current bindings inlined (Bun's
+    /// `Statement.toString()`).
+    #[op(name = "expandedSql")]
+    pub fn expanded_sql(ctx: &mut Ctx, sid: u32) -> Result<Value, OpError> {
+        let stmt = stmt_ptr(ctx, sid)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let p = unsafe { (api.expanded_sql)(stmt) };
+        if p.is_null() {
+            return Ok(Value::from_string(String::new()));
+        }
+        let s = unsafe { cstr(p) };
+        unsafe { (api.free)(p as *mut c_void) };
+        Ok(Value::from_string(s))
+    }
+
+    #[op]
+    pub fn libversion(ctx: &mut Ctx) -> Result<Value, OpError> {
+        ensure_api(ctx)?;
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let v = unsafe { cstr((api.libversion)()) };
+        Ok(Value::from_string(v))
+    }
+
+    #[op(coerce, name = "setCustomSQLite")]
+    pub fn set_custom_sqlite(ctx: &mut Ctx, path: String) -> Result<Value, OpError> {
+        if !std::path::Path::new(&path).is_file() {
+            return Err(NativeError::runtime(format!(
+                "Database.setCustomSQLite library not found: {path}"
+            ))
+            .into());
+        }
+        let sqlite = state(ctx);
+        if sqlite.api.is_some() || !sqlite.dbs.is_empty() {
+            return Err(NativeError::runtime(
+                "Database.setCustomSQLite must be called before opening a database",
+            )
+            .into());
+        }
+        sqlite.custom_path = Some(path);
+        Ok(Value::Undefined)
+    }
+
+    /// `SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION`: allows only the C `sqlite3_load_extension` interface,
+    /// as Node does. `sqlite3_enable_load_extension` would also switch on the SQL `load_extension()`
+    /// function, which lets any SQL text load native code.
+    const SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION: c_int = 1005;
+
+    #[op(name = "enableLoadExtension")]
+    pub fn enable_load_extension(ctx: &mut Ctx, id: u32, allow: Value) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let enabled = match allow {
+            Value::Bool(value) => value,
+            _ => return Err(NativeError::type_error("allow must be a boolean").into()),
+        };
+        let api = state(ctx).api.as_ref().unwrap().clone();
+        let mut actual: c_int = 0;
+        // SAFETY: the documented (int, int*) shape of the variadic configuration call.
+        let rc = unsafe {
+            (api.db_config)(
+                db,
+                SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION,
+                i32::from(enabled),
+                &mut actual as *mut c_int,
+            )
+        };
+        if rc != SQLITE_OK {
+            // A library built without extension loading has nothing to disable.
+            let omitted = api
+                .compileoption_used
+                .is_some_and(|used| unsafe { used(c"OMIT_LOAD_EXTENSION".as_ptr()) != 0 });
+            if omitted && !enabled {
+                return Ok(Value::Undefined);
+            }
+            return Err(NativeError::runtime(if omitted {
                 "the loaded SQLite library does not support extensions".to_string()
             } else {
                 "unable to configure SQLite extension loading".to_string()
-            },
-        ).into());
-    }
-    Ok(Value::Undefined)
-}
-
-#[op(coerce, name = "loadExtension")]
-pub fn load_extension(ctx: &mut Ctx, id: u32, path: String) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let path = std::ffi::CString::new(path)
-        .map_err(|_| NativeError::type_error("extension path contains a null byte"))?;
-    let (load, free) = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        (api.load_extension, api.free)
-    };
-    let Some(load) = load else {
-        return Err(NativeError::runtime("the loaded SQLite library does not support extensions",
-        ).into());
-    };
-    let mut message: *mut c_char = std::ptr::null_mut();
-    let rc = unsafe { load(db, path.as_ptr(), std::ptr::null(), &mut message) };
-    if rc != SQLITE_OK {
-        let text = unsafe { cstr(message) };
-        if !message.is_null() {
-            unsafe { free(message as *mut c_void) };
+            })
+            .into());
         }
-        return Err(sqlite_err(
-            rc,
-            if text.is_empty() {
-                "unable to load SQLite extension".to_string()
-            } else {
-                text
-            },
-        ).into());
+        Ok(Value::Undefined)
     }
-    Ok(Value::Undefined)
-}
 
-#[op(name = "fileControl")]
-pub fn file_control(ctx: &mut Ctx, id: u32, command: i32, value: Option<Value>) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let file_control = state(ctx).api.as_ref().unwrap().file_control;
-    let value = value.as_ref().unwrap_or(&Value::Undefined);
-    let mut number = value.as_num_opt().unwrap_or(0.0) as i32;
-    let pointer = if matches!(value, Value::Undefined | Value::Null) {
-        std::ptr::null_mut()
-    } else if value.as_num_opt().is_some() {
-        &mut number as *mut i32 as *mut c_void
-    } else if let Some((_kind, _len, ptr)) = ctx.typed_array_raw(value) {
-        ptr as *mut c_void
-    } else {
-        return Err(NativeError::type_error("Database.fileControl value must be a number, TypedArray, null, or undefined",
-        ).into());
-    };
-    let rc = unsafe { file_control(db, std::ptr::null(), command, pointer) };
-    if rc != SQLITE_OK {
-        return Err(db_error(ctx, db, "sqlite3_file_control failed").into());
-    }
-    Ok(Value::Undefined)
-}
-
-/// `serialize(dbId) -> Uint8Array` — a byte-for-byte snapshot of the main database (what a
-/// `VACUUM INTO` of it would contain). Honest throw when the system libsqlite3 predates
-/// `sqlite3_serialize`.
-#[op]
-pub fn serialize(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
-    let db = db_ptr(ctx, id)?;
-    let bytes: Vec<u8> = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let Some(serialize) = api.serialize else {
-            return Err(NativeError::runtime("Database.serialize is not supported in lumen (system libsqlite3 lacks sqlite3_serialize)",
-            ).into());
+    #[op(coerce, name = "loadExtension")]
+    pub fn load_extension(ctx: &mut Ctx, id: u32, path: String) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let path = std::ffi::CString::new(path)
+            .map_err(|_| NativeError::type_error("extension path contains a null byte"))?;
+        let (load, free) = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            (api.load_extension, api.free)
         };
-        let schema = b"main\0";
-        let mut size: i64 = 0;
-        // SAFETY: `db` is live; `schema` is NUL-terminated; `size` receives the byte count. With
-        // flags=0 the returned buffer is sqlite3_malloc'd and ours to free.
-        let p = unsafe { serialize(db, schema.as_ptr() as *const c_char, &mut size, 0) };
-        if p.is_null() {
-            return Err(NativeError::runtime("sqlite3_serialize failed (out of memory?)").into());
+        let Some(load) = load else {
+            return Err(NativeError::runtime(
+                "the loaded SQLite library does not support extensions",
+            )
+            .into());
+        };
+        let mut message: *mut c_char = std::ptr::null_mut();
+        let rc = unsafe { load(db, path.as_ptr(), std::ptr::null(), &mut message) };
+        if rc != SQLITE_OK {
+            let text = unsafe { cstr(message) };
+            if !message.is_null() {
+                unsafe { free(message as *mut c_void) };
+            }
+            return Err(sqlite_err(
+                rc,
+                if text.is_empty() {
+                    "unable to load SQLite extension".to_string()
+                } else {
+                    text
+                },
+            )
+            .into());
         }
-        let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
-        unsafe { (api.free)(p as *mut c_void) };
-        bytes
-    };
-    Ok(ctx.make_uint8array(&bytes)?)
-}
+        Ok(Value::Undefined)
+    }
 
-/// `deserialize(bytes) -> dbId` — open a fresh in-memory database whose contents are the given
-/// serialized image (read-write; SQLite owns a resizable copy of the bytes).
-#[op]
-pub fn deserialize(ctx: &mut Ctx, buf: Value) -> Result<Value, OpError> {
-    ensure_api(ctx)?;
-    let bytes: Vec<u8> = match ctx.typed_array_raw(&buf) {
-        Some((_, len, ptr)) if !ptr.is_null() && len > 0 => unsafe {
-            std::slice::from_raw_parts(ptr, len).to_vec()
-        },
-        Some(_) => Vec::new(),
-        None => {
-            return Err(NativeError::type_error("Database.deserialize expects a TypedArray or Buffer",
-            ).into())
+    #[op(name = "fileControl")]
+    pub fn file_control(
+        ctx: &mut Ctx,
+        id: u32,
+        command: i32,
+        value: Option<Value>,
+    ) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let file_control = state(ctx).api.as_ref().unwrap().file_control;
+        let value = value.as_ref().unwrap_or(&Value::Undefined);
+        let mut number = value.as_num_opt().unwrap_or(0.0) as i32;
+        let pointer = if matches!(value, Value::Undefined | Value::Null) {
+            std::ptr::null_mut()
+        } else if value.as_num_opt().is_some() {
+            &mut number as *mut i32 as *mut c_void
+        } else if let Some((_kind, _len, ptr)) = ctx.typed_array_raw(value) {
+            ptr as *mut c_void
+        } else {
+            return Err(NativeError::type_error(
+                "Database.fileControl value must be a number, TypedArray, null, or undefined",
+            )
+            .into());
+        };
+        let rc = unsafe { file_control(db, std::ptr::null(), command, pointer) };
+        if rc != SQLITE_OK {
+            return Err(db_error(ctx, db, "sqlite3_file_control failed").into());
         }
-    };
+        Ok(Value::Undefined)
+    }
 
-    {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        if api.deserialize.is_none() || api.malloc64.is_none() {
-            return Err(NativeError::runtime("Database.deserialize is not supported in lumen (system libsqlite3 lacks sqlite3_deserialize)",
+    /// `serialize(dbId) -> Uint8Array` — a byte-for-byte snapshot of the main database (what a
+    /// `VACUUM INTO` of it would contain). Honest throw when the system libsqlite3 predates
+    /// `sqlite3_serialize`.
+    #[op]
+    pub fn serialize(ctx: &mut Ctx, id: u32) -> Result<Value, OpError> {
+        let db = db_ptr(ctx, id)?;
+        let bytes: Vec<u8> = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let Some(serialize) = api.serialize else {
+                return Err(NativeError::runtime("Database.serialize is not supported in lumen (system libsqlite3 lacks sqlite3_serialize)",
             ).into());
-        }
-    }
-
-    // Open the shell :memory: db that will adopt the image.
-    let mut db: *mut c_void = std::ptr::null_mut();
-    let rc = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let path = b":memory:\0";
-        // SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
-        unsafe {
-            (api.open_v2)(
-                path.as_ptr() as *const c_char,
-                &mut db,
-                2 | 4,
-                std::ptr::null(),
-            )
-        }
-    };
-    if rc != SQLITE_OK || db.is_null() {
-        return Err(NativeError::runtime("unable to open in-memory database").into());
-    }
-
-    let rc = {
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        let deserialize = api.deserialize.unwrap();
-        let malloc64 = api.malloc64.unwrap();
-        // SQLite requires the image in memory it can manage: copy into sqlite3_malloc'd space and
-        // hand ownership over with FREEONCLOSE (1) | RESIZEABLE (2).
-        let p = unsafe { malloc64(bytes.len().max(1) as u64) } as *mut u8;
-        if p.is_null() {
-            unsafe { (api.close_v2)(db) };
-            return Err(NativeError::runtime("sqlite3_malloc64 failed").into());
-        }
-        // SAFETY: `p` has capacity for `bytes.len()` bytes; src/dst don't overlap.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+            };
             let schema = b"main\0";
-            deserialize(
-                db,
-                schema.as_ptr() as *const c_char,
-                p,
-                bytes.len() as i64,
-                bytes.len() as i64,
-                1 | 2, // SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE
-            )
-        }
-    };
-    if rc != SQLITE_OK {
-        let err = db_error(ctx, db, "sqlite3_deserialize failed");
-        let api = state(ctx).api.as_ref().unwrap().clone();
-        unsafe { (api.close_v2)(db) };
-        return Err(err.into());
+            let mut size: i64 = 0;
+            // SAFETY: `db` is live; `schema` is NUL-terminated; `size` receives the byte count. With
+            // flags=0 the returned buffer is sqlite3_malloc'd and ours to free.
+            let p = unsafe { serialize(db, schema.as_ptr() as *const c_char, &mut size, 0) };
+            if p.is_null() {
+                return Err(
+                    NativeError::runtime("sqlite3_serialize failed (out of memory?)").into(),
+                );
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(p, size as usize).to_vec() };
+            unsafe { (api.free)(p as *mut c_void) };
+            bytes
+        };
+        Ok(ctx.make_uint8array(&bytes)?)
     }
 
-    let st = state(ctx);
-    let id = st.next_id();
-    st.dbs.insert(id, Db { ptr: db, active: Rc::new(ActiveCell::new(0)), pending:Rc::new(RefCell::new(None)), functions:Default::default() });
-    Ok(Value::Num(id as f64))
-}
+    /// `deserialize(bytes) -> dbId` — open a fresh in-memory database whose contents are the given
+    /// serialized image (read-write; SQLite owns a resizable copy of the bytes).
+    #[op]
+    pub fn deserialize(ctx: &mut Ctx, buf: Value) -> Result<Value, OpError> {
+        ensure_api(ctx)?;
+        let bytes: Vec<u8> = match ctx.typed_array_raw(&buf) {
+            Some((_, len, ptr)) if !ptr.is_null() && len > 0 => unsafe {
+                std::slice::from_raw_parts(ptr, len).to_vec()
+            },
+            Some(_) => Vec::new(),
+            None => {
+                return Err(NativeError::type_error(
+                    "Database.deserialize expects a TypedArray or Buffer",
+                )
+                .into())
+            }
+        };
 
+        {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            if api.deserialize.is_none() || api.malloc64.is_none() {
+                return Err(NativeError::runtime("Database.deserialize is not supported in lumen (system libsqlite3 lacks sqlite3_deserialize)",
+            ).into());
+            }
+        }
+
+        // Open the shell :memory: db that will adopt the image.
+        let mut db: *mut c_void = std::ptr::null_mut();
+        let rc = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let path = b":memory:\0";
+            // SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
+            unsafe {
+                (api.open_v2)(
+                    path.as_ptr() as *const c_char,
+                    &mut db,
+                    2 | 4,
+                    std::ptr::null(),
+                )
+            }
+        };
+        if rc != SQLITE_OK || db.is_null() {
+            return Err(NativeError::runtime("unable to open in-memory database").into());
+        }
+
+        let rc = {
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            let deserialize = api.deserialize.unwrap();
+            let malloc64 = api.malloc64.unwrap();
+            // SQLite requires the image in memory it can manage: copy into sqlite3_malloc'd space and
+            // hand ownership over with FREEONCLOSE (1) | RESIZEABLE (2).
+            let p = unsafe { malloc64(bytes.len().max(1) as u64) } as *mut u8;
+            if p.is_null() {
+                unsafe { (api.close_v2)(db) };
+                return Err(NativeError::runtime("sqlite3_malloc64 failed").into());
+            }
+            // SAFETY: `p` has capacity for `bytes.len()` bytes; src/dst don't overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+                let schema = b"main\0";
+                deserialize(
+                    db,
+                    schema.as_ptr() as *const c_char,
+                    p,
+                    bytes.len() as i64,
+                    bytes.len() as i64,
+                    1 | 2, // SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE
+                )
+            }
+        };
+        if rc != SQLITE_OK {
+            let err = db_error(ctx, db, "sqlite3_deserialize failed");
+            let api = state(ctx).api.as_ref().unwrap().clone();
+            unsafe { (api.close_v2)(db) };
+            return Err(err.into());
+        }
+
+        let st = state(ctx);
+        let id = st.next_id();
+        st.dbs.insert(
+            id,
+            Db {
+                ptr: db,
+                active: Rc::new(ActiveCell::new(0)),
+                pending: Rc::new(RefCell::new(None)),
+                functions: Default::default(),
+            },
+        );
+        Ok(Value::Num(id as f64))
+    }
 }
 
 /// Map a SQLite result code (primary or extended) to its constant name, as Bun exposes on

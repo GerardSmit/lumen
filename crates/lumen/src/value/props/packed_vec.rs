@@ -213,7 +213,11 @@ impl PackedVec {
         if cap - len >= extra {
             return;
         }
-        let want = if self.head != 0 { extra.max(len) } else { extra };
+        let want = if self.head != 0 {
+            extra.max(len)
+        } else {
+            extra
+        };
         let total = cap + self.head as usize;
         if !self.inline && total - len >= want {
             self.with_vec(0, |_| ());
@@ -406,7 +410,11 @@ impl Drop for PackedVec {
             }
             if !self.inline {
                 let base = self.ptr.sub(self.head as usize);
-                drop(Vec::from_raw_parts(base, 0, (self.cap + self.head) as usize));
+                drop(Vec::from_raw_parts(
+                    base,
+                    0,
+                    (self.cap + self.head) as usize,
+                ));
             }
         }
     }
@@ -453,7 +461,10 @@ mod tests {
             assert!(p.pop_front().is_some());
             p.push(prop((k + 10) as f64));
         }
-        assert_eq!(nums(&p), (10_000..10_010).map(|k| k as f64).collect::<Vec<_>>());
+        assert_eq!(
+            nums(&p),
+            (10_000..10_010).map(|k| k as f64).collect::<Vec<_>>()
+        );
         p.prepend([prop(-2.0), prop(-1.0)].into_iter());
         assert_eq!(nums(&p)[..3], [-2.0, -1.0, 10_000.0]);
         for k in 0..1000 {
@@ -486,7 +497,12 @@ mod tests {
             p.push(prop(k as f64));
         }
         assert!(!p.inline);
-        assert_eq!(nums(&p), [-1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+        assert_eq!(
+            nums(&p),
+            [
+                -1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0
+            ]
+        );
         let mut q = unsafe { PackedVec::inline_raw(buf, 0, 4) };
         q.push(prop(1.0));
         q.prepend([prop(-3.0), prop(-2.0)].into_iter());

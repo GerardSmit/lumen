@@ -83,10 +83,9 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         obj.borrow_mut()
             .props
             .insert("length", Property::data(Value::Num(l), false, false, true));
-        obj.borrow_mut().props.insert(
-            "name",
-            Property::data(name, false, false, true),
-        );
+        obj.borrow_mut()
+            .props
+            .insert("name", Property::data(name, false, false, true));
         Ok(Value::Obj(obj))
     });
     it.def_method(&fp, "toString", 0, |i, this, _args| {
@@ -249,6 +248,9 @@ pub(super) fn install_generator_function_ctors(it: &mut Interp) {
 /// Shared CreateDynamicFunction for the Function/Generator/Async/AsyncGenerator constructors:
 /// synthesize `<prefix> anonymous(<params>) { <body> }`, parse it, and build the function object.
 fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Result<Value, Value> {
+    if crate::native_ops::dynamic_code_disabled() {
+        return Err(i.make_error("EvalError", "dynamic code is not available in an AOT build"));
+    }
     let (params, body) = if args.is_empty() {
         (String::new(), String::new())
     } else {

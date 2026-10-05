@@ -9,13 +9,18 @@ const SLICE_MS: i64 = 20;
 
 /// Repeats `wait_once(slice_ms)` (which reports whether anything is ready) until something is
 /// ready or `timeout_ms` passes (`None`: forever), servicing signals between slices.
-pub(crate) fn wait<T: Send>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_once: impl FnMut(i32) -> Result<(bool, T), FsError> + Send) -> R<T> {
+pub(crate) fn wait<T: Send>(
+    it: &mut Interp,
+    timeout_ms: Option<i64>,
+    mut wait_once: impl FnMut(i32) -> Result<(bool, T), FsError> + Send,
+) -> R<T> {
     it.flush_out();
     let start = it.platform.borrow().monotonic_ns();
     loop {
         let left = match timeout_ms {
             Some(ms) => {
-                let spent = (it.platform.borrow().monotonic_ns().saturating_sub(start) / 1_000_000) as i64;
+                let spent =
+                    (it.platform.borrow().monotonic_ns().saturating_sub(start) / 1_000_000) as i64;
                 (ms - spent).max(0)
             }
             None => SLICE_MS,
@@ -37,7 +42,7 @@ pub(crate) fn wait<T: Send>(it: &mut Interp, timeout_ms: Option<i64>, mut wait_o
 /// On Windows, only sockets are supported; on Unix, all file descriptors.
 #[lumen_bind::module(name = "select")]
 pub mod select {
-    use crate::bind::{type_object, opaque_instance, Py, This};
+    use crate::bind::{opaque_instance, type_object, Py, This};
     use crate::builtins::posixm::as_file_descriptor;
     use crate::object::*;
     use crate::vm::{dict_del_str, dict_set_str, Interp};
@@ -77,7 +82,13 @@ pub mod select {
     /// On Windows, only sockets are supported; on Unix, all file
     /// descriptors can be used.
     #[op]
-    fn select(it: &mut Interp, rlist: &Value, wlist: &Value, xlist: &Value, timeout: Option<&Value>) -> R<Value> {
+    fn select(
+        it: &mut Interp,
+        rlist: &Value,
+        wlist: &Value,
+        xlist: &Value,
+        timeout: Option<&Value>,
+    ) -> R<Value> {
         let timeout_ms = match timeout {
             None | Some(Value::None) => None,
             Some(v) => {
@@ -86,7 +97,9 @@ pub mod select {
                     v if v.is_int_like() => it.index_of(v)? as f64,
                     v => {
                         let name = it.type_name_of(v);
-                        return Err(it.type_error(&format!("'{name}' object cannot be interpreted as an integer")));
+                        return Err(it.type_error(&format!(
+                            "'{name}' object cannot be interpreted as an integer"
+                        )));
                     }
                 };
                 if secs.is_nan() {
@@ -98,9 +111,20 @@ pub mod select {
                 Some((secs * 1000.0).ceil().min(i64::MAX as f64) as i64)
             }
         };
-        let lists = [fd_list(it, rlist)?, fd_list(it, wlist)?, fd_list(it, xlist)?];
-        let fds: Vec<Vec<i32>> = lists.iter().map(|l| l.iter().map(|e| e.1).collect()).collect();
-        if fds.iter().flatten().any(|&fd| fd as usize >= lumen_os::poll::FD_SETSIZE) {
+        let lists = [
+            fd_list(it, rlist)?,
+            fd_list(it, wlist)?,
+            fd_list(it, xlist)?,
+        ];
+        let fds: Vec<Vec<i32>> = lists
+            .iter()
+            .map(|l| l.iter().map(|e| e.1).collect())
+            .collect();
+        if fds
+            .iter()
+            .flatten()
+            .any(|&fd| fd as usize >= lumen_os::poll::FD_SETSIZE)
+        {
             return Err(it.value_error("filedescriptor out of range in select()"));
         }
         let ready = super::wait(it, timeout_ms, |ms| {
@@ -110,7 +134,15 @@ pub mod select {
         let out = lists
             .iter()
             .zip(&ready)
-            .map(|(list, flags)| Value::list(list.iter().zip(flags).filter(|e| *e.1).map(|e| e.0 .0.clone()).collect()))
+            .map(|(list, flags)| {
+                Value::list(
+                    list.iter()
+                        .zip(flags)
+                        .filter(|e| *e.1)
+                        .map(|e| e.0 .0.clone())
+                        .collect(),
+                )
+            })
             .collect();
         Ok(Value::tuple(out))
     }
@@ -141,13 +173,19 @@ pub mod select {
         ///     either an integer, or an object with a fileno() method returning an int
         ///   eventmask
         ///     an optional bitmask describing the type of events to check for
-        fn register(slf: This<Py<Self>>, it: &mut Interp, fd: &Value, eventmask: Option<&Value>) -> R<()> {
+        fn register(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            fd: &Value,
+            eventmask: Option<&Value>,
+        ) -> R<()> {
             let fd = as_file_descriptor(it, fd)?;
             let mask = event_mask(it, eventmask, POLLIN | POLLPRI | POLLOUT)?;
-            slf.0.with(it, |s| match s.fds.iter_mut().find(|e| e.0 == fd) {
-                Some(e) => e.1 = mask,
-                None => s.fds.push((fd, mask)),
-            })
+            slf.0
+                .with(it, |s| match s.fds.iter_mut().find(|e| e.0 == fd) {
+                    Some(e) => e.1 = mask,
+                    None => s.fds.push((fd, mask)),
+                })
         }
 
         /// Modify an already registered file descriptor.
@@ -160,13 +198,15 @@ pub mod select {
         fn modify(slf: This<Py<Self>>, it: &mut Interp, fd: &Value, eventmask: &Value) -> R<()> {
             let fd = as_file_descriptor(it, fd)?;
             let mask = event_mask(it, Some(eventmask), 0)?;
-            let found = slf.0.with(it, |s| match s.fds.iter_mut().find(|e| e.0 == fd) {
-                Some(e) => {
-                    e.1 = mask;
-                    true
-                }
-                None => false,
-            })?;
+            let found = slf
+                .0
+                .with(it, |s| match s.fds.iter_mut().find(|e| e.0 == fd) {
+                    Some(e) => {
+                        e.1 = mask;
+                        true
+                    }
+                    None => false,
+                })?;
             if !found {
                 return Err(it.os_error_errno(2, None, None));
             }
@@ -198,24 +238,37 @@ pub mod select {
         fn poll(slf: This<Py<Self>>, it: &mut Interp, timeout: Option<&Value>) -> R<Value> {
             let timeout_ms = match timeout {
                 None | Some(Value::None) => None,
-                Some(Value::Float(f)) if f.is_nan() => return Err(it.value_error("Invalid value NaN (not a number)")),
+                Some(Value::Float(f)) if f.is_nan() => {
+                    return Err(it.value_error("Invalid value NaN (not a number)"));
+                }
                 Some(Value::Float(f)) => Some(f.ceil() as i64),
                 Some(v) if v.is_int_like() => Some(it.index_of(v)?),
                 Some(_) => return Err(it.type_error("timeout must be an integer or None")),
             };
             let timeout_ms = timeout_ms.filter(|&ms| ms >= 0);
-            let busy = slf.0.with(it, |s| std::mem::replace(&mut s.polling, true))?;
+            let busy = slf
+                .0
+                .with(it, |s| std::mem::replace(&mut s.polling, true))?;
             if busy {
                 return Err(it.runtime_error("concurrent poll() invocation"));
             }
-            let mut fds: Vec<PollFd> = slf.0.with(it, |s| s.fds.iter().map(|&(fd, ev)| PollFd::new(fd, ev)).collect())?;
-            let r = super::wait(it, timeout_ms, |ms| lumen_os::poll::poll(&mut fds, ms).map(|n| (n > 0, ())));
+            let mut fds: Vec<PollFd> = slf.0.with(it, |s| {
+                s.fds.iter().map(|&(fd, ev)| PollFd::new(fd, ev)).collect()
+            })?;
+            let r = super::wait(it, timeout_ms, |ms| {
+                lumen_os::poll::poll(&mut fds, ms).map(|n| (n > 0, ()))
+            });
             slf.0.with(it, |s| s.polling = false)?;
             r?;
             let out = fds
                 .iter()
                 .filter(|f| f.revents != 0)
-                .map(|f| Value::tuple(vec![Value::Int(f.fd as i64), Value::Int(f.revents as u16 as i64)]))
+                .map(|f| {
+                    Value::tuple(vec![
+                        Value::Int(f.fd as i64),
+                        Value::Int(f.revents as u16 as i64),
+                    ])
+                })
                 .collect();
             Ok(Value::list(out))
         }
@@ -228,7 +281,13 @@ pub mod select {
     #[op(name = "poll")]
     fn new_poll(it: &mut Interp) -> Value {
         let cls = type_object::<Poll>(it);
-        opaque_instance(&cls, Poll { fds: Vec::new(), polling: false })
+        opaque_instance(
+            &cls,
+            Poll {
+                fds: Vec::new(),
+                polling: false,
+            },
+        )
     }
 
     const FD_SETSIZE: i64 = 1024;
@@ -240,12 +299,20 @@ pub mod select {
     fn seconds_to_ms(it: &mut Interp, v: Option<&Value>) -> R<Option<i64>> {
         match v {
             None | Some(Value::None) => Ok(None),
-            Some(Value::Float(f)) if f.is_nan() => Err(it.value_error("Invalid value NaN (not a number)")),
-            Some(Value::Float(f)) => Ok(Some((f * 1000.0).ceil().min(i64::MAX as f64) as i64).filter(|&ms| ms >= 0)),
-            Some(v) if v.is_int_like() => Ok(Some(it.index_of(v)?.saturating_mul(1000)).filter(|&ms| ms >= 0)),
+            Some(Value::Float(f)) if f.is_nan() => {
+                Err(it.value_error("Invalid value NaN (not a number)"))
+            }
+            Some(Value::Float(f)) => {
+                Ok(Some((f * 1000.0).ceil().min(i64::MAX as f64) as i64).filter(|&ms| ms >= 0))
+            }
+            Some(v) if v.is_int_like() => {
+                Ok(Some(it.index_of(v)?.saturating_mul(1000)).filter(|&ms| ms >= 0))
+            }
             Some(v) => {
                 let name = it.type_name_of(v);
-                Err(it.type_error(&format!("'{name}' object cannot be interpreted as an integer")))
+                Err(it.type_error(&format!(
+                    "'{name}' object cannot be interpreted as an integer"
+                )))
             }
         }
     }
@@ -284,7 +351,8 @@ pub mod select {
         fn ctl(&self, it: &mut Interp, op: i32, fd: &Value, events: u32) -> R<()> {
             let epfd = self.live(it)?;
             let fd = as_file_descriptor(it, fd)?;
-            lumen_os::event::epoll_ctl(epfd, op, fd, events).map_err(|e| it.os_error_errno(e.errno(), None, None))
+            lumen_os::event::epoll_ctl(epfd, op, fd, events)
+                .map_err(|e| it.os_error_errno(e.errno(), None, None))
         }
     }
 
@@ -301,14 +369,23 @@ pub mod select {
         ///     Deprecated and completely ignored.  However, when supplied, its value
         ///     must be 0 or select.EPOLL_CLOEXEC, otherwise OSError is raised.
         #[constructor]
-        fn new(it: &mut Interp, #[kw] #[default(-1)] sizehint: i32, #[kw] #[default(0)] flags: i32) -> R<Epoll> {
+        fn new(
+            it: &mut Interp,
+            #[kw]
+            #[default(-1)]
+            sizehint: i32,
+            #[kw]
+            #[default(0)]
+            flags: i32,
+        ) -> R<Epoll> {
             if sizehint != -1 && sizehint <= 0 {
                 return Err(it.value_error("negative sizehint"));
             }
             if flags != 0 && flags != 0o2000000 {
                 return Err(it.os_error_errno(22, None, None));
             }
-            let fd = lumen_os::event::epoll_create().map_err(|e| it.os_error_errno(e.errno(), None, None))?;
+            let fd = lumen_os::event::epoll_create()
+                .map_err(|e| it.os_error_errno(e.errno(), None, None))?;
             Ok(Epoll { fd })
         }
 
@@ -350,7 +427,12 @@ pub mod select {
         ///     a bit set composed of the various EPOLL constants
         ///
         /// The epoll interface supports all file descriptors that support poll.
-        fn register(&self, it: &mut Interp, #[kw] fd: &Value, #[kw] eventmask: Option<&Value>) -> R<()> {
+        fn register(
+            &self,
+            it: &mut Interp,
+            #[kw] fd: &Value,
+            #[kw] eventmask: Option<&Value>,
+        ) -> R<()> {
             let mask = event_bits(it, eventmask, 1 | 2 | 4)?;
             self.ctl(it, 1, fd, mask)
         }
@@ -384,12 +466,21 @@ pub mod select {
         ///
         /// Returns a list containing any descriptors that have events to report,
         /// as a list of (fd, events) 2-tuples.
-        fn poll(slf: This<Py<Self>>, it: &mut Interp, #[kw] timeout: Option<&Value>, #[kw] #[default(-1)] maxevents: i64) -> R<Value> {
+        fn poll(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw] timeout: Option<&Value>,
+            #[kw]
+            #[default(-1)]
+            maxevents: i64,
+        ) -> R<Value> {
             let timeout_ms = seconds_to_ms(it, timeout)?;
             let max = if maxevents == -1 {
                 FD_SETSIZE - 1
             } else if maxevents < 1 {
-                return Err(it.value_error(&format!("maxevents must be greater than 0, got {maxevents}")));
+                return Err(it.value_error(&format!(
+                    "maxevents must be greater than 0, got {maxevents}"
+                )));
             } else {
                 maxevents
             };
@@ -398,7 +489,12 @@ pub mod select {
                 lumen_os::event::epoll_wait(fd, max as usize, ms).map(|v| (!v.is_empty(), v))
             })?;
             Ok(Value::list(
-                events.into_iter().map(|(fd, ev)| Value::tuple(vec![Value::Int(fd as i64), Value::Int(ev as i64)])).collect(),
+                events
+                    .into_iter()
+                    .map(|(fd, ev)| {
+                        Value::tuple(vec![Value::Int(fd as i64), Value::Int(ev as i64)])
+                    })
+                    .collect(),
             ))
         }
 
@@ -439,14 +535,33 @@ pub mod select {
         fn new(
             it: &mut Interp,
             #[kw] ident: &Value,
-            #[kw] #[default(-1)] filter: i16,
-            #[kw] #[default(1)] flags: u16,
-            #[kw] #[default(0)] fflags: u32,
-            #[kw] #[default(0)] data: i64,
-            #[kw] #[default(0)] udata: usize,
+            #[kw]
+            #[default(-1)]
+            filter: i16,
+            #[kw]
+            #[default(1)]
+            flags: u16,
+            #[kw]
+            #[default(0)]
+            fflags: u32,
+            #[kw]
+            #[default(0)]
+            data: i64,
+            #[kw]
+            #[default(0)]
+            udata: usize,
         ) -> R<KeventObj> {
             let ident = as_file_descriptor(it, ident)? as usize;
-            Ok(KeventObj { k: Kevent { ident, filter, flags, fflags, data: data as isize, udata } })
+            Ok(KeventObj {
+                k: Kevent {
+                    ident,
+                    filter,
+                    flags,
+                    fflags,
+                    data: data as isize,
+                    udata,
+                },
+            })
         }
 
         #[getter]
@@ -578,7 +693,8 @@ pub mod select {
     impl Kqueue {
         #[constructor]
         fn new(it: &mut Interp) -> R<Kqueue> {
-            let fd = lumen_os::event::kqueue().map_err(|e| it.os_error_errno(e.errno(), None, None))?;
+            let fd =
+                lumen_os::event::kqueue().map_err(|e| it.os_error_errno(e.errno(), None, None))?;
             Ok(Kqueue { fd })
         }
 
@@ -622,10 +738,18 @@ pub mod select {
         ///   timeout
         ///     The maximum time to wait in seconds, or else None to wait forever.
         ///     This accepts floats for smaller timeouts, too.
-        fn control(slf: This<Py<Self>>, it: &mut Interp, changelist: &Value, maxevents: i64, timeout: Option<&Value>) -> R<Value> {
+        fn control(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            changelist: &Value,
+            maxevents: i64,
+            timeout: Option<&Value>,
+        ) -> R<Value> {
             let fd = slf.0.borrow(it)?.live(it)?;
             if maxevents < 0 {
-                return Err(it.value_error(&format!("Length of eventlist must be 0 or positive, got {maxevents}")));
+                return Err(it.value_error(&format!(
+                    "Length of eventlist must be 0 or positive, got {maxevents}"
+                )));
             }
             let timeout_ms = match timeout {
                 None | Some(Value::None) => None,
@@ -635,7 +759,9 @@ pub mod select {
                         v if v.is_int_like() => it.index_of(v)? as f64,
                         v => {
                             let name = it.type_name_of(v);
-                            return Err(it.type_error(&format!("'{name}' object cannot be interpreted as an integer")));
+                            return Err(it.type_error(&format!(
+                                "'{name}' object cannot be interpreted as an integer"
+                            )));
                         }
                     };
                     if secs.is_nan() {
@@ -655,22 +781,33 @@ pub mod select {
                 };
                 for item in items {
                     let Some(p) = Py::<KeventObj>::from_value(it, &item) else {
-                        return Err(it.type_error("changelist must be an iterable of select.kevent objects"));
+                        return Err(it.type_error(
+                            "changelist must be an iterable of select.kevent objects",
+                        ));
                     };
                     changes.push(p.borrow(it)?.k);
                 }
             }
             if !changes.is_empty() {
-                lumen_os::event::kevent(fd, &changes, 0, Some((0, 0))).map_err(|e| it.os_error_errno(e.errno(), None, None))?;
+                lumen_os::event::kevent(fd, &changes, 0, Some((0, 0)))
+                    .map_err(|e| it.os_error_errno(e.errno(), None, None))?;
             }
             if maxevents == 0 {
                 return Ok(Value::list(Vec::new()));
             }
             let events = super::wait(it, timeout_ms, |ms| {
-                let r = lumen_os::event::kevent(fd, &[], maxevents as usize, Some((i64::from(ms) / 1000, i64::from(ms) % 1000 * 1_000_000)))?;
+                let r = lumen_os::event::kevent(
+                    fd,
+                    &[],
+                    maxevents as usize,
+                    Some((i64::from(ms) / 1000, i64::from(ms) % 1000 * 1_000_000)),
+                )?;
                 Ok((!r.is_empty(), r))
             })?;
-            let out = events.into_iter().map(|k| Py::new(it, KeventObj { k }).value().clone()).collect();
+            let out = events
+                .into_iter()
+                .map(|k| Py::new(it, KeventObj { k }).value().clone())
+                .collect();
             Ok(Value::list(out))
         }
     }

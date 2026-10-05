@@ -8,9 +8,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use lumen_bind::NativeError;
-use lumen_host::{Ctx, Value};
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 use lumen_host::{CompletionSender, TaskId, TaskRegistry};
+use lumen_host::{Ctx, Value};
 
 pub(crate) use lumen_os::signal::number;
 
@@ -34,7 +34,11 @@ mod bindings {
     /// `signalUnwatch` (`undefined` where signals cannot be watched), or throws a uv-style error
     /// for a signal that cannot be caught.
     #[op(name = "signalWatch")]
-    fn signal_watch(ctx: &mut Ctx, name: Value, callback: Value) -> Result<Option<f64>, NativeError> {
+    fn signal_watch(
+        ctx: &mut Ctx,
+        name: Value,
+        callback: Value,
+    ) -> Result<Option<f64>, NativeError> {
         let Some(sig) = (match name {
             Value::Str(s) => number(s.as_ref()),
             _ => None,
@@ -50,7 +54,9 @@ mod bindings {
                 return Ok(None);
             };
             if imp::catchable(sig) {
-                let registry = ctx.host_mut::<TaskRegistry>().expect("runtime task registry");
+                let registry = ctx
+                    .host_mut::<TaskRegistry>()
+                    .expect("runtime task registry");
                 let task = registry.register_stream(callback, decode_signal);
                 registry.set_unref(task);
                 if let Some(key) = imp::watch(sig, sender, task) {
@@ -156,7 +162,11 @@ mod imp {
         targets: Vec<Target>,
     }
 
-    static WATCH: Mutex<Watch> = Mutex::new(Watch { depth: 0, pending: false, targets: Vec::new() });
+    static WATCH: Mutex<Watch> = Mutex::new(Watch {
+        depth: 0,
+        pending: false,
+        targets: Vec::new(),
+    });
     static WATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
     fn start_watcher() -> bool {
@@ -179,7 +189,9 @@ mod imp {
                             libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
                         };
                         if n < 0 {
-                            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                            if std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                            {
                                 continue;
                             }
                             return;
@@ -222,7 +234,16 @@ mod imp {
 
     fn set_handler(sig: i32, install: bool) -> bool {
         use lumen_os::signal::{set_disposition, Disposition};
-        set_disposition(sig, if install { Disposition::Catch } else { Disposition::Default }, true).is_ok()
+        set_disposition(
+            sig,
+            if install {
+                Disposition::Catch
+            } else {
+                Disposition::Default
+            },
+            true,
+        )
+        .is_ok()
     }
 
     pub(super) fn catchable(sig: i32) -> bool {
@@ -239,7 +260,12 @@ mod imp {
             return None;
         }
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        listeners.push(Listener { sig, key, sender, task });
+        listeners.push(Listener {
+            sig,
+            key,
+            sender,
+            task,
+        });
         Some(key)
     }
 
@@ -264,7 +290,13 @@ mod imp {
         if watch.depth > 0 {
             watch.depth -= 1;
             WATCH_DEPTH.store(watch.depth, Ordering::SeqCst);
-            if watch.depth == 0 && !LISTENERS.lock().unwrap().iter().any(|l| l.sig == libc::SIGINT) {
+            if watch.depth == 0
+                && !LISTENERS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|l| l.sig == libc::SIGINT)
+            {
                 set_handler(libc::SIGINT, false);
             }
         }
@@ -277,7 +309,11 @@ mod imp {
 
     pub(super) fn break_register(raised: Arc<AtomicBool>, fired: Arc<AtomicBool>) -> u64 {
         let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-        WATCH.lock().unwrap().targets.push(Target { key, raised, fired });
+        WATCH
+            .lock()
+            .unwrap()
+            .targets
+            .push(Target { key, raised, fired });
         key
     }
 
@@ -312,7 +348,10 @@ mod imp {
 }
 
 #[cfg(all(unix, not(target_arch = "wasm32")))]
-fn decode_signal(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_signal(
+    _ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
     let sig = payload.downcast::<i32>().map(|b| *b).unwrap_or(0);
     Ok(vec![Value::Num(sig as f64)])
 }
@@ -331,7 +370,8 @@ impl SigintBreak {
         let fired = Arc::new(AtomicBool::new(false));
         #[cfg(all(unix, not(target_arch = "wasm32")))]
         {
-            let key = imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
+            let key =
+                imp::watchdog_start().then(|| imp::break_register(raised, Arc::clone(&fired)));
             SigintBreak { fired, key }
         }
         #[cfg(not(all(unix, not(target_arch = "wasm32"))))]

@@ -11,7 +11,12 @@ members = [
     "crates/lumen-common",
     "crates/lumen-crypto",
     "crates/lumen-difftest",
+    "crates/lumen-exe-runtime",
     "crates/lumen-host",
+    "crates/lumen-html",
+    "crates/lumen-html-image",
+    "crates/lumen-html-js",
+    "crates/lumen-html-text",
     "crates/lumen-node",
     "crates/lumen-os",
     "crates/lumen-py",
@@ -20,10 +25,16 @@ members = [
     "crates/lumen-timers",
     "crates/lumen-tls",
     "crates/lumen-web",
+    "crates/lumen-webstreams",
     "crates/lumen-wasm",
     "crates/node-compat-runner",
     "crates/test262-runner",
 ]
+
+[patch.crates-io]
+# Upstream 0.16.0's profile-only edcstat module uses Vec without importing it
+# from alloc, which breaks its supported no_std + alloc configuration.
+rusty_h264-decoder = { path = "vendor/rusty_h264-decoder-0.16.0" }
 
 [workspace.package]
 version = "0.1.3"

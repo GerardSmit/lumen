@@ -422,10 +422,15 @@ fn node_test_runner_runs_sequentially_and_reports() {
     let lines = out.lines();
     let summary = lines.join("\n");
     assert!(
-        lines.contains(&"order before,first,afterEach,second,afterEach,afterEach,third,afterEach".to_string()),
+        lines.contains(
+            &"order before,first,afterEach,second,afterEach,afterEach,third,afterEach".to_string()
+        ),
         "{summary}"
     );
-    assert!(summary.contains("ok 1 - first waits for its promise"), "{summary}");
+    assert!(
+        summary.contains("ok 1 - first waits for its promise"),
+        "{summary}"
+    );
     assert!(summary.contains("not ok 3 - fails"), "{summary}");
     assert!(summary.contains("# tests 4"), "{summary}");
     assert!(summary.contains("# suites 1"), "{summary}");
@@ -499,7 +504,11 @@ fn write_file_exclusive_create_and_mode() {
         console.log(mode, second, numeric, fs.existsSync(file));
     "##,
     );
-    let expected = if cfg!(windows) { "n/a EEXIST open true EEXIST false" } else { "700 EEXIST open true EEXIST false" };
+    let expected = if cfg!(windows) {
+        "n/a EEXIST open true EEXIST false"
+    } else {
+        "700 EEXIST open true EEXIST false"
+    };
     assert_eq!(out.lines(), [expected]);
 }
 
@@ -577,5 +586,13 @@ fn http2_request_ended_before_connect_keeps_frame_order() {
     );
     let mut lines = out.lines();
     lines.sort();
-    assert_eq!(lines, ["body /first:", "body /second:hello", "response 200", "response 200"]);
+    assert_eq!(
+        lines,
+        [
+            "body /first:",
+            "body /second:hello",
+            "response 200",
+            "response 200"
+        ]
+    );
 }

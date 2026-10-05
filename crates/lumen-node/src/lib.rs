@@ -32,11 +32,6 @@ mod bunhash;
 #[cfg(not(target_arch = "wasm32"))]
 mod child;
 mod codec;
-mod glue_dev;
-#[cfg(windows)]
-mod win_spawn;
-#[cfg(windows)]
-mod win_pipe;
 mod crypto;
 #[cfg(not(target_arch = "wasm32"))]
 mod dns;
@@ -44,16 +39,22 @@ mod dns;
 mod dylib;
 #[cfg(all(feature = "bun", not(target_arch = "wasm32")))]
 mod ffi;
+#[cfg(feature = "compiler")]
+mod glue_dev;
+#[cfg(windows)]
+mod win_pipe;
+#[cfg(windows)]
+mod win_spawn;
 use lumen_common::hash;
-#[path = "../../lumen-runtime/src/jsx.rs"]
-mod jsx;
+#[cfg(target_arch = "wasm32")]
+mod browser;
+mod fsb;
 #[cfg(not(target_arch = "wasm32"))]
 mod napi;
-mod fsb;
 mod native;
-mod oscon;
 #[cfg(not(target_arch = "wasm32"))]
 mod net;
+mod oscon;
 mod password;
 mod pathops;
 mod signals;
@@ -66,8 +67,6 @@ mod vm_context;
 mod vm_timeout;
 mod zlib;
 #[cfg(target_arch = "wasm32")]
-mod browser;
-#[cfg(target_arch = "wasm32")]
 use browser::{child, dns, napi, net, tls, vm_timeout};
 #[cfg(all(feature = "bun", target_arch = "wasm32"))]
 use browser::{ffi, sqlite};
@@ -75,7 +74,10 @@ use browser::{ffi, sqlite};
 pub use signals::SigintBreak;
 
 pub fn extension() -> Extension {
+    #[cfg(feature = "compiler")]
     let dev_glue = glue_dev::source();
+    #[cfg(not(feature = "compiler"))]
+    let dev_glue = None;
     Extension {
         name: "node",
         modules: &[
@@ -109,7 +111,11 @@ pub fn extension() -> Extension {
             state.put(zlib::ZlibHandles::default());
         }),
         js_init: dev_glue,
-        js_init_snapshot: if dev_glue.is_some() { None } else { Some(JS_GLUE_AOT) },
+        js_init_snapshot: if dev_glue.is_some() {
+            None
+        } else {
+            Some(JS_GLUE_AOT)
+        },
     }
 }
 
@@ -295,9 +301,9 @@ mod node_bindings {
                     let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
                     ctx.write_heap_snapshot(&mut out)
                 });
-                written
-                    .map(|()| None)
-                    .map_err(|e| NativeError::runtime(format!("cannot write heap snapshot '{path}': {e}")))
+                written.map(|()| None).map_err(|e| {
+                    NativeError::runtime(format!("cannot write heap snapshot '{path}': {e}"))
+                })
             }
             _ => {
                 let mut out = Vec::new();
@@ -316,20 +322,25 @@ mod node_bindings {
         let times = times.as_num_opt().unwrap_or(0.0).max(0.0) as u32;
         let thread_id = thread_id.as_num_opt().unwrap_or(0.0) as u32;
         let dir = match dir {
-            Some(Value::Str(d)) if !d.to_string().is_empty() => Some(std::path::PathBuf::from(d.to_string())),
+            Some(Value::Str(d)) if !d.to_string().is_empty() => {
+                Some(std::path::PathBuf::from(d.to_string()))
+            }
             _ => None,
         };
         ctx.set_near_limit_hook(
             times,
             Box::new(move |interp| {
-                static SEQUENCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                static SEQUENCE: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
                 let seq = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 let name = format!(
                     "Heap.{}.{}.{thread_id}.{seq:03}.heapsnapshot",
                     local_stamp(),
                     std::process::id()
                 );
-                let path = dir.as_ref().map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
+                let path = dir
+                    .as_ref()
+                    .map_or_else(|| std::path::PathBuf::from(&name), |d| d.join(&name));
                 let _ = std::fs::File::create(&path).and_then(|f| {
                     let mut out = std::io::BufWriter::with_capacity(64 * 1024, f);
                     interp.write_heap_snapshot(&mut out)
@@ -348,7 +359,10 @@ mod node_bindings {
     /// `[liveHeapObjects, arrayBufferBytes]` for `process.memoryUsage()`.
     #[op(name = "memoryStats")]
     pub fn memory_stats(ctx: &mut Ctx) -> Vec<f64> {
-        vec![ctx.live_object_count() as f64, lumen_common::buffer::tracked_bytes() as f64]
+        vec![
+            ctx.live_object_count() as f64,
+            lumen_common::buffer::tracked_bytes() as f64,
+        ]
     }
 
     /// `(callback | null)` — log every collection and queue `callback` as a microtask after it;
@@ -399,7 +413,13 @@ mod node_bindings {
     /// `(init, before, after, settled)` — install V8-style promise hooks (`v8.promiseHooks`,
     /// async_hooks); all four non-callable removes them.
     #[op(name = "setPromiseHooks")]
-    pub fn set_promise_hooks(ctx: &mut Ctx, init: Value, before: Value, after: Value, settled: Value) {
+    pub fn set_promise_hooks(
+        ctx: &mut Ctx,
+        init: Value,
+        before: Value,
+        after: Value,
+        settled: Value,
+    ) {
         ctx.set_promise_hooks(Some([init, before, after, settled]));
     }
 
@@ -434,8 +454,15 @@ mod node_bindings {
     }
 
     #[op(coerce, name = "transformJsx")]
-    pub fn transform_jsx(source: &str) -> Result<String, OpError> {
-        jsx::transform(source).map_err(OpError::syntax_error)
+    pub fn transform_jsx(source: &str, ts: Option<bool>) -> Result<String, OpError> {
+        // Bun's default classic output keeps transformSync usable as a standalone script.
+        let options = lumen::JsxOptions {
+            runtime: lumen::JsxRuntime::Classic,
+            ..Default::default()
+        };
+        lumen::transpile_jsx(source, ts.unwrap_or(false), &options).map_err(|error| {
+            OpError::syntax_error(format!("{} (line {})", error.message, error.line))
+        })
     }
 
     /// `stripTypes(code)`: Node's strip-only TypeScript erasure (the engine parser's TypeScript
@@ -446,7 +473,13 @@ mod node_bindings {
     pub fn strip_types(code: &str) -> Result<String, OpError> {
         lumen::typescript::strip_types(code).map_err(|e| {
             // Node's `stack` for these: the code frame (no file name), then the header.
-            let stack = lumen::typescript::node_error_text("", code, Some((e.offset, e.end)), e.line, &e.message);
+            let stack = lumen::typescript::node_error_text(
+                "",
+                code,
+                Some((e.offset, e.end)),
+                e.line,
+                &e.message,
+            );
             let err = OpError::syntax_error(e.message);
             let err = match e.code {
                 Some(c) => err.with_code(c),
@@ -461,7 +494,12 @@ mod node_bindings {
     /// synthesized header, so positions are the file's; its frames print as `filename`. With `ts`
     /// the source is TypeScript (the engine's strip-only mode; errors carry Node's `code`).
     #[op(coerce, name = "compileCommonJS")]
-    pub fn compile_commonjs(ctx: &mut Ctx, source: &str, filename: &str, ts: Value) -> Result<Value, Value> {
+    pub fn compile_commonjs(
+        ctx: &mut Ctx,
+        source: &str,
+        filename: &str,
+        ts: Value,
+    ) -> Result<Value, Value> {
         let ts = matches!(ts, Value::Bool(true));
         ctx.compile_cjs_function(source, &lumen::typescript::CJS_PARAMS, filename, ts)
     }
@@ -473,7 +511,10 @@ fn local_stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     match lumen_os::time::localtime(secs) {
-        Ok(tm) => format!("{:04}{:02}{:02}.{:02}{:02}{:02}", tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec),
+        Ok(tm) => format!(
+            "{:04}{:02}{:02}.{:02}{:02}{:02}",
+            tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec
+        ),
         Err(_) => format!("{}.{:06}", secs / 86_400, secs % 86_400),
     }
 }
@@ -569,7 +610,11 @@ mod os_bindings {
     pub fn sysinfo(ctx: &mut Ctx) -> Value {
         let obj = Value::Obj(ctx.new_object());
         let _ = ctx.set_member(&obj, "uptime", Value::Num(lumen_os::sysinfo::uptime()));
-        let _ = ctx.set_member(&obj, "freemem", Value::Num(lumen_os::sysinfo::free_memory()));
+        let _ = ctx.set_member(
+            &obj,
+            "freemem",
+            Value::Num(lumen_os::sysinfo::free_memory()),
+        );
         let load = lumen_os::sysinfo::loadavg();
         for (key, n) in ["load1", "load5", "load15"].into_iter().zip(load) {
             let _ = ctx.set_member(&obj, key, Value::Num(n));
@@ -577,10 +622,22 @@ mod os_bindings {
         let user = lumen_os::ident::current_user();
         let _ = ctx.set_member(&obj, "uid", Value::Num(user.uid as f64));
         let _ = ctx.set_member(&obj, "gid", Value::Num(user.gid as f64));
-        let _ = ctx.set_member(&obj, "username", Value::from_string(user.name.unwrap_or_default()));
+        let _ = ctx.set_member(
+            &obj,
+            "username",
+            Value::from_string(user.name.unwrap_or_default()),
+        );
         let shell = user.shell.filter(|s| !s.is_empty());
-        let _ = ctx.set_member(&obj, "shell", shell.map(Value::from_string).unwrap_or(Value::Null));
-        let _ = ctx.set_member(&obj, "homedir", Value::from_string(user.dir.unwrap_or_default()));
+        let _ = ctx.set_member(
+            &obj,
+            "shell",
+            shell.map(Value::from_string).unwrap_or(Value::Null),
+        );
+        let _ = ctx.set_member(
+            &obj,
+            "homedir",
+            Value::from_string(user.dir.unwrap_or_default()),
+        );
         obj
     }
 
@@ -613,7 +670,9 @@ mod os_bindings {
 }
 
 /// Finalize native addon producers while the owning realm remains alive.
-pub fn shutdown_native_addons(ctx: &mut Ctx) { napi::shutdown(ctx); }
+pub fn shutdown_native_addons(ctx: &mut Ctx) {
+    napi::shutdown(ctx);
+}
 
 /// Close every socket and listener the realm still holds, ending the threads blocked on them.
 pub fn close_native_io(ctx: &mut Ctx) {
@@ -632,5 +691,6 @@ pub fn shutdown_native_resources(ctx: &mut Ctx) {
 }
 
 /// Wake child realms blocked on their stdio pipes (see `child::close_child_pipes`).
-pub fn close_child_pipes(ctx: &mut Ctx) { child::close_child_pipes(ctx); }
-
+pub fn close_child_pipes(ctx: &mut Ctx) {
+    child::close_child_pipes(ctx);
+}

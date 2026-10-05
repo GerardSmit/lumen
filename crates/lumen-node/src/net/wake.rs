@@ -50,7 +50,11 @@ pub(super) fn wake_all() {
 
 /// Park until `fd` reports one of `events` (or an error/hangup): `Ok(true)`. `Ok(false)` once
 /// `cancelled` is set and [`wake_all`] has run.
-pub(super) fn wait(fd: RawFd, events: libc::c_short, cancelled: &AtomicBool) -> std::io::Result<bool> {
+pub(super) fn wait(
+    fd: RawFd,
+    events: libc::c_short,
+    cancelled: &AtomicBool,
+) -> std::io::Result<bool> {
     loop {
         if cancelled.load(Ordering::SeqCst) {
             return Ok(false);
@@ -60,7 +64,10 @@ pub(super) fn wait(fd: RawFd, events: libc::c_short, cancelled: &AtomicBool) -> 
             return Ok(false);
         }
         use lumen_os::poll::{poll, PollFd, POLLIN};
-        let mut fds = [PollFd::new(fd, events), PollFd::new(epoch.read.as_raw_fd(), POLLIN)];
+        let mut fds = [
+            PollFd::new(fd, events),
+            PollFd::new(epoch.read.as_raw_fd(), POLLIN),
+        ];
         if let Err(e) = poll(&mut fds, -1) {
             if e.errno() == libc::EINTR {
                 continue;

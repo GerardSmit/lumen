@@ -56,12 +56,14 @@ fn bump_state(ctx: &mut Ctx) -> f64 {
     c.0 as f64
 }
 
-
 #[test]
 fn extension_installs_state_globals_and_namespaces() {
     static EXT: Extension = Extension {
         name: "counter",
-        modules: &[globals::<counter_globals::Module>, namespace::<counter_ns::Module>],
+        modules: &[
+            globals::<counter_globals::Module>,
+            namespace::<counter_ns::Module>,
+        ],
         state_init: Some(|state| state.put(Counter(0))),
         js_init: None,
         js_init_snapshot: None,

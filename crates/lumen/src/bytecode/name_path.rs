@@ -106,7 +106,9 @@ impl NamePath {
             return None;
         };
         let pointer = self.resolve(env)?;
-        if pointer != Rc::as_ptr(&interp.global_env) || object.as_ptr() != Gc::as_ptr(&interp.global) {
+        if pointer != Rc::as_ptr(&interp.global_env)
+            || object.as_ptr() != Gc::as_ptr(&interp.global)
+        {
             return None;
         }
         global_value(interp, &interp.global, *shape, *slot)?;
@@ -310,12 +312,20 @@ impl Chunk {
         cache: u32,
         write: bool,
     ) -> Option<*mut Binding> {
-        self.name_paths.get(cache as usize)?.borrow().as_ref()?.binding_ptr(env, write)
+        self.name_paths
+            .get(cache as usize)?
+            .borrow()
+            .as_ref()?
+            .binding_ptr(env, write)
     }
 
     /// [`NamePath::global_slot`] of cache `cache`'s path.
     pub(crate) fn name_path_global(&self, interp: &Interp, env: &Env, cache: u32) -> Option<usize> {
-        self.name_paths.get(cache as usize)?.borrow().as_ref()?.global_slot(interp, env)
+        self.name_paths
+            .get(cache as usize)?
+            .borrow()
+            .as_ref()?
+            .global_slot(interp, env)
     }
 
     /// Whether cache `cache` holds a path, and whether it ends at the global object.

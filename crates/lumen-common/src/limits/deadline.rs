@@ -27,7 +27,10 @@ impl Deadline {
                 }
             })
             .expect("spawn deadline thread");
-        Deadline { cancel, thread: Some(thread) }
+        Deadline {
+            cancel,
+            thread: Some(thread),
+        }
     }
 
     /// Leaves the timer running to its end, whatever happens to the owner.
@@ -38,7 +41,9 @@ impl Deadline {
 
 impl Drop for Deadline {
     fn drop(&mut self) {
-        let Some(thread) = self.thread.take() else { return };
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
         let (lock, cvar) = &*self.cancel;
         *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
         cvar.notify_all();
@@ -55,7 +60,9 @@ mod tests {
     fn fires_after_the_limit() {
         let fired = Arc::new(AtomicBool::new(false));
         let flag = fired.clone();
-        let deadline = Deadline::start("test-deadline", Duration::from_millis(10), move || flag.store(true, SeqCst));
+        let deadline = Deadline::start("test-deadline", Duration::from_millis(10), move || {
+            flag.store(true, SeqCst)
+        });
         std::thread::sleep(Duration::from_millis(200));
         assert!(fired.load(SeqCst));
         drop(deadline);
@@ -65,7 +72,11 @@ mod tests {
     fn dropping_cancels() {
         let fired = Arc::new(AtomicBool::new(false));
         let flag = fired.clone();
-        drop(Deadline::start("test-deadline", Duration::from_secs(3600), move || flag.store(true, SeqCst)));
+        drop(Deadline::start(
+            "test-deadline",
+            Duration::from_secs(3600),
+            move || flag.store(true, SeqCst),
+        ));
         assert!(!fired.load(SeqCst));
     }
 }

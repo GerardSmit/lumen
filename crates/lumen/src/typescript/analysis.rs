@@ -263,7 +263,13 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
             .param_names
             .iter()
             .zip(&f.params)
-            .map(|(n, k)| format!("{{\"name\":{},\"type\":{}}}", lumen_common::json::json_string(n), kind_json(k)))
+            .map(|(n, k)| {
+                format!(
+                    "{{\"name\":{},\"type\":{}}}",
+                    lumen_common::json::json_string(n),
+                    kind_json(k)
+                )
+            })
             .collect();
         let locals: Vec<String> = f
             .locals
@@ -315,7 +321,12 @@ pub fn report_json(table: &TypeTable, src: &str, file: &str) -> String {
         let methods: Vec<String> = c
             .methods
             .iter()
-            .map(|(n, o)| format!("{{\"name\":{},\"fn\":{o}}}", lumen_common::json::json_string(n)))
+            .map(|(n, o)| {
+                format!(
+                    "{{\"name\":{},\"fn\":{o}}}",
+                    lumen_common::json::json_string(n)
+                )
+            })
             .collect();
         classes.push(format!(
             "{{\"id\":{i},\"name\":{},\"start\":{},\"end\":{},{},\"parent\":{},\"sound\":{}{note},\"fields\":[{}],\"methods\":[{}]}}",

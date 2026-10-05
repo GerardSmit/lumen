@@ -12,8 +12,9 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-host = { path = "../lumen-host" }
+lumen = { path = "../lumen", default-features = false }
 lumen-bind = { path = "../lumen-bind" }
+lumen-host = { path = "../lumen-host", default-features = false }
 lumen-os = { path = "../lumen-os" }
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-codegen = { path = "../lumen-codegen" }
@@ -28,6 +29,19 @@ js-sys = "0.3"
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]
 lumen = { path = "../lumen" }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
+
+[dev-dependencies]
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+
+[features]
+default = ["compiler", "jit", "aot-native", "intl", "typed"]
+compiler = ["lumen-host/compiler"]
+jit = ["compiler", "lumen-host/jit"]
+aot-native = ["lumen-host/aot-native"]
+intl = ["lumen-host/intl"]
+typed = ["compiler", "lumen-host/typed"]
+parallel = ["lumen-host/parallel"]
 
 [lints]
 workspace = true

@@ -57,15 +57,21 @@ fn run_bounded(ctx: &mut Ctx, ms: f64, callee: Value, break_on_sigint: bool) -> 
     let sigint = break_on_sigint.then(|| SigintBreak::new(Arc::clone(&raised)));
     let fired = Arc::new(Fired {
         timeout: Arc::new(AtomicBool::new(false)),
-        sigint: sigint.as_ref().map_or_else(|| Arc::new(AtomicBool::new(false)), SigintBreak::fired_flag),
+        sigint: sigint
+            .as_ref()
+            .map_or_else(|| Arc::new(AtomicBool::new(false)), SigintBreak::fired_flag),
     });
     let watchdog = timed.then(|| {
         let (raised, fired) = (Arc::clone(&raised), Arc::clone(&fired.timeout));
-        Deadline::start("lumen-vm-timeout", Duration::from_secs_f64(ms / 1000.0), move || {
-            // `fired` first: the unwinding side reads it after seeing the flag.
-            fired.store(true, Ordering::SeqCst);
-            raised.store(true, Ordering::SeqCst);
-        })
+        Deadline::start(
+            "lumen-vm-timeout",
+            Duration::from_secs_f64(ms / 1000.0),
+            move || {
+                // `fired` first: the unwinding side reads it after seeing the flag.
+                fired.store(true, Ordering::SeqCst);
+                raised.store(true, Ordering::SeqCst);
+            },
+        )
     });
     ACTIVE.with(|a| a.borrow_mut().push(Arc::clone(&fired)));
     let result = ctx.invoke(callee, Value::Undefined, &[]);

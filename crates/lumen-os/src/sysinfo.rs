@@ -131,16 +131,24 @@ pub fn available_memory(rss: u64) -> (u64, u64) {
             .or_else(|| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok())
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|limit| *limit > 0 && *limit < total);
-        let available = limit.map_or(host_available, |limit| host_available.min(limit.saturating_sub(rss)));
+        let available = limit.map_or(host_available, |limit| {
+            host_available.min(limit.saturating_sub(rss))
+        });
         (available, limit.unwrap_or(0))
     }
     #[cfg(target_os = "macos")]
     {
         let n = |name| sysctl::<u64>(name).unwrap_or(0);
         let total = n("hw.memsize");
-        let pages = n("vm.page_free_count") + n("vm.page_inactive_count") + n("vm.page_purgeable_count");
+        let pages =
+            n("vm.page_free_count") + n("vm.page_inactive_count") + n("vm.page_purgeable_count");
         let page_size = sysctl::<u64>("hw.pagesize").unwrap_or(4096);
-        (pages.saturating_mul(page_size).min(total.saturating_sub(rss)), 0)
+        (
+            pages
+                .saturating_mul(page_size)
+                .min(total.saturating_sub(rss)),
+            0,
+        )
     }
     #[cfg(windows)]
     {
@@ -160,10 +168,18 @@ pub fn cpu_and_memory() -> (String, u64, u64) {
     {
         let mut model = [0u8; 256];
         let model = sysctl_bytes("machdep.cpu.brand_string", &mut model)
-            .map(|n| String::from_utf8_lossy(&model[..n]).trim_end_matches('\0').to_string())
+            .map(|n| {
+                String::from_utf8_lossy(&model[..n])
+                    .trim_end_matches('\0')
+                    .to_string()
+            })
             .unwrap_or_default();
         let hz = sysctl::<u64>("hw.cpufrequency").unwrap_or(0);
-        (model, hz / 1_000_000, sysctl::<u64>("hw.memsize").unwrap_or(0))
+        (
+            model,
+            hz / 1_000_000,
+            sysctl::<u64>("hw.memsize").unwrap_or(0),
+        )
     }
     #[cfg(target_os = "linux")]
     {
@@ -176,7 +192,9 @@ pub fn cpu_and_memory() -> (String, u64, u64) {
                 .map(|(_, v)| v.trim().to_string())
         };
         let model = field("model name").unwrap_or_default();
-        let mhz = field("cpu MHz").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0) as u64;
+        let mhz = field("cpu MHz")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0) as u64;
         (model, mhz, meminfo(&["MemTotal:"])[0])
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -214,7 +232,11 @@ pub fn uptime() -> f64 {
     {
         std::fs::read_to_string("/proc/uptime")
             .ok()
-            .and_then(|t| t.split_whitespace().next().and_then(|n| n.parse::<f64>().ok()))
+            .and_then(|t| {
+                t.split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse::<f64>().ok())
+            })
             .unwrap_or(0.0)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -245,7 +267,13 @@ fn sysctl<T: Default>(name: &str) -> Option<T> {
     let mut len = std::mem::size_of::<T>();
     // SAFETY: `value` is a writable `T` of `len` bytes.
     let rc = unsafe {
-        libc::sysctlbyname(cname.as_ptr(), (&mut value as *mut T).cast(), &mut len, std::ptr::null_mut(), 0)
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            (&mut value as *mut T).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
     };
     (rc == 0).then_some(value)
 }
@@ -256,12 +284,22 @@ fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
     let cname = std::ffi::CString::new(name).ok()?;
     let mut len = buf.len();
     // SAFETY: `buf` is writable for `len` bytes and `len` is updated to the bytes written.
-    let rc = unsafe { libc::sysctlbyname(cname.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
     (rc == 0).then_some(len)
 }
 
 pub fn cpu_count() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Byte values of `/proc/meminfo` fields (`"MemTotal:"`), 0 for a missing one.
@@ -324,14 +362,22 @@ pub fn tmpdir_from(env: impl Fn(&str) -> Option<String>) -> String {
     let get = |name: &str| env(name).filter(|v| !v.is_empty());
     if cfg!(windows) {
         let mut path = get("TEMP").or_else(|| get("TMP")).unwrap_or_else(|| {
-            format!("{}\\temp", get("SystemRoot").or_else(|| get("windir")).unwrap_or_default())
+            format!(
+                "{}\\temp",
+                get("SystemRoot")
+                    .or_else(|| get("windir"))
+                    .unwrap_or_default()
+            )
         });
         if path.len() > 1 && path.ends_with('\\') && !path.ends_with(":\\") {
             path.pop();
         }
         path
     } else {
-        let mut path = get("TMPDIR").or_else(|| get("TMP")).or_else(|| get("TEMP")).unwrap_or_else(|| "/tmp".into());
+        let mut path = get("TMPDIR")
+            .or_else(|| get("TMP"))
+            .or_else(|| get("TEMP"))
+            .unwrap_or_else(|| "/tmp".into());
         if path.len() > 1 && path.ends_with('/') {
             path.pop();
         }
@@ -414,14 +460,20 @@ mod win {
     }
 
     pub fn memory_counters() -> MemoryCounters {
-        let mut memory = MemoryCounters { cb: std::mem::size_of::<MemoryCounters>() as u32, ..Default::default() };
+        let mut memory = MemoryCounters {
+            cb: std::mem::size_of::<MemoryCounters>() as u32,
+            ..Default::default()
+        };
         // SAFETY: the pseudo-handle needs no closing; `memory` carries its size.
         unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut memory, memory.cb) };
         memory
     }
 
     pub fn memory_status() -> MemoryStatusEx {
-        let mut status = MemoryStatusEx { length: std::mem::size_of::<MemoryStatusEx>() as u32, ..Default::default() };
+        let mut status = MemoryStatusEx {
+            length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            ..Default::default()
+        };
         // SAFETY: `status` carries its size.
         unsafe { GlobalMemoryStatusEx(&mut status) };
         status
@@ -434,13 +486,18 @@ mod tests {
 
     #[test]
     fn tmpdir_rules() {
-        let env = |vars: &'static [(&'static str, &'static str)]| move |k: &str| vars.iter().find(|v| v.0 == k).map(|v| v.1.to_string());
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| vars.iter().find(|v| v.0 == k).map(|v| v.1.to_string())
+        };
         if cfg!(windows) {
             assert_eq!(tmpdir_from(env(&[("TEMP", "C:\\")])), "C:\\");
             assert_eq!(tmpdir_from(env(&[("TEMP", "\\temp\\")])), "\\temp");
         } else {
             assert_eq!(tmpdir_from(env(&[])), "/tmp");
-            assert_eq!(tmpdir_from(env(&[("TMPDIR", ""), ("TMP", "/tmp2/")])), "/tmp2");
+            assert_eq!(
+                tmpdir_from(env(&[("TMPDIR", ""), ("TMP", "/tmp2/")])),
+                "/tmp2"
+            );
             assert_eq!(tmpdir_from(env(&[("TMPDIR", "/tmpdir\\")])), "/tmpdir\\");
             assert_eq!(tmpdir_from(env(&[("TMPDIR", "/")])), "/");
         }
@@ -450,6 +507,11 @@ mod tests {
     fn usage() {
         let u = resource_usage().unwrap();
         assert!(u.max_rss_kib > 0 || cfg!(not(any(unix, windows))));
-        let _ = (resident_set_bytes(), available_memory(0), cpu_and_memory(), get_priority(0));
+        let _ = (
+            resident_set_bytes(),
+            available_memory(0),
+            cpu_and_memory(),
+            get_priority(0),
+        );
     }
 }

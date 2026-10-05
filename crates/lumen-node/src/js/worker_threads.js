@@ -44,8 +44,26 @@
   // event) and Node-style ones (called with the event's value: a message's data, an emit's
   // argument). A listener that throws is an uncaught exception, as in Node.
 
-  const ET = EventTarget.prototype;
+  // Browser embedders can replace the global EventTarget after this Node module loads. Node
+  // MessagePorts must keep using the constructor whose prototype their methods and listener
+  // internals were built against; a later DOM EventTarget has different instance state.
+  // The DOM adapter may replace these globals before node:worker_threads is first required. Keep
+  // Node ports tied to the constructors and private state created by the shared event unit.
   const internals = __eventTargetInternals;
+  const NodeEvent = internals.Event;
+  const NodeEventTarget = internals.NodeEventTarget;
+  class NodeMessageEvent extends NodeEvent {
+    constructor(type, init = {}) {
+      super(type, init);
+      init = init && typeof init === "object" ? init : {};
+      this.data = init.data === undefined ? null : init.data;
+      this.origin = init.origin === undefined ? "" : `${init.origin}`;
+      this.lastEventId = init.lastEventId === undefined ? "" : `${init.lastEventId}`;
+      this.source = init.source === undefined ? null : init.source;
+      this.ports = Object.freeze(init.ports === undefined ? [] : [...init.ports]);
+    }
+  }
+  const ET = NodeEventTarget.prototype;
   const kEvents = internals.kEvents;
   const nodeStyle = new WeakMap(); // registered wrapper -> the user's listener
   const onceRemoved = new WeakMap(); // `once` listener -> the target's listener-removed hook
@@ -126,7 +144,7 @@
         onRemove(this, String(type));
       },
       dispatchEvent(event) {
-        if (!(event instanceof Event)) throw new __errors.ERR_INVALID_ARG_TYPE("event", "Event", event);
+        if (!(event instanceof NodeEvent)) throw new __errors.ERR_INVALID_ARG_TYPE("event", "Event", event);
         hybridDispatch(this, event.type, event, () => event);
         return !event.defaultPrevented;
       },
@@ -137,7 +155,7 @@
       removeListener(type, listener) { return removeNode.call(this, type, listener); },
       emit(type, arg) {
         return hybridDispatch(this, type, arg, () => {
-          const event = new Event(type);
+          const event = new NodeEvent(type);
           event.detail = arg;
           return event;
         });
@@ -206,7 +224,7 @@
     return state;
   }
 
-  const MessagePortMethods = class MessagePort extends EventTarget {
+  const MessagePortMethods = class MessagePort extends NodeEventTarget {
     postMessage(message, transfer) {
       const state = portStateOf(this);
       if (arguments.length === 0) {
@@ -283,12 +301,12 @@
   }
   // Node: MessagePort.prototype -> NodeEventTarget.prototype -> EventTarget.prototype, and the
   // constructor is not callable at all (instances come from MessageChannel or a transfer).
-  const nodeEventTargetProto = Object.create(EventTarget.prototype);
+  const nodeEventTargetProto = Object.create(NodeEventTarget.prototype);
   makeNodeTargetMethods(nodeEventTargetProto, messagePortListenerAdded, messagePortListenerRemoved);
   function MessagePort() {
     throw nodeError(TypeError, "ERR_CONSTRUCT_CALL_INVALID", "Constructor cannot be called");
   }
-  Object.setPrototypeOf(MessagePort, EventTarget);
+  Object.setPrototypeOf(MessagePort, NodeEventTarget);
   Object.setPrototypeOf(MessagePortMethods.prototype, nodeEventTargetProto);
   Object.defineProperty(MessagePortMethods.prototype, "constructor", { value: MessagePort, writable: true, configurable: true });
   MessagePort.prototype = MessagePortMethods.prototype;
@@ -393,11 +411,11 @@
     try {
       decoded = decodeMessage(bytes);
     } catch (error) {
-      hybridDispatch(port, "messageerror", error, () => new MessageEvent("messageerror", { data: error }));
+      hybridDispatch(port, "messageerror", error, () => new NodeMessageEvent("messageerror", { data: error }));
       return;
     }
     const { data, ports } = decoded;
-    hybridDispatch(port, "message", data, () => new MessageEvent("message", { data, ports }));
+    hybridDispatch(port, "message", data, () => new NodeMessageEvent("message", { data, ports }));
   }
   function finishClose(port) {
     const state = portState.get(port);
@@ -423,7 +441,7 @@
   }
 
   function createPort(id, hooks = true) {
-    const port = Reflect.construct(EventTarget, [], MessagePort);
+    const port = Reflect.construct(NodeEventTarget, [], MessagePort);
     portState.set(port, {
       id, refed: false, started: false, closing: false, closingLocal: false, destroyed: false, detached: false,
     });
@@ -521,7 +539,7 @@
     if (state === undefined) throw new __errors.ERR_INVALID_THIS("BroadcastChannel");
     return state;
   }
-  class BroadcastChannel extends EventTarget {
+  class BroadcastChannel extends NodeEventTarget {
     constructor(name) {
       if (arguments.length === 0) throw new __errors.ERR_MISSING_ARGS("name");
       super();
@@ -535,11 +553,11 @@
       const self = this;
       port.on("message", (data) => {
         if (state.port === null) return;
-        hybridDispatch(self, "message", data, () => new MessageEvent("message", { data }));
+        hybridDispatch(self, "message", data, () => new NodeMessageEvent("message", { data }));
       });
       port.on("messageerror", (error) => {
         if (state.port === null) return;
-        hybridDispatch(self, "messageerror", error, () => new MessageEvent("messageerror", { data: error }));
+        hybridDispatch(self, "messageerror", error, () => new NodeMessageEvent("messageerror", { data: error }));
       });
       port.ref();
     }
@@ -1326,12 +1344,15 @@
       fn.disabled = true;
       return fn;
     };
-    const stubs = ["abort", "chdir", "send", "disconnect"];
+    const hasIpc = Boolean(process.env.NODE_CHANNEL_FD);
+    const stubs = ["abort", "chdir"];
+    if (hasIpc) stubs.push("send", "disconnect");
+    else for (const name of ["send", "disconnect", "channel", "connected"]) delete process[name];
     if (process.platform !== "win32") stubs.push("setuid", "seteuid", "setgid", "setegid", "setgroups", "initgroups");
     for (const name of stubs) {
       Object.defineProperty(process, name, { value: unsupported(name), writable: true, configurable: true, enumerable: true });
     }
-    for (const name of ["channel", "connected"]) {
+    for (const name of hasIpc ? ["channel", "connected"] : []) {
       Object.defineProperty(process, name, {
         configurable: true,
         enumerable: true,

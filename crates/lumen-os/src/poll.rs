@@ -14,7 +14,11 @@ pub struct PollFd {
 
 impl PollFd {
     pub fn new(fd: i32, events: i16) -> PollFd {
-        PollFd { fd, events, revents: 0 }
+        PollFd {
+            fd,
+            events,
+            revents: 0,
+        }
     }
 }
 
@@ -72,13 +76,23 @@ mod imp {
                 tv_sec: (timeout_ms.max(0) / 1000) as _,
                 tv_usec: ((timeout_ms.max(0) % 1000) * 1000) as _,
             };
-            let tvp = if timeout_ms < 0 { std::ptr::null_mut() } else { &mut tv as *mut libc::timeval };
+            let tvp = if timeout_ms < 0 {
+                std::ptr::null_mut()
+            } else {
+                &mut tv as *mut libc::timeval
+            };
             let [r, w, x] = &mut sets;
             if libc::select(nfds, r, w, x, tvp) < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
-            let flags = |set: &libc::fd_set, list: &[i32]| list.iter().map(|&fd| libc::FD_ISSET(fd, set)).collect();
-            Ok([flags(&sets[0], lists[0]), flags(&sets[1], lists[1]), flags(&sets[2], lists[2])])
+            let flags = |set: &libc::fd_set, list: &[i32]| {
+                list.iter().map(|&fd| libc::FD_ISSET(fd, set)).collect()
+            };
+            Ok([
+                flags(&sets[0], lists[0]),
+                flags(&sets[1], lists[1]),
+                flags(&sets[2], lists[2]),
+            ])
         }
     }
 
@@ -86,7 +100,13 @@ mod imp {
     /// `revents` set. `EINTR` is returned as an error, for the caller to handle signals.
     pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> Result<usize, FsError> {
         // SAFETY: `PollFd` has `struct pollfd`'s layout and `fds` is a live slice.
-        let n = unsafe { libc::poll(fds.as_mut_ptr().cast::<libc::pollfd>(), fds.len() as libc::nfds_t, timeout_ms) };
+        let n = unsafe {
+            libc::poll(
+                fds.as_mut_ptr().cast::<libc::pollfd>(),
+                fds.len() as libc::nfds_t,
+                timeout_ms,
+            )
+        };
         if n < 0 {
             return Err(std::io::Error::last_os_error().into());
         }

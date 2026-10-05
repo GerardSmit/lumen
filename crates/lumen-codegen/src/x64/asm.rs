@@ -127,7 +127,16 @@ impl Asm {
     /// Emit `[pfx] [REX] opc modrm [sib] [disp]`; `imm_len` immediate bytes must follow (they
     /// shift the end of the instruction a RIP-relative operand is measured from). `byte` marks
     /// 8-bit register operands, which need a REX prefix to name SPL/BPL/SIL/DIL.
-    pub fn op(&mut self, pfx: u8, w: bool, opc: &[u8], reg: u8, rm: RM, byte: bool, imm_len: usize) {
+    pub fn op(
+        &mut self,
+        pfx: u8,
+        w: bool,
+        opc: &[u8],
+        reg: u8,
+        rm: RM,
+        byte: bool,
+        imm_len: usize,
+    ) {
         if pfx != 0 {
             self.buf.push(pfx);
         }
@@ -211,7 +220,11 @@ impl Asm {
 
     fn rel(&mut self, l: Label, short: bool, jump: usize) {
         let pos = self.buf.len();
-        let (kind, n) = if short { (Kind::Rel8, 1) } else { (Kind::Rel32, 4) };
+        let (kind, n) = if short {
+            (Kind::Rel8, 1)
+        } else {
+            (Kind::Rel32, 4)
+        };
         self.fixups.push(Fixup {
             pos,
             end: pos + n,

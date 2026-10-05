@@ -23,6 +23,7 @@ type ServerMethod = unsafe extern "C" fn() -> *const SslMethod;
 type CtxNew = unsafe extern "C" fn(*const SslMethod) -> *mut SslCtx;
 type CtxFree = unsafe extern "C" fn(*mut SslCtx);
 type CtxDefaultPaths = unsafe extern "C" fn(*mut SslCtx) -> c_int;
+type CtxGetCertStore = unsafe extern "C" fn(*const SslCtx) -> *mut c_void;
 type CtxSetVerify = unsafe extern "C" fn(*mut SslCtx, c_int, *const c_void);
 type SslNew = unsafe extern "C" fn(*mut SslCtx) -> *mut Ssl;
 type SslFree = unsafe extern "C" fn(*mut Ssl);
@@ -42,6 +43,7 @@ type PemRead =
     unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *const c_void, *mut c_void) -> *mut c_void;
 type CtxUseObject = unsafe extern "C" fn(*mut SslCtx, *mut c_void) -> c_int;
 type CtxCheckKey = unsafe extern "C" fn(*const SslCtx) -> c_int;
+type StoreAddCert = unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int;
 type ObjectFree = unsafe extern "C" fn(*mut c_void);
 type SslGetVersion = unsafe extern "C" fn(*const Ssl) -> *const c_char;
 type SslGetCipher = unsafe extern "C" fn(*const Ssl) -> *const c_void;
@@ -59,6 +61,7 @@ struct Api {
     ctx_new: CtxNew,
     ctx_free: CtxFree,
     ctx_default_paths: CtxDefaultPaths,
+    ctx_get_cert_store: CtxGetCertStore,
     ctx_set_verify: CtxSetVerify,
     ssl_new: SslNew,
     ssl_free: SslFree,
@@ -85,6 +88,7 @@ struct Api {
     ctx_use_cert: CtxUseObject,
     ctx_use_key: CtxUseObject,
     ctx_check_key: CtxCheckKey,
+    store_add_cert: StoreAddCert,
     cert_free: ObjectFree,
     key_free: ObjectFree,
     err_get_error: ErrGetError,
@@ -106,6 +110,7 @@ impl Api {
                 ctx_new,
                 ctx_free: ssl.function("SSL_CTX_free")?,
                 ctx_default_paths: ssl.function("SSL_CTX_set_default_verify_paths")?,
+                ctx_get_cert_store: ssl.function("SSL_CTX_get_cert_store")?,
                 ctx_set_verify: ssl.function("SSL_CTX_set_verify")?,
                 ssl_new: ssl.function("SSL_new")?,
                 ssl_free: ssl.function("SSL_free")?,
@@ -132,6 +137,7 @@ impl Api {
                 ctx_use_cert: ssl.function("SSL_CTX_use_certificate")?,
                 ctx_use_key: ssl.function("SSL_CTX_use_PrivateKey")?,
                 ctx_check_key: ssl.function("SSL_CTX_check_private_key")?,
+                store_add_cert: crypto.function("X509_STORE_add_cert")?,
                 cert_free: crypto.function("X509_free")?,
                 key_free: crypto.function("EVP_PKEY_free")?,
                 err_get_error: crypto.function("ERR_get_error")?,
@@ -209,6 +215,26 @@ impl TlsStream {
         protocols: &[String],
         verify_peer: bool,
     ) -> Result<Self, String> {
+        Self::connect_internal(stream, hostname, protocols, verify_peer, None)
+    }
+
+    /// Connect with the default trust paths plus certificate authorities supplied for this
+    /// connection only. The hostname still controls both SNI and certificate name verification.
+    pub fn connect_with_extra_roots(
+        stream: TcpStream,
+        hostname: &str,
+        pem: &[u8],
+    ) -> Result<Self, String> {
+        Self::connect_internal(stream, hostname, &[], true, Some(pem))
+    }
+
+    fn connect_internal(
+        stream: TcpStream,
+        hostname: &str,
+        protocols: &[String],
+        verify_peer: bool,
+        extra_roots: Option<&[u8]>,
+    ) -> Result<Self, String> {
         let api = Api::load()?;
         let method: ClientMethod = unsafe { api._ssl_lib.function("TLS_client_method")? };
         let context = unsafe { (api.ctx_new)(method()) };
@@ -219,6 +245,12 @@ impl TlsStream {
         if verify_peer && unsafe { (api.ctx_default_paths)(context) } != 1 {
             unsafe { (api.ctx_free)(context) };
             return Err("OpenSSL could not load default CA paths".into());
+        }
+        if let Some(pem) = extra_roots {
+            if let Err(error) = api.add_extra_roots(context, pem) {
+                unsafe { (api.ctx_free)(context) };
+                return Err(error);
+            }
         }
         let ssl = unsafe { (api.ssl_new)(context) };
         if ssl.is_null() {
@@ -452,6 +484,26 @@ impl TlsStream {
 }
 
 impl Api {
+    fn add_extra_roots(&self, context: *mut SslCtx, pem: &[u8]) -> Result<(), String> {
+        let blocks = pem_certificate_blocks(pem)?;
+        let store = unsafe { (self.ctx_get_cert_store)(context) };
+        if store.is_null() {
+            return Err("OpenSSL could not access the connection CA store".into());
+        }
+        for block in blocks {
+            let certificate = self.read_pem(block, true)?;
+            let added = unsafe { (self.store_add_cert)(store, certificate) };
+            if added != 1 {
+                let detail = self.error_queue();
+                unsafe { (self.cert_free)(certificate) };
+                return Err(format!("invalid TLS CA certificate: {detail}"));
+            }
+            // X509_STORE_add_cert retains its own reference on success.
+            unsafe { (self.cert_free)(certificate) };
+        }
+        Ok(())
+    }
+
     fn read_pem(&self, bytes: &[u8], certificate: bool) -> Result<*mut c_void, String> {
         let length =
             c_int::try_from(bytes.len()).map_err(|_| "PEM input is too large".to_string())?;
@@ -506,6 +558,35 @@ impl Api {
             messages.join("; ")
         }
     }
+}
+
+fn pem_certificate_blocks(mut input: &[u8]) -> Result<Vec<&[u8]>, String> {
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+
+    let mut blocks = Vec::new();
+    loop {
+        while input.first().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            input = &input[1..];
+        }
+        if input.is_empty() {
+            break;
+        }
+        if !input.starts_with(BEGIN) {
+            return Err("invalid TLS CA PEM: expected a CERTIFICATE block".into());
+        }
+        let end_start = input
+            .windows(END.len())
+            .position(|window| window == END)
+            .ok_or_else(|| "invalid TLS CA PEM: missing END CERTIFICATE marker".to_string())?;
+        let end = end_start + END.len();
+        blocks.push(&input[..end]);
+        input = &input[end..];
+    }
+    if blocks.is_empty() {
+        return Err("invalid TLS CA PEM: no certificate found".into());
+    }
+    Ok(blocks)
 }
 
 impl Read for TlsStream {
@@ -626,5 +707,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
         assert!(output.status.success());
         assert_eq!(output.stdout, b"pong");
+    }
+
+    #[test]
+    fn extra_roots_are_connection_scoped_and_validated() {
+        if Command::new("openssl").arg("version").output().is_err() {
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "lumen-tls-extra-roots-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let certificate = directory.join("cert.pem");
+        let key = directory.join("key.pem");
+        let generated = Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&certificate)
+            .args([
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost",
+            ])
+            .output()
+            .unwrap();
+        assert!(generated.status.success());
+        let certificate_pem = std::fs::read(&certificate).unwrap();
+        let private_key_pem = std::fs::read(&key).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_certificate = certificate_pem.clone();
+        let server_key = private_key_pem.clone();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut tls = TlsStream::accept(tcp, &server_certificate, &server_key).unwrap();
+            let mut request = [0u8; 4];
+            tls.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            tls.write_all(b"pong").unwrap();
+        });
+        let tcp = TcpStream::connect(address).unwrap();
+        let mut client =
+            TlsStream::connect_with_extra_roots(tcp, "localhost", &certificate_pem).unwrap();
+        client.write_all(b"ping").unwrap();
+        let mut response = [0u8; 4];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        server.join().unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            TlsStream::accept(tcp, &certificate_pem, &private_key_pem).err()
+        });
+        let tcp = TcpStream::connect(address).unwrap();
+        let error = TlsStream::connect(tcp, "localhost")
+            .err()
+            .expect("the ordinary client must not inherit a connection-local root");
+        assert!(error.contains("TLS handshake failed"), "{error}");
+        assert!(server.join().unwrap().is_some());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = TcpStream::connect(address).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let error = TlsStream::connect_with_extra_roots(tcp, "localhost", b"not a certificate")
+            .err()
+            .expect("invalid extra-root PEM must be rejected");
+        assert!(error.contains("PEM"), "{error}");
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

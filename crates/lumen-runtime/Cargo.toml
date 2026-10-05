@@ -11,22 +11,32 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen = { path = "../lumen", features = ["embed"] }
-lumen-bind = { path = "../lumen-bind" }
 lumen-common = { path = "../lumen-common" }
-lumen-host = { path = "../lumen-host" }
+lumen-bind = { path = "../lumen-bind" }
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
+lumen-host = { path = "../lumen-host", default-features = false }
 lumen-node = { path = "../lumen-node", default-features = false }
 lumen-os = { path = "../lumen-os" }
 lumen-timers = { path = "../lumen-timers" }
-lumen-web = { path = "../lumen-web" }
+lumen-web = { path = "../lumen-web", default-features = false }
 
 # Build-only: build.rs precompiles the embedded JS (no runtime dep).
 [build-dependencies]
 lumen = { path = "../lumen" }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
+
+[dev-dependencies]
+lumen-html-js = { path = "../lumen-html-js" }
 
 # lumen-node's optional builtins (see its Cargo.toml), all on by default.
 [features]
-default = ["bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+default = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+compiler = ["lumen/compiler", "lumen-host/compiler", "lumen-node/compiler", "lumen-web/compiler"]
+jit = ["compiler", "lumen/jit", "lumen-host/jit", "lumen-node/jit", "lumen-web/jit"]
+aot-native = ["lumen/aot-native", "lumen-host/aot-native", "lumen-node/aot-native", "lumen-web/aot-native"]
+intl = ["lumen/intl", "lumen-host/intl", "lumen-node/intl", "lumen-web/intl"]
+typed = ["compiler", "lumen/typed", "lumen-host/typed", "lumen-node/typed", "lumen-web/typed"]
+parallel = ["lumen/parallel", "lumen-host/parallel", "lumen-node/parallel", "lumen-web/parallel"]
 bun = ["lumen-node/bun"]
 bundled-sqlite = ["lumen-node/bundled-sqlite"]
 http2 = ["lumen-node/http2"]

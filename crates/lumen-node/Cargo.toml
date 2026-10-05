@@ -11,13 +11,13 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-lumen-host = { path = "../lumen-host" }
+lumen-host = { path = "../lumen-host", default-features = false }
 lumen-common = { path = "../lumen-common", features = ["hash", "crypt"] }
 lumen-os = { path = "../lumen-os" }
 # RSA, DSA, finite-field DH, primes and their key generation: OpenSSL first, RustCrypto as fallback.
 lumen-crypto = { path = "../lumen-crypto", default-features = false }
 # Natives are declared with lumen-bind and exposed through lumen's JS host (`embed`).
-lumen = { path = "../lumen", features = ["embed"] }
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 
 # node:crypto and crypto.subtle: RustCrypto for ciphers, EC and EdDSA on every platform (native and wasm32); lumen carries
@@ -76,11 +76,18 @@ libc = "0.2"
 # Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
 [build-dependencies]
 lumen = { path = "../lumen" }
+lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 # Optional builtins (all on by default). Embedders and mobile builds can turn them off with
 # `default-features = false` (through lumen-runtime's features of the same names).
 [features]
-default = ["bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+default = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
+compiler = ["lumen/compiler", "lumen-host/compiler"]
+jit = ["compiler", "lumen/jit", "lumen-host/jit"]
+aot-native = ["lumen/aot-native", "lumen-host/aot-native"]
+intl = ["lumen/intl", "lumen-host/intl"]
+typed = ["compiler", "lumen/typed", "lumen-host/typed"]
+parallel = ["lumen/parallel", "lumen-host/parallel"]
 # Asymmetric crypto backends (see lumen-crypto): each is a no-op on targets that cannot host it.
 crypto-openssl = ["lumen-crypto/openssl"]
 crypto-apple = ["lumen-crypto/apple"]

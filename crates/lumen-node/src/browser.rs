@@ -24,7 +24,15 @@ pub mod child {
         use super::*;
 
         #[op]
-        pub fn spawn(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value, _a6: Value) -> Result<(), OpError> {
+        pub fn spawn(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+            _a4: Value,
+            _a5: Value,
+            _a6: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -64,7 +72,13 @@ pub mod child {
         }
 
         #[op(name = "writeFd")]
-        pub fn write_fd(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value) -> Result<(), OpError> {
+        pub fn write_fd(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+            _a4: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -74,7 +88,16 @@ pub mod child {
         }
 
         #[op(name = "execSync")]
-        pub fn exec_sync(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value, _a6: Value, _a7: Value) -> Result<(), OpError> {
+        pub fn exec_sync(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+            _a4: Value,
+            _a5: Value,
+            _a6: Value,
+            _a7: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -117,7 +140,14 @@ pub mod net {
         use super::*;
 
         #[op]
-        pub fn connect(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value) -> Result<(), OpError> {
+        pub fn connect(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+            _a4: Value,
+            _a5: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -282,12 +312,22 @@ pub mod net {
         }
 
         #[op(name = "addSourceMembership")]
-        pub fn add_source_membership(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+        pub fn add_source_membership(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
         #[op(name = "dropSourceMembership")]
-        pub fn drop_source_membership(_a0: Value, _a1: Value, _a2: Value, _a3: Value) -> Result<(), OpError> {
+        pub fn drop_source_membership(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -517,7 +557,14 @@ pub mod sqlite {
         }
 
         #[op]
-        pub fn function(_a0: Value, _a1: Value, _a2: Value, _a3: Value, _a4: Value, _a5: Value) -> Result<(), OpError> {
+        pub fn function(
+            _a0: Value,
+            _a1: Value,
+            _a2: Value,
+            _a3: Value,
+            _a4: Value,
+            _a5: Value,
+        ) -> Result<(), OpError> {
             Err(unsupported_error())
         }
 
@@ -678,8 +725,13 @@ pub mod vm_timeout {
         use super::*;
 
         #[op(name = "runWithTimeout")]
-        pub fn run_with_timeout(ctx: &mut Ctx, _timeout_ms: Value, callee: Value) -> Result<Value, OpError> {
-            ctx.invoke(callee, Value::Undefined, &[]).map_err(OpError::thrown)
+        pub fn run_with_timeout(
+            ctx: &mut Ctx,
+            _timeout_ms: Value,
+            callee: Value,
+        ) -> Result<Value, OpError> {
+            ctx.invoke(callee, Value::Undefined, &[])
+                .map_err(OpError::thrown)
         }
     }
 }

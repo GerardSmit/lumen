@@ -46,6 +46,251 @@ fn eval_ok(rt: &mut Runtime, src: &str) {
     }
 }
 
+#[test]
+fn browser_host_realm_installs_isolated_globals_on_shared_runtime_state() {
+    let (mut runtime, _, _) = test_runtime();
+    let _queued_parent_timer = runtime
+        .engine()
+        .eval_value(
+            "globalThis.parentTimerRan = false; setTimeout(() => { parentTimerRan = true; }, 0)",
+        )
+        .expect("parent timer script parses")
+        .unwrap_or_else(|_| panic!("parent timer script runs"));
+
+    let child = runtime.engine().ctx().create_host_realm();
+    runtime
+        .install_browser_realm(&child)
+        .expect("browser providers install in child realm");
+
+    let child_capabilities = runtime
+        .engine()
+        .eval_value_in_host_realm(
+            &child,
+            "typeof URL === 'function' && typeof fetch === 'function' && typeof TextEncoder === 'function' && typeof setTimeout === 'function' && typeof process === 'undefined' && typeof require === 'undefined' && typeof Worker === 'undefined'",
+            false,
+        )
+        .expect("child browser capability script parses")
+        .unwrap_or_else(|_| panic!("child browser capability script runs"));
+    assert!(matches!(child_capabilities, Value::Bool(true)));
+
+    let parent_has_node = runtime
+        .engine()
+        .eval_value("typeof process === 'object' && typeof URL === 'function'")
+        .expect("parent capability script parses")
+        .unwrap_or_else(|_| panic!("parent capability script runs"));
+    assert!(matches!(parent_has_node, Value::Bool(true)));
+
+    let queued_without_checkpoint = runtime
+        .engine()
+        .eval_value_in_host_realm(
+            &child,
+            "globalThis.childMicrotaskRan = false; globalThis.childTimerRan = false; const childGlobal = globalThis; queueMicrotask(() => { childMicrotaskRan = globalThis === childGlobal; }); setTimeout(() => { childTimerRan = globalThis === childGlobal; }, 0); true",
+            false,
+        )
+        .expect("child callback script parses")
+        .unwrap_or_else(|_| panic!("child callback script runs"));
+    assert!(matches!(queued_without_checkpoint, Value::Bool(true)));
+    let callbacks_are_still_queued = runtime
+        .engine()
+        .eval_value_in_host_realm(&child, "!childMicrotaskRan && !childTimerRan", false)
+        .expect("child pending result script parses")
+        .unwrap_or_else(|_| panic!("child pending result script runs"));
+    assert!(matches!(callbacks_are_still_queued, Value::Bool(true)));
+
+    // The child callbacks and the parent's pre-existing timer all share this Runtime's event
+    // loop, but each JS closure still executes in the realm where it was created.
+    runtime.run_until_idle();
+    let child_callbacks_ran_in_child = runtime
+        .engine()
+        .eval_value_in_host_realm(&child, "childMicrotaskRan && childTimerRan", false)
+        .expect("child result script parses")
+        .unwrap_or_else(|_| panic!("child result script runs"));
+    assert!(matches!(child_callbacks_ran_in_child, Value::Bool(true)));
+    let parent_timer_ran = runtime
+        .engine()
+        .eval_value("parentTimerRan")
+        .expect("parent result script parses")
+        .unwrap_or_else(|_| panic!("parent result script runs"));
+    assert!(matches!(parent_timer_ran, Value::Bool(true)));
+}
+
+fn eval_host_value(
+    runtime: &mut Runtime,
+    realm: &lumen::embed::RealmHandle,
+    source: &str,
+) -> Value {
+    runtime
+        .engine()
+        .eval_value_in_host_realm(realm, source, false)
+        .unwrap_or_else(|_| panic!("host-realm script parses"))
+        .unwrap_or_else(|_| panic!("host-realm script runs"))
+}
+
+#[test]
+fn browser_timers_are_owned_by_their_realm_and_retained_callbacks_survive_cancel() {
+    let (mut runtime, _, stderr) = test_runtime();
+    let parent = runtime.engine().ctx().current_host_realm();
+    let child = runtime.engine().ctx().create_host_realm();
+    runtime
+        .install_browser_realm(&child)
+        .expect("browser providers install in the child realm");
+
+    let child_setup = eval_host_value(
+        &mut runtime,
+        &child,
+        "globalThis.intervalCalls = 0; globalThis.timeoutRan = false; globalThis.retainedCalls = 0; true",
+    );
+    assert!(matches!(child_setup, Value::Bool(true)));
+    let child_interval = eval_host_value(&mut runtime, &child, "setInterval");
+    let child_timeout = eval_host_value(&mut runtime, &child, "setTimeout");
+    let child_interval_callback =
+        eval_host_value(&mut runtime, &child, "() => { intervalCalls++; }");
+    let child_timeout_callback =
+        eval_host_value(&mut runtime, &child, "() => { timeoutRan = true; }");
+    let retained_callback = eval_host_value(&mut runtime, &child, "() => { retainedCalls++; }");
+
+    // Schedule through child-realm native functions while the parent is the original caller.
+    // The timer belongs to the function's target realm, not the invocation/security actor.
+    let interval_id = runtime
+        .engine()
+        .call_function(
+            &child_interval,
+            Value::Undefined,
+            &[child_interval_callback, Value::Num(0.0)],
+        )
+        .unwrap_or_else(|_| panic!("child interval registration succeeds"));
+    assert!(matches!(interval_id, Value::Num(_)));
+    assert!(runtime
+        .engine()
+        .ctx()
+        .current_host_realm()
+        .same_realm(&parent));
+    let timeout_id = runtime
+        .engine()
+        .call_function(
+            &child_timeout,
+            Value::Undefined,
+            &[child_timeout_callback, Value::Num(0.0)],
+        )
+        .unwrap_or_else(|_| panic!("child timeout registration succeeds"));
+    assert!(matches!(timeout_id, Value::Num(_)));
+    assert!(runtime
+        .engine()
+        .ctx()
+        .current_host_realm()
+        .same_realm(&parent));
+
+    // Clearing an ID through a different realm does not remove the child's timer entry.
+    let parent_clear_timeout = runtime
+        .engine()
+        .eval_value("clearTimeout")
+        .unwrap_or_else(|_| panic!("parent clearTimeout parses"))
+        .unwrap_or_else(|_| panic!("parent clearTimeout exists"));
+    runtime
+        .engine()
+        .call_function(
+            &parent_clear_timeout,
+            Value::Undefined,
+            std::slice::from_ref(&timeout_id),
+        )
+        .unwrap_or_else(|_| panic!("parent clearTimeout call succeeds"));
+    assert!(runtime
+        .engine()
+        .ctx()
+        .current_host_realm()
+        .same_realm(&parent));
+
+    let _parent_timer = runtime
+        .engine()
+        .eval_value(
+            "globalThis.parentTimerRan = false; setTimeout(() => { parentTimerRan = true; }, 0)",
+        )
+        .unwrap_or_else(|_| panic!("parent timer parses"))
+        .unwrap_or_else(|_| panic!("parent timer registers"));
+    assert!(runtime
+        .engine()
+        .ctx()
+        .current_host_realm()
+        .same_realm(&parent));
+
+    {
+        let timers = runtime
+            .engine()
+            .ctx()
+            .host_mut::<lumen_timers::Timers>()
+            .expect("runtime timer registry");
+        assert_eq!(timers.pending_for_realm(&parent), 1, "parent owns its timer");
+        assert_eq!(timers.pending_for_realm(&child), 2, "child owns both timers");
+    }
+
+    // Navigation cancellation removes both child-owned timers while preserving the parent's
+    // timer. Dropping the queued callbacks does not invalidate a separately retained function
+    // from the old document.
+    assert_eq!(runtime.cancel_timers_for_realm(&child), 2);
+    runtime.run_until_idle();
+    assert!(stderr.lines().is_empty(), "queued callbacks must not error: {:?}", stderr.lines());
+    let child_timeout_state = eval_host_value(
+        &mut runtime,
+        &child,
+        "!timeoutRan && intervalCalls === 0 && retainedCalls === 0",
+    );
+    assert!(matches!(child_timeout_state, Value::Bool(true)));
+    let parent_timer_ran = runtime
+        .engine()
+        .eval_value("parentTimerRan")
+        .unwrap_or_else(|_| panic!("parent result parses"))
+        .unwrap_or_else(|_| panic!("parent result runs"));
+    assert!(matches!(parent_timer_ran, Value::Bool(true)));
+
+    runtime
+        .engine()
+        .ctx()
+        .dispose_host_realm(&child)
+        .expect("retire the old child realm");
+    runtime
+        .engine()
+        .call_function(&retained_callback, Value::Undefined, &[])
+        .unwrap_or_else(|_| panic!("retained callback remains callable after retirement"));
+    let retained_callback_state = eval_host_value(
+        &mut runtime,
+        &child,
+        "retainedCalls === 1 && intervalCalls === 0",
+    );
+    assert!(matches!(retained_callback_state, Value::Bool(true)));
+}
+
+#[test]
+fn repeated_discarded_realms_release_their_interval_entries() {
+    let (mut runtime, _, _) = test_runtime();
+    for _ in 0..24 {
+        let realm = runtime.engine().ctx().create_host_realm();
+        runtime
+            .install_browser_realm(&realm)
+            .expect("browser providers install in each fresh realm");
+        let interval = eval_host_value(&mut runtime, &realm, "setInterval(() => {}, 0)");
+        assert!(matches!(interval, Value::Num(_)));
+
+        assert_eq!(runtime.cancel_timers_for_realm(&realm), 1);
+        assert!(!runtime
+            .engine()
+            .ctx()
+            .op_state()
+            .get::<lumen_timers::Timers>()
+            .is_some_and(lumen_timers::Timers::has_pending));
+        runtime
+            .engine()
+            .ctx()
+            .dispose_host_realm(&realm)
+            .expect("discard the realm after its timers are cancelled");
+    }
+    assert!(!runtime
+        .engine()
+        .ctx()
+        .op_state()
+        .get::<lumen_timers::Timers>()
+        .is_some_and(lumen_timers::Timers::has_pending));
+}
+
 /// The Phase-2 acceptance test: setTimeout + queueMicrotask + console.log complete in the
 /// right order and the loop exits by itself.
 #[test]
@@ -155,8 +400,16 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
     assert_eq!(out.lines(), ["exit 1"]);
     // Reported as Node reports it: the inspected error, then the version line.
     let err = err.lines();
-    assert_eq!(err.first().map(String::as_str), Some("TypeError: boom"), "{err:?}");
-    assert_eq!(err.last().map(String::as_str), Some("Node.js v20.11.0"), "{err:?}");
+    assert_eq!(
+        err.first().map(String::as_str),
+        Some("TypeError: boom"),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.last().map(String::as_str),
+        Some("Node.js v20.11.0"),
+        "{err:?}"
+    );
 
     // A 'uncaughtException' listener owns the error and the loop carries on; an unhandled
     // rejection with no 'unhandledRejection' listener is raised through the same hook.
@@ -181,6 +434,57 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
         ]
     );
     assert_eq!(err.lines(), Vec::<String>::new());
+}
+
+#[test]
+fn browser_rejection_collection_is_opt_in_and_preserves_late_handled_reason() {
+    let (mut rt, _, _) = test_runtime();
+    rt.enable_browser_rejection_events();
+    assert!(matches!(
+        rt.engine()
+            .eval(
+                "globalThis.__browserRejected = Promise.reject('browser-reason')",
+                false
+            )
+            .expect("rejection script parses"),
+        Completion::Value(_)
+    ));
+    rt.run_until_idle();
+    assert_eq!(rt.fatal_exit_code(), None);
+    let first = rt.take_browser_rejection_events();
+    assert_eq!(first.len(), 1);
+    let promise = match first.into_iter().next().unwrap() {
+        BrowserRejectionEvent::Unhandled { promise, reason } => {
+            assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "browser-reason"));
+            promise
+        }
+        BrowserRejectionEvent::Handled { .. } => panic!("first browser notification was handled"),
+    };
+
+    assert!(matches!(
+        rt.engine()
+            .eval("__browserRejected.catch(() => {})", false)
+            .expect("late handler parses"),
+        Completion::Value(_)
+    ));
+    rt.run_until_idle();
+    assert_eq!(rt.fatal_exit_code(), None);
+    let handled = rt.take_browser_rejection_events();
+    assert_eq!(handled.len(), 1);
+    match handled.into_iter().next().unwrap() {
+        BrowserRejectionEvent::Handled {
+            promise: handled_promise,
+            reason,
+        } => {
+            assert!(rt.engine().ctx().object_addr(&promise).is_some());
+            assert_eq!(
+                rt.engine().ctx().object_addr(&handled_promise),
+                rt.engine().ctx().object_addr(&promise)
+            );
+            assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "browser-reason"));
+        }
+        BrowserRejectionEvent::Unhandled { .. } => panic!("late notification was unhandled"),
+    }
 }
 
 #[test]
@@ -219,7 +523,11 @@ fn process_emitter_materializes_on_first_use_with_the_same_observable_state() {
         ]
     );
     assert_eq!(err.lines().len(), 2, "{:?}", err.lines());
-    assert!(err.lines()[0].ends_with("Warning: careful"), "{:?}", err.lines());
+    assert!(
+        err.lines()[0].ends_with("Warning: careful"),
+        "{:?}",
+        err.lines()
+    );
 
     let (mut rt, out, err) = test_runtime();
     eval_ok(
@@ -232,14 +540,22 @@ fn process_emitter_materializes_on_first_use_with_the_same_observable_state() {
     rt.run_to_completion();
     assert_eq!(rt.finish_process(), 0);
     assert_eq!(out.lines(), ["exit 0"]);
-    assert!(err.lines()[0].ends_with("Warning: alone"), "{:?}", err.lines());
+    assert!(
+        err.lines()[0].ends_with("Warning: alone"),
+        "{:?}",
+        err.lines()
+    );
 }
 
 #[test]
 fn module_loader_path_math_matches_node_path() {
     let dir = TempDir::new("loader-path");
     std::fs::create_dir_all(std::path::Path::new(&dir.path("a/b"))).unwrap();
-    std::fs::write(dir.path("a/b/c.js"), "module.exports = __filename + '|' + __dirname;").unwrap();
+    std::fs::write(
+        dir.path("a/b/c.js"),
+        "module.exports = __filename + '|' + __dirname;",
+    )
+    .unwrap();
     std::fs::write(dir.path("a/d.json"), "{}").unwrap();
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
@@ -569,6 +885,15 @@ fn bun_jsc_uses_live_heap_gc_and_microtask_instrumentation() {
 
 #[test]
 fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(bun_transpiler_transforms_typescript_jsx_and_scans_modules_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn bun_transpiler_transforms_typescript_jsx_and_scans_modules_body() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(
         &mut rt,
@@ -579,6 +904,9 @@ fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
         console.log(js.includes(": number"), js.includes("if (false)"), Function(`${js}; return answer`)());
         const jsx = new Transpiler({ loader: "jsx" }).transformSync("const el = <div id=\"x\">hello</div>;");
         console.log(jsx.includes('React.createElement("div"'), jsx.includes('"hello"'));
+        const tsx = new Transpiler({ loader: "tsx" }).transformSync("const id=<T,>(x:T):T=>x; const n:number=3; const el=<a value={id<number>(n)}>{n+1}</a>;");
+        const el = Function("React", `${tsx}; return el;`)({ createElement(type, props, ...children) { return { type, props, children }; } });
+        console.log(el.type, el.props.value, el.children[0]);
         const scan = ts.scan('import value from "pkg"; export { value as result }; const lazy = import("later");');
         console.log(scan.exports.join(","), scan.imports.map(item => `${item.kind}:${item.path}`).join(","));
         ts.transform("const value: string = 'ok'").then(code => console.log(!code.includes(": string")));
@@ -589,8 +917,44 @@ fn bun_transpiler_transforms_typescript_jsx_and_scans_modules() {
         [
             "false true 42",
             "true true",
+            "a 3 4",
             "result import-statement:pkg,dynamic-import:later",
             "true",
+        ]
+    );
+}
+
+#[test]
+fn jsx_tsx_entry_dependencies_commonjs_and_tsconfig() {
+    let dir = TempDir::new("native-jsx");
+    std::fs::create_dir_all(dir.0.join("runtime")).unwrap();
+    std::fs::write(
+        dir.0.join("runtime/jsx-runtime.mjs"),
+        "export function jsx(type,props,key){return {type,props,key};} export const jsxs=jsx;",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.0.join("tsconfig.json"),
+        r#"{"compilerOptions":{"jsx":"react-jsx","jsxImportSource":"./runtime"}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.0.join("label.jsx"), "export const label=<b>&copy;</b>;").unwrap();
+    std::fs::write(dir.0.join("app.tsx"), "import {label} from './label.jsx'; const id=<T,>(x:T):T=>x; const n:number=3; console.log(JSON.stringify(<section n={id<number>(n)}>{label}</section>));").unwrap();
+    std::fs::write(dir.0.join("common.tsx"), "/** @jsxRuntime classic @jsx h */ const id=<T,>(x:T):T=>x; function h(type,props,...children){return {type,props,children};} module.exports=<a n={id<number>(5)}>{6}</a>;").unwrap();
+    let (mut rt, out, _) = test_runtime();
+    rt.run_module(&dir.path("app.tsx")).unwrap();
+    eval_ok(
+        &mut rt,
+        &format!(
+            "console.log(JSON.stringify(require({:?})));",
+            dir.path("common.tsx")
+        ),
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            r#"{"type":"section","props":{"n":3,"children":{"type":"b","props":{"children":"©"}}}}"#,
+            r#"{"type":"a","props":{"n":5},"children":[6]}"#,
         ]
     );
 }
@@ -757,10 +1121,7 @@ fn fs_descriptors_read_write_and_close() {
             file = dir.path("h.txt"),
         ),
     );
-    assert_eq!(
-        out.lines(),
-        [r#""line one\nline two\n""#, "stale: EBADF"]
-    );
+    assert_eq!(out.lines(), [r#""line one\nline two\n""#, "stale: EBADF"]);
 }
 
 #[test]
@@ -819,7 +1180,9 @@ fn web_base64_edge_cases() {
     );
     assert_eq!(
         out.lines(),
-        [r#"""|"YQ=="|"YWI="|"YWJj"|"aOlsbG//AA=="|InvalidCharacterError|InvalidCharacterError|"dW5kZWZpbmVk"|"MTI="|""|"a"|"a"|"ab"|"abc"|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|100000"#]
+        [
+            r#"""|"YQ=="|"YWI="|"YWJj"|"aOlsbG//AA=="|InvalidCharacterError|InvalidCharacterError|"dW5kZWZpbmVk"|"MTI="|""|"a"|"a"|"ab"|"abc"|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|InvalidCharacterError|100000"#
+        ]
     );
 }
 
@@ -1986,7 +2349,12 @@ fn node_path_and_os_builtins() {
     assert_eq!(
         out.lines(),
         if cfg!(windows) {
-            ["a\\c .gz q", "\\a\\b true false", "string string true", "true"]
+            [
+                "a\\c .gz q",
+                "\\a\\b true false",
+                "string string true",
+                "true",
+            ]
         } else {
             ["a/c .gz q", "/a/b true false", "string string true", "true"]
         }
@@ -2282,7 +2650,11 @@ fn esm_imports_node_builtins_named_and_default() {
     .unwrap();
     let (mut rt, out, _err) = test_runtime();
     rt.run_module(&entry.to_string_lossy()).expect("runs");
-    let joined = if cfg!(windows) { "b.js x\\y" } else { "b.js x/y" };
+    let joined = if cfg!(windows) {
+        "b.js x\\y"
+    } else {
+        "b.js x/y"
+    };
     assert_eq!(out.lines(), ["function function", joined, "string"]);
 }
 

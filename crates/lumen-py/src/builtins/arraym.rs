@@ -16,7 +16,10 @@ pub mod array {
     use crate::bind::{buffer_error, opaque_instance, type_object, KwArgs, Py, This};
     use crate::object::*;
     use crate::vm::{dict_set_str, Interp};
-    use lumen_common::buffer::{load, store_f64, store_int_wrapping, struct_code, BufferError, ByteOrder, ByteStore, ElemKind, StructMode};
+    use lumen_common::buffer::{
+        load, store_f64, store_int_wrapping, struct_code, BufferError, ByteOrder, ByteStore,
+        ElemKind, StructMode,
+    };
     use lumen_common::smuggle;
     use std::rc::Rc;
 
@@ -37,13 +40,21 @@ pub mod array {
     impl Spec {
         pub fn of(tc: u8) -> Option<Spec> {
             if is_unicode(tc) {
-                return Some(Spec { tc, kind: ElemKind::U32, size: 4 });
+                return Some(Spec {
+                    tc,
+                    kind: ElemKind::U32,
+                    size: 4,
+                });
             }
             if !TYPECODES.as_bytes().contains(&tc) {
                 return None;
             }
             let c = struct_code(tc, StructMode::Native)?;
-            Some(Spec { tc, kind: c.kind?, size: c.size })
+            Some(Spec {
+                tc,
+                kind: c.kind?,
+                size: c.size,
+            })
         }
 
         /// The buffer format a `memoryview` of the array reports.
@@ -97,7 +108,10 @@ pub mod array {
     fn int_item(it: &mut Interp, tc: u8, v: &Value) -> R<i128> {
         if !it.has_index(v) {
             let t = it.type_name_of(v);
-            return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+            return Err(it.type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                t
+            )));
         }
         let n = index_i128(it, v)?;
         let neg = match n {
@@ -127,11 +141,23 @@ pub mod array {
                 };
                 match tc {
                     b'b' => {
-                        range(it, n, i16::MIN as i128, i16::MAX as i128, "signed short integer")?;
+                        range(
+                            it,
+                            n,
+                            i16::MIN as i128,
+                            i16::MAX as i128,
+                            "signed short integer",
+                        )?;
                         range(it, n, i8::MIN as i128, i8::MAX as i128, "signed char")?;
                     }
                     b'B' => range(it, n, 0, 255, "unsigned byte integer")?,
-                    b'h' => range(it, n, i16::MIN as i128, i16::MAX as i128, "signed short integer")?,
+                    b'h' => range(
+                        it,
+                        n,
+                        i16::MIN as i128,
+                        i16::MAX as i128,
+                        "signed short integer",
+                    )?,
                     b'H' => {
                         range(it, n, i32::MIN as i128, i32::MAX as i128, "signed integer")?;
                         range(it, n, 0, u16::MAX as i128, "unsigned short")?;
@@ -146,7 +172,10 @@ pub mod array {
                     return Err(overflow(it, "can't convert negative value to unsigned int"));
                 }
                 let Some(n) = n.filter(|n| u64::try_from(*n).is_ok()) else {
-                    return Err(overflow(it, "Python int too large to convert to C unsigned long"));
+                    return Err(overflow(
+                        it,
+                        "Python int too large to convert to C unsigned long",
+                    ));
                 };
                 if tc == b'I' && n > u32::MAX as i128 {
                     return Err(overflow(it, "unsigned int is greater than maximum"));
@@ -199,13 +228,17 @@ pub mod array {
                         (Some(c), None) => c,
                         _ => {
                             let n = smuggle::code_points(s).count();
-                            return Err(it.type_error(&format!("array item must be a unicode character, not a string of length {n}")));
+                            return Err(it.type_error(&format!(
+                                "array item must be a unicode character, not a string of length {n}"
+                            )));
                         }
                     }
                 }
                 _ => {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("array item must be a unicode character, not {t}")));
+                    return Err(
+                        it.type_error(&format!("array item must be a unicode character, not {t}"))
+                    );
                 }
             };
             buf.copy_from_slice(&cp.to_ne_bytes());
@@ -225,7 +258,10 @@ pub mod array {
             let cp = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
             let mut s = String::new();
             if cp > 0x10FFFF || !smuggle::push_code_point(&mut s, cp) {
-                return Err(it.value_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", cp)));
+                return Err(it.value_error(&format!(
+                    "character U+{:x} is not in range [U+0000; U+10ffff]",
+                    cp
+                )));
             }
             return Ok(Value::string(s));
         }
@@ -242,7 +278,10 @@ pub mod array {
 
     fn resize_error(it: &mut Interp, e: BufferError) -> Obj {
         match e {
-            BufferError::Pinned => it.new_exc_str("BufferError", "cannot resize an array that is exporting buffers"),
+            BufferError::Pinned => it.new_exc_str(
+                "BufferError",
+                "cannot resize an array that is exporting buffers",
+            ),
             e => buffer_error(it, e),
         }
     }
@@ -284,7 +323,9 @@ pub mod array {
             Some(s) => s.to_string(),
             None => {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("{} must be a unicode character, not {}", what, t)));
+                return Err(
+                    it.type_error(&format!("{} must be a unicode character, not {}", what, t))
+                );
             }
         };
         let mut cps = smuggle::code_points(&s);
@@ -328,7 +369,9 @@ pub mod array {
 
     fn from_unicode(it: &mut Interp, spec: Spec, store: &ByteStore, s: &str) -> R<()> {
         if !is_unicode(spec.tc) {
-            return Err(it.value_error("fromunicode() may only be called on unicode type arrays ('u' or 'w')"));
+            return Err(it.value_error(
+                "fromunicode() may only be called on unicode type arrays ('u' or 'w')",
+            ));
         }
         let mut data = Vec::new();
         for cp in smuggle::code_points(s) {
@@ -339,18 +382,27 @@ pub mod array {
 
     fn to_unicode(it: &mut Interp, spec: Spec, store: &ByteStore) -> R<Value> {
         if !is_unicode(spec.tc) {
-            return Err(it.value_error("tounicode() may only be called on unicode type arrays ('u' or 'w')"));
+            return Err(it.value_error(
+                "tounicode() may only be called on unicode type arrays ('u' or 'w')",
+            ));
         }
         let data = store.to_vec();
         if spec.tc == b'w' {
-            let enc = if cfg!(target_endian = "little") { "utf-32-le" } else { "utf-32-be" };
+            let enc = if cfg!(target_endian = "little") {
+                "utf-32-le"
+            } else {
+                "utf-32-be"
+            };
             return it.call_method(&Value::bytes(data), "decode", vec![Value::str(enc)]);
         }
         let mut s = String::new();
         for c in data.chunks_exact(4) {
             let cp = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
             if cp > 0x10FFFF || !smuggle::push_code_point(&mut s, cp) {
-                return Err(it.value_error(&format!("character U+{:x} is not in range [U+0000; U+10ffff]", cp)));
+                return Err(it.value_error(&format!(
+                    "character U+{:x} is not in range [U+0000; U+10ffff]",
+                    cp
+                )));
             }
         }
         Ok(Value::string(s))
@@ -362,7 +414,10 @@ pub mod array {
             match &o.kind {
                 Kind::Str(_) => {
                     if !is_unicode(spec.tc) {
-                        return Err(it.type_error(&format!("cannot use a str to initialize an array with typecode '{}'", spec.tc as char)));
+                        return Err(it.type_error(&format!(
+                            "cannot use a str to initialize an array with typecode '{}'",
+                            spec.tc as char
+                        )));
                     }
                     let s = init.as_str().unwrap_or("").to_string();
                     return from_unicode(it, spec, store, &s);
@@ -384,7 +439,10 @@ pub mod array {
         }
         if let Some((other, data)) = array_of(it, init) {
             if is_unicode(other.tc) && !is_unicode(spec.tc) {
-                return Err(it.type_error(&format!("cannot use a unicode array to initialize an array with typecode '{}'", spec.tc as char)));
+                return Err(it.type_error(&format!(
+                    "cannot use a unicode array to initialize an array with typecode '{}'",
+                    spec.tc as char
+                )));
             }
             if other == spec {
                 let data = data.to_vec();
@@ -474,7 +532,10 @@ pub mod array {
 
     impl Array {
         fn with(spec: Spec, bytes: Vec<u8>) -> Array {
-            Array { spec, store: Rc::new(ByteStore::new(bytes).growable()) }
+            Array {
+                spec,
+                store: Rc::new(ByteStore::new(bytes).growable()),
+            }
         }
 
         fn len(&self) -> usize {
@@ -494,7 +555,13 @@ pub mod array {
     }
 
     /// The index of the first item equal to `v` in `start..stop`.
-    fn find(it: &mut Interp, slf: &Py<Array>, v: &Value, start: usize, stop: usize) -> R<Option<usize>> {
+    fn find(
+        it: &mut Interp,
+        slf: &Py<Array>,
+        v: &Value,
+        start: usize,
+        stop: usize,
+    ) -> R<Option<usize>> {
         let (spec, store) = get(it, slf)?;
         let mut i = start;
         while i < stop.min(store.len() / spec.size) {
@@ -507,9 +574,17 @@ pub mod array {
         Ok(None)
     }
 
-    fn remove_range(it: &mut Interp, spec: Spec, store: &ByteStore, start: usize, stop: usize) -> R<()> {
+    fn remove_range(
+        it: &mut Interp,
+        spec: Spec,
+        store: &ByteStore,
+        start: usize,
+        stop: usize,
+    ) -> R<()> {
         if stop > start {
-            edit(it, store, |v| drop(v.drain(start * spec.size..stop * spec.size)))?;
+            edit(it, store, |v| {
+                drop(v.drain(start * spec.size..stop * spec.size))
+            })?;
         }
         Ok(())
     }
@@ -526,7 +601,9 @@ pub mod array {
     }
 
     fn compare(it: &mut Interp, slf: &Py<Array>, other: &Value, op: CmpOp) -> R<Value> {
-        let Some((ospec, ostore)) = array_of(it, other) else { return Ok(Value::NotImplemented) };
+        let Some((ospec, ostore)) = array_of(it, other) else {
+            return Ok(Value::NotImplemented);
+        };
         let (spec, store) = get(it, slf)?;
         let (n, m) = (store.len() / spec.size, ostore.len() / ospec.size);
         if n != m && matches!(op, CmpOp::Eq | CmpOp::NotEq) {
@@ -568,14 +645,24 @@ pub mod array {
     #[methods]
     impl Array {
         #[constructor(hint(py(text_signature = "")))]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("array.__new__(X): X is not a type object")) };
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("array.__new__(X): X is not a type object"));
+            };
             let base = type_object::<Array>(it);
             if Rc::ptr_eq(&cls, &base) && !kw.is_empty() {
                 return Err(it.type_error("array.array() takes no keyword arguments"));
             }
             if args.is_empty() || args.len() > 2 {
-                return Err(it.type_error(&format!("array() takes at most 2 arguments ({} given)", args.len())));
+                return Err(it.type_error(&format!(
+                    "array() takes at most 2 arguments ({} given)",
+                    args.len()
+                )));
             }
             let tc = typecode_of(it, &args[0], "array() argument 1")?;
             if tc == b'u' {
@@ -586,7 +673,9 @@ pub mod array {
                     1,
                 )?;
             }
-            let Some(spec) = Spec::of(tc) else { return Err(bad_typecode(it)) };
+            let Some(spec) = Spec::of(tc) else {
+                return Err(bad_typecode(it));
+            };
             let arr = Array::with(spec, Vec::new());
             if let Some(init) = args.get(1) {
                 initialize(it, spec, &arr.store, init)?;
@@ -626,7 +715,10 @@ pub mod array {
         /// raised.
         fn byteswap(&self, it: &mut Interp) -> R<()> {
             let size = self.spec.size;
-            let mut b = self.store.try_bytes_mut().map_err(|e| buffer_error(it, e))?;
+            let mut b = self
+                .store
+                .try_bytes_mut()
+                .map_err(|e| buffer_error(it, e))?;
             for c in b.chunks_exact_mut(size) {
                 c.reverse();
             }
@@ -668,7 +760,10 @@ pub mod array {
             if n < 0 {
                 return Err(it.value_error("negative count"));
             }
-            let Some(nbytes) = (n as usize).checked_mul(spec.size).filter(|b| *b <= isize::MAX as usize) else {
+            let Some(nbytes) = (n as usize)
+                .checked_mul(spec.size)
+                .filter(|b| *b <= isize::MAX as usize)
+            else {
                 return Err(it.memory_error());
             };
             let b = it.call_method(f, "read", vec![Value::Int(nbytes as i64)])?;
@@ -711,7 +806,9 @@ pub mod array {
         fn fromunicode(&self, it: &mut Interp, ustr: &Value) -> R<()> {
             let Some(s) = ustr.as_str() else {
                 let t = it.type_name_of(ustr);
-                return Err(it.type_error(&format!("fromunicode() argument must be str, not {}", t)));
+                return Err(
+                    it.type_error(&format!("fromunicode() argument must be str, not {}", t))
+                );
             };
             let s = s.to_string();
             from_unicode(it, self.spec, &self.store, &s)
@@ -720,9 +817,21 @@ pub mod array {
         /// Return index of first occurrence of v in the array.
         ///
         /// Raise ValueError if the value is not present.
-        fn index(slf: This<Py<Self>>, it: &mut Interp, v: &Value, #[default(0)] start: isize, #[default(isize::MAX)] stop: isize) -> R<usize> {
+        fn index(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            v: &Value,
+            #[default(0)] start: isize,
+            #[default(isize::MAX)] stop: isize,
+        ) -> R<usize> {
             let n = { slf.0.borrow(it)?.len() } as isize;
-            let clamp = |i: isize| if i < 0 { (i + n).max(0) as usize } else { i as usize };
+            let clamp = |i: isize| {
+                if i < 0 {
+                    (i + n).max(0) as usize
+                } else {
+                    i as usize
+                }
+            };
             match find(it, &slf.0, v, clamp(start), clamp(stop))? {
                 Some(i) => Ok(i),
                 None => Err(it.value_error("array.index(x): x not in array")),
@@ -781,7 +890,10 @@ pub mod array {
         /// Reverse the order of the items in the array.
         fn reverse(&self, it: &mut Interp) -> R<()> {
             let size = self.spec.size;
-            let mut b = self.store.try_bytes_mut().map_err(|e| buffer_error(it, e))?;
+            let mut b = self
+                .store
+                .try_bytes_mut()
+                .map_err(|e| buffer_error(it, e))?;
             let n = b.len() / size;
             for k in 0..n / 2 {
                 let (x, y) = (k * size, (n - 1 - k) * size);
@@ -827,7 +939,8 @@ pub mod array {
         #[method(name = "__reduce_ex__", hint(py(text_signature = "($self, value, /)")))]
         fn reduce_ex(slf: This<Py<Self>>, it: &mut Interp, protocol: &Value) -> R<Value> {
             let slf = slf.0;
-            let is_int = matches!(protocol, Value::Int(_) | Value::Bool(_)) || matches!(protocol, Value::Obj(o) if matches!(o.kind, Kind::Int(_)));
+            let is_int = matches!(protocol, Value::Int(_) | Value::Bool(_))
+                || matches!(protocol, Value::Obj(o) if matches!(o.kind, Kind::Int(_)));
             if !is_int {
                 return Err(it.type_error("__reduce_ex__ argument should be an integer"));
             }
@@ -842,7 +955,12 @@ pub mod array {
             }
             let module = Value::Obj(it.import_module("array")?);
             let recon = it.get_attr_str(&module, "_array_reconstructor")?;
-            let args = Value::tuple(vec![ty, tc, Value::Int(spec.mformat()), Value::bytes(store.to_vec())]);
+            let args = Value::tuple(vec![
+                ty,
+                tc,
+                Value::Int(spec.mformat()),
+                Value::bytes(store.to_vec()),
+            ]);
             Ok(Value::tuple(vec![recon, args, dict]))
         }
 
@@ -914,7 +1032,10 @@ pub mod array {
             }
             let Some((ospec, ostore)) = array_of(it, value) else {
                 let t = it.type_name_of(value);
-                return Err(it.type_error(&format!("can only assign array (not \"{}\") to array slice", t)));
+                return Err(it.type_error(&format!(
+                    "can only assign array (not \"{}\") to array slice",
+                    t
+                )));
             };
             if ospec != spec {
                 return Err(it.type_error("bad argument type for built-in operation"));
@@ -924,7 +1045,10 @@ pub mod array {
             let count = crate::ops::slice_len(start, stop, step);
             let m = data.len() / spec.size;
             if step == 1 {
-                let (a, b) = (start as usize * spec.size, (start as usize + count) * spec.size);
+                let (a, b) = (
+                    start as usize * spec.size,
+                    (start as usize + count) * spec.size,
+                );
                 if m == count {
                     store.write_at(a, &data);
                     return Ok(());
@@ -932,7 +1056,10 @@ pub mod array {
                 return edit(it, &store, |v| drop(v.splice(a..b, data)));
             }
             if m != count {
-                return Err(it.value_error(&format!("attempt to assign array of size {} to extended slice of size {}", m, count)));
+                return Err(it.value_error(&format!(
+                    "attempt to assign array of size {} to extended slice of size {}",
+                    m, count
+                )));
             }
             for (k, p) in slice_positions(start, step, count).enumerate() {
                 store.write_at(p * spec.size, &data[k * spec.size..(k + 1) * spec.size]);
@@ -964,7 +1091,12 @@ pub mod array {
                 drop_item[p] = true;
             }
             edit(it, &store, |v| {
-                let kept: Vec<u8> = v.chunks_exact(spec.size).zip(&drop_item).filter(|(_, d)| !**d).flat_map(|(c, _)| c.iter().copied()).collect();
+                let kept: Vec<u8> = v
+                    .chunks_exact(spec.size)
+                    .zip(&drop_item)
+                    .filter(|(_, d)| !**d)
+                    .flat_map(|(c, _)| c.iter().copied())
+                    .collect();
                 *v = kept;
             })
         }
@@ -976,7 +1108,10 @@ pub mod array {
 
         #[proto(iter)]
         fn __iter__(slf: This<Py<Self>>) -> ArrayIter {
-            ArrayIter { arr: Some(slf.0), index: 0 }
+            ArrayIter {
+                arr: Some(slf.0),
+                index: 0,
+            }
         }
 
         #[proto(repr)]
@@ -989,7 +1124,11 @@ pub mod array {
             if store.is_empty() {
                 return Ok(Value::string(format!("{}('{}')", name, tc)));
             }
-            let body = if is_unicode(spec.tc) { to_unicode(it, spec, &store)? } else { Value::list(decode_all(it, spec, &store.to_vec())?) };
+            let body = if is_unicode(spec.tc) {
+                to_unicode(it, spec, &store)?
+            } else {
+                Value::list(decode_all(it, spec, &store.to_vec())?)
+            };
             let r = it.repr_of(&body)?;
             Ok(Value::string(format!("{}('{}', {})", name, tc, r)))
         }
@@ -1029,7 +1168,9 @@ pub mod array {
             let (spec, store) = get(it, &slf.0)?;
             let Some((ospec, ostore)) = array_of(it, other) else {
                 let t = it.type_name_of(other);
-                return Err(it.type_error(&format!("can only append array (not \"{}\") to array", t)));
+                return Err(
+                    it.type_error(&format!("can only append array (not \"{}\") to array", t))
+                );
             };
             if ospec != spec {
                 return Err(it.type_error("bad argument type for built-in operation"));
@@ -1044,7 +1185,9 @@ pub mod array {
             let (spec, store) = get(it, &slf.0)?;
             let Some((ospec, ostore)) = array_of(it, other) else {
                 let t = it.type_name_of(other);
-                return Err(it.type_error(&format!("can only extend array with array (not \"{}\")", t)));
+                return Err(
+                    it.type_error(&format!("can only extend array with array (not \"{}\")", t))
+                );
             };
             if ospec != spec {
                 return Err(it.type_error("can only extend with array of same kind"));
@@ -1070,7 +1213,9 @@ pub mod array {
         fn __imul__(slf: This<Py<Self>>, it: &mut Interp, n: &Value) -> R<Value> {
             let n = it.index_or(n, "OverflowError")?;
             let (_, store) = get(it, &slf.0)?;
-            let Some(data) = repeat(&store.bytes(), n) else { return Err(it.memory_error()) };
+            let Some(data) = repeat(&store.bytes(), n) else {
+                return Err(it.memory_error());
+            };
             if data.len() != store.len() {
                 edit(it, &store, |v| *v = data)?;
             }
@@ -1093,7 +1238,9 @@ pub mod array {
 
         #[proto(next)]
         fn __next__(&mut self, it: &mut Interp) -> R<Option<Value>> {
-            let Some(arr) = &self.arr else { return Ok(None) };
+            let Some(arr) = &self.arr else {
+                return Ok(None);
+            };
             let (spec, store) = get(it, arr)?;
             if self.index < store.len() / spec.size {
                 let v = item_at(it, spec, &store, self.index)?;
@@ -1110,7 +1257,11 @@ pub mod array {
             let builtins = Value::Obj(it.import_module("builtins")?);
             let iter = it.get_attr_str(&builtins, "iter")?;
             Ok(match &self.arr {
-                Some(a) => Value::tuple(vec![iter, Value::tuple(vec![a.value().clone()]), Value::Int(self.index as i64)]),
+                Some(a) => Value::tuple(vec![
+                    iter,
+                    Value::tuple(vec![a.value().clone()]),
+                    Value::Int(self.index as i64),
+                ]),
                 None => Value::tuple(vec![iter, Value::tuple(vec![Value::tuple(Vec::new())])]),
             })
         }
@@ -1128,7 +1279,13 @@ pub mod array {
 
     /// Internal. Used for pickling support.
     #[op]
-    fn _array_reconstructor(it: &mut Interp, arraytype: &Value, typecode: &Value, mformat_code: i64, items: &Value) -> R<Value> {
+    fn _array_reconstructor(
+        it: &mut Interp,
+        arraytype: &Value,
+        typecode: &Value,
+        mformat_code: i64,
+        items: &Value,
+    ) -> R<Value> {
         let Value::Obj(cls) = arraytype else {
             let t = it.type_name_of(arraytype);
             return Err(it.type_error(&format!("first argument must be a type object, not {}", t)));
@@ -1143,7 +1300,9 @@ pub mod array {
             return Err(it.type_error(&format!("{} is not a subtype of array.array", n)));
         }
         let tc = typecode_of(it, typecode, "_array_reconstructor() argument 2")?;
-        let Some(mut spec) = Spec::of(tc) else { return Err(it.value_error("second argument must be a valid type code")) };
+        let Some(mut spec) = Spec::of(tc) else {
+            return Err(it.value_error("second argument must be a valid type code"));
+        };
         if !(0..=21).contains(&mformat_code) {
             return Err(it.value_error("third argument must be a valid machine format code."));
         }
@@ -1152,7 +1311,9 @@ pub mod array {
                 Kind::Bytes(b) => b.clone(),
                 _ => {
                     let t = it.type_name_of(items);
-                    return Err(it.type_error(&format!("fourth argument should be bytes, not {}", t)));
+                    return Err(
+                        it.type_error(&format!("fourth argument should be bytes, not {}", t))
+                    );
                 }
             },
             _ => {
@@ -1165,16 +1326,30 @@ pub mod array {
             from_bytes(it, spec, &arr.store, &data)?;
             return Ok(opaque_instance(cls, arr));
         }
-        let size = [1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 8, 8, 8, 8, 4, 4, 8, 8, 2, 2, 4, 4][mformat_code as usize];
+        let size = [
+            1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 8, 8, 8, 8, 4, 4, 8, 8, 2, 2, 4, 4,
+        ][mformat_code as usize];
         if data.len() % size != 0 {
             return Err(it.value_error("string length not a multiple of item size"));
         }
         let big = mformat_code % 2 == 1 && mformat_code > 1;
-        let order = if big { ByteOrder::Big } else { ByteOrder::Little };
+        let order = if big {
+            ByteOrder::Big
+        } else {
+            ByteOrder::Little
+        };
         let converted = match mformat_code {
             14..=17 => {
-                let kind = if size == 4 { ElemKind::F32 } else { ElemKind::F64 };
-                Value::list(data.chunks_exact(size).map(|c| Value::Float(lumen_common::buffer::load_f64(kind, c, order))).collect())
+                let kind = if size == 4 {
+                    ElemKind::F32
+                } else {
+                    ElemKind::F64
+                };
+                Value::list(
+                    data.chunks_exact(size)
+                        .map(|c| Value::Float(lumen_common::buffer::load_f64(kind, c, order)))
+                        .collect(),
+                )
             }
             18..=21 => {
                 let enc = match mformat_code {
@@ -1186,7 +1361,8 @@ pub mod array {
                 it.call_method(items, "decode", vec![Value::str(enc)])?
             }
             _ => {
-                let signed = mformat_code == 1 || (mformat_code >= 2 && (mformat_code - 2) % 4 >= 2);
+                let signed =
+                    mformat_code == 1 || (mformat_code >= 2 && (mformat_code - 2) % 4 >= 2);
                 let kind = lumen_common::buffer::format::int_kind(size, signed);
                 for c in TYPECODES.bytes() {
                     if let Some(s) = Spec::of(c) {
@@ -1196,7 +1372,11 @@ pub mod array {
                         }
                     }
                 }
-                Value::list(data.chunks_exact(size).map(|c| scalar_value(load(kind, c, order))).collect())
+                Value::list(
+                    data.chunks_exact(size)
+                        .map(|c| scalar_value(load(kind, c, order)))
+                        .collect(),
+                )
             }
         };
         let arr = Array::with(spec, Vec::new());

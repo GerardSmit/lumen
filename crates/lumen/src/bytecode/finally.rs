@@ -177,7 +177,10 @@ impl Compiler {
                     self.scopes.pop();
                     return Err(b);
                 }
-                let (c, n) = (*self.blk_envs.last().expect("just opened"), self.name_idx(name));
+                let (c, n) = (
+                    *self.blk_envs.last().expect("just opened"),
+                    self.name_idx(name),
+                );
                 self.emit(Op::BlkInit(c, n));
             }
             Some(Pattern::Ident(name)) => {

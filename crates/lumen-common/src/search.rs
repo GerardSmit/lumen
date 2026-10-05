@@ -57,13 +57,25 @@ mod tests {
     }
 
     fn naive_r(h: &[u8], n: &[u8]) -> Option<usize> {
-        (0..=h.len().checked_sub(n.len())?).rev().find(|&i| &h[i..i + n.len()] == n)
+        (0..=h.len().checked_sub(n.len())?)
+            .rev()
+            .find(|&i| &h[i..i + n.len()] == n)
     }
 
     #[test]
     fn agrees_with_a_naive_search() {
-        let hays: [&[u8]; 6] = [b"", b"a", b"abracadabra", b"aaaaaaaaaaaaaaaaaaaab", b"xyzxyzxyzxy\x00\xffzz", b"mississippi river"];
-        let needles: [&[u8]; 12] = [b"", b"a", b"b", b"ab", b"abra", b"cad", b"aab", b"aaaaab", b"xyzxy", b"\xffz", b"ssi", b"issip"];
+        let hays: [&[u8]; 6] = [
+            b"",
+            b"a",
+            b"abracadabra",
+            b"aaaaaaaaaaaaaaaaaaaab",
+            b"xyzxyzxyzxy\x00\xffzz",
+            b"mississippi river",
+        ];
+        let needles: [&[u8]; 12] = [
+            b"", b"a", b"b", b"ab", b"abra", b"cad", b"aab", b"aaaaab", b"xyzxy", b"\xffz", b"ssi",
+            b"issip",
+        ];
         for h in hays {
             for n in needles {
                 if !n.is_empty() {

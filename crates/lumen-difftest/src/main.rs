@@ -39,7 +39,8 @@ use lumen::{Completion, Engine};
 /// Uncapped in the parent; a `--check` child engages the cap, so a runaway program dies the
 /// instant it asks for too much instead of spiking RSS between polls.
 #[global_allocator]
-static ALLOC: lumen_common::limits::CappedAlloc = lumen_common::limits::CappedAlloc::new(usize::MAX);
+static ALLOC: lumen_common::limits::CappedAlloc =
+    lumen_common::limits::CappedAlloc::new(usize::MAX);
 
 /// xorshift64*: deterministic, dependency-free.
 struct Rng(u64);
@@ -411,13 +412,19 @@ fn run_capped(exe: &std::path::Path, src: &str, tmp: &std::path::Path) -> Verdic
         lumen_os::sysinfo::resident_set_bytes_of(pid).is_some_and(|b| b > CAP_MB * 1024 * 1024)
             || start.elapsed().as_millis() as u64 > TIMEOUT_MS
     };
-    match lumen_os::child::wait_or_kill(&mut child, std::time::Duration::from_millis(4), over_budget).unwrap() {
+    match lumen_os::child::wait_or_kill(
+        &mut child,
+        std::time::Duration::from_millis(4),
+        over_budget,
+    )
+    .unwrap()
+    {
         Some(status) => match status.code() {
-                Some(3) => Verdict::Diverge,
-                Some(0) => Verdict::Agree,
-                // Nonzero-but-not-3 (a crash/abort in BOTH tiers, e.g. a stack overflow on a
-                // deeply-recursive program) is inconclusive, not a divergence.
-                _ => Verdict::Inconclusive,
+            Some(3) => Verdict::Diverge,
+            Some(0) => Verdict::Agree,
+            // Nonzero-but-not-3 (a crash/abort in BOTH tiers, e.g. a stack overflow on a
+            // deeply-recursive program) is inconclusive, not a divergence.
+            _ => Verdict::Inconclusive,
         },
         None => Verdict::Inconclusive,
     }

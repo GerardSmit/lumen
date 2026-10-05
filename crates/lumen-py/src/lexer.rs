@@ -181,7 +181,9 @@ pub fn tokenize_extra(src: &str) -> (Vec<RawToken>, Option<SyntaxError>) {
             lx.line_starts.push(k + 1);
         }
     }
-    let r = lx.lex_until(chars.len(), true).and_then(|()| lx.finish_extra());
+    let r = lx
+        .lex_until(chars.len(), true)
+        .and_then(|()| lx.finish_extra());
     let toks = lx
         .toks
         .iter()
@@ -310,13 +312,33 @@ impl<'a> Lexer<'a> {
             let span = match tok {
                 Tok::Dedent | Tok::EndMarker => {
                     let at = self.index_at(line, col);
-                    Span { start: at, end: at, end_line: line, end_col: col }
+                    Span {
+                        start: at,
+                        end: at,
+                        end_line: line,
+                        end_col: col,
+                    }
                 }
-                Tok::Indent => Span { start: self.index_at(line, 0), end: self.i, end_line: self.line, end_col: self.col },
+                Tok::Indent => Span {
+                    start: self.index_at(line, 0),
+                    end: self.i,
+                    end_line: self.line,
+                    end_col: self.col,
+                },
                 // CPython ends a newline token one column after its start, also at the end of
                 // the input, where its text is empty.
-                Tok::Newline | Tok::Nl => Span { start: self.index_at(line, col), end: self.i, end_line: line, end_col: col + 1 },
-                _ => Span { start: self.index_at(line, col), end: self.i, end_line: self.line, end_col: self.col },
+                Tok::Newline | Tok::Nl => Span {
+                    start: self.index_at(line, col),
+                    end: self.i,
+                    end_line: line,
+                    end_col: col + 1,
+                },
+                _ => Span {
+                    start: self.index_at(line, col),
+                    end: self.i,
+                    end_line: self.line,
+                    end_col: self.col,
+                },
             };
             self.spans.push(span);
         }
@@ -376,11 +398,21 @@ impl<'a> Lexer<'a> {
     /// line and the closing `DEDENT`s and `ENDMARKER` at the start of the line after it.
     fn finish_extra(&mut self) -> Result<(), SyntaxError> {
         if !self.brackets.is_empty() {
-            let line = if self.col == 0 { self.line.saturating_sub(1).max(1) } else { self.line };
+            let line = if self.col == 0 {
+                self.line.saturating_sub(1).max(1)
+            } else {
+                self.line
+            };
             return self.err("unexpected EOF in multi-line statement", line, 0);
         }
         let (mut line, col) = (self.line, self.col);
-        if !matches!(self.toks.last(), None | Some(Token { tok: Tok::Newline | Tok::Nl, .. })) {
+        if !matches!(
+            self.toks.last(),
+            None | Some(Token {
+                tok: Tok::Newline | Tok::Nl,
+                ..
+            })
+        ) {
             self.push(Tok::Newline, line, col);
         }
         if col != 0 {
@@ -728,7 +760,13 @@ impl<'a> Lexer<'a> {
 
     /// Literal text up to the closing quote (or, in a format spec, up to its `}`), with the
     /// replacement fields in it. A doubled brace ends a `FSTRING_MIDDLE` after its first brace.
-    fn fstring_text(&mut self, q: Quote, raw: bool, spec: bool, open: (u32, u32)) -> Result<(), SyntaxError> {
+    fn fstring_text(
+        &mut self,
+        q: Quote,
+        raw: bool,
+        spec: bool,
+        open: (u32, u32),
+    ) -> Result<(), SyntaxError> {
         let mut chunk = (self.line, self.col, self.i);
         let mut after_field = false;
         loop {
@@ -740,7 +778,10 @@ impl<'a> Lexer<'a> {
                     None => return self.unterminated(q, open.0, open.1),
                     Some('{' | '}') => self.bump(),
                     Some('N') if !raw && self.peek(2) == Some('{') => {
-                        while self.i < self.src.len() && self.src[self.i] != '}' && self.src[self.i] != '\n' {
+                        while self.i < self.src.len()
+                            && self.src[self.i] != '}'
+                            && self.src[self.i] != '\n'
+                        {
                             self.bump();
                         }
                         if self.i < self.src.len() {
@@ -753,7 +794,9 @@ impl<'a> Lexer<'a> {
                     }
                 },
                 '\n' if !q.triple => return self.unterminated(q, open.0, open.1),
-                _ if c == q.ch && (!q.triple || (self.peek(1) == Some(c) && self.peek(2) == Some(c))) => {
+                _ if c == q.ch
+                    && (!q.triple || (self.peek(1) == Some(c) && self.peek(2) == Some(c))) =>
+                {
                     if spec {
                         return self.err("f-string: expecting '}'", self.line, self.col);
                     }
@@ -842,7 +885,11 @@ impl<'a> Lexer<'a> {
             j += 1;
             if self.src.get(j) == Some(&'_') {
                 if !is_digit(self.src.get(j + 1)) {
-                    return self.err("invalid decimal literal", self.line, self.col + (j - self.i) as u32);
+                    return self.err(
+                        "invalid decimal literal",
+                        self.line,
+                        self.col + (j - self.i) as u32,
+                    );
                 }
                 j += 1;
             }

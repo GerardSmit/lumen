@@ -2,9 +2,9 @@
 //! owns no socket; `tls.js` moves encrypted bytes between it and the underlying stream.
 
 #[cfg(all(unix, not(target_os = "android")))]
-pub use imp::TlsRegistry;
-#[cfg(all(unix, not(target_os = "android")))]
 pub(crate) use imp::bindings::Module;
+#[cfg(all(unix, not(target_os = "android")))]
+pub use imp::TlsRegistry;
 
 #[cfg(not(all(unix, not(target_os = "android"))))]
 pub(crate) use unsupported::Module;
@@ -25,7 +25,9 @@ mod unsupported {
         use lumen::embed::{NativeError, NativeResult};
 
         fn unavailable() -> NativeResult<()> {
-            Err(NativeError::runtime("node:tls is not available on this platform"))
+            Err(NativeError::runtime(
+                "node:tls is not available on this platform",
+            ))
         }
 
         #[op]
@@ -138,11 +140,18 @@ mod imp {
             Value::Str(s) => Some(s.as_str().to_string()),
             _ => Some(
                 ctx.coerce_string(v)
-                    .map_err(|_| NativeError::type_error("cannot convert the argument to a string"))?
+                    .map_err(|_| {
+                        NativeError::type_error("cannot convert the argument to a string")
+                    })?
                     .to_string(),
             ),
         };
-        Ok(Poly { bytes, text, num: v.as_num_opt().unwrap_or(0.0), flag: matches!(v, Value::Bool(true)) })
+        Ok(Poly {
+            bytes,
+            text,
+            num: v.as_num_opt().unwrap_or(0.0),
+            flag: matches!(v, Value::Bool(true)),
+        })
     }
 
     fn hello_out(hello: ClientHello) -> Data {
@@ -179,7 +188,12 @@ mod imp {
         }
 
         #[op(name = "ctxNew")]
-        pub fn ctx_new(state: &mut State<TlsRegistry>, method: Lenient<Option<String>>, min: Lenient<f64>, max: Lenient<f64>) -> Result<f64, NativeError> {
+        pub fn ctx_new(
+            state: &mut State<TlsRegistry>,
+            method: Lenient<Option<String>>,
+            min: Lenient<f64>,
+            max: Lenient<f64>,
+        ) -> Result<f64, NativeError> {
             let context = Context::new(method.0.as_deref(), min.0 as i32, max.0 as i32)?;
             state.next += 1;
             let id = state.next;
@@ -188,7 +202,13 @@ mod imp {
         }
 
         #[op(name = "ctxOp")]
-        pub fn ctx_op(ctx: &mut Ctx, id: Lenient<u64>, name: Lenient<Option<String>>, a: &Value, passphrase: &Value) -> TlsResult {
+        pub fn ctx_op(
+            ctx: &mut Ctx,
+            id: Lenient<u64>,
+            name: Lenient<Option<String>>,
+            a: &Value,
+            passphrase: &Value,
+        ) -> TlsResult {
             let id = id.0;
             let name = name.0.unwrap_or_default();
             let a = poly(ctx, a)?;
@@ -224,7 +244,9 @@ mod imp {
                         },
                         "addRootCerts" => done(context.add_root_certs())?,
                         "setCiphers" => done(context.set_ciphers(&text.unwrap_or_default()))?,
-                        "setCipherSuites" => done(context.set_cipher_suites(&text.unwrap_or_default()))?,
+                        "setCipherSuites" => {
+                            done(context.set_cipher_suites(&text.unwrap_or_default()))?
+                        }
                         "setSigalgs" => done(context.set_sigalgs(&text.unwrap_or_default()))?,
                         "setECDHCurve" => done(context.set_ecdh_curve(&text.unwrap_or_default()))?,
                         "setDHParam" => match context.set_dh_param(bytes.as_deref())? {
@@ -256,7 +278,12 @@ mod imp {
                             context.close();
                             Data::None
                         }
-                        other => return Err(EngineError::plain(format!("unknown context operation {other}")).into()),
+                        other => {
+                            return Err(EngineError::plain(format!(
+                                "unknown context operation {other}"
+                            ))
+                            .into());
+                        }
                     })
                 })(),
             };
@@ -267,7 +294,11 @@ mod imp {
         }
 
         #[op(name = "sessNew")]
-        pub fn sess_new(state: &mut State<TlsRegistry>, context_id: Lenient<u64>, is_server: Flag) -> Result<f64, NativeError> {
+        pub fn sess_new(
+            state: &mut State<TlsRegistry>,
+            context_id: Lenient<u64>,
+            is_server: Flag,
+        ) -> Result<f64, NativeError> {
             let registry = &mut **state;
             let Some(context) = registry.contexts.get(&context_id.0) else {
                 return Err(EngineError::plain("SecureContext is closed").into());
@@ -303,13 +334,22 @@ mod imp {
             let number = a.num;
             let flag_a = a.flag;
             let flag_b = b.flag;
-            let sni_context = if name == "setSniContext" { Some(a.num as u64) } else { None };
+            let sni_context = if name == "setSniContext" {
+                Some(a.num as u64)
+            } else {
+                None
+            };
             let bytes = a.bytes;
             let text = a.text;
             let label = b.text;
             let context_bytes = context.0;
             let registry = state;
-            let sni = sni_context.and_then(|id| registry.contexts.get(&id).map(|context| context as *const Context));
+            let sni = sni_context.and_then(|id| {
+                registry
+                    .contexts
+                    .get(&id)
+                    .map(|context| context as *const Context)
+            });
             let Some(session) = registry.sessions.get_mut(&id) else {
                 return Err(EngineError::plain("TLS session is closed").into());
             };
@@ -319,20 +359,30 @@ mod imp {
                     Data::None
                 }
                 "verifyError" => match session.verify_error() {
-                    Some((code, reason)) => Data::List(vec![Data::Float(code as f64), Data::Str(reason)]),
+                    Some((code, reason)) => {
+                        Data::List(vec![Data::Float(code as f64), Data::Str(reason)])
+                    }
                     None => Data::None,
                 },
                 "protocol" => session.protocol().map_or(Data::None, Data::Str),
                 "cipher" => match session.cipher() {
-                    Some((name, standard, version)) => {
-                        Data::List(vec![Data::Str(name), Data::Str(standard), Data::Str(version)])
-                    }
+                    Some((name, standard, version)) => Data::List(vec![
+                        Data::Str(name),
+                        Data::Str(standard),
+                        Data::Str(version),
+                    ]),
                     None => Data::None,
                 },
-                "alpnSelected" => session.alpn_selected().map_or(Data::Bool(false), Data::Bytes),
-                "setAlpn" => Data::Bool(bytes.is_some_and(|protocols| session.set_alpn_protocols(&protocols))),
+                "alpnSelected" => session
+                    .alpn_selected()
+                    .map_or(Data::Bool(false), Data::Bytes),
+                "setAlpn" => Data::Bool(
+                    bytes.is_some_and(|protocols| session.set_alpn_protocols(&protocols)),
+                ),
                 "servername" => session.servername().map_or(Data::Bool(false), Data::Str),
-                "setServername" => Data::Bool(text.is_some_and(|name| session.set_servername(&name))),
+                "setServername" => {
+                    Data::Bool(text.is_some_and(|name| session.set_servername(&name)))
+                }
                 "getSession" => session.session_bytes().map_or(Data::None, Data::Bytes),
                 "setSession" => Data::Bool(bytes.is_some_and(|data| session.set_session(&data))),
                 "loadSession" => {
@@ -391,11 +441,17 @@ mod imp {
                     Data::None
                 }
                 "setAlpnChoice" => {
-                    session.set_alpn_choice(if number < 0.0 { None } else { Some(number as usize) });
+                    session.set_alpn_choice(if number < 0.0 {
+                        None
+                    } else {
+                        Some(number as usize)
+                    });
                     Data::None
                 }
                 "certRequest" => match session.take_cert_request() {
-                    Some((servername, ocsp)) => Data::List(vec![Data::Str(servername), Data::Bool(ocsp)]),
+                    Some((servername, ocsp)) => {
+                        Data::List(vec![Data::Str(servername), Data::Bool(ocsp)])
+                    }
                     None => Data::None,
                 },
                 "certDone" => {
@@ -403,10 +459,18 @@ mod imp {
                     Data::None
                 }
                 "ephemeralKey" => match session.ephemeral_key() {
-                    Some((kind, bits)) => Data::List(vec![Data::Float(kind as f64), Data::Float(bits as f64)]),
+                    Some((kind, bits)) => {
+                        Data::List(vec![Data::Float(kind as f64), Data::Float(bits as f64)])
+                    }
                     None => Data::None,
                 },
-                "sharedSigalgs" => Data::List(session.shared_sigalgs().into_iter().map(Data::Str).collect()),
+                "sharedSigalgs" => Data::List(
+                    session
+                        .shared_sigalgs()
+                        .into_iter()
+                        .map(Data::Str)
+                        .collect(),
+                ),
                 "shutdown" => {
                     session.shutdown();
                     Data::None
@@ -417,14 +481,25 @@ mod imp {
                     Data::None
                 }
                 "handshakeFinished" => Data::Bool(session.handshake_finished()),
-                other => return Err(EngineError::plain(format!("unknown session operation {other}")).into()),
+                other => {
+                    return Err(
+                        EngineError::plain(format!("unknown session operation {other}")).into(),
+                    );
+                }
             })
         }
 
         #[op]
-        pub fn feed(state: &mut State<TlsRegistry>, id: Lenient<u64>, data: Lenient<Option<Vec<u8>>>) -> bool {
+        pub fn feed(
+            state: &mut State<TlsRegistry>,
+            id: Lenient<u64>,
+            data: Lenient<Option<Vec<u8>>>,
+        ) -> bool {
             let data = data.0.unwrap_or_default();
-            state.sessions.get_mut(&id.0).is_some_and(|session| session.feed(&data))
+            state
+                .sessions
+                .get_mut(&id.0)
+                .is_some_and(|session| session.feed(&data))
         }
 
         #[op]
@@ -436,7 +511,11 @@ mod imp {
         }
 
         #[op]
-        pub fn read(state: &mut State<TlsRegistry>, id: Lenient<u64>, max: Lenient<Option<f64>>) -> Data {
+        pub fn read(
+            state: &mut State<TlsRegistry>,
+            id: Lenient<u64>,
+            max: Lenient<Option<f64>>,
+        ) -> Data {
             let max = max.0.unwrap_or(65536.0) as usize;
             match state.sessions.get_mut(&id.0) {
                 None => Data::Float(-1.0),
@@ -448,9 +527,16 @@ mod imp {
         }
 
         #[op]
-        pub fn write(state: &mut State<TlsRegistry>, id: Lenient<u64>, data: Lenient<Option<Vec<u8>>>) -> f64 {
+        pub fn write(
+            state: &mut State<TlsRegistry>,
+            id: Lenient<u64>,
+            data: Lenient<Option<Vec<u8>>>,
+        ) -> f64 {
             let data = data.0.unwrap_or_default();
-            state.sessions.get_mut(&id.0).map_or(-1, |session| session.write(&data)) as f64
+            state
+                .sessions
+                .get_mut(&id.0)
+                .map_or(-1, |session| session.write(&data)) as f64
         }
 
         #[op]
@@ -468,10 +554,14 @@ mod imp {
                     .map(|event| match event {
                         Event::HandshakeStart => Data::List(vec![Data::Str("hs-start".into())]),
                         Event::HandshakeDone => Data::List(vec![Data::Str("hs-done".into())]),
-                        Event::NewSession { id, session } => {
-                            Data::List(vec![Data::Str("session".into()), Data::Bytes(id), Data::Bytes(session)])
+                        Event::NewSession { id, session } => Data::List(vec![
+                            Data::Str("session".into()),
+                            Data::Bytes(id),
+                            Data::Bytes(session),
+                        ]),
+                        Event::Keylog(line) => {
+                            Data::List(vec![Data::Str("keylog".into()), Data::Bytes(line)])
                         }
-                        Event::Keylog(line) => Data::List(vec![Data::Str("keylog".into()), Data::Bytes(line)]),
                         Event::OcspResponse(response) => Data::List(vec![
                             Data::Str("ocsp".into()),
                             response.map_or(Data::None, Data::Bytes),
@@ -484,7 +574,11 @@ mod imp {
         /// The session's last error, returned (not thrown) as an error value.
         #[op(name = "lastError")]
         pub fn last_error(ctx: &mut Ctx, id: Lenient<u64>) -> Value {
-            let error = match ctx.op_state().get::<TlsRegistry>().and_then(|state| state.sessions.get(&id.0)) {
+            let error = match ctx
+                .op_state()
+                .get::<TlsRegistry>()
+                .and_then(|state| state.sessions.get(&id.0))
+            {
                 Some(session) => session.last_error(),
                 None => EngineError::plain("TLS session is closed"),
             };

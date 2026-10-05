@@ -143,10 +143,18 @@ mod tests {
     #[test]
     fn broken_down() {
         let t = Tm::from_epoch(1_500_000_000, 0);
-        assert_eq!((t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.wday, t.yday), (2017, 7, 14, 2, 40, 0, 4, 195));
+        assert_eq!(
+            (t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.wday, t.yday),
+            (2017, 7, 14, 2, 40, 0, 4, 195)
+        );
         assert_eq!(t.to_epoch_utc(), 1_500_000_000);
         assert_eq!(Tm::from_epoch(-1, 0).to_epoch_utc(), -1);
-        let t = Tm { year: 2023, mon: 13, mday: 1, ..Tm::default() };
+        let t = Tm {
+            year: 2023,
+            mon: 13,
+            mday: 1,
+            ..Tm::default()
+        };
         assert_eq!(t.to_epoch_utc(), 1_704_067_200);
     }
 }

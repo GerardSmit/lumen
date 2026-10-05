@@ -8,7 +8,7 @@
 //! arguments, which may use a spill slot directly. A spilled register operand is reloaded into a
 //! scratch register by the emitter (`x16`, `x17`, `x30`; `v30`, `v31`).
 
-use super::asm::{Cond, FOp1, FOp2, LdSt, Rrr};
+use super::asm::{Cond, FOp1, FOp2, LdSt, Rrr, SelectOp};
 use crate::machinst::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,7 @@ impl Size {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpRhs {
     Reg(VReg),
+    Sxtw(VReg),
     Imm { imm12: u16, shift: bool, neg: bool },
 }
 
@@ -42,7 +43,8 @@ pub enum CmpRhs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Amode {
     Imm(VReg, i32),
-    Reg(VReg, VReg),
+    Reg(VReg, VReg, bool),
+    Sxtw(VReg, VReg, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +85,18 @@ pub struct CallInfo {
 
 #[derive(Clone, Debug)]
 pub enum MInst {
+    Prefetch {
+        addr: Amode,
+    },
+    VZero {
+        dst: VReg,
+    },
+    Vector {
+        op: crate::ir::VectorOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+    },
     /// Function entry: parameters arrive in fixed registers or incoming stack slots
     /// (`[fp + 16 + offset]`, `bytes` wide).
     Args {
@@ -98,6 +112,10 @@ pub enum MInst {
     MovImm {
         dst: VReg,
         imm: u64,
+    },
+    SymbolAddr {
+        dst: VReg,
+        id: u32,
     },
     /// Float copy (all 64 bits).
     FMov {
@@ -155,11 +173,26 @@ pub enum MInst {
         b: VReg,
         c: VReg,
     },
+    Madd {
+        size: Size,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+        c: VReg,
+    },
     Bit {
         op: BitOp,
         size: Size,
         dst: VReg,
         src: VReg,
+    },
+    Bitfield {
+        size: Size,
+        dst: VReg,
+        src: VReg,
+        signed: bool,
+        immr: u8,
+        imms: u8,
     },
     /// Sign-extend the low `from` bits.
     Sext {
@@ -183,6 +216,13 @@ pub enum MInst {
         a: VReg,
         b: CmpRhs,
     },
+    CCmp {
+        size: Size,
+        a: VReg,
+        b: VReg,
+        cc: Cond,
+        nzcv: u8,
+    },
     FCmp {
         double: bool,
         a: VReg,
@@ -195,6 +235,8 @@ pub enum MInst {
     },
     /// `dst = cc ? t : f`
     CSel {
+        size: Size,
+        op: SelectOp,
         cc: Cond,
         dst: VReg,
         t: VReg,
@@ -239,6 +281,10 @@ pub enum MInst {
         dst: VReg,
         src: VReg,
     },
+    FToJsInt32 {
+        dst: VReg,
+        src: VReg,
+    },
     /// Bit-exact `fmov` from a general register (`S32`: w → s, `S64`: x → d).
     GprToFpr {
         size: Size,
@@ -263,6 +309,13 @@ pub enum MInst {
     /// Branch on `reg != 0` (32-bit test).
     Cbnz {
         reg: VReg,
+        taken: usize,
+        not_taken: usize,
+    },
+    TestBit {
+        reg: VReg,
+        bit: u8,
+        nz: bool,
         taken: usize,
         not_taken: usize,
     },
@@ -291,7 +344,7 @@ pub enum MInst {
 fn amode_uses(a: &Amode, out: &mut Vec<Operand>) {
     match *a {
         Amode::Imm(b, _) => out.push(Operand::use_reg(b)),
-        Amode::Reg(b, i) => {
+        Amode::Reg(b, i, _) | Amode::Sxtw(b, i, _) => {
             out.push(Operand::use_reg(b));
             if i != b {
                 out.push(Operand::use_reg(i));
@@ -325,8 +378,10 @@ impl MachInst for MInst {
                 out.push(Operand::def_any(*dst));
             }
             MovImm { dst, .. } => out.push(Operand::def_any(*dst)),
-            FConst { dst, .. } | CSet { dst, .. } => out.push(Operand::def_reg(*dst)),
-            Rrr { dst, a, b, .. } | FAlu { dst, a, b, .. } => {
+            VZero { dst } | FConst { dst, .. } | CSet { dst, .. } | SymbolAddr { dst, .. } => {
+                out.push(Operand::def_reg(*dst))
+            }
+            Vector { dst, a, b, .. } | Rrr { dst, a, b, .. } | FAlu { dst, a, b, .. } => {
                 uses(out, &[*a, *b]);
                 out.push(Operand::def_reg(*dst));
             }
@@ -344,12 +399,14 @@ impl MachInst for MInst {
             | FCvt { dst, src: a, .. }
             | IntToF { dst, src: a, .. }
             | FToInt { dst, src: a, .. }
+            | FToJsInt32 { dst, src: a }
+            | Bitfield { dst, src: a, .. }
             | GprToFpr { dst, src: a, .. }
             | FprToGpr { dst, src: a, .. } => {
                 out.push(Operand::use_reg(*a));
                 out.push(Operand::def_reg(*dst));
             }
-            Msub { dst, a, b, c, .. } => {
+            Msub { dst, a, b, c, .. } | Madd { dst, a, b, c, .. } => {
                 uses(out, &[*a, *b, *c]);
                 out.push(Operand::def_reg(*dst));
             }
@@ -357,6 +414,7 @@ impl MachInst for MInst {
                 amode_uses(addr, out);
                 out.push(Operand::def_reg(*dst));
             }
+            Prefetch { addr } => amode_uses(addr, out),
             Store { src, addr, .. } => {
                 let n = out.len();
                 amode_uses(addr, out);
@@ -366,13 +424,13 @@ impl MachInst for MInst {
             }
             Cmp { a, b, .. } => {
                 out.push(Operand::use_reg(*a));
-                if let CmpRhs::Reg(b) = b {
+                if let CmpRhs::Reg(b) | CmpRhs::Sxtw(b) = b {
                     if b != a {
                         out.push(Operand::use_reg(*b));
                     }
                 }
             }
-            FCmp { a, b, .. } => uses(out, &[*a, *b]),
+            FCmp { a, b, .. } | CCmp { a, b, .. } => uses(out, &[*a, *b]),
             Call(c) => {
                 let CallInfo {
                     target,
@@ -402,9 +460,10 @@ impl MachInst for MInst {
                     out.push(Operand::use_any(a));
                 }
             }
-            BrTable { index: r, .. } | Cbnz { reg: r, .. } | TrapNz { reg: r, .. } => {
-                out.push(Operand::use_reg(*r))
-            }
+            BrTable { index: r, .. }
+            | Cbnz { reg: r, .. }
+            | TestBit { reg: r, .. }
+            | TrapNz { reg: r, .. } => out.push(Operand::use_reg(*r)),
             Ret { vals } => {
                 for &(v, r) in vals {
                     out.push(Operand::use_fixed(v, r));

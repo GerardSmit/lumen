@@ -1,11 +1,14 @@
 //! Compiled for-in with uncaptured lexical heads and shared oracle enumeration.
+#[cfg(feature = "compiler")]
 use super::{Bail, CResult, Compiler, Home, LoopCtx, Op};
+#[cfg(feature = "compiler")]
 use crate::ast::{DeclKind, Expr, Stmt};
 use crate::interpreter::{Abrupt, Interp};
 use crate::value::Value;
 
+#[cfg(feature = "compiler")]
 impl Compiler {
-    pub(super) fn for_in_statement(
+    pub(crate) fn for_in_statement(
         &mut self,
         kind: DeclKind,
         name: &str,
@@ -51,7 +54,7 @@ impl Compiler {
 
     /// `for (var x in o)` / `for (x in o)`: each key is written to the existing binding
     /// (hoisted var, outer local, captured name or global), as PutValue does.
-    pub(super) fn for_in_assign(&mut self, name: &str, right: &Expr, body: &Stmt) -> CResult {
+    pub(crate) fn for_in_assign(&mut self, name: &str, right: &Expr, body: &Stmt) -> CResult {
         let store = match self.home(name) {
             Some(Home::Slot(_, true)) | Some(Home::Env(true)) | Some(Home::Blk(_, true)) => {
                 return Err(Bail)
@@ -133,7 +136,7 @@ impl Compiler {
 
 /// The snapshot is an internal array, never exposed to JS. Read its own storage directly so
 /// array-prototype changes cannot alter enumeration. Release the borrow before proxy callbacks.
-pub(super) fn step(
+pub(crate) fn step(
     i: &mut Interp,
     slots: &mut [Value],
     base: u16,

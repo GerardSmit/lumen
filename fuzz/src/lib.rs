@@ -7,6 +7,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use lumen::Engine;
+#[cfg(feature = "runtime")]
 use lumen_runtime::Runtime;
 
 const STACK_BYTES: usize = 256 * 1024 * 1024;
@@ -46,6 +47,7 @@ pub fn on_worker<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R
 
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+    #[cfg(feature = "runtime")]
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
@@ -64,6 +66,7 @@ pub fn eval(src: String, fresh: bool) {
 }
 
 /// Evaluate `src` in the worker's full runtime (web extensions installed: `WebAssembly`, ...).
+#[cfg(feature = "runtime")]
 pub fn eval_runtime(src: String) {
     on_worker(move || {
         RUNTIME.with(|slot| {

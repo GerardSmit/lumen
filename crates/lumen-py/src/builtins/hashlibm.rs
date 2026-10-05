@@ -19,7 +19,11 @@ fn data_of(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
 }
 
 /// The initial data of a constructor, given as `data` or as the deprecated `string` keyword.
-fn initial_data(it: &mut Interp, data: Option<&Value>, string: Option<&Value>) -> R<Option<Vec<u8>>> {
+fn initial_data(
+    it: &mut Interp,
+    data: Option<&Value>,
+    string: Option<&Value>,
+) -> R<Option<Vec<u8>>> {
     match (data, string) {
         (Some(_), Some(_)) => Err(it.type_error(
             "'data' and 'string' are mutually exclusive and support for 'string' keyword parameter is slated for removal in a future version.",
@@ -54,11 +58,18 @@ const NAMES: [(&str, Algo); 19] = [
 
 fn algo_by_name(name: &str) -> Option<Algo> {
     let lower = name.to_ascii_lowercase();
-    NAMES.iter().find(|(n, _)| *n == lower).map(|&(_, a)| a).or_else(|| Algo::from_name(name))
+    NAMES
+        .iter()
+        .find(|(n, _)| *n == lower)
+        .map(|&(_, a)| a)
+        .or_else(|| Algo::from_name(name))
 }
 
 fn py_name(algo: Algo) -> &'static str {
-    NAMES.iter().find(|&&(_, a)| a == algo).map_or("unknown", |&(n, _)| n)
+    NAMES
+        .iter()
+        .find(|&&(_, a)| a == algo)
+        .map_or("unknown", |&(n, _)| n)
 }
 
 fn new_hash(it: &mut Interp, algo: Algo, data: Option<Vec<u8>>) -> Value {
@@ -70,7 +81,12 @@ fn new_hash(it: &mut Interp, algo: Algo, data: Option<Vec<u8>>) -> Value {
 }
 
 /// A constructor of one fixed digest: `data` (or `string`) is the initial input.
-fn construct(it: &mut Interp, algo: Algo, data: Option<&Value>, string: Option<&Value>) -> R<Value> {
+fn construct(
+    it: &mut Interp,
+    algo: Algo,
+    data: Option<&Value>,
+    string: Option<&Value>,
+) -> R<Value> {
     let data = initial_data(it, data, string)?;
     Ok(new_hash(it, algo, data))
 }
@@ -82,13 +98,21 @@ pub fn compare_digest(it: &mut Interp, a: &Value, b: &Value) -> R<bool> {
     let (x, y) = match (a.as_str(), b.as_str()) {
         (Some(x), Some(y)) => {
             if !x.is_ascii() || !y.is_ascii() {
-                return Err(it.type_error("comparing strings with non-ASCII characters is not supported"));
+                return Err(
+                    it.type_error("comparing strings with non-ASCII characters is not supported")
+                );
             }
             (x.as_bytes().to_vec(), y.as_bytes().to_vec())
         }
-        _ if !it.is_buffer(a) || !it.is_buffer(b) || a.as_str().is_some() || b.as_str().is_some() => {
+        _ if !it.is_buffer(a)
+            || !it.is_buffer(b)
+            || a.as_str().is_some()
+            || b.as_str().is_some() =>
+        {
             let (ta, tb) = (it.type_name_of(a), it.type_name_of(b));
-            return Err(it.type_error(&format!("unsupported operand types(s) or combination of types: '{ta}' and '{tb}'")));
+            return Err(it.type_error(&format!(
+                "unsupported operand types(s) or combination of types: '{ta}' and '{tb}'"
+            )));
         }
         _ => (it.buffer_bytes(a)?, it.buffer_bytes(b)?),
     };
@@ -122,7 +146,11 @@ pub mod _hashlib {
             Some(s) => s.to_string(),
             None => {
                 let n = it.get_attr_str(digest, "__name__").ok();
-                match n.as_ref().and_then(|n| n.as_str()).and_then(|n| n.strip_prefix("openssl_")) {
+                match n
+                    .as_ref()
+                    .and_then(|n| n.as_str())
+                    .and_then(|n| n.strip_prefix("openssl_"))
+                {
                     Some(n) if it.is_callable(digest) => n.to_string(),
                     _ => {
                         let r = it.repr_of(digest)?;
@@ -154,8 +182,12 @@ pub mod _hashlib {
                     }
                     Ok(self.h.clone().finish_len(n as usize))
                 }
-                (true, None) => Err(it.type_error(&format!("{method}() missing required argument 'length' (pos 1)"))),
-                (false, Some(_)) => Err(it.type_error(&format!("{method}() takes no arguments (1 given)"))),
+                (true, None) => Err(it.type_error(&format!(
+                    "{method}() missing required argument 'length' (pos 1)"
+                ))),
+                (false, Some(_)) => {
+                    Err(it.type_error(&format!("{method}() takes no arguments (1 given)")))
+                }
                 (false, None) => Ok(self.h.clone().finish()),
             }
         }
@@ -171,13 +203,21 @@ pub mod _hashlib {
 
         /// Return the digest value as a bytes object.
         fn digest(slf: This<Py<Self>>, it: &mut Interp, #[kw] length: Option<&Value>) -> R<Value> {
-            let h = Hash { h: slf.0.borrow(it)?.h.clone() };
+            let h = Hash {
+                h: slf.0.borrow(it)?.h.clone(),
+            };
             Ok(Value::bytes(h.result(it, "digest", length)?))
         }
 
         /// Return the digest value as a string of hexadecimal digits.
-        fn hexdigest(slf: This<Py<Self>>, it: &mut Interp, #[kw] length: Option<&Value>) -> R<String> {
-            let h = Hash { h: slf.0.borrow(it)?.h.clone() };
+        fn hexdigest(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw] length: Option<&Value>,
+        ) -> R<String> {
+            let h = Hash {
+                h: slf.0.borrow(it)?.h.clone(),
+            };
             Ok(hex_encode(&h.result(it, "hexdigest", length)?))
         }
 
@@ -210,7 +250,11 @@ pub mod _hashlib {
         fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let algo = slf.0.borrow(it)?.h.algo();
             let ty = if algo.is_xof() { "HASHXOF" } else { "HASH" };
-            Ok(format!("<{} _hashlib.{ty} object @ {:#x}>", py_name(algo), it.id_of(slf.0.value())))
+            Ok(format!(
+                "<{} _hashlib.{ty} object @ {:#x}>",
+                py_name(algo),
+                it.id_of(slf.0.value())
+            ))
         }
     }
 
@@ -244,7 +288,10 @@ pub mod _hashlib {
 
         /// Return a copy ("clone") of the HMAC object.
         fn copy(&self) -> HmacObj {
-            HmacObj { m: self.m.clone(), algo: self.algo }
+            HmacObj {
+                m: self.m.clone(),
+                algo: self.algo,
+            }
         }
 
         #[getter]
@@ -265,7 +312,11 @@ pub mod _hashlib {
         #[proto(repr)]
         fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let algo = slf.0.borrow(it)?.algo;
-            Ok(format!("<hmac-{} HMAC object @ {:#x}>", py_name(algo), it.id_of(slf.0.value())))
+            Ok(format!(
+                "<hmac-{} HMAC object @ {:#x}>",
+                py_name(algo),
+                it.id_of(slf.0.value())
+            ))
         }
     }
 
@@ -280,7 +331,9 @@ pub mod _hashlib {
         it: &mut Interp,
         #[kw] name: &str,
         #[kw] data: Option<&Value>,
-        #[kwonly] #[default(true)] usedforsecurity: bool,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
         #[kwonly] string: Option<&Value>,
     ) -> R<Value> {
         let _ = usedforsecurity;
@@ -292,96 +345,192 @@ pub mod _hashlib {
 
     /// Returns a md5 hash object; optionally initialized with a string
     #[op]
-    fn openssl_md5(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_md5(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Md5, data, string)
     }
 
     /// Returns a sha1 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha1(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha1(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha1, data, string)
     }
 
     /// Returns a sha224 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha224(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha224(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha224, data, string)
     }
 
     /// Returns a sha256 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha256(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha256(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha256, data, string)
     }
 
     /// Returns a sha384 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha384(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha384(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha384, data, string)
     }
 
     /// Returns a sha512 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha512(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha512(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha512, data, string)
     }
 
     /// Returns a sha3-224 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha3_224(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha3_224(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_224, data, string)
     }
 
     /// Returns a sha3-256 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha3_256(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha3_256(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_256, data, string)
     }
 
     /// Returns a sha3-384 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha3_384(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha3_384(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_384, data, string)
     }
 
     /// Returns a sha3-512 hash object; optionally initialized with a string
     #[op]
-    fn openssl_sha3_512(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_sha3_512(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_512, data, string)
     }
 
     /// Returns a shake-128 variable hash object; optionally initialized with a string
     #[op]
-    fn openssl_shake_128(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_shake_128(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Shake128, data, string)
     }
 
     /// Returns a shake-256 variable hash object; optionally initialized with a string
     #[op]
-    fn openssl_shake_256(it: &mut Interp, #[kw] data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool, #[kwonly] string: Option<&Value>) -> R<Value> {
+    fn openssl_shake_256(
+        it: &mut Interp,
+        #[kw] data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+        #[kwonly] string: Option<&Value>,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Shake256, data, string)
     }
 
     /// Password based key derivation function 2 (PKCS #5 v2.0) with HMAC as pseudorandom function.
     #[op]
-    fn pbkdf2_hmac(it: &mut Interp, #[kw] hash_name: &str, #[kw] password: &Value, #[kw] salt: &Value, #[kw] iterations: i64, #[kw] dklen: Option<&Value>) -> R<Vec<u8>> {
+    fn pbkdf2_hmac(
+        it: &mut Interp,
+        #[kw] hash_name: &str,
+        #[kw] password: &Value,
+        #[kw] salt: &Value,
+        #[kw] iterations: i64,
+        #[kw] dklen: Option<&Value>,
+    ) -> R<Vec<u8>> {
         let password = data_of(it, password)?;
         let salt = data_of(it, salt)?;
         let algo = match algo_by_name(hash_name).filter(|&a| lumen_common::hash::supports_mac(a)) {
             Some(a) => a,
-            None => return Err(unsupported(it, "[digital envelope routines] unsupported".into())),
+            None => {
+                return Err(unsupported(
+                    it,
+                    "[digital envelope routines] unsupported".into(),
+                ))
+            }
         };
         if iterations < 1 {
             return Err(it.value_error("iteration value must be greater than 0."));
@@ -399,7 +548,13 @@ pub mod _hashlib {
         if dklen > i32::MAX as i64 {
             return Err(it.new_exc_str("OverflowError", "key length is too great."));
         }
-        Ok(lumen_common::hash::pbkdf2(algo, &password, &salt, iterations as u32, dklen as usize))
+        Ok(lumen_common::hash::pbkdf2(
+            algo,
+            &password,
+            &salt,
+            iterations as u32,
+            dklen as usize,
+        ))
     }
 
     /// scrypt password-based key derivation function.
@@ -412,16 +567,30 @@ pub mod _hashlib {
         #[kwonly] n: Option<&Value>,
         #[kwonly] r: Option<&Value>,
         #[kwonly] p: Option<&Value>,
-        #[kwonly] #[default(0)] maxmem: i64,
-        #[kwonly] #[default(64)] dklen: i64,
+        #[kwonly]
+        #[default(0)]
+        maxmem: i64,
+        #[kwonly]
+        #[default(64)]
+        dklen: i64,
     ) -> R<Vec<u8>> {
         const MAX_MEM: u64 = 32 * 1024 * 1024;
         let password = data_of(it, password)?;
-        let Some(salt) = salt else { return Err(it.type_error("salt is required")) };
+        let Some(salt) = salt else {
+            return Err(it.type_error("salt is required"));
+        };
         let salt = data_of(it, salt)?;
         let (Some(n), Some(r), Some(p)) = (n, r, p) else {
-            let missing = if n.is_none() { "n" } else if r.is_none() { "r" } else { "p" };
-            return Err(it.type_error(&format!("{missing} is required and must be an unsigned int")));
+            let missing = if n.is_none() {
+                "n"
+            } else if r.is_none() {
+                "r"
+            } else {
+                "p"
+            };
+            return Err(it.type_error(&format!(
+                "{missing} is required and must be an unsigned int"
+            )));
         };
         let n = it.index_of(n)?;
         let r = it.index_of(r)?;
@@ -436,19 +605,33 @@ pub mod _hashlib {
             return Err(it.value_error("dklen must be greater than 0 and smaller than 2147483647"));
         }
         let limit = if maxmem == 0 { MAX_MEM } else { maxmem as u64 };
-        let need = (128u64.saturating_mul(r.max(0) as u64)).saturating_mul((n as u64).saturating_add(2).saturating_add(p.max(0) as u64));
+        let need = (128u64.saturating_mul(r.max(0) as u64))
+            .saturating_mul((n as u64).saturating_add(2).saturating_add(p.max(0) as u64));
         if r < 1 || p < 1 || r > u32::MAX as i64 || p > u32::MAX as i64 {
             return Err(it.value_error("Invalid parameter combination for n, r, p, maxmem."));
         }
         if need > limit {
             return Err(it.value_error("[digital envelope routines] memory limit exceeded"));
         }
-        lumen_common::hash::scrypt(&password, &salt, n as u64, r as u32, p as u32, dklen as usize).map_err(|e| it.value_error(&e))
+        lumen_common::hash::scrypt(
+            &password,
+            &salt,
+            n as u64,
+            r as u32,
+            p as u32,
+            dklen as usize,
+        )
+        .map_err(|e| it.value_error(&e))
     }
 
     /// Single-shot HMAC.
     #[op]
-    fn hmac_digest(it: &mut Interp, #[kw] key: &Value, #[kw] msg: &Value, #[kw] digest: &Value) -> R<Vec<u8>> {
+    fn hmac_digest(
+        it: &mut Interp,
+        #[kw] key: &Value,
+        #[kw] msg: &Value,
+        #[kw] digest: &Value,
+    ) -> R<Vec<u8>> {
         let key = it.bytes_of(key)?;
         let msg = data_of(it, msg)?;
         let algo = mac_algo(it, digest)?;
@@ -457,14 +640,22 @@ pub mod _hashlib {
 
     /// Return a new hmac object.
     #[op]
-    fn hmac_new(it: &mut Interp, #[kw] key: &Value, #[kw] msg: Option<&Value>, #[kw] digestmod: Option<&Value>) -> R<Value> {
+    fn hmac_new(
+        it: &mut Interp,
+        #[kw] key: &Value,
+        #[kw] msg: Option<&Value>,
+        #[kw] digestmod: Option<&Value>,
+    ) -> R<Value> {
         let key = it.bytes_of(key)?;
         let Some(digestmod) = digestmod.filter(|v| !v.is_none()) else {
             return Err(it.type_error("Missing required parameter 'digestmod'."));
         };
         let algo = mac_algo(it, digestmod)?;
         let Some(mut m) = Hmac::new(algo, &key) else {
-            return Err(unsupported(it, format!("unsupported hash type {}", py_name(algo))));
+            return Err(unsupported(
+                it,
+                format!("unsupported hash type {}", py_name(algo)),
+            ));
         };
         if let Some(msg) = msg.filter(|v| !v.is_none()) {
             let data = data_of(it, msg)?;
@@ -507,8 +698,18 @@ pub mod _hashlib {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let value_error = it.exc_type("ValueError");
-        let unsupported = crate::builtins::native::new_type(it, "_hashlib", "UnsupportedDigestmodError", Some(&value_error), Layout::Exception);
-        dict_set_str(&d, "UnsupportedDigestmodError", Value::Obj(unsupported.clone()));
+        let unsupported = crate::builtins::native::new_type(
+            it,
+            "_hashlib",
+            "UnsupportedDigestmodError",
+            Some(&value_error),
+            Layout::Exception,
+        );
+        dict_set_str(
+            &d,
+            "UnsupportedDigestmodError",
+            Value::Obj(unsupported.clone()),
+        );
         it.native_state::<State>().unsupported = Some(unsupported);
         let hash = type_object::<Hash>(it);
         dict_set_str(&d, "HASHXOF", Value::Obj(hash));
@@ -534,7 +735,13 @@ pub mod _md5 {
 
     /// Return a new MD5 hash object; optionally initialized with a string.
     #[op]
-    fn md5(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn md5(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Md5, string, None)
     }
@@ -547,7 +754,13 @@ pub mod _sha1 {
 
     /// Return a new SHA1 hash object; optionally initialized with a string.
     #[op]
-    fn sha1(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha1(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha1, string, None)
     }
@@ -560,28 +773,52 @@ pub mod _sha2 {
 
     /// Return a new SHA-224 hash object; optionally initialized with a string.
     #[op]
-    fn sha224(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha224(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha224, string, None)
     }
 
     /// Return a new SHA-256 hash object; optionally initialized with a string.
     #[op]
-    fn sha256(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha256(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha256, string, None)
     }
 
     /// Return a new SHA-384 hash object; optionally initialized with a string.
     #[op]
-    fn sha384(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha384(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha384, string, None)
     }
 
     /// Return a new SHA-512 hash object; optionally initialized with a string.
     #[op]
-    fn sha512(it: &mut Interp, #[kw] string: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha512(
+        it: &mut Interp,
+        #[kw] string: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha512, string, None)
     }
@@ -594,42 +831,78 @@ pub mod _sha3 {
 
     /// Return a new SHA3 hash object.
     #[op]
-    fn sha3_224(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha3_224(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_224, data, None)
     }
 
     /// Return a new SHA3 hash object.
     #[op]
-    fn sha3_256(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha3_256(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_256, data, None)
     }
 
     /// Return a new SHA3 hash object.
     #[op]
-    fn sha3_384(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha3_384(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_384, data, None)
     }
 
     /// Return a new SHA3 hash object.
     #[op]
-    fn sha3_512(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn sha3_512(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Sha3_512, data, None)
     }
 
     /// Return a new SHAKE hash object.
     #[op]
-    fn shake_128(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn shake_128(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Shake128, data, None)
     }
 
     /// Return a new SHAKE hash object.
     #[op]
-    fn shake_256(it: &mut Interp, data: Option<&Value>, #[kwonly] #[default(true)] usedforsecurity: bool) -> R<Value> {
+    fn shake_256(
+        it: &mut Interp,
+        data: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        usedforsecurity: bool,
+    ) -> R<Value> {
         let _ = usedforsecurity;
         construct(it, Algo::Shake256, data, None)
     }
@@ -720,23 +993,62 @@ pub mod _blake2 {
             cls: This<Value>,
             it: &mut Interp,
             data: Option<&Value>,
-            #[kwonly] #[default(64)] digest_size: i64,
+            #[kwonly]
+            #[default(64)]
+            digest_size: i64,
             #[kwonly] key: Option<&Value>,
             #[kwonly] salt: Option<&Value>,
             #[kwonly] person: Option<&Value>,
-            #[kwonly] #[default(1)] fanout: i64,
-            #[kwonly] #[default(1)] depth: i64,
-            #[kwonly] #[default(0)] leaf_size: i64,
-            #[kwonly] #[default(0)] node_offset: i64,
-            #[kwonly] #[default(0)] node_depth: i64,
-            #[kwonly] #[default(0)] inner_size: i64,
-            #[kwonly] #[default(false)] last_node: bool,
-            #[kwonly] #[default(true)] usedforsecurity: bool,
+            #[kwonly]
+            #[default(1)]
+            fanout: i64,
+            #[kwonly]
+            #[default(1)]
+            depth: i64,
+            #[kwonly]
+            #[default(0)]
+            leaf_size: i64,
+            #[kwonly]
+            #[default(0)]
+            node_offset: i64,
+            #[kwonly]
+            #[default(0)]
+            node_depth: i64,
+            #[kwonly]
+            #[default(0)]
+            inner_size: i64,
+            #[kwonly]
+            #[default(false)]
+            last_node: bool,
+            #[kwonly]
+            #[default(true)]
+            usedforsecurity: bool,
         ) -> R<Value> {
             let _ = usedforsecurity;
-            let tree = [fanout, depth, leaf_size, node_offset, node_depth, inner_size];
-            let b = blake2_new(it, true, Blake2Args { data, digest_size, key, salt, person, tree, last_node })?;
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
+            let tree = [
+                fanout,
+                depth,
+                leaf_size,
+                node_offset,
+                node_depth,
+                inner_size,
+            ];
+            let b = blake2_new(
+                it,
+                true,
+                Blake2Args {
+                    data,
+                    digest_size,
+                    key,
+                    salt,
+                    person,
+                    tree,
+                    last_node,
+                },
+            )?;
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
             Ok(opaque_instance(cls, Blake2b(b)))
         }
 
@@ -788,23 +1100,62 @@ pub mod _blake2 {
             cls: This<Value>,
             it: &mut Interp,
             data: Option<&Value>,
-            #[kwonly] #[default(32)] digest_size: i64,
+            #[kwonly]
+            #[default(32)]
+            digest_size: i64,
             #[kwonly] key: Option<&Value>,
             #[kwonly] salt: Option<&Value>,
             #[kwonly] person: Option<&Value>,
-            #[kwonly] #[default(1)] fanout: i64,
-            #[kwonly] #[default(1)] depth: i64,
-            #[kwonly] #[default(0)] leaf_size: i64,
-            #[kwonly] #[default(0)] node_offset: i64,
-            #[kwonly] #[default(0)] node_depth: i64,
-            #[kwonly] #[default(0)] inner_size: i64,
-            #[kwonly] #[default(false)] last_node: bool,
-            #[kwonly] #[default(true)] usedforsecurity: bool,
+            #[kwonly]
+            #[default(1)]
+            fanout: i64,
+            #[kwonly]
+            #[default(1)]
+            depth: i64,
+            #[kwonly]
+            #[default(0)]
+            leaf_size: i64,
+            #[kwonly]
+            #[default(0)]
+            node_offset: i64,
+            #[kwonly]
+            #[default(0)]
+            node_depth: i64,
+            #[kwonly]
+            #[default(0)]
+            inner_size: i64,
+            #[kwonly]
+            #[default(false)]
+            last_node: bool,
+            #[kwonly]
+            #[default(true)]
+            usedforsecurity: bool,
         ) -> R<Value> {
             let _ = usedforsecurity;
-            let tree = [fanout, depth, leaf_size, node_offset, node_depth, inner_size];
-            let b = blake2_new(it, false, Blake2Args { data, digest_size, key, salt, person, tree, last_node })?;
-            let Value::Obj(cls) = &cls.0 else { unreachable!() };
+            let tree = [
+                fanout,
+                depth,
+                leaf_size,
+                node_offset,
+                node_depth,
+                inner_size,
+            ];
+            let b = blake2_new(
+                it,
+                false,
+                Blake2Args {
+                    data,
+                    digest_size,
+                    key,
+                    salt,
+                    person,
+                    tree,
+                    last_node,
+                },
+            )?;
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!()
+            };
             Ok(opaque_instance(cls, Blake2s(b)))
         }
 
@@ -852,8 +1203,17 @@ pub mod _blake2 {
         for (wide, prefix) in [(true, "BLAKE2B"), (false, "BLAKE2S")] {
             let size = Blake2::max_size(wide) as i64;
             let salt = Blake2::salt_size(wide) as i64;
-            let ty = if wide { type_object::<Blake2b>(it) } else { type_object::<Blake2s>(it) };
-            let attrs = [("SALT_SIZE", salt), ("PERSON_SIZE", salt), ("MAX_KEY_SIZE", size), ("MAX_DIGEST_SIZE", size)];
+            let ty = if wide {
+                type_object::<Blake2b>(it)
+            } else {
+                type_object::<Blake2s>(it)
+            };
+            let attrs = [
+                ("SALT_SIZE", salt),
+                ("PERSON_SIZE", salt),
+                ("MAX_KEY_SIZE", size),
+                ("MAX_DIGEST_SIZE", size),
+            ];
             for (name, v) in attrs {
                 let _ = it.set_attr_str(&Value::Obj(ty.clone()), name, Value::Int(v));
                 dict_set_str(&d, &format!("{prefix}_{name}"), Value::Int(v));

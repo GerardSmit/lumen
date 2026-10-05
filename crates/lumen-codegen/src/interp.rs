@@ -11,7 +11,12 @@ pub trait Env {
     fn load(&mut self, addr: u64, bytes: u32) -> u64;
     fn store(&mut self, addr: u64, bytes: u32, value: u64);
     fn call(&mut self, func: &ExtFunc, sig: &Signature, args: &[u64]) -> Result<Vec<u64>, u32>;
-    fn call_indirect(&mut self, sig: &Signature, callee: u64, args: &[u64]) -> Result<Vec<u64>, u32>;
+    fn call_indirect(
+        &mut self,
+        sig: &Signature,
+        callee: u64,
+        args: &[u64],
+    ) -> Result<Vec<u64>, u32>;
 }
 
 /// An [`Env`] over a byte buffer addressed from 0, with no callable functions.
@@ -40,12 +45,12 @@ impl Env for BufferEnv {
 
 /// Run `func` on `args` (raw bits, see [`eval`]). `Err(code)` is a trap.
 pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>, u32> {
-    let mut vals = vec![0u64; func.values.len()];
+    let mut vals = vec![0u128; func.values.len()];
     let mut block = func.entry();
-    let mut incoming: Vec<u64> = args
+    let mut incoming: Vec<u128> = args
         .iter()
         .zip(&func.sig.params)
-        .map(|(&a, &t)| eval::norm(t, a))
+        .map(|(&a, &t)| eval::norm(t, a) as u128)
         .collect();
     assert_eq!(incoming.len(), func.sig.params.len(), "argument count");
     loop {
@@ -53,15 +58,26 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
         for (&p, &v) in data.params.iter().zip(&incoming) {
             vals[p.index()] = v;
         }
-        let get = |vals: &[u64], v: Value| vals[func.resolve(v).index()];
+        let get = |vals: &[u128], v: Value| vals[func.resolve(v).index()];
         let mut next = None;
         for &inst in &data.insts {
             let d = func.inst(inst);
             let results = func.results(inst);
             match d {
+                InstData::Prefetch { .. } => {}
+                InstData::Vzero => vals[results[0].index()] = 0,
+                InstData::VectorBinary { op, args } => {
+                    vals[results[0].index()] =
+                        eval::vector(*op, get(&vals, args[0]), get(&vals, args[1]));
+                }
                 InstData::Load { kind, addr, offset } => {
                     // An I32 address is held zero-extended, so both pointer widths work as is.
-                    let a = get(&vals, *addr).wrapping_add(*offset as i64 as u64);
+                    let a = (get(&vals, *addr) as u64).wrapping_add(*offset as i64 as u64);
+                    if *kind == MemKind::V128 {
+                        vals[results[0].index()] =
+                            env.load(a, 8) as u128 | (env.load(a + 8, 8) as u128) << 64;
+                        continue;
+                    }
                     let raw = env.load(a, kind.bytes());
                     let v = if kind.is_signed() {
                         let sh = 64 - 8 * kind.bytes();
@@ -69,7 +85,7 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                     } else {
                         raw
                     };
-                    vals[results[0].index()] = eval::norm(kind.ty(), v);
+                    vals[results[0].index()] = eval::norm(kind.ty(), v) as u128;
                 }
                 InstData::Store {
                     kind,
@@ -77,22 +93,29 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                     value,
                     offset,
                 } => {
-                    let a = get(&vals, *addr).wrapping_add(*offset as i64 as u64);
-                    env.store(a, kind.bytes(), get(&vals, *value));
+                    let a = (get(&vals, *addr) as u64).wrapping_add(*offset as i64 as u64);
+                    let v = get(&vals, *value);
+                    if *kind == MemKind::V128 {
+                        env.store(a, 8, v as u64);
+                        env.store(a + 8, 8, (v >> 64) as u64);
+                    } else {
+                        env.store(a, kind.bytes(), v as u64);
+                    }
                 }
                 InstData::Call { func: f, args } => {
                     let ext = &func.funcs[f.index()];
-                    let a: Vec<u64> = args.iter().map(|&v| get(&vals, v)).collect();
+                    let a: Vec<u64> = args.iter().map(|&v| get(&vals, v) as u64).collect();
                     let r = env.call(ext, &func.sigs[ext.sig.index()], &a)?;
                     for (&res, v) in results.iter().zip(r) {
-                        vals[res.index()] = eval::norm(func.value_type(res), v);
+                        vals[res.index()] = eval::norm(func.value_type(res), v) as u128;
                     }
                 }
                 InstData::CallIndirect { sig, callee, args } => {
-                    let a: Vec<u64> = args.iter().map(|&v| get(&vals, v)).collect();
-                    let r = env.call_indirect(&func.sigs[sig.index()], get(&vals, *callee), &a)?;
+                    let a: Vec<u64> = args.iter().map(|&v| get(&vals, v) as u64).collect();
+                    let r =
+                        env.call_indirect(&func.sigs[sig.index()], get(&vals, *callee) as u64, &a)?;
                     for (&res, v) in results.iter().zip(r) {
-                        vals[res.index()] = eval::norm(func.value_type(res), v);
+                        vals[res.index()] = eval::norm(func.value_type(res), v) as u128;
                     }
                 }
                 InstData::Trap { code } => return Err(*code),
@@ -103,7 +126,11 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                 }
                 InstData::Jump { dest } => next = Some(dest),
                 InstData::Brif { cond, then, else_ } => {
-                    next = Some(if get(&vals, *cond) as u32 != 0 { then } else { else_ });
+                    next = Some(if get(&vals, *cond) as u32 != 0 {
+                        then
+                    } else {
+                        else_
+                    });
                 }
                 InstData::BrTable {
                     index,
@@ -114,12 +141,23 @@ pub fn run(func: &Function, env: &mut dyn Env, args: &[u64]) -> Result<Vec<u64>,
                     next = Some(targets.get(i).unwrap_or(default));
                 }
                 InstData::Return { args } => {
-                    return Ok(args.iter().map(|&v| get(&vals, v)).collect());
+                    return Ok(args.iter().map(|&v| get(&vals, v) as u64).collect());
+                }
+                InstData::CheckedBinary { op, args } => {
+                    let a = get(&vals, args[0]) as i32;
+                    let b = get(&vals, args[1]) as i32;
+                    let (value, overflow) = match op {
+                        CheckedOp::IaddOv => a.overflowing_add(b),
+                        CheckedOp::IsubOv => a.overflowing_sub(b),
+                        CheckedOp::ImulOv => a.overflowing_mul(b),
+                    };
+                    vals[results[0].index()] = value as u32 as u128;
+                    vals[results[1].index()] = overflow as u128;
                 }
                 _ => {
-                    let v = eval::pure_inst(func, d, |v| get(&vals, v))
+                    let v = eval::pure_inst(func, d, |v| get(&vals, v) as u64)
                         .unwrap_or_else(|| panic!("{inst}: undefined operation {d:?}"));
-                    vals[results[0].index()] = v;
+                    vals[results[0].index()] = v as u128;
                 }
             }
         }

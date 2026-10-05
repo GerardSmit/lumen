@@ -137,7 +137,11 @@ pub(super) fn compile(
                     Home::Remat
                 } else if u == 0 {
                     Home::Unused
-                } else if data.is_pure() && results.len() == 1 && u == 1 && use_block[r.index()] == Some(b) {
+                } else if data.is_pure()
+                    && results.len() == 1
+                    && u == 1
+                    && use_block[r.index()] == Some(b)
+                {
                     Home::Inline
                 } else {
                     new_local(f.value_type(r), &mut locals)
@@ -438,9 +442,12 @@ impl Emitter<'_> {
         for &inst in &insts[..insts.len().saturating_sub(1)] {
             let data = f.inst(inst);
             let results = f.results(inst);
-            let deferred = results
-                .iter()
-                .all(|r| matches!(self.home[r.index()], Home::Remat | Home::Inline | Home::Unused));
+            let deferred = results.iter().all(|r| {
+                matches!(
+                    self.home[r.index()],
+                    Home::Remat | Home::Inline | Home::Unused
+                )
+            });
             if data.is_pure() && deferred {
                 continue;
             }
@@ -516,6 +523,35 @@ impl Emitter<'_> {
         let data = f.inst(inst);
         let ty = |v: Value| f.value_type(v);
         match data {
+            InstData::Prefetch { .. } => self.op(0x01),
+            InstData::Vzero => {
+                self.op(0xfd);
+                self.u(12);
+                self.code.extend_from_slice(&[0; 16]);
+            }
+            InstData::VectorBinary { op, args } => {
+                use VectorOp::*;
+                self.operand(args[0])?;
+                self.operand(args[1])?;
+                self.op(0xfd);
+                self.u(match op {
+                    I32x4Add => 0xae,
+                    I32x4Mul => 0xb5,
+                    I32x4Min => 0xb6,
+                    I32x4Max => 0xb8,
+                    I32x4Eq => 0x37,
+                    I32x4Lt => 0x39,
+                    F64x2Add => 0xf0,
+                    F64x2Mul => 0xf2,
+                    F64x2Min => 0xf4,
+                    F64x2Max => 0xf5,
+                    F64x2Eq => 0x47,
+                    F64x2Lt => 0x49,
+                    And => 0x4e,
+                    AndNot => 0x4f,
+                    Or => 0x50,
+                });
+            }
             InstData::Iconst { ty: Type::I32, imm } => {
                 self.op(0x41);
                 sleb(&mut self.code, *imm as i32 as i64);
@@ -523,6 +559,9 @@ impl Emitter<'_> {
             InstData::Iconst { imm, .. } => {
                 self.op(0x42);
                 sleb(&mut self.code, *imm);
+            }
+            InstData::SymbolAddr { .. } => {
+                return Err("symbol addresses require a native AOT target".into())
             }
             InstData::F32const { bits } => {
                 self.op(0x43);
@@ -541,6 +580,7 @@ impl Emitter<'_> {
                 self.operand(args[1])?;
                 self.op(binary(*op, ty(args[0]))?);
             }
+            InstData::CheckedBinary { .. } => return Err("unlegalized checked arithmetic".into()),
             InstData::IntCmp { cc, args } => {
                 self.operand(args[0])?;
                 self.operand(args[1])?;
@@ -555,7 +595,10 @@ impl Emitter<'_> {
                 self.operand(args[0])?;
                 self.operand(args[1])?;
                 use FloatCC::*;
-                let i = [Eq, Ne, Lt, Gt, Le, Ge].iter().position(|c| c == cc).unwrap() as u8;
+                let i = [Eq, Ne, Lt, Gt, Le, Ge]
+                    .iter()
+                    .position(|c| c == cc)
+                    .unwrap() as u8;
                 self.op(if ty(args[0]) == Type::F32 { 0x5b } else { 0x61 } + i);
             }
             InstData::Select {
@@ -574,12 +617,20 @@ impl Emitter<'_> {
             }
             InstData::Load { kind, addr, offset } => {
                 self.mem_addr(*addr, *offset)?;
+                if *kind == MemKind::V128 {
+                    self.op(0xfd);
+                    self.u(0);
+                    self.u(4);
+                    self.u((*offset).max(0) as u64);
+                    return Ok(());
+                }
                 use MemKind::*;
                 let opcode = match kind {
                     I32 => 0x28,
                     I64 => 0x29,
                     F32 => 0x2a,
                     F64 => 0x2b,
+                    V128 => unreachable!(),
                     I32S8 => 0x2c,
                     I32U8 => 0x2d,
                     I32S16 => 0x2e,
@@ -601,12 +652,20 @@ impl Emitter<'_> {
             } => {
                 self.mem_addr(*addr, *offset)?;
                 self.operand(*value)?;
+                if *kind == MemKind::V128 {
+                    self.op(0xfd);
+                    self.u(11);
+                    self.u(4);
+                    self.u((*offset).max(0) as u64);
+                    return Ok(());
+                }
                 use MemKind::*;
                 let opcode = match kind {
                     I32 => 0x36,
                     I64 => 0x37,
                     F32 => 0x38,
                     F64 => 0x39,
+                    V128 => unreachable!(),
                     I32S8 | I32U8 => 0x3a,
                     I32S16 | I32U16 => 0x3b,
                     I64S8 | I64U8 => 0x3c,
@@ -620,7 +679,8 @@ impl Emitter<'_> {
                     self.operand(a)?;
                 }
                 let ext = &f.funcs[func.index()];
-                let idx = (self.resolve)(ext.id).ok_or_else(|| format!("wasm: unresolved fn {}", ext.id))?;
+                let idx = (self.resolve)(ext.id)
+                    .ok_or_else(|| format!("wasm: unresolved fn {}", ext.id))?;
                 self.op(0x41);
                 sleb(&mut self.code, idx as i32 as i64);
                 self.call_indirect(ext.sig);
@@ -683,15 +743,19 @@ fn binary(op: BinaryOp, ty: Type) -> Result<u8, String> {
     use BinaryOp::*;
     // Integer ops share one order from i32.add (0x6a) / i64.add (0x7c); float ops from
     // f32.add (0x92) / f64.add (0xa0).
-    let int = [Iadd, Isub, Imul, Sdiv, Udiv, Srem, Urem, Band, Bor, Bxor, Ishl, Sshr, Ushr, Rotl, Rotr];
+    let int = [
+        Iadd, Isub, Imul, Sdiv, Udiv, Srem, Urem, Band, Bor, Bxor, Ishl, Sshr, Ushr, Rotl, Rotr,
+    ];
     let float = [Fadd, Fsub, Fmul, Fdiv, Fmin, Fmax, Fcopysign];
     let (base, i) = match ty {
         Type::I32 => (0x6a, int.iter().position(|&o| o == op)),
         Type::I64 => (0x7c, int.iter().position(|&o| o == op)),
         Type::F32 => (0x92, float.iter().position(|&o| o == op)),
         Type::F64 => (0xa0, float.iter().position(|&o| o == op)),
+        Type::V128 => return Err("use vector_binary for V128".into()),
     };
-    i.map(|i| base + i as u8).ok_or_else(|| format!("wasm: {op:?} on {ty:?}"))
+    i.map(|i| base + i as u8)
+        .ok_or_else(|| format!("wasm: {op:?} on {ty:?}"))
 }
 
 fn convert(op: ConvOp, from: Type, to: Type) -> Result<&'static [u8], String> {

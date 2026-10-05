@@ -10,7 +10,9 @@ pub mod xz;
 
 use std::ffi::c_int;
 
-use brotli::enc::encode::{BrotliEncoderOperation, BrotliEncoderParameter, BrotliEncoderStateStruct};
+use brotli::enc::encode::{
+    BrotliEncoderOperation, BrotliEncoderParameter, BrotliEncoderStateStruct,
+};
 use brotli::enc::StandardAlloc;
 use brotli::{BrotliResult, BrotliState, HeapAlloc, HuffmanCode};
 use libz_rs_sys as z;
@@ -46,27 +48,50 @@ fn stream_size() -> c_int {
 
 impl ZStream {
     /// `deflateInit2`; `window_bits` carries zlib's wrapper convention (negative: raw, +16: gzip).
-    pub fn deflate(level: i32, window_bits: i32, mem_level: i32, strategy: i32) -> Result<Self, i32> {
+    pub fn deflate(
+        level: i32,
+        window_bits: i32,
+        mem_level: i32,
+        strategy: i32,
+    ) -> Result<Self, i32> {
         let mut strm = Box::new(z::z_stream::default());
         // SAFETY: `strm` is a live, default-initialised stream with its allocator set.
         let code = unsafe {
-            z::deflateInit2_(&mut *strm, level, 8, window_bits, mem_level, strategy, z::zlibVersion(), stream_size())
+            z::deflateInit2_(
+                &mut *strm,
+                level,
+                8,
+                window_bits,
+                mem_level,
+                strategy,
+                z::zlibVersion(),
+                stream_size(),
+            )
         };
         if code != Z_OK {
             return Err(code);
         }
-        Ok(ZStream { strm, deflating: true, carry: Vec::new() })
+        Ok(ZStream {
+            strm,
+            deflating: true,
+            carry: Vec::new(),
+        })
     }
 
     /// `inflateInit2`; `window_bits` as for [`ZStream::deflate`] (+32: auto-detect zlib or gzip).
     pub fn inflate(window_bits: i32) -> Result<Self, i32> {
         let mut strm = Box::new(z::z_stream::default());
         // SAFETY: as for `deflate`.
-        let code = unsafe { z::inflateInit2_(&mut *strm, window_bits, z::zlibVersion(), stream_size()) };
+        let code =
+            unsafe { z::inflateInit2_(&mut *strm, window_bits, z::zlibVersion(), stream_size()) };
         if code != Z_OK {
             return Err(code);
         }
-        Ok(ZStream { strm, deflating: false, carry: Vec::new() })
+        Ok(ZStream {
+            strm,
+            deflating: false,
+            carry: Vec::new(),
+        })
     }
 
     pub fn run(&mut self, flush: i32, input: &[u8], output: &mut [u8]) -> ZStep {
@@ -76,7 +101,11 @@ impl ZStream {
             output[..carried].copy_from_slice(&self.carry[..carried]);
             self.carry.drain(..carried);
             if !self.carry.is_empty() {
-                return ZStep { code: Z_OK, consumed: 0, produced: carried };
+                return ZStep {
+                    code: Z_OK,
+                    consumed: 0,
+                    produced: carried,
+                };
             }
         }
         let output = &mut output[carried..];
@@ -116,9 +145,17 @@ impl ZStream {
         // SAFETY: the dictionary slice is live for the call.
         unsafe {
             if self.deflating {
-                z::deflateSetDictionary(&mut *self.strm, dictionary.as_ptr(), dictionary.len() as u32)
+                z::deflateSetDictionary(
+                    &mut *self.strm,
+                    dictionary.as_ptr(),
+                    dictionary.len() as u32,
+                )
             } else {
-                z::inflateSetDictionary(&mut *self.strm, dictionary.as_ptr(), dictionary.len() as u32)
+                z::inflateSetDictionary(
+                    &mut *self.strm,
+                    dictionary.as_ptr(),
+                    dictionary.len() as u32,
+                )
             }
         }
     }
@@ -183,7 +220,11 @@ impl ZStream {
         if code != Z_OK {
             return Err(code);
         }
-        Ok(ZStream { strm, deflating: self.deflating, carry: self.carry.clone() })
+        Ok(ZStream {
+            strm,
+            deflating: self.deflating,
+            carry: self.carry.clone(),
+        })
     }
 
     #[allow(clippy::unnecessary_cast)] // `uLong` is 32-bit on some targets
@@ -208,7 +249,9 @@ impl Drop for ZStream {
 /// The zlib version string the library reports.
 pub fn zlib_version() -> String {
     // SAFETY: `zlibVersion` returns a NUL-terminated static string.
-    unsafe { std::ffi::CStr::from_ptr(z::zlibVersion()) }.to_string_lossy().into_owned()
+    unsafe { std::ffi::CStr::from_ptr(z::zlibVersion()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[inline]
@@ -249,7 +292,12 @@ fn step_window(out_len: usize, want: usize, limit: usize) -> usize {
     want.min(limit.saturating_sub(out_len).saturating_add(1))
 }
 
-fn decompress_with(window_bits: i32, data: &[u8], what: &str, limit: usize) -> Result<Vec<u8>, String> {
+fn decompress_with(
+    window_bits: i32,
+    data: &[u8],
+    what: &str,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let mut z = ZStream::inflate(window_bits).map_err(|_| format!("{what}: init failed"))?;
     let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(limit));
     let mut consumed = 0;
@@ -310,7 +358,7 @@ pub fn gzip_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, Str
     decompress_with(31, data, "gzip", limit)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "none")))]
 pub fn zstd_compress(data: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(data, 0).expect("in-memory zstd compression")
 }
@@ -332,16 +380,16 @@ pub fn zstd_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     zstd_decompress_limited(data, usize::MAX)
 }
 /// [`zstd_decompress`], failing with [`OUTPUT_LIMIT`] once the output passes `limit` bytes.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "none")))]
 pub fn zstd_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut decoder = zstd::stream::read::Decoder::new(data).map_err(|e| e.to_string())?;
     read_limited(&mut decoder, limit)
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "none"))]
 pub fn zstd_compress(data: &[u8]) -> Vec<u8> {
     ruzstd::encoding::compress_to_vec(data, ruzstd::encoding::CompressionLevel::Fastest)
 }
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", target_os = "none"))]
 pub fn zstd_decompress_limited(data: &[u8], limit: usize) -> Result<Vec<u8>, String> {
     let mut decoder = ruzstd::decoding::StreamingDecoder::new(data).map_err(|e| e.to_string())?;
     read_limited(&mut decoder, limit)
@@ -376,7 +424,10 @@ impl BrotliEncoder {
                 state.set_parameter(p, value);
             }
         }
-        BrotliEncoder { state, params: params.to_vec() }
+        BrotliEncoder {
+            state,
+            params: params.to_vec(),
+        }
     }
 
     pub fn reset(&mut self) {
@@ -494,7 +545,10 @@ impl Default for BrotliDecoder {
 
 impl BrotliDecoder {
     pub fn new() -> Self {
-        BrotliDecoder { state: new_decoder_state(), total_out: 0 }
+        BrotliDecoder {
+            state: new_decoder_state(),
+            total_out: 0,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -543,7 +597,10 @@ mod tests {
         let data = vec![7u8; 100_000];
         let err = Some(OUTPUT_LIMIT.to_string());
         for (packed, f) in [
-            (zlib_compress(&data), zlib_decompress_limited as fn(&[u8], usize) -> _),
+            (
+                zlib_compress(&data),
+                zlib_decompress_limited as fn(&[u8], usize) -> _,
+            ),
             (gzip_compress(&data), gzip_decompress_limited),
             (deflate(&data), inflate_limited),
             (zstd_compress(&data), zstd_decompress_limited),

@@ -389,7 +389,11 @@ pub mod _operator {
     /// Otherwise, it may over- or under-estimate by an arbitrary amount.
     /// The result will be an integer >= 0.
     #[op]
-    fn length_hint(it: &mut Interp, obj: &Value, #[default(Value::Int(0))] default: Value) -> R<Value> {
+    fn length_hint(
+        it: &mut Interp,
+        obj: &Value,
+        #[default(Value::Int(0))] default: Value,
+    ) -> R<Value> {
         if default.as_bigint().is_none() {
             let t = it.type_name_of(&default);
             return Err(it.type_error(&format!("'{t}' object cannot be interpreted as an integer")));
@@ -402,7 +406,9 @@ pub mod _operator {
                 Err(e) => return Err(e),
             }
         }
-        let Some(hint) = it.lookup_mro(&cls, "__length_hint__") else { return Ok(default) };
+        let Some(hint) = it.lookup_mro(&cls, "__length_hint__") else {
+            return Ok(default);
+        };
         let bound = it.bind_descr(&hint, obj, &cls)?;
         let r = match it.call(&bound, Vec::new(), Vec::new()) {
             Ok(r) => r,
@@ -424,7 +430,12 @@ pub mod _operator {
 
     /// Same as obj(*args, **kwargs).
     #[op]
-    fn call(it: &mut Interp, obj: &Value, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+    fn call(
+        it: &mut Interp,
+        obj: &Value,
+        #[varargs] args: &[Value],
+        #[varkw] kw: KwArgs,
+    ) -> R<Value> {
         it.call(obj, args.to_vec(), kw.to_vec())
     }
 
@@ -462,7 +473,12 @@ pub mod _operator {
     #[methods]
     impl AttrGetter {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             if !kw.is_empty() {
                 return Err(it.type_error("attrgetter() takes no keyword arguments"));
             }
@@ -471,11 +487,21 @@ pub mod _operator {
             }
             let mut paths = Vec::new();
             for a in args {
-                let Some(s) = a.as_str() else { return Err(it.type_error("attribute name must be a string")) };
+                let Some(s) = a.as_str() else {
+                    return Err(it.type_error("attribute name must be a string"));
+                };
                 paths.push(s.split('.').map(Value::str).collect());
             }
-            let Value::Obj(cls) = cls.0 else { unreachable!() };
-            Ok(opaque_instance(&cls, AttrGetter { attrs: args.to_vec(), paths }))
+            let Value::Obj(cls) = cls.0 else {
+                unreachable!()
+            };
+            Ok(opaque_instance(
+                &cls,
+                AttrGetter {
+                    attrs: args.to_vec(),
+                    paths,
+                },
+            ))
         }
 
         #[proto(call)]
@@ -490,13 +516,20 @@ pub mod _operator {
                 }
                 out.push(v);
             }
-            Ok(if out.len() == 1 { out.pop().unwrap() } else { Value::tuple(out) })
+            Ok(if out.len() == 1 {
+                out.pop().unwrap()
+            } else {
+                Value::tuple(out)
+            })
         }
 
         #[proto(repr)]
         fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let attrs = slf.0.borrow(it)?.attrs.clone();
-            Ok(format!("operator.attrgetter({})", reprs(it, &attrs)?.join(", ")))
+            Ok(format!(
+                "operator.attrgetter({})",
+                reprs(it, &attrs)?.join(", ")
+            ))
         }
 
         /// Return state information for pickling
@@ -519,15 +552,27 @@ pub mod _operator {
     #[methods]
     impl ItemGetter {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             if !kw.is_empty() {
                 return Err(it.type_error("itemgetter() takes no keyword arguments"));
             }
             if args.is_empty() {
                 return Err(it.type_error("itemgetter expected 1 argument, got 0"));
             }
-            let Value::Obj(cls) = cls.0 else { unreachable!() };
-            Ok(opaque_instance(&cls, ItemGetter { items: args.to_vec() }))
+            let Value::Obj(cls) = cls.0 else {
+                unreachable!()
+            };
+            Ok(opaque_instance(
+                &cls,
+                ItemGetter {
+                    items: args.to_vec(),
+                },
+            ))
         }
 
         #[proto(call)]
@@ -546,7 +591,10 @@ pub mod _operator {
         #[proto(repr)]
         fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let items = slf.0.borrow(it)?.items.clone();
-            Ok(format!("operator.itemgetter({})", reprs(it, &items)?.join(", ")))
+            Ok(format!(
+                "operator.itemgetter({})",
+                reprs(it, &items)?.join(", ")
+            ))
         }
 
         /// Return state information for pickling
@@ -572,14 +620,32 @@ pub mod _operator {
     #[methods]
     impl MethodCaller {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             let Some((name, rest)) = args.split_first() else {
-                return Err(it.type_error("methodcaller needs at least one argument, the method name"));
+                return Err(
+                    it.type_error("methodcaller needs at least one argument, the method name")
+                );
             };
-            let Some(s) = name.as_str() else { return Err(it.type_error("method name must be a string")) };
+            let Some(s) = name.as_str() else {
+                return Err(it.type_error("method name must be a string"));
+            };
             let name = Value::str(s);
-            let Value::Obj(cls) = cls.0 else { unreachable!() };
-            Ok(opaque_instance(&cls, MethodCaller { name, args: rest.to_vec(), kwargs: kw.to_vec() }))
+            let Value::Obj(cls) = cls.0 else {
+                unreachable!()
+            };
+            Ok(opaque_instance(
+                &cls,
+                MethodCaller {
+                    name,
+                    args: rest.to_vec(),
+                    kwargs: kw.to_vec(),
+                },
+            ))
         }
 
         #[proto(call)]

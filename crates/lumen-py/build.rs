@@ -38,12 +38,19 @@ use lexer::Tok;
 const CHUNK_TARGET: usize = 256 * 1024;
 
 fn collect(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
-    let mut entries: Vec<_> = std::fs::read_dir(dir).expect("read lib dir").filter_map(Result::ok).collect();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .expect("read lib dir")
+        .filter_map(Result::ok)
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
-        let child = if rel.is_empty() { name.clone() } else { format!("{}/{}", rel, name) };
+        let child = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", rel, name)
+        };
         if path.is_dir() {
             collect(&path, &child, out);
         } else if name.ends_with(".py") {
@@ -80,15 +87,14 @@ fn significant(src: &str) -> Result<Significant, String> {
     if let Some(e) = err {
         return Err(format!("lexer error: {e:?}"));
     }
-    Ok(
-        toks.into_iter()
-            .filter(|t| !matches!(t.tok, Tok::Comment | Tok::Nl))
-            .map(|t| match t.tok {
-                Tok::Newline => (t.tok, t.text, (t.start.0, 0), (t.end.0, 0)),
-                _ => (t.tok, t.text, t.start, t.end),
-            })
-            .collect(),
-    )
+    Ok(toks
+        .into_iter()
+        .filter(|t| !matches!(t.tok, Tok::Comment | Tok::Nl))
+        .map(|t| match t.tok {
+            Tok::Newline => (t.tok, t.text, (t.start.0, 0), (t.end.0, 0)),
+            _ => (t.tok, t.text, t.start, t.end),
+        })
+        .collect())
 }
 
 /// `src` without comments. Newlines stay, so every other token keeps its line; `Err` (with the
@@ -110,10 +116,20 @@ fn strip_comments(src: &str) -> Result<String, String> {
     }
     let mut lines: Vec<String> = src.split('\n').map(str::to_string).collect();
     for &(line, col, len) in comments.iter().rev() {
-        let l = lines.get_mut(line as usize - 1).ok_or("comment line out of range")?;
-        let start = l.char_indices().nth(col as usize).map(|(i, _)| i).ok_or("comment column out of range")?;
+        let l = lines
+            .get_mut(line as usize - 1)
+            .ok_or("comment line out of range")?;
+        let start = l
+            .char_indices()
+            .nth(col as usize)
+            .map(|(i, _)| i)
+            .ok_or("comment column out of range")?;
         let end = start + len;
-        if l.get(start..end).ok_or("comment span off char boundary")?.as_bytes()[0] != b'#' {
+        if l.get(start..end)
+            .ok_or("comment span off char boundary")?
+            .as_bytes()[0]
+            != b'#'
+        {
             return Err(format!("comment position mismatch at {line}:{col}"));
         }
         let head = l[..start].trim_end_matches([' ', '\t']).to_string();
@@ -144,7 +160,12 @@ fn main() {
 
     let mut generated = String::new();
     let external = feature("PY_STDLIB_EXTERNAL");
-    writeln!(generated, "pub const EXTERNAL_DIR: &str = {:?};", lib.display().to_string()).unwrap();
+    writeln!(
+        generated,
+        "pub const EXTERNAL_DIR: &str = {:?};",
+        lib.display().to_string()
+    )
+    .unwrap();
 
     let mut files = Vec::new();
     if !external {
@@ -152,15 +173,29 @@ fn main() {
     }
     let mut rules = Vec::new();
     if !feature("PY_STDLIB_FULL") {
-        parse_rules(&std::fs::read_to_string(manifest.join("stdlib-exclude.txt")).expect("read stdlib-exclude.txt"), &mut rules);
+        parse_rules(
+            &std::fs::read_to_string(manifest.join("stdlib-exclude.txt"))
+                .expect("read stdlib-exclude.txt"),
+            &mut rules,
+        );
     }
     if let Ok(extra) = std::env::var("LUMEN_PY_STDLIB_EXCLUDE") {
-        rules.extend(extra.split(',').map(str::trim).filter(|r| !r.is_empty()).map(str::to_string));
+        rules.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string),
+        );
     }
     files.retain(|(rel, _)| !excluded(&rules, rel));
 
     let keep_comments = feature("PY_STDLIB_COMMENTS");
-    let quality = if std::env::var("PROFILE").is_ok_and(|p| p != "debug") { 11 } else { 5 };
+    let quality = if std::env::var("PROFILE").is_ok_and(|p| p != "debug") {
+        11
+    } else {
+        5
+    };
 
     let mut chunks: Vec<(u32, u32, u32)> = Vec::new();
     let mut index: Vec<(String, u32, u32, u32)> = Vec::new();
@@ -183,7 +218,8 @@ fn main() {
 
     for (rel, path) in &files {
         println!("cargo:rerun-if-changed={}", path.display());
-        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let src = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         raw_total += src.len();
         let src_len = src.len();
         let body = if keep_comments {
@@ -201,13 +237,22 @@ fn main() {
         if !cur.is_empty() && cur.len() + body.len() > CHUNK_TARGET {
             flush(&mut cur, &mut blob, &mut chunks);
         }
-        index.push((rel.clone(), chunks.len() as u32, cur.len() as u32, body.len() as u32));
+        index.push((
+            rel.clone(),
+            chunks.len() as u32,
+            cur.len() as u32,
+            body.len() as u32,
+        ));
         cur.extend_from_slice(body.as_bytes());
     }
     flush(&mut cur, &mut blob, &mut chunks);
 
     if !unstripped.is_empty() {
-        println!("cargo:warning=lumen-py: {} stdlib modules embedded with comments: {}", unstripped.len(), unstripped.join(", "));
+        println!(
+            "cargo:warning=lumen-py: {} stdlib modules embedded with comments: {}",
+            unstripped.len(),
+            unstripped.join(", ")
+        );
     }
     println!(
         "cargo:warning=lumen-py stdlib: {} files, {} source bytes, {} after stripping, {} embedded bytes; {} unchanged: {}",
@@ -220,8 +265,14 @@ fn main() {
     );
 
     std::fs::write(out_dir.join("stdlib.br"), &blob).expect("write stdlib blob");
-    writeln!(generated, "pub static BLOB: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/stdlib.br\"));").unwrap();
-    generated.push_str("/// `(offset, compressed length, uncompressed length)` of each chunk in `BLOB`.\n");
+    writeln!(
+        generated,
+        "pub static BLOB: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/stdlib.br\"));"
+    )
+    .unwrap();
+    generated.push_str(
+        "/// `(offset, compressed length, uncompressed length)` of each chunk in `BLOB`.\n",
+    );
     generated.push_str("pub static CHUNKS: &[(u32, u32, u32)] = &[\n");
     for (o, c, u) in &chunks {
         writeln!(generated, "    ({o}, {c}, {u}),").unwrap();

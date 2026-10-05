@@ -49,9 +49,9 @@ use lumen_host::{CallbackQueue, CompletionSender, Ctx, TaskId, TaskRegistry, Val
 const UDP_POLL: Duration = Duration::from_millis(200);
 
 #[cfg(unix)]
-mod wake;
-#[cfg(unix)]
 mod fdpass;
+#[cfg(unix)]
+mod wake;
 /// Descriptor passing is unix-only (Windows IPC rides the child's stdio instead).
 #[cfg(not(unix))]
 mod fdpass {
@@ -60,16 +60,46 @@ mod fdpass {
     fn unsupported() -> OpError {
         NativeError::runtime("socket descriptor passing is not supported on this platform").into()
     }
-    pub(super) fn adopt_fd(_c: &mut Ctx, _fd: f64) -> Result<Value, OpError> { Err(unsupported()) }
-    pub(super) fn socket_fd(_c: &mut Ctx, _sid: u64) -> f64 { -1.0 }
-    pub(super) fn server_fd(_c: &mut Ctx, _sid: u64) -> f64 { -1.0 }
-    pub(super) fn udp_fd(_c: &mut Ctx, _sid: u64) -> f64 { -1.0 }
+    pub(super) fn adopt_fd(_c: &mut Ctx, _fd: f64) -> Result<Value, OpError> {
+        Err(unsupported())
+    }
+    pub(super) fn socket_fd(_c: &mut Ctx, _sid: u64) -> f64 {
+        -1.0
+    }
+    pub(super) fn server_fd(_c: &mut Ctx, _sid: u64) -> f64 {
+        -1.0
+    }
+    pub(super) fn udp_fd(_c: &mut Ctx, _sid: u64) -> f64 {
+        -1.0
+    }
     pub(super) fn release(_c: &mut Ctx, _sid: u64) {}
-    pub(super) fn read_msg(_c: &mut Ctx, _sid: u64, _resolve: Value, _reject: Value) -> Result<(), OpError> { Err(unsupported()) }
-    pub(super) fn try_send_msg(_c: &mut Ctx, _sid: u64, _data: &[u8], _fd: Option<f64>) -> f64 { 0.0 }
-    pub(super) fn write_msg(_c: &mut Ctx, _sid: u64, _data: Vec<u8>, _fd: Option<f64>, _resolve: Value, _reject: Value) -> Result<(), OpError> { Err(unsupported()) }
-    pub(super) fn guess_handle(_fd: Option<f64>) -> &'static str { "UNKNOWN" }
-    pub(super) fn dup_fd(_fd: Option<f64>) -> f64 { -1.0 }
+    pub(super) fn read_msg(
+        _c: &mut Ctx,
+        _sid: u64,
+        _resolve: Value,
+        _reject: Value,
+    ) -> Result<(), OpError> {
+        Err(unsupported())
+    }
+    pub(super) fn try_send_msg(_c: &mut Ctx, _sid: u64, _data: &[u8], _fd: Option<f64>) -> f64 {
+        0.0
+    }
+    pub(super) fn write_msg(
+        _c: &mut Ctx,
+        _sid: u64,
+        _data: Vec<u8>,
+        _fd: Option<f64>,
+        _resolve: Value,
+        _reject: Value,
+    ) -> Result<(), OpError> {
+        Err(unsupported())
+    }
+    pub(super) fn guess_handle(_fd: Option<f64>) -> &'static str {
+        "UNKNOWN"
+    }
+    pub(super) fn dup_fd(_fd: Option<f64>) -> f64 {
+        -1.0
+    }
     pub(super) fn close_fd(_fd: Option<f64>) {}
 }
 
@@ -338,7 +368,9 @@ fn net_error(e: &NetErr) -> NativeError {
     if let Some(n) = e.errno.filter(|_| cfg!(unix)) {
         err = err.with_prop("errno", -n);
     }
-    err = err.with_prop("code", e.code).with_prop("syscall", e.syscall);
+    err = err
+        .with_prop("code", e.code)
+        .with_prop("syscall", e.syscall);
     if let Some(a) = &e.address {
         err = err.with_prop("address", a.clone());
     }
@@ -490,7 +522,11 @@ fn connect_tcp_from(
     if ip.is_ipv6() != addr.is_ipv6() {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
@@ -718,7 +754,8 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
             let mut v: i32 = 0;
             let mut len = 4u32;
             // SAFETY: `v` is a live i32 and `len` its size, for an open socket.
-            let rc = unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
+            let rc =
+                unsafe { getsockopt(fd, SOL_SOCKET, name, (&mut v as *mut i32).cast(), &mut len) };
             (rc == 0 && v >= 0).then_some(v as usize)
         };
         let space = match (query(SO_SNDBUF), query(SO_NWRITE)) {
@@ -732,7 +769,11 @@ fn try_write(stream: &NetStream, data: &[u8]) -> usize {
     }
     // SAFETY: `fd` is an open socket owned by `stream`, and `data` is a live buffer of `len` bytes.
     let n = unsafe { send(fd, data.as_ptr().cast(), data.len(), MSG_DONTWAIT) };
-    if n > 0 { n as usize } else { 0 }
+    if n > 0 {
+        n as usize
+    } else {
+        0
+    }
 }
 
 /// Windows has no per-call non-blocking send; the socket stays blocking (its reader thread
@@ -821,13 +862,23 @@ fn listen_tcp(host: &str, port: u16, backlog: i32, flags: u32) -> std::io::Resul
             .next()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EADDRNOTAVAIL))?,
     };
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_STREAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
     os::setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_REUSEADDR, 1).map_err(os_error)?;
     if addr.is_ipv6() {
-        os::setsockopt_int(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, (flags & IPV6ONLY != 0) as i32).map_err(os_error)?;
+        os::setsockopt_int(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            (flags & IPV6ONLY != 0) as i32,
+        )
+        .map_err(os_error)?;
     }
     os::bind(fd, &addr.into()).map_err(os_error)?;
     os::listen(fd, backlog).map_err(os_error)?;
@@ -968,7 +1019,11 @@ fn bind_udp(addr: SocketAddr, flags: u32) -> std::io::Result<UdpSocket> {
     use std::os::fd::FromRawFd;
     const IPV6ONLY: u32 = 1;
     const REUSEADDR: u32 = 4;
-    let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+    let domain = if addr.is_ipv6() {
+        libc::AF_INET6
+    } else {
+        libc::AF_INET
+    };
     let fd = os::socket(domain, libc::SOCK_DGRAM, 0).map_err(os_error)?;
     // SAFETY: `fd` is a fresh descriptor owned by nothing else.
     let socket = unsafe { UdpSocket::from_raw_fd(fd) };
@@ -1051,7 +1106,13 @@ fn with_udp(
 #[cfg(unix)]
 fn set_ipv6_multicast_hops(socket: &UdpSocket, hops: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
-    lumen_os::net::setsockopt_int(socket.as_raw_fd(), libc::IPPROTO_IPV6, libc::IPV6_MULTICAST_HOPS, hops).map_err(os_error)
+    lumen_os::net::setsockopt_int(
+        socket.as_raw_fd(),
+        libc::IPPROTO_IPV6,
+        libc::IPV6_MULTICAST_HOPS,
+        hops,
+    )
+    .map_err(os_error)
 }
 
 #[cfg(not(unix))]
@@ -1188,24 +1249,20 @@ fn udp_source_membership(
     join: bool,
 ) -> Result<(), OpError> {
     let interface_text = interface_text.unwrap_or_default();
-    let source = parse_v4(&source_text).map_err(|_| {
-        NativeError::type_error(format!("Invalid source address: {source_text}"),
-        )
-    })?;
-    let group = parse_v4(&group_text).map_err(|_| {
-        NativeError::type_error(format!("Invalid multicast address: {group_text}"),
-        )
-    })?;
+    let source = parse_v4(&source_text)
+        .map_err(|_| NativeError::type_error(format!("Invalid source address: {source_text}")))?;
+    let group = parse_v4(&group_text)
+        .map_err(|_| NativeError::type_error(format!("Invalid multicast address: {group_text}")))?;
     if !group.is_multicast() {
-        return Err(NativeError::type_error(format!("Invalid multicast address: {group_text}"),
-        ).into());
+        return Err(
+            NativeError::type_error(format!("Invalid multicast address: {group_text}")).into(),
+        );
     }
     let interface = if interface_text.is_empty() {
         Ipv4Addr::UNSPECIFIED
     } else {
         parse_v4(&interface_text).map_err(|_| {
-            NativeError::type_error(format!("Invalid interface address: {interface_text}"),
-            )
+            NativeError::type_error(format!("Invalid interface address: {interface_text}"))
         })?
     };
     let kind6 = ctx
@@ -1214,8 +1271,10 @@ fn udp_source_membership(
         .map(|entry| entry.kind6)
         .unwrap_or(false);
     if kind6 {
-        return Err(NativeError::runtime("source-specific multicast is only supported for udp4 sockets",
-        ).into());
+        return Err(NativeError::runtime(
+            "source-specific multicast is only supported for udp4 sockets",
+        )
+        .into());
     }
     let syscall = if join {
         "addSourceSpecificMembership"
@@ -1350,7 +1409,9 @@ fn win_setsockopt<T>(socket: &UdpSocket, level: i32, name: i32, value: &T) -> st
         Ok(())
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
@@ -1368,7 +1429,13 @@ fn set_source_membership(
     ))
 }
 
-fn udp_membership(ctx: &mut Ctx, sid: u64, mcast: String, iface: Option<String>, join: bool) -> Result<(), OpError> {
+fn udp_membership(
+    ctx: &mut Ctx,
+    sid: u64,
+    mcast: String,
+    iface: Option<String>,
+    join: bool,
+) -> Result<(), OpError> {
     let iface = iface.unwrap_or_default();
     let kind6 = ctx
         .host_mut::<DgramRegistry>()
@@ -1382,9 +1449,8 @@ fn udp_membership(ctx: &mut Ctx, sid: u64, mcast: String, iface: Option<String>,
     };
 
     if kind6 {
-        let group = parse_v6(&mcast).map_err(|_| {
-            NativeError::type_error(format!("Invalid multicast address: {mcast}"))
-        })?;
+        let group = parse_v6(&mcast)
+            .map_err(|_| NativeError::type_error(format!("Invalid multicast address: {mcast}")))?;
         let idx = iface.parse::<u32>().unwrap_or(0);
         return with_udp(ctx, sid, syscall, |s, _| {
             if join {
@@ -1399,9 +1465,8 @@ fn udp_membership(ctx: &mut Ctx, sid: u64, mcast: String, iface: Option<String>,
     let iface_addr = if iface.is_empty() {
         Ipv4Addr::UNSPECIFIED
     } else {
-        parse_v4(&iface).map_err(|_| {
-            NativeError::type_error(format!("Invalid interface address: {iface}"))
-        })?
+        parse_v4(&iface)
+            .map_err(|_| NativeError::type_error(format!("Invalid interface address: {iface}")))?
     };
     with_udp(ctx, sid, syscall, |s, _| {
         if join {
@@ -1512,12 +1577,22 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
     use std::os::windows::io::AsRawSocket;
     #[link(name = "ws2_32")]
     extern "system" {
-        fn getsockopt(socket: usize, level: i32, name: i32, value: *mut u8, length: *mut i32) -> i32;
+        fn getsockopt(
+            socket: usize,
+            level: i32,
+            name: i32,
+            value: *mut u8,
+            length: *mut i32,
+        ) -> i32;
         fn WSAGetLastError() -> i32;
     }
     let mut value = 0i32;
     let mut length = std::mem::size_of::<i32>() as i32;
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     // SAFETY: the socket is live for the borrow; value/length describe a valid i32 buffer.
     let rc = unsafe {
         getsockopt(
@@ -1532,13 +1607,19 @@ fn socket_buffer_size(socket: &UdpSocket, receive: bool) -> std::io::Result<i32>
         Ok(value)
     } else {
         // SAFETY: reads this thread's last Winsock error.
-        Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+        Err(std::io::Error::from_raw_os_error(unsafe {
+            WSAGetLastError()
+        }))
     }
 }
 
 #[cfg(windows)]
 fn set_socket_buffer_size(socket: &UdpSocket, receive: bool, size: i32) -> std::io::Result<()> {
-    let name = if receive { WIN_SO_RCVBUF } else { WIN_SO_SNDBUF };
+    let name = if receive {
+        WIN_SO_RCVBUF
+    } else {
+        WIN_SO_SNDBUF
+    };
     win_setsockopt(socket, WIN_SOL_SOCKET, name, &size)
 }
 
@@ -1794,7 +1875,8 @@ mod tcp_bindings {
                 } else {
                     local_host.parse().ok()
                 };
-                let local = (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
+                let local =
+                    (local_ip.is_some() || local_port != 0).then_some((local_ip, local_port));
                 let mut last = None;
                 for addr in addrs {
                     match connect_tcp(addr, local) {
@@ -1814,7 +1896,12 @@ mod tcp_bindings {
     }
 
     #[op(coerce, name = "connectPath")]
-    fn op_connect_path(ctx: &mut Ctx, path: String, resolve: Value, reject: Value) -> Result<(), OpError> {
+    fn op_connect_path(
+        ctx: &mut Ctx,
+        path: String,
+        resolve: Value,
+        reject: Value,
+    ) -> Result<(), OpError> {
         let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
         #[cfg(unix)]
         {
@@ -1841,8 +1928,9 @@ mod tcp_bindings {
         #[cfg(not(any(unix, windows)))]
         {
             let _ = (resolve, reject);
-            Err(NativeError::runtime(format!("Unix-domain sockets are not supported on this platform: {path}"),
-            ))
+            Err(NativeError::runtime(format!(
+                "Unix-domain sockets are not supported on this platform: {path}"
+            )))
         }
     }
 
@@ -1871,7 +1959,10 @@ mod tcp_bindings {
         if unref {
             reg.set_unref(id);
         }
-        if let Some(e) = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get_mut(&sid)) {
+        if let Some(e) = ctx
+            .host_mut::<NetRegistry>()
+            .and_then(|r| r.sockets.get_mut(&sid))
+        {
             e.pending = Some(id);
         }
         completions(ctx).run_blocking(id, move || {
@@ -1886,7 +1977,8 @@ mod tcp_bindings {
                 }
                 match lumen_os::net::recv(stream.raw_fd(), &mut buf, libc::MSG_DONTWAIT) {
                     Ok(n) => break Ok(n),
-                    Err(e) if lumen_os::net::would_block(e.errno()) || e.errno() == libc::EINTR => {}
+                    Err(e) if lumen_os::net::would_block(e.errno()) || e.errno() == libc::EINTR => {
+                    }
                     Err(e) => break Err(os_error(e)),
                 }
             };
@@ -1908,7 +2000,13 @@ mod tcp_bindings {
 
     /// `(socketId, bytes, resolve, reject)` — write all bytes; resolves when flushed.
     #[op(coerce, name = "write")]
-    fn op_write(ctx: &mut Ctx, sid: f64, data: Vec<u8>, resolve: Value, reject: Value) -> Result<(), OpError> {
+    fn op_write(
+        ctx: &mut Ctx,
+        sid: f64,
+        data: Vec<u8>,
+        resolve: Value,
+        reject: Value,
+    ) -> Result<(), OpError> {
         let sid = uid(sid);
         let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
 
@@ -1964,7 +2062,10 @@ mod tcp_bindings {
     #[op(coerce, name = "endWritable")]
     fn op_end_writable(ctx: &mut Ctx, sid: f64) {
         let sid = uid(sid);
-        if let Some(e) = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get(&sid)) {
+        if let Some(e) = ctx
+            .host_mut::<NetRegistry>()
+            .and_then(|r| r.sockets.get(&sid))
+        {
             let _ = e.stream.shutdown(Shutdown::Write);
         }
     }
@@ -2055,8 +2156,18 @@ mod tcp_bindings {
     /// `(host, port, backlog, flags)` — bind a listener (synchronous, like `std`); returns
     /// `{ serverId, address, port, family }` or throws an errno-tagged error (`EADDRINUSE`, …).
     #[op(coerce, name = "listen")]
-    fn op_listen(ctx: &mut Ctx, host: String, port: f64, backlog: Option<f64>, flags: Option<f64>) -> Result<Value, OpError> {
-        let host = if host.is_empty() { "0.0.0.0".to_string() } else { host };
+    fn op_listen(
+        ctx: &mut Ctx,
+        host: String,
+        port: f64,
+        backlog: Option<f64>,
+        flags: Option<f64>,
+    ) -> Result<Value, OpError> {
+        let host = if host.is_empty() {
+            "0.0.0.0".to_string()
+        } else {
+            host
+        };
         let port = port_of(port);
         let backlog = backlog.filter(|b| *b > 0.0).unwrap_or(511.0) as i32;
         let flags = flags.map_or(0, uid) as u32;
@@ -2072,7 +2183,9 @@ mod tcp_bindings {
             .local_addr()
             .map_err(|e| NativeError::runtime(format!("local_addr: {e}")))?;
 
-        let reg = ctx.host_mut::<NetRegistry>().expect("net registry installed");
+        let reg = ctx
+            .host_mut::<NetRegistry>()
+            .expect("net registry installed");
         let id = reg.next_server;
         reg.next_server += 1;
         reg.servers.insert(
@@ -2094,7 +2207,11 @@ mod tcp_bindings {
 
         let o = Value::Obj(ctx.new_object());
         let _ = ctx.set_member(&o, "serverId", Value::Num(id as f64));
-        let _ = ctx.set_member(&o, "address", Value::from_string(local_addr.ip().to_string()));
+        let _ = ctx.set_member(
+            &o,
+            "address",
+            Value::from_string(local_addr.ip().to_string()),
+        );
         let _ = ctx.set_member(&o, "port", Value::Num(local_addr.port() as f64));
         let _ = ctx.set_member(&o, "family", Value::str(family_of(&local_addr)));
         Ok(o)
@@ -2106,7 +2223,9 @@ mod tcp_bindings {
         {
             let listener = UnixListener::bind(&path)
                 .map_err(|error| net_error(&path_err("listen", path.clone(), error)))?;
-            let reg = ctx.host_mut::<NetRegistry>().expect("net registry installed");
+            let reg = ctx
+                .host_mut::<NetRegistry>()
+                .expect("net registry installed");
             let id = reg.next_server;
             reg.next_server += 1;
             reg.servers.insert(
@@ -2133,7 +2252,9 @@ mod tcp_bindings {
         {
             let listener = crate::win_pipe::PipeListener::bind(&path)
                 .map_err(|error| net_error(&path_err("listen", path.clone(), error)))?;
-            let reg = ctx.host_mut::<NetRegistry>().expect("net registry installed");
+            let reg = ctx
+                .host_mut::<NetRegistry>()
+                .expect("net registry installed");
             let id = reg.next_server;
             reg.next_server += 1;
             reg.servers.insert(
@@ -2154,8 +2275,9 @@ mod tcp_bindings {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Err(NativeError::runtime(format!("Unix-domain sockets are not supported on this platform: {path}"),
-            ))
+            Err(NativeError::runtime(format!(
+                "Unix-domain sockets are not supported on this platform: {path}"
+            )))
         }
     }
 
@@ -2184,7 +2306,10 @@ mod tcp_bindings {
         if unref {
             reg.set_unref(id);
         }
-        if let Some(e) = ctx.host_mut::<NetRegistry>().and_then(|r| r.servers.get_mut(&sid)) {
+        if let Some(e) = ctx
+            .host_mut::<NetRegistry>()
+            .and_then(|r| r.servers.get_mut(&sid))
+        {
             e.pending = Some(id);
         }
         completions(ctx).run_blocking(id, move || {
@@ -2204,7 +2329,13 @@ mod tcp_bindings {
                         };
                         break Ok(stream);
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::ConnectionAborted
+                        ) => {}
                     Err(e) => break Err(e),
                 }
             };
@@ -2230,7 +2361,9 @@ mod tcp_bindings {
     #[op(coerce, name = "closeServer")]
     fn op_close_server(ctx: &mut Ctx, sid: f64) {
         let sid = uid(sid);
-        let entry = ctx.host_mut::<NetRegistry>().and_then(|r| r.servers.remove(&sid));
+        let entry = ctx
+            .host_mut::<NetRegistry>()
+            .and_then(|r| r.servers.remove(&sid));
         if let Some(entry) = entry {
             close_server_entry(entry);
         }
@@ -2287,7 +2420,13 @@ mod udp_bindings {
     /// empty for the wildcard; `flags` the libuv `UV_UDP_*` bits). Returns
     /// `{ socketId, address, port, family }` or throws an errno-tagged error.
     #[op(coerce, name = "bind")]
-    fn op_udp_bind(ctx: &mut Ctx, kind: String, host: String, port: f64, flags: Option<f64>) -> Result<Value, OpError> {
+    fn op_udp_bind(
+        ctx: &mut Ctx,
+        kind: String,
+        host: String,
+        port: f64,
+        flags: Option<f64>,
+    ) -> Result<Value, OpError> {
         let kind6 = kind == "udp6";
         let host = if !host.is_empty() {
             host
@@ -2313,7 +2452,9 @@ mod udp_bindings {
             .local_addr()
             .map_err(|e| NativeError::runtime(format!("local_addr: {e}")))?;
 
-        let reg = ctx.host_mut::<DgramRegistry>().expect("dgram registry installed");
+        let reg = ctx
+            .host_mut::<DgramRegistry>()
+            .expect("dgram registry installed");
         let id = reg.next;
         reg.next += 1;
         reg.sockets.insert(
@@ -2396,7 +2537,10 @@ mod udp_bindings {
         if unref {
             reg.set_unref(id);
         }
-        if let Some(e) = ctx.host_mut::<DgramRegistry>().and_then(|r| r.sockets.get_mut(&sid)) {
+        if let Some(e) = ctx
+            .host_mut::<DgramRegistry>()
+            .and_then(|r| r.sockets.get_mut(&sid))
+        {
             e.pending = Some(id);
         }
         completions(ctx).run_blocking(id, move || {
@@ -2410,7 +2554,12 @@ mod udp_bindings {
                         buf.truncate(n);
                         break RecvResult::Msg(buf, from);
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
                         if closed.load(Ordering::SeqCst) {
                             break RecvResult::Closed;
                         }
@@ -2426,7 +2575,13 @@ mod udp_bindings {
     /// `(socketId, bytes, port, address)` — send one datagram to `address:port` (a connected socket
     /// passes an empty address); returns the byte count or throws an errno-tagged error.
     #[op(coerce, name = "send")]
-    fn op_udp_send(ctx: &mut Ctx, sid: f64, data: &[u8], port: f64, address: String) -> Result<f64, OpError> {
+    fn op_udp_send(
+        ctx: &mut Ctx,
+        sid: f64,
+        data: &[u8],
+        port: f64,
+        address: String,
+    ) -> Result<f64, OpError> {
         let sid = uid(sid);
         let port = port_of(port);
         let found = ctx
@@ -2527,7 +2682,11 @@ mod udp_bindings {
     }
 
     #[op(coerce, name = "setMulticastInterface")]
-    fn op_udp_set_multicast_interface(ctx: &mut Ctx, sid: f64, interface: String) -> Result<(), OpError> {
+    fn op_udp_set_multicast_interface(
+        ctx: &mut Ctx,
+        sid: f64,
+        interface: String,
+    ) -> Result<(), OpError> {
         with_udp(ctx, uid(sid), "setMulticastInterface", |socket, kind6| {
             set_multicast_interface(socket, kind6, &interface)
         })
@@ -2536,12 +2695,22 @@ mod udp_bindings {
     /// `(socketId, multicastAddress, interface)` — join a multicast group. For udp4 `interface` is an
     /// IPv4 address (default `0.0.0.0`); for udp6 it is an interface index (default 0).
     #[op(coerce, name = "addMembership")]
-    fn op_udp_add_membership(ctx: &mut Ctx, sid: f64, group: String, iface: Option<String>) -> Result<(), OpError> {
+    fn op_udp_add_membership(
+        ctx: &mut Ctx,
+        sid: f64,
+        group: String,
+        iface: Option<String>,
+    ) -> Result<(), OpError> {
         udp_membership(ctx, uid(sid), group, iface, true)
     }
 
     #[op(coerce, name = "dropMembership")]
-    fn op_udp_drop_membership(ctx: &mut Ctx, sid: f64, group: String, iface: Option<String>) -> Result<(), OpError> {
+    fn op_udp_drop_membership(
+        ctx: &mut Ctx,
+        sid: f64,
+        group: String,
+        iface: Option<String>,
+    ) -> Result<(), OpError> {
         udp_membership(ctx, uid(sid), group, iface, false)
     }
 
@@ -2600,7 +2769,12 @@ mod udp_bindings {
     }
 
     #[op(coerce, name = "setBufferSize")]
-    fn op_udp_set_buffer_size(ctx: &mut Ctx, sid: f64, receive: bool, size: Option<f64>) -> Result<(), OpError> {
+    fn op_udp_set_buffer_size(
+        ctx: &mut Ctx,
+        sid: f64,
+        receive: bool,
+        size: Option<f64>,
+    ) -> Result<(), OpError> {
         let sid = uid(sid);
         let size = size.map_or(0, uid).min(i32::MAX as u64) as i32;
         let socket = ctx

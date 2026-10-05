@@ -81,14 +81,12 @@ fn forged_handles_are_not_exported_and_growable_sharing_is_refused() {
             .unwrap()
             .ok()
             .expect("evaluation must succeed");
-        assert!(
-            realm
-                .ctx()
-                .export_shared_array_buffer(&value)
-                .ok()
-                .expect("plain values are not errors")
-                .is_none()
-        );
+        assert!(realm
+            .ctx()
+            .export_shared_array_buffer(&value)
+            .ok()
+            .expect("plain values are not errors")
+            .is_none());
     }
     let growable = realm
         .eval_value("new SharedArrayBuffer(4, {maxByteLength: 8})")

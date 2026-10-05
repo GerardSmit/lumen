@@ -371,14 +371,15 @@ fn worker_loop(
                 // loop) test, which makes no progress for the whole window, is killed.
                 let mut deadline = Instant::now() + chunk_timeout();
                 let mut last_len = 0u64;
-                let waited = lumen_os::child::wait_or_kill(&mut child, Duration::from_millis(20), || {
-                    let len = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
-                    if len > last_len {
-                        last_len = len;
-                        deadline = Instant::now() + chunk_timeout();
-                    }
-                    Instant::now() >= deadline
-                });
+                let waited =
+                    lumen_os::child::wait_or_kill(&mut child, Duration::from_millis(20), || {
+                        let len = std::fs::metadata(&out_file).map(|m| m.len()).unwrap_or(0);
+                        if len > last_len {
+                            last_len = len;
+                            deadline = Instant::now() + chunk_timeout();
+                        }
+                        Instant::now() >= deadline
+                    });
                 match waited {
                     Ok(Some(st)) => Ok(st),
                     Ok(None) => {

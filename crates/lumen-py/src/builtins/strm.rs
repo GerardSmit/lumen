@@ -33,10 +33,15 @@ impl<'a> FromArg<'a, PyHost> for Fill<'a> {
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Obj> {
         match v.as_str() {
             Some(s) if count_code_points(s) == 1 => Ok(Fill(s)),
-            Some(_) => Err(PyHost::with_ctx(cx, |it| it.type_error("The fill character must be exactly one character long"))),
+            Some(_) => Err(PyHost::with_ctx(cx, |it| {
+                it.type_error("The fill character must be exactly one character long")
+            })),
             None => Err(PyHost::with_ctx(cx, |it| {
                 let t = it.type_name_of(v);
-                it.type_error(&format!("The fill character must be a unicode character, not {}", t))
+                it.type_error(&format!(
+                    "The fill character must be a unicode character, not {}",
+                    t
+                ))
             })),
         }
     }
@@ -66,7 +71,14 @@ impl Interp {
     }
 }
 
-fn strip_impl(it: &mut Interp, slf: StrRef<'_>, chars: Option<&Value>, name: &str, left: bool, right: bool) -> R<Value> {
+fn strip_impl(
+    it: &mut Interp,
+    slf: StrRef<'_>,
+    chars: Option<&Value>,
+    name: &str,
+    left: bool,
+    right: bool,
+) -> R<Value> {
     let StrRef(v, s) = slf;
     let chars: Option<Vec<u32>> = match chars {
         Some(Value::None) | None => None,
@@ -116,7 +128,13 @@ fn strip_impl(it: &mut Interp, slf: StrRef<'_>, chars: Option<&Value>, name: &st
     Ok(Value::str(t))
 }
 
-fn split_impl(it: &mut Interp, s: &PyStr, sep: Option<&Value>, max: isize, right: bool) -> R<Value> {
+fn split_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    sep: Option<&Value>,
+    max: isize,
+    right: bool,
+) -> R<Value> {
     let sep: Option<&str> = match sep {
         None | Some(Value::None) => None,
         Some(v) => match v.as_str() {
@@ -195,7 +213,10 @@ fn split_impl(it: &mut Interp, s: &PyStr, sep: Option<&Value>, max: isize, right
                         out.push(Value::str(rest));
                         break;
                     }
-                    let start = rest.rfind(is_py_space).map(|i| i + rest[i..].chars().next().map_or(1, |c| c.len_utf8())).unwrap_or(0);
+                    let start = rest
+                        .rfind(is_py_space)
+                        .map(|i| i + rest[i..].chars().next().map_or(1, |c| c.len_utf8()))
+                        .unwrap_or(0);
                     out.push(Value::str(&rest[start..]));
                     rest = &rest[..start];
                     n += 1;
@@ -214,7 +235,11 @@ fn partition_impl(it: &mut Interp, s: &PyStr, sep: &Value, right: bool) -> R<Val
     }
     let pos = if right { s.s.rfind(sep) } else { s.s.find(sep) };
     Ok(match pos {
-        Some(i) => Value::tuple(vec![Value::str(&s.s[..i]), Value::str(sep), Value::str(&s.s[i + sep.len()..])]),
+        Some(i) => Value::tuple(vec![
+            Value::str(&s.s[..i]),
+            Value::str(sep),
+            Value::str(&s.s[i + sep.len()..]),
+        ]),
         None if right => Value::tuple(vec![Value::str(""), Value::str(""), Value::str(&s.s)]),
         None => Value::tuple(vec![Value::str(&s.s), Value::str(""), Value::str("")]),
     })
@@ -222,12 +247,19 @@ fn partition_impl(it: &mut Interp, s: &PyStr, sep: &Value, right: bool) -> R<Val
 
 /// The optional `start` / `end` of `find` and friends (`_PyEval_SliceIndex`), clamped to
 /// `0..=nchars` (`start` may reach `nchars + 1`, so a search past the end finds nothing).
-fn opt_range(it: &mut Interp, start: Option<&Value>, end: Option<&Value>, nchars: usize) -> R<(usize, usize)> {
+fn opt_range(
+    it: &mut Interp,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    nchars: usize,
+) -> R<(usize, usize)> {
     let get = |it: &mut Interp, v: Option<&Value>, dflt: i64| -> R<i64> {
         match v {
             None | Some(Value::None) => Ok(dflt),
             Some(Value::Int(i)) => Ok(*i),
-            Some(v) if !it.has_index(v) => Err(it.type_error("slice indices must be integers or None or have an __index__ method")),
+            Some(v) if !it.has_index(v) => Err(
+                it.type_error("slice indices must be integers or None or have an __index__ method")
+            ),
             Some(v) => it.slice_index(v),
         }
     };
@@ -243,7 +275,15 @@ fn opt_range(it: &mut Interp, start: Option<&Value>, end: Option<&Value>, nchars
     Ok((s.min(n + 1) as usize, e.min(n) as usize))
 }
 
-fn find_impl(it: &mut Interp, s: &PyStr, sub: &Value, start: Option<&Value>, end: Option<&Value>, right: bool, raise: bool) -> R<i64> {
+fn find_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    sub: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    right: bool,
+    raise: bool,
+) -> R<i64> {
     let sub = must_be_str(it, sub)?;
     let (st, en) = opt_range(it, start, end, s.nchars)?;
     let found = if st > en || st > s.nchars {
@@ -252,8 +292,18 @@ fn find_impl(it: &mut Interp, s: &PyStr, sub: &Value, start: Option<&Value>, end
         let bs = s.byte_offset(st);
         let be = s.byte_offset(en);
         let hay = &s.s[bs..be];
-        let pos = if right { hay.rfind(sub) } else { search::find(hay.as_bytes(), sub.as_bytes()) };
-        pos.map(|p| if s.ascii { bs + p } else { count_code_points(&s.s[..bs + p]) })
+        let pos = if right {
+            hay.rfind(sub)
+        } else {
+            search::find(hay.as_bytes(), sub.as_bytes())
+        };
+        pos.map(|p| {
+            if s.ascii {
+                bs + p
+            } else {
+                count_code_points(&s.s[..bs + p])
+            }
+        })
     };
     match found {
         Some(i) => Ok(i as i64),
@@ -262,10 +312,30 @@ fn find_impl(it: &mut Interp, s: &PyStr, sub: &Value, start: Option<&Value>, end
     }
 }
 
-fn startswith_impl(it: &mut Interp, s: &PyStr, prefix: &Value, start: Option<&Value>, end: Option<&Value>, name: &str, at_end: bool) -> R<bool> {
+fn startswith_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    prefix: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    name: &str,
+    at_end: bool,
+) -> R<bool> {
     let (st, en) = opt_range(it, start, end, s.nchars)?;
-    let hay = if st > en || st > s.nchars { None } else { Some(s.slice(st, en)) };
-    let test = |p: &str| hay.is_some_and(|h| if at_end { h.ends_with(p) } else { h.starts_with(p) });
+    let hay = if st > en || st > s.nchars {
+        None
+    } else {
+        Some(s.slice(st, en))
+    };
+    let test = |p: &str| {
+        hay.is_some_and(|h| {
+            if at_end {
+                h.ends_with(p)
+            } else {
+                h.starts_with(p)
+            }
+        })
+    };
     if let Some(p) = prefix.as_str() {
         return Ok(test(p));
     }
@@ -280,7 +350,10 @@ fn startswith_impl(it: &mut Interp, s: &PyStr, prefix: &Value, start: Option<&Va
                     }
                     None => {
                         let t = it.type_name_of(x);
-                        return Err(it.type_error(&format!("tuple for {} must only contain str, not {}", name, t)));
+                        return Err(it.type_error(&format!(
+                            "tuple for {} must only contain str, not {}",
+                            name, t
+                        )));
                     }
                 }
             }
@@ -288,7 +361,10 @@ fn startswith_impl(it: &mut Interp, s: &PyStr, prefix: &Value, start: Option<&Va
         }
         None => {
             let t = it.type_name_of(prefix);
-            Err(it.type_error(&format!("{} first arg must be str or a tuple of str, not {}", name, t)))
+            Err(it.type_error(&format!(
+                "{} first arg must be str or a tuple of str, not {}",
+                name, t
+            )))
         }
     }
 }
@@ -304,7 +380,11 @@ fn all_have(s: &PyStr, f: u16) -> bool {
 /// `str.isupper` (`upper`) or `str.islower`: some cased character, and none of the other case
 /// or titlecase.
 fn is_one_case(s: &PyStr, upper: bool) -> bool {
-    let (want, other) = if upper { (flag::UPPER, flag::LOWER) } else { (flag::LOWER, flag::UPPER) };
+    let (want, other) = if upper {
+        (flag::UPPER, flag::LOWER)
+    } else {
+        (flag::LOWER, flag::UPPER)
+    };
     let mut cased = false;
     for c in code_points(&s.s) {
         let t = char_type(c);
@@ -316,13 +396,23 @@ fn is_one_case(s: &PyStr, upper: bool) -> bool {
     cased
 }
 
-fn justify(it: &mut Interp, slf: StrRef<'_>, width: isize, fill: Passed<Fill<'_>>, mode: u8) -> R<Value> {
+fn justify(
+    it: &mut Interp,
+    slf: StrRef<'_>,
+    width: isize,
+    fill: Passed<Fill<'_>>,
+    mode: u8,
+) -> R<Value> {
     let StrRef(v, s) = slf;
     let fill = fill.0.map_or(" ", |f| f.0);
     let n = s.nchars as i64;
     let width = width as i64;
     if width <= n {
-        return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) { v.clone() } else { Value::str(&s.s) });
+        return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) {
+            v.clone()
+        } else {
+            Value::str(&s.s)
+        });
     }
     let total = (width - n) as usize;
     it.check_str_len(total.saturating_mul(fill.len()).saturating_add(s.s.len()))?;
@@ -356,28 +446,50 @@ pub struct Str;
 #[lumen_bind::methods]
 impl Str {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[kw] object: Passed<&Value>, #[kw] encoding: Passed<&str>, #[kw] errors: Passed<&str>) -> R<Value> {
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] object: Passed<&Value>,
+        #[kw] encoding: Passed<&str>,
+        #[kw] errors: Passed<&str>,
+    ) -> R<Value> {
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let v = match object.0 {
             None => Value::str(""),
             Some(x) if encoding.0.is_none() && errors.0.is_none() => it.str_value(x)?,
             Some(x) => {
                 let data = match x {
-                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(x)?,
-                    Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => return Err(it.type_error("decoding str is not supported")),
+                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                        it.bytes_of(x)?
+                    }
+                    Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => {
+                        return Err(it.type_error("decoding str is not supported"));
+                    }
                     _ => {
                         let t = it.type_name_of(x);
-                        return Err(it.type_error(&format!("decoding to str: need a bytes-like object, {} found", t)));
+                        return Err(it.type_error(&format!(
+                            "decoding to str: need a bytes-like object, {} found",
+                            t
+                        )));
                     }
                 };
-                Value::string(it.decode_bytes(&data, encoding.0.unwrap_or("utf-8"), errors.0.unwrap_or("strict"))?)
+                Value::string(it.decode_bytes(
+                    &data,
+                    encoding.0.unwrap_or("utf-8"),
+                    errors.0.unwrap_or("strict"),
+                )?)
             }
         };
         if Rc::ptr_eq(cls, &it.types.str_) {
             return Ok(v);
         }
         let s = v.as_str().unwrap_or("").to_string();
-        Ok(Value::Obj(Object::with_cls(cls.clone(), Kind::Str(PyStr::from_box(s.into_boxed_str())))))
+        Ok(Value::Obj(Object::with_cls(
+            cls.clone(),
+            Kind::Str(PyStr::from_box(s.into_boxed_str())),
+        )))
     }
 
     /// Return a copy of the string converted to uppercase.
@@ -464,7 +576,14 @@ impl Str {
     /// delimited.  With natural text that includes punctuation, consider using
     /// the regular expression module.
     #[method]
-    fn split(slf: This<StrRef<'_>>, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn split(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&Value>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, slf.0 .1, sep, maxsplit, false)
     }
 
@@ -482,7 +601,14 @@ impl Str {
     ///
     /// Splitting starts at the end of the string and works to the front.
     #[method]
-    fn rsplit(slf: This<StrRef<'_>>, it: &mut Interp, #[kw] sep: Option<&Value>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn rsplit(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&Value>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, slf.0 .1, sep, maxsplit, true)
     }
 
@@ -491,13 +617,29 @@ impl Str {
     /// Line breaks are not included in the resulting list unless keepends is given and
     /// true.
     #[method]
-    fn splitlines(slf: This<StrRef<'_>>, #[kw] #[default(false)] keepends: bool) -> Value {
+    fn splitlines(
+        slf: This<StrRef<'_>>,
+        #[kw]
+        #[default(false)]
+        keepends: bool,
+    ) -> Value {
         let s = &slf.0 .1.s;
         let mut out = Vec::new();
         let mut start = 0;
         let mut chars = s.char_indices().peekable();
         while let Some((bi, c)) = chars.next() {
-            if matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}') {
+            if matches!(
+                c,
+                '\n' | '\r'
+                    | '\x0b'
+                    | '\x0c'
+                    | '\x1c'
+                    | '\x1d'
+                    | '\x1e'
+                    | '\u{85}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+            ) {
                 let mut end = bi + c.len_utf8();
                 if c == '\r' && chars.peek().is_some_and(|&(_, d)| d == '\n') {
                     chars.next();
@@ -549,11 +691,17 @@ impl Str {
     fn join(slf: This<StrRef<'_>>, it: &mut Interp, iterable: &Value) -> R<Value> {
         let sep = &slf.0 .1.s;
         let items = match iterable {
-            Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) => it.iterate_to_vec(iterable)?,
+            Value::Obj(o)
+                if o.cls.is_none() && matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) =>
+            {
+                it.iterate_to_vec(iterable)?
+            }
             _ => {
                 let iter = match it.get_iter(iterable) {
                     Ok(i) => i,
-                    Err(e) if it.exc_is(&e, "TypeError") => return Err(it.type_error("can only join an iterable")),
+                    Err(e) if it.exc_is(&e, "TypeError") => {
+                        return Err(it.type_error("can only join an iterable"));
+                    }
                     Err(e) => return Err(e),
                 };
                 it.iterate_to_vec(&iter)?
@@ -577,7 +725,10 @@ impl Str {
                 }
                 None => {
                     let t = it.type_name_of(v);
-                    return Err(it.type_error(&format!("sequence item {}: expected str instance, {} found", i, t)));
+                    return Err(it.type_error(&format!(
+                        "sequence item {}: expected str instance, {} found",
+                        i, t
+                    )));
                 }
             }
         }
@@ -593,18 +744,38 @@ impl Str {
     /// If the optional argument count is given, only the first count occurrences are
     /// replaced.
     #[method]
-    fn replace(slf: This<StrRef<'_>>, it: &mut Interp, old: &str, new: &str, #[kw] #[default(-1)] count: isize) -> R<Value> {
+    fn replace(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        old: &str,
+        new: &str,
+        #[kw]
+        #[default(-1)]
+        count: isize,
+    ) -> R<Value> {
         let s = slf.0 .1;
         let count = count as i64;
         let growth = new.len().saturating_sub(old.len());
         if growth > 0 {
-            let n = if old.is_empty() { s.nchars + 1 } else { s.s.matches(old).count() };
+            let n = if old.is_empty() {
+                s.nchars + 1
+            } else {
+                s.s.matches(old).count()
+            };
             let hits = if count < 0 { n } else { n.min(count as usize) };
-            let extra = if old.is_empty() { new.len().saturating_mul(hits) } else { growth.saturating_mul(hits) };
+            let extra = if old.is_empty() {
+                new.len().saturating_mul(hits)
+            } else {
+                growth.saturating_mul(hits)
+            };
             it.check_str_len(s.s.len().saturating_add(extra))?;
         }
         if old.is_empty() {
-            let limit = if count < 0 { usize::MAX } else { count as usize };
+            let limit = if count < 0 {
+                usize::MAX
+            } else {
+                count as usize
+            };
             let mut out = String::new();
             let mut n = 0;
             for c in s.s.chars() {
@@ -633,7 +804,13 @@ impl Str {
     ///
     /// Return -1 on failure.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn find(slf: This<StrRef<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn find(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         find_impl(it, slf.0 .1, sub, start, end, false, false)
     }
 
@@ -645,7 +822,13 @@ impl Str {
     ///
     /// Return -1 on failure.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn rfind(slf: This<StrRef<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn rfind(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         find_impl(it, slf.0 .1, sub, start, end, true, false)
     }
 
@@ -657,7 +840,13 @@ impl Str {
     ///
     /// Raises ValueError when the substring is not found.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn index(slf: This<StrRef<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn index(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         find_impl(it, slf.0 .1, sub, start, end, false, true)
     }
 
@@ -669,7 +858,13 @@ impl Str {
     ///
     /// Raises ValueError when the substring is not found.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn rindex(slf: This<StrRef<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn rindex(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         find_impl(it, slf.0 .1, sub, start, end, true, true)
     }
 
@@ -679,7 +874,13 @@ impl Str {
     /// string S[start:end].  Optional arguments start and end are
     /// interpreted as in slice notation.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn count(slf: This<StrRef<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn count(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         let s = slf.0 .1;
         let sub = must_be_str(it, sub)?;
         let (st, en) = opt_range(it, start, end, s.nchars)?;
@@ -700,7 +901,13 @@ impl Str {
     /// With optional end, stop comparing S at that position.
     /// prefix can also be a tuple of strings to try.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn startswith(slf: This<StrRef<'_>>, it: &mut Interp, prefix: &Value, start: Option<&Value>, end: Option<&Value>) -> R<bool> {
+    fn startswith(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        prefix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
         startswith_impl(it, slf.0 .1, prefix, start, end, "startswith", false)
     }
 
@@ -711,7 +918,13 @@ impl Str {
     /// With optional end, stop comparing S at that position.
     /// suffix can also be a tuple of strings to try.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn endswith(slf: This<StrRef<'_>>, it: &mut Interp, suffix: &Value, start: Option<&Value>, end: Option<&Value>) -> R<bool> {
+    fn endswith(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        suffix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
         startswith_impl(it, slf.0 .1, suffix, start, end, "endswith", true)
     }
 
@@ -733,7 +946,11 @@ impl Str {
     #[method]
     fn removesuffix(slf: This<StrRef<'_>>, suffix: &str) -> Value {
         let s = &slf.0 .1.s;
-        Value::str(if suffix.is_empty() { s } else { s.strip_suffix(suffix).unwrap_or(s) })
+        Value::str(if suffix.is_empty() {
+            s
+        } else {
+            s.strip_suffix(suffix).unwrap_or(s)
+        })
     }
 
     /// Return True if the string is an alphabetic string, False otherwise.
@@ -751,7 +968,10 @@ impl Str {
     /// there is at least one character in the string.
     #[method]
     fn isalnum(slf: This<StrRef<'_>>) -> bool {
-        all_have(slf.0 .1, flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC)
+        all_have(
+            slf.0 .1,
+            flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC,
+        )
     }
 
     /// Return True if the string is a digit string, False otherwise.
@@ -862,7 +1082,10 @@ impl Str {
     fn isidentifier(slf: This<StrRef<'_>>) -> bool {
         let mut cps = code_points(&slf.0 .1.s);
         match cps.next() {
-            Some(c) => (c == '_' as u32 || crate::unicode::has(c, flag::XID_START)) && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE)),
+            Some(c) => {
+                (c == '_' as u32 || crate::unicode::has(c, flag::XID_START))
+                    && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE))
+            }
             None => false,
         }
     }
@@ -871,7 +1094,12 @@ impl Str {
     ///
     /// Padding is done using the specified fill character (default is a space).
     #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
-    fn ljust(slf: This<StrRef<'_>>, it: &mut Interp, width: isize, fillchar: Passed<Fill<'_>>) -> R<Value> {
+    fn ljust(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
         justify(it, slf.0, width, fillchar, 0)
     }
 
@@ -879,7 +1107,12 @@ impl Str {
     ///
     /// Padding is done using the specified fill character (default is a space).
     #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
-    fn rjust(slf: This<StrRef<'_>>, it: &mut Interp, width: isize, fillchar: Passed<Fill<'_>>) -> R<Value> {
+    fn rjust(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
         justify(it, slf.0, width, fillchar, 1)
     }
 
@@ -887,7 +1120,12 @@ impl Str {
     ///
     /// Padding is done using the specified fill character (default is a space).
     #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
-    fn center(slf: This<StrRef<'_>>, it: &mut Interp, width: isize, fillchar: Passed<Fill<'_>>) -> R<Value> {
+    fn center(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
         justify(it, slf.0, width, fillchar, 2)
     }
 
@@ -899,7 +1137,11 @@ impl Str {
         let StrRef(v, s) = slf.0;
         let (n, width) = (s.nchars as i64, width as i64);
         if width <= n {
-            return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) { v.clone() } else { Value::str(&s.s) });
+            return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) {
+                v.clone()
+            } else {
+                Value::str(&s.s)
+            });
         }
         it.check_str_len((width - n) as usize + s.s.len())?;
         let pad = "0".repeat((width - n) as usize);
@@ -914,8 +1156,15 @@ impl Str {
     ///
     /// If tabsize is not given, a tab size of 8 characters is assumed.
     #[method]
-    fn expandtabs(slf: This<StrRef<'_>>, it: &mut Interp, #[kw] #[default(8)] tabsize: i32) -> R<Value> {
-        let out = lumen_common::text::expand_tabs(&slf.0 .1.s, tabsize as i64, |n| it.check_str_len(n))?;
+    fn expandtabs(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default(8)]
+        tabsize: i32,
+    ) -> R<Value> {
+        let out =
+            lumen_common::text::expand_tabs(&slf.0 .1.s, tabsize as i64, |n| it.check_str_len(n))?;
         Ok(Value::string(out))
     }
 
@@ -930,8 +1179,21 @@ impl Str {
     ///     'xmlcharrefreplace' as well as any other name registered with
     ///     codecs.register_error that can handle UnicodeEncodeErrors.
     #[method]
-    fn encode(slf: This<StrRef<'_>>, it: &mut Interp, #[kw] #[default("utf-8")] encoding: &str, #[kw] #[default("strict")] errors: &str) -> R<Value> {
-        Ok(Value::bytes(it.encode_str(&slf.0 .1.s, encoding, errors)?))
+    fn encode(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<Value> {
+        Ok(Value::bytes(it.encode_str(
+            &slf.0 .1.s,
+            encoding,
+            errors,
+        )?))
     }
 
     /// S.format(*args, **kwargs) -> str
@@ -939,7 +1201,12 @@ impl Str {
     /// Return a formatted version of S, using substitutions from args and kwargs.
     /// The substitutions are identified by braces ('{' and '}').
     #[method(hint(py(text_signature = "")))]
-    fn format(slf: This<StrRef<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<String> {
+    fn format(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<String> {
         it.str_format(&slf.0 .1.s, args, &kwargs.to_vec())
     }
 
@@ -978,15 +1245,33 @@ impl Str {
         let Some(y) = y.0 else {
             let items: Vec<(Value, Value)> = match x {
                 Value::Obj(o) => match &o.kind {
-                    Kind::Dict(p) => p.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
-                    _ => return Err(it.type_error("if you give only one argument to maketrans it must be a dict")),
+                    Kind::Dict(p) => p
+                        .borrow()
+                        .iter()
+                        .map(|e| (e.key.clone(), e.val.clone()))
+                        .collect(),
+                    _ => {
+                        return Err(it.type_error(
+                            "if you give only one argument to maketrans it must be a dict",
+                        ));
+                    }
                 },
-                _ => return Err(it.type_error("if you give only one argument to maketrans it must be a dict")),
+                _ => {
+                    return Err(it.type_error(
+                        "if you give only one argument to maketrans it must be a dict",
+                    ));
+                }
             };
             for (k, v) in items {
                 let key = match k.as_str() {
-                    Some(s) if count_code_points(s) == 1 => Value::Int(code_points(s).next().unwrap_or(0) as i64),
-                    Some(_) => return Err(it.value_error("string keys in translate table must be of length 1")),
+                    Some(s) if count_code_points(s) == 1 => {
+                        Value::Int(code_points(s).next().unwrap_or(0) as i64)
+                    }
+                    Some(_) => {
+                        return Err(
+                            it.value_error("string keys in translate table must be of length 1")
+                        );
+                    }
                     None => k,
                 };
                 it.dict_set(&d, key, v)?;
@@ -994,7 +1279,9 @@ impl Str {
             return Ok(Value::Obj(d));
         };
         let Some(x) = x.as_str() else {
-            return Err(it.type_error("first maketrans argument must be a string if there is a second argument"));
+            return Err(it.type_error(
+                "first maketrans argument must be a string if there is a second argument",
+            ));
         };
         let xs: Vec<u32> = code_points(x).collect();
         let ys: Vec<u32> = code_points(y).collect();
@@ -1034,7 +1321,11 @@ impl Str {
                 }
                 Ok(v) => match v.as_str() {
                     Some(r) => out.push_str(r),
-                    None => return Err(it.type_error("character mapping must return integer, None or str")),
+                    None => {
+                        return Err(
+                            it.type_error("character mapping must return integer, None or str")
+                        );
+                    }
                 },
                 Err(e) => {
                     if it.exc_is(&e, "LookupError") {
@@ -1082,7 +1373,15 @@ impl Str {
 pub fn init(it: &mut Interp) {
     let t = it.types.str_.clone();
     crate::bind::extend_type_documented::<Str>(it, &t);
-    reg_slots(it, &t, &["__getitem__", "__len__", "__contains__", "__iter__"]);
-    reg_binops(it, &t, &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"]);
+    reg_slots(
+        it,
+        &t,
+        &["__getitem__", "__len__", "__contains__", "__iter__"],
+    );
+    reg_binops(
+        it,
+        &t,
+        &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"],
+    );
     reg_compare(it, &t, true);
 }

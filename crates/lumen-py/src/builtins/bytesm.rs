@@ -21,8 +21,18 @@ impl<'a> FromArg<'a, PyHost> for ByteSelf<'a> {
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
         if let Value::Obj(o) = v {
             match &o.kind {
-                Kind::Bytes(b) => return Ok(ByteSelf { v, d: Cow::Borrowed(b) }),
-                Kind::ByteArray(b) => return Ok(ByteSelf { v, d: Cow::Owned(b.to_vec()) }),
+                Kind::Bytes(b) => {
+                    return Ok(ByteSelf {
+                        v,
+                        d: Cow::Borrowed(b),
+                    });
+                }
+                Kind::ByteArray(b) => {
+                    return Ok(ByteSelf {
+                        v,
+                        d: Cow::Owned(b.to_vec()),
+                    });
+                }
                 _ => {}
             }
         }
@@ -89,7 +99,12 @@ fn zeroed(it: &mut Interp, n: usize) -> R<Vec<u8>> {
 }
 
 /// The contents `bytes(source, encoding, errors)` / `bytearray(...)` describe.
-fn build(it: &mut Interp, source: Passed<&Value>, encoding: Passed<&str>, errors: Passed<&str>) -> R<Vec<u8>> {
+fn build(
+    it: &mut Interp,
+    source: Passed<&Value>,
+    encoding: Passed<&str>,
+    errors: Passed<&str>,
+) -> R<Vec<u8>> {
     let Some(src) = source.0 else {
         if encoding.0.is_some() {
             return Err(it.type_error("encoding without a string argument"));
@@ -100,7 +115,9 @@ fn build(it: &mut Interp, source: Passed<&Value>, encoding: Passed<&str>, errors
         return Ok(Vec::new());
     };
     if let Some(s) = src.as_str() {
-        let Some(enc) = encoding.0 else { return Err(it.type_error("string argument without an encoding")) };
+        let Some(enc) = encoding.0 else {
+            return Err(it.type_error("string argument without an encoding"));
+        };
         return it.encode_str(s, enc, errors.0.unwrap_or("strict"));
     }
     if encoding.0.is_some() {
@@ -117,7 +134,9 @@ fn build(it: &mut Interp, source: Passed<&Value>, encoding: Passed<&str>, errors
             zeroed(it, *n as usize)
         }
         Value::Bool(n) => zeroed(it, *n as usize),
-        Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => Err(it.overflow_err("cannot fit 'int' into an index-sized integer")),
+        Value::Obj(o) if matches!(o.kind, Kind::Int(_)) => {
+            Err(it.overflow_err("cannot fit 'int' into an index-sized integer"))
+        }
         _ => it.bytes_from_object(src),
     }
 }
@@ -144,19 +163,32 @@ fn sub_arg(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
         return it.bytes_of(v);
     }
     let t = it.type_name_of(v);
-    Err(it.type_error(&format!("argument should be integer or bytes-like object, not '{t}'")))
+    Err(it.type_error(&format!(
+        "argument should be integer or bytes-like object, not '{t}'"
+    )))
 }
 
 /// The `start` / `end` of `find` and friends (`_PyEval_SliceIndex`), clamped to `0..=len`.
-fn opt_range(it: &mut Interp, start: Option<&Value>, end: Option<&Value>, len: usize) -> R<(usize, usize)> {
+fn opt_range(
+    it: &mut Interp,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    len: usize,
+) -> R<(usize, usize)> {
     let len = len as i64;
     let norm = |it: &mut Interp, v: Option<&Value>, d: i64| -> R<i64> {
         match v {
             None | Some(Value::None) => Ok(d),
-            Some(v) if !it.has_index(v) => Err(it.type_error("slice indices must be integers or None or have an __index__ method")),
+            Some(v) if !it.has_index(v) => Err(
+                it.type_error("slice indices must be integers or None or have an __index__ method")
+            ),
             Some(v) => {
                 let i = it.slice_index(v)?;
-                Ok(if i < 0 { i.saturating_add(len).max(0) } else { i.min(len) })
+                Ok(if i < 0 {
+                    i.saturating_add(len).max(0)
+                } else {
+                    i.min(len)
+                })
             }
         }
     };
@@ -165,7 +197,14 @@ fn opt_range(it: &mut Interp, start: Option<&Value>, end: Option<&Value>, len: u
     Ok((s as usize, e as usize))
 }
 
-fn find_impl(it: &mut Interp, h: &[u8], sub: &Value, start: Option<&Value>, end: Option<&Value>, rev: bool) -> R<Option<usize>> {
+fn find_impl(
+    it: &mut Interp,
+    h: &[u8],
+    sub: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    rev: bool,
+) -> R<Option<usize>> {
     let n = sub_arg(it, sub)?;
     let (s, e) = opt_range(it, start, end, h.len())?;
     if s > e {
@@ -174,20 +213,36 @@ fn find_impl(it: &mut Interp, h: &[u8], sub: &Value, start: Option<&Value>, end:
     Ok(find_sub(&h[..e], &n, s, rev))
 }
 
-fn affix(it: &mut Interp, h: &[u8], prefix: &Value, start: Option<&Value>, end: Option<&Value>, name: &str, at_start: bool) -> R<bool> {
+fn affix(
+    it: &mut Interp,
+    h: &[u8],
+    prefix: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    name: &str,
+    at_start: bool,
+) -> R<bool> {
     let cands = match prefix.tuple_items() {
         Some(t) => t.to_vec(),
         None if it.is_buffer(prefix) => vec![prefix.clone()],
         None => {
             let t = it.type_name_of(prefix);
-            return Err(it.type_error(&format!("{name} first arg must be bytes or a tuple of bytes, not {t}")));
+            return Err(it.type_error(&format!(
+                "{name} first arg must be bytes or a tuple of bytes, not {t}"
+            )));
         }
     };
     let (s, e) = opt_range(it, start, end, h.len())?;
     let hay = if s > e { None } else { Some(&h[s..e]) };
     for c in cands {
         let n = it.buffer_bytes(&c)?;
-        if hay.is_some_and(|h| if at_start { h.starts_with(&n) } else { h.ends_with(&n) }) {
+        if hay.is_some_and(|h| {
+            if at_start {
+                h.starts_with(&n)
+            } else {
+                h.ends_with(&n)
+            }
+        }) {
             return Ok(true);
         }
     }
@@ -219,7 +274,13 @@ fn strip_impl(slf: &ByteSelf<'_>, chars: Option<&[u8]>, left: bool, right: bool)
     slf.wrap(h[s..e].to_vec())
 }
 
-fn split_impl(it: &mut Interp, slf: &ByteSelf<'_>, sep: Option<&[u8]>, max: isize, rev: bool) -> R<Value> {
+fn split_impl(
+    it: &mut Interp,
+    slf: &ByteSelf<'_>,
+    sep: Option<&[u8]>,
+    max: isize,
+    rev: bool,
+) -> R<Value> {
     let h: &[u8] = &slf.d;
     let max = max as i64;
     let mut parts: Vec<&[u8]> = Vec::new();
@@ -312,7 +373,9 @@ fn split_impl(it: &mut Interp, slf: &ByteSelf<'_>, sep: Option<&[u8]>, max: isiz
             }
         }
     }
-    Ok(Value::list(parts.into_iter().map(|p| slf.wrap(p.to_vec())).collect()))
+    Ok(Value::list(
+        parts.into_iter().map(|p| slf.wrap(p.to_vec())).collect(),
+    ))
 }
 
 fn splitlines_impl(slf: &ByteSelf<'_>, keepends: bool) -> Value {
@@ -355,11 +418,15 @@ fn partition_impl(it: &mut Interp, slf: &ByteSelf<'_>, sep: &[u8], rev: bool) ->
 fn join_impl(it: &mut Interp, slf: &ByteSelf<'_>, iterable: &Value) -> R<Value> {
     let sep = &slf.d;
     let items = match iterable {
-        Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) => it.iterate_to_vec(iterable)?,
+        Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) => {
+            it.iterate_to_vec(iterable)?
+        }
         _ => {
             let iter = match it.get_iter(iterable) {
                 Ok(i) => i,
-                Err(e) if it.exc_is(&e, "TypeError") => return Err(it.type_error("can only join an iterable")),
+                Err(e) if it.exc_is(&e, "TypeError") => {
+                    return Err(it.type_error("can only join an iterable"));
+                }
                 Err(e) => return Err(e),
             };
             it.iterate_to_vec(&iter)?
@@ -392,7 +459,10 @@ fn join_impl(it: &mut Interp, slf: &ByteSelf<'_>, iterable: &Value) -> R<Value> 
             _ if it.is_buffer(v) => out.extend(it.bytes_of(v)?),
             _ => {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("sequence item {}: expected a bytes-like object, {} found", i, t)));
+                return Err(it.type_error(&format!(
+                    "sequence item {}: expected a bytes-like object, {} found",
+                    i, t
+                )));
             }
         }
     }
@@ -401,7 +471,11 @@ fn join_impl(it: &mut Interp, slf: &ByteSelf<'_>, iterable: &Value) -> R<Value> 
 
 fn hex_impl(it: &mut Interp, d: &[u8], sep: Passed<&Value>, bytes_per_sep: isize) -> R<String> {
     let sep = super::memview::hex_sep_arg(it, sep.0)?;
-    Ok(lumen_common::codec::hex_encode_sep(d, sep, bytes_per_sep as i64))
+    Ok(lumen_common::codec::hex_encode_sep(
+        d,
+        sep,
+        bytes_per_sep as i64,
+    ))
 }
 
 /// `bytes.fromhex(string)` / `bytearray.fromhex(string)` for class `cls` (a subclass is called
@@ -410,17 +484,25 @@ fn fromhex_impl(it: &mut Interp, cls: &Value, string: &Value, array: bool) -> R<
     let digits: Vec<u32> = if let Some(s) = string.as_str() {
         let cps: Vec<u32> = lumen_common::smuggle::code_points(s).collect();
         if let Some(at) = cps.iter().position(|&c| c >= 128) {
-            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {at}")));
+            return Err(it.value_error(&format!(
+                "non-hexadecimal number found in fromhex() arg at position {at}"
+            )));
         }
         cps
     } else if it.is_buffer(string) {
         it.bytes_of(string)?.into_iter().map(u32::from).collect()
     } else {
         let t = it.type_name_of(string);
-        return Err(it.type_error(&format!("fromhex() argument must be str or bytes-like, not {t}")));
+        return Err(it.type_error(&format!(
+            "fromhex() argument must be str or bytes-like, not {t}"
+        )));
     };
     let is_space = |c: u32| matches!(c, 0x20 | 0x09..=0x0d);
-    let digit = |c: u32| char::from_u32(c).and_then(|c| c.to_digit(16)).filter(|_| c < 128);
+    let digit = |c: u32| {
+        char::from_u32(c)
+            .and_then(|c| c.to_digit(16))
+            .filter(|_| c < 128)
+    };
     let mut out = Vec::with_capacity(digits.len() / 2);
     let mut i = 0;
     loop {
@@ -431,27 +513,47 @@ fn fromhex_impl(it: &mut Interp, cls: &Value, string: &Value, array: bool) -> R<
             break;
         }
         let Some(hi) = digit(digits[i]) else {
-            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {i}")));
+            return Err(it.value_error(&format!(
+                "non-hexadecimal number found in fromhex() arg at position {i}"
+            )));
         };
         i += 1;
         if i >= digits.len() {
-            return Err(it.value_error("fromhex() arg must contain an even number of hexadecimal digits"));
+            return Err(
+                it.value_error("fromhex() arg must contain an even number of hexadecimal digits")
+            );
         }
         let Some(lo) = digit(digits[i]) else {
-            return Err(it.value_error(&format!("non-hexadecimal number found in fromhex() arg at position {i}")));
+            return Err(it.value_error(&format!(
+                "non-hexadecimal number found in fromhex() arg at position {i}"
+            )));
         };
         i += 1;
         out.push((hi * 16 + lo) as u8);
     }
-    let exact = if array { Value::Obj(Object::new(Kind::ByteArray(ba_store(out)))) } else { Value::bytes(out) };
-    let base = if array { &it.types.bytearray } else { &it.types.bytes };
+    let exact = if array {
+        Value::Obj(Object::new(Kind::ByteArray(ba_store(out))))
+    } else {
+        Value::bytes(out)
+    };
+    let base = if array {
+        &it.types.bytearray
+    } else {
+        &it.types.bytes
+    };
     match cls {
         Value::Obj(c) if !Rc::ptr_eq(c, base) => it.call(cls, vec![exact], Vec::new()),
         _ => Ok(exact),
     }
 }
 
-fn justify(it: &mut Interp, slf: &ByteSelf<'_>, width: isize, fill: Passed<FillByte>, mode: u8) -> R<Value> {
+fn justify(
+    it: &mut Interp,
+    slf: &ByteSelf<'_>,
+    width: isize,
+    fill: Passed<FillByte>,
+    mode: u8,
+) -> R<Value> {
     let d = &slf.d;
     let w = width.max(0) as usize;
     let fill = fill.0.map_or(b' ', |f| f.0);
@@ -476,16 +578,25 @@ fn justify(it: &mut Interp, slf: &ByteSelf<'_>, width: isize, fill: Passed<FillB
 
 /// `bytearray.__reduce_ex__(proto)`: a latin-1 `str` below protocol 3 (for Python 2), else bytes.
 fn reduce_impl(it: &mut Interp, slf: &ByteSelf<'_>, proto: i32) -> Value {
-    let Value::Obj(o) = slf.v else { unreachable!("a bytearray") };
+    let Value::Obj(o) = slf.v else {
+        unreachable!("a bytearray")
+    };
     let state = o.dict.borrow().clone().map_or(Value::None, Value::Obj);
     let args = if proto < 3 {
-        vec![Value::string(slf.d.iter().map(|&b| b as char).collect::<String>()), Value::str("latin-1")]
+        vec![
+            Value::string(slf.d.iter().map(|&b| b as char).collect::<String>()),
+            Value::str("latin-1"),
+        ]
     } else if slf.d.is_empty() {
         Vec::new()
     } else {
         vec![Value::bytes(slf.d.to_vec())]
     };
-    Value::tuple(vec![Value::Obj(it.type_of(slf.v)), Value::tuple(args), state])
+    Value::tuple(vec![
+        Value::Obj(it.type_of(slf.v)),
+        Value::tuple(args),
+        state,
+    ])
 }
 
 fn byte_val(it: &mut Interp, v: &Value) -> R<u8> {
@@ -510,7 +621,13 @@ impl ByteMethods {
     ///
     /// Return -1 on failure.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn find(slf: This<ByteSelf<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn find(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         Ok(find_impl(it, &slf.0.d, sub, start, end, false)?.map_or(-1, |i| i as i64))
     }
 
@@ -522,7 +639,13 @@ impl ByteMethods {
     ///
     /// Return -1 on failure.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn rfind(slf: This<ByteSelf<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn rfind(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         Ok(find_impl(it, &slf.0.d, sub, start, end, true)?.map_or(-1, |i| i as i64))
     }
 
@@ -534,7 +657,13 @@ impl ByteMethods {
     ///
     /// Raises ValueError when the subsection is not found.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn index(slf: This<ByteSelf<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn index(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         match find_impl(it, &slf.0.d, sub, start, end, false)? {
             Some(i) => Ok(i as i64),
             None => Err(it.value_error("subsection not found")),
@@ -549,7 +678,13 @@ impl ByteMethods {
     ///
     /// Raise ValueError when the subsection is not found.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn rindex(slf: This<ByteSelf<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn rindex(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         match find_impl(it, &slf.0.d, sub, start, end, true)? {
             Some(i) => Ok(i as i64),
             None => Err(it.value_error("subsection not found")),
@@ -562,7 +697,13 @@ impl ByteMethods {
     /// bytes B[start:end].  Optional arguments start and end are interpreted
     /// as in slice notation.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn count(slf: This<ByteSelf<'_>>, it: &mut Interp, sub: &Value, start: Option<&Value>, end: Option<&Value>) -> R<i64> {
+    fn count(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
         let h = &slf.0.d;
         let n = sub_arg(it, sub)?;
         let (s, e) = opt_range(it, start, end, h.len())?;
@@ -582,7 +723,13 @@ impl ByteMethods {
     /// With optional end, stop comparing B at that position.
     /// prefix can also be a tuple of bytes to try.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn startswith(slf: This<ByteSelf<'_>>, it: &mut Interp, prefix: &Value, start: Option<&Value>, end: Option<&Value>) -> R<bool> {
+    fn startswith(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        prefix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
         affix(it, &slf.0.d, prefix, start, end, "startswith", true)
     }
 
@@ -593,7 +740,13 @@ impl ByteMethods {
     /// With optional end, stop comparing B at that position.
     /// suffix can also be a tuple of bytes to try.
     #[method(hint(py(arg_style = "parse", text_signature = "")))]
-    fn endswith(slf: This<ByteSelf<'_>>, it: &mut Interp, suffix: &Value, start: Option<&Value>, end: Option<&Value>) -> R<bool> {
+    fn endswith(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        suffix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
         affix(it, &slf.0.d, suffix, start, end, "endswith", false)
     }
 
@@ -606,7 +759,13 @@ impl ByteMethods {
     /// If the optional argument count is given, only the first count occurrences are
     /// replaced.
     #[method]
-    fn replace(slf: This<ByteSelf<'_>>, it: &mut Interp, old: &[u8], new: &[u8], #[default(-1)] count: isize) -> R<Value> {
+    fn replace(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        old: &[u8],
+        new: &[u8],
+        #[default(-1)] count: isize,
+    ) -> R<Value> {
         let h: &[u8] = &slf.0.d;
         let mut max = count as i64;
         let growth = new.len().saturating_sub(old.len());
@@ -618,7 +777,9 @@ impl ByteMethods {
             } else {
                 let mut from = 0;
                 while hits < cap {
-                    let Some(p) = find_sub(h, old, from, false) else { break };
+                    let Some(p) = find_sub(h, old, from, false) else {
+                        break;
+                    };
                     hits += 1;
                     from = p + old.len();
                 }
@@ -701,7 +862,19 @@ impl ByteMethods {
     /// and the rest lower-cased.
     #[method(hint(py(text_signature = "")))]
     fn capitalize(slf: This<ByteSelf<'_>>) -> Value {
-        let out = slf.0.d.iter().enumerate().map(|(i, b)| if i == 0 { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() }).collect();
+        let out = slf
+            .0
+            .d
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if i == 0 {
+                    b.to_ascii_uppercase()
+                } else {
+                    b.to_ascii_lowercase()
+                }
+            })
+            .collect();
         slf.0.wrap(out)
     }
 
@@ -711,7 +884,18 @@ impl ByteMethods {
     /// to lowercase ASCII and vice versa.
     #[method(hint(py(text_signature = "")))]
     fn swapcase(slf: This<ByteSelf<'_>>) -> Value {
-        let out = slf.0.d.iter().map(|b| if b.is_ascii_uppercase() { b.to_ascii_lowercase() } else { b.to_ascii_uppercase() }).collect();
+        let out = slf
+            .0
+            .d
+            .iter()
+            .map(|b| {
+                if b.is_ascii_uppercase() {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                }
+            })
+            .collect();
         slf.0.wrap(out)
     }
 
@@ -727,7 +911,11 @@ impl ByteMethods {
             .d
             .iter()
             .map(|b| {
-                let r = if prev { b.to_ascii_lowercase() } else { b.to_ascii_uppercase() };
+                let r = if prev {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                };
                 prev = b.is_ascii_alphabetic();
                 r
             })
@@ -858,7 +1046,12 @@ impl ByteMethods {
     /// All characters occurring in the optional argument delete are removed.
     /// The remaining characters are mapped through the given translation table.
     #[method(hint(py(text_signature = "($self, table, /, delete=b'')")))]
-    fn translate(slf: This<ByteSelf<'_>>, it: &mut Interp, table: &Value, #[kw] delete: Passed<&[u8]>) -> R<Value> {
+    fn translate(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        table: &Value,
+        #[kw] delete: Passed<&[u8]>,
+    ) -> R<Value> {
         let table = if table.is_none() {
             None
         } else {
@@ -901,7 +1094,13 @@ impl ByteMethods {
     ///
     /// If tabsize is not given, a tab size of 8 characters is assumed.
     #[method]
-    fn expandtabs(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] #[default(8)] tabsize: i32) -> R<Value> {
+    fn expandtabs(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default(8)]
+        tabsize: i32,
+    ) -> R<Value> {
         let ts = tabsize as i64;
         let mut out = Vec::new();
         let mut col = 0i64;
@@ -932,7 +1131,12 @@ impl ByteMethods {
     ///
     /// Padding is done using the specified fill character.
     #[method(hint(py(text_signature = "($self, width, fillchar=b' ', /)")))]
-    fn ljust(slf: This<ByteSelf<'_>>, it: &mut Interp, width: isize, fillchar: Passed<FillByte>) -> R<Value> {
+    fn ljust(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<FillByte>,
+    ) -> R<Value> {
         justify(it, &slf.0, width, fillchar, 0)
     }
 
@@ -940,7 +1144,12 @@ impl ByteMethods {
     ///
     /// Padding is done using the specified fill character.
     #[method(hint(py(text_signature = "($self, width, fillchar=b' ', /)")))]
-    fn rjust(slf: This<ByteSelf<'_>>, it: &mut Interp, width: isize, fillchar: Passed<FillByte>) -> R<Value> {
+    fn rjust(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<FillByte>,
+    ) -> R<Value> {
         justify(it, &slf.0, width, fillchar, 1)
     }
 
@@ -948,7 +1157,12 @@ impl ByteMethods {
     ///
     /// Padding is done using the specified fill character.
     #[method(hint(py(text_signature = "($self, width, fillchar=b' ', /)")))]
-    fn center(slf: This<ByteSelf<'_>>, it: &mut Interp, width: isize, fillchar: Passed<FillByte>) -> R<Value> {
+    fn center(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<FillByte>,
+    ) -> R<Value> {
         justify(it, &slf.0, width, fillchar, 2)
     }
 
@@ -982,8 +1196,16 @@ pub struct Bytes;
 #[lumen_bind::methods]
 impl Bytes {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[kw] source: Passed<&Value>, #[kw] encoding: Passed<&str>, #[kw] errors: Passed<&str>) -> R<Value> {
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] source: Passed<&Value>,
+        #[kw] encoding: Passed<&str>,
+        #[kw] errors: Passed<&str>,
+    ) -> R<Value> {
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let v = build(it, source, encoding, errors)?;
         if Rc::ptr_eq(cls, &it.types.bytes) {
             Ok(Value::bytes(v))
@@ -1003,7 +1225,16 @@ impl Bytes {
     ///     as well as any other name registered with codecs.register_error that
     ///     can handle UnicodeDecodeErrors.
     #[method]
-    fn decode(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] #[default("utf-8")] encoding: &str, #[kw] #[default("strict")] errors: &str) -> R<String> {
+    fn decode(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<String> {
         it.decode_bytes(&slf.0.d, encoding, errors)
     }
 
@@ -1026,7 +1257,14 @@ impl Bytes {
     /// >>> value.hex(':', -2)
     /// 'b901:ef'
     #[method]
-    fn hex(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Passed<&Value>, #[kw] #[default(1)] bytes_per_sep: isize) -> R<String> {
+    fn hex(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Passed<&Value>,
+        #[kw]
+        #[default(1)]
+        bytes_per_sep: isize,
+    ) -> R<String> {
         hex_impl(it, &slf.0.d, sep, bytes_per_sep)
     }
 
@@ -1061,7 +1299,14 @@ impl Bytes {
     ///     Maximum number of splits to do.
     ///     -1 (the default value) means no limit.
     #[method]
-    fn split(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Option<&[u8]>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn split(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&[u8]>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, &slf.0, sep, maxsplit, false)
     }
 
@@ -1077,7 +1322,14 @@ impl Bytes {
     ///
     /// Splitting is done starting at the end of the bytes and working to the front.
     #[method]
-    fn rsplit(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Option<&[u8]>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn rsplit(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&[u8]>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, &slf.0, sep, maxsplit, true)
     }
 
@@ -1086,7 +1338,12 @@ impl Bytes {
     /// Line breaks are not included in the resulting list unless keepends is given and
     /// true.
     #[method]
-    fn splitlines(slf: This<ByteSelf<'_>>, #[kw] #[default(false)] keepends: bool) -> Value {
+    fn splitlines(
+        slf: This<ByteSelf<'_>>,
+        #[kw]
+        #[default(false)]
+        keepends: bool,
+    ) -> Value {
         splitlines_impl(&slf.0, keepends)
     }
 
@@ -1177,12 +1434,23 @@ impl ByteArray {
     #[constructor(hint(py(text_signature = "")))]
     fn new(cls: This<Value>, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Value {
         let _ = (args, kwargs);
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
-        Value::Obj(Object::with_cls(cls.clone(), Kind::ByteArray(ba_store(Vec::new()))))
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
+        Value::Obj(Object::with_cls(
+            cls.clone(),
+            Kind::ByteArray(ba_store(Vec::new())),
+        ))
     }
 
     #[proto(init)]
-    fn init(slf: This<BaRef<'_>>, it: &mut Interp, #[kw] source: Passed<&Value>, #[kw] encoding: Passed<&str>, #[kw] errors: Passed<&str>) -> R<()> {
+    fn init(
+        slf: This<BaRef<'_>>,
+        it: &mut Interp,
+        #[kw] source: Passed<&Value>,
+        #[kw] encoding: Passed<&str>,
+        #[kw] errors: Passed<&str>,
+    ) -> R<()> {
         let v = build(it, source, encoding, errors)?;
         it.ba_edit(slf.0 .0, |b| *b = v)
     }
@@ -1198,7 +1466,16 @@ impl ByteArray {
     ///     as well as any other name registered with codecs.register_error that
     ///     can handle UnicodeDecodeErrors.
     #[method]
-    fn decode(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] #[default("utf-8")] encoding: &str, #[kw] #[default("strict")] errors: &str) -> R<String> {
+    fn decode(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<String> {
         it.decode_bytes(&slf.0.d, encoding, errors)
     }
 
@@ -1221,7 +1498,14 @@ impl ByteArray {
     /// >>> value.hex(':', -2)
     /// 'b901:ef'
     #[method]
-    fn hex(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Passed<&Value>, #[kw] #[default(1)] bytes_per_sep: isize) -> R<String> {
+    fn hex(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Passed<&Value>,
+        #[kw]
+        #[default(1)]
+        bytes_per_sep: isize,
+    ) -> R<String> {
         hex_impl(it, &slf.0.d, sep, bytes_per_sep)
     }
 
@@ -1254,7 +1538,14 @@ impl ByteArray {
     ///     Maximum number of splits to do.
     ///     -1 (the default value) means no limit.
     #[method]
-    fn split(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Option<&[u8]>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn split(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&[u8]>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, &slf.0, sep, maxsplit, false)
     }
 
@@ -1270,7 +1561,14 @@ impl ByteArray {
     ///
     /// Splitting is done starting at the end of the bytearray and working to the front.
     #[method]
-    fn rsplit(slf: This<ByteSelf<'_>>, it: &mut Interp, #[kw] sep: Option<&[u8]>, #[kw] #[default(-1)] maxsplit: isize) -> R<Value> {
+    fn rsplit(
+        slf: This<ByteSelf<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&[u8]>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
         split_impl(it, &slf.0, sep, maxsplit, true)
     }
 
@@ -1279,7 +1577,12 @@ impl ByteArray {
     /// Line breaks are not included in the resulting list unless keepends is given and
     /// true.
     #[method]
-    fn splitlines(slf: This<ByteSelf<'_>>, #[kw] #[default(false)] keepends: bool) -> Value {
+    fn splitlines(
+        slf: This<ByteSelf<'_>>,
+        #[kw]
+        #[default(false)]
+        keepends: bool,
+    ) -> Value {
         splitlines_impl(&slf.0, keepends)
     }
 
@@ -1353,7 +1656,9 @@ impl ByteArray {
                 let t = it.type_name_of(iterable_of_ints);
                 return Err(it.type_error(&format!("can't extend bytearray with {t}")));
             }
-            v if v.as_str().is_some() => return Err(it.type_error("expected iterable of integers; got: 'str'")),
+            v if v.as_str().is_some() => {
+                return Err(it.type_error("expected iterable of integers; got: 'str'"));
+            }
             v => it.bytes_from_object(v)?,
         };
         it.ba_edit(slf.0 .0, |v| v.extend(items))
@@ -1458,7 +1763,11 @@ pub fn init(it: &mut Interp) {
     let (bytes, ba) = (it.types.bytes.clone(), it.types.bytearray.clone());
     for t in [&bytes, &ba] {
         install_all::<ByteMethods>(t);
-        reg_slots(it, t, &["__getitem__", "__len__", "__contains__", "__iter__"]);
+        reg_slots(
+            it,
+            t,
+            &["__getitem__", "__len__", "__contains__", "__iter__"],
+        );
         reg_binops(it, t, &["__add__", "__mul__", "__rmul__"]);
         reg_compare(it, t, true);
     }
@@ -1479,6 +1788,7 @@ impl Interp {
 
     /// In-place (same-length) writes to a `bytearray`; allowed while exported.
     pub fn ba_write<'a>(&mut self, b: &'a ByteStore) -> R<lumen_common::buffer::BytesMut<'a>> {
-        b.try_bytes_mut().map_err(|e| crate::bind::buffer_error(self, e))
+        b.try_bytes_mut()
+            .map_err(|e| crate::bind::buffer_error(self, e))
     }
 }

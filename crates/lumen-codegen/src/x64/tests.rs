@@ -41,7 +41,8 @@ extern "C" fn h_many(
     a10: i32,
     a11: i64,
 ) -> f64 {
-    a0 as f64 * 1.5 + f1 - a2 as f64 + f3 as f64 * 2.0 + a4 as f64 - f5 * 0.25 + a6 as f64
+    a0 as f64 * 1.5 + f1 - a2 as f64 + f3 as f64 * 2.0 + a4 as f64 - f5 * 0.25
+        + a6 as f64
         + a7 as f64 * 3.0
         - f8
         + (a9 >> 7) as f64
@@ -50,7 +51,10 @@ extern "C" fn h_many(
 }
 
 fn mix_sig() -> Signature {
-    Signature::new(vec![Type::I64, Type::F64, Type::I32, Type::F32], vec![Type::I64])
+    Signature::new(
+        vec![Type::I64, Type::F64, Type::I32, Type::F32],
+        vec![Type::I64],
+    )
 }
 
 fn many_sig() -> Signature {
@@ -112,7 +116,9 @@ impl Env for TestEnv {
         Ok(call_host(func.id, args))
     }
     fn call_indirect(&mut self, _: &Signature, callee: u64, args: &[u64]) -> Result<Vec<u64>, u32> {
-        let id = (1..=2).find(|&i| resolve(i) == Some(callee)).expect("callee");
+        let id = (1..=2)
+            .find(|&i| resolve(i) == Some(callee))
+            .expect("callee");
         Ok(call_host(id, args))
     }
 }
@@ -257,9 +263,12 @@ impl Gen<'_> {
         use MemKind::*;
         match t {
             Type::I32 => self.r.pick(&[I32, I32S8, I32U8, I32S16, I32U16]),
-            Type::I64 => self.r.pick(&[I64, I64S8, I64U8, I64S16, I64U16, I64S32, I64U32]),
+            Type::I64 => self
+                .r
+                .pick(&[I64, I64S8, I64U8, I64S16, I64U16, I64S32, I64U32]),
             Type::F32 => F32,
             Type::F64 => F64,
+            Type::V128 => unreachable!(),
         }
     }
 
@@ -306,7 +315,13 @@ impl Gen<'_> {
                 self.b.binary(op, a, b)
             }
             5 => {
-                let mut ops = vec![UnaryOp::Clz, UnaryOp::Ctz, UnaryOp::Popcnt, UnaryOp::Sext8, UnaryOp::Sext16];
+                let mut ops = vec![
+                    UnaryOp::Clz,
+                    UnaryOp::Ctz,
+                    UnaryOp::Popcnt,
+                    UnaryOp::Sext8,
+                    UnaryOp::Sext16,
+                ];
                 if t == Type::I64 {
                     ops.push(UnaryOp::Sext32);
                 }
@@ -389,7 +404,9 @@ impl Gen<'_> {
         let other = if t == Type::F32 { Type::F64 } else { Type::F32 };
         match self.r.below(9) {
             0..=2 => {
-                let op = self.r.pick(&[Fadd, Fsub, Fmul, Fdiv, Fmin, Fmax, Fcopysign]);
+                let op = self
+                    .r
+                    .pick(&[Fadd, Fsub, Fmul, Fdiv, Fmin, Fmax, Fcopysign]);
                 let a = self.expr(t, d);
                 let mut b = self.expr(t, d);
                 if op == Fcopysign {
@@ -399,7 +416,9 @@ impl Gen<'_> {
             }
             3 => {
                 use UnaryOp::*;
-                let op = self.r.pick(&[Fneg, Fabs, Sqrt, Ceil, Floor, Trunc, Nearest]);
+                let op = self
+                    .r
+                    .pick(&[Fneg, Fabs, Sqrt, Ceil, Floor, Trunc, Nearest]);
                 let a = self.expr(t, d);
                 self.b.unary(op, a)
             }
@@ -411,7 +430,11 @@ impl Gen<'_> {
             }
             5 => {
                 let a = self.expr(other, d);
-                let op = if t == Type::F64 { ConvOp::Promote } else { ConvOp::Demote };
+                let op = if t == Type::F64 {
+                    ConvOp::Promote
+                } else {
+                    ConvOp::Demote
+                };
                 self.b.convert(op, t, a)
             }
             6 => {
@@ -427,7 +450,15 @@ impl Gen<'_> {
             }
             _ => {
                 let (a, off) = self.address();
-                self.b.load(if t == Type::F32 { MemKind::F32 } else { MemKind::F64 }, a, off)
+                self.b.load(
+                    if t == Type::F32 {
+                        MemKind::F32
+                    } else {
+                        MemKind::F64
+                    },
+                    a,
+                    off,
+                )
             }
         }
     }
@@ -489,8 +520,11 @@ impl Gen<'_> {
             }
             73..=82 if depth > 0 && budget => {
                 let c = self.expr(Type::I32, 2);
-                let (then, else_, merge) =
-                    (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                let (then, else_, merge) = (
+                    self.b.create_block(),
+                    self.b.create_block(),
+                    self.b.create_block(),
+                );
                 self.b.brif(c, then, &[], else_, &[]);
                 self.b.seal_block(then);
                 self.b.seal_block(else_);
@@ -512,8 +546,11 @@ impl Gen<'_> {
                 let z = self.b.iconst(Type::I32, 0);
                 self.b.def_var(i, z);
                 let n = self.b.iconst(Type::I32, self.r.below(4) as i64);
-                let (header, body, exit) =
-                    (self.b.create_block(), self.b.create_block(), self.b.create_block());
+                let (header, body, exit) = (
+                    self.b.create_block(),
+                    self.b.create_block(),
+                    self.b.create_block(),
+                );
                 self.b.jump(header, &[]);
                 self.b.switch_to_block(header);
                 let iv = self.b.use_var(i);
@@ -537,7 +574,8 @@ impl Gen<'_> {
                 let idx = self.b.binary(BinaryOp::Band, idx, m);
                 let ts: Vec<Block> = (0..4).map(|_| self.b.create_block()).collect();
                 let merge = self.b.create_block();
-                let targets: Vec<(Block, Vec<Value>)> = ts[..3].iter().map(|&t| (t, vec![])).collect();
+                let targets: Vec<(Block, Vec<Value>)> =
+                    ts[..3].iter().map(|&t| (t, vec![])).collect();
                 self.b.br_table(idx, &targets, (ts[3], &[]));
                 for &t in &ts {
                     self.b.seal_block(t);
@@ -564,7 +602,10 @@ fn params() -> Vec<Type> {
 }
 
 fn random_program(seed: u64) -> Function {
-    let mut f = Function::new(format!("rand{seed}"), Signature::new(params(), vec![Type::I64]));
+    let mut f = Function::new(
+        format!("rand{seed}"),
+        Signature::new(params(), vec![Type::I64]),
+    );
     let mix = f.import_function(mix_sig(), 1);
     let many = f.import_function(many_sig(), 2);
     let mix_sig = f.import_signature(mix_sig());
@@ -608,6 +649,7 @@ fn random_program(seed: u64) -> Function {
                 let c = g.canon(x, t);
                 g.b.convert(ConvOp::Bitcast, Type::I64, c)
             }
+            Type::V128 => unreachable!(),
         };
         let r = g.b.iconst(Type::I64, 7);
         let acc2 = g.b.binary(BinaryOp::Rotl, acc, r);
@@ -666,7 +708,10 @@ fn check(f: &Function, args: &[u64]) {
         };
         let got = run_native(func, cfg, &nargs, &mut ctx);
         assert_eq!(got, want, "{label} result, args {args:x?}\n{func}");
-        assert!(mem == env.mem, "{label} memory differs, args {args:x?}\n{func}");
+        assert!(
+            mem == env.mem,
+            "{label} memory differs, args {args:x?}\n{func}"
+        );
         assert_eq!(ctx.entry_sp, 0, "entry sp restored");
     }
 }
@@ -676,8 +721,24 @@ fn arg_sets() -> Vec<Vec<u64>> {
     let f32b = |x: f32| x.to_bits() as u64;
     vec![
         vec![0, 0, fp, 5, 17, f32b(1.5), 2.25f64.to_bits()],
-        vec![0, 0, fp, u32::MAX as u64, i64::MIN as u64, f32b(-0.0), f64::NAN.to_bits()],
-        vec![0, 0, fp, 0x8000_0000, 0x7fff_ffff_ffff_ffff, f32b(f32::INFINITY), (-1e300f64).to_bits()],
+        vec![
+            0,
+            0,
+            fp,
+            u32::MAX as u64,
+            i64::MIN as u64,
+            f32b(-0.0),
+            f64::NAN.to_bits(),
+        ],
+        vec![
+            0,
+            0,
+            fp,
+            0x8000_0000,
+            0x7fff_ffff_ffff_ffff,
+            f32b(f32::INFINITY),
+            (-1e300f64).to_bits(),
+        ],
         vec![0, 0, fp, 12345, 3, f32b(3e9), 4294967296.5f64.to_bits()],
     ]
 }
@@ -722,6 +783,7 @@ fn high_pressure_across_calls() {
             I64 => ints[i],
             F32 => ps[5],
             F64 => floats[i],
+            V128 => unreachable!(),
         })
         .collect();
     let r = b.call_fn(many, &args)[0];
@@ -752,7 +814,10 @@ fn stack_limit_traps() {
         entry_sp: 0,
         stack_limit: u64::MAX,
     };
-    assert_eq!(run_native(&f, &config(), &[0], &mut ctx), Err(STACK_OVERFLOW));
+    assert_eq!(
+        run_native(&f, &config(), &[0], &mut ctx),
+        Err(STACK_OVERFLOW)
+    );
     assert_eq!(ctx.entry_sp, 0);
     ctx.stack_limit = 0;
     let got = run_native(&f, &config(), &[0], &mut ctx).unwrap();

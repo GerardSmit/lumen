@@ -30,6 +30,17 @@ pub struct Features {
 }
 
 impl Features {
+    pub fn from_bits(bits: u64) -> Features {
+        use lumen_common::target::x64::*;
+        Features {
+            lzcnt: bits & LZCNT != 0,
+            bmi1: bits & BMI1 != 0,
+            bmi2: bits & BMI2 != 0,
+            popcnt: bits & POPCNT != 0,
+            sse41: bits & SSE41 != 0,
+        }
+    }
+
     pub fn host() -> Features {
         #[cfg(target_arch = "x86_64")]
         {
@@ -80,15 +91,26 @@ pub struct Reloc {
 }
 
 pub struct Compiled {
+    pub unwind: Vec<u8>,
+    pub windows_unwind: Vec<u8>,
     pub code: Vec<u8>,
     pub relocs: Vec<Reloc>,
+    /// AArch64 direct-call instructions, paired with their function ids.
+    /// Empty for x86-64. Used when converting host output to GOT-based AOT code.
+    pub direct_calls: Vec<Reloc>,
+    /// Native AOT symbolic-address loads; `offset` identifies the patch field.
+    pub symbol_loads: Vec<Reloc>,
 }
 
 impl Compiled {
     /// Patch every relocation with the address `resolve` gives its function.
     pub fn link(&mut self, resolve: impl Fn(u32) -> Option<u64>) -> Result<(), String> {
+        if !self.symbol_loads.is_empty() {
+            return Err("symbol addresses require native AOT linking".into());
+        }
         for r in &self.relocs {
-            let addr = resolve(r.func_id).ok_or_else(|| format!("x64: unresolved fn {}", r.func_id))?;
+            let addr =
+                resolve(r.func_id).ok_or_else(|| format!("x64: unresolved fn {}", r.func_id))?;
             self.code[r.offset..r.offset + 8].copy_from_slice(&addr.to_le_bytes());
         }
         Ok(())
@@ -102,10 +124,27 @@ pub fn load(
     compiled: &[Compiled],
     resolve: impl Fn(u32, &[u64]) -> Option<u64>,
 ) -> Result<(crate::jitmem::ExecMemory, Vec<u64>), String> {
+    load_aligned(compiled, 16, resolve)
+}
+
+pub fn load_aligned(
+    compiled: &[Compiled],
+    alignment: usize,
+    resolve: impl Fn(u32, &[u64]) -> Option<u64>,
+) -> Result<(crate::jitmem::ExecMemory, Vec<u64>), String> {
+    if !matches!(alignment, 16 | 64) {
+        return Err("x64: entry alignment must be 16 or 64".into());
+    }
+    if compiled
+        .iter()
+        .any(|function| !function.symbol_loads.is_empty())
+    {
+        return Err("symbol addresses require native AOT linking".into());
+    }
     let mut offs = Vec::with_capacity(compiled.len());
     let mut len = 0;
     for c in compiled {
-        len = (len + 15) & !15;
+        len = (len + alignment - 1) & !(alignment - 1);
         offs.push(len);
         len += c.code.len();
     }
@@ -134,10 +173,23 @@ pub fn compile(func: &Function, cfg: &Config) -> Result<Compiled, String> {
 }
 
 /// [`compile`], consuming `f` (no copy; the IR is freed once lowered).
-pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> {
+pub fn compile_owned(f: Function, cfg: &Config) -> Result<Compiled, String> {
+    compile_owned_aligned(f, cfg, 1)
+}
+
+pub fn compile_owned_aligned(
+    mut f: Function,
+    cfg: &Config,
+    alignment: usize,
+) -> Result<Compiled, String> {
+    if !matches!(alignment, 1 | 16 | 64) {
+        return Err("x64: loop alignment must be 1, 16 or 64".into());
+    }
     legalize(
         &mut f,
         Legal {
+            checked_i32: true,
+            js_to_i32: false,
             from_u64: false,
             to_uint: false,
             to_int_sat: false,
@@ -151,6 +203,7 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
     let lowered = lower::lower(&f, &graph, &cfg.abi, &cfg.features)?;
     // The IR is no longer needed: free it before the allocator's tables are built.
     let ctx_first = f.sig.params.first() == Some(&Type::I64);
+    let vectors = f.values.iter().any(|v| v.ty == Type::V128);
     drop((graph, f));
     let alloc = crate::regalloc::allocate(&lowered.vcode, &cfg.abi.reg_info());
     let needs_ctx = lowered.has_traps || cfg.traps.is_some_and(|t| t.stack_limit.is_some());
@@ -162,13 +215,29 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
             return Err("x64: trapping functions take the context pointer first".into());
         }
     }
-    let frame = emit::Frame::new(&alloc, lowered.outgoing, needs_ctx);
+    let frame = emit::Frame::with_vectors(&alloc, lowered.outgoing, needs_ctx, vectors);
     let traps = cfg.traps.as_ref();
-    let (_, fits, _) =
-        emit::Emitter::new(&lowered.vcode, &alloc, &cfg.abi, &frame, traps, Vec::new()).emit()?;
-    let (code, _, relocs) =
-        emit::Emitter::new(&lowered.vcode, &alloc, &cfg.abi, &frame, traps, fits).emit()?;
-    Ok(Compiled { code, relocs })
+    let (_, mut fits, _, _, _, _) =
+        emit::Emitter::new(&lowered.vcode, &alloc, &cfg.abi, &frame, traps, Vec::new())
+            .with_alignment(alignment)
+            .emit()?;
+    // Padding can grow when branches shrink. Keep long branches in aligned mode
+    // so both layout passes use identical instruction lengths.
+    if alignment > 1 {
+        fits.fill(false);
+    }
+    let (code, _, relocs, symbol_loads, unwind, windows_unwind) =
+        emit::Emitter::new(&lowered.vcode, &alloc, &cfg.abi, &frame, traps, fits)
+            .with_alignment(alignment)
+            .emit()?;
+    Ok(Compiled {
+        unwind,
+        windows_unwind,
+        code,
+        relocs,
+        direct_calls: Vec::new(),
+        symbol_loads,
+    })
 }
 
 /// The callee-saved registers of either ABI, which the trampoline saves unconditionally.
@@ -181,6 +250,14 @@ const TRAMP_GPRS: [u8; 7] = [3, 6, 7, 12, 13, 14, 15];
 /// argument 0 is normally `ctx` itself), stores the result in `slots[0]` and returns 0, or
 /// returns `code + 1` when the function traps.
 pub fn trampoline(sig: &Signature, cfg: &Config) -> Result<Vec<u8>, String> {
+    if sig
+        .params
+        .iter()
+        .chain(&sig.results)
+        .any(|t| *t == Type::V128)
+    {
+        return Err("x64: vectors are internal values, not C ABI parameters/results".into());
+    }
     if sig.results.len() > 1 {
         return Err("x64: multiple results are not supported".into());
     }
@@ -218,7 +295,15 @@ pub fn trampoline(sig: &Signature, cfg: &Config) -> Result<Vec<u8>, String> {
     a.mov_store(true, asm::RAX, RM::mem(asm::RBP, prev_s));
     a.op(0, true, &[0x8d], asm::RAX, RM::Rip(resume), false, 0);
     a.mov_store(true, asm::RAX, RM::mem(asm::RBP, resume_s));
-    a.op(0, true, &[0x8d], asm::RAX, RM::mem(asm::RBP, resume_s), false, 0);
+    a.op(
+        0,
+        true,
+        &[0x8d],
+        asm::RAX,
+        RM::mem(asm::RBP, resume_s),
+        false,
+        0,
+    );
     a.mov_store(true, asm::RAX, RM::mem(a0, off));
     a.mov_rr(asm::R11, a1);
     a.mov_rr(asm::R10, a2);
@@ -240,7 +325,15 @@ pub fn trampoline(sig: &Signature, cfg: &Config) -> Result<Vec<u8>, String> {
     match sig.results.first() {
         Some(t) if t.is_float() => {
             // movd/movq rax, xmm0: the result's bits, zero-extended.
-            a.op(0x66, *t == Type::F64, &[0x0f, 0x7e], 0, RM::Reg(asm::RAX), false, 0);
+            a.op(
+                0x66,
+                *t == Type::F64,
+                &[0x0f, 0x7e],
+                0,
+                RM::Reg(asm::RAX),
+                false,
+                0,
+            );
             a.mov_store(true, asm::RAX, RM::mem(asm::R10, 0));
         }
         Some(_) => a.mov_store(true, asm::RAX, RM::mem(asm::R10, 0)),
@@ -267,7 +360,15 @@ pub fn trampoline(sig: &Signature, cfg: &Config) -> Result<Vec<u8>, String> {
 
     // A trap stub returned here with rsp just above the resume slot and eax = code + 1.
     a.bind(resume);
-    a.op(0, true, &[0x8d], asm::RBP, RM::mem(asm::RSP, -resume_s - 8), false, 0);
+    a.op(
+        0,
+        true,
+        &[0x8d],
+        asm::RBP,
+        RM::mem(asm::RSP, -resume_s - 8),
+        false,
+        0,
+    );
     a.jmp(common);
     a.finish()?;
     Ok(a.buf)
@@ -275,3 +376,6 @@ pub fn trampoline(sig: &Signature, cfg: &Config) -> Result<Vec<u8>, String> {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests;
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod cpu_tests;

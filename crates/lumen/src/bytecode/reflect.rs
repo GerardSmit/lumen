@@ -89,8 +89,7 @@ pub(crate) fn note_source(src: &str) {
             let before = src[..at].trim_end().chars().next_back();
             let after = &src[at + name.len()..];
             if (before == Some('.') && ident_end(after))
-                || (matches!(before, Some('\'' | '"' | '`'))
-                    && after.starts_with(['\'', '"', '`']))
+                || (matches!(before, Some('\'' | '"' | '`')) && after.starts_with(['\'', '"', '`']))
             {
                 ENABLED.store(true, Ordering::Relaxed);
                 return;
@@ -112,7 +111,14 @@ pub(crate) fn is_legacy(func: &Function) -> bool {
 #[inline(never)]
 pub(super) fn stash_compiled(i: &mut Interp, head: &[Value], tail: &[Value], slots: *const Value) {
     let args: Rc<[Value]> = head.iter().chain(tail).cloned().collect();
-    put(i, ReflectStash { args, scope: None, slots });
+    put(
+        i,
+        ReflectStash {
+            args,
+            scope: None,
+            slots,
+        },
+    );
 }
 
 /// Record the innermost (just pushed) tree-walker frame's arguments and parameter scope.
@@ -223,14 +229,18 @@ fn live_params(func: &Function) -> Vec<bool> {
         .collect();
     // An `arguments` object (named in the body, an inner arrow or a direct `eval`, which the
     // scan counts) context-allocates every parameter — unless a parameter shadows it.
-    let uses_arguments = func.scan_flags() & crate::ast::SCAN_ARGUMENTS != 0
-        && !names.contains(&"arguments");
+    let uses_arguments =
+        func.scan_flags() & crate::ast::SCAN_ARGUMENTS != 0 && !names.contains(&"arguments");
     if !simple || uses_arguments {
         return vec![false; n];
     }
+    #[cfg(not(feature = "compiler"))]
+    return vec![false; n];
+    #[cfg(feature = "compiler")]
     let captured = super::CaptureScan::run(func)
         .map(|c| c.0)
         .unwrap_or_default();
+    #[cfg(feature = "compiler")]
     (0..n)
         .map(|k| !captured.contains(names[k]) && !names[k + 1..].contains(&names[k]))
         .collect()
@@ -294,7 +304,9 @@ pub(crate) fn read_arguments(i: &mut Interp, this: &Value) -> Value {
 
 /// Install the getter intrinsics (see the module docs). Their `this` is the function read.
 pub(crate) fn install(i: &mut Interp) {
-    let a = i.make_native("get arguments", 0, |i, this, _| Ok(read_arguments(i, &this)));
+    let a = i.make_native("get arguments", 0, |i, this, _| {
+        Ok(read_arguments(i, &this))
+    });
     let c = i.make_native("get caller", 0, |i, this, _| Ok(read_caller(i, &this)));
     i.extra_protos.insert(ARGUMENTS_GETTER, a);
     i.extra_protos.insert(CALLER_GETTER, c);

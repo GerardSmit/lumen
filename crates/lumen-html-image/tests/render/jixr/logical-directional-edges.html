@@ -1,0 +1,41 @@
+<!doctype html>
+<style>
+  html, body { margin: 0; background: white; }
+  .stage { position: relative; width: 300px; height: 160px; background: #e8eef8; }
+  .rtl {
+    position: absolute;
+    direction: rtl;
+    inset-inline-start: 20px;
+    inset-block-start: 12px;
+    width: 80px;
+    height: 36px;
+    padding-inline-start: 6px;
+    padding-inline-end: 10px;
+    background: #dbeafe;
+    border-inline-start: 4px solid #174ea6;
+    border-inline-end: 4px solid #16a34a;
+  }
+  .vertical {
+    position: absolute;
+    writing-mode: vertical-rl;
+    inset-inline-start: 16px;
+    inset-block-start: 24px;
+    width: 44px;
+    height: 52px;
+    background: #fef3c7;
+    border-inline-start: 4px solid #dc2626;
+    border-inline-end: 4px solid #16a34a;
+  }
+  .vertical-block {
+    position: absolute;
+    writing-mode: vertical-rl;
+    inset-inline-start: 16px;
+    inset-block-start: 92px;
+    width: 44px;
+    height: 52px;
+    background: #fef3c7;
+    border-block-start: 4px solid #174ea6;
+    border-block-end: 4px solid #f59e0b;
+  }
+</style>
+<div class="stage"><div class="rtl"></div><div class="vertical"></div><div class="vertical-block"></div></div>

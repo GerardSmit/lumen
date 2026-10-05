@@ -42,7 +42,9 @@ pub fn parse_counts(output: &str) -> Counts {
     let mut c = Counts::default();
     for line in output.lines() {
         let line = line.trim_end();
-        let Some((_, verdict)) = line.rsplit_once(" ... ") else { continue };
+        let Some((_, verdict)) = line.rsplit_once(" ... ") else {
+            continue;
+        };
         let verdict = verdict.trim();
         if verdict == "ok" || verdict == "expected failure" {
             c.pass += 1;
@@ -72,7 +74,9 @@ pub fn last_line(output: &str) -> String {
 pub fn classify(counts: Counts, exit_code: Option<i32>, output: &str) -> Status {
     if counts.total() == 0 {
         return match exit_code {
-            Some(0) if output.contains("Ran 0 tests") => Status::ImportError("ran 0 tests".to_string()),
+            Some(0) if output.contains("Ran 0 tests") => {
+                Status::ImportError("ran 0 tests".to_string())
+            }
             Some(_) => Status::ImportError(last_line(output)),
             None => Status::Crash(last_line(output)),
         };
@@ -105,24 +109,60 @@ Ran 6 tests in 0.1s
     #[test]
     fn counts_every_verdict() {
         let c = parse_counts(SAMPLE);
-        assert_eq!(c, Counts { pass: 2, fail: 2, error: 1, skip: 1 });
+        assert_eq!(
+            c,
+            Counts {
+                pass: 2,
+                fail: 2,
+                error: 1,
+                skip: 1
+            }
+        );
     }
 
     #[test]
     fn classifies_import_errors() {
-        let out = "Traceback (most recent call last):\nModuleNotFoundError: No module named '_io'\n";
+        let out =
+            "Traceback (most recent call last):\nModuleNotFoundError: No module named '_io'\n";
         let s = classify(parse_counts(out), Some(1), out);
-        assert_eq!(s, Status::ImportError("ModuleNotFoundError: No module named '_io'".to_string()));
+        assert_eq!(
+            s,
+            Status::ImportError("ModuleNotFoundError: No module named '_io'".to_string())
+        );
     }
 
     #[test]
     fn classifies_ok_and_failed() {
-        assert_eq!(classify(Counts { pass: 3, ..Counts::default() }, Some(0), ""), Status::Ok);
-        assert_eq!(classify(Counts { pass: 3, fail: 1, ..Counts::default() }, Some(1), ""), Status::Failed);
+        assert_eq!(
+            classify(
+                Counts {
+                    pass: 3,
+                    ..Counts::default()
+                },
+                Some(0),
+                ""
+            ),
+            Status::Ok
+        );
+        assert_eq!(
+            classify(
+                Counts {
+                    pass: 3,
+                    fail: 1,
+                    ..Counts::default()
+                },
+                Some(1),
+                ""
+            ),
+            Status::Failed
+        );
     }
 
     #[test]
     fn signal_exit_without_results_is_a_crash() {
-        assert!(matches!(classify(Counts::default(), None, "boom"), Status::Crash(_)));
+        assert!(matches!(
+            classify(Counts::default(), None, "boom"),
+            Status::Crash(_)
+        ));
     }
 }

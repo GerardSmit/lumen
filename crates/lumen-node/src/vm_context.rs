@@ -36,7 +36,8 @@ pub(crate) mod bindings {
         line_offset: i32,
         _column_offset: i32,
     ) -> Result<(), OpError> {
-        ctx.vm_compile_script(&code, &filename, line_offset).map_err(OpError::thrown)?;
+        ctx.vm_compile_script(&code, &filename, line_offset)
+            .map_err(OpError::thrown)?;
         Ok(())
     }
 

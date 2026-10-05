@@ -3,7 +3,9 @@
 //! Every run-time helper here delegates to the tree-walker's own routine for the operation, in
 //! the tree-walker's evaluation order — the compiler only reorders nothing and interleaves the
 //! compiled sub-expressions exactly where the oracle evaluates them.
-use super::{step_and_store, Bail, CResult, Compiler, Home, Op, UpdKind};
+use super::{step_and_store, Op, UpdKind};
+#[cfg(feature = "compiler")]
+use super::{Bail, CResult, Compiler, Home};
 use crate::ast::{Class, Expr, PropDef, PropKey};
 use crate::interpreter::{Abrupt, Env, Interp};
 use crate::value::Value;
@@ -18,7 +20,7 @@ fn pop(stack: &mut Vec<Value>) -> Value {
     stack.pop().expect("vm stack underflow")
 }
 
-pub(super) fn get_private(
+pub(crate) fn get_private(
     i: &mut Interp,
     env: &Env,
     name: &str,
@@ -40,7 +42,7 @@ fn put_private(i: &mut Interp, base: &Value, k: &str, v: Value) -> Result<(), Ab
     }
 }
 
-pub(super) fn set_private(
+pub(crate) fn set_private(
     i: &mut Interp,
     env: &Env,
     name: &str,
@@ -54,7 +56,7 @@ pub(super) fn set_private(
     Ok(())
 }
 
-pub(super) fn get_private_method(
+pub(crate) fn get_private_method(
     i: &mut Interp,
     env: &Env,
     name: &str,
@@ -68,7 +70,7 @@ pub(super) fn get_private_method(
     Ok(())
 }
 
-pub(super) fn private_in(
+pub(crate) fn private_in(
     i: &mut Interp,
     env: &Env,
     name: &str,
@@ -86,7 +88,7 @@ pub(super) fn private_in(
     }
 }
 
-pub(super) fn update_private(
+pub(crate) fn update_private(
     i: &mut Interp,
     env: &Env,
     name: &str,
@@ -110,7 +112,7 @@ fn literal_obj(stack: &[Value]) -> crate::value::Gc {
     }
 }
 
-pub(super) fn init_prop(
+pub(crate) fn init_prop(
     i: &mut Interp,
     key: &str,
     named: bool,
@@ -128,7 +130,7 @@ pub(super) fn init_prop(
     Ok(())
 }
 
-pub(super) fn init_prop_computed(
+pub(crate) fn init_prop_computed(
     i: &mut Interp,
     named: bool,
     stack: &mut Vec<Value>,
@@ -190,13 +192,13 @@ pub(super) fn init_method(
     Ok(())
 }
 
-pub(super) fn copy_data_props(i: &mut Interp, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
+pub(crate) fn copy_data_props(i: &mut Interp, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
     let v = pop(stack);
     let obj = literal_obj(stack);
     i.copy_data_properties_into(&obj, &v, &[])
 }
 
-pub(super) fn set_proto_lit(stack: &mut Vec<Value>) {
+pub(crate) fn set_proto_lit(stack: &mut Vec<Value>) {
     let v = pop(stack);
     let obj = literal_obj(stack);
     match v {
@@ -227,7 +229,7 @@ pub(super) fn make_class(
     Ok(())
 }
 
-pub(super) fn super_get(
+pub(crate) fn super_get(
     i: &mut Interp,
     env: &Env,
     key: Option<&str>,
@@ -257,14 +259,14 @@ pub(super) fn super_get(
     Ok(())
 }
 
-pub(super) fn super_base(i: &mut Interp, env: &Env, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
+pub(crate) fn super_base(i: &mut Interp, env: &Env, stack: &mut Vec<Value>) -> Result<(), Abrupt> {
     let home = i.super_base(env)?;
     stack.push(home);
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn super_method(
+pub(crate) fn super_method(
     i: &mut Interp,
     env: &Env,
     this_val: &Value,
@@ -295,7 +297,7 @@ pub(super) fn super_method(
 
 /// Append `items` to the array literal on top of the stack (an elision: `hole`, no items),
 /// keeping its `length` as the next index — exactly the oracle's `eval_array` stores.
-pub(super) fn array_append(
+pub(crate) fn array_append(
     stack: &mut [Value],
     items: impl IntoIterator<Item = Value>,
     hole: bool,
@@ -309,7 +311,7 @@ pub(super) fn array_append(
 /// Append one value to the array literal `ao` (see [`append_to`]): the common single-element
 /// case appends at the packed frontier with one `length` lookup.
 #[inline]
-pub(super) fn append_one(ao: &crate::value::Gc, v: Value) {
+pub(crate) fn append_one(ao: &crate::value::Gc, v: Value) {
     let r = ao.borrow_mut().props.push_array_element(v);
     if let Err(v) = r {
         append_to(ao, std::iter::once(v), false);
@@ -318,7 +320,7 @@ pub(super) fn append_one(ao: &crate::value::Gc, v: Value) {
 
 /// [`array_append`] on the array literal `ao` itself (the compiled code's `ArrayAppend`
 /// helper appends through here without an operand stack).
-pub(super) fn append_to(ao: &crate::value::Gc, items: impl IntoIterator<Item = Value>, hole: bool) {
+pub(crate) fn append_to(ao: &crate::value::Gc, items: impl IntoIterator<Item = Value>, hole: bool) {
     let mut o = ao.borrow_mut();
     let mut idx = match o.props.get("length").map(|p| p.value()) {
         Some(Value::Num(n)) => n as usize,
@@ -368,7 +370,7 @@ pub(super) fn append_to(ao: &crate::value::Gc, items: impl IntoIterator<Item = V
     }
 }
 
-pub(super) fn obj_rest(
+pub(crate) fn obj_rest(
     i: &mut Interp,
     keys: &[Rc<str>],
     stack: &mut Vec<Value>,
@@ -432,7 +434,9 @@ fn class_time_expr_ok(e: &Expr) -> bool {
         Expr::Func(f) => {
             !f.is_arrow
                 || f.source().is_some_and(|src| {
-                    !src.contains("arguments") && !src.contains("super") && !src.contains("new.target")
+                    !src.contains("arguments")
+                        && !src.contains("super")
+                        && !src.contains("new.target")
                 })
         }
         Expr::Call { callee, args, .. } | Expr::New { callee, args, .. } => {
@@ -462,12 +466,13 @@ fn class_ok(c: &Class) -> bool {
         })
 }
 
+#[cfg(feature = "compiler")]
 impl Compiler {
     /// `target &&= / ||= / ??= value`: the Reference is evaluated once, GetValue, then either
     /// the current value (short-circuit, no PutValue) or the RHS stored and produced. An
     /// anonymous function RHS is named after an identifier target (the oracle names it after
     /// evaluation; an anonymous class, whose name is observable during its definition, bails).
-    pub(super) fn logical_assign(&mut self, op: &str, target: &Expr, value: &Expr) -> CResult {
+    pub(crate) fn logical_assign(&mut self, op: &str, target: &Expr, value: &Expr) -> CResult {
         let jump = |c: &mut Compiler| match op {
             "&&=" => c.emit(Op::JumpIfFalsePeek(0)),
             "||=" => c.emit(Op::JumpIfTruePeek(0)),
@@ -479,9 +484,9 @@ impl Compiler {
                     return Err(Bail);
                 }
                 let (load, store) = match self.home(name) {
-                    Some(Home::Slot(_, true)) | Some(Home::Env(true)) | Some(Home::Blk(_, true)) => {
-                        return Err(Bail)
-                    }
+                    Some(Home::Slot(_, true))
+                    | Some(Home::Env(true))
+                    | Some(Home::Blk(_, true)) => return Err(Bail),
                     Some(Home::Slot(slot, false)) => (Op::LoadLocal(slot), Op::StoreLocal(slot)),
                     Some(Home::Blk(c, false)) => {
                         let n = self.name_idx(name);
@@ -565,7 +570,7 @@ impl Compiler {
 
     /// A class expression/declaration value: ClassDefinitionEvaluation by the oracle over the
     /// current env. `name` is the NamedEvaluation target for an anonymous class.
-    pub(super) fn class_value(&mut self, c: &Rc<Class>, name: Option<&str>) -> CResult {
+    pub(crate) fn class_value(&mut self, c: &Rc<Class>, name: Option<&str>) -> CResult {
         if !class_ok(c) {
             if super::bail_log_enabled() {
                 let bad = c
@@ -601,7 +606,7 @@ impl Compiler {
     }
 
     /// General object literal (anything the template path `object_literal` refuses).
-    pub(super) fn object_literal_general(&mut self, props: &[PropDef]) -> CResult {
+    pub(crate) fn object_literal_general(&mut self, props: &[PropDef]) -> CResult {
         self.emit(Op::NewObject);
         for prop in props {
             match prop {
@@ -672,4 +677,3 @@ impl Compiler {
         Ok(())
     }
 }
-

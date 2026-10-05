@@ -41,7 +41,8 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
     let Some(fd) = fd_arg(fd) else {
         return Err(NativeError::type_error("adoptFd: fd must be a non-negative integer").into());
     };
-    let sock_type = sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|e| OpError::from(fd_error("open", &e)))?;
+    let sock_type = sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE)
+        .map_err(|e| OpError::from(fd_error("open", &e)))?;
     let family = socket_family(fd).map_err(|e| OpError::from(fd_error("open", &e)))?;
     let listening = sock_type == libc::SOCK_STREAM
         && sockopt_int(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN).unwrap_or(0) != 0;
@@ -62,7 +63,9 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
         // SAFETY: the caller hands this descriptor over; it is a UDP socket (checked above).
         let socket = unsafe { UdpSocket::from_raw_fd(fd) };
         let _ = socket.set_read_timeout(Some(UDP_POLL));
-        let reg = ctx.host_mut::<DgramRegistry>().expect("dgram registry installed");
+        let reg = ctx
+            .host_mut::<DgramRegistry>()
+            .expect("dgram registry installed");
         let id = reg.next;
         reg.next += 1;
         reg.sockets.insert(
@@ -82,7 +85,9 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
         let (listener, local_addr) = if kind == "tcp" {
             // SAFETY: a listening TCP socket handed over by the caller.
             let listener = unsafe { TcpListener::from_raw_fd(fd) };
-            let addr = listener.local_addr().map_err(|e| OpError::from(fd_error("open", &e)))?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| OpError::from(fd_error("open", &e)))?;
             (NetListener::Tcp(listener), ServerAddress::Tcp(addr))
         } else {
             // SAFETY: a listening Unix socket handed over by the caller.
@@ -95,7 +100,9 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
             (NetListener::Unix(listener), ServerAddress::Unix(path))
         };
         listener.set_nonblocking();
-        let reg = ctx.host_mut::<NetRegistry>().expect("net registry installed");
+        let reg = ctx
+            .host_mut::<NetRegistry>()
+            .expect("net registry installed");
         let id = reg.next_server;
         reg.next_server += 1;
         reg.servers.insert(
@@ -112,7 +119,12 @@ pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
         set_member(ctx, &o, "serverId", Value::Num(id as f64));
         match local_addr {
             ServerAddress::Tcp(addr) => {
-                set_member(ctx, &o, "address", Value::from_string(addr.ip().to_string()));
+                set_member(
+                    ctx,
+                    &o,
+                    "address",
+                    Value::from_string(addr.ip().to_string()),
+                );
                 set_member(ctx, &o, "port", Value::Num(addr.port() as f64));
                 set_member(ctx, &o, "family", Value::str(family_of(&addr)));
             }
@@ -171,10 +183,13 @@ pub(super) fn udp_fd(ctx: &mut Ctx, sid: u64) -> f64 {
 /// (it lives on in the process the descriptor was sent to): the parked reader is cancelled and
 /// the descriptor closed once it lets go.
 pub(super) fn release(ctx: &mut Ctx, sid: u64) {
-    let pending = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.remove(&sid)).and_then(|e| {
-        e.cancel.store(true, Ordering::SeqCst);
-        e.pending
-    });
+    let pending = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.remove(&sid))
+        .and_then(|e| {
+            e.cancel.store(true, Ordering::SeqCst);
+            e.pending
+        });
     wake::wake_all();
     if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
         tasks.take(id);
@@ -189,7 +204,12 @@ fn recv_with_fds(fd: RawFd, buf: &mut [u8], fds: &mut Vec<RawFd>) -> std::io::Re
 
 /// `(socketId, resolve, reject)` — read from a channel socket, collecting any descriptors that
 /// arrive with the bytes. Resolves `(bytes, fds)`, or `(null, [])` at EOF.
-pub(super) fn read_msg(ctx: &mut Ctx, sid: u64, resolve: Value, reject: Value) -> Result<(), OpError> {
+pub(super) fn read_msg(
+    ctx: &mut Ctx,
+    sid: u64,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
     let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
     let found = ctx
         .host_mut::<NetRegistry>()
@@ -202,9 +222,14 @@ pub(super) fn read_msg(ctx: &mut Ctx, sid: u64, resolve: Value, reject: Value) -
     };
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_msg);
     if unref {
-        ctx.host_mut::<TaskRegistry>().expect("registry").set_unref(id);
+        ctx.host_mut::<TaskRegistry>()
+            .expect("registry")
+            .set_unref(id);
     }
-    if let Some(e) = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get_mut(&sid)) {
+    if let Some(e) = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get_mut(&sid))
+    {
         e.pending = Some(id);
     }
     completions(ctx).run_blocking(id, move || {
@@ -221,7 +246,11 @@ pub(super) fn read_msg(ctx: &mut Ctx, sid: u64, resolve: Value, reject: Value) -
                     buf.truncate(n);
                     break Ok((buf, fds));
                 }
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
                 Err(e) => break Err(net_err("read", &e, None)),
             }
         };
@@ -261,7 +290,10 @@ fn pass_arg(fd: Option<f64>) -> RawFd {
 /// with `fd` (-1 for none) riding on the first byte. Returns the byte count; the descriptor went
 /// out iff it is positive.
 pub(super) fn try_send_msg(ctx: &mut Ctx, sid: u64, data: &[u8], pass: Option<f64>) -> f64 {
-    let stream = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get(&sid)).map(|e| e.stream.clone());
+    let stream = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get(&sid))
+        .map(|e| e.stream.clone());
     let Some(stream) = stream else { return 0.0 };
     let pass = pass_arg(pass);
     if data.is_empty() {
@@ -275,7 +307,9 @@ pub(super) fn try_send_msg(ctx: &mut Ctx, sid: u64, data: &[u8], pass: Option<f6
             sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF),
             sockopt_int(fd, libc::SOL_SOCKET, libc::SO_NWRITE),
         ) {
-            (Ok(buf), Ok(queued)) if buf >= 0 && queued >= 0 => (buf as usize).saturating_sub(queued as usize),
+            (Ok(buf), Ok(queued)) if buf >= 0 && queued >= 0 => {
+                (buf as usize).saturating_sub(queued as usize)
+            }
             _ => 0,
         };
         &data[..data.len().min(space)]
@@ -298,7 +332,10 @@ pub(super) fn write_msg(
 ) -> Result<(), OpError> {
     let pass = pass_arg(pass);
     let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
-    let stream = ctx.host_mut::<NetRegistry>().and_then(|r| r.sockets.get(&sid)).map(|e| e.stream.clone());
+    let stream = ctx
+        .host_mut::<NetRegistry>()
+        .and_then(|r| r.sockets.get(&sid))
+        .map(|e| e.stream.clone());
     let Some(stream) = stream else {
         let e = std::io::Error::from_raw_os_error(libc::EPIPE);
         let err = net_error_value(ctx, &net_err("write", &e, None));
@@ -330,7 +367,9 @@ pub(super) fn write_msg(
 
 /// `(fd)` — libuv's `uv_guess_handle`: "TCP", "TTY", "UDP", "FILE", "PIPE" or "UNKNOWN".
 pub(super) fn guess_handle(fd: Option<f64>) -> &'static str {
-    let Some(fd) = fd.and_then(fd_arg) else { return "UNKNOWN" };
+    let Some(fd) = fd.and_then(fd_arg) else {
+        return "UNKNOWN";
+    };
     // SAFETY: isatty/fstat on an arbitrary descriptor number only report on it.
     if unsafe { libc::isatty(fd) } == 1 {
         return "TTY";

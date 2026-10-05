@@ -21,8 +21,10 @@ pub(crate) mod http_ops {
     pub(crate) mod bindings {
         use super::*;
 
-        /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`.
+        /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject, _redirectMode, options?)`
+        /// -> the request's cancellation control.
         #[op(coerce)]
+        #[allow(clippy::too_many_arguments)]
         fn request(
             ctx: &mut Ctx,
             method: String,
@@ -31,7 +33,9 @@ pub(crate) mod http_ops {
             body: Value,
             resolve: Value,
             reject: Value,
-        ) -> Result<(), OpError> {
+            _redirect_mode: Option<Value>,
+            fetch_options: Option<Value>,
+        ) -> Result<Value, OpError> {
             let headers = crate::read_header_pairs(ctx, &headers)?;
             let body = crate::read_body(ctx, &body)?;
             let (resolve, reject) = crate::callbacks(resolve, reject, "__http.request")?;
@@ -47,9 +51,33 @@ pub(crate) mod http_ops {
                 Some(b) => Uint8Array::from(b.as_slice()).into(),
                 None => JsValue::NULL,
             };
+            let options = js_sys::Object::new();
+            if let Some(value) = fetch_options.filter(|value| value.as_obj().is_some()) {
+                for name in ["mode", "credentials", "redirect"] {
+                    let option = ctx
+                        .get_member(&value, name)
+                        .map_err(|abrupt| OpError::thrown(lumen::embed::abrupt_value(abrupt)))?;
+                    if !matches!(option, Value::Undefined) {
+                        let option = ctx.coerce_string(&option)?.to_string();
+                        js_sys::Reflect::set(
+                            &options,
+                            &JsValue::from_str(name),
+                            &JsValue::from_str(&option),
+                        )
+                        .map_err(|_| NativeError::type_error("invalid browser Fetch options"))?;
+                    }
+                }
+            }
             let started = call_host(
                 "fetch",
-                &[JsValue::from_f64(id as f64), method.into(), target.into(), pairs.into(), body],
+                &[
+                    JsValue::from_f64(id as f64),
+                    method.into(),
+                    target.into(),
+                    pairs.into(),
+                    body,
+                    options.into(),
+                ],
             );
             if let Err(message) = started {
                 if let Some(r) = ctx.host_mut::<lumen_host::TaskRegistry>() {
@@ -57,13 +85,16 @@ pub(crate) mod http_ops {
                 }
                 return Err(NativeError::type_error(format!("fetch failed: {message}")).into());
             }
-            Ok(())
+            Ok(ctx.new_instance(crate::request_control::RequestControl { id }))
         }
     }
 
-    /// `ok` events carry `[status, statusText, url, body, name1, value1, ...]`, `error` events the
-    /// failure message.
-    fn decode_fetch(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+    /// Headers arrive before the body: `[status, statusText, url, requestIdOrNull,
+    /// name1, value1, ...]`. Byte payloads remain accepted from older embedders.
+    fn decode_fetch(
+        ctx: &mut Ctx,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Result<Vec<Value>, Value> {
         let event = *payload.downcast::<Event>().expect("fetch payload");
         if event.kind != "ok" {
             let message = match event.args.into_iter().next() {
@@ -72,29 +103,58 @@ pub(crate) mod http_ops {
             };
             return Err(ctx.make_error("TypeError", message));
         }
-        let mut it = event.args.into_iter();
+        let mut it = event.args.into_iter().peekable();
         let (
             Some(Arg::Data(Data::Float(status))),
             Some(Arg::Data(Data::Str(status_text))),
             Some(Arg::Data(Data::Str(url))),
-            Some(Arg::Data(Data::Bytes(body))),
-        ) =
-            (it.next(), it.next(), it.next(), it.next())
+            Some(body),
+        ) = (it.next(), it.next(), it.next(), it.next())
         else {
             return Err(ctx.make_error("TypeError", "fetch: malformed response from the host"));
         };
+        let metadata = if matches!(it.peek(), Some(Arg::Data(Data::Bool(_)))) {
+            match (it.next(), it.next()) {
+                (Some(Arg::Data(Data::Bool(redirected))), Some(Arg::Data(Data::Str(kind)))) => {
+                    Some((redirected, kind))
+                }
+                _ => return Err(ctx.make_error("TypeError", "fetch: malformed response metadata")),
+            }
+        } else {
+            None
+        };
         let mut pairs = Vec::new();
-        while let (Some(Arg::Data(Data::Str(k))), Some(Arg::Data(Data::Str(v)))) = (it.next(), it.next()) {
+        while let (Some(Arg::Data(Data::Str(k))), Some(Arg::Data(Data::Str(v)))) =
+            (it.next(), it.next())
+        {
             pairs.push(ctx.make_array(vec![Value::from_string(k), Value::from_string(v)]));
         }
         let obj = Value::Obj(ctx.new_object());
+        if let Some((redirected, kind)) = metadata {
+            let _ = ctx.set_member(&obj, "redirected", Value::Bool(redirected));
+            let _ = ctx.set_member(&obj, "type", Value::from_string(kind));
+        }
         let _ = ctx.set_member(&obj, "status", Value::Num(status));
         let _ = ctx.set_member(&obj, "statusText", Value::from_string(status_text));
         let _ = ctx.set_member(&obj, "url", Value::from_string(url));
         let headers = ctx.make_array(pairs);
         let _ = ctx.set_member(&obj, "headers", headers);
-        let body = arg_value(ctx, body.into())?;
-        let _ = ctx.set_member(&obj, "body", body);
+        match body {
+            Arg::Data(Data::Float(id)) if id.is_finite() && id >= 0.0 && id.fract() == 0.0 => {
+                let reader = ctx.new_instance(crate::http_body::ResponseBody {
+                    request_id: id as u64,
+                });
+                let _ = ctx.set_member(&obj, "bodyReader", reader);
+            }
+            Arg::Null => {
+                let _ = ctx.set_member(&obj, "body", Value::Null);
+            }
+            body @ Arg::Data(Data::Bytes(_)) => {
+                let body = arg_value(ctx, body)?;
+                let _ = ctx.set_member(&obj, "body", body);
+            }
+            _ => return Err(ctx.make_error("TypeError", "fetch: invalid body handle")),
+        }
         Ok(vec![obj])
     }
 }
@@ -114,9 +174,16 @@ pub(crate) mod websocket {
         /// `__ws.connect(url, protocols, dispatch)` -> id. The host opens a browser `WebSocket`
         /// and pushes `open` / `text` / `binary` / `close` / `error` events for the returned id.
         #[op(coerce)]
-        fn connect(ctx: &mut Ctx, target: String, protocols: String, dispatch: Value) -> Result<f64, NativeError> {
+        fn connect(
+            ctx: &mut Ctx,
+            target: String,
+            protocols: String,
+            dispatch: Value,
+        ) -> Result<f64, NativeError> {
             if !dispatch.is_callable() {
-                return Err(NativeError::type_error("connect: dispatch must be a function"));
+                return Err(NativeError::type_error(
+                    "connect: dispatch must be a function",
+                ));
             }
             let id = {
                 let registry = ctx
@@ -126,7 +193,11 @@ pub(crate) mod websocket {
             };
             if let Err(message) = call_host(
                 "wsOpen",
-                &[JsValue::from_f64(id as f64), target.into(), protocols.into()],
+                &[
+                    JsValue::from_f64(id as f64),
+                    target.into(),
+                    protocols.into(),
+                ],
             ) {
                 if let Some(r) = ctx.host_mut::<lumen_host::TaskRegistry>() {
                     r.cancel(id);
@@ -145,7 +216,9 @@ pub(crate) mod websocket {
             };
             match call_host("wsSend", &[JsValue::from_f64(id), data]) {
                 Ok(v) => Ok(v.as_bool().unwrap_or(true)),
-                Err(message) => Err(NativeError::runtime(format!("WebSocket send: {message}")).into()),
+                Err(message) => {
+                    Err(NativeError::runtime(format!("WebSocket send: {message}")).into())
+                }
             }
         }
 
@@ -153,7 +226,14 @@ pub(crate) mod websocket {
         #[op(coerce)]
         fn close(id: f64, code: Option<f64>, reason: String) {
             let code = code.unwrap_or(1000.0);
-            let _ = call_host("wsClose", &[JsValue::from_f64(id), JsValue::from_f64(code), reason.into()]);
+            let _ = call_host(
+                "wsClose",
+                &[
+                    JsValue::from_f64(id),
+                    JsValue::from_f64(code),
+                    reason.into(),
+                ],
+            );
         }
 
         #[op]

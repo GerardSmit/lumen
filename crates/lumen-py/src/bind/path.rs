@@ -35,7 +35,11 @@ impl<const FD: bool> FsPath<FD> {
 /// `s` as `str`, or as `bytes` when `bytes`.
 pub fn wrap_path(bytes: bool, s: String) -> Value {
     if bytes {
-        Value::bytes(lumen_common::smuggle::unescape_text(&s).into_owned().into_bytes())
+        Value::bytes(
+            lumen_common::smuggle::unescape_text(&s)
+                .into_owned()
+                .into_bytes(),
+        )
     } else {
         Value::string(s)
     }
@@ -57,7 +61,10 @@ pub fn fspath(it: &mut Interp, v: &Value) -> R<Value> {
     let t = it.type_of(v);
     let Some(m) = it.lookup_mro(&t, "__fspath__") else {
         let n = it.type_name(&t);
-        return Err(it.type_error(&format!("expected str, bytes or os.PathLike object, not {}", n)));
+        return Err(it.type_error(&format!(
+            "expected str, bytes or os.PathLike object, not {}",
+            n
+        )));
     };
     let f = it.bind_descr(&m, v, &t)?;
     let r = it.call(&f, Vec::new(), Vec::new())?;
@@ -65,14 +72,20 @@ pub fn fspath(it: &mut Interp, v: &Value) -> R<Value> {
         return Ok(r);
     }
     let (n, rn) = (it.type_name(&t), it.type_name_of(&r));
-    Err(it.type_error(&format!("expected {}.__fspath__() to return str or bytes, not {}", n, rn)))
+    Err(it.type_error(&format!(
+        "expected {}.__fspath__() to return str or bytes, not {}",
+        n, rn
+    )))
 }
 
 /// `PyUnicode_FSConverter` to raw bytes: `str` is encoded as `utf-8`/`surrogateescape`.
 pub fn fs_bytes(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
     let mut p = fspath(it, v)?;
     if p.as_str().is_some() {
-        let args = vec![Value::string("utf-8".to_string()), Value::string("surrogateescape".to_string())];
+        let args = vec![
+            Value::string("utf-8".to_string()),
+            Value::string("surrogateescape".to_string()),
+        ];
         p = it.call_method(&p, "encode", args)?;
     }
     let b = match &p {
@@ -88,38 +101,68 @@ pub fn fs_bytes(it: &mut Interp, v: &Value) -> R<Vec<u8>> {
     Ok(b)
 }
 
-fn convert<const FD: bool>(it: &mut Interp, d: &'static FnDesc, at: Slot, v: &Value) -> R<FsPath<FD>> {
+fn convert<const FD: bool>(
+    it: &mut Interp,
+    d: &'static FnDesc,
+    at: Slot,
+    v: &Value,
+) -> R<FsPath<FD>> {
     let fname = args::py_name(d);
-    let argname = at.index().and_then(|i| d.named().nth(i as usize)).map(|p| p.name).unwrap_or("path");
+    let argname = at
+        .index()
+        .and_then(|i| d.named().nth(i as usize))
+        .map(|p| p.name)
+        .unwrap_or("path");
     convert_path(it, fname, argname, v, FD, false)
 }
 
 /// CPython's `path_converter` for `fname`'s argument `argname`: `allow_fd` accepts an `int`,
 /// `nullable` accepts `None` (as `"."`).
-pub fn convert_path<const FD: bool>(it: &mut Interp, fname: &str, argname: &str, v: &Value, allow_fd: bool, nullable: bool) -> R<FsPath<FD>> {
+pub fn convert_path<const FD: bool>(
+    it: &mut Interp,
+    fname: &str,
+    argname: &str,
+    v: &Value,
+    allow_fd: bool,
+    nullable: bool,
+) -> R<FsPath<FD>> {
     if nullable && matches!(v, Value::None) {
-        return Ok(FsPath { path: ".".to_string(), fd: None, bytes: false, obj: Value::None });
+        return Ok(FsPath {
+            path: ".".to_string(),
+            fd: None,
+            bytes: false,
+            obj: Value::None,
+        });
     }
     if allow_fd && v.is_int_like() && !matches!(v, Value::Bool(_)) {
         let fd = convert::to_int(it, v, IntKind::new(32, true, false))? as i32;
-        return Ok(FsPath { path: String::new(), fd: Some(fd), bytes: false, obj: v.clone() });
+        return Ok(FsPath {
+            path: String::new(),
+            fd: Some(fd),
+            bytes: false,
+            obj: v.clone(),
+        });
     }
-    let resolved = if v.as_str().is_some() || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_))) {
-        v.clone()
-    } else {
-        let t = it.type_of(v);
-        if it.lookup_mro(&t, "__fspath__").is_none() {
-            let what = match (allow_fd, nullable) {
-                (true, true) => "string, bytes, os.PathLike, integer or None",
-                (true, false) => "string, bytes, os.PathLike or integer",
-                (false, true) => "string, bytes, os.PathLike or None",
-                (false, false) => "string, bytes or os.PathLike",
-            };
-            let tn = it.type_name(&t);
-            return Err(it.type_error(&format!("{}: {} should be {}, not {}", fname, argname, what, tn)));
-        }
-        fspath(it, v)?
-    };
+    let resolved =
+        if v.as_str().is_some() || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_))) {
+            v.clone()
+        } else {
+            let t = it.type_of(v);
+            if it.lookup_mro(&t, "__fspath__").is_none() {
+                let what = match (allow_fd, nullable) {
+                    (true, true) => "string, bytes, os.PathLike, integer or None",
+                    (true, false) => "string, bytes, os.PathLike or integer",
+                    (false, true) => "string, bytes, os.PathLike or None",
+                    (false, false) => "string, bytes or os.PathLike",
+                };
+                let tn = it.type_name(&t);
+                return Err(it.type_error(&format!(
+                    "{}: {} should be {}, not {}",
+                    fname, argname, what, tn
+                )));
+            }
+            fspath(it, v)?
+        };
     let (path, bytes) = match &resolved {
         Value::Obj(o) => match &o.kind {
             Kind::Str(s) => (s.s.to_string(), false),
@@ -129,9 +172,17 @@ pub fn convert_path<const FD: bool>(it: &mut Interp, fname: &str, argname: &str,
         _ => unreachable!("fspath returns str or bytes"),
     };
     if path.contains('\0') {
-        return Err(it.value_error(&format!("{}: embedded null character in {}", fname, argname)));
+        return Err(it.value_error(&format!(
+            "{}: embedded null character in {}",
+            fname, argname
+        )));
     }
-    Ok(FsPath { path, fd: None, bytes, obj: v.clone() })
+    Ok(FsPath {
+        path,
+        fd: None,
+        bytes,
+        obj: v.clone(),
+    })
 }
 
 impl<'a, const FD: bool> FromArg<'a, PyHost> for FsPath<FD> {

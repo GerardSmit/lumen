@@ -189,7 +189,13 @@ mod system {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios", not(unix))))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    not(unix)
+)))]
 mod system {
     pub(super) static TABLE: &[(&str, i32, &str)] = &[];
 }
@@ -215,7 +221,9 @@ pub fn code_of_errno(n: i32) -> Option<&'static str> {
 
 /// `strerror` text for a libuv name.
 pub fn message(code: &str) -> &'static str {
-    entries().find(|e| e.0 == code).map_or("Unknown error", |e| e.2)
+    entries()
+        .find(|e| e.0 == code)
+        .map_or("Unknown error", |e| e.2)
 }
 
 /// The C library's `strerror` for a numeric errno (the table's text off Unix).
@@ -311,8 +319,8 @@ fn os_code(n: i32) -> Option<&'static str> {
         740 | 998 | 1920 => "EACCES",
         1314 => "EPERM", // PRIVILEGE_NOT_HELD
         1921 => "ELOOP",
-        4390 => "EINVAL", // NOT_A_REPARSE_POINT
-        4393 => "EINVAL", // INVALID_REPARSE_DATA
+        4390 => "EINVAL",  // NOT_A_REPARSE_POINT
+        4393 => "EINVAL",  // INVALID_REPARSE_DATA
         10022 => "EINVAL", // WSAEINVAL
         10038 => "ENOTSOCK",
         10040 => "EMSGSIZE",
@@ -403,7 +411,12 @@ pub fn errno_location() -> *mut libc::c_int {
     unsafe {
         libc::__errno()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "android"
+    )))]
     unsafe {
         libc::__errno_location()
     }
@@ -429,7 +442,10 @@ mod tests {
         let e = io::Error::from_raw_os_error(errno_of_code("ENOENT").unwrap());
         assert_eq!(uv_code(&e), "ENOENT");
         assert_eq!(FsError::from(e).errno(), errno_of_code("ENOENT").unwrap());
-        assert_eq!(code_of_errno(errno_of_code("EEXIST").unwrap()), Some("EEXIST"));
+        assert_eq!(
+            code_of_errno(errno_of_code("EEXIST").unwrap()),
+            Some("EEXIST")
+        );
         assert_eq!(message("ENOTDIR"), "Not a directory");
         assert_eq!(errno_of_code("EOF"), None);
         let kind_only = io::Error::from(io::ErrorKind::PermissionDenied);

@@ -69,11 +69,15 @@ pub fn fast_eq(a: &Value, b: &Value) -> Option<bool> {
         (Value::None, Value::None) => Some(true),
         (Value::Bool(x), Value::Bool(y)) => Some(x == y),
         (Value::Bool(x), Value::Int(y)) | (Value::Int(y), Value::Bool(x)) => Some(*x as i64 == *y),
-        (Value::Float(x), Value::Float(y)) => Some(x == y || (x.is_nan() && x.to_bits() == y.to_bits())),
+        (Value::Float(x), Value::Float(y)) => {
+            Some(x == y || (x.is_nan() && x.to_bits() == y.to_bits()))
+        }
         (Value::Float(x), Value::Int(y)) | (Value::Int(y), Value::Float(x)) => {
             Some(*x == *y as f64 && (*y as f64) as i64 == *y)
         }
-        (Value::Float(x), Value::Bool(y)) | (Value::Bool(y), Value::Float(x)) => Some(*x == *y as i64 as f64),
+        (Value::Float(x), Value::Bool(y)) | (Value::Bool(y), Value::Float(x)) => {
+            Some(*x == *y as i64 as f64)
+        }
         (Value::Obj(x), Value::Obj(y)) => {
             if Rc::ptr_eq(x, y) {
                 return Some(true);
@@ -98,15 +102,22 @@ pub fn fast_eq(a: &Value, b: &Value) -> Option<bool> {
                 }
                 (Kind::Int(s), Kind::Int(t)) => Some(s == t),
                 (Kind::Bytes(s), Kind::Bytes(t)) => Some(s == t),
-                (Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_), Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_)) => Some(false),
+                (
+                    Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_),
+                    Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_),
+                ) => Some(false),
                 _ => None,
             }
         }
         (Value::Obj(o), Value::Int(_) | Value::Bool(_) | Value::None | Value::Float(_))
         | (Value::Int(_) | Value::Bool(_) | Value::None | Value::Float(_), Value::Obj(o)) => {
             let plain = o.cls.is_none();
-            let int_vs_int = matches!(&o.kind, Kind::Int(_)) && !matches!(a, Value::Float(_) | Value::None) && !matches!(b, Value::Float(_) | Value::None);
-            if plain && (matches!(&o.kind, Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_)) || int_vs_int) {
+            let int_vs_int = matches!(&o.kind, Kind::Int(_))
+                && !matches!(a, Value::Float(_) | Value::None)
+                && !matches!(b, Value::Float(_) | Value::None);
+            if plain
+                && (matches!(&o.kind, Kind::Str(_) | Kind::Tuple(_) | Kind::Bytes(_)) || int_vs_int)
+            {
                 Some(false)
             } else {
                 None
@@ -119,7 +130,11 @@ pub fn fast_eq(a: &Value, b: &Value) -> Option<bool> {
 
 fn probe_next(slot: usize, perturb: &mut u64, mask: usize) -> usize {
     *perturb >>= 5;
-    (slot.wrapping_mul(5).wrapping_add(*perturb as usize).wrapping_add(1)) & mask
+    (slot
+        .wrapping_mul(5)
+        .wrapping_add(*perturb as usize)
+        .wrapping_add(1))
+        & mask
 }
 
 impl PyDict {
@@ -140,14 +155,22 @@ impl PyDict {
         let mut i = (hash as u64 as usize) & mask;
         let mut perturb = hash as u64;
         loop {
-            let probes = if i + SET_LINEAR <= mask { SET_LINEAR } else { 0 };
+            let probes = if i + SET_LINEAR <= mask {
+                SET_LINEAR
+            } else {
+                0
+            };
             for k in 0..=probes {
                 if visit(i + k) {
                     return;
                 }
             }
             perturb >>= 5;
-            i = i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize) & mask;
+            i = i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize)
+                & mask;
         }
     }
 
@@ -187,7 +210,11 @@ impl PyDict {
         let mut i = (e.hash as u64 as usize) & mask;
         let mut perturb = e.hash as u64;
         loop {
-            let probes = if i + SET_LINEAR <= mask { SET_LINEAR } else { 0 };
+            let probes = if i + SET_LINEAR <= mask {
+                SET_LINEAR
+            } else {
+                0
+            };
             for k in 0..=probes {
                 if entries[i + k].is_none() {
                     entries[i + k] = Some(e);
@@ -195,7 +222,11 @@ impl PyDict {
                 }
             }
             perturb >>= 5;
-            i = i.wrapping_mul(5).wrapping_add(1).wrapping_add(perturb as usize) & mask;
+            i = i
+                .wrapping_mul(5)
+                .wrapping_add(1)
+                .wrapping_add(perturb as usize)
+                & mask;
         }
     }
 
@@ -248,7 +279,11 @@ impl PyDict {
         self.fill += 1;
         let mask = self.entries.len() - 1;
         if self.fill * 5 >= mask * 3 {
-            let target = if self.live > 50000 { self.live * 2 } else { self.live * 4 };
+            let target = if self.live > 50000 {
+                self.live * 2
+            } else {
+                self.live * 4
+            };
             self.set_resize(target);
             return self.set_slot_of(hash);
         }
@@ -311,7 +346,13 @@ impl PyDict {
     pub fn notify_cloned(&self) {
         let mask = self.watch.0.get();
         if mask != 0 {
-            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Cloned, None, None);
+            watch::dict_event(
+                mask,
+                self as *const PyDict as usize,
+                DictEvent::Cloned,
+                None,
+                None,
+            );
         }
     }
 
@@ -466,7 +507,13 @@ impl PyDict {
         self.version.0.set(0);
         let mask = self.watch.0.get();
         if mask != 0 && !self.set_mode {
-            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Added, Some(&key), Some(&val));
+            watch::dict_event(
+                mask,
+                self as *const PyDict as usize,
+                DictEvent::Added,
+                Some(&key),
+                Some(&val),
+            );
         }
         if self.set_mode {
             return self.set_insert(hash, key, val);
@@ -489,7 +536,13 @@ impl PyDict {
         let mask = self.watch.0.get();
         if mask != 0 && !self.set_mode {
             if let Some(Some(e)) = self.entries.get(idx) {
-                watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Deleted, Some(&e.key), None);
+                watch::dict_event(
+                    mask,
+                    self as *const PyDict as usize,
+                    DictEvent::Deleted,
+                    Some(&e.key),
+                    None,
+                );
             }
         }
         if self.set_mode {
@@ -532,7 +585,13 @@ impl PyDict {
     pub fn clear(&mut self) {
         let mask = self.watch.0.get();
         if mask != 0 && !self.set_mode {
-            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Cleared, None, None);
+            watch::dict_event(
+                mask,
+                self as *const PyDict as usize,
+                DictEvent::Cleared,
+                None,
+                None,
+            );
         }
         if self.live > 0 {
             self.version.0.set(0);
@@ -581,7 +640,9 @@ impl PyDict {
     }
 
     pub fn last_live(&self) -> Option<usize> {
-        (0..self.entries.len()).rev().find(|&i| self.entries[i].is_some())
+        (0..self.entries.len())
+            .rev()
+            .find(|&i| self.entries[i].is_some())
     }
 }
 
@@ -633,7 +694,9 @@ mod tests {
     #[test]
     fn set_removal_leaves_probe_chains_intact() {
         let mut d = int_set(&[0, 8, 16, 24]);
-        let Lookup::Found(slot) = d.lookup(8, &Value::Int(8)) else { panic!("missing") };
+        let Lookup::Found(slot) = d.lookup(8, &Value::Int(8)) else {
+            panic!("missing")
+        };
         assert!(d.remove(slot).is_some());
         assert!(matches!(d.lookup(8, &Value::Int(8)), Lookup::Missing));
         assert!(matches!(d.lookup(24, &Value::Int(24)), Lookup::Found(_)));
@@ -653,7 +716,10 @@ mod tests {
                 d.remove(ix);
             }
         }
-        assert_eq!(order(&d), (0..40).filter(|i| i % 2 == 1).collect::<Vec<_>>());
+        assert_eq!(
+            order(&d),
+            (0..40).filter(|i| i % 2 == 1).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -661,7 +727,13 @@ impl Drop for PyDict {
     fn drop(&mut self) {
         let mask = self.watch.0.get();
         if mask != 0 && !self.set_mode {
-            watch::dict_event(mask, self as *const PyDict as usize, DictEvent::Deallocated, None, None);
+            watch::dict_event(
+                mask,
+                self as *const PyDict as usize,
+                DictEvent::Deallocated,
+                None,
+                None,
+            );
         }
     }
 }

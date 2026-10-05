@@ -24,10 +24,14 @@ mod bindings {
         match gai_lookup(&hostname, family as u8, flags as i32) {
             Ok(list) => Ok(Data::List(
                 list.into_iter()
-                    .map(|(address, family)| Data::List(vec![Data::Str(address), Data::Int(family as i64)]))
+                    .map(|(address, family)| {
+                        Data::List(vec![Data::Str(address), Data::Int(family as i64)])
+                    })
                     .collect(),
             )),
-            Err(code) => Err(SendError::new("Error", format!("getaddrinfo {code}")).with_code(code)),
+            Err(code) => {
+                Err(SendError::new("Error", format!("getaddrinfo {code}")).with_code(code))
+            }
         }
     }
 
@@ -36,7 +40,9 @@ mod bindings {
     fn op_getnameinfo(address: String, port: f64) -> Result<Data, SendError> {
         match name_info(&address, port as u16) {
             Ok((host, service)) => Ok(Data::List(vec![Data::Str(host), Data::Str(service)])),
-            Err(code) => Err(SendError::new("Error", format!("getnameinfo {code}")).with_code(code)),
+            Err(code) => {
+                Err(SendError::new("Error", format!("getnameinfo {code}")).with_code(code))
+            }
         }
     }
 
@@ -44,7 +50,10 @@ mod bindings {
     /// `Resolver`'s initial server list. Reading the file is cheap, so this stays synchronous.
     #[op(name = "getServers")]
     fn op_get_servers() -> Vec<String> {
-        resolv_nameservers().into_iter().map(|ip| ip.to_string()).collect()
+        resolv_nameservers()
+            .into_iter()
+            .map(|ip| ip.to_string())
+            .collect()
     }
 }
 
@@ -75,7 +84,9 @@ fn gai_lookup(hostname: &str, family: u8, flags: i32) -> Result<Vec<(String, u8)
 /// Resolve through `ToSocketAddrs`, keeping only the requested family (0 = both).
 #[cfg(not(unix))]
 fn gai_lookup(hostname: &str, family: u8, _flags: i32) -> Result<Vec<(String, u8)>, &'static str> {
-    let addrs = (hostname, 0u16).to_socket_addrs().map_err(|_| "EAI_NONAME")?;
+    let addrs = (hostname, 0u16)
+        .to_socket_addrs()
+        .map_err(|_| "EAI_NONAME")?;
     let out: Vec<(String, u8)> = addrs
         .map(|a| (a.ip().to_string(), if a.is_ipv6() { 6 } else { 4 }))
         .filter(|(_, fam)| family == 0 || family == *fam)

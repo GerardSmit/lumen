@@ -143,8 +143,13 @@ pub enum BitOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ext {
     /// `movsx`/`movzx` from 8 or 16 bits into 32 or 64; `movsxd` from 32 into 64.
-    S { from: u8, to: Size },
-    Z { from: u8 },
+    S {
+        from: u8,
+        to: Size,
+    },
+    Z {
+        from: u8,
+    },
 }
 
 /// A load's width and extension.
@@ -155,6 +160,7 @@ pub enum LoadKind {
     Ext(Ext),
     F32,
     F64,
+    V128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +171,7 @@ pub enum StoreKind {
     B64,
     F32,
     F64,
+    V128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +208,26 @@ pub struct CallInfo {
 
 #[derive(Clone, Debug)]
 pub enum MInst {
+    /// Packed SSE2/SSE4.1 operation. `dst` is the first input and result.
+    Packed {
+        opcode: u16,
+        imm: Option<u8>,
+        dst: VReg,
+        src: VReg,
+    },
+    Prefetch {
+        addr: Amode,
+    },
+    AtomicAdd {
+        addr: VReg,
+        dst: VReg,
+    },
+    AtomicCas {
+        addr: VReg,
+        expected: VReg,
+        replacement: VReg,
+        dst: VReg,
+    },
     /// Function entry: parameters arrive in fixed registers or incoming stack slots
     /// (`[rbp + offset]`).
     Args {
@@ -216,6 +243,10 @@ pub enum MInst {
         size: Size,
         dst: VReg,
         imm: u64,
+    },
+    SymbolAddr {
+        dst: VReg,
+        id: u32,
     },
     /// `dst = dst op src`
     Alu {
@@ -445,6 +476,35 @@ impl MachInst for MInst {
     fn operands(&self, out: &mut Vec<Operand>) {
         use MInst::*;
         match self {
+            Packed { dst, src, .. } => {
+                out.push(Operand::use_any(*src));
+                out.push(Operand::mod_reg(*dst));
+            }
+            Prefetch { addr } => amode_uses(addr, out),
+            AtomicAdd { addr, dst } => {
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*addr)
+                });
+                out.push(Operand::mod_reg(*dst));
+            }
+            AtomicCas {
+                addr,
+                expected,
+                replacement,
+                dst,
+            } => {
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*addr)
+                });
+                out.push(Operand::use_fixed(*expected, super::regs::RAX));
+                out.push(Operand {
+                    late: true,
+                    ..Operand::use_reg(*replacement)
+                });
+                out.push(Operand::def_fixed(*dst, super::regs::RAX));
+            }
             Args { regs, stack } => {
                 for &(v, r) in regs {
                     out.push(Operand::def_fixed(v, r));
@@ -508,7 +568,11 @@ impl MachInst for MInst {
                     late: true,
                     ..Operand::use_any(*divisor)
                 });
-                let r = if *rem { super::regs::RDX } else { super::regs::RAX };
+                let r = if *rem {
+                    super::regs::RDX
+                } else {
+                    super::regs::RAX
+                };
                 out.push(Operand::def_fixed(*dst, r));
             }
             Bit { dst, src, .. } | MovX { dst, src, .. } => {
@@ -527,7 +591,9 @@ impl MachInst for MInst {
                 amode_uses(addr, out);
                 out.push(Operand::def_reg(*dst));
             }
-            Setcc { dst, .. } | XmmConst { dst, .. } => out.push(Operand::def_reg(*dst)),
+            Setcc { dst, .. } | XmmConst { dst, .. } | SymbolAddr { dst, .. } => {
+                out.push(Operand::def_reg(*dst))
+            }
             Cmov { dst, src, .. } => {
                 out.push(Operand::use_any(*src));
                 out.push(Operand::mod_reg(*dst));

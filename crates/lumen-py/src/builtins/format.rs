@@ -1,12 +1,12 @@
 //! The format-spec mini-language, `str.format` and `%` formatting.
 
-use crate::pyint::{BigInt, PyInt};
 use crate::fmath;
-use lumen_common::float::format::{fixed, significant};
-use lumen_common::rounding::Mode;
 use crate::num::{float_repr, to_num, Num};
 use crate::object::*;
+use crate::pyint::{BigInt, PyInt};
 use crate::vm::*;
+use lumen_common::float::format::{fixed, significant};
+use lumen_common::rounding::Mode;
 
 pub use crate::repr::ascii_escape;
 
@@ -51,16 +51,26 @@ impl Interp {
     pub fn parse_spec(&mut self, spec: &str, tname: &str) -> R<Spec> {
         let s = lumen_common::fmtspec::parse(spec).map_err(|e| match e.message() {
             Some(m) => self.value_error(m),
-            None => self.value_error(&format!("Invalid format specifier '{}' for object of type '{}'", spec, tname)),
+            None => self.value_error(&format!(
+                "Invalid format specifier '{}' for object of type '{}'",
+                spec, tname
+            )),
         })?;
         let bad_type = match (s.grouping, s.ty) {
-            (Some(g), Some(ty)) if !matches!(ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F') && !(g == '_' && matches!(ty, 'b' | 'o' | 'x' | 'X')) => {
+            (Some(g), Some(ty))
+                if !matches!(ty, 'd' | 'e' | 'f' | 'g' | 'E' | 'G' | '%' | 'F')
+                    && !(g == '_' && matches!(ty, 'b' | 'o' | 'x' | 'X')) =>
+            {
                 Some((g, ty))
             }
             _ => s.frac_grouping.zip(s.ty.filter(|&t| t == 'n')),
         };
         if let Some((g, ty)) = bad_type {
-            let ty = if ty.is_ascii_graphic() { ty.to_string() } else { format!("\\x{:x}", ty as u32) };
+            let ty = if ty.is_ascii_graphic() {
+                ty.to_string()
+            } else {
+                format!("\\x{:x}", ty as u32)
+            };
             return Err(self.value_error(&format!("Cannot specify '{g}' with '{ty}'.")));
         }
         if let Some(w) = s.width {
@@ -78,7 +88,8 @@ impl Interp {
                         Some(s) => Ok(s.to_string()),
                         None => {
                             let t = self.type_name_of(&r);
-                            Err(self.type_error(&format!("__format__ must return a str, not {}", t)))
+                            Err(self
+                                .type_error(&format!("__format__ must return a str, not {}", t)))
                         }
                     };
                 }
@@ -114,16 +125,30 @@ impl Interp {
                 }
                 let sp = self.parse_spec(spec, "complex")?;
                 if sp.zero {
-                    return Err(self.value_error("Zero padding is not allowed in complex format specifier"));
+                    return Err(
+                        self.value_error("Zero padding is not allowed in complex format specifier")
+                    );
                 }
                 if matches!(sp.align, Some('=')) {
-                    return Err(self.value_error("'=' alignment flag is not allowed in complex format specifier"));
+                    return Err(self.value_error(
+                        "'=' alignment flag is not allowed in complex format specifier",
+                    ));
                 }
-                if let Some(c) = sp.ty.filter(|c| !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n')) {
-                    return Err(self.value_error(&format!("Unknown format code '{c}' for object of type 'complex'")));
+                if let Some(c) = sp
+                    .ty
+                    .filter(|c| !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n'))
+                {
+                    return Err(self.value_error(&format!(
+                        "Unknown format code '{c}' for object of type 'complex'"
+                    )));
                 }
                 let body = match sp.ty {
-                    None if sp.precision.is_none() && sp.grouping.is_none() && sp.frac_grouping.is_none() => crate::repr::complex_repr(*re, *im),
+                    None if sp.precision.is_none()
+                        && sp.grouping.is_none()
+                        && sp.frac_grouping.is_none() =>
+                    {
+                        crate::repr::complex_repr(*re, *im)
+                    }
                     ty => {
                         let ty = ty.unwrap_or('r');
                         let part_spec = |plus: bool| {
@@ -158,26 +183,48 @@ impl Interp {
                         };
                         let show_re = !(*re == 0.0 && re.is_sign_positive() && sp.ty.is_none());
                         // Without a type the parts are reprs, which complex shows without ".0".
-                        let part = |s: String| if sp.ty.is_none() { s.strip_suffix(".0").map(str::to_string).unwrap_or(s) } else { s };
+                        let part = |s: String| {
+                            if sp.ty.is_none() {
+                                s.strip_suffix(".0").map(str::to_string).unwrap_or(s)
+                            } else {
+                                s
+                            }
+                        };
                         let i = part(self.format_float(*im, &part_spec(show_re))?);
                         let j = 'j';
                         if show_re {
                             let r = part(self.format_float(*re, &part_spec(false))?);
                             let paren = sp.ty.is_none();
-                            format!("{}{}{}{}{}{}", if paren { "(" } else { "" }, r, i, j, "", if paren { ")" } else { "" })
+                            format!(
+                                "{}{}{}{}{}{}",
+                                if paren { "(" } else { "" },
+                                r,
+                                i,
+                                j,
+                                "",
+                                if paren { ")" } else { "" }
+                            )
                         } else {
                             format!("{}{}", i, j)
                         }
                     }
                 };
-                return Ok(pad(&body, sp.width.unwrap_or(0), sp.fill.unwrap_or(' ' as u32), sp.align.unwrap_or('>')));
+                return Ok(pad(
+                    &body,
+                    sp.width.unwrap_or(0),
+                    sp.fill.unwrap_or(' ' as u32),
+                    sp.align.unwrap_or('>'),
+                ));
             }
         }
         if spec.is_empty() {
             return self.str_of(v);
         }
         let t = self.type_name_of(v);
-        Err(self.type_error(&format!("unsupported format string passed to {}.__format__", t)))
+        Err(self.type_error(&format!(
+            "unsupported format string passed to {}.__format__",
+            t
+        )))
     }
 
     fn format_str(&mut self, s: &str, spec: &str) -> R<String> {
@@ -186,17 +233,26 @@ impl Interp {
         }
         let sp = self.parse_spec(spec, "str")?;
         if sp.z {
-            return Err(self.value_error("Negative zero coercion (z) not allowed in format specifier"));
+            return Err(
+                self.value_error("Negative zero coercion (z) not allowed in format specifier")
+            );
         }
         match sp.ty {
             None | Some('s') => {}
-            Some(c) => return Err(self.value_error(&format!("Unknown format code '{}' for object of type 'str'", c))),
+            Some(c) => {
+                return Err(self.value_error(&format!(
+                    "Unknown format code '{}' for object of type 'str'",
+                    c
+                )));
+            }
         }
         if sp.sign.is_some() {
             return Err(self.value_error("Sign not allowed in string format specifier"));
         }
         if sp.alt {
-            return Err(self.value_error("Alternate form (#) not allowed in string format specifier"));
+            return Err(
+                self.value_error("Alternate form (#) not allowed in string format specifier")
+            );
         }
         if sp.align == Some('=') {
             return Err(self.value_error("'=' alignment not allowed in string format specifier"));
@@ -209,13 +265,27 @@ impl Interp {
             body.truncate(lumen_common::smuggle::code_point_offset(&body, p));
         }
         let fill = sp.fill.unwrap_or(if sp.zero { '0' } else { ' ' } as u32);
-        Ok(pad(&body, sp.width.unwrap_or(0), fill, sp.align.unwrap_or('<')))
+        Ok(pad(
+            &body,
+            sp.width.unwrap_or(0),
+            fill,
+            sp.align.unwrap_or('<'),
+        ))
     }
 
-    fn apply_number_layout(&self, sp: &Spec, sign: &str, prefix: &str, digits: &str, default_align: char) -> String {
+    fn apply_number_layout(
+        &self,
+        sp: &Spec,
+        sign: &str,
+        prefix: &str,
+        digits: &str,
+        default_align: char,
+    ) -> String {
         let width = sp.width.unwrap_or(0);
         let fill = sp.fill.unwrap_or(if sp.zero { '0' } else { ' ' } as u32);
-        let align = sp.align.unwrap_or(if sp.zero { '=' } else { default_align });
+        let align = sp
+            .align
+            .unwrap_or(if sp.zero { '=' } else { default_align });
         let body_len = sign.chars().count() + prefix.chars().count() + digits.chars().count();
         if align == '=' {
             let mut d = digits.to_string();
@@ -223,9 +293,17 @@ impl Interp {
                 let need = width - body_len;
                 if fill == '0' as u32 && sp.grouping.is_some() {
                     let sep = sp.grouping.unwrap_or(',');
-                    let size = if matches!(sp.ty, Some('b' | 'o' | 'x' | 'X')) { 4 } else { 3 };
+                    let size = if matches!(sp.ty, Some('b' | 'o' | 'x' | 'X')) {
+                        4
+                    } else {
+                        3
+                    };
                     let hex = size == 4;
-                    let split = digits.find(|c: char| !((hex && c.is_ascii_alphanumeric()) || c.is_ascii_digit() || c == sep)).unwrap_or(digits.len());
+                    let split = digits
+                        .find(|c: char| {
+                            !((hex && c.is_ascii_alphanumeric()) || c.is_ascii_digit() || c == sep)
+                        })
+                        .unwrap_or(digits.len());
                     let (int_part, rest) = digits.split_at(split);
                     let mut plain: String = int_part.chars().filter(|c| *c != sep).collect();
                     let total = width - sign.chars().count() - prefix.chars().count();
@@ -258,7 +336,9 @@ impl Interp {
         }
         let sp = self.parse_spec(spec, "int")?;
         if sp.z && !matches!(sp.ty, Some('e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%')) {
-            return Err(self.value_error("Negative zero coercion (z) not allowed in format specifier"));
+            return Err(
+                self.value_error("Negative zero coercion (z) not allowed in format specifier")
+            );
         }
         let ty = sp.ty.unwrap_or('d');
         if matches!(ty, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | '%') {
@@ -269,7 +349,10 @@ impl Interp {
             return self.format_float(f, spec);
         }
         if !matches!(ty, 'd' | 'b' | 'o' | 'x' | 'X' | 'c' | 'n') {
-            return Err(self.value_error(&format!("Unknown format code '{}' for object of type 'int'", ty)));
+            return Err(self.value_error(&format!(
+                "Unknown format code '{}' for object of type 'int'",
+                ty
+            )));
         }
         if sp.precision.is_some() {
             return Err(self.value_error("Precision not allowed in integer format specifier"));
@@ -278,13 +361,21 @@ impl Interp {
             if sp.sign.is_some() {
                 return Err(self.value_error("Sign not allowed with integer format specifier 'c'"));
             }
-            let c = n.to_i64().and_then(|i| u32::try_from(i).ok()).and_then(lumen_common::smuggle::code_point_str);
+            let c = n
+                .to_i64()
+                .and_then(|i| u32::try_from(i).ok())
+                .and_then(lumen_common::smuggle::code_point_str);
             let c = match c {
                 Some(c) => c,
                 None => return Err(self.overflow_err("%c arg not in range(0x110000)")),
             };
             let fill = sp.fill.unwrap_or(' ' as u32);
-            return Ok(pad(&c, sp.width.unwrap_or(0), fill, sp.align.unwrap_or('>')));
+            return Ok(pad(
+                &c,
+                sp.width.unwrap_or(0),
+                fill,
+                sp.align.unwrap_or('>'),
+            ));
         }
         let neg = n.is_negative();
         let mag = n.abs();
@@ -294,7 +385,11 @@ impl Interp {
             'x' | 'X' => (16, "0x"),
             _ => (10, ""),
         };
-        let mut digits = if radix == 10 { self.int_to_decimal(&mag)? } else { mag.to_string_radix(radix) };
+        let mut digits = if radix == 10 {
+            self.int_to_decimal(&mag)?
+        } else {
+            mag.to_string_radix(radix)
+        };
         if ty == 'X' {
             digits = digits.to_uppercase();
         }
@@ -344,7 +439,10 @@ impl Interp {
         let ty = sp.ty;
         if let Some(c) = ty {
             if !matches!(c, 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
-                return Err(self.value_error(&format!("Unknown format code '{}' for object of type 'float'", c)));
+                return Err(self.value_error(&format!(
+                    "Unknown format code '{}' for object of type 'float'",
+                    c
+                )));
             }
         }
         let neg = f.is_sign_negative() && !f.is_nan();
@@ -359,12 +457,18 @@ impl Interp {
                 Some('f') | Some('F') => fixed(a, sp.precision.unwrap_or(6), Mode::HalfEven),
                 Some('e') | Some('E') => fmt_exp(a, sp.precision.unwrap_or(6), sp.alt),
                 Some('%') => fixed(a * 100.0, sp.precision.unwrap_or(6), Mode::HalfEven),
-                Some('g') | Some('G') | Some('n') => fmt_general(a, sp.precision.unwrap_or(6), sp.alt),
+                Some('g') | Some('G') | Some('n') => {
+                    fmt_general(a, sp.precision.unwrap_or(6), sp.alt)
+                }
                 _ => match sp.precision {
                     None => float_repr(a),
                     Some(p) => {
                         let g = fmt_general_with(a, p, sp.alt, 1);
-                        if g.contains('.') || g.contains('e') || g.contains("inf") || g.contains("nan") {
+                        if g.contains('.')
+                            || g.contains('e')
+                            || g.contains("inf")
+                            || g.contains("nan")
+                        {
                             g
                         } else {
                             format!("{}.0", g)
@@ -373,7 +477,13 @@ impl Interp {
                 },
             }
         };
-        if sp.alt && !body.contains('.') && !body.contains('e') && !a.is_nan() && !a.is_infinite() && matches!(ty, Some('f') | Some('F') | Some('%')) {
+        if sp.alt
+            && !body.contains('.')
+            && !body.contains('e')
+            && !a.is_nan()
+            && !a.is_infinite()
+            && matches!(ty, Some('f') | Some('F') | Some('%'))
+        {
             body.push('.');
         }
         if ty == Some('%') {
@@ -384,9 +494,17 @@ impl Interp {
         }
         if let Some(g) = sp.frac_grouping {
             if let Some(dot) = body.find('.') {
-                let frac_len = body[dot + 1..].find(|c: char| !c.is_ascii_digit()).unwrap_or(body.len() - dot - 1);
-                let grouped = lumen_common::fmtspec::group_fraction(&body[dot + 1..dot + 1 + frac_len], g);
-                body = format!("{}.{}{}", &body[..dot], grouped, &body[dot + 1 + frac_len..]);
+                let frac_len = body[dot + 1..]
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(body.len() - dot - 1);
+                let grouped =
+                    lumen_common::fmtspec::group_fraction(&body[dot + 1..dot + 1 + frac_len], g);
+                body = format!(
+                    "{}.{}{}",
+                    &body[..dot],
+                    grouped,
+                    &body[dot + 1 + frac_len..]
+                );
             }
         }
         if let Some(g) = sp.grouping {
@@ -396,7 +514,8 @@ impl Interp {
             };
             body = format!("{}{}", group_digits(&int_part, g, 3), rest);
         }
-        let neg = neg && !(sp.z && a.is_finite() && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
+        let neg = neg
+            && !(sp.z && a.is_finite() && !body.chars().any(|c| c.is_ascii_digit() && c != '0'));
         let sign = if neg {
             "-"
         } else {
@@ -407,7 +526,10 @@ impl Interp {
             }
         };
         if !a.is_finite() && sp.grouping.is_some() {
-            let plain = Spec { grouping: None, ..sp.clone() };
+            let plain = Spec {
+                grouping: None,
+                ..sp.clone()
+            };
             return Ok(self.apply_number_layout(&plain, sign, "", &body, '>'));
         }
         Ok(self.apply_number_layout(&sp, sign, "", &body, '>'))
@@ -423,7 +545,16 @@ impl Interp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn format_template(&mut self, fmt: &str, args: &[Value], kw: &[(Obj, Value)], auto: &mut usize, manual: &mut bool, auto_used: &mut bool, depth: u32) -> R<String> {
+    fn format_template(
+        &mut self,
+        fmt: &str,
+        args: &[Value],
+        kw: &[(Obj, Value)],
+        auto: &mut usize,
+        manual: &mut bool,
+        auto_used: &mut bool,
+        depth: u32,
+    ) -> R<String> {
         if depth == 0 {
             return Err(self.value_error("Max string recursion exceeded"));
         }
@@ -479,7 +610,16 @@ impl Interp {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn format_field(&mut self, field: &str, args: &[Value], kw: &[(Obj, Value)], auto: &mut usize, manual: &mut bool, auto_used: &mut bool, depth: u32) -> R<String> {
+    fn format_field(
+        &mut self,
+        field: &str,
+        args: &[Value],
+        kw: &[(Obj, Value)],
+        auto: &mut usize,
+        manual: &mut bool,
+        auto_used: &mut bool,
+        depth: u32,
+    ) -> R<String> {
         let chars: Vec<char> = field.chars().collect();
         let mut i = 0;
         let mut bracket = 0;
@@ -497,7 +637,9 @@ impl Interp {
         let mut spec = String::new();
         if i < chars.len() && chars[i] == '!' {
             if i + 1 >= chars.len() {
-                return Err(self.value_error("end of string while looking for conversion specifier"));
+                return Err(
+                    self.value_error("end of string while looking for conversion specifier")
+                );
             }
             conv = Some(chars[i + 1]);
             i += 2;
@@ -513,24 +655,44 @@ impl Interp {
         let rest = &name[first_end..];
         let mut value = if first.is_empty() {
             if *manual {
-                return Err(self.value_error("cannot switch from manual field specification to automatic field numbering"));
+                return Err(self.value_error(
+                    "cannot switch from manual field specification to automatic field numbering",
+                ));
             }
             *auto_used = true;
             let idx = *auto;
             *auto += 1;
             match args.get(idx) {
                 Some(v) => v.clone(),
-                None => return Err(self.new_exc_str("IndexError", &format!("Replacement index {} out of range for positional args tuple", idx))),
+                None => {
+                    return Err(self.new_exc_str(
+                        "IndexError",
+                        &format!(
+                            "Replacement index {} out of range for positional args tuple",
+                            idx
+                        ),
+                    ));
+                }
             }
         } else if first.chars().all(|c| c.is_ascii_digit()) {
             if *auto_used {
-                return Err(self.value_error("cannot switch from automatic field numbering to manual field specification"));
+                return Err(self.value_error(
+                    "cannot switch from automatic field numbering to manual field specification",
+                ));
             }
             *manual = true;
             let idx: usize = first.parse().unwrap_or(usize::MAX);
             match args.get(idx) {
                 Some(v) => v.clone(),
-                None => return Err(self.new_exc_str("IndexError", &format!("Replacement index {} out of range for positional args tuple", idx))),
+                None => {
+                    return Err(self.new_exc_str(
+                        "IndexError",
+                        &format!(
+                            "Replacement index {} out of range for positional args tuple",
+                            idx
+                        ),
+                    ));
+                }
             }
         } else {
             match Interp::kw_get(kw, first) {
@@ -558,11 +720,17 @@ impl Interp {
                     return Err(self.value_error("Missing ']' in format string"));
                 }
                 let key: String = rc[k + 1..e].iter().collect();
-                let kv = if !key.is_empty() && key.chars().all(|c| c.is_ascii_digit()) { Value::Int(key.parse().unwrap_or(0)) } else { Value::str(&key) };
+                let kv = if !key.is_empty() && key.chars().all(|c| c.is_ascii_digit()) {
+                    Value::Int(key.parse().unwrap_or(0))
+                } else {
+                    Value::str(&key)
+                };
                 value = self.getitem(&value, &kv)?;
                 k = e + 1;
             } else {
-                return Err(self.value_error("Only '.' or '[' may follow ']' in format field specifier"));
+                return Err(
+                    self.value_error("Only '.' or '[' may follow ']' in format field specifier")
+                );
             }
         }
         value = match conv {
@@ -572,7 +740,11 @@ impl Interp {
             Some('a') => Value::string(ascii_escape(&self.repr_of(&value)?)),
             Some(c) => return Err(self.value_error(&format!("Unknown conversion specifier {}", c))),
         };
-        let spec = if spec.contains('{') { self.format_template(&spec, args, kw, auto, manual, auto_used, depth - 1)? } else { spec };
+        let spec = if spec.contains('{') {
+            self.format_template(&spec, args, kw, auto, manual, auto_used, depth - 1)?
+        } else {
+            spec
+        };
         self.format_value(&value, &spec)
     }
 }
@@ -597,7 +769,11 @@ fn fmt_general_with(a: f64, prec: usize, alt: bool, shorten: i32) -> String {
     let p = if prec == 0 { 1 } else { prec };
     let (_, x) = significant(a, p, Mode::HalfEven);
     if a == 0.0 && shorten == 0 {
-        return if alt { format!("0.{}", "0".repeat(p - 1)) } else { "0".into() };
+        return if alt {
+            format!("0.{}", "0".repeat(p - 1))
+        } else {
+            "0".into()
+        };
     }
     if x >= -4 && x < p as i32 - shorten {
         let decimals = (p as i32 - 1 - x).max(0) as usize;
@@ -639,8 +815,13 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
         Some(t) => (t.to_vec(), None),
         None => {
             let is_map = matches!(args, Value::Obj(o) if matches!(o.kind, Kind::Dict(_)))
-                || (matches!(args, Value::Obj(o) if o.cls.is_some()) && it.lookup_mro(&it.type_of(args), "__getitem__").is_some() && !matches!(args, Value::Obj(o) if matches!(o.kind, Kind::Str(_) | Kind::Tuple(_) | Kind::List(_))));
-            (vec![args.clone()], if is_map { Some(args.clone()) } else { None })
+                || (matches!(args, Value::Obj(o) if o.cls.is_some())
+                    && it.lookup_mro(&it.type_of(args), "__getitem__").is_some()
+                    && !matches!(args, Value::Obj(o) if matches!(o.kind, Kind::Str(_) | Kind::Tuple(_) | Kind::List(_))));
+            (
+                vec![args.clone()],
+                if is_map { Some(args.clone()) } else { None },
+            )
         }
     };
     let mut next = 0usize;
@@ -672,7 +853,8 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
             key = Some(f[i + 1..j - 1].iter().collect());
             i = j;
         }
-        let (mut minus, mut plus, mut space, mut alt, mut zero) = (false, false, false, false, false);
+        let (mut minus, mut plus, mut space, mut alt, mut zero) =
+            (false, false, false, false, false);
         while i < f.len() {
             match f[i] {
                 '-' => minus = true,
@@ -703,7 +885,13 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                 i += 1;
             }
             if i > st {
-                let w: usize = f[st..i].iter().collect::<String>().parse().ok().filter(|&w| w <= i64::MAX as usize).ok_or_else(|| it.value_error("width too big"))?;
+                let w: usize = f[st..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+                    .filter(|&w| w <= i64::MAX as usize)
+                    .ok_or_else(|| it.value_error("width too big"))?;
                 width = Some(w);
             }
         }
@@ -728,7 +916,13 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                     i += 1;
                 }
                 let digits: String = f[st..i].iter().collect();
-                prec = Some(if digits.is_empty() { 0 } else { digits.parse().map_err(|_| it.value_error("precision too big"))? });
+                prec = Some(if digits.is_empty() {
+                    0
+                } else {
+                    digits
+                        .parse()
+                        .map_err(|_| it.value_error("precision too big"))?
+                });
             }
             if prec.is_some_and(|p| p > i32::MAX as usize) {
                 return Err(it.value_error("precision too big"));
@@ -791,10 +985,16 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                             Ok(n) => n,
                             Err(_) => {
                                 let t = it.type_name_of(&arg);
-                                return Err(it.type_error(&format!("%c requires an int or a unicode character, not {}", t)));
+                                return Err(it.type_error(&format!(
+                                    "%c requires an int or a unicode character, not {}",
+                                    t
+                                )));
                             }
                         };
-                        match u32::try_from(n).ok().and_then(lumen_common::smuggle::code_point_str) {
+                        match u32::try_from(n)
+                            .ok()
+                            .and_then(lumen_common::smuggle::code_point_str)
+                        {
                             Some(c) => c,
                             None => return Err(it.overflow_err("%c arg not in range(0x110000)")),
                         }
@@ -807,11 +1007,16 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                     Some(Num::I(i)) => BigInt::from_i64(i),
                     Some(Num::B(b)) => b,
                     Some(Num::F(_)) if !matches!(ty, 'd' | 'i' | 'u') => {
-                        return Err(it.type_error(&format!("%{} format: an integer is required, not float", ty)));
+                        return Err(it.type_error(&format!(
+                            "%{} format: an integer is required, not float",
+                            ty
+                        )));
                     }
                     Some(Num::F(f)) => {
                         if f.is_nan() || f.is_infinite() {
-                            return Err(it.value_error("cannot convert float NaN or infinity to integer"));
+                            return Err(
+                                it.value_error("cannot convert float NaN or infinity to integer")
+                            );
                         }
                         BigInt::from_f64_trunc(fmath::trunc(f))
                     }
@@ -820,8 +1025,15 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                             BigInt::from_i64(it.index_of(&arg)?)
                         } else {
                             let t = it.type_name_of(&arg);
-                            let w = if matches!(ty, 'd' | 'i' | 'u') { "a real number" } else { "an integer" };
-                            return Err(it.type_error(&format!("%{} format: {} is required, not {}", ty, w, t)));
+                            let w = if matches!(ty, 'd' | 'i' | 'u') {
+                                "a real number"
+                            } else {
+                                "an integer"
+                            };
+                            return Err(it.type_error(&format!(
+                                "%{} format: {} is required, not {}",
+                                ty, w, t
+                            )));
                         }
                     }
                 };
@@ -830,7 +1042,11 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                     'x' | 'X' => 16,
                     _ => 10,
                 };
-                let mut d = if radix == 10 { it.int_to_decimal(&big.abs())? } else { big.abs().to_string_radix(radix) };
+                let mut d = if radix == 10 {
+                    it.int_to_decimal(&big.abs())?
+                } else {
+                    big.abs().to_string_radix(radix)
+                };
                 if ty == 'X' {
                     d = d.to_uppercase();
                 }
@@ -873,7 +1089,12 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                         return Err(e);
                     }
                 };
-                let spec = format!("{}{}{}", if alt { "#" } else { "" }, prec.map(|p| format!(".{}", p)).unwrap_or_default(), ty);
+                let spec = format!(
+                    "{}{}{}",
+                    if alt { "#" } else { "" },
+                    prec.map(|p| format!(".{}", p)).unwrap_or_default(),
+                    ty
+                );
                 let s = it.format_float(f.abs(), &spec)?;
                 sign = if f.is_sign_negative() && !f.is_nan() {
                     "-".into()
@@ -887,7 +1108,12 @@ pub fn percent_format(it: &mut Interp, fmt: &Value, args: &Value) -> R<String> {
                 body = s;
             }
             c => {
-                return Err(it.value_error(&format!("unsupported format character '{}' (0x{:x}) at index {}", c, c as u32, i - 1)));
+                return Err(it.value_error(&format!(
+                    "unsupported format character '{}' (0x{:x}) at index {}",
+                    c,
+                    c as u32,
+                    i - 1
+                )));
             }
         }
         let total = sign.len() + lumen_common::smuggle::count_code_points(&body);

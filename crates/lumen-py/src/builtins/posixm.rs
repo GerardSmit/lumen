@@ -4,7 +4,10 @@
 //! [`Platform`]: crate::platform::Platform
 
 /// `PyObject_AsFileDescriptor`: an int, or the result of the object's `fileno()`.
-pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) -> crate::object::R<i32> {
+pub fn as_file_descriptor(
+    it: &mut crate::vm::Interp,
+    v: &crate::object::Value,
+) -> crate::object::R<i32> {
     let fd = if v.is_int_like() {
         it.index_of(v)?
     } else if it.get_attr_str(v, "fileno").is_ok() {
@@ -17,7 +20,9 @@ pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) 
         return Err(it.type_error("argument must be an int, or have a fileno() method."));
     };
     if fd < 0 {
-        return Err(it.value_error(&format!("file descriptor cannot be a negative integer ({fd})")));
+        return Err(it.value_error(&format!(
+            "file descriptor cannot be a negative integer ({fd})"
+        )));
     }
     i32::try_from(fd).map_err(|_| it.overflow_err("Python int too large to convert to C int"))
 }
@@ -29,7 +34,7 @@ pub fn as_file_descriptor(it: &mut crate::vm::Interp, v: &crate::object::Value) 
 #[lumen_bind::module(name = "posix")]
 pub mod posix {
     use super::super::sysextra::{structseq_full, structseq_type};
-    use crate::bind::{convert_path, fspath, wrap_path, Py, PathArg, PathOrFd, This};
+    use crate::bind::{convert_path, fspath, wrap_path, PathArg, PathOrFd, Py, This};
     use crate::object::*;
     use crate::platform::{DirentKind, IoError, OsStat, ProcGroup, Timespec};
     use crate::pyint::BigInt;
@@ -41,9 +46,28 @@ pub mod posix {
     struct TimesResult;
 
     const STAT_FIELDS: [&str; 22] = [
-        "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", "", "", "", "st_atime", "st_mtime",
-        "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns", "st_blksize", "st_blocks", "st_rdev", "st_flags",
-        "st_gen", "st_birthtime",
+        "st_mode",
+        "st_ino",
+        "st_dev",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "",
+        "",
+        "",
+        "st_atime",
+        "st_mtime",
+        "st_ctime",
+        "st_atime_ns",
+        "st_mtime_ns",
+        "st_ctime_ns",
+        "st_blksize",
+        "st_blocks",
+        "st_rdev",
+        "st_flags",
+        "st_gen",
+        "st_birthtime",
     ];
 
     fn stat_result_type(it: &mut Interp) -> Obj {
@@ -55,11 +79,23 @@ pub mod posix {
     }
 
     fn uname_result_type(it: &mut Interp) -> Obj {
-        structseq_type::<UnameResult>(it, "posix", "uname_result", &["sysname", "nodename", "release", "version", "machine"], 5)
+        structseq_type::<UnameResult>(
+            it,
+            "posix",
+            "uname_result",
+            &["sysname", "nodename", "release", "version", "machine"],
+            5,
+        )
     }
 
     fn times_result_type(it: &mut Interp) -> Obj {
-        let f = ["user", "system", "children_user", "children_system", "elapsed"];
+        let f = [
+            "user",
+            "system",
+            "children_user",
+            "children_system",
+            "elapsed",
+        ];
         structseq_type::<TimesResult>(it, "posix", "times_result", &f, 5)
     }
 
@@ -124,13 +160,25 @@ pub mod posix {
 
     fn unavailable(it: &mut Interp, fname: &str, arg: &str) -> Obj {
         let cls = it.exc_type("NotImplementedError");
-        it.new_exc(&cls, vec![Value::string(format!("{}: {} unavailable on this platform", fname, arg))])
+        it.new_exc(
+            &cls,
+            vec![Value::string(format!(
+                "{}: {} unavailable on this platform",
+                fname, arg
+            ))],
+        )
     }
 
     /// `path` resolved against the directory open on `dir_fd`, when one is given.
-    fn at_path<const FD: bool>(it: &mut Interp, dir_fd: Option<i32>, path: &crate::bind::FsPath<FD>) -> R<String> {
+    fn at_path<const FD: bool>(
+        it: &mut Interp,
+        dir_fd: Option<i32>,
+        path: &crate::bind::FsPath<FD>,
+    ) -> R<String> {
         match dir_fd {
-            Some(fd) => lumen_os::posix::at_path(fd, &path.path).map_err(|e| fs_path_err(it, e, path)),
+            Some(fd) => {
+                lumen_os::posix::at_path(fd, &path.path).map_err(|e| fs_path_err(it, e, path))
+            }
             None => Ok(path.path.clone()),
         }
     }
@@ -212,7 +260,13 @@ pub mod posix {
     ) -> R<bool> {
         let rp = at_path(it, dir_fd, &path)?;
         if effective_ids || !follow_symlinks {
-            return Ok(lumen_os::posix::access_ex(&rp, mode as u32, effective_ids, follow_symlinks).is_ok());
+            return Ok(lumen_os::posix::access_ex(
+                &rp,
+                mode as u32,
+                effective_ids,
+                follow_symlinks,
+            )
+            .is_ok());
         }
         Ok(it.platform.borrow_mut().access(&rp, mode as u32).is_ok())
     }
@@ -240,7 +294,11 @@ pub mod posix {
         r.map(|s| wrap_path(true, s)).map_err(|e| os_err(it, e))
     }
 
-    fn list_dir(it: &mut Interp, fname: &str, path: &Value) -> R<(PathOrFd, Vec<(String, DirentKind)>)> {
+    fn list_dir(
+        it: &mut Interp,
+        fname: &str,
+        path: &Value,
+    ) -> R<(PathOrFd, Vec<(String, DirentKind)>)> {
         let p: PathOrFd = convert_path(it, fname, "path", path, true, true)?;
         let dir = match p.fd {
             Some(fd) => lumen_os::posix::fd_path(fd).map_err(|e| fs_err(it, e))?,
@@ -257,7 +315,9 @@ pub mod posix {
     #[op]
     fn listdir(it: &mut Interp, #[kw] path: Option<&Value>) -> R<Value> {
         let (p, entries) = list_dir(it, "listdir", path.unwrap_or(&Value::None))?;
-        Ok(Value::list(entries.into_iter().map(|(n, _)| p.wrap(n)).collect()))
+        Ok(Value::list(
+            entries.into_iter().map(|(n, _)| p.wrap(n)).collect(),
+        ))
     }
 
     /// Return an iterator of DirEntry objects for given path.
@@ -269,7 +329,13 @@ pub mod posix {
             None if matches!(p.obj, Value::None) => ".".to_string(),
             None => p.path.clone(),
         };
-        let it_state = ScandirIterator { dir, bytes: p.bytes, by_fd: p.fd.is_some(), entries: entries.into_iter(), closed: false };
+        let it_state = ScandirIterator {
+            dir,
+            bytes: p.bytes,
+            by_fd: p.fd.is_some(),
+            entries: entries.into_iter(),
+            closed: false,
+        };
         Ok(Py::new(it, it_state))
     }
 
@@ -293,13 +359,23 @@ pub mod posix {
         fn __next__(slf: This<Py<Self>>, it: &mut Interp) -> R<Option<Value>> {
             let next = {
                 let mut s = slf.0.borrow_mut(it)?;
-                if s.closed { None } else { s.entries.next().map(|e| (e, s.dir.clone(), s.bytes, s.by_fd)) }
+                if s.closed {
+                    None
+                } else {
+                    s.entries
+                        .next()
+                        .map(|e| (e, s.dir.clone(), s.bytes, s.by_fd))
+                }
             };
             let Some(((name, kind), dir, bytes, by_fd)) = next else {
                 slf.0.borrow_mut(it)?.closed = true;
                 return Ok(None);
             };
-            let path = if dir.ends_with('/') { format!("{}{}", dir, name) } else { format!("{}/{}", dir, name) };
+            let path = if dir.ends_with('/') {
+                format!("{}{}", dir, name)
+            } else {
+                format!("{}/{}", dir, name)
+            };
             let entry = DirEntry {
                 name: wrap_path(bytes, name.clone()),
                 path: wrap_path(bytes, if by_fd { name.clone() } else { path.clone() }),
@@ -343,7 +419,16 @@ pub mod posix {
             let (cached, text, is_link, path) = {
                 let s = slf.borrow(it)?;
                 let follow = follow && matches!(s.kind, DirentKind::Link | DirentKind::Unknown);
-                (if follow { s.stat.clone() } else { s.lstat.clone() }, s.text.clone(), follow, s.path.clone())
+                (
+                    if follow {
+                        s.stat.clone()
+                    } else {
+                        s.lstat.clone()
+                    },
+                    s.text.clone(),
+                    follow,
+                    s.path.clone(),
+                )
             };
             if let Some(v) = cached {
                 return Ok(v);
@@ -354,19 +439,32 @@ pub mod posix {
                 Err(e) => return Err(it.os_error_io(&e, Some(&path))),
             };
             let mut s = slf.borrow_mut(it)?;
-            if is_link { s.stat = Some(st.clone()) } else { s.lstat = Some(st.clone()) }
+            if is_link {
+                s.stat = Some(st.clone())
+            } else {
+                s.lstat = Some(st.clone())
+            }
             Ok(st)
         }
 
         fn mode(slf: &Py<Self>, it: &mut Interp, follow: bool) -> R<Option<u32>> {
             match Self::fetch(slf, it, follow) {
-                Ok(st) => Ok(st.tuple_items().and_then(|t| t[0].as_i64()).map(|m| m as u32)),
+                Ok(st) => Ok(st
+                    .tuple_items()
+                    .and_then(|t| t[0].as_i64())
+                    .map(|m| m as u32)),
                 Err(e) if it.exc_is(&e, "FileNotFoundError") => Ok(None),
                 Err(e) => Err(e),
             }
         }
 
-        fn is_type(slf: &Py<Self>, it: &mut Interp, follow: bool, want: DirentKind, fmt: u32) -> R<bool> {
+        fn is_type(
+            slf: &Py<Self>,
+            it: &mut Interp,
+            follow: bool,
+            want: DirentKind,
+            fmt: u32,
+        ) -> R<bool> {
             let kind = slf.borrow(it)?.kind;
             if kind != DirentKind::Unknown && !(follow && kind == DirentKind::Link) {
                 return Ok(kind == want);
@@ -390,13 +488,37 @@ pub mod posix {
         }
 
         /// Return True if the entry is a directory; cached per entry.
-        fn is_dir(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<bool> {
-            Self::is_type(&slf.0, it, follow_symlinks, DirentKind::Dir, lumen_os::fs::S_IFDIR)
+        fn is_dir(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<bool> {
+            Self::is_type(
+                &slf.0,
+                it,
+                follow_symlinks,
+                DirentKind::Dir,
+                lumen_os::fs::S_IFDIR,
+            )
         }
 
         /// Return True if the entry is a file; cached per entry.
-        fn is_file(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<bool> {
-            Self::is_type(&slf.0, it, follow_symlinks, DirentKind::File, lumen_os::fs::S_IFREG)
+        fn is_file(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<bool> {
+            Self::is_type(
+                &slf.0,
+                it,
+                follow_symlinks,
+                DirentKind::File,
+                lumen_os::fs::S_IFREG,
+            )
         }
 
         /// Return True if the entry is a symbolic link; cached per entry.
@@ -410,7 +532,13 @@ pub mod posix {
         }
 
         /// Return stat_result object for the entry; cached per entry.
-        fn stat(slf: This<Py<Self>>, it: &mut Interp, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<Value> {
+        fn stat(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kwonly]
+            #[default(true)]
+            follow_symlinks: bool,
+        ) -> R<Value> {
             Self::fetch(&slf.0, it, follow_symlinks)
         }
 
@@ -471,7 +599,14 @@ pub mod posix {
         r.map_err(|e| path_err(it, e, &path))
     }
 
-    fn do_rename(it: &mut Interp, fname: &str, src: &PathArg, dst: &PathArg, src_dir_fd: Option<i32>, dst_dir_fd: Option<i32>) -> R<()> {
+    fn do_rename(
+        it: &mut Interp,
+        fname: &str,
+        src: &PathArg,
+        dst: &PathArg,
+        src_dir_fd: Option<i32>,
+        dst_dir_fd: Option<i32>,
+    ) -> R<()> {
         if src.bytes != dst.bytes {
             return Err(it.type_error(&format!("{}: src and dst must be the same type", fname)));
         }
@@ -545,7 +680,10 @@ pub mod posix {
             return Err(it.type_error("symlink: src and dst must be the same type"));
         }
         let rdst = at_path(it, dir_fd, &dst)?;
-        let r = it.platform.borrow_mut().symlink(&src.path, &rdst, target_is_directory);
+        let r = it
+            .platform
+            .borrow_mut()
+            .symlink(&src.path, &rdst, target_is_directory);
         r.map_err(|e| it.os_error_errno(e.errno, Some(&src.obj), Some(&dst.obj)))
     }
 
@@ -571,7 +709,8 @@ pub mod posix {
         let rp = at_path(it, dir_fd, &path)?;
         if !follow_symlinks {
             if cfg!(target_vendor = "apple") && path.fd.is_none() {
-                return lumen_os::posix::lchmod(&rp, mode as u32).map_err(|e| fs_path_err(it, e, &path));
+                return lumen_os::posix::lchmod(&rp, mode as u32)
+                    .map_err(|e| fs_path_err(it, e, &path));
             }
             return Err(unavailable(it, "chmod", "follow_symlinks"));
         }
@@ -612,7 +751,10 @@ pub mod posix {
             return lumen_os::posix::fchown(fd, uid, gid).map_err(|e| fs_path_err(it, e, &path));
         }
         let rp = at_path(it, dir_fd, &path)?;
-        let r = it.platform.borrow_mut().chown(&rp, uid, gid, follow_symlinks);
+        let r = it
+            .platform
+            .borrow_mut()
+            .chown(&rp, uid, gid, follow_symlinks);
         r.map_err(|e| path_err(it, e, &path))
     }
 
@@ -637,15 +779,24 @@ pub mod posix {
                     sec += 1;
                     nsec -= 1e9;
                 }
-                Ok(Timespec { sec, nsec: nsec as u32 })
+                Ok(Timespec {
+                    sec,
+                    nsec: nsec as u32,
+                })
             }
-            _ => Ok(Timespec { sec: it.index_of(v)?, nsec: 0 }),
+            _ => Ok(Timespec {
+                sec: it.index_of(v)?,
+                nsec: 0,
+            }),
         }
     }
 
     fn ns_timespec(it: &mut Interp, v: &Value) -> R<Timespec> {
         let n = it.index_of(v)?;
-        Ok(Timespec { sec: n.div_euclid(1_000_000_000), nsec: n.rem_euclid(1_000_000_000) as u32 })
+        Ok(Timespec {
+            sec: n.div_euclid(1_000_000_000),
+            nsec: n.rem_euclid(1_000_000_000) as u32,
+        })
     }
 
     /// Set the access and modified time of path.
@@ -662,13 +813,21 @@ pub mod posix {
     ) -> R<()> {
         let rp = at_path(it, dir_fd, &path)?;
         let (atime, mtime) = match (times, ns) {
-            (Some(_), Some(_)) => return Err(it.value_error("utime: you may specify either 'times' or 'ns' but not both")),
+            (Some(_), Some(_)) => {
+                return Err(
+                    it.value_error("utime: you may specify either 'times' or 'ns' but not both")
+                );
+            }
             (Some(t), None) => match t.tuple_items() {
                 Some([a, m]) if a.is_int_like() || matches!(a, Value::Float(_)) => {
                     let (a, m) = (a.clone(), m.clone());
                     (timespec_of(it, &a)?, timespec_of(it, &m)?)
                 }
-                _ => return Err(it.type_error("utime: 'times' must be either a tuple of two ints or None")),
+                _ => {
+                    return Err(
+                        it.type_error("utime: 'times' must be either a tuple of two ints or None")
+                    );
+                }
             },
             (None, Some(n)) => match n.tuple_items() {
                 Some([a, m]) => {
@@ -679,13 +838,19 @@ pub mod posix {
             },
             (None, None) => {
                 let now = it.platform.borrow().wall_time_ns() as i64;
-                let t = Timespec { sec: now / 1_000_000_000, nsec: (now % 1_000_000_000) as u32 };
+                let t = Timespec {
+                    sec: now / 1_000_000_000,
+                    nsec: (now % 1_000_000_000) as u32,
+                };
                 (t, t)
             }
         };
         let r = match path.fd {
             Some(fd) => it.platform.borrow_mut().fd_utimes(fd, atime, mtime),
-            None => it.platform.borrow_mut().utimes(&rp, atime, mtime, follow_symlinks),
+            None => it
+                .platform
+                .borrow_mut()
+                .utimes(&rp, atime, mtime, follow_symlinks),
         };
         r.map_err(|e| path_err(it, e, &path))
     }
@@ -750,7 +915,14 @@ pub mod posix {
 
     /// Duplicate file descriptor.
     #[op]
-    fn dup2(it: &mut Interp, #[kw] fd: i32, #[kw] fd2: i32, #[kw] #[default(true)] inheritable: bool) -> R<i32> {
+    fn dup2(
+        it: &mut Interp,
+        #[kw] fd: i32,
+        #[kw] fd2: i32,
+        #[kw]
+        #[default(true)]
+        inheritable: bool,
+    ) -> R<i32> {
         let r = it.platform.borrow_mut().fd_dup2(fd, fd2, inheritable);
         r.map_err(|e| os_err(it, e))
     }
@@ -776,7 +948,10 @@ pub mod posix {
             return Err(it.os_error_errno(einval(), None, None));
         }
         let mut buf = vec![0u8; length as usize];
-        let r = it.platform.borrow_mut().fd_read(fd, &mut buf, Some(offset as u64));
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_read(fd, &mut buf, Some(offset as u64));
         let n = r.map_err(|e| os_err(it, e))?;
         buf.truncate(n);
         Ok(Value::bytes(buf))
@@ -792,7 +967,10 @@ pub mod posix {
     /// Write bytes to a file descriptor starting at a particular offset.
     #[op]
     fn pwrite(it: &mut Interp, fd: i32, buffer: &[u8], offset: i64) -> R<usize> {
-        let r = it.platform.borrow_mut().fd_write(fd, buffer, Some(offset as u64));
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_write(fd, buffer, Some(offset as u64));
         r.map_err(|e| os_err(it, e))
     }
 
@@ -841,7 +1019,10 @@ pub mod posix {
     /// Set the inheritable flag of the specified file descriptor.
     #[op]
     fn set_inheritable(it: &mut Interp, fd: i32, inheritable: i32) -> R<()> {
-        let r = it.platform.borrow_mut().fd_set_inheritable(fd, inheritable != 0);
+        let r = it
+            .platform
+            .borrow_mut()
+            .fd_set_inheritable(fd, inheritable != 0);
         r.map_err(|e| os_err(it, e))
     }
 
@@ -862,7 +1043,11 @@ pub mod posix {
     /// Return a string describing the encoding of a terminal's file descriptor.
     #[op]
     fn device_encoding(it: &mut Interp, #[kw] fd: i32) -> Value {
-        if it.platform.borrow_mut().fd_isatty(fd) { Value::str("UTF-8") } else { Value::None }
+        if it.platform.borrow_mut().fd_isatty(fd) {
+            Value::str("UTF-8")
+        } else {
+            Value::None
+        }
     }
 
     /// Return the size of the terminal window as (columns, lines).
@@ -871,7 +1056,10 @@ pub mod posix {
         let r = it.platform.borrow_mut().terminal_size(fd);
         let (cols, lines) = r.map_err(|e| os_err(it, e))?;
         let ty = terminal_size_type(it);
-        Ok(structseq_full(&ty, vec![Value::Int(cols as i64), Value::Int(lines as i64)]))
+        Ok(structseq_full(
+            &ty,
+            vec![Value::Int(cols as i64), Value::Int(lines as i64)],
+        ))
     }
 
     // ---- process -------------------------------------------------------------------------------
@@ -896,7 +1084,10 @@ pub mod posix {
         let r = it.platform.borrow().process_times();
         let t = r.map_err(|e| os_err(it, e))?;
         let ty = times_result_type(it);
-        Ok(structseq_full(&ty, t.into_iter().map(Value::Float).collect()))
+        Ok(structseq_full(
+            &ty,
+            t.into_iter().map(Value::Float).collect(),
+        ))
     }
 
     /// Return a bytes object containing random bytes suitable for cryptographic use.
@@ -958,7 +1149,9 @@ pub mod posix {
     fn getgroups(it: &mut Interp) -> R<Value> {
         let r = it.platform.borrow_mut().getgroups();
         let g = r.map_err(|e| os_err(it, e))?;
-        Ok(Value::list(g.into_iter().map(|g| Value::Int(g as i64)).collect()))
+        Ok(Value::list(
+            g.into_iter().map(|g| Value::Int(g as i64)).collect(),
+        ))
     }
 
     fn group(it: &mut Interp, call: ProcGroup) -> R<i32> {
@@ -1083,7 +1276,13 @@ pub mod posix {
     struct WaitidResult;
 
     fn waitid_type(it: &mut Interp) -> Obj {
-        structseq_type::<WaitidResult>(it, "posix", "waitid_result", &["si_pid", "si_uid", "si_signo", "si_status", "si_code"], 5)
+        structseq_type::<WaitidResult>(
+            it,
+            "posix",
+            "waitid_result",
+            &["si_pid", "si_uid", "si_signo", "si_status", "si_code"],
+            5,
+        )
     }
 
     fn fs_err(it: &mut Interp, e: lumen_os::FsError) -> Obj {
@@ -1111,19 +1310,33 @@ pub mod posix {
 
     pub(crate) fn before_fork(it: &mut Interp) {
         it.flush_out();
-        let hooks: Vec<Value> = it.native_state::<ForkHooks>().before.iter().rev().cloned().collect();
+        let hooks: Vec<Value> = it
+            .native_state::<ForkHooks>()
+            .before
+            .iter()
+            .rev()
+            .cloned()
+            .collect();
         run_fork_hooks(it, hooks);
     }
 
     pub(crate) fn after_fork(it: &mut Interp, in_child: bool) {
         let state = it.native_state::<ForkHooks>();
-        let hooks = if in_child { state.child.clone() } else { state.parent.clone() };
+        let hooks = if in_child {
+            state.child.clone()
+        } else {
+            state.parent.clone()
+        };
         run_fork_hooks(it, hooks);
     }
 
     /// Runs `spawn` (a fork) between the registered fork hooks; `pid_of` extracts the child
     /// indicator from its result.
-    fn forked<T>(it: &mut Interp, spawn: impl FnOnce() -> Result<T, lumen_os::FsError>, pid_of: impl Fn(&T) -> i32) -> R<T> {
+    fn forked<T>(
+        it: &mut Interp,
+        spawn: impl FnOnce() -> Result<T, lumen_os::FsError>,
+        pid_of: impl Fn(&T) -> i32,
+    ) -> R<T> {
         before_fork(it);
         match spawn() {
             Ok(r) => {
@@ -1163,7 +1376,11 @@ pub mod posix {
         #[kwonly] after_in_child: Option<&Value>,
         #[kwonly] after_in_parent: Option<&Value>,
     ) -> R<()> {
-        let given = [("before", before), ("after_in_child", after_in_child), ("after_in_parent", after_in_parent)];
+        let given = [
+            ("before", before),
+            ("after_in_child", after_in_child),
+            ("after_in_parent", after_in_parent),
+        ];
         if given.iter().all(|(_, v)| v.is_none()) {
             return Err(it.type_error("At least one argument is required."));
         }
@@ -1219,8 +1436,17 @@ pub mod posix {
         lumen_os::tty::login_tty(fd).map_err(|e| fs_err(it, e))
     }
 
-    fn rusage_result(it: &mut Interp, pid: i32, status: i32, usage: &lumen_os::rlimit::Rusage) -> (i32, i32, Value) {
-        (pid, status, crate::builtins::resourcem::resource::rusage_value(it, usage))
+    fn rusage_result(
+        it: &mut Interp,
+        pid: i32,
+        status: i32,
+        usage: &lumen_os::rlimit::Rusage,
+    ) -> (i32, i32, Value) {
+        (
+            pid,
+            status,
+            crate::builtins::resourcem::resource::rusage_value(it, usage),
+        )
     }
 
     /// Wait for completion of a child process.
@@ -1242,7 +1468,8 @@ pub mod posix {
     #[op]
     fn wait4(it: &mut Interp, pid: i32, options: i32) -> R<(i32, i32, Value)> {
         it.flush_out();
-        let (pid, status, usage) = lumen_os::proc::wait4(pid, options).map_err(|e| fs_err(it, e))?;
+        let (pid, status, usage) =
+            lumen_os::proc::wait4(pid, options).map_err(|e| fs_err(it, e))?;
         it.poll()?;
         Ok(rusage_result(it, pid, status, &usage))
     }
@@ -1269,7 +1496,9 @@ pub mod posix {
         it.flush_out();
         let info = lumen_os::proc::waitid(idtype, id, options).map_err(|e| fs_err(it, e))?;
         it.poll()?;
-        let Some(w) = info else { return Ok(Value::None) };
+        let Some(w) = info else {
+            return Ok(Value::None);
+        };
         let ty = waitid_type(it);
         Ok(structseq_full(
             &ty,
@@ -1376,7 +1605,11 @@ pub mod posix {
         super::as_file_descriptor(it, v)
     }
 
-    fn fs_path_err<const FD: bool>(it: &mut Interp, e: lumen_os::FsError, p: &crate::bind::FsPath<FD>) -> Obj {
+    fn fs_path_err<const FD: bool>(
+        it: &mut Interp,
+        e: lumen_os::FsError,
+        p: &crate::bind::FsPath<FD>,
+    ) -> Obj {
         it.os_error_errno(e.errno(), Some(&p.obj), None)
     }
 
@@ -1426,7 +1659,13 @@ pub mod posix {
     }
 
     /// The `argv` of `exec*` / `posix_spawn*`: a non-empty tuple or list of paths.
-    fn argv_list(it: &mut Interp, argv: &Value, what: &str, empty_msg: &str, type_msg: &str) -> R<Vec<Vec<u8>>> {
+    fn argv_list(
+        it: &mut Interp,
+        argv: &Value,
+        what: &str,
+        empty_msg: &str,
+        type_msg: &str,
+    ) -> R<Vec<Vec<u8>>> {
         let _ = what;
         if !is_sequence(argv) {
             return Err(it.type_error(type_msg));
@@ -1449,7 +1688,10 @@ pub mod posix {
         let (keys, vals) = (it.iterate_to_vec(&keys)?, it.iterate_to_vec(&vals)?);
         let mut out = Vec::with_capacity(keys.len());
         for (k, v) in keys.iter().zip(&vals) {
-            let (mut key, val) = (crate::bind::path::fs_bytes(it, k)?, crate::bind::path::fs_bytes(it, v)?);
+            let (mut key, val) = (
+                crate::bind::path::fs_bytes(it, k)?,
+                crate::bind::path::fs_bytes(it, v)?,
+            );
             if key.is_empty() || key[1..].contains(&b'=') {
                 return Err(it.value_error("illegal environment variable name"));
             }
@@ -1474,7 +1716,13 @@ pub mod posix {
     ///     Tuple or list of strings.
     #[op]
     fn execv(it: &mut Interp, path: PathArg, argv: &Value) -> R<Value> {
-        let args = argv_list(it, argv, "execv", "execv() arg 2 must not be empty", "execv() arg 2 must be a tuple or list")?;
+        let args = argv_list(
+            it,
+            argv,
+            "execv",
+            "execv() arg 2 must not be empty",
+            "execv() arg 2 must be a tuple or list",
+        )?;
         if args[0].is_empty() {
             return Err(it.value_error("execv() arg 2 first element cannot be empty"));
         }
@@ -1492,8 +1740,19 @@ pub mod posix {
     ///   env
     ///     Dictionary of strings mapping to strings.
     #[op]
-    fn execve(it: &mut Interp, #[kw] path: PathOrFd, #[kw] argv: &Value, #[kw] env: &Value) -> R<Value> {
-        let args = argv_list(it, argv, "execve", "execve: argv must not be empty", "execve: argv must be a tuple or list")?;
+    fn execve(
+        it: &mut Interp,
+        #[kw] path: PathOrFd,
+        #[kw] argv: &Value,
+        #[kw] env: &Value,
+    ) -> R<Value> {
+        let args = argv_list(
+            it,
+            argv,
+            "execve",
+            "execve: argv must not be empty",
+            "execve: argv must be a tuple or list",
+        )?;
         if !has_getitem(it, env) {
             return Err(it.type_error("execve: environment must be a mapping object"));
         }
@@ -1515,12 +1774,17 @@ pub mod posix {
         for action in it.iterate_to_vec(actions)? {
             let items = match action.tuple_items() {
                 Some(t) if !t.is_empty() => t.to_vec(),
-                _ => return Err(it.type_error("Each file_actions element must be a non-empty tuple")),
+                _ => {
+                    return Err(
+                        it.type_error("Each file_actions element must be a non-empty tuple")
+                    );
+                }
             };
             let tag = it.index_of(&items[0])?;
             let fd_at = |it: &mut Interp, i: usize| -> R<i32> {
                 let n = it.index_of(&items[i])?;
-                i32::try_from(n).map_err(|_| it.overflow_err("Python int too large to convert to C int"))
+                i32::try_from(n)
+                    .map_err(|_| it.overflow_err("Python int too large to convert to C int"))
             };
             match tag {
                 SPAWN_OPEN => {
@@ -1531,7 +1795,12 @@ pub mod posix {
                     let path = crate::bind::path::fs_bytes(it, &items[2])?;
                     let flags = fd_at(it, 3)?;
                     let mode = it.index_of(&items[4])? as u32;
-                    out.push(FileAction::Open { fd, path, flags, mode });
+                    out.push(FileAction::Open {
+                        fd,
+                        path,
+                        flags,
+                        mode,
+                    });
                 }
                 SPAWN_CLOSE => {
                     if items.len() != 2 {
@@ -1547,7 +1816,9 @@ pub mod posix {
                 }
                 SPAWN_CLOSEFROM if lumen_os::posix::spawn_has_closefrom() => {
                     if items.len() != 2 {
-                        return Err(it.type_error("A closefrom file_action tuple must have 2 elements"));
+                        return Err(
+                            it.type_error("A closefrom file_action tuple must have 2 elements")
+                        );
                     }
                     out.push(FileAction::CloseFrom(fd_at(it, 1)?));
                 }
@@ -1572,7 +1843,11 @@ pub mod posix {
         setsigdef: Option<&Value>,
         scheduler: Option<&Value>,
     ) -> R<Value> {
-        let fname = if search { "posix_spawnp" } else { "posix_spawn" };
+        let fname = if search {
+            "posix_spawnp"
+        } else {
+            "posix_spawn"
+        };
         let args = argv_list(
             it,
             argv,
@@ -1582,7 +1857,9 @@ pub mod posix {
         )?;
         let env_given = !matches!(env, Value::None);
         if env_given && !has_getitem(it, env) {
-            return Err(it.type_error(&format!("{fname}: environment must be a mapping object or None")));
+            return Err(it.type_error(&format!(
+                "{fname}: environment must be a mapping object or None"
+            )));
         }
         if let Some(s) = scheduler {
             if !matches!(s, Value::None) && s.tuple_items().is_none() {
@@ -1592,7 +1869,11 @@ pub mod posix {
         if args[0].is_empty() {
             return Err(it.value_error(&format!("{fname}: argv first element cannot be empty")));
         }
-        let envs = if env_given { Some(env_list(it, env)?) } else { None };
+        let envs = if env_given {
+            Some(env_list(it, env)?)
+        } else {
+            None
+        };
         let actions = match file_actions {
             Some(a) if !matches!(a, Value::None) => spawn_actions(it, a)?,
             _ => Vec::new(),
@@ -1600,7 +1881,10 @@ pub mod posix {
         let mut attrs = lumen_os::posix::SpawnAttrs::default();
         if let Some(pg) = setpgroup.filter(|v| !matches!(v, Value::None)) {
             let n = it.index_of(pg)?;
-            attrs.setpgroup = Some(i32::try_from(n).map_err(|_| it.overflow_err("Python int too large to convert to C int"))?);
+            attrs.setpgroup = Some(
+                i32::try_from(n)
+                    .map_err(|_| it.overflow_err("Python int too large to convert to C int"))?,
+            );
         }
         attrs.resetids = resetids;
         if setsid {
@@ -1618,7 +1902,12 @@ pub mod posix {
         if let Some(s) = scheduler.filter(|v| !matches!(v, Value::None)) {
             if !lumen_os::posix::spawn_has_scheduler() {
                 let cls = it.exc_type("NotImplementedError");
-                return Err(it.new_exc(&cls, vec![Value::str("The scheduler option is not supported in this system.")]));
+                return Err(it.new_exc(
+                    &cls,
+                    vec![Value::str(
+                        "The scheduler option is not supported in this system.",
+                    )],
+                ));
             }
             let items = s.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
             if items.len() != 2 {
@@ -1631,7 +1920,14 @@ pub mod posix {
             };
             attrs.scheduler = Some((policy, priority));
         }
-        let r = lumen_os::posix::posix_spawn(path.path.as_bytes(), search, &args, envs.as_deref(), &actions, &attrs);
+        let r = lumen_os::posix::posix_spawn(
+            path.path.as_bytes(),
+            search,
+            &args,
+            envs.as_deref(),
+            &actions,
+            &attrs,
+        );
         match r {
             Ok(pid) => Ok(Value::Int(pid as i64)),
             Err(e) => Err(fs_path_err(it, e, path)),
@@ -1669,13 +1965,30 @@ pub mod posix {
         env: &Value,
         #[kwonly] file_actions: Option<&Value>,
         #[kwonly] setpgroup: Option<&Value>,
-        #[kwonly] #[default(false)] resetids: bool,
-        #[kwonly] #[default(false)] setsid: bool,
+        #[kwonly]
+        #[default(false)]
+        resetids: bool,
+        #[kwonly]
+        #[default(false)]
+        setsid: bool,
         #[kwonly] setsigmask: Option<&Value>,
         #[kwonly] setsigdef: Option<&Value>,
         #[kwonly] scheduler: Option<&Value>,
     ) -> R<Value> {
-        posix_spawn_impl(it, false, &path, argv, env, file_actions, setpgroup, resetids, setsid, setsigmask, setsigdef, scheduler)
+        posix_spawn_impl(
+            it,
+            false,
+            &path,
+            argv,
+            env,
+            file_actions,
+            setpgroup,
+            resetids,
+            setsid,
+            setsigmask,
+            setsigdef,
+            scheduler,
+        )
     }
 
     /// Execute the program specified by path in a new process.
@@ -1709,13 +2022,30 @@ pub mod posix {
         env: &Value,
         #[kwonly] file_actions: Option<&Value>,
         #[kwonly] setpgroup: Option<&Value>,
-        #[kwonly] #[default(false)] resetids: bool,
-        #[kwonly] #[default(false)] setsid: bool,
+        #[kwonly]
+        #[default(false)]
+        resetids: bool,
+        #[kwonly]
+        #[default(false)]
+        setsid: bool,
         #[kwonly] setsigmask: Option<&Value>,
         #[kwonly] setsigdef: Option<&Value>,
         #[kwonly] scheduler: Option<&Value>,
     ) -> R<Value> {
-        posix_spawn_impl(it, true, &path, argv, env, file_actions, setpgroup, resetids, setsid, setsigmask, setsigdef, scheduler)
+        posix_spawn_impl(
+            it,
+            true,
+            &path,
+            argv,
+            env,
+            file_actions,
+            setpgroup,
+            resetids,
+            setsid,
+            setsigmask,
+            setsigdef,
+            scheduler,
+        )
     }
 
     // ---- paths and descriptors -----------------------------------------------------------------
@@ -1754,8 +2084,16 @@ pub mod posix {
     /// follow_symlinks may not be implemented on your platform.  If it is
     /// unavailable, using it will raise a NotImplementedError.
     #[op]
-    fn chflags(it: &mut Interp, #[kw] path: PathArg, #[kw] flags: u64, #[kw] #[default(true)] follow_symlinks: bool) -> R<()> {
-        lumen_os::posix::chflags(&path.path, flags as u32, follow_symlinks).map_err(|e| fs_path_err(it, e, &path))
+    fn chflags(
+        it: &mut Interp,
+        #[kw] path: PathArg,
+        #[kw] flags: u64,
+        #[kw]
+        #[default(true)]
+        follow_symlinks: bool,
+    ) -> R<()> {
+        lumen_os::posix::chflags(&path.path, flags as u32, follow_symlinks)
+            .map_err(|e| fs_path_err(it, e, &path))
     }
 
     /// Set file flags.
@@ -1764,7 +2102,8 @@ pub mod posix {
     /// Equivalent to chflags(path, flags, follow_symlinks=False).
     #[op]
     fn lchflags(it: &mut Interp, #[kw] path: PathArg, #[kw] flags: u64) -> R<()> {
-        lumen_os::posix::chflags(&path.path, flags as u32, false).map_err(|e| fs_path_err(it, e, &path))
+        lumen_os::posix::chflags(&path.path, flags as u32, false)
+            .map_err(|e| fs_path_err(it, e, &path))
     }
 
     /// Change the access permissions of a file, without following symbolic links.
@@ -1783,7 +2122,14 @@ pub mod posix {
     /// dir_fd may not be implemented on your platform.
     ///   If it is unavailable, using it will raise a NotImplementedError.
     #[op]
-    fn mkfifo(it: &mut Interp, #[kw] path: PathArg, #[kw] #[default(438)] mode: i32, #[kwonly] dir_fd: Option<i32>) -> R<()> {
+    fn mkfifo(
+        it: &mut Interp,
+        #[kw] path: PathArg,
+        #[kw]
+        #[default(438)]
+        mode: i32,
+        #[kwonly] dir_fd: Option<i32>,
+    ) -> R<()> {
         let rp = at_path(it, dir_fd, &path)?;
         lumen_os::posix::mkfifo(&rp, mode as u32).map_err(|e| fs_err(it, e))
     }
@@ -1805,8 +2151,12 @@ pub mod posix {
     fn mknod(
         it: &mut Interp,
         #[kw] path: PathArg,
-        #[kw] #[default(384)] mode: i32,
-        #[kw] #[default(0)] device: u64,
+        #[kw]
+        #[default(384)]
+        mode: i32,
+        #[kw]
+        #[default(0)]
+        device: u64,
         #[kwonly] dir_fd: Option<i32>,
     ) -> R<()> {
         let rp = at_path(it, dir_fd, &path)?;
@@ -1877,10 +2227,14 @@ pub mod posix {
         for item in items {
             match crate::builtins::memview::with_writable(it, &item, |b| b.len())? {
                 Some(n) => out.push((item, n)),
-                None if it.is_buffer(&item) => return Err(it.new_exc_str("BufferError", "Object is not writable.")),
+                None if it.is_buffer(&item) => {
+                    return Err(it.new_exc_str("BufferError", "Object is not writable."));
+                }
                 None => {
                     let t = it.type_name_of(&item);
-                    return Err(it.type_error(&format!("a bytes-like object is required, not '{t}'")));
+                    return Err(
+                        it.type_error(&format!("a bytes-like object is required, not '{t}'"))
+                    );
                 }
             }
         }
@@ -1888,13 +2242,20 @@ pub mod posix {
     }
 
     /// Distributes the `n` bytes a vectored read produced over the buffers it filled, in order.
-    fn scatter(it: &mut Interp, targets: &[(Value, usize)], filled: &[Vec<u8>], mut n: usize) -> R<()> {
+    fn scatter(
+        it: &mut Interp,
+        targets: &[(Value, usize)],
+        filled: &[Vec<u8>],
+        mut n: usize,
+    ) -> R<()> {
         for ((item, _), data) in targets.iter().zip(filled) {
             if n == 0 {
                 break;
             }
             let take = n.min(data.len());
-            crate::builtins::memview::with_writable(it, item, |b| b[..take].copy_from_slice(&data[..take]))?;
+            crate::builtins::memview::with_writable(it, item, |b| {
+                b[..take].copy_from_slice(&data[..take])
+            })?;
             n -= take;
         }
         Ok(())
@@ -1943,7 +2304,13 @@ pub mod posix {
     ///
     /// Using non-zero flags requires Linux 4.6 or newer.
     #[op]
-    fn preadv(it: &mut Interp, fd: i32, buffers: &Value, offset: i64, #[default(0)] flags: i32) -> R<usize> {
+    fn preadv(
+        it: &mut Interp,
+        fd: i32,
+        buffers: &Value,
+        offset: i64,
+        #[default(0)] flags: i32,
+    ) -> R<usize> {
         if flags != 0 && !cfg!(any(target_os = "linux", target_os = "android")) {
             return Err(unavailable(it, "preadv2", "flags"));
         }
@@ -1976,7 +2343,13 @@ pub mod posix {
     ///
     /// Using non-zero flags requires Linux 4.7 or newer.
     #[op]
-    fn pwritev(it: &mut Interp, fd: i32, buffers: &Value, offset: i64, #[default(0)] flags: i32) -> R<usize> {
+    fn pwritev(
+        it: &mut Interp,
+        fd: i32,
+        buffers: &Value,
+        offset: i64,
+        #[default(0)] flags: i32,
+    ) -> R<usize> {
         if flags != 0 && !cfg!(any(target_os = "linux", target_os = "android")) {
             return Err(unavailable(it, "pwritev2", "flags"));
         }
@@ -2004,17 +2377,32 @@ pub mod posix {
                 let bufs = match seq {
                     Some(s) if !matches!(s, Value::None) => {
                         if !is_sequence(s) {
-                            return Err(it.type_error(&format!("sendfile() {what} must be a sequence")));
+                            return Err(
+                                it.type_error(&format!("sendfile() {what} must be a sequence"))
+                            );
                         }
-                        it.iterate_to_vec(s)?.iter().map(|i| it.buffer_bytes(i)).collect::<R<Vec<_>>>()?
+                        it.iterate_to_vec(s)?
+                            .iter()
+                            .map(|i| it.buffer_bytes(i))
+                            .collect::<R<Vec<_>>>()?
                     }
                     _ => Vec::new(),
                 };
                 parts.push(bufs);
             }
-            let (h, t): (Vec<&[u8]>, Vec<&[u8]>) =
-                (parts[0].iter().map(|b| b.as_slice()).collect(), parts[1].iter().map(|b| b.as_slice()).collect());
-            let r = lumen_os::posix::sendfile_bsd(out_fd, in_fd, off, count, &h, &t, flags.unwrap_or(0));
+            let (h, t): (Vec<&[u8]>, Vec<&[u8]>) = (
+                parts[0].iter().map(|b| b.as_slice()).collect(),
+                parts[1].iter().map(|b| b.as_slice()).collect(),
+            );
+            let r = lumen_os::posix::sendfile_bsd(
+                out_fd,
+                in_fd,
+                off,
+                count,
+                &h,
+                &t,
+                flags.unwrap_or(0),
+            );
             return r.map(|n| Value::Int(n as i64)).map_err(|e| fs_err(it, e));
         }
         let off = match offset {
@@ -2056,12 +2444,15 @@ pub mod posix {
 
     /// A `str`, `bytes` or `os.PathLike` as text (embedded NULs are fine: nothing is opened).
     fn nonstrict_path(it: &mut Interp, fname: &str, arg: &str, v: &Value) -> R<(String, bool)> {
-        let is_text = v.as_str().is_some() || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)));
+        let is_text =
+            v.as_str().is_some() || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)));
         if !is_text {
             let t = it.type_of(v);
             if it.lookup_mro(&t, "__fspath__").is_none() {
                 let tn = it.type_name(&t);
-                return Err(it.type_error(&format!("{fname}: {arg} should be string, bytes or os.PathLike, not {tn}")));
+                return Err(it.type_error(&format!(
+                    "{fname}: {arg} should be string, bytes or os.PathLike, not {tn}"
+                )));
             }
         }
         match fspath(it, v)? {
@@ -2088,7 +2479,11 @@ pub mod posix {
     fn _path_splitroot_ex(it: &mut Interp, #[kw] p: &Value) -> R<Value> {
         let (text, bytes) = nonstrict_path(it, "_path_splitroot_ex", "p", p)?;
         let root = lumen_common::pypath::root_len(&text);
-        Ok(Value::tuple(vec![wrap_path(bytes, String::new()), wrap_path(bytes, text[..root].to_string()), wrap_path(bytes, text[root..].to_string())]))
+        Ok(Value::tuple(vec![
+            wrap_path(bytes, String::new()),
+            wrap_path(bytes, text[..root].to_string()),
+            wrap_path(bytes, text[root..].to_string()),
+        ]))
     }
 
     // ---- credentials and priorities ------------------------------------------------------------
@@ -2138,14 +2533,22 @@ pub mod posix {
     /// Set the current process's real, effective, and saved user ids.
     #[op]
     fn setresuid(it: &mut Interp, ruid: &Value, euid: &Value, suid: &Value) -> R<()> {
-        let (r, e, s) = (id_arg(it, ruid, "uid")?, id_arg(it, euid, "uid")?, id_arg(it, suid, "uid")?);
+        let (r, e, s) = (
+            id_arg(it, ruid, "uid")?,
+            id_arg(it, euid, "uid")?,
+            id_arg(it, suid, "uid")?,
+        );
         lumen_os::posix::setresuid(r, e, s).map_err(|e| fs_err(it, e))
     }
 
     /// Set the current process's real, effective, and saved group ids.
     #[op]
     fn setresgid(it: &mut Interp, rgid: &Value, egid: &Value, sgid: &Value) -> R<()> {
-        let (r, e, s) = (id_arg(it, rgid, "gid")?, id_arg(it, egid, "gid")?, id_arg(it, sgid, "gid")?);
+        let (r, e, s) = (
+            id_arg(it, rgid, "gid")?,
+            id_arg(it, egid, "gid")?,
+            id_arg(it, sgid, "gid")?,
+        );
         lumen_os::posix::setresgid(r, e, s).map_err(|e| fs_err(it, e))
     }
 
@@ -2153,14 +2556,18 @@ pub mod posix {
     #[op]
     fn getresuid(it: &mut Interp) -> R<Value> {
         let ids = lumen_os::posix::getresuid().map_err(|e| fs_err(it, e))?;
-        Ok(Value::tuple(ids.iter().map(|&i| Value::Int(i as i64)).collect()))
+        Ok(Value::tuple(
+            ids.iter().map(|&i| Value::Int(i as i64)).collect(),
+        ))
     }
 
     /// Return a tuple of the current process's real, effective, and saved group ids.
     #[op]
     fn getresgid(it: &mut Interp) -> R<Value> {
         let ids = lumen_os::posix::getresgid().map_err(|e| fs_err(it, e))?;
-        Ok(Value::tuple(ids.iter().map(|&i| Value::Int(i as i64)).collect()))
+        Ok(Value::tuple(
+            ids.iter().map(|&i| Value::Int(i as i64)).collect(),
+        ))
     }
 
     /// Set the groups of the current process to list.
@@ -2170,11 +2577,17 @@ pub mod posix {
             return Err(it.type_error("setgroups argument must be a sequence"));
         }
         let items = it.iterate_to_vec(groups)?;
-        let max = lumen_os::posix::limits().iter().find(|(n, _)| *n == "NGROUPS_MAX").map_or(65536, |(_, v)| *v) as usize;
+        let max = lumen_os::posix::limits()
+            .iter()
+            .find(|(n, _)| *n == "NGROUPS_MAX")
+            .map_or(65536, |(_, v)| *v) as usize;
         if items.len() > max {
             return Err(it.value_error("too many groups"));
         }
-        let gids = items.iter().map(|g| id_arg(it, g, "gid")).collect::<R<Vec<_>>>()?;
+        let gids = items
+            .iter()
+            .map(|g| id_arg(it, g, "gid"))
+            .collect::<R<Vec<_>>>()?;
         lumen_os::ident::setgroups(&gids).map_err(|e| fs_err(it, e))
     }
 
@@ -2199,7 +2612,9 @@ pub mod posix {
     fn getgrouplist(it: &mut Interp, user: &str, group: &Value) -> R<Value> {
         let group = id_arg(it, group, "gid")?;
         let groups = lumen_os::posix::getgrouplist(user, group).map_err(|e| fs_err(it, e))?;
-        Ok(Value::list(groups.into_iter().map(|g| Value::Int(g as i64)).collect()))
+        Ok(Value::list(
+            groups.into_iter().map(|g| Value::Int(g as i64)).collect(),
+        ))
     }
 
     /// Make the current process a session leader.
@@ -2216,7 +2631,12 @@ pub mod posix {
 
     /// Set program scheduling priority.
     #[op]
-    fn setpriority(it: &mut Interp, #[kw] which: i32, #[kw] who: i64, #[kw] priority: i32) -> R<()> {
+    fn setpriority(
+        it: &mut Interp,
+        #[kw] which: i32,
+        #[kw] who: i64,
+        #[kw] priority: i32,
+    ) -> R<()> {
         lumen_os::posix::setpriority(which, who as u32, priority).map_err(|e| fs_err(it, e))
     }
 
@@ -2279,8 +2699,19 @@ pub mod posix {
 
     struct StatvfsResult;
 
-    const STATVFS_FIELDS: [&str; 11] =
-        ["f_bsize", "f_frsize", "f_blocks", "f_bfree", "f_bavail", "f_files", "f_ffree", "f_favail", "f_flag", "f_namemax", "f_fsid"];
+    const STATVFS_FIELDS: [&str; 11] = [
+        "f_bsize",
+        "f_frsize",
+        "f_blocks",
+        "f_bfree",
+        "f_bavail",
+        "f_files",
+        "f_ffree",
+        "f_favail",
+        "f_flag",
+        "f_namemax",
+        "f_fsid",
+    ];
 
     fn statvfs_type(it: &mut Interp) -> Obj {
         structseq_type::<StatvfsResult>(it, "os", "statvfs_result", &STATVFS_FIELDS, 10)
@@ -2288,7 +2719,10 @@ pub mod posix {
 
     fn statvfs_value(it: &mut Interp, s: &lumen_os::posix::StatVfs) -> Value {
         let ty = statvfs_type(it);
-        let vals = [s.bsize, s.frsize, s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.favail, s.flag, s.namemax, s.fsid];
+        let vals = [
+            s.bsize, s.frsize, s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.favail, s.flag,
+            s.namemax, s.fsid,
+        ];
         structseq_full(&ty, vals.iter().map(|&n| uint(n)).collect())
     }
 
@@ -2432,7 +2866,10 @@ pub mod posix {
         if !it.isinstance_value(v, &Value::Obj(ty))? {
             return Err(it.type_error("must have a sched_param object"));
         }
-        let p = v.tuple_items().and_then(|t| t.first().cloned()).unwrap_or(Value::Int(0));
+        let p = v
+            .tuple_items()
+            .and_then(|t| t.first().cloned())
+            .unwrap_or(Value::Int(0));
         let n = it.index_of(&p)?;
         i32::try_from(n).map_err(|_| it.overflow_err("Python int too large to convert to C int"))
     }
@@ -2573,19 +3010,32 @@ pub mod posix {
         if size < 0 {
             return Err(it.value_error("negative argument not allowed"));
         }
-        lumen_os::posix::getrandom(size as usize, flags).map(Value::bytes).map_err(|e| fs_err(it, e))
+        lumen_os::posix::getrandom(size as usize, flags)
+            .map(Value::bytes)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Create an anonymous file.
     #[op]
-    fn memfd_create(it: &mut Interp, #[kw] name: &Value, #[kw] #[default(lumen_os::posix::MFD_CLOEXEC)] flags: u32) -> R<i32> {
+    fn memfd_create(
+        it: &mut Interp,
+        #[kw] name: &Value,
+        #[kw]
+        #[default(lumen_os::posix::MFD_CLOEXEC)]
+        flags: u32,
+    ) -> R<i32> {
         let n = crate::bind::path::fs_bytes(it, name)?;
-        lumen_os::posix::memfd_create(&String::from_utf8_lossy(&n), flags).map_err(|e| fs_err(it, e))
+        lumen_os::posix::memfd_create(&String::from_utf8_lossy(&n), flags)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Creates and returns an event notification file descriptor.
     #[op]
-    fn eventfd(it: &mut Interp, initval: u32, #[default(lumen_os::posix::EFD_CLOEXEC)] flags: i32) -> R<i32> {
+    fn eventfd(
+        it: &mut Interp,
+        initval: u32,
+        #[default(lumen_os::posix::EFD_CLOEXEC)] flags: i32,
+    ) -> R<i32> {
         lumen_os::posix::eventfd(initval, flags).map_err(|e| fs_err(it, e))
     }
 
@@ -2594,7 +3044,9 @@ pub mod posix {
     fn eventfd_read(it: &mut Interp, fd: &Value) -> R<Value> {
         let fd = fdv(it, fd)?;
         it.wait_fd(fd, lumen_os::poll::POLLIN)?;
-        lumen_os::posix::eventfd_read(fd).map(uint).map_err(|e| fs_err(it, e))
+        lumen_os::posix::eventfd_read(fd)
+            .map(uint)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Write eventfd value.
@@ -2609,7 +3061,13 @@ pub mod posix {
     /// The descriptor can be used to perform process management without races
     /// and signals.
     #[op]
-    fn pidfd_open(it: &mut Interp, #[kw] pid: i32, #[kw] #[default(0)] flags: u32) -> R<i32> {
+    fn pidfd_open(
+        it: &mut Interp,
+        #[kw] pid: i32,
+        #[kw]
+        #[default(0)]
+        flags: u32,
+    ) -> R<i32> {
         lumen_os::posix::pidfd_open(pid, flags).map_err(|e| fs_err(it, e))
     }
 
@@ -2629,7 +3087,13 @@ pub mod posix {
     ///   nstype
     ///     Type of namespace.
     #[op]
-    fn setns(it: &mut Interp, #[kw] fd: &Value, #[kw] #[default(0)] nstype: i32) -> R<()> {
+    fn setns(
+        it: &mut Interp,
+        #[kw] fd: &Value,
+        #[kw]
+        #[default(0)]
+        nstype: i32,
+    ) -> R<()> {
         let fd = fdv(it, fd)?;
         lumen_os::posix::setns(fd, nstype).map_err(|e| fs_err(it, e))
     }
@@ -2662,7 +3126,8 @@ pub mod posix {
             return Err(it.value_error("negative value for 'count' not allowed"));
         }
         let (os, od) = (opt_off(it, offset_src)?, opt_off(it, offset_dst)?);
-        lumen_os::posix::copy_file_range(src, dst, count as usize, os, od).map_err(|e| fs_err(it, e))
+        lumen_os::posix::copy_file_range(src, dst, count as usize, os, od)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Transfer count bytes from one pipe to a descriptor or vice versa.
@@ -2689,7 +3154,9 @@ pub mod posix {
         #[kw] count: isize,
         #[kw] offset_src: Option<&Value>,
         #[kw] offset_dst: Option<&Value>,
-        #[kw] #[default(0)] flags: u32,
+        #[kw]
+        #[default(0)]
+        flags: u32,
     ) -> R<usize> {
         if count < 0 {
             return Err(it.value_error("negative value for 'count' not allowed"));
@@ -2705,20 +3172,32 @@ pub mod posix {
     ///   flags
     ///     0 or a bit mask of os.TFD_NONBLOCK or os.TFD_CLOEXEC.
     #[op]
-    fn timerfd_create(it: &mut Interp, clockid: i32, #[kwonly] #[default(0)] flags: i32) -> R<i32> {
-        lumen_os::posix::timerfd_create(clockid, flags | lumen_os::posix::TFD_CLOEXEC).map_err(|e| fs_err(it, e))
+    fn timerfd_create(
+        it: &mut Interp,
+        clockid: i32,
+        #[kwonly]
+        #[default(0)]
+        flags: i32,
+    ) -> R<i32> {
+        lumen_os::posix::timerfd_create(clockid, flags | lumen_os::posix::TFD_CLOEXEC)
+            .map_err(|e| fs_err(it, e))
     }
 
     fn ns_of_seconds(it: &mut Interp, secs: f64, what: &str) -> R<i64> {
         let ns = (secs * 1e9).floor();
         if !ns.is_finite() || ns.abs() >= 9.2e18 {
-            return Err(it.overflow_err(&format!("timestamp too large to convert to C _PyTime_t: {what}")));
+            return Err(it.overflow_err(&format!(
+                "timestamp too large to convert to C _PyTime_t: {what}"
+            )));
         }
         Ok(ns as i64)
     }
 
     fn timer_pair_secs(a: (i64, i64)) -> Value {
-        Value::tuple(vec![Value::Float(a.0 as f64 * 1e-9), Value::Float(a.1 as f64 * 1e-9)])
+        Value::tuple(vec![
+            Value::Float(a.0 as f64 * 1e-9),
+            Value::Float(a.1 as f64 * 1e-9),
+        ])
     }
 
     fn timer_pair_ns(a: (i64, i64)) -> Value {
@@ -2739,12 +3218,21 @@ pub mod posix {
     fn timerfd_settime(
         it: &mut Interp,
         fd: &Value,
-        #[kwonly] #[default(0)] flags: i32,
-        #[kwonly] #[default(0.0)] initial: f64,
-        #[kwonly] #[default(0.0)] interval: f64,
+        #[kwonly]
+        #[default(0)]
+        flags: i32,
+        #[kwonly]
+        #[default(0.0)]
+        initial: f64,
+        #[kwonly]
+        #[default(0.0)]
+        interval: f64,
     ) -> R<Value> {
         let fd = fdv(it, fd)?;
-        let (i, v) = (ns_of_seconds(it, initial, "initial")?, ns_of_seconds(it, interval, "interval")?);
+        let (i, v) = (
+            ns_of_seconds(it, initial, "initial")?,
+            ns_of_seconds(it, interval, "interval")?,
+        );
         let old = lumen_os::posix::timerfd_settime(fd, flags, i, v).map_err(|e| fs_err(it, e))?;
         Ok(timer_pair_secs(old))
     }
@@ -2763,12 +3251,19 @@ pub mod posix {
     fn timerfd_settime_ns(
         it: &mut Interp,
         fd: &Value,
-        #[kwonly] #[default(0)] flags: i32,
-        #[kwonly] #[default(0)] initial: i64,
-        #[kwonly] #[default(0)] interval: i64,
+        #[kwonly]
+        #[default(0)]
+        flags: i32,
+        #[kwonly]
+        #[default(0)]
+        initial: i64,
+        #[kwonly]
+        #[default(0)]
+        interval: i64,
     ) -> R<Value> {
         let fd = fdv(it, fd)?;
-        let old = lumen_os::posix::timerfd_settime(fd, flags, initial, interval).map_err(|e| fs_err(it, e))?;
+        let old = lumen_os::posix::timerfd_settime(fd, flags, initial, interval)
+            .map_err(|e| fs_err(it, e))?;
         Ok(timer_pair_ns(old))
     }
 
@@ -2779,7 +3274,9 @@ pub mod posix {
     #[op]
     fn timerfd_gettime(it: &mut Interp, fd: &Value) -> R<Value> {
         let fd = fdv(it, fd)?;
-        lumen_os::posix::timerfd_gettime(fd).map(timer_pair_secs).map_err(|e| fs_err(it, e))
+        lumen_os::posix::timerfd_gettime(fd)
+            .map(timer_pair_secs)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Return a tuple of a timer file descriptor's (next expiration, interval) in nanoseconds.
@@ -2789,7 +3286,9 @@ pub mod posix {
     #[op]
     fn timerfd_gettime_ns(it: &mut Interp, fd: &Value) -> R<Value> {
         let fd = fdv(it, fd)?;
-        lumen_os::posix::timerfd_gettime(fd).map(timer_pair_ns).map_err(|e| fs_err(it, e))
+        lumen_os::posix::timerfd_gettime(fd)
+            .map(timer_pair_ns)
+            .map_err(|e| fs_err(it, e))
     }
 
     /// Return the value of extended attribute attribute on path.
@@ -2800,7 +3299,14 @@ pub mod posix {
     /// a symbolic link, getxattr will examine the symbolic link itself
     /// instead of the file the link points to.
     #[op]
-    fn getxattr(it: &mut Interp, #[kw] path: PathArg, #[kw] attribute: PathArg, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<Value> {
+    fn getxattr(
+        it: &mut Interp,
+        #[kw] path: PathArg,
+        #[kw] attribute: PathArg,
+        #[kwonly]
+        #[default(true)]
+        follow_symlinks: bool,
+    ) -> R<Value> {
         let r = lumen_os::posix::getxattr(&path.path, &attribute.path, follow_symlinks);
         r.map(Value::bytes).map_err(|e| fs_path_err(it, e, &path))
     }
@@ -2817,10 +3323,15 @@ pub mod posix {
         #[kw] path: PathArg,
         #[kw] attribute: PathArg,
         #[kw] value: &[u8],
-        #[kw] #[default(0)] flags: i32,
-        #[kwonly] #[default(true)] follow_symlinks: bool,
+        #[kw]
+        #[default(0)]
+        flags: i32,
+        #[kwonly]
+        #[default(true)]
+        follow_symlinks: bool,
     ) -> R<()> {
-        let r = lumen_os::posix::setxattr(&path.path, &attribute.path, value, flags, follow_symlinks);
+        let r =
+            lumen_os::posix::setxattr(&path.path, &attribute.path, value, flags, follow_symlinks);
         r.map_err(|e| fs_path_err(it, e, &path))
     }
 
@@ -2831,7 +3342,14 @@ pub mod posix {
     ///   link, removexattr will modify the symbolic link itself instead of the file
     ///   the link points to.
     #[op]
-    fn removexattr(it: &mut Interp, #[kw] path: PathArg, #[kw] attribute: PathArg, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<()> {
+    fn removexattr(
+        it: &mut Interp,
+        #[kw] path: PathArg,
+        #[kw] attribute: PathArg,
+        #[kwonly]
+        #[default(true)]
+        follow_symlinks: bool,
+    ) -> R<()> {
         let r = lumen_os::posix::removexattr(&path.path, &attribute.path, follow_symlinks);
         r.map_err(|e| fs_path_err(it, e, &path))
     }
@@ -2844,9 +3362,23 @@ pub mod posix {
     ///   link, listxattr will examine the symbolic link itself instead of the file
     ///   the link points to.
     #[op]
-    fn listxattr(it: &mut Interp, #[kw] path: Option<&Value>, #[kwonly] #[default(true)] follow_symlinks: bool) -> R<Value> {
-        let p: PathArg = convert_path(it, "listxattr", "path", path.unwrap_or(&Value::None), false, true)?;
-        let names = lumen_os::posix::listxattr(&p.path, follow_symlinks).map_err(|e| fs_path_err(it, e, &p))?;
+    fn listxattr(
+        it: &mut Interp,
+        #[kw] path: Option<&Value>,
+        #[kwonly]
+        #[default(true)]
+        follow_symlinks: bool,
+    ) -> R<Value> {
+        let p: PathArg = convert_path(
+            it,
+            "listxattr",
+            "path",
+            path.unwrap_or(&Value::None),
+            false,
+            true,
+        )?;
+        let names = lumen_os::posix::listxattr(&p.path, follow_symlinks)
+            .map_err(|e| fs_path_err(it, e, &p))?;
         Ok(Value::list(names.into_iter().map(|n| p.wrap(n)).collect()))
     }
 
@@ -2916,7 +3448,11 @@ pub mod posix {
         if cfg!(target_vendor = "apple") {
             have.extend(["HAVE_LCHFLAGS", "HAVE_LCHMOD"]);
         }
-        dict_set_str(&d, "_have_functions", Value::list(have.iter().map(|n| Value::str(n)).collect()));
+        dict_set_str(
+            &d,
+            "_have_functions",
+            Value::list(have.iter().map(|n| Value::str(n)).collect()),
+        );
         dict_set_str(&d, "waitid_result", Value::Obj(waitid_type(it)));
         dict_set_str(&d, "statvfs_result", Value::Obj(statvfs_type(it)));
         for (name, v) in lumen_os::posix::limits()
@@ -2929,14 +3465,30 @@ pub mod posix {
         {
             dict_set_str(&d, name, Value::Int(v));
         }
-        for (name, v) in [("POSIX_SPAWN_OPEN", 0), ("POSIX_SPAWN_CLOSE", 1), ("POSIX_SPAWN_DUP2", 2)] {
+        for (name, v) in [
+            ("POSIX_SPAWN_OPEN", 0),
+            ("POSIX_SPAWN_CLOSE", 1),
+            ("POSIX_SPAWN_DUP2", 2),
+        ] {
             dict_set_str(&d, name, Value::Int(v));
         }
         if lumen_os::posix::spawn_has_closefrom() {
-            dict_set_str(&d, "POSIX_SPAWN_CLOSEFROM", Value::Int(lumen_os::posix::SPAWN_CLOSEFROM));
+            dict_set_str(
+                &d,
+                "POSIX_SPAWN_CLOSEFROM",
+                Value::Int(lumen_os::posix::SPAWN_CLOSEFROM),
+            );
         }
-        dict_set_str(&d, "confstr_names", names_dict(it, lumen_os::posix::confstr_names()));
-        dict_set_str(&d, "pathconf_names", names_dict(it, lumen_os::posix::pathconf_names()));
+        dict_set_str(
+            &d,
+            "confstr_names",
+            names_dict(it, lumen_os::posix::confstr_names()),
+        );
+        dict_set_str(
+            &d,
+            "pathconf_names",
+            names_dict(it, lumen_os::posix::pathconf_names()),
+        );
         if cfg!(any(target_os = "linux", target_os = "android")) {
             dict_set_str(&d, "sched_param", Value::Obj(sched_param_type(it)));
         } else {
@@ -2945,7 +3497,14 @@ pub mod posix {
             }
         }
         if !cfg!(target_vendor = "apple") {
-            for name in ["chflags", "lchflags", "lchmod", "_fcopyfile", "_inputhook", "_is_inputhook_installed"] {
+            for name in [
+                "chflags",
+                "lchflags",
+                "lchmod",
+                "_fcopyfile",
+                "_inputhook",
+                "_is_inputhook_installed",
+            ] {
                 dict_del_str(&d, name);
             }
         }

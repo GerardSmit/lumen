@@ -114,26 +114,44 @@ struct Builder {
 }
 
 pub fn build(module: &Module) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder {
+        scopes: Vec::new(),
+        ids: BTreeMap::new(),
+        cur: 0,
+        line: 1,
+        err: None,
+    };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_body(&module.body);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
-    let mut t = SymTable { scopes: b.scopes, ids: b.ids };
+    let mut t = SymTable {
+        scopes: b.scopes,
+        ids: b.ids,
+    };
     let empty = BTreeSet::new();
     analyze(&mut t, 0, &empty, None, &empty)?;
     Ok(t)
 }
 
 pub fn build_expr(e: &Expr) -> Result<SymTable, SymError> {
-    let mut b = Builder { scopes: Vec::new(), ids: BTreeMap::new(), cur: 0, line: 1, err: None };
+    let mut b = Builder {
+        scopes: Vec::new(),
+        ids: BTreeMap::new(),
+        cur: 0,
+        line: 1,
+        err: None,
+    };
     b.new_scope(ScopeKind::Module, "<module>".into(), None, false);
     b.visit_expr(e);
     if let Some(e) = b.err.take() {
         return Err(e);
     }
-    let mut t = SymTable { scopes: b.scopes, ids: b.ids };
+    let mut t = SymTable {
+        scopes: b.scopes,
+        ids: b.ids,
+    };
     let empty = BTreeSet::new();
     analyze(&mut t, 0, &empty, None, &empty)?;
     Ok(t)
@@ -156,9 +174,11 @@ fn analyze(
     let mut free: BTreeSet<Rc<str>> = BTreeSet::new();
     let line = t.scopes[id].line;
     let class_flags: BTreeMap<Rc<str>, u32> = match class_entry {
-        Some(c) if t.scopes[id].can_see_class_scope => {
-            t.scopes[c].syms.iter().map(|(n, s)| (n.clone(), s.flags)).collect()
-        }
+        Some(c) if t.scopes[id].can_see_class_scope => t.scopes[c]
+            .syms
+            .iter()
+            .map(|(n, s)| (n.clone(), s.flags))
+            .collect(),
         _ => BTreeMap::new(),
     };
     for (name, sym) in t.scopes[id].syms.iter_mut() {
@@ -167,7 +187,10 @@ fn analyze(
             sym.scope = Sc::GlobalExplicit;
         } else if f & DEF_NONLOCAL != 0 {
             if !bound.contains(name) {
-                return Err(SymError { msg: format!("no binding for nonlocal '{}' found", name), line });
+                return Err(SymError {
+                    msg: format!("no binding for nonlocal '{}' found", name),
+                    line,
+                });
             }
             if type_params.contains(name) && f & DEF_TYPE_PARAM == 0 {
                 return Err(SymError { msg: format!("nonlocal binding not allowed for type parameter '{}'", name), line });
@@ -225,13 +248,21 @@ fn analyze(
             } else if let Some(&i) = s.index.get(&name) {
                 match s.syms[i].1.scope {
                     Sc::GlobalImplicit => s.syms[i].1.scope = Sc::Free,
-                    Sc::Local | Sc::Cell if kind == ScopeKind::Class => s.extra_free.push(name.clone()),
+                    Sc::Local | Sc::Cell if kind == ScopeKind::Class => {
+                        s.extra_free.push(name.clone())
+                    }
                     _ => {}
                 }
                 free.insert(name.clone());
             } else if kind != ScopeKind::Module {
                 let n = s.syms.len();
-                s.syms.push((name.clone(), Sym { flags: DEF_USE, scope: Sc::Free }));
+                s.syms.push((
+                    name.clone(),
+                    Sym {
+                        flags: DEF_USE,
+                        scope: Sc::Free,
+                    },
+                ));
                 s.index.insert(name.clone(), n);
                 free.insert(name.clone());
             }
@@ -245,7 +276,13 @@ fn analyze(
 }
 
 impl Builder {
-    fn new_scope(&mut self, kind: ScopeKind, name: Rc<str>, key: Option<usize>, is_comp: bool) -> usize {
+    fn new_scope(
+        &mut self,
+        kind: ScopeKind,
+        name: Rc<str>,
+        key: Option<usize>,
+        is_comp: bool,
+    ) -> usize {
         let id = self.scopes.len();
         let private = match kind {
             ScopeKind::Class => Some(name.clone()),
@@ -282,7 +319,10 @@ impl Builder {
 
     fn error(&mut self, msg: String) {
         if self.err.is_none() {
-            self.err = Some(SymError { msg, line: self.line });
+            self.err = Some(SymError {
+                msg,
+                line: self.line,
+            });
         }
     }
 
@@ -298,14 +338,23 @@ impl Builder {
             None => {
                 let n = s.syms.len();
                 s.index.insert(name.clone(), n);
-                s.syms.push((name, Sym { flags, scope: Sc::Unknown }));
+                s.syms.push((
+                    name,
+                    Sym {
+                        flags,
+                        scope: Sc::Unknown,
+                    },
+                ));
             }
         }
     }
 
     fn def(&mut self, name: &str) {
         let cur = self.cur;
-        if let Some(&i) = self.scopes[cur].index.get(&mangle(&self.scopes[cur].private, name)) {
+        if let Some(&i) = self.scopes[cur]
+            .index
+            .get(&mangle(&self.scopes[cur].private, name))
+        {
             let f = self.scopes[cur].syms[i].1.flags;
             if f & DEF_GLOBAL != 0 && self.scopes[cur].kind == ScopeKind::Module {
                 return;
@@ -357,7 +406,12 @@ impl Builder {
     }
 
     fn visit_annotations(&mut self, args: &Arguments) {
-        for a in args.posonlyargs.iter().chain(args.args.iter()).chain(args.kwonlyargs.iter()) {
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(args.args.iter())
+            .chain(args.kwonlyargs.iter())
+        {
             if let Some(an) = &a.annotation {
                 self.visit_expr(an);
             }
@@ -371,10 +425,21 @@ impl Builder {
 
     /// Enters the `<generic parameters of X>` scope and declares the type parameters in it.
     /// Returns the scope to go back to.
-    fn enter_type_params(&mut self, name: &Ident, params: &[TypeParam], args: Option<&Arguments>, is_class: bool) -> usize {
+    fn enter_type_params(
+        &mut self,
+        name: &Ident,
+        params: &[TypeParam],
+        args: Option<&Arguments>,
+        is_class: bool,
+    ) -> usize {
         let saved = self.cur;
         let in_class = self.scopes[saved].kind == ScopeKind::Class;
-        let id = self.new_scope(ScopeKind::Function, name.clone(), Some(type_params_key(params)), false);
+        let id = self.new_scope(
+            ScopeKind::Function,
+            name.clone(),
+            Some(type_params_key(params)),
+            false,
+        );
         self.scopes[id].ann = Some(AnnKind::TypeParams);
         self.cur = id;
         if in_class {
@@ -388,7 +453,10 @@ impl Builder {
         }
         if let Some(args) = args {
             let has_kwdefaults = args.kw_defaults.iter().any(|d| d.is_some());
-            for (present, n) in [(!args.defaults.is_empty(), ".defaults"), (has_kwdefaults, ".kwdefaults")] {
+            for (present, n) in [
+                (!args.defaults.is_empty(), ".defaults"),
+                (has_kwdefaults, ".kwdefaults"),
+            ] {
                 if present {
                     self.add(id, n, DEF_PARAM);
                     self.scopes[id].params.push(n.into());
@@ -398,7 +466,11 @@ impl Builder {
         for tp in params {
             self.line = tp.pos.line;
             self.add(id, tp.name(), DEF_TYPE_PARAM | DEF_LOCAL);
-            if let TypeParamKind::TypeVar { name, bound: Some(b) } = &tp.kind {
+            if let TypeParamKind::TypeVar {
+                name,
+                bound: Some(b),
+            } = &tp.kind
+            {
                 let key = tp as *const TypeParam as usize;
                 self.enter_annotation_scope(name.clone(), key, AnnKind::TypeVarBound, in_class);
                 self.visit_expr(b);
@@ -423,7 +495,9 @@ impl Builder {
         let msg = match self.scopes[self.cur].ann {
             Some(AnnKind::TypeVarBound) => format!("{what} cannot be used within a TypeVar bound"),
             Some(AnnKind::TypeAlias) => format!("{what} cannot be used within a type alias"),
-            Some(AnnKind::TypeParams) => format!("{what} cannot be used within the definition of a generic"),
+            Some(AnnKind::TypeParams) => {
+                format!("{what} cannot be used within the definition of a generic")
+            }
             None => return,
         };
         self.error(msg);
@@ -469,7 +543,8 @@ impl Builder {
                     self.visit_expr(d);
                 }
                 let generic = !c.type_params.is_empty();
-                let outer = generic.then(|| self.enter_type_params(&c.name, &c.type_params, None, true));
+                let outer =
+                    generic.then(|| self.enter_type_params(&c.name, &c.type_params, None, true));
                 self.line = s.pos.line;
                 for b in &c.bases {
                     self.visit_expr(b);
@@ -488,9 +563,15 @@ impl Builder {
                 self.visit_body(&c.body);
                 self.cur = outer.unwrap_or(saved);
             }
-            StmtKind::TypeAlias { name, type_params, value } => {
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                value,
+            } => {
                 self.visit_expr(name);
-                let ExprKind::Name { id: alias, .. } = &name.kind else { return };
+                let ExprKind::Name { id: alias, .. } = &name.kind else {
+                    return;
+                };
                 let in_class = self.scopes[self.cur].kind == ScopeKind::Class;
                 let saved = self.cur;
                 if !type_params.is_empty() {
@@ -525,7 +606,12 @@ impl Builder {
                 self.visit_expr(target);
                 self.visit_expr(value);
             }
-            StmtKind::AnnAssign { target, annotation, value, .. } => {
+            StmtKind::AnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            } => {
                 if let Some(v) = value {
                     self.visit_expr(v);
                 }
@@ -534,7 +620,13 @@ impl Builder {
                     self.visit_expr(annotation);
                 }
             }
-            StmtKind::For { target, iter, body, orelse, .. } => {
+            StmtKind::For {
+                target,
+                iter,
+                body,
+                orelse,
+                ..
+            } => {
                 self.visit_expr(iter);
                 self.visit_expr(target);
                 self.visit_body(body);
@@ -577,7 +669,13 @@ impl Builder {
                     self.visit_expr(e);
                 }
             }
-            StmtKind::Try { body, handlers, orelse, finalbody, .. } => {
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                ..
+            } => {
                 self.visit_body(body);
                 for h in handlers {
                     self.line = h.pos.line;
@@ -625,7 +723,10 @@ impl Builder {
                     if let Some(&i) = self.scopes[cur].index.get(&m) {
                         let f = self.scopes[cur].syms[i].1.flags;
                         if f & DEF_LOCAL != 0 && self.scopes[cur].kind != ScopeKind::Module {
-                            self.error(format!("name '{}' is assigned to before global declaration", n));
+                            self.error(format!(
+                                "name '{}' is assigned to before global declaration",
+                                n
+                            ));
                         }
                     }
                     self.add(cur, n, DEF_GLOBAL);
@@ -654,7 +755,11 @@ impl Builder {
                     self.visit_pattern(p);
                 }
             }
-            Pattern::MatchMapping { keys, patterns, rest } => {
+            Pattern::MatchMapping {
+                keys,
+                patterns,
+                rest,
+            } => {
                 for k in keys {
                     self.visit_expr(k);
                 }
@@ -665,7 +770,12 @@ impl Builder {
                     self.def(r);
                 }
             }
-            Pattern::MatchClass { cls, patterns, kwd_patterns, .. } => {
+            Pattern::MatchClass {
+                cls,
+                patterns,
+                kwd_patterns,
+                ..
+            } => {
                 self.visit_expr(cls);
                 for p in patterns.iter().chain(kwd_patterns.iter()) {
                     self.visit_pattern(p);
@@ -687,7 +797,14 @@ impl Builder {
         }
     }
 
-    fn visit_comp(&mut self, e: &Expr, gens: &[Comprehension], elts: &[&Expr], name: &str, is_genexp: bool) {
+    fn visit_comp(
+        &mut self,
+        e: &Expr,
+        gens: &[Comprehension],
+        elts: &[&Expr],
+        name: &str,
+        is_genexp: bool,
+    ) {
         self.visit_expr(&gens[0].iter);
         self.check_nested_scope("comprehension");
         let key = e as *const Expr as usize;
@@ -793,12 +910,20 @@ impl Builder {
                     self.visit_expr(x);
                 }
             }
-            ExprKind::ListComp { elt, generators } => self.visit_comp(e, generators, &[elt], "<listcomp>", false),
-            ExprKind::SetComp { elt, generators } => self.visit_comp(e, generators, &[elt], "<setcomp>", false),
-            ExprKind::DictComp { key, value, generators } => {
-                self.visit_comp(e, generators, &[key, value], "<dictcomp>", false)
+            ExprKind::ListComp { elt, generators } => {
+                self.visit_comp(e, generators, &[elt], "<listcomp>", false)
             }
-            ExprKind::GeneratorExp { elt, generators } => self.visit_comp(e, generators, &[elt], "<genexpr>", true),
+            ExprKind::SetComp { elt, generators } => {
+                self.visit_comp(e, generators, &[elt], "<setcomp>", false)
+            }
+            ExprKind::DictComp {
+                key,
+                value,
+                generators,
+            } => self.visit_comp(e, generators, &[key, value], "<dictcomp>", false),
+            ExprKind::GeneratorExp { elt, generators } => {
+                self.visit_comp(e, generators, &[elt], "<genexpr>", true)
+            }
             ExprKind::Await(v) => {
                 self.check_annotation_scope("await expression");
                 self.visit_expr(v);
@@ -815,13 +940,19 @@ impl Builder {
                 self.visit_expr(v);
                 self.mark_gen();
             }
-            ExprKind::Compare { left, comparators, .. } => {
+            ExprKind::Compare {
+                left, comparators, ..
+            } => {
                 self.visit_expr(left);
                 for c in comparators {
                     self.visit_expr(c);
                 }
             }
-            ExprKind::Call { func, args, keywords } => {
+            ExprKind::Call {
+                func,
+                args,
+                keywords,
+            } => {
                 if let ExprKind::Name { id, .. } = &func.kind {
                     if &**id == "super" && self.scopes[self.cur].kind == ScopeKind::Function {
                         let cur = self.cur;
@@ -841,7 +972,9 @@ impl Builder {
                     self.visit_expr(p);
                 }
             }
-            ExprKind::FormattedValue { value, format_spec, .. } => {
+            ExprKind::FormattedValue {
+                value, format_spec, ..
+            } => {
                 self.visit_expr(value);
                 if let Some(f) = format_spec {
                     self.visit_expr(f);
@@ -875,7 +1008,10 @@ impl Builder {
     }
 
     fn parent_of(&self, id: usize) -> usize {
-        (0..id).rev().find(|&p| self.scopes[p].children.contains(&id)).unwrap_or(0)
+        (0..id)
+            .rev()
+            .find(|&p| self.scopes[p].children.contains(&id))
+            .unwrap_or(0)
     }
 
     fn mark_gen(&mut self) {

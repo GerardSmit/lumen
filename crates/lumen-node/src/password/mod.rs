@@ -16,12 +16,12 @@
 //! Not preserved: the argon2 crate rejects `m < 8 * p`, where Zig (and so Bun) clamped the
 //! matrix and still recorded the requested `m`; and associated data is limited to 32 bytes.
 
+use crate::hash::{digest, Algo};
 use argon2::password_hash::{
     Error as PhError, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, AssociatedData, ParamsBuilder, Version};
 use base64::Engine;
-use crate::hash::{digest, Algo};
 use subtle::ConstantTimeEq;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -268,8 +268,15 @@ pub(crate) mod bindings {
     }
 
     #[op(name = "hashSync")]
-    pub fn hash_sync(password: &[u8], algorithm: &str, m: f64, t: f64, cost: f64) -> NativeResult<String> {
-        hash_password(password, algorithm, sat_u32(m), sat_u32(t), sat_u32(cost)).map_err(NativeError::runtime)
+    pub fn hash_sync(
+        password: &[u8],
+        algorithm: &str,
+        m: f64,
+        t: f64,
+        cost: f64,
+    ) -> NativeResult<String> {
+        hash_password(password, algorithm, sat_u32(m), sat_u32(t), sat_u32(cost))
+            .map_err(NativeError::runtime)
     }
 
     #[op(name = "verifySync")]
@@ -278,7 +285,13 @@ pub(crate) mod bindings {
     }
 
     #[op(async, name = "hash")]
-    pub fn hash_async(password: Vec<u8>, algorithm: String, m: f64, t: f64, cost: f64) -> Result<String, SendError> {
+    pub fn hash_async(
+        password: Vec<u8>,
+        algorithm: String,
+        m: f64,
+        t: f64,
+        cost: f64,
+    ) -> Result<String, SendError> {
         hash_password(&password, &algorithm, sat_u32(m), sat_u32(t), sat_u32(cost))
             .map_err(|e| SendError::new("Error", e))
     }
@@ -301,7 +314,16 @@ pub(crate) mod bindings {
         secret: Vec<u8>,
         associated_data: Vec<u8>,
     ) -> NativeResult<Vec<u8>> {
-        let params = argon2_params("crypto.argon2Sync", algorithm, lanes, out_len, m_cost, t_cost, secret, associated_data)?;
+        let params = argon2_params(
+            "crypto.argon2Sync",
+            algorithm,
+            lanes,
+            out_len,
+            m_cost,
+            t_cost,
+            secret,
+            associated_data,
+        )?;
         argon2_hash(message, nonce, &params).map_err(NativeError::runtime)
     }
 
@@ -318,8 +340,17 @@ pub(crate) mod bindings {
         secret: Vec<u8>,
         associated_data: Vec<u8>,
     ) -> Result<Vec<u8>, SendError> {
-        let params = argon2_params("crypto.argon2", &algorithm, lanes, out_len, m_cost, t_cost, secret, associated_data)
-            .map_err(SendError::from)?;
+        let params = argon2_params(
+            "crypto.argon2",
+            &algorithm,
+            lanes,
+            out_len,
+            m_cost,
+            t_cost,
+            secret,
+            associated_data,
+        )
+        .map_err(SendError::from)?;
         argon2_hash(&message, &nonce, &params).map_err(|e| SendError::new("Error", e))
     }
 }
@@ -360,7 +391,9 @@ mod tests {
 
     #[test]
     fn bcrypt_prehash_boundary() {
-        let bcrypt_raw = |pw: &[u8], salt: &[u8; 16], cost: u32| lumen_common::crypt::bcrypt_raw(&bcrypt_key(pw), salt, cost);
+        let bcrypt_raw = |pw: &[u8], salt: &[u8; 16], cost: u32| {
+            lumen_common::crypt::bcrypt_raw(&bcrypt_key(pw), salt, cost)
+        };
         let salt = [3u8; 16];
         let long = vec![b'A'; 100];
         assert_eq!(

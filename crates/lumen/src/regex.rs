@@ -3,8 +3,8 @@
 
 use lumen_common::regex::js::{self, elem_of_cp};
 use lumen_common::regex::{self as core, ExecOptions};
-pub use lumen_common::regex::{Abort, BacktrackLimit, Captures, BACKTRACK_LIMIT_MSG};
 pub(crate) use lumen_common::regex::{set_host_poll, take_abort};
+pub use lumen_common::regex::{Abort, BacktrackLimit, Captures, BACKTRACK_LIMIT_MSG};
 
 /// A compiled ECMAScript regular expression.
 pub struct Regex {
@@ -284,7 +284,10 @@ mod internal_engine_diagnostics {
         let re = super::Regex::new("HF(?=;)", "i").unwrap();
         let input = crate::lstr::LStr::from("xhf;y");
         let text = super::ReText::new_rc(false, &input);
-        assert_eq!(re.exec_text_shared(&text, 0).unwrap().unwrap()[0], Some((1, 3)));
+        assert_eq!(
+            re.exec_text_shared(&text, 0).unwrap().unwrap()[0],
+            Some((1, 3))
+        );
     }
 
     #[test]
@@ -330,8 +333,16 @@ mod internal_engine_diagnostics {
 
     fn assert_limit(pattern: &str, subject: &str) {
         let t = std::time::Instant::now();
-        assert_eq!(try_find(pattern, "", subject), Err(super::BacktrackLimit), "{pattern}");
-        assert!(t.elapsed().as_secs() < 5, "{pattern} took {:?}", t.elapsed());
+        assert_eq!(
+            try_find(pattern, "", subject),
+            Err(super::BacktrackLimit),
+            "{pattern}"
+        );
+        assert!(
+            t.elapsed().as_secs() < 5,
+            "{pattern} took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
@@ -348,7 +359,10 @@ mod internal_engine_diagnostics {
     #[test]
     fn long_linear_matches_stay_under_the_limit() {
         let subject = "ab".repeat(500_000) + "c";
-        assert_eq!(find("(a|b)*c", "", &subject).unwrap()[0], Some((0, subject.len())));
+        assert_eq!(
+            find("(a|b)*c", "", &subject).unwrap()[0],
+            Some((0, subject.len()))
+        );
         let words = "lorem ipsum, dolor sit amet. ".repeat(40_000);
         let mut pos = 0;
         let re = super::Regex::new("\\w+", "g").unwrap();

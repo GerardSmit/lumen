@@ -20,12 +20,28 @@ pub fn kw_name(k: &Obj) -> &str {
 impl Interp {
     pub fn arity_error(&mut self, fname: &str, given: usize, min: usize, max: usize) -> Obj {
         let msg = if min == max {
-            let w = if min == 1 { "exactly one argument".to_string() } else { format!("exactly {} arguments", min) };
+            let w = if min == 1 {
+                "exactly one argument".to_string()
+            } else {
+                format!("exactly {} arguments", min)
+            };
             format!("{}() takes {} ({} given)", fname, w, given)
         } else if given < min {
-            format!("{}() takes at least {} argument{} ({} given)", fname, min, plural(min), given)
+            format!(
+                "{}() takes at least {} argument{} ({} given)",
+                fname,
+                min,
+                plural(min),
+                given
+            )
         } else {
-            format!("{}() takes at most {} argument{} ({} given)", fname, max, plural(max), given)
+            format!(
+                "{}() takes at most {} argument{} ({} given)",
+                fname,
+                max,
+                plural(max),
+                given
+            )
         };
         self.type_error(&msg)
     }
@@ -45,7 +61,14 @@ impl Interp {
     }
 
     /// Binds positionals then keywords to `names`; `required` leading parameters must be present.
-    pub fn bind_args(&mut self, fname: &str, args: &[Value], kw: &[(Obj, Value)], names: &[&str], required: usize) -> R<Vec<Option<Value>>> {
+    pub fn bind_args(
+        &mut self,
+        fname: &str,
+        args: &[Value],
+        kw: &[(Obj, Value)],
+        names: &[&str],
+        required: usize,
+    ) -> R<Vec<Option<Value>>> {
         let mut out: Vec<Option<Value>> = vec![None; names.len()];
         if args.len() > names.len() {
             return Err(self.arity_error(fname, args.len(), required, names.len()));
@@ -58,16 +81,31 @@ impl Interp {
             match names.iter().position(|n| *n == kn) {
                 Some(i) => {
                     if out[i].is_some() {
-                        return Err(self.type_error(&format!("argument for {}() given by name ('{}') and position ({})", fname, kn, i + 1)));
+                        return Err(self.type_error(&format!(
+                            "argument for {}() given by name ('{}') and position ({})",
+                            fname,
+                            kn,
+                            i + 1
+                        )));
                     }
                     out[i] = Some(v.clone());
                 }
-                None => return Err(self.type_error(&format!("{}() got an unexpected keyword argument '{}'", fname, kn))),
+                None => {
+                    return Err(self.type_error(&format!(
+                        "{}() got an unexpected keyword argument '{}'",
+                        fname, kn
+                    )))
+                }
             }
         }
         for (i, n) in names.iter().enumerate().take(required) {
             if out[i].is_none() {
-                return Err(self.type_error(&format!("{}() missing required argument '{}' (pos {})", fname, n, i + 1)));
+                return Err(self.type_error(&format!(
+                    "{}() missing required argument '{}' (pos {})",
+                    fname,
+                    n,
+                    i + 1
+                )));
             }
         }
         Ok(out)
@@ -126,7 +164,11 @@ impl Interp {
                 }
                 _ => {
                     let t = self.type_name_of(&r);
-                    Err(self.type_error(&format!("{}.__float__ returned non-float (type {})", self.type_name_of(v), t)))
+                    Err(self.type_error(&format!(
+                        "{}.__float__ returned non-float (type {})",
+                        self.type_name_of(v),
+                        t
+                    )))
                 }
             };
         }
@@ -140,7 +182,10 @@ impl Interp {
 
     /// Calls `sys.displayhook(v)`, as an interactive expression statement does.
     pub fn display_hook(&mut self, v: Value) -> R<Value> {
-        let hook = self.sys_module.clone().and_then(|m| dict_get_str(&self.module_dict(&m), "displayhook"));
+        let hook = self
+            .sys_module
+            .clone()
+            .and_then(|m| dict_get_str(&self.module_dict(&m), "displayhook"));
         match hook {
             Some(h) => self.call(&h, vec![v], Vec::new()),
             None => Err(self.runtime_error("lost sys.displayhook")),
@@ -167,7 +212,12 @@ impl Interp {
                         let msg = format!(
                             "__complex__ returned non-complex (type {t}).  The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python."
                         );
-                        crate::builtins::warningsm::warn_category(self, "DeprecationWarning", &msg, 1)?;
+                        crate::builtins::warningsm::warn_category(
+                            self,
+                            "DeprecationWarning",
+                            &msg,
+                            1,
+                        )?;
                     }
                     match &o.kind {
                         Kind::Complex(re, im) => Ok((*re, *im)),
@@ -206,7 +256,10 @@ impl Interp {
         };
         if !ok {
             let t = self.type_name_of(v);
-            return Err(self.type_error(&format!("descriptor '{}' for '{}' objects doesn't apply to a '{}' object", meth, ty, t)));
+            return Err(self.type_error(&format!(
+                "descriptor '{}' for '{}' objects doesn't apply to a '{}' object",
+                meth, ty, t
+            )));
         }
         Ok(())
     }

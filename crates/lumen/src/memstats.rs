@@ -45,7 +45,7 @@ pub fn enabled() -> bool {
 pub enum Cat {
     /// Nothing more specific: host/std allocations, the runtime's Rust state.
     Other = 0,
-    /// The object slab's chunks (over-aligned blocks; see `value::heap`).
+    /// Over-aligned allocations without category headers, including object-slab chunks.
     Slab = 1,
     /// Source text kept by the parser and the AST it builds (script, module, lazy bodies).
     Parse = 2,
@@ -67,11 +67,13 @@ pub enum Cat {
     StackTrace = 10,
     /// JIT: native code metadata.
     Jit = 11,
+    /// Native HTML DOM, style, layout, text, display-list and image-render allocations.
+    Html = lumen_common::memcat::HTML_CATEGORY_ID,
 }
 
-pub const CAT_NAMES: [&str; 12] = [
+pub const CAT_NAMES: [&str; 13] = [
     "other (host/std)",
-    "object slab chunks",
+    "over-aligned blocks / object slab chunks",
     "parse: source + AST",
     "AST decoded from blobs",
     "bytecode compiled",
@@ -82,6 +84,7 @@ pub const CAT_NAMES: [&str; 12] = [
     "program run",
     "stack traces",
     "JIT metadata",
+    "HTML DOM and rendering",
 ];
 
 /// The current thread's allocation category (see [`Cat`]).
@@ -92,34 +95,13 @@ pub fn current_cat() -> u8 {
 }
 
 /// Restores the previous category on drop (see [`enter`]).
-#[must_use]
-pub struct CatGuard {
-    #[cfg(feature = "mem-stats")]
-    prev: u8,
-}
-
-#[cfg(feature = "mem-stats")]
-impl Drop for CatGuard {
-    fn drop(&mut self) {
-        lumen_common::memcat::replace(self.prev);
-    }
-}
+pub type CatGuard = lumen_common::memcat::Guard;
 
 /// Attribute this thread's allocations to `cat` until the guard drops. Free without the
 /// `mem-stats` feature.
 #[inline(always)]
 pub fn enter(cat: Cat) -> CatGuard {
-    #[cfg(feature = "mem-stats")]
-    {
-        CatGuard {
-            prev: lumen_common::memcat::replace(cat as u8),
-        }
-    }
-    #[cfg(not(feature = "mem-stats"))]
-    {
-        let _ = cat;
-        CatGuard {}
-    }
+    lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::from_id(cat as u8))
 }
 
 /// Live bytes by category and block-size bucket (feature `mem-stats`; zeros without it).
@@ -138,6 +120,52 @@ pub fn categories() -> Option<[isize; 32]> {
     #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
     {
         Some(lumen_common::fastalloc::category_bytes())
+    }
+    #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
+    {
+        None
+    }
+}
+
+/// Cumulative allocation requests and successful reallocation requests with alignment greater
+/// than 16, grouped by the category active when each request was made. The byte values are
+/// logical requested sizes, not live bytes; summing their per-profile delta with sampled
+/// category live bytes is a conservative upper bound for allocations whose alignment prevents
+/// header-based live attribution. Returns `None` when `mem-stats` is disabled.
+pub fn overaligned_requests_by_category() -> Option<([usize; 32], [usize; 32])> {
+    #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
+    {
+        Some(lumen_common::fastalloc::overaligned_by_category())
+    }
+    #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
+    {
+        None
+    }
+}
+
+/// Exact outstanding count and logical requested live bytes for over-aligned allocations by
+/// original allocation category. The final flag is true if the bounded allocator-side ledger
+/// overflowed or lost a pointer, in which case per-category attribution is incomplete. Returns
+/// `None` when `mem-stats` is disabled.
+pub fn overaligned_live_by_category() -> Option<([isize; 32], [isize; 32], bool)> {
+    #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
+    {
+        Some(lumen_common::fastalloc::overaligned_live_by_category())
+    }
+    #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
+    {
+        None
+    }
+}
+
+/// Outstanding normal-alignment allocation counts and the live inner-layout bytes used by
+/// `ClassAlloc` for each category. The byte values include the 16-byte category header and any
+/// ClassAlloc size-class rounding. Over-aligned blocks are not represented because they store
+/// no category header; use [`overaligned_live_by_category`] for their ledger-tracked live bytes.
+pub fn category_allocation_overhead() -> Option<([isize; 32], [isize; 32])> {
+    #[cfg(all(feature = "mem-stats", not(target_arch = "wasm32")))]
+    {
+        Some(lumen_common::fastalloc::category_allocation_overhead())
     }
     #[cfg(not(all(feature = "mem-stats", not(target_arch = "wasm32"))))]
     {
@@ -437,11 +465,7 @@ pub fn address_space() -> Option<AddressSpace> {
                     } else {
                         a.private_other += size;
                     }
-                    let min = a
-                        .largest
-                        .iter_mut()
-                        .min_by_key(|e| e.0)
-                        .expect("non-empty");
+                    let min = a.largest.iter_mut().min_by_key(|e| e.0).expect("non-empty");
                     if size > min.0 {
                         *min = (size, info.protect);
                     }
@@ -520,11 +544,22 @@ pub fn phase(label: &str) {
         ));
         if let Some(cats) = categories() {
             let slab = cats[Cat::Slab as usize].max(0) as usize;
-            line.push_str(&format!(" excl. slab chunks {:>9}", fmt_bytes(live.saturating_sub(slab))));
+            line.push_str(&format!(
+                " excl. slab chunks {:>9}",
+                fmt_bytes(live.saturating_sub(slab))
+            ));
             if std::env::var_os("LUMEN_MEM_CATS").is_some() {
                 line.push_str(&format!(" [shapes={}]", crate::value::shape_count()));
-                for (k, name) in CAT_NAMES.iter().enumerate().filter(|(k, _)| *k != Cat::Slab as usize) {
-                    line.push_str(&format!(" [{}={}]", name.split(' ').next().unwrap_or(""), cats[k] / 1024));
+                for (k, name) in CAT_NAMES
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != Cat::Slab as usize)
+                {
+                    line.push_str(&format!(
+                        " [{}={}]",
+                        name.split(' ').next().unwrap_or(""),
+                        cats[k] / 1024
+                    ));
                 }
             }
         }
@@ -596,7 +631,9 @@ impl crate::interpreter::Interp {
     pub fn mem_report(&mut self) {
         report_process();
         if let Some(cats) = categories() {
-            eprintln!("[mem] ---- live allocator bytes by category (what was current when allocated) ----");
+            eprintln!(
+                "[mem] ---- live allocator bytes by category (what was current when allocated) ----"
+            );
             let total: isize = cats.iter().sum();
             for (k, name) in CAT_NAMES.iter().enumerate() {
                 if cats[k] != 0 {
@@ -607,8 +644,14 @@ impl crate::interpreter::Interp {
                     );
                 }
             }
-            eprintln!("[mem]   {:<26} {:>10}", "total", fmt_bytes(total.max(0) as usize));
-            eprintln!("[mem]   by block size:            <=32    <=64   <=128   <=256    <=1K    <=4K   <=64K   larger");
+            eprintln!(
+                "[mem]   {:<26} {:>10}",
+                "total",
+                fmt_bytes(total.max(0) as usize)
+            );
+            eprintln!(
+                "[mem]   by block size:            <=32    <=64   <=128   <=256    <=1K    <=4K   <=64K   larger"
+            );
             let sizes = size_buckets();
             for (k, name) in CAT_NAMES.iter().enumerate() {
                 if cats[k] >= 256 << 10 {

@@ -78,7 +78,11 @@ fn exact_fraction_digits(v: f64) -> usize {
     let bits = v.to_bits();
     let biased = ((bits >> 52) & 0x7ff) as i64;
     let mantissa = bits & 0xf_ffff_ffff_ffff;
-    let significand = if biased == 0 { mantissa } else { (1u64 << 52) | mantissa };
+    let significand = if biased == 0 {
+        mantissa
+    } else {
+        (1u64 << 52) | mantissa
+    };
     if significand == 0 {
         return 0;
     }
@@ -93,7 +97,10 @@ fn exact_fraction_digits(v: f64) -> usize {
 /// `d.ddde±x` into (`dddd`, x).
 fn split_sci(s: &str) -> (String, i32) {
     let (m, e) = s.split_once('e').unwrap_or((s, "0"));
-    (m.chars().filter(|c| *c != '.').collect(), e.parse().unwrap_or(0))
+    (
+        m.chars().filter(|c| *c != '.').collect(),
+        e.parse().unwrap_or(0),
+    )
 }
 
 #[cfg(test)]

@@ -6,21 +6,21 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
-[dependencies]
-lumen-common = { path = "../lumen-common" }
-
-# The shared dlopen loader (`lumen_os::dynlib`) is how desktop Unix reaches the system OpenSSL.
+# Desktop Unix keeps its dlopen OpenSSL transport (through the shared `lumen_os::dynlib` loader).
+# Rustls is also built there for its transport-free client state machine, which the managed kernel
+# drives over its own sockets.
 [target.'cfg(all(unix, not(target_os = "android")))'.dependencies]
 lumen-os = { path = "../lumen-os" }
 
-# Desktop Unix dlopens system OpenSSL. Android and Windows use rustls on the ring provider,
-# trusting the operating system's certificate store with bundled roots as a fallback.
-[target.'cfg(any(not(unix), target_os = "android"))'.dependencies]
+[dependencies]
+lumen-common = { path = "../lumen-common" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-native-certs = "0.8"
 webpki-roots = "1"
 
-[target.'cfg(any(not(unix), target_os = "android"))'.dev-dependencies]
+[target.'cfg(all(any(not(unix), target_os = "android"), not(target_os = "none")))'.dependencies]
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 
 [lints]

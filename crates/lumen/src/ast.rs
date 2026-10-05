@@ -5,6 +5,32 @@ use std::rc::Rc;
 
 pub type P<T> = Box<T>;
 
+/// JSX lexical syntax retains byte spans and ordinary JS/TS tokens in expression containers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsxElement {
+    /// `None` denotes a fragment (`<>...</>`).
+    pub name: Option<String>,
+    pub attributes: Vec<JsxAttribute>,
+    pub children: Vec<JsxChild>,
+    pub start: u32,
+    pub end: u32,
+    pub line: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsxAttribute {
+    Named(String, Option<JsxChild>),
+    Spread(crate::token::SubToks),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum JsxChild {
+    Text(String),
+    Element(Rc<JsxElement>),
+    Expression(crate::token::SubToks),
+    Spread(crate::token::SubToks),
+}
+
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Expr),
@@ -634,8 +660,7 @@ impl Function {
     /// The body is not decoded yet and comes from an ahead-of-time blob (already validated at
     /// build time, so decoding it can wait until something needs the statements).
     pub fn body_is_aot_deferred(&self) -> bool {
-        self.body.borrow().is_none()
-            && self.lazy.borrow().as_ref().is_some_and(|l| l.aot.is_some())
+        self.body.borrow().is_none() && self.lazy.borrow().as_ref().is_some_and(|l| l.aot.is_some())
     }
 
     /// Parse a skipped body. A failed parse is remembered and returned again on every later
@@ -653,13 +678,13 @@ impl Function {
             return Ok(());
         };
         let parsed = match &lazy.aot {
-            Some(aot) => crate::precompiled::decode_body(aot).map_err(|message| {
-                crate::parser::ParseError {
+            Some(aot) => {
+                crate::precompiled::decode_body(aot).map_err(|message| crate::parser::ParseError {
                     message,
                     line: 0,
                     at_eof: false,
-                }
-            }),
+                })
+            }
             None => crate::parser::parse_lazy_body(lazy, self),
         };
         match parsed {
@@ -696,7 +721,8 @@ impl Function {
         // The home-object bits are decided from the source text, which a release does not
         // change (and re-deciding them reads it: for a precompiled function, decompressing kept
         // text). The body facts are recomputed from the re-materialised body.
-        self.scan.set(self.scan.get() & (SCAN_HOME_CHECKED | SCAN_NEEDS_HOME));
+        self.scan
+            .set(self.scan.get() & (SCAN_HOME_CHECKED | SCAN_NEEDS_HOME));
         self.hoist.take();
         true
     }
@@ -724,9 +750,8 @@ impl Function {
             None => true,
             Some(t) => t.contains("super") || t.contains("eval") || t.contains('\\'),
         };
-        self.scan.set(
-            self.scan.get() | SCAN_HOME_CHECKED | if needs { SCAN_NEEDS_HOME } else { 0 },
-        );
+        self.scan
+            .set(self.scan.get() | SCAN_HOME_CHECKED | if needs { SCAN_NEEDS_HOME } else { 0 });
         needs
     }
 

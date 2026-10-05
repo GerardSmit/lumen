@@ -750,7 +750,10 @@ fn share_env_exchanges_live_writes_deletions_and_descriptors_without_host_mutati
     let key = "LUMEN_EMBEDDING_SHARE_ENV_TEST";
     let host_before = std::env::var_os(key);
     let mut realm = Realm::default();
-    realm.env = vec![(key.into(), "initial".into()), ("DELETE_ME".into(), "old".into())];
+    realm.env = vec![
+        (key.into(), "initial".into()),
+        ("DELETE_ME".into(), "old".into()),
+    ];
     let ran = realm.run(&scratch, r#"
         const {Worker,SHARE_ENV}=require('node:worker_threads');
         const kept=process.env;
@@ -774,7 +777,10 @@ fn share_env_exchanges_live_writes_deletions_and_descriptors_without_host_mutati
         worker.on('error',e=>{console.error(e.stack);process.exitCode=1;});
     "#);
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert_eq!(ran.stdout, "[\"updated\",\"42\",\"string\",true,true,\"new\"]\n");
+    assert_eq!(
+        ran.stdout,
+        "[\"updated\",\"42\",\"string\",true,true,\"new\"]\n"
+    );
     assert_eq!(std::env::var_os(key), host_before);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
@@ -856,7 +862,11 @@ fn fork_with_advanced_serialization_round_trips_structured_values() {
          child.send({ big: 21n, map: new Map([[1, 2]]), date: new Date(0) });",
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
-    assert!(ran.stdout.contains("bigint 42 [[1,2]] true"), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains("bigint 42 [[1,2]] true"),
+        "{}",
+        ran.stdout
+    );
     assert!(ran.stdout.contains("exit 7"), "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
@@ -877,7 +887,11 @@ fn killing_a_child_realm_reports_the_signal() {
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     assert!(ran.stdout.contains("killed true"), "{}", ran.stdout);
-    assert!(ran.stdout.contains("exit null SIGTERM true"), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains("exit null SIGTERM true"),
+        "{}",
+        ran.stdout
+    );
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -913,7 +927,10 @@ fn spawn_of_exec_path_pipes_stdio_to_a_child_realm() {
 #[test]
 fn child_realm_inherits_the_parent_streams() {
     let scratch = Scratch::new("spawn-inherit");
-    scratch.file("child.cjs", "console.log('from child'); console.error('child err');");
+    scratch.file(
+        "child.cjs",
+        "console.log('from child'); console.error('child err');",
+    );
     let ran = Realm::default().run(
         &scratch,
         "require('child_process').spawn(process.execPath, [__dirname + '/child.cjs'], { stdio: 'inherit' });",
@@ -1003,7 +1020,11 @@ fn a_child_blocked_on_an_unread_pipe_does_not_outlive_its_parent() {
          setTimeout(() => process.exit(5), 400);",
     );
     assert_eq!(ran.exit, RealmExit::Exited(5), "{}", ran.stderr);
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -1023,7 +1044,11 @@ fn killing_a_child_blocked_on_an_unread_pipe_frees_it() {
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     assert!(ran.stdout.contains("exit null SIGKILL"), "{}", ran.stdout);
-    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
 
@@ -1044,7 +1069,11 @@ fn only_the_ipc_slot_gets_the_channel_descriptor() {
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     // Like Node, the child consumes NODE_CHANNEL_FD while opening the channel.
-    assert!(ran.stdout.contains(r#"{"echo":"hi","fd":false}"#), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains(r#"{"echo":"hi","fd":false}"#),
+        "{}",
+        ran.stdout
+    );
     assert!(ran.stdout.contains("close 0"), "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
 }
@@ -1077,7 +1106,10 @@ fn a_signal_reaches_the_child_realms_listener() {
 #[test]
 fn an_unhandled_catchable_signal_takes_its_default_action() {
     let scratch = Scratch::new("child-signal-default");
-    scratch.file("child.cjs", "setInterval(() => {}, 1000); process.send('up');");
+    scratch.file(
+        "child.cjs",
+        "setInterval(() => {}, 1000); process.send('up');",
+    );
     let ran = Realm::default().run(
         &scratch,
         "const { fork } = require('child_process');
@@ -1147,7 +1179,10 @@ fn spawn_sync_of_exec_path_runs_a_child_realm() {
         "let input = ''; process.stdin.on('data', (d) => input += d);
          process.stdin.on('end', () => { console.log('out:' + input + ':' + process.argv.slice(2)); console.error('err'); process.exit(4); });",
     );
-    scratch.file("loud.cjs", "for (;;) process.stdout.write('x'.repeat(4096));");
+    scratch.file(
+        "loud.cjs",
+        "for (;;) process.stdout.write('x'.repeat(4096));",
+    );
     scratch.file("slow.cjs", "setInterval(() => {}, 1000);");
     let ran = Realm::default().run(
         &scratch,
@@ -1162,7 +1197,11 @@ fn spawn_sync_of_exec_path_runs_a_child_realm() {
     );
     assert_eq!(ran.exit, RealmExit::Exited(0), "{}", ran.stderr);
     assert!(ran.stdout.contains("threw 4"), "{}", ran.stdout);
-    assert!(ran.stdout.contains(r#"[4,null,"out:in:a\n","err\n",true]"#), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains(r#"[4,null,"out:in:a\n","err\n",true]"#),
+        "{}",
+        ran.stdout
+    );
     assert!(ran.stdout.contains("ENOBUFS SIGTERM"), "{}", ran.stdout);
     assert!(ran.stdout.contains("ETIMEDOUT SIGTERM"), "{}", ran.stdout);
     std::fs::remove_dir_all(&scratch.0).unwrap();
@@ -1171,8 +1210,14 @@ fn spawn_sync_of_exec_path_runs_a_child_realm() {
 #[test]
 fn module_graph_that_fails_to_link_is_rejected_every_time() {
     let scratch = Scratch::new("esm-failed-link");
-    scratch.file("a.mjs", "import { b } from './b.mjs'; globalThis.ranA = true; export const a = b;");
-    scratch.file("b.mjs", "import { gone } from './c.mjs'; export const b = gone;");
+    scratch.file(
+        "a.mjs",
+        "import { b } from './b.mjs'; globalThis.ranA = true; export const a = b;",
+    );
+    scratch.file(
+        "b.mjs",
+        "import { gone } from './c.mjs'; export const b = gone;",
+    );
     scratch.file("c.mjs", "export const present = 1;");
     let ran = Realm::default().run(
         &scratch,
@@ -1190,7 +1235,10 @@ fn module_graph_that_fails_to_link_is_rejected_every_time() {
 fn failed_module_graph_can_be_imported_again() {
     let scratch = Scratch::new("esm-failed-graph");
     scratch.file("a.mjs", "import { b } from './b.mjs'; export const a = b;");
-    scratch.file("b.mjs", "import { gone } from './missing.mjs'; export const b = gone;");
+    scratch.file(
+        "b.mjs",
+        "import { gone } from './missing.mjs'; export const b = gone;",
+    );
     let ran = Realm::default().run(
         &scratch,
         r#"

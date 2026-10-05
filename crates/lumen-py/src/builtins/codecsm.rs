@@ -13,7 +13,10 @@ pub struct Text<'a> {
 impl<'a> FromArg<'a, PyHost> for Text<'a> {
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
         match v.as_pystr() {
-            Some(s) => Ok(Text { s: &s.s[..], n: s.nchars }),
+            Some(s) => Ok(Text {
+                s: &s.s[..],
+                n: s.nchars,
+            }),
             None => Err(cx.arg_error(at, "str", v)),
         }
     }
@@ -57,12 +60,29 @@ fn pair_bytes(b: Vec<u8>, n: usize) -> Value {
     Value::tuple(vec![Value::bytes(b), Value::Int(n as i64)])
 }
 
-fn utf16_32_encode(it: &mut Interp, s: Text<'_>, errors: &str, byteorder: i32, wide: bool) -> R<Value> {
-    let out = if wide { codecs::utf32_encode(it, s.s, errors, byteorder)? } else { codecs::utf16_encode(it, s.s, errors, byteorder)? };
+fn utf16_32_encode(
+    it: &mut Interp,
+    s: Text<'_>,
+    errors: &str,
+    byteorder: i32,
+    wide: bool,
+) -> R<Value> {
+    let out = if wide {
+        codecs::utf32_encode(it, s.s, errors, byteorder)?
+    } else {
+        codecs::utf16_encode(it, s.s, errors, byteorder)?
+    };
     Ok(pair_bytes(out, s.n))
 }
 
-fn utf16_32_decode(it: &mut Interp, data: &[u8], errors: &str, byteorder: &mut i32, final_: bool, wide: bool) -> R<(String, usize)> {
+fn utf16_32_decode(
+    it: &mut Interp,
+    data: &[u8],
+    errors: &str,
+    byteorder: &mut i32,
+    final_: bool,
+    wide: bool,
+) -> R<(String, usize)> {
     if wide {
         codecs::utf32_decode(it, data, errors, byteorder, final_)
     } else {
@@ -109,7 +129,16 @@ pub mod _codecs {
     /// and 'backslashreplace' as well as any other name registered with
     /// codecs.register_error that can handle ValueErrors.
     #[op]
-    fn encode(it: &mut Interp, #[kw] obj: &Value, #[kw] #[default("utf-8")] encoding: &str, #[kw] #[default("strict")] errors: &str) -> R<Value> {
+    fn encode(
+        it: &mut Interp,
+        #[kw] obj: &Value,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<Value> {
         codecs::encode_obj(it, obj, encoding, errors)
     }
 
@@ -121,7 +150,16 @@ pub mod _codecs {
     /// and 'backslashreplace' as well as any other name registered with
     /// codecs.register_error that can handle ValueErrors.
     #[op]
-    fn decode(it: &mut Interp, #[kw] obj: &Value, #[kw] #[default("utf-8")] encoding: &str, #[kw] #[default("strict")] errors: &str) -> R<Value> {
+    fn decode(
+        it: &mut Interp,
+        #[kw] obj: &Value,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<Value> {
         codecs::decode_obj(it, obj, encoding, errors)
     }
 
@@ -160,11 +198,19 @@ pub mod _codecs {
 
     #[op]
     fn utf_8_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>) -> R<Value> {
-        Ok(pair_bytes(codecs::utf8_encode(it, str.s, super::errors(errors))?, str.n))
+        Ok(pair_bytes(
+            codecs::utf8_encode(it, str.s, super::errors(errors))?,
+            str.n,
+        ))
     }
 
     #[op]
-    fn utf_8_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_8_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = codecs::utf8_decode(it, data, super::errors(errors), r#final)?;
         Ok(pair_str(s, n))
     }
@@ -175,14 +221,30 @@ pub mod _codecs {
     }
 
     #[op]
-    fn utf_7_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_7_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = codecs::utf7_decode(it, data, super::errors(errors), r#final)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_16_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>, #[default(0)] byteorder: i32) -> R<Value> {
-        utf16_32_encode(it, str, super::errors(errors), byteorder.clamp(-1, 1), false)
+    fn utf_16_encode(
+        it: &mut Interp,
+        str: Text<'_>,
+        errors: Option<Errors<'_>>,
+        #[default(0)] byteorder: i32,
+    ) -> R<Value> {
+        utf16_32_encode(
+            it,
+            str,
+            super::errors(errors),
+            byteorder.clamp(-1, 1),
+            false,
+        )
     }
 
     #[op]
@@ -196,7 +258,12 @@ pub mod _codecs {
     }
 
     #[op]
-    fn utf_32_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>, #[default(0)] byteorder: i32) -> R<Value> {
+    fn utf_32_encode(
+        it: &mut Interp,
+        str: Text<'_>,
+        errors: Option<Errors<'_>>,
+        #[default(0)] byteorder: i32,
+    ) -> R<Value> {
         utf16_32_encode(it, str, super::errors(errors), byteorder.clamp(-1, 1), true)
     }
 
@@ -211,42 +278,74 @@ pub mod _codecs {
     }
 
     #[op]
-    fn utf_16_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_16_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut 0, r#final, false)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_16_le_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_16_le_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut -1, r#final, false)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_16_be_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_16_be_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut 1, r#final, false)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_32_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_32_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut 0, r#final, true)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_32_le_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_32_le_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut -1, r#final, true)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn utf_32_be_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, #[default(false)] r#final: bool) -> R<Value> {
+    fn utf_32_be_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        #[default(false)] r#final: bool,
+    ) -> R<Value> {
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut 1, r#final, true)?;
         Ok(pair_str(s, n))
     }
 
-    #[op(hint(py(text_signature = "($module, data, errors=None, byteorder=0, final=False,\n                 /)")))]
+    #[op(hint(py(
+        text_signature = "($module, data, errors=None, byteorder=0, final=False,\n                 /)"
+    )))]
     fn utf_16_ex_decode(
         it: &mut Interp,
         data: &[u8],
@@ -256,10 +355,16 @@ pub mod _codecs {
     ) -> R<Value> {
         let mut bo = byteorder.clamp(-1, 1);
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut bo, r#final, false)?;
-        Ok(Value::tuple(vec![Value::string(s), Value::Int(n as i64), Value::Int(bo as i64)]))
+        Ok(Value::tuple(vec![
+            Value::string(s),
+            Value::Int(n as i64),
+            Value::Int(bo as i64),
+        ]))
     }
 
-    #[op(hint(py(text_signature = "($module, data, errors=None, byteorder=0, final=False,\n                 /)")))]
+    #[op(hint(py(
+        text_signature = "($module, data, errors=None, byteorder=0, final=False,\n                 /)"
+    )))]
     fn utf_32_ex_decode(
         it: &mut Interp,
         data: &[u8],
@@ -269,12 +374,19 @@ pub mod _codecs {
     ) -> R<Value> {
         let mut bo = byteorder.clamp(-1, 1);
         let (s, n) = utf16_32_decode(it, data, super::errors(errors), &mut bo, r#final, true)?;
-        Ok(Value::tuple(vec![Value::string(s), Value::Int(n as i64), Value::Int(bo as i64)]))
+        Ok(Value::tuple(vec![
+            Value::string(s),
+            Value::Int(n as i64),
+            Value::Int(bo as i64),
+        ]))
     }
 
     #[op]
     fn latin_1_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>) -> R<Value> {
-        Ok(pair_bytes(codecs::latin1_encode(it, str.s, super::errors(errors))?, str.n))
+        Ok(pair_bytes(
+            codecs::latin1_encode(it, str.s, super::errors(errors))?,
+            str.n,
+        ))
     }
 
     #[op]
@@ -284,7 +396,10 @@ pub mod _codecs {
 
     #[op]
     fn ascii_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>) -> R<Value> {
-        Ok(pair_bytes(codecs::ascii_encode(it, str.s, super::errors(errors))?, str.n))
+        Ok(pair_bytes(
+            codecs::ascii_encode(it, str.s, super::errors(errors))?,
+            str.n,
+        ))
     }
 
     #[op]
@@ -294,14 +409,34 @@ pub mod _codecs {
     }
 
     #[op]
-    fn charmap_encode(it: &mut Interp, str: Text<'_>, errors: Option<Errors<'_>>, mapping: Option<&Value>) -> R<Value> {
-        let out = codecs::charmap_encode(it, str.s, super::errors(errors), mapping.unwrap_or(&Value::None))?;
+    fn charmap_encode(
+        it: &mut Interp,
+        str: Text<'_>,
+        errors: Option<Errors<'_>>,
+        mapping: Option<&Value>,
+    ) -> R<Value> {
+        let out = codecs::charmap_encode(
+            it,
+            str.s,
+            super::errors(errors),
+            mapping.unwrap_or(&Value::None),
+        )?;
         Ok(pair_bytes(out, str.n))
     }
 
     #[op]
-    fn charmap_decode(it: &mut Interp, data: &[u8], errors: Option<Errors<'_>>, mapping: Option<&Value>) -> R<Value> {
-        let s = codecs::charmap_decode(it, data, super::errors(errors), mapping.unwrap_or(&Value::None))?;
+    fn charmap_decode(
+        it: &mut Interp,
+        data: &[u8],
+        errors: Option<Errors<'_>>,
+        mapping: Option<&Value>,
+    ) -> R<Value> {
+        let s = codecs::charmap_decode(
+            it,
+            data,
+            super::errors(errors),
+            mapping.unwrap_or(&Value::None),
+        )?;
         Ok(pair_str(s, data.len()))
     }
 
@@ -321,14 +456,24 @@ pub mod _codecs {
     }
 
     #[op]
-    fn unicode_escape_decode(it: &mut Interp, data: &Value, errors: Option<Errors<'_>>, #[default(true)] r#final: bool) -> R<Value> {
+    fn unicode_escape_decode(
+        it: &mut Interp,
+        data: &Value,
+        errors: Option<Errors<'_>>,
+        #[default(true)] r#final: bool,
+    ) -> R<Value> {
         let d = text_or_bytes(it, data)?;
         let (s, n) = codecs::unicode_escape_decode(it, &d, super::errors(errors), r#final, false)?;
         Ok(pair_str(s, n))
     }
 
     #[op]
-    fn raw_unicode_escape_decode(it: &mut Interp, data: &Value, errors: Option<Errors<'_>>, #[default(true)] r#final: bool) -> R<Value> {
+    fn raw_unicode_escape_decode(
+        it: &mut Interp,
+        data: &Value,
+        errors: Option<Errors<'_>>,
+        #[default(true)] r#final: bool,
+    ) -> R<Value> {
         let d = text_or_bytes(it, data)?;
         let (s, n) = codecs::unicode_escape_decode(it, &d, super::errors(errors), r#final, true)?;
         Ok(pair_str(s, n))
@@ -340,7 +485,10 @@ pub mod _codecs {
             Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => it.bytes_of(data)?,
             _ => {
                 let t = it.type_name_of(data);
-                return Err(it.type_error(&format!("escape_encode() argument 1 must be bytes, not {}", t)));
+                return Err(it.type_error(&format!(
+                    "escape_encode() argument 1 must be bytes, not {}",
+                    t
+                )));
             }
         };
         let n = d.len();

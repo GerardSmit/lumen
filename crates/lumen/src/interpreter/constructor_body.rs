@@ -18,7 +18,11 @@ impl Interp {
     /// wins; any other non-undefined value is a TypeError; otherwise the current `this` binding
     /// found from `env` — a ReferenceError while still uninitialized (no `super()` ran). Both
     /// errors belong to the caller's realm.
-    pub(crate) fn derived_construct_result(&mut self, env: &Env, v: Value) -> Result<Value, Abrupt> {
+    pub(crate) fn derived_construct_result(
+        &mut self,
+        env: &Env,
+        v: Value,
+    ) -> Result<Value, Abrupt> {
         if matches!(v, Value::Obj(_)) {
             return Ok(v);
         }

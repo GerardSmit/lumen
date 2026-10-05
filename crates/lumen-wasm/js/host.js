@@ -51,22 +51,78 @@ export async function createRuntime({
 
   const push = (id, kind, args) => handle(session.pushEvent(id, kind, args));
   const sockets = new Map();
+  const requests = new Map();
 
   const host = {
-    fetch(id, method, url, headers, body) {
+    fetch(id, method, url, headers, body, options = {}) {
+      const controller = new AbortController();
+      const state = { controller, reader: null };
+      requests.set(id, state);
       (async () => {
         try {
-          const init = { method, headers: new Headers(headers) };
+          const init = { method, headers: new Headers(headers), signal: controller.signal };
+          for (const name of ["mode", "credentials", "redirect"]) {
+            if (options[name] !== undefined) init[name] = options[name];
+          }
           if (body !== null && method !== 'GET' && method !== 'HEAD') init.body = body;
           const res = await fetchImpl(url, init);
-          const bytes = new Uint8Array(await res.arrayBuffer());
           const pairs = [];
           res.headers.forEach((v, k) => pairs.push(k, v));
-          push(id, 'ok', [res.status, res.statusText, res.url || url, bytes, ...pairs]);
+          if (controller.signal.aborted) { if (res.body) await res.body.cancel(); return; }
+          if (res.body) {
+            state.reader = res.body.getReader();
+            // No read is issued until the guest stream asks for a chunk.
+            push(id, 'ok', [res.status, res.statusText, res.url, id, res.redirected === true, res.type || "basic", ...pairs]);
+          } else if (res.body === null || method === 'HEAD' || [204, 205, 304].includes(res.status)) {
+            requests.delete(id);
+            push(id, 'ok', [res.status, res.statusText, res.url, null, res.redirected === true, res.type || "basic", ...pairs]);
+          } else {
+            // Compatibility with embedders predating the response reader bridge.
+            const bytes = new Uint8Array(await res.arrayBuffer());
+            if (controller.signal.aborted) return;
+            requests.delete(id);
+            push(id, 'ok', [res.status, res.statusText, res.url, bytes, res.redirected === true, res.type || "basic", ...pairs]);
+          }
         } catch (e) {
+          requests.delete(id);
+          if (controller.signal.aborted) return;
           push(id, 'error', [String((e && e.message) || e)]);
         }
       })();
+    },
+    fetchRead(id, taskId) {
+      const state = requests.get(id);
+      (async () => {
+        try {
+          if (!state || !state.reader) throw new Error('Fetch response body is closed');
+          const result = await state.reader.read();
+          if (state.controller.signal.aborted) throw new Error('Fetch response body was aborted');
+          if (result.done) {
+            state.reader.releaseLock();
+            state.reader = null;
+            requests.delete(id);
+            push(taskId, 'end', []);
+          } else {
+            push(taskId, 'chunk', [result.value]);
+          }
+        } catch (e) {
+          requests.delete(id);
+          // Pending guest reads must settle even when the parent request aborts.
+          push(taskId, 'error', [String((e && e.message) || e)]);
+        }
+      })();
+    },
+    fetchAbort(id) {
+      const state = requests.get(id);
+      if (state) {
+        state.controller.abort();
+        if (state.reader) {
+          state.reader.cancel().catch(() => {}).finally(() => {
+            if (state.reader) { state.reader.releaseLock(); state.reader = null; }
+          });
+        }
+      }
+      requests.delete(id);
     },
     wsOpen(id, url, protocols) {
       const list = protocols ? protocols.split(',').map((p) => p.trim()).filter(Boolean) : [];

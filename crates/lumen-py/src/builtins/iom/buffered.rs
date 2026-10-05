@@ -53,7 +53,9 @@ impl Drop for Buffered {
         }
         let Some(raw) = &self.raw else { return };
         let data = std::mem::take(&mut self.write_buf);
-        let target = crate::builtins::native::with_opaque::<super::fileio::FileIO, _>(raw, |f| f.drop_target());
+        let target = crate::builtins::native::with_opaque::<super::fileio::FileIO, _>(raw, |f| {
+            f.drop_target()
+        });
         if let Some(Some((fd, platform))) = target {
             if let Ok(mut p) = platform.try_borrow_mut() {
                 let mut rest = &data[..];
@@ -90,8 +92,12 @@ pub struct BufferedRandom(Buffered);
 
 /// The shared state of any of the three classes; `RuntimeError` on reentrant use.
 fn with_b<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut Buffered) -> X) -> R<X> {
-    let Value::Obj(o) = v else { return Err(it.type_error("expected a buffered stream")) };
-    let Kind::Opaque(cell) = &o.kind else { return Err(it.type_error("expected a buffered stream")) };
+    let Value::Obj(o) = v else {
+        return Err(it.type_error("expected a buffered stream"));
+    };
+    let Kind::Opaque(cell) = &o.kind else {
+        return Err(it.type_error("expected a buffered stream"));
+    };
     let Ok(mut b) = cell.try_borrow_mut() else {
         let r = it.repr_of(v).unwrap_or_default();
         return Err(it.new_exc_str("RuntimeError", &format!("reentrant call inside {}", r)));
@@ -112,7 +118,9 @@ fn with_b<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut Buffered) -> X) -> 
 
 /// The raw stream of an initialized, attached object.
 fn raw_of(it: &mut Interp, v: &Value) -> R<Value> {
-    let (raw, detached) = with_b(it, v, |b| (if b.ok { b.raw.clone() } else { None }, b.detached))?;
+    let (raw, detached) = with_b(it, v, |b| {
+        (if b.ok { b.raw.clone() } else { None }, b.detached)
+    })?;
     match raw {
         Some(r) => Ok(r),
         None if detached => Err(it.value_error("raw stream has been detached")),
@@ -156,7 +164,13 @@ fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
     }
     let k = it.index_of(&r)?;
     if k < 0 || k as usize > n {
-        return Err(it.new_exc_str("OSError", &format!("raw readinto() returned invalid length {} (should have been between 0 and {})", k, n)));
+        return Err(it.new_exc_str(
+            "OSError",
+            &format!(
+                "raw readinto() returned invalid length {} (should have been between 0 and {})",
+                k, n
+            ),
+        ));
     }
     let mut data = it.bytes_of(&ba)?;
     data.truncate(k as usize);
@@ -178,7 +192,14 @@ fn raw_write(it: &mut Interp, raw: &Value, data: &[u8]) -> R<Option<usize>> {
     }
     let n = it.index_of(&r)?;
     if n < 0 || n as usize > data.len() {
-        return Err(it.new_exc_str("OSError", &format!("raw write() returned invalid length {} (should have been between 0 and {})", n, data.len())));
+        return Err(it.new_exc_str(
+            "OSError",
+            &format!(
+                "raw write() returned invalid length {} (should have been between 0 and {})",
+                n,
+                data.len()
+            ),
+        ));
     }
     Ok(Some(n as usize))
 }
@@ -188,11 +209,18 @@ fn raw_seek(it: &mut Interp, raw: &Value, pos: i64, whence: i32) -> R<i64> {
         let r = it.platform.borrow_mut().fd_seek(fd, pos, whence);
         r.map_err(|e| it.os_error_io(&e, None))? as i64
     } else {
-        let r = it.call_method(raw, "seek", vec![Value::Int(pos), Value::Int(whence as i64)])?;
+        let r = it.call_method(
+            raw,
+            "seek",
+            vec![Value::Int(pos), Value::Int(whence as i64)],
+        )?;
         it.index_of(&r)?
     };
     if n < 0 {
-        return Err(it.new_exc_str("OSError", &format!("Raw stream returned invalid position {}", n)));
+        return Err(it.new_exc_str(
+            "OSError",
+            &format!("Raw stream returned invalid position {}", n),
+        ));
     }
     Ok(n)
 }
@@ -206,7 +234,10 @@ fn raw_tell(it: &mut Interp, raw: &Value) -> R<i64> {
         it.index_of(&r)?
     };
     if n < 0 {
-        return Err(it.new_exc_str("OSError", &format!("Raw stream returned invalid position {}", n)));
+        return Err(it.new_exc_str(
+            "OSError",
+            &format!("Raw stream returned invalid position {}", n),
+        ));
     }
     Ok(n)
 }
@@ -221,7 +252,14 @@ fn check_raw(it: &mut Interp, raw: &Value, method: &str, msg: &str) -> R<()> {
 fn blocking_error(it: &mut Interp, msg: &str, written: usize) -> Obj {
     let t = it.exc_type("BlockingIOError");
     let errno = lumen_os::errno::errno_of_code("EAGAIN").unwrap_or(35) as i64;
-    it.new_exc(&t, vec![Value::Int(errno), Value::str(msg), Value::Int(written as i64)])
+    it.new_exc(
+        &t,
+        vec![
+            Value::Int(errno),
+            Value::str(msg),
+            Value::Int(written as i64),
+        ],
+    )
 }
 
 // ---- shared implementation ---------------------------------------------------------------
@@ -273,7 +311,11 @@ fn flush_unlocked(it: &mut Interp, v: &Value, raw: &Value) -> R<()> {
             Ok(Some(n)) => n,
             Ok(None) => {
                 with_b(it, v, |b| b.write_buf = data)?;
-                return Err(blocking_error(it, "write could not complete without blocking", 0));
+                return Err(blocking_error(
+                    it,
+                    "write could not complete without blocking",
+                    0,
+                ));
             }
             Err(e) => {
                 with_b(it, v, |b| {
@@ -484,8 +526,15 @@ fn readline(it: &mut Interp, v: &Value, limit: i64) -> R<Vec<u8>> {
     loop {
         let done = with_b(it, v, |b| {
             let avail = &b.read_buf[b.read_pos..];
-            let room = if limit < 0 { avail.len() } else { (limit as usize - out.len()).min(avail.len()) };
-            let n = avail[..room].iter().position(|&c| c == b'\n').map_or(room, |p| p + 1);
+            let room = if limit < 0 {
+                avail.len()
+            } else {
+                (limit as usize - out.len()).min(avail.len())
+            };
+            let n = avail[..room]
+                .iter()
+                .position(|&c| c == b'\n')
+                .map_or(room, |p| p + 1);
             out.extend_from_slice(&avail[..n]);
             b.read_pos += n;
             out.last() == Some(&b'\n') || (limit >= 0 && out.len() >= limit as usize)
@@ -509,7 +558,9 @@ fn write(it: &mut Interp, v: &Value, data: &[u8]) -> R<usize> {
     if raw_closed(it, &raw)? {
         return Err(it.value_error("write to closed file"));
     }
-    let (ahead, bs) = with_b(it, v, |b| (if b.readable { b.readahead() } else { 0 }, b.buffer_size))?;
+    let (ahead, bs) = with_b(it, v, |b| {
+        (if b.readable { b.readahead() } else { 0 }, b.buffer_size)
+    })?;
     if ahead > 0 {
         raw_seek(it, &raw, -(ahead as i64), 1)?;
     }
@@ -529,7 +580,11 @@ fn write(it: &mut Interp, v: &Value, data: &[u8]) -> R<usize> {
             let room = with_b(it, v, |b| bs.saturating_sub(b.write_buf.len()))?;
             let n = room.min(data.len());
             with_b(it, v, |b| b.write_buf.extend_from_slice(&data[..n]))?;
-            return Err(blocking_error(it, "write could not complete without blocking", n));
+            return Err(blocking_error(
+                it,
+                "write could not complete without blocking",
+                n,
+            ));
         }
         Err(e) => return Err(e),
     }
@@ -543,8 +598,14 @@ fn write(it: &mut Interp, v: &Value, data: &[u8]) -> R<usize> {
             Some(n) => written += n,
             None => {
                 let n = (data.len() - written).min(bs);
-                with_b(it, v, |b| b.write_buf.extend_from_slice(&data[written..written + n]))?;
-                return Err(blocking_error(it, "write could not complete without blocking", written + n));
+                with_b(it, v, |b| {
+                    b.write_buf.extend_from_slice(&data[written..written + n])
+                })?;
+                return Err(blocking_error(
+                    it,
+                    "write could not complete without blocking",
+                    written + n,
+                ));
             }
         }
     }
@@ -576,14 +637,23 @@ fn seek(it: &mut Interp, v: &Value, target: &Value, whence: i32) -> R<i64> {
     check_raw(it, &raw, "seekable", "File or stream is not seekable.")?;
     if !it.has_index(target) {
         let t = it.type_name_of(target);
-        return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+        return Err(it.type_error(&format!(
+            "'{}' object cannot be interpreted as an integer",
+            t
+        )));
     }
     let target = it.index_of(target)?;
-    let (readable, ahead, pending) = with_b(it, v, |b| (b.readable, b.readahead() as i64, !b.write_buf.is_empty()))?;
+    let (readable, ahead, pending) = with_b(it, v, |b| {
+        (b.readable, b.readahead() as i64, !b.write_buf.is_empty())
+    })?;
     if whence != 2 && readable && ahead > 0 && !pending {
         let current = raw_tell(it, &raw)?;
         let logical = current - ahead;
-        let offset = if whence == 0 { target - logical } else { target };
+        let offset = if whence == 0 {
+            target - logical
+        } else {
+            target
+        };
         let done = with_b(it, v, |b| {
             if offset >= -(b.read_pos as i64) && offset <= ahead {
                 b.read_pos = (b.read_pos as i64 + offset) as usize;
@@ -666,19 +736,30 @@ fn repr(it: &mut Interp, v: &Value) -> R<String> {
             let r = it.repr_of(&n)?;
             Ok(format!("<{} name={}>", tn, r))
         }
-        Err(e) if it.exc_is(&e, "AttributeError") || it.exc_is(&e, "ValueError") => Ok(format!("<{}>", tn)),
+        Err(e) if it.exc_is(&e, "AttributeError") || it.exc_is(&e, "ValueError") => {
+            Ok(format!("<{}>", tn))
+        }
         Err(e) => Err(e),
     }
 }
 
-fn next_line<T: lumen_bind::Class + lumen_bind::Methods<super::PyHost>>(it: &mut Interp, v: &Value) -> R<Option<Value>> {
+fn next_line<T: lumen_bind::Class + lumen_bind::Methods<super::PyHost>>(
+    it: &mut Interp,
+    v: &Value,
+) -> R<Option<Value>> {
     let line = if super::exact::<T>(it, v).is_some() {
         Value::bytes(readline(it, v, -1)?)
     } else {
         let l = it.call_method(v, "readline", Vec::new())?;
         if !matches!(&l, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_))) {
             let t = it.type_name_of(&l);
-            return Err(it.new_exc_str("OSError", &format!("readline() should have returned a bytes object, not '{}'", t)));
+            return Err(it.new_exc_str(
+                "OSError",
+                &format!(
+                    "readline() should have returned a bytes object, not '{}'",
+                    t
+                ),
+            ));
         }
         l
     };
@@ -716,7 +797,9 @@ pub fn write_bytes(it: &mut Interp, v: &Value, data: &[u8]) -> R<usize> {
 
 /// Whether `v` is one of the native buffered classes (not a Python subclass).
 pub fn is_native(it: &mut Interp, v: &Value) -> bool {
-    super::exact::<BufferedReader>(it, v).is_some() || super::exact::<BufferedWriter>(it, v).is_some() || super::exact::<BufferedRandom>(it, v).is_some()
+    super::exact::<BufferedReader>(it, v).is_some()
+        || super::exact::<BufferedWriter>(it, v).is_some()
+        || super::exact::<BufferedRandom>(it, v).is_some()
 }
 
 /// `v.closed` of a native buffered object over a native `FileIO`, without method calls.
@@ -761,7 +844,14 @@ impl BufferedReader {
     }
 
     #[proto(init)]
-    fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] raw: &Value, #[kw] #[default(131072)] buffer_size: i64) -> R<()> {
+    fn __init__(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] raw: &Value,
+        #[kw]
+        #[default(131072)]
+        buffer_size: i64,
+    ) -> R<()> {
         init(it, slf.0.value(), Mode::Reader, raw, buffer_size)
     }
 
@@ -793,7 +883,12 @@ impl BufferedReader {
         readline(it, slf.0.value(), n)
     }
 
-    fn seek(slf: This<Py<Self>>, it: &mut Interp, target: &Value, #[default(0)] whence: i32) -> R<i64> {
+    fn seek(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        target: &Value,
+        #[default(0)] whence: i32,
+    ) -> R<i64> {
         seek(it, slf.0.value(), target, whence)
     }
 
@@ -896,7 +991,14 @@ impl BufferedWriter {
     }
 
     #[proto(init)]
-    fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] raw: &Value, #[kw] #[default(131072)] buffer_size: i64) -> R<()> {
+    fn __init__(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] raw: &Value,
+        #[kw]
+        #[default(131072)]
+        buffer_size: i64,
+    ) -> R<()> {
         init(it, slf.0.value(), Mode::Writer, raw, buffer_size)
     }
 
@@ -904,7 +1006,12 @@ impl BufferedWriter {
         write(it, slf.0.value(), buffer)
     }
 
-    fn seek(slf: This<Py<Self>>, it: &mut Interp, target: &Value, #[default(0)] whence: i32) -> R<i64> {
+    fn seek(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        target: &Value,
+        #[default(0)] whence: i32,
+    ) -> R<i64> {
         seek(it, slf.0.value(), target, whence)
     }
 
@@ -1002,7 +1109,14 @@ impl BufferedRandom {
     }
 
     #[proto(init)]
-    fn __init__(slf: This<Py<Self>>, it: &mut Interp, #[kw] raw: &Value, #[kw] #[default(131072)] buffer_size: i64) -> R<()> {
+    fn __init__(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] raw: &Value,
+        #[kw]
+        #[default(131072)]
+        buffer_size: i64,
+    ) -> R<()> {
         init(it, slf.0.value(), Mode::Random, raw, buffer_size)
     }
 
@@ -1038,7 +1152,12 @@ impl BufferedRandom {
         write(it, slf.0.value(), buffer)
     }
 
-    fn seek(slf: This<Py<Self>>, it: &mut Interp, target: &Value, #[default(0)] whence: i32) -> R<i64> {
+    fn seek(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        target: &Value,
+        #[default(0)] whence: i32,
+    ) -> R<i64> {
         seek(it, slf.0.value(), target, whence)
     }
 
@@ -1162,24 +1281,45 @@ fn pair(it: &mut Interp, slf: &Py<BufferedRWPair>) -> R<(Value, Value)> {
     }
 }
 
-fn forward(it: &mut Interp, slf: &Py<BufferedRWPair>, writer: bool, name: &str, args: Vec<Value>) -> R<Value> {
+fn forward(
+    it: &mut Interp,
+    slf: &Py<BufferedRWPair>,
+    writer: bool,
+    name: &str,
+    args: Vec<Value>,
+) -> R<Value> {
     let (r, w) = pair(it, slf)?;
     it.call_method(if writer { &w } else { &r }, name, args)
 }
 
 #[lumen_bind::methods]
 impl BufferedRWPair {
-    #[constructor(hint(py(text_signature = "(reader, writer, buffer_size=DEFAULT_BUFFER_SIZE, /)")))]
+    #[constructor(hint(py(
+        text_signature = "(reader, writer, buffer_size=DEFAULT_BUFFER_SIZE, /)"
+    )))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BufferedRWPair {
         let _ = (args, kwargs);
-        BufferedRWPair { reader: None, writer: None }
+        BufferedRWPair {
+            reader: None,
+            writer: None,
+        }
     }
 
     #[proto(init)]
-    fn __init__(slf: This<Py<Self>>, it: &mut Interp, reader: &Value, writer: &Value, #[default(131072)] buffer_size: i64) -> R<()> {
+    fn __init__(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        reader: &Value,
+        writer: &Value,
+        #[default(131072)] buffer_size: i64,
+    ) -> R<()> {
         check_raw(it, reader, "readable", "File or stream is not readable.")?;
         check_raw(it, writer, "writable", "File or stream is not writable.")?;
-        let size = if buffer_size <= 0 { 0 } else { buffer_size as usize };
+        let size = if buffer_size <= 0 {
+            0
+        } else {
+            buffer_size as usize
+        };
         let r = Py::new(it, BufferedReader(Buffered::default())).into_value();
         init(it, &r, Mode::Reader, reader, buffer_size)?;
         let w = Py::new(it, BufferedWriter(Buffered::default())).into_value();

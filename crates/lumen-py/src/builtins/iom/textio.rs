@@ -24,7 +24,11 @@ pub struct NlState {
 
 impl NlState {
     pub fn new(translate: bool) -> NlState {
-        NlState { translate, pendingcr: false, seennl: 0 }
+        NlState {
+            translate,
+            pendingcr: false,
+            seennl: 0,
+        }
     }
 
     /// Newline handling of already decoded `output`.
@@ -277,9 +281,15 @@ impl TextIOWrapper {
     }
 
     fn take_decoded(&mut self, n: i64) -> Vec<u32> {
-        let Some(d) = &self.decoded else { return Vec::new() };
+        let Some(d) = &self.decoded else {
+            return Vec::new();
+        };
         let avail = d.len() - self.used;
-        let n = if n < 0 || n as usize > avail { avail } else { n as usize };
+        let n = if n < 0 || n as usize > avail {
+            avail
+        } else {
+            n as usize
+        };
         let out = d[self.used..self.used + n].to_vec();
         self.used += n;
         out
@@ -303,7 +313,9 @@ type Slf = Py<TextIOWrapper>;
 
 /// CPython's `CHECK_ATTACHED`: the buffer of an initialized, attached wrapper.
 fn attached(it: &mut Interp, slf: &Slf) -> R<Value> {
-    let (buf, detached) = slf.with(it, |s| (if s.ok { s.buffer.clone() } else { None }, s.detached))?;
+    let (buf, detached) = slf.with(it, |s| {
+        (if s.ok { s.buffer.clone() } else { None }, s.detached)
+    })?;
     match buf {
         Some(b) => Ok(b),
         None if detached => Err(it.value_error("underlying buffer has been detached")),
@@ -341,7 +353,11 @@ fn with_dec<X>(it: &mut Interp, slf: &Slf, f: impl FnOnce(&mut Interp, &mut Dec)
     r
 }
 
-fn with_enc<X>(it: &mut Interp, slf: &Slf, f: impl FnOnce(&mut Interp, &mut IncrementalEncoder) -> R<X>) -> R<X> {
+fn with_enc<X>(
+    it: &mut Interp,
+    slf: &Slf,
+    f: impl FnOnce(&mut Interp, &mut IncrementalEncoder) -> R<X>,
+) -> R<X> {
     let Some(mut e) = slf.with(it, |s| s.encoder.take())? else {
         return Err(unsupported(it, "not writable"));
     };
@@ -372,10 +388,18 @@ fn writeflush(it: &mut Interp, slf: &Slf) -> R<()> {
 fn bytes_from(it: &mut Interp, v: &Value, method: &str) -> R<Vec<u8>> {
     match v {
         Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(v),
-        Value::Obj(o) if matches!(o.kind, Kind::Opaque(_)) && crate::builtins::memview::is_buffer_object(it, v) => it.bytes_of(v),
+        Value::Obj(o)
+            if matches!(o.kind, Kind::Opaque(_))
+                && crate::builtins::memview::is_buffer_object(it, v) =>
+        {
+            it.bytes_of(v)
+        }
         _ => {
             let t = it.type_name_of(v);
-            Err(it.type_error(&format!("underlying {}() should have returned a bytes-like object, not '{}'", method, t)))
+            Err(it.type_error(&format!(
+                "underlying {}() should have returned a bytes-like object, not '{}'",
+                method, t
+            )))
         }
     }
 }
@@ -392,13 +416,31 @@ fn buffer_read(it: &mut Interp, buffer: &Value, n: i64, one: bool) -> R<Vec<u8>>
 
 /// CPython's `textiowrapper_read_chunk`: false at end of file.
 fn read_chunk(it: &mut Interp, slf: &Slf, size_hint: usize) -> R<bool> {
-    let (buffer, telling, ratio, chunk, read1) = slf.with(it, |s| (s.buffer.clone(), s.telling, s.b2cratio, s.chunk_size, s.has_read1))?;
-    let Some(buffer) = buffer else { return Ok(false) };
+    let (buffer, telling, ratio, chunk, read1) = slf.with(it, |s| {
+        (
+            s.buffer.clone(),
+            s.telling,
+            s.b2cratio,
+            s.chunk_size,
+            s.has_read1,
+        )
+    })?;
+    let Some(buffer) = buffer else {
+        return Ok(false);
+    };
     if !has_decoder(it, slf)? {
         return Err(unsupported(it, "not readable"));
     }
-    let snap = if telling { Some(with_dec(it, slf, |it, d| d.getstate(it))?) } else { None };
-    let hint = if size_hint > 0 { (ratio.max(1.0) * size_hint as f64) as usize } else { 0 };
+    let snap = if telling {
+        Some(with_dec(it, slf, |it, d| d.getstate(it))?)
+    } else {
+        None
+    };
+    let hint = if size_hint > 0 {
+        (ratio.max(1.0) * size_hint as f64) as usize
+    } else {
+        0
+    };
     let input = buffer_read(it, &buffer, chunk.max(hint) as i64, read1)?;
     let eof = input.is_empty();
     let decoded = with_dec(it, slf, |it, d| d.decode(it, &input, eof))?;
@@ -406,7 +448,11 @@ fn read_chunk(it: &mut Interp, slf: &Slf, size_hint: usize) -> R<bool> {
     let nchars = cps.len();
     slf.with(it, |s| {
         s.set_decoded(Some(cps));
-        s.b2cratio = if nchars > 0 { input.len() as f64 / nchars as f64 } else { 0.0 };
+        s.b2cratio = if nchars > 0 {
+            input.len() as f64 / nchars as f64
+        } else {
+            0.0
+        };
         if let Some((mut buf, flags)) = snap {
             buf.extend_from_slice(&input);
             s.snapshot = Some((flags, buf));
@@ -427,7 +473,11 @@ fn read(it: &mut Interp, slf: &Slf, n: i64) -> R<String> {
         } else {
             it.call_method(&buffer, "read", Vec::new())?
         };
-        let input = if r.is_none() { Vec::new() } else { bytes_from(it, &r, "read")? };
+        let input = if r.is_none() {
+            Vec::new()
+        } else {
+            bytes_from(it, &r, "read")?
+        };
         let decoded = with_dec(it, slf, |it, d| d.decode(it, &input, true))?;
         let head = slf.with(it, |s| {
             let h = s.take_decoded(-1);
@@ -455,8 +505,12 @@ fn read(it: &mut Interp, slf: &Slf, n: i64) -> R<String> {
 fn readline(it: &mut Interp, slf: &Slf, limit: i64) -> R<String> {
     open_buffer(it, slf)?;
     writeflush(it, slf)?;
-    let (translate, universal, readnl) = slf.with(it, |s| (s.readtranslate, s.readuniversal, s.readnl.clone()))?;
-    let readnl: Vec<u32> = readnl.as_deref().map(|s| code_points(s).collect()).unwrap_or_default();
+    let (translate, universal, readnl) =
+        slf.with(it, |s| (s.readtranslate, s.readuniversal, s.readnl.clone()))?;
+    let readnl: Vec<u32> = readnl
+        .as_deref()
+        .map(|s| code_points(s).collect())
+        .unwrap_or_default();
     let mut chunks: Vec<u32> = Vec::new();
     let mut remaining: Option<Vec<u32>> = None;
     loop {
@@ -489,7 +543,13 @@ fn readline(it: &mut Interp, slf: &Slf, limit: i64) -> R<String> {
             }
         })?;
         let found = find_line_ending(translate, universal, &readnl, &line[start..]);
-        let budget = |chunked: usize| if limit >= 0 { Some((limit as usize).saturating_sub(chunked)) } else { None };
+        let budget = |chunked: usize| {
+            if limit >= 0 {
+                Some((limit as usize).saturating_sub(chunked))
+            } else {
+                None
+            }
+        };
         let (endpos, done) = match found {
             Some(e) => {
                 let e = match budget(chunks.len()) {
@@ -499,7 +559,11 @@ fn readline(it: &mut Interp, slf: &Slf, limit: i64) -> R<String> {
                 (e, true)
             }
             None => {
-                let consumed = if translate || universal || readnl.len() <= 1 { line.len() } else { line.len().saturating_sub(readnl.len() - 1) };
+                let consumed = if translate || universal || readnl.len() <= 1 {
+                    line.len()
+                } else {
+                    line.len().saturating_sub(readnl.len() - 1)
+                };
                 match budget(chunks.len()) {
                     Some(b) if consumed >= b => (b, true),
                     _ => (consumed, false),
@@ -525,8 +589,15 @@ fn write(it: &mut Interp, slf: &Slf, text: &str) -> R<usize> {
         return Err(unsupported(it, "not writable"));
     }
     let n = lumen_common::smuggle::count_code_points(text);
-    let (writetranslate, writenl, line_buffering, write_through, chunk) =
-        slf.with(it, |s| (s.writetranslate, s.writenl.clone(), s.line_buffering, s.write_through, s.chunk_size))?;
+    let (writetranslate, writenl, line_buffering, write_through, chunk) = slf.with(it, |s| {
+        (
+            s.writetranslate,
+            s.writenl.clone(),
+            s.line_buffering,
+            s.write_through,
+            s.chunk_size,
+        )
+    })?;
     let haslf = ((writetranslate && writenl.is_some()) || line_buffering) && text.contains('\n');
     let text = match &writenl {
         Some(nl) if haslf && writetranslate => std::borrow::Cow::Owned(text.replace('\n', nl)),
@@ -556,14 +627,26 @@ fn write(it: &mut Interp, slf: &Slf, text: &str) -> R<usize> {
 }
 
 fn decoder_setstate(it: &mut Interp, slf: &Slf, c: &Cookie) -> R<()> {
-    with_dec(it, slf, |it, d| if c.start_pos == 0 && c.dec_flags == 0 { d.reset(it) } else { d.setstate(it, Vec::new(), c.dec_flags) })
+    with_dec(it, slf, |it, d| {
+        if c.start_pos == 0 && c.dec_flags == 0 {
+            d.reset(it)
+        } else {
+            d.setstate(it, Vec::new(), c.dec_flags)
+        }
+    })
 }
 
 fn encoder_reset(it: &mut Interp, slf: &Slf, start_of_stream: bool) -> R<()> {
     if !slf.with(it, |s| s.encoder.is_some())? {
         return Ok(());
     }
-    with_enc(it, slf, |it, e| if start_of_stream { e.reset(it) } else { e.setstate(it, 0) })
+    with_enc(it, slf, |it, e| {
+        if start_of_stream {
+            e.reset(it)
+        } else {
+            e.setstate(it, 0)
+        }
+    })
 }
 
 fn tell(it: &mut Interp, slf: &Slf) -> R<Value> {
@@ -578,10 +661,22 @@ fn tell(it: &mut Interp, slf: &Slf) -> R<Value> {
     writeflush(it, slf)?;
     it.call_method(slf.value(), "flush", Vec::new())?;
     let posobj = it.call_method(&buffer, "tell", Vec::new())?;
-    let snapshot = slf.with(it, |s| if s.decoder.is_some() { s.snapshot.clone() } else { None })?;
-    let Some((dec_flags, next_input)) = snapshot else { return Ok(posobj) };
+    let snapshot = slf.with(it, |s| {
+        if s.decoder.is_some() {
+            s.snapshot.clone()
+        } else {
+            None
+        }
+    })?;
+    let Some((dec_flags, next_input)) = snapshot else {
+        return Ok(posobj);
+    };
     let position = it.index_of(&posobj)?;
-    let mut cookie = Cookie { start_pos: position - next_input.len() as i64, dec_flags, ..Default::default() };
+    let mut cookie = Cookie {
+        start_pos: position - next_input.len() as i64,
+        dec_flags,
+        ..Default::default()
+    };
     let (used, ratio) = slf.with(it, |s| (s.used, s.b2cratio))?;
     if used == 0 {
         return Ok(cookie.build());
@@ -661,9 +756,7 @@ fn seek(it: &mut Interp, slf: &Slf, cookie_obj: &Value, whence: i32) -> R<Value>
     if !slf.with(it, |s| s.seekable)? {
         return Err(unsupported(it, "underlying stream is not seekable"));
     }
-    let is_zero = |it: &mut Interp, v: &Value| -> R<bool> {
-        it.values_eq(v, &Value::Int(0))
-    };
+    let is_zero = |it: &mut Interp, v: &Value| -> R<bool> { it.values_eq(v, &Value::Int(0)) };
     let mut cookie_obj = cookie_obj.clone();
     match whence {
         1 => {
@@ -690,7 +783,11 @@ fn seek(it: &mut Interp, slf: &Slf, cookie_obj: &Value, whence: i32) -> R<Value>
             return Ok(res);
         }
         0 => {}
-        _ => return Err(it.value_error(&format!("invalid whence ({}, should be 0, 1 or 2)", whence))),
+        _ => {
+            return Err(
+                it.value_error(&format!("invalid whence ({}, should be 0, 1 or 2)", whence))
+            );
+        }
     }
     let lt = it.compare_op(crate::ast::CmpOp::Lt, &cookie_obj, &Value::Int(0))?;
     if it.truthy(&lt)? {
@@ -711,7 +808,10 @@ fn seek(it: &mut Interp, slf: &Slf, cookie_obj: &Value, whence: i32) -> R<Value>
         let r = it.call_method(&buffer, "read", vec![Value::Int(cookie.bytes_to_feed)])?;
         if !matches!(&r, Value::Obj(o) if matches!(o.kind, Kind::Bytes(_))) {
             let t = it.type_name_of(&r);
-            return Err(it.type_error(&format!("underlying read() should have returned a bytes object, not '{}'", t)));
+            return Err(it.type_error(&format!(
+                "underlying read() should have returned a bytes object, not '{}'",
+                t
+            )));
         }
         let input = it.bytes_of(&r)?;
         let decoded = with_dec(it, slf, |it, d| d.decode(it, &input, cookie.need_eof))?;
@@ -732,18 +832,32 @@ fn seek(it: &mut Interp, slf: &Slf, cookie_obj: &Value, whence: i32) -> R<Value>
 }
 
 fn make_codecs(it: &mut Interp, slf: &Slf, buffer: &Value) -> R<()> {
-    let (encoding, errors, universal, translate) = slf.with(it, |s| (s.encoding.clone(), s.errors.clone(), s.readuniversal, s.readtranslate))?;
+    let (encoding, errors, universal, translate) = slf.with(it, |s| {
+        (
+            s.encoding.clone(),
+            s.errors.clone(),
+            s.readuniversal,
+            s.readtranslate,
+        )
+    })?;
     let norm = crate::codecs::normalize_encoding(&encoding);
     if crate::codecs::native_codec(&norm).is_none() {
         crate::codecs::lookup_text(it, &encoding, "codecs.open()")?;
     }
     let decoder = if super::call_bool(it, buffer, "readable")? {
         let codec = IncrementalDecoder::new(it, &encoding, &errors)?;
-        Some(Dec { codec, nl: universal.then(|| NlState::new(translate)) })
+        Some(Dec {
+            codec,
+            nl: universal.then(|| NlState::new(translate)),
+        })
     } else {
         None
     };
-    let encoder = if super::call_bool(it, buffer, "writable")? { Some(IncrementalEncoder::new(it, &encoding, &errors)?) } else { None };
+    let encoder = if super::call_bool(it, buffer, "writable")? {
+        Some(IncrementalEncoder::new(it, &encoding, &errors)?)
+    } else {
+        None
+    };
     slf.with(it, |s| {
         s.decoder = decoder;
         s.encoder = encoder;
@@ -822,7 +936,16 @@ pub fn new_textio(
     write_through: bool,
 ) -> R<Value> {
     let py = Py::new(it, TextIOWrapper::blank());
-    init(it, &py, &buffer, encoding, errors, newline, line_buffering, write_through)?;
+    init(
+        it,
+        &py,
+        &buffer,
+        encoding,
+        errors,
+        newline,
+        line_buffering,
+        write_through,
+    )?;
     Ok(py.into_value())
 }
 
@@ -844,7 +967,10 @@ fn opt_str<'a>(it: &mut Interp, v: Option<&'a Value>, func: &str, arg: &str) -> 
             Some(s) => Ok(Some(s)),
             None => {
                 let t = it.type_name_of(v);
-                Err(it.type_error(&format!("{}() argument '{}' must be str or None, not {}", func, arg, t)))
+                Err(it.type_error(&format!(
+                    "{}() argument '{}' must be str or None, not {}",
+                    func, arg, t
+                )))
             }
         },
     }
@@ -852,7 +978,9 @@ fn opt_str<'a>(it: &mut Interp, v: Option<&'a Value>, func: &str, arg: &str) -> 
 
 #[lumen_bind::methods]
 impl TextIOWrapper {
-    #[constructor(hint(py(text_signature = "(buffer, encoding=None, errors=None, newline=None,\n              line_buffering=False, write_through=False)")))]
+    #[constructor(hint(py(
+        text_signature = "(buffer, encoding=None, errors=None, newline=None,\n              line_buffering=False, write_through=False)"
+    )))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> TextIOWrapper {
         let _ = (args, kwargs);
         TextIOWrapper::blank()
@@ -877,7 +1005,16 @@ impl TextIOWrapper {
         let encoding = opt_str(it, encoding, "TextIOWrapper", "encoding")?;
         let errors = opt_str(it, errors, "TextIOWrapper", "errors")?;
         let newline = opt_str(it, newline, "TextIOWrapper", "newline")?;
-        init(it, &slf.0, buffer, encoding, errors, newline, line_buffering, write_through)
+        init(
+            it,
+            &slf.0,
+            buffer,
+            encoding,
+            errors,
+            newline,
+            line_buffering,
+            write_through,
+        )
     }
 
     /// Write string s to stream.
@@ -964,14 +1101,23 @@ impl TextIOWrapper {
     /// Any other argument combinations are invalid,
     /// and may raise exceptions.
     #[method(hint(py(text_signature = "($self, cookie, whence=os.SEEK_SET, /)")))]
-    fn seek(slf: This<Py<Self>>, it: &mut Interp, cookie: &Value, #[default(0)] whence: i32) -> R<Value> {
+    fn seek(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        cookie: &Value,
+        #[default(0)] whence: i32,
+    ) -> R<Value> {
         seek(it, &slf.0, cookie, whence)
     }
 
     fn truncate(slf: This<Py<Self>>, it: &mut Interp, pos: Option<&Value>) -> R<Value> {
         let buffer = attached(it, &slf.0)?;
         it.call_method(slf.0.value(), "flush", Vec::new())?;
-        it.call_method(&buffer, "truncate", vec![pos.cloned().unwrap_or(Value::None)])
+        it.call_method(
+            &buffer,
+            "truncate",
+            vec![pos.cloned().unwrap_or(Value::None)],
+        )
     }
 
     /// Separate the underlying buffer from the TextIOBase and return it.
@@ -1004,8 +1150,13 @@ impl TextIOWrapper {
         let errs = opt_str(it, errors, "reconfigure", "errors")?;
         let newline_given = newline.is_some();
         let nl = opt_str(it, newline, "reconfigure", "newline")?;
-        if slf.0.with(it, |s| s.decoded.is_some())? && (enc.is_some() || errs.is_some() || newline_given) {
-            return Err(unsupported(it, "It is not possible to set the encoding or newline of stream after the first read"));
+        if slf.0.with(it, |s| s.decoded.is_some())?
+            && (enc.is_some() || errs.is_some() || newline_given)
+        {
+            return Err(unsupported(
+                it,
+                "It is not possible to set the encoding or newline of stream after the first read",
+            ));
         }
         if newline_given {
             check_newline(it, nl)?;
@@ -1029,10 +1180,18 @@ impl TextIOWrapper {
             let (cur_enc, cur_err) = slf.0.with(it, |s| (s.encoding.clone(), s.errors.clone()))?;
             let (new_enc, new_err) = match enc {
                 None => (cur_enc, errs.map_or(cur_err, str::to_string)),
-                Some("locale") => (super::locale_encoding(it).to_string(), errs.unwrap_or("strict").to_string()),
+                Some("locale") => (
+                    super::locale_encoding(it).to_string(),
+                    errs.unwrap_or("strict").to_string(),
+                ),
                 Some(e) => (e.to_string(), errs.unwrap_or("strict").to_string()),
             };
-            let old = slf.0.with(it, |s| (std::mem::replace(&mut s.encoding, new_enc), std::mem::replace(&mut s.errors, new_err)))?;
+            let old = slf.0.with(it, |s| {
+                (
+                    std::mem::replace(&mut s.encoding, new_enc),
+                    std::mem::replace(&mut s.errors, new_err),
+                )
+            })?;
             if let Err(e) = make_codecs(it, &slf.0, &buffer) {
                 slf.0.with(it, |s| (s.encoding, s.errors) = old)?;
                 return Err(e);
@@ -1119,7 +1278,12 @@ impl TextIOWrapper {
     #[getter]
     fn newlines(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         attached(it, &slf.0)?;
-        slf.0.with(it, |s| s.decoder.as_ref().and_then(|d| d.nl.as_ref()).map_or(Value::None, NlState::newlines))
+        slf.0.with(it, |s| {
+            s.decoder
+                .as_ref()
+                .and_then(|d| d.nl.as_ref())
+                .map_or(Value::None, NlState::newlines)
+        })
     }
 
     #[getter(name = "_CHUNK_SIZE")]
@@ -1158,7 +1322,10 @@ impl TextIOWrapper {
             let l = it.call_method(slf.0.value(), "readline", Vec::new())?;
             if l.as_str().is_none() {
                 let t = it.type_name_of(&l);
-                return Err(it.new_exc_str("OSError", &format!("readline() should have returned a str object, not '{}'", t)));
+                return Err(it.new_exc_str(
+                    "OSError",
+                    &format!("readline() should have returned a str object, not '{}'", t),
+                ));
             }
             l
         };
@@ -1222,7 +1389,11 @@ impl IncrementalNewlineDecoder {
     #[constructor(hint(py(text_signature = "(decoder, translate, errors='strict')")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> IncrementalNewlineDecoder {
         let _ = (args, kwargs);
-        IncrementalNewlineDecoder { decoder: None, nl: NlState::new(false), errors: Value::None }
+        IncrementalNewlineDecoder {
+            decoder: None,
+            nl: NlState::new(false),
+            errors: Value::None,
+        }
     }
 
     #[proto(init)]
@@ -1242,7 +1413,14 @@ impl IncrementalNewlineDecoder {
         })
     }
 
-    fn decode(slf: This<Py<Self>>, it: &mut Interp, #[kw] input: &Value, #[kw] #[default(false)] r#final: bool) -> R<String> {
+    fn decode(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] input: &Value,
+        #[kw]
+        #[default(false)]
+        r#final: bool,
+    ) -> R<String> {
         let d = nld_decoder(it, &slf.0)?;
         let out = if d.is_none() {
             input.clone()
@@ -1253,7 +1431,10 @@ impl IncrementalNewlineDecoder {
         };
         let Some(s) = out.as_str() else {
             let t = it.type_name_of(&out);
-            return Err(it.type_error(&format!("decoder should return a string result, not '{}'", t)));
+            return Err(it.type_error(&format!(
+                "decoder should return a string result, not '{}'",
+                t
+            )));
         };
         let s = s.to_string();
         slf.0.with(it, |st| st.nl.feed(s, r#final))
@@ -1271,7 +1452,10 @@ impl IncrementalNewlineDecoder {
             }
         };
         let pend = slf.0.with(it, |s| s.nl.pendingcr)?;
-        Ok(Value::tuple(vec![buf, Value::Int((flag << 1) | pend as i64)]))
+        Ok(Value::tuple(vec![
+            buf,
+            Value::Int((flag << 1) | pend as i64),
+        ]))
     }
 
     fn setstate(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
@@ -1282,7 +1466,11 @@ impl IncrementalNewlineDecoder {
         };
         slf.0.with(it, |s| s.nl.pendingcr = flag & 1 != 0)?;
         if !d.is_none() {
-            it.call_method(&d, "setstate", vec![Value::tuple(vec![buf, Value::Int(flag >> 1)])])?;
+            it.call_method(
+                &d,
+                "setstate",
+                vec![Value::tuple(vec![buf, Value::Int(flag >> 1)])],
+            )?;
         }
         Ok(())
     }

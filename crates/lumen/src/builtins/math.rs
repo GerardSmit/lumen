@@ -55,8 +55,7 @@ pub(crate) fn nf_math_max(i: &mut Interp, _this: Value, a: &[Value]) -> Result<V
         };
         if n.is_nan() {
             nan = true;
-        } else if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative())
-        {
+        } else if n > m || (n == 0.0 && m == 0.0 && n.is_sign_positive() && m.is_sign_negative()) {
             m = n;
         }
     }
@@ -73,8 +72,7 @@ pub(crate) fn nf_math_min(i: &mut Interp, _this: Value, a: &[Value]) -> Result<V
         };
         if n.is_nan() {
             nan = true;
-        } else if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive())
-        {
+        } else if n < m || (n == 0.0 && m == 0.0 && n.is_sign_negative() && m.is_sign_positive()) {
             m = n;
         }
     }

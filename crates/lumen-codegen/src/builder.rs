@@ -92,7 +92,10 @@ impl<'a> FunctionBuilder<'a> {
     /// branch to the block is emitted.
     pub fn append_block_param(&mut self, block: Block, ty: Type) -> Value {
         let st = &mut self.blocks[block.index()];
-        debug_assert!(st.preds.is_empty(), "explicit parameter added after a branch");
+        debug_assert!(
+            st.preds.is_empty(),
+            "explicit parameter added after a branch"
+        );
         debug_assert_eq!(
             st.explicit_params,
             self.func.blocks[block.index()].params.len(),
@@ -159,7 +162,11 @@ impl<'a> FunctionBuilder<'a> {
 
     pub fn def_var(&mut self, var: Variable, val: Value) {
         let block = self.cur.expect("no current block");
-        debug_assert_eq!(self.func.value_type(val), self.var_type(var), "{var:?} type");
+        debug_assert_eq!(
+            self.func.value_type(val),
+            self.var_type(var),
+            "{var:?} type"
+        );
         self.set_def(block, var, val);
     }
 
@@ -230,6 +237,7 @@ impl<'a> FunctionBuilder<'a> {
             Type::I32 | Type::I64 => InstData::Iconst { ty, imm: 0 },
             Type::F32 => InstData::F32const { bits: 0 },
             Type::F64 => InstData::F64const { bits: 0 },
+            Type::V128 => InstData::Vzero,
         };
         let inst = self.func.make_inst(data);
         let entry = self.func.entry();
@@ -303,7 +311,9 @@ impl<'a> FunctionBuilder<'a> {
             return self.push1(data);
         };
         let inst = self.func.make_inst(data);
-        self.func.blocks[entry.index()].insts.insert(self.n_consts, inst);
+        self.func.blocks[entry.index()]
+            .insts
+            .insert(self.n_consts, inst);
         self.n_consts += 1;
         let v = self.func.results(inst)[0];
         self.consts.insert((ty, bits), v);
@@ -311,14 +321,26 @@ impl<'a> FunctionBuilder<'a> {
     }
     pub fn iconst(&mut self, ty: Type, imm: i64) -> Value {
         debug_assert!(ty.is_int());
-        let imm = if ty == Type::I32 { imm as i32 as i64 } else { imm };
+        let imm = if ty == Type::I32 {
+            imm as i32 as i64
+        } else {
+            imm
+        };
         self.konst(ty, imm as u64, InstData::Iconst { ty, imm })
     }
     /// An integer constant of its own (not pooled): for a placeholder patched after building.
     pub fn iconst_unique(&mut self, ty: Type, imm: i64) -> Value {
         debug_assert!(ty.is_int());
-        let imm = if ty == Type::I32 { imm as i32 as i64 } else { imm };
+        let imm = if ty == Type::I32 {
+            imm as i32 as i64
+        } else {
+            imm
+        };
         self.push1(InstData::Iconst { ty, imm })
+    }
+    /// Load a relocatable address from a native AOT image's GOT.
+    pub fn symbol_addr(&mut self, id: u32) -> Value {
+        self.push1(InstData::SymbolAddr { id })
     }
     pub fn f32const(&mut self, v: f32) -> Value {
         self.f32const_bits(v.to_bits())
@@ -338,6 +360,23 @@ impl<'a> FunctionBuilder<'a> {
     pub fn binary(&mut self, op: BinaryOp, a: Value, b: Value) -> Value {
         debug_assert_eq!(self.func.value_type(a), self.func.value_type(b), "{op:?}");
         self.push1(InstData::Binary { op, args: [a, b] })
+    }
+    pub fn vector_binary(&mut self, op: VectorOp, a: Value, b: Value) -> Value {
+        self.push1(InstData::VectorBinary { op, args: [a, b] })
+    }
+    pub fn prefetch(&mut self, addr: Value, offset: i32) {
+        self.push(InstData::Prefetch { addr, offset });
+    }
+    pub fn vector_select(&mut self, mask: Value, a: Value, b: Value) -> Value {
+        let yes = self.vector_binary(VectorOp::And, mask, a);
+        let no = self.vector_binary(VectorOp::AndNot, b, mask);
+        self.vector_binary(VectorOp::Or, yes, no)
+    }
+    /// Signed I32 arithmetic returning `(wrapped_result, overflow)`.
+    pub fn checked_binary(&mut self, op: CheckedOp, a: Value, b: Value) -> (Value, Value) {
+        let inst = self.push(InstData::CheckedBinary { op, args: [a, b] });
+        let results = self.func.results(inst);
+        (results[0], results[1])
     }
     pub fn icmp(&mut self, cc: IntCC, a: Value, b: Value) -> Value {
         self.push1(InstData::IntCmp { cc, args: [a, b] })
@@ -403,7 +442,12 @@ impl<'a> FunctionBuilder<'a> {
         let else_ = self.call(else_, else_args);
         self.push(InstData::Brif { cond, then, else_ });
     }
-    pub fn br_table(&mut self, index: Value, targets: &[(Block, Vec<Value>)], default: (Block, &[Value])) {
+    pub fn br_table(
+        &mut self,
+        index: Value,
+        targets: &[(Block, Vec<Value>)],
+        default: (Block, &[Value]),
+    ) {
         let targets = targets.iter().map(|(b, a)| self.call(*b, a)).collect();
         let default = self.call(default.0, default.1);
         self.push(InstData::BrTable {

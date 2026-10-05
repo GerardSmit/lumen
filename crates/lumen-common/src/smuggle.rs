@@ -127,6 +127,85 @@ pub fn push_char_utf16(out: &mut String, c: char) {
     }
 }
 
+/// The UTF-16 code units of `s` (smuggled scalars decode to their lone surrogates).
+pub fn utf16_units(s: &str) -> Vec<u16> {
+    if s.is_ascii() {
+        return crate::scan::latin1_to_utf16(s.as_bytes());
+    }
+    let mut out = Vec::with_capacity(s.len());
+    let mut at = 0;
+    while at < s.len() {
+        at += crate::scan::utf8_bmp_prefix(&s[at..], &mut out);
+        if at == s.len() {
+            break;
+        }
+        let c = s[at..].chars().next().unwrap();
+        match smuggled(c) {
+            Some(unit) => out.push(unit),
+            None => {
+                let mut buf = [0u16; 2];
+                out.extend_from_slice(c.encode_utf16(&mut buf));
+            }
+        }
+        at += c.len_utf8();
+    }
+    out
+}
+
+/// The UTF-16 code-unit length of `s` without materializing the units.
+pub fn utf16_unit_len(s: &str) -> usize {
+    if s.is_ascii() {
+        return s.len();
+    }
+    s.chars()
+        .map(|c| {
+            if smuggled(c).is_some() {
+                1
+            } else {
+                c.len_utf16()
+            }
+        })
+        .sum()
+}
+
+/// Rebuild a UTF-16 string from code units, smuggling lone surrogates into valid UTF-8.
+pub fn utf16_from_units(units: &[u16]) -> String {
+    if let Some(text) = crate::scan::utf16_to_ascii(units) {
+        return text;
+    }
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        i += crate::scan::utf16_bmp_prefix(&units[i..], &mut out);
+        if i == units.len() {
+            break;
+        }
+        let unit = units[i] as u32;
+        if (0xD800..0xDC00).contains(&unit)
+            && i + 1 < units.len()
+            && (0xDC00..0xE000).contains(&(units[i + 1] as u32))
+        {
+            let code_point = 0x10000 + ((unit - 0xD800) << 10) + (units[i + 1] as u32 - 0xDC00);
+            if code_point < SMUGGLE_BASE {
+                out.push(char::from_u32(code_point).unwrap());
+            } else {
+                // A real character in the smuggle range is stored as its surrogate pair.
+                out.push(smuggle(units[i]));
+                out.push(smuggle(units[i + 1]));
+            }
+            i += 2;
+            continue;
+        }
+        if (0xD800..0xE000).contains(&unit) {
+            out.push(smuggle(units[i]));
+        } else {
+            out.push(char::from_u32(unit).unwrap());
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Decoded text (no lone surrogates) as a UTF-16 string.
 pub fn utf16_text(s: &str) -> Cow<'_, str> {
     if !may_contain(s) || !s.chars().any(|c| c as u32 >= SMUGGLE_BASE) {
@@ -260,7 +339,12 @@ fn decode_slow(s: &str, i: usize, c: u32) -> (u32, usize) {
         return (c - SMUGGLE_BASE + 0xD800, 4);
     }
     if is_head(c) {
-        if let Some(t) = s[i + 4..].chars().next().map(|t| t as u32).filter(|&t| is_tail(t)) {
+        if let Some(t) = s[i + 4..]
+            .chars()
+            .next()
+            .map(|t| t as u32)
+            .filter(|&t| is_tail(t))
+        {
             let high = c - HEAD_BASE + RESERVED_HIGH;
             let low = t - TAIL_BASE + 0xDC00;
             return (0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00), 8);
@@ -370,7 +454,11 @@ mod tests {
             assert_eq!(count_code_points(&s), 1);
             assert!(seen.insert(s));
         }
-        let pair = format!("{}{}", code_point_str(0xDBFF).unwrap(), code_point_str(0xDFFF).unwrap());
+        let pair = format!(
+            "{}{}",
+            code_point_str(0xDBFF).unwrap(),
+            code_point_str(0xDFFF).unwrap()
+        );
         assert_ne!(pair, code_point_str(0x10FFFF).unwrap());
         assert_eq!(cps(&pair), [0xDBFF, 0xDFFF]);
     }
@@ -382,15 +470,29 @@ mod tests {
             .map(|&c| code_point_str(c).unwrap())
             .collect();
         assert_eq!(count_code_points(&s), 5);
-        assert_eq!(cps(&s[code_point_offset(&s, 2)..]), [0xDC00, 0x10F000, 0x10EFFF]);
+        assert_eq!(
+            cps(&s[code_point_offset(&s, 2)..]),
+            [0xDC00, 0x10F000, 0x10EFFF]
+        );
         assert_eq!(code_point_offset(&s, 9), s.len());
-        let order = [0x41, 0xD800, 0xE000, 0xFFFF, 0x10000, 0x10EFFF, 0x10F000, 0x10F7FF, 0x10F800, 0x10FFFF];
+        let order = [
+            0x41, 0xD800, 0xE000, 0xFFFF, 0x10000, 0x10EFFF, 0x10F000, 0x10F7FF, 0x10F800, 0x10FFFF,
+        ];
         for w in order.windows(2) {
             let (a, b) = (code_point_str(w[0]).unwrap(), code_point_str(w[1]).unwrap());
-            assert_eq!(cmp_code_points(&a, &b), Ordering::Less, "{:x} < {:x}", w[0], w[1]);
+            assert_eq!(
+                cmp_code_points(&a, &b),
+                Ordering::Less,
+                "{:x} < {:x}",
+                w[0],
+                w[1]
+            );
             assert_eq!(cmp_code_points(&b, &a), Ordering::Greater);
         }
         assert_eq!(cmp_code_points("ab", "abc"), Ordering::Less);
-        assert_eq!(escape_text("x\u{10FFFF}"), code_point_str(0x78).unwrap() + &code_point_str(0x10FFFF).unwrap());
+        assert_eq!(
+            escape_text("x\u{10FFFF}"),
+            code_point_str(0x78).unwrap() + &code_point_str(0x10FFFF).unwrap()
+        );
     }
 }

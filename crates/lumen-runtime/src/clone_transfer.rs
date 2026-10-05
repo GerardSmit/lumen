@@ -3,9 +3,9 @@
 //! Each realm stages at most 1024 capabilities per message and 32 nested serialization frames.
 //! A getter may post another message without overwriting the outer frame. Delivery replaces the incoming
 //! frame; deserialization's `finish` releases it, and realm teardown drops both frames.
+use lumen::embed::SharedBufferHandle;
 use lumen_bind::NativeError;
 use lumen_host::OpError;
-use lumen::embed::SharedBufferHandle;
 use lumen_host::{Ctx, Extension, Value};
 
 const MAX_ATTACHMENTS: usize = 1024;
@@ -34,21 +34,31 @@ fn state(ctx: &mut Ctx) -> &mut CloneTransfers {
 
 fn stage(ctx: &mut Ctx, attachment: CloneAttachment) -> Result<usize, OpError> {
     let Some(outgoing) = state(ctx).outgoing.last_mut() else {
-        return Err(NativeError::named("DataCloneError", "No structured-clone frame is active").into());
+        return Err(
+            NativeError::named("DataCloneError", "No structured-clone frame is active").into(),
+        );
     };
     if outgoing.len() >= MAX_ATTACHMENTS {
-        return Err(NativeError::named("DataCloneError", "Too many structured-clone attachments").into());
+        return Err(
+            NativeError::named("DataCloneError", "Too many structured-clone attachments").into(),
+        );
     }
     let index = outgoing.len();
     outgoing.push(attachment);
     Ok(index)
 }
 
-pub(crate) fn stage_port(ctx: &mut Ctx, port: crate::ports::PortTransfer) -> Result<usize, OpError> {
+pub(crate) fn stage_port(
+    ctx: &mut Ctx,
+    port: crate::ports::PortTransfer,
+) -> Result<usize, OpError> {
     stage(ctx, CloneAttachment::Port(port))
 }
 
-pub(crate) fn take_port(ctx: &mut Ctx, index: usize) -> Result<crate::ports::PortTransfer, OpError> {
+pub(crate) fn take_port(
+    ctx: &mut Ctx,
+    index: usize,
+) -> Result<crate::ports::PortTransfer, OpError> {
     let incoming = &mut state(ctx).incoming;
     match incoming.get_mut(index) {
         Some(slot @ Some(CloneAttachment::Port(_))) => {
@@ -57,8 +67,11 @@ pub(crate) fn take_port(ctx: &mut Ctx, index: usize) -> Result<crate::ports::Por
             };
             Ok(port)
         }
-        _ => Err(NativeError::named("DataCloneError", "MessagePort attachment is absent or already consumed",
-        ).into()),
+        _ => Err(NativeError::named(
+            "DataCloneError",
+            "MessagePort attachment is absent or already consumed",
+        )
+        .into()),
     }
 }
 
@@ -81,7 +94,11 @@ mod bindings {
     #[op(name = "begin")]
     fn op_begin(ctx: &mut Ctx) -> Result<(), OpError> {
         if state(ctx).outgoing.len() >= MAX_NESTED_FRAMES {
-            return Err(NativeError::named("DataCloneError", "Structured-clone nesting limit exceeded").into());
+            return Err(NativeError::named(
+                "DataCloneError",
+                "Structured-clone nesting limit exceeded",
+            )
+            .into());
         }
         state(ctx).outgoing.push(Vec::new());
         Ok(())
@@ -112,8 +129,11 @@ mod bindings {
     #[op(name = "detachBuffer")]
     fn op_detach_buffer(ctx: &mut Ctx, buffer: &Value) -> Result<(), OpError> {
         if !ctx.is_transferable_array_buffer(buffer) {
-            return Err(NativeError::named("DataCloneError", "ArrayBuffer is detached or cannot be transferred",
-            ).into());
+            return Err(NativeError::named(
+                "DataCloneError",
+                "ArrayBuffer is detached or cannot be transferred",
+            )
+            .into());
         }
         ctx.array_buffer_detach(buffer);
         Ok(())
@@ -129,22 +149,33 @@ mod bindings {
 
     #[op(name = "exportShared")]
     fn op_export_shared(ctx: &mut Ctx, buffer: &Value) -> Result<f64, OpError> {
-        let handle = ctx
-            .export_shared_array_buffer(buffer)?
-            .ok_or_else(|| NativeError::named("DataCloneError", "Expected a genuine SharedArrayBuffer"))?;
+        let handle = ctx.export_shared_array_buffer(buffer)?.ok_or_else(|| {
+            NativeError::named("DataCloneError", "Expected a genuine SharedArrayBuffer")
+        })?;
         Ok(stage(ctx, CloneAttachment::Shared(handle))? as f64)
     }
 
     #[op(name = "importShared", coerce)]
     fn op_import_shared(ctx: &mut Ctx, index: f64) -> Result<Value, OpError> {
-        if !(index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index < MAX_ATTACHMENTS as f64) {
-            return Err(NativeError::named("DataCloneError", "Invalid shared-memory attachment index").into());
+        if !(index.is_finite()
+            && index >= 0.0
+            && index.fract() == 0.0
+            && index < MAX_ATTACHMENTS as f64)
+        {
+            return Err(NativeError::named(
+                "DataCloneError",
+                "Invalid shared-memory attachment index",
+            )
+            .into());
         }
         let handle = match state(ctx).incoming.get(index as usize) {
             Some(Some(CloneAttachment::Shared(handle))) => handle.clone(),
             _ => {
-                return Err(NativeError::named("DataCloneError", "Shared-memory attachment is not admitted to this message",
-                ).into());
+                return Err(NativeError::named(
+                    "DataCloneError",
+                    "Shared-memory attachment is not admitted to this message",
+                )
+                .into());
             }
         };
         Ok(ctx.import_shared_array_buffer(&handle))

@@ -35,7 +35,10 @@ impl IoError {
             IoErrorKind::NotADirectory => "ENOTDIR",
             IoErrorKind::Other => "EIO",
         };
-        IoError { kind, errno: lumen_os::errno::errno_of_code(code).unwrap_or(5) }
+        IoError {
+            kind,
+            errno: lumen_os::errno::errno_of_code(code).unwrap_or(5),
+        }
     }
 
     pub fn from_errno(errno: i32) -> IoError {
@@ -136,10 +139,14 @@ pub trait Platform {
     }
 
     fn is_file(&mut self, path: &str) -> bool {
-        self.filesystem().stat(path, true).is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFREG)
+        self.filesystem()
+            .stat(path, true)
+            .is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFREG)
     }
     fn is_dir(&mut self, path: &str) -> bool {
-        self.filesystem().stat(path, true).is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFDIR)
+        self.filesystem()
+            .stat(path, true)
+            .is_ok_and(|s| s.mode & lumen_os::fs::S_IFMT == lumen_os::fs::S_IFDIR)
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, IoError> {
@@ -147,7 +154,9 @@ pub trait Platform {
     }
 
     fn canonicalize(&mut self, path: &str) -> String {
-        self.filesystem().realpath(path).unwrap_or_else(|_| path.to_string())
+        self.filesystem()
+            .realpath(path)
+            .unwrap_or_else(|_| path.to_string())
     }
 
     /// Resolves `name` (a single path component) against the entries in order, preferring a
@@ -156,11 +165,19 @@ pub trait Platform {
         for dir in entries {
             let pkg = join_path(&join_path(dir, name), "__init__.py");
             if self.is_file(&pkg) {
-                return self.read_file(&pkg).ok().map(|source| FoundModule { filename: pkg, source, is_package: true });
+                return self.read_file(&pkg).ok().map(|source| FoundModule {
+                    filename: pkg,
+                    source,
+                    is_package: true,
+                });
             }
             let file = join_path(dir, &format!("{}.py", name));
             if self.is_file(&file) {
-                return self.read_file(&file).ok().map(|source| FoundModule { filename: file, source, is_package: false });
+                return self.read_file(&file).ok().map(|source| FoundModule {
+                    filename: file,
+                    source,
+                    is_package: false,
+                });
             }
         }
         None
@@ -282,7 +299,13 @@ pub trait Platform {
     fn chown(&mut self, path: &str, uid: u32, gid: u32, follow: bool) -> PResult<()> {
         Ok(self.filesystem().chown(path, uid, gid, follow)?)
     }
-    fn utimes(&mut self, path: &str, atime: Timespec, mtime: Timespec, follow: bool) -> PResult<()> {
+    fn utimes(
+        &mut self,
+        path: &str,
+        atime: Timespec,
+        mtime: Timespec,
+        follow: bool,
+    ) -> PResult<()> {
         Ok(self.filesystem().utimes(path, atime, mtime, follow)?)
     }
     fn getcwd(&mut self) -> PResult<String> {
@@ -320,7 +343,13 @@ pub trait Platform {
     }
     /// `[sysname, nodename, release, version, machine]`.
     fn uname(&self) -> [String; 5] {
-        ["lumen".to_string(), "localhost".to_string(), "0".to_string(), "0".to_string(), "unknown".to_string()]
+        [
+            "lumen".to_string(),
+            "localhost".to_string(),
+            "0".to_string(),
+            "0".to_string(),
+            "unknown".to_string(),
+        ]
     }
     /// `[user, system, children_user, children_system, elapsed]` in seconds.
     fn process_times(&self) -> PResult<[f64; 5]> {
@@ -436,13 +465,19 @@ impl Default for StdPlatform {
 
 impl StdPlatform {
     pub fn new() -> StdPlatform {
-        StdPlatform { start: std::time::Instant::now(), fs: Arc::new(OsFs) }
+        StdPlatform {
+            start: std::time::Instant::now(),
+            fs: Arc::new(OsFs),
+        }
     }
 }
 
 impl Platform for StdPlatform {
     fn executable(&self) -> String {
-        std::env::current_exe().map_or_else(|_| "lumen-py".to_string(), |p| p.to_string_lossy().into_owned())
+        std::env::current_exe().map_or_else(
+            |_| "lumen-py".to_string(),
+            |p| p.to_string_lossy().into_owned(),
+        )
     }
 
     fn write_stdout(&mut self, bytes: &[u8]) {
@@ -462,7 +497,10 @@ impl Platform for StdPlatform {
 
     fn read_stdin(&mut self, buf: &mut [u8]) -> PResult<usize> {
         use std::io::Read;
-        std::io::stdin().lock().read(buf).map_err(|e| IoError::from_errno(lumen_os::errno::errno(&e)))
+        std::io::stdin()
+            .lock()
+            .read(buf)
+            .map_err(|e| IoError::from_errno(lumen_os::errno::errno(&e)))
     }
 
     fn filesystem(&self) -> Arc<dyn FileSystem> {
@@ -474,7 +512,10 @@ impl Platform for StdPlatform {
     }
 
     fn wall_time_ns(&self) -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as u64
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
     }
 
     fn sleep(&mut self, secs: f64) {
@@ -494,7 +535,12 @@ impl Platform for StdPlatform {
     }
 
     fn platform_name(&self) -> String {
-        if cfg!(target_os = "macos") { "darwin" } else { std::env::consts::OS }.to_string()
+        if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            std::env::consts::OS
+        }
+        .to_string()
     }
 
     fn fd_isatty(&mut self, fd: Fd) -> bool {
@@ -530,7 +576,12 @@ impl Platform for StdPlatform {
     }
 
     fn user_ids(&self) -> [u32; 4] {
-        [lumen_os::proc::getuid(), lumen_os::proc::geteuid(), lumen_os::proc::getgid(), lumen_os::proc::getegid()]
+        [
+            lumen_os::proc::getuid(),
+            lumen_os::proc::geteuid(),
+            lumen_os::proc::getgid(),
+            lumen_os::proc::getegid(),
+        ]
     }
 
     fn umask(&mut self, mask: u32) -> u32 {
@@ -538,7 +589,15 @@ impl Platform for StdPlatform {
     }
 
     fn uname(&self) -> [String; 5] {
-        lumen_os::proc::uname().unwrap_or_else(|_| ["lumen".to_string(), String::new(), String::new(), String::new(), String::new()])
+        lumen_os::proc::uname().unwrap_or_else(|_| {
+            [
+                "lumen".to_string(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ]
+        })
     }
 
     fn process_times(&self) -> PResult<[f64; 5]> {

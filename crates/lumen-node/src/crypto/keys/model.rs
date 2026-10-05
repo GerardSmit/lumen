@@ -11,8 +11,13 @@ use super::{decoder_unsupported, invalid_private, KResult};
 
 /// `g^x mod p`, the public value of a DH or DSA private key.
 fn exp_public(p: &BigUint, g: &BigUint, x: &BigUint) -> Option<BigUint> {
-    let params = lumen_crypto::DhParams { p: p.to_bytes_be(), g: g.to_bytes_be() };
-    let y = lumen_crypto::backend().dh_public(&params, &x.to_bytes_be()).ok()?;
+    let params = lumen_crypto::DhParams {
+        p: p.to_bytes_be(),
+        g: g.to_bytes_be(),
+    };
+    let y = lumen_crypto::backend()
+        .dh_public(&params, &x.to_bytes_be())
+        .ok()?;
     Some(BigUint::from_bytes_be(&y))
 }
 
@@ -129,16 +134,26 @@ pub fn pss_hash(name: &str) -> Option<(&'static str, u32)> {
 }
 
 fn hash_by_oid(oid: &ObjectIdentifier) -> Option<&'static str> {
-    PSS_HASHES.iter().find(|h| ObjectIdentifier::new(h.1).ok().as_ref() == Some(oid)).map(|h| h.0)
+    PSS_HASHES
+        .iter()
+        .find(|h| ObjectIdentifier::new(h.1).ok().as_ref() == Some(oid))
+        .map(|h| h.0)
 }
 
 fn hash_oid(name: &str) -> ObjectIdentifier {
-    let oid = PSS_HASHES.iter().find(|h| h.0 == name).map_or("1.3.14.3.2.26", |h| h.1);
+    let oid = PSS_HASHES
+        .iter()
+        .find(|h| h.0 == name)
+        .map_or("1.3.14.3.2.26", |h| h.1);
     ObjectIdentifier::new_unwrap(oid)
 }
 
 impl PssParams {
-    pub const DEFAULT: PssParams = PssParams { hash: "sha1", mgf1_hash: "sha1", salt_length: 20 };
+    pub const DEFAULT: PssParams = PssParams {
+        hash: "sha1",
+        mgf1_hash: "sha1",
+        salt_length: 20,
+    };
 
     /// Parses an `RSASSA-PSS-params` SEQUENCE (content bytes).
     pub fn parse(body: &[u8]) -> Option<PssParams> {
@@ -170,14 +185,23 @@ impl PssParams {
     pub fn to_der(&self) -> Vec<u8> {
         let mut body = Vec::new();
         if self.hash != "sha1" {
-            body.extend(asn1::explicit(0, &asn1::seq(&[&asn1::oid(&hash_oid(self.hash))])));
+            body.extend(asn1::explicit(
+                0,
+                &asn1::seq(&[&asn1::oid(&hash_oid(self.hash))]),
+            ));
         }
         if self.mgf1_hash != "sha1" {
             let inner = asn1::seq(&[&asn1::oid(&hash_oid(self.mgf1_hash))]);
-            body.extend(asn1::explicit(1, &asn1::seq(&[&asn1::oid(&asn1::OID_MGF1), &inner])));
+            body.extend(asn1::explicit(
+                1,
+                &asn1::seq(&[&asn1::oid(&asn1::OID_MGF1), &inner]),
+            ));
         }
         if self.salt_length != 20 {
-            body.extend(asn1::explicit(2, &asn1::small_uint(self.salt_length as u64)));
+            body.extend(asn1::explicit(
+                2,
+                &asn1::small_uint(self.salt_length as u64),
+            ));
         }
         asn1::tlv(TAG_SEQUENCE, &body)
     }
@@ -208,7 +232,9 @@ impl AsymKey {
             AsymKey::Rsa(k) => k.private.is_some(),
             AsymKey::Dsa(k) => k.x.is_some(),
             AsymKey::Ec(k) => k.d.is_some(),
-            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => k.private.is_some(),
+            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => {
+                k.private.is_some()
+            }
             AsymKey::Dh(k) => k.x.is_some(),
         }
     }
@@ -235,7 +261,9 @@ impl AsymKey {
             AsymKey::Rsa(k) => k.private = None,
             AsymKey::Dsa(k) => k.x = None,
             AsymKey::Ec(k) => k.d = None,
-            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => k.private = None,
+            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => {
+                k.private = None
+            }
             AsymKey::Dh(k) => k.x = None,
         }
         k
@@ -250,7 +278,11 @@ impl AsymKey {
             },
             AsymKey::Dsa(k) => asn1::seq(&[&asn1::oid(&asn1::OID_DSA), &k.params_der()]),
             AsymKey::Ec(k) => {
-                let params = if k.explicit { k.curve.explicit_params() } else { asn1::oid(&k.curve.oid()) };
+                let params = if k.explicit {
+                    k.curve.explicit_params()
+                } else {
+                    asn1::oid(&k.curve.oid())
+                };
                 asn1::seq(&[&asn1::oid(&asn1::OID_EC), &params])
             }
             AsymKey::Ed25519(_) => asn1::seq(&[&asn1::oid(&asn1::OID_ED25519)]),
@@ -260,7 +292,11 @@ impl AsymKey {
             AsymKey::Dh(k) => match &k.q {
                 Some(q) => asn1::seq(&[
                     &asn1::oid(&asn1::OID_DHX),
-                    &asn1::seq(&[&asn1::biguint(&k.p), &asn1::biguint(&k.g), &asn1::biguint(q)]),
+                    &asn1::seq(&[
+                        &asn1::biguint(&k.p),
+                        &asn1::biguint(&k.g),
+                        &asn1::biguint(q),
+                    ]),
                 ]),
                 None => asn1::seq(&[
                     &asn1::oid(&asn1::OID_DH),
@@ -276,7 +312,9 @@ impl AsymKey {
             AsymKey::Rsa(k) => k.pkcs1_public_der(),
             AsymKey::Dsa(k) => asn1::biguint(&k.y),
             AsymKey::Ec(k) => k.point.clone(),
-            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => k.public.clone(),
+            AsymKey::Ed25519(k) | AsymKey::Ed448(k) | AsymKey::X25519(k) | AsymKey::X448(k) => {
+                k.public.clone()
+            }
             AsymKey::Dh(k) => asn1::biguint(&k.y),
         };
         asn1::seq(&[&self.algorithm_identifier(), &asn1::bit_string(&key)])
@@ -293,7 +331,11 @@ impl AsymKey {
             }
             AsymKey::Dh(k) => asn1::biguint(k.x.as_ref().ok_or_else(not_private)?),
         };
-        Ok(asn1::seq(&[&asn1::small_uint(0), &self.algorithm_identifier(), &asn1::octets(&inner)]))
+        Ok(asn1::seq(&[
+            &asn1::small_uint(0),
+            &self.algorithm_identifier(),
+            &asn1::octets(&inner),
+        ]))
     }
 
     /// The normalized form a `KeyObjectHandle` stores for this key.
@@ -344,7 +386,10 @@ impl RsaKey {
 
     /// The public half in the form `lumen_crypto` takes.
     pub fn public_parts(&self) -> lumen_crypto::RsaPublicKey {
-        lumen_crypto::RsaPublicKey { n: self.n.to_bytes_be(), e: self.e.to_bytes_be() }
+        lumen_crypto::RsaPublicKey {
+            n: self.n.to_bytes_be(),
+            e: self.e.to_bytes_be(),
+        }
     }
 
     /// The private key in the form `lumen_crypto` takes.
@@ -367,7 +412,14 @@ impl RsaKey {
         RsaKey {
             n: num(&k.public.n),
             e: num(&k.public.e),
-            private: Some(RsaPrivateParts { d: num(&k.d), p: num(&k.p), q: num(&k.q), dp: num(&k.dp), dq: num(&k.dq), qi: num(&k.qi) }),
+            private: Some(RsaPrivateParts {
+                d: num(&k.d),
+                p: num(&k.p),
+                q: num(&k.q),
+                dp: num(&k.dp),
+                dq: num(&k.dq),
+                qi: num(&k.qi),
+            }),
             pss,
         }
     }
@@ -376,13 +428,21 @@ impl RsaKey {
 impl DsaKey {
     /// DER `Dss-Parms` SEQUENCE.
     pub fn params_der(&self) -> Vec<u8> {
-        asn1::seq(&[&asn1::biguint(&self.p), &asn1::biguint(&self.q), &asn1::biguint(&self.g)])
+        asn1::seq(&[
+            &asn1::biguint(&self.p),
+            &asn1::biguint(&self.q),
+            &asn1::biguint(&self.g),
+        ])
     }
 
     /// The public half in the form `lumen_crypto` takes.
     pub fn public_parts(&self) -> lumen_crypto::DsaPublicKey {
         lumen_crypto::DsaPublicKey {
-            params: lumen_crypto::DsaParams { p: self.p.to_bytes_be(), q: self.q.to_bytes_be(), g: self.g.to_bytes_be() },
+            params: lumen_crypto::DsaParams {
+                p: self.p.to_bytes_be(),
+                q: self.q.to_bytes_be(),
+                g: self.g.to_bytes_be(),
+            },
             y: self.y.to_bytes_be(),
         }
     }
@@ -390,7 +450,10 @@ impl DsaKey {
     /// The private key in the form `lumen_crypto` takes.
     pub fn private_parts(&self) -> KResult<lumen_crypto::DsaPrivateKey> {
         let x = self.x.as_ref().ok_or_else(not_private)?;
-        Ok(lumen_crypto::DsaPrivateKey { public: self.public_parts(), x: x.to_bytes_be() })
+        Ok(lumen_crypto::DsaPrivateKey {
+            public: self.public_parts(),
+            x: x.to_bytes_be(),
+        })
     }
 
     /// Builds the model from a generated `lumen_crypto` key.
@@ -413,7 +476,11 @@ impl EcKey {
         let d = self.d.as_ref()?;
         let mut parts: Vec<Vec<u8>> = vec![asn1::small_uint(1), asn1::octets(d)];
         if with_params {
-            let params = if self.explicit { self.curve.explicit_params() } else { asn1::oid(&self.curve.oid()) };
+            let params = if self.explicit {
+                self.curve.explicit_params()
+            } else {
+                asn1::oid(&self.curve.oid())
+            };
             parts.push(asn1::explicit(0, &params));
         }
         parts.push(asn1::explicit(1, &asn1::bit_string(&self.point)));
@@ -426,9 +493,11 @@ impl EcKey {
     where
         C: elliptic_curve::CurveArithmetic,
         elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-        elliptic_curve::AffinePoint<C>: elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
+        elliptic_curve::AffinePoint<C>:
+            elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
     {
-        elliptic_curve::PublicKey::<C>::from_sec1_bytes(&self.point).map_err(|_| super::invalid_point())
+        elliptic_curve::PublicKey::<C>::from_sec1_bytes(&self.point)
+            .map_err(|_| super::invalid_point())
     }
 
     /// The private key as an `elliptic_curve` secret key of curve `C` (which must be `self.curve`).
@@ -449,32 +518,47 @@ impl EcKey {
 impl OkpKey {
     /// The private key as a fixed-size array (`N` = 32 for Ed25519/X25519, 57 for Ed448, 56 for X448).
     pub fn private_array<const N: usize>(&self) -> KResult<[u8; N]> {
-        self.private.as_deref().ok_or_else(not_private)?.try_into().map_err(|_| invalid_private())
-    }
-
-    pub fn public_array<const N: usize>(&self) -> KResult<[u8; N]> {
-        self.public.as_slice().try_into().map_err(|_| decoder_unsupported())
-    }
-
-    pub fn ed25519_signing(&self) -> KResult<ed25519_dalek::SigningKey> {
-        Ok(ed25519_dalek::SigningKey::from_bytes(&self.private_array::<32>()?))
-    }
-
-    pub fn ed25519_verifying(&self) -> KResult<ed25519_dalek::VerifyingKey> {
-        ed25519_dalek::VerifyingKey::from_bytes(&self.public_array::<32>()?).map_err(|_| decoder_unsupported())
-    }
-
-    pub fn ed448_signing(&self) -> KResult<ed448_goldilocks_plus::SigningKey> {
-        ed448_goldilocks_plus::SigningKey::try_from(self.private.as_deref().ok_or_else(not_private)?)
+        self.private
+            .as_deref()
+            .ok_or_else(not_private)?
+            .try_into()
             .map_err(|_| invalid_private())
     }
 
+    pub fn public_array<const N: usize>(&self) -> KResult<[u8; N]> {
+        self.public
+            .as_slice()
+            .try_into()
+            .map_err(|_| decoder_unsupported())
+    }
+
+    pub fn ed25519_signing(&self) -> KResult<ed25519_dalek::SigningKey> {
+        Ok(ed25519_dalek::SigningKey::from_bytes(
+            &self.private_array::<32>()?,
+        ))
+    }
+
+    pub fn ed25519_verifying(&self) -> KResult<ed25519_dalek::VerifyingKey> {
+        ed25519_dalek::VerifyingKey::from_bytes(&self.public_array::<32>()?)
+            .map_err(|_| decoder_unsupported())
+    }
+
+    pub fn ed448_signing(&self) -> KResult<ed448_goldilocks_plus::SigningKey> {
+        ed448_goldilocks_plus::SigningKey::try_from(
+            self.private.as_deref().ok_or_else(not_private)?,
+        )
+        .map_err(|_| invalid_private())
+    }
+
     pub fn ed448_verifying(&self) -> KResult<ed448_goldilocks_plus::VerifyingKey> {
-        ed448_goldilocks_plus::VerifyingKey::from_bytes(&self.public_array::<57>()?).map_err(|_| decoder_unsupported())
+        ed448_goldilocks_plus::VerifyingKey::from_bytes(&self.public_array::<57>()?)
+            .map_err(|_| decoder_unsupported())
     }
 
     pub fn x25519_secret(&self) -> KResult<x25519_dalek::StaticSecret> {
-        Ok(x25519_dalek::StaticSecret::from(self.private_array::<32>()?))
+        Ok(x25519_dalek::StaticSecret::from(
+            self.private_array::<32>()?,
+        ))
     }
 
     pub fn x25519_public(&self) -> KResult<x25519_dalek::PublicKey> {
@@ -486,7 +570,11 @@ impl DhKey {
     /// DER `DHParameter` (PKCS#3) or X9.42 `DomainParameters` when `q` is known.
     pub fn params_der(&self) -> Vec<u8> {
         match &self.q {
-            Some(q) => asn1::seq(&[&asn1::biguint(&self.p), &asn1::biguint(&self.g), &asn1::biguint(q)]),
+            Some(q) => asn1::seq(&[
+                &asn1::biguint(&self.p),
+                &asn1::biguint(&self.g),
+                &asn1::biguint(q),
+            ]),
             None => asn1::seq(&[&asn1::biguint(&self.p), &asn1::biguint(&self.g)]),
         }
     }
@@ -497,15 +585,23 @@ pub fn okp_public(kind: &str, private: &[u8]) -> KResult<Vec<u8>> {
     match kind {
         "ed25519" => {
             let seed: [u8; 32] = private.try_into().map_err(|_| invalid_private())?;
-            Ok(ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes().to_vec())
+            Ok(ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes()
+                .to_vec())
         }
         "ed448" => {
-            let sk = ed448_goldilocks_plus::SigningKey::try_from(private).map_err(|_| invalid_private())?;
+            let sk = ed448_goldilocks_plus::SigningKey::try_from(private)
+                .map_err(|_| invalid_private())?;
             Ok(sk.verifying_key().to_bytes().to_vec())
         }
         "x25519" => {
             let k: [u8; 32] = private.try_into().map_err(|_| invalid_private())?;
-            Ok(x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(k)).to_bytes().to_vec())
+            Ok(
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(k))
+                    .to_bytes()
+                    .to_vec(),
+            )
         }
         "x448" => {
             let k: [u8; 56] = private.try_into().map_err(|_| invalid_private())?;
@@ -538,7 +634,10 @@ fn parse_alg(r: &mut Reader<'_>) -> Option<(ObjectIdentifier, Option<(u8, Vec<u8
     Some((oid, params))
 }
 
-fn rsa_variant(oid: &ObjectIdentifier, params: &Option<(u8, Vec<u8>)>) -> Option<Option<Option<PssParams>>> {
+fn rsa_variant(
+    oid: &ObjectIdentifier,
+    params: &Option<(u8, Vec<u8>)>,
+) -> Option<Option<Option<PssParams>>> {
     if *oid == asn1::OID_RSA {
         return match params {
             None => Some(None),
@@ -563,7 +662,10 @@ fn ec_params(params: &Option<(u8, Vec<u8>)>) -> Option<(EcCurve, bool)> {
     match params {
         Some((TAG_OID, raw)) => {
             let (_, c) = asn1::single(raw)?;
-            Some((EcCurve::from_oid(&ObjectIdentifier::from_bytes(c).ok()?)?, false))
+            Some((
+                EcCurve::from_oid(&ObjectIdentifier::from_bytes(c).ok()?)?,
+                false,
+            ))
         }
         Some((TAG_SEQUENCE, raw)) => Some((EcCurve::from_explicit(raw)?, true)),
         _ => None,
@@ -582,7 +684,10 @@ fn three_ints(raw: &[u8]) -> Option<(BigUint, BigUint, BigUint)> {
 }
 
 /// `(p, g, q)` of PKCS#3 `DHParameter` (`q` absent) or X9.42 `DomainParameters`.
-fn dh_params(oid: &ObjectIdentifier, params: &Option<(u8, Vec<u8>)>) -> Option<(BigUint, BigUint, Option<BigUint>)> {
+fn dh_params(
+    oid: &ObjectIdentifier,
+    params: &Option<(u8, Vec<u8>)>,
+) -> Option<(BigUint, BigUint, Option<BigUint>)> {
     let (_, raw) = params.as_ref()?;
     let (tag, body) = asn1::single(raw)?;
     if tag != TAG_SEQUENCE {
@@ -644,7 +749,19 @@ pub fn parse_pkcs1_private(der: &[u8], pss: Option<Option<PssParams>>) -> Option
     let dq = r.biguint()?;
     let qi = r.biguint()?;
     r.finish()?;
-    Some(RsaKey { n, e, private: Some(RsaPrivateParts { d, p, q, dp, dq, qi }), pss })
+    Some(RsaKey {
+        n,
+        e,
+        private: Some(RsaPrivateParts {
+            d,
+            p,
+            q,
+            dp,
+            dq,
+            qi,
+        }),
+        pss,
+    })
 }
 
 /// Parses a SEC1 `ECPrivateKey`; `curve` comes from the enclosing structure when it has one.
@@ -685,7 +802,12 @@ pub fn parse_sec1(der: &[u8], outer: Option<(EcCurve, bool)>) -> KResult<EcKey> 
         }
         None => derived,
     };
-    Ok(EcKey { curve, point, d: Some(d), explicit })
+    Ok(EcKey {
+        curve,
+        point,
+        d: Some(d),
+        explicit,
+    })
 }
 
 /// Parses a legacy OpenSSL `DSAPrivateKey` (`SEQUENCE { 0, p, q, g, y, x }`).
@@ -704,7 +826,13 @@ pub fn parse_dsa_legacy(der: &[u8]) -> Option<DsaKey> {
     let y = r.biguint()?;
     let x = r.biguint()?;
     r.finish()?;
-    Some(DsaKey { p, q, g, y, x: Some(x) })
+    Some(DsaKey {
+        p,
+        q,
+        g,
+        y,
+        x: Some(x),
+    })
 }
 
 impl DsaKey {
@@ -733,18 +861,36 @@ fn parse_spki(der: &[u8]) -> Option<KResult<AsymKey>> {
     r.finish()?;
     if let Some(pss) = rsa_variant(&oid, &params) {
         let (n, e) = parse_pkcs1_public(key)?;
-        return Some(Ok(AsymKey::Rsa(RsaKey { n, e, private: None, pss })));
+        return Some(Ok(AsymKey::Rsa(RsaKey {
+            n,
+            e,
+            private: None,
+            pss,
+        })));
     }
     if oid == asn1::OID_DSA {
         let (p, q, g) = three_ints(&params?.1)?;
         let mut kr = Reader::new(key);
         let y = kr.biguint()?;
         kr.finish()?;
-        return Some(Ok(AsymKey::Dsa(DsaKey { p, q, g, y, x: None })));
+        return Some(Ok(AsymKey::Dsa(DsaKey {
+            p,
+            q,
+            g,
+            y,
+            x: None,
+        })));
     }
     if oid == asn1::OID_EC {
         let (curve, explicit) = ec_params(&params)?;
-        return Some(curve.normalize_point(key).map(|point| AsymKey::Ec(EcKey { curve, point, d: None, explicit })));
+        return Some(curve.normalize_point(key).map(|point| {
+            AsymKey::Ec(EcKey {
+                curve,
+                point,
+                d: None,
+                explicit,
+            })
+        }));
     }
     if let Some((ctor, kind, len)) = okp_ctor(&oid) {
         if params.is_some() || key.len() != len {
@@ -761,12 +907,21 @@ fn parse_spki(der: &[u8]) -> Option<KResult<AsymKey>> {
                 return None;
             }
         }
-        return Some(Ok(ctor(OkpKey { public: key.to_vec(), private: None })));
+        return Some(Ok(ctor(OkpKey {
+            public: key.to_vec(),
+            private: None,
+        })));
     }
     if oid == asn1::OID_DH || oid == asn1::OID_DHX {
         let (p, g, q) = dh_params(&oid, &params)?;
         let y = Reader::new(key).biguint()?;
-        return Some(Ok(AsymKey::Dh(DhKey { p, g, q, y, x: None })));
+        return Some(Ok(AsymKey::Dh(DhKey {
+            p,
+            g,
+            q,
+            y,
+            x: None,
+        })));
     }
     None
 }
@@ -793,7 +948,13 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
         let (p, q, g) = three_ints(&params?.1)?;
         let x = Reader::new(key).biguint()?;
         let y = exp_public(&p, &g, &x)?;
-        return Some(Ok(AsymKey::Dsa(DsaKey { p, q, g, y, x: Some(x) })));
+        return Some(Ok(AsymKey::Dsa(DsaKey {
+            p,
+            q,
+            g,
+            y,
+            x: Some(x),
+        })));
     }
     if oid == asn1::OID_EC {
         let outer = ec_params(&params)?;
@@ -803,17 +964,30 @@ fn parse_pkcs8(der: &[u8]) -> Option<KResult<AsymKey>> {
         if params.is_some() {
             return None;
         }
-        let (TAG_OCTET_STRING, raw) = asn1::single(key)? else { return None };
+        let (TAG_OCTET_STRING, raw) = asn1::single(key)? else {
+            return None;
+        };
         if raw.len() != len {
             return None;
         }
-        return Some(okp_public(kind, raw).map(|public| ctor(OkpKey { public, private: Some(raw.to_vec()) })));
+        return Some(okp_public(kind, raw).map(|public| {
+            ctor(OkpKey {
+                public,
+                private: Some(raw.to_vec()),
+            })
+        }));
     }
     if oid == asn1::OID_DH || oid == asn1::OID_DHX {
         let (p, g, q) = dh_params(&oid, &params)?;
         let x = Reader::new(key).biguint()?;
         let y = exp_public(&p, &g, &x)?;
-        return Some(Ok(AsymKey::Dh(DhKey { p, g, q, y, x: Some(x) })));
+        return Some(Ok(AsymKey::Dh(DhKey {
+            p,
+            g,
+            q,
+            y,
+            x: Some(x),
+        })));
     }
     None
 }

@@ -10,8 +10,9 @@ license.workspace = true
 # `js` crate's `backend-lumen` feature for how it slots in.
 
 [dependencies]
-lumen-codegen = { path = "../lumen-codegen" }
+lumen-codegen = { path = "../lumen-codegen", optional = true }
 lumen-common = { path = "../lumen-common" }
+lumen-os = { path = "../lumen-os" }
 # The language-neutral binding framework (`#[lumen_bind::op]`, `#[class]`, `#[module]`); the
 # JS host lives in `embed_convert`. Only pulled in by the `embed` feature.
 lumen-bind = { path = "../lumen-bind", optional = true }
@@ -21,11 +22,14 @@ lumen-common = { path = "../lumen-common", features = ["test-support"] }
 lumen-bind = { path = "../lumen-bind" }
 
 [features]
-default = ["intl", "typed"]
+default = ["compiler", "intl", "typed", "jit", "aot-native"]
+compiler = []
+jit = ["compiler", "dep:lumen-codegen"]
+aot-native = ["lumen-os/native-signing"]
 # The typed tier's TypeScript/JSDoc analysis (`lumen::typescript::analyze`, the checker behind
 # `lumen typed`). TypeScript *syntax* is always parsed; this adds the type checker. Off for a
 # small build (release-small, mobile).
-typed = []
+typed = ["compiler"]
 # ECMA-402 (`Intl`) and the CLDR data tables backing it — the single largest contributor to
 # binary size. Disable (`--no-default-features`) for a small build: the `Intl` global is absent
 # and the `toLocale*` methods degrade to their locale-independent forms (like engines built
@@ -36,9 +40,11 @@ intl = []
 # public-API commitment on a published crate, gated until it stabilizes with those crates.
 # Includes the JS host of `lumen-bind` (`lumen::embed::JsHost`).
 embed = ["dep:lumen-bind"]
+# `lumen:parallel` run/spawn with heap-graph handoff between engines. Implies `embed`.
+parallel = ["embed"]
 # Exposes internal compilation stages (`lumen::bench_api`) for the `internals` benchmark. Not a
 # stability commitment — for measurement only.
-bench = []
+bench = ["compiler"]
 # Exact allocation counters in `fastalloc` for the `LUMEN_MEM_STATS=1` report (live / peak /
 # free-list-cached bytes). They sit on the allocation fast path, so they are off by default; the
 # rest of the report (OS counters, system-heap summary, the engine's per-category walk) works
@@ -56,6 +62,11 @@ harness = false
 [[bench]]
 name = "collections"
 harness = false
+
+[[bench]]
+name = "graph_transfer"
+harness = false
+required-features = ["parallel", "bench"]
 
 # Internal-stage benchmarks (lexer/parser/snapshot). Needs the `bench` feature for `bench_api`.
 [[bench]]

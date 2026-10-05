@@ -64,7 +64,8 @@ fn get(b: &[u8], at: &mut usize) -> Option<u64> {
 /// Empty when nothing has a position, or (defensively) when the counts disagree — a chunk then
 /// simply has no call positions rather than wrong ones.
 pub(crate) fn encode(ops: &[Op], sites: &[u32]) -> Box<[u8]> {
-    if sites.iter().all(|&p| p == NO_POS) || ops.iter().filter(|op| is_site(op)).count() != sites.len()
+    if sites.iter().all(|&p| p == NO_POS)
+        || ops.iter().filter(|op| is_site(op)).count() != sites.len()
     {
         return Box::default();
     }

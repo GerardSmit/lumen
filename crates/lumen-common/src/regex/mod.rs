@@ -25,6 +25,7 @@ mod matcher;
 mod program;
 pub mod sre;
 
+pub use crate::limits::Abort;
 pub use captures::Captures;
 pub use charclass::{Builtin, BuiltinSet, CharClass, Flavor, PreMap};
 pub(crate) use compile::NEST_ERROR;
@@ -33,7 +34,6 @@ pub use fold::{
     py_is_space, py_is_word, py_lower, py_upper, CaseFold,
 };
 pub use ir::Node;
-pub use crate::limits::Abort;
 pub use limits::{set_host_poll, take_abort, BacktrackLimit, BACKTRACK_LIMIT_MSG};
 pub use matcher::{ExecOptions, Mode, ReInput};
 pub use program::{Dialect, Options, Regex};

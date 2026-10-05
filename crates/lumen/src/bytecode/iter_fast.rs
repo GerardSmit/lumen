@@ -88,8 +88,7 @@ fn holds_at(holder: &Gc, slot: usize, f: &Gc) -> bool {
     let Ok(b) = (unsafe { holder.try_borrow_unguarded() }) else {
         return false;
     };
-    b.ic_plain.get()
-        && b.props.entry_at(slot).is_some_and(|p| p.holds_obj(f))
+    b.ic_plain.get() && b.props.entry_at(slot).is_some_and(|p| p.holds_obj(f))
 }
 
 /// The protector for Arrays: iterating `o` is exactly the intrinsic Array Iterator, with no
@@ -135,7 +134,16 @@ fn array_ok_slow(i: &Interp, o: &Gc, shape: u32) -> bool {
         Some(Value::Obj(f)) => f,
         _ => return true,
     };
-    remember(&i.lang.iter_proof.arr, ap, aip, &key, "next", values, next, shape);
+    remember(
+        &i.lang.iter_proof.arr,
+        ap,
+        aip,
+        &key,
+        "next",
+        values,
+        next,
+        shape,
+    );
     true
 }
 
@@ -181,7 +189,16 @@ fn array_push_ok_slow(i: &Interp, o: &Gc, shape: u32, push: crate::value::Native
     };
     let native = matches!(f.borrow().call, crate::value::Callable::Native(fp) if fp as usize == push as usize);
     if native {
-        remember(&i.lang.iter_proof.push, ap.clone(), ap, "push", "push", f.clone(), f, shape);
+        remember(
+            &i.lang.iter_proof.push,
+            ap.clone(),
+            ap,
+            "push",
+            "push",
+            f.clone(),
+            f,
+            shape,
+        );
     }
     native
 }
@@ -207,12 +224,22 @@ fn remember(
     if epoch == u32::MAX {
         return;
     }
-    let (Some(proto_slot), Some(ip_slot)) =
-        (proto.borrow().props.slot_of(key), ip.borrow().props.slot_of(ip_key))
-    else {
+    let (Some(proto_slot), Some(ip_slot)) = (
+        proto.borrow().props.slot_of(key),
+        ip.borrow().props.slot_of(ip_key),
+    ) else {
         return;
     };
-    let p = Proof { epoch, proto, ip, proto_slot, ip_slot, iter_fn, next, shape: Cell::new(shape) };
+    let p = Proof {
+        epoch,
+        proto,
+        ip,
+        proto_slot,
+        ip_slot,
+        iter_fn,
+        next,
+        shape: Cell::new(shape),
+    };
     if !(p.holds(&p.proto.clone(), shape)) {
         return;
     }
@@ -295,14 +322,16 @@ fn coll_ok_slow(i: &Interp, o: &Gc, idx: usize, proto_key: &str, proto: &Gc, sha
 /// Realm setup: remember a Map/Set `@@iterator` function (`set`) and iterator `next`.
 pub(crate) fn remember_collection_intrinsics(i: &mut Interp, set: bool, iter_fn: &Value) {
     if let Value::Obj(f) = iter_fn {
-        i.extra_protos.insert(if set { SET_ITER_FN } else { MAP_ITER_FN }, f.clone());
+        i.extra_protos
+            .insert(if set { SET_ITER_FN } else { MAP_ITER_FN }, f.clone());
     }
 }
 
 /// Realm setup: remember the `next` of `%MapIteratorPrototype%` / `%SetIteratorPrototype%`.
 pub(crate) fn remember_collection_next(i: &mut Interp, set: bool, proto: &Gc) {
     if let Some(Value::Obj(f)) = proto.borrow().props.get("next").map(|p| p.value()) {
-        i.extra_protos.insert(if set { SET_NEXT_FN } else { MAP_NEXT_FN }, f);
+        i.extra_protos
+            .insert(if set { SET_NEXT_FN } else { MAP_NEXT_FN }, f);
     }
 }
 
@@ -535,7 +564,11 @@ pub(crate) fn materialize(i: &Interp, it: &mut Value, nx: &mut Value) {
         let (idx, kind) = if f == DONE { (0.0, VALUES) } else { decode(f) };
         let obj = crate::builtins::make_array_iterator_pub(
             i,
-            if f == DONE { Value::Undefined } else { Value::Obj(target.clone()) },
+            if f == DONE {
+                Value::Undefined
+            } else {
+                Value::Obj(target.clone())
+            },
             kind,
         );
         if let Value::Obj(o) = &obj {
@@ -560,7 +593,10 @@ pub(crate) fn materialize(i: &Interp, it: &mut Value, nx: &mut Value) {
         idx,
         f == DONE,
     );
-    let next = i.extra_protos.get(if set { SET_NEXT_FN } else { MAP_NEXT_FN }).cloned();
+    let next = i
+        .extra_protos
+        .get(if set { SET_NEXT_FN } else { MAP_NEXT_FN })
+        .cloned();
     *it = obj;
     *nx = next.map_or(Value::Undefined, Value::Obj);
 }
@@ -576,7 +612,12 @@ pub(crate) fn materialize_slots(i: &Interp, slots: &mut [Value], it: u16) {
 
 /// [`step`] on `slots[is]` / `slots[ns]`.
 #[inline]
-pub(crate) fn step_slots(i: &Interp, slots: &mut [Value], is: u16, ns: u16) -> Option<Option<Value>> {
+pub(crate) fn step_slots(
+    i: &Interp,
+    slots: &mut [Value],
+    is: u16,
+    ns: u16,
+) -> Option<Option<Value>> {
     let (is, ns) = (is as usize, ns as usize);
     if !matches!(slots.get(is), Some(Value::Num(_))) || is == ns || ns >= slots.len() {
         return None;
@@ -645,7 +686,8 @@ fn return_absent_from(proto: &Gc) -> bool {
             return false;
         }
         let b = o.borrow();
-        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) || b.props.get("return").is_some() {
+        if !b.ic_plain.get() || !matches!(b.exotic, Exotic::None) || b.props.get("return").is_some()
+        {
             return false;
         }
         cur = b.proto.clone();
@@ -725,7 +767,11 @@ pub(crate) fn array_packed(i: &Interp, v: &Value, max: usize, mut push: impl FnM
     let Ok(b) = (unsafe { o.try_borrow_unguarded() }) else {
         return false;
     };
-    match b.props.packed_elements().and_then(|e| e.get(..len as usize)) {
+    match b
+        .props
+        .packed_elements()
+        .and_then(|e| e.get(..len as usize))
+    {
         Some(run) if !run.iter().any(|p| p.is_hole()) => {
             for p in run {
                 push(p.unpack());
@@ -764,7 +810,10 @@ pub(crate) fn array_elems(i: &Interp, v: &Value, mut push: impl FnMut(Value)) ->
     for k in 0..len {
         push(match b.props.get_index(k) {
             Some(p) => p.value(),
-            None => b.props.get(&k.to_string()).map_or(Value::Undefined, |p| p.value()),
+            None => b
+                .props
+                .get(&k.to_string())
+                .map_or(Value::Undefined, |p| p.value()),
         });
     }
     true

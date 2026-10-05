@@ -17,13 +17,18 @@ const HIDDEN: &str = "_structseq_hidden";
 pub fn structseq_hidden(v: &Value) -> Vec<Value> {
     let Value::Obj(o) = v else { return Vec::new() };
     let d = o.dict.borrow().clone();
-    d.and_then(|d| dict_get_str(&d, HIDDEN)).and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default()
+    d.and_then(|d| dict_get_str(&d, HIDDEN))
+        .and_then(|t| t.tuple_items().map(|t| t.to_vec()))
+        .unwrap_or_default()
 }
 
 fn field(it: &mut Interp, seq: &Value, index: usize) -> R<Value> {
     match seq.tuple_items() {
         Some(items) if index < items.len() => Ok(items[index].clone()),
-        Some(items) => Ok(structseq_hidden(seq).get(index - items.len()).cloned().unwrap_or(Value::None)),
+        Some(items) => Ok(structseq_hidden(seq)
+            .get(index - items.len())
+            .cloned()
+            .unwrap_or(Value::None)),
         None => Err(it.type_error("descriptor requires a struct sequence")),
     }
 }
@@ -163,25 +168,51 @@ pub struct StructSeq;
 impl StructSeq {
     // `T(sequence, dict=None)`.
     #[constructor]
-    fn new(cls: This<Value>, it: &mut Interp, #[kw] sequence: &Value, #[kw] dict: Option<&Value>) -> R<Value> {
-        let Value::Obj(ty) = &*cls else { unreachable!("checked by the entry") };
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] sequence: &Value,
+        #[kw] dict: Option<&Value>,
+    ) -> R<Value> {
+        let Value::Obj(ty) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let seq = it.iterate_to_vec(sequence)?;
         let (min, max) = (type_int(ty, "n_sequence_fields"), type_int(ty, "n_fields"));
         let tname = it.type_display(ty);
         if seq.len() < min || seq.len() > max {
             let msg = if min == max {
-                format!("{}() takes a {}-sequence ({}-sequence given)", tname, min, seq.len())
+                format!(
+                    "{}() takes a {}-sequence ({}-sequence given)",
+                    tname,
+                    min,
+                    seq.len()
+                )
             } else if seq.len() < min {
-                format!("{}() takes an at least {}-sequence ({}-sequence given)", tname, min, seq.len())
+                format!(
+                    "{}() takes an at least {}-sequence ({}-sequence given)",
+                    tname,
+                    min,
+                    seq.len()
+                )
             } else {
-                format!("{}() takes an at most {}-sequence ({}-sequence given)", tname, max, seq.len())
+                format!(
+                    "{}() takes an at most {}-sequence ({}-sequence given)",
+                    tname,
+                    max,
+                    seq.len()
+                )
             };
             return Err(it.type_error(&msg));
         }
         let dict = match dict {
             None => None,
             Some(Value::Obj(d)) if dict_of(&Value::Obj(d.clone())).is_some() => Some(d.clone()),
-            Some(_) => return Err(it.type_error(&format!("{}() takes a dict as second arg, if any", tname))),
+            Some(_) => {
+                return Err(
+                    it.type_error(&format!("{}() takes a dict as second arg, if any", tname))
+                )
+            }
         };
         let mut vals = seq[..min].to_vec();
         for (i, name) in hidden_names(ty).iter().enumerate() {
@@ -205,7 +236,11 @@ impl StructSeq {
         if let Some(Value::Obj(n)) = names {
             if let Kind::Tuple(names) = &n.kind {
                 for (name, v) in names.iter().zip(slf.0 .1.iter()) {
-                    parts.push(format!("{}={}", name.as_str().unwrap_or("?"), it.repr_of(v)?));
+                    parts.push(format!(
+                        "{}={}",
+                        name.as_str().unwrap_or("?"),
+                        it.repr_of(v)?
+                    ));
                 }
             }
         }
@@ -222,12 +257,20 @@ impl StructSeq {
                 it.dict_set(&d, name, x)?;
             }
         }
-        Ok(Value::tuple(vec![Value::Obj(ty), Value::tuple(vec![Value::tuple(visible.to_vec()), Value::Obj(d)])]))
+        Ok(Value::tuple(vec![
+            Value::Obj(ty),
+            Value::tuple(vec![Value::tuple(visible.to_vec()), Value::Obj(d)]),
+        ]))
     }
 }
 
 /// A tuple subclass with named read-only fields, like CPython's `sys.version_info`.
-pub fn new_structseq_type(it: &mut Interp, module: &str, name: &str, fields: &[&'static str]) -> Obj {
+pub fn new_structseq_type(
+    it: &mut Interp,
+    module: &str,
+    name: &str,
+    fields: &[&'static str],
+) -> Obj {
     let tuple = it.types.tuple.clone();
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
@@ -235,7 +278,11 @@ pub fn new_structseq_type(it: &mut Interp, module: &str, name: &str, fields: &[&
     }
     crate::bind::install_into::<StructSeq>(&ty, &["__repr__"]);
     if let Some(d) = ty.dict.borrow().as_ref() {
-        dict_set_str(d, "_fields", Value::tuple(fields.iter().map(|f| Value::str(f)).collect()));
+        dict_set_str(
+            d,
+            "_fields",
+            Value::tuple(fields.iter().map(|f| Value::str(f)).collect()),
+        );
         dict_set_str(d, "n_fields", Value::Int(fields.len() as i64));
         dict_set_str(d, "n_sequence_fields", Value::Int(fields.len() as i64));
     }
@@ -247,19 +294,38 @@ pub fn structseq(ty: &Obj, vals: Vec<Value>) -> Value {
 }
 
 fn type_int(ty: &Obj, name: &str) -> usize {
-    ty.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name)).and_then(|v| v.as_i64()).unwrap_or(0) as usize
+    ty.dict
+        .borrow()
+        .as_ref()
+        .and_then(|d| dict_get_str(d, name))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as usize
 }
 
 fn hidden_names(ty: &Obj) -> Vec<Value> {
-    let all = ty.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "_structseq_fields"));
-    let all = all.and_then(|t| t.tuple_items().map(|t| t.to_vec())).unwrap_or_default();
-    all.get(type_int(ty, "n_sequence_fields")..).map(|t| t.to_vec()).unwrap_or_default()
+    let all = ty
+        .dict
+        .borrow()
+        .as_ref()
+        .and_then(|d| dict_get_str(d, "_structseq_fields"));
+    let all = all
+        .and_then(|t| t.tuple_items().map(|t| t.to_vec()))
+        .unwrap_or_default();
+    all.get(type_int(ty, "n_sequence_fields")..)
+        .map(|t| t.to_vec())
+        .unwrap_or_default()
 }
 
 /// A struct sequence type like CPython's `os.stat_result`: `fields` lists all `n_fields` names in
 /// order (`""` for an unnamed field); the first `n_seq` are the tuple items, the rest are reachable
 /// by name only. Instances can be built from Python as `T(sequence, dict=None)` and pickle.
-pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields: &[&'static str], n_seq: usize) -> Obj {
+pub fn new_structseq_type_ext(
+    it: &mut Interp,
+    module: &str,
+    name: &str,
+    fields: &[&'static str],
+    n_seq: usize,
+) -> Obj {
     let tuple = it.types.tuple.clone();
     let ty = new_type(it, module, name, Some(&tuple), Layout::Tuple);
     for (i, f) in fields.iter().enumerate() {
@@ -268,22 +334,44 @@ pub fn new_structseq_type_ext(it: &mut Interp, module: &str, name: &str, fields:
         }
     }
     crate::bind::install_into::<StructSeq>(&ty, &["__new__", "__repr__", "__reduce__"]);
-    let named: Vec<Value> = fields.iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
-    let match_args: Vec<Value> = fields[..n_seq].iter().filter(|f| !f.is_empty()).map(|f| Value::str(f)).collect();
+    let named: Vec<Value> = fields
+        .iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| Value::str(f))
+        .collect();
+    let match_args: Vec<Value> = fields[..n_seq]
+        .iter()
+        .filter(|f| !f.is_empty())
+        .map(|f| Value::str(f))
+        .collect();
     if let Some(d) = ty.dict.borrow().as_ref() {
         dict_set_str(d, "_fields", Value::tuple(named));
         dict_set_str(d, "__match_args__", Value::tuple(match_args));
-        dict_set_str(d, "_structseq_fields", Value::tuple(fields.iter().map(|f| Value::str(f)).collect()));
+        dict_set_str(
+            d,
+            "_structseq_fields",
+            Value::tuple(fields.iter().map(|f| Value::str(f)).collect()),
+        );
         dict_set_str(d, "n_fields", Value::Int(fields.len() as i64));
         dict_set_str(d, "n_sequence_fields", Value::Int(n_seq as i64));
-        dict_set_str(d, "n_unnamed_fields", Value::Int(fields.iter().filter(|f| f.is_empty()).count() as i64));
+        dict_set_str(
+            d,
+            "n_unnamed_fields",
+            Value::Int(fields.iter().filter(|f| f.is_empty()).count() as i64),
+        );
     }
     ty
 }
 
 /// The interpreter's single [`new_structseq_type_ext`] type identified by the marker type `K`,
 /// created on first use, so natives can build instances without a module lookup.
-pub fn structseq_type<K: 'static>(it: &mut Interp, module: &str, name: &str, fields: &[&'static str], n_seq: usize) -> Obj {
+pub fn structseq_type<K: 'static>(
+    it: &mut Interp,
+    module: &str,
+    name: &str,
+    fields: &[&'static str],
+    n_seq: usize,
+) -> Obj {
     let key = std::any::TypeId::of::<K>();
     if let Some(t) = it.native_types.get(&key) {
         return t.clone();
@@ -307,7 +395,13 @@ pub fn structseq_full(ty: &Obj, mut vals: Vec<Value>) -> Value {
 pub fn set_structseq_hidden(v: &Value, hidden: Vec<Value>) {
     if let Value::Obj(o) = v {
         let mut slot = o.dict.borrow_mut();
-        let d = slot.get_or_insert_with(|| Object::new(Kind::Dict(std::cell::RefCell::new(crate::dict::PyDict::new())))).clone();
+        let d = slot
+            .get_or_insert_with(|| {
+                Object::new(Kind::Dict(std::cell::RefCell::new(
+                    crate::dict::PyDict::new(),
+                )))
+            })
+            .clone();
         drop(slot);
         dict_set_str(&d, HIDDEN, Value::tuple(hidden));
     }
@@ -326,7 +420,12 @@ type Ns<'a> = Inst<'a, SimpleNamespace>;
 #[lumen_bind::methods]
 impl SimpleNamespace {
     #[proto(init)]
-    fn init(slf: This<Ns<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Ns<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         if !args.is_empty() {
             return Err(it.type_error("no positional arguments expected"));
         }
@@ -344,7 +443,11 @@ impl SimpleNamespace {
             return Ok("namespace(...)".into());
         }
         let items: Vec<(Value, Value)> = match o.dict.borrow().as_ref().map(|d| &d.kind) {
-            Some(Kind::Dict(d)) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
+            Some(Kind::Dict(d)) => d
+                .borrow()
+                .iter()
+                .map(|e| (e.key.clone(), e.val.clone()))
+                .collect(),
             _ => Vec::new(),
         };
         let mut parts = Vec::new();
@@ -363,19 +466,30 @@ impl SimpleNamespace {
             return Err(e);
         }
         let ty = it.type_of_obj(o);
-        let exact = it.simple_namespace_type().is_some_and(|t| Rc::ptr_eq(&t, &ty));
-        let name = if exact { "namespace".to_string() } else { it.type_name(&ty) };
+        let exact = it
+            .simple_namespace_type()
+            .is_some_and(|t| Rc::ptr_eq(&t, &ty));
+        let name = if exact {
+            "namespace".to_string()
+        } else {
+            it.type_name(&ty)
+        };
         Ok(format!("{}({})", name, parts.join(", ")))
     }
 
     #[proto(eq)]
     fn eq(slf: This<Ns<'_>>, it: &mut Interp, value: &Value) -> R<Value> {
-        let Value::Obj(y) = value else { return Ok(Value::NotImplemented) };
+        let Value::Obj(y) = value else {
+            return Ok(Value::NotImplemented);
+        };
         let nt = it.simple_namespace_type();
         if !nt.is_some_and(|t| it.is_subtype(&it.type_of_obj(y), &t)) {
             return Ok(Value::NotImplemented);
         }
-        let (dx, dy) = (Value::Obj(it.instance_dict(slf.0 .0)), Value::Obj(it.instance_dict(y)));
+        let (dx, dy) = (
+            Value::Obj(it.instance_dict(slf.0 .0)),
+            Value::Obj(it.instance_dict(y)),
+        );
         it.compare_op(crate::ast::CmpOp::Eq, &dx, &dy)
     }
 
@@ -539,7 +653,9 @@ impl Interp {
 
     /// `gi_frame` / `cr_frame` / `ag_frame` of a generator that is not finished.
     pub fn gen_frame_object(&mut self, g: &Obj) -> Value {
-        let Kind::Generator(gd) = &g.kind else { return Value::None };
+        let Kind::Generator(gd) = &g.kind else {
+            return Value::None;
+        };
         if let Ok(mut st) = gd.state.try_borrow_mut() {
             if let GenState::Created(f) | GenState::Suspended(f) = &mut *st {
                 if let Some(o) = &f.fobj {
@@ -553,7 +669,12 @@ impl Interp {
                 return v;
             }
         }
-        let running = self.frames.iter().rposition(|f| f.generator.as_ref().and_then(|w| w.upgrade()).is_some_and(|x| Rc::ptr_eq(&x, g)));
+        let running = self.frames.iter().rposition(|f| {
+            f.generator
+                .as_ref()
+                .and_then(|w| w.upgrade())
+                .is_some_and(|x| Rc::ptr_eq(&x, g))
+        });
         match running {
             Some(d) => self.frame_object(d),
             None => Value::None,
@@ -575,7 +696,19 @@ impl Interp {
     }
 
     pub fn dead_frame_object(&self, code: Rc<Code>, globals: Obj, line: u32, lasti: u32) -> Value {
-        let data = FrameObj { serial: 0, gen: None, dead: None, back: None, code, globals, line, lasti, trace: None, trace_lines: true, trace_opcodes: false };
+        let data = FrameObj {
+            serial: 0,
+            gen: None,
+            dead: None,
+            back: None,
+            code,
+            globals,
+            line,
+            lasti,
+            trace: None,
+            trace_lines: true,
+            trace_opcodes: false,
+        };
         new_opaque(&self.types.frame, data)
     }
 }
@@ -648,7 +781,9 @@ impl FrameObj {
 
     #[setter]
     fn set_f_lineno(&mut self, it: &mut Interp, value: &Value) -> R<()> {
-        let Value::Int(line) = value else { return Err(it.value_error("lineno must be an integer")) };
+        let Value::Int(line) = value else {
+            return Err(it.value_error("lineno must be an integer"));
+        };
         let at = self.running_at(it);
         crate::jump::set_lineno(it, at, *line)
     }
@@ -661,7 +796,11 @@ impl FrameObj {
     #[getter]
     fn f_back(&self, it: &mut Interp) -> Value {
         if let Some(d) = self.running_at(it) {
-            return if d > 0 { it.frame_object(d - 1) } else { Value::None };
+            return if d > 0 {
+                it.frame_object(d - 1)
+            } else {
+                Value::None
+            };
         }
         self.back.clone().unwrap_or(Value::None)
     }
@@ -683,12 +822,18 @@ impl FrameObj {
 
     #[getter]
     fn f_trace(&self, it: &mut Interp) -> Value {
-        self.peek(it, |fr| fr.trace.clone()).unwrap_or_else(|| self.trace.clone()).unwrap_or(Value::None)
+        self.peek(it, |fr| fr.trace.clone())
+            .unwrap_or_else(|| self.trace.clone())
+            .unwrap_or(Value::None)
     }
 
     #[setter]
     fn set_f_trace(&mut self, it: &mut Interp, value: &Value) {
-        let v = if value.is_none() { None } else { Some(value.clone()) };
+        let v = if value.is_none() {
+            None
+        } else {
+            Some(value.clone())
+        };
         let mine = v.clone();
         if self.poke(it, |fr| fr.trace = v).is_none() {
             self.trace = mine;
@@ -697,12 +842,15 @@ impl FrameObj {
 
     #[getter]
     fn f_trace_lines(&self, it: &mut Interp) -> bool {
-        self.peek(it, |fr| fr.trace_lines).unwrap_or(self.trace_lines)
+        self.peek(it, |fr| fr.trace_lines)
+            .unwrap_or(self.trace_lines)
     }
 
     #[setter]
     fn set_f_trace_lines(&mut self, it: &mut Interp, value: &Value) -> R<()> {
-        let Value::Bool(b) = value else { return Err(it.type_error("attribute value type must be bool")) };
+        let Value::Bool(b) = value else {
+            return Err(it.type_error("attribute value type must be bool"));
+        };
         let b = *b;
         if self.poke(it, |fr| fr.trace_lines = b).is_none() {
             self.trace_lines = b;
@@ -712,12 +860,15 @@ impl FrameObj {
 
     #[getter]
     fn f_trace_opcodes(&self, it: &mut Interp) -> bool {
-        self.peek(it, |fr| fr.trace_opcodes).unwrap_or(self.trace_opcodes)
+        self.peek(it, |fr| fr.trace_opcodes)
+            .unwrap_or(self.trace_opcodes)
     }
 
     #[setter]
     fn set_f_trace_opcodes(&mut self, it: &mut Interp, value: &Value) -> R<()> {
-        let Value::Bool(b) = value else { return Err(it.type_error("attribute value type must be bool")) };
+        let Value::Bool(b) = value else {
+            return Err(it.type_error("attribute value type must be bool"));
+        };
         let b = *b;
         if self.poke(it, |fr| fr.trace_opcodes = b).is_none() {
             self.trace_opcodes = b;
@@ -748,10 +899,21 @@ impl FrameObj {
 
     #[proto(repr)]
     fn repr(slf: This<&Value>, it: &mut Interp) -> R<String> {
-        let Some((code, line)) = with_opaque::<FrameObj, _>(&slf, |d| (d.code.clone(), d.peek(it, frame_line).unwrap_or(d.line as i64))) else {
+        let Some((code, line)) = with_opaque::<FrameObj, _>(&slf, |d| {
+            (
+                d.code.clone(),
+                d.peek(it, frame_line).unwrap_or(d.line as i64),
+            )
+        }) else {
             return Err(it.self_state_err("frame"));
         };
-        Ok(format!("<frame at {:#x}, file '{}', line {}, code {}>", it.id_of(&slf), code.filename, line, code.name))
+        Ok(format!(
+            "<frame at {:#x}, file '{}', line {}, code {}>",
+            it.id_of(&slf),
+            code.filename,
+            line,
+            code.name
+        ))
     }
 }
 
@@ -820,7 +982,13 @@ impl CodeType {
         #[kwonly] co_linetable: Option<&Value>,
         #[kwonly] co_exceptiontable: Option<&Value>,
     ) -> R<Value> {
-        let _ = (co_nlocals, co_stacksize, co_code, co_linetable, co_exceptiontable);
+        let _ = (
+            co_nlocals,
+            co_stacksize,
+            co_code,
+            co_linetable,
+            co_exceptiontable,
+        );
         let c = &slf.0 .0;
         let count = |it: &mut Interp, v: Option<i64>, old: u32, what: &str| -> R<u32> {
             match v {
@@ -836,7 +1004,9 @@ impl CodeType {
                     Some(items) => Ok(Some(items.to_vec())),
                     None => {
                         let t = it.type_name_of(v);
-                        Err(it.type_error(&format!("replace() argument '{what}' must be tuple, not {t}")))
+                        Err(it.type_error(&format!(
+                            "replace() argument '{what}' must be tuple, not {t}"
+                        )))
                     }
                 },
             }
@@ -847,8 +1017,14 @@ impl CodeType {
                 _ => Err(it.type_error(&format!("{what} must be a tuple of strings"))),
             }
         };
-        let strings = |it: &mut Interp, v: Option<Vec<Value>>, old: &[Rc<str>], what: &str| -> R<Vec<Rc<str>>> {
-            let Some(items) = v else { return Ok(old.to_vec()) };
+        let strings = |it: &mut Interp,
+                       v: Option<Vec<Value>>,
+                       old: &[Rc<str>],
+                       what: &str|
+         -> R<Vec<Rc<str>>> {
+            let Some(items) = v else {
+                return Ok(old.to_vec());
+            };
             items
                 .iter()
                 .map(|x| match &str_obj(it, x, what)?.kind {
@@ -864,7 +1040,10 @@ impl CodeType {
         let cellvars = tuple(it, co_cellvars, "co_cellvars")?;
         let names = match names {
             None => c.names.clone(),
-            Some(items) => items.iter().map(|x| str_obj(it, x, "co_names")).collect::<R<Vec<_>>>()?,
+            Some(items) => items
+                .iter()
+                .map(|x| str_obj(it, x, "co_names"))
+                .collect::<R<Vec<_>>>()?,
         };
         let code = Code {
             name: co_name.map_or_else(|| c.name.clone(), Rc::from),
@@ -898,7 +1077,13 @@ impl CodeType {
         let code = &slf.0 .0;
         let items = lumen_common::lineno::line_ranges(&code.lines)
             .into_iter()
-            .map(|(start, end, line)| Value::tuple(vec![Value::Int(2 * start as i64), Value::Int(2 * end as i64), Value::Int(line as i64)]))
+            .map(|(start, end, line)| {
+                Value::tuple(vec![
+                    Value::Int(2 * start as i64),
+                    Value::Int(2 * end as i64),
+                    Value::Int(line as i64),
+                ])
+            })
             .collect();
         it.get_iter(&Value::list(items))
     }

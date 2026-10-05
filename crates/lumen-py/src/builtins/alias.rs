@@ -70,7 +70,15 @@ impl Interp {
     }
 
     fn new_alias(&mut self, origin: Value, args: Vec<Value>, starred: bool) -> Value {
-        Py::new(self, AliasData { origin, args, starred }).into_value()
+        Py::new(
+            self,
+            AliasData {
+                origin,
+                args,
+                starred,
+            },
+        )
+        .into_value()
     }
 
     fn type_arg_repr(&mut self, v: &Value) -> R<String> {
@@ -84,7 +92,8 @@ impl Interp {
             if matches!(o.kind, Kind::Type(_)) && Rc::ptr_eq(o, &self.types.none_type) {
                 return Ok("None".into());
             }
-            let has_origin = self.get_attr_str(v, "__origin__").is_ok() && self.get_attr_str(v, "__args__").is_ok();
+            let has_origin = self.get_attr_str(v, "__origin__").is_ok()
+                && self.get_attr_str(v, "__args__").is_ok();
             if !has_origin {
                 if matches!(o.kind, Kind::Type(_)) {
                     return Ok(self.type_display(o));
@@ -93,7 +102,11 @@ impl Interp {
                 let m = self.get_attr_str(v, "__module__");
                 if let (Ok(q), Ok(m)) = (q, m) {
                     if let (Some(q), Some(m)) = (q.as_str(), m.as_str()) {
-                        return Ok(if m == "builtins" { q.to_string() } else { format!("{}.{}", m, q) });
+                        return Ok(if m == "builtins" {
+                            q.to_string()
+                        } else {
+                            format!("{}.{}", m, q)
+                        });
                     }
                 }
             }
@@ -167,7 +180,8 @@ impl Interp {
 
     /// `_unpacked_tuple_args`: the arguments of `*tuple[...]` / `Unpack[tuple[...]]`.
     fn unpacked_tuple_args(&mut self, arg: &Value) -> R<Option<Vec<Value>>> {
-        let fast = with_opaque::<AliasData, _>(arg, |d| (d.starred, d.origin.clone(), d.args.clone()));
+        let fast =
+            with_opaque::<AliasData, _>(arg, |d| (d.starred, d.origin.clone(), d.args.clone()));
         if let Some((true, Value::Obj(o), args)) = fast {
             if Rc::ptr_eq(&o, &self.types.tuple) {
                 return Ok(Some(args));
@@ -212,8 +226,14 @@ impl Interp {
 
     /// `subs_tvars`: `obj[...]` with the parameters of `obj` replaced from `argitems`.
     fn subs_tvars(&mut self, obj: &Value, params: &[Value], argitems: &[Value]) -> R<Value> {
-        let Some(subparams) = self.opt_attr(obj, "__parameters__")? else { return Ok(obj.clone()) };
-        let Some(subparams) = subparams.tuple_items().map(|t| t.to_vec()).filter(|t| !t.is_empty()) else {
+        let Some(subparams) = self.opt_attr(obj, "__parameters__")? else {
+            return Ok(obj.clone());
+        };
+        let Some(subparams) = subparams
+            .tuple_items()
+            .map(|t| t.to_vec())
+            .filter(|t| !t.is_empty())
+        else {
             return Ok(obj.clone());
         };
         let mut subargs: Vec<Value> = Vec::with_capacity(subparams.len());
@@ -223,7 +243,9 @@ impl Interp {
                     let param_type = self.type_of(&params[i]);
                     let replacement = &argitems[i];
                     match replacement.tuple_items() {
-                        Some(t) if self.lookup_mro(&param_type, "__iter__").is_some() => subargs.extend(t.iter().cloned()),
+                        Some(t) if self.lookup_mro(&param_type, "__iter__").is_some() => {
+                            subargs.extend(t.iter().cloned())
+                        }
                         _ => subargs.push(replacement.clone()),
                     }
                 }
@@ -242,11 +264,17 @@ impl Interp {
         }
         let mut item = Value::tuple(self.unpack_args(key)?);
         for param in &params {
-            let Some(prepare) = self.opt_attr(param, "__typing_prepare_subst__")? else { continue };
+            let Some(prepare) = self.opt_attr(param, "__typing_prepare_subst__")? else {
+                continue;
+            };
             if prepare.is_none() {
                 continue;
             }
-            let arg = if item.tuple_items().is_some() { item.clone() } else { Value::tuple(vec![item.clone()]) };
+            let arg = if item.tuple_items().is_some() {
+                item.clone()
+            } else {
+                Value::tuple(vec![item.clone()])
+            };
             item = self.call(&prepare, vec![this.clone(), arg], Vec::new())?;
         }
         let Some(given) = item.tuple_items().map(|t| t.to_vec()) else {
@@ -254,8 +282,18 @@ impl Interp {
         };
         if given.len() != params.len() {
             let r = self.repr_of(this)?;
-            let word = if given.len() > params.len() { "many" } else { "few" };
-            return Err(self.type_error(&format!("Too {} arguments for {}; actual {}, expected {}", word, r, given.len(), params.len())));
+            let word = if given.len() > params.len() {
+                "many"
+            } else {
+                "few"
+            };
+            return Err(self.type_error(&format!(
+                "Too {} arguments for {}; actual {}, expected {}",
+                word,
+                r,
+                given.len(),
+                params.len()
+            )));
         }
         let mut new_args = Vec::with_capacity(args.len());
         for arg in args {
@@ -306,7 +344,11 @@ impl Interp {
             let inner = with_opaque::<UnionData, _>(&m, |u| u.args.clone());
             let items = match inner {
                 Some(args) => args,
-                None => vec![if m.is_none() { Value::Obj(self.types.none_type.clone()) } else { m }],
+                None => vec![if m.is_none() {
+                    Value::Obj(self.types.none_type.clone())
+                } else {
+                    m
+                }],
             };
             for x in items {
                 if !self.contains_value(&flat, &x)? {
@@ -325,20 +367,28 @@ impl Interp {
 impl AliasData {
     #[constructor(hint(py(text_signature = "")))]
     fn new(cls: This<Value>, it: &mut Interp, origin: &Value, args: &Value) -> Value {
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let alias = it.make_alias(origin.clone(), args);
         let base = type_object::<AliasData>(it);
         if Rc::ptr_eq(cls, &base) {
             return alias;
         }
-        let data = with_opaque::<AliasData, _>(&alias, |d| AliasData { origin: d.origin.clone(), args: d.args.clone(), starred: false });
+        let data = with_opaque::<AliasData, _>(&alias, |d| AliasData {
+            origin: d.origin.clone(),
+            args: d.args.clone(),
+            starred: false,
+        });
         new_opaque(cls, data.expect("a new alias"))
     }
 
     #[proto(getattribute)]
     fn getattribute(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<Value> {
         let this = slf.0.value().clone();
-        let Value::Obj(n) = name else { return Err(it.type_error("attribute name must be string")) };
+        let Value::Obj(n) = name else {
+            return Err(it.type_error("attribute name must be string"));
+        };
         if ALIAS_OWN.contains(&name.as_str().unwrap_or("")) {
             let cls = it.type_of(&this);
             return it.generic_getattr(&this, &cls, n);
@@ -352,7 +402,9 @@ impl AliasData {
         if ALIAS_OWN.contains(&name.as_str().unwrap_or("")) {
             return Err(it.new_exc_str("AttributeError", "readonly attribute"));
         }
-        let Value::Obj(n) = name else { return Err(it.type_error("attribute name must be string")) };
+        let Value::Obj(n) = name else {
+            return Err(it.type_error("attribute name must be string"));
+        };
         it.set_attr(&self.origin, n, value.clone())
     }
 
@@ -360,11 +412,21 @@ impl AliasData {
     fn repr(&self, it: &mut Interp) -> R<String> {
         let o = it.type_arg_repr(&self.origin)?;
         let inner = it.alias_args_repr(&self.args)?;
-        Ok(format!("{}{}[{}]", if self.starred { "*" } else { "" }, o, inner))
+        Ok(format!(
+            "{}{}[{}]",
+            if self.starred { "*" } else { "" },
+            o,
+            inner
+        ))
     }
 
     #[proto(call)]
-    fn call(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn call(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let this = slf.0.value().clone();
         let origin = slf.0.borrow(it)?.origin.clone();
         let r = it.call(&origin, args.to_vec(), kwargs.to_vec())?;
@@ -393,13 +455,19 @@ impl AliasData {
 
     #[proto(eq)]
     fn eq(&self, it: &mut Interp, value: &Value) -> R<Value> {
-        let Some((o2, a2, s2)) = with_opaque::<AliasData, _>(value, |d| (d.origin.clone(), d.args.clone(), d.starred)) else {
+        let Some((o2, a2, s2)) =
+            with_opaque::<AliasData, _>(value, |d| (d.origin.clone(), d.args.clone(), d.starred))
+        else {
             return Ok(Value::NotImplemented);
         };
         if self.starred != s2 || !it.values_eq(&self.origin, &o2)? {
             return Ok(Value::Bool(false));
         }
-        it.compare_op(CmpOp::Eq, &Value::tuple(self.args.clone()), &Value::tuple(a2))
+        it.compare_op(
+            CmpOp::Eq,
+            &Value::tuple(self.args.clone()),
+            &Value::tuple(a2),
+        )
     }
 
     #[proto(hash)]
@@ -453,12 +521,16 @@ impl AliasData {
 
     #[proto(or)]
     fn or(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
-        Ok(it.union_binop(&slf, value)?.unwrap_or(Value::NotImplemented))
+        Ok(it
+            .union_binop(&slf, value)?
+            .unwrap_or(Value::NotImplemented))
     }
 
     #[proto(ror)]
     fn ror(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
-        Ok(it.union_binop(value, &slf)?.unwrap_or(Value::NotImplemented))
+        Ok(it
+            .union_binop(value, &slf)?
+            .unwrap_or(Value::NotImplemented))
     }
 
     #[proto(iter)]
@@ -470,7 +542,10 @@ impl AliasData {
     #[method(name = "__reduce__", hint(py(text_signature = "")))]
     fn reduce(&self, it: &mut Interp) -> R<Value> {
         let ty = Value::Obj(type_object::<AliasData>(it));
-        let plain = Value::tuple(vec![ty, Value::tuple(vec![self.origin.clone(), Value::tuple(self.args.clone())])]);
+        let plain = Value::tuple(vec![
+            ty,
+            Value::tuple(vec![self.origin.clone(), Value::tuple(self.args.clone())]),
+        ]);
         if !self.starred {
             return Ok(plain);
         }
@@ -528,7 +603,9 @@ impl UnionData {
 
     #[proto(eq)]
     fn eq(&self, it: &mut Interp, value: &Value) -> R<Value> {
-        let Some(b) = with_opaque::<UnionData, _>(value, |d| d.args.clone()) else { return Ok(Value::NotImplemented) };
+        let Some(b) = with_opaque::<UnionData, _>(value, |d| d.args.clone()) else {
+            return Ok(Value::NotImplemented);
+        };
         if self.args.len() != b.len() {
             return Ok(Value::Bool(false));
         }
@@ -548,12 +625,16 @@ impl UnionData {
 
     #[proto(or)]
     fn or(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
-        Ok(it.union_binop(&slf, value)?.unwrap_or(Value::NotImplemented))
+        Ok(it
+            .union_binop(&slf, value)?
+            .unwrap_or(Value::NotImplemented))
     }
 
     #[proto(ror)]
     fn ror(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
-        Ok(it.union_binop(value, &slf)?.unwrap_or(Value::NotImplemented))
+        Ok(it
+            .union_binop(value, &slf)?
+            .unwrap_or(Value::NotImplemented))
     }
 
     #[proto(getitem)]
@@ -562,7 +643,9 @@ impl UnionData {
         let args = slf.0.borrow(it)?.args.clone();
         let new_args = it.subst_args(&this, &args, key)?;
         let mut rest = new_args.into_iter();
-        let Some(mut res) = rest.next() else { return it.make_union(Vec::new()) };
+        let Some(mut res) = rest.next() else {
+            return it.make_union(Vec::new());
+        };
         for arg in rest {
             res = it.binary_op(crate::ast::BinOp::BitOr, &res, &arg)?;
         }
@@ -590,7 +673,11 @@ impl UnionData {
         }
         let mut checked = Vec::with_capacity(items.len());
         for item in &items {
-            checked.push(super::typingm::type_check(it, item, "Union[arg, ...]: each arg must be a type.")?);
+            checked.push(super::typingm::type_check(
+                it,
+                item,
+                "Union[arg, ...]: each arg must be a type.",
+            )?);
         }
         it.make_union(checked)
     }
@@ -605,7 +692,11 @@ impl UnionData {
 /// Creates both types, their attributes being CPython's member and getset descriptors.
 pub fn init(it: &mut Interp) {
     let generic = type_object::<AliasData>(it);
-    super::descr::install_getsets::<AliasData>(it, &generic, &["__origin__", "__args__", "__unpacked__"]);
+    super::descr::install_getsets::<AliasData>(
+        it,
+        &generic,
+        &["__origin__", "__args__", "__unpacked__"],
+    );
     let union = type_object::<UnionData>(it);
     super::descr::install_getsets::<UnionData>(it, &union, &["__args__", "__origin__"]);
 }

@@ -25,7 +25,10 @@ pub fn os_pipe() -> R<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     check(unsafe { libc::pipe(fds.as_mut_ptr()) })?;
     // SAFETY: both descriptors are fresh and owned by nobody else.
     let (r, w) = unsafe {
-        (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1]))
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
     };
     set_inheritable(fds[0], false)?;
     set_inheritable(fds[1], false)?;
@@ -69,7 +72,11 @@ pub fn set_inheritable(fd: i32, inheritable: bool) -> R<()> {
     {
         // SAFETY: F_GETFD/F_SETFD only touch the descriptor flags.
         let flags = check(unsafe { libc::fcntl(fd, libc::F_GETFD) })?;
-        let new = if inheritable { flags & !libc::FD_CLOEXEC } else { flags | libc::FD_CLOEXEC };
+        let new = if inheritable {
+            flags & !libc::FD_CLOEXEC
+        } else {
+            flags | libc::FD_CLOEXEC
+        };
         if new != flags {
             check(unsafe { libc::fcntl(fd, libc::F_SETFD, new) })?;
         }
@@ -101,7 +108,11 @@ pub fn set_blocking(fd: i32, blocking: bool) -> R<()> {
     {
         // SAFETY: F_GETFL/F_SETFL only touch the file status flags.
         let flags = check(unsafe { libc::fcntl(fd, libc::F_GETFL) })?;
-        let new = if blocking { flags & !libc::O_NONBLOCK } else { flags | libc::O_NONBLOCK };
+        let new = if blocking {
+            flags & !libc::O_NONBLOCK
+        } else {
+            flags | libc::O_NONBLOCK
+        };
         if new != flags {
             check(unsafe { libc::fcntl(fd, libc::F_SETFL, new) })?;
         }

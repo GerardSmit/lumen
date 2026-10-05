@@ -408,7 +408,7 @@ impl Shape {
                     return self
                         .chain()
                         .find(|(_, k)| key_eq(k, key))
-                        .map(|(s, _)| s.len - 1)
+                        .map(|(s, _)| s.len - 1);
                 }
             },
         };
@@ -607,7 +607,12 @@ impl ShapeTable {
             }
             let shape = self.by_id.remove(&id).expect("present");
             self.children.remove(&id);
-            if let Keys::Chain { parent: Some(p), key, .. } = &shape.keys {
+            if let Keys::Chain {
+                parent: Some(p),
+                key,
+                ..
+            } = &shape.keys
+            {
                 self.transitions.remove(&(p.id, key.clone()));
                 if let std::collections::hash_map::Entry::Occupied(mut e) =
                     self.children.entry(p.id)

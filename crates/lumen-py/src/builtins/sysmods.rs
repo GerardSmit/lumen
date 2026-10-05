@@ -61,7 +61,12 @@ pub mod gc {
     ///
     /// The number of unreachable objects is returned.
     #[op]
-    fn collect(it: &mut Interp, #[kw] #[default(2)] generation: i64) -> R<i64> {
+    fn collect(
+        it: &mut Interp,
+        #[kw]
+        #[default(2)]
+        generation: i64,
+    ) -> R<i64> {
         let g = self::generation(it, generation)?;
         Ok(it.gc_collect_checked(g) as i64)
     }
@@ -104,9 +109,17 @@ pub mod gc {
     /// collection.
     ///
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
-    fn set_threshold(threshold0: i32, threshold1: lumen_bind::Passed<i32>, threshold2: lumen_bind::Passed<i32>) {
+    fn set_threshold(
+        threshold0: i32,
+        threshold1: lumen_bind::Passed<i32>,
+        threshold2: lumen_bind::Passed<i32>,
+    ) {
         let t = |v: i32| v.max(0) as usize;
-        crate::gc::set_thresholds([Some(t(threshold0)), threshold1.0.map(t), threshold2.0.map(t)]);
+        crate::gc::set_thresholds([
+            Some(t(threshold0)),
+            threshold1.0.map(t),
+            threshold2.0.map(t),
+        ]);
     }
 
     /// Set the garbage collection debugging flags.
@@ -166,8 +179,12 @@ pub mod gc {
     #[op]
     fn get_objects(it: &mut Interp, #[kw] generation: Option<i64>) -> R<Vec<Value>> {
         let g = match generation {
-            Some(g) if g >= 3 => return Err(it.value_error("generation parameter must be less than the number of available generations (3)")),
-            Some(g) if g < 0 => return Err(it.value_error("generation parameter cannot be negative")),
+            Some(g) if g >= 3 => return Err(it.value_error(
+                "generation parameter must be less than the number of available generations (3)",
+            )),
+            Some(g) if g < 0 => {
+                return Err(it.value_error("generation parameter cannot be negative"));
+            }
             Some(g) => Some(g as usize),
             None => None,
         };
@@ -178,7 +195,10 @@ pub mod gc {
     /// Return the list of objects that directly refer to any of objs.
     #[op(hint(py(text_signature = "")))]
     fn get_referrers(#[varargs] objs: &[Value]) -> Vec<Value> {
-        crate::gc::referrers(objs).into_iter().map(Value::Obj).collect()
+        crate::gc::referrers(objs)
+            .into_iter()
+            .map(Value::Obj)
+            .collect()
     }
 
     /// get_referents(*objs) -> list
@@ -261,11 +281,17 @@ pub mod atexit {
     ///
     ///     func is returned to facilitate usage as a decorator.
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
-    fn register(it: &mut Interp, func: &Value, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn register(
+        it: &mut Interp,
+        func: &Value,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         if !it.is_callable(func) {
             return Err(it.type_error("the first argument must be callable"));
         }
-        it.atexit.push((func.clone(), args.to_vec(), kwargs.to_vec()));
+        it.atexit
+            .push((func.clone(), args.to_vec(), kwargs.to_vec()));
         Ok(func.clone())
     }
 

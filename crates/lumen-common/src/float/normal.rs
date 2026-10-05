@@ -5,7 +5,9 @@ use super::MathError;
 /// Horner evaluation with fused multiply-adds, matching the contraction a C compiler applies to
 /// CPython's `_statistics` so results agree to the last bit.
 fn horner(r: f64, coeffs: &[f64]) -> f64 {
-    coeffs[1..].iter().fold(coeffs[0], |acc, &c| acc.mul_add(r, c))
+    coeffs[1..]
+        .iter()
+        .fold(coeffs[0], |acc, &c| acc.mul_add(r, c))
 }
 
 /// The `p`-quantile of the normal distribution with mean `mu` and standard deviation `sigma`:

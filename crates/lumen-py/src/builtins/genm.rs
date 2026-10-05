@@ -35,7 +35,13 @@ impl Interp {
 
     /// The exception `throw(typ, val, tb)` raises into the generator; the three-argument form
     /// warns as deprecated, as in CPython 3.12.
-    fn throw_exc(&mut self, name: &str, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Obj> {
+    fn throw_exc(
+        &mut self,
+        name: &str,
+        typ: &Value,
+        val: Option<&Value>,
+        tb: Option<&Value>,
+    ) -> R<Obj> {
         if val.is_some() || tb.is_some() {
             let msg = format!("the (type, exc, tb) signature of {name}() is deprecated, use the single-arg signature instead.");
             crate::builtins::warningsm::warn_category(self, "DeprecationWarning", &msg, 1)?;
@@ -44,7 +50,8 @@ impl Interp {
         let val = val.cloned().filter(|v| !v.is_none());
         let exc = match (&typ, val) {
             (Value::Obj(o), Some(v)) if matches!(o.kind, Kind::Type(_)) => {
-                let inst = if matches!(&v, Value::Obj(vo) if matches!(vo.kind, Kind::Exception(_))) {
+                let inst = if matches!(&v, Value::Obj(vo) if matches!(vo.kind, Kind::Exception(_)))
+                {
                     v
                 } else {
                     let args = match v.tuple_items() {
@@ -83,7 +90,13 @@ impl GenMethods {
     /// the (type, val, tb) signature is deprecated,
     /// and may be removed in a future version of Python.
     #[method(hint(py(text_signature = "")))]
-    fn throw(slf: This<Gen<'_>>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+    fn throw(
+        slf: This<Gen<'_>>,
+        it: &mut Interp,
+        typ: &Value,
+        val: Option<&Value>,
+        tb: Option<&Value>,
+    ) -> R<Value> {
         let exc = it.throw_exc("throw", typ, val, tb)?;
         let r = it.gen_throw(slf.0 .0, exc)?;
         it.gen_result(r)
@@ -152,7 +165,9 @@ pub struct AsyncGenHooks {
 /// `async_gen_init_hooks`: on the first `__anext__`/`asend`/`athrow`/`aclose` of `g`, calls
 /// the `firstiter` hook with it.
 fn agen_init_hooks(it: &mut Interp, g: &Obj) -> R<()> {
-    let Kind::Generator(gd) = &g.kind else { return Ok(()) };
+    let Kind::Generator(gd) = &g.kind else {
+        return Ok(());
+    };
     if gd.hooks_inited.replace(true) {
         return Ok(());
     }
@@ -197,11 +212,22 @@ impl AsyncGenerator {
     /// the (type, val, tb) signature is deprecated,
     /// and may be removed in a future version of Python.
     #[method(hint(py(text_signature = "")))]
-    fn athrow(slf: This<Gen<'_>>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+    fn athrow(
+        slf: This<Gen<'_>>,
+        it: &mut Interp,
+        typ: &Value,
+        val: Option<&Value>,
+        tb: Option<&Value>,
+    ) -> R<Value> {
         let g = slf.0 .0;
         agen_init_hooks(it, g)?;
         let exc = it.throw_exc("athrow", typ, val, tb)?;
-        Ok(new_asend(it, &Value::Obj(g.clone()), "athrow", Value::Obj(exc)))
+        Ok(new_asend(
+            it,
+            &Value::Obj(g.clone()),
+            "athrow",
+            Value::Obj(exc),
+        ))
     }
 
     /// aclose() -> raise GeneratorExit inside generator.
@@ -221,7 +247,10 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
     let d = it.instance_dict(&o);
     let get = |n: &str| dict_get_str(&d, n).unwrap_or(Value::None);
     if matches!(get("done"), Value::Bool(true)) {
-        return Err(it.new_exc_str("RuntimeError", "cannot reuse already awaited __anext__()/asend()"));
+        return Err(it.new_exc_str(
+            "RuntimeError",
+            "cannot reuse already awaited __anext__()/asend()",
+        ));
     }
     let g = match get("agen") {
         Value::Obj(g) => g,
@@ -233,7 +262,11 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
     let r = if !started {
         match mode.as_str() {
             "anext" | "asend" => {
-                let v = if mode == "asend" { get("arg") } else { Value::None };
+                let v = if mode == "asend" {
+                    get("arg")
+                } else {
+                    Value::None
+                };
                 match throw {
                     Some(e) => it.gen_throw(&g, e),
                     None => it.gen_send(&g, v),
@@ -261,7 +294,9 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
                 if let Kind::AsyncGenValue(x) = &vo.kind {
                     finish(&d);
                     if mode == "aclose" {
-                        return Err(it.new_exc_str("RuntimeError", "async generator ignored GeneratorExit"));
+                        return Err(
+                            it.new_exc_str("RuntimeError", "async generator ignored GeneratorExit")
+                        );
                     }
                     return Err(it.stop_iteration(x.clone()));
                 }
@@ -278,7 +313,9 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
         }
         Err(e) => {
             finish(&d);
-            if mode == "aclose" && (it.exc_is(&e, "GeneratorExit") || it.exc_is(&e, "StopAsyncIteration")) {
+            if mode == "aclose"
+                && (it.exc_is(&e, "GeneratorExit") || it.exc_is(&e, "StopAsyncIteration"))
+            {
                 return Err(it.stop_iteration(Value::None));
             }
             Err(e)
@@ -325,7 +362,13 @@ impl AsyncGenAsend {
     /// the (type, val, tb) signature is deprecated,
     /// and may be removed in a future version of Python.
     #[method(hint(py(text_signature = "")))]
-    fn throw(slf: This<&Value>, it: &mut Interp, typ: &Value, val: Option<&Value>, tb: Option<&Value>) -> R<Value> {
+    fn throw(
+        slf: This<&Value>,
+        it: &mut Interp,
+        typ: &Value,
+        val: Option<&Value>,
+        tb: Option<&Value>,
+    ) -> R<Value> {
         let exc = it.throw_exc("throw", typ, val, tb)?;
         asend_step(it, &slf, Value::None, Some(exc))
     }
@@ -341,7 +384,11 @@ impl AsyncGenAsend {
 }
 
 pub fn init(it: &mut Interp) {
-    for t in [it.types.generator.clone(), it.types.coroutine.clone(), it.types.async_generator.clone()] {
+    for t in [
+        it.types.generator.clone(),
+        it.types.coroutine.clone(),
+        it.types.async_generator.clone(),
+    ] {
         crate::bind::install_into::<GenMethods>(&t, &["send", "throw", "close"]);
     }
     let g = it.types.generator.clone();

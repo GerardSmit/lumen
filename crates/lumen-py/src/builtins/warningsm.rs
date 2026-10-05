@@ -22,20 +22,40 @@ pub mod _warnings {
         let m = it.import_module("_warnings")?;
         let f = it.get_attr_str(&Value::Obj(m), "warn")?;
         let cat = Value::Obj(it.exc_type(category));
-        it.call(&f, vec![Value::str(msg), cat, Value::Int(stacklevel)], Vec::new())?;
+        it.call(
+            &f,
+            vec![Value::str(msg), cat, Value::Int(stacklevel)],
+            Vec::new(),
+        )?;
         Ok(())
     }
 
     /// `PyErr_WarnExplicit(category, msg, filename, lineno, NULL, NULL)` for a builtin category:
     /// the module is the filename without `.py`, and there is no registry.
-    pub fn warn_explicit_category(it: &mut Interp, category: &str, msg: &str, filename: &str, lineno: u32) -> R<()> {
+    pub fn warn_explicit_category(
+        it: &mut Interp,
+        category: &str,
+        msg: &str,
+        filename: &str,
+        lineno: u32,
+    ) -> R<()> {
         // Through `warnings`, not `_py_warnings`: importing it binds `_py_warnings._wm`, which compile-time
         // warnings can need before user code ever imports `warnings`.
         let w = Value::Obj(it.import_module("warnings")?);
         let f = it.get_attr_str(&w, "warn_explicit")?;
         let cat = Value::Obj(it.exc_type(category));
         let module = Value::str(filename.strip_suffix(".py").unwrap_or(filename));
-        it.call(&f, vec![Value::str(msg), cat, Value::str(filename), Value::Int(lineno as i64), module], Vec::new())?;
+        it.call(
+            &f,
+            vec![
+                Value::str(msg),
+                cat,
+                Value::str(filename),
+                Value::Int(lineno as i64),
+                module,
+            ],
+            Vec::new(),
+        )?;
         Ok(())
     }
 
@@ -68,7 +88,9 @@ pub mod _warnings {
         if let Some(v) = skip_file_prefixes {
             if v.tuple_items().is_none() {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("warn() argument 'skip_file_prefixes' must be tuple, not {t}")));
+                return Err(it.type_error(&format!(
+                    "warn() argument 'skip_file_prefixes' must be tuple, not {t}"
+                )));
             }
             kwargs.push((it.str_obj("skip_file_prefixes"), v.clone()));
         }
@@ -148,7 +170,13 @@ pub mod _warnings {
             .iter()
             .map(|(action, cat, module)| {
                 let module = module.map(Value::str).unwrap_or(Value::None);
-                Value::tuple(vec![Value::str(action), Value::None, Value::Obj(it.exc_types[cat].clone()), module, Value::Int(0)])
+                Value::tuple(vec![
+                    Value::str(action),
+                    Value::None,
+                    Value::Obj(it.exc_types[cat].clone()),
+                    module,
+                    Value::Int(0),
+                ])
             })
             .collect();
         dict_set_str(&d, "filters", Value::list(filters));

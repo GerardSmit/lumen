@@ -93,23 +93,20 @@ fn console_output_matches_node() {
 
 #[test]
 fn logging_does_not_materialise_stdio_streams() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         console.log("a", 1, { b: [1, 2] });
         console.error("e");
         const ops = process._console;
         console.log(ops.live(1), ops.live(2));
         process.stdout;
         console.log(ops.live(1), ops.live(2));
-        "#,
-    );
+        "#);
     assert_eq!(out, "a 1 { b: [ 1, 2 ] }\nfalse false\ntrue false\n");
 }
 
 #[test]
 fn console_and_stdout_writes_stay_ordered() {
-    let (out, err) = run(
-        r#"
+    let (out, err) = run(r#"
         console.log("1");
         process.stdout.write("2\n");
         console.log({ three: 3 });
@@ -119,22 +116,19 @@ fn console_and_stdout_writes_stay_ordered() {
         process.stderr.write("e2\n");
         console.error({ e: 3 });
         process.on("exit", () => { console.error("bye"); process.stderr.write("bye2\n"); });
-        "#,
-    );
+        "#);
     assert_eq!(out, "1\n2\n{ three: 3 }\n4 no newline 5\n");
     assert_eq!(err, "e1\ne2\n{ e: 3 }\nbye\nbye2\n");
 }
 
 #[test]
 fn large_interleaved_output_keeps_order() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         for (let i = 0; i < 20000; i++) {
           if (i % 3 === 0) process.stdout.write("w" + i + "\n"); else console.log("l", i, { i });
         }
         process.stdout.write("tail");
-        "#,
-    );
+        "#);
     let mut expected = String::new();
     for i in 0..20000 {
         if i % 3 == 0 {
@@ -149,8 +143,7 @@ fn large_interleaved_output_keeps_order() {
 
 #[test]
 fn patched_stdout_write_captures_console_output() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         const write = process.stdout.write;
         const seen = [];
         process.stdout.write = (chunk) => { seen.push(String(chunk)); return true; };
@@ -158,31 +151,27 @@ fn patched_stdout_write_captures_console_output() {
         console.info("hidden too");
         process.stdout.write = write;
         console.log(JSON.stringify(seen));
-        "#,
-    );
+        "#);
     assert_eq!(out, "[\"hidden { a: 1 }\\n\",\"hidden too\\n\"]\n");
 }
 
 #[test]
 fn replaced_stdout_property_receives_console_output() {
-    let (out, err) = run(
-        r#"
+    let (out, err) = run(r#"
         const log = console.log;
         Object.defineProperty(process, "stdout", {
           value: { write(text) { process.stderr.write("fake:" + text); return true; } },
           configurable: true,
         });
         log("x", 1);
-        "#,
-    );
+        "#);
     assert_eq!(out, "");
     assert_eq!(err, "fake:x 1\n");
 }
 
 #[test]
 fn groups_indent_and_unwind() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         console.group("g");
         console.log({ a: 1 }, "line\nbreak");
         console.group();
@@ -190,22 +179,19 @@ fn groups_indent_and_unwind() {
         console.groupEnd();
         console.groupEnd();
         console.log("out");
-        "#,
-    );
+        "#);
     assert_eq!(out, "g\n  { a: 1 } line\n  break\n    deeper\nout\n");
 }
 
 #[test]
 fn values_the_native_formatter_declines_still_print_like_node() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         class P { constructor() { this.x = 1; } [Symbol.for("nodejs.util.inspect.custom")]() { return "custom!"; } }
         console.log(new P(), new Map([[1, { a: 2 }]]), new Set([1]), [1, , 3], { f() {} }.f.name);
         const circular = { name: "c" }; circular.me = circular;
         console.log(circular);
         console.log("%o", 1);
-        "#,
-    );
+        "#);
     assert_eq!(
         out,
         "custom! Map(1) { 1 => { a: 2 } } Set(1) { 1 } [ 1, <1 empty item>, 3 ] f\n<ref *1> { name: 'c', me: [Circular *1] }\n1\n"
@@ -214,12 +200,10 @@ fn values_the_native_formatter_declines_still_print_like_node() {
 
 #[test]
 fn changing_inspect_default_options_applies_to_console() {
-    let (out, _) = run(
-        r#"
+    let (out, _) = run(r#"
         console.log({ a: { b: { c: { d: 1 } } } });
         require("util").inspect.defaultOptions.depth = 0;
         console.log({ a: { b: 1 } });
-        "#,
-    );
+        "#);
     assert_eq!(out, "{ a: { b: { c: [Object] } } }\n{ a: [Object] }\n");
 }

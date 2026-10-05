@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 lumen-host = { path = "../lumen-host" }
-lumen-runtime = { path = "../lumen-runtime", default-features = false, features = ["bun", "http2", "cluster", "dgram", "wasi"] }
+lumen-runtime = { path = "../lumen-runtime", default-features = false, features = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi"] }
 
 # The crypto backends are chosen by the final binary (see lumen-cli); a build of this crate alone
 # gets the defaults.

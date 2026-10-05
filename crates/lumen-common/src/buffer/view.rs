@@ -8,7 +8,13 @@ use super::BufferError;
 /// length-tracking view (`track`), as many whole elements as fit past `offset`. `None` = out of
 /// bounds (the buffer shrank under the view).
 #[inline(always)]
-pub fn span_len(buf_len: usize, offset: usize, elsize: usize, len: usize, track: bool) -> Option<usize> {
+pub fn span_len(
+    buf_len: usize,
+    offset: usize,
+    elsize: usize,
+    len: usize,
+    track: bool,
+) -> Option<usize> {
     if track {
         if offset > buf_len {
             None
@@ -29,7 +35,9 @@ pub fn shape_product(shape: &[usize]) -> Option<usize> {
     if shape.contains(&0) {
         return Some(0);
     }
-    shape.iter().try_fold(1usize, |acc, &n| acc.checked_mul(n).filter(|&p| p <= isize::MAX as usize))
+    shape.iter().try_fold(1usize, |acc, &n| {
+        acc.checked_mul(n).filter(|&p| p <= isize::MAX as usize)
+    })
 }
 
 /// C-order (row-major) strides for `shape`.
@@ -57,13 +65,23 @@ pub fn f_strides(shape: &[usize], itemsize: usize) -> Vec<isize> {
 /// Python's `PySlice_Unpack` + `PySlice_AdjustIndices`: clamp `start`/`stop` (`None` = omitted,
 /// meaning the end appropriate for the step's sign) against `len` and return
 /// `(start, slice_len)`. `step` must be nonzero.
-pub fn adjust_slice(len: usize, start: Option<isize>, stop: Option<isize>, step: isize) -> (isize, usize) {
+pub fn adjust_slice(
+    len: usize,
+    start: Option<isize>,
+    stop: Option<isize>,
+    step: isize,
+) -> (isize, usize) {
     let (start, _, n) = adjust_slice_bounds(len, start, stop, step);
     (start, n)
 }
 
 /// [`adjust_slice`] that also returns the clamped `stop`: `(start, stop, slice_len)`.
-pub fn adjust_slice_bounds(len: usize, start: Option<isize>, stop: Option<isize>, step: isize) -> (isize, isize, usize) {
+pub fn adjust_slice_bounds(
+    len: usize,
+    start: Option<isize>,
+    stop: Option<isize>,
+    step: isize,
+) -> (isize, isize, usize) {
     debug_assert!(step != 0);
     let len = len as isize;
     let clamp = |v: Option<isize>, default: isize| -> isize {
@@ -131,7 +149,14 @@ pub struct ViewDesc {
 impl ViewDesc {
     /// `len` unsigned bytes at `offset` (Python's default `memoryview` format `B`).
     pub fn bytes(offset: usize, len: usize, readonly: bool) -> ViewDesc {
-        ViewDesc::contiguous(offset, Some(ElemKind::U8), 1, ByteOrder::NATIVE, vec![len], readonly)
+        ViewDesc::contiguous(
+            offset,
+            Some(ElemKind::U8),
+            1,
+            ByteOrder::NATIVE,
+            vec![len],
+            readonly,
+        )
     }
 
     /// A C-contiguous view of `shape` elements.
@@ -144,7 +169,15 @@ impl ViewDesc {
         readonly: bool,
     ) -> ViewDesc {
         let strides = c_strides(&shape, itemsize);
-        ViewDesc { offset, itemsize, elem, order, shape, strides, readonly }
+        ViewDesc {
+            offset,
+            itemsize,
+            elem,
+            order,
+            shape,
+            strides,
+            readonly,
+        }
     }
 
     pub fn ndim(&self) -> usize {
@@ -159,7 +192,9 @@ impl ViewDesc {
 
     /// Bytes the view's elements occupy if laid out contiguously; `None` past `isize::MAX`.
     pub fn checked_nbytes(&self) -> Option<usize> {
-        self.checked_nitems()?.checked_mul(self.itemsize).filter(|&n| n <= isize::MAX as usize)
+        self.checked_nitems()?
+            .checked_mul(self.itemsize)
+            .filter(|&n| n <= isize::MAX as usize)
     }
 
     /// [`checked_nitems`](Self::checked_nitems), saturating at `usize::MAX`: a view that large
@@ -240,7 +275,10 @@ impl ViewDesc {
     /// Byte offset of the element at `idx` (one in-range index per dimension).
     pub fn item_offset(&self, idx: &[usize]) -> usize {
         debug_assert_eq!(idx.len(), self.ndim());
-        let off = idx.iter().zip(&self.strides).fold(self.offset as isize, |a, (&i, &s)| a + i as isize * s);
+        let off = idx
+            .iter()
+            .zip(&self.strides)
+            .fold(self.offset as isize, |a, (&i, &s)| a + i as isize * s);
         off as usize
     }
 
@@ -295,7 +333,14 @@ impl ViewDesc {
                 vec![nbytes / itemsize]
             }
         };
-        Ok(ViewDesc::contiguous(self.offset, elem, itemsize, order, shape, self.readonly))
+        Ok(ViewDesc::contiguous(
+            self.offset,
+            elem,
+            itemsize,
+            order,
+            shape,
+            self.readonly,
+        ))
     }
 
     /// Call `f` with the byte offset of every element, in C (row-major) order.
@@ -383,7 +428,14 @@ mod tests {
     fn strides_and_contiguity() {
         assert_eq!(c_strides(&[2, 3], 4), [12, 4]);
         assert_eq!(f_strides(&[2, 3], 4), [4, 8]);
-        let v = ViewDesc::contiguous(0, Some(ElemKind::I32), 4, ByteOrder::Little, vec![2, 3], false);
+        let v = ViewDesc::contiguous(
+            0,
+            Some(ElemKind::I32),
+            4,
+            ByteOrder::Little,
+            vec![2, 3],
+            false,
+        );
         assert!(v.is_c_contiguous() && !v.is_f_contiguous());
         assert_eq!((v.nitems(), v.nbytes(), v.extent()), (6, 24, Some((0, 24))));
         let col = v.slice(1, 1, 1, 1);
@@ -408,7 +460,14 @@ mod tests {
     #[test]
     fn strided_gather_scatter_and_negative_steps() {
         let buf: Vec<u8> = (0..12).collect();
-        let v = ViewDesc::contiguous(0, Some(ElemKind::U8), 1, ByteOrder::Little, vec![3, 4], false);
+        let v = ViewDesc::contiguous(
+            0,
+            Some(ElemKind::U8),
+            1,
+            ByteOrder::Little,
+            vec![3, 4],
+            false,
+        );
         // [:, ::2]
         let s = v.slice(1, 0, 2, 2);
         assert_eq!(s.gather(&buf), [0, 2, 4, 6, 8, 10]);
@@ -430,19 +489,44 @@ mod tests {
     #[test]
     fn casts() {
         let v = ViewDesc::bytes(0, 8, false);
-        let d = v.cast(Some(ElemKind::F64), 8, ByteOrder::Little, None).unwrap();
+        let d = v
+            .cast(Some(ElemKind::F64), 8, ByteOrder::Little, None)
+            .unwrap();
         assert_eq!((d.shape.clone(), d.strides.clone()), (vec![1], vec![8]));
         let buf = 1.5f64.to_le_bytes();
-        assert_eq!(load_f64(d.elem.unwrap(), &buf[d.item_offset(&[0])..], d.order), 1.5);
-        let m = v.cast(Some(ElemKind::U16), 2, ByteOrder::Little, Some(vec![2, 2])).unwrap();
+        assert_eq!(
+            load_f64(d.elem.unwrap(), &buf[d.item_offset(&[0])..], d.order),
+            1.5
+        );
+        let m = v
+            .cast(Some(ElemKind::U16), 2, ByteOrder::Little, Some(vec![2, 2]))
+            .unwrap();
         assert_eq!(m.strides, [4, 2]);
-        assert_eq!(v.cast(Some(ElemKind::I32), 4, ByteOrder::Little, Some(vec![3])), Err(CastError::SizeMismatch));
-        assert_eq!(ViewDesc::bytes(0, 7, false).cast(None, 2, ByteOrder::Little, None), Err(CastError::SizeMismatch));
-        assert_eq!(v.cast(None, 1, ByteOrder::Little, Some(vec![1 << 62, 4])), Err(CastError::TooLarge));
-        assert_eq!(v.cast(None, 8, ByteOrder::Little, Some(vec![1 << 61, 4])), Err(CastError::TooLarge));
-        assert_eq!(v.cast(None, 1 << 62, ByteOrder::Little, Some(vec![1 << 61])), Err(CastError::SizeMismatch));
+        assert_eq!(
+            v.cast(Some(ElemKind::I32), 4, ByteOrder::Little, Some(vec![3])),
+            Err(CastError::SizeMismatch)
+        );
+        assert_eq!(
+            ViewDesc::bytes(0, 7, false).cast(None, 2, ByteOrder::Little, None),
+            Err(CastError::SizeMismatch)
+        );
+        assert_eq!(
+            v.cast(None, 1, ByteOrder::Little, Some(vec![1 << 62, 4])),
+            Err(CastError::TooLarge)
+        );
+        assert_eq!(
+            v.cast(None, 8, ByteOrder::Little, Some(vec![1 << 61, 4])),
+            Err(CastError::TooLarge)
+        );
+        assert_eq!(
+            v.cast(None, 1 << 62, ByteOrder::Little, Some(vec![1 << 61])),
+            Err(CastError::SizeMismatch)
+        );
         let strided = v.slice(0, 0, 2, 4);
-        assert_eq!(strided.cast(None, 1, ByteOrder::Little, None), Err(CastError::NotContiguous));
+        assert_eq!(
+            strided.cast(None, 1, ByteOrder::Little, None),
+            Err(CastError::NotContiguous)
+        );
     }
 
     #[test]
@@ -458,7 +542,10 @@ mod tests {
         let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![1 << 62, 4, 0], false);
         assert_eq!((huge.nitems(), huge.extent()), (0, Some((0, 0))));
         let huge = ViewDesc::contiguous(0, None, 8, ByteOrder::Little, vec![1 << 62, 4], false);
-        assert_eq!((huge.checked_nitems(), huge.nbytes(), huge.extent()), (None, usize::MAX, None));
+        assert_eq!(
+            (huge.checked_nitems(), huge.nbytes(), huge.extent()),
+            (None, usize::MAX, None)
+        );
         assert_eq!(huge.check(usize::MAX), Err(BufferError::OutOfBounds));
         assert_eq!(span_len(16, usize::MAX, 4, 3, false), None);
         assert_eq!(span_len(16, 4, 4, usize::MAX, false), None);

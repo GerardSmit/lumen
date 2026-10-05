@@ -22,16 +22,23 @@
 //! - [x] Streams (`ReadableStream`, `WritableStream`, `TransformStream`, the text and compression
 //!   streams, queuing strategies) come from lumen-node's `webstreams.js` (Node's own WHATWG
 //!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
-//!   Bodies remain buffered, so a stream used as a body must produce its data synchronously.
+//!   Fetch reads native response bodies incrementally; body consumption and cloning also
+//!   accept asynchronous streams. Request uploads are prepared before transport delivery.
 //! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
 
+use lumen_bind::NativeError;
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
-use lumen_bind::NativeError;
 use lumen_host::{Ctx, Extension, OpError, OpState, Value};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
+#[cfg(not(target_arch = "wasm32"))]
+mod http_body;
+#[cfg(target_arch = "wasm32")]
+#[path = "browser_body.rs"]
+mod http_body;
+mod request_control;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
@@ -39,6 +46,240 @@ mod sse;
 mod url;
 #[cfg(not(target_arch = "wasm32"))]
 mod websocket;
+
+/// A fetched web resource with the URL that survived HTTP redirects. Runtime module loaders use
+/// this instead of maintaining a second HTTP/TLS implementation.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct ModuleResource {
+    pub url: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+/// A bounded native resource response, including unsuccessful HTTP status
+/// codes. It uses the same transport, redirect, routing and trust handling as
+/// module loading; callers apply their resource type's response policy.
+#[cfg(not(target_arch = "wasm32"))]
+pub use http::HttpResponse as ResourceResponse;
+
+/// Per-runtime routing and trust configuration for native HTTP(S) fetches.
+///
+/// A route changes only the socket address. Requests retain the URL's logical host and port for
+/// the HTTP `Host` header, TLS SNI, and certificate hostname verification. Clones share an
+/// immutable snapshot; mutating a clone uses copy-on-write, so an in-flight request keeps the
+/// configuration it started with.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+pub struct FetchConfig {
+    routes: std::sync::Arc<std::collections::HashMap<(String, u16), FetchRoute>>,
+    require_routes: bool,
+    /// Internal single-hop policy for the Fetch origin adapter.
+    manual_redirect: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub(crate) struct FetchRoute {
+    pub(crate) address: std::net::SocketAddr,
+    pub(crate) extra_ca_pem: Option<std::sync::Arc<[u8]>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FetchConfig {
+    /// Restrict requests, including redirected requests, to explicitly configured routes.
+    /// Ordinary runtimes allow system DNS by default; fixture runtimes opt into this policy.
+    pub fn set_require_routes(&mut self, required: bool) {
+        self.require_routes = required;
+    }
+
+    pub(crate) fn requires_routes(&self) -> bool {
+        self.require_routes
+    }
+
+    /// Route a logical URL host and port to a concrete socket address.
+    pub fn set_route(
+        &mut self,
+        host: &str,
+        logical_port: u16,
+        address: std::net::SocketAddr,
+    ) -> Result<(), String> {
+        self.set_route_inner(host, logical_port, address, None)
+    }
+
+    /// Route a logical URL host and port and add the supplied PEM certificates to the existing
+    /// system trust roots for HTTPS requests through this route.
+    pub fn set_route_with_extra_roots(
+        &mut self,
+        host: &str,
+        logical_port: u16,
+        address: std::net::SocketAddr,
+        extra_ca_pem: impl Into<Vec<u8>>,
+    ) -> Result<(), String> {
+        let extra_ca_pem = extra_ca_pem.into();
+        if extra_ca_pem.is_empty() {
+            return Err("extra CA PEM bundle is empty".into());
+        }
+        self.set_route_inner(host, logical_port, address, Some(extra_ca_pem.into()))
+    }
+
+    /// Remove a route, returning whether one was present.
+    pub fn remove_route(&mut self, host: &str, logical_port: u16) -> Result<bool, String> {
+        let host = normalize_route_host(host)?;
+        Ok(std::sync::Arc::make_mut(&mut self.routes)
+            .remove(&(host, logical_port))
+            .is_some())
+    }
+
+    fn set_route_inner(
+        &mut self,
+        host: &str,
+        logical_port: u16,
+        address: std::net::SocketAddr,
+        extra_ca_pem: Option<std::sync::Arc<[u8]>>,
+    ) -> Result<(), String> {
+        if logical_port == 0 {
+            return Err("logical route port must be nonzero".into());
+        }
+        let host = normalize_route_host(host)?;
+        std::sync::Arc::make_mut(&mut self.routes).insert(
+            (host, logical_port),
+            FetchRoute {
+                address,
+                extra_ca_pem,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn route_for(&self, host: &str, logical_port: u16) -> Option<FetchRoute> {
+        let host = normalize_route_host(host).ok()?;
+        self.routes.get(&(host, logical_port)).cloned()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_route_host(host: &str) -> Result<String, String> {
+    let trimmed = host.trim();
+    let (host, was_bracketed) = match trimmed
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+    {
+        Some(host) => (host, true),
+        None => (trimmed, false),
+    };
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return Ok(address.to_string());
+    }
+    if was_bracketed || host.contains(':') {
+        return Err(format!("invalid route host '{trimmed}'"));
+    }
+
+    // Reuse Lumen's WHATWG URL host and IDNA normalization rather than maintaining another
+    // hostname parser in the network adapter.
+    let parsed = crate::url::parse(&format!("http://{host}/"), None)?;
+    if parsed.host.is_none()
+        || parsed.port.is_some()
+        || parsed.path != "/"
+        || parsed.query.is_some()
+        || parsed.fragment.is_some()
+        || !parsed.username.is_empty()
+        || !parsed.password.is_empty()
+    {
+        return Err(format!("invalid route host '{trimmed}'"));
+    }
+    let normalized = parsed.hostname().trim_end_matches('.').to_owned();
+    if normalized.is_empty() {
+        return Err("route host is empty".into());
+    }
+    Ok(normalized)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fetch_config_tests {
+    use super::FetchConfig;
+    use std::net::SocketAddr;
+
+    #[test]
+    fn cloned_fetch_config_keeps_its_route_snapshot() {
+        let first: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let second: SocketAddr = "127.0.0.1:8002".parse().unwrap();
+        let mut original = FetchConfig::default();
+        original.set_route("WPT.TEST.", 8000, first).unwrap();
+        let snapshot = original.clone();
+        original.set_route("wpt.test", 8000, second).unwrap();
+
+        assert_eq!(snapshot.route_for("wpt.test", 8000).unwrap().address, first);
+        assert_eq!(
+            original.route_for("WPT.TEST.", 8000).unwrap().address,
+            second
+        );
+        assert!(original.remove_route("wpt.test", 8000).unwrap());
+        assert!(original.route_for("wpt.test", 8000).is_none());
+        assert_eq!(snapshot.route_for("wpt.test", 8000).unwrap().address, first);
+    }
+}
+
+/// Fetch a complete HTTP(S) resource using the same verified transport and redirect handling as
+/// `fetch()`. This synchronous form is intended for the runtime's synchronous ESM loader, which
+/// runs on a worker's own runtime thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_module_resource(url: &str) -> Result<ModuleResource, String> {
+    let response = http::request("GET", url, &[], None)?;
+    module_resource_from_response(response)
+}
+
+/// Fetch a complete HTTP(S) module resource using the supplied routing and trust snapshot.
+/// Runtime module loaders can use this when they have per-runtime fetch configuration.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_module_resource_with_config(
+    url: &str,
+    config: &FetchConfig,
+) -> Result<ModuleResource, String> {
+    let response = load_resource_with_config(url, config)?;
+    module_resource_from_response(response)
+}
+
+/// Fetch a resource with a captured routing/trust configuration, retaining
+/// HTTP failures for callers which model stylesheet or image load failure.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_resource_with_config(
+    url: &str,
+    config: &FetchConfig,
+) -> Result<ResourceResponse, String> {
+    http::request_with_config("GET", url, &[], None, config)
+}
+
+/// Fetch a module resource using the supplied routing and trust snapshot, requiring the initial
+/// URL and every redirect target to have the same HTTP(S) origin. This is used for classic Worker
+/// entry scripts, whose fetch uses same-origin mode; `importScripts()` continues to use the
+/// cross-origin-capable `load_module_resource_with_config` path.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_module_resource_same_origin_with_config(
+    url: &str,
+    config: &FetchConfig,
+) -> Result<ModuleResource, String> {
+    let response = http::request_with_config_same_origin("GET", url, &[], None, config)?;
+    module_resource_from_response(response)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn module_resource_from_response(response: http::HttpResponse) -> Result<ModuleResource, String> {
+    if !(200..300).contains(&response.status) {
+        return Err(format!(
+            "module fetch '{}' failed with HTTP {}",
+            response.url, response.status
+        ));
+    }
+    let content_type = response.content_type();
+    Ok(ModuleResource {
+        url: response.url,
+        content_type,
+        bytes: response.body,
+    })
+}
+
+/// Whether a response has one of the JavaScript MIME essences accepted for module scripts.
+pub use lumen_common::mime::is_javascript_module_mime;
 
 #[cfg(target_arch = "wasm32")]
 mod browser;
@@ -73,8 +314,8 @@ pub fn extension() -> Extension {
         name: "web",
         modules: &[
             lumen_host::namespace::<perf::Module>,
-            lumen_host::namespace::<encoding::Module>,
-            lumen_host::namespace::<url_ops::Module>,
+            encoding_namespace,
+            url_namespace,
             lumen_host::namespace::<crypto::Module>,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,
@@ -83,12 +324,25 @@ pub fn extension() -> Extension {
             lumen_host::namespace::<wasm_ops::WasmModule>,
         ],
         state_init: Some(|state: &mut OpState| {
-            state.put(server::ServerRegistry::default());
-            state.put(websocket::WsRegistry::default());
-            state.put(sse::SseRegistry::default());
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                state.put(FetchConfig::default());
+                state.put(server::ServerRegistry::default());
+                state.put(websocket::WsRegistry::default());
+                state.put(sse::SseRegistry::default());
+            }
             state.put(wasm_ops::WasmStore::default());
         }),
-        js_init: None,
+        js_init: {
+            #[cfg(feature = "compiler")]
+            {
+                Some(JS_GLUE_SOURCE)
+            }
+            #[cfg(not(feature = "compiler"))]
+            {
+                None
+            }
+        },
         js_init_snapshot: Some(JS_GLUE_AOT),
     }
 }
@@ -98,6 +352,8 @@ pub fn extension() -> Extension {
 /// of truth — and precompiled there to an ahead-of-time blob (AST, bytecode, compressed function
 /// text), loaded at boot (see `lumen_host::install`).
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
+#[cfg(feature = "compiler")]
+const JS_GLUE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
 
 #[lumen_bind::module(name = "__perf")]
 mod perf {
@@ -113,126 +369,14 @@ mod perf {
     }
 }
 
-#[lumen_bind::module(name = "__encoding")]
-mod encoding {
-    use super::*;
-
-    #[op(coerce)]
-    pub fn encode(s: String) -> Vec<u8> {
-        lumen_host::well_formed_utf8(&s).as_bytes().to_vec()
-    }
-
-    /// `(u8array, fatal)`; the glue has already converted ArrayBuffer inputs to views.
-    #[op(coerce)]
-    pub fn decode(bytes: &[u8], fatal: bool) -> Result<Value, OpError> {
-        let text = if fatal {
-            std::str::from_utf8(bytes)
-                .map_err(|_| OpError::type_error("TextDecoder: invalid utf-8 (fatal)"))?
-                .to_owned()
-        } else {
-            String::from_utf8_lossy(bytes).into_owned()
-        };
-        Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(text)))
-    }
-
-    /// Base64 of a Latin-1 string, or `null` when a char is past U+00FF.
-    #[op(coerce)]
-    pub fn btoa(s: String) -> Option<String> {
-        let bytes = s.chars().map(|c| u8::try_from(u32::from(c)).ok()).collect::<Option<Vec<u8>>>()?;
-        Some(lumen_common::codec::base64_encode(&bytes, false, true))
-    }
-
-    /// forgiving-base64 decode to a Latin-1 string, or `null` on invalid input.
-    #[op(coerce)]
-    pub fn atob(s: String) -> Option<String> {
-        lumen_common::codec::base64_decode_forgiving(s.as_bytes())
-            .map(|bytes| bytes.into_iter().map(char::from).collect())
-    }
+fn encoding_namespace(ctx: &mut Ctx) -> Result<(), Value> {
+    let ns = ctx.namespace_object("__encoding");
+    ctx.install_module::<lumen_host::encoding::bindings::Module>(&ns)
 }
 
-/// `[href, protocol_end, username_end, host_start, host_end, port, pathname_start, search_start,
-/// hash_start, scheme_type]`: the shape Node's `URLContext` keeps (ada's url_components).
-fn url_record(ctx: &mut Ctx, u: &url::Url) -> Value {
-    let mut items = vec![Value::from_string(u.href())];
-    items.extend(u.components().iter().map(|&c| Value::Num(c as f64)));
-    ctx.make_array(items)
-}
-
-#[lumen_bind::module(name = "__url")]
-mod url_ops {
-    use super::*;
-
-    /// `(input, base?)` -> URL record array, or `null` when either fails to parse (the JS side
-    /// raises `ERR_INVALID_URL`).
-    #[op(coerce)]
-    pub fn parse(ctx: &mut Ctx, input: String, base: Option<String>) -> Option<Value> {
-        let base = match base {
-            Some(b) => Some(url::parse_url(&b, None)?),
-            None => None,
-        };
-        url::parse_url(&input, base.as_ref()).map(|u| url_record(ctx, &u))
-    }
-
-    /// `(href, action, value)` -> updated record, or `null` when the setter declines (Node's
-    /// `bindingUrl.update`; action numbering is internal/url's `updateActions`).
-    #[op(coerce)]
-    pub fn update(ctx: &mut Ctx, href: String, action: i32, value: String) -> Option<Value> {
-        let mut u = url::parse_url(&href, None)?;
-        let ok = match action {
-            0 => u.set_protocol(&value),
-            1 => u.set_host(&value),
-            2 => u.set_hostname(&value),
-            3 => u.set_port(&value),
-            4 => u.set_username(&value),
-            5 => u.set_password(&value),
-            6 => u.set_pathname(&value),
-            7 => {
-                u.set_search(&value);
-                true
-            }
-            8 => {
-                u.set_hash(&value);
-                true
-            }
-            9 => u.set_href(&value),
-            _ => false,
-        };
-        ok.then(|| url_record(ctx, &u))
-    }
-
-    #[op(coerce, name = "canParse")]
-    pub fn can_parse(input: String, base: Option<String>) -> bool {
-        match base {
-            Some(b) => url::parse_url(&b, None).is_some_and(|base| url::parse_url(&input, Some(&base)).is_some()),
-            None => url::parse_url(&input, None).is_some(),
-        }
-    }
-
-    #[op(coerce, name = "domainToASCII")]
-    pub fn domain_to_ascii(input: String) -> String {
-        url::domain_to_ascii(&input)
-    }
-
-    #[op(coerce, name = "domainToUnicode")]
-    pub fn domain_to_unicode(input: String) -> String {
-        url::domain_to_unicode(&input)
-    }
-
-    #[op(coerce, name = "toASCII")]
-    pub fn idna_to_ascii(input: String) -> String {
-        url::idna_to_ascii(&input)
-    }
-
-    #[op(coerce, name = "toUnicode")]
-    pub fn idna_to_unicode(input: String) -> String {
-        url::domain_to_unicode_raw(&input)
-    }
-
-    /// `(href, hash, unicode, search, auth)` -> href with the dropped parts removed.
-    #[op(coerce)]
-    pub fn format(href: String, hash: bool, unicode: bool, search: bool, auth: bool) -> String {
-        url::format(&href, hash, unicode, search, auth).unwrap_or(href)
-    }
+fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
+    let ns = ctx.namespace_object("__url");
+    ctx.install_module::<lumen_host::url::bindings::Module>(&ns)
 }
 
 // ---- crypto ----
@@ -267,7 +411,14 @@ mod crypto {
         b[6] = (b[6] & 0x0f) | 0x40; // version 4
         b[8] = (b[8] & 0x3f) | 0x80; // variant 10
         let s: String = b.iter().map(|x| format!("{x:02x}")).collect();
-        Ok(format!("{}-{}-{}-{}-{}", &s[0..8], &s[8..12], &s[12..16], &s[16..20], &s[20..32]))
+        Ok(format!(
+            "{}-{}-{}-{}-{}",
+            &s[0..8],
+            &s[8..12],
+            &s[12..16],
+            &s[16..20],
+            &s[20..32]
+        ))
     }
 
     #[op(coerce)]
@@ -290,11 +441,17 @@ mod crypto {
 use browser::http_ops;
 
 /// The `(resolve, reject)` callback pair an async op settles through, or a `TypeError`.
-pub(crate) fn callbacks(resolve: Value, reject: Value, who: &str) -> Result<(Value, Value), NativeError> {
+pub(crate) fn callbacks(
+    resolve: Value,
+    reject: Value,
+    who: &str,
+) -> Result<(Value, Value), NativeError> {
     if resolve.is_callable() && reject.is_callable() {
         Ok((resolve, reject))
     } else {
-        Err(NativeError::type_error(format!("{who} expects (resolve, reject)")))
+        Err(NativeError::type_error(format!(
+            "{who} expects (resolve, reject)"
+        )))
     }
 }
 
@@ -315,9 +472,11 @@ pub(crate) fn read_body(ctx: &mut Ctx, v: &Value) -> Result<Option<Vec<u8>>, Val
 mod http_ops {
     use super::*;
 
-    /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject)`: one HTTP request on the
-    /// threadpool, settled through the TaskRegistry like every async op.
+    /// `(method, url, headerPairs, bodyOrUndefined, resolve, reject, redirectMode?)`: one HTTP
+    /// request on the threadpool, settled through the TaskRegistry like every async op. Returns
+    /// the request's cancellation control.
     #[op(coerce)]
+    #[allow(clippy::too_many_arguments)]
     fn request(
         ctx: &mut Ctx,
         method: String,
@@ -326,20 +485,41 @@ mod http_ops {
         body: Value,
         resolve: Value,
         reject: Value,
-    ) -> Result<(), OpError> {
+        redirect_mode: Option<String>,
+    ) -> Result<Value, OpError> {
         let headers = read_header_pairs(ctx, &headers)?;
         let body = read_body(ctx, &body)?;
         let (resolve, reject) = callbacks(resolve, reject, "__http.request")?;
+        let mut fetch_config = ctx
+            .op_state()
+            .get::<FetchConfig>()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(mode) = redirect_mode {
+            if mode != "follow" && mode != "manual" {
+                return Err(OpError::type_error("invalid transport redirect mode"));
+            }
+            fetch_config.manual_redirect = mode == "manual";
+        }
         let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_http);
+        let cancellation = lumen_os::net::TcpCancellation::default();
+        let worker_cancellation = cancellation.clone();
         let spawn = ctx
             .op_state()
             .get::<SpawnHandle>()
             .expect("runtime installs the spawn handle")
             .clone();
         spawn.spawn_blocking(id, move || {
-            Box::new(http::request(&method, &target, &headers, body.as_deref()))
+            Box::new(http::open_request_cancellable_with_config(
+                &method,
+                &target,
+                &headers,
+                body.as_deref(),
+                &worker_cancellation,
+                &fetch_config,
+            ))
         });
-        Ok(())
+        Ok(ctx.new_instance(request_control::RequestControl { id, cancellation }))
     }
 }
 
@@ -373,7 +553,7 @@ pub(crate) fn read_header_pairs(ctx: &mut Ctx, v: &Value) -> Result<Vec<(String,
 #[cfg(not(target_arch = "wasm32"))]
 fn decode_http(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
     let result = *payload
-        .downcast::<Result<http::HttpResponse, String>>()
+        .downcast::<Result<http::OpenHttpResponse, String>>()
         .expect("http payload");
     let response = match result {
         Ok(r) => r,
@@ -390,7 +570,11 @@ fn decode_http(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
         .collect();
     let headers = ctx.make_array(pairs);
     let _ = ctx.set_member(&obj, "headers", headers);
-    let body = ctx.make_uint8array(&response.body)?;
-    let _ = ctx.set_member(&obj, "body", body);
+    if response.body.is_empty() {
+        let _ = ctx.set_member(&obj, "body", Value::Null);
+    } else {
+        let body = ctx.new_instance(http_body::ResponseBody::new(response.body));
+        let _ = ctx.set_member(&obj, "bodyReader", body);
+    }
     Ok(vec![obj])
 }

@@ -81,7 +81,15 @@ pub mod itertools {
     #[methods]
     impl Count {
         #[constructor(hint(py(text_signature = "(start=0, step=1)")))]
-        fn new(it: &mut Interp, #[kw] #[default(0)] start: Value, #[kw] #[default(1)] step: Value) -> R<Count> {
+        fn new(
+            it: &mut Interp,
+            #[kw]
+            #[default(0)]
+            start: Value,
+            #[kw]
+            #[default(1)]
+            step: Value,
+        ) -> R<Count> {
             for v in [&start, &step] {
                 if !it.number_check(v) {
                     return Err(it.type_error("a number is required"));
@@ -186,7 +194,8 @@ pub mod itertools {
         /// Private method returning an estimate of len(list(it)).
         #[method(hint(py(text_signature = "")))]
         fn __length_hint__(&self) -> NativeResult<i64> {
-            self.times.ok_or_else(|| NativeError::type_error("len() of unsized object"))
+            self.times
+                .ok_or_else(|| NativeError::type_error("len() of unsized object"))
         }
     }
 
@@ -261,7 +270,9 @@ pub mod itertools {
         /// Alternative chain() constructor taking a single iterable argument that evaluates lazily.
         #[classmethod]
         fn from_iterable(cls: This<Value>, it: &mut Interp, iterable: &Value) -> R<Value> {
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("from_iterable() needs a class")) };
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("from_iterable() needs a class"));
+            };
             let outer = it.get_iter(iterable)?;
             Ok(chain_of(move |it| it.iter_next(&outer)).into_object(&cls))
         }
@@ -274,7 +285,14 @@ pub mod itertools {
     #[methods]
     impl Accumulate {
         #[constructor(hint(py(text_signature = "(iterable, func=None, *, initial=None)")))]
-        fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] #[default(Value::None)] func: Value, #[kwonly] initial: Option<Value>) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            #[kw] iterable: &Value,
+            #[kw]
+            #[default(Value::None)]
+            func: Value,
+            #[kwonly] initial: Option<Value>,
+        ) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             let mut initial = initial;
             let mut total: Option<Value> = None;
@@ -283,7 +301,9 @@ pub mod itertools {
                     total = Some(i.clone());
                     return Ok(Some(i));
                 }
-                let Some(v) = it.iter_next(&src)? else { return Ok(None) };
+                let Some(v) = it.iter_next(&src)? else {
+                    return Ok(None);
+                };
                 let next = match &total {
                     None => v,
                     Some(t) if func.is_none() => it.binary_op(BinOp::Add, t, &v)?,
@@ -309,8 +329,12 @@ pub mod itertools {
             let data = it.get_iter(data)?;
             let sel = it.get_iter(selectors)?;
             Ok(NativeIter::new(move |it| loop {
-                let Some(d) = it.iter_next(&data)? else { return Ok(None) };
-                let Some(s) = it.iter_next(&sel)? else { return Ok(None) };
+                let Some(d) = it.iter_next(&data)? else {
+                    return Ok(None);
+                };
+                let Some(s) = it.iter_next(&sel)? else {
+                    return Ok(None);
+                };
                 if it.truthy(&s)? {
                     return Ok(Some(d));
                 }
@@ -331,7 +355,9 @@ pub mod itertools {
             let src = it.get_iter(iterable)?;
             let mut dropping = true;
             Ok(NativeIter::new(move |it| loop {
-                let Some(v) = it.iter_next(&src)? else { return Ok(None) };
+                let Some(v) = it.iter_next(&src)? else {
+                    return Ok(None);
+                };
                 if dropping {
                     let r = it.call(&predicate, vec![v.clone()], Vec::new())?;
                     if it.truthy(&r)? {
@@ -358,7 +384,9 @@ pub mod itertools {
                 if done {
                     return Ok(None);
                 }
-                let Some(v) = it.iter_next(&src)? else { return Ok(None) };
+                let Some(v) = it.iter_next(&src)? else {
+                    return Ok(None);
+                };
                 let r = it.call(&predicate, vec![v.clone()], Vec::new())?;
                 if it.truthy(&r)? {
                     Ok(Some(v))
@@ -382,7 +410,9 @@ pub mod itertools {
         fn new(it: &mut Interp, function: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             Ok(NativeIter::new(move |it| loop {
-                let Some(v) = it.iter_next(&src)? else { return Ok(None) };
+                let Some(v) = it.iter_next(&src)? else {
+                    return Ok(None);
+                };
                 if !is_true(it, &function, &v)? {
                     return Ok(Some(v));
                 }
@@ -400,7 +430,9 @@ pub mod itertools {
         fn new(it: &mut Interp, function: Value, iterable: &Value) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
             Ok(NativeIter::new(move |it| {
-                let Some(v) = it.iter_next(&src)? else { return Ok(None) };
+                let Some(v) = it.iter_next(&src)? else {
+                    return Ok(None);
+                };
                 let args = it.iterate_to_vec(&v)?;
                 Ok(Some(it.call(&function, args, Vec::new())?))
             }))
@@ -425,7 +457,9 @@ pub mod itertools {
                     started = true;
                     prev = it.iter_next(&src)?;
                 }
-                let Some(p) = prev.clone() else { return Ok(None) };
+                let Some(p) = prev.clone() else {
+                    return Ok(None);
+                };
                 match it.iter_next(&src)? {
                     Some(n) => {
                         prev = Some(n.clone());
@@ -462,7 +496,14 @@ pub mod itertools {
     #[methods]
     impl Batched {
         #[constructor(hint(py(text_signature = "(iterable, n, *, strict=False)")))]
-        fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] n: isize, #[kwonly] #[default(false)] strict: bool) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            #[kw] iterable: &Value,
+            #[kw] n: isize,
+            #[kwonly]
+            #[default(false)]
+            strict: bool,
+        ) -> R<NativeIter> {
             if n < 1 {
                 return Err(it.value_error("n must be at least one"));
             }
@@ -505,23 +546,46 @@ pub mod itertools {
         #[constructor(hint(py(text_signature = "")))]
         fn new(it: &mut Interp, #[varargs] args: &[Value]) -> R<NativeIter> {
             if args.len() < 2 {
-                return Err(it.type_error(&format!("islice expected at least 2 arguments, got {}", args.len())));
+                return Err(it.type_error(&format!(
+                    "islice expected at least 2 arguments, got {}",
+                    args.len()
+                )));
             }
             if args.len() > 4 {
-                return Err(it.type_error(&format!("islice expected at most 4 arguments, got {}", args.len())));
+                return Err(it.type_error(&format!(
+                    "islice expected at most 4 arguments, got {}",
+                    args.len()
+                )));
             }
-            let stop_msg = "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
+            let stop_msg =
+                "Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
             let idx_msg = "Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
             let (start, stop, step) = if args.len() == 2 {
-                let stop = if args[1].is_none() { None } else { Some(nonneg_int(it, &args[1], stop_msg)?) };
+                let stop = if args[1].is_none() {
+                    None
+                } else {
+                    Some(nonneg_int(it, &args[1], stop_msg)?)
+                };
                 (0, stop, 1)
             } else {
-                let start = if args[1].is_none() { 0 } else { nonneg_int(it, &args[1], idx_msg)? };
-                let stop = if args[2].is_none() { None } else { Some(nonneg_int(it, &args[2], idx_msg)?) };
+                let start = if args[1].is_none() {
+                    0
+                } else {
+                    nonneg_int(it, &args[1], idx_msg)?
+                };
+                let stop = if args[2].is_none() {
+                    None
+                } else {
+                    Some(nonneg_int(it, &args[2], idx_msg)?)
+                };
                 let step = match args.get(3) {
                     Some(v) if !v.is_none() => match it.has_index(v).then(|| it.index_of(v)) {
                         Some(Ok(s)) if s > 0 => s,
-                        _ => return Err(it.value_error("Step for islice() must be a positive integer or None.")),
+                        _ => {
+                            return Err(it.value_error(
+                                "Step for islice() must be a positive integer or None.",
+                            ));
+                        }
                     },
                     _ => 1,
                 };
@@ -574,12 +638,20 @@ pub mod itertools {
     #[methods]
     impl ZipLongest {
         #[constructor(hint(py(text_signature = "")))]
-        fn new(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<NativeIter> {
             let mut fill = Value::None;
             if !kwargs.is_empty() {
                 match kwargs.get("fillvalue") {
                     Some(v) if kwargs.len() == 1 => fill = v.clone(),
-                    _ => return Err(it.type_error("zip_longest() got an unexpected keyword argument")),
+                    _ => {
+                        return Err(
+                            it.type_error("zip_longest() got an unexpected keyword argument")
+                        );
+                    }
                 }
             }
             let mut its: Vec<Option<Value>> = Vec::with_capacity(args.len());
@@ -635,11 +707,20 @@ pub mod itertools {
         fn at(shared: &Rc<RefCell<TeeShared>>, p: usize) -> Tee {
             let pos = Rc::new(Cell::new(p));
             shared.borrow_mut().positions.push(Rc::downgrade(&pos));
-            Tee { shared: shared.clone(), pos }
+            Tee {
+                shared: shared.clone(),
+                pos,
+            }
         }
 
         fn of_iter(src: Value) -> Tee {
-            let shared = Rc::new(RefCell::new(TeeShared { src, buf: VecDeque::new(), base: 0, positions: Vec::new(), running: false }));
+            let shared = Rc::new(RefCell::new(TeeShared {
+                src,
+                buf: VecDeque::new(),
+                base: 0,
+                positions: Vec::new(),
+                running: false,
+            }));
             Tee::at(&shared, 0)
         }
     }
@@ -686,7 +767,13 @@ pub mod itertools {
             self.pos.set(p + 1);
             let mut s = self.shared.borrow_mut();
             s.positions.retain(|w| w.strong_count() > 0);
-            let min = s.positions.iter().filter_map(|w| w.upgrade()).map(|c| c.get()).min().unwrap_or(p + 1);
+            let min = s
+                .positions
+                .iter()
+                .filter_map(|w| w.upgrade())
+                .map(|c| c.get())
+                .min()
+                .unwrap_or(p + 1);
             while s.base < min && !s.buf.is_empty() {
                 s.buf.pop_front();
                 s.base += 1;
@@ -748,8 +835,14 @@ pub mod itertools {
             let b = g.borrow();
             (b.src.clone(), b.keyfunc.clone())
         };
-        let Some(v) = it.iter_next(&src)? else { return Ok(false) };
-        let k = if keyfunc.is_none() { v.clone() } else { it.call(&keyfunc, vec![v.clone()], Vec::new())? };
+        let Some(v) = it.iter_next(&src)? else {
+            return Ok(false);
+        };
+        let k = if keyfunc.is_none() {
+            v.clone()
+        } else {
+            it.call(&keyfunc, vec![v.clone()], Vec::new())?
+        };
         let mut b = g.borrow_mut();
         b.currvalue = Some(v);
         b.currkey = Some(k);
@@ -776,9 +869,22 @@ pub mod itertools {
     #[methods]
     impl GroupBy {
         #[constructor(hint(py(text_signature = "(iterable, key=None)")))]
-        fn new(it: &mut Interp, #[kw] iterable: &Value, #[kw] #[default(Value::None)] key: Value) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            #[kw] iterable: &Value,
+            #[kw]
+            #[default(Value::None)]
+            key: Value,
+        ) -> R<NativeIter> {
             let src = it.get_iter(iterable)?;
-            let g = Rc::new(RefCell::new(GroupState { src, keyfunc: key, tgtkey: None, currkey: None, currvalue: None, grouper_id: 0 }));
+            let g = Rc::new(RefCell::new(GroupState {
+                src,
+                keyfunc: key,
+                tgtkey: None,
+                currkey: None,
+                currvalue: None,
+                grouper_id: 0,
+            }));
             let mut next_id = 0u64;
             Ok(NativeIter::new(move |it| {
                 next_id += 1;
@@ -821,7 +927,10 @@ pub mod itertools {
                     }
                     Ok(g2.borrow_mut().currvalue.take())
                 });
-                Ok(Some(Value::tuple(vec![key, grouper.instance_of::<Grouper>(it)])))
+                Ok(Some(Value::tuple(vec![
+                    key,
+                    grouper.instance_of::<Grouper>(it),
+                ])))
             }))
         }
     }
@@ -853,7 +962,13 @@ pub mod itertools {
     #[methods]
     impl Product {
         #[constructor(hint(py(text_signature = "")))]
-        fn new(it: &mut Interp, #[varargs] iterables: &[Value], #[kwonly] #[default(1)] repeat: isize) -> R<NativeIter> {
+        fn new(
+            it: &mut Interp,
+            #[varargs] iterables: &[Value],
+            #[kwonly]
+            #[default(1)]
+            repeat: isize,
+        ) -> R<NativeIter> {
             if repeat < 0 {
                 return Err(it.value_error("repeat argument cannot be negative"));
             }
@@ -888,7 +1003,13 @@ pub mod itertools {
                     }
                 }
                 started = true;
-                Ok(Some(Value::tuple(indices.iter().zip(pools.iter()).map(|(&i, p)| p[i].clone()).collect())))
+                Ok(Some(Value::tuple(
+                    indices
+                        .iter()
+                        .zip(pools.iter())
+                        .map(|(&i, p)| p[i].clone())
+                        .collect(),
+                )))
             }))
         }
     }

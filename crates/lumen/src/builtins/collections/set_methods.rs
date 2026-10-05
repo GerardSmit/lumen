@@ -154,7 +154,10 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // and re-append entries, and the walk observes that (appended entries are visited).
             let mut idx = 0usize;
             loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
+                let entry = i
+                    .map_data
+                    .get(&ptr)
+                    .and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
                 let (k, _) = match entry {
                     Some(kv) => kv,
                     None => break,
@@ -233,7 +236,10 @@ pub(super) fn install_set_methods(it: &mut Interp) {
         }
         let mut idx = 0usize;
         loop {
-            let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
+            let entry = i
+                .map_data
+                .get(&ptr)
+                .and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
             let (k, _) = match entry {
                 Some(kv) => kv,
                 None => break,
@@ -270,7 +276,10 @@ pub(super) fn install_set_methods(it: &mut Interp) {
             // Walk this Set LIVE by index (the `has` callback may mutate it), probing the other.
             let mut idx = 0usize;
             loop {
-                let entry = i.map_data.get(&ptr).and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
+                let entry = i
+                    .map_data
+                    .get(&ptr)
+                    .and_then(|e| e.next(&mut idx).map(|(k, v)| (k.unpack(), v.unpack())));
                 let (k, _) = match entry {
                     Some(kv) => kv,
                     None => break,

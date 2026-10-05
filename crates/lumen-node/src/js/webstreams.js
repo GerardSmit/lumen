@@ -154,7 +154,10 @@ function builtinModule(id) {
 function internalBinding(name) {
   switch (name) {
     case "messaging":
-      return { DOMException: globalThis.DOMException };
+      return {
+        DOMException: globalThis.DOMException,
+        structuredClone: (value, options) => globalThis.structuredClone(value, options),
+      };
     case "buffer":
       return {
         copyArrayBuffer(destination, destinationOffset, source, sourceOffset, bytesToCopy) {
@@ -6528,8 +6531,16 @@ module.exports = {
 // ---- registration ------------------------------------------------------------------------------
 
 const web = require("stream/web");
-const { readableStreamDefaultReaderReadSync } = require("internal/webstreams/readablestream");
-// lumen-web's fetch.js drains a stream given as a Request/Response body synchronously.
+const { readableStreamDefaultReaderReadSync, readableStreamTee } = require("internal/webstreams/readablestream");
+// Fetch's body clone uses the same stream implementation, with copied chunks on
+// the second branch as required by Fetch (ordinary ReadableStream.tee shares them).
+Object.defineProperty(web.ReadableStream.prototype, Symbol.for("lumen.cloneBody"), {
+  value() { return readableStreamTee(this, true); },
+  writable: true,
+  enumerable: false,
+  configurable: true,
+});
+// The HTTP server's synchronous response fast path consumes already-ready streams.
 Object.defineProperty(web.ReadableStreamDefaultReader.prototype, Symbol.for("lumen.readSync"), {
   value() { return readableStreamDefaultReaderReadSync(this); },
   writable: true,

@@ -1,0 +1,18 @@
+<!doctype html><style>
+html,body{margin:0;background:#fff}
+.grid{display:grid;grid-template-columns:100px 100px;gap:10px;width:300px;background:#e8eef8}
+.sub{display:grid;grid-column:1 / 3;grid-row:1 / 3;grid-template-columns:subgrid;grid-template-rows:subgrid;background:#fce8e6}
+.sub>div:nth-child(1){background:#174ea6;height:40px}
+.sub>div:nth-child(2){background:#fbbc04;height:70px}
+.sub>div:nth-child(3){background:#34a853;height:20px}
+.after{display:grid;grid-column:1 / 3;grid-template-columns:subgrid;grid-template-rows:30px}
+.after>div{background:#a142f4}
+.spanning{display:grid;grid-template-columns:100px;gap:10px;width:300px;background:#e6f4ea;margin-top:12px}
+.spanning>div:nth-child(1){grid-row:1 / 3;height:100px;background:#0b8043}
+.spanning>div:nth-child(2){grid-row:3;height:20px;background:#137333}
+</style>
+<div class=grid>
+  <div class=sub><div></div><div></div><div></div></div>
+  <div class=after><div></div><div></div></div>
+</div>
+<div class=spanning><div></div><div></div></div>

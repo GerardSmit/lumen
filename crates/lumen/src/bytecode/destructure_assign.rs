@@ -13,7 +13,12 @@ use crate::ast::Expr;
 impl Compiler {
     /// `target = value` with an array/object literal target; `keep`: leave the RHS value (the
     /// expression's result) on the stack.
-    pub(super) fn destructure_assign(&mut self, target: &Expr, value: &Expr, keep: bool) -> CResult {
+    pub(super) fn destructure_assign(
+        &mut self,
+        target: &Expr,
+        value: &Expr,
+        keep: bool,
+    ) -> CResult {
         let pat = crate::parser::destructuring_target(target).ok_or(Bail)?;
         self.expr(value)?;
         if keep {

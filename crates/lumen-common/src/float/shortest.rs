@@ -45,11 +45,18 @@ impl Write for Buf {
 }
 
 fn sci(args: core::fmt::Arguments<'_>) -> Digits {
-    let mut b = Buf { buf: [0; 32], len: 0 };
+    let mut b = Buf {
+        buf: [0; 32],
+        len: 0,
+    };
     let _ = b.write_fmt(args);
     let s = &b.buf[..b.len];
     let e = s.iter().position(|&c| c == b'e').unwrap_or(s.len());
-    let mut d = Digits { buf: [0; 32], len: 0, decpt: 0 };
+    let mut d = Digits {
+        buf: [0; 32],
+        len: 0,
+        decpt: 0,
+    };
     for &c in &s[..e] {
         if c.is_ascii_digit() {
             d.buf[d.len as usize] = c;
@@ -83,9 +90,14 @@ pub fn shortest(v: f64) -> Digits {
         return d;
     }
     let r = sci(format_args!("{:.*e}", d.len() - 1, v));
-    let mut b = Buf { buf: [0; 32], len: 0 };
+    let mut b = Buf {
+        buf: [0; 32],
+        len: 0,
+    };
     let _ = write!(b, "{}e{}", r.as_str(), r.decpt - r.len() as i32);
-    let back = core::str::from_utf8(&b.buf[..b.len]).ok().and_then(|s| s.parse::<f64>().ok());
+    let back = core::str::from_utf8(&b.buf[..b.len])
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok());
     if back == Some(v) && r.len() <= d.len() {
         r
     } else {

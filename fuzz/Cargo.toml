@@ -9,8 +9,14 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+lumen-common = { path = "../crates/lumen-common" }
+lumen-html = { path = "../crates/lumen-html" }
 lumen = { path = "../crates/lumen", features = ["bench"] }
-lumen-runtime = { path = "../crates/lumen-runtime" }
+lumen-runtime = { path = "../crates/lumen-runtime", optional = true }
+
+[features]
+default = ["runtime"]
+runtime = ["dep:lumen-runtime"]
 
 # Not part of the main workspace: needs nightly + libfuzzer and has its own lockfile.
 [workspace]
@@ -21,8 +27,16 @@ debug = 1
 panic = "abort"
 
 [[bin]]
+name = "precompiled"
+path = "fuzz_targets/precompiled.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "wasm_decode"
 path = "fuzz_targets/wasm_decode.rs"
+required-features = ["runtime"]
 test = false
 doc = false
 bench = false
@@ -49,8 +63,36 @@ doc = false
 bench = false
 
 [[bin]]
+name = "jsx_parse"
+path = "fuzz_targets/jsx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "snapshot_decode"
 path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "html_parse"
+path = "fuzz_targets/html_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "css_parse"
+path = "fuzz_targets/css_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "html_selectors"
+path = "fuzz_targets/html_selectors.rs"
 test = false
 doc = false
 bench = false

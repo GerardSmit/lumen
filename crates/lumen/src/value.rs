@@ -4,10 +4,12 @@
 
 use crate::ast::Function;
 use crate::interpreter::{Env, Interp};
+use lumen_common::buffer::{self, ByteOrder, ElemKind};
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::rc::Rc;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::Arc;
-use lumen_common::buffer::{self, ByteOrder, ElemKind};
 
 /// A handle to a heap object. Opaque on purpose: every engine site goes through this API rather
 /// than `Rc`/`RefCell` directly, so the storage underneath can move to a traced heap without
@@ -214,7 +216,7 @@ impl Gc {
     /// slots, which the object's map adopts as its entry storage when its entries fit.
     #[inline(always)]
     fn alloc(state: &GcState, obj: Object, class: heap::SlotClass) -> Gc {
-        let p = state.heap.alloc(&state.live, class);
+        let p = state.heap.alloc(&state.counters, class);
         unsafe {
             p.write(ObjCell::new(obj));
             if class != heap::SlotClass::Plain {
@@ -339,7 +341,11 @@ unsafe fn gc_drop_slow(p: std::ptr::NonNull<GcBox>) {
     DROP_DEPTH.set(depth + 1);
     gc_drop_box(p);
     if depth == 0 {
-        while let Some(q) = DROP_PENDING.try_with(|q| q.borrow_mut().pop()).ok().flatten() {
+        while let Some(q) = DROP_PENDING
+            .try_with(|q| q.borrow_mut().pop())
+            .ok()
+            .flatten()
+        {
             gc_drop_box(q);
         }
     }
@@ -562,7 +568,10 @@ pub(crate) unsafe fn value_from_words(tag: u64, payload: u64) -> Value {
 #[inline(always)]
 pub(crate) unsafe fn take_value_words(p: *mut Value) -> Value {
     let w = p as *mut u64;
-    let (tag, payload) = (std::ptr::read_volatile(w), std::ptr::read_volatile(w.add(1)));
+    let (tag, payload) = (
+        std::ptr::read_volatile(w),
+        std::ptr::read_volatile(w.add(1)),
+    );
     std::ptr::write_volatile(w, 0);
     value_from_words(tag, payload)
 }
@@ -580,7 +589,10 @@ pub(crate) fn push_value(out: &mut Vec<Value>, v: Value) {
     }
     unsafe {
         let n = out.len();
-        out.as_mut_ptr().add(n).cast::<std::mem::MaybeUninit<[u64; 2]>>().write(bits);
+        out.as_mut_ptr()
+            .add(n)
+            .cast::<std::mem::MaybeUninit<[u64; 2]>>()
+            .write(bits);
         out.set_len(n + 1);
     }
 }
@@ -717,8 +729,8 @@ impl PackedValue {
     #[inline(always)]
     pub(crate) fn as_num(&self) -> Option<f64> {
         match self.tag() {
-            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR | PACK_SYM
-            | PACK_OBJ => None,
+            PACK_UNDEFINED | PACK_EMPTY | PACK_NULL | PACK_BOOL | PACK_BIGINT | PACK_STR
+            | PACK_SYM | PACK_OBJ => None,
             _ => Some(f64::from_bits(self.0)),
         }
     }
@@ -843,14 +855,20 @@ impl<'a> PropRef<'a> {
     #[inline(always)]
     pub(crate) fn of(p: &'a Property) -> PropRef<'a> {
         // SAFETY: a bitwise copy that is never dropped, borrowed no longer than `p`.
-        PropRef(std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p) }), std::marker::PhantomData)
+        PropRef(
+            std::mem::ManuallyDrop::new(unsafe { std::ptr::read(p) }),
+            std::marker::PhantomData,
+        )
     }
 
     /// The plain data element held in packed word `w`.
     #[inline(always)]
     pub(crate) fn elem(w: &'a PackedValue) -> PropRef<'a> {
         PropRef(
-            std::mem::ManuallyDrop::new(Property { packed: PackedValue(w.0), meta: PROP_PLAIN }),
+            std::mem::ManuallyDrop::new(Property {
+                packed: PackedValue(w.0),
+                meta: PROP_PLAIN,
+            }),
             std::marker::PhantomData,
         )
     }
@@ -1037,13 +1055,22 @@ impl Value {
     }
     /// Exact little-endian magnitude words and sign for the native BigInt bridge.
     pub fn bigint_words(&self) -> Option<(bool, &[u64])> {
-        match self { Value::BigInt(value) => Some(value.words()), _ => None }
+        match self {
+            Value::BigInt(value) => Some(value.words()),
+            _ => None,
+        }
     }
     pub fn as_obj(&self) -> Option<&Gc> {
         match self {
             Value::Obj(o) => Some(o),
             _ => None,
         }
+    }
+    /// Stable identity for a live object in this realm. Native hosts can use
+    /// this to associate opaque capabilities with object handles without
+    /// reading user-visible properties.
+    pub fn object_identity(&self) -> Option<usize> {
+        self.as_obj().map(|object| Gc::as_ptr(object) as usize)
     }
     /// The number, if this is a `Number` (an embedder convenience for reading op arguments).
     pub fn as_num_opt(&self) -> Option<f64> {
@@ -1084,6 +1111,8 @@ pub enum Callable {
     NativeData(Rc<NativeCallable>),
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(Box<UserCallable>),
+    #[cfg(feature = "aot-native")]
+    Aot(Box<AotCallable>),
     /// The result of `Function.prototype.bind`.
     Bound(Box<BoundCallable>),
     /// A ShadowRealm wrapped function: `target` is a callable inside the sub-realm identified by
@@ -1132,6 +1161,14 @@ pub struct UserCallable {
     pub(crate) env: Env,
 }
 
+#[cfg(feature = "aot-native")]
+#[derive(Clone)]
+pub struct AotCallable {
+    pub(crate) program: Rc<crate::native_aot::NativeProgram>,
+    pub(crate) function_index: u32,
+    pub(crate) env: Env,
+}
+
 #[derive(Clone)]
 pub struct WrappedShadowCallable {
     pub(crate) realm: usize,
@@ -1149,7 +1186,10 @@ impl Callable {
     /// Whether this is a function behavior (neither `None` nor a non-callable slot variant).
     #[inline]
     pub(crate) fn is_fn(&self) -> bool {
-        !matches!(self, Callable::None | Callable::Promise(_) | Callable::SplitView(_))
+        !matches!(
+            self,
+            Callable::None | Callable::Promise(_) | Callable::SplitView(_)
+        )
     }
 
     pub(crate) fn user(func: Rc<Function>, env: Env) -> Callable {
@@ -1365,7 +1405,8 @@ impl Object {
     where
         I: ExactSizeIterator<Item = Value>,
     {
-        if template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == template.entries.len() {
+        if template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == template.entries.len()
+        {
             return Self::alloc_from_template_iter(template, proto, values);
         }
         if values.len() <= heap::INLINE_PROPS && template.can_instantiate_inline() {
@@ -1420,7 +1461,7 @@ impl Object {
         assert!(template.fast_template(heap::INLINE_PROPS_WIDE) && values.len() == n);
         let class = heap::SlotClass::inline_for(n);
         with_gc_state(|state| unsafe {
-            let p = state.heap.alloc(&state.live, class);
+            let p = state.heap.alloc(&state.counters, class);
             let slots = heap::inline_props(p);
             // Values first (moved in, no refcount traffic), then the header over them. A
             // panicking iterator could only leak the slot, never expose a half-built box: the
@@ -1472,11 +1513,14 @@ impl Object {
         let shape = props::array_length_shape();
         with_gc_state(|state| unsafe {
             let class = heap::SlotClass::array_for(len);
-            let p = state.heap.alloc(&state.live, class);
+            let p = state.heap.alloc(&state.counters, class);
             let named = heap::inline_props(p);
             named.write(array_length(len));
-            let elems =
-                props::DenseStorage::write_in_box(heap::inline_dense(p), class.array_slots(), values);
+            let elems = props::DenseStorage::write_in_box(
+                heap::inline_dense(p),
+                class.array_slots(),
+                values,
+            );
             p.write(ObjCell::new(Object {
                 proto,
                 props: Props::array_inline_raw(shape, named, heap::ARRAY_NAMED, elems),
@@ -1501,9 +1545,13 @@ impl Object {
         if len <= heap::ARRAY_SLOTS_MAX {
             return Self::alloc_array_iter(proto, values);
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, k| unsafe {
-            d.adopt_in_box(slot, k, values)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, k| unsafe { d.adopt_in_box(slot, k, values) },
+        )
     }
 
     /// [`Object::new_array_from_iter`] over an owned vector.
@@ -1514,9 +1562,13 @@ impl Object {
         }
         let len = values.len();
         let packed: Vec<PackedValue> = values.into_iter().map(PackedValue::pack).collect();
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
-            d.install_in_box(slot, props::PackedVec::from(packed))
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, _| unsafe { d.install_in_box(slot, props::PackedVec::from(packed)) },
+        )
     }
 
     /// A new plain Array holding a copy of `src`'s packed plain elements `start..end`, or `None`
@@ -1532,11 +1584,22 @@ impl Object {
     fn new_array_from_packed(proto: Option<Gc>, packed: props::PackedVec) -> Gc {
         let len = packed.len();
         if len <= heap::ARRAY_SLOTS_MAX {
-            return Self::new_array_from_iter(proto, packed.iter().map(PackedValue::unpack).collect::<Vec<_>>().into_iter());
+            return Self::new_array_from_iter(
+                proto,
+                packed
+                    .iter()
+                    .map(PackedValue::unpack)
+                    .collect::<Vec<_>>()
+                    .into_iter(),
+            );
         }
-        Self::new_array_parts(proto, Props::array_shell(), len, [array_length(len)], |d, slot, _| unsafe {
-            d.install_in_box(slot, packed)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::array_shell(),
+            len,
+            [array_length(len)],
+            |d, slot, _| unsafe { d.install_in_box(slot, packed) },
+        )
     }
 
     /// The `RegExp.prototype.exec` match array: packed captures plus the `index`, `input` and
@@ -1555,9 +1618,13 @@ impl Object {
             Property::plain(input),
             Property::plain(groups),
         ];
-        Self::new_array_parts(proto, Props::exec_result_shell(), len, named, |d, slot, k| unsafe {
-            d.adopt_in_box(slot, k, values)
-        })
+        Self::new_array_parts(
+            proto,
+            Props::exec_result_shell(),
+            len,
+            named,
+            |d, slot, k| unsafe { d.adopt_in_box(slot, k, values) },
+        )
     }
 
     /// An Array around a shell map (see [`Props::array_shell`]): its named entries (in shape
@@ -1579,7 +1646,11 @@ impl Object {
             let mut b = obj.borrow_mut();
             b.props.entries.extend_exact(named.into_iter());
             // An array-class box: its sidecar area is unused until now.
-            fill(&mut b.props.elems, heap::inline_dense(bx), class.array_slots());
+            fill(
+                &mut b.props.elems,
+                heap::inline_dense(bx),
+                class.array_slots(),
+            );
         }
         obj
     }
@@ -1658,7 +1729,8 @@ impl Object {
 /// instant exactly one of the threads that can reach this state is running.
 pub(crate) struct GcState {
     heap: heap::ObjHeap,
-    live: Cell<i64>,
+    /// The live count, slab size and coroutine time, shared with [`HeapStats`] handles.
+    counters: Arc<RealmCounters>,
     scopes: RefCell<Vec<std::rc::Weak<RefCell<crate::interpreter::Scope>>>>,
     /// Every function the parser gave a lazy body, weakly: the collector's flush pass releases
     /// the bodies that went cold (see `Function::release_cold_body`). Dead entries are pruned by
@@ -1676,15 +1748,19 @@ pub(crate) struct GcState {
     scope_serial: Cell<u64>,
 }
 
+#[cfg(test)]
+#[path = "value/heap_transfer_tests.rs"]
+mod heap_transfer_tests;
+
 // See the type-level comment: exclusivity comes from the coroutine handoff, not from these cells.
 unsafe impl Send for GcState {}
 unsafe impl Sync for GcState {}
 
 impl GcState {
-    fn new() -> Arc<GcState> {
+    pub(crate) fn new() -> Arc<GcState> {
         Arc::new(GcState {
             heap: heap::ObjHeap::new(),
-            live: Cell::new(0),
+            counters: Arc::new(RealmCounters::default()),
             scopes: RefCell::new(Vec::new()),
             lazy_fns: RefCell::new(Vec::new()),
             lazy_fns_next: Cell::new(LAZY_FNS_PRUNE_MIN),
@@ -1692,6 +1768,27 @@ impl GcState {
             scope_epoch: Cell::new(0),
             scope_serial: Cell::new(0),
         })
+    }
+
+    /// Requires exclusive ownership of `other`; no realm may run on either
+    /// heap until all side tables and prototypes have also been installed.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn absorb(&self, other: &GcState) {
+        let mut shapes = std::collections::HashMap::new();
+        other.heap.for_each_live(|pointer| unsafe {
+            (*(*pointer).value.get()).props.remap_shape(&mut shapes);
+        });
+        let live = self.counters.live();
+        self.heap.absorb(&other.heap, live);
+        live.set(live.get() + other.counters.live().replace(0));
+        self.counters.note_chunks(self.heap.chunk_count());
+        other.counters.note_chunks(0);
+        self.scopes
+            .borrow_mut()
+            .append(&mut other.scopes.borrow_mut());
+        self.lazy_fns
+            .borrow_mut()
+            .append(&mut other.lazy_fns.borrow_mut());
     }
 }
 
@@ -1759,9 +1856,100 @@ pub(crate) fn enter_gc_state(state: Arc<GcState>) -> Arc<GcState> {
     })
 }
 
+/// The live-object count of one heap. Only the thread currently running on the heap (see
+/// [`GcState`]) writes it, so a relaxed load and store (no read-modify-write) keep the
+/// allocation path as cheap as a plain cell while another thread may read it.
+pub(crate) struct LiveCount(AtomicI64);
+
+impl LiveCount {
+    pub(crate) const fn new(value: i64) -> Self {
+        Self(AtomicI64::new(value))
+    }
+    #[inline(always)]
+    pub(crate) fn get(&self) -> i64 {
+        self.0.load(Relaxed)
+    }
+    #[inline(always)]
+    pub(crate) fn set(&self, value: i64) {
+        self.0.store(value, Relaxed)
+    }
+    #[cfg(any(test, feature = "parallel"))]
+    pub(crate) fn replace(&self, value: i64) -> i64 {
+        self.0.swap(value, Relaxed)
+    }
+}
+
+/// O(1) counters of one heap state, written by the thread running on it and readable from any
+/// thread through [`HeapStats`]. Kept apart from [`GcState`] so a handle outliving the realm
+/// pins these few words, not the heap.
+#[derive(Default)]
+pub(crate) struct RealmCounters {
+    live: LiveCount,
+    /// Slab chunks mapped for this heap (each [`heap::CHUNK_BYTES`] of address space).
+    chunks: AtomicUsize,
+    /// Wall time coroutine bodies ran on pooled workers while the heap's own thread waited for
+    /// them (see `coroutine::ThreadCoro::resume`).
+    coroutine_nanos: AtomicU64,
+}
+
+impl Default for LiveCount {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl RealmCounters {
+    pub(crate) fn live(&self) -> &LiveCount {
+        &self.live
+    }
+    #[inline]
+    pub(crate) fn chunk_added(&self) {
+        self.chunks.fetch_add(1, Relaxed);
+    }
+    fn note_chunks(&self, chunks: usize) {
+        self.chunks.store(chunks, Relaxed);
+    }
+}
+
+/// Counts `elapsed` as coroutine time of the heap the calling thread runs on.
+pub(crate) fn note_coroutine_time(elapsed: std::time::Duration) {
+    let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    with_gc_state(|state| state.counters.coroutine_nanos.fetch_add(nanos, Relaxed));
+}
+
+/// A cheap, thread-safe view of one realm's heap: take it on the realm's own thread with
+/// [`HeapStats::current`], then read it from anywhere. Every read is a few relaxed atomic loads.
+///
+/// What it counts: objects in the realm's slab (including those allocated by its coroutine
+/// bodies, which run on the realm's heap) and the slab chunks holding them. Not counted: strings,
+/// element and property buffers past a box's inline slots, bytecode and native buffers, which
+/// come from the process allocator, and the heaps of worker threads and child realms.
+#[derive(Clone)]
+pub struct HeapStats(Arc<RealmCounters>);
+
+impl HeapStats {
+    /// The heap the calling thread allocates into.
+    pub fn current() -> HeapStats {
+        HeapStats(with_gc_state(|state| state.counters.clone()))
+    }
+    /// Live objects right now (may lag one allocation behind on another thread).
+    pub fn live_objects(&self) -> i64 {
+        self.0.live.get()
+    }
+    /// Bytes of address space the object slab holds (whole chunks, used or spare).
+    pub fn slab_bytes(&self) -> u64 {
+        (self.0.chunks.load(Relaxed) as u64).saturating_mul(heap::CHUNK_BYTES as u64)
+    }
+    /// Total time coroutine bodies (generators, async functions) ran on pooled worker threads
+    /// for this heap, measured as wall time between handoffs: CPU time unless a body blocked.
+    pub fn coroutine_time(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.0.coroutine_nanos.load(Relaxed))
+    }
+}
+
 /// Number of live heap objects right now.
 pub fn live_objects() -> i64 {
-    with_gc_state(|state| state.live.get())
+    with_gc_state(|state| state.counters.live.get())
 }
 
 /// Visit every currently-live heap object in place. `f` must not allocate, free or drop a
@@ -1782,7 +1970,7 @@ pub(crate) fn gc_for_each_live(mut f: impl FnMut(&Gc)) {
 /// and taking a handle only increments counts, so no object can disappear mid-walk.
 pub fn gc_snapshot() -> Vec<Gc> {
     with_gc_state(|state| {
-        let mut live = Vec::with_capacity(state.live.get().max(0) as usize);
+        let mut live = Vec::with_capacity(state.counters.live.get().max(0) as usize);
         state.heap.for_each_live(|b| unsafe {
             strong_bump(&*b);
             live.push(Gc(std::ptr::NonNull::new_unchecked(b)));
@@ -1800,9 +1988,7 @@ pub(crate) fn gc_allocator_trim_due() -> bool {
     once_a_second(&LAST)
 }
 
-fn once_a_second(
-    last: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>,
-) -> bool {
+fn once_a_second(last: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>) -> bool {
     let now = std::time::Instant::now();
     last.with(|l| match l.get() {
         Some(t) if now.duration_since(t) < std::time::Duration::from_secs(1) => false,
@@ -1822,7 +2008,15 @@ pub(crate) fn gc_trim_heap() {
         static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     }
     let keep = if once_a_second(&LAST) { 1 } else { SPARE_CHUNKS };
-    with_gc_state(|state| state.heap.trim(keep));
+    with_gc_state(|state| {
+        state.heap.trim(keep);
+        state.counters.note_chunks(state.heap.chunk_count());
+    });
+}
+
+/// A disposed-realm boundary will not immediately refill its empty parcel chunks.
+pub(crate) fn gc_trim_quiescent_heap() {
+    with_gc_state(|state| state.heap.trim(1));
 }
 
 /// Return empty slab chunks to the system once objects dying by reference count (no sweep,
@@ -1830,7 +2024,13 @@ pub(crate) fn gc_trim_heap() {
 /// (see `ObjHeap::trim_if_emptied`). Polled from the interpreter's safe points.
 #[inline]
 pub(crate) fn gc_trim_emptied() {
-    if with_gc_state(|state| state.heap.trim_if_emptied(SPARE_CHUNKS)) {
+    if with_gc_state(|state| {
+        let trimmed = state.heap.trim_if_emptied(SPARE_CHUNKS);
+        if trimmed {
+            state.counters.note_chunks(state.heap.chunk_count());
+        }
+        trimmed
+    }) {
         #[cfg(not(target_arch = "wasm32"))]
         crate::fastalloc::release_free_pages();
     }
@@ -2287,7 +2487,11 @@ impl Property {
     /// The number held by a data property, if any (no clone).
     #[inline]
     pub(crate) fn num_value(&self) -> Option<f64> {
-        if self.accessor() { None } else { self.packed.as_num() }
+        if self.accessor() {
+            None
+        } else {
+            self.packed.as_num()
+        }
     }
     /// The object this data property holds, as [`Gc::as_ptr`] gives it (no clone).
     #[inline]
@@ -2317,7 +2521,10 @@ impl Property {
     /// The plain data property for packed element word `w`.
     #[inline]
     pub(crate) fn from_elem(w: PackedValue) -> Property {
-        Property { packed: w, meta: PROP_PLAIN }
+        Property {
+            packed: w,
+            meta: PROP_PLAIN,
+        }
     }
     /// Overwrite a data property that holds a number with the number `n` (no drop needed).
     #[inline]
@@ -2395,7 +2602,7 @@ pub(crate) use props::{bump_proto_epoch, fn_key, proto_epoch, shape_table_census
 pub(crate) fn shape_count() -> usize {
     shape_table_census().shapes
 }
-pub(crate) use props::{jit_props_layout, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK};
+pub(crate) use props::{MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_OK, jit_props_layout};
 pub(crate) use props::{jit_shared_shape, proto_epoch_addr};
 
 /// A canonical array-index property key (`"0"`, `"42"` — decimal, no leading zeros, fits u32).

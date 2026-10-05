@@ -32,6 +32,9 @@ thread_local! {
     static LIMIT: Cell<usize> = const { Cell::new(0) };
     /// `(base, size)` an embedder recorded for this thread (see [`set_thread_stack_size`]).
     static RECORDED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// `(lowest address, size)` of a host-provided stack (see [`set_thread_stack_bounds`]); wins over
+    /// the queried bounds.
+    static EXPLICIT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 #[inline(always)]
@@ -85,21 +88,58 @@ pub fn set_thread_stack_size(bytes: usize) {
     LIMIT.with(|l| l.set(0));
 }
 
+/// Declare the stack the current thread's code now runs on: `low` is its lowest address and `size`
+/// its length in bytes. For an embedder that runs an engine on a stack it allocated itself (a
+/// cooperative scheduler giving each realm its own stack); the queried thread bounds would
+/// describe the wrong stack. The bounds are per thread-local state: call it on a stack's first
+/// entry, and again whenever the thread-local block is shared between stacks. `size == 0` goes
+/// back to the queried bounds.
+pub fn set_thread_stack_bounds(low: usize, size: usize) {
+    EXPLICIT.with(|e| e.set((low, size)));
+    LIMIT.with(|l| l.set(0));
+}
+
 #[cold]
 #[inline(never)]
 fn init() -> usize {
-    let lim = bounds()
+    let explicit = EXPLICIT.with(Cell::get);
+    let lim = (explicit.1 != 0)
+        .then_some(explicit)
+        .or_else(bounds)
         .or_else(|| {
             let (base, size) = RECORDED.with(Cell::get);
             (size != 0).then(|| (base.saturating_sub(size), size))
         })
         .map(|(low, size)| {
-            let margin = (size / 8).clamp(MIN_MARGIN, MAX_MARGIN);
+            let margin = safety_margin(size);
             (low + margin).min(sp()).max(1)
         })
         .unwrap_or(1);
     LIMIT.with(|l| l.set(lim));
     lim
+}
+
+fn safety_margin(size: usize) -> usize {
+    // A fixed desktop reserve must not consume an embedded stack's entire budget.
+    (size / 8).clamp(MIN_MARGIN, MAX_MARGIN).min(size / 4)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_stack_keeps_evaluation_headroom() {
+        assert_eq!(safety_margin(256 * 1024), 64 * 1024);
+        assert_eq!(safety_margin(512 * 1024), 128 * 1024);
+        assert_eq!(safety_margin(64 * 1024), 16 * 1024);
+    }
+
+    #[test]
+    fn desktop_stack_retains_its_reserve() {
+        assert_eq!(safety_margin(2 * 1024 * 1024), MIN_MARGIN);
+        assert_eq!(safety_margin(64 * 1024 * 1024), MAX_MARGIN);
+    }
 }
 
 /// `(lowest address, size)` of the current thread's stack.
@@ -114,7 +154,10 @@ fn bounds() -> Option<(usize, usize)> {
     unsafe {
         let t = pthread_self();
         let size = pthread_get_stacksize_np(t);
-        Some(((pthread_get_stackaddr_np(t) as usize).checked_sub(size)?, size))
+        Some((
+            (pthread_get_stackaddr_np(t) as usize).checked_sub(size)?,
+            size,
+        ))
     }
 }
 

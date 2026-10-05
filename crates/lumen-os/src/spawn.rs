@@ -53,7 +53,10 @@ mod imp {
     }
 
     fn null_terminated(list: &[CString]) -> Vec<*const libc::c_char> {
-        list.iter().map(|c| c.as_ptr()).chain(std::iter::once(std::ptr::null())).collect()
+        list.iter()
+            .map(|c| c.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect()
     }
 
     /// Forks and execs per `cfg`; `preexec` runs in the child just before the descriptors are
@@ -70,7 +73,10 @@ mod imp {
         let argv = null_terminated(&args);
         let exec_array = null_terminated(&exes);
         let envp = env.as_deref().map(null_terminated);
-        let groups: Option<Vec<libc::gid_t>> = cfg.extra_groups.as_ref().map(|g| g.iter().map(|&g| g as libc::gid_t).collect());
+        let groups: Option<Vec<libc::gid_t>> = cfg
+            .extra_groups
+            .as_ref()
+            .map(|g| g.iter().map(|&g| g as libc::gid_t).collect());
         let child = Child {
             cfg,
             argv: &argv,
@@ -114,7 +120,11 @@ mod imp {
         if flags < 0 {
             return false;
         }
-        let new = if inheritable { flags & !libc::FD_CLOEXEC } else { flags | libc::FD_CLOEXEC };
+        let new = if inheritable {
+            flags & !libc::FD_CLOEXEC
+        } else {
+            flags | libc::FD_CLOEXEC
+        };
         new == flags || libc::fcntl(fd, libc::F_SETFD, new) >= 0
     }
 
@@ -150,7 +160,13 @@ mod imp {
     /// Closes `[from, to)`.
     unsafe fn close_range(from: i32, to: i32) {
         #[cfg(target_os = "linux")]
-        if libc::syscall(libc::SYS_close_range, from as libc::c_uint, (to - 1) as libc::c_uint, 0) == 0 {
+        if libc::syscall(
+            libc::SYS_close_range,
+            from as libc::c_uint,
+            (to - 1) as libc::c_uint,
+            0,
+        ) == 0
+        {
             return;
         }
         for fd in from..to {

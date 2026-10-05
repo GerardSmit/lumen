@@ -227,13 +227,25 @@ pub fn current_user() -> PasswdEntry {
     {
         // SAFETY: no arguments, cannot fail.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let mut entry = passwd(uid).unwrap_or(PasswdEntry { uid: 0, gid: 0, name: None, dir: None, shell: None });
+        let mut entry = passwd(uid).unwrap_or(PasswdEntry {
+            uid: 0,
+            gid: 0,
+            name: None,
+            dir: None,
+            shell: None,
+        });
         entry.uid = uid as i64;
         entry.gid = gid as i64;
         entry
     }
     #[cfg(not(unix))]
-    PasswdEntry { uid: -1, gid: -1, name: None, dir: None, shell: None }
+    PasswdEntry {
+        uid: -1,
+        gid: -1,
+        name: None,
+        dir: None,
+        shell: None,
+    }
 }
 
 /// The login name of `uid` (`getpwuid`).

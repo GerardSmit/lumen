@@ -25,6 +25,7 @@ pub enum Type {
     I64,
     F32,
     F64,
+    V128,
 }
 
 impl Type {
@@ -38,6 +39,7 @@ impl Type {
         match self {
             Type::I32 | Type::F32 => 32,
             Type::I64 | Type::F64 => 64,
+            Type::V128 => 128,
         }
     }
 }
@@ -243,6 +245,8 @@ pub enum ConvOp {
     ToSintSat,
     /// Float → unsigned int, truncating and saturating (NaN → 0).
     ToUintSat,
+    /// JavaScript ToInt32: truncate and reduce modulo 2^32; NaN/infinity -> 0.
+    ToJsInt32,
     /// F32 → F64.
     Promote,
     /// F64 → F32.
@@ -258,6 +262,7 @@ pub enum MemKind {
     I64,
     F32,
     F64,
+    V128,
     I32S8,
     I32U8,
     I32S16,
@@ -279,6 +284,7 @@ impl MemKind {
             I64 | I64S8 | I64U8 | I64S16 | I64U16 | I64S32 | I64U32 => Type::I64,
             F32 => Type::F32,
             F64 => Type::F64,
+            V128 => Type::V128,
         }
     }
     /// Bytes accessed.
@@ -289,6 +295,7 @@ impl MemKind {
             I32S16 | I32U16 | I64S16 | I64U16 => 2,
             I32 | F32 | I64S32 | I64U32 => 4,
             I64 | F64 => 8,
+            V128 => 16,
         }
     }
     pub fn is_signed(self) -> bool {
@@ -306,9 +313,23 @@ pub struct BlockCall {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum InstData {
+    /// Optional read-prefetch hint; never changes program semantics or accesses memory in the oracle.
+    Prefetch {
+        addr: Value,
+        offset: i32,
+    },
+    Vzero,
+    VectorBinary {
+        op: VectorOp,
+        args: [Value; 2],
+    },
     Iconst {
         ty: Type,
         imm: i64,
+    },
+    /// Load a pointer from a symbolic GOT slot. `id` is resolved by the AOT linker.
+    SymbolAddr {
+        id: u32,
     },
     F32const {
         bits: u32,
@@ -322,6 +343,11 @@ pub enum InstData {
     },
     Binary {
         op: BinaryOp,
+        args: [Value; 2],
+    },
+    /// Signed I32 arithmetic: wrapped I32 result and I32 overflow flag (0/1).
+    CheckedBinary {
+        op: CheckedOp,
         args: [Value; 2],
     },
     /// `args[0] cc args[1]` as I32 0/1.
@@ -399,6 +425,34 @@ pub enum InstData {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckedOp {
+    IaddOv,
+    IsubOv,
+    ImulOv,
+}
+
+/// Lane arithmetic wraps for I32; floating minimum/maximum have the scalar IEEE semantics.
+/// Comparisons produce all-one or all-zero lane masks. AndNot is `a & !b`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VectorOp {
+    I32x4Add,
+    I32x4Mul,
+    I32x4Min,
+    I32x4Max,
+    I32x4Eq,
+    I32x4Lt,
+    F64x2Add,
+    F64x2Mul,
+    F64x2Min,
+    F64x2Max,
+    F64x2Eq,
+    F64x2Lt,
+    And,
+    AndNot,
+    Or,
+}
+
 impl InstData {
     pub fn is_terminator(&self) -> bool {
         matches!(
@@ -416,10 +470,13 @@ impl InstData {
     pub fn is_pure(&self) -> bool {
         matches!(
             self,
-            InstData::Iconst { .. }
+            InstData::Vzero
+                | InstData::VectorBinary { .. }
+                | InstData::Iconst { .. }
                 | InstData::F32const { .. }
                 | InstData::F64const { .. }
                 | InstData::Unary { .. }
+                | InstData::CheckedBinary { .. }
                 | InstData::IntCmp { .. }
                 | InstData::FloatCmp { .. }
                 | InstData::Select { .. }
@@ -432,12 +489,16 @@ impl InstData {
     /// Visit the value operands, including branch arguments.
     pub fn for_each_arg(&self, mut f: impl FnMut(Value)) {
         match self {
+            InstData::Vzero => {}
             InstData::Iconst { .. }
             | InstData::F32const { .. }
             | InstData::F64const { .. }
             | InstData::Trap { .. } => {}
+            InstData::SymbolAddr { .. } => {}
             InstData::Unary { arg, .. } | InstData::Convert { arg, .. } => f(*arg),
             InstData::Binary { args, .. }
+            | InstData::VectorBinary { args, .. }
+            | InstData::CheckedBinary { args, .. }
             | InstData::IntCmp { args, .. }
             | InstData::FloatCmp { args, .. } => {
                 f(args[0]);
@@ -452,12 +513,14 @@ impl InstData {
                 f(*if_true);
                 f(*if_false);
             }
-            InstData::Load { addr, .. } => f(*addr),
+            InstData::Load { addr, .. } | InstData::Prefetch { addr, .. } => f(*addr),
             InstData::Store { addr, value, .. } => {
                 f(*addr);
                 f(*value);
             }
-            InstData::Call { args, .. } | InstData::Return { args } => args.iter().for_each(|&a| f(a)),
+            InstData::Call { args, .. } | InstData::Return { args } => {
+                args.iter().for_each(|&a| f(a))
+            }
             InstData::CallIndirect { callee, args, .. } => {
                 f(*callee);
                 args.iter().for_each(|&a| f(a));
@@ -491,12 +554,16 @@ impl InstData {
             }
         }
         match self {
+            InstData::Vzero => {}
             InstData::Iconst { .. }
             | InstData::F32const { .. }
             | InstData::F64const { .. }
             | InstData::Trap { .. } => {}
+            InstData::SymbolAddr { .. } => {}
             InstData::Unary { arg, .. } | InstData::Convert { arg, .. } => *arg = f(*arg),
             InstData::Binary { args, .. }
+            | InstData::VectorBinary { args, .. }
+            | InstData::CheckedBinary { args, .. }
             | InstData::IntCmp { args, .. }
             | InstData::FloatCmp { args, .. } => {
                 args[0] = f(args[0]);
@@ -511,7 +578,7 @@ impl InstData {
                 *if_true = f(*if_true);
                 *if_false = f(*if_false);
             }
-            InstData::Load { addr, .. } => *addr = f(*addr),
+            InstData::Load { addr, .. } | InstData::Prefetch { addr, .. } => *addr = f(*addr),
             InstData::Store { addr, value, .. } => {
                 *addr = f(*addr);
                 *value = f(*value);
@@ -630,7 +697,10 @@ impl Function {
 
     pub fn results(&self, inst: Inst) -> &[Value] {
         let i = inst.index();
-        let end = self.inst_results.get(i + 1).map_or(self.result_pool.len(), |&e| e as usize);
+        let end = self
+            .inst_results
+            .get(i + 1)
+            .map_or(self.result_pool.len(), |&e| e as usize);
         &self.result_pool[self.inst_results[i] as usize..end]
     }
 
@@ -673,18 +743,25 @@ impl Function {
     pub fn result_types(&self, data: &InstData) -> Vec<Type> {
         let ty = |v: Value| self.value_type(v);
         match data {
+            InstData::Vzero | InstData::VectorBinary { .. } => vec![Type::V128],
             InstData::Iconst { ty, .. } => vec![*ty],
+            InstData::SymbolAddr { .. } => vec![Type::I64],
             InstData::F32const { .. } => vec![Type::F32],
             InstData::F64const { .. } => vec![Type::F64],
-            InstData::Unary { op, arg } => vec![if *op == UnaryOp::Eqz { Type::I32 } else { ty(*arg) }],
+            InstData::Unary { op, arg } => vec![if *op == UnaryOp::Eqz {
+                Type::I32
+            } else {
+                ty(*arg)
+            }],
             InstData::Binary { args, .. } => vec![ty(args[0])],
+            InstData::CheckedBinary { .. } => vec![Type::I32, Type::I32],
             InstData::IntCmp { .. } | InstData::FloatCmp { .. } => vec![Type::I32],
             InstData::Select { if_true, .. } => vec![ty(*if_true)],
             InstData::Convert { to, .. } => vec![*to],
             InstData::Load { kind, .. } => vec![kind.ty()],
-            InstData::Call { func, .. } => {
-                self.sigs[self.funcs[func.index()].sig.index()].results.clone()
-            }
+            InstData::Call { func, .. } => self.sigs[self.funcs[func.index()].sig.index()]
+                .results
+                .clone(),
             InstData::CallIndirect { sig, .. } => self.sigs[sig.index()].results.clone(),
             _ => Vec::new(),
         }

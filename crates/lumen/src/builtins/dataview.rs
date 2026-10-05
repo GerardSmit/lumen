@@ -82,7 +82,9 @@ fn dv_get(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     let v = i.with_buffer_bytes(view.0, |b| {
         let b = b.get(start..start + elem.size())?;
         Some(if elem.is_64bit_int() {
-            Value::BigInt(crate::bigint::JsBigInt::from_i128(buffer::load_int(elem, b, order)))
+            Value::BigInt(crate::bigint::JsBigInt::from_i128(buffer::load_int(
+                elem, b, order,
+            )))
         } else {
             Value::Num(buffer::load_f64(elem, b, order))
         })
@@ -209,7 +211,9 @@ pub(crate) fn dv_jit_view(i: &mut Interp, obj: &Gc, name: &str) -> Option<(*mut 
                 if p.accessor() {
                     return None;
                 }
-                let Value::Obj(fo) = p.value() else { return None };
+                let Value::Obj(fo) = p.value() else {
+                    return None;
+                };
                 let fb = fo.try_borrow().ok()?;
                 match fb.call {
                     crate::value::Callable::Native(fp) if fp as usize == want as usize => break,
@@ -254,7 +258,9 @@ pub(crate) fn jit_byte_length(i: &Interp, obj: &Gc) -> Option<usize> {
                 if !p.accessor() {
                     return None;
                 }
-                let Some(Value::Obj(g)) = p.getter() else { return None };
+                let Some(Value::Obj(g)) = p.getter() else {
+                    return None;
+                };
                 let gb = g.try_borrow().ok()?;
                 match gb.call {
                     crate::value::Callable::Native(fp) => break fp as usize,
@@ -268,7 +274,13 @@ pub(crate) fn jit_byte_length(i: &Interp, obj: &Gc) -> Option<usize> {
     };
     let p = Gc::as_ptr(obj) as usize;
     if fp == super::typedarray::ab_bytelength_get as crate::value::NativeFn as usize {
-        if i.shared_buffers.contains_key(&p) || !obj.try_borrow().ok()?.props.contains("\u{0}ab_max_byte_length") {
+        if i.shared_buffers.contains_key(&p)
+            || !obj
+                .try_borrow()
+                .ok()?
+                .props
+                .contains("\u{0}ab_max_byte_length")
+        {
             return None;
         }
         Some(i.array_buffers.get(&p).map_or(0, |b| b.len()))
@@ -304,12 +316,24 @@ pub(super) fn install_dataview(it: &mut Interp) {
     for &(name, f, _, set) in DV_METHODS {
         it.def_method(&proto, name, if set { 2 } else { 1 }, f);
     }
-    it.def_method(&proto, "getFloat16", 1, |i, this, a| dv_get(i, &this, a, TaKind::F16));
-    it.def_method(&proto, "setFloat16", 2, |i, this, a| dv_set(i, &this, a, TaKind::F16));
-    it.def_method(&proto, "getBigInt64", 1, |i, this, a| dv_get(i, &this, a, TaKind::I64));
-    it.def_method(&proto, "getBigUint64", 1, |i, this, a| dv_get(i, &this, a, TaKind::U64));
-    it.def_method(&proto, "setBigInt64", 2, |i, this, a| dv_set(i, &this, a, TaKind::I64));
-    it.def_method(&proto, "setBigUint64", 2, |i, this, a| dv_set(i, &this, a, TaKind::U64));
+    it.def_method(&proto, "getFloat16", 1, |i, this, a| {
+        dv_get(i, &this, a, TaKind::F16)
+    });
+    it.def_method(&proto, "setFloat16", 2, |i, this, a| {
+        dv_set(i, &this, a, TaKind::F16)
+    });
+    it.def_method(&proto, "getBigInt64", 1, |i, this, a| {
+        dv_get(i, &this, a, TaKind::I64)
+    });
+    it.def_method(&proto, "getBigUint64", 1, |i, this, a| {
+        dv_get(i, &this, a, TaKind::U64)
+    });
+    it.def_method(&proto, "setBigInt64", 2, |i, this, a| {
+        dv_set(i, &this, a, TaKind::I64)
+    });
+    it.def_method(&proto, "setBigUint64", 2, |i, this, a| {
+        dv_set(i, &this, a, TaKind::U64)
+    });
 
     let ctor = it.make_native("DataView", 1, |i, _t, a| {
         if !i.constructing {

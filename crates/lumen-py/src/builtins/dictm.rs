@@ -50,7 +50,9 @@ impl<'a> FromArg<'a, PyHost> for AnySetRef<'a> {
     #[inline(always)]
     fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
         match v {
-            Value::Obj(o) if matches!(o.kind, Kind::Set(_) | Kind::FrozenSet(_)) => Ok(AnySetRef(o)),
+            Value::Obj(o) if matches!(o.kind, Kind::Set(_) | Kind::FrozenSet(_)) => {
+                Ok(AnySetRef(o))
+            }
             _ => Err(cx.arg_error(at, "set", v)),
         }
     }
@@ -72,11 +74,16 @@ impl<'a> FromArg<'a, PyHost> for SetRef<'a> {
 
 fn update_dict(it: &mut Interp, d: &Obj, name: &str, args: &[Value], kwargs: KwArgs) -> R<()> {
     if args.len() > 1 {
-        return Err(it.type_error(&format!("{} expected at most 1 argument, got {}", name, args.len())));
+        return Err(it.type_error(&format!(
+            "{} expected at most 1 argument, got {}",
+            name,
+            args.len()
+        )));
     }
     if let Some(src) = args.first() {
         let into_empty = pydict_of(d).filter(|p| p.borrow().watch() != 0 && p.borrow().is_empty());
-        let from_dict = matches!(src, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Dict(_)));
+        let from_dict =
+            matches!(src, Value::Obj(o) if o.cls.is_none() && matches!(o.kind, Kind::Dict(_)));
         match into_empty {
             Some(p) if from_dict => {
                 let mask = p.borrow().watch();
@@ -112,14 +119,26 @@ pub struct Dict;
 #[lumen_bind::methods]
 impl Dict {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let _ = (args, kwargs);
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         it.alloc_instance(cls)
     }
 
     #[proto(init)]
-    fn init(slf: This<DictRef<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<DictRef<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         update_dict(it, slf.0 .0, "dict", args, kwargs)
     }
 
@@ -137,7 +156,12 @@ impl Dict {
 
     /// Return the value for key if key is in the dictionary, else default.
     #[method]
-    fn get(slf: This<DictRef<'_>>, it: &mut Interp, key: &Value, #[default(Value::None)] default: Value) -> R<Value> {
+    fn get(
+        slf: This<DictRef<'_>>,
+        it: &mut Interp,
+        key: &Value,
+        #[default(Value::None)] default: Value,
+    ) -> R<Value> {
         Ok(it.dict_get(slf.0 .0, key)?.unwrap_or(default))
     }
 
@@ -145,7 +169,12 @@ impl Dict {
     ///
     /// Return the value for key if key is in the dictionary, else default.
     #[method]
-    fn setdefault(slf: This<DictRef<'_>>, it: &mut Interp, key: &Value, #[default(Value::None)] default: Value) -> R<Value> {
+    fn setdefault(
+        slf: This<DictRef<'_>>,
+        it: &mut Interp,
+        key: &Value,
+        #[default(Value::None)] default: Value,
+    ) -> R<Value> {
         let d = slf.0 .0;
         if let Some(v) = it.dict_get(d, key)? {
             return Ok(v);
@@ -159,7 +188,12 @@ impl Dict {
     /// If the key is not found, return the default if given; otherwise,
     /// raise a KeyError.
     #[method(hint(py(text_signature = "($self, key, default=<unrepresentable>, /)")))]
-    fn pop(slf: This<DictRef<'_>>, it: &mut Interp, key: &Value, default: Passed<Value>) -> R<Value> {
+    fn pop(
+        slf: This<DictRef<'_>>,
+        it: &mut Interp,
+        key: &Value,
+        default: Passed<Value>,
+    ) -> R<Value> {
         match it.dict_remove(slf.0 .0, key)? {
             Some(v) => Ok(v),
             None => match default.0 {
@@ -175,7 +209,9 @@ impl Dict {
     /// Raises KeyError if the dict is empty.
     #[method]
     fn popitem(slf: This<DictRef<'_>>, it: &mut Interp) -> R<Value> {
-        let Some(pd) = pydict_of(slf.0 .0) else { return Err(it.new_exc_str("KeyError", "popitem(): dictionary is empty")) };
+        let Some(pd) = pydict_of(slf.0 .0) else {
+            return Err(it.new_exc_str("KeyError", "popitem(): dictionary is empty"));
+        };
         let last = pd.borrow().last_live();
         let e = last.and_then(|i| pd.borrow_mut().remove(i));
         match e {
@@ -187,19 +223,28 @@ impl Dict {
     /// D.keys() -> a set-like object providing a view on D's keys
     #[method(hint(py(text_signature = "")))]
     fn keys(slf: This<DictRef<'_>>) -> Value {
-        Value::Obj(Object::new(Kind::DictView(slf.0 .0.clone(), ViewKind::Keys)))
+        Value::Obj(Object::new(Kind::DictView(
+            slf.0 .0.clone(),
+            ViewKind::Keys,
+        )))
     }
 
     /// D.values() -> an object providing a view on D's values
     #[method(hint(py(text_signature = "")))]
     fn values(slf: This<DictRef<'_>>) -> Value {
-        Value::Obj(Object::new(Kind::DictView(slf.0 .0.clone(), ViewKind::Values)))
+        Value::Obj(Object::new(Kind::DictView(
+            slf.0 .0.clone(),
+            ViewKind::Values,
+        )))
     }
 
     /// D.items() -> a set-like object providing a view on D's items
     #[method(hint(py(text_signature = "")))]
     fn items(slf: This<DictRef<'_>>) -> Value {
-        Value::Obj(Object::new(Kind::DictView(slf.0 .0.clone(), ViewKind::Items)))
+        Value::Obj(Object::new(Kind::DictView(
+            slf.0 .0.clone(),
+            ViewKind::Items,
+        )))
     }
 
     /// D.update([E, ]**F) -> None.  Update D from mapping/iterable E and F.
@@ -207,7 +252,12 @@ impl Dict {
     /// If E is present and lacks a .keys() method, then does:  for k, v in E: D[k] = v
     /// In either case, this is followed by: for k in F:  D[k] = F[k]
     #[method(hint(py(text_signature = "")))]
-    fn update(slf: This<DictRef<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn update(
+        slf: This<DictRef<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         update_dict(it, slf.0 .0, "update", args, kwargs)
     }
 
@@ -222,12 +272,21 @@ impl Dict {
     /// D.copy() -> a shallow copy of D
     #[method(hint(py(text_signature = "")))]
     fn copy(slf: This<DictRef<'_>>) -> Value {
-        Value::dict(pydict_of(slf.0 .0).map(|p| p.borrow().clone()).unwrap_or_default())
+        Value::dict(
+            pydict_of(slf.0 .0)
+                .map(|p| p.borrow().clone())
+                .unwrap_or_default(),
+        )
     }
 
     /// Create a new dictionary with keys from iterable and values set to value.
     #[classmethod]
-    fn fromkeys(cls: This<Value>, it: &mut Interp, iterable: &Value, #[default(Value::None)] value: Value) -> R<Value> {
+    fn fromkeys(
+        cls: This<Value>,
+        it: &mut Interp,
+        iterable: &Value,
+        #[default(Value::None)] value: Value,
+    ) -> R<Value> {
         let d = it.call(&cls, Vec::new(), Vec::new())?;
         for k in it.iterate_to_vec(iterable)? {
             it.setitem(&d, k, value.clone())?;
@@ -238,7 +297,9 @@ impl Dict {
     /// Return a reverse iterator over the dict keys.
     #[method(name = "__reversed__")]
     fn reversed(slf: This<DictRef<'_>>, it: &mut Interp) -> R<Value> {
-        let ks = pydict_of(slf.0 .0).map(|p| p.borrow().keys()).unwrap_or_default();
+        let ks = pydict_of(slf.0 .0)
+            .map(|p| p.borrow().keys())
+            .unwrap_or_default();
         let l = Value::list(ks.into_iter().rev().collect());
         it.get_iter(&l)
     }
@@ -250,7 +311,9 @@ impl Dict {
 
     #[proto(ior)]
     fn ior(slf: This<Value>, it: &mut Interp, value: &Value) -> R<Value> {
-        let Value::Obj(d) = &slf.0 else { unreachable!("checked by the entry") };
+        let Value::Obj(d) = &slf.0 else {
+            unreachable!("checked by the entry")
+        };
         it.dict_update_from(d, value)?;
         Ok(slf.0)
     }
@@ -390,7 +453,9 @@ fn set_inplace(it: &mut Interp, slf: Value, value: &Value, op: BinOp) -> R<Value
     if !is_any_set(value) {
         return Ok(Value::NotImplemented);
     }
-    let Value::Obj(s) = &slf else { unreachable!("checked by the entry") };
+    let Value::Obj(s) = &slf else {
+        unreachable!("checked by the entry")
+    };
     set_update_with(it, s, std::slice::from_ref(value), op)?;
     Ok(slf)
 }
@@ -405,9 +470,16 @@ pub struct Set;
 #[lumen_bind::methods]
 impl Set {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let _ = (args, kwargs);
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         it.alloc_instance(cls)
     }
 
@@ -466,7 +538,9 @@ impl Set {
     /// Raises KeyError if the set is empty.
     #[method(hint(py(text_signature = "")))]
     fn pop(slf: This<SetRef<'_>>, it: &mut Interp) -> R<Value> {
-        let Some(pd) = pydict_of(slf.0 .0) else { return Err(it.new_exc_str("KeyError", "pop from an empty set")) };
+        let Some(pd) = pydict_of(slf.0 .0) else {
+            return Err(it.new_exc_str("KeyError", "pop from an empty set"));
+        };
         let first = pd.borrow().next_live(0);
         match first.and_then(|i| pd.borrow_mut().remove(i)) {
             Some(e) => Ok(e.key),
@@ -504,7 +578,11 @@ impl Set {
     ///
     /// (i.e. all elements that are in both sets.)
     #[method(hint(py(text_signature = "")))]
-    fn intersection(slf: This<AnySetRef<'_>>, it: &mut Interp, #[varargs] others: &[Value]) -> R<Value> {
+    fn intersection(
+        slf: This<AnySetRef<'_>>,
+        it: &mut Interp,
+        #[varargs] others: &[Value],
+    ) -> R<Value> {
         set_algebra(it, slf.0 .0, others, BinOp::BitAnd)
     }
 
@@ -512,7 +590,11 @@ impl Set {
     ///
     /// (i.e. all elements that are in this set but not the others.)
     #[method(hint(py(text_signature = "")))]
-    fn difference(slf: This<AnySetRef<'_>>, it: &mut Interp, #[varargs] others: &[Value]) -> R<Value> {
+    fn difference(
+        slf: This<AnySetRef<'_>>,
+        it: &mut Interp,
+        #[varargs] others: &[Value],
+    ) -> R<Value> {
         set_algebra(it, slf.0 .0, others, BinOp::Sub)
     }
 
@@ -557,13 +639,21 @@ impl Set {
 
     /// Update a set with the intersection of itself and another.
     #[method(hint(py(text_signature = "")))]
-    fn intersection_update(slf: This<SetRef<'_>>, it: &mut Interp, #[varargs] others: &[Value]) -> R<()> {
+    fn intersection_update(
+        slf: This<SetRef<'_>>,
+        it: &mut Interp,
+        #[varargs] others: &[Value],
+    ) -> R<()> {
         set_update_with(it, slf.0 .0, others, BinOp::BitAnd)
     }
 
     /// Remove all elements of another set from this set.
     #[method(hint(py(text_signature = "")))]
-    fn difference_update(slf: This<SetRef<'_>>, it: &mut Interp, #[varargs] others: &[Value]) -> R<()> {
+    fn difference_update(
+        slf: This<SetRef<'_>>,
+        it: &mut Interp,
+        #[varargs] others: &[Value],
+    ) -> R<()> {
         set_update_with(it, slf.0 .0, others, BinOp::Sub)
     }
 
@@ -605,7 +695,11 @@ impl Set {
             Err(e) if it.exc_is(&e, "AttributeError") => Value::None,
             Err(e) => return Err(e),
         };
-        Ok(Value::tuple(vec![cls, Value::tuple(vec![Value::list(keys)]), state]))
+        Ok(Value::tuple(vec![
+            cls,
+            Value::tuple(vec![Value::list(keys)]),
+            state,
+        ]))
     }
 
     #[proto(repr)]
@@ -625,7 +719,9 @@ pub struct FrozenSet;
 impl FrozenSet {
     #[constructor(hint(py(text_signature = "")))]
     fn new(cls: This<Value>, it: &mut Interp, iterable: Passed<&Value>) -> R<Value> {
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let items = match iterable.0 {
             Some(src) => it.iterate_to_vec(src)?,
             None => Vec::new(),
@@ -641,7 +737,10 @@ impl FrozenSet {
             Kind::FrozenSet(d) => d.borrow().clone(),
             _ => PyDict::new(),
         };
-        Ok(Value::Obj(Object::with_cls(cls.clone(), Kind::FrozenSet(RefCell::new(d)))))
+        Ok(Value::Obj(Object::with_cls(
+            cls.clone(),
+            Kind::FrozenSet(RefCell::new(d)),
+        )))
     }
 
     #[proto(hash)]
@@ -652,25 +751,59 @@ impl FrozenSet {
 
 pub fn init(it: &mut Interp) {
     use crate::bind::{extend_type_documented, install_into};
-    let (dict, set, frozenset) = (it.types.dict.clone(), it.types.set.clone(), it.types.frozenset.clone());
+    let (dict, set, frozenset) = (
+        it.types.dict.clone(),
+        it.types.set.clone(),
+        it.types.frozenset.clone(),
+    );
     extend_type_documented::<Dict>(it, &dict);
     if let Some(d) = dict.dict.borrow().as_ref() {
         dict_set_str(d, "__hash__", Value::None);
     }
-    reg_slots(it, &dict, &["__setitem__", "__delitem__", "__len__", "__iter__"]);
+    reg_slots(
+        it,
+        &dict,
+        &["__setitem__", "__delitem__", "__len__", "__iter__"],
+    );
     reg_binops(it, &dict, &["__or__", "__ror__"]);
     reg_compare(it, &dict, true);
 
-    let views = [it.types.dict_keys.clone(), it.types.dict_values.clone(), it.types.dict_items.clone()];
+    let views = [
+        it.types.dict_keys.clone(),
+        it.types.dict_values.clone(),
+        it.types.dict_items.clone(),
+    ];
     crate::bind::extend_type::<DictKeys>(it, &views[0]);
     crate::bind::extend_type::<DictValues>(it, &views[1]);
     crate::bind::extend_type::<DictItems>(it, &views[2]);
     for (i, vt) in views.iter().enumerate() {
         let set_like = i != 1;
-        install_into::<DictViews>(vt, if set_like { &["isdisjoint", "__repr__"] } else { &["__repr__"] });
-        reg_slots(it, vt, if set_like { &["__len__", "__contains__", "__iter__"] } else { &["__len__", "__iter__"] });
+        install_into::<DictViews>(
+            vt,
+            if set_like {
+                &["isdisjoint", "__repr__"]
+            } else {
+                &["__repr__"]
+            },
+        );
+        reg_slots(
+            it,
+            vt,
+            if set_like {
+                &["__len__", "__contains__", "__iter__"]
+            } else {
+                &["__len__", "__iter__"]
+            },
+        );
         if set_like {
-            reg_binops(it, vt, &["__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__", "__rxor__"]);
+            reg_binops(
+                it,
+                vt,
+                &[
+                    "__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__",
+                    "__rxor__",
+                ],
+            );
             reg_compare(it, vt, true);
             if let Some(d) = vt.dict.borrow().as_ref() {
                 dict_set_str(d, "__hash__", Value::None);
@@ -686,13 +819,29 @@ pub fn init(it: &mut Interp) {
     install_into::<Set>(
         &frozenset,
         &[
-            "__contains__", "copy", "union", "intersection", "difference", "symmetric_difference", "issubset", "issuperset",
-            "isdisjoint", "__reduce__", "__repr__",
+            "__contains__",
+            "copy",
+            "union",
+            "intersection",
+            "difference",
+            "symmetric_difference",
+            "issubset",
+            "issuperset",
+            "isdisjoint",
+            "__reduce__",
+            "__repr__",
         ],
     );
     for t in [&set, &frozenset] {
         reg_slots(it, t, &["__len__", "__iter__"]);
-        reg_binops(it, t, &["__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__", "__rxor__"]);
+        reg_binops(
+            it,
+            t,
+            &[
+                "__and__", "__rand__", "__or__", "__ror__", "__sub__", "__rsub__", "__xor__",
+                "__rxor__",
+            ],
+        );
         reg_compare(it, t, true);
     }
 }
@@ -700,7 +849,11 @@ pub fn init(it: &mut Interp) {
 /// The `mapping` attribute of the dict views as CPython's getset descriptor (its type exists once
 /// `descr` is initialised).
 pub fn init_descriptors(it: &mut Interp) {
-    for vt in [it.types.dict_keys.clone(), it.types.dict_values.clone(), it.types.dict_items.clone()] {
+    for vt in [
+        it.types.dict_keys.clone(),
+        it.types.dict_values.clone(),
+        it.types.dict_items.clone(),
+    ] {
         super::descr::install_getsets::<DictViews>(it, &vt, &[]);
     }
 }

@@ -19,7 +19,9 @@ mod generated {
 
 /// The path below [`FROZEN_DIR`] with no leading slash (empty for the directory itself).
 fn relative(path: &str) -> Option<&str> {
-    path.strip_prefix(FROZEN_DIR)?.strip_prefix('/').or(if path == FROZEN_DIR { Some("") } else { None })
+    path.strip_prefix(FROZEN_DIR)?
+        .strip_prefix('/')
+        .or(if path == FROZEN_DIR { Some("") } else { None })
 }
 
 #[cfg(not(feature = "py-stdlib-external"))]
@@ -39,19 +41,28 @@ impl Archive {
             files.insert(path, (chunk, offset, len));
             let mut dir = path;
             while let Some((parent, name)) = dir.rsplit_once('/') {
-                dirs.entry(parent.to_string()).or_default().insert(name.to_string(), dir != path);
+                dirs.entry(parent.to_string())
+                    .or_default()
+                    .insert(name.to_string(), dir != path);
                 dir = parent;
             }
-            dirs.entry(String::new()).or_default().insert(dir.to_string(), dir != path);
+            dirs.entry(String::new())
+                .or_default()
+                .insert(dir.to_string(), dir != path);
         }
-        Archive { files, dirs, chunks: generated::CHUNKS.iter().map(|_| OnceLock::new()).collect() }
+        Archive {
+            files,
+            dirs,
+            chunks: generated::CHUNKS.iter().map(|_| OnceLock::new()).collect(),
+        }
     }
 
     fn chunk(&self, index: u32) -> &[u8] {
         self.chunks[index as usize].get_or_init(|| {
             let (offset, packed, len) = generated::CHUNKS[index as usize];
             let packed = &generated::BLOB[offset as usize..(offset + packed) as usize];
-            lumen_common::compress::brotli_decompress_limited(packed, len as usize).expect("embedded stdlib chunk is valid")
+            lumen_common::compress::brotli_decompress_limited(packed, len as usize)
+                .expect("embedded stdlib chunk is valid")
         })
     }
 }
@@ -61,9 +72,15 @@ impl Backend for Archive {
     fn stat(&self, path: &str) -> Option<RemoteStat> {
         let rel = relative(path)?;
         if let Some(&(_, _, len)) = self.files.get(rel) {
-            return Some(RemoteStat { is_dir: false, size: len as u64 });
+            return Some(RemoteStat {
+                is_dir: false,
+                size: len as u64,
+            });
         }
-        self.dirs.contains_key(rel).then_some(RemoteStat { is_dir: true, size: 0 })
+        self.dirs.contains_key(rel).then_some(RemoteStat {
+            is_dir: true,
+            size: 0,
+        })
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -78,9 +95,17 @@ impl Backend for Archive {
             entries
                 .iter()
                 .map(|(name, &is_dir)| {
-                    let full = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                    let full = if rel.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{rel}/{name}")
+                    };
                     let size = self.files.get(full.as_str()).map_or(0, |f| f.2 as u64);
-                    RemoteEntry { name: name.clone(), is_dir, size }
+                    RemoteEntry {
+                        name: name.clone(),
+                        is_dir,
+                        size,
+                    }
                 })
                 .collect(),
         )
@@ -97,7 +122,13 @@ struct DirBackend {
 impl DirBackend {
     fn host_path(&self, path: &str) -> Option<String> {
         let rel = relative(path)?;
-        (!rel.split('/').any(|part| part == "..")).then(|| if rel.is_empty() { self.root.clone() } else { format!("{}/{rel}", self.root) })
+        (!rel.split('/').any(|part| part == "..")).then(|| {
+            if rel.is_empty() {
+                self.root.clone()
+            } else {
+                format!("{}/{rel}", self.root)
+            }
+        })
     }
 }
 
@@ -107,7 +138,10 @@ impl Backend for DirBackend {
         use lumen_os::fs::{S_IFDIR, S_IFMT};
         use lumen_os::vfs::{FileSystem, OsFs};
         let st = OsFs.stat(&self.host_path(path)?, true).ok()?;
-        Some(RemoteStat { is_dir: st.mode & S_IFMT == S_IFDIR, size: st.size })
+        Some(RemoteStat {
+            is_dir: st.mode & S_IFMT == S_IFDIR,
+            size: st.size,
+        })
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -124,7 +158,11 @@ impl Backend for DirBackend {
                 .into_iter()
                 .filter_map(|(name, _)| {
                     let st = self.stat(&format!("{}/{name}", path.trim_end_matches('/')))?;
-                    Some(RemoteEntry { name, is_dir: st.is_dir, size: st.size })
+                    Some(RemoteEntry {
+                        name,
+                        is_dir: st.is_dir,
+                        size: st.size,
+                    })
                 })
                 .collect(),
         )
@@ -148,7 +186,9 @@ fn backend() -> Arc<dyn Backend> {
         .cloned()
         .or_else(|| std::env::var("LUMEN_PY_STDLIB").ok())
         .unwrap_or_else(|| generated::EXTERNAL_DIR.to_string());
-    Arc::new(DirBackend { root: root.trim_end_matches('/').to_string() })
+    Arc::new(DirBackend {
+        root: root.trim_end_matches('/').to_string(),
+    })
 }
 
 #[cfg(not(feature = "py-stdlib-external"))]

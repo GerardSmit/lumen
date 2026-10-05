@@ -4,8 +4,8 @@ use super::captures::Captures;
 use super::charclass::{Flavor, PreMap};
 use super::fold::{fold_eq, is_line_terminator_u32, is_word_ic, py_is_word, CaseFold};
 use super::limits::{self, BacktrackLimit};
-use crate::limits::Abort;
 use super::program::{Dialect, FirstFilter, Inst, Regex, Rep};
+use crate::limits::Abort;
 
 /// Backtracking budget of one `exec` (all start positions together): `STEP_BASE` plus
 /// `STEP_PER_ELEM` per subject element. Linear-time patterns spend a small constant per element,
@@ -310,14 +310,17 @@ impl<I: ReInput> Matcher<I> {
                     );
                 }
                 Inst::Any => {
-                    return Some(self.step(pos).is_some_and(|(found, _)| {
-                        self.dotall() || !self.is_line_term(found)
-                    }));
+                    return Some(
+                        self.step(pos)
+                            .is_some_and(|(found, _)| self.dotall() || !self.is_line_term(found)),
+                    );
                 }
                 Inst::Class(class) => {
-                    return Some(self.step(pos).is_some_and(|(found, _)| {
-                        class.matches(found, self.icase(), self.fold)
-                    }));
+                    return Some(
+                        self.step(pos).is_some_and(|(found, _)| {
+                            class.matches(found, self.icase(), self.fold)
+                        }),
+                    );
                 }
                 Inst::Many { rep, min, .. } => {
                     let matches_here = self
@@ -647,11 +650,7 @@ impl<I: ReInput> Matcher<I> {
                         greedy,
                     } => {
                         let (min, cap) = (*min, max.unwrap_or(usize::MAX));
-                        let room = if self.back {
-                            pos
-                        } else {
-                            self.n - pos
-                        };
+                        let room = if self.back { pos } else { self.n - pos };
                         if *greedy {
                             let mut avail = 0;
                             while avail < cap
@@ -1003,11 +1002,7 @@ impl<I: ReInput> Matcher<I> {
             unreachable!()
         };
         let cap = max.unwrap_or(usize::MAX);
-        let room = if self.back {
-            pos
-        } else {
-            self.n - pos
-        };
+        let room = if self.back { pos } else { self.n - pos };
         let mut first = include;
         loop {
             if !first {
@@ -1113,7 +1108,6 @@ enum Bt {
     },
 }
 
-
 /// How a match attempt is anchored.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
@@ -1197,10 +1191,13 @@ impl Regex {
                 input.ascii_bytes(),
                 n == input.len() && opts.mode != Mode::FullMatch && !opts.must_advance,
             ) {
-                return Ok(
-                    find_ascii_literal(bytes, opts.start, literal, opts.mode == Mode::Match)
-                        .map(Captures::one),
-                );
+                return Ok(find_ascii_literal(
+                    bytes,
+                    opts.start,
+                    literal,
+                    opts.mode == Mode::Match,
+                )
+                .map(Captures::one));
             }
         }
         let search = opts.mode == Mode::Search;

@@ -136,7 +136,11 @@ pub struct ParamSpecArgs {
     origin: Value,
 }
 
-#[lumen_bind::class(name = "ParamSpecKwargs", module = "typing", hint(py(final, unhashable)))]
+#[lumen_bind::class(
+    name = "ParamSpecKwargs",
+    module = "typing",
+    hint(py(final, unhashable))
+)]
 /// The kwargs for a ParamSpec object.
 ///
 /// Given a ParamSpec object P, P.kwargs is an instance of ParamSpecKwargs.
@@ -222,7 +226,11 @@ fn default_arg(it: &mut Interp, default: Option<&Value>) -> Option<Value> {
 
 /// A type parameter's `__default__`: evaluated on first use when it came from the type
 /// parameter syntax, `NoDefault` when there is none.
-fn default_of(it: &mut Interp, default: Option<Value>, evaluate: Option<Value>) -> R<(Value, bool)> {
+fn default_of(
+    it: &mut Interp,
+    default: Option<Value>,
+    evaluate: Option<Value>,
+) -> R<(Value, bool)> {
     if let Some(d) = default {
         return Ok((d, false));
     }
@@ -304,7 +312,12 @@ pub(crate) fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
     if arg.is_none() {
         return Ok(Value::Obj(it.types.none_type.clone()));
     }
-    call_typing(it, "_type_check", vec![arg.clone(), Value::str(msg)], Vec::new())
+    call_typing(
+        it,
+        "_type_check",
+        vec![arg.clone(), Value::str(msg)],
+        Vec::new(),
+    )
 }
 
 /// The `__name__` of the module whose code is running (CPython's `caller()`).
@@ -322,7 +335,12 @@ fn set_module(it: &mut Interp, v: &Value, module: Value) {
     }
 }
 
-fn variance_checks(it: &mut Interp, covariant: bool, contravariant: bool, infer_variance: bool) -> R<()> {
+fn variance_checks(
+    it: &mut Interp,
+    covariant: bool,
+    contravariant: bool,
+    infer_variance: bool,
+) -> R<()> {
     if covariant && contravariant {
         return Err(it.value_error("Bivariant types are not supported."));
     }
@@ -332,7 +350,12 @@ fn variance_checks(it: &mut Interp, covariant: bool, contravariant: bool, infer_
     Ok(())
 }
 
-fn variance_repr(name: &Value, covariant: bool, contravariant: bool, infer_variance: bool) -> String {
+fn variance_repr(
+    name: &Value,
+    covariant: bool,
+    contravariant: bool,
+    infer_variance: bool,
+) -> String {
     let n = name.as_str().unwrap_or("");
     if infer_variance {
         return n.to_string();
@@ -349,14 +372,20 @@ fn variance_repr(name: &Value, covariant: bool, contravariant: bool, infer_varia
 
 /// Replaces each `TypeVarTuple` in `params` with `Unpack[tvt]`.
 fn unpack_typevartuples(it: &mut Interp, params: &Value) -> R<Value> {
-    let Some(items) = params.tuple_items() else { return Ok(params.clone()) };
+    let Some(items) = params.tuple_items() else {
+        return Ok(params.clone());
+    };
     if !items.iter().any(is_typevartuple) {
         return Ok(params.clone());
     }
     let items = items.to_vec();
     let mut out = Vec::with_capacity(items.len());
     for p in items {
-        out.push(if is_typevartuple(&p) { unpack(it, &p)? } else { p });
+        out.push(if is_typevartuple(&p) {
+            unpack(it, &p)?
+        } else {
+            p
+        });
     }
     Ok(Value::tuple(out))
 }
@@ -392,9 +421,15 @@ impl TypeVar {
         #[kw] name: StrRef<'_>,
         #[varargs] constraints: &[Value],
         #[kwonly] bound: Option<&Value>,
-        #[kwonly] #[default(false)] covariant: bool,
-        #[kwonly] #[default(false)] contravariant: bool,
-        #[kwonly] #[default(false)] infer_variance: bool,
+        #[kwonly]
+        #[default(false)]
+        covariant: bool,
+        #[kwonly]
+        #[default(false)]
+        contravariant: bool,
+        #[kwonly]
+        #[default(false)]
+        infer_variance: bool,
         #[kwonly] default: Option<&Value>,
     ) -> R<Value> {
         variance_checks(it, covariant, contravariant, infer_variance)?;
@@ -406,7 +441,9 @@ impl TypeVar {
         let constraints = match constraints.len() {
             0 => None,
             1 => return Err(it.type_error("A single constraint is not allowed")),
-            _ if bound.is_some() => return Err(it.type_error("Constraints cannot be combined with bound=...")),
+            _ if bound.is_some() => {
+                return Err(it.type_error("Constraints cannot be combined with bound=..."));
+            }
             _ => Some(Value::tuple(constraints.to_vec())),
         };
         let module = caller_module(it);
@@ -434,7 +471,9 @@ impl TypeVar {
 
     #[getter(name = "__default__")]
     fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
         let (v, evaluated) = default_of(it, d, e)?;
         if evaluated {
             slf.0.with(it, |d| d.default = Some(v.clone()))?;
@@ -448,11 +487,15 @@ impl TypeVar {
 
     #[getter(name = "__bound__")]
     fn bound(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (bound, eval) = slf.0.with(it, |d| (d.bound.clone(), d.evaluate_bound.clone()))?;
+        let (bound, eval) = slf
+            .0
+            .with(it, |d| (d.bound.clone(), d.evaluate_bound.clone()))?;
         if let Some(b) = bound {
             return Ok(b);
         }
-        let Some(f) = eval else { return Ok(Value::None) };
+        let Some(f) = eval else {
+            return Ok(Value::None);
+        };
         let b = it.call(&f, Vec::new(), Vec::new())?;
         slf.0.with(it, |d| d.bound = Some(b.clone()))?;
         Ok(b)
@@ -460,11 +503,15 @@ impl TypeVar {
 
     #[getter(name = "__constraints__")]
     fn constraints(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (cons, eval) = slf.0.with(it, |d| (d.constraints.clone(), d.evaluate_constraints.clone()))?;
+        let (cons, eval) = slf.0.with(it, |d| {
+            (d.constraints.clone(), d.evaluate_constraints.clone())
+        })?;
         if let Some(c) = cons {
             return Ok(c);
         }
-        let Some(f) = eval else { return Ok(Value::tuple(Vec::new())) };
+        let Some(f) = eval else {
+            return Ok(Value::tuple(Vec::new()));
+        };
         let c = it.call(&f, Vec::new(), Vec::new())?;
         slf.0.with(it, |d| d.constraints = Some(c.clone()))?;
         Ok(c)
@@ -487,12 +534,22 @@ impl TypeVar {
 
     #[proto(repr)]
     fn repr(&self) -> String {
-        variance_repr(&self.name, self.covariant, self.contravariant, self.infer_variance)
+        variance_repr(
+            &self.name,
+            self.covariant,
+            self.contravariant,
+            self.infer_variance,
+        )
     }
 
     #[method(name = "__typing_subst__")]
     fn typing_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] arg: &Value) -> R<Value> {
-        call_typing(it, "_typevar_subst", vec![slf.0.value().clone(), arg.clone()], Vec::new())
+        call_typing(
+            it,
+            "_typevar_subst",
+            vec![slf.0.value().clone(), arg.clone()],
+            Vec::new(),
+        )
     }
 
     #[method(name = "__reduce__")]
@@ -527,16 +584,30 @@ impl ParamSpec {
         it: &mut Interp,
         #[kw] name: StrRef<'_>,
         #[kwonly] bound: Option<&Value>,
-        #[kwonly] #[default(false)] covariant: bool,
-        #[kwonly] #[default(false)] contravariant: bool,
-        #[kwonly] #[default(false)] infer_variance: bool,
+        #[kwonly]
+        #[default(false)]
+        covariant: bool,
+        #[kwonly]
+        #[default(false)]
+        contravariant: bool,
+        #[kwonly]
+        #[default(false)]
+        infer_variance: bool,
         #[kwonly] default: Option<&Value>,
     ) -> R<Value> {
         variance_checks(it, covariant, contravariant, infer_variance)?;
         let default = default_arg(it, default);
         let bound = type_check(it, bound.unwrap_or(&Value::None), "Bound must be a type.")?;
         let module = caller_module(it);
-        let data = ParamSpec { name: name.0.clone(), bound: Some(bound), covariant, contravariant, infer_variance, default, evaluate_default: None };
+        let data = ParamSpec {
+            name: name.0.clone(),
+            bound: Some(bound),
+            covariant,
+            contravariant,
+            infer_variance,
+            default,
+            evaluate_default: None,
+        };
         let v = Py::new(it, data).into_value();
         set_module(it, &v, module);
         Ok(v)
@@ -554,7 +625,9 @@ impl ParamSpec {
 
     #[getter(name = "__default__")]
     fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
         let (v, evaluated) = default_of(it, d, e)?;
         if evaluated {
             slf.0.with(it, |d| d.default = Some(v.clone()))?;
@@ -584,28 +657,60 @@ impl ParamSpec {
     /// Represents positional arguments.
     #[getter]
     fn args(slf: This<Py<Self>>, it: &mut Interp) -> Value {
-        Py::new(it, ParamSpecArgs { origin: slf.0.value().clone() }).into_value()
+        Py::new(
+            it,
+            ParamSpecArgs {
+                origin: slf.0.value().clone(),
+            },
+        )
+        .into_value()
     }
 
     /// Represents keyword arguments.
     #[getter]
     fn kwargs(slf: This<Py<Self>>, it: &mut Interp) -> Value {
-        Py::new(it, ParamSpecKwargs { origin: slf.0.value().clone() }).into_value()
+        Py::new(
+            it,
+            ParamSpecKwargs {
+                origin: slf.0.value().clone(),
+            },
+        )
+        .into_value()
     }
 
     #[proto(repr)]
     fn repr(&self) -> String {
-        variance_repr(&self.name, self.covariant, self.contravariant, self.infer_variance)
+        variance_repr(
+            &self.name,
+            self.covariant,
+            self.contravariant,
+            self.infer_variance,
+        )
     }
 
     #[method(name = "__typing_subst__")]
     fn typing_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] arg: &Value) -> R<Value> {
-        call_typing(it, "_paramspec_subst", vec![slf.0.value().clone(), arg.clone()], Vec::new())
+        call_typing(
+            it,
+            "_paramspec_subst",
+            vec![slf.0.value().clone(), arg.clone()],
+            Vec::new(),
+        )
     }
 
     #[method(name = "__typing_prepare_subst__")]
-    fn typing_prepare_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] alias: &Value, #[kw] args: &Value) -> R<Value> {
-        call_typing(it, "_paramspec_prepare_subst", vec![slf.0.value().clone(), alias.clone(), args.clone()], Vec::new())
+    fn typing_prepare_subst(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] alias: &Value,
+        #[kw] args: &Value,
+    ) -> R<Value> {
+        call_typing(
+            it,
+            "_paramspec_prepare_subst",
+            vec![slf.0.value().clone(), alias.clone(), args.clone()],
+            Vec::new(),
+        )
     }
 
     #[method(name = "__reduce__")]
@@ -642,12 +747,20 @@ fn psattr_repr(it: &mut Interp, origin: &Value, suffix: &str) -> R<String> {
 }
 
 /// `==` / `!=` of two `ParamSpecArgs` (or two `ParamSpecKwargs`): their origins compared.
-fn psattr_cmp(it: &mut Interp, a: &Value, b: &Value, origin: fn(&Value) -> Option<Value>, negate: bool) -> R<Value> {
+fn psattr_cmp(
+    it: &mut Interp,
+    a: &Value,
+    b: &Value,
+    origin: fn(&Value) -> Option<Value>,
+    negate: bool,
+) -> R<Value> {
     let (t1, t2) = (it.type_of(a), it.type_of(b));
     if !std::rc::Rc::ptr_eq(&t1, &t2) {
         return Ok(Value::NotImplemented);
     }
-    let (Some(o1), Some(o2)) = (origin(a), origin(b)) else { return Ok(Value::NotImplemented) };
+    let (Some(o1), Some(o2)) = (origin(a), origin(b)) else {
+        return Ok(Value::NotImplemented);
+    };
     let eq = it.values_eq(&o1, &o2)?;
     Ok(Value::Bool(eq != negate))
 }
@@ -664,7 +777,9 @@ fn kwargs_origin(v: &Value) -> Option<Value> {
 impl ParamSpecArgs {
     #[constructor(hint(py(text_signature = "", arg_name = "paramspecargs")))]
     fn new(#[kw] origin: &Value) -> ParamSpecArgs {
-        ParamSpecArgs { origin: origin.clone() }
+        ParamSpecArgs {
+            origin: origin.clone(),
+        }
     }
 
     #[getter(name = "__origin__")]
@@ -699,7 +814,9 @@ impl ParamSpecArgs {
 impl ParamSpecKwargs {
     #[constructor(hint(py(text_signature = "", arg_name = "paramspeckwargs")))]
     fn new(#[kw] origin: &Value) -> ParamSpecKwargs {
-        ParamSpecKwargs { origin: origin.clone() }
+        ParamSpecKwargs {
+            origin: origin.clone(),
+        }
     }
 
     #[getter(name = "__origin__")]
@@ -735,10 +852,23 @@ impl ParamSpecKwargs {
 #[lumen_bind::methods]
 impl TypeVarTuple {
     #[constructor(hint(py(text_signature = "", arg_name = "typevartuple")))]
-    fn new(_cls: This<Value>, it: &mut Interp, #[kw] name: StrRef<'_>, #[kwonly] default: Option<&Value>) -> R<Value> {
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[kwonly] default: Option<&Value>,
+    ) -> R<Value> {
         let module = caller_module(it);
         let default = default_arg(it, default);
-        let v = Py::new(it, TypeVarTuple { name: name.0.clone(), default, evaluate_default: None }).into_value();
+        let v = Py::new(
+            it,
+            TypeVarTuple {
+                name: name.0.clone(),
+                default,
+                evaluate_default: None,
+            },
+        )
+        .into_value();
         set_module(it, &v, module);
         Ok(v)
     }
@@ -750,7 +880,9 @@ impl TypeVarTuple {
 
     #[getter(name = "__default__")]
     fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (d, e) = slf.0.with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
         let (v, evaluated) = default_of(it, d, e)?;
         if evaluated {
             slf.0.with(it, |d| d.default = Some(v.clone()))?;
@@ -780,8 +912,18 @@ impl TypeVarTuple {
     }
 
     #[method(name = "__typing_prepare_subst__")]
-    fn typing_prepare_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] alias: &Value, #[kw] args: &Value) -> R<Value> {
-        call_typing(it, "_typevartuple_prepare_subst", vec![slf.0.value().clone(), alias.clone(), args.clone()], Vec::new())
+    fn typing_prepare_subst(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] alias: &Value,
+        #[kw] args: &Value,
+    ) -> R<Value> {
+        call_typing(
+            it,
+            "_typevartuple_prepare_subst",
+            vec![slf.0.value().clone(), alias.clone(), args.clone()],
+            Vec::new(),
+        )
     }
 
     #[method(name = "__reduce__")]
@@ -814,14 +956,25 @@ fn new_typealias(it: &mut Interp, data: TypeAliasType, module: Option<Value>) ->
 #[lumen_bind::methods]
 impl TypeAliasType {
     #[constructor(hint(py(text_signature = "", arg_name = "typealias")))]
-    fn new(_cls: This<Value>, it: &mut Interp, #[kw] name: StrRef<'_>, #[kw] value: &Value, #[kwonly] type_params: Option<&Value>) -> R<Value> {
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[kw] value: &Value,
+        #[kwonly] type_params: Option<&Value>,
+    ) -> R<Value> {
         let type_params = match type_params {
             None => None,
             Some(tp) if tp.tuple_items().is_some() => Some(tp.clone()),
             Some(_) => return Err(it.type_error("type_params must be a tuple")),
         };
         let module = caller_module(it);
-        let data = TypeAliasType { name: name.0.clone(), type_params, compute_value: None, value: Some(value.clone()) };
+        let data = TypeAliasType {
+            name: name.0.clone(),
+            type_params,
+            compute_value: None,
+            value: Some(value.clone()),
+        };
         new_typealias(it, data, Some(module))
     }
 
@@ -832,11 +985,15 @@ impl TypeAliasType {
 
     #[getter(name = "__value__")]
     fn value(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
-        let (value, compute) = slf.0.with(it, |d| (d.value.clone(), d.compute_value.clone()))?;
+        let (value, compute) = slf
+            .0
+            .with(it, |d| (d.value.clone(), d.compute_value.clone()))?;
         if let Some(v) = value {
             return Ok(v);
         }
-        let Some(f) = compute else { return Ok(Value::None) };
+        let Some(f) = compute else {
+            return Ok(Value::None);
+        };
         let v = it.call(&f, Vec::new(), Vec::new())?;
         slf.0.with(it, |d| d.value = Some(v.clone()))?;
         Ok(v)
@@ -844,7 +1001,9 @@ impl TypeAliasType {
 
     #[getter(name = "__type_params__")]
     fn type_params(&self) -> Value {
-        self.type_params.clone().unwrap_or_else(|| Value::tuple(Vec::new()))
+        self.type_params
+            .clone()
+            .unwrap_or_else(|| Value::tuple(Vec::new()))
     }
 
     #[getter(name = "__parameters__")]
@@ -870,7 +1029,9 @@ impl TypeAliasType {
 
     #[proto(or)]
     fn or(slf: This<&Value>, it: &mut Interp, right: &Value) -> R<Value> {
-        Ok(it.union_binop(&slf, right)?.unwrap_or(Value::NotImplemented))
+        Ok(it
+            .union_binop(&slf, right)?
+            .unwrap_or(Value::NotImplemented))
     }
 
     #[proto(ror)]
@@ -902,7 +1063,9 @@ fn alias_attr_error(it: &mut Interp, name: &Value) -> Obj {
     let name = name.as_str().unwrap_or("");
     let msg = match name {
         "__name__" | "__type_params__" => "readonly attribute".to_string(),
-        "__value__" | "__parameters__" | "__module__" => format!("attribute '{name}' of 'typing.TypeAliasType' objects is not writable"),
+        "__value__" | "__parameters__" | "__module__" => {
+            format!("attribute '{name}' of 'typing.TypeAliasType' objects is not writable")
+        }
         _ => format!("'typing.TypeAliasType' object has no attribute '{name}'"),
     };
     it.new_exc_str("AttributeError", &msg)
@@ -941,12 +1104,22 @@ impl Generic {
     ///
     #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
     fn class_getitem(cls: This<Value>, it: &mut Interp, params: &Value) -> R<Value> {
-        call_typing(it, "_generic_class_getitem", vec![cls.0, params.clone()], Vec::new())
+        call_typing(
+            it,
+            "_generic_class_getitem",
+            vec![cls.0, params.clone()],
+            Vec::new(),
+        )
     }
 
     /// Function to initialize subclasses.
     #[classmethod(name = "__init_subclass__", hint(py(text_signature = "")))]
-    fn init_subclass(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn init_subclass(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let mut all = vec![cls.0];
         all.extend_from_slice(args);
         call_typing(it, "_generic_init_subclass", all, kwargs.to_vec())
@@ -974,14 +1147,35 @@ pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
         )
         .into_value()),
         INTRINSIC1_PARAMSPEC => {
-            let data = ParamSpec { name: v, bound: None, covariant: false, contravariant: false, infer_variance: true, default: None, evaluate_default: None };
+            let data = ParamSpec {
+                name: v,
+                bound: None,
+                covariant: false,
+                contravariant: false,
+                infer_variance: true,
+                default: None,
+                evaluate_default: None,
+            };
             Ok(Py::new(it, data).into_value())
         }
-        INTRINSIC1_TYPEVARTUPLE => Ok(Py::new(it, TypeVarTuple { name: v, default: None, evaluate_default: None }).into_value()),
+        INTRINSIC1_TYPEVARTUPLE => Ok(Py::new(
+            it,
+            TypeVarTuple {
+                name: v,
+                default: None,
+                evaluate_default: None,
+            },
+        )
+        .into_value()),
         INTRINSIC1_SUBSCRIPT_GENERIC => {
             let params = unpack_typevartuples(it, &v)?;
             let generic = generic_type(it);
-            call_typing(it, "_GenericAlias", vec![Value::Obj(generic), params], Vec::new())
+            call_typing(
+                it,
+                "_GenericAlias",
+                vec![Value::Obj(generic), params],
+                Vec::new(),
+            )
         }
         INTRINSIC1_TYPEALIAS => {
             let items = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
@@ -1073,9 +1267,28 @@ pub mod _typing {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let tv = type_object::<TypeVar>(it);
-        install_getsets::<TypeVar>(it, &tv, &["__name__", "__covariant__", "__contravariant__", "__infer_variance__"]);
+        install_getsets::<TypeVar>(
+            it,
+            &tv,
+            &[
+                "__name__",
+                "__covariant__",
+                "__contravariant__",
+                "__infer_variance__",
+            ],
+        );
         let ps = type_object::<ParamSpec>(it);
-        install_getsets::<ParamSpec>(it, &ps, &["__name__", "__bound__", "__covariant__", "__contravariant__", "__infer_variance__"]);
+        install_getsets::<ParamSpec>(
+            it,
+            &ps,
+            &[
+                "__name__",
+                "__bound__",
+                "__covariant__",
+                "__contravariant__",
+                "__infer_variance__",
+            ],
+        );
         let psa = type_object::<ParamSpecArgs>(it);
         install_getsets::<ParamSpecArgs>(it, &psa, &["__origin__"]);
         let psk = type_object::<ParamSpecKwargs>(it);

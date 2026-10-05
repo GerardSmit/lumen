@@ -106,7 +106,13 @@ fn fd_of(it: &mut Interp, slf: &Py<FileIO>) -> R<i32> {
 }
 
 /// A new `FileIO(file, mode, closefd, opener)` of exactly the native class.
-pub fn new_fileio(it: &mut Interp, file: &Value, mode: &str, closefd: bool, opener: Option<&Value>) -> R<Value> {
+pub fn new_fileio(
+    it: &mut Interp,
+    file: &Value,
+    mode: &str,
+    closefd: bool,
+    opener: Option<&Value>,
+) -> R<Value> {
     let py = Py::new(it, FileIO::empty());
     init(it, &py, file, mode, closefd, opener)?;
     Ok(py.into_value())
@@ -142,13 +148,22 @@ fn bad_mode(it: &mut Interp) -> Obj {
     it.value_error("Must have exactly one of create/read/write/append mode and at most one plus")
 }
 
-fn init(it: &mut Interp, slf: &Py<FileIO>, file: &Value, mode: &str, closefd: bool, opener: Option<&Value>) -> R<()> {
+fn init(
+    it: &mut Interp,
+    slf: &Py<FileIO>,
+    file: &Value,
+    mode: &str,
+    closefd: bool,
+    opener: Option<&Value>,
+) -> R<()> {
     let platform = it.platform.clone();
     {
         let old = std::mem::replace(&mut *slf.borrow_mut(it)?, FileIO::empty());
         drop(old);
     }
-    if matches!(file, Value::Float(_)) || matches!(file, Value::Obj(o) if matches!(o.kind, Kind::Float(_))) {
+    if matches!(file, Value::Float(_))
+        || matches!(file, Value::Obj(o) if matches!(o.kind, Kind::Float(_)))
+    {
         return Err(it.type_error("integer argument expected, got float"));
     }
     let mut fd = -1;
@@ -157,7 +172,8 @@ fn init(it: &mut Interp, slf: &Py<FileIO>, file: &Value, mode: &str, closefd: bo
         if n < 0 {
             return Err(it.value_error("negative file descriptor"));
         }
-        fd = i32::try_from(n).map_err(|_| it.overflow_err("signed integer is greater than maximum"))?;
+        fd = i32::try_from(n)
+            .map_err(|_| it.overflow_err("signed integer is greater than maximum"))?;
     }
     let mut st = FileIO::empty();
     let (mut rwa, mut plus) = (false, false);
@@ -304,7 +320,11 @@ fn readall_fd(it: &mut Interp, slf: &Py<FileIO>) -> R<Value> {
     drop(p);
     let mut out: Vec<u8> = Vec::with_capacity(size_hint);
     loop {
-        let want = if out.len() < size_hint { size_hint - out.len() } else { SMALLCHUNK.max(out.len() / 4) };
+        let want = if out.len() < size_hint {
+            size_hint - out.len()
+        } else {
+            SMALLCHUNK.max(out.len() / 4)
+        };
         let start = out.len();
         out.resize(start + want, 0);
         match read_some(it, fd, &mut out[start..])? {
@@ -431,7 +451,12 @@ impl FileIO {
     /// many platforms allow seeking beyond the end of a file).
     ///
     /// Note that not all file objects are seekable.
-    fn seek(slf: This<Py<Self>>, it: &mut Interp, pos: &Value, #[default(0)] whence: i32) -> R<u64> {
+    fn seek(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        pos: &Value,
+        #[default(0)] whence: i32,
+    ) -> R<u64> {
         let fd = fd_of(it, &slf.0)?;
         if matches!(pos, Value::Float(_)) || !it.has_index(pos) {
             return Err(it.type_error("an integer is required"));
@@ -609,7 +634,10 @@ impl FileIO {
             None => Ok(format!("<{} fd={} mode='{}' closefd={}>", tn, fd, mode, cf)),
             Some(n) => {
                 let r = it.repr_of(&n)?;
-                Ok(format!("<{} name={} mode='{}' closefd={}>", tn, r, mode, cf))
+                Ok(format!(
+                    "<{} name={} mode='{}' closefd={}>",
+                    tn, r, mode, cf
+                ))
             }
         }
     }

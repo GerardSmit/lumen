@@ -1,8 +1,8 @@
 //! Object model: values, heap objects and their payloads.
 
-use crate::pyint::BigInt;
 use crate::bytecode::Code;
 use crate::dict::PyDict;
+use crate::pyint::BigInt;
 use crate::vm::{Frame, Interp};
 pub use lumen_common::buffer::ByteStore;
 use std::cell::{Cell, RefCell};
@@ -48,7 +48,12 @@ pub const GC_FINALIZED: u8 = 1;
 
 impl GcCell {
     pub const fn new() -> GcCell {
-        GcCell { idx: Cell::new(0), seq: Cell::new(0), gen: Cell::new(0), flags: Cell::new(0) }
+        GcCell {
+            idx: Cell::new(0),
+            seq: Cell::new(0),
+            gen: Cell::new(0),
+            flags: Cell::new(0),
+        }
     }
 }
 
@@ -72,7 +77,10 @@ pub(crate) struct IdState {
 }
 
 pub(crate) fn id_state_take() -> IdState {
-    IdState { free: FREE_IDS.with(|f| std::mem::take(&mut *f.borrow_mut())), next: NEXT_ID.with(|n| n.replace(1)) }
+    IdState {
+        free: FREE_IDS.with(|f| std::mem::take(&mut *f.borrow_mut())),
+        next: NEXT_ID.with(|n| n.replace(1)),
+    }
 }
 
 pub(crate) fn id_state_put(state: IdState) {
@@ -142,8 +150,18 @@ impl PyStr {
 
     pub fn from_box(s: Box<str>) -> PyStr {
         let ascii = s.is_ascii();
-        let nchars = if ascii { s.len() } else { lumen_common::smuggle::count_code_points(&s) };
-        PyStr { s, ascii, nchars, hash: Cell::new(0), hashed: Cell::new(false) }
+        let nchars = if ascii {
+            s.len()
+        } else {
+            lumen_common::smuggle::count_code_points(&s)
+        };
+        PyStr {
+            s,
+            ascii,
+            nchars,
+            hash: Cell::new(0),
+            hashed: Cell::new(false),
+        }
     }
 
     pub fn hash(&self) -> i64 {
@@ -333,20 +351,68 @@ pub enum ViewKind {
 }
 
 pub enum IterState {
-    List { list: Obj, idx: usize },
-    Tuple { tup: Obj, idx: usize },
-    Str { s: Obj, pos: usize },
-    Bytes { b: Obj, idx: usize },
-    Range { cur: i64, stop: i64, step: i64 },
-    Dict { dict: Obj, pos: usize, len: usize, kind: ViewKind },
-    Set { set: Obj, pos: usize, len: usize },
-    Seq { obj: Value, idx: i64 },
-    CallIter { f: Value, sentinel: Value, done: bool },
-    Reversed { seq: Value, idx: i64 },
-    Enumerate { it: Value, idx: i64 },
-    Zip { its: Vec<Value>, strict: bool },
-    Map { f: Value, its: Vec<Value>, strict: bool },
-    Filter { f: Value, it: Value },
+    List {
+        list: Obj,
+        idx: usize,
+    },
+    Tuple {
+        tup: Obj,
+        idx: usize,
+    },
+    Str {
+        s: Obj,
+        pos: usize,
+    },
+    Bytes {
+        b: Obj,
+        idx: usize,
+    },
+    Range {
+        cur: i64,
+        stop: i64,
+        step: i64,
+    },
+    Dict {
+        dict: Obj,
+        pos: usize,
+        len: usize,
+        kind: ViewKind,
+    },
+    Set {
+        set: Obj,
+        pos: usize,
+        len: usize,
+    },
+    Seq {
+        obj: Value,
+        idx: i64,
+    },
+    CallIter {
+        f: Value,
+        sentinel: Value,
+        done: bool,
+    },
+    Reversed {
+        seq: Value,
+        idx: i64,
+    },
+    Enumerate {
+        it: Value,
+        idx: i64,
+    },
+    Zip {
+        its: Vec<Value>,
+        strict: bool,
+    },
+    Map {
+        f: Value,
+        its: Vec<Value>,
+        strict: bool,
+    },
+    Filter {
+        f: Value,
+        it: Value,
+    },
     Native(Box<dyn FnMut(&mut Interp) -> R<Option<Value>>>),
     /// A `Native` iterator whose step is running (its closure is out of the cell).
     Running,
@@ -410,15 +476,33 @@ impl Object {
     }
 
     pub fn new(kind: Kind) -> Obj {
-        Object::alloc(Object { cls: None, dict: RefCell::new(None), id: Cell::new(0), gc: GcCell::new(), kind })
+        Object::alloc(Object {
+            cls: None,
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            gc: GcCell::new(),
+            kind,
+        })
     }
 
     pub fn with_cls(cls: Obj, kind: Kind) -> Obj {
-        Object::alloc(Object { cls: Some(cls), dict: RefCell::new(None), id: Cell::new(0), gc: GcCell::new(), kind })
+        Object::alloc(Object {
+            cls: Some(cls),
+            dict: RefCell::new(None),
+            id: Cell::new(0),
+            gc: GcCell::new(),
+            kind,
+        })
     }
 
     pub fn with_dict(kind: Kind, dict: Obj) -> Obj {
-        Object::alloc(Object { cls: None, dict: RefCell::new(Some(dict)), id: Cell::new(0), gc: GcCell::new(), kind })
+        Object::alloc(Object {
+            cls: None,
+            dict: RefCell::new(Some(dict)),
+            id: Cell::new(0),
+            gc: GcCell::new(),
+            kind,
+        })
     }
 
     pub fn type_data(&self) -> Option<&TypeData> {
@@ -541,7 +625,9 @@ impl Value {
 
     pub fn is(&self, o: &Value) -> bool {
         match (self, o) {
-            (Value::None, Value::None) | (Value::NotImplemented, Value::NotImplemented) | (Value::Ellipsis, Value::Ellipsis) => true,
+            (Value::None, Value::None)
+            | (Value::NotImplemented, Value::NotImplemented)
+            | (Value::Ellipsis, Value::Ellipsis) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Int(a), Value::Int(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
@@ -633,7 +719,16 @@ pub fn ba_store(v: Vec<u8>) -> Rc<ByteStore> {
 /// types); tuples only when they hold something that can.
 pub fn kind_tracked(k: &Kind) -> bool {
     match k {
-        Kind::Str(_) | Kind::Int(_) | Kind::Float(_) | Kind::Complex(..) | Kind::Bytes(_) | Kind::ByteArray(_) | Kind::Code(_) | Kind::Range(_) | Kind::BigRange(_) | Kind::Frame => false,
+        Kind::Str(_)
+        | Kind::Int(_)
+        | Kind::Float(_)
+        | Kind::Complex(..)
+        | Kind::Bytes(_)
+        | Kind::ByteArray(_)
+        | Kind::Code(_)
+        | Kind::Range(_)
+        | Kind::BigRange(_)
+        | Kind::Frame => false,
         Kind::Tuple(items) => items.iter().any(|v| matches!(v, Value::Obj(_))),
         _ => true,
     }

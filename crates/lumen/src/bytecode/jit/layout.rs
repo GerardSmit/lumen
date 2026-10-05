@@ -205,7 +205,7 @@ fn layout() -> Option<&'static Layout> {
 const ELEM_SIZE: i64 = std::mem::size_of::<crate::value::PackedValue>() as i64;
 
 /// Continue in a fresh block when `ok` (I32) is non-zero, else branch to `miss`.
-fn guard(fb: &mut FunctionBuilder, ok: IrValue, miss: Block) {
+pub(crate) fn guard(fb: &mut FunctionBuilder, ok: IrValue, miss: Block) {
     let next = fb.create_block();
     fb.brif(ok, next, &[], miss, &[]);
     fb.seal_block(next);
@@ -248,7 +248,13 @@ fn object(fb: &mut FunctionBuilder, l: &Layout, v: IrValue, miss: Block, write: 
     let free = if write {
         cmp_imm(fb, IntCC::Eq, Type::I32, flag, 0)
     } else {
-        cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64)
+        cmp_imm(
+            fb,
+            IntCC::Ult,
+            Type::I32,
+            flag,
+            crate::value::BORROW_MUT as i64,
+        )
     };
     guard(fb, free, miss);
     gc
@@ -377,7 +383,12 @@ fn element_prop(
 /// The address of element 0's `Property` of the object in `v` when its elements are packed
 /// storage holding at least `n` entries (so its `length` is at least `n`); else branch to
 /// `miss`. Read the entries with [`packed_word`].
-pub(crate) fn packed_prefix(fb: &mut FunctionBuilder, v: IrValue, n: usize, miss: Block) -> IrValue {
+pub(crate) fn packed_prefix(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    n: usize,
+    miss: Block,
+) -> IrValue {
     let Some(l) = layout() else {
         always_miss(fb, miss);
         return fb.iconst(PTR, 0);
@@ -395,7 +406,12 @@ pub(crate) fn packed_prefix(fb: &mut FunctionBuilder, v: IrValue, n: usize, miss
 }
 
 /// The NaN-boxed word of packed entry `j` from [`packed_prefix`]'s `base`, guarded not a hole.
-pub(crate) fn packed_word(fb: &mut FunctionBuilder, base: IrValue, j: usize, miss: Block) -> IrValue {
+pub(crate) fn packed_word(
+    fb: &mut FunctionBuilder,
+    base: IrValue,
+    j: usize,
+    miss: Block,
+) -> IrValue {
     if layout().is_none() {
         always_miss(fb, miss);
         return fb.iconst(Type::I64, 0);
@@ -685,7 +701,13 @@ pub(crate) fn str_ascii_unit(
         return fb.iconst(Type::I32, 0);
     };
     let cap = fb.load(MemKind::I32, hdr, l.str_cap);
-    let ascii = bin_imm(fb, BinaryOp::Band, Type::I32, cap, crate::lstr::ASCII_HINT as i64);
+    let ascii = bin_imm(
+        fb,
+        BinaryOp::Band,
+        Type::I32,
+        cap,
+        crate::lstr::ASCII_HINT as i64,
+    );
     let ascii = cmp_imm(fb, IntCC::Ne, Type::I32, ascii, 0);
     guard(fb, ascii, miss);
     let i = index_ptr(fb, index, miss);
@@ -1073,7 +1095,13 @@ fn proto_hop(
     let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
     guard(fb, some, miss);
     let flag = fb.load(MemKind::I32U16, p, l.borrow);
-    let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
+    let free = cmp_imm(
+        fb,
+        IntCC::Ult,
+        Type::I32,
+        flag,
+        crate::value::BORROW_MUT as i64,
+    );
     guard(fb, free, miss);
     exotic_is(fb, l, p, kinds, miss);
     let sh = fb.load(MemKind::I32, p, l.shape);
@@ -1084,7 +1112,12 @@ fn proto_hop(
 
 /// `v.<prop>` via the baked IC as a Number (F64): misses unless it is a data property holding
 /// one.
-pub(crate) fn prop_get_num(fb: &mut FunctionBuilder, v: IrValue, ic: &PropIc, miss: Block) -> IrValue {
+pub(crate) fn prop_get_num(
+    fb: &mut FunctionBuilder,
+    v: IrValue,
+    ic: &PropIc,
+    miss: Block,
+) -> IrValue {
     let Some(l) = layout() else {
         always_miss(fb, miss);
         return fb.f64const(0.0);
@@ -1229,7 +1262,9 @@ pub(crate) struct CreateWay {
 pub(crate) fn create_ic(chunk: &Chunk, cache: u32) -> Vec<CreateWay> {
     let mut ways: Vec<CreateWay> = Vec::new();
     for k in 0..PROP_IC_WAYS {
-        let Some(cell) = chunk.caches.get(cache as usize + k) else { break };
+        let Some(cell) = chunk.caches.get(cache as usize + k) else {
+            break;
+        };
         let st = cell.get();
         if st.depth != crate::bytecode::IC_CREATE || ways.iter().any(|w| w.recv == st.recv_shape) {
             continue;
@@ -1289,7 +1324,13 @@ pub(crate) fn prop_create(
     let shape = fb.load(MemKind::I32, gc, l.shape);
     let len = fb.load(MemKind::I32, gc, l.entries_len);
     let cap = fb.load(MemKind::I32, gc, l.entries_cap);
-    let cap = bin_imm(fb, BinaryOp::Band, Type::I32, cap, l.cap_slots as i32 as i64);
+    let cap = bin_imm(
+        fb,
+        BinaryOp::Band,
+        Type::I32,
+        cap,
+        l.cap_slots as i32 as i64,
+    );
     // The prototype as the fill records it (`Gc::as_ptr`, 0 for none).
     let proto = fb.load(PTR_MEM, gc, l.proto);
     let z = fb.iconst(PTR, 0);
@@ -1316,7 +1357,13 @@ pub(crate) fn prop_create(
         // The way still records this creation, for this prototype, at this epoch.
         let c = fb.iconst(PTR, w.cell as i64);
         let depth = fb.load(MemKind::I32U8, c, o(offset_of!(IcState, depth)));
-        let ok = cmp_imm(fb, IntCC::Eq, Type::I32, depth, crate::bytecode::IC_CREATE as i64);
+        let ok = cmp_imm(
+            fb,
+            IntCC::Eq,
+            Type::I32,
+            depth,
+            crate::bytecode::IC_CREATE as i64,
+        );
         let rs = fb.load(MemKind::I32, c, o(offset_of!(IcState, recv_shape)));
         let ok2 = cmp_imm(fb, IntCC::Eq, Type::I32, rs, w.recv as i32 as i64);
         let ok = fb.binary(BinaryOp::Band, ok, ok2);
@@ -1500,7 +1547,13 @@ pub(crate) fn gc_probe(
         return;
     };
     let flag = fb.load(MemKind::I32U16, gc, l.borrow);
-    let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
+    let free = cmp_imm(
+        fb,
+        IntCC::Ult,
+        Type::I32,
+        flag,
+        crate::value::BORROW_MUT as i64,
+    );
     guard(fb, free, miss);
     probe_chain(fb, l, gc, shapes, off, want, slot, miss);
 }
@@ -1556,7 +1609,13 @@ fn probe_chain(
             let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
             guard(fb, some, miss);
             let flag = fb.load(MemKind::I32U16, p, l.borrow);
-            let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
+            let free = cmp_imm(
+                fb,
+                IntCC::Ult,
+                Type::I32,
+                flag,
+                crate::value::BORROW_MUT as i64,
+            );
             guard(fb, free, miss);
             gc = p;
         }
@@ -1622,7 +1681,12 @@ pub(crate) fn shaped_entries(
 }
 
 /// The NaN-boxed word of entry `slot` (of [`shaped_entries`] `base`); misses on an accessor.
-pub(crate) fn entry_word(fb: &mut FunctionBuilder, base: IrValue, slot: u32, miss: Block) -> IrValue {
+pub(crate) fn entry_word(
+    fb: &mut FunctionBuilder,
+    base: IrValue,
+    slot: u32,
+    miss: Block,
+) -> IrValue {
     let Some((l, off)) = layout().and_then(|l| Some((l, entry_off(l, slot)?))) else {
         always_miss(fb, miss);
         return fb.iconst(Type::I64, 0);
@@ -1818,7 +1882,13 @@ pub(crate) fn accessor_probe(
             let some = cmp_imm(fb, IntCC::Ne, PTR, p, 0);
             guard(fb, some, miss);
             let flag = fb.load(MemKind::I32U16, p, l.borrow);
-            let free = cmp_imm(fb, IntCC::Ult, Type::I32, flag, crate::value::BORROW_MUT as i64);
+            let free = cmp_imm(
+                fb,
+                IntCC::Ult,
+                Type::I32,
+                flag,
+                crate::value::BORROW_MUT as i64,
+            );
             guard(fb, free, miss);
             gc = p;
         }
@@ -1835,7 +1905,9 @@ pub(crate) fn accessor_probe(
     let acc = bin_imm(fb, BinaryOp::Band, PTR, meta, PROP_ACCESSOR as i64);
     let is_acc = cmp_imm(fb, IntCC::Ne, PTR, acc, 0);
     guard(fb, is_acc, miss);
-    let flags = (PROP_ACCESSOR | PROP_WRITABLE | crate::value::PROP_ENUMERABLE
+    let flags = (PROP_ACCESSOR
+        | PROP_WRITABLE
+        | crate::value::PROP_ENUMERABLE
         | crate::value::PROP_CONFIGURABLE) as i64;
     let boxp = bin_imm(fb, BinaryOp::Band, PTR, meta, !flags);
     let some = cmp_imm(fb, IntCC::Ne, PTR, boxp, 0);

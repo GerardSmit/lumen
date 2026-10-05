@@ -12,8 +12,21 @@ use std::rc::Rc;
 fn weak_target(it: &mut Interp, v: &Value) -> R<Obj> {
     let ok = match v {
         Value::Obj(o) => match &o.kind {
-            Kind::Str(_) | Kind::Int(_) | Kind::Float(_) | Kind::Complex(..) | Kind::Tuple(_) | Kind::List(_) | Kind::Dict(_) | Kind::Bytes(_) | Kind::ByteArray(_) => o.cls.is_some(),
-            Kind::Slice(..) | Kind::Range(_) | Kind::BigRange(_) | Kind::Iter(_) | Kind::Cell(_) | Kind::Code(_) => o.cls.is_some(),
+            Kind::Str(_)
+            | Kind::Int(_)
+            | Kind::Float(_)
+            | Kind::Complex(..)
+            | Kind::Tuple(_)
+            | Kind::List(_)
+            | Kind::Dict(_)
+            | Kind::Bytes(_)
+            | Kind::ByteArray(_) => o.cls.is_some(),
+            Kind::Slice(..)
+            | Kind::Range(_)
+            | Kind::BigRange(_)
+            | Kind::Iter(_)
+            | Kind::Cell(_)
+            | Kind::Code(_) => o.cls.is_some(),
             _ => true,
         },
         _ => false,
@@ -34,11 +47,17 @@ fn referent(v: &Value) -> Option<Option<Obj>> {
 fn arity(it: &mut Interp, name: &str, given: usize, min: usize, max: usize) -> R<()> {
     if given < min {
         let s = if min == 1 { "" } else { "s" };
-        return Err(it.type_error(&format!("{} expected at least {} argument{}, got {}", name, min, s, given)));
+        return Err(it.type_error(&format!(
+            "{} expected at least {} argument{}, got {}",
+            name, min, s, given
+        )));
     }
     if given > max {
         let s = if max == 1 { "" } else { "s" };
-        return Err(it.type_error(&format!("{} expected at most {} argument{}, got {}", name, max, s, given)));
+        return Err(it.type_error(&format!(
+            "{} expected at most {} argument{}, got {}",
+            name, max, s, given
+        )));
     }
     Ok(())
 }
@@ -46,21 +65,39 @@ fn arity(it: &mut Interp, name: &str, given: usize, min: usize, max: usize) -> R
 #[lumen_bind::methods]
 impl WeakRefData {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let _ = kwargs;
         arity(it, "__new__", args.len(), 1, 2)?;
-        let Value::Obj(cls) = &*cls else { return Err(it.type_error("ref.__new__(X): X is not a type object")) };
+        let Value::Obj(cls) = &*cls else {
+            return Err(it.type_error("ref.__new__(X): X is not a type object"));
+        };
         let target = weak_target(it, &args[0])?;
         let callback = args.get(1).cloned().unwrap_or(Value::None);
         if callback.is_none() && Rc::ptr_eq(cls, &type_object::<WeakRefData>(it)) {
             for r in weak::live_refs(&target) {
-                let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, cls)) && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| d.callback.is_none()).unwrap_or(false);
+                let reusable = matches!(&r.cls, Some(c) if Rc::ptr_eq(c, cls))
+                    && with_opaque::<WeakRefData, bool>(&Value::Obj(r.clone()), |d| {
+                        d.callback.is_none()
+                    })
+                    .unwrap_or(false);
                 if reusable {
                     return Ok(Value::Obj(r));
                 }
             }
         }
-        let v = opaque_instance(cls, WeakRefData { target: Rc::downgrade(&target), callback, hash: None });
+        let v = opaque_instance(
+            cls,
+            WeakRefData {
+                target: Rc::downgrade(&target),
+                callback,
+                hash: None,
+            },
+        );
         if let Value::Obj(o) = &v {
             weak::register(&target, o);
         }
@@ -68,13 +105,23 @@ impl WeakRefData {
     }
 
     #[proto(init)]
-    fn init(slf: This<&Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<&Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let _ = (slf, kwargs);
         arity(it, "__init__", args.len(), 1, 2)
     }
 
     #[proto(call)]
-    fn call(&self, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn call(
+        &self,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         if !kwargs.is_empty() {
             return Err(it.type_error("weakref() takes no keyword arguments"));
         }
@@ -93,7 +140,9 @@ impl WeakRefData {
         if let Some(h) = cached {
             return Ok(h);
         }
-        let Some(o) = target else { return Err(it.type_error("weak object has gone away")) };
+        let Some(o) = target else {
+            return Err(it.type_error("weak object has gone away"));
+        };
         let h = it.hash_value(&Value::Obj(o))?;
         slf.0.borrow_mut(it)?.hash = Some(h);
         Ok(h)
@@ -139,7 +188,12 @@ impl WeakRefData {
         match referent(slf.0.value()).flatten() {
             Some(o) => {
                 let t = it.type_name_of(&Value::Obj(o.clone()));
-                format!("<weakref at {:#x}; to '{}' at {:#x}>", id, t, it.id_of(&Value::Obj(o)))
+                format!(
+                    "<weakref at {:#x}; to '{}' at {:#x}>",
+                    id,
+                    t,
+                    it.id_of(&Value::Obj(o))
+                )
             }
             None => format!("<weakref at {:#x}; dead>", id),
         }
@@ -174,14 +228,20 @@ fn ref_eq(it: &mut Interp, a: &Value, b: &Value, ne: bool) -> R<Value> {
 fn proxy_target(it: &mut Interp, p: &Py<ProxyData>) -> R<Value> {
     match p.borrow(it)?.target.upgrade() {
         Some(o) => Ok(Value::Obj(o)),
-        None => Err(it.new_exc_str("ReferenceError", "weakly-referenced object no longer exists")),
+        None => Err(it.new_exc_str(
+            "ReferenceError",
+            "weakly-referenced object no longer exists",
+        )),
     }
 }
 
 fn unproxy(it: &mut Interp, v: &Value) -> R<Value> {
     match with_opaque::<ProxyData, _>(v, |d| d.target.upgrade()) {
         Some(Some(o)) => Ok(Value::Obj(o)),
-        Some(None) => Err(it.new_exc_str("ReferenceError", "weakly-referenced object no longer exists")),
+        Some(None) => Err(it.new_exc_str(
+            "ReferenceError",
+            "weakly-referenced object no longer exists",
+        )),
         None => Ok(v.clone()),
     }
 }
@@ -239,8 +299,18 @@ impl ProxyData {
     #[proto(repr)]
     fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
         let id = it.id_of(slf.0.value());
-        let t = slf.0.borrow(it)?.target.upgrade().map_or(Value::None, Value::Obj);
-        Ok(format!("<weakproxy at {:#x} to {} at {:#x}>", id, it.type_name_of(&t), it.id_of(&t)))
+        let t = slf
+            .0
+            .borrow(it)?
+            .target
+            .upgrade()
+            .map_or(Value::None, Value::Obj);
+        Ok(format!(
+            "<weakproxy at {:#x} to {} at {:#x}>",
+            id,
+            it.type_name_of(&t),
+            it.id_of(&t)
+        ))
     }
 
     #[proto(str)]
@@ -586,7 +656,12 @@ pub struct CallableProxy;
 #[lumen_bind::methods]
 impl CallableProxy {
     #[proto(call)]
-    fn call(slf: This<Py<ProxyData>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn call(
+        slf: This<Py<ProxyData>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let t = proxy_target(it, &slf.0)?;
         it.call(&t, args.to_vec(), kwargs.to_vec())
     }
@@ -605,8 +680,18 @@ pub mod _weakref {
     fn proxy(it: &mut Interp, object: &Value, callback: Option<&Value>) -> R<Value> {
         let target = weak_target(it, object)?;
         let callback = callback.cloned().unwrap_or(Value::None);
-        let cls = if it.is_callable(object) { type_object::<CallableProxy>(it) } else { type_object::<ProxyData>(it) };
-        let v = opaque_instance(&cls, ProxyData { target: Rc::downgrade(&target), callback });
+        let cls = if it.is_callable(object) {
+            type_object::<CallableProxy>(it)
+        } else {
+            type_object::<ProxyData>(it)
+        };
+        let v = opaque_instance(
+            &cls,
+            ProxyData {
+                target: Rc::downgrade(&target),
+                callback,
+            },
+        );
         if let Value::Obj(o) = &v {
             weak::register(&target, o);
         }
@@ -638,7 +723,10 @@ pub mod _weakref {
             Value::Obj(d) if matches!(d.kind, Kind::Dict(_)) => d,
             _ => {
                 let t = it.type_name_of(dct);
-                return Err(it.type_error(&format!("_remove_dead_weakref() argument 1 must be dict, not {}", t)));
+                return Err(it.type_error(&format!(
+                    "_remove_dead_weakref() argument 1 must be dict, not {}",
+                    t
+                )));
             }
         };
         if let Some(r) = it.dict_get(d, key)? {
@@ -658,9 +746,13 @@ pub mod _weakref {
         let callable = type_object::<CallableProxy>(it);
         crate::bind::install_all::<ProxyData>(&callable);
         let d = it.module_dict(m);
-        for (name, ty) in [("ReferenceType", &refty), ("ref", &refty), ("ProxyType", &proxy), ("CallableProxyType", &callable)] {
+        for (name, ty) in [
+            ("ReferenceType", &refty),
+            ("ref", &refty),
+            ("ProxyType", &proxy),
+            ("CallableProxyType", &callable),
+        ] {
             dict_set_str(&d, name, Value::Obj(ty.clone()));
         }
     }
 }
-

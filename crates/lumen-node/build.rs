@@ -367,7 +367,10 @@ fn main() {
             name: file.name,
             wrap: file.wrap,
             lazy: LAZY.contains(&file.name),
-            feature: GATED.iter().find(|(name, _)| *name == file.name).map(|(_, f)| *f),
+            feature: GATED
+                .iter()
+                .find(|(name, _)| *name == file.name)
+                .map(|(_, f)| *f),
         })
         .collect();
     let feature_on = |f: &str| std::env::var_os(format!("CARGO_FEATURE_{f}")).is_some();
@@ -379,8 +382,12 @@ fn main() {
     let mem_marks = std::env::var_os("LUMEN_GLUE_MEM_MARKS").is_some();
     let glue = glue::assemble(&entries, read, feature_on, mem_marks);
 
-    let blob = lumen::precompiled::precompile_glue(&glue, "node-glue")
-        .unwrap_or_else(|e| panic!("node glue failed to precompile: {e}"));
+    let blob = if std::env::var_os("CARGO_FEATURE_COMPILER").is_some() {
+        lumen::precompiled::precompile_glue(&glue, "node-glue")
+    } else {
+        lumen_aot::native::precompile_glue_for_build(&glue, "node-glue")
+    }
+    .unwrap_or_else(|e| panic!("node glue failed to precompile: {e}"));
 
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     // node_glue.js is for reference only (not linked).
@@ -444,7 +451,10 @@ fn generate_esm_exports(js: &str) -> String {
             );
         }
     }
-    assert!(!entries.is_empty() && !process.is_empty(), "esm_exports.js: nothing parsed");
+    assert!(
+        !entries.is_empty() && !process.is_empty(),
+        "esm_exports.js: nothing parsed"
+    );
     entries.push(("process".to_string(), process.join(" ")));
     let mut out = String::from("/// Each builtin's ESM named exports, space-separated (generated from esm_exports.js).\npub static ESM_EXPORTS: &[(&str, &str)] = &[\n");
     for (name, list) in &entries {

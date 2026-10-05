@@ -26,7 +26,9 @@ impl Interp {
 
     pub fn compile_eval_str(&mut self, src: &str, filename: &str) -> R<Rc<crate::bytecode::Code>> {
         let text = src.trim();
-        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || crate::parser::parse(text, filename));
+        let parsed = crate::limits::with_literal_digit_limit(self.int_max_str_digits, || {
+            crate::parser::parse(text, filename)
+        });
         let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), text)),
@@ -65,12 +67,20 @@ fn radix_str(it: &mut Interp, v: &Value, radix: u32, prefix: &str) -> R<String> 
                 BigInt::from_i64(it.index_of(v)?)
             } else {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+                return Err(it.type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    t
+                )));
             }
         }
     };
     let s = n.abs().to_string_radix(radix);
-    Ok(format!("{}{}{}", if n.is_negative() { "-" } else { "" }, prefix, s))
+    Ok(format!(
+        "{}{}{}",
+        if n.is_negative() { "-" } else { "" },
+        prefix,
+        s
+    ))
 }
 
 fn attr_name(it: &mut Interp, v: &Value) -> R<Obj> {
@@ -94,7 +104,10 @@ fn async_call(it: &mut Interp, v: &Value, special: &str, what: &str) -> R<Value>
 }
 
 pub(crate) fn frame_globals(it: &Interp) -> Obj {
-    it.frames.last().map(|f| f.globals.clone()).unwrap_or_else(|| it.builtins.clone())
+    it.frames
+        .last()
+        .map(|f| f.globals.clone())
+        .unwrap_or_else(|| it.builtins.clone())
 }
 
 /// `locals()`: the frame's namespace, or a snapshot of its fast locals and cells.
@@ -129,7 +142,14 @@ pub(crate) fn locals_value(it: &mut Interp) -> Value {
     Value::Obj(d)
 }
 
-fn minmax(it: &mut Interp, a: &[Value], key: Option<&Value>, default: Option<&Value>, name: &str, want_max: bool) -> R<Value> {
+fn minmax(
+    it: &mut Interp,
+    a: &[Value],
+    key: Option<&Value>,
+    default: Option<&Value>,
+    name: &str,
+    want_max: bool,
+) -> R<Value> {
     if a.is_empty() {
         return Err(it.type_error(&format!("{} expected at least 1 argument, got 0", name)));
     }
@@ -139,7 +159,10 @@ fn minmax(it: &mut Interp, a: &[Value], key: Option<&Value>, default: Option<&Va
         it.get_iter(&a[0])?
     } else {
         if default.is_some() {
-            return Err(it.type_error(&format!("Cannot specify a default for {}() with multiple positional arguments", name)));
+            return Err(it.type_error(&format!(
+                "Cannot specify a default for {}() with multiple positional arguments",
+                name
+            )));
         }
         it.get_iter(&Value::tuple(a.to_vec()))?
     };
@@ -149,7 +172,11 @@ fn minmax(it: &mut Interp, a: &[Value], key: Option<&Value>, default: Option<&Va
             None => Err(it.value_error(&format!("{}() iterable argument is empty", name))),
         };
     };
-    let op = if want_max { crate::ast::CmpOp::Gt } else { crate::ast::CmpOp::Lt };
+    let op = if want_max {
+        crate::ast::CmpOp::Gt
+    } else {
+        crate::ast::CmpOp::Lt
+    };
     let mut best = first;
     let mut best_key = match &key {
         None => best.clone(),
@@ -185,7 +212,7 @@ fn round_number(it: &mut Interp, x: &Value, nd: Option<&Value>) -> R<Value> {
                     return Ok(match x {
                         Value::Bool(b) => Value::Int(*b as i64),
                         _ => x.clone(),
-                    })
+                    });
                 }
                 Some(n) => it.index_of(n)?,
             };
@@ -224,7 +251,11 @@ fn round_number(it: &mut Interp, x: &Value, nd: Option<&Value>) -> R<Value> {
                     return Ok(Value::Float(0.0 * f));
                 }
                 if n >= 0 {
-                    let s = lumen_common::float::format::fixed(f, n as usize, lumen_common::rounding::Mode::HalfEven);
+                    let s = lumen_common::float::format::fixed(
+                        f,
+                        n as usize,
+                        lumen_common::rounding::Mode::HalfEven,
+                    );
                     Ok(Value::Float(s.parse::<f64>().map_or(f, |r| r.copysign(f))))
                 } else {
                     let p = fmath::powi(10.0, (-n) as i32);
@@ -278,7 +309,11 @@ fn sum_values(it: &mut Interp, iterable: &Value, mut acc: Value) -> R<Value> {
             };
             if let Some(xf) = xf {
                 let t = s + xf;
-                let nc = if s.abs() >= xf.abs() { c + ((s - t) + xf) } else { c + ((xf - t) + s) };
+                let nc = if s.abs() >= xf.abs() {
+                    c + ((s - t) + xf)
+                } else {
+                    c + ((xf - t) + s)
+                };
                 fsum = Some((t, nc));
                 continue;
             }
@@ -299,7 +334,11 @@ fn sum_values(it: &mut Interp, iterable: &Value, mut acc: Value) -> R<Value> {
                     _ => 0.0,
                 };
                 let t = *p + xf;
-                let c = if p.abs() >= xf.abs() { (*p - t) + xf } else { (xf - t) + *p };
+                let c = if p.abs() >= xf.abs() {
+                    (*p - t) + xf
+                } else {
+                    (xf - t) + *p
+                };
                 fsum = Some((t, c));
                 continue;
             }
@@ -312,7 +351,14 @@ fn sum_values(it: &mut Interp, iterable: &Value, mut acc: Value) -> R<Value> {
     Ok(acc)
 }
 
-fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: Option<&Value>, closure: Option<&Value>, is_eval: bool) -> R<Value> {
+fn eval_exec(
+    it: &mut Interp,
+    source: &Value,
+    globals: Option<&Value>,
+    locals: Option<&Value>,
+    closure: Option<&Value>,
+    is_eval: bool,
+) -> R<Value> {
     let name = if is_eval { "eval" } else { "exec" };
     let globals_d = match globals {
         None => frame_globals(it),
@@ -342,7 +388,12 @@ fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: O
             return Err(it.type_error(&format!("locals must be a mapping or None, not {}", t)));
         }
     };
-    let bad = |it: &mut Interp| it.type_error(&format!("{}() arg 1 must be a string, bytes or code object", name));
+    let bad = |it: &mut Interp| {
+        it.type_error(&format!(
+            "{}() arg 1 must be a string, bytes or code object",
+            name
+        ))
+    };
     let code = match source {
         Value::Obj(o) => match &o.kind {
             Kind::Code(c) => c.clone(),
@@ -379,7 +430,9 @@ fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: O
                 if items.len() == nfree {
                     for v in items {
                         match v {
-                            Value::Obj(cell) if matches!(cell.kind, Kind::Cell(_)) => cells.push(cell.clone()),
+                            Value::Obj(cell) if matches!(cell.kind, Kind::Cell(_)) => {
+                                cells.push(cell.clone())
+                            }
                             _ => break,
                         }
                     }
@@ -387,7 +440,9 @@ fn eval_exec(it: &mut Interp, source: &Value, globals: Option<&Value>, locals: O
             }
         }
         if cells.len() != nfree {
-            return Err(it.type_error(&format!("code object requires a closure of exactly length {nfree}")));
+            return Err(it.type_error(&format!(
+                "code object requires a closure of exactly length {nfree}"
+            )));
         }
     }
     if dict_get_str(&globals_d, "__builtins__").is_none() {
@@ -411,7 +466,13 @@ fn fs_filename(it: &mut Interp, v: &Value) -> R<String> {
 
 const PY_CF_ONLY_AST: i64 = 0x400;
 
-fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &str, flags: i64) -> R<Value> {
+fn compile_source(
+    it: &mut Interp,
+    mut source: Value,
+    filename: &Value,
+    mode: &str,
+    flags: i64,
+) -> R<Value> {
     let filename = fs_filename(it, filename)?;
     let ast_mode = match mode {
         "exec" => super::astconv::Mode::Exec,
@@ -420,7 +481,9 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         "func_type" if flags & PY_CF_ONLY_AST != 0 => {
             return Err(it.value_error("compile() mode 'func_type' is not supported"));
         }
-        "func_type" => return Err(it.value_error("compile() mode 'func_type' requires flag PyCF_ONLY_AST")),
+        "func_type" => {
+            return Err(it.value_error("compile() mode 'func_type' requires flag PyCF_ONLY_AST"));
+        }
         _ => return Err(it.value_error("compile() mode must be 'exec', 'eval' or 'single'")),
     };
     if crate::bind::is_instance::<super::astm::_ast::AST>(it, &source) {
@@ -433,27 +496,45 @@ fn compile_source(it: &mut Interp, mut source: Value, filename: &Value, mode: &s
         source = it.call(&unparse, vec![source], Vec::new())?;
     }
     let src = match &source {
-        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => o.as_str_kind().unwrap_or("").to_string(),
+        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => {
+            o.as_str_kind().unwrap_or("").to_string()
+        }
         _ => match crate::builtins::memview::contiguous_bytes(it, &source)? {
             Some(bytes) => it.decode_source(&bytes, &filename)?,
-            None => return Err(it.type_error("compile() arg 1 must be a string, bytes or AST object")),
+            None => {
+                return Err(it.type_error("compile() arg 1 must be a string, bytes or AST object"));
+            }
         },
     };
     if src.contains('\0') {
-        let e = it.syntax_error("source code string cannot contain null bytes", &filename, 0, None, "");
+        let e = it.syntax_error(
+            "source code string cannot contain null bytes",
+            &filename,
+            0,
+            None,
+            "",
+        );
         if let Some(d) = e.dict.borrow().as_ref() {
             dict_set_str(d, "lineno", Value::None);
         }
         return Err(e);
     }
     if flags & PY_CF_ONLY_AST != 0 {
-        let text = if ast_mode == super::astconv::Mode::Eval { src.trim_start_matches([' ', '\t']) } else { &src };
-        let parsed = crate::limits::with_literal_digit_limit(it.int_max_str_digits, || crate::parser::parse(text, &filename));
+        let text = if ast_mode == super::astconv::Mode::Eval {
+            src.trim_start_matches([' ', '\t'])
+        } else {
+            &src
+        };
+        let parsed = crate::limits::with_literal_digit_limit(it.int_max_str_digits, || {
+            crate::parser::parse(text, &filename)
+        });
         let module = match parsed {
             Ok(m) => m,
             Err(e) => return Err(it.syntax_error(&e.msg, &filename, e.line, Some(e.col), text)),
         };
-        if ast_mode == super::astconv::Mode::Eval && !matches!(module.body.as_slice(), [s] if matches!(s.kind, StmtKind::Expr(_))) {
+        if ast_mode == super::astconv::Mode::Eval
+            && !matches!(module.body.as_slice(), [s] if matches!(s.kind, StmtKind::Expr(_)))
+        {
             return Err(it.syntax_error("invalid syntax", &filename, 1, None, text));
         }
         return super::astconv::module_to_py(it, &module, ast_mode);
@@ -489,7 +570,9 @@ pub mod builtin_fns {
     ///     a file-like object (stream); defaults to the current sys.stdout.
     ///   flush
     ///     whether to forcibly flush the stream.
-    #[op(hint(py(text_signature = "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)")))]
+    #[op(hint(py(
+        text_signature = "($module, /, *args, sep=' ', end='\\n', file=None, flush=False)"
+    )))]
     fn print(
         it: &mut Interp,
         #[varargs] args: &[Value],
@@ -557,7 +640,7 @@ pub mod builtin_fns {
                 return Ok(match i.checked_abs() {
                     Some(v) => Value::Int(v),
                     None => Value::big(BigInt::from_i64(*i).abs()),
-                })
+                });
             }
             Value::Float(f) => return Ok(Value::Float(f.abs())),
             Value::Bool(b) => return Ok(Value::Int(*b as i64)),
@@ -571,10 +654,12 @@ pub mod builtin_fns {
                     Kind::Int(b) => return Ok(Value::big(b.abs())),
                     Kind::Float(f) => return Ok(Value::Float(f.abs())),
                     Kind::Complex(r, i) => {
-                        return match lumen_common::float::complex::abs(lumen_common::float::complex::Complex::new(*r, *i)) {
+                        return match lumen_common::float::complex::abs(
+                            lumen_common::float::complex::Complex::new(*r, *i),
+                        ) {
                             Ok(f) => Ok(Value::Float(f)),
                             Err(_) => Err(it.overflow_err("absolute value too large")),
-                        }
+                        };
                     }
                     _ => {}
                 }
@@ -679,7 +764,10 @@ pub mod builtin_fns {
     #[op]
     fn chr(it: &mut Interp, i: &Value) -> R<Value> {
         let n = it.index_of(i)?;
-        match u32::try_from(n).ok().and_then(lumen_common::smuggle::code_point_str) {
+        match u32::try_from(n)
+            .ok()
+            .and_then(lumen_common::smuggle::code_point_str)
+        {
             Some(c) => Ok(Value::str(&c)),
             None => Err(it.value_error("chr() arg not in range(0x110000)")),
         }
@@ -690,9 +778,14 @@ pub mod builtin_fns {
     fn ord(it: &mut Interp, c: &Value) -> R<i64> {
         if let Value::Obj(o) = c {
             match &o.kind {
-                Kind::Str(s) if s.nchars == 1 => return Ok(lumen_common::smuggle::code_points(&s.s).next().unwrap_or(0) as i64),
+                Kind::Str(s) if s.nchars == 1 => {
+                    return Ok(lumen_common::smuggle::code_points(&s.s).next().unwrap_or(0) as i64);
+                }
                 Kind::Str(s) => {
-                    return Err(it.type_error(&format!("ord() expected a character, but string of length {} found", s.nchars)))
+                    return Err(it.type_error(&format!(
+                        "ord() expected a character, but string of length {} found",
+                        s.nchars
+                    )));
                 }
                 Kind::Bytes(b) if b.len() == 1 => return Ok(b[0] as i64),
                 Kind::ByteArray(b) if b.len() == 1 => return Ok(b.bytes()[0] as i64),
@@ -700,7 +793,10 @@ pub mod builtin_fns {
             }
         }
         let t = it.type_name_of(c);
-        Err(it.type_error(&format!("ord() expected string of length 1, but {} found", t)))
+        Err(it.type_error(&format!(
+            "ord() expected string of length 1, but {} found",
+            t
+        )))
     }
 
     /// getattr(object, name[, default]) -> value
@@ -712,7 +808,9 @@ pub mod builtin_fns {
     fn getattr(it: &mut Interp, object: &Value, name: &Value, default: Passed<&Value>) -> R<Value> {
         let n = attr_name(it, name)?;
         match it.get_attr(object, &n) {
-            Err(e) if default.0.is_some() && it.exc_is(&e, "AttributeError") => Ok(default.0.cloned().unwrap_or(Value::None)),
+            Err(e) if default.0.is_some() && it.exc_is(&e, "AttributeError") => {
+                Ok(default.0.cloned().unwrap_or(Value::None))
+            }
             r => r,
         }
     }
@@ -770,7 +868,10 @@ pub mod builtin_fns {
                 },
                 _ => Vec::new(),
             };
-            let mut names: Vec<String> = keys.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect();
+            let mut names: Vec<String> = keys
+                .iter()
+                .filter_map(|k| k.as_str().map(|s| s.to_string()))
+                .collect();
             names.sort();
             return Ok(Value::list(names.into_iter().map(Value::string).collect()));
         };
@@ -791,12 +892,17 @@ pub mod builtin_fns {
         if it.user_special(x, "__divmod__").is_some() {
             return it.call_method(x, "__divmod__", vec![y.clone()]);
         }
-        if it.user_special(y, "__rdivmod__").is_some() && it.user_special(x, "__floordiv__").is_none() {
+        if it.user_special(y, "__rdivmod__").is_some()
+            && it.user_special(x, "__floordiv__").is_none()
+        {
             return it.call_method(y, "__rdivmod__", vec![x.clone()]);
         }
         if to_num(x).is_none() || to_num(y).is_none() {
             let (ta, tb) = (it.type_name_of(x), it.type_name_of(y));
-            return Err(it.type_error(&format!("unsupported operand type(s) for divmod(): '{}' and '{}'", ta, tb)));
+            return Err(it.type_error(&format!(
+                "unsupported operand type(s) for divmod(): '{}' and '{}'",
+                ta, tb
+            )));
         }
         let q = it.binary_op(BinOp::FloorDiv, x, y)?;
         let r = it.binary_op(BinOp::Mod, x, y)?;
@@ -845,7 +951,9 @@ pub mod builtin_fns {
             return Ok(locals_value(it));
         };
         match it.get_attr_str(obj, "__dict__") {
-            Err(e) if it.exc_is(&e, "AttributeError") => Err(it.type_error("vars() argument must have __dict__ attribute")),
+            Err(e) if it.exc_is(&e, "AttributeError") => {
+                Err(it.type_error("vars() argument must have __dict__ attribute"))
+            }
             r => r,
         }
     }
@@ -881,7 +989,11 @@ pub mod builtin_fns {
         for name in ["stdin", "stdout", "stderr"] {
             match it.sys_attr(name) {
                 Some(f) if !f.is_none() => streams.push(f),
-                _ => return Err(it.new_exc_str("RuntimeError", &format!("input(): lost sys.{}", name))),
+                _ => {
+                    return Err(
+                        it.new_exc_str("RuntimeError", &format!("input(): lost sys.{}", name))
+                    );
+                }
             }
         }
         let (fin, fout, ferr) = (&streams[0], &streams[1], &streams[2]);
@@ -934,15 +1046,21 @@ pub mod builtin_fns {
         };
         let callable = match object {
             Value::Obj(o) => {
-                matches!(o.kind, Kind::Function(_) | Kind::Method(..) | Kind::Native(_) | Kind::Type(_))
-                    || it.lookup_mro(&it.type_of_obj(o), "__call__").is_some()
+                matches!(
+                    o.kind,
+                    Kind::Function(_) | Kind::Method(..) | Kind::Native(_) | Kind::Type(_)
+                ) || it.lookup_mro(&it.type_of_obj(o), "__call__").is_some()
             }
             _ => false,
         };
         if !callable {
             return Err(it.type_error("iter(v, w): v must be callable"));
         }
-        Ok(it.mk_iter(IterState::CallIter { f: object.clone(), sentinel: sentinel.clone(), done: false }))
+        Ok(it.mk_iter(IterState::CallIter {
+            f: object.clone(),
+            sentinel: sentinel.clone(),
+            done: false,
+        }))
     }
 
     /// next(iterator[, default])
@@ -1003,7 +1121,12 @@ pub mod builtin_fns {
     /// Some types, such as ints, are able to use a more efficient algorithm when
     /// invoked using the three argument form.
     #[op(hint(py(text_signature = "($module, /, base, exp, mod=None)")))]
-    fn pow(it: &mut Interp, #[kw] base: &Value, #[kw] exp: &Value, #[kw] r#mod: Option<&Value>) -> R<Value> {
+    fn pow(
+        it: &mut Interp,
+        #[kw] base: &Value,
+        #[kw] exp: &Value,
+        #[kw] r#mod: Option<&Value>,
+    ) -> R<Value> {
         let Some(m) = r#mod else {
             return it.binary_op(BinOp::Pow, base, exp);
         };
@@ -1014,7 +1137,11 @@ pub mod builtin_fns {
         let differ = !Rc::ptr_eq(&tb, &te);
         let exp_first = differ && it.is_subtype(&te, &tb);
         for step in 0..2 {
-            let (recv, other, name) = if (step == 0) == exp_first { (exp, base, "__rpow__") } else { (base, exp, "__pow__") };
+            let (recv, other, name) = if (step == 0) == exp_first {
+                (exp, base, "__rpow__")
+            } else {
+                (base, exp, "__pow__")
+            };
             if name == "__rpow__" && !differ {
                 continue;
             }
@@ -1030,19 +1157,30 @@ pub mod builtin_fns {
             Value::Obj(o) => matches!(o.kind, Kind::Int(_) | Kind::Float(_)),
             _ => false,
         };
-        let is_float = |v: &Value| matches!(v, Value::Float(_)) || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Float(_)));
-        let is_complex = |v: &Value| matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Complex(..)));
+        let is_float = |v: &Value| {
+            matches!(v, Value::Float(_))
+                || matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Float(_)))
+        };
+        let is_complex =
+            |v: &Value| matches!(v, Value::Obj(o) if matches!(o.kind, Kind::Complex(..)));
         // The numeric slots of the operands, tried in order as `ternary_op` does.
         for v in [base, exp, m] {
             if is_float(v) && is_real(base) && is_real(exp) {
-                return Err(it.type_error("pow() 3rd argument not allowed unless all arguments are integers"));
+                return Err(it.type_error(
+                    "pow() 3rd argument not allowed unless all arguments are integers",
+                ));
             }
-            if is_complex(v) && (is_real(base) || is_complex(base)) && (is_real(exp) || is_complex(exp)) {
+            if is_complex(v)
+                && (is_real(base) || is_complex(base))
+                && (is_real(exp) || is_complex(exp))
+            {
                 return Err(it.value_error("complex modulo"));
             }
         }
         let (a, b, c) = (it.tp_name_of(base), it.tp_name_of(exp), it.tp_name_of(m));
-        Err(it.type_error(&format!("unsupported operand type(s) for ** or pow(): '{a}', '{b}', '{c}'")))
+        Err(it.type_error(&format!(
+            "unsupported operand type(s) for ** or pow(): '{a}', '{b}', '{c}'"
+        )))
     }
 
     /// Return the canonical string representation of the object.
@@ -1077,7 +1215,12 @@ pub mod builtin_fns {
             match k {
                 "key" => key = Some(v.clone()).filter(|v| !v.is_none()),
                 "reverse" => reverse = it.truthy(v)?,
-                other => return Err(it.type_error(&format!("'{}' is an invalid keyword argument for sort()", other))),
+                other => {
+                    return Err(it.type_error(&format!(
+                        "'{}' is an invalid keyword argument for sort()",
+                        other
+                    )));
+                }
             }
         }
         it.sort_values(&mut items, key, reverse)?;
@@ -1115,7 +1258,12 @@ pub mod builtin_fns {
     /// fromlist is not empty.  The level argument is used to determine whether to
     /// perform absolute or relative imports: 0 is absolute, while a positive number
     /// is the number of parent directories to search relative to the current module.
-    #[op(name = "__import__", hint(py(text_signature = "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)")))]
+    #[op(
+        name = "__import__",
+        hint(py(
+            text_signature = "($module, /, name, globals=None, locals=None, fromlist=(),\n           level=0)"
+        ))
+    )]
     fn import(
         it: &mut Interp,
         #[kw] name: &Value,
@@ -1145,7 +1293,11 @@ pub mod builtin_fns {
     ///
     /// Internal helper function used by the class statement.
     #[op(name = "__build_class__", hint(py(text_signature = "")))]
-    fn build_class(it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs<'_>) -> R<Value> {
+    fn build_class(
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kw: KwArgs<'_>,
+    ) -> R<Value> {
         it.build_class(args.to_vec(), kw.to_vec())
     }
 
@@ -1172,7 +1324,12 @@ pub mod builtin_fns {
     /// defaulting to the current globals and locals.
     /// If only globals is given, locals defaults to it.
     #[op(hint(py(text_signature = "($module, source, /, globals=None, locals=None)")))]
-    fn eval(it: &mut Interp, source: &Value, #[kw] globals: Option<&Value>, #[kw] locals: Option<&Value>) -> R<Value> {
+    fn eval(
+        it: &mut Interp,
+        source: &Value,
+        #[kw] globals: Option<&Value>,
+        #[kw] locals: Option<&Value>,
+    ) -> R<Value> {
         eval_exec(it, source, globals, locals, None, true)
     }
 
@@ -1185,8 +1342,16 @@ pub mod builtin_fns {
     /// If only globals is given, locals defaults to it.
     /// The closure must be a tuple of cellvars, and can only be used
     /// when source is a code object requiring exactly that many cellvars.
-    #[op(hint(py(text_signature = "($module, source, /, globals=None, locals=None, *, closure=None)")))]
-    fn exec(it: &mut Interp, source: &Value, #[kw] globals: Option<&Value>, #[kw] locals: Option<&Value>, #[kwonly] closure: Option<&Value>) -> R<Value> {
+    #[op(hint(py(
+        text_signature = "($module, source, /, globals=None, locals=None, *, closure=None)"
+    )))]
+    fn exec(
+        it: &mut Interp,
+        source: &Value,
+        #[kw] globals: Option<&Value>,
+        #[kw] locals: Option<&Value>,
+        #[kwonly] closure: Option<&Value>,
+    ) -> R<Value> {
         eval_exec(it, source, globals, locals, closure, false)
     }
 
@@ -1214,7 +1379,9 @@ pub mod builtin_fns {
         #[kw] flags: Option<&Value>,
         #[kw] _dont_inherit: Option<&Value>,
         #[kw] _optimize: Option<&Value>,
-        #[kwonly] #[name("_feature_version")] _feature_version: Option<&Value>,
+        #[kwonly]
+        #[name("_feature_version")]
+        _feature_version: Option<&Value>,
     ) -> R<Value> {
         let flags = match flags {
             Some(v) => it.index_of(v)?,

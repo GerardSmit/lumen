@@ -12,7 +12,10 @@ pub struct CappedAlloc {
 
 impl CappedAlloc {
     pub const fn new(cap: usize) -> CappedAlloc {
-        CappedAlloc { live: AtomicUsize::new(0), cap: AtomicUsize::new(cap) }
+        CappedAlloc {
+            live: AtomicUsize::new(0),
+            cap: AtomicUsize::new(cap),
+        }
     }
 
     pub fn set_cap(&self, cap: usize) {

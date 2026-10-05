@@ -9,6 +9,112 @@ use crate::unicode_norm_impl::{self as norm, NormData};
 
 pub use db::UNIDATA_VERSION;
 
+/// Unicode versions used by the independent segmentation data providers.
+pub const GRAPHEME_UNICODE_VERSION: (u64, u64, u64) = unicode_segmentation::UNICODE_VERSION;
+pub const WORD_UNICODE_VERSION: (u64, u64, u64) = unicode_segmentation::UNICODE_VERSION;
+pub const LINE_BREAK_UNICODE_VERSION: (u8, u8, u8) = unicode_linebreak::UNICODE_VERSION;
+pub use unicode_linebreak::{break_property, BreakClass, BreakOpportunity};
+
+/// Allocation-free UAX #14 opportunities as UTF-8 byte offsets, including end of text.
+/// Mandatory breaks include paragraph separators and the end of text.
+/// Complex-context scripts use the provider's alphabetic fallback; dictionary breaking is absent.
+/// Uses the numeric tailoring in UAX #14 §8.2 Example 7, as does LineBreakTest.
+pub fn line_breaks(text: &str) -> impl Iterator<Item = (usize, BreakOpportunity)> + '_ {
+    crate::linebreak::opportunities(text)
+}
+
+/// Allocation-free extended grapheme clusters (UAX #29), with UTF-8 byte offsets.
+pub fn graphemes(text: &str) -> unicode_segmentation::GraphemeIndices<'_> {
+    unicode_segmentation::UnicodeSegmentation::grapheme_indices(text, true)
+}
+
+/// Allocation-free default UAX #29 word-boundary segments, including spaces
+/// and punctuation. Offsets are UTF-8 bytes; dictionary tailoring is absent.
+pub fn word_boundaries(text: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
+    unicode_segmentation::UnicodeSegmentation::split_word_bound_indices(text)
+}
+
+/// First caret boundary strictly before a byte offset. Out-of-range offsets clamp to end.
+pub fn previous_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    unicode_segmentation::GraphemeCursor::new(offset, text.len(), true)
+        .prev_boundary(text, 0)
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+/// First caret boundary strictly after a byte offset; out-of-range offsets clamp to end.
+pub fn next_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = scalar_boundary(text, offset);
+    unicode_segmentation::GraphemeCursor::new(offset, text.len(), true)
+        .next_boundary(text, 0)
+        .ok()
+        .flatten()
+        .unwrap_or(text.len())
+}
+
+fn scalar_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+#[cfg(test)]
+mod segmentation_tests {
+    use super::*;
+
+    #[test]
+    fn caret_boundaries_preserve_clusters() {
+        assert_eq!(GRAPHEME_UNICODE_VERSION, (16, 0, 0));
+        assert_eq!(LINE_BREAK_UNICODE_VERSION, (15, 0, 0));
+        for cluster in ["e\u{301}", "\r\n", "🇳🇱", "👩🏽‍💻", "\u{1100}\u{1161}\u{11a8}"]
+        {
+            let text = format!("a{cluster}z");
+            let end = 1 + cluster.len();
+            assert_eq!(graphemes(&text).count(), 3, "{cluster}");
+            for offset in 1..end {
+                assert_eq!(next_grapheme_boundary(&text, offset), end);
+            }
+            for offset in 2..=end {
+                assert_eq!(previous_grapheme_boundary(&text, offset), 1);
+            }
+        }
+        assert_eq!(next_grapheme_boundary("", 100), 0);
+        assert_eq!(previous_grapheme_boundary("", 100), 0);
+        assert_eq!(next_grapheme_boundary("a", 100), 1);
+        assert_eq!(previous_grapheme_boundary("a", 100), 0);
+    }
+
+    #[test]
+    fn line_breaks_preserve_joiners_and_mandatory_breaks() {
+        use BreakOpportunity::{Allowed, Mandatory};
+        assert_eq!(
+            line_breaks("a b").collect::<Vec<_>>(),
+            [(2, Allowed), (3, Mandatory)]
+        );
+        assert_eq!(
+            line_breaks("a\r\nb").collect::<Vec<_>>(),
+            [(3, Mandatory), (4, Mandatory)]
+        );
+        for text in ["a\u{a0}b", "a\u{2060}b", "e\u{301}", "👩🏽‍💻"] {
+            assert_eq!(
+                line_breaks(text).collect::<Vec<_>>(),
+                [(text.len(), Mandatory)]
+            );
+        }
+        assert_eq!(
+            line_breaks("中文").collect::<Vec<_>>(),
+            [(3, Allowed), (6, Mandatory)]
+        );
+    }
+}
+
 /// Which database version answers: the current one or the UCD 3.2.0 deltas.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Version {
@@ -76,7 +182,10 @@ pub fn props(cp: u32, version: Version) -> Props {
             Err(_) => return current,
         }
     };
-    Props { digit: current.digit, ..to_props(db::RECORDS[old as usize]) }
+    Props {
+        digit: current.digit,
+        ..to_props(db::RECORDS[old as usize])
+    }
 }
 
 fn decomp_offset(cp: u32, version: Version) -> usize {
@@ -135,7 +244,10 @@ impl NormData for Norm {
     }
 
     fn compose(&self, a: u32, b: u32) -> Option<u32> {
-        db::COMPOSE.binary_search_by(|&(x, y, _)| (x, y).cmp(&(a, b))).ok().map(|k| db::COMPOSE[k].2)
+        db::COMPOSE
+            .binary_search_by(|&(x, y, _)| (x, y).cmp(&(a, b)))
+            .ok()
+            .map(|k| db::COMPOSE[k].2)
     }
 }
 
@@ -149,13 +261,17 @@ const V_COUNT: u32 = 21;
 const T_COUNT: u32 = 28;
 const N_COUNT: u32 = V_COUNT * T_COUNT;
 const S_COUNT: u32 = 19 * N_COUNT;
-const JAMO_L: [&str; 19] = ["G", "GG", "N", "D", "DD", "R", "M", "B", "BB", "S", "SS", "", "J", "JJ", "C", "K", "T", "P", "H"];
+const JAMO_L: [&str; 19] = [
+    "G", "GG", "N", "D", "DD", "R", "M", "B", "BB", "S", "SS", "", "J", "JJ", "C", "K", "T", "P",
+    "H",
+];
 const JAMO_V: [&str; 21] = [
-    "A", "AE", "YA", "YAE", "EO", "E", "YEO", "YE", "O", "WA", "WAE", "OE", "YO", "U", "WEO", "WE", "WI", "YU", "EU", "YI", "I",
+    "A", "AE", "YA", "YAE", "EO", "E", "YEO", "YE", "O", "WA", "WAE", "OE", "YO", "U", "WEO", "WE",
+    "WI", "YU", "EU", "YI", "I",
 ];
 const JAMO_T: [&str; 28] = [
-    "", "G", "GG", "GS", "N", "NJ", "NH", "D", "L", "LG", "LM", "LB", "LS", "LT", "LP", "LH", "M", "B", "BS", "S", "SS", "NG",
-    "J", "C", "K", "T", "P", "H",
+    "", "G", "GG", "GS", "N", "NJ", "NH", "D", "L", "LG", "LM", "LB", "LS", "LT", "LP", "LH", "M",
+    "B", "BS", "S", "SS", "NG", "J", "C", "K", "T", "P", "H",
 ];
 const HANGUL_PREFIX: &str = "HANGUL SYLLABLE ";
 const CJK_PREFIX: &str = "CJK UNIFIED IDEOGRAPH-";
@@ -167,7 +283,10 @@ fn stored_name(i: usize) -> String {
     loop {
         let token = db::NAME_TOKENS.get(t);
         let w = (token & 0x3fff) as usize;
-        out.push_str(&db::LEXICON[db::LEXICON_OFFSETS.get(w) as usize..db::LEXICON_OFFSETS.get(w + 1) as usize]);
+        out.push_str(
+            &db::LEXICON
+                [db::LEXICON_OFFSETS.get(w) as usize..db::LEXICON_OFFSETS.get(w + 1) as usize],
+        );
         if token & 0x8000 != 0 {
             return out;
         }
@@ -183,11 +302,19 @@ pub fn name(cp: u32, version: Version) -> Option<String> {
     }
     if (S_BASE..S_BASE + S_COUNT).contains(&cp) {
         let s = cp - S_BASE;
-        let (l, v, t) = ((s / N_COUNT) as usize, ((s % N_COUNT) / T_COUNT) as usize, (s % T_COUNT) as usize);
-        return Some(format!("{HANGUL_PREFIX}{}{}{}", JAMO_L[l], JAMO_V[v], JAMO_T[t]));
+        let (l, v, t) = (
+            (s / N_COUNT) as usize,
+            ((s % N_COUNT) / T_COUNT) as usize,
+            (s % T_COUNT) as usize,
+        );
+        return Some(format!(
+            "{HANGUL_PREFIX}{}{}{}",
+            JAMO_L[l], JAMO_V[v], JAMO_T[t]
+        ));
     }
     let k = db::NAME_RANGES.partition_point(|r| r.1 < cp);
-    if let Some(&(lo, _, prefix, kind, start, width)) = db::NAME_RANGES.get(k).filter(|r| r.0 <= cp) {
+    if let Some(&(lo, _, prefix, kind, start, width)) = db::NAME_RANGES.get(k).filter(|r| r.0 <= cp)
+    {
         return Some(if kind == 0 {
             format!("{prefix}{cp:04X}")
         } else {
@@ -231,7 +358,9 @@ fn hangul_lookup(rest: &str) -> Option<u32> {
 }
 
 fn is_unified_ideograph(cp: u32) -> bool {
-    db::NAME_RANGES.iter().any(|&(lo, hi, prefix, ..)| prefix == CJK_PREFIX && (lo..=hi).contains(&cp))
+    db::NAME_RANGES
+        .iter()
+        .any(|&(lo, hi, prefix, ..)| prefix == CJK_PREFIX && (lo..=hi).contains(&cp))
 }
 
 /// The code point(s) named `name`. Hangul syllables and CJK unified ideographs match only in
@@ -242,7 +371,11 @@ pub fn lookup(name: &str, version: Version, named_sequences: bool) -> Option<Vec
         return hangul_lookup(rest).map(|c| vec![c]);
     }
     if let Some(hex) = name.strip_prefix(CJK_PREFIX) {
-        if !(4..=5).contains(&hex.len()) || !hex.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)) {
+        if !(4..=5).contains(&hex.len())
+            || !hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        {
             return None;
         }
         let cp = u32::from_str_radix(hex, 16).ok()?;
@@ -261,7 +394,9 @@ fn lookup_upper(up: &str, version: Version, named_sequences: bool) -> Option<Vec
         if prefix == CJK_PREFIX {
             continue;
         }
-        let Some(rest) = up.strip_prefix(prefix) else { continue };
+        let Some(rest) = up.strip_prefix(prefix) else {
+            continue;
+        };
         let cp = if kind == 0 {
             let cp = u32::from_str_radix(rest, 16).ok()?;
             (format!("{cp:04X}") == rest).then_some(cp)
@@ -341,7 +476,14 @@ pub fn char_type(cp: u32) -> CharType {
         db::TYPE_INDEX2.get((block << db::SHIFT) + (cp & ((1 << db::SHIFT) - 1)) as usize) as usize
     };
     let (flags, upper, lower, title, fold) = db::TYPE_RECORDS[k];
-    CharType { cp, flags, upper, lower, title, fold }
+    CharType {
+        cp,
+        flags,
+        upper,
+        lower,
+        title,
+        fold,
+    }
 }
 
 impl CharType {
@@ -359,9 +501,17 @@ impl CharType {
     fn mapping(&self, m: i32) -> CaseMapping {
         if m >= db::EXTENDED {
             let at = (m - db::EXTENDED) as usize;
-            CaseMapping { one: None, at: at + 1, end: at + 1 + db::TYPE_EXT.get(at) as usize }
+            CaseMapping {
+                one: None,
+                at: at + 1,
+                end: at + 1 + db::TYPE_EXT.get(at) as usize,
+            }
         } else {
-            CaseMapping { one: Some((self.cp as i32 + m) as u32), at: 0, end: 0 }
+            CaseMapping {
+                one: Some((self.cp as i32 + m) as u32),
+                at: 0,
+                end: 0,
+            }
         }
     }
 
@@ -393,7 +543,11 @@ pub struct CaseMapping {
 impl CaseMapping {
     /// The mapping to `c` alone.
     pub fn single(c: u32) -> CaseMapping {
-        CaseMapping { one: Some(c), at: 0, end: 0 }
+        CaseMapping {
+            one: Some(c),
+            at: 0,
+            end: 0,
+        }
     }
 }
 
@@ -419,7 +573,10 @@ mod tests {
     #[test]
     fn properties() {
         let p = props('9' as u32, Version::Current);
-        assert_eq!((p.category, p.bidirectional, p.decimal, p.digit, p.numeric), ("Nd", "EN", Some(9), Some(9), Some(9.0)));
+        assert_eq!(
+            (p.category, p.bidirectional, p.decimal, p.digit, p.numeric),
+            ("Nd", "EN", Some(9), Some(9), Some(9.0))
+        );
         let p = props(0x2468, Version::Current);
         assert_eq!((p.decimal, p.digit, p.numeric), (None, Some(9), Some(9.0)));
         assert_eq!(props(0x5341, Version::Current).numeric, Some(10.0));
@@ -435,10 +592,24 @@ mod tests {
         let t = |c: char| char_type(c as u32);
         let s = |m: CaseMapping| m.map(|c| char::from_u32(c).unwrap()).collect::<String>();
         assert!(t('a').is(flag::ALPHA | flag::LOWER) && !t('a').is(flag::UPPER));
-        assert!(t('\u{1c5}').is(flag::TITLE) && t('\u{2168}').is(flag::NUMERIC) && !t('\u{2168}').is(flag::DIGIT));
-        assert!(t('\u{2460}').is(flag::DIGIT) && !t('\u{2460}').is(flag::DECIMAL) && t('\u{663}').is(flag::DECIMAL));
-        assert!(t('\u{1c}').is(flag::SPACE) && t('\u{a0}').is(flag::SPACE) && !t('\u{a0}').is(flag::PRINTABLE));
-        assert!(t('\'').is(flag::CASE_IGNORABLE) && t('\u{2b0}').is(flag::CASED | flag::CASE_IGNORABLE));
+        assert!(
+            t('\u{1c5}').is(flag::TITLE)
+                && t('\u{2168}').is(flag::NUMERIC)
+                && !t('\u{2168}').is(flag::DIGIT)
+        );
+        assert!(
+            t('\u{2460}').is(flag::DIGIT)
+                && !t('\u{2460}').is(flag::DECIMAL)
+                && t('\u{663}').is(flag::DECIMAL)
+        );
+        assert!(
+            t('\u{1c}').is(flag::SPACE)
+                && t('\u{a0}').is(flag::SPACE)
+                && !t('\u{a0}').is(flag::PRINTABLE)
+        );
+        assert!(
+            t('\'').is(flag::CASE_IGNORABLE) && t('\u{2b0}').is(flag::CASED | flag::CASE_IGNORABLE)
+        );
         assert_eq!(s(t('\u{df}').upper()), "SS");
         assert_eq!(s(t('\u{df}').title()), "Ss");
         assert_eq!(s(t('\u{df}').fold()), "ss");
@@ -452,34 +623,85 @@ mod tests {
     #[test]
     fn decompositions() {
         assert_eq!(decomposition(0xe9, Version::Current), "0065 0301");
-        assert_eq!(decomposition(0xbc, Version::Current), "<fraction> 0031 2044 0034");
+        assert_eq!(
+            decomposition(0xbc, Version::Current),
+            "<fraction> 0031 2044 0034"
+        );
         assert_eq!(decomposition('a' as u32, Version::Current), "");
     }
 
     #[test]
     fn names() {
-        assert_eq!(name('a' as u32, Version::Current).as_deref(), Some("LATIN SMALL LETTER A"));
-        assert_eq!(name(0xf60, Version::Current).as_deref(), Some("TIBETAN LETTER -A"));
-        assert_eq!(name(0xac00, Version::Current).as_deref(), Some("HANGUL SYLLABLE GA"));
-        assert_eq!(name(0xd7a3, Version::Current).as_deref(), Some("HANGUL SYLLABLE HIH"));
-        assert_eq!(name(0x4e00, Version::Current).as_deref(), Some("CJK UNIFIED IDEOGRAPH-4E00"));
-        assert_eq!(name(0x18800, Version::Current).as_deref(), Some("TANGUT COMPONENT-001"));
+        assert_eq!(
+            name('a' as u32, Version::Current).as_deref(),
+            Some("LATIN SMALL LETTER A")
+        );
+        assert_eq!(
+            name(0xf60, Version::Current).as_deref(),
+            Some("TIBETAN LETTER -A")
+        );
+        assert_eq!(
+            name(0xac00, Version::Current).as_deref(),
+            Some("HANGUL SYLLABLE GA")
+        );
+        assert_eq!(
+            name(0xd7a3, Version::Current).as_deref(),
+            Some("HANGUL SYLLABLE HIH")
+        );
+        assert_eq!(
+            name(0x4e00, Version::Current).as_deref(),
+            Some("CJK UNIFIED IDEOGRAPH-4E00")
+        );
+        assert_eq!(
+            name(0x18800, Version::Current).as_deref(),
+            Some("TANGUT COMPONENT-001")
+        );
         assert_eq!(name(0, Version::Current), None);
-        assert_eq!(lookup("latin small letter a", Version::Current, false), Some(vec![0x61]));
-        assert_eq!(lookup("HANGUL SYLLABLE GAG", Version::Current, false), Some(vec![0xac01]));
-        assert_eq!(lookup("CJK UNIFIED IDEOGRAPH-4E00", Version::Current, false), Some(vec![0x4e00]));
-        assert_eq!(lookup("cjk unified ideograph-4e00", Version::Current, false), None);
-        assert_eq!(lookup("TANGUT COMPONENT-002", Version::Current, false), Some(vec![0x18801]));
+        assert_eq!(
+            lookup("latin small letter a", Version::Current, false),
+            Some(vec![0x61])
+        );
+        assert_eq!(
+            lookup("HANGUL SYLLABLE GAG", Version::Current, false),
+            Some(vec![0xac01])
+        );
+        assert_eq!(
+            lookup("CJK UNIFIED IDEOGRAPH-4E00", Version::Current, false),
+            Some(vec![0x4e00])
+        );
+        assert_eq!(
+            lookup("cjk unified ideograph-4e00", Version::Current, false),
+            None
+        );
+        assert_eq!(
+            lookup("TANGUT COMPONENT-002", Version::Current, false),
+            Some(vec![0x18801])
+        );
         assert_eq!(lookup("NULL", Version::Current, false), Some(vec![0]));
         assert_eq!(lookup("NULL", Version::V3_2_0, false), None);
-        assert_eq!(lookup("LATIN SMALL LETTER R WITH TILDE", Version::Current, false), None);
-        assert_eq!(lookup("LATIN SMALL LETTER R WITH TILDE", Version::Current, true), Some(vec![0x72, 0x303]));
+        assert_eq!(
+            lookup("LATIN SMALL LETTER R WITH TILDE", Version::Current, false),
+            None
+        );
+        assert_eq!(
+            lookup("LATIN SMALL LETTER R WITH TILDE", Version::Current, true),
+            Some(vec![0x72, 0x303])
+        );
     }
 
     #[test]
     fn normalization() {
-        assert_eq!(normalize(&[0x65, 0x301], "NFC", Version::Current), vec![0xe9]);
-        assert_eq!(normalize(&[0xfb01], "NFKD", Version::Current), vec![0x66, 0x69]);
-        assert_eq!(normalize(&[0xac01], "NFD", Version::Current), vec![0x1100, 0x1161, 0x11a8]);
+        assert_eq!(
+            normalize(&[0x65, 0x301], "NFC", Version::Current),
+            vec![0xe9]
+        );
+        assert_eq!(
+            normalize(&[0xfb01], "NFKD", Version::Current),
+            vec![0x66, 0x69]
+        );
+        assert_eq!(
+            normalize(&[0xac01], "NFD", Version::Current),
+            vec![0x1100, 0x1161, 0x11a8]
+        );
     }
 }

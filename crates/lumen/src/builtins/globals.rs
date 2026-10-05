@@ -125,6 +125,9 @@ pub(super) fn install_globals(it: &mut Interp) {
     // Indirect eval: runs in the global scope. (A *direct* `eval(...)` call is intercepted in
     // `eval_call` and run in the caller's scope; both share this same function object.)
     let eval_fn = it.make_native("eval", 1, |i, _this, args| {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(i.make_error("EvalError", "dynamic code is not available in an AOT build"));
+        }
         crate::bytecode::reflect::native_transparent(i);
         let code = match arg(args, 0) {
             Value::Str(s) => s,

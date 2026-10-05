@@ -34,7 +34,8 @@ impl<T: Into<Data>> From<T> for Arg {
 
 /// The error of an API with no browser counterpart (`code` `ERR_NOT_SUPPORTED_IN_BROWSER`).
 pub fn unsupported(what: &str) -> NativeError {
-    NativeError::runtime(format!("{what} is not supported in the browser")).with_code("ERR_NOT_SUPPORTED_IN_BROWSER")
+    NativeError::runtime(format!("{what} is not supported in the browser"))
+        .with_code("ERR_NOT_SUPPORTED_IN_BROWSER")
 }
 
 /// A message from the browser to a registered task (a fetch response, a WebSocket event):
@@ -47,7 +48,10 @@ pub struct Event {
 
 impl Event {
     pub fn new(kind: impl Into<String>, args: Vec<Arg>) -> Event {
-        Event { kind: kind.into(), args }
+        Event {
+            kind: kind.into(),
+            args,
+        }
     }
 }
 

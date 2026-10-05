@@ -1,8 +1,8 @@
 //! Numeric mirror synchronization and indexed value updates.
 use super::{
-    f64_exact_i32, Props, MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT,
+    MIRROR_ALL_I32, MIRROR_HOLE, MIRROR_NO_HOLES, MIRROR_OK, NO_SLOT, Props, f64_exact_i32,
 };
-use crate::value::{canonical_index, PackedValue, Value};
+use crate::value::{PackedValue, Value, canonical_index};
 
 impl Props {
     /// Drop the element mirror (a foreign mutable escape or an unmirrorable element).

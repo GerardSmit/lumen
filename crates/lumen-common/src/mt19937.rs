@@ -21,7 +21,10 @@ impl Default for Mt19937 {
 
 impl Mt19937 {
     pub fn new() -> Self {
-        let mut mt = Mt19937 { state: [0; N], index: N };
+        let mut mt = Mt19937 {
+            state: [0; N],
+            index: N,
+        };
         mt.init_genrand(19650218);
         mt
     }
@@ -30,7 +33,9 @@ impl Mt19937 {
         self.state[0] = s;
         for i in 1..N {
             let prev = self.state[i - 1];
-            self.state[i] = 1812433253u32.wrapping_mul(prev ^ (prev >> 30)).wrapping_add(i as u32);
+            self.state[i] = 1812433253u32
+                .wrapping_mul(prev ^ (prev >> 30))
+                .wrapping_add(i as u32);
         }
         self.index = N;
     }
@@ -43,7 +48,9 @@ impl Mt19937 {
         let mut k = N.max(key.len());
         while k > 0 {
             let prev = self.state[i - 1];
-            self.state[i] = (self.state[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1664525)).wrapping_add(key[j]).wrapping_add(j as u32);
+            self.state[i] = (self.state[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1664525))
+                .wrapping_add(key[j])
+                .wrapping_add(j as u32);
             i += 1;
             j += 1;
             if i >= N {
@@ -58,7 +65,8 @@ impl Mt19937 {
         k = N - 1;
         while k > 0 {
             let prev = self.state[i - 1];
-            self.state[i] = (self.state[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1566083941)).wrapping_sub(i as u32);
+            self.state[i] = (self.state[i] ^ (prev ^ (prev >> 30)).wrapping_mul(1566083941))
+                .wrapping_sub(i as u32);
             i += 1;
             if i >= N {
                 self.state[0] = self.state[N - 1];

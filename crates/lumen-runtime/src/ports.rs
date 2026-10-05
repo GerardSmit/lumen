@@ -5,10 +5,10 @@
 //! it (`listen`), and a sender on any thread wakes that task through the receiving realm's
 //! completion channel. The JS side drains one message per wake, so each message is its own
 //! macrotask (microtasks run between messages, as with Node's per-message callback scopes).
-use lumen_bind::NativeError;
-use lumen_host::OpError;
 use crate::clone_transfer::{self, CloneAttachment, CloneMessage};
 use lumen::embed::JsFunction;
+use lumen_bind::NativeError;
+use lumen_host::OpError;
 use lumen_host::{CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
 use lumen_os::channel::{Pop, Queue};
 use std::collections::HashMap;
@@ -27,6 +27,8 @@ struct Endpoint {
     peer: Mutex<Weak<Endpoint>>,
     waker: Mutex<Option<Waker>>,
     wake_pending: AtomicBool,
+    close_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    close_notified: AtomicBool,
     /// A BroadcastChannel endpoint: posts fan out to every other endpoint of this name.
     group: Option<String>,
 }
@@ -41,6 +43,8 @@ impl Endpoint {
             peer: Mutex::new(Weak::new()),
             waker: Mutex::new(None),
             wake_pending: AtomicBool::new(false),
+            close_hook: Mutex::new(None),
+            close_notified: AtomicBool::new(false),
         })
     }
 
@@ -55,7 +59,9 @@ impl Endpoint {
         }
         let waker = self.waker.lock().unwrap();
         match waker.as_ref() {
-            Some(w) => w.sender.send(w.task, Box::new(PortTransfer(Arc::clone(self)))),
+            Some(w) => w
+                .sender
+                .send(w.task, Box::new(PortTransfer(Arc::clone(self)))),
             None => self.wake_pending.store(false, Ordering::SeqCst),
         }
     }
@@ -64,23 +70,58 @@ impl Endpoint {
         if let Some(name) = &self.group {
             self.queue.close();
             self.queue.clear();
-            if let Some(members) = GROUPS.lock().unwrap().as_mut().and_then(|g| g.get_mut(name)) {
-                members.retain(|m| m.strong_count() > 0 && !std::ptr::eq(m.as_ptr(), Arc::as_ptr(self)));
+            if let Some(members) = GROUPS
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|g| g.get_mut(name))
+            {
+                members.retain(|m| {
+                    m.strong_count() > 0 && !std::ptr::eq(m.as_ptr(), Arc::as_ptr(self))
+                });
             }
             self.wake();
+            self.notify_close();
             return;
         }
         self.queue.close();
         self.wake();
+        self.notify_close();
         if let Some(peer) = self.peer() {
             peer.queue.close();
             peer.wake();
+            peer.notify_close();
+        }
+    }
+
+    fn notify_close(&self) {
+        // A close can race with `on_close` when a port is adopted just as its peer shuts down.
+        // Only mark the callback consumed after extracting an installed hook; otherwise the
+        // installer observes `closed` and gets a chance to deliver it itself.
+        let hook = self.close_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            if !self.close_notified.swap(true, Ordering::SeqCst) {
+                hook();
+            }
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct PortTransfer(Arc<Endpoint>);
+
+impl PortTransfer {
+    pub(crate) fn on_close(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.0.close_hook.lock().unwrap() = Some(hook);
+        if self.0.queue.is_closed() {
+            self.0.notify_close();
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.0.close_both();
+    }
+}
 
 struct Handle {
     port: PortTransfer,
@@ -141,7 +182,10 @@ fn release(ctx: &mut Ctx, id: u64) -> Option<PortTransfer> {
     Some(handle.port)
 }
 
-fn decode_wake(_ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+fn decode_wake(
+    _ctx: &mut Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
     if let Ok(port) = payload.downcast::<PortTransfer>() {
         port.0.wake_pending.store(false, Ordering::SeqCst);
     }
@@ -291,7 +335,9 @@ mod bindings {
             return Ok(());
         };
         let (port, old) = port;
-        let reg = ctx.host_mut::<TaskRegistry>().expect("task registry installed");
+        let reg = ctx
+            .host_mut::<TaskRegistry>()
+            .expect("task registry installed");
         if let Some(old) = old {
             reg.cancel(old);
         }
@@ -344,7 +390,11 @@ mod bindings {
     #[op(name = "import", coerce)]
     fn op_import(ctx: &mut Ctx, index: f64) -> Result<f64, OpError> {
         if !(index.is_finite() && index >= 0.0 && index.fract() == 0.0 && index < 1024.0) {
-            return Err(NativeError::named("DataCloneError", "Invalid MessagePort attachment index").into());
+            return Err(NativeError::named(
+                "DataCloneError",
+                "Invalid MessagePort attachment index",
+            )
+            .into());
         }
         let port = clone_transfer::take_port(ctx, index as usize)?;
         Ok(adopt(ctx, port) as f64)

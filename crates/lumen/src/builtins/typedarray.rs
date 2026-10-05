@@ -38,7 +38,12 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
     sab_getter(it, &proto, "maxByteLength", |i, this, _| {
         require_shared_buffer(i, &this)?;
         this.as_obj()
-            .and_then(|o| o.borrow().props.get("\u{0}ab_max_byte_length").map(|p| p.value()))
+            .and_then(|o| {
+                o.borrow()
+                    .props
+                    .get("\u{0}ab_max_byte_length")
+                    .map(|p| p.value())
+            })
             .ok_or_else(|| i.make_error("TypeError", "not a SharedArrayBuffer"))
     });
     sab_getter(it, &proto, "growable", |i, this, _| {
@@ -66,7 +71,8 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
         if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.resize(new_len as usize).map_err(|e| buffer_error(i, e))?;
+            buf.resize(new_len as usize)
+                .map_err(|e| buffer_error(i, e))?;
         }
         Ok(Value::Undefined)
     });
@@ -182,8 +188,13 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(bp, new_store(len, max.map(|m| m as usize)).into());
-        set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max.unwrap_or(n)));
+        i.array_buffers
+            .insert(bp, new_store(len, max.map(|m| m as usize)).into());
+        set_internal(
+            &obj,
+            "\u{0}ab_max_byte_length",
+            Value::Num(max.unwrap_or(n)),
+        );
         set_internal(&obj, "\u{0}ab_resizable", Value::Bool(max.is_some()));
         let id = crate::interpreter::alloc_shared_mem(len);
         i.shared_buffers.insert(bp, id);
@@ -379,10 +390,12 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
     });
     ab_getter(it, &proto, "resizable", |i, this, _| {
         reject_shared_buffer(i, &this)?;
-        match this
-            .as_obj()
-            .and_then(|o| o.borrow().props.get("\u{0}ab_resizable").map(|pr| pr.value()))
-        {
+        match this.as_obj().and_then(|o| {
+            o.borrow()
+                .props
+                .get("\u{0}ab_resizable")
+                .map(|pr| pr.value())
+        }) {
             Some(v) => Ok(v),
             None => Err(i.make_error("TypeError", "not an ArrayBuffer")),
         }
@@ -601,8 +614,13 @@ pub(super) fn install_array_buffer(it: &mut Interp) {
         let len = n as usize;
         let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers.insert(p, new_store(len, max.map(|m| m as usize)).into());
-        set_internal(&obj, "\u{0}ab_max_byte_length", Value::Num(max.unwrap_or(n)));
+        i.array_buffers
+            .insert(p, new_store(len, max.map(|m| m as usize)).into());
+        set_internal(
+            &obj,
+            "\u{0}ab_max_byte_length",
+            Value::Num(max.unwrap_or(n)),
+        );
         set_internal(&obj, "\u{0}ab_resizable", Value::Bool(max.is_some()));
         Ok(Value::Obj(obj))
     });
@@ -1026,6 +1044,37 @@ fn ta_native(
                 Some(l) => l,
                 None => return Ok(Value::Num(-1.0)),
             };
+            if !last && !info.kind.is_bigint() {
+                if let Value::Num(needle) = &search {
+                    let start = if from >= 0.0 {
+                        (from as usize).min(len)
+                    } else {
+                        (len as f64 + from).max(0.0) as usize
+                    };
+                    let end = len.min(curlen);
+                    if start >= end {
+                        return Ok(Value::Num(-1.0));
+                    }
+                    let es = info.kind.elsize();
+                    let found = i
+                        .with_buffer_bytes(info.buffer, |bytes| {
+                            bytes
+                                .get(info.offset + start * es..info.offset + end * es)
+                                .and_then(|bytes| {
+                                    lumen_common::scan::numeric_find(
+                                        bytes,
+                                        info.kind.elem(),
+                                        *needle,
+                                        false,
+                                    )
+                                })
+                        })
+                        .flatten();
+                    return Ok(Value::Num(
+                        found.map(|k| (start + k) as f64).unwrap_or(-1.0),
+                    ));
+                }
+            }
             let order: Vec<i64> = if last {
                 let k = if from >= 0.0 {
                     from.min((len - 1) as f64) as i64
@@ -1076,6 +1125,30 @@ fn ta_native(
             } else {
                 (from as usize).min(len)
             };
+            if !info.kind.is_bigint() {
+                if let Value::Num(needle) = &search {
+                    let end = len.min(i.ta_len(&info).unwrap_or(0));
+                    if lo >= end {
+                        return Ok(Value::Bool(false));
+                    }
+                    let es = info.kind.elsize();
+                    let found = i
+                        .with_buffer_bytes(info.buffer, |bytes| {
+                            bytes
+                                .get(info.offset + lo * es..info.offset + end * es)
+                                .and_then(|bytes| {
+                                    lumen_common::scan::numeric_find(
+                                        bytes,
+                                        info.kind.elem(),
+                                        *needle,
+                                        true,
+                                    )
+                                })
+                        })
+                        .flatten();
+                    return Ok(Value::Bool(found.is_some()));
+                }
+            }
             for k in lo..len {
                 let v = i.ta_read(&info, k);
                 if same_value_zero(&v, &search) {
@@ -1105,8 +1178,23 @@ fn ta_native(
                 .ok_or_else(|| i.make_error("TypeError", "TypedArray is out of bounds"))?;
             let start = start.min(curlen);
             let end = end.min(curlen);
-            for k in start..end {
-                ab(i.ta_store(&info, k, &value))?;
+            if start < end {
+                let es = info.kind.elsize();
+                let mut pattern = [0u8; 8];
+                match &value {
+                    Value::BigInt(n) => info
+                        .kind
+                        .write_int(n.to_i128_wrapping(), &mut pattern[..es]),
+                    Value::Num(n) => info.kind.write(*n, &mut pattern[..es]),
+                    _ => unreachable!(),
+                }
+                let begin = info.offset + start * es;
+                let limit = info.offset + end * es;
+                i.with_buffer_bytes_mut(info.buffer, |buf| {
+                    if let Some(dst) = buf.get_mut(begin..limit) {
+                        lumen_common::scan::fill_pattern(dst, &pattern[..es]);
+                    }
+                });
             }
             Ok(this.clone())
         })()),
@@ -1131,11 +1219,9 @@ fn ta_native(
                 .min(curlen as i64 - to as i64)
                 .min(curlen as i64 - from as i64);
             if count > 0 {
-                let snap: Vec<Value> = (0..count as usize)
-                    .map(|j| i.ta_read(&info, from + j))
-                    .collect();
-                for (j, v) in snap.iter().enumerate() {
-                    ab(i.ta_store(&info, to + j, v))?;
+                // Snapshot bytes for overlap and preserve floating NaN payloads.
+                if let Some(bytes) = i.ta_read_bytes(&info, from, count as usize) {
+                    i.ta_write_bytes(&info, to, &bytes);
                 }
             }
             Ok(this.clone())
@@ -1246,6 +1332,25 @@ fn ta_native(
                     // earlier writes.
                     let es = info.kind.elsize();
                     let n = count.min(curlen.saturating_sub(start));
+                    // Owned stores cannot move during this owner-thread turn. Only disjoint
+                    // ranges can use a snapshot: aliasing species retains sequential Set order.
+                    let disjoint = match (
+                        i.array_buffers.get(&info.buffer),
+                        i.array_buffers.get(&new_info.buffer),
+                    ) {
+                        (Some(src), Some(dst)) if !src.is_external() && !dst.is_external() => {
+                            let source = src.as_ptr() as usize + info.offset + start * es;
+                            let target = dst.as_ptr() as usize + new_info.offset;
+                            source + n * es <= target || target + n * es <= source
+                        }
+                        _ => false,
+                    };
+                    if disjoint {
+                        if let Some(bytes) = i.ta_read_bytes(&info, start, n) {
+                            i.ta_write_bytes(&new_info, 0, &bytes);
+                        }
+                        return Ok(new_ta);
+                    }
                     for j in 0..n {
                         if let Some(bytes) = i.ta_read_bytes(&info, start + j, 1) {
                             debug_assert_eq!(bytes.len(), es);
@@ -1481,14 +1586,18 @@ fn ta_construct(i: &mut Interp, args: &[Value], kind: TaKind) -> Result<Value, V
             let n = if n.is_nan() { 0.0 } else { n.trunc() };
             if !(0.0..=9007199254740991.0).contains(&n) {
                 let shown = i.num_to_str(n);
-                return Err(i.make_error("RangeError", format!("Invalid typed array length: {shown}")));
+                return Err(
+                    i.make_error("RangeError", format!("Invalid typed array length: {shown}"))
+                );
             }
             let len = n as usize;
             // A fresh typed array is one flat allocation, so the byte ceiling is the bound —
             // not the element cap that guards Value-per-element arrays. `Buffer.alloc(2 MiB)`
             // is ordinary Node.
             if len.saturating_mul(es) > MAX_BUFFER_BYTES {
-                return Err(i.make_error("RangeError", format!("Invalid typed array length: {len}")));
+                return Err(
+                    i.make_error("RangeError", format!("Invalid typed array length: {len}"))
+                );
             }
             let (bv, bp) = make_array_buffer(i, len * es);
             (bv, bp, 0, len, false)
@@ -1763,7 +1872,13 @@ pub(super) fn install_typed_arrays(it: &mut Interp) {
         it.def_method(&ta_proto, name, len, *f);
     }
     // %TypedArray%.prototype.toString is the very same function object as %Array.prototype.toString%.
-    if let Some(p) = it.array_proto.borrow().props.get("toString").map(|p| p.clone()) {
+    if let Some(p) = it
+        .array_proto
+        .borrow()
+        .props
+        .get("toString")
+        .map(|p| p.clone())
+    {
         ta_proto.borrow_mut().props.insert("toString", p);
     }
     // %TypedArray%.prototype[@@iterator] is the same function object as its own `values`.
@@ -1915,7 +2030,11 @@ use lumen_common::codec::{self, LastChunk, PartialDecode};
 /// FromHex: an odd UTF-16 length is an error before anything is decoded.
 fn hex_decode_spec(s: &str, max_len: usize) -> PartialDecode {
     if !crate::jstr::unit_len(s).is_multiple_of(2) {
-        return PartialDecode { read: 0, bytes: Vec::new(), error: true };
+        return PartialDecode {
+            read: 0,
+            bytes: Vec::new(),
+            error: true,
+        };
     }
     codec::hex_decode_partial(s.as_bytes(), max_len)
 }
@@ -2013,7 +2132,11 @@ pub(super) fn install_uint8_base64(it: &mut Interp) {
             false
         };
         let bytes = u8_bytes(i, &this)?;
-        Ok(Value::from_string(codec::base64_encode(&bytes, url, !omit_padding)))
+        Ok(Value::from_string(codec::base64_encode(
+            &bytes,
+            url,
+            !omit_padding,
+        )))
     });
     it.def_method(&ctor, "fromHex", 1, |i, _t, a| {
         let s = match arg(a, 0) {

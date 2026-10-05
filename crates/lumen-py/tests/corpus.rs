@@ -22,7 +22,9 @@ use std::time::Duration;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn corpus_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("py")
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("py")
 }
 
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -76,8 +78,18 @@ fn run_script(script: &Path) -> Result<Outcome, String> {
     let stdout = out_h.join().unwrap_or_default();
     let stderr = err_h.join().unwrap_or_default();
     let stderr = String::from_utf8_lossy(&stderr);
-    let last_stderr = stderr.trim_end_matches('\n').lines().next_back().unwrap_or("").to_string();
-    Ok(Outcome { stdout, last_stderr, code: status.and_then(|s| s.code()), timed_out })
+    let last_stderr = stderr
+        .trim_end_matches('\n')
+        .lines()
+        .next_back()
+        .unwrap_or("")
+        .to_string();
+    Ok(Outcome {
+        stdout,
+        last_stderr,
+        code: status.and_then(|s| s.code()),
+        timed_out,
+    })
 }
 
 fn first_diff(expected: &[u8], actual: &[u8]) -> String {
@@ -116,11 +128,17 @@ fn check(script: &Path) -> Option<String> {
         None
     } else {
         let mut lines = err_text.lines();
-        let code: i32 = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(1);
+        let code: i32 = lines
+            .next()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(1);
         Some((code, lines.next().unwrap_or("").to_string()))
     };
     if out.stdout != expected_out {
-        return Some(format!("stdout differs, {}", first_diff(&expected_out, &out.stdout)));
+        return Some(format!(
+            "stdout differs, {}",
+            first_diff(&expected_out, &out.stdout)
+        ));
     }
     match expected_err {
         Some((code, last)) => {
@@ -147,14 +165,21 @@ fn check(script: &Path) -> Option<String> {
 }
 
 fn rel(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/")
+    p.strip_prefix(root)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// `path -> reason` from `expected-failures.txt`; lines without a reason are returned separately.
 fn read_baseline(path: &Path) -> (BTreeMap<String, String>, Vec<String>) {
     let mut map = BTreeMap::new();
     let mut missing = Vec::new();
-    for line in fs::read_to_string(path).unwrap_or_default().lines().map(str::trim) {
+    for line in fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+    {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -183,7 +208,9 @@ fn corpus() {
     let next = Arc::new(AtomicUsize::new(0));
     let results: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
     let scripts = Arc::new(scripts);
-    let workers = thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let workers = thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(16);
     let handles: Vec<_> = (0..workers)
         .map(|_| {
             let (next, results, scripts, root) =
@@ -224,9 +251,14 @@ fn corpus() {
     let (baseline, missing_reasons) = read_baseline(&baseline_path);
     let allowed = |path: &str| baseline.contains_key(path);
 
-    let failing: Vec<&(String, Option<String>)> = results.iter().filter(|(_, r)| r.is_some()).collect();
+    let failing: Vec<&(String, Option<String>)> =
+        results.iter().filter(|(_, r)| r.is_some()).collect();
     for (path, r) in &failing {
-        let tag = if allowed(path) { "expected-fail" } else { "FAIL" };
+        let tag = if allowed(path) {
+            "expected-fail"
+        } else {
+            "FAIL"
+        };
         println!("{tag}: {path}: {}", r.as_deref().unwrap_or(""));
     }
     for (path, r) in &results {
@@ -260,8 +292,11 @@ fn corpus() {
         "expected-failures.txt entries need a `# reason`:\n{}",
         missing_reasons.join("\n")
     );
-    let unexpected: Vec<&str> =
-        failing.iter().map(|(p, _)| p.as_str()).filter(|p| !allowed(p)).collect();
+    let unexpected: Vec<&str> = failing
+        .iter()
+        .map(|(p, _)| p.as_str())
+        .filter(|p| !allowed(p))
+        .collect();
     assert!(
         unexpected.is_empty(),
         "{} corpus file(s) failed unexpectedly:\n{}",

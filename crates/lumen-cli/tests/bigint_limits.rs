@@ -23,7 +23,10 @@ fn timeout_stops_long_bigint_operations() {
     for src in cases {
         let (out, elapsed) = lumen(&["--timeout=300", "-e", src]);
         assert_eq!(out.status.code(), Some(124), "{src}: {out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("timed out after 300 ms"), "{src}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("timed out after 300 ms"),
+            "{src}"
+        );
         assert!(elapsed < limit, "{src}: {elapsed:?}");
     }
 }

@@ -5,7 +5,9 @@ use proc_macro::{Delimiter, Group, Spacing, Span, TokenStream, TokenTree};
 pub type Res<T> = Result<T, (Span, String)>;
 
 pub fn compile_error(span: Span, msg: &str) -> TokenStream {
-    let ts: TokenStream = format!("::core::compile_error!{{ {msg:?} }}").parse().unwrap();
+    let ts: TokenStream = format!("::core::compile_error!{{ {msg:?} }}")
+        .parse()
+        .unwrap();
     ts.into_iter()
         .map(|mut t| {
             t.set_span(span);
@@ -22,7 +24,12 @@ pub fn with_error(item: TokenStream, span: Span, msg: &str) -> TokenStream {
 }
 
 pub fn parse_ts(code: &str, span: Span) -> Res<TokenStream> {
-    code.parse::<TokenStream>().map_err(|e| (span, format!("internal: generated code did not parse: {e}\n{code}")))
+    code.parse::<TokenStream>().map_err(|e| {
+        (
+            span,
+            format!("internal: generated code did not parse: {e}\n{code}"),
+        )
+    })
 }
 
 pub fn is_punct(t: &TokenTree, c: char) -> bool {
@@ -120,13 +127,25 @@ impl Opts {
         self.flags.iter().any(|(k, _)| k == f)
     }
     pub fn get(&self, k: &str) -> Option<&str> {
-        self.kv.iter().rev().find(|(a, _, _)| a == k).map(|(_, v, _)| v.as_str())
+        self.kv
+            .iter()
+            .rev()
+            .find(|(a, _, _)| a == k)
+            .map(|(_, v, _)| v.as_str())
     }
     pub fn list(&self, k: &str) -> Vec<String> {
-        self.lists.iter().filter(|(a, _, _)| a == k).flat_map(|(_, v, _)| v.clone()).collect()
+        self.lists
+            .iter()
+            .filter(|(a, _, _)| a == k)
+            .flat_map(|(_, v, _)| v.clone())
+            .collect()
     }
     pub fn map(&self, k: &str) -> Vec<(String, String)> {
-        self.maps.iter().filter(|(a, _, _)| a == k).flat_map(|(_, v, _)| v.clone()).collect()
+        self.maps
+            .iter()
+            .filter(|(a, _, _)| a == k)
+            .flat_map(|(_, v, _)| v.clone())
+            .collect()
     }
     pub fn check(&self, allowed: &[&str]) -> Res<()> {
         let names = self
@@ -139,7 +158,13 @@ impl Opts {
             .chain(self.hint_span.iter().map(|s| (HINT, s)));
         for (k, s) in names {
             if !allowed.contains(&k) && !k.starts_with("__") {
-                return Err((*s, format!("unknown option `{k}` (expected one of: {})", allowed.join(", "))));
+                return Err((
+                    *s,
+                    format!(
+                        "unknown option `{k}` (expected one of: {})",
+                        allowed.join(", ")
+                    ),
+                ));
             }
         }
         Ok(())
@@ -163,18 +188,32 @@ pub fn parse_opts(ts: TokenStream) -> Res<Opts> {
         match part.as_slice() {
             [] => {}
             [TokenTree::Ident(i)] => o.flags.push((i.to_string(), i.span())),
-            [TokenTree::Ident(i), TokenTree::Punct(p), TokenTree::Literal(l)] if p.as_char() == '=' => {
+            [TokenTree::Ident(i), TokenTree::Punct(p), TokenTree::Literal(l)]
+                if p.as_char() == '=' =>
+            {
                 o.kv.push((i.to_string(), string_lit(l)?, i.span()))
             }
-            [TokenTree::Ident(i), TokenTree::Group(g)] if g.delimiter() == Delimiter::Parenthesis && i.to_string() == "hint" => {
+            [TokenTree::Ident(i), TokenTree::Punct(p), rest @ ..]
+                if i.to_string() == "extends" && p.as_char() == '=' && !rest.is_empty() =>
+            {
+                o.kv.push((i.to_string(), type_str(rest), i.span()))
+            }
+            [TokenTree::Ident(i), TokenTree::Group(g)]
+                if g.delimiter() == Delimiter::Parenthesis && i.to_string() == "hint" =>
+            {
                 let inner: Vec<TokenTree> = g.stream().into_iter().collect();
                 for p in split_commas(&inner) {
                     match p.as_slice() {
                         [] => {}
-                        [TokenTree::Ident(h), TokenTree::Group(hg)] if hg.delimiter() == Delimiter::Parenthesis => {
+                        [TokenTree::Ident(h), TokenTree::Group(hg)]
+                            if hg.delimiter() == Delimiter::Parenthesis =>
+                        {
                             let ho = parse_opts(hg.stream())?;
                             if !ho.lists.is_empty() || !ho.maps.is_empty() || !ho.hints.is_empty() {
-                                return Err((h.span(), "hints are `flag` or `key = \"value\"`".into()));
+                                return Err((
+                                    h.span(),
+                                    "hints are `flag` or `key = \"value\"`".into(),
+                                ));
                             }
                             for (f, _) in ho.flags {
                                 o.hints.push((h.to_string(), f, String::new()));
@@ -183,21 +222,32 @@ pub fn parse_opts(ts: TokenStream) -> Res<Opts> {
                                 o.hints.push((h.to_string(), k, v));
                             }
                         }
-                        other => return Err((other[0].span(), "expected `host(key = \"value\", ..)`".into())),
+                        other => {
+                            return Err((
+                                other[0].span(),
+                                "expected `host(key = \"value\", ..)`".into(),
+                            ))
+                        }
                     }
                 }
                 o.hint_span = Some(i.span());
             }
-            [TokenTree::Ident(i), TokenTree::Group(g)] if g.delimiter() == Delimiter::Parenthesis => {
+            [TokenTree::Ident(i), TokenTree::Group(g)]
+                if g.delimiter() == Delimiter::Parenthesis =>
+            {
                 let inner: Vec<TokenTree> = g.stream().into_iter().collect();
                 if inner.iter().any(|t| is_punct(t, '=')) {
                     let mut pairs = Vec::new();
                     for p in split_commas(&inner) {
                         match p.as_slice() {
-                            [TokenTree::Ident(h), TokenTree::Punct(e), TokenTree::Literal(l)] if e.as_char() == '=' => {
+                            [TokenTree::Ident(h), TokenTree::Punct(e), TokenTree::Literal(l)]
+                                if e.as_char() == '=' =>
+                            {
                                 pairs.push((h.to_string(), string_lit(l)?))
                             }
-                            other => return Err((other[0].span(), "expected `host = \"name\"`".into())),
+                            other => {
+                                return Err((other[0].span(), "expected `host = \"name\"`".into()))
+                            }
                         }
                     }
                     o.maps.push((i.to_string(), pairs, i.span()));
@@ -212,7 +262,12 @@ pub fn parse_opts(ts: TokenStream) -> Res<Opts> {
                     o.lists.push((i.to_string(), items, i.span()));
                 }
             }
-            other => return Err((other[0].span(), "expected `flag`, `key = \"value\"` or `key(..)`".into())),
+            other => {
+                return Err((
+                    other[0].span(),
+                    "expected `flag`, `key = \"value\"` or `key(..)`".into(),
+                ))
+            }
         }
     }
     Ok(o)
@@ -235,7 +290,8 @@ impl Attr {
     }
     /// A binding attribute named `n` (`n`, `lumen_bind::n`, `::lumen_bind::n`).
     pub fn is(&self, n: &str) -> bool {
-        self.name() == n && (self.path == n || self.path.trim_start_matches("::") == format!("lumen_bind::{n}"))
+        self.name() == n
+            && (self.path == n || self.path.trim_start_matches("::") == format!("lumen_bind::{n}"))
     }
     pub fn args_ts(&self) -> TokenStream {
         self.args.as_ref().map(|g| g.stream()).unwrap_or_default()
@@ -246,7 +302,9 @@ impl Attr {
 pub fn take_attrs(toks: &[TokenTree], mut i: usize) -> (Vec<Attr>, usize) {
     let mut attrs = Vec::new();
     while i + 1 < toks.len() && is_punct(&toks[i], '#') {
-        let TokenTree::Group(g) = &toks[i + 1] else { break };
+        let TokenTree::Group(g) = &toks[i + 1] else {
+            break;
+        };
         if g.delimiter() != Delimiter::Bracket {
             break;
         }
@@ -265,7 +323,12 @@ pub fn take_attrs(toks: &[TokenTree], mut i: usize) -> (Vec<Attr>, usize) {
             Some(TokenTree::Group(a)) if a.delimiter() == Delimiter::Parenthesis => Some(a.clone()),
             _ => None,
         };
-        attrs.push(Attr { path, args, span: toks[i].span(), tokens: vec![toks[i].clone(), toks[i + 1].clone()] });
+        attrs.push(Attr {
+            path,
+            args,
+            span: toks[i].span(),
+            tokens: vec![toks[i].clone(), toks[i + 1].clone()],
+        });
         i += 2;
     }
     (attrs, i)
@@ -279,7 +342,9 @@ pub fn doc_of(toks: &[TokenTree]) -> Option<String> {
         if a.path != "doc" {
             continue;
         }
-        let TokenTree::Group(g) = &a.tokens[1] else { continue };
+        let TokenTree::Group(g) = &a.tokens[1] else {
+            continue;
+        };
         let inner: Vec<TokenTree> = g.stream().into_iter().collect();
         if let [_, TokenTree::Punct(p), TokenTree::Literal(l)] = inner.as_slice() {
             if p.as_char() == '=' {
@@ -505,9 +570,18 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
     loop {
         match toks.get(i) {
             Some(t) if is_ident(t, "const") || is_ident(t, "default") => i += 1,
-            Some(t) if is_ident(t, "async") => return Err((t.span(), "write a plain fn and add the `async` option".into())),
-            Some(t) if is_ident(t, "unsafe") => return Err((t.span(), "unsafe fns cannot be bound".into())),
-            Some(t) if is_ident(t, "extern") => return Err((t.span(), "extern fns cannot be bound".into())),
+            Some(t) if is_ident(t, "async") => {
+                return Err((
+                    t.span(),
+                    "write a plain fn and add the `async` option".into(),
+                ))
+            }
+            Some(t) if is_ident(t, "unsafe") => {
+                return Err((t.span(), "unsafe fns cannot be bound".into()))
+            }
+            Some(t) if is_ident(t, "extern") => {
+                return Err((t.span(), "extern fns cannot be bound".into()))
+            }
             _ => break,
         }
     }
@@ -540,7 +614,10 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
                     prev_quote = p.as_char() == '\'';
                 }
                 TokenTree::Ident(id) if depth == 1 && !prev_quote => {
-                    return Err((id.span(), "generic type parameters are not supported (lifetimes only)".into()));
+                    return Err((
+                        id.span(),
+                        "generic type parameters are not supported (lifetimes only)".into(),
+                    ));
                 }
                 _ => {
                     prev_dash = false;
@@ -565,7 +642,7 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
         let p = &raw[start..];
         let span = p.first().map_or(pg.span(), |t| t.span());
         let colon = (0..p.len()).find(|&k| {
-            matches!(&p[k], TokenTree::Punct(c) if c.as_char() == ':' && c.spacing() == Spacing::Alone)
+            matches!(&p[k], TokenTree::Punct(c) if c.as_char() == ':')
                 && !(k > 0 && matches!(&p[k - 1], TokenTree::Punct(c) if c.as_char() == ':' && c.spacing() == Spacing::Joint))
         });
         let Some(colon) = colon else {
@@ -586,10 +663,18 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
             _ => return Err((span, "parameters must be plain names".into())),
         };
         let ty = p[colon + 1..].to_vec();
-        params.push(Param { name: pname, ts: type_str(&ty), ty, attrs, span });
+        params.push(Param {
+            name: pname,
+            ts: type_str(&ty),
+            ty,
+            attrs,
+            span,
+        });
     }
     let mut ret = None;
-    if toks.get(i).is_some_and(|t| is_punct(t, '-')) && toks.get(i + 1).is_some_and(|t| is_punct(t, '>')) {
+    if toks.get(i).is_some_and(|t| is_punct(t, '-'))
+        && toks.get(i + 1).is_some_and(|t| is_punct(t, '>'))
+    {
         i += 2;
         let start = i;
         while i < toks.len()
@@ -601,7 +686,15 @@ pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {
         }
         ret = Some(toks[start..i].to_vec());
     }
-    Ok(Sig { name, name_span, vis, receiver, params, ret, doc })
+    Ok(Sig {
+        name,
+        name_span,
+        vis,
+        receiver,
+        params,
+        ret,
+        doc,
+    })
 }
 
 /// The fn item with the binding attributes on its parameters removed (they are not real
@@ -627,7 +720,10 @@ pub fn strip_fn(toks: &[TokenTree], keep_attr: &dyn Fn(&Attr) -> bool) -> TokenS
                 let mut ps: Vec<TokenTree> = Vec::new();
                 for (n, raw) in split_commas(&inner).into_iter().enumerate() {
                     if n > 0 {
-                        ps.push(TokenTree::Punct(proc_macro::Punct::new(',', Spacing::Alone)));
+                        ps.push(TokenTree::Punct(proc_macro::Punct::new(
+                            ',',
+                            Spacing::Alone,
+                        )));
                     }
                     let (pattrs, s) = take_attrs(&raw, 0);
                     for a in &pattrs {

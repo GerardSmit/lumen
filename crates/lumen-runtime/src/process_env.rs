@@ -1,7 +1,7 @@
 //! Realm-owned environment data. SHARE_ENV passes this backing only to admitted child workers;
 //! writes never mutate the embedding process's OS environment.
-use lumen_bind::NativeError;
 use lumen::embed::OpError;
+use lumen_bind::NativeError;
 use lumen_host::{Ctx, Extension, OpState, Value};
 use std::sync::{Arc, Mutex};
 
@@ -53,8 +53,7 @@ pub(crate) fn replace(
         ..Default::default()
     };
     for (key, value) in values {
-        next.set(key, value)
-            .map_err(NativeError::value_error)?;
+        next.set(key, value).map_err(NativeError::value_error)?;
     }
     let backing = ctx
         .op_state()
@@ -115,7 +114,12 @@ mod bindings {
     fn op_set(ctx: &mut Ctx, key: String, value: String) -> Result<(), OpError> {
         let backing = backing(ctx);
         let changed = (key == "TZ").then(|| value.clone());
-        backing.0.lock().unwrap().set(key, value).map_err(OpError::range_error)?;
+        backing
+            .0
+            .lock()
+            .unwrap()
+            .set(key, value)
+            .map_err(OpError::range_error)?;
         if let Some(value) = changed {
             time_zone_changed(ctx, "TZ", Some(&value));
         }
@@ -137,7 +141,14 @@ mod bindings {
 
     #[op(name = "keys")]
     fn op_keys(ctx: &mut Ctx) -> Vec<String> {
-        backing(ctx).0.lock().unwrap().values.iter().map(|(key, _)| key.clone()).collect()
+        backing(ctx)
+            .0
+            .lock()
+            .unwrap()
+            .values
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 
     #[op(name = "reset")]

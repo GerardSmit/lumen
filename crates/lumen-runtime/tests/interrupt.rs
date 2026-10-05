@@ -352,7 +352,8 @@ fn a_deadline_interrupts_a_blocked_loop() {
             runtime.set_deadline(Duration::from_millis(200));
             let started = Instant::now();
             let _ = runtime.eval("setInterval(() => {}, 10);");
-            tx.send((started.elapsed(), runtime.is_interrupted())).unwrap();
+            tx.send((started.elapsed(), runtime.is_interrupted()))
+                .unwrap();
         })
         .unwrap();
     let (elapsed, interrupted) = rx
@@ -394,6 +395,8 @@ fn an_interrupt_before_the_script_runs_stops_it_at_once() {
             tx.send(started.elapsed()).unwrap();
         })
         .unwrap();
-    let elapsed = rx.recv_timeout(HARD_DEADLINE).expect("the loop never stopped");
+    let elapsed = rx
+        .recv_timeout(HARD_DEADLINE)
+        .expect("the loop never stopped");
     assert!(elapsed < STOP_WITHIN, "{elapsed:?}");
 }

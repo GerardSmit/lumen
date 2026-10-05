@@ -34,7 +34,12 @@ pub mod _string {
             if c == '{' || c == '}' {
                 if i + 1 < chars.len() && chars[i + 1] == c {
                     lit.push(c);
-                    out.push(Value::tuple(vec![Value::string(std::mem::take(&mut lit)), Value::None, Value::None, Value::None]));
+                    out.push(Value::tuple(vec![
+                        Value::string(std::mem::take(&mut lit)),
+                        Value::None,
+                        Value::None,
+                        Value::None,
+                    ]));
                     i += 2;
                     continue;
                 }
@@ -57,7 +62,11 @@ pub mod _string {
                     j += 1;
                 }
                 if j >= chars.len() {
-                    let msg = if i + 1 == chars.len() { "Single '{' encountered in format string" } else { "expected '}' before end of string" };
+                    let msg = if i + 1 == chars.len() {
+                        "Single '{' encountered in format string"
+                    } else {
+                        "expected '}' before end of string"
+                    };
                     return Err(parse_error(it, msg));
                 }
                 let field = &chars[i + 1..j];
@@ -77,7 +86,10 @@ pub mod _string {
                 let mut spec = String::new();
                 if k < field.len() && field[k] == '!' {
                     if k + 1 >= field.len() {
-                        return Err(parse_error(it, "end of string while looking for conversion specifier"));
+                        return Err(parse_error(
+                            it,
+                            "end of string while looking for conversion specifier",
+                        ));
                     }
                     conv = Some(field[k + 1].to_string());
                     k += 2;
@@ -88,7 +100,12 @@ pub mod _string {
                 if k < field.len() && field[k] == ':' {
                     spec = field[k + 1..].iter().collect();
                 }
-                out.push(Value::tuple(vec![Value::string(std::mem::take(&mut lit)), Value::string(name), Value::string(spec), opt(conv)]));
+                out.push(Value::tuple(vec![
+                    Value::string(std::mem::take(&mut lit)),
+                    Value::string(name),
+                    Value::string(spec),
+                    opt(conv),
+                ]));
                 i = j + 1;
             } else {
                 lit.push(c);
@@ -96,7 +113,12 @@ pub mod _string {
             }
         }
         if !lit.is_empty() {
-            out.push(Value::tuple(vec![Value::string(lit), Value::None, Value::None, Value::None]));
+            out.push(Value::tuple(vec![
+                Value::string(lit),
+                Value::None,
+                Value::None,
+                Value::None,
+            ]));
         }
         it.native_get_iter(&Value::list(out))
     }
@@ -108,9 +130,19 @@ pub mod _string {
             return Err(expected_str(it, name));
         };
         let chars: Vec<char> = name.chars().collect();
-        let first_end = chars.iter().position(|c| *c == '.' || *c == '[').unwrap_or(chars.len());
+        let first_end = chars
+            .iter()
+            .position(|c| *c == '.' || *c == '[')
+            .unwrap_or(chars.len());
         let first: String = chars[..first_end].iter().collect();
-        let first_val = if !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()) { first.parse::<i64>().map(Value::Int).unwrap_or_else(|_| Value::string(first.clone())) } else { Value::string(first) };
+        let first_val = if !first.is_empty() && first.chars().all(|c| c.is_ascii_digit()) {
+            first
+                .parse::<i64>()
+                .map(Value::Int)
+                .unwrap_or_else(|_| Value::string(first.clone()))
+        } else {
+            Value::string(first)
+        };
         let mut rest: Vec<Value> = Vec::new();
         let mut k = first_end;
         while k < chars.len() {
@@ -137,15 +169,23 @@ pub mod _string {
                 if key.is_empty() {
                     return Err(parse_error(it, "Empty attribute in format string"));
                 }
-                let kv = if key.chars().all(|c| c.is_ascii_digit()) { key.parse::<i64>().map(Value::Int).unwrap_or_else(|_| Value::string(key.clone())) } else { Value::string(key) };
+                let kv = if key.chars().all(|c| c.is_ascii_digit()) {
+                    key.parse::<i64>()
+                        .map(Value::Int)
+                        .unwrap_or_else(|_| Value::string(key.clone()))
+                } else {
+                    Value::string(key)
+                };
                 rest.push(Value::tuple(vec![Value::Bool(false), kv]));
                 k = e + 1;
             } else {
-                return Err(parse_error(it, "Only '.' or '[' may follow ']' in format field specifier"));
+                return Err(parse_error(
+                    it,
+                    "Only '.' or '[' may follow ']' in format field specifier",
+                ));
             }
         }
         let iter = it.native_get_iter(&Value::list(rest))?;
         Ok(Value::tuple(vec![first_val, iter]))
     }
-
 }

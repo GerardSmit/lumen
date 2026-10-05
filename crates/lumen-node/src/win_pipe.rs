@@ -93,7 +93,12 @@ extern "system" {
         transferred: *mut u32,
         wait: Bool,
     ) -> Bool;
-    fn CreateEventW(security: *mut c_void, manual_reset: Bool, initial: Bool, name: *const u16) -> Handle;
+    fn CreateEventW(
+        security: *mut c_void,
+        manual_reset: Bool,
+        initial: Bool,
+        name: *const u16,
+    ) -> Handle;
     fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> Bool;
     fn CloseHandle(handle: Handle) -> Bool;
     fn GetFileType(file: Handle) -> u32;
@@ -393,7 +398,8 @@ impl PipeListener {
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         }
         // SAFETY: `handle` is the listener's pending instance.
-        let connected = match overlapped_call(handle, |ov| unsafe { ConnectNamedPipe(handle, ov) }) {
+        let connected = match overlapped_call(handle, |ov| unsafe { ConnectNamedPipe(handle, ov) })
+        {
             Ok(_) | Err(ERROR_PIPE_CONNECTED) => true,
             // A client that connected and left before the wait: the instance is unusable.
             Err(ERROR_NO_DATA) => false,

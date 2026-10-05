@@ -28,7 +28,9 @@ pub enum DecodeError {
 impl DecodeError {
     pub fn position(self) -> Option<usize> {
         match self {
-            DecodeError::InvalidByte(p) | DecodeError::InvalidPadding(p) | DecodeError::TrailingBits(p) => Some(p),
+            DecodeError::InvalidByte(p)
+            | DecodeError::InvalidPadding(p)
+            | DecodeError::TrailingBits(p) => Some(p),
             DecodeError::InvalidLength => None,
         }
     }
@@ -278,9 +280,17 @@ pub enum Padding {
 
 /// Strict base64: only the chosen alphabet, canonical padding as requested, no whitespace, and
 /// zero bits below the final byte. Errors carry the byte offset.
-pub fn base64_decode_strict(src: &[u8], url: bool, padding: Padding) -> Result<Vec<u8>, DecodeError> {
+pub fn base64_decode_strict(
+    src: &[u8],
+    url: bool,
+    padding: Padding,
+) -> Result<Vec<u8>, DecodeError> {
     let table = if url { &UNB64_URL } else { &UNB64_STD };
-    let pads = if padding == Padding::Forbidden { 0 } else { src.iter().rev().take_while(|&&c| c == b'=').count() };
+    let pads = if padding == Padding::Forbidden {
+        0
+    } else {
+        src.iter().rev().take_while(|&&c| c == b'=').count()
+    };
     let data_len = src.len() - pads;
     if pads > 2 {
         return Err(DecodeError::InvalidPadding(data_len + 2));
@@ -318,7 +328,11 @@ pub fn base64_decode_strict(src: &[u8], url: bool, padding: Padding) -> Result<V
         }
         1 => return Err(DecodeError::InvalidLength),
         len => {
-            let bad_pads = if padding == Padding::Required { pads != want_pads } else { pads != 0 && pads != want_pads };
+            let bad_pads = if padding == Padding::Required {
+                pads != want_pads
+            } else {
+                pads != 0 && pads != want_pads
+            };
             if bad_pads {
                 return Err(DecodeError::InvalidPadding(src.len()));
             }
@@ -460,7 +474,10 @@ pub fn uu_decode_line(src: &[u8]) -> Result<Vec<u8>, &'static str> {
             bin_len -= 1;
         }
     }
-    if rest.iter().any(|&c| !matches!(c, b' ' | b'`' | b'\n' | b'\r')) {
+    if rest
+        .iter()
+        .any(|&c| !matches!(c, b' ' | b'`' | b'\n' | b'\r'))
+    {
         return Err("Trailing garbage");
     }
     Ok(out)
@@ -471,7 +488,13 @@ pub fn uu_encode_line(data: &[u8], backtick: bool) -> Result<Vec<u8>, &'static s
     if data.len() > 45 {
         return Err("At most 45 bytes at once");
     }
-    let ch = |v: u32| if backtick && v == 0 { b'`' } else { b' ' + v as u8 };
+    let ch = |v: u32| {
+        if backtick && v == 0 {
+            b'`'
+        } else {
+            b' ' + v as u8
+        }
+    };
     let mut out = vec![ch(data.len() as u32)];
     for chunk in data.chunks(3) {
         let mut n = 0u32;
@@ -492,7 +515,11 @@ pub fn crc_hqx(data: &[u8], crc: u32) -> u32 {
     for &b in data {
         crc ^= (b as u32) << 8;
         for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 { (crc << 1) ^ 0x1021 } else { crc << 1 };
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
         }
         crc &= 0xffff;
     }
@@ -521,7 +548,10 @@ pub fn qp_decode(src: &[u8], header: bool) -> Vec<u8> {
             } else if src[i] == b'=' {
                 out.push(b'=');
                 i += 1;
-            } else if let (Some(h), Some(l)) = (hex_digit(src[i]), src.get(i + 1).and_then(|&c| hex_digit(c))) {
+            } else if let (Some(h), Some(l)) = (
+                hex_digit(src[i]),
+                src.get(i + 1).and_then(|&c| hex_digit(c)),
+            ) {
                 out.push(h << 4 | l);
                 i += 2;
             } else {
@@ -543,7 +573,10 @@ pub fn qp_decode(src: &[u8], header: bool) -> Vec<u8> {
 pub fn qp_encode(data: &[u8], quotetabs: bool, istext: bool, header: bool) -> Vec<u8> {
     const MAXLINESIZE: usize = 76;
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let crlf = data.iter().position(|&c| c == b'\n').is_some_and(|p| p > 0 && data[p - 1] == b'\r');
+    let crlf = data
+        .iter()
+        .position(|&c| c == b'\n')
+        .is_some_and(|p| p > 0 && data[p - 1] == b'\r');
     let mut out = Vec::with_capacity(data.len() * 3 / 2);
     let soft_break = |out: &mut Vec<u8>| {
         out.push(b'=');
@@ -612,13 +645,26 @@ pub fn hex_decode_partial(src: &[u8], max_len: usize) -> PartialDecode {
     let mut bytes = Vec::with_capacity((src.len() / 2).min(max_len));
     let mut read = 0;
     while read < src.len() && bytes.len() < max_len {
-        match (hex_digit(src[read]), src.get(read + 1).copied().and_then(hex_digit)) {
+        match (
+            hex_digit(src[read]),
+            src.get(read + 1).copied().and_then(hex_digit),
+        ) {
             (Some(hi), Some(lo)) => bytes.push(hi << 4 | lo),
-            _ => return PartialDecode { read, bytes, error: true },
+            _ => {
+                return PartialDecode {
+                    read,
+                    bytes,
+                    error: true,
+                }
+            }
         }
         read += 2;
     }
-    PartialDecode { read, bytes, error: false }
+    PartialDecode {
+        read,
+        bytes,
+        error: false,
+    }
 }
 
 #[inline]
@@ -630,7 +676,11 @@ fn is_ascii_whitespace(c: u8) -> bool {
 /// optional, only the standard alphabet is accepted and stray bits in the last group are dropped.
 /// `None` for anything else.
 pub fn base64_decode_forgiving(src: &[u8]) -> Option<Vec<u8>> {
-    let mut data: Vec<u8> = src.iter().copied().filter(|&c| !is_ascii_whitespace(c)).collect();
+    let mut data: Vec<u8> = src
+        .iter()
+        .copied()
+        .filter(|&c| !is_ascii_whitespace(c))
+        .collect();
     if data.len().is_multiple_of(4) {
         for _ in 0..2 {
             if data.last() == Some(&b'=') {
@@ -674,7 +724,12 @@ pub enum LastChunk {
 /// FromBase64 of `Uint8Array.fromBase64` / `setFromBase64`: ASCII whitespace is skipped, one
 /// alphabet is accepted, and decoding stops once `max_len` bytes are produced or before a group
 /// that would not fit.
-pub fn base64_decode_partial(src: &[u8], url: bool, last: LastChunk, max_len: usize) -> PartialDecode {
+pub fn base64_decode_partial(
+    src: &[u8],
+    url: bool,
+    last: LastChunk,
+    max_len: usize,
+) -> PartialDecode {
     let table = if url { &UNB64_URL } else { &UNB64_STD };
     let len = src.len();
     let mut bytes = Vec::new();
@@ -709,7 +764,8 @@ pub fn base64_decode_partial(src: &[u8], url: bool, last: LastChunk, max_len: us
             if !group.is_empty() {
                 match last {
                     LastChunk::StopBeforePartial => return done(read, bytes, false),
-                    LastChunk::Loose if group.len() > 1 && decode_group(&group, false, &mut bytes) => {}
+                    LastChunk::Loose
+                        if group.len() > 1 && decode_group(&group, false, &mut bytes) => {}
                     _ => return done(read, bytes, true),
                 }
             }
@@ -840,18 +896,51 @@ mod tests {
     #[test]
     fn base64_strict() {
         let req = Padding::Required;
-        assert_eq!(base64_decode_strict(b"Zm9vYg==", false, req).unwrap(), b"foob");
+        assert_eq!(
+            base64_decode_strict(b"Zm9vYg==", false, req).unwrap(),
+            b"foob"
+        );
         assert_eq!(base64_decode_strict(b"Zm8=", false, req).unwrap(), b"fo");
-        assert_eq!(base64_decode_strict(b"Zm8", false, req), Err(DecodeError::InvalidPadding(3)));
-        assert_eq!(base64_decode_strict(b"Zm8", false, Padding::Optional).unwrap(), b"fo");
-        assert_eq!(base64_decode_strict(b"Zm9v\n", false, req), Err(DecodeError::InvalidByte(4)));
-        assert_eq!(base64_decode_strict(b"Zm9!", false, req), Err(DecodeError::InvalidByte(3)));
-        assert_eq!(base64_decode_strict(b"Zm9=Zm9v", false, req), Err(DecodeError::InvalidByte(3)));
-        assert_eq!(base64_decode_strict(b"Zh==", false, req), Err(DecodeError::TrailingBits(1)));
-        assert_eq!(base64_decode_strict(b"Z", false, Padding::Optional), Err(DecodeError::InvalidLength));
-        assert_eq!(base64_decode_strict(b"-_8", true, Padding::Forbidden).unwrap(), vec![0xfb, 0xff]);
-        assert_eq!(base64_decode_strict(b"+/8", true, Padding::Forbidden), Err(DecodeError::InvalidByte(0)));
-        assert_eq!(base64_decode_strict(b"Zg===", false, req), Err(DecodeError::InvalidPadding(4)));
+        assert_eq!(
+            base64_decode_strict(b"Zm8", false, req),
+            Err(DecodeError::InvalidPadding(3))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zm8", false, Padding::Optional).unwrap(),
+            b"fo"
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zm9v\n", false, req),
+            Err(DecodeError::InvalidByte(4))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zm9!", false, req),
+            Err(DecodeError::InvalidByte(3))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zm9=Zm9v", false, req),
+            Err(DecodeError::InvalidByte(3))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zh==", false, req),
+            Err(DecodeError::TrailingBits(1))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Z", false, Padding::Optional),
+            Err(DecodeError::InvalidLength)
+        );
+        assert_eq!(
+            base64_decode_strict(b"-_8", true, Padding::Forbidden).unwrap(),
+            vec![0xfb, 0xff]
+        );
+        assert_eq!(
+            base64_decode_strict(b"+/8", true, Padding::Forbidden),
+            Err(DecodeError::InvalidByte(0))
+        );
+        assert_eq!(
+            base64_decode_strict(b"Zg===", false, req),
+            Err(DecodeError::InvalidPadding(4))
+        );
     }
 
     #[test]
@@ -872,23 +961,75 @@ mod tests {
             let d = base64_decode_partial(s, false, last, max);
             (d.read, d.bytes, d.error)
         };
-        assert_eq!(p(b"SGVsbG8=", LastChunk::Loose, usize::MAX), (8, b"Hello".to_vec(), false));
-        assert_eq!(p(b"SGVsbA", LastChunk::Loose, usize::MAX), (6, b"Hell".to_vec(), false));
-        assert_eq!(p(b"SGVsbA", LastChunk::Strict, usize::MAX), (4, b"Hel".to_vec(), true));
-        assert_eq!(p(b"SGVsbA", LastChunk::StopBeforePartial, usize::MAX), (4, b"Hel".to_vec(), false));
-        assert_eq!(p(b"SGVsbB==", LastChunk::Strict, usize::MAX), (4, b"Hel".to_vec(), true));
-        assert_eq!(p(b"SGVsbG8=extra", LastChunk::Loose, usize::MAX), (4, b"Hel".to_vec(), true));
-        assert_eq!(p(b"SGVs bG8g", LastChunk::Loose, 4), (4, b"Hel".to_vec(), false));
-        assert_eq!(base64_decode_partial(b"-_8", true, LastChunk::Loose, 9).bytes, vec![0xfb, 0xff]);
+        assert_eq!(
+            p(b"SGVsbG8=", LastChunk::Loose, usize::MAX),
+            (8, b"Hello".to_vec(), false)
+        );
+        assert_eq!(
+            p(b"SGVsbA", LastChunk::Loose, usize::MAX),
+            (6, b"Hell".to_vec(), false)
+        );
+        assert_eq!(
+            p(b"SGVsbA", LastChunk::Strict, usize::MAX),
+            (4, b"Hel".to_vec(), true)
+        );
+        assert_eq!(
+            p(b"SGVsbA", LastChunk::StopBeforePartial, usize::MAX),
+            (4, b"Hel".to_vec(), false)
+        );
+        assert_eq!(
+            p(b"SGVsbB==", LastChunk::Strict, usize::MAX),
+            (4, b"Hel".to_vec(), true)
+        );
+        assert_eq!(
+            p(b"SGVsbG8=extra", LastChunk::Loose, usize::MAX),
+            (4, b"Hel".to_vec(), true)
+        );
+        assert_eq!(
+            p(b"SGVs bG8g", LastChunk::Loose, 4),
+            (4, b"Hel".to_vec(), false)
+        );
+        assert_eq!(
+            base64_decode_partial(b"-_8", true, LastChunk::Loose, 9).bytes,
+            vec![0xfb, 0xff]
+        );
         assert!(base64_decode_partial(b"+/8", true, LastChunk::Loose, 9).error);
     }
 
     #[test]
     fn hex_partial() {
-        assert_eq!(hex_decode_partial(b"0aff", 9), PartialDecode { read: 4, bytes: vec![10, 255], error: false });
-        assert_eq!(hex_decode_partial(b"0aff", 1), PartialDecode { read: 2, bytes: vec![10], error: false });
-        assert_eq!(hex_decode_partial(b"0azz", 9), PartialDecode { read: 2, bytes: vec![10], error: true });
-        assert_eq!(hex_decode_partial(b"0af", 9), PartialDecode { read: 2, bytes: vec![10], error: true });
+        assert_eq!(
+            hex_decode_partial(b"0aff", 9),
+            PartialDecode {
+                read: 4,
+                bytes: vec![10, 255],
+                error: false
+            }
+        );
+        assert_eq!(
+            hex_decode_partial(b"0aff", 1),
+            PartialDecode {
+                read: 2,
+                bytes: vec![10],
+                error: false
+            }
+        );
+        assert_eq!(
+            hex_decode_partial(b"0azz", 9),
+            PartialDecode {
+                read: 2,
+                bytes: vec![10],
+                error: true
+            }
+        );
+        assert_eq!(
+            hex_decode_partial(b"0af", 9),
+            PartialDecode {
+                read: 2,
+                bytes: vec![10],
+                error: true
+            }
+        );
     }
 
     #[test]

@@ -16,14 +16,26 @@ pub mod _functools {
     /// ((((1+2)+3)+4)+5).  If initial is present, it is placed before the items
     /// of the iterable in the calculation, and serves as a default when the
     /// iterable is empty.
-    #[op(hint(py(text_signature = "($module, function, iterable, initial=<unrepresentable>, /)")))]
-    fn reduce(it: &mut Interp, function: &Value, iterable: &Value, #[varargs] initial: &[Value]) -> R<Value> {
+    #[op(hint(py(
+        text_signature = "($module, function, iterable, initial=<unrepresentable>, /)"
+    )))]
+    fn reduce(
+        it: &mut Interp,
+        function: &Value,
+        iterable: &Value,
+        #[varargs] initial: &[Value],
+    ) -> R<Value> {
         if initial.len() > 1 {
-            return Err(it.type_error(&format!("reduce expected at most 3 arguments, got {}", initial.len() + 2)));
+            return Err(it.type_error(&format!(
+                "reduce expected at most 3 arguments, got {}",
+                initial.len() + 2
+            )));
         }
         let iter = match it.get_iter(iterable) {
             Ok(i) => i,
-            Err(e) if it.exc_is(&e, "TypeError") => return Err(it.type_error("reduce() arg 2 must support iteration")),
+            Err(e) if it.exc_is(&e, "TypeError") => {
+                return Err(it.type_error("reduce() arg 2 must support iteration"));
+            }
             Err(e) => return Err(e),
         };
         let mut acc = initial.first().cloned();
@@ -42,7 +54,15 @@ pub mod _functools {
     ///     Function that compares two objects.
     #[op]
     fn cmp_to_key(it: &mut Interp, #[kw] mycmp: &Value) -> R<Value> {
-        Ok(Py::new(it, KeyWrapper { cmp: mycmp.clone(), obj: None }).value().clone())
+        Ok(Py::new(
+            it,
+            KeyWrapper {
+                cmp: mycmp.clone(),
+                obj: None,
+            },
+        )
+        .value()
+        .clone())
     }
 
     #[class(name = "KeyWrapper", module = "functools", hint(py(final, unhashable)))]
@@ -60,7 +80,9 @@ pub mod _functools {
             (me.cmp.clone(), me.obj.clone())
         };
         let b = other.borrow(it)?.obj.clone();
-        let (Some(a), Some(b)) = (a, b) else { return Err(it.new_exc_str("AttributeError", "object")) };
+        let (Some(a), Some(b)) = (a, b) else {
+            return Err(it.new_exc_str("AttributeError", "object"));
+        };
         let r = it.call(&cmp, vec![a, b], Vec::new())?;
         it.rich_compare(op, &r, &Value::Int(0))
     }
@@ -70,13 +92,23 @@ pub mod _functools {
         #[proto(call)]
         fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[kw] obj: &Value) -> R<Value> {
             let cmp = slf.0.borrow(it)?.cmp.clone();
-            Ok(Py::new(it, KeyWrapper { cmp, obj: Some(obj.clone()) }).value().clone())
+            Ok(Py::new(
+                it,
+                KeyWrapper {
+                    cmp,
+                    obj: Some(obj.clone()),
+                },
+            )
+            .value()
+            .clone())
         }
 
         /// Value wrapped by a key function.
         #[getter]
         fn obj(&self, it: &mut Interp) -> R<Value> {
-            self.obj.clone().ok_or_else(|| it.new_exc_str("AttributeError", "obj"))
+            self.obj
+                .clone()
+                .ok_or_else(|| it.new_exc_str("AttributeError", "obj"))
         }
 
         #[setter(name = "obj")]
@@ -196,11 +228,18 @@ pub mod _functools {
     #[methods]
     impl Partial {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             let Some((func, rest)) = args.split_first() else {
                 return Err(it.type_error("type 'partial' takes at least one argument"));
             };
-            let Value::Obj(cls) = cls.0 else { unreachable!() };
+            let Value::Obj(cls) = cls.0 else {
+                unreachable!()
+            };
             let mut func = func.clone();
             if !it.is_callable(&func) {
                 return Err(it.type_error("the first argument must be callable"));
@@ -256,7 +295,15 @@ pub mod _functools {
             for (k, v) in kw {
                 it.dict_set(&kd, Value::Obj(k), v)?;
             }
-            Ok(opaque_instance(&cls, Partial { func, args: Value::tuple(all_args), keywords, phcount }))
+            Ok(opaque_instance(
+                &cls,
+                Partial {
+                    func,
+                    args: Value::tuple(all_args),
+                    keywords,
+                    phcount,
+                },
+            ))
         }
 
         fn __get__(slf: This<Py<Self>>, obj: &Value, _cls: Option<&Value>) -> R<Value> {
@@ -268,7 +315,12 @@ pub mod _functools {
         }
 
         #[proto(call)]
-        fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn __call__(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             let (func, pargs, keywords) = partial_parts(it, &slf.0)?;
             let phcount = slf.0.borrow(it)?.phcount;
             if args.len() < phcount {
@@ -291,7 +343,10 @@ pub mod _functools {
             let mut kwargs = it.dict_to_kwargs(&keywords)?;
             for (k, v) in kw.to_vec() {
                 let name = k.as_str_kind().unwrap_or("");
-                match kwargs.iter_mut().find(|(e, _)| e.as_str_kind() == Some(name)) {
+                match kwargs
+                    .iter_mut()
+                    .find(|(e, _)| e.as_str_kind() == Some(name))
+                {
                     Some(slot) => slot.1 = v,
                     None => kwargs.push((k, v)),
                 }
@@ -320,7 +375,9 @@ pub mod _functools {
         #[proto(repr)]
         fn __repr__(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let me = slf.0.value().clone();
-            let Some(me_obj) = me.as_obj().cloned() else { unreachable!() };
+            let Some(me_obj) = me.as_obj().cloned() else {
+                unreachable!()
+            };
             if it.repr_enter(&me_obj) {
                 return Ok("...".into());
             }
@@ -330,10 +387,15 @@ pub mod _functools {
                 for a in args.tuple_items().unwrap_or(&[]).to_vec() {
                     parts.push(it.repr_of(&a)?);
                 }
-                let items: Vec<(Value, Value)> = match crate::containers::pydict_of(keywords.as_obj().unwrap()) {
-                    Some(d) => d.borrow().iter().map(|e| (e.key.clone(), e.val.clone())).collect(),
-                    None => Vec::new(),
-                };
+                let items: Vec<(Value, Value)> =
+                    match crate::containers::pydict_of(keywords.as_obj().unwrap()) {
+                        Some(d) => d
+                            .borrow()
+                            .iter()
+                            .map(|e| (e.key.clone(), e.val.clone()))
+                            .collect(),
+                        None => Vec::new(),
+                    };
                 for (k, v) in items {
                     let ks = it.str_of(&k)?;
                     let vs = it.repr_of(&v)?;
@@ -354,7 +416,11 @@ pub mod _functools {
                 Some(d) if dict_len(&d) > 0 => Value::Obj(d),
                 _ => Value::None,
             };
-            Ok(Value::tuple(vec![cls, Value::tuple(vec![func.clone()]), Value::tuple(vec![func, args, keywords, dict])]))
+            Ok(Value::tuple(vec![
+                cls,
+                Value::tuple(vec![func.clone()]),
+                Value::tuple(vec![func, args, keywords, dict]),
+            ]))
         }
 
         #[method(hint(py(text_signature = "")))]
@@ -374,7 +440,9 @@ pub mod _functools {
             trailing_placeholder(it, &arg_items)?;
             let phcount = count_placeholders(it, &arg_items);
             let args = match args {
-                Value::Obj(o) if o.cls.is_some() => Value::tuple(args.tuple_items().unwrap_or(&[]).to_vec()),
+                Value::Obj(o) if o.cls.is_some() => {
+                    Value::tuple(args.tuple_items().unwrap_or(&[]).to_vec())
+                }
                 _ => args.clone(),
             };
             let keywords = match kw {
@@ -437,12 +505,20 @@ pub mod _functools {
         kwd_mark: Value,
     }
 
-    fn make_key(it: &mut Interp, args: &[Value], kw: &[(Obj, Value)], typed: bool, kwd_mark: &Value) -> Value {
+    fn make_key(
+        it: &mut Interp,
+        args: &[Value],
+        kw: &[(Obj, Value)],
+        typed: bool,
+        kwd_mark: &Value,
+    ) -> Value {
         if kw.is_empty() && !typed {
             if let [only] = args {
                 let fast = match only {
                     Value::Int(_) => true,
-                    Value::Obj(o) => o.cls.is_none() && matches!(o.kind, Kind::Str(_) | Kind::Int(_)),
+                    Value::Obj(o) => {
+                        o.cls.is_none() && matches!(o.kind, Kind::Str(_) | Kind::Int(_))
+                    }
                     _ => false,
                 };
                 if fast {
@@ -472,7 +548,14 @@ pub mod _functools {
     #[methods]
     impl LruCache {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[kw] user_function: &Value, #[kw] maxsize: &Value, #[kw] typed: &Value, #[kw] cache_info_type: &Value) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[kw] user_function: &Value,
+            #[kw] maxsize: &Value,
+            #[kw] typed: &Value,
+            #[kw] cache_info_type: &Value,
+        ) -> R<Value> {
             if !it.is_callable(user_function) {
                 return Err(it.type_error("the first argument must be callable"));
             }
@@ -484,19 +567,41 @@ pub mod _functools {
                 return Err(it.type_error("maxsize should be integer or None"));
             };
             let typed = it.truthy(typed)?;
-            let Value::Obj(cls) = cls.0 else { unreachable!() };
+            let Value::Obj(cls) = cls.0 else {
+                unreachable!()
+            };
             let kwd_mark = Value::Obj(Object::new(Kind::Instance));
             let cache = it.new_dict();
-            let state = LruCache { func: user_function.clone(), maxsize, typed, cache_info_type: cache_info_type.clone(), cache, hits: 0, misses: 0, kwd_mark };
+            let state = LruCache {
+                func: user_function.clone(),
+                maxsize,
+                typed,
+                cache_info_type: cache_info_type.clone(),
+                cache,
+                hits: 0,
+                misses: 0,
+                kwd_mark,
+            };
             Ok(opaque_instance(&cls, state))
         }
 
         #[proto(call)]
-        fn __call__(slf: This<Py<Self>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kw: KwArgs) -> R<Value> {
+        fn __call__(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kw: KwArgs,
+        ) -> R<Value> {
             let kw = kw.to_vec();
             let (func, maxsize, typed, cache, kwd_mark) = {
                 let me = slf.0.borrow(it)?;
-                (me.func.clone(), me.maxsize, me.typed, me.cache.clone(), me.kwd_mark.clone())
+                (
+                    me.func.clone(),
+                    me.maxsize,
+                    me.typed,
+                    me.cache.clone(),
+                    me.kwd_mark.clone(),
+                )
             };
             if maxsize == Some(0) {
                 slf.0.borrow_mut(it)?.misses += 1;
@@ -505,9 +610,15 @@ pub mod _functools {
             let key = make_key(it, args, &kw, typed, &kwd_mark);
             // The key is hashed once; the cache entries are moved and inserted with that hash.
             let hash = it.hash_value(&key)?;
-            let Some(store) = crate::containers::pydict_of(&cache) else { unreachable!() };
+            let Some(store) = crate::containers::pydict_of(&cache) else {
+                unreachable!()
+            };
             if let Some(idx) = it.dict_find(&cache, hash, &key)? {
-                let entry = if maxsize.is_some() { store.borrow_mut().remove(idx) } else { None };
+                let entry = if maxsize.is_some() {
+                    store.borrow_mut().remove(idx)
+                } else {
+                    None
+                };
                 let value = match entry {
                     Some(e) => {
                         let v = e.val.clone();
@@ -543,14 +654,29 @@ pub mod _functools {
         fn cache_info(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (ty, hits, misses, maxsize, cache) = {
                 let me = slf.0.borrow(it)?;
-                (me.cache_info_type.clone(), me.hits, me.misses, me.maxsize, me.cache.clone())
+                (
+                    me.cache_info_type.clone(),
+                    me.hits,
+                    me.misses,
+                    me.maxsize,
+                    me.cache.clone(),
+                )
             };
             let size = crate::containers::pydict_of(&cache).map_or(0, |d| d.borrow().len());
             let maxsize = match maxsize {
                 Some(m) => Value::Int(m as i64),
                 None => Value::None,
             };
-            it.call(&ty, vec![Value::Int(hits as i64), Value::Int(misses as i64), maxsize, Value::Int(size as i64)], Vec::new())
+            it.call(
+                &ty,
+                vec![
+                    Value::Int(hits as i64),
+                    Value::Int(misses as i64),
+                    maxsize,
+                    Value::Int(size as i64),
+                ],
+                Vec::new(),
+            )
         }
 
         /// Clear the cache and cache statistics

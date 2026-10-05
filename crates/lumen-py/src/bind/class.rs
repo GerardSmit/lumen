@@ -75,7 +75,13 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
             dict_set_str(d, "__doc__", c.doc.map_or(Value::None, Value::str));
         }
         if !members.iter().any(|m| m.desc.role == Role::Constructor) {
-            let f = Value::Obj(Object::new(Kind::Native(NativeData { name: "__new__", f: no_new, method: false, desc: None, owner: None })));
+            let f = Value::Obj(Object::new(Kind::Native(NativeData {
+                name: "__new__",
+                f: no_new,
+                method: false,
+                desc: None,
+                owner: None,
+            })));
             dict_set_str(d, "__new__", f);
         }
         if c.flags & CLASS_GENERIC != 0 {
@@ -86,7 +92,11 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
                 desc: None,
                 owner: None,
             })));
-            dict_set_str(d, "__class_getitem__", Value::Obj(Object::new(Kind::ClassMethod(f))));
+            dict_set_str(
+                d,
+                "__class_getitem__",
+                Value::Obj(Object::new(Kind::ClassMethod(f))),
+            );
         }
     }
     ty
@@ -108,19 +118,28 @@ pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
 struct TextSigs(std::collections::HashMap<usize, Value>);
 
 fn set_text_signature(it: &mut Interp, ty: &Obj, members: &[FnItem<PyHost>]) {
-    let sig = members.iter().find(|m| m.desc.role == Role::Constructor).and_then(|m| args::text_signature(m.desc));
+    let sig = members
+        .iter()
+        .find(|m| m.desc.role == Role::Constructor)
+        .and_then(|m| args::text_signature(m.desc));
     if let Some(sig) = sig {
         set_type_text_signature(it, ty, Value::string(sig));
     }
 }
 
 pub fn set_type_text_signature(it: &mut Interp, ty: &Obj, sig: Value) {
-    it.native_state::<TextSigs>().0.insert(std::rc::Rc::as_ptr(ty) as usize, sig);
+    it.native_state::<TextSigs>()
+        .0
+        .insert(std::rc::Rc::as_ptr(ty) as usize, sig);
 }
 
 /// `type.__text_signature__`: the signature of a native type, else `None`.
 pub fn type_text_signature(it: &mut Interp, ty: &Obj) -> Value {
-    it.native_state::<TextSigs>().0.get(&(std::rc::Rc::as_ptr(ty) as usize)).cloned().unwrap_or(Value::None)
+    it.native_state::<TextSigs>()
+        .0
+        .get(&(std::rc::Rc::as_ptr(ty) as usize))
+        .cloned()
+        .unwrap_or(Value::None)
 }
 
 /// [`extend_type`], plus the class docstring and `__text_signature__` of `T`: a core type whose
@@ -163,7 +182,9 @@ pub fn install_all<T: Methods<PyHost>>(ty: &Obj) {
 }
 
 fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) {
-    let Some(d) = ty.dict.borrow().clone() else { return };
+    let Some(d) = ty.dict.borrow().clone() else {
+        return;
+    };
     for m in members {
         let desc = m.desc;
         if !desc.exposed_to(HOST) || only.is_some_and(|o| !o.contains(&py_name(desc))) {
@@ -179,7 +200,9 @@ fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) 
                 owner: Some(NativeOwner::Class(ty.clone())),
             })));
             let v = match desc.role {
-                Role::Static if desc.has(flags::CLASS_RECV) => Value::Obj(Object::new(Kind::ClassMethod(f))),
+                Role::Static if desc.has(flags::CLASS_RECV) => {
+                    Value::Obj(Object::new(Kind::ClassMethod(f)))
+                }
                 Role::Static => Value::Obj(Object::new(Kind::StaticMethod(f))),
                 Role::Getter | Role::Setter => {
                     let (mut fget, mut fset) = match dict_get_str(&d, name) {
@@ -195,7 +218,13 @@ fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) 
                         fset = f;
                     }
                     let doc = desc.doc.map(Value::str).unwrap_or(Value::None);
-                    Value::Obj(Object::new(Kind::Property(PropData { fget, fset, fdel: Value::None, doc, name: Default::default() })))
+                    Value::Obj(Object::new(Kind::Property(PropData {
+                        fget,
+                        fset,
+                        fdel: Value::None,
+                        doc,
+                        name: Default::default(),
+                    })))
                 }
                 _ => f,
             };
@@ -219,7 +248,10 @@ fn class_getitem(it: &mut Interp, a: &[Value], kw: &[(Obj, Value)]) -> R<Value> 
         return Err(it.type_error("__class_getitem__() takes no keyword arguments"));
     }
     if a.len() != 2 {
-        let msg = format!("__class_getitem__() takes exactly one argument ({} given)", a.len().saturating_sub(1));
+        let msg = format!(
+            "__class_getitem__() takes exactly one argument ({} given)",
+            a.len().saturating_sub(1)
+        );
         return Err(it.type_error(&msg));
     }
     Ok(it.make_alias(a[0].clone(), &a[1]))
@@ -311,12 +343,17 @@ pub(super) fn opaque_cell(v: &Value) -> Option<&RefCell<Box<dyn Any>>> {
 
 /// A new instance of class `cls` holding `value`.
 pub fn opaque_instance<T: Any>(cls: &Obj, value: T) -> Value {
-    Value::Obj(Object::with_cls(cls.clone(), Kind::Opaque(RefCell::new(Box::new(value)))))
+    Value::Obj(Object::with_cls(
+        cls.clone(),
+        Kind::Opaque(RefCell::new(Box::new(value))),
+    ))
 }
 
 /// Whether `v` is an instance of `T` (exact type or a Python subclass).
 pub fn is_instance<T: Class>(it: &Interp, v: &Value) -> bool {
-    let Some(cell) = opaque_cell(v) else { return false };
+    let Some(cell) = opaque_cell(v) else {
+        return false;
+    };
     match cell.try_borrow() {
         Ok(b) => b.is::<T>(),
         Err(_) => match (it.native_types.get(&TypeId::of::<T>()), v) {
@@ -330,7 +367,10 @@ pub fn is_instance<T: Class>(it: &Interp, v: &Value) -> bool {
 #[inline(never)]
 pub(super) fn reentrant<T: Class>(it: &mut Interp) -> Obj {
     let q = args::class_qualname(T::DESC);
-    it.new_exc_str("RuntimeError", &format!("reentrant access to a '{}' object", q))
+    it.new_exc_str(
+        "RuntimeError",
+        &format!("reentrant access to a '{}' object", q),
+    )
 }
 
 /// A typed handle to an instance of a native class: the Python object, not borrowed. Take
@@ -343,7 +383,10 @@ pub struct Py<T> {
 
 impl<T> Clone for Py<T> {
     fn clone(&self) -> Self {
-        Py { v: self.v.clone(), _t: PhantomData }
+        Py {
+            v: self.v.clone(),
+            _t: PhantomData,
+        }
     }
 }
 
@@ -395,7 +438,9 @@ impl<T: Class> Py<T> {
     /// Exclusive borrow; `RuntimeError` when the object is already borrowed (re-entrancy).
     pub fn borrow_mut(&self, it: &mut Interp) -> R<RefMut<'_, T>> {
         match self.cell().try_borrow_mut() {
-            Ok(b) => Ok(RefMut::map(b, |b| b.downcast_mut::<T>().expect("Py<T> type"))),
+            Ok(b) => Ok(RefMut::map(b, |b| {
+                b.downcast_mut::<T>().expect("Py<T> type")
+            })),
             Err(_) => Err(reentrant::<T>(it)),
         }
     }
@@ -419,7 +464,10 @@ impl NativeIter {
 
     /// An instance of class `cls` stepping this closure.
     pub fn into_object(self, cls: &Obj) -> Value {
-        Value::Obj(Object::with_cls(cls.clone(), Kind::Iter(RefCell::new(IterState::Native(self.0)))))
+        Value::Obj(Object::with_cls(
+            cls.clone(),
+            Kind::Iter(RefCell::new(IterState::Native(self.0))),
+        ))
     }
 
     /// An instance of the native class `T` (a `native_iter` class) stepping this closure.

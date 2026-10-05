@@ -31,7 +31,15 @@ pub mod _bisect {
     }
 
     /// The insertion point for `x`; `right` puts it after any equal entries.
-    fn search(it: &mut Interp, a: &Value, x: &Value, lo: i64, hi: Option<&Value>, key: Option<&Value>, right: bool) -> R<i64> {
+    fn search(
+        it: &mut Interp,
+        a: &Value,
+        x: &Value,
+        lo: i64,
+        hi: Option<&Value>,
+        key: Option<&Value>,
+        right: bool,
+    ) -> R<i64> {
         if lo < 0 {
             return Err(it.value_error("lo must be non-negative"));
         }
@@ -50,7 +58,11 @@ pub mod _bisect {
             if let Some(k) = key {
                 probe = it.call(k, vec![probe], Vec::new())?;
             }
-            let go_right = if right { !less(it, x, &probe)? } else { less(it, &probe, x)? };
+            let go_right = if right {
+                !less(it, x, &probe)?
+            } else {
+                less(it, &probe, x)?
+            };
             if go_right {
                 lo = mid + 1;
             } else {
@@ -60,7 +72,15 @@ pub mod _bisect {
         Ok(lo)
     }
 
-    fn insort(it: &mut Interp, a: &Value, x: &Value, lo: i64, hi: Option<&Value>, key: Option<&Value>, right: bool) -> R<()> {
+    fn insort(
+        it: &mut Interp,
+        a: &Value,
+        x: &Value,
+        lo: i64,
+        hi: Option<&Value>,
+        key: Option<&Value>,
+        right: bool,
+    ) -> R<()> {
         let probe = match key.filter(|k| !k.is_none()) {
             Some(k) => it.call(k, vec![x.clone()], Vec::new())?,
             None => x.clone(),
@@ -89,7 +109,16 @@ pub mod _bisect {
     ///
     /// A custom key function can be supplied to customize the sort order.
     #[op]
-    fn bisect_right(it: &mut Interp, #[kw] a: &Value, #[kw] x: &Value, #[kw] #[default(0)] lo: i64, #[kw] hi: Option<&Value>, #[kwonly] key: Option<&Value>) -> R<i64> {
+    fn bisect_right(
+        it: &mut Interp,
+        #[kw] a: &Value,
+        #[kw] x: &Value,
+        #[kw]
+        #[default(0)]
+        lo: i64,
+        #[kw] hi: Option<&Value>,
+        #[kwonly] key: Option<&Value>,
+    ) -> R<i64> {
         search(it, a, x, lo, hi, key, true)
     }
 
@@ -104,7 +133,16 @@ pub mod _bisect {
     ///
     /// A custom key function can be supplied to customize the sort order.
     #[op]
-    fn bisect_left(it: &mut Interp, #[kw] a: &Value, #[kw] x: &Value, #[kw] #[default(0)] lo: i64, #[kw] hi: Option<&Value>, #[kwonly] key: Option<&Value>) -> R<i64> {
+    fn bisect_left(
+        it: &mut Interp,
+        #[kw] a: &Value,
+        #[kw] x: &Value,
+        #[kw]
+        #[default(0)]
+        lo: i64,
+        #[kw] hi: Option<&Value>,
+        #[kwonly] key: Option<&Value>,
+    ) -> R<i64> {
         search(it, a, x, lo, hi, key, false)
     }
 
@@ -117,7 +155,16 @@ pub mod _bisect {
     ///
     /// A custom key function can be supplied to customize the sort order.
     #[op]
-    fn insort_right(it: &mut Interp, #[kw] a: &Value, #[kw] x: &Value, #[kw] #[default(0)] lo: i64, #[kw] hi: Option<&Value>, #[kwonly] key: Option<&Value>) -> R<()> {
+    fn insort_right(
+        it: &mut Interp,
+        #[kw] a: &Value,
+        #[kw] x: &Value,
+        #[kw]
+        #[default(0)]
+        lo: i64,
+        #[kw] hi: Option<&Value>,
+        #[kwonly] key: Option<&Value>,
+    ) -> R<()> {
         insort(it, a, x, lo, hi, key, true)
     }
 
@@ -130,7 +177,16 @@ pub mod _bisect {
     ///
     /// A custom key function can be supplied to customize the sort order.
     #[op]
-    fn insort_left(it: &mut Interp, #[kw] a: &Value, #[kw] x: &Value, #[kw] #[default(0)] lo: i64, #[kw] hi: Option<&Value>, #[kwonly] key: Option<&Value>) -> R<()> {
+    fn insort_left(
+        it: &mut Interp,
+        #[kw] a: &Value,
+        #[kw] x: &Value,
+        #[kw]
+        #[default(0)]
+        lo: i64,
+        #[kw] hi: Option<&Value>,
+        #[kwonly] key: Option<&Value>,
+    ) -> R<()> {
         insort(it, a, x, lo, hi, key, false)
     }
 }

@@ -28,7 +28,10 @@ fn is_smi(_i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     // V8's 64-bit Smi range without pointer compression (Node's build): a 32-bit integer.
     Ok(Value::Bool(match a.first() {
         Some(Value::Num(n)) => {
-            n.fract() == 0.0 && *n >= i32::MIN as f64 && *n <= i32::MAX as f64 && !(*n == 0.0 && n.is_sign_negative())
+            n.fract() == 0.0
+                && *n >= i32::MIN as f64
+                && *n <= i32::MAX as f64
+                && !(*n == 0.0 && n.is_sign_negative())
         }
         _ => false,
     }))
@@ -41,7 +44,9 @@ fn collect_garbage(i: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, Val
 
 fn debug_print(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let v = a.first().cloned().unwrap_or(Value::Undefined);
-    let text = i.console_format(std::slice::from_ref(&v)).unwrap_or_default();
+    let text = i
+        .console_format(std::slice::from_ref(&v))
+        .unwrap_or_default();
     println!("DebugPrint: {text}");
     Ok(v)
 }

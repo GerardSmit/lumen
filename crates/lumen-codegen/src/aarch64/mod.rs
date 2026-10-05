@@ -1,7 +1,7 @@
 //! The AArch64 (ARM64) backend: legalize → lower ([`lower`]) → allocate
 //! ([`crate::regalloc`]) → emit ([`emit`]), plus the entry trampoline that runs generated code
 //! and catches traps. Targets Apple Silicon macOS, Linux and Android on arm64 (and Windows on
-//! ARM64, minus unwind data); see [`regs`] for the ABI variants.
+//! ARM64); see [`regs`] for the ABI variants.
 //!
 //! The public API and the trap contract mirror [`crate::x64`], and the configuration and output
 //! types are shared with it: the trampoline saves the address of a *resume slot* at
@@ -32,6 +32,8 @@ pub use crate::x64::{Compiled, Reloc, TrapConfig};
 pub struct Config {
     pub abi: Abi,
     pub traps: Option<TrapConfig>,
+    /// System-wide intersection; zero selects the portable ARMv8.0 sequences.
+    pub features: u64,
 }
 
 impl Config {
@@ -39,6 +41,7 @@ impl Config {
         Config {
             abi: regs::host_abi(),
             traps,
+            features: 0,
         }
     }
 }
@@ -50,15 +53,36 @@ pub fn load(
     compiled: &[Compiled],
     resolve: impl Fn(u32, &[u64]) -> Option<u64>,
 ) -> Result<(crate::jitmem::ExecMemory, Vec<u64>), String> {
+    load_aligned(compiled, 16, resolve)
+}
+
+pub fn load_aligned(
+    compiled: &[Compiled],
+    alignment: usize,
+    resolve: impl Fn(u32, &[u64]) -> Option<u64>,
+) -> Result<(crate::jitmem::ExecMemory, Vec<u64>), String> {
+    if !matches!(alignment, 16 | 64) {
+        return Err("aarch64: entry alignment must be 16 or 64".into());
+    }
+    if compiled
+        .iter()
+        .any(|function| !function.symbol_loads.is_empty())
+    {
+        return Err("symbol addresses require native AOT linking".into());
+    }
     let mut offs = Vec::with_capacity(compiled.len());
     let mut len = 0;
     for c in compiled {
-        len = (len + 15) & !15;
+        len = (len + alignment - 1) & !(alignment - 1);
         offs.push(len);
         len += c.code.len();
     }
     let mut result = Ok(Vec::new());
     let mem = crate::jitmem::ExecMemory::with_len(len, |buf, base| {
+        if base as usize % alignment != 0 {
+            result = Err("aarch64: executable allocator did not honor entry alignment".into());
+            return;
+        }
         // Padding decodes as `udf #0`.
         buf.fill(0);
         let addrs: Vec<u64> = offs.iter().map(|&o| base + o as u64).collect();
@@ -83,7 +107,18 @@ pub fn compile(func: &Function, cfg: &Config) -> Result<Compiled, String> {
 }
 
 /// [`compile`], consuming `f` (no copy; the IR is freed once lowered).
-pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> {
+pub fn compile_owned(f: Function, cfg: &Config) -> Result<Compiled, String> {
+    compile_owned_aligned(f, cfg, 4)
+}
+
+pub fn compile_owned_aligned(
+    mut f: Function,
+    cfg: &Config,
+    alignment: usize,
+) -> Result<Compiled, String> {
+    if !matches!(alignment, 4 | 16 | 64) {
+        return Err("aarch64: loop alignment must be 4, 16 or 64".into());
+    }
     legalize(
         &mut f,
         Legal {
@@ -92,6 +127,8 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
             to_int_sat: true,
             srem_min_neg1: true,
             fcopysign: false,
+            checked_i32: true,
+            js_to_i32: cfg.features & lumen_common::target::aarch64::JSCVT != 0,
         },
     );
     crate::opt::remove_unreachable(&mut f);
@@ -100,6 +137,7 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
     let lowered = lower::lower(&f, &graph, &cfg.abi)?;
     // The IR is no longer needed: free it before the allocator's tables are built.
     let ctx_first = f.sig.params.first() == Some(&Type::I64);
+    let wide = f.values.iter().any(|v| v.ty == Type::V128);
     drop((graph, f));
     let alloc = crate::regalloc::allocate(&lowered.vcode, &cfg.abi.reg_info());
     let needs_ctx = lowered.has_traps || cfg.traps.is_some_and(|t| t.stack_limit.is_some());
@@ -111,10 +149,21 @@ pub fn compile_owned(mut f: Function, cfg: &Config) -> Result<Compiled, String> 
             return Err("aarch64: trapping functions take the context pointer first".into());
         }
     }
-    let frame = emit::Frame::new(&alloc, lowered.outgoing, needs_ctx)?;
-    let (code, relocs) =
-        emit::Emitter::new(&lowered.vcode, &alloc, &frame, cfg.traps.as_ref()).emit()?;
-    Ok(Compiled { code, relocs })
+    let frame = emit::Frame::new(&alloc, lowered.outgoing, needs_ctx, wide)?;
+    let (code, relocs, direct_calls, symbol_loads, unwind, windows_unwind) =
+        emit::Emitter::new(&lowered.vcode, &alloc, &frame, cfg.traps.as_ref())
+            .with_windows(cfg.abi.windows)
+            .with_loop_alignment(alignment)
+            .with_features(cfg.features)
+            .emit()?;
+    Ok(Compiled {
+        unwind,
+        windows_unwind,
+        code,
+        relocs,
+        direct_calls,
+        symbol_loads,
+    })
 }
 
 /// Trampoline frame, below `fp`: x19..x28 at -16..-80 (pairs), d8..d15 at -96..-144, then

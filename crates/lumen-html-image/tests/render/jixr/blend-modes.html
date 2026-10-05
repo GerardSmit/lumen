@@ -1,0 +1,45 @@
+<!doctype html>
+<!-- jixr-compare: threshold=32 max-diff-ratio=0 -->
+<style>
+html,body{margin:0;background:#ffffff}
+.stage{width:200px;height:44px;background-image:linear-gradient(to right, #ff0000 0%, #00ff00 50%, #0000ff 100%);margin:6px;position:relative}
+.over{position:absolute;left:90px;top:4px;width:30px;height:36px;background:#808080;opacity:0.9}
+.m1 .over{mix-blend-mode:multiply}
+.m2 .over{mix-blend-mode:screen}
+.m3 .over{mix-blend-mode:overlay}
+.m4 .over{mix-blend-mode:darken}
+.m5 .over{mix-blend-mode:lighten}
+.m6 .over{mix-blend-mode:color-dodge}
+.m7 .over{mix-blend-mode:color-burn}
+.m8 .over{mix-blend-mode:hard-light}
+.m9 .over{mix-blend-mode:soft-light}
+.m10 .over{mix-blend-mode:difference}
+.m11 .over{mix-blend-mode:exclusion}
+.m12 .over{mix-blend-mode:hue}
+.m13 .over{mix-blend-mode:saturation}
+.m14 .over{mix-blend-mode:color}
+.m15 .over{mix-blend-mode:luminosity}
+.m16 .over{mix-blend-mode:normal}
+.iso{position:absolute;left:0;top:0;width:60px;height:60px;isolation:isolate}
+.iso .inner{position:absolute;left:15px;top:15px;width:30px;height:30px;background:#00ff00;mix-blend-mode:multiply}
+.noiso{position:absolute;left:80px;top:0;width:60px;height:60px}
+.noiso .inner{position:absolute;left:15px;top:15px;width:30px;height:30px;background:#00ff00;mix-blend-mode:multiply}
+.isostage{width:140px;height:60px;background:#ff0000;margin:6px;position:relative}
+</style>
+<div class="stage m1"><div class=over></div></div>
+<div class="stage m2"><div class=over></div></div>
+<div class="stage m3"><div class=over></div></div>
+<div class="stage m4"><div class=over></div></div>
+<div class="stage m5"><div class=over></div></div>
+<div class="stage m6"><div class=over></div></div>
+<div class="stage m7"><div class=over></div></div>
+<div class="stage m8"><div class=over></div></div>
+<div class="stage m9"><div class=over></div></div>
+<div class="stage m10"><div class=over></div></div>
+<div class="stage m11"><div class=over></div></div>
+<div class="stage m12"><div class=over></div></div>
+<div class="stage m13"><div class=over></div></div>
+<div class="stage m14"><div class=over></div></div>
+<div class="stage m15"><div class=over></div></div>
+<div class="stage m16"><div class=over></div></div>
+<div class=isostage><div class=iso><div class=inner></div></div><div class=noiso><div class=inner></div></div></div>

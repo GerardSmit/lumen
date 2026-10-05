@@ -35,6 +35,9 @@ pub(super) fn install_shadow_realm(it: &mut Interp) {
 }
 
 fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
+    if crate::native_ops::dynamic_code_disabled() {
+        return Err(i.make_error("EvalError", "dynamic code is not available in an AOT build"));
+    }
     let ptr = map_ptr(&this)
         .filter(|p| i.shadow_realms.contains_key(p))
         .ok_or_else(|| {

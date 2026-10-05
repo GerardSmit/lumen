@@ -29,7 +29,9 @@ impl<'a> FromArg<'a, PyHost> for IterRef<'a> {
 /// A new iterator of type `cls`: the builtin type `base` itself, or a subclass of it.
 fn new_iter(it: &Interp, cls: &Value, base: &Obj, st: IterState) -> Value {
     match cls {
-        Value::Obj(c) if !std::rc::Rc::ptr_eq(c, base) => Value::Obj(Object::with_cls(c.clone(), Kind::Iter(RefCell::new(st)))),
+        Value::Obj(c) if !std::rc::Rc::ptr_eq(c, base) => {
+            Value::Obj(Object::with_cls(c.clone(), Kind::Iter(RefCell::new(st))))
+        }
         _ => it.mk_iter(st),
     }
 }
@@ -56,7 +58,10 @@ impl Range {
         for v in args {
             if !it.has_index(v) {
                 let t = it.type_name_of(v);
-                return Err(it.type_error(&format!("'{}' object cannot be interpreted as an integer", t)));
+                return Err(it.type_error(&format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    t
+                )));
             }
             match v.as_bigint() {
                 Some(b) => {
@@ -88,7 +93,9 @@ impl Range {
             if step.is_zero() {
                 return Err(it.value_error("range() arg 3 must not be zero"));
             }
-            return Ok(Value::Obj(Object::new(Kind::BigRange(Box::new([start, stop, step])))));
+            return Ok(Value::Obj(Object::new(Kind::BigRange(Box::new([
+                start, stop, step,
+            ])))));
         }
         let (start, stop, step) = match ints.len() {
             1 => (0, ints[0], 1),
@@ -98,7 +105,11 @@ impl Range {
         if step == 0 {
             return Err(it.value_error("range() arg 3 must not be zero"));
         }
-        Ok(Value::Obj(Object::new(Kind::Range(RangeData { start, stop, step }))))
+        Ok(Value::Obj(Object::new(Kind::Range(RangeData {
+            start,
+            stop,
+            step,
+        }))))
     }
 
     /// rangeobject.index(value) -> integer -- return index of value.
@@ -216,14 +227,24 @@ pub struct Enumerate;
 #[lumen_bind::methods]
 impl Enumerate {
     #[constructor(hint(py(text_signature = "(iterable, start=0)")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[kw] iterable: &Value, #[kw] start: Passed<&Value>) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] iterable: &Value,
+        #[kw] start: Passed<&Value>,
+    ) -> R<Value> {
         let src = it.get_iter(iterable)?;
         let idx = match start.0 {
             Some(v) => it.index_of(v)?,
             None => 0,
         };
         let base = it.types.enumerate.clone();
-        Ok(new_iter(it, &cls, &base, IterState::Enumerate { it: src, idx }))
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Enumerate { it: src, idx },
+        ))
     }
 
     /// See PEP 585
@@ -251,7 +272,12 @@ pub struct Zip;
 #[lumen_bind::methods]
 impl Zip {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] iterables: &[Value], #[kwonly] strict: Option<&Value>) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] iterables: &[Value],
+        #[kwonly] strict: Option<&Value>,
+    ) -> R<Value> {
         let strict = match strict {
             Some(v) => it.truthy(v)?,
             None => false,
@@ -286,7 +312,12 @@ pub struct Map;
 #[lumen_bind::methods]
 impl Map {
     #[constructor(hint(py(text_signature = "(function, iterable, /, *iterables, strict=False)")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[kwonly] strict: Option<&Value>) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[kwonly] strict: Option<&Value>,
+    ) -> R<Value> {
         if args.len() < 2 {
             return Err(it.type_error("map() must have at least two arguments."));
         }
@@ -299,7 +330,16 @@ impl Map {
             its.push(it.get_iter(v)?);
         }
         let base = it.types.map.clone();
-        Ok(new_iter(it, &cls, &base, IterState::Map { f: args[0].clone(), its, strict }))
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Map {
+                f: args[0].clone(),
+                its,
+                strict,
+            },
+        ))
     }
 
     /// Set state information for unpickling.
@@ -326,7 +366,15 @@ impl Filter {
     fn new(cls: This<Value>, it: &mut Interp, function: &Value, iterable: &Value) -> R<Value> {
         let src = it.get_iter(iterable)?;
         let base = it.types.filter.clone();
-        Ok(new_iter(it, &cls, &base, IterState::Filter { f: function.clone(), it: src }))
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Filter {
+                f: function.clone(),
+                it: src,
+            },
+        ))
     }
 }
 
@@ -359,7 +407,15 @@ impl Reversed {
             return Err(it.type_error(&format!("'{}' object is not reversible", t)));
         }
         let n = it.len_of(seq)? as i64;
-        Ok(new_iter(it, &cls, &base, IterState::Reversed { seq: seq.clone(), idx: n - 1 }))
+        Ok(new_iter(
+            it,
+            &cls,
+            &base,
+            IterState::Reversed {
+                seq: seq.clone(),
+                idx: n - 1,
+            },
+        ))
     }
 }
 
@@ -407,7 +463,9 @@ fn builtin_fn(it: &mut Interp, name: &str) -> R<Value> {
 
 /// The keys, values or items a dict or set iterator has left, from entry `pos`.
 fn remaining_entries(d: &Obj, pos: usize, kind: Option<ViewKind>) -> Vec<Value> {
-    let Some(pd) = crate::containers::pydict_of(d) else { return Vec::new() };
+    let Some(pd) = crate::containers::pydict_of(d) else {
+        return Vec::new();
+    };
     let pd = pd.borrow();
     let mut out = Vec::new();
     let mut i = pos;
@@ -435,8 +493,12 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Unpicklable,
     }
     let plan = match &*st.borrow() {
-        IterState::List { list, idx } => Plan::Indexed("iter", Value::Obj(list.clone()), *idx as i64),
-        IterState::Tuple { tup, idx } => Plan::Indexed("iter", Value::Obj(tup.clone()), *idx as i64),
+        IterState::List { list, idx } => {
+            Plan::Indexed("iter", Value::Obj(list.clone()), *idx as i64)
+        }
+        IterState::Tuple { tup, idx } => {
+            Plan::Indexed("iter", Value::Obj(tup.clone()), *idx as i64)
+        }
         IterState::Str { s, pos } => {
             let n = match &s.kind {
                 Kind::Str(ps) => lumen_common::smuggle::code_points(&ps.s[..*pos]).count(),
@@ -446,18 +508,38 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         }
         IterState::Bytes { b, idx } => Plan::Indexed("iter", Value::Obj(b.clone()), *idx as i64),
         IterState::Range { cur, stop, step } => Plan::Range(*cur, *stop, *step),
-        IterState::Dict { dict, pos, kind, .. } => Plan::Done("iter", Value::list(remaining_entries(dict, *pos, Some(*kind)))),
-        IterState::Set { set, pos, .. } => Plan::Done("iter", Value::list(remaining_entries(set, *pos, None))),
-        IterState::Seq { idx, .. } if *idx == i64::MIN => Plan::Done("iter", Value::tuple(Vec::new())),
+        IterState::Dict {
+            dict, pos, kind, ..
+        } => Plan::Done(
+            "iter",
+            Value::list(remaining_entries(dict, *pos, Some(*kind))),
+        ),
+        IterState::Set { set, pos, .. } => {
+            Plan::Done("iter", Value::list(remaining_entries(set, *pos, None)))
+        }
+        IterState::Seq { idx, .. } if *idx == i64::MIN => {
+            Plan::Done("iter", Value::tuple(Vec::new()))
+        }
         IterState::Seq { obj, idx } => Plan::Indexed("iter", obj.clone(), *idx),
         IterState::CallIter { done: true, .. } => Plan::Done("iter", Value::tuple(Vec::new())),
-        IterState::CallIter { f, sentinel, .. } => Plan::Args("iter", vec![f.clone(), sentinel.clone()]),
+        IterState::CallIter { f, sentinel, .. } => {
+            Plan::Args("iter", vec![f.clone(), sentinel.clone()])
+        }
         IterState::Reversed { seq, idx } if *idx < 0 => {
             let is_list = matches!(seq, Value::Obj(so) if matches!(so.kind, Kind::List(_)) && so.cls.is_none());
-            Plan::Done("reversed", if is_list { Value::list(Vec::new()) } else { Value::tuple(Vec::new()) })
+            Plan::Done(
+                "reversed",
+                if is_list {
+                    Value::list(Vec::new())
+                } else {
+                    Value::tuple(Vec::new())
+                },
+            )
         }
         IterState::Reversed { seq, idx } => Plan::Indexed("reversed", seq.clone(), *idx),
-        IterState::Enumerate { it: inner, idx } => Plan::Args("enumerate", vec![inner.clone(), Value::Int(*idx)]),
+        IterState::Enumerate { it: inner, idx } => {
+            Plan::Args("enumerate", vec![inner.clone(), Value::Int(*idx)])
+        }
         IterState::Zip { its, strict } => Plan::Zip(its.clone(), *strict),
         IterState::Map { f, its, strict } => {
             let mut args = vec![f.clone()];
@@ -480,7 +562,11 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Plan::Range(cur, stop, step) => {
             let n = slice_len(cur, stop, step) as i64;
             let end = cur.saturating_add(n.saturating_mul(step));
-            let r = Value::Obj(Object::new(Kind::Range(RangeData { start: cur, stop: end, step })));
+            let r = Value::Obj(Object::new(Kind::Range(RangeData {
+                start: cur,
+                stop: end,
+                step,
+            })));
             let f = builtin_fn(it, "iter")?;
             Value::tuple(vec![f, Value::tuple(vec![r]), Value::None])
         }
@@ -574,7 +660,17 @@ pub fn init(it: &mut Interp) {
     use crate::bind::{extend_type, install_into};
     let range = it.types.range.clone();
     extend_type::<Range>(it, &range);
-    reg_slots(it, &range, &["__getitem__", "__len__", "__contains__", "__iter__", "__reversed__"]);
+    reg_slots(
+        it,
+        &range,
+        &[
+            "__getitem__",
+            "__len__",
+            "__contains__",
+            "__iter__",
+            "__reversed__",
+        ],
+    );
     reg_compare(it, &range, false);
 
     let slice = it.types.slice.clone();
@@ -582,8 +678,13 @@ pub fn init(it: &mut Interp) {
     reg_compare(it, &slice, true);
 
     let types = &it.types;
-    let (enumerate, zip, map, filter, reversed) =
-        (types.enumerate.clone(), types.zip.clone(), types.map.clone(), types.filter.clone(), types.reversed.clone());
+    let (enumerate, zip, map, filter, reversed) = (
+        types.enumerate.clone(),
+        types.zip.clone(),
+        types.map.clone(),
+        types.filter.clone(),
+        types.reversed.clone(),
+    );
     extend_type::<Enumerate>(it, &enumerate);
     extend_type::<Zip>(it, &zip);
     extend_type::<Map>(it, &map);

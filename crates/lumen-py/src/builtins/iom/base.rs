@@ -16,7 +16,13 @@ fn iobase_closed(it: &mut Interp, v: &Value) -> R<bool> {
     }
 }
 
-fn check_flag(it: &mut Interp, v: &Value, method: &str, msg: Option<&Value>, default: &str) -> R<Value> {
+fn check_flag(
+    it: &mut Interp,
+    v: &Value,
+    method: &str,
+    msg: Option<&Value>,
+    default: &str,
+) -> R<Value> {
     let r = call(it, v, method, Vec::new())?;
     if !it.truthy(&r)? {
         let m = match msg {
@@ -177,17 +183,35 @@ impl IOBase {
 
     #[method(name = "_checkSeekable", hint(py(text_signature = "($self, /)")))]
     fn check_seekable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
-        check_flag(it, &slf.0, "seekable", msg, "File or stream is not seekable.")
+        check_flag(
+            it,
+            &slf.0,
+            "seekable",
+            msg,
+            "File or stream is not seekable.",
+        )
     }
 
     #[method(name = "_checkReadable", hint(py(text_signature = "($self, /)")))]
     fn check_readable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
-        check_flag(it, &slf.0, "readable", msg, "File or stream is not readable.")
+        check_flag(
+            it,
+            &slf.0,
+            "readable",
+            msg,
+            "File or stream is not readable.",
+        )
     }
 
     #[method(name = "_checkWritable", hint(py(text_signature = "($self, /)")))]
     fn check_writable(slf: This<Value>, it: &mut Interp, msg: Option<&Value>) -> R<Value> {
-        check_flag(it, &slf.0, "writable", msg, "File or stream is not writable.")
+        check_flag(
+            it,
+            &slf.0,
+            "writable",
+            msg,
+            "File or stream is not writable.",
+        )
     }
 
     /// Return underlying file descriptor if one exists.
@@ -235,11 +259,16 @@ impl IOBase {
             let mut nreadahead = 1i64;
             if let Some(peek) = &peek {
                 let ahead = it.call(peek, vec![Value::Int(1)], Vec::new())?;
-                let Some(ahead) = super::bytes_result(it, &ahead, "peek")? else { break };
+                let Some(ahead) = super::bytes_result(it, &ahead, "peek")? else {
+                    break;
+                };
                 if ahead.is_empty() {
                     break;
                 }
-                let n = ahead.iter().position(|&b| b == b'\n').map_or(ahead.len(), |p| p + 1);
+                let n = ahead
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map_or(ahead.len(), |p| p + 1);
                 nreadahead = n as i64;
                 if limit >= 0 {
                     nreadahead = nreadahead.min(limit - res.len() as i64);
@@ -248,10 +277,15 @@ impl IOBase {
             let b = call(it, &v, "read", vec![Value::Int(nreadahead)])?;
             let b = match &b {
                 Value::None => break,
-                Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => it.bytes_of(&b)?,
+                Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                    it.bytes_of(&b)?
+                }
                 _ => {
                     let t = it.type_name_of(&b);
-                    return Err(it.new_exc_str("OSError", &format!("read() should have returned a bytes object, not '{}'", t)));
+                    return Err(it.new_exc_str(
+                        "OSError",
+                        &format!("read() should have returned a bytes object, not '{}'", t),
+                    ));
                 }
             };
             if b.is_empty() {
@@ -346,7 +380,10 @@ impl RawIOBase {
         let n = it.index_of(&n)?;
         let mut data = it.bytes_of(&ba)?;
         if n < 0 || n as usize > data.len() {
-            return Err(it.value_error(&format!("readinto returned {} outside buffer size {}", n, size)));
+            return Err(it.value_error(&format!(
+                "readinto returned {} outside buffer size {}",
+                n, size
+            )));
         }
         data.truncate(n as usize);
         Ok(Value::bytes(data))
@@ -366,7 +403,12 @@ impl RawIOBase {
     fn readall(slf: This<Value>, it: &mut Interp) -> R<Value> {
         let mut out: Vec<u8> = Vec::new();
         loop {
-            let data = call(it, &slf.0, "read", vec![Value::Int(DEFAULT_BUFFER_SIZE as i64)])?;
+            let data = call(
+                it,
+                &slf.0,
+                "read",
+                vec![Value::Int(DEFAULT_BUFFER_SIZE as i64)],
+            )?;
             match &data {
                 Value::None => {
                     if out.is_empty() {
@@ -411,7 +453,12 @@ fn buffered_readinto(it: &mut Interp, v: &Value, buffer: &mut [u8], method: &str
         None => return Err(it.type_error(&format!("{}() should return bytes", method))),
     };
     if data.len() > buffer.len() {
-        return Err(it.value_error(&format!("{}() returned too much data: {} bytes requested, {} returned", method, buffer.len(), data.len())));
+        return Err(it.value_error(&format!(
+            "{}() returned too much data: {} bytes requested, {} returned",
+            method,
+            buffer.len(),
+            data.len()
+        )));
     }
     buffer[..data.len()].copy_from_slice(&data);
     Ok(data.len())

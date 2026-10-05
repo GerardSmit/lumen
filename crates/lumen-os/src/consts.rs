@@ -47,7 +47,7 @@ static SYSEXITS: &[(&str, i64)] = &[
 mod unix {
     libc_table!(pub(super) OPEN: O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, O_CREAT, O_EXCL, O_TRUNC, O_NONBLOCK,
         O_NDELAY, O_SYNC, O_DSYNC, O_NOCTTY, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_ACCMODE, O_ASYNC,
-        #[cfg(not(target_os = "android"))] O_FSYNC);
+        #[cfg(not(any(target_os = "android", target_env = "musl")))] O_FSYNC);
     libc_table!(pub(super) MISC: SEEK_DATA, SEEK_HOLE, WNOHANG, WUNTRACED, WCONTINUED, WEXITED, WSTOPPED, WNOWAIT,
         P_ALL, P_PID, P_PGID, PRIO_PROCESS, PRIO_PGRP, PRIO_USER, RTLD_LAZY, RTLD_NOW, RTLD_GLOBAL, RTLD_LOCAL,
         RTLD_NODELETE, RTLD_NOLOAD, F_LOCK, F_TLOCK, F_ULOCK, F_TEST);
@@ -308,7 +308,12 @@ mod system {
     libc_table!(pub(super) MISC: PRIO_DARWIN_THREAD, PRIO_DARWIN_PROCESS, PRIO_DARWIN_BG, PRIO_DARWIN_NONUI);
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 mod system {
     pub(super) static OPEN: &[(&str, i64)] = &[];
     pub(super) static MISC: &[(&str, i64)] = &[];

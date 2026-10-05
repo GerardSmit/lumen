@@ -291,6 +291,9 @@ impl FileSystem for OsFs {
 /// The process's file system: the OS natively, the process-wide [`mem`] tree on targets
 /// without one (`wasm32-unknown-unknown`).
 pub fn host() -> &'static dyn FileSystem {
+    if let Some(overlay) = EMBEDDED_ASSETS.get() {
+        return overlay;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         &OsFs
@@ -299,6 +302,32 @@ pub fn host() -> &'static dyn FileSystem {
     {
         mem()
     }
+}
+
+static EMBEDDED_ASSETS: std::sync::OnceLock<Overlay> = std::sync::OnceLock::new();
+
+/// Mount application assets read-only at `/lumen-assets` for filesystem APIs.
+/// The process-wide mount is intended for a standalone executable's one app.
+pub fn install_assets(blob: &[u8]) -> Result<(), &'static str> {
+    let Some(archive) = lumen_common::aot::assets::from_blob(blob)? else {
+        return Ok(());
+    };
+    if EMBEDDED_ASSETS.get().is_some() {
+        return Err("embedded assets already installed");
+    }
+    let upper = MemFs::with_fd_base(1 << 28);
+    for (name, bytes) in archive.entries() {
+        upper.insert(
+            &format!("/lumen-assets/{name}"),
+            bytes.to_vec(),
+            0o444,
+            0o555,
+        );
+    }
+    let lower: Arc<dyn FileSystem> = Arc::new(OsFs);
+    EMBEDDED_ASSETS
+        .set(Overlay::new(Arc::new(upper), lower, true))
+        .map_err(|_| "embedded assets already installed")
 }
 
 /// `upper` layered over `lower`: an absolute path that exists in `upper` (other than `/`) is
@@ -315,7 +344,11 @@ const EACCES: FsError = FsError("EACCES");
 
 impl Overlay {
     pub fn new(upper: Arc<dyn FileSystem>, lower: Arc<dyn FileSystem>, read_only: bool) -> Overlay {
-        Overlay { upper, lower, read_only }
+        Overlay {
+            upper,
+            lower,
+            read_only,
+        }
     }
 
     pub fn upper(&self) -> &Arc<dyn FileSystem> {
@@ -436,8 +469,15 @@ impl FileSystem for Overlay {
     }
     fn mkdir(&self, path: &str, mode: u32, recursive: bool) -> R<Option<String>> {
         if self.read_only && self.in_upper(path) {
-            let is_dir = self.upper.stat(path, true).is_ok_and(|s| s.mode & S_IFMT == S_IFDIR);
-            return if recursive && is_dir { Ok(None) } else { Err(FsError("EEXIST")) };
+            let is_dir = self
+                .upper
+                .stat(path, true)
+                .is_ok_and(|s| s.mode & S_IFMT == S_IFDIR);
+            return if recursive && is_dir {
+                Ok(None)
+            } else {
+                Err(FsError("EEXIST"))
+            };
         }
         self.for_write(path)?.mkdir(path, mode, recursive)
     }
@@ -516,7 +556,9 @@ mod tests {
         upper.insert("/frozen/lib/a.py", &b"A = 1\n"[..], 0o444, 0o555);
         let lower = Arc::new(MemFs::new());
         lower.mkdir("/frozen", 0o755, false).unwrap();
-        lower.write_file("/tmp.txt", b"lower", O_WRONLY | O_CREAT, 0o644).unwrap();
+        lower
+            .write_file("/tmp.txt", b"lower", O_WRONLY | O_CREAT, 0o644)
+            .unwrap();
         let fs = Overlay::new(Arc::new(upper), lower.clone(), true);
         assert_eq!(fs.read_file("/frozen/lib/a.py", 0).unwrap(), b"A = 1\n");
         assert_eq!(fs.read_file("/tmp.txt", 0).unwrap(), b"lower");

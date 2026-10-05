@@ -1,0 +1,49 @@
+{
+    "packages":  [
+                     {
+                         "git_head":  null,
+                         "repository":  "git+https://github.com/preactjs/preact.git",
+                         "license":  "MIT",
+                         "name":  "preact",
+                         "version":  "10.27.2",
+                         "tarball":  "https://registry.npmjs.org/preact/-/preact-10.27.2.tgz",
+                         "integrity":  "sha512-5SYSgFKSyhCbk6SrXyMpqjb5+MQBgfvEKE/OC+PujcY34sOpqtr+0AZQtPYx5IA6VxynQ7rUPCtKzyovpj9Bpg==",
+                         "sha256":  "f1d9cb453deb8d922c2f21702d719d23d24aaa3cab1a89a3dd326d0d8f6b3c70"
+                     },
+                     {
+                         "git_head":  "861811347b8fa936b4a114fc022db9b8253b3d86",
+                         "repository":  "git+https://github.com/facebook/react.git",
+                         "license":  "MIT",
+                         "name":  "react",
+                         "version":  "19.2.0",
+                         "tarball":  "https://registry.npmjs.org/react/-/react-19.2.0.tgz",
+                         "integrity":  "sha512-tmbWg6W31tQLeB5cdIBOicJDJRR2KzXsV7uSK9iNfLWQ5bIZfxuPEHp7M8wiHyHnn0DD1i7w3Zmin0FtkrwoCQ==",
+                         "sha256":  "4de5ae8fd4773b2356f95a22e58cb154a161c35376aef7c006490fb964556d66"
+                     },
+                     {
+                         "git_head":  "861811347b8fa936b4a114fc022db9b8253b3d86",
+                         "repository":  "git+https://github.com/facebook/react.git",
+                         "license":  "MIT",
+                         "name":  "react-dom",
+                         "version":  "19.2.0",
+                         "tarball":  "https://registry.npmjs.org/react-dom/-/react-dom-19.2.0.tgz",
+                         "integrity":  "sha512-UlbRu4cAiGaIewkPyiRGJk0imDN2T3JjieT6spoL2UeSf5od4n5LB/mQ4ejmxhCFT1tYe8IvaFulzynWovsEFQ==",
+                         "sha256":  "6c47e801364162210540ccee8bc5d813e032ae361ba4e2be72102e76093ecf5b"
+                     },
+                     {
+                         "git_head":  "861811347b8fa936b4a114fc022db9b8253b3d86",
+                         "repository":  "git+https://github.com/facebook/react.git",
+                         "license":  "MIT",
+                         "name":  "scheduler",
+                         "version":  "0.27.0",
+                         "tarball":  "https://registry.npmjs.org/scheduler/-/scheduler-0.27.0.tgz",
+                         "integrity":  "sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==",
+                         "sha256":  "ab26ce35ce4032f04b78cfc5bbb4cfe13358e9fe7a5433a8aa6315c3debc5095"
+                     }
+                 ],
+    "font":  {
+                 "sha256":  "76d04c18ea243f426b7de1f3ad208e927008f961dc5945e5aad352d0dfde8ee8",
+                 "path":  "lumen-html-text/fonts/LiberationSans-Regular.ttf",
+                 "license":  "OFL-1.1"
+             }
+}

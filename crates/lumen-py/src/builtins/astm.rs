@@ -1,8 +1,8 @@
 //! `_ast`: the AST node classes, built from the generated [`super::astnodes`] table as CPython's
 //! `init_types` builds them (`type(name, (base,), ...)` under the native `ast.AST`).
 
-use std::collections::HashMap;
 use crate::object::Obj;
+use std::collections::HashMap;
 
 /// The node classes by name, for converting a parsed tree into `_ast` objects.
 #[derive(Default)]
@@ -29,16 +29,28 @@ pub mod _ast {
     #[methods]
     impl AST {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<Value> {
             let _ = (args, kwargs);
-            let Value::Obj(cls) = cls.0 else { return Err(it.type_error("AST.__new__(X): X is not a type object")) };
+            let Value::Obj(cls) = cls.0 else {
+                return Err(it.type_error("AST.__new__(X): X is not a type object"));
+            };
             Ok(opaque_instance(&cls, AST))
         }
 
         // `ast_type_init`: positional arguments fill `_fields` in order, keywords set any
         // attribute.
         #[proto(init)]
-        fn __init__(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        fn __init__(
+            slf: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<()> {
             let cls = it.type_of(&slf.0);
             let fields = it.get_attr_str(&Value::Obj(cls.clone()), "_fields")?;
             let fields = it.iterate_to_vec(&fields)?;
@@ -46,7 +58,9 @@ pub mod _ast {
                 let name = it.type_name(&cls);
                 let n = fields.len();
                 let s = if n == 1 { "" } else { "s" };
-                return Err(it.type_error(&format!("{name} constructor takes at most {n} positional argument{s}")));
+                return Err(it.type_error(&format!(
+                    "{name} constructor takes at most {n} positional argument{s}"
+                )));
             }
             for (name, v) in fields.iter().zip(args) {
                 let Value::Obj(name) = name else { continue };
@@ -64,7 +78,9 @@ pub mod _ast {
                 if at.is_some_and(|p| p < args.len()) {
                     let t = it.tp_name(&cls);
                     let k = key.as_str_kind().unwrap_or("");
-                    return Err(it.type_error(&format!("{t} got multiple values for argument '{k}'")));
+                    return Err(
+                        it.type_error(&format!("{t} got multiple values for argument '{k}'"))
+                    );
                 }
                 it.set_attr(&slf.0, &key, v)?;
             }
@@ -74,9 +90,18 @@ pub mod _ast {
         #[method(name = "__reduce__")]
         fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
             let cls = it.type_of(&slf.0);
-            let Value::Obj(o) = &slf.0 else { return Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(Vec::new())])) };
+            let Value::Obj(o) = &slf.0 else {
+                return Ok(Value::tuple(vec![
+                    Value::Obj(cls),
+                    Value::tuple(Vec::new()),
+                ]));
+            };
             let d = it.instance_dict(o);
-            Ok(Value::tuple(vec![Value::Obj(cls), Value::tuple(Vec::new()), Value::Obj(d)]))
+            Ok(Value::tuple(vec![
+                Value::Obj(cls),
+                Value::tuple(Vec::new()),
+                Value::Obj(d),
+            ]))
         }
     }
 
@@ -99,21 +124,33 @@ pub mod _ast {
         it.set_attr_str(&ast_v, "__match_args__", empty.clone())?;
         it.set_attr_str(&ast_v, "_attributes", empty)?;
         dict_set_str(&d, "AST", ast_v.clone());
-        for (name, v) in [("PyCF_ALLOW_TOP_LEVEL_AWAIT", PY_CF_ALLOW_TOP_LEVEL_AWAIT), ("PyCF_ONLY_AST", PY_CF_ONLY_AST), ("PyCF_TYPE_COMMENTS", PY_CF_TYPE_COMMENTS)] {
+        for (name, v) in [
+            ("PyCF_ALLOW_TOP_LEVEL_AWAIT", PY_CF_ALLOW_TOP_LEVEL_AWAIT),
+            ("PyCF_ONLY_AST", PY_CF_ONLY_AST),
+            ("PyCF_TYPE_COMMENTS", PY_CF_TYPE_COMMENTS),
+        ] {
             dict_set_str(&d, name, Value::Int(v));
         }
         let type_ty = Value::Obj(it.types.type_.clone());
         let mut made = AstTypes::default();
         made.by_name.insert("AST", ast);
         for n in NODE_TYPES {
-            let base = made.by_name.get(n.base).cloned().ok_or_else(|| it.type_error("ast base"))?;
+            let base = made
+                .by_name
+                .get(n.base)
+                .cloned()
+                .ok_or_else(|| it.type_error("ast base"))?;
             let fields = str_tuple(n.fields.iter().map(|f| f.0));
             let ns = it.new_dict();
             dict_set_str(&ns, "_fields", fields.clone());
             dict_set_str(&ns, "__match_args__", fields);
             dict_set_str(&ns, "__module__", Value::str("ast"));
             dict_set_str(&ns, "__doc__", Value::str(n.doc));
-            let args = vec![Value::str(n.name), Value::tuple(vec![Value::Obj(base)]), Value::Obj(ns)];
+            let args = vec![
+                Value::str(n.name),
+                Value::tuple(vec![Value::Obj(base)]),
+                Value::Obj(ns),
+            ];
             let ty = it.call(&type_ty, args, Vec::new())?;
             if let Some(attrs) = n.attributes {
                 it.set_attr_str(&ty, "_attributes", str_tuple(attrs.iter().copied()))?;

@@ -36,7 +36,11 @@ fn run(src: &str) -> (i32, String, String) {
             let code = it.run_source(&src, "<limits>");
             it.flush_out();
             let c = cap.borrow();
-            (code, String::from_utf8_lossy(&c.out).into_owned(), String::from_utf8_lossy(&c.err).into_owned())
+            (
+                code,
+                String::from_utf8_lossy(&c.out).into_owned(),
+                String::from_utf8_lossy(&c.err).into_owned(),
+            )
         })
         .unwrap()
         .join()
@@ -54,7 +58,10 @@ fn outcomes(exprs: &[&str]) -> Vec<String> {
     let started = Instant::now();
     let (code, out, err) = run(&src);
     assert_eq!(code, 0, "{err}");
-    assert!(started.elapsed() < Duration::from_secs(5), "size checks must fail fast");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "size checks must fail fast"
+    );
     let lines: Vec<String> = out.lines().map(str::to_string).collect();
     assert_eq!(lines.len(), exprs.len(), "{out}");
     lines
@@ -105,13 +112,25 @@ for v in ([0, 1], bytearray(b'ab')):
 
 #[test]
 fn repeat_with_empty_operand_or_zero_count_is_cheap() {
-    expect(&[("len([] * N)", "ok"), ("len('' * N)", "ok"), ("len(b'' * N)", "ok"), ("len([0] * 0)", "ok"), ("len('ab' * -N)", "ok")]);
+    expect(&[
+        ("len([] * N)", "ok"),
+        ("len('' * N)", "ok"),
+        ("len(b'' * N)", "ok"),
+        ("len([0] * 0)", "ok"),
+        ("len('ab' * -N)", "ok"),
+    ]);
 }
 
 #[test]
 fn repeat_count_past_ssize_t_is_overflow_error() {
     let msg = "OverflowError: cannot fit 'int' into an index-sized integer";
-    expect(&[("[0] * HUGE", msg), ("'a' * HUGE", msg), ("HUGE * b'a'", msg), ("bytes(HUGE)", msg), ("bytearray(HUGE)", msg)]);
+    expect(&[
+        ("[0] * HUGE", msg),
+        ("'a' * HUGE", msg),
+        ("HUGE * b'a'", msg),
+        ("bytes(HUGE)", msg),
+        ("bytearray(HUGE)", msg),
+    ]);
 }
 
 #[test]
@@ -125,7 +144,10 @@ fn materialising_a_huge_range_raises_memory_error() {
         ("bytes(range(N))", mem),
         ("list(range(10**30, 10**30 + 5))", "ok"),
         ("len(range(N))", "ok"),
-        ("list(range(10**30))", "OverflowError: Python int too large to convert to C ssize_t"),
+        (
+            "list(range(10**30))",
+            "OverflowError: Python int too large to convert to C ssize_t",
+        ),
     ]);
 }
 
@@ -161,7 +183,12 @@ fn expandtabs_checks_tabsize_and_result_size() {
 
 #[test]
 fn bytes_constructors_raise_memory_error() {
-    expect(&[("bytes(N)", "MemoryError: "), ("bytearray(N)", "MemoryError: "), ("bytes(5)", "ok"), ("bytes(-1)", "ValueError: negative count")]);
+    expect(&[
+        ("bytes(N)", "MemoryError: "),
+        ("bytearray(N)", "MemoryError: "),
+        ("bytes(5)", "ok"),
+        ("bytes(-1)", "ValueError: negative count"),
+    ]);
 }
 
 #[test]
@@ -172,8 +199,14 @@ fn format_width_and_precision_are_limited() {
         ("format('a', '>1000000000000')", "MemoryError: "),
         ("format(1.5, '1000000000000.2f')", "MemoryError: "),
         ("'{:{}}'.format(1, N)", "MemoryError: "),
-        ("format(1, '1' * 30)", "ValueError: Too many decimal digits in format string"),
-        ("format(1.5, '.1000000000000f')", "ValueError: precision too big"),
+        (
+            "format(1, '1' * 30)",
+            "ValueError: Too many decimal digits in format string",
+        ),
+        (
+            "format(1.5, '.1000000000000f')",
+            "ValueError: precision too big",
+        ),
         ("format('a', '.1000000000000')", "ok"),
         ("'%1000000000000d' % 1", "MemoryError: "),
         ("'%*d' % (N, 1)", "MemoryError: "),
@@ -205,7 +238,10 @@ fn replace_and_join_check_the_result_size_up_front() {
 fn int_to_bytes_and_big_int_results_are_limited() {
     expect(&[
         ("(1).to_bytes(N, 'big')", "MemoryError: "),
-        ("(1).to_bytes(HUGE, 'big')", "OverflowError: Python int too large to convert to C ssize_t"),
+        (
+            "(1).to_bytes(HUGE, 'big')",
+            "OverflowError: Python int too large to convert to C ssize_t",
+        ),
         ("1 << N", "MemoryError: "),
         ("1 << HUGE", "OverflowError: too many digits in integer"),
         ("2 ** N", "MemoryError: "),
@@ -279,10 +315,16 @@ fn embedder_can_set_the_digit_limit() {
             assert!(!it.set_int_max_str_digits(100));
             assert!(it.set_int_max_str_digits(640));
             assert_eq!(it.int_max_str_digits(), 640);
-            let code = it.run_source("try:\n    str(10 ** 640)\nexcept ValueError:\n    raise SystemExit(7)\n", "<limit>");
+            let code = it.run_source(
+                "try:\n    str(10 ** 640)\nexcept ValueError:\n    raise SystemExit(7)\n",
+                "<limit>",
+            );
             assert_eq!(code, 7);
             assert!(it.set_int_max_str_digits(0));
-            assert_eq!(it.run_source("assert len(str(10 ** 640)) == 641\n", "<limit>"), 0);
+            assert_eq!(
+                it.run_source("assert len(str(10 ** 640)) == 641\n", "<limit>"),
+                0
+            );
         })
         .unwrap()
         .join()
@@ -292,7 +334,8 @@ fn embedder_can_set_the_digit_limit() {
 #[test]
 fn digit_limit_error_for_a_huge_value_is_immediate() {
     let started = Instant::now();
-    let (code, out, err) = run("try:\n    str(7 ** 2000000)\nexcept ValueError as e:\n    print('ValueError')\n");
+    let (code, out, err) =
+        run("try:\n    str(7 ** 2000000)\nexcept ValueError as e:\n    print('ValueError')\n");
     assert_eq!(code, 0, "{err}");
     assert_eq!(out, "ValueError\n");
     assert!(started.elapsed() < Duration::from_secs(3));

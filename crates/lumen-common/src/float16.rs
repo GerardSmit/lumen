@@ -22,7 +22,11 @@ pub fn f64_to_f16_bits(x: f64) -> Option<u16> {
         return Some(sign);
     }
     let m = (1u64 << 52) | mant;
-    let (shift, base) = if e >= -14 { (42u32, ((e + 15) as u64) << 10) } else { ((42 + (-14 - e)) as u32, 0) };
+    let (shift, base) = if e >= -14 {
+        (42u32, ((e + 15) as u64) << 10)
+    } else {
+        ((42 + (-14 - e)) as u32, 0)
+    };
     let mut q = m >> shift;
     let rem = m & ((1u64 << shift) - 1);
     let half = 1u64 << (shift - 1);

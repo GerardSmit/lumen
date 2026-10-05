@@ -40,19 +40,32 @@ fn parse_digits_limit(text: &str, origin: &str) -> Result<usize, String> {
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
-    let mut opts = Options { timeout_ms: None, max_memory_mb: None, int_max_str_digits: DEFAULT_INT_MAX_STR_DIGITS, script_args: Vec::new() };
+    let mut opts = Options {
+        timeout_ms: None,
+        max_memory_mb: None,
+        int_max_str_digits: DEFAULT_INT_MAX_STR_DIGITS,
+        script_args: Vec::new(),
+    };
     let mut digits_from_x = false;
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
         if let Some(v) = a.strip_prefix("--timeout=") {
-            opts.timeout_ms = Some(v.parse().map_err(|_| format!("lumen-py: invalid value for --timeout={v}\n"))?);
+            opts.timeout_ms = Some(
+                v.parse()
+                    .map_err(|_| format!("lumen-py: invalid value for --timeout={v}\n"))?,
+            );
         } else if let Some(v) = a.strip_prefix("--max-memory=") {
-            opts.max_memory_mb = Some(v.parse().map_err(|_| format!("lumen-py: invalid value for --max-memory={v}\n"))?);
+            opts.max_memory_mb = Some(
+                v.parse()
+                    .map_err(|_| format!("lumen-py: invalid value for --max-memory={v}\n"))?,
+            );
         } else if a == "-X" || (a.starts_with("-X") && a.len() > 2) {
             let spec = if a == "-X" {
                 i += 1;
-                args.get(i).map(String::as_str).ok_or_else(|| "Argument expected for the -X option\n".to_string())?
+                args.get(i)
+                    .map(String::as_str)
+                    .ok_or_else(|| "Argument expected for the -X option\n".to_string())?
             } else {
                 &a[2..]
             };
@@ -78,7 +91,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         }
     }
     if opts.timeout_ms.is_none() {
-        opts.timeout_ms = std::env::var("LUMEN_TIMEOUT_MS").ok().and_then(|v| v.trim().parse().ok());
+        opts.timeout_ms = std::env::var("LUMEN_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok());
     }
     Ok(opts)
 }
@@ -125,7 +140,11 @@ pub fn run_main(args: &[String]) -> i32 {
             let abs = it.platform.borrow_mut().canonicalize(path);
             crate::platform::parent_dir(&abs)
         }
-        _ => it.platform.borrow_mut().getcwd().unwrap_or_else(|_| ".".into()),
+        _ => it
+            .platform
+            .borrow_mut()
+            .getcwd()
+            .unwrap_or_else(|_| ".".into()),
     };
     let mut dirs = vec![first_dir];
     if let Ok(extra) = std::env::var("PYTHONPATH") {
@@ -143,7 +162,10 @@ pub fn run_main(args: &[String]) -> i32 {
             argv.extend(opts.script_args[2..].iter().cloned());
             it.set_argv(&argv);
             let name = name.replace('\\', "\\\\").replace('\'', "\\'");
-            it.run_source(&format!("import runpy\nrunpy._run_module_as_main('{name}')\n"), "<string>")
+            it.run_source(
+                &format!("import runpy\nrunpy._run_module_as_main('{name}')\n"),
+                "<string>",
+            )
         }
         Target::Command(src) => {
             let mut argv = vec!["-c".to_string()];
@@ -167,10 +189,13 @@ pub fn run_main(args: &[String]) -> i32 {
 /// A watchdog thread raises the interpreter's interrupt when the budget runs out.
 fn start_watchdog(it: &Interp, ms: u64) {
     let handle = it.interrupt_handle();
-    Deadline::start("lumen-py-timeout", std::time::Duration::from_millis(ms), move || {
-        TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
-        handle.interrupt();
-    })
+    Deadline::start(
+        "lumen-py-timeout",
+        std::time::Duration::from_millis(ms),
+        move || {
+            TIMED_OUT_AFTER.store(ms, Ordering::SeqCst);
+            handle.interrupt();
+        },
+    )
     .detach();
 }
-

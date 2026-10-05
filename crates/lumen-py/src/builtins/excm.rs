@@ -15,7 +15,10 @@ fn set_args(e: &Obj, args: &[Value]) {
 fn keyword_fields(it: &mut Interp, d: &Obj, kw: KwArgs, allowed: &[&str], cls: &str) -> R<()> {
     for (k, v) in kw.iter() {
         if !allowed.contains(&k) {
-            return Err(it.type_error(&format!("'{}' is an invalid keyword argument for {}()", k, cls)));
+            return Err(it.type_error(&format!(
+                "'{}' is an invalid keyword argument for {}()",
+                k, cls
+            )));
         }
         dict_set_str(d, k, v.clone());
     }
@@ -29,9 +32,16 @@ pub struct BaseException;
 #[lumen_bind::methods]
 impl BaseException {
     #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
         let _ = kwargs;
-        let Value::Obj(cls) = &*cls else { unreachable!("checked by the entry") };
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
         let o = it.alloc_instance(cls)?;
         if let Value::Obj(e) = &o {
             set_args(e, args);
@@ -41,7 +51,12 @@ impl BaseException {
 
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let e = slf.0 .0;
         if !kwargs.is_empty() {
             let n = it.type_name(&it.type_of_obj(e));
@@ -115,9 +130,15 @@ impl BaseException {
         let Some(state) = dict_of(state) else {
             return Err(it.type_error("state is not a dictionary"));
         };
-        let entries: Vec<(Value, Value)> = state.borrow().iter().map(|en| (en.key.clone(), en.val.clone())).collect();
+        let entries: Vec<(Value, Value)> = state
+            .borrow()
+            .iter()
+            .map(|en| (en.key.clone(), en.val.clone()))
+            .collect();
         for (k, v) in entries {
-            let Value::Obj(name) = &k else { return Err(it.type_error("attribute name must be string")) };
+            let Value::Obj(name) = &k else {
+                return Err(it.type_error("attribute name must be string"));
+            };
             it.set_attr(&slf, name, v)?;
         }
         Ok(())
@@ -134,7 +155,12 @@ impl StopIteration {
     #[getter]
     fn value(slf: This<Exc<'_>>, it: &mut Interp) -> Value {
         let e = slf.0 .0;
-        if let Some(v) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "value")) {
+        if let Some(v) = e
+            .dict
+            .borrow()
+            .as_ref()
+            .and_then(|d| dict_get_str(d, "value"))
+        {
             return v;
         }
         it.stop_value(e)
@@ -151,7 +177,12 @@ impl SystemExit {
     #[getter]
     fn code(slf: This<Exc<'_>>) -> Value {
         let e = slf.0 .0;
-        if let Some(v) = e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, "code")) {
+        if let Some(v) = e
+            .dict
+            .borrow()
+            .as_ref()
+            .and_then(|d| dict_get_str(d, "code"))
+        {
             return v;
         }
         match &e.kind {
@@ -173,7 +204,12 @@ pub struct ImportError;
 impl ImportError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let e = slf.0 .0;
         set_args(e, args);
         let d = it.instance_dict(e);
@@ -192,7 +228,12 @@ pub struct AttributeError;
 impl AttributeError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let e = slf.0 .0;
         set_args(e, args);
         let d = it.instance_dict(e);
@@ -213,7 +254,12 @@ pub struct NameError;
 impl NameError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let e = slf.0 .0;
         set_args(e, args);
         let d = it.instance_dict(e);
@@ -244,7 +290,13 @@ pub(crate) fn char_escape(cp: u32) -> String {
 
 /// `UnicodeEncodeError.__init__` and friends: `(encoding, object, start, end, reason)`, or
 /// without `encoding` for `UnicodeTranslateError`.
-fn unicode_init(it: &mut Interp, e: &Obj, args: &[Value], kwargs: &KwArgs, kind: UnicodeKind) -> R<()> {
+fn unicode_init(
+    it: &mut Interp,
+    e: &Obj,
+    args: &[Value],
+    kwargs: &KwArgs,
+    kind: UnicodeKind,
+) -> R<()> {
     set_args(e, args);
     if !kwargs.is_empty() {
         let name = it.type_name_of(&Value::Obj(e.clone()));
@@ -253,7 +305,11 @@ fn unicode_init(it: &mut Interp, e: &Obj, args: &[Value], kwargs: &KwArgs, kind:
     let with_encoding = kind != UnicodeKind::Translate;
     let want = if with_encoding { 5 } else { 4 };
     if args.len() != want {
-        return Err(it.type_error(&format!("function takes exactly {} arguments ({} given)", want, args.len())));
+        return Err(it.type_error(&format!(
+            "function takes exactly {} arguments ({} given)",
+            want,
+            args.len()
+        )));
     }
     let not_str = |it: &mut Interp, n: usize, v: &Value| {
         let t = it.type_name_of(v);
@@ -271,7 +327,9 @@ fn unicode_init(it: &mut Interp, e: &Obj, args: &[Value], kwargs: &KwArgs, kind:
     let object = if kind == UnicodeKind::Decode {
         match &args[off] {
             Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => args[off].clone(),
-            Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => Value::bytes(it.bytes_of(&args[off])?),
+            Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => {
+                Value::bytes(it.bytes_of(&args[off])?)
+            }
             v => {
                 let t = it.type_name_of(v);
                 return Err(it.type_error(&format!("a bytes-like object is required, not '{}'", t)));
@@ -301,7 +359,9 @@ fn unicode_init(it: &mut Interp, e: &Obj, args: &[Value], kwargs: &KwArgs, kind:
 /// `end` and `reason` attributes (empty before `__init__` set them).
 fn unicode_text(it: &mut Interp, e: &Obj, kind: UnicodeKind) -> R<String> {
     let d = it.instance_dict(e);
-    let Some(object) = dict_get_str(&d, "object") else { return Ok(String::new()) };
+    let Some(object) = dict_get_str(&d, "object") else {
+        return Ok(String::new());
+    };
     let get = |n: &str| dict_get_str(&d, n).unwrap_or(Value::None);
     let (sv, ev, rv, encv) = (get("start"), get("end"), get("reason"), get("encoding"));
     let start = it.index_of(&sv)?;
@@ -314,16 +374,31 @@ fn unicode_text(it: &mut Interp, e: &Obj, kind: UnicodeKind) -> R<String> {
     };
     let single = if kind == UnicodeKind::Decode {
         let b = it.bytes_of(&object)?;
-        (start >= 0 && (start as usize) < b.len() && end == start + 1).then(|| format!("byte 0x{:02x}", b[start as usize]))
+        (start >= 0 && (start as usize) < b.len() && end == start + 1)
+            .then(|| format!("byte 0x{:02x}", b[start as usize]))
     } else {
-        let c = object.as_pystr().filter(|s| start >= 0 && (start as usize) < s.nchars && end == start + 1).and_then(|s| s.char_at(start as usize));
+        let c = object
+            .as_pystr()
+            .filter(|s| start >= 0 && (start as usize) < s.nchars && end == start + 1)
+            .and_then(|s| s.char_at(start as usize));
         c.map(|c| format!("character '{}'", char_escape(c)))
     };
     Ok(match single {
         Some(what) => format!("{} {} in position {}: {}", prefix, what, start, reason),
         None => {
-            let what = if kind == UnicodeKind::Decode { "bytes" } else { "characters" };
-            format!("{} {} in position {}-{}: {}", prefix, what, start, end - 1, reason)
+            let what = if kind == UnicodeKind::Decode {
+                "bytes"
+            } else {
+                "characters"
+            };
+            format!(
+                "{} {} in position {}-{}: {}",
+                prefix,
+                what,
+                start,
+                end - 1,
+                reason
+            )
         }
     })
 }
@@ -352,7 +427,12 @@ pub struct UnicodeEncodeError;
 impl UnicodeEncodeError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Encode)
     }
 
@@ -370,7 +450,12 @@ pub struct UnicodeDecodeError;
 impl UnicodeDecodeError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Decode)
     }
 
@@ -388,7 +473,12 @@ pub struct UnicodeTranslateError;
 impl UnicodeTranslateError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Translate)
     }
 
@@ -398,8 +488,15 @@ impl UnicodeTranslateError {
     }
 }
 
-
-const SYNTAX_FIELDS: [&str; 7] = ["filename", "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line"];
+const SYNTAX_FIELDS: [&str; 7] = [
+    "filename",
+    "lineno",
+    "offset",
+    "text",
+    "end_lineno",
+    "end_offset",
+    "print_file_and_line",
+];
 
 // `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
 #[lumen_bind::class(name = "SyntaxError")]
@@ -409,7 +506,12 @@ pub struct SyntaxError;
 impl SyntaxError {
     /// Initialize self.  See help(type(self)) for accurate signature.
     #[proto(init)]
-    fn init(slf: This<Exc<'_>>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
         let _ = kwargs;
         let e = slf.0 .0;
         set_args(e, args);
@@ -442,11 +544,19 @@ impl SyntaxError {
 
 /// `msg (file, line N)` with the file's base name, as CPython's `SyntaxError_str`.
 pub fn syntax_error_str(it: &mut Interp, e: &Obj) -> R<String> {
-    let field = |n: &str| e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, n)).unwrap_or(Value::None);
+    let field = |n: &str| {
+        e.dict
+            .borrow()
+            .as_ref()
+            .and_then(|d| dict_get_str(d, n))
+            .unwrap_or(Value::None)
+    };
     let msg = field("msg");
     let msg = it.str_of(&msg)?;
     let filename = field("filename");
-    let file = filename.as_str().map(|f| f.rsplit('/').next().unwrap_or(f).to_string());
+    let file = filename
+        .as_str()
+        .map(|f| f.rsplit('/').next().unwrap_or(f).to_string());
     let line = match field("lineno") {
         Value::Int(n) => Some(n),
         _ => None,

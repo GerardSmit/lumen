@@ -35,7 +35,9 @@ pub mod binascii {
         }
         buffer(it, v).map_err(|_| {
             let t = it.type_name_of(v);
-            it.type_error(&format!("argument should be bytes, buffer or ASCII string, not '{t}'"))
+            it.type_error(&format!(
+                "argument should be bytes, buffer or ASCII string, not '{t}'"
+            ))
         })
     }
 
@@ -55,7 +57,13 @@ pub mod binascii {
 
     /// Uuencode line of data.
     #[op]
-    fn b2a_uu(it: &mut Interp, data: &Value, #[kwonly] #[default(false)] backtick: bool) -> R<Vec<u8>> {
+    fn b2a_uu(
+        it: &mut Interp,
+        data: &Value,
+        #[kwonly]
+        #[default(false)]
+        backtick: bool,
+    ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         codec::uu_encode_line(&data, backtick).map_err(|e| error(it, e))
     }
@@ -66,14 +74,26 @@ pub mod binascii {
     ///     When set to True, bytes that are not part of the base64 standard are not allowed.
     ///     The same applies to excess data after padding (= / ==).
     #[op]
-    fn a2b_base64(it: &mut Interp, data: &Value, #[kwonly] #[default(false)] strict_mode: bool) -> R<Vec<u8>> {
+    fn a2b_base64(
+        it: &mut Interp,
+        data: &Value,
+        #[kwonly]
+        #[default(false)]
+        strict_mode: bool,
+    ) -> R<Vec<u8>> {
         let data = ascii_buffer(it, data)?;
         codec::base64_decode_binascii(&data, strict_mode).map_err(|e| error(it, &e.to_string()))
     }
 
     /// Base64-code line of data.
     #[op]
-    fn b2a_base64(it: &mut Interp, data: &Value, #[kwonly] #[default(true)] newline: bool) -> R<Vec<u8>> {
+    fn b2a_base64(
+        it: &mut Interp,
+        data: &Value,
+        #[kwonly]
+        #[default(true)]
+        newline: bool,
+    ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let mut out = codec::base64_encode(&data, false, true).into_bytes();
         if newline {
@@ -98,7 +118,12 @@ pub mod binascii {
         Ok(lumen_common::compress::crc32_from(crc, &data))
     }
 
-    fn hex_impl(it: &mut Interp, data: &Value, sep: Option<&Value>, bytes_per_sep: Option<&Value>) -> R<Vec<u8>> {
+    fn hex_impl(
+        it: &mut Interp,
+        data: &Value,
+        sep: Option<&Value>,
+        bytes_per_sep: Option<&Value>,
+    ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         let sep = crate::builtins::memview::hex_sep_arg(it, sep)?;
         let per = match bytes_per_sep {
@@ -127,7 +152,12 @@ pub mod binascii {
     /// >>> binascii.b2a_hex(b'\xb9\x01\xef', b'_', 2)
     /// b'b9_01ef'
     #[op]
-    fn b2a_hex(it: &mut Interp, #[kw] data: &Value, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<Vec<u8>> {
+    fn b2a_hex(
+        it: &mut Interp,
+        #[kw] data: &Value,
+        #[kw] sep: Option<&Value>,
+        #[kw] bytes_per_sep: Option<&Value>,
+    ) -> R<Vec<u8>> {
         hex_impl(it, data, sep, bytes_per_sep)
     }
 
@@ -142,7 +172,12 @@ pub mod binascii {
     /// The return value is a bytes object.  This function is also
     /// available as "b2a_hex()".
     #[op]
-    fn hexlify(it: &mut Interp, #[kw] data: &Value, #[kw] sep: Option<&Value>, #[kw] bytes_per_sep: Option<&Value>) -> R<Vec<u8>> {
+    fn hexlify(
+        it: &mut Interp,
+        #[kw] data: &Value,
+        #[kw] sep: Option<&Value>,
+        #[kw] bytes_per_sep: Option<&Value>,
+    ) -> R<Vec<u8>> {
         hex_impl(it, data, sep, bytes_per_sep)
     }
 
@@ -180,7 +215,13 @@ pub mod binascii {
 
     /// Decode a string of qp-encoded data.
     #[op]
-    fn a2b_qp(it: &mut Interp, #[kw] data: &Value, #[kw] #[default(false)] header: bool) -> R<Vec<u8>> {
+    fn a2b_qp(
+        it: &mut Interp,
+        #[kw] data: &Value,
+        #[kw]
+        #[default(false)]
+        header: bool,
+    ) -> R<Vec<u8>> {
         let data = ascii_buffer(it, data)?;
         Ok(codec::qp_decode(&data, header))
     }
@@ -194,9 +235,15 @@ pub mod binascii {
     fn b2a_qp(
         it: &mut Interp,
         #[kw] data: &Value,
-        #[kw] #[default(false)] quotetabs: bool,
-        #[kw] #[default(true)] istext: bool,
-        #[kw] #[default(false)] header: bool,
+        #[kw]
+        #[default(false)]
+        quotetabs: bool,
+        #[kw]
+        #[default(true)]
+        istext: bool,
+        #[kw]
+        #[default(false)]
+        header: bool,
     ) -> R<Vec<u8>> {
         let data = buffer(it, data)?;
         Ok(codec::qp_encode(&data, quotetabs, istext, header))
@@ -207,9 +254,21 @@ pub mod binascii {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         let value_error = it.exc_type("ValueError");
-        let err = crate::builtins::native::new_type(it, "binascii", "Error", Some(&value_error), Layout::Exception);
+        let err = crate::builtins::native::new_type(
+            it,
+            "binascii",
+            "Error",
+            Some(&value_error),
+            Layout::Exception,
+        );
         let exc = it.exc_type("Exception");
-        let incomplete = crate::builtins::native::new_type(it, "binascii", "Incomplete", Some(&exc), Layout::Exception);
+        let incomplete = crate::builtins::native::new_type(
+            it,
+            "binascii",
+            "Incomplete",
+            Some(&exc),
+            Layout::Exception,
+        );
         dict_set_str(&d, "Error", Value::Obj(err.clone()));
         dict_set_str(&d, "Incomplete", Value::Obj(incomplete));
         it.native_state::<State>().error = Some(err);

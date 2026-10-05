@@ -39,7 +39,7 @@ pub mod _thread {
             Some(v) => match it.index_of(v) {
                 Ok(n) => n as f64,
                 Err(e) if it.exc_is(&e, "OverflowError") => {
-                    return Err(it.overflow_err("timestamp too large to convert to C _PyTime_t"))
+                    return Err(it.overflow_err("timestamp too large to convert to C _PyTime_t"));
                 }
                 Err(e) => return Err(e),
             },
@@ -109,9 +109,12 @@ pub mod _thread {
                 if self.try_take() {
                     return Ok(true);
                 }
-                return Err(it.runtime_error("deadlock: lock is already held and there is no other thread to release it"));
+                return Err(it.runtime_error(
+                    "deadlock: lock is already held and there is no other thread to release it",
+                ));
             }
-            let deadline = (timeout >= 0.0).then(|| Instant::now() + Duration::from_secs_f64(timeout));
+            let deadline =
+                (timeout >= 0.0).then(|| Instant::now() + Duration::from_secs_f64(timeout));
             let main = it.is_main_thread();
             loop {
                 let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
@@ -170,7 +173,13 @@ pub mod _thread {
     }
 
     fn new_lock(it: &mut Interp) -> Value {
-        Py::new(it, Lock { core: Rc::new(LockCore::default()) }).into_value()
+        Py::new(
+            it,
+            Lock {
+                core: Rc::new(LockCore::default()),
+            },
+        )
+        .into_value()
     }
 
     fn lock_core(it: &mut Interp, slf: &Py<Lock>) -> R<Rc<LockCore>> {
@@ -191,7 +200,14 @@ pub mod _thread {
         /// and the return value reflects whether the lock is acquired.
         /// The blocking operation is interruptible.
         #[method(hint(py(aliases = "acquire_lock")))]
-        fn acquire(slf: This<Py<Self>>, it: &mut Interp, #[kw] #[default(true)] blocking: bool, #[kw] timeout: Option<&Value>) -> R<bool> {
+        fn acquire(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw]
+            #[default(true)]
+            blocking: bool,
+            #[kw] timeout: Option<&Value>,
+        ) -> R<bool> {
             let (blocking, timeout) = acquire_args(it, blocking, timeout)?;
             lock_core(it, &slf.0)?.acquire(it, blocking, timeout)
         }
@@ -229,7 +245,11 @@ pub mod _thread {
         fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
             let locked = slf.0.borrow(it)?.core.locked.get();
             let state = if locked { "locked" } else { "unlocked" };
-            Ok(format!("<{state} {} object at {:#x}>", it.tp_name_of(slf.0.value()), it.id_of(slf.0.value())))
+            Ok(format!(
+                "<{state} {} object at {:#x}>",
+                it.tp_name_of(slf.0.value()),
+                it.id_of(slf.0.value())
+            ))
         }
     }
 
@@ -290,8 +310,15 @@ pub mod _thread {
         #[constructor]
         fn new(cls: This<Value>, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> Value {
             let _ = (args, kwargs);
-            let Value::Obj(cls) = &cls.0 else { unreachable!("a type") };
-            crate::bind::opaque_instance(cls, RLock { core: Rc::new(RLockCore::default()) })
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!("a type")
+            };
+            crate::bind::opaque_instance(
+                cls,
+                RLock {
+                    core: Rc::new(RLockCore::default()),
+                },
+            )
         }
 
         /// Lock the lock.  `blocking` indicates whether we should wait
@@ -306,7 +333,14 @@ pub mod _thread {
         /// Precisely, if the current thread already holds the lock, its
         /// internal counter is simply incremented. If nobody holds the lock,
         /// the lock is taken and its internal counter initialized to 1.
-        fn acquire(slf: This<Py<Self>>, it: &mut Interp, #[kw] #[default(true)] blocking: bool, #[kw] timeout: Option<&Value>) -> R<bool> {
+        fn acquire(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            #[kw]
+            #[default(true)]
+            blocking: bool,
+            #[kw] timeout: Option<&Value>,
+        ) -> R<bool> {
             let (blocking, timeout) = acquire_args(it, blocking, timeout)?;
             rlock_core(it, &slf.0)?.acquire(it, blocking, timeout)
         }
@@ -404,7 +438,11 @@ pub mod _thread {
         fn _acquire_restore(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
             let (count, owner) = match state.tuple_items() {
                 Some([c, o]) => (it.index_of(c)?, it.index_of(o)?),
-                _ => return Err(it.type_error("_acquire_restore() argument 1 must be tuple of 2 items")),
+                _ => {
+                    return Err(
+                        it.type_error("_acquire_restore() argument 1 must be tuple of 2 items")
+                    );
+                }
             };
             let core = rlock_core(it, &slf.0)?;
             core.lock.acquire(it, true, -1.0)?;
@@ -426,7 +464,10 @@ pub mod _thread {
             let count = core.count.get();
             let state = if count > 0 { "locked" } else { "unlocked" };
             let (name, id) = (it.tp_name_of(slf.0.value()), it.id_of(slf.0.value()));
-            Ok(format!("<{state} {name} object owner={} count={count} at {id:#x}>", core.owner.get()))
+            Ok(format!(
+                "<{state} {name} object owner={} count={count} at {id:#x}>",
+                core.owner.get()
+            ))
         }
     }
 
@@ -439,7 +480,10 @@ pub mod _thread {
 
     fn init_overridden(it: &mut Interp, cls: &Obj) -> bool {
         let base = type_object::<Local>(it);
-        match (it.lookup_mro(&base, "__init__"), it.lookup_mro(cls, "__init__")) {
+        match (
+            it.lookup_mro(&base, "__init__"),
+            it.lookup_mro(cls, "__init__"),
+        ) {
             (Some(a), Some(b)) => !a.is(&b),
             _ => false,
         }
@@ -477,7 +521,9 @@ pub mod _thread {
         if slf.borrow(it)?.current == Some(me) {
             return Ok(());
         }
-        let Value::Obj(o) = slf.value() else { return Ok(()) };
+        let Value::Obj(o) = slf.value() else {
+            return Ok(());
+        };
         let existing = slf.borrow(it)?.dicts.get(&me).cloned();
         if let Some(d) = existing {
             install_dict(o, d);
@@ -506,14 +552,26 @@ pub mod _thread {
     #[methods]
     impl Local {
         #[constructor]
-        fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<Value> {
-            let Value::Obj(cls) = &cls.0 else { unreachable!("a type") };
+        fn new(
+            cls: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<Value> {
+            let Value::Obj(cls) = &cls.0 else {
+                unreachable!("a type")
+            };
             if (!args.is_empty() || !kwargs.is_empty()) && !init_overridden(it, cls) {
                 return Err(it.type_error("Initialization arguments are not supported"));
             }
             let me = ident();
             let d = it.new_dict();
-            let state = Local { args: args.to_vec(), kwargs: kwargs.to_vec(), dicts: HashMap::from([(me, d.clone())]), current: Some(me) };
+            let state = Local {
+                args: args.to_vec(),
+                kwargs: kwargs.to_vec(),
+                dicts: HashMap::from([(me, d.clone())]),
+                current: Some(me),
+            };
             let v = crate::bind::opaque_instance(cls, state);
             if let Value::Obj(o) = &v {
                 install_dict(o, d);
@@ -528,7 +586,12 @@ pub mod _thread {
         }
 
         #[proto(init)]
-        fn init(slf: This<Value>, it: &mut Interp, #[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> R<()> {
+        fn init(
+            slf: This<Value>,
+            it: &mut Interp,
+            #[varargs] args: &[Value],
+            #[varkw] kwargs: KwArgs,
+        ) -> R<()> {
             let _ = (slf, it, args, kwargs);
             Ok(())
         }
@@ -567,7 +630,9 @@ pub mod _thread {
             reg.all.iter().filter_map(Weak::upgrade).collect()
         };
         for o in locals {
-            let Some(local) = Py::<Local>::from_value(it, &Value::Obj(o.clone())) else { continue };
+            let Some(local) = Py::<Local>::from_value(it, &Value::Obj(o.clone())) else {
+                continue;
+            };
             let taken = match local.borrow_mut(it) {
                 Ok(mut l) => {
                     if l.current == Some(ident) {
@@ -621,7 +686,15 @@ pub mod _thread {
                 core.try_take();
             }
         }
-        Py::new(it, ThreadHandle { ident: Cell::new(0), started: Cell::new(false), done }).into_value()
+        Py::new(
+            it,
+            ThreadHandle {
+                ident: Cell::new(0),
+                started: Cell::new(false),
+                done,
+            },
+        )
+        .into_value()
     }
 
     fn handle_core(it: &mut Interp, slf: &Py<ThreadHandle>) -> R<Rc<LockCore>> {
@@ -692,7 +765,14 @@ pub mod _thread {
     /// Starts a joinable thread that calls `function()` and returns its handle. A non-daemon
     /// thread is joined by `_shutdown`.
     #[op]
-    fn start_joinable_thread(it: &mut Interp, function: &Value, #[kw] handle: Option<&Value>, #[kw] #[default(true)] daemon: bool) -> R<Value> {
+    fn start_joinable_thread(
+        it: &mut Interp,
+        function: &Value,
+        #[kw] handle: Option<&Value>,
+        #[kw]
+        #[default(true)]
+        daemon: bool,
+    ) -> R<Value> {
         if !it.is_callable(function) {
             return Err(it.type_error("thread function must be callable"));
         }
@@ -818,7 +898,12 @@ pub mod _thread {
     /// unhandled exception; a stack trace will be printed unless the exception
     /// is SystemExit.
     #[op(hint(py(aliases = "start_new")))]
-    fn start_new_thread(it: &mut Interp, function: &Value, args: &Value, kwargs: Option<&Value>) -> R<i64> {
+    fn start_new_thread(
+        it: &mut Interp,
+        function: &Value,
+        args: &Value,
+        kwargs: Option<&Value>,
+    ) -> R<i64> {
         if !it.is_callable(function) {
             return Err(it.type_error("first arg must be callable"));
         }
@@ -873,20 +958,31 @@ pub mod _thread {
     struct ExceptHookArgs;
 
     fn except_hook_args_type(it: &mut Interp) -> Obj {
-        structseq_type::<ExceptHookArgs>(it, "_thread", "_ExceptHookArgs", &["exc_type", "exc_value", "exc_traceback", "thread"], 4)
+        structseq_type::<ExceptHookArgs>(
+            it,
+            "_thread",
+            "_ExceptHookArgs",
+            &["exc_type", "exc_value", "exc_traceback", "thread"],
+            4,
+        )
     }
 
     /// Handle uncaught Thread.run() exception.
     #[op]
     fn _excepthook(it: &mut Interp, args: &Value) -> R<()> {
         let expected = except_hook_args_type(it);
-        let is_args = matches!(args, Value::Obj(_)) && std::rc::Rc::ptr_eq(&it.type_of(args), &expected);
+        let is_args =
+            matches!(args, Value::Obj(_)) && std::rc::Rc::ptr_eq(&it.type_of(args), &expected);
         if !is_args {
             return Err(it.type_error("_thread._excepthook argument type must be ExceptHookArgs"));
         }
         let (exc_type, exc_value, thread) = match args.tuple_items() {
             Some([t, v, _, th]) => (t.clone(), v.clone(), th.clone()),
-            _ => return Err(it.type_error("_thread._excepthook argument type must be ExceptHookArgs")),
+            _ => {
+                return Err(
+                    it.type_error("_thread._excepthook argument type must be ExceptHookArgs")
+                );
+            }
         };
         let system_exit = it.exc_type("SystemExit");
         if matches!(&exc_type, Value::Obj(t) if Rc::ptr_eq(t, &system_exit)) {
@@ -919,7 +1015,11 @@ pub mod _thread {
             Value::Obj(e) if matches!(e.kind, Kind::Exception(_)) => it.format_exception(e),
             v => format!("{}\n", it.str_of(v)?),
         };
-        it.call_method(&file, "write", vec![Value::string(format!("Exception in thread {who}:\n"))])?;
+        it.call_method(
+            &file,
+            "write",
+            vec![Value::string(format!("Exception in thread {who}:\n"))],
+        )?;
         it.call_method(&file, "write", vec![Value::string(body)])?;
         it.call_method(&file, "flush", Vec::new())?;
         Ok(())

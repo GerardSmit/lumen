@@ -177,11 +177,21 @@ impl Parser {
                 self.advance();
                 let npos = self.pos();
                 let id = self.ident()?;
-                let name = mk(npos, ExprKind::Name { id, ctx: Ctx::Store });
+                let name = mk(
+                    npos,
+                    ExprKind::Name {
+                        id,
+                        ctx: Ctx::Store,
+                    },
+                );
                 let type_params = self.type_params()?;
                 self.expect_op("=")?;
                 let value = self.expression()?;
-                StmtKind::TypeAlias { name, type_params, value }
+                StmtKind::TypeAlias {
+                    name,
+                    type_params,
+                    value,
+                }
             }
             _ => return self.expr_stmt(out),
         };

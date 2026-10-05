@@ -48,7 +48,12 @@ pub mod unicodedata {
         Value::string(out)
     }
 
-    fn or_default(it: &mut Interp, v: Option<Value>, default: Passed<&Value>, msg: &str) -> R<Value> {
+    fn or_default(
+        it: &mut Interp,
+        v: Option<Value>,
+        default: Passed<&Value>,
+        msg: &str,
+    ) -> R<Value> {
         match (v, default.0) {
             (Some(v), _) => Ok(v),
             (None, Some(d)) => Ok(d.clone()),
@@ -100,7 +105,10 @@ pub mod unicodedata {
             Some(cps) => Ok(string(&cps)),
             None => {
                 let e = it.exc_type("KeyError");
-                Err(it.new_exc(&e, vec![Value::string(format!("undefined character name '{name}'"))]))
+                Err(it.new_exc(
+                    &e,
+                    vec![Value::string(format!("undefined character name '{name}'"))],
+                ))
             }
         }
     }
@@ -307,7 +315,12 @@ pub mod unicodedata {
         /// Returns the decimal value assigned to the character chr as integer.
         /// If no such value is defined, default is returned, or, if not given,
         /// ValueError is raised.
-        fn decimal(slf: This<Py<Self>>, it: &mut Interp, chr: &Value, default: Passed<&Value>) -> R<Value> {
+        fn decimal(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            chr: &Value,
+            default: Passed<&Value>,
+        ) -> R<Value> {
             let v = ver(&slf, it)?;
             decimal_impl(it, v, chr, default)
         }
@@ -317,7 +330,12 @@ pub mod unicodedata {
         /// Returns the digit value assigned to the character chr as integer.
         /// If no such value is defined, default is returned, or, if not given,
         /// ValueError is raised.
-        fn digit(slf: This<Py<Self>>, it: &mut Interp, chr: &Value, default: Passed<&Value>) -> R<Value> {
+        fn digit(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            chr: &Value,
+            default: Passed<&Value>,
+        ) -> R<Value> {
             let v = ver(&slf, it)?;
             digit_impl(it, v, chr, default)
         }
@@ -327,7 +345,12 @@ pub mod unicodedata {
         /// Returns the numeric value assigned to the character chr as float.
         /// If no such value is defined, default is returned, or, if not given,
         /// ValueError is raised.
-        fn numeric(slf: This<Py<Self>>, it: &mut Interp, chr: &Value, default: Passed<&Value>) -> R<Value> {
+        fn numeric(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            chr: &Value,
+            default: Passed<&Value>,
+        ) -> R<Value> {
             let v = ver(&slf, it)?;
             numeric_impl(it, v, chr, default)
         }
@@ -380,7 +403,12 @@ pub mod unicodedata {
         /// Return whether the Unicode string unistr is in the normal form 'form'.
         ///
         /// Valid values for form are 'NFC', 'NFKC', 'NFD', and 'NFKD'.
-        fn is_normalized(slf: This<Py<Self>>, it: &mut Interp, form: &Value, unistr: &Value) -> R<bool> {
+        fn is_normalized(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            form: &Value,
+            unistr: &Value,
+        ) -> R<bool> {
             let v = ver(&slf, it)?;
             is_normalized_impl(it, v, form, unistr)
         }
@@ -388,7 +416,12 @@ pub mod unicodedata {
         /// Return the normal form 'form' for the Unicode string unistr.
         ///
         /// Valid values for form are 'NFC', 'NFKC', 'NFD', and 'NFKD'.
-        fn normalize(slf: This<Py<Self>>, it: &mut Interp, form: &Value, unistr: &Value) -> R<Value> {
+        fn normalize(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            form: &Value,
+            unistr: &Value,
+        ) -> R<Value> {
             let v = ver(&slf, it)?;
             normalize_impl(it, v, form, unistr)
         }
@@ -397,7 +430,12 @@ pub mod unicodedata {
         ///
         /// If no name is defined, default is returned, or, if not given,
         /// ValueError is raised.
-        fn name(slf: This<Py<Self>>, it: &mut Interp, chr: &Value, default: Passed<&Value>) -> R<Value> {
+        fn name(
+            slf: This<Py<Self>>,
+            it: &mut Interp,
+            chr: &Value,
+            default: Passed<&Value>,
+        ) -> R<Value> {
             let v = ver(&slf, it)?;
             name_impl(it, v, chr, default)
         }
@@ -417,7 +455,12 @@ pub mod unicodedata {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
         dict_set_str(&d, "unidata_version", Value::str(ucd::UNIDATA_VERSION));
-        let old = Py::new(it, Ucd { version: Version::V3_2_0 });
+        let old = Py::new(
+            it,
+            Ucd {
+                version: Version::V3_2_0,
+            },
+        );
         dict_set_str(&d, "ucd_3_2_0", old.value().clone());
     }
 }

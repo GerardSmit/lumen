@@ -1,0 +1,15 @@
+<!doctype html><!--
+  jixr-compare: max-diff-ratio=0.01
+  Poppler filters the scaled image XObjects slightly differently from Chromium. Window and
+  ImageSharp remain exact; the tolerance applies only to the PDF raster edge pixels.
+-->
+<style>
+html,body{margin:0;background:#fff}
+.stage{display:flex;gap:8px;padding:12px;background:#e8eef8}
+img{display:block;width:56px;height:40px;background:#d7dee8;outline:2px solid #182433}
+.contain{object-fit:contain;object-position:left bottom}
+.cover{object-fit:cover;object-position:right top}
+.none{object-fit:none;object-position:100% 100%}
+.scale-down{object-fit:scale-down;object-position:right top}
+</style>
+<div class=stage><img class=contain src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAECAYAAACzzX7wAAAAEklEQVR4nGN45mb0Hx9moL0CAH1xS6HwNwlBAAAAAElFTkSuQmCC"><img class=cover src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAECAYAAACzzX7wAAAAEklEQVR4nGN45mb0Hx9moL0CAH1xS6HwNwlBAAAAAElFTkSuQmCC"><img class=none src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAIUlEQVR42mMQ91v2H4R/72EFY3Q+A0EFuCRgfMIKBoEbAJHKmKFnaCjvAAAAAElFTkSuQmCC"><img class=scale-down src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAECAYAAACzzX7wAAAAEklEQVR4nGN45mb0Hx9moL0CAH1xS6HwNwlBAAAAAElFTkSuQmCC"></div>

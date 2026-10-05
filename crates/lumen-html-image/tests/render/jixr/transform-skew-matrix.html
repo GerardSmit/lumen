@@ -1,0 +1,26 @@
+<!doctype html>
+<meta charset="utf-8">
+<!-- jixr-compare: threshold=32 max-diff-ratio=0.018 -->
+<style>
+  html, body { margin: 0; width: 320px; height: 200px; overflow: hidden; background: #fff; }
+  .stage { position: relative; width: 320px; height: 200px; background: #eef2f8; }
+  .box { position: absolute; width: 60px; height: 40px; transform-origin: 0 0; }
+  .a { left: 20px; top: 20px; background: #d93025; transform: skewX(20deg); }
+  .b { left: 120px; top: 20px; background: #1a73e8; transform: skew(10deg, 15deg); }
+  .c { left: 220px; top: 20px; background: #188038; transform: matrix(1, 0.3, -0.2, 1, 0, 0); }
+  .d { left: 20px; top: 110px; background: #f9ab00; transform: matrix(1.5, 0, 0, 0.75, 10, 5); }
+  .e { left: 140px; top: 110px; background: #9334e6; transform: scale(2, 1) rotate(30deg); }
+  .f { left: 240px; top: 110px; background: #00838f; transform: matrix3d(1,0.25,0,0, -0.25,1,0,0, 0,0,1,0, 4,2,0,1); }
+  .g { left: 20px; top: 60px; width: 80px; height: 34px; border: 4px solid #202124;
+       background: linear-gradient(90deg, #fbbc04, #ea4335); transform: skewY(-12deg); }
+  .g > i { display: block; width: 24px; height: 10px; margin: 6px; background: #fff; }
+</style>
+<div class="stage">
+  <div class="box a"></div>
+  <div class="box b"></div>
+  <div class="box c"></div>
+  <div class="box d"></div>
+  <div class="box e"></div>
+  <div class="box f"></div>
+  <div class="box g"><i></i></div>
+</div>

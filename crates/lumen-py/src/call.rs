@@ -34,7 +34,9 @@ impl Interp {
             Value::Obj(o) => o,
             _ => {
                 let t = self.type_name_of(f);
-                return Err(self.new_exc_str("TypeError", &format!("'{}' object is not callable", t)));
+                return Err(
+                    self.new_exc_str("TypeError", &format!("'{}' object is not callable", t))
+                );
             }
         };
         if lumen_common::stack::exhausted() {
@@ -73,7 +75,8 @@ impl Interp {
                     }
                     None => {
                         let t = self.type_name_of(f);
-                        Err(self.new_exc_str("TypeError", &format!("'{}' object is not callable", t)))
+                        Err(self
+                            .new_exc_str("TypeError", &format!("'{}' object is not callable", t)))
                     }
                 }
             }
@@ -100,7 +103,12 @@ impl Interp {
         self.call_inline_plain(f, args, kw)
     }
 
-    pub(crate) fn call_inline_plain(&mut self, f: &Value, mut args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+    pub(crate) fn call_inline_plain(
+        &mut self,
+        f: &Value,
+        mut args: Vec<Value>,
+        kw: Vec<(Obj, Value)>,
+    ) -> R<bool> {
         if let Value::Obj(o) = f {
             match &o.kind {
                 Kind::Function(_) => {
@@ -144,7 +152,10 @@ impl Interp {
             }
             None => {
                 let t = self.type_name_of(obj);
-                Err(self.new_exc_str("AttributeError", &format!("'{}' object has no attribute '{}'", t, name)))
+                Err(self.new_exc_str(
+                    "AttributeError",
+                    &format!("'{}' object has no attribute '{}'", t, name),
+                ))
             }
         }
     }
@@ -154,13 +165,24 @@ impl Interp {
         self.call(&f, args, Vec::new())
     }
 
-    pub fn bind_frame(&mut self, func_obj: &Obj, args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<Frame> {
+    pub fn bind_frame(
+        &mut self,
+        func_obj: &Obj,
+        args: Vec<Value>,
+        kw: Vec<(Obj, Value)>,
+    ) -> R<Frame> {
         let func = match &func_obj.kind {
             Kind::Function(f) => f,
             _ => unreachable!(),
         };
         let code = func.code.borrow().clone();
-        let mut frame = self.new_frame(code.clone(), func.globals.clone(), None, Some(func_obj.clone()), &func.closure);
+        let mut frame = self.new_frame(
+            code.clone(),
+            func.globals.clone(),
+            None,
+            Some(func_obj.clone()),
+            &func.closure,
+        );
         let argcount = code.argcount as usize;
         let kwonly = code.kwonly as usize;
         let has_varargs = code.has(CO_VARARGS);
@@ -221,7 +243,10 @@ impl Interp {
                 Some(i) => {
                     if frame.locals[i].is_some() {
                         let name = func.qualname.borrow().to_string();
-                        return Err(self.new_exc_str("TypeError", &format!("{}() got multiple values for argument '{}'", name, kname)));
+                        return Err(self.new_exc_str(
+                            "TypeError",
+                            &format!("{}() got multiple values for argument '{}'", name, kname),
+                        ));
                     }
                     frame.locals[i] = Some(v);
                 }
@@ -233,7 +258,10 @@ impl Interp {
                         let name = func.qualname.borrow().to_string();
                         let in_posonly = code.varnames[..posonly].iter().any(|n| &**n == kname);
                         let msg = if in_posonly {
-                            format!("{}() got some positional-only arguments passed as keyword arguments: '{}'", name, kname)
+                            format!(
+                                "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                                name, kname
+                            )
                         } else {
                             format!("{}() got an unexpected keyword argument '{}'", name, kname)
                         };
@@ -258,7 +286,13 @@ impl Interp {
             let name = func.qualname.borrow().to_string();
             return Err(self.new_exc_str(
                 "TypeError",
-                &format!("{}() missing {} required positional argument{}: {}", name, missing.len(), plural(missing.len()), join_names(&missing)),
+                &format!(
+                    "{}() missing {} required positional argument{}: {}",
+                    name,
+                    missing.len(),
+                    plural(missing.len()),
+                    join_names(&missing)
+                ),
             ));
         }
         if kwonly > 0 {
@@ -290,17 +324,33 @@ impl Interp {
         Ok(frame)
     }
 
-    pub fn make_function(&mut self, code: Value, closure: Option<Value>, ann: Option<Value>, kwd: Option<Value>, defaults: Option<Value>) -> R<Value> {
+    pub fn make_function(
+        &mut self,
+        code: Value,
+        closure: Option<Value>,
+        ann: Option<Value>,
+        kwd: Option<Value>,
+        defaults: Option<Value>,
+    ) -> R<Value> {
         let code = match &code {
             Value::Obj(o) => match &o.kind {
                 Kind::Code(c) => c.clone(),
-                _ => return Err(self.new_exc_str("SystemError", "MakeFunction expects a code object")),
+                _ => {
+                    return Err(
+                        self.new_exc_str("SystemError", "MakeFunction expects a code object")
+                    );
+                }
             },
             _ => return Err(self.new_exc_str("SystemError", "MakeFunction expects a code object")),
         };
         let globals = self.frames.last().unwrap().globals.clone();
         let closure: Vec<Obj> = match closure {
-            Some(c) => c.tuple_items().unwrap_or(&[]).iter().filter_map(|v| v.as_obj().cloned()).collect(),
+            Some(c) => c
+                .tuple_items()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|v| v.as_obj().cloned())
+                .collect(),
             None => Vec::new(),
         };
         let defaults: Vec<Value> = match defaults {
@@ -343,14 +393,20 @@ impl Interp {
         let is_dict = dict_of(src).is_some();
         if !is_dict && self.get_attr_str(src, "keys").is_err() {
             let t = self.type_name_of(src);
-            return Err(self.type_error(&format!("{}() argument after ** must be a mapping, not {}", fname, t)));
+            return Err(self.type_error(&format!(
+                "{}() argument after ** must be a mapping, not {}",
+                fname, t
+            )));
         }
         let pairs = self.dict_to_kwargs(src)?;
         for (k, v) in pairs {
             let kv = Value::Obj(k.clone());
             if self.dict_get(d, &kv)?.is_some() {
                 let name = kv.as_str().unwrap_or("").to_string();
-                return Err(self.type_error(&format!("{}() got multiple values for keyword argument '{}'", fname, name)));
+                return Err(self.type_error(&format!(
+                    "{}() got multiple values for keyword argument '{}'",
+                    fname, name
+                )));
             }
             self.dict_set(d, kv, v)?;
         }
@@ -362,7 +418,9 @@ impl Interp {
         if let Some(dd) = dict_of(d) {
             for e in dd.borrow().iter() {
                 match &e.key {
-                    Value::Obj(k) if matches!(k.kind, Kind::Str(_)) => out.push((k.clone(), e.val.clone())),
+                    Value::Obj(k) if matches!(k.kind, Kind::Str(_)) => {
+                        out.push((k.clone(), e.val.clone()))
+                    }
                     _ => return Err(self.new_exc_str("TypeError", "keywords must be strings")),
                 }
             }
@@ -413,15 +471,27 @@ impl Interp {
 
     /// The generator `g` is suspended in a `yield from` over another suspended generator.
     fn delegate_of(g: &Obj) -> Option<Obj> {
-        let Kind::Generator(gd) = &g.kind else { return None };
+        let Kind::Generator(gd) = &g.kind else {
+            return None;
+        };
         let state = gd.state.try_borrow().ok()?;
-        let GenState::Suspended(frame) = &*state else { return None };
+        let GenState::Suspended(frame) = &*state else {
+            return None;
+        };
         if !matches!(frame.code.ops.get(frame.pc), Some(Op::YieldFrom)) {
             return None;
         }
-        let Some(Value::Obj(sub)) = frame.stack.last() else { return None };
-        let Kind::Generator(sd) = &sub.kind else { return None };
-        let suspended = sd.state.try_borrow().map(|s| matches!(&*s, GenState::Suspended(_))).unwrap_or(false);
+        let Some(Value::Obj(sub)) = frame.stack.last() else {
+            return None;
+        };
+        let Kind::Generator(sd) = &sub.kind else {
+            return None;
+        };
+        let suspended = sd
+            .state
+            .try_borrow()
+            .map(|s| matches!(&*s, GenState::Suspended(_)))
+            .unwrap_or(false);
         suspended.then(|| sub.clone())
     }
 
@@ -447,9 +517,17 @@ impl Interp {
                 overflow = true;
                 break;
             }
-            let Some(sub) = Self::delegate_of(&cur) else { break };
-            let Kind::Generator(gd) = &cur.kind else { unreachable!() };
-            let GenState::Suspended(frame) = std::mem::replace(&mut *gd.state.borrow_mut(), GenState::Running) else { unreachable!() };
+            let Some(sub) = Self::delegate_of(&cur) else {
+                break;
+            };
+            let Kind::Generator(gd) = &cur.kind else {
+                unreachable!()
+            };
+            let GenState::Suspended(frame) =
+                std::mem::replace(&mut *gd.state.borrow_mut(), GenState::Running)
+            else {
+                unreachable!()
+            };
             // the waiting frames stay on the stack, so the leaf sees its callers
             self.frames.push(*frame);
             chain.push(cur);
@@ -500,19 +578,28 @@ impl Interp {
             GenState::Created(f) => {
                 if !value.is_none() {
                     *gd.state.borrow_mut() = GenState::Created(f);
-                    return Err(self.new_exc_str("TypeError", "can't send non-None value to a just-started generator"));
+                    return Err(self.new_exc_str(
+                        "TypeError",
+                        "can't send non-None value to a just-started generator",
+                    ));
                 }
                 (*f, true)
             }
             GenState::Suspended(f) => (*f, false),
             GenState::Running => {
-                let what = if gd.kind == GenKind::Coroutine { "coroutine" } else { "generator" };
+                let what = if gd.kind == GenKind::Coroutine {
+                    "coroutine"
+                } else {
+                    "generator"
+                };
                 return Err(self.new_exc_str("ValueError", &format!("{} already executing", what)));
             }
             GenState::Done => {
                 *gd.state.borrow_mut() = GenState::Done;
                 if gd.kind == GenKind::Coroutine {
-                    return Err(self.new_exc_str("RuntimeError", "cannot reuse already awaited coroutine"));
+                    return Err(
+                        self.new_exc_str("RuntimeError", "cannot reuse already awaited coroutine")
+                    );
                 }
                 return Ok(GenResult::Return(Value::None));
             }
@@ -520,7 +607,13 @@ impl Interp {
         self.resume_frame(g, frame, if first { None } else { Some(value) }, None)
     }
 
-    fn resume_frame(&mut self, g: &Obj, mut frame: Frame, send: Option<Value>, throw: Option<Obj>) -> R<GenResult> {
+    fn resume_frame(
+        &mut self,
+        g: &Obj,
+        mut frame: Frame,
+        send: Option<Value>,
+        throw: Option<Obj>,
+    ) -> R<GenResult> {
         let gd = match &g.kind {
             Kind::Generator(gd) => gd,
             _ => unreachable!(),
@@ -668,9 +761,14 @@ impl Interp {
             exc
         };
         match self.gen_throw(g, exc) {
-            Ok(GenResult::Yield(_)) => {
-                Err(self.new_exc_str("RuntimeError", if gd.kind == GenKind::Coroutine { "coroutine ignored GeneratorExit" } else { "generator ignored GeneratorExit" }))
-            }
+            Ok(GenResult::Yield(_)) => Err(self.new_exc_str(
+                "RuntimeError",
+                if gd.kind == GenKind::Coroutine {
+                    "coroutine ignored GeneratorExit"
+                } else {
+                    "generator ignored GeneratorExit"
+                },
+            )),
             Ok(GenResult::Return(_)) => Ok(()),
             Err(e) => {
                 if self.exc_is(&e, "GeneratorExit") || self.exc_is(&e, "StopIteration") {
@@ -698,7 +796,11 @@ impl Interp {
                 return self.gen_send(o, v);
             }
         }
-        let r = if v.is_none() { self.call_special(it, "__next__", Vec::new()) } else { self.call_method(it, "send", vec![v]) };
+        let r = if v.is_none() {
+            self.call_special(it, "__next__", Vec::new())
+        } else {
+            self.call_method(it, "send", vec![v])
+        };
         match r {
             Ok(v) => Ok(GenResult::Yield(v)),
             Err(e) => {
@@ -727,7 +829,9 @@ impl Interp {
                 if let Value::Obj(o) = &it {
                     if let Kind::Generator(gd) = &o.kind {
                         if gd.kind == GenKind::Coroutine {
-                            return Err(self.new_exc_str("TypeError", "__await__() returned a coroutine"));
+                            return Err(
+                                self.new_exc_str("TypeError", "__await__() returned a coroutine")
+                            );
                         }
                     }
                 }
@@ -742,7 +846,11 @@ impl Interp {
 
     pub fn lookup_context_methods(&mut self, mgr: &Value, is_async: bool) -> R<(Value, Value)> {
         let cls = self.type_of(mgr);
-        let (en, ex) = if is_async { ("__aenter__", "__aexit__") } else { ("__enter__", "__exit__") };
+        let (en, ex) = if is_async {
+            ("__aenter__", "__aexit__")
+        } else {
+            ("__enter__", "__exit__")
+        };
         let enter = self.lookup_mro(&cls, en);
         let exit = self.lookup_mro(&cls, ex);
         match (enter, exit) {
@@ -753,8 +861,15 @@ impl Interp {
             }
             _ => {
                 let t = self.type_name_of(mgr);
-                let proto = if is_async { "asynchronous context manager protocol" } else { "context manager protocol" };
-                Err(self.new_exc_str("TypeError", &format!("'{}' object does not support the {}", t, proto)))
+                let proto = if is_async {
+                    "asynchronous context manager protocol"
+                } else {
+                    "context manager protocol"
+                };
+                Err(self.new_exc_str(
+                    "TypeError",
+                    &format!("'{}' object does not support the {}", t, proto),
+                ))
             }
         }
     }
