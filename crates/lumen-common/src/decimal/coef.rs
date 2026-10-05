@@ -44,7 +44,7 @@ pub fn is_odd(c: &BigInt) -> bool {
     w.first().is_some_and(|w| w & 1 == 1)
 }
 
-const LOG10_2: f64 = 0.301_029_995_663_981_2;
+const LOG10_2: f64 = std::f64::consts::LOG10_2;
 
 /// The number of decimal digits of `c` (1 for zero).
 pub fn ndigits(c: &BigInt) -> u64 {

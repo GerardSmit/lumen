@@ -374,7 +374,7 @@ mod tests {
             shadow,
         }]);
         let image = crate::render(&list, 16, 10, 1.0, true).unwrap();
-        assert_eq!(&image.pixels[(0 * 16 + 8) * 4..][..4], &[255, 0, 0, 255]);
+        assert_eq!(&image.pixels[8 * 4..][..4], &[255, 0, 0, 255]);
     }
 
     #[test]

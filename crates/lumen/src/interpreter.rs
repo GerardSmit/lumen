@@ -1632,7 +1632,7 @@ impl Interp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod event_handler_compile_tests {
     use super::*;
     use crate::Engine;

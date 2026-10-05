@@ -8,6 +8,8 @@ publish = false
 
 [lib]
 crate-type = ["staticlib"]
+# The crate defines the C `main`, which collides with the test harness entry point.
+test = false
 
 [dependencies]
 lumen = { path = "../lumen", default-features = false }
