@@ -11,6 +11,7 @@ mod dtd;
 mod parser;
 mod scan;
 
+pub use chars::{is_name, is_name_char, is_name_start, is_xml_char};
 pub use parser::{Parser, ParserKind};
 
 use std::cell::{Cell, RefCell};
