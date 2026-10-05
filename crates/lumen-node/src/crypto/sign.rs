@@ -1,14 +1,15 @@
-//! Signatures (RSA PKCS#1 v1.5 and PSS, DSA, ECDSA, Ed25519, Ed448) and RSA encryption padding.
-//! The padding schemes are written out over the RSA primitive so that any digest `node:crypto`
-//! names can be used; the curve and DSA arithmetic is RustCrypto's.
+//! Signatures (RSA PKCS#1 v1.5 and PSS, DSA, ECDSA, Ed25519, Ed448) and RSA encryption padding. RSA
+//! and DSA go through `lumen_crypto::backend()`; this module resolves Node's options (digest names,
+//! PSS key restrictions, salt lengths, DER vs IEEE P1363 encoding) into the backend's neutral
+//! schemes. ECDSA and EdDSA run on RustCrypto.
 
 use lumen::embed::OpError;
-use num_bigint_dig::BigUint;
-use rand_core::{OsRng, RngCore};
+use lumen_crypto::{backend, CryptoError, PssSalt, RsaPadding, RsaScheme};
 use signature::hazmat::{PrehashSigner, PrehashVerifier, RandomizedPrehashSigner};
 use signature::Signer;
 
-use super::keys::{asn1, with_ec_curve, AsymKey, EcCurve, EcKey, PssParams, RsaKey};
+use super::keys::{asn1, with_ec_curve, AsymKey, DsaKey, EcCurve, EcKey, PssParams, RsaKey};
+use super::op_error;
 use crate::hash::{self, Algo};
 
 #[lumen_bind::module(name = "crypto")]
@@ -22,26 +23,8 @@ pub(crate) mod bindings {
     const SALT_DIGEST: i32 = -1;
     const SALT_MAX_OR_AUTO: i32 = -2;
 
-    fn ossl(hex: &str, library: &str, reason: &str, code: &'static str) -> OpError {
-        OpError::error(format!("error:{hex}:{library}::{reason}")).with_code(code)
-    }
-
-    fn data_too_large() -> OpError {
-        ossl(
-            "0200006E",
-            "rsa routines",
-            "data too large for key size",
-            "ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_KEY_SIZE",
-        )
-    }
-
-    fn data_too_small() -> OpError {
-        ossl(
-            "0200007A",
-            "rsa routines",
-            "data too small for key size",
-            "ERR_OSSL_RSA_DATA_TOO_SMALL_FOR_KEY_SIZE",
-        )
+    fn ossl(hex: &str, library: &str, reason: &str) -> OpError {
+        op_error(CryptoError::openssl(hex, library, reason))
     }
 
     fn illegal_padding() -> OpError {
@@ -49,53 +32,19 @@ pub(crate) mod bindings {
             "1C8000A5",
             "Provider routines",
             "illegal or unsupported padding mode",
-            "ERR_OSSL_ILLEGAL_OR_UNSUPPORTED_PADDING_MODE",
         )
     }
 
     fn invalid_digest() -> OpError {
-        ossl(
-            "1C80007A",
-            "Provider routines",
-            "invalid digest",
-            "ERR_OSSL_INVALID_DIGEST",
-        )
+        ossl("1C80007A", "Provider routines", "invalid digest")
     }
 
     fn digest_not_allowed() -> OpError {
-        ossl(
-            "1C8000AE",
-            "Provider routines",
-            "digest not allowed",
-            "ERR_OSSL_DIGEST_NOT_ALLOWED",
-        )
+        ossl("1C8000AE", "Provider routines", "digest not allowed")
     }
 
     fn invalid_salt() -> OpError {
-        ossl(
-            "1C8000A8",
-            "Provider routines",
-            "invalid salt length",
-            "ERR_OSSL_INVALID_SALT_LENGTH",
-        )
-    }
-
-    fn padding_check_failed() -> OpError {
-        ossl(
-            "02000072",
-            "rsa routines",
-            "padding check failed",
-            "ERR_OSSL_RSA_PADDING_CHECK_FAILED",
-        )
-    }
-
-    fn oaep_decoding() -> OpError {
-        ossl(
-            "02000079",
-            "rsa routines",
-            "oaep decoding error",
-            "ERR_OSSL_RSA_OAEP_DECODING_ERROR",
-        )
+        ossl("1C8000A8", "Provider routines", "invalid salt length")
     }
 
     fn unsupported_keytype() -> OpError {
@@ -103,7 +52,6 @@ pub(crate) mod bindings {
             "03000096",
             "digital envelope routines",
             "operation not supported for this keytype",
-            "ERR_OSSL_EVP_OPERATION_NOT_SUPPORTED_FOR_THIS_KEYTYPE",
         )
     }
 
@@ -118,119 +66,14 @@ pub(crate) mod bindings {
         })
     }
 
-    fn digest_oid(algo: Algo) -> Option<&'static str> {
-        Some(match algo {
-            Algo::Md5 => "1.2.840.113549.2.5",
-            Algo::Sha1 => "1.3.14.3.2.26",
-            Algo::Sha224 => "2.16.840.1.101.3.4.2.4",
-            Algo::Sha256 => "2.16.840.1.101.3.4.2.1",
-            Algo::Sha384 => "2.16.840.1.101.3.4.2.2",
-            Algo::Sha512 => "2.16.840.1.101.3.4.2.3",
-            Algo::Sha512_224 => "2.16.840.1.101.3.4.2.5",
-            Algo::Sha512_256 => "2.16.840.1.101.3.4.2.6",
-            Algo::Sha3_224 => "2.16.840.1.101.3.4.2.7",
-            Algo::Sha3_256 => "2.16.840.1.101.3.4.2.8",
-            Algo::Sha3_384 => "2.16.840.1.101.3.4.2.9",
-            Algo::Sha3_512 => "2.16.840.1.101.3.4.2.10",
-            Algo::Ripemd160 => "1.3.36.3.2.1",
-            Algo::Sm3 => "1.2.156.10197.1.401",
-            _ => return None,
-        })
-    }
-
-    /// The DER `DigestInfo` of a PKCS#1 v1.5 signature (`md5-sha1` signs the bare concatenation).
-    fn digest_info(algo: Algo, hashed: &[u8]) -> Result<Vec<u8>, OpError> {
-        if algo == Algo::Md5Sha1 {
-            return Ok(hashed.to_vec());
-        }
-        let oid = digest_oid(algo).ok_or_else(invalid_digest)?;
-        let oid = der::asn1::ObjectIdentifier::new(oid).map_err(|_| invalid_digest())?;
-        let id = asn1::seq(&[&asn1::oid(&oid), &asn1::null()]);
-        Ok(asn1::seq(&[&id, &asn1::octets(hashed)]))
-    }
-
-    fn mgf1(algo: Algo, seed: &[u8], len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len + algo.out_len());
-        let mut counter = 0u32;
-        while out.len() < len {
-            let mut block = seed.to_vec();
-            block.extend_from_slice(&counter.to_be_bytes());
-            out.extend(hash::digest(algo, &block));
-            counter += 1;
-        }
-        out.truncate(len);
-        out
-    }
-
-    fn xor_into(a: &mut [u8], b: &[u8]) {
-        for (x, y) in a.iter_mut().zip(b) {
-            *x ^= y;
-        }
-    }
-
-    fn mod_len(k: &RsaKey) -> usize {
-        k.n.bits().div_ceil(8)
-    }
-
-    fn rsa_public_op(k: &RsaKey, m: &BigUint) -> BigUint {
-        m.modpow(&k.e, &k.n)
-    }
-
-    fn rsa_private_op(k: &RsaKey, c: &BigUint) -> Result<BigUint, OpError> {
-        let parts = k
-            .private
-            .as_ref()
-            .ok_or_else(|| OpError::error("key is not a private key"))?;
-        let zero = BigUint::from(0u8);
-        if parts.p == zero || parts.q == zero || parts.dp == zero || parts.dq == zero {
-            return Ok(c.modpow(&parts.d, &k.n));
-        }
-        let m1 = c.modpow(&parts.dp, &parts.p);
-        let m2 = c.modpow(&parts.dq, &parts.q);
-        let diff = if m1 >= m2 {
-            &m1 - &m2
-        } else {
-            &m1 + &parts.p - (&m2 % &parts.p)
-        };
-        let h = (&parts.qi * diff) % &parts.p;
-        Ok(m2 + h * &parts.q)
-    }
-
-    fn random_nonzero(len: usize) -> Vec<u8> {
-        let mut v = vec![0u8; len];
-        OsRng.fill_bytes(&mut v);
-        for b in v.iter_mut() {
-            while *b == 0 {
-                let mut one = [0u8; 1];
-                OsRng.fill_bytes(&mut one);
-                *b = one[0];
-            }
-        }
-        v
-    }
-
-    fn rsa_run(k: &RsaKey, private: bool, input: &BigUint) -> Result<BigUint, OpError> {
-        if input >= &k.n {
-            return Err(ossl(
-                "02000084",
-                "rsa routines",
-                "data too large for modulus",
-                "ERR_OSSL_RSA_DATA_TOO_LARGE_FOR_MODULUS",
-            ));
-        }
-        if private {
-            rsa_private_op(k, input)
-        } else {
-            Ok(rsa_public_op(k, input))
-        }
-    }
-
     struct PssConfig {
         hash: Algo,
         mgf1: Algo,
         salt: i32,
     }
 
+    /// The digests and salt length of a PSS operation: the key's restrictions when it has any (the
+    /// requested digest must match, the salt may not be shorter), otherwise the request.
     fn pss_config(k: &RsaKey, hash: Option<&str>, salt: Option<i32>) -> Result<PssConfig, OpError> {
         let requested = hash.map(digest_algo).transpose()?;
         let restriction: Option<PssParams> = k.pss.flatten();
@@ -259,113 +102,14 @@ pub(crate) mod bindings {
         })
     }
 
-    fn pss_encode(
-        em_bits: usize,
-        mhash: &[u8],
-        cfg: &PssConfig,
-        signing_salt: usize,
-    ) -> Result<Vec<u8>, OpError> {
-        let em_len = em_bits.div_ceil(8);
-        let h_len = cfg.hash.out_len();
-        if em_len < h_len + signing_salt + 2 {
-            return Err(data_too_large());
+    /// `None` for a salt length no scheme can mean.
+    fn pss_salt(salt: i32) -> Option<PssSalt> {
+        match salt {
+            SALT_MAX_OR_AUTO => Some(PssSalt::MaxOrAuto),
+            SALT_DIGEST => Some(PssSalt::Digest),
+            s if s >= 0 => Some(PssSalt::Length(s as u32)),
+            _ => None,
         }
-        let mut salt = vec![0u8; signing_salt];
-        OsRng.fill_bytes(&mut salt);
-        let mut m = vec![0u8; 8];
-        m.extend_from_slice(mhash);
-        m.extend_from_slice(&salt);
-        let h = hash::digest(cfg.hash, &m);
-        let mut db = vec![0u8; em_len - h_len - 1];
-        let one = db.len() - signing_salt - 1;
-        db[one] = 1;
-        db[one + 1..].copy_from_slice(&salt);
-        let mask = mgf1(cfg.mgf1, &h, db.len());
-        xor_into(&mut db, &mask);
-        db[0] &= 0xff >> (8 * em_len - em_bits);
-        db.extend_from_slice(&h);
-        db.push(0xbc);
-        Ok(db)
-    }
-
-    fn pss_verify(em_bits: usize, em: &[u8], mhash: &[u8], cfg: &PssConfig) -> bool {
-        let em_len = em_bits.div_ceil(8);
-        let h_len = cfg.hash.out_len();
-        if em.len() != em_len || em_len < h_len + 2 || em[em_len - 1] != 0xbc {
-            return false;
-        }
-        let (masked, rest) = em.split_at(em_len - h_len - 1);
-        let h = &rest[..h_len];
-        let top_mask = 0xffu8 >> (8 * em_len - em_bits);
-        if masked[0] & !top_mask != 0 {
-            return false;
-        }
-        let mut db = masked.to_vec();
-        let mask = mgf1(cfg.mgf1, h, db.len());
-        xor_into(&mut db, &mask);
-        db[0] &= top_mask;
-        let Some(one) = db.iter().position(|&b| b != 0) else {
-            return false;
-        };
-        if db[one] != 1 {
-            return false;
-        }
-        let salt = &db[one + 1..];
-        let expected_salt = match cfg.salt {
-            SALT_MAX_OR_AUTO => salt.len(),
-            SALT_DIGEST => h_len,
-            s => s as usize,
-        };
-        if salt.len() != expected_salt {
-            return false;
-        }
-        let mut m = vec![0u8; 8];
-        m.extend_from_slice(mhash);
-        m.extend_from_slice(salt);
-        hash::digest(cfg.hash, &m) == h
-    }
-
-    /// EMSA-PSS verification of the recovered message representative `m` against `data`.
-    fn pss_verify_message(k: &RsaKey, m: &BigUint, cfg: &PssConfig, data: &[u8]) -> bool {
-        let em_bits = k.n.bits() - 1;
-        let em_len = em_bits.div_ceil(8);
-        let mb = m.to_bytes_be();
-        if mb.len() > em_len {
-            return false;
-        }
-        pss_verify(
-            em_bits,
-            &asn1::pad_be(&mb, em_len),
-            &hash::digest(cfg.hash, data),
-            cfg,
-        )
-    }
-
-    /// RSASSA-PSS verification with MGF1 over `hash` and a fixed salt length (X.509 signatures).
-    pub(crate) fn rsa_pss_verify(
-        n: &[u8],
-        e: &[u8],
-        hash: Algo,
-        salt: usize,
-        data: &[u8],
-        sig: &[u8],
-    ) -> bool {
-        let k = RsaKey {
-            n: BigUint::from_bytes_be(n),
-            e: BigUint::from_bytes_be(e),
-            private: None,
-            pss: None,
-        };
-        let s = BigUint::from_bytes_be(sig);
-        if sig.len() != mod_len(&k) || s >= k.n {
-            return false;
-        }
-        let cfg = PssConfig {
-            hash,
-            mgf1: hash,
-            salt: i32::try_from(salt).unwrap_or(i32::MAX),
-        };
-        pss_verify_message(&k, &rsa_public_op(&k, &s), &cfg, data)
     }
 
     fn rsa_default_padding(k: &RsaKey) -> i32 {
@@ -376,6 +120,46 @@ pub(crate) mod bindings {
         }
     }
 
+    fn default_hash(hash: Option<&str>) -> Result<Algo, OpError> {
+        hash.map(digest_algo)
+            .transpose()
+            .map(|h| h.unwrap_or(Algo::Sha256))
+    }
+
+    /// The scheme and the digest to hash the message with. `verify` makes an impossible salt length
+    /// a failed verification instead of an error (the caller handles `None`).
+    fn rsa_scheme(
+        k: &RsaKey,
+        hash: Option<&str>,
+        padding: Option<i32>,
+        salt: Option<i32>,
+        verify: bool,
+    ) -> Result<Option<(RsaScheme, Algo)>, OpError> {
+        let padding = padding.unwrap_or_else(|| rsa_default_padding(k));
+        match padding {
+            RSA_PKCS1_PADDING if k.pss.is_none() => {
+                let algo = default_hash(hash)?;
+                Ok(Some((RsaScheme::Pkcs1 { hash: algo }, algo)))
+            }
+            RSA_PKCS1_PSS_PADDING => {
+                let cfg = pss_config(k, hash, salt)?;
+                match pss_salt(cfg.salt) {
+                    Some(salt) => Ok(Some((
+                        RsaScheme::Pss {
+                            hash: cfg.hash,
+                            mgf1: cfg.mgf1,
+                            salt,
+                        },
+                        cfg.hash,
+                    ))),
+                    None if verify => Ok(None),
+                    None => Err(invalid_salt()),
+                }
+            }
+            _ => Err(illegal_padding()),
+        }
+    }
+
     fn rsa_sign(
         k: &RsaKey,
         hash: Option<&str>,
@@ -383,43 +167,12 @@ pub(crate) mod bindings {
         salt: Option<i32>,
         data: &[u8],
     ) -> Result<Vec<u8>, OpError> {
-        let padding = padding.unwrap_or_else(|| rsa_default_padding(k));
-        let k_len = mod_len(k);
-        let em = match padding {
-            RSA_PKCS1_PADDING if k.pss.is_none() => {
-                let algo = hash.map(digest_algo).transpose()?.unwrap_or(Algo::Sha256);
-                let t = digest_info(algo, &hash::digest(algo, data))?;
-                if k_len < t.len() + 11 {
-                    return Err(ossl(
-                        "02000070",
-                        "rsa routines",
-                        "digest too big for rsa key",
-                        "ERR_OSSL_RSA_DIGEST_TOO_BIG_FOR_RSA_KEY",
-                    ));
-                }
-                let mut em = vec![0x00, 0x01];
-                em.resize(k_len - t.len() - 1, 0xff);
-                em.push(0);
-                em.extend_from_slice(&t);
-                em
-            }
-            RSA_PKCS1_PSS_PADDING => {
-                let cfg = pss_config(k, hash, salt)?;
-                let em_bits = k.n.bits() - 1;
-                let em_len = em_bits.div_ceil(8);
-                let max = em_len.saturating_sub(cfg.hash.out_len() + 2);
-                let salt_len = match cfg.salt {
-                    SALT_MAX_OR_AUTO => max,
-                    SALT_DIGEST => cfg.hash.out_len(),
-                    s if s >= 0 => s as usize,
-                    _ => return Err(invalid_salt()),
-                };
-                pss_encode(em_bits, &hash::digest(cfg.hash, data), &cfg, salt_len)?
-            }
-            _ => return Err(illegal_padding()),
-        };
-        let s = rsa_private_op(k, &BigUint::from_bytes_be(&em))?;
-        Ok(asn1::pad_be(&s.to_bytes_be(), k_len))
+        let (scheme, algo) =
+            rsa_scheme(k, hash, padding, salt, false)?.expect("signing schemes are never absent");
+        let key = k.private_parts().map_err(OpError::from)?;
+        backend()
+            .rsa_sign(&key, &scheme, &hash::digest(algo, data))
+            .map_err(op_error)
     }
 
     fn rsa_verify(
@@ -430,47 +183,12 @@ pub(crate) mod bindings {
         data: &[u8],
         sig: &[u8],
     ) -> Result<bool, OpError> {
-        let padding = padding.unwrap_or_else(|| rsa_default_padding(k));
-        let k_len = mod_len(k);
-        match padding {
-            RSA_PKCS1_PADDING | RSA_PKCS1_PSS_PADDING => {}
-            _ => return Err(illegal_padding()),
-        }
-        if padding == RSA_PKCS1_PADDING && k.pss.is_some() {
-            return Err(illegal_padding());
-        }
-        let cfg = if padding == RSA_PKCS1_PSS_PADDING {
-            Some(pss_config(k, hash, salt)?)
-        } else {
-            None
-        };
-        let pkcs_algo = match &cfg {
-            None => Some(hash.map(digest_algo).transpose()?.unwrap_or(Algo::Sha256)),
-            Some(_) => None,
-        };
-        if sig.len() != k_len {
+        let Some((scheme, algo)) = rsa_scheme(k, hash, padding, salt, true)? else {
             return Ok(false);
-        }
-        let s = BigUint::from_bytes_be(sig);
-        if s >= k.n {
-            return Ok(false);
-        }
-        let m = rsa_public_op(k, &s);
-        match (cfg, pkcs_algo) {
-            (Some(cfg), _) => Ok(pss_verify_message(k, &m, &cfg, data)),
-            (None, Some(algo)) => {
-                let t = digest_info(algo, &hash::digest(algo, data))?;
-                if k_len < t.len() + 11 {
-                    return Ok(false);
-                }
-                let mut expected = vec![0x00, 0x01];
-                expected.resize(k_len - t.len() - 1, 0xff);
-                expected.push(0);
-                expected.extend_from_slice(&t);
-                Ok(asn1::pad_be(&m.to_bytes_be(), k_len) == expected)
-            }
-            _ => Ok(false),
-        }
+        };
+        backend()
+            .rsa_verify(&k.public_parts(), &scheme, &hash::digest(algo, data), sig)
+            .map_err(op_error)
     }
 
     fn der_to_rs(der: &[u8], len: usize) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -519,7 +237,7 @@ pub(crate) mod bindings {
             EcCurve::P521 => {
                 let sk = p521::ecdsa::SigningKey::from_slice(&scalar).map_err(|_| sign_failed())?;
                 let sig = sk
-                    .sign_prehash_with_rng(&mut OsRng, &prehash)
+                    .sign_prehash_with_rng(&mut lumen_crypto::SysRng, &prehash)
                     .map_err(|_| sign_failed())?;
                 sig.to_bytes().to_vec()
             }
@@ -553,64 +271,31 @@ pub(crate) mod bindings {
         })
     }
 
-    fn dsa_sign(
-        k: &crate::crypto::keys::DsaKey,
-        hashed: &[u8],
-        p1363: bool,
-    ) -> Result<Vec<u8>, OpError> {
-        use signature::SignatureEncoding;
-        let sk = k.dsa_signing()?;
-        let sig = sk
-            .sign_prehash_with_rng(&mut OsRng, hashed)
-            .map_err(|_| sign_failed())?;
-        if p1363 {
-            let len = k.q.bits().div_ceil(8);
-            Ok([
-                asn1::pad_be(&sig.r().to_bytes_be(), len),
-                asn1::pad_be(&sig.s().to_bytes_be(), len),
-            ]
-            .concat())
-        } else {
-            Ok(sig.to_bytes().to_vec())
+    fn dsa_sign(k: &DsaKey, hashed: &[u8], p1363: bool) -> Result<Vec<u8>, OpError> {
+        let der = backend()
+            .dsa_sign(&k.private_parts().map_err(OpError::from)?, hashed)
+            .map_err(op_error)?;
+        if !p1363 {
+            return Ok(der);
         }
+        let len = k.q.bits().div_ceil(8);
+        let (r, s) = der_to_rs(&der, len).ok_or_else(sign_failed)?;
+        Ok([r, s].concat())
     }
 
-    fn dsa_verify(k: &crate::crypto::keys::DsaKey, hashed: &[u8], sig: &[u8], p1363: bool) -> bool {
-        let Ok(vk) = k.dsa_verifying() else {
-            return false;
-        };
-        let len = k.q.bits().div_ceil(8);
-        let (r, s) = if p1363 {
+    fn dsa_verify(k: &DsaKey, hashed: &[u8], sig: &[u8], p1363: bool) -> bool {
+        let der = if p1363 {
+            let len = k.q.bits().div_ceil(8);
             if sig.len() != 2 * len {
                 return false;
             }
-            (
-                BigUint::from_bytes_be(&sig[..len]),
-                BigUint::from_bytes_be(&sig[len..]),
-            )
+            rs_to_der(&sig[..len], &sig[len..])
         } else {
-            let mut outer = asn1::Reader::new(sig);
-            let Some(mut seq) = outer.sequence() else {
-                return false;
-            };
-            if outer.finish().is_none() {
-                return false;
-            }
-            let (Some(r), Some(s)) = (seq.biguint(), seq.biguint()) else {
-                return false;
-            };
-            (r, s)
+            sig.to_vec()
         };
-        let Ok(sig) = dsa::Signature::from_components(r, s) else {
-            return false;
-        };
-        vk.verify_prehash(hashed, &sig).is_ok()
-    }
-
-    fn default_hash(hash: Option<&str>) -> Result<Algo, OpError> {
-        hash.map(digest_algo)
-            .transpose()
-            .map(|h| h.unwrap_or(Algo::Sha256))
+        backend()
+            .dsa_verify(&k.public_parts(), hashed, &der)
+            .unwrap_or(false)
     }
 
     fn sign_with(
@@ -725,123 +410,13 @@ pub(crate) mod bindings {
     fn oaep_hash(name: Option<&str>) -> Result<Algo, OpError> {
         match name {
             None => Ok(Algo::Sha1),
-            Some(n) => Algo::from_name(n).filter(|a| !a.is_xof()).ok_or_else(|| {
-                OpError::error("Digest method not supported").with_code("ERR_OSSL_EVP_UNSUPPORTED")
-            }),
+            Some(n) => Algo::from_name(n)
+                .filter(|a| !a.is_xof() && *a != Algo::Md5Sha1)
+                .ok_or_else(|| {
+                    OpError::error("Digest method not supported")
+                        .with_code("ERR_OSSL_EVP_UNSUPPORTED")
+                }),
         }
-    }
-
-    fn oaep_encrypt(k: &RsaKey, algo: Algo, label: &[u8], msg: &[u8]) -> Result<Vec<u8>, OpError> {
-        let k_len = mod_len(k);
-        let h_len = algo.out_len();
-        if msg.len() + 2 * h_len + 2 > k_len {
-            return Err(data_too_large());
-        }
-        let mut db = hash::digest(algo, label);
-        db.resize(k_len - msg.len() - h_len - 2, 0);
-        db.push(1);
-        db.extend_from_slice(msg);
-        let mut seed = vec![0u8; h_len];
-        OsRng.fill_bytes(&mut seed);
-        let db_mask = mgf1(algo, &seed, db.len());
-        xor_into(&mut db, &db_mask);
-        let seed_mask = mgf1(algo, &db, h_len);
-        xor_into(&mut seed, &seed_mask);
-        let mut em = vec![0u8];
-        em.extend(seed);
-        em.extend(db);
-        let c = rsa_run(k, false, &BigUint::from_bytes_be(&em))?;
-        Ok(asn1::pad_be(&c.to_bytes_be(), k_len))
-    }
-
-    fn oaep_decrypt(
-        k: &RsaKey,
-        algo: Algo,
-        label: &[u8],
-        input: &[u8],
-    ) -> Result<Vec<u8>, OpError> {
-        let k_len = mod_len(k);
-        let h_len = algo.out_len();
-        if input.len() > k_len {
-            return Err(data_too_large());
-        }
-        if input.len() < k_len {
-            return Err(data_too_small());
-        }
-        if k_len < 2 * h_len + 2 {
-            return Err(oaep_decoding());
-        }
-        let m = rsa_run(k, true, &BigUint::from_bytes_be(input))?;
-        let em = asn1::pad_be(&m.to_bytes_be(), k_len);
-        let (y, rest) = (em[0], &em[1..]);
-        let mut seed = rest[..h_len].to_vec();
-        let mut db = rest[h_len..].to_vec();
-        xor_into(&mut seed, &mgf1(algo, &db, h_len));
-        let mask = mgf1(algo, &seed, db.len());
-        xor_into(&mut db, &mask);
-        let l_hash = hash::digest(algo, label);
-        let tail = &db[h_len..];
-        match tail.iter().position(|&b| b != 0) {
-            Some(i) if tail[i] == 1 && y == 0 && db[..h_len] == l_hash[..] => {
-                Ok(tail[i + 1..].to_vec())
-            }
-            _ => Err(oaep_decoding()),
-        }
-    }
-
-    fn pkcs1_encrypt(k: &RsaKey, private: bool, msg: &[u8]) -> Result<Vec<u8>, OpError> {
-        let k_len = mod_len(k);
-        if msg.len() + 11 > k_len {
-            return Err(data_too_large());
-        }
-        let ps_len = k_len - msg.len() - 3;
-        let mut em = vec![0x00, if private { 0x01 } else { 0x02 }];
-        if private {
-            em.resize(2 + ps_len, 0xff);
-        } else {
-            em.extend(random_nonzero(ps_len));
-        }
-        em.push(0);
-        em.extend_from_slice(msg);
-        let c = rsa_run(k, private, &BigUint::from_bytes_be(&em))?;
-        Ok(asn1::pad_be(&c.to_bytes_be(), k_len))
-    }
-
-    fn pkcs1_decrypt(k: &RsaKey, private: bool, input: &[u8]) -> Result<Vec<u8>, OpError> {
-        let k_len = mod_len(k);
-        if input.len() > k_len {
-            return Err(data_too_large());
-        }
-        if input.len() < k_len {
-            return Err(data_too_small());
-        }
-        let m = rsa_run(k, private, &BigUint::from_bytes_be(input))?;
-        let em = asn1::pad_be(&m.to_bytes_be(), k_len);
-        let block_type = if private { 2 } else { 1 };
-        if em[0] != 0 || em[1] != block_type {
-            return Err(padding_check_failed());
-        }
-        let body = &em[2..];
-        let sep = body
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(padding_check_failed)?;
-        if sep < 8 || (!private && body[..sep].iter().any(|&b| b != 0xff)) {
-            return Err(padding_check_failed());
-        }
-        Ok(body[sep + 1..].to_vec())
-    }
-
-    fn raw_transform(k: &RsaKey, private: bool, input: &[u8]) -> Result<Vec<u8>, OpError> {
-        let k_len = mod_len(k);
-        if input.len() > k_len {
-            return Err(data_too_large());
-        }
-        if input.len() < k_len {
-            return Err(data_too_small());
-        }
-        let out = rsa_run(k, private, &BigUint::from_bytes_be(input))?;
-        Ok(asn1::pad_be(&out.to_bytes_be(), k_len))
     }
 
     /// `publicEncrypt` (0), `privateDecrypt` (1), `privateEncrypt` (2) and `publicDecrypt` (3).
@@ -863,25 +438,168 @@ pub(crate) mod bindings {
         if private_key_op && k.private.is_none() {
             return Err(OpError::error("key is not a private key"));
         }
-        match (operation, padding) {
-            (0, RSA_PKCS1_OAEP_PADDING) => oaep_encrypt(
-                k,
-                oaep_hash(oaep.as_deref())?,
-                label.as_deref().unwrap_or(&[]),
+        let padding = match padding {
+            RSA_PKCS1_OAEP_PADDING => {
+                let hash = oaep_hash(oaep.as_deref())?;
+                RsaPadding::Oaep {
+                    hash,
+                    mgf1: hash,
+                    label: label.unwrap_or_default(),
+                }
+            }
+            RSA_PKCS1_PADDING => RsaPadding::Pkcs1,
+            RSA_NO_PADDING => RsaPadding::None,
+            _ => return Err(illegal_padding()),
+        };
+        let backend = backend();
+        let out = match operation {
+            0 => backend.rsa_encrypt(&k.public_parts(), &padding, input),
+            1 => backend.rsa_decrypt(&k.private_parts().map_err(OpError::from)?, &padding, input),
+            2 => backend.rsa_private_encrypt(
+                &k.private_parts().map_err(OpError::from)?,
+                &padding,
                 input,
             ),
-            (1, RSA_PKCS1_OAEP_PADDING) => oaep_decrypt(
-                k,
-                oaep_hash(oaep.as_deref())?,
-                label.as_deref().unwrap_or(&[]),
-                input,
-            ),
-            (0, RSA_PKCS1_PADDING) => pkcs1_encrypt(k, false, input),
-            (1, RSA_PKCS1_PADDING) => pkcs1_decrypt(k, true, input),
-            (2, RSA_PKCS1_PADDING) => pkcs1_encrypt(k, true, input),
-            (3, RSA_PKCS1_PADDING) => pkcs1_decrypt(k, false, input),
-            (_, RSA_NO_PADDING) => raw_transform(k, private_key_op, input),
-            _ => Err(illegal_padding()),
+            _ => backend.rsa_public_decrypt(&k.public_parts(), &padding, input),
+        };
+        out.map_err(op_error)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use base64::Engine;
+
+        // The 1024-bit key and the vectors were produced by `openssl` 3 (genpkey, dgst -sign, pkeyutl
+        // -encrypt / -sign) over MSG and PLAIN; `lumen-crypto` checks them per backend, these exercise
+        // the option handling on top.
+        const KEY: &str = "MIICdQIBADANBgkqhkiG9w0BAQEFAASCAl8wggJbAgEAAoGBAJtNDLz0UW46tFwXTJtyHEdrOhK2sf9U50jA1RmUmXL78rYSfjOHX7aTE6bAs+5nli6qXC2UhJokBGN6zHviQu/INLejVSD7Tp6nPMrvtkh82vl5IY6sLX3F5TqY7Rp7Bjf+yysg8drMe5LbjqMAJjdM5QtzlKIZNyDk8EUkWF/rAgMBAAECgYBoIfnwmUIgz2wwc88CTDl6CgQemDIyKxQKTIKXbHSYDShpvWyx0Iv1OBltLrl3mi2xjLnSNkvTr2Lh8W07hDOs2PN/hYX1/eRmnld1NPGCbJFG4eYnSiDwNz7jet5JUtm0IrwRzkQHmqJMxDIqg/OBY8aIfj70Ytz8BnVEiXLQgQJBAMvUhNGd1teAX64/H4Boelwmw70FXvjVLLDj1E9NqII7fhOJGosD1ksSu1CFgBdiGa7dw/ylxzKntIfgPq/ALSkCQQDDDMXxy3LxdWQZw+fbA9jbqST8NXxdH/U5FTDSWdcBHdQVwqrhZT64/3jZ2b8vnepPRE55XBTR3Bg4y+sPL7LzAkB42R+GSFbAnlQcM0CyGT+ysykKQMz2Ky28EtglzJ1D2ZH+cyNRmIzNJeX4763qLzea/dDdUkywM85NYR7JhN9BAkAvORl3mBVFJnHM1yR8XysSy5nbwitQ9JrPbjT6yKuIZqthdVcf6P5NlfSxccmbArWm6VfChCu6P3pRzfUkIR1HAkBuuZDNn0dfPCVg6JlOY4DRrSnz2rjq0QicshjzacDdGJQsroOz7pyKBXq4mnZTkp3GbiZCNOOA25aV2jMTMvj5";
+        const MSG: &[u8] = b"lumen rsa vectors";
+        const PLAIN: &[u8] = b"oaep secret";
+        const PKCS1_SHA256: &str = "4684dcaf60d92662eba75673a2b818fd35da7aa04350add326c0ed80967fc8bdbeae98fb62411e8adaffd30f280f23cbc05b1d77ca68ffcf7246a16175eb156b24fa31af7a524aa9063528c3e9be026a41e36840d3dfa2b131d4162f9d8347615c5164a88badb8915585534d46d5b5f48e38dc2b2151bf739a98a5b00bd3ccf5";
+        const PSS_MGF1_SHA1: &str = "0c0323a4283101cd2d59917922e26234accd56f475bf20248017eee43376e82877cc288486a1c0cdbd864f6e89d1602fceb4b189dd283a25acdc6b6ad1ebc9e6d8e102d8ded6a950a513885eb2d4acdbea61f4887ed305b97c7c1e0efabde1164f8c6d830909ecce77622992bd2971d9454aab0dc6cd66ee750b145a199d218d";
+        const OAEP_SHA256_LABEL: &str = "6ec8febf285d7c1e9caaa605ad27adae951ce69d5cbd892facf6cb3d7ba953c28ca0c355dd462f4fcd8b35a477ad8cfe84f7353c9ed04fb609c00b68418cce206de3f84f66bb4bc401f321b6d0ff764893030f6f67d492ca5fb284de022b7cdfc541bda0bb642b28284d08618054fbdcdcc7adadb6a381da402a4fa2c0e075d5";
+        const PRIVATE_ENCRYPTED: &str = "8402076ded2788f9645b875445f0d7d696a540e20b69834f7b408a7e38867adc713dfcae5e82648ffd1451c483e8026f80127fd9b0a78321f3ede7e791919018a1b37e021be5c8a2e7d7ec9b90bf978f91fe8632fef63bf0d5399f4d101df2aeca5b01fb46e70db13e87d9c0f3f2a51383df2ad8be224449673df8667391f81b";
+
+        fn pkcs8() -> Vec<u8> {
+            base64::engine::general_purpose::STANDARD
+                .decode(KEY)
+                .unwrap()
+        }
+
+        fn key() -> RsaKey {
+            match AsymKey::from_pkcs8_der(&pkcs8()).unwrap() {
+                AsymKey::Rsa(k) => k,
+                _ => unreachable!(),
+            }
+        }
+
+        fn hex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        #[test]
+        fn pkcs1_v15_signature_matches_openssl() {
+            let k = key();
+            assert_eq!(
+                rsa_sign(&k, Some("sha256"), None, None, MSG).unwrap(),
+                hex(PKCS1_SHA256)
+            );
+            assert!(rsa_verify(&k, Some("sha256"), None, None, MSG, &hex(PKCS1_SHA256)).unwrap());
+            assert!(
+                !rsa_verify(&k, Some("sha256"), None, None, b"other", &hex(PKCS1_SHA256)).unwrap()
+            );
+            assert!(!rsa_verify(&k, Some("sha512"), None, None, MSG, &hex(PKCS1_SHA256)).unwrap());
+        }
+
+        #[test]
+        fn pss_key_restrictions_decide_the_scheme() {
+            let mut k = key();
+            k.pss = Some(Some(PssParams {
+                hash: "sha256",
+                mgf1_hash: "sha1",
+                salt_length: 0,
+            }));
+            assert!(rsa_verify(
+                &k,
+                None,
+                None,
+                Some(SALT_MAX_OR_AUTO),
+                MSG,
+                &hex(PSS_MGF1_SHA1)
+            )
+            .unwrap());
+            let sig = rsa_sign(&k, None, None, Some(16), MSG).unwrap();
+            assert!(rsa_verify(&k, None, None, Some(16), MSG, &sig).unwrap());
+            assert!(!rsa_verify(&k, None, None, Some(15), MSG, &sig).unwrap());
+            let wrong_digest = rsa_sign(&k, Some("sha512"), None, None, MSG)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                wrong_digest.contains("digest not allowed"),
+                "{wrong_digest}"
+            );
+            let short_salt = rsa_sign(&k, None, None, Some(-3), MSG)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                short_salt.contains("illegal") || short_salt.contains("salt"),
+                "{short_salt}"
+            );
+        }
+
+        #[test]
+        fn rsa_cipher_runs_every_operation() {
+            let der = pkcs8();
+            let public = AsymKey::Rsa(key()).to_spki_der();
+            let label = vec![0x00, 0xff, 0x10];
+            let oaep = rsa_cipher(
+                1,
+                2,
+                &der,
+                &hex(OAEP_SHA256_LABEL),
+                RSA_PKCS1_OAEP_PADDING,
+                Some("sha256".into()),
+                Some(label.clone()),
+            )
+            .unwrap();
+            assert_eq!(oaep, PLAIN);
+            let ct = rsa_cipher(0, 1, &public, PLAIN, RSA_PKCS1_OAEP_PADDING, None, None).unwrap();
+            assert_eq!(
+                rsa_cipher(1, 2, &der, &ct, RSA_PKCS1_OAEP_PADDING, None, None).unwrap(),
+                PLAIN
+            );
+            assert_eq!(
+                rsa_cipher(2, 2, &der, PLAIN, RSA_PKCS1_PADDING, None, None).unwrap(),
+                hex(PRIVATE_ENCRYPTED)
+            );
+            assert_eq!(
+                rsa_cipher(
+                    3,
+                    1,
+                    &public,
+                    &hex(PRIVATE_ENCRYPTED),
+                    RSA_PKCS1_PADDING,
+                    None,
+                    None
+                )
+                .unwrap(),
+                PLAIN
+            );
+            let unsupported = rsa_cipher(0, 1, &public, PLAIN, 99, None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                unsupported.contains("illegal or unsupported padding mode"),
+                "{unsupported}"
+            );
+            let public_only = rsa_cipher(1, 1, &public, PLAIN, RSA_PKCS1_PADDING, None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(public_only.contains("not a private key"), "{public_only}");
         }
     }
 }

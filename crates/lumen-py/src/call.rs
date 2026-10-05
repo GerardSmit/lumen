@@ -7,6 +7,9 @@ use crate::vm::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+/// `Py_C_RECURSION_LIMIT` of CPython 3.12 release builds.
+const C_RECURSION_LIMIT: usize = 10_000;
+
 fn plural(n: usize) -> &'static str {
     if n == 1 {
         ""
@@ -93,7 +96,14 @@ impl Interp {
         self.run(entry, None)
     }
 
-    pub fn call_inline(
+    pub fn call_inline(&mut self, f: &Value, args: Vec<Value>, kw: Vec<(Obj, Value)>) -> R<bool> {
+        if self.mon.active {
+            return self.call_inline_monitored(f, args, kw);
+        }
+        self.call_inline_plain(f, args, kw)
+    }
+
+    pub(crate) fn call_inline_plain(
         &mut self,
         f: &Value,
         mut args: Vec<Value>,
@@ -115,6 +125,11 @@ impl Interp {
         }
         let r = self.call(f, args, kw)?;
         self.frames.last_mut().unwrap().stack.push(r);
+        // CPython checks for signals when a native call returns, so a handler that raises
+        // interrupts the code right after a blocking call (before any cleanup that follows it).
+        if lumen_os::signal::any_pending() {
+            crate::builtins::signalm::check(self)?;
+        }
         Ok(false)
     }
 
@@ -160,7 +175,7 @@ impl Interp {
             Kind::Function(f) => f,
             _ => unreachable!(),
         };
-        let code = func.code.clone();
+        let code = func.code.borrow().clone();
         let mut frame = self.new_frame(
             code.clone(),
             func.globals.clone(),
@@ -243,7 +258,10 @@ impl Interp {
                         let name = func.qualname.borrow().to_string();
                         let in_posonly = code.varnames[..posonly].iter().any(|n| &**n == kname);
                         let msg = if in_posonly {
-                            format!("{}() got some positional-only arguments passed as keyword arguments: '{}'", name, kname)
+                            format!(
+                                "{}() got some positional-only arguments passed as keyword arguments: '{}'",
+                                name, kname
+                            )
                         } else {
                             format!("{}() got an unexpected keyword argument '{}'", name, kname)
                         };
@@ -320,7 +338,7 @@ impl Interp {
                 _ => {
                     return Err(
                         self.new_exc_str("SystemError", "MakeFunction expects a code object")
-                    )
+                    );
                 }
             },
             _ => return Err(self.new_exc_str("SystemError", "MakeFunction expects a code object")),
@@ -356,7 +374,7 @@ impl Interp {
         let f = Function {
             name: RefCell::new(code.name.clone()),
             qualname: RefCell::new(code.qualname.clone()),
-            code,
+            code: RefCell::new(code),
             globals,
             defaults: RefCell::new(defaults),
             kwdefaults: RefCell::new(kwdefaults),
@@ -451,7 +469,106 @@ impl Interp {
         }))))
     }
 
+    /// The generator `g` is suspended in a `yield from` over another suspended generator.
+    fn delegate_of(g: &Obj) -> Option<Obj> {
+        let Kind::Generator(gd) = &g.kind else {
+            return None;
+        };
+        let state = gd.state.try_borrow().ok()?;
+        let GenState::Suspended(frame) = &*state else {
+            return None;
+        };
+        if !matches!(frame.code.ops.get(frame.pc), Some(Op::YieldFrom)) {
+            return None;
+        }
+        let Some(Value::Obj(sub)) = frame.stack.last() else {
+            return None;
+        };
+        let Kind::Generator(sd) = &sub.kind else {
+            return None;
+        };
+        let suspended = sd
+            .state
+            .try_borrow()
+            .map(|s| matches!(&*s, GenState::Suspended(_)))
+            .unwrap_or(false);
+        suspended.then(|| sub.clone())
+    }
+
+    fn set_gen_state(g: &Obj, state: GenState) {
+        if let Kind::Generator(gd) = &g.kind {
+            *gd.state.borrow_mut() = state;
+        }
+    }
+
+    /// Resumes a chain of `yield from` delegations at its innermost generator: the generators
+    /// in between would only pass the value down and the yielded value up, so a yield costs
+    /// one resumption instead of one per level (deep recursive generators, `await` chains).
+    fn gen_send_delegated(&mut self, g: &Obj, value: Value) -> R<GenResult> {
+        let mut chain: Vec<Obj> = Vec::new();
+        let mut cur = g.clone();
+        let base = self.frames.len();
+        let mut overflow = false;
+        loop {
+            // each level counts toward the recursion limit as the nested resumptions would, and
+            // CPython's nested resumptions are also bounded by its C recursion limit
+            if base + chain.len() >= self.recursion_limit || chain.len() >= C_RECURSION_LIMIT {
+                Self::set_gen_state(&cur, GenState::Done);
+                overflow = true;
+                break;
+            }
+            let Some(sub) = Self::delegate_of(&cur) else {
+                break;
+            };
+            let Kind::Generator(gd) = &cur.kind else {
+                unreachable!()
+            };
+            let GenState::Suspended(frame) =
+                std::mem::replace(&mut *gd.state.borrow_mut(), GenState::Running)
+            else {
+                unreachable!()
+            };
+            // the waiting frames stay on the stack, so the leaf sees its callers
+            self.frames.push(*frame);
+            chain.push(cur);
+            cur = sub;
+        }
+        let mut res = if overflow {
+            Err(self.new_exc_str("RecursionError", "maximum recursion depth exceeded"))
+        } else {
+            self.gen_send_one(&cur, value)
+        };
+        while let Some(parent) = chain.pop() {
+            let mut frame = Box::new(self.frames.pop().expect("delegating frame"));
+            match res {
+                Ok(GenResult::Yield(y)) => {
+                    Self::set_gen_state(&parent, GenState::Suspended(frame));
+                    while let Some(p) = chain.pop() {
+                        let f = Box::new(self.frames.pop().expect("delegating frame"));
+                        Self::set_gen_state(&p, GenState::Suspended(f));
+                    }
+                    return Ok(GenResult::Yield(y));
+                }
+                Ok(GenResult::Return(v)) => {
+                    frame.stack.pop();
+                    frame.stack.push(v);
+                    frame.pc += 1;
+                    res = self.resume_frame(&parent, *frame, None, None);
+                }
+                Err(e) => res = self.resume_frame(&parent, *frame, None, Some(e)),
+            }
+        }
+        res
+    }
+
     pub fn gen_send(&mut self, g: &Obj, value: Value) -> R<GenResult> {
+        if !self.mon.active && Self::delegate_of(g).is_some() {
+            return self.gen_send_delegated(g, value);
+        }
+        self.gen_send_one(g, value)
+    }
+
+    fn gen_send_one(&mut self, g: &Obj, value: Value) -> R<GenResult> {
         let gd = match &g.kind {
             Kind::Generator(gd) => gd,
             _ => return Err(self.new_exc_str("TypeError", "not a generator")),
@@ -504,6 +621,14 @@ impl Interp {
         if let Some(v) = send {
             frame.stack.push(v);
         }
+        frame.generator = Some(Rc::downgrade(g));
+        frame.entry = if throw.is_some() {
+            crate::trace::ENTRY_THROW
+        } else if frame.pc == 0 {
+            crate::trace::ENTRY_START
+        } else {
+            crate::trace::ENTRY_RESUME
+        };
         if let Err(e) = self.push_frame(frame) {
             *gd.state.borrow_mut() = GenState::Done;
             return Err(e);

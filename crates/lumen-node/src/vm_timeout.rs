@@ -11,13 +11,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lumen_common::limits::Deadline;
-use lumen_host::{ops, Ctx, OpDecl, Value};
+use lumen::embed::OpError;
+use lumen_host::{Ctx, Value};
 
 use crate::signals::SigintBreak;
 
-pub const VM_OPS: &[OpDecl] = ops![
-    "runWithTimeout" (3) => op_run_with_timeout,
-];
+pub(crate) use bindings::Module;
+
+#[lumen_bind::module(name = "__vm")]
+pub(crate) mod bindings {
+    use super::*;
+
+    /// `(timeoutMs, fn, breakOnSigint)`: call `fn()`; if the deadline passes first (or SIGINT
+    /// arrives, with `breakOnSigint`), throw the matching error.
+    #[op(coerce, name = "runWithTimeout")]
+    pub fn run_with_timeout(ctx: &mut Ctx, ms: f64, callee: Value, break_on_sigint: bool) -> Result<Value, OpError> {
+        run_bounded(ctx, ms, callee, break_on_sigint)
+    }
+}
 
 /// What stopped a bounded run: the deadline, or SIGINT.
 #[derive(Default)]
@@ -37,15 +48,10 @@ thread_local! {
     static ACTIVE: RefCell<Vec<Arc<Fired>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `(timeoutMs, fn, breakOnSigint)` — call `fn()`; if the deadline passes first (or SIGINT
-/// arrives, with `breakOnSigint`), throw the matching error.
-fn op_run_with_timeout(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let ms = args.first().and_then(Value::as_num_opt).unwrap_or(0.0);
-    let callee = args.get(1).cloned().unwrap_or(Value::Undefined);
-    let break_on_sigint = matches!(args.get(2), Some(Value::Bool(true)));
+fn run_bounded(ctx: &mut Ctx, ms: f64, callee: Value, break_on_sigint: bool) -> Result<Value, OpError> {
     let timed = ms.is_finite() && ms > 0.0;
     if !timed && !break_on_sigint {
-        return ctx.invoke(callee, Value::Undefined, &[]);
+        return ctx.invoke(callee, Value::Undefined, &[]).map_err(OpError::thrown);
     }
     let raised = ctx.script_timeout_flag();
     let sigint = break_on_sigint.then(|| SigintBreak::new(Arc::clone(&raised)));
@@ -83,15 +89,12 @@ fn op_run_with_timeout(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value
     }
     match result {
         Err(_) if fired.timeout.load(Ordering::SeqCst) => {
-            let err = ctx.make_error("Error", format!("Script execution timed out after {ms}ms"));
-            let _ = ctx.set_member(&err, "code", Value::str("ERR_SCRIPT_EXECUTION_TIMEOUT"));
-            Err(err)
+            Err(OpError::error(format!("Script execution timed out after {ms}ms")).with_code("ERR_SCRIPT_EXECUTION_TIMEOUT"))
         }
         Err(_) if fired.sigint.load(Ordering::SeqCst) => {
-            let err = ctx.make_error("Error", "Script execution was interrupted by `SIGINT`");
-            let _ = ctx.set_member(&err, "code", Value::str("ERR_SCRIPT_EXECUTION_INTERRUPTED"));
-            Err(err)
+            Err(OpError::error("Script execution was interrupted by `SIGINT`").with_code("ERR_SCRIPT_EXECUTION_INTERRUPTED"))
         }
-        other => other,
+        Err(thrown) => Err(OpError::thrown(thrown)),
+        Ok(v) => Ok(v),
     }
 }

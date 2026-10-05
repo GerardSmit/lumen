@@ -561,7 +561,8 @@ pub struct Sig {
 }
 
 /// Parameter attributes the macros consume.
-pub const PARAM_ATTRS: &[&str] = &["kw", "kwonly", "varargs", "varkw", "default"];
+/// `#[name("..")]` gives the parameter a name its Rust identifier cannot spell (`_feature_version`).
+pub const PARAM_ATTRS: &[&str] = &["kw", "kwonly", "varargs", "varkw", "default", "name"];
 
 /// Parse a fn item (`attrs vis qualifiers fn name <lifetimes> (params) -> ret where .. { body }`).
 pub fn parse_fn(toks: &[TokenTree]) -> Res<Sig> {

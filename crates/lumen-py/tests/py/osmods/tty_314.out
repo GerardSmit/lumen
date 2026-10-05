@@ -1,0 +1,31 @@
+7 list True
+True True True
+True True
+(0, 0)
+(30, 100)
+TypeError tcsetwinsize, arg 2: must be a two-item sequence
+OverflowError winsize value(s) out of range.
+0
+1
+error (9, 'Bad file descriptor')
+error (22, 'Invalid argument')
+TypeError tcsetattr, arg 3: must be 7 element list
+TypeError tcsetattr, arg 3: must be 7 element list
+termios.error (19, 'Operation not supported by device')
+Exception termios
+True b'out\r\n'
+b'in'
+os.terminal_size(columns=100, lines=30)
+0 b'\x1e\x00d\x00\x00\x00\x00\x00'
+b'\x1e\x00d\x00\x00\x00\x00\x00'
+True
+1
+True
+True
+ValueError file descriptor cannot be a negative integer (-1)
+0
+7 8 9
+0
+0
+0
+1 0

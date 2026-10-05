@@ -101,6 +101,8 @@ pub trait Host: Sized + 'static {
     ) -> Result<i128, Self::Error>;
     fn to_bigint(cx: &Self::Cx<'_>, v: &Self::Value, at: Slot) -> Result<BigInt, Self::Error>;
     fn to_bool(cx: &Self::Cx<'_>, v: &Self::Value, at: Slot) -> Result<bool, Self::Error>;
+    /// Whether `v` is the host's own `true` (no truthiness coercion).
+    fn is_true(v: &Self::Value) -> bool;
     fn to_str<'c>(
         cx: &'c Self::Cx<'_>,
         v: &'c Self::Value,
@@ -221,6 +223,16 @@ pub trait Native<H: Host>: 'static {
 /// A `#[class]` struct.
 pub trait Class: 'static {
     const DESC: &'static ClassDesc;
+
+    /// Reports the references the instance's state holds (for a host's cycle collector);
+    /// `#[class]` implements it from the fields whose types implement [`crate::Trace`].
+    fn gc_trace(&self, v: &mut dyn crate::Visit) {
+        let _ = v;
+    }
+
+    /// Drops the references the instance's state holds, breaking the cycles it is part of.
+    fn gc_clear(&mut self) {}
+
     fn view(&self, ty: std::any::TypeId) -> Option<&dyn std::any::Any>
     where
         Self: Sized,

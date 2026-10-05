@@ -1,0 +1,5 @@
+None
+True
+[('call', None), ('c_call', 'len'), ('c_return', 'len'), ('return', 2)]
+None
+[('call', None), ('return', None)]

@@ -1,0 +1,4 @@
+True [('line', 1), ('line', 2), ('line', 3), ('return', 3)]
+False [('return', 3)]
+('probe', 'caller', None, True, False, True)
+[('line', 1), ('line', 2), ('line', 3), ('return', 3)]

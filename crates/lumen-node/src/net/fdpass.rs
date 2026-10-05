@@ -22,8 +22,12 @@ fn socket_family(fd: RawFd) -> std::io::Result<libc::c_int> {
     Ok(lumen_os::net::getsockname(fd).map_err(os_error)?.family())
 }
 
-fn fd_error(ctx: &mut Ctx, syscall: &'static str, error: &std::io::Error) -> Value {
-    net_error_value(ctx, &net_err(syscall, error, None))
+fn fd_error(syscall: &'static str, error: &std::io::Error) -> NativeError {
+    net_error(&net_err(syscall, error, None))
+}
+
+fn fd_arg(n: f64) -> Option<RawFd> {
+    (n >= 0.0 && n <= i32::MAX as f64 && n.fract() == 0.0).then_some(n as RawFd)
 }
 
 fn set_member(ctx: &mut Ctx, o: &Value, key: &str, value: Value) {
@@ -33,14 +37,13 @@ fn set_member(ctx: &mut Ctx, o: &Value, key: &str, value: Value) {
 /// `(fd)` — take ownership of an inherited or received socket descriptor. Returns
 /// `{ type: 'tcp' | 'pipe' | 'udp', server, ... }`: a connected stream adds `desc` (the
 /// `register_stream` descriptor), a listener `serverId` and its address, a UDP socket `socketId`.
-pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd = match args.first().and_then(Value::as_num_opt) {
-        Some(n) if n >= 0.0 && n <= i32::MAX as f64 && n.fract() == 0.0 => n as RawFd,
-        _ => return Err(ctx.make_error("TypeError", "adoptFd: fd must be a non-negative integer")),
+pub(super) fn adopt_fd(ctx: &mut Ctx, fd: f64) -> Result<Value, OpError> {
+    let Some(fd) = fd_arg(fd) else {
+        return Err(NativeError::type_error("adoptFd: fd must be a non-negative integer").into());
     };
-    let sock_type =
-        sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).map_err(|e| fd_error(ctx, "open", &e))?;
-    let family = socket_family(fd).map_err(|e| fd_error(ctx, "open", &e))?;
+    let sock_type = sockopt_int(fd, libc::SOL_SOCKET, libc::SO_TYPE)
+        .map_err(|e| OpError::from(fd_error("open", &e)))?;
+    let family = socket_family(fd).map_err(|e| OpError::from(fd_error("open", &e)))?;
     let listening = sock_type == libc::SOCK_STREAM
         && sockopt_int(fd, libc::SOL_SOCKET, libc::SO_ACCEPTCONN).unwrap_or(0) != 0;
     set_cloexec(fd);
@@ -51,7 +54,7 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         libc::AF_INET | libc::AF_INET6 if sock_type == libc::SOCK_STREAM => "tcp",
         _ => {
             let e = std::io::Error::from_raw_os_error(libc::EINVAL);
-            return Err(fd_error(ctx, "open", &e));
+            return Err(fd_error("open", &e).into());
         }
     };
     set_member(ctx, &o, "type", Value::str(kind));
@@ -84,7 +87,7 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
             let listener = unsafe { TcpListener::from_raw_fd(fd) };
             let addr = listener
                 .local_addr()
-                .map_err(|e| fd_error(ctx, "open", &e))?;
+                .map_err(|e| OpError::from(fd_error("open", &e)))?;
             (NetListener::Tcp(listener), ServerAddress::Tcp(addr))
         } else {
             // SAFETY: a listening Unix socket handed over by the caller.
@@ -147,43 +150,39 @@ pub(super) fn op_adopt_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
 }
 
 /// `(socketId)` — the descriptor of a connected socket, or -1.
-pub(super) fn op_socket_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
+pub(super) fn socket_fd(ctx: &mut Ctx, sid: u64) -> f64 {
     let fd = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
         .map(|e| e.stream.raw_fd())
         .unwrap_or(-1);
-    Ok(Value::Num(fd as f64))
+    fd as f64
 }
 
 /// `(serverId)` — the descriptor of a listener, or -1.
-pub(super) fn op_server_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
+pub(super) fn server_fd(ctx: &mut Ctx, sid: u64) -> f64 {
     let fd = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.servers.get(&sid))
         .map(|e| e.listener.raw_fd())
         .unwrap_or(-1);
-    Ok(Value::Num(fd as f64))
+    fd as f64
 }
 
 /// `(socketId)` — the descriptor of a UDP socket, or -1.
-pub(super) fn op_udp_fd(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
+pub(super) fn udp_fd(ctx: &mut Ctx, sid: u64) -> f64 {
     let fd = ctx
         .host_mut::<DgramRegistry>()
         .and_then(|r| r.sockets.get(&sid))
         .map(|e| e.socket.as_raw_fd())
         .unwrap_or(-1);
-    Ok(Value::Num(fd as f64))
+    fd as f64
 }
 
 /// `(socketId)` — close this process's copy of a socket without shutting the connection down
 /// (it lives on in the process the descriptor was sent to): the parked reader is cancelled and
 /// the descriptor closed once it lets go.
-pub(super) fn op_release(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
+pub(super) fn release(ctx: &mut Ctx, sid: u64) {
     let pending = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.remove(&sid))
@@ -195,7 +194,6 @@ pub(super) fn op_release(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Val
     if let (Some(id), Some(tasks)) = (pending, ctx.host_mut::<TaskRegistry>()) {
         tasks.take(id);
     }
-    Ok(Value::Undefined)
 }
 
 type MsgResult = Result<(Vec<u8>, Vec<RawFd>), NetErr>;
@@ -206,9 +204,13 @@ fn recv_with_fds(fd: RawFd, buf: &mut [u8], fds: &mut Vec<RawFd>) -> std::io::Re
 
 /// `(socketId, resolve, reject)` — read from a channel socket, collecting any descriptors that
 /// arrive with the bytes. Resolves `(bytes, fds)`, or `(null, [])` at EOF.
-pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(1), args.get(2))?;
+pub(super) fn read_msg(
+    ctx: &mut Ctx,
+    sid: u64,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
+    let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
     let found = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
@@ -216,7 +218,7 @@ pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
     let Some((stream, unref, cancel)) = found else {
         let empty = ctx.make_array(Vec::new());
         enqueue(ctx, resolve, vec![Value::Null, empty]);
-        return Ok(Value::Undefined);
+        return Ok(());
     };
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_msg);
     if unref {
@@ -254,7 +256,7 @@ pub(super) fn op_read_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Va
         };
         Box::new(result)
     });
-    Ok(Value::Undefined)
+    Ok(())
 }
 
 fn decode_msg(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
@@ -277,8 +279,8 @@ fn send_with_fd(fd: RawFd, data: &[u8], pass: RawFd, dontwait: bool) -> std::io:
     lumen_os::net::send_fd(fd, data, (pass >= 0).then_some(pass), flags).map_err(os_error)
 }
 
-fn pass_arg(args: &[Value], i: usize) -> RawFd {
-    match args.get(i).and_then(Value::as_num_opt) {
+fn pass_arg(fd: Option<f64>) -> RawFd {
+    match fd {
         Some(n) if n >= 0.0 && n <= i32::MAX as f64 => n as RawFd,
         _ => -1,
     }
@@ -287,21 +289,15 @@ fn pass_arg(args: &[Value], i: usize) -> RawFd {
 /// `(socketId, bytes, fd)` — `uv_try_write` for a channel: send what the socket takes right now,
 /// with `fd` (-1 for none) riding on the first byte. Returns the byte count; the descriptor went
 /// out iff it is positive.
-pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
+pub(super) fn try_send_msg(ctx: &mut Ctx, sid: u64, data: &[u8], pass: Option<f64>) -> f64 {
     let stream = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
         .map(|e| e.stream.clone());
-    let Some(stream) = stream else {
-        return Ok(Value::Num(0.0));
-    };
-    let data = ctx
-        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "trySendMsg expects bytes"))?;
-    let pass = pass_arg(args, 2);
+    let Some(stream) = stream else { return 0.0 };
+    let pass = pass_arg(pass);
     if data.is_empty() {
-        return Ok(Value::Num(0.0));
+        return 0.0;
     }
     let fd = stream.raw_fd();
     // Darwin blocks a send larger than the free buffer space despite MSG_DONTWAIT (see try_write).
@@ -319,22 +315,23 @@ pub(super) fn op_try_send_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resul
         &data[..data.len().min(space)]
     };
     if data.is_empty() {
-        return Ok(Value::Num(0.0));
+        return 0.0;
     }
-    Ok(Value::Num(
-        send_with_fd(fd, &data, pass, true).unwrap_or(0) as f64
-    ))
+    send_with_fd(fd, data, pass, true).unwrap_or(0) as f64
 }
 
 /// `(socketId, bytes, fd, resolve, reject)` — write all bytes on a worker thread, `fd` (-1 for
 /// none) attached to the first chunk.
-pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let sid = arg_u64(args, 0);
-    let data = ctx
-        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "writeMsg expects bytes"))?;
-    let pass = pass_arg(args, 2);
-    let (resolve, reject) = take_resolve_reject(ctx, args.get(3), args.get(4))?;
+pub(super) fn write_msg(
+    ctx: &mut Ctx,
+    sid: u64,
+    data: Vec<u8>,
+    pass: Option<f64>,
+    resolve: Value,
+    reject: Value,
+) -> Result<(), OpError> {
+    let pass = pass_arg(pass);
+    let (resolve, reject) = take_resolve_reject(Some(&resolve), Some(&reject))?;
     let stream = ctx
         .host_mut::<NetRegistry>()
         .and_then(|r| r.sockets.get(&sid))
@@ -343,7 +340,7 @@ pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<V
         let e = std::io::Error::from_raw_os_error(libc::EPIPE);
         let err = net_error_value(ctx, &net_err("write", &e, None));
         enqueue(ctx, reject, vec![err]);
-        return Ok(Value::Undefined);
+        return Ok(());
     };
     let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
     completions(ctx).run_blocking(id, move || {
@@ -365,26 +362,25 @@ pub(super) fn op_write_msg(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<V
         };
         Box::new(result)
     });
-    Ok(Value::Undefined)
+    Ok(())
 }
 
 /// `(fd)` — libuv's `uv_guess_handle`: "TCP", "TTY", "UDP", "FILE", "PIPE" or "UNKNOWN".
-pub(super) fn op_guess_handle(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd = match args.first().and_then(Value::as_num_opt) {
-        Some(n) if n >= 0.0 && n <= i32::MAX as f64 && n.fract() == 0.0 => n as RawFd,
-        _ => return Ok(Value::str("UNKNOWN")),
+pub(super) fn guess_handle(fd: Option<f64>) -> &'static str {
+    let Some(fd) = fd.and_then(fd_arg) else {
+        return "UNKNOWN";
     };
     // SAFETY: isatty/fstat on an arbitrary descriptor number only report on it.
     if unsafe { libc::isatty(fd) } == 1 {
-        return Ok(Value::str("TTY"));
+        return "TTY";
     }
     // SAFETY: a zeroed stat is a valid out-buffer.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
     if unsafe { libc::fstat(fd, &mut st) } < 0 {
-        return Ok(Value::str("UNKNOWN"));
+        return "UNKNOWN";
     }
-    let kind = match st.st_mode & libc::S_IFMT {
+    match st.st_mode & libc::S_IFMT {
         libc::S_IFREG | libc::S_IFCHR => "FILE",
         libc::S_IFIFO => "PIPE",
         libc::S_IFSOCK => {
@@ -397,25 +393,23 @@ pub(super) fn op_guess_handle(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Resu
             }
         }
         _ => "UNKNOWN",
-    };
-    Ok(Value::str(kind))
+    }
 }
 
 /// `(fd)` — a close-on-exec duplicate, so a queued handle write keeps its descriptor even if the
 /// handle is closed before the write goes out. -1 on failure.
-pub(super) fn op_dup_fd(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd = pass_arg(args, 0);
+pub(super) fn dup_fd(fd: Option<f64>) -> f64 {
+    let fd = pass_arg(fd);
     if fd < 0 {
-        return Ok(Value::Num(-1.0));
+        return -1.0;
     }
-    Ok(Value::Num(lumen_os::net::dup(fd).unwrap_or(-1) as f64))
+    lumen_os::net::dup(fd).unwrap_or(-1) as f64
 }
 
 /// `(fd)` — close a raw descriptor this glue owns (a `dupFd` copy, an unclaimed received one).
-pub(super) fn op_close_fd(_ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let fd = pass_arg(args, 0);
+pub(super) fn close_fd(fd: Option<f64>) {
+    let fd = pass_arg(fd);
     if fd >= 0 {
         let _ = lumen_os::net::close(fd);
     }
-    Ok(Value::Undefined)
 }

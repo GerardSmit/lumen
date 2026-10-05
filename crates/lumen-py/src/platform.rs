@@ -127,6 +127,11 @@ pub trait Platform {
     fn sleep(&mut self, secs: f64);
     fn entropy(&mut self, buf: &mut [u8]);
 
+    /// Whether Python threads may run on OS threads of this host.
+    fn supports_threads(&self) -> bool {
+        false
+    }
+
     /// The file system every path and descriptor operation below goes through.
     fn filesystem(&self) -> Arc<dyn FileSystem> {
         static NONE: OnceLock<Arc<dyn FileSystem>> = OnceLock::new();
@@ -517,6 +522,10 @@ impl Platform for StdPlatform {
         std::thread::sleep(std::time::Duration::try_from_secs_f64(secs).unwrap_or_default());
     }
 
+    fn supports_threads(&self) -> bool {
+        cfg!(not(target_arch = "wasm32"))
+    }
+
     fn entropy(&mut self, buf: &mut [u8]) {
         let _ = lumen_os::proc::entropy(buf);
     }
@@ -750,6 +759,10 @@ impl Platform for MemPlatform {
 
     fn sleep(&mut self, secs: f64) {
         self.inner.sleep(secs)
+    }
+
+    fn supports_threads(&self) -> bool {
+        self.inner.supports_threads()
     }
 
     fn entropy(&mut self, buf: &mut [u8]) {

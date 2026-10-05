@@ -1,36 +1,48 @@
 //! `str` methods.
 
-use super::numeric::{reg_binops, reg_compare};
-use super::slots::reg_slots;
+use super::slots::{reg_binops, reg_compare, reg_slots};
+use crate::bind::{KwArgs, PyCx, PyHost, This};
 use crate::object::*;
 use crate::unicode::Case;
 use crate::vm::*;
+use lumen_bind::{FromArg, Host, Passed, Slot};
 use lumen_common::search;
-use lumen_common::smuggle::{code_points, may_contain};
+use lumen_common::smuggle::{code_points, count_code_points, may_contain, push_code_point};
 use lumen_common::ucd::{char_type, flag};
 use std::rc::Rc;
 
-type Kw<'a> = &'a [(Obj, Value)];
+/// A `str` (or subclass instance): the receiver of the str methods.
+#[derive(Clone, Copy)]
+pub struct StrRef<'a>(pub &'a Value, pub &'a PyStr);
 
-fn this<'a>(it: &mut Interp, a: &'a [Value], name: &str) -> R<&'a PyStr> {
-    match a.first().and_then(|v| v.as_pystr()) {
-        Some(s) => Ok(s),
-        None => {
-            let t = a.first().map(|v| it.type_name_of(v)).unwrap_or_default();
-            Err(it.type_error(&format!(
-                "descriptor '{}' for 'str' objects doesn't apply to a '{}' object",
-                name, t
-            )))
+impl<'a> FromArg<'a, PyHost> for StrRef<'a> {
+    #[inline(always)]
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, at: Slot) -> Result<Self, Obj> {
+        match v.as_pystr() {
+            Some(s) => Ok(StrRef(v, s)),
+            None => Err(cx.arg_error(at, "str", v)),
         }
     }
 }
 
-fn str_arg<'a>(it: &mut Interp, v: &'a Value, meth: &str) -> R<&'a str> {
-    match v.as_str() {
-        Some(s) => Ok(s),
-        None => {
-            let t = it.type_name_of(v);
-            Err(it.type_error(&format!("{}() argument must be str, not {}", meth, t)))
+/// The `fillchar` of `ljust` / `rjust` / `center`: exactly one character.
+#[derive(Clone, Copy)]
+pub struct Fill<'a>(&'a str);
+
+impl<'a> FromArg<'a, PyHost> for Fill<'a> {
+    fn from_arg(cx: &'a PyCx<'_>, v: &'a Value, _: Slot) -> Result<Self, Obj> {
+        match v.as_str() {
+            Some(s) if count_code_points(s) == 1 => Ok(Fill(s)),
+            Some(_) => Err(PyHost::with_ctx(cx, |it| {
+                it.type_error("The fill character must be exactly one character long")
+            })),
+            None => Err(PyHost::with_ctx(cx, |it| {
+                let t = it.type_name_of(v);
+                it.type_error(&format!(
+                    "The fill character must be a unicode character, not {}",
+                    t
+                ))
+            })),
         }
     }
 }
@@ -39,50 +51,14 @@ fn is_py_space(c: char) -> bool {
     crate::unicode::is_space(c as u32)
 }
 
-fn str_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let cls = match a.first() {
-        Some(Value::Obj(c)) if matches!(c.kind, Kind::Type(_)) => c.clone(),
-        _ => return Err(it.type_error("str.__new__(X): X is not a type object")),
-    };
-    let b = it.bind_args("str", &a[1..], kw, &["object", "encoding", "errors"], 0)?;
-    let v = match &b[0] {
-        None => Value::str(""),
-        Some(x) => {
-            if b[1].is_some() || b[2].is_some() {
-                let enc = match &b[1] {
-                    Some(e) => it.str_arg(e, "str() argument 'encoding'")?,
-                    None => "utf-8".into(),
-                };
-                let errs = match &b[2] {
-                    Some(e) => it.str_arg(e, "str() argument 'errors'")?,
-                    None => "strict".into(),
-                };
-                let data = match x {
-                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
-                        it.bytes_of(x)?
-                    }
-                    _ => {
-                        let t = it.type_name_of(x);
-                        return Err(it.type_error(&format!(
-                            "decoding to str: need a bytes-like object, {} found",
-                            t
-                        )));
-                    }
-                };
-                Value::string(it.decode_bytes(&data, &enc, &errs)?)
-            } else {
-                it.str_value(x)?
-            }
+fn must_be_str<'a>(it: &mut Interp, v: &'a Value) -> R<&'a str> {
+    match v.as_str() {
+        Some(s) => Ok(s),
+        None => {
+            let t = it.type_name_of(v);
+            Err(it.type_error(&format!("must be str, not {}", t)))
         }
-    };
-    if Rc::ptr_eq(&cls, &it.types.str_) {
-        return Ok(v);
     }
-    let s = v.as_str().unwrap_or("").to_string();
-    Ok(Value::Obj(Object::with_cls(
-        cls,
-        Kind::Str(PyStr::from_box(s.into_boxed_str())),
-    )))
 }
 
 impl Interp {
@@ -95,41 +71,21 @@ impl Interp {
     }
 }
 
-fn convert_case(it: &mut Interp, a: &[Value], name: &str, case: Case) -> R<Value> {
-    let s = this(it, a, name)?;
-    Ok(Value::string(crate::unicode::convert(&s.s, case)))
-}
-
-fn upper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "upper", Case::Upper)
-}
-
-fn lower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "lower", Case::Lower)
-}
-
-fn casefold(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "casefold", Case::Fold)
-}
-
-fn capitalize(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "capitalize", Case::Capitalize)
-}
-
-fn title(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "title", Case::Title)
-}
-
-fn swapcase(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    convert_case(it, a, "swapcase", Case::SwapCase)
-}
-
-fn strip_impl(it: &mut Interp, a: &[Value], name: &str, left: bool, right: bool) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 1, 2)?;
-    let s = this(it, a, name)?;
-    let chars: Option<Vec<u32>> = match a.get(1) {
+fn strip_impl(
+    it: &mut Interp,
+    slf: StrRef<'_>,
+    chars: Option<&Value>,
+    name: &str,
+    left: bool,
+    right: bool,
+) -> R<Value> {
+    let StrRef(v, s) = slf;
+    let chars: Option<Vec<u32>> = match chars {
         Some(Value::None) | None => None,
-        Some(v) => Some(str_arg(it, v, name).map(|x| code_points(x).collect())?),
+        Some(c) => match c.as_str() {
+            Some(x) => Some(code_points(x).collect()),
+            None => return Err(it.type_error(&format!("{} arg must be None or str", name))),
+        },
     };
     let pred = |c: u32| match &chars {
         None => char::from_u32(c).is_some_and(is_py_space),
@@ -166,43 +122,30 @@ fn strip_impl(it: &mut Interp, a: &[Value], name: &str, left: bool, right: bool)
             t = t.trim_end_matches(pred);
         }
     }
-    if t.len() == s.s.len()
-        && a[0].as_str().is_some()
-        && matches!(&a[0], Value::Obj(o) if o.cls.is_none())
-    {
-        return Ok(a[0].clone());
+    if t.len() == s.s.len() && matches!(v, Value::Obj(o) if o.cls.is_none()) {
+        return Ok(v.clone());
     }
     Ok(Value::str(t))
 }
 
-fn strip(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    strip_impl(it, a, "strip", true, true)
-}
-fn lstrip(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    strip_impl(it, a, "lstrip", true, false)
-}
-fn rstrip(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    strip_impl(it, a, "rstrip", false, true)
-}
-
-fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> R<Value> {
-    let b = it.bind_args(name, &a[1.min(a.len())..], kw, &["sep", "maxsplit"], 0)?;
-    let s = this(it, a, name)?;
-    let sep: Option<String> = match &b[0] {
+fn split_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    sep: Option<&Value>,
+    max: isize,
+    right: bool,
+) -> R<Value> {
+    let sep: Option<&str> = match sep {
         None | Some(Value::None) => None,
-        Some(v) => Some(
-            str_arg(it, v, "must be str or None, not")
-                .map(|x| x.to_string())
-                .map_err(|_| {
-                    let t = it.type_name_of(v);
-                    it.type_error(&format!("must be str or None, not {}", t))
-                })?,
-        ),
+        Some(v) => match v.as_str() {
+            Some(x) => Some(x),
+            None => {
+                let t = it.type_name_of(v);
+                return Err(it.type_error(&format!("must be str or None, not {}", t)));
+            }
+        },
     };
-    let max = match &b[1] {
-        Some(v) => it.index_of(v)?,
-        None => -1,
-    };
+    let max = max as i64;
     let mut out: Vec<Value> = Vec::new();
     match sep {
         Some(sep) => {
@@ -213,7 +156,7 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> 
                 let mut rest: &str = &s.s;
                 let mut n = 0;
                 while max < 0 || n < max {
-                    match rest.find(&sep) {
+                    match rest.find(sep) {
                         Some(i) => {
                             out.push(Value::str(&rest[..i]));
                             rest = &rest[i + sep.len()..];
@@ -226,20 +169,18 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> 
             } else {
                 let mut rest: &str = &s.s;
                 let mut n = 0;
-                let mut tail: Vec<Value> = Vec::new();
                 while max < 0 || n < max {
-                    match rest.rfind(&sep) {
+                    match rest.rfind(sep) {
                         Some(i) => {
-                            tail.push(Value::str(&rest[i + sep.len()..]));
+                            out.push(Value::str(&rest[i + sep.len()..]));
                             rest = &rest[..i];
                             n += 1;
                         }
                         None => break,
                     }
                 }
-                tail.push(Value::str(rest));
-                tail.reverse();
-                out = tail;
+                out.push(Value::str(rest));
+                out.reverse();
             }
         }
         None => {
@@ -263,86 +204,32 @@ fn split_impl(it: &mut Interp, a: &[Value], kw: Kw, name: &str, right: bool) -> 
             } else {
                 let mut rest: &str = &s.s;
                 let mut n = 0;
-                let mut tail: Vec<Value> = Vec::new();
                 loop {
                     rest = rest.trim_end_matches(is_py_space);
                     if rest.is_empty() {
                         break;
                     }
                     if max >= 0 && n >= max {
-                        tail.push(Value::str(rest));
+                        out.push(Value::str(rest));
                         break;
                     }
                     let start = rest
                         .rfind(is_py_space)
                         .map(|i| i + rest[i..].chars().next().map_or(1, |c| c.len_utf8()))
                         .unwrap_or(0);
-                    tail.push(Value::str(&rest[start..]));
+                    out.push(Value::str(&rest[start..]));
                     rest = &rest[..start];
                     n += 1;
                 }
-                tail.reverse();
-                out = tail;
+                out.reverse();
             }
         }
     }
     Ok(Value::list(out))
 }
 
-fn split(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    split_impl(it, a, kw, "split", false)
-}
-fn rsplit(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    split_impl(it, a, kw, "rsplit", true)
-}
-
-fn splitlines(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("splitlines", &a[1.min(a.len())..], kw, &["keepends"], 0)?;
-    let keep = match &b[0] {
-        Some(v) => it.truthy(v)?,
-        None => false,
-    };
-    let s = this(it, a, "splitlines")?;
-    let chars: Vec<(usize, char)> = s.s.char_indices().collect();
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        let (bi, c) = chars[i];
-        let is_break = matches!(
-            c,
-            '\n' | '\r'
-                | '\x0b'
-                | '\x0c'
-                | '\x1c'
-                | '\x1d'
-                | '\x1e'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        );
-        if is_break {
-            let mut end = bi + c.len_utf8();
-            if c == '\r' && i + 1 < chars.len() && chars[i + 1].1 == '\n' {
-                i += 1;
-                end += 1;
-            }
-            let line_end = if keep { end } else { bi };
-            out.push(Value::str(&s.s[start..line_end]));
-            start = end;
-        }
-        i += 1;
-    }
-    if start < s.s.len() {
-        out.push(Value::str(&s.s[start..]));
-    }
-    Ok(Value::list(out))
-}
-
-fn partition_impl(it: &mut Interp, a: &[Value], right: bool) -> R<Value> {
-    it.check_args("partition", a, 2, 2)?;
-    let s = this(it, a, "partition")?;
-    let sep = str_arg(it, &a[1], "partition")?;
+fn partition_impl(it: &mut Interp, s: &PyStr, sep: &Value, right: bool) -> R<Value> {
+    let sep = must_be_str(it, sep)?;
     if sep.is_empty() {
         return Err(it.value_error("empty separator"));
     }
@@ -353,134 +240,32 @@ fn partition_impl(it: &mut Interp, a: &[Value], right: bool) -> R<Value> {
             Value::str(sep),
             Value::str(&s.s[i + sep.len()..]),
         ]),
-        None => {
-            if right {
-                Value::tuple(vec![Value::str(""), Value::str(""), Value::str(&s.s)])
-            } else {
-                Value::tuple(vec![Value::str(&s.s), Value::str(""), Value::str("")])
-            }
-        }
+        None if right => Value::tuple(vec![Value::str(""), Value::str(""), Value::str(&s.s)]),
+        None => Value::tuple(vec![Value::str(&s.s), Value::str(""), Value::str("")]),
     })
 }
 
-fn partition(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    partition_impl(it, a, false)
-}
-fn rpartition(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    partition_impl(it, a, true)
-}
-
-fn join(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.join", a, 2, 2)?;
-    let sep = this(it, a, "join")?.s.clone();
-    let items = it.iterate_to_vec(&a[1])?;
-    let mut total = sep.len().saturating_mul(items.len().saturating_sub(1));
-    for v in &items {
-        total = total.saturating_add(v.as_str().map_or(0, str::len));
-    }
-    let mut out = it.string_with_capacity(total)?;
-    for (i, v) in items.iter().enumerate() {
-        if i & 0x3ff == 0 {
-            it.poll()?;
-        }
-        match v.as_str() {
-            Some(s) => {
-                if i > 0 {
-                    out.push_str(&sep);
-                }
-                out.push_str(s);
-            }
-            None => {
-                let t = it.type_name_of(v);
-                return Err(it.type_error(&format!(
-                    "sequence item {}: expected str instance, {} found",
-                    i, t
-                )));
-            }
-        }
-    }
-    Ok(Value::string(out))
-}
-
-fn replace(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args(
-        "replace",
-        &a[1.min(a.len())..],
-        kw,
-        &["old", "new", "count"],
-        2,
-    )?;
-    let s = this(it, a, "replace")?;
-    let old = str_arg(it, b[0].as_ref().unwrap_or(&Value::None), "replace")?.to_string();
-    let new = str_arg(it, b[1].as_ref().unwrap_or(&Value::None), "replace")?.to_string();
-    let count = match &b[2] {
-        Some(v) => it.index_of(v)?,
-        None => -1,
-    };
-    let growth = new.len().saturating_sub(old.len());
-    if growth > 0 {
-        let hits = if old.is_empty() {
-            let n = s.nchars + 1;
-            if count < 0 {
-                n
-            } else {
-                n.min(count as usize)
-            }
-        } else {
-            let n = s.s.matches(old.as_str()).count();
-            if count < 0 {
-                n
-            } else {
-                n.min(count as usize)
-            }
-        };
-        let extra = if old.is_empty() {
-            new.len().saturating_mul(hits)
-        } else {
-            growth.saturating_mul(hits)
-        };
-        it.check_str_len(s.s.len().saturating_add(extra))?;
-    }
-    if count < 0 {
-        if old.is_empty() {
-            let mut out = String::new();
-            for c in s.s.chars() {
-                out.push_str(&new);
-                out.push(c);
-            }
-            out.push_str(&new);
-            return Ok(Value::string(out));
-        }
-        return Ok(Value::string(s.s.replace(&old, &new)));
-    }
-    if old.is_empty() {
-        let mut out = String::new();
-        let mut n = 0;
-        for c in s.s.chars() {
-            if n < count {
-                out.push_str(&new);
-                n += 1;
-            }
-            out.push(c);
-        }
-        if n < count {
-            out.push_str(&new);
-        }
-        return Ok(Value::string(out));
-    }
-    Ok(Value::string(s.s.replacen(&old, &new, count as usize)))
-}
-
-fn opt_range(it: &mut Interp, a: &[Value], from: usize, nchars: usize) -> R<(usize, usize)> {
+/// The optional `start` / `end` of `find` and friends (`_PyEval_SliceIndex`), clamped to
+/// `0..=nchars` (`start` may reach `nchars + 1`, so a search past the end finds nothing).
+fn opt_range(
+    it: &mut Interp,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    nchars: usize,
+) -> R<(usize, usize)> {
     let get = |it: &mut Interp, v: Option<&Value>, dflt: i64| -> R<i64> {
         match v {
             None | Some(Value::None) => Ok(dflt),
+            Some(Value::Int(i)) => Ok(*i),
+            Some(v) if !it.has_index(v) => Err(
+                it.type_error("slice indices must be integers or None or have an __index__ method")
+            ),
             Some(v) => it.slice_index(v),
         }
     };
     let n = nchars as i64;
-    let mut s = get(it, a.get(from), 0)?;
-    let mut e = get(it, a.get(from + 1), n)?;
+    let mut s = get(it, start, 0)?;
+    let mut e = get(it, end, n)?;
     if s < 0 {
         s = s.saturating_add(n).max(0);
     }
@@ -490,17 +275,17 @@ fn opt_range(it: &mut Interp, a: &[Value], from: usize, nchars: usize) -> R<(usi
     Ok((s.min(n + 1) as usize, e.min(n) as usize))
 }
 
-fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 2, 4)?;
-    let s = this(it, a, name)?;
-    let sub = match a[1].as_str() {
-        Some(x) => x,
-        None => {
-            let t = it.type_name_of(&a[1]);
-            return Err(it.type_error(&format!("must be str, not {}", t)));
-        }
-    };
-    let (st, en) = opt_range(it, a, 2, s.nchars)?;
+fn find_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    sub: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    right: bool,
+    raise: bool,
+) -> R<i64> {
+    let sub = must_be_str(it, sub)?;
+    let (st, en) = opt_range(it, start, end, s.nchars)?;
     let found = if st > en || st > s.nchars {
         None
     } else {
@@ -516,186 +301,85 @@ fn find_impl(it: &mut Interp, a: &[Value], name: &str, right: bool, raise: bool)
             if s.ascii {
                 bs + p
             } else {
-                lumen_common::smuggle::count_code_points(&s.s[..bs + p])
+                count_code_points(&s.s[..bs + p])
             }
         })
     };
     match found {
-        Some(i) => Ok(Value::Int(i as i64)),
-        None => {
-            if raise {
-                Err(it.value_error("substring not found"))
-            } else {
-                Ok(Value::Int(-1))
-            }
-        }
+        Some(i) => Ok(i as i64),
+        None if raise => Err(it.value_error("substring not found")),
+        None => Ok(-1),
     }
 }
 
-fn find(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    find_impl(it, a, "find", false, false)
-}
-fn rfind(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    find_impl(it, a, "rfind", true, false)
-}
-fn index(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    find_impl(it, a, "index", false, true)
-}
-fn rindex(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    find_impl(it, a, "rindex", true, true)
-}
-
-fn count(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.count", a, 2, 4)?;
-    let s = this(it, a, "count")?;
-    let sub = match a[1].as_str() {
-        Some(x) => x,
-        None => {
-            let t = it.type_name_of(&a[1]);
-            return Err(it.type_error(&format!("must be str, not {}", t)));
-        }
+fn startswith_impl(
+    it: &mut Interp,
+    s: &PyStr,
+    prefix: &Value,
+    start: Option<&Value>,
+    end: Option<&Value>,
+    name: &str,
+    at_end: bool,
+) -> R<bool> {
+    let (st, en) = opt_range(it, start, end, s.nchars)?;
+    let hay = if st > en || st > s.nchars {
+        None
+    } else {
+        Some(s.slice(st, en))
     };
-    let (st, en) = opt_range(it, a, 2, s.nchars)?;
-    if st > en {
-        return Ok(Value::Int(0));
-    }
-    let hay = s.slice(st, en);
-    if sub.is_empty() {
-        return Ok(Value::Int(
-            lumen_common::smuggle::count_code_points(hay) as i64 + 1,
-        ));
-    }
-    Ok(Value::Int(
-        search::count(hay.as_bytes(), sub.as_bytes(), usize::MAX) as i64,
-    ))
-}
-
-fn startswith_impl(it: &mut Interp, a: &[Value], name: &str, end: bool) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 2, 4)?;
-    let s = this(it, a, name)?;
-    let (st, en) = opt_range(it, a, 2, s.nchars)?;
-    if st > en || st > s.nchars {
-        return Ok(Value::Bool(false));
-    }
-    let hay = s.slice(st, en);
     let test = |p: &str| {
-        if end {
-            hay.ends_with(p)
-        } else {
-            hay.starts_with(p)
-        }
+        hay.is_some_and(|h| {
+            if at_end {
+                h.ends_with(p)
+            } else {
+                h.starts_with(p)
+            }
+        })
     };
-    match &a[1] {
-        v if v.as_str().is_some() => Ok(Value::Bool(test(v.as_str().unwrap_or("")))),
-        v => match v.tuple_items() {
-            Some(items) => {
-                for x in items {
-                    match x.as_str() {
-                        Some(p) => {
-                            if test(p) {
-                                return Ok(Value::Bool(true));
-                            }
-                        }
-                        None => {
-                            let t = it.type_name_of(x);
-                            return Err(it.type_error(&format!(
-                                "tuple for {} must only contain str, not {}",
-                                name, t
-                            )));
+    if let Some(p) = prefix.as_str() {
+        return Ok(test(p));
+    }
+    match prefix.tuple_items() {
+        Some(items) => {
+            for x in items {
+                match x.as_str() {
+                    Some(p) => {
+                        if test(p) {
+                            return Ok(true);
                         }
                     }
+                    None => {
+                        let t = it.type_name_of(x);
+                        return Err(it.type_error(&format!(
+                            "tuple for {} must only contain str, not {}",
+                            name, t
+                        )));
+                    }
                 }
-                Ok(Value::Bool(false))
             }
-            None => {
-                let t = it.type_name_of(v);
-                Err(it.type_error(&format!(
-                    "{} first arg must be str or a tuple of str, not {}",
-                    name, t
-                )))
-            }
-        },
+            Ok(false)
+        }
+        None => {
+            let t = it.type_name_of(prefix);
+            Err(it.type_error(&format!(
+                "{} first arg must be str or a tuple of str, not {}",
+                name, t
+            )))
+        }
     }
 }
 
-fn startswith(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    startswith_impl(it, a, "startswith", false)
-}
-fn endswith(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    startswith_impl(it, a, "endswith", true)
+fn all_chars(s: &PyStr, nonempty: bool, f: impl Fn(u32) -> bool) -> bool {
+    (!nonempty || s.nchars > 0) && code_points(&s.s).all(f)
 }
 
-fn removeprefix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("removeprefix", a, 2, 2)?;
-    let s = this(it, a, "removeprefix")?;
-    let p = str_arg(it, &a[1], "removeprefix")?;
-    Ok(Value::str(s.s.strip_prefix(p).unwrap_or(&s.s)))
-}
-
-fn removesuffix(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("removesuffix", a, 2, 2)?;
-    let s = this(it, a, "removesuffix")?;
-    let p = str_arg(it, &a[1], "removesuffix")?;
-    Ok(Value::str(if p.is_empty() {
-        &s.s
-    } else {
-        s.s.strip_suffix(p).unwrap_or(&s.s)
-    }))
-}
-
-fn all_chars(
-    it: &mut Interp,
-    a: &[Value],
-    name: &str,
-    nonempty: bool,
-    f: impl Fn(u32) -> bool,
-) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 1, 1)?;
-    let s = this(it, a, name)?;
-    Ok(Value::Bool(
-        (!nonempty || s.nchars > 0) && code_points(&s.s).all(f),
-    ))
-}
-
-fn all_have(it: &mut Interp, a: &[Value], name: &str, f: u16) -> R<Value> {
-    all_chars(it, a, name, true, |c| crate::unicode::has(c, f))
-}
-
-fn isalpha(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_have(it, a, "isalpha", flag::ALPHA)
-}
-fn isalnum(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_have(
-        it,
-        a,
-        "isalnum",
-        flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC,
-    )
-}
-fn isdigit(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_have(it, a, "isdigit", flag::DIGIT)
-}
-fn isdecimal(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_have(it, a, "isdecimal", flag::DECIMAL)
-}
-fn isnumeric(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_have(it, a, "isnumeric", flag::NUMERIC)
-}
-fn isspace(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isspace", true, crate::unicode::is_space)
-}
-fn isascii(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isascii", false, |c| c < 0x80)
-}
-fn isprintable(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    all_chars(it, a, "isprintable", false, crate::unicode::is_printable)
+fn all_have(s: &PyStr, f: u16) -> bool {
+    all_chars(s, true, |c| crate::unicode::has(c, f))
 }
 
 /// `str.isupper` (`upper`) or `str.islower`: some cased character, and none of the other case
 /// or titlecase.
-fn is_one_case(it: &mut Interp, a: &[Value], name: &str, upper: bool) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 1, 1)?;
-    let s = this(it, a, name)?;
+fn is_one_case(s: &PyStr, upper: bool) -> bool {
     let (want, other) = if upper {
         (flag::UPPER, flag::LOWER)
     } else {
@@ -705,79 +389,30 @@ fn is_one_case(it: &mut Interp, a: &[Value], name: &str, upper: bool) -> R<Value
     for c in code_points(&s.s) {
         let t = char_type(c);
         if t.is(other | flag::TITLE) {
-            return Ok(Value::Bool(false));
+            return false;
         }
         cased |= t.is(want);
     }
-    Ok(Value::Bool(cased))
+    cased
 }
 
-fn isupper(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    is_one_case(it, a, "isupper", true)
-}
-
-fn islower(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    is_one_case(it, a, "islower", false)
-}
-
-fn istitle(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.istitle", a, 1, 1)?;
-    let s = this(it, a, "istitle")?;
-    let mut prev_cased = false;
-    let mut cased = false;
-    for c in code_points(&s.s) {
-        let t = char_type(c);
-        if t.is(flag::UPPER | flag::TITLE) {
-            if prev_cased {
-                return Ok(Value::Bool(false));
-            }
-            prev_cased = true;
-            cased = true;
-        } else if t.is(flag::LOWER) {
-            if !prev_cased {
-                return Ok(Value::Bool(false));
-            }
-            prev_cased = true;
-            cased = true;
-        } else {
-            prev_cased = false;
-        }
-    }
-    Ok(Value::Bool(cased))
-}
-
-fn isidentifier(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.isidentifier", a, 1, 1)?;
-    let s = this(it, a, "isidentifier")?;
-    let mut cps = code_points(&s.s);
-    let ok = match cps.next() {
-        Some(c) => {
-            (c == '_' as u32 || crate::unicode::has(c, flag::XID_START))
-                && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE))
-        }
-        None => false,
-    };
-    Ok(Value::Bool(ok))
-}
-
-fn fill_arg(it: &mut Interp, a: &[Value], idx: usize) -> R<String> {
-    match a.get(idx) {
-        None => Ok(" ".into()),
-        Some(v) => match v.as_str() {
-            Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => Ok(s.to_string()),
-            _ => Err(it.type_error("The fill character must be exactly one character long")),
-        },
-    }
-}
-
-fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
-    it.check_args(&format!("str.{}", name), a, 2, 3)?;
-    let s = this(it, a, name)?;
-    let width = it.index_of(&a[1])?;
-    let fill = fill_arg(it, a, 2)?;
+fn justify(
+    it: &mut Interp,
+    slf: StrRef<'_>,
+    width: isize,
+    fill: Passed<Fill<'_>>,
+    mode: u8,
+) -> R<Value> {
+    let StrRef(v, s) = slf;
+    let fill = fill.0.map_or(" ", |f| f.0);
     let n = s.nchars as i64;
+    let width = width as i64;
     if width <= n {
-        return Ok(Value::str(&s.s));
+        return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) {
+            v.clone()
+        } else {
+            Value::str(&s.s)
+        });
     }
     let total = (width - n) as usize;
     it.check_str_len(total.saturating_mul(fill.len()).saturating_add(s.s.len()))?;
@@ -795,265 +430,949 @@ fn justify(it: &mut Interp, a: &[Value], name: &str, mode: u8) -> R<Value> {
     Ok(Value::string(out))
 }
 
-fn ljust(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    justify(it, a, "ljust", 0)
-}
-fn rjust(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    justify(it, a, "rjust", 1)
-}
-fn center(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    justify(it, a, "center", 2)
-}
+#[lumen_bind::class(name = "str")]
+/// str(object='') -> str
+/// str(bytes_or_buffer[, encoding[, errors]]) -> str
+///
+/// Create a new string object from the given object. If encoding or
+/// errors is specified, then the object must expose a data buffer
+/// that will be decoded using the given encoding and error handler.
+/// Otherwise, returns the result of object.__str__() (if defined)
+/// or repr(object).
+/// encoding defaults to sys.getdefaultencoding().
+/// errors defaults to 'strict'.
+pub struct Str;
 
-fn zfill(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("str.zfill", a, 2, 2)?;
-    let s = this(it, a, "zfill")?;
-    let width = it.index_of(&a[1])?;
-    let n = s.nchars as i64;
-    if width <= n {
-        return Ok(Value::str(&s.s));
+#[lumen_bind::methods]
+impl Str {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[kw] object: Passed<&Value>,
+        #[kw] encoding: Passed<&str>,
+        #[kw] errors: Passed<&str>,
+    ) -> R<Value> {
+        let Value::Obj(cls) = &*cls else {
+            unreachable!("checked by the entry")
+        };
+        let v = match object.0 {
+            None => Value::str(""),
+            Some(x) if encoding.0.is_none() && errors.0.is_none() => it.str_value(x)?,
+            Some(x) => {
+                let data = match x {
+                    Value::Obj(o) if matches!(o.kind, Kind::Bytes(_) | Kind::ByteArray(_)) => {
+                        it.bytes_of(x)?
+                    }
+                    Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => {
+                        return Err(it.type_error("decoding str is not supported"));
+                    }
+                    _ => {
+                        let t = it.type_name_of(x);
+                        return Err(it.type_error(&format!(
+                            "decoding to str: need a bytes-like object, {} found",
+                            t
+                        )));
+                    }
+                };
+                Value::string(it.decode_bytes(
+                    &data,
+                    encoding.0.unwrap_or("utf-8"),
+                    errors.0.unwrap_or("strict"),
+                )?)
+            }
+        };
+        if Rc::ptr_eq(cls, &it.types.str_) {
+            return Ok(v);
+        }
+        let s = v.as_str().unwrap_or("").to_string();
+        Ok(Value::Obj(Object::with_cls(
+            cls.clone(),
+            Kind::Str(PyStr::from_box(s.into_boxed_str())),
+        )))
     }
-    it.check_str_len((width - n) as usize + s.s.len())?;
-    let pad = "0".repeat((width - n) as usize);
-    let (sign, rest) = match s.s.chars().next() {
-        Some(c @ ('+' | '-')) => (c.to_string(), &s.s[1..]),
-        _ => (String::new(), &s.s[..]),
-    };
-    Ok(Value::string(format!("{}{}{}", sign, pad, rest)))
-}
 
-fn expandtabs(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("expandtabs", &a[1.min(a.len())..], kw, &["tabsize"], 0)?;
-    let ts = match &b[0] {
-        Some(v) => it.index_of(v)?,
-        None => 8,
-    };
-    if i32::try_from(ts).is_err() {
-        return Err(it.overflow_err("Python int too large to convert to C int"));
+    /// Return a copy of the string converted to uppercase.
+    #[method]
+    fn upper(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::Upper)
     }
-    let s = this(it, a, "expandtabs")?;
-    let mut out = String::new();
-    let mut col = 0i64;
-    for c in s.s.chars() {
-        match c {
-            '\t' => {
-                if ts > 0 {
-                    let n = ts - (col % ts);
-                    it.check_str_len(out.len() + n as usize)?;
-                    out.extend(std::iter::repeat_n(' ', n as usize));
-                    col += n;
+
+    /// Return a copy of the string converted to lowercase.
+    #[method]
+    fn lower(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::Lower)
+    }
+
+    /// Return a version of the string suitable for caseless comparisons.
+    #[method]
+    fn casefold(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::Fold)
+    }
+
+    /// Return a capitalized version of the string.
+    ///
+    /// More specifically, make the first character have upper case and the rest lower
+    /// case.
+    #[method]
+    fn capitalize(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::Capitalize)
+    }
+
+    /// Return a version of the string where each word is titlecased.
+    ///
+    /// More specifically, words start with uppercased characters and all remaining
+    /// cased characters have lower case.
+    #[method]
+    fn title(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::Title)
+    }
+
+    /// Convert uppercase characters to lowercase and lowercase characters to uppercase.
+    #[method]
+    fn swapcase(slf: This<StrRef<'_>>) -> String {
+        crate::unicode::convert(&slf.0 .1.s, Case::SwapCase)
+    }
+
+    /// Return a copy of the string with leading and trailing whitespace removed.
+    ///
+    /// If chars is given and not None, remove characters in chars instead.
+    #[method]
+    fn strip(slf: This<StrRef<'_>>, it: &mut Interp, chars: Option<&Value>) -> R<Value> {
+        strip_impl(it, slf.0, chars, "strip", true, true)
+    }
+
+    /// Return a copy of the string with leading whitespace removed.
+    ///
+    /// If chars is given and not None, remove characters in chars instead.
+    #[method]
+    fn lstrip(slf: This<StrRef<'_>>, it: &mut Interp, chars: Option<&Value>) -> R<Value> {
+        strip_impl(it, slf.0, chars, "lstrip", true, false)
+    }
+
+    /// Return a copy of the string with trailing whitespace removed.
+    ///
+    /// If chars is given and not None, remove characters in chars instead.
+    #[method]
+    fn rstrip(slf: This<StrRef<'_>>, it: &mut Interp, chars: Option<&Value>) -> R<Value> {
+        strip_impl(it, slf.0, chars, "rstrip", false, true)
+    }
+
+    /// Return a list of the substrings in the string, using sep as the separator string.
+    ///
+    ///   sep
+    ///     The separator used to split the string.
+    ///
+    ///     When set to None (the default value), will split on any whitespace
+    ///     character (including \n \r \t \f and spaces) and will discard
+    ///     empty strings from the result.
+    ///   maxsplit
+    ///     Maximum number of splits.
+    ///     -1 (the default value) means no limit.
+    ///
+    /// Splitting starts at the front of the string and works to the end.
+    ///
+    /// Note, str.split() is mainly useful for data that has been intentionally
+    /// delimited.  With natural text that includes punctuation, consider using
+    /// the regular expression module.
+    #[method]
+    fn split(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&Value>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
+        split_impl(it, slf.0 .1, sep, maxsplit, false)
+    }
+
+    /// Return a list of the substrings in the string, using sep as the separator string.
+    ///
+    ///   sep
+    ///     The separator used to split the string.
+    ///
+    ///     When set to None (the default value), will split on any whitespace
+    ///     character (including \n \r \t \f and spaces) and will discard
+    ///     empty strings from the result.
+    ///   maxsplit
+    ///     Maximum number of splits.
+    ///     -1 (the default value) means no limit.
+    ///
+    /// Splitting starts at the end of the string and works to the front.
+    #[method]
+    fn rsplit(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw] sep: Option<&Value>,
+        #[kw]
+        #[default(-1)]
+        maxsplit: isize,
+    ) -> R<Value> {
+        split_impl(it, slf.0 .1, sep, maxsplit, true)
+    }
+
+    /// Return a list of the lines in the string, breaking at line boundaries.
+    ///
+    /// Line breaks are not included in the resulting list unless keepends is given and
+    /// true.
+    #[method]
+    fn splitlines(
+        slf: This<StrRef<'_>>,
+        #[kw]
+        #[default(false)]
+        keepends: bool,
+    ) -> Value {
+        let s = &slf.0 .1.s;
+        let mut out = Vec::new();
+        let mut start = 0;
+        let mut chars = s.char_indices().peekable();
+        while let Some((bi, c)) = chars.next() {
+            if matches!(
+                c,
+                '\n' | '\r'
+                    | '\x0b'
+                    | '\x0c'
+                    | '\x1c'
+                    | '\x1d'
+                    | '\x1e'
+                    | '\u{85}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+            ) {
+                let mut end = bi + c.len_utf8();
+                if c == '\r' && chars.peek().is_some_and(|&(_, d)| d == '\n') {
+                    chars.next();
+                    end += 1;
+                }
+                out.push(Value::str(&s[start..if keepends { end } else { bi }]));
+                start = end;
+            }
+        }
+        if start < s.len() {
+            out.push(Value::str(&s[start..]));
+        }
+        Value::list(out)
+    }
+
+    /// Partition the string into three parts using the given separator.
+    ///
+    /// This will search for the separator in the string.  If the separator is found,
+    /// returns a 3-tuple containing the part before the separator, the separator
+    /// itself, and the part after it.
+    ///
+    /// If the separator is not found, returns a 3-tuple containing the original string
+    /// and two empty strings.
+    #[method]
+    fn partition(slf: This<StrRef<'_>>, it: &mut Interp, sep: &Value) -> R<Value> {
+        partition_impl(it, slf.0 .1, sep, false)
+    }
+
+    /// Partition the string into three parts using the given separator.
+    ///
+    /// This will search for the separator in the string, starting at the end. If
+    /// the separator is found, returns a 3-tuple containing the part before the
+    /// separator, the separator itself, and the part after it.
+    ///
+    /// If the separator is not found, returns a 3-tuple containing two empty strings
+    /// and the original string.
+    #[method]
+    fn rpartition(slf: This<StrRef<'_>>, it: &mut Interp, sep: &Value) -> R<Value> {
+        partition_impl(it, slf.0 .1, sep, true)
+    }
+
+    /// Concatenate any number of strings.
+    ///
+    /// The string whose method is called is inserted in between each given string.
+    /// The result is returned as a new string.
+    ///
+    /// Example: '.'.join(['ab', 'pq', 'rs']) -> 'ab.pq.rs'
+    #[method]
+    fn join(slf: This<StrRef<'_>>, it: &mut Interp, iterable: &Value) -> R<Value> {
+        let sep = &slf.0 .1.s;
+        let items = match iterable {
+            Value::Obj(o)
+                if o.cls.is_none() && matches!(o.kind, Kind::List(_) | Kind::Tuple(_)) =>
+            {
+                it.iterate_to_vec(iterable)?
+            }
+            _ => {
+                let iter = match it.get_iter(iterable) {
+                    Ok(i) => i,
+                    Err(e) if it.exc_is(&e, "TypeError") => {
+                        return Err(it.type_error("can only join an iterable"));
+                    }
+                    Err(e) => return Err(e),
+                };
+                it.iterate_to_vec(&iter)?
+            }
+        };
+        let mut total = sep.len().saturating_mul(items.len().saturating_sub(1));
+        for v in &items {
+            total = total.saturating_add(v.as_str().map_or(0, str::len));
+        }
+        let mut out = it.string_with_capacity(total)?;
+        for (i, v) in items.iter().enumerate() {
+            if i & 0x3ff == 0 {
+                it.poll()?;
+            }
+            match v.as_str() {
+                Some(s) => {
+                    if i > 0 {
+                        out.push_str(sep);
+                    }
+                    out.push_str(s);
+                }
+                None => {
+                    let t = it.type_name_of(v);
+                    return Err(it.type_error(&format!(
+                        "sequence item {}: expected str instance, {} found",
+                        i, t
+                    )));
                 }
             }
-            '\n' | '\r' => {
+        }
+        Ok(Value::string(out))
+    }
+
+    /// Return a copy with all occurrences of substring old replaced by new.
+    ///
+    ///   count
+    ///     Maximum number of occurrences to replace.
+    ///     -1 (the default value) means replace all occurrences.
+    ///
+    /// If the optional argument count is given, only the first count occurrences are
+    /// replaced.
+    #[method]
+    fn replace(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        old: &str,
+        new: &str,
+        #[kw]
+        #[default(-1)]
+        count: isize,
+    ) -> R<Value> {
+        let s = slf.0 .1;
+        let count = count as i64;
+        let growth = new.len().saturating_sub(old.len());
+        if growth > 0 {
+            let n = if old.is_empty() {
+                s.nchars + 1
+            } else {
+                s.s.matches(old).count()
+            };
+            let hits = if count < 0 { n } else { n.min(count as usize) };
+            let extra = if old.is_empty() {
+                new.len().saturating_mul(hits)
+            } else {
+                growth.saturating_mul(hits)
+            };
+            it.check_str_len(s.s.len().saturating_add(extra))?;
+        }
+        if old.is_empty() {
+            let limit = if count < 0 {
+                usize::MAX
+            } else {
+                count as usize
+            };
+            let mut out = String::new();
+            let mut n = 0;
+            for c in s.s.chars() {
+                if n < limit {
+                    out.push_str(new);
+                    n += 1;
+                }
                 out.push(c);
-                col = 0;
             }
-            c => {
-                out.push(c);
-                col += 1;
+            if n < limit {
+                out.push_str(new);
+            }
+            return Ok(Value::string(out));
+        }
+        if count < 0 {
+            return Ok(Value::string(s.s.replace(old, new)));
+        }
+        Ok(Value::string(s.s.replacen(old, new, count as usize)))
+    }
+
+    /// S.find(sub[, start[, end]]) -> int
+    ///
+    /// Return the lowest index in S where substring sub is found,
+    /// such that sub is contained within S[start:end].  Optional
+    /// arguments start and end are interpreted as in slice notation.
+    ///
+    /// Return -1 on failure.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn find(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
+        find_impl(it, slf.0 .1, sub, start, end, false, false)
+    }
+
+    /// S.rfind(sub[, start[, end]]) -> int
+    ///
+    /// Return the highest index in S where substring sub is found,
+    /// such that sub is contained within S[start:end].  Optional
+    /// arguments start and end are interpreted as in slice notation.
+    ///
+    /// Return -1 on failure.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn rfind(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
+        find_impl(it, slf.0 .1, sub, start, end, true, false)
+    }
+
+    /// S.index(sub[, start[, end]]) -> int
+    ///
+    /// Return the lowest index in S where substring sub is found,
+    /// such that sub is contained within S[start:end].  Optional
+    /// arguments start and end are interpreted as in slice notation.
+    ///
+    /// Raises ValueError when the substring is not found.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn index(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
+        find_impl(it, slf.0 .1, sub, start, end, false, true)
+    }
+
+    /// S.rindex(sub[, start[, end]]) -> int
+    ///
+    /// Return the highest index in S where substring sub is found,
+    /// such that sub is contained within S[start:end].  Optional
+    /// arguments start and end are interpreted as in slice notation.
+    ///
+    /// Raises ValueError when the substring is not found.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn rindex(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
+        find_impl(it, slf.0 .1, sub, start, end, true, true)
+    }
+
+    /// S.count(sub[, start[, end]]) -> int
+    ///
+    /// Return the number of non-overlapping occurrences of substring sub in
+    /// string S[start:end].  Optional arguments start and end are
+    /// interpreted as in slice notation.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn count(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        sub: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<i64> {
+        let s = slf.0 .1;
+        let sub = must_be_str(it, sub)?;
+        let (st, en) = opt_range(it, start, end, s.nchars)?;
+        if st > en {
+            return Ok(0);
+        }
+        let hay = s.slice(st, en);
+        if sub.is_empty() {
+            return Ok(count_code_points(hay) as i64 + 1);
+        }
+        Ok(search::count(hay.as_bytes(), sub.as_bytes(), usize::MAX) as i64)
+    }
+
+    /// S.startswith(prefix[, start[, end]]) -> bool
+    ///
+    /// Return True if S starts with the specified prefix, False otherwise.
+    /// With optional start, test S beginning at that position.
+    /// With optional end, stop comparing S at that position.
+    /// prefix can also be a tuple of strings to try.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn startswith(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        prefix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
+        startswith_impl(it, slf.0 .1, prefix, start, end, "startswith", false)
+    }
+
+    /// S.endswith(suffix[, start[, end]]) -> bool
+    ///
+    /// Return True if S ends with the specified suffix, False otherwise.
+    /// With optional start, test S beginning at that position.
+    /// With optional end, stop comparing S at that position.
+    /// suffix can also be a tuple of strings to try.
+    #[method(hint(py(arg_style = "parse", text_signature = "")))]
+    fn endswith(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        suffix: &Value,
+        start: Option<&Value>,
+        end: Option<&Value>,
+    ) -> R<bool> {
+        startswith_impl(it, slf.0 .1, suffix, start, end, "endswith", true)
+    }
+
+    /// Return a str with the given prefix string removed if present.
+    ///
+    /// If the string starts with the prefix string, return string[len(prefix):].
+    /// Otherwise, return a copy of the original string.
+    #[method]
+    fn removeprefix(slf: This<StrRef<'_>>, prefix: &str) -> Value {
+        let s = &slf.0 .1.s;
+        Value::str(s.strip_prefix(prefix).unwrap_or(s))
+    }
+
+    /// Return a str with the given suffix string removed if present.
+    ///
+    /// If the string ends with the suffix string and that suffix is not empty,
+    /// return string[:-len(suffix)]. Otherwise, return a copy of the original
+    /// string.
+    #[method]
+    fn removesuffix(slf: This<StrRef<'_>>, suffix: &str) -> Value {
+        let s = &slf.0 .1.s;
+        Value::str(if suffix.is_empty() {
+            s
+        } else {
+            s.strip_suffix(suffix).unwrap_or(s)
+        })
+    }
+
+    /// Return True if the string is an alphabetic string, False otherwise.
+    ///
+    /// A string is alphabetic if all characters in the string are alphabetic and there
+    /// is at least one character in the string.
+    #[method]
+    fn isalpha(slf: This<StrRef<'_>>) -> bool {
+        all_have(slf.0 .1, flag::ALPHA)
+    }
+
+    /// Return True if the string is an alpha-numeric string, False otherwise.
+    ///
+    /// A string is alpha-numeric if all characters in the string are alpha-numeric and
+    /// there is at least one character in the string.
+    #[method]
+    fn isalnum(slf: This<StrRef<'_>>) -> bool {
+        all_have(
+            slf.0 .1,
+            flag::ALPHA | flag::DECIMAL | flag::DIGIT | flag::NUMERIC,
+        )
+    }
+
+    /// Return True if the string is a digit string, False otherwise.
+    ///
+    /// A string is a digit string if all characters in the string are digits and there
+    /// is at least one character in the string.
+    #[method]
+    fn isdigit(slf: This<StrRef<'_>>) -> bool {
+        all_have(slf.0 .1, flag::DIGIT)
+    }
+
+    /// Return True if the string is a decimal string, False otherwise.
+    ///
+    /// A string is a decimal string if all characters in the string are decimal and
+    /// there is at least one character in the string.
+    #[method]
+    fn isdecimal(slf: This<StrRef<'_>>) -> bool {
+        all_have(slf.0 .1, flag::DECIMAL)
+    }
+
+    /// Return True if the string is a numeric string, False otherwise.
+    ///
+    /// A string is numeric if all characters in the string are numeric and there is at
+    /// least one character in the string.
+    #[method]
+    fn isnumeric(slf: This<StrRef<'_>>) -> bool {
+        all_have(slf.0 .1, flag::NUMERIC)
+    }
+
+    /// Return True if the string is a whitespace string, False otherwise.
+    ///
+    /// A string is whitespace if all characters in the string are whitespace and there
+    /// is at least one character in the string.
+    #[method]
+    fn isspace(slf: This<StrRef<'_>>) -> bool {
+        all_chars(slf.0 .1, true, crate::unicode::is_space)
+    }
+
+    /// Return True if all characters in the string are ASCII, False otherwise.
+    ///
+    /// ASCII characters have code points in the range U+0000-U+007F.
+    /// Empty string is ASCII too.
+    #[method]
+    fn isascii(slf: This<StrRef<'_>>) -> bool {
+        slf.0 .1.ascii || all_chars(slf.0 .1, false, |c| c < 0x80)
+    }
+
+    /// Return True if all characters in the string are printable, False otherwise.
+    ///
+    /// A character is printable if repr() may use it in its output.
+    #[method]
+    fn isprintable(slf: This<StrRef<'_>>) -> bool {
+        all_chars(slf.0 .1, false, crate::unicode::is_printable)
+    }
+
+    /// Return True if the string is an uppercase string, False otherwise.
+    ///
+    /// A string is uppercase if all cased characters in the string are uppercase and
+    /// there is at least one cased character in the string.
+    #[method]
+    fn isupper(slf: This<StrRef<'_>>) -> bool {
+        is_one_case(slf.0 .1, true)
+    }
+
+    /// Return True if the string is a lowercase string, False otherwise.
+    ///
+    /// A string is lowercase if all cased characters in the string are lowercase and
+    /// there is at least one cased character in the string.
+    #[method]
+    fn islower(slf: This<StrRef<'_>>) -> bool {
+        is_one_case(slf.0 .1, false)
+    }
+
+    /// Return True if the string is a title-cased string, False otherwise.
+    ///
+    /// In a title-cased string, upper- and title-case characters may only
+    /// follow uncased characters and lowercase characters only cased ones.
+    #[method]
+    fn istitle(slf: This<StrRef<'_>>) -> bool {
+        let mut prev_cased = false;
+        let mut cased = false;
+        for c in code_points(&slf.0 .1.s) {
+            let t = char_type(c);
+            if t.is(flag::UPPER | flag::TITLE) {
+                if prev_cased {
+                    return false;
+                }
+                prev_cased = true;
+                cased = true;
+            } else if t.is(flag::LOWER) {
+                if !prev_cased {
+                    return false;
+                }
+                prev_cased = true;
+                cased = true;
+            } else {
+                prev_cased = false;
             }
         }
+        cased
     }
-    Ok(Value::string(out))
-}
 
-fn encode(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args(
-        "encode",
-        &a[1.min(a.len())..],
-        kw,
-        &["encoding", "errors"],
-        0,
-    )?;
-    let s = this(it, a, "encode")?.s.clone();
-    let enc = match &b[0] {
-        Some(v) => it.str_arg(v, "encode() argument 'encoding'")?,
-        None => "utf-8".into(),
-    };
-    let errs = match &b[1] {
-        Some(v) => it.str_arg(v, "encode() argument 'errors'")?,
-        None => "strict".into(),
-    };
-    Ok(Value::bytes(it.encode_str(&s, &enc, &errs)?))
-}
-
-fn format_m(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let s = this(it, a, "format")?.s.clone();
-    Ok(Value::string(it.str_format(&s, &a[1..], kw)?))
-}
-
-fn format_map(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("format_map", a, 2, 2)?;
-    let s = this(it, a, "format_map")?.s.clone();
-    let mut kw: Vec<(Obj, Value)> = Vec::new();
-    // Resolve names lazily by pre-collecting the mapping's keys referenced in the template.
-    let keys = it.call_method(&a[1], "keys", Vec::new())?;
-    for k in it.iterate_to_vec(&keys)? {
-        if let Value::Obj(ko) = &k {
-            if matches!(ko.kind, Kind::Str(_)) {
-                let v = it.getitem(&a[1], &k)?;
-                kw.push((ko.clone(), v));
+    /// Return True if the string is a valid Python identifier, False otherwise.
+    ///
+    /// Call keyword.iskeyword(s) to test whether string s is a reserved identifier,
+    /// such as "def" or "class".
+    #[method]
+    fn isidentifier(slf: This<StrRef<'_>>) -> bool {
+        let mut cps = code_points(&slf.0 .1.s);
+        match cps.next() {
+            Some(c) => {
+                (c == '_' as u32 || crate::unicode::has(c, flag::XID_START))
+                    && cps.all(|c| crate::unicode::has(c, flag::XID_CONTINUE))
             }
+            None => false,
         }
     }
-    Ok(Value::string(it.str_format(&s, &[], &kw)?))
-}
 
-fn maketrans(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("maketrans", a, 1, 3)?;
-    let d = it.new_dict();
-    if a.len() == 1 {
-        let items = match &a[0] {
-            Value::Obj(o) if matches!(o.kind, Kind::Dict(_)) => {
-                let e: Vec<(Value, Value)> = match &o.kind {
+    /// Return a left-justified string of length width.
+    ///
+    /// Padding is done using the specified fill character (default is a space).
+    #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
+    fn ljust(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
+        justify(it, slf.0, width, fillchar, 0)
+    }
+
+    /// Return a right-justified string of length width.
+    ///
+    /// Padding is done using the specified fill character (default is a space).
+    #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
+    fn rjust(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
+        justify(it, slf.0, width, fillchar, 1)
+    }
+
+    /// Return a centered string of length width.
+    ///
+    /// Padding is done using the specified fill character (default is a space).
+    #[method(hint(py(text_signature = "($self, width, fillchar=' ', /)")))]
+    fn center(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        width: isize,
+        fillchar: Passed<Fill<'_>>,
+    ) -> R<Value> {
+        justify(it, slf.0, width, fillchar, 2)
+    }
+
+    /// Pad a numeric string with zeros on the left, to fill a field of the given width.
+    ///
+    /// The string is never truncated.
+    #[method]
+    fn zfill(slf: This<StrRef<'_>>, it: &mut Interp, width: isize) -> R<Value> {
+        let StrRef(v, s) = slf.0;
+        let (n, width) = (s.nchars as i64, width as i64);
+        if width <= n {
+            return Ok(if matches!(v, Value::Obj(o) if o.cls.is_none()) {
+                v.clone()
+            } else {
+                Value::str(&s.s)
+            });
+        }
+        it.check_str_len((width - n) as usize + s.s.len())?;
+        let pad = "0".repeat((width - n) as usize);
+        let (sign, rest) = match s.s.as_bytes().first() {
+            Some(b'+' | b'-') => (&s.s[..1], &s.s[1..]),
+            _ => ("", &s.s[..]),
+        };
+        Ok(Value::string(format!("{}{}{}", sign, pad, rest)))
+    }
+
+    /// Return a copy where all tab characters are expanded using spaces.
+    ///
+    /// If tabsize is not given, a tab size of 8 characters is assumed.
+    #[method]
+    fn expandtabs(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default(8)]
+        tabsize: i32,
+    ) -> R<Value> {
+        let out =
+            lumen_common::text::expand_tabs(&slf.0 .1.s, tabsize as i64, |n| it.check_str_len(n))?;
+        Ok(Value::string(out))
+    }
+
+    /// Encode the string using the codec registered for encoding.
+    ///
+    ///   encoding
+    ///     The encoding in which to encode the string.
+    ///   errors
+    ///     The error handling scheme to use for encoding errors.
+    ///     The default is 'strict' meaning that encoding errors raise a
+    ///     UnicodeEncodeError.  Other possible values are 'ignore', 'replace' and
+    ///     'xmlcharrefreplace' as well as any other name registered with
+    ///     codecs.register_error that can handle UnicodeEncodeErrors.
+    #[method]
+    fn encode(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[kw]
+        #[default("utf-8")]
+        encoding: &str,
+        #[kw]
+        #[default("strict")]
+        errors: &str,
+    ) -> R<Value> {
+        Ok(Value::bytes(it.encode_str(
+            &slf.0 .1.s,
+            encoding,
+            errors,
+        )?))
+    }
+
+    /// S.format(*args, **kwargs) -> str
+    ///
+    /// Return a formatted version of S, using substitutions from args and kwargs.
+    /// The substitutions are identified by braces ('{' and '}').
+    #[method(hint(py(text_signature = "")))]
+    fn format(
+        slf: This<StrRef<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<String> {
+        it.str_format(&slf.0 .1.s, args, &kwargs.to_vec())
+    }
+
+    /// S.format_map(mapping) -> str
+    ///
+    /// Return a formatted version of S, using substitutions from mapping.
+    /// The substitutions are identified by braces ('{' and '}').
+    #[method(hint(py(text_signature = "")))]
+    fn format_map(slf: This<StrRef<'_>>, it: &mut Interp, mapping: &Value) -> R<String> {
+        let mut kw: Vec<(Obj, Value)> = Vec::new();
+        // The names are looked up front: every str key of the mapping.
+        let keys = it.call_method(mapping, "keys", Vec::new())?;
+        for k in it.iterate_to_vec(&keys)? {
+            if let Value::Obj(ko) = &k {
+                if matches!(ko.kind, Kind::Str(_)) {
+                    let v = it.getitem(mapping, &k)?;
+                    kw.push((ko.clone(), v));
+                }
+            }
+        }
+        it.str_format(&slf.0 .1.s, &[], &kw)
+    }
+
+    /// Return a translation table usable for str.translate().
+    ///
+    /// If there is only one argument, it must be a dictionary mapping Unicode
+    /// ordinals (integers) or characters to Unicode ordinals, strings or None.
+    /// Character keys will be then converted to ordinals.
+    /// If there are two arguments, they must be strings of equal length, and
+    /// in the resulting dictionary, each character in x will be mapped to the
+    /// character at the same position in y. If there is a third argument, it
+    /// must be a string, whose characters will be mapped to None in the result.
+    #[method]
+    fn maketrans(it: &mut Interp, x: &Value, y: Passed<&str>, z: Passed<&str>) -> R<Value> {
+        let d = it.new_dict();
+        let Some(y) = y.0 else {
+            let items: Vec<(Value, Value)> = match x {
+                Value::Obj(o) => match &o.kind {
                     Kind::Dict(p) => p
                         .borrow()
                         .iter()
                         .map(|e| (e.key.clone(), e.val.clone()))
                         .collect(),
-                    _ => Vec::new(),
-                };
-                e
-            }
-            _ => {
-                return Err(
-                    it.type_error("if you give only one argument to maketrans it must be a dict")
-                )
-            }
-        };
-        for (k, v) in items {
-            let key = match k.as_str() {
-                Some(s) if lumen_common::smuggle::count_code_points(s) == 1 => {
-                    Value::Int(lumen_common::smuggle::code_points(s).next().unwrap_or(0) as i64)
+                    _ => {
+                        return Err(it.type_error(
+                            "if you give only one argument to maketrans it must be a dict",
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(it.type_error(
+                        "if you give only one argument to maketrans it must be a dict",
+                    ));
                 }
-                Some(_) => {
-                    return Err(it.value_error("string keys in translate table must be of length 1"))
-                }
-                None => k,
             };
-            it.dict_set(&d, key, v)?;
-        }
-        return Ok(Value::Obj(d));
-    }
-    let x: Vec<u32> = lumen_common::smuggle::code_points(a[0].as_str().unwrap_or("")).collect();
-    let y: Vec<u32> = lumen_common::smuggle::code_points(a[1].as_str().unwrap_or("")).collect();
-    if x.len() != y.len() {
-        return Err(it.value_error("the first two maketrans arguments must have equal length"));
-    }
-    for (p, q) in x.iter().zip(y.iter()) {
-        it.dict_set(&d, Value::Int(*p as i64), Value::Int(*q as i64))?;
-    }
-    if let Some(z) = a.get(2) {
-        for c in lumen_common::smuggle::code_points(z.as_str().unwrap_or("")) {
-            it.dict_set(&d, Value::Int(c as i64), Value::None)?;
-        }
-    }
-    Ok(Value::Obj(d))
-}
-
-fn translate(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("translate", a, 2, 2)?;
-    let s = this(it, a, "translate")?.s.clone();
-    let mut out = String::new();
-    for c in lumen_common::smuggle::code_points(&s) {
-        match it.getitem(&a[1], &Value::Int(c as i64)) {
-            Ok(Value::None) => {}
-            Ok(Value::Int(i)) => {
-                if !u32::try_from(i)
-                    .is_ok_and(|i| lumen_common::smuggle::push_code_point(&mut out, i))
-                {
-                    return Err(it.value_error("character mapping must be in range(0x110000)"));
-                }
+            for (k, v) in items {
+                let key = match k.as_str() {
+                    Some(s) if count_code_points(s) == 1 => {
+                        Value::Int(code_points(s).next().unwrap_or(0) as i64)
+                    }
+                    Some(_) => {
+                        return Err(
+                            it.value_error("string keys in translate table must be of length 1")
+                        );
+                    }
+                    None => k,
+                };
+                it.dict_set(&d, key, v)?;
             }
-            Ok(v) => match v.as_str() {
-                Some(r) => out.push_str(r),
-                None => {
-                    return Err(it.type_error("character mapping must return integer, None or str"))
-                }
-            },
-            Err(e) => {
-                if it.exc_is(&e, "LookupError") {
-                    lumen_common::smuggle::push_code_point(&mut out, c);
-                } else {
-                    return Err(e);
-                }
+            return Ok(Value::Obj(d));
+        };
+        let Some(x) = x.as_str() else {
+            return Err(it.type_error(
+                "first maketrans argument must be a string if there is a second argument",
+            ));
+        };
+        let xs: Vec<u32> = code_points(x).collect();
+        let ys: Vec<u32> = code_points(y).collect();
+        if xs.len() != ys.len() {
+            return Err(it.value_error("the first two maketrans arguments must have equal length"));
+        }
+        for (p, q) in xs.iter().zip(ys.iter()) {
+            it.dict_set(&d, Value::Int(*p as i64), Value::Int(*q as i64))?;
+        }
+        if let Some(z) = z.0 {
+            for c in code_points(z) {
+                it.dict_set(&d, Value::Int(c as i64), Value::None)?;
             }
         }
+        Ok(Value::Obj(d))
     }
-    Ok(Value::string(out))
-}
 
-fn str_str(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__str__", a, 1, 1)?;
-    match &a[0] {
-        Value::Obj(o) if matches!(o.kind, Kind::Str(_)) && o.cls.is_some() => {
-            Ok(Value::str(a[0].as_str().unwrap_or("")))
+    /// Replace each character in the string using the given translation table.
+    ///
+    ///   table
+    ///     Translation table, which must be a mapping of Unicode ordinals to
+    ///     Unicode ordinals, strings, or None.
+    ///
+    /// The table must implement lookup/indexing via __getitem__, for instance a
+    /// dictionary or list.  If this operation raises LookupError, the character is
+    /// left untouched.  Characters mapped to None are deleted.
+    #[method]
+    fn translate(slf: This<StrRef<'_>>, it: &mut Interp, table: &Value) -> R<Value> {
+        let mut out = String::new();
+        for c in code_points(&slf.0 .1.s) {
+            match it.getitem(table, &Value::Int(c as i64)) {
+                Ok(Value::None) => {}
+                Ok(Value::Int(i)) => {
+                    if !u32::try_from(i).is_ok_and(|i| push_code_point(&mut out, i)) {
+                        return Err(it.value_error("character mapping must be in range(0x110000)"));
+                    }
+                }
+                Ok(v) => match v.as_str() {
+                    Some(r) => out.push_str(r),
+                    None => {
+                        return Err(
+                            it.type_error("character mapping must return integer, None or str")
+                        );
+                    }
+                },
+                Err(e) => {
+                    if it.exc_is(&e, "LookupError") {
+                        push_code_point(&mut out, c);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
         }
-        v => it.str_value(v),
+        Ok(Value::string(out))
     }
-}
 
-fn str_getnewargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::tuple(vec![it.str_value(&a[0])?]))
+    #[proto(str)]
+    fn str(slf: This<StrRef<'_>>) -> Value {
+        let StrRef(v, s) = slf.0;
+        match v {
+            Value::Obj(o) if o.cls.is_some() => Value::str(&s.s),
+            _ => v.clone(),
+        }
+    }
+
+    #[method(name = "__getnewargs__", hint(py(text_signature = "")))]
+    fn getnewargs(slf: This<StrRef<'_>>) -> Value {
+        Value::tuple(vec![Value::str(&slf.0 .1.s)])
+    }
+
+    #[proto(hash)]
+    fn hash(slf: This<&Value>, it: &mut Interp) -> R<i64> {
+        it.native_hash(&slf)
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<&Value>, it: &mut Interp) -> R<String> {
+        it.native_repr(&slf)
+    }
+
+    /// Return a formatted version of the string as described by format_spec.
+    #[method(name = "__format__")]
+    fn dunder_format(slf: This<StrRef<'_>>, it: &mut Interp, format_spec: &str) -> R<String> {
+        it.native_format(slf.0 .0, format_spec)
+    }
 }
 
 pub fn init(it: &mut Interp) {
     let t = it.types.str_.clone();
-    it.reg_new(&t, str_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("upper", upper),
-        ("lower", lower),
-        ("casefold", casefold),
-        ("capitalize", capitalize),
-        ("title", title),
-        ("swapcase", swapcase),
-        ("strip", strip),
-        ("lstrip", lstrip),
-        ("rstrip", rstrip),
-        ("split", split),
-        ("rsplit", rsplit),
-        ("splitlines", splitlines),
-        ("partition", partition),
-        ("rpartition", rpartition),
-        ("join", join),
-        ("replace", replace),
-        ("find", find),
-        ("rfind", rfind),
-        ("index", index),
-        ("rindex", rindex),
-        ("count", count),
-        ("startswith", startswith),
-        ("endswith", endswith),
-        ("removeprefix", removeprefix),
-        ("removesuffix", removesuffix),
-        ("isalpha", isalpha),
-        ("isalnum", isalnum),
-        ("isdigit", isdigit),
-        ("isdecimal", isdecimal),
-        ("isnumeric", isnumeric),
-        ("isspace", isspace),
-        ("isascii", isascii),
-        ("isprintable", isprintable),
-        ("isupper", isupper),
-        ("islower", islower),
-        ("istitle", istitle),
-        ("isidentifier", isidentifier),
-        ("ljust", ljust),
-        ("rjust", rjust),
-        ("center", center),
-        ("zfill", zfill),
-        ("expandtabs", expandtabs),
-        ("encode", encode),
-        ("format", format_m),
-        ("format_map", format_map),
-        ("translate", translate),
-        ("__str__", str_str),
-        ("__getnewargs__", str_getnewargs),
-    ];
-    for (n, f) in methods {
-        it.reg(&t, n, *f);
-    }
-    it.reg_static(&t, "maketrans", maketrans);
+    crate::bind::extend_type_documented::<Str>(it, &t);
     reg_slots(
         it,
         &t,
@@ -1065,25 +1384,4 @@ pub fn init(it: &mut Interp) {
         &["__add__", "__mul__", "__rmul__", "__mod__", "__rmod__"],
     );
     reg_compare(it, &t, true);
-    let hash = |it: &mut Interp, a: &[Value], _kw: Kw| -> R<Value> {
-        Ok(Value::Int(it.native_hash(&a[0])?))
-    };
-    let _ = hash;
-    it.reg(&t, "__hash__", str_hash);
-    it.reg(&t, "__repr__", str_repr_m);
-    it.reg(&t, "__format__", str_format_m);
-}
-
-fn str_hash(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::Int(it.native_hash(&a[0])?))
-}
-
-fn str_repr_m(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::string(it.native_repr(&a[0])?))
-}
-
-fn str_format_m(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__format__", a, 2, 2)?;
-    let spec = it.str_arg(&a[1], "format_spec")?;
-    Ok(Value::string(it.native_format(&a[0], &spec)?))
 }

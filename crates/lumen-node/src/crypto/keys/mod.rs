@@ -32,7 +32,6 @@ mod pem;
 
 pub use curves::{with_ec_curve, EcCurve};
 pub use dh_groups::dh_group;
-pub use gen::{safe_prime, safe_prime_congruent};
 pub use model::{pss_hash, x448_mul, AsymKey, DsaKey, EcKey, PssParams, RsaKey};
 pub use pem::KeyCipher;
 
@@ -387,7 +386,9 @@ pub(crate) mod bindings {
                 num_bigint_dig::BigUint::from_bytes_be(&p),
                 num_bigint_dig::BigUint::from(g),
             ),
-            (None, None, Some(bits)) => (gen::safe_prime(bits)?, num_bigint_dig::BigUint::from(g)),
+            (None, None, Some(bits)) => {
+                (gen::safe_prime(bits, g)?, num_bigint_dig::BigUint::from(g))
+            }
             _ => return Err(SendError::new("Error", "Invalid DH parameters")),
         };
         gen::dh(p, g).map(pair)

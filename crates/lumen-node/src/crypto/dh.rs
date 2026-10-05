@@ -1,26 +1,16 @@
-//! Diffie-Hellman: finite-field DH over `num-bigint-dig`, ECDH and the stateless key agreement of
-//! `crypto.diffieHellman` (EC, X25519, X448, DH).
+//! Diffie-Hellman: finite-field DH through `lumen_crypto::backend()`, ECDH and the stateless key
+//! agreement of `crypto.diffieHellman` (EC, X25519, X448, DH).
 
 use lumen::embed::OpError;
-use num_bigint_dig::prime::probably_prime;
-use num_bigint_dig::{BigUint, RandBigInt};
-use rand_core::OsRng;
+use lumen_crypto::{backend, DhParams, DH_CHECK_PUBKEY_TOO_LARGE, DH_CHECK_PUBKEY_TOO_SMALL};
+use num_bigint_dig::BigUint;
 
-use super::keys::{
-    asn1, dh_group, safe_prime, safe_prime_congruent, with_ec_curve, x448_mul, AsymKey, EcCurve,
-};
+use super::keys::{asn1, dh_group, with_ec_curve, x448_mul, AsymKey, EcCurve};
+use super::op_error;
 
 #[lumen_bind::module(name = "crypto")]
 pub(crate) mod bindings {
     use super::*;
-
-    const DH_CHECK_P_NOT_PRIME: u32 = 1;
-    const DH_CHECK_P_NOT_SAFE_PRIME: u32 = 2;
-    const DH_NOT_SUITABLE_GENERATOR: u32 = 8;
-    const DH_MODULUS_TOO_SMALL: u32 = 128;
-    const DH_MODULUS_TOO_LARGE: u32 = 256;
-    const DH_MIN_MODULUS_BITS: usize = 512;
-    const DH_MAX_MODULUS_BITS: usize = 10000;
 
     fn failed(message: &'static str) -> OpError {
         OpError::error(message).with_code("ERR_CRYPTO_OPERATION_FAILED")
@@ -32,72 +22,29 @@ pub(crate) mod bindings {
             .with_code("ERR_OSSL_MISMATCHING_DOMAIN_PARAMETERS")
     }
 
-    fn num(bytes: &[u8]) -> BigUint {
-        BigUint::from_bytes_be(bytes)
-    }
-
     fn minimal(n: &BigUint) -> Vec<u8> {
         let bytes = n.to_bytes_be();
         let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
         bytes[start..].to_vec()
     }
 
-    fn small_mod(n: &BigUint, m: u32) -> u32 {
-        let r = n % BigUint::from(m);
-        r.to_bytes_be()
-            .iter()
-            .fold(0u32, |acc, &b| (acc << 8) | b as u32)
+    fn params(p: &[u8], g: &[u8]) -> DhParams {
+        DhParams {
+            p: p.to_vec(),
+            g: g.to_vec(),
+        }
     }
 
     /// `DH_check`: the `verifyError` flags of the parameters.
     #[op(name = "dhVerify")]
-    fn dh_verify(p: &[u8], g: &[u8]) -> u32 {
-        let (p, g) = (num(p), num(g));
-        let one = BigUint::from(1u8);
-        let mut flags = 0;
-        if p.bits() < DH_MIN_MODULUS_BITS {
-            flags |= DH_MODULUS_TOO_SMALL;
-        }
-        if p.bits() > DH_MAX_MODULUS_BITS {
-            flags |= DH_MODULUS_TOO_LARGE;
-        }
-        if g <= one || p <= BigUint::from(2u8) || g >= &p - &one {
-            flags |= DH_NOT_SUITABLE_GENERATOR;
-        } else if g == BigUint::from(2u8) {
-            if !matches!(small_mod(&p, 24), 11 | 23) {
-                flags |= DH_NOT_SUITABLE_GENERATOR;
-            }
-        } else if g == BigUint::from(5u8) && !matches!(small_mod(&p, 10), 3 | 7) {
-            flags |= DH_NOT_SUITABLE_GENERATOR;
-        }
-        if !probably_prime(&p, 20) {
-            flags |= DH_CHECK_P_NOT_PRIME;
-        } else if !probably_prime(&((&p - &one) >> 1usize), 20) {
-            flags |= DH_CHECK_P_NOT_SAFE_PRIME;
-        }
-        flags
+    fn dh_verify(p: &[u8], g: &[u8]) -> Result<u32, OpError> {
+        backend().dh_check(&params(p, g)).map_err(op_error)
     }
 
     /// A safe prime of `bits` bits that `g` (2 or 5) generates a subgroup of.
     #[op(name = "dhGenPrime")]
     fn dh_gen_prime(bits: u32, g: u32) -> Result<Vec<u8>, OpError> {
-        // OpenSSL's congruences for the generator: p ≡ 23 (mod 24) for 2, p ≡ 59 (mod 60) for 5.
-        match g {
-            2 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 24, 23))),
-            5 if bits >= 6 => return Ok(minimal(&safe_prime_congruent(bits, 60, 59))),
-            _ => {}
-        }
-        loop {
-            let p = safe_prime(bits)?;
-            let suitable = match g {
-                2 => matches!(small_mod(&p, 24), 11 | 23),
-                5 => matches!(small_mod(&p, 10), 3 | 7),
-                _ => true,
-            };
-            if suitable {
-                return Ok(minimal(&p));
-            }
-        }
+        backend().dh_generate_prime(bits, g).map_err(op_error)
     }
 
     /// A key pair `[private, public]` for the parameters.
@@ -107,38 +54,34 @@ pub(crate) mod bindings {
         g: &[u8],
         private: Option<Vec<u8>>,
     ) -> Result<(Vec<u8>, Vec<u8>), OpError> {
-        let (p, g) = (num(p), num(g));
-        if p.bits() < DH_MIN_MODULUS_BITS || p.bits() > DH_MAX_MODULUS_BITS {
-            return Err(failed("Key generation failed"));
-        }
-        let x = match private {
-            Some(x) => num(&x),
-            None => OsRng.gen_biguint_range(&BigUint::from(2u8), &(&p - BigUint::from(2u8))),
-        };
-        let y = g.modpow(&x, &p);
-        Ok((minimal(&x), minimal(&y)))
+        backend()
+            .dh_generate_key(&params(p, g), private.as_deref())
+            .map_err(op_error)
     }
 
     #[op(name = "dhPublic")]
-    fn dh_public(p: &[u8], g: &[u8], x: &[u8]) -> Vec<u8> {
-        let p = num(p);
-        minimal(&num(g).modpow(&num(x), &p))
+    fn dh_public(p: &[u8], g: &[u8], x: &[u8]) -> Result<Vec<u8>, OpError> {
+        backend().dh_public(&params(p, g), x).map_err(op_error)
     }
 
     #[op(name = "dhCompute")]
-    fn dh_compute(p: &[u8], x: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpError> {
-        let (p, peer) = (num(p), num(peer));
-        let one = BigUint::from(1u8);
-        if peer <= one {
+    fn dh_compute(p: &[u8], g: &[u8], x: &[u8], peer: &[u8]) -> Result<Vec<u8>, OpError> {
+        let params = params(p, g);
+        let backend = backend();
+        let flags = backend.dh_check_public(&params, peer).map_err(op_error)?;
+        if flags & DH_CHECK_PUBKEY_TOO_SMALL != 0 {
             return Err(OpError::range_error("Supplied key is too small")
                 .with_code("ERR_CRYPTO_INVALID_KEYLEN"));
         }
-        if peer >= &p - &one {
+        if flags & DH_CHECK_PUBKEY_TOO_LARGE != 0 {
             return Err(OpError::range_error("Supplied key is too large")
                 .with_code("ERR_CRYPTO_INVALID_KEYLEN"));
         }
-        let secret = peer.modpow(&num(x), &p);
-        Ok(asn1::pad_be(&secret.to_bytes_be(), p.bits().div_ceil(8)))
+        if flags != 0 {
+            return Err(OpError::range_error("Supplied key is invalid")
+                .with_code("ERR_CRYPTO_INVALID_KEYLEN"));
+        }
+        backend.dh_compute(&params, x, peer).map_err(op_error)
     }
 
     /// `[p, g]` of a MODP group.
@@ -278,10 +221,95 @@ pub(crate) mod bindings {
                     return Err(domain_mismatch());
                 }
                 let x = a.x.as_ref().ok_or_else(mismatch)?;
-                let secret = b.y.modpow(x, &a.p);
-                Ok(asn1::pad_be(&secret.to_bytes_be(), a.p.bits().div_ceil(8)))
+                let dh = DhParams {
+                    p: a.p.to_bytes_be(),
+                    g: a.g.to_bytes_be(),
+                };
+                backend()
+                    .dh_compute(&dh, &x.to_bytes_be(), &b.y.to_bytes_be())
+                    .map_err(op_error)
             }
             _ => Err(mismatch()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use lumen_crypto::{
+            DH_CHECK_P_NOT_PRIME, DH_CHECK_P_NOT_SAFE_PRIME, DH_MODULUS_TOO_SMALL,
+            DH_NOT_SUITABLE_GENERATOR,
+        };
+
+        fn num(b: &[u8]) -> BigUint {
+            BigUint::from_bytes_be(b)
+        }
+
+        fn group(name: &str) -> (Vec<u8>, Vec<u8>) {
+            let (p, g) = dh_group(name).unwrap();
+            (minimal(&p), minimal(&g))
+        }
+
+        #[test]
+        fn modp_groups_verify_clean() {
+            for name in ["modp1", "modp2", "modp5", "modp14"] {
+                let (p, g) = group(name);
+                assert_eq!(dh_verify(&p, &g).unwrap(), 0, "{name}");
+            }
+        }
+
+        #[test]
+        fn verify_flags() {
+            let (p, g) = group("modp5");
+            let mut composite = p.clone();
+            *composite.last_mut().unwrap() ^= 0x0e;
+            assert_ne!(dh_verify(&composite, &g).unwrap() & DH_CHECK_P_NOT_PRIME, 0);
+            let not_safe = (BigUint::from(1u8) << 521usize) - BigUint::from(1u8);
+            assert_eq!(
+                dh_verify(&minimal(&not_safe), &[2]).unwrap() & DH_CHECK_P_NOT_SAFE_PRIME,
+                DH_CHECK_P_NOT_SAFE_PRIME
+            );
+            assert_ne!(dh_verify(&[0x17], &[2]).unwrap() & DH_MODULUS_TOO_SMALL, 0);
+            assert_ne!(dh_verify(&p, &[1]).unwrap() & DH_NOT_SUITABLE_GENERATOR, 0);
+        }
+
+        #[test]
+        fn key_agreement_matches_reference_exponentiation() {
+            let (p, g) = group("modp2");
+            let (x1, y1) = dh_gen_key(&p, &g, None).unwrap();
+            let (x2, y2) = dh_gen_key(&p, &g, None).unwrap();
+            let (pn, gn) = (num(&p), num(&g));
+            assert_eq!(num(&y1), gn.modpow(&num(&x1), &pn));
+            let s1 = dh_compute(&p, &g, &x1, &y2).unwrap();
+            let s2 = dh_compute(&p, &g, &x2, &y1).unwrap();
+            assert_eq!(s1, s2);
+            assert_eq!(s1.len(), p.len());
+            assert_eq!(num(&s1), num(&y2).modpow(&num(&x1), &pn));
+            assert_eq!(dh_public(&p, &g, &x1).unwrap(), y1);
+        }
+
+        #[test]
+        fn peer_range_is_enforced() {
+            let (p, g) = group("modp1");
+            let (x, _) = dh_gen_key(&p, &g, None).unwrap();
+            assert!(dh_compute(&p, &g, &x, &[1])
+                .unwrap_err()
+                .to_string()
+                .contains("too small"));
+            let p_minus_1 = minimal(&(num(&p) - BigUint::from(1u8)));
+            assert!(dh_compute(&p, &g, &x, &p_minus_1)
+                .unwrap_err()
+                .to_string()
+                .contains("too large"));
+        }
+
+        #[test]
+        fn generated_prime_is_safe_and_suits_the_generator() {
+            for g in [2u32, 5] {
+                let p = num(&dh_gen_prime(512, g).unwrap());
+                assert_eq!(p.bits(), 512);
+                assert_eq!(dh_verify(&minimal(&p), &[g as u8]).unwrap(), 0, "g={g}");
+            }
         }
     }
 }

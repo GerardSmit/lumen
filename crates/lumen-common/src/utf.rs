@@ -14,6 +14,117 @@ pub struct Malformed {
     pub reason: &'static str,
 }
 
+/// One decoding step at a position of the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// A code point (never a surrogate) and the bytes it occupied.
+    Char(u32, usize),
+    Bad(Malformed),
+    /// The input ends inside a character; more bytes may complete it.
+    Incomplete,
+}
+
+/// The malformed range for a UTF-8 error at `start` (`err_len` as `Utf8Error::error_len`);
+/// `None` when the input just ends early and more data may follow (`!final_`).
+fn utf8_malformed(
+    data: &[u8],
+    start: usize,
+    err_len: Option<usize>,
+    final_: bool,
+) -> Option<Malformed> {
+    match err_len {
+        Some(n) => {
+            let b = data[start];
+            let reason = if (0x80..0xC2).contains(&b) || b >= 0xF5 {
+                "invalid start byte"
+            } else {
+                "invalid continuation byte"
+            };
+            Some(Malformed {
+                start,
+                end: start + n,
+                reason,
+            })
+        }
+        None if !final_ => None,
+        None => Some(Malformed {
+            start,
+            end: data.len(),
+            reason: "unexpected end of data",
+        }),
+    }
+}
+
+/// The UTF-8 character at byte `pos` of `data`.
+pub fn step_utf8(data: &[u8], pos: usize, final_: bool) -> Step {
+    let window = &data[pos..data.len().min(pos + 4)];
+    let err = match std::str::from_utf8(window) {
+        Ok(s) => return first_char(s),
+        Err(e) if e.valid_up_to() > 0 => {
+            // SAFETY: from_utf8 validated these bytes.
+            return first_char(unsafe {
+                std::str::from_utf8_unchecked(&window[..e.valid_up_to()])
+            });
+        }
+        Err(e) => e,
+    };
+    match utf8_malformed(data, pos, err.error_len(), final_) {
+        Some(m) => Step::Bad(m),
+        None => Step::Incomplete,
+    }
+}
+
+fn first_char(s: &str) -> Step {
+    s.chars()
+        .next()
+        .map_or(Step::Incomplete, |c| Step::Char(c as u32, c.len_utf8()))
+}
+
+/// The UTF-16 character at byte `pos` of `data`.
+pub fn step_utf16(data: &[u8], pos: usize, big_endian: bool, final_: bool) -> Step {
+    let unit = |i: usize| -> u32 {
+        let b = [data[i], data[i + 1]];
+        (if big_endian {
+            u16::from_be_bytes(b)
+        } else {
+            u16::from_le_bytes(b)
+        }) as u32
+    };
+    let bad = |end: usize, reason: &'static str| {
+        Step::Bad(Malformed {
+            start: pos,
+            end,
+            reason,
+        })
+    };
+    let ends_early = |reason: &'static str| {
+        if final_ {
+            bad(data.len(), reason)
+        } else {
+            Step::Incomplete
+        }
+    };
+    if pos + 1 >= data.len() {
+        return ends_early("truncated data");
+    }
+    let u = unit(pos);
+    if !(0xD800..0xE000).contains(&u) {
+        return Step::Char(u, 2);
+    }
+    if u >= 0xDC00 {
+        return bad(pos + 2, "illegal encoding");
+    }
+    if pos + 3 >= data.len() {
+        return ends_early("unexpected end of data");
+    }
+    let u2 = unit(pos + 2);
+    if (0xDC00..0xE000).contains(&u2) {
+        Step::Char(0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00), 4)
+    } else {
+        bad(pos + 2, "illegal UTF-16 surrogate")
+    }
+}
+
 /// Decode UTF-8 `data` onto `out`, returning how many bytes were consumed (all of them when
 /// `final_`; otherwise an incomplete sequence at the end is left over).
 ///
@@ -38,26 +149,8 @@ pub fn decode_utf8<E>(
         let start = pos + good;
         // SAFETY: from_utf8 validated these bytes.
         out.push_str(&spelling.text(unsafe { std::str::from_utf8_unchecked(&data[pos..start]) }));
-        let bad = match err_len {
-            Some(n) => {
-                let b = data[start];
-                let reason = if (0x80..0xC2).contains(&b) || b >= 0xF5 {
-                    "invalid start byte"
-                } else {
-                    "invalid continuation byte"
-                };
-                Malformed {
-                    start,
-                    end: start + n,
-                    reason,
-                }
-            }
-            None if !final_ => return Ok(start),
-            None => Malformed {
-                start,
-                end: data.len(),
-                reason: "unexpected end of data",
-            },
+        let Some(bad) = utf8_malformed(data, start, err_len, final_) else {
+            return Ok(start);
         };
         pos = on_error(data, bad, out)?;
     }
@@ -74,45 +167,15 @@ pub fn decode_utf16<E>(
     out: &mut String,
     mut on_error: impl FnMut(&mut Cow<'_, [u8]>, Malformed, &mut String) -> Result<usize, E>,
 ) -> Result<usize, E> {
-    let unit = |d: &[u8], i: usize| -> u32 {
-        let b = [d[i], d[i + 1]];
-        (if big_endian {
-            u16::from_be_bytes(b)
-        } else {
-            u16::from_le_bytes(b)
-        }) as u32
-    };
     while pos < data.len() {
-        let (start, end, reason) = if pos + 1 >= data.len() {
-            if !final_ {
-                break;
+        match step_utf16(data, pos, big_endian, final_) {
+            Step::Char(cp, n) => {
+                spelling.push(out, cp);
+                pos += n;
             }
-            (pos, data.len(), "truncated data")
-        } else {
-            let u = unit(data, pos);
-            if !(0xD800..0xE000).contains(&u) {
-                spelling.push(out, u);
-                pos += 2;
-                continue;
-            }
-            if u >= 0xDC00 {
-                (pos, pos + 2, "illegal encoding")
-            } else if pos + 3 >= data.len() {
-                if !final_ {
-                    break;
-                }
-                (pos, data.len(), "unexpected end of data")
-            } else {
-                let u2 = unit(data, pos + 2);
-                if (0xDC00..0xE000).contains(&u2) {
-                    spelling.push(out, 0x10000 + ((u - 0xD800) << 10) + (u2 - 0xDC00));
-                    pos += 4;
-                    continue;
-                }
-                (pos, pos + 2, "illegal UTF-16 surrogate")
-            }
-        };
-        pos = on_error(data, Malformed { start, end, reason }, out)?;
+            Step::Bad(m) => pos = on_error(data, m, out)?,
+            Step::Incomplete => break,
+        }
     }
     Ok(pos)
 }

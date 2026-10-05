@@ -29,8 +29,6 @@ pub fn extension() -> Extension {
             lumen_host::globals::<globals::Module>,
             lumen_host::globals::<immediate::Module>,
         ],
-        globals: &[],
-        namespaces: &[],
         state_init: Some(|state| state.put(Timers::default())),
         js_init: None,
         js_init_snapshot: None,

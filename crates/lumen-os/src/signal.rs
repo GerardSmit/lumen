@@ -185,6 +185,16 @@ pub fn block_on_this_thread() {
     }
 }
 
+/// Ignores `SIGXFSZ`, so a write past `RLIMIT_FSIZE` fails with `EFBIG` instead of killing the
+/// process (`SIGPIPE` is already ignored by Rust's runtime).
+pub fn ignore_file_size_limit_signal() {
+    #[cfg(unix)]
+    // SAFETY: signal(3) with SIG_IGN.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+    }
+}
+
 /// Whether `sig` can be caught or ignored at all.
 pub fn catchable(sig: i32) -> bool {
     #[cfg(unix)]

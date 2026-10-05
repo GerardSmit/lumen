@@ -4,12 +4,53 @@
 //! emits for PEP 695 syntax. Like CPython, the heavier logic (type checks, substitution,
 //! `Generic[...]`) is delegated to private helpers in `typing.py`.
 
-use super::native::*;
+use super::native::{new_type, with_opaque};
+use super::strm::StrRef;
+use crate::bind::{type_object, KwArgs, Py, This};
 use crate::bytecode::*;
 use crate::object::*;
 use crate::vm::*;
 
-pub struct TypeVarData {
+#[lumen_bind::class(name = "TypeVar", module = "typing", hint(py(final)))]
+/// Type variable.
+///
+/// The preferred way to construct a type variable is via the dedicated
+/// syntax for generic functions, classes, and type aliases::
+///
+///     class Sequence[T]:  # T is a TypeVar
+///         ...
+///
+/// This syntax can also be used to create bound and constrained type
+/// variables::
+///
+///     # S is a TypeVar bound to str
+///     class StrSequence[S: str]:
+///         ...
+///
+///     # A is a TypeVar constrained to str or bytes
+///     class StrOrBytesSequence[A: (str, bytes)]:
+///         ...
+///
+/// However, if desired, reusable type variables can also be constructed
+/// manually, like so::
+///
+///    T = TypeVar('T')  # Can be anything
+///    S = TypeVar('S', bound=str)  # Can be any subtype of str
+///    A = TypeVar('A', str, bytes)  # Must be exactly str or bytes
+///
+/// Type variables exist primarily for the benefit of static type
+/// checkers.  They serve as the parameters for generic types as well
+/// as for generic function and type alias definitions.
+///
+/// The variance of type variables is inferred by type checkers when they
+/// are created through the type parameter syntax and when
+/// ``infer_variance=True`` is passed. Manually created type variables may
+/// be explicitly marked covariant or contravariant by passing
+/// ``covariant=True`` or ``contravariant=True``. By default, manually
+/// created type variables are invariant. See PEP 484 and PEP 695 for more
+/// details.
+///
+pub struct TypeVar {
     name: Value,
     bound: Option<Value>,
     evaluate_bound: Option<Value>,
@@ -18,47 +59,245 @@ pub struct TypeVarData {
     covariant: bool,
     contravariant: bool,
     infer_variance: bool,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
 }
 
-pub struct ParamSpecData {
+#[lumen_bind::class(name = "ParamSpec", module = "typing", hint(py(final)))]
+/// Parameter specification variable.
+///
+/// The preferred way to construct a parameter specification is via the
+/// dedicated syntax for generic functions, classes, and type aliases,
+/// where the use of '**' creates a parameter specification::
+///
+///     type IntFunc[**P] = Callable[P, int]
+///
+/// For compatibility with Python 3.11 and earlier, ParamSpec objects
+/// can also be created as follows::
+///
+///     P = ParamSpec('P')
+///
+/// Parameter specification variables exist primarily for the benefit of
+/// static type checkers.  They are used to forward the parameter types of
+/// one callable to another callable, a pattern commonly found in
+/// higher-order functions and decorators.  They are only valid when used
+/// in ``Concatenate``, or as the first argument to ``Callable``, or as
+/// parameters for user-defined Generics. See class Generic for more
+/// information on generic types.
+///
+/// An example for annotating a decorator::
+///
+///     def add_logging[**P, T](f: Callable[P, T]) -> Callable[P, T]:
+///         '''A type-safe decorator to add logging to a function.'''
+///         def inner(*args: P.args, **kwargs: P.kwargs) -> T:
+///             logging.info(f'{f.__name__} was called')
+///             return f(*args, **kwargs)
+///         return inner
+///
+///     @add_logging
+///     def add_two(x: float, y: float) -> float:
+///         '''Add two numbers together.'''
+///         return x + y
+///
+/// Parameter specification variables can be introspected. e.g.::
+///
+///     >>> P = ParamSpec("P")
+///     >>> P.__name__
+///     'P'
+///
+/// Note that only parameter specification variables defined in the global
+/// scope can be pickled.
+///
+pub struct ParamSpec {
     name: Value,
     bound: Option<Value>,
     covariant: bool,
     contravariant: bool,
     infer_variance: bool,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
 }
 
-pub struct TypeVarTupleData {
-    name: Value,
-}
-
-struct ParamSpecAttr {
+#[lumen_bind::class(name = "ParamSpecArgs", module = "typing", hint(py(final, unhashable)))]
+/// The args for a ParamSpec object.
+///
+/// Given a ParamSpec object P, P.args is an instance of ParamSpecArgs.
+///
+/// ParamSpecArgs objects have a reference back to their ParamSpec::
+///
+///     >>> P = ParamSpec("P")
+///     >>> P.args.__origin__ is P
+///     True
+///
+/// This type is meant for runtime introspection and has no special meaning
+/// to static type checkers.
+///
+pub struct ParamSpecArgs {
     origin: Value,
 }
 
-pub struct TypeAliasData {
+#[lumen_bind::class(
+    name = "ParamSpecKwargs",
+    module = "typing",
+    hint(py(final, unhashable))
+)]
+/// The kwargs for a ParamSpec object.
+///
+/// Given a ParamSpec object P, P.kwargs is an instance of ParamSpecKwargs.
+///
+/// ParamSpecKwargs objects have a reference back to their ParamSpec::
+///
+///     >>> P = ParamSpec("P")
+///     >>> P.kwargs.__origin__ is P
+///     True
+///
+/// This type is meant for runtime introspection and has no special meaning
+/// to static type checkers.
+///
+pub struct ParamSpecKwargs {
+    origin: Value,
+}
+
+#[lumen_bind::class(name = "TypeVarTuple", module = "typing", hint(py(final)))]
+/// Type variable tuple. A specialized form of type variable that enables
+/// variadic generics.
+///
+/// The preferred way to construct a type variable tuple is via the
+/// dedicated syntax for generic functions, classes, and type aliases,
+/// where a single '*' indicates a type variable tuple::
+///
+///     def move_first_element_to_last[T, *Ts](tup: tuple[T, *Ts]) -> tuple[*Ts, T]:
+///         return (*tup[1:], tup[0])
+///
+/// For compatibility with Python 3.11 and earlier, TypeVarTuple objects
+/// can also be created as follows::
+///
+///     Ts = TypeVarTuple('Ts')  # Can be given any name
+///
+/// Just as a TypeVar (type variable) is a placeholder for a single type,
+/// a TypeVarTuple is a placeholder for an *arbitrary* number of types. For
+/// example, if we define a generic class using a TypeVarTuple::
+///
+///     class C[*Ts]: ...
+///
+/// Then we can parameterize that class with an arbitrary number of type
+/// arguments::
+///
+///     C[int]       # Fine
+///     C[int, str]  # Also fine
+///     C[()]        # Even this is fine
+///
+/// For more details, see PEP 646.
+///
+/// Note that only TypeVarTuples defined in the global scope can be
+/// pickled.
+///
+pub struct TypeVarTuple {
+    name: Value,
+    default: Option<Value>,
+    evaluate_default: Option<Value>,
+}
+
+#[lumen_bind::class(name = "NoDefaultType", module = "typing", hint(py(final)))]
+/// The type of the NoDefault singleton.
+pub struct NoDefaultType;
+
+/// `typing.NoDefault`, the value of `__default__` of a type parameter without a default.
+pub fn no_default(it: &mut Interp) -> Value {
+    if let Some(v) = it.native_state::<NoDefaultSingleton>().0.clone() {
+        return v;
+    }
+    let v = Py::new(it, NoDefaultType).into_value();
+    it.native_state::<NoDefaultSingleton>().0 = Some(v.clone());
+    v
+}
+
+#[derive(Default)]
+struct NoDefaultSingleton(Option<Value>);
+
+fn is_no_default(it: &mut Interp, v: &Value) -> bool {
+    v.is(&no_default(it))
+}
+
+/// The `default` argument of a type parameter constructor: `None` for `NoDefault`.
+fn default_arg(it: &mut Interp, default: Option<&Value>) -> Option<Value> {
+    default.filter(|d| !is_no_default(it, d)).cloned()
+}
+
+/// A type parameter's `__default__`: evaluated on first use when it came from the type
+/// parameter syntax, `NoDefault` when there is none.
+fn default_of(
+    it: &mut Interp,
+    default: Option<Value>,
+    evaluate: Option<Value>,
+) -> R<(Value, bool)> {
+    if let Some(d) = default {
+        return Ok((d, false));
+    }
+    match evaluate {
+        Some(f) => Ok((it.call(&f, Vec::new(), Vec::new())?, true)),
+        None => Ok((no_default(it), false)),
+    }
+}
+
+#[lumen_bind::class(name = "TypeAliasType", module = "typing", hint(py(final)))]
+/// Type alias.
+///
+/// Type aliases are created through the type statement::
+///
+///     type Alias = int
+///
+/// In this example, Alias and int will be treated equivalently by static
+/// type checkers.
+///
+/// At runtime, Alias is an instance of TypeAliasType. The __name__
+/// attribute holds the name of the type alias. The value of the type alias
+/// is stored in the __value__ attribute. It is evaluated lazily, so the
+/// value is computed only if the attribute is accessed.
+///
+/// Type aliases can also be generic::
+///
+///     type ListOrSet[T] = list[T] | set[T]
+///
+/// In this case, the type parameters of the alias are stored in the
+/// __type_params__ attribute.
+///
+/// See PEP 695 for more information.
+///
+pub struct TypeAliasType {
     name: Value,
     type_params: Option<Value>,
     compute_value: Option<Value>,
     value: Option<Value>,
-    module: Option<Value>,
 }
+
+#[lumen_bind::class(name = "Generic", module = "typing")]
+/// Abstract base class for generic types.
+///
+/// On Python 3.12 and newer, generic classes implicitly inherit from
+/// Generic when they declare a parameter list after the class's name::
+///
+///     class Mapping[KT, VT]:
+///         def __getitem__(self, key: KT) -> VT:
+///             ...
+///         # Etc.
+///
+/// On older versions of Python, however, generic classes have to
+/// explicitly inherit from Generic.
+///
+/// After a class has been declared to be generic, it can then be used as
+/// follows::
+///
+///     def lookup_name[KT, VT](mapping: Mapping[KT, VT], key: KT, default: VT) -> VT:
+///         try:
+///             return mapping[key]
+///         except KeyError:
+///             return default
+///
+pub struct Generic;
 
 pub fn is_type_alias(v: &Value) -> bool {
-    with_opaque::<TypeAliasData, _>(v, |_| ()).is_some()
-}
-
-fn typing_dict(it: &mut Interp) -> R<Obj> {
-    let m = it.import_module("_typing")?;
-    Ok(it.module_dict(&m))
-}
-
-fn typing_type(it: &mut Interp, name: &str) -> R<Obj> {
-    let d = typing_dict(it)?;
-    match dict_get_str(&d, name) {
-        Some(Value::Obj(t)) => Ok(t),
-        _ => Err(it.new_exc_str("SystemError", &format!("Cannot find {name} type"))),
-    }
+    with_opaque::<TypeAliasType, _>(v, |_| ()).is_some()
 }
 
 /// Calls `typing.<name>(*args, **kw)`.
@@ -69,7 +308,7 @@ fn call_typing(it: &mut Interp, name: &str, args: Vec<Value>, kw: Vec<(Obj, Valu
 }
 
 /// `typing._type_check(arg, msg)`, with `None` meaning `type(None)` as in CPython's C helper.
-fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
+pub(crate) fn type_check(it: &mut Interp, arg: &Value, msg: &str) -> R<Value> {
     if arg.is_none() {
         return Ok(Value::Obj(it.types.none_type.clone()));
     }
@@ -96,14 +335,6 @@ fn set_module(it: &mut Interp, v: &Value, module: Value) {
     }
 }
 
-fn name_arg(it: &mut Interp, fname: &str, v: &Value) -> R<Value> {
-    if v.as_str().is_none() {
-        let t = it.type_name_of(v);
-        return Err(it.type_error(&format!("{fname}() argument 'name' must be str, not {t}")));
-    }
-    Ok(v.clone())
-}
-
 fn variance_checks(
     it: &mut Interp,
     covariant: bool,
@@ -124,10 +355,10 @@ fn variance_repr(
     covariant: bool,
     contravariant: bool,
     infer_variance: bool,
-) -> Value {
+) -> String {
     let n = name.as_str().unwrap_or("");
     if infer_variance {
-        return Value::str(n);
+        return n.to_string();
     }
     let prefix = if covariant {
         '+'
@@ -136,7 +367,7 @@ fn variance_repr(
     } else {
         '~'
     };
-    Value::string(format!("{prefix}{n}"))
+    format!("{prefix}{n}")
 }
 
 /// Replaces each `TypeVarTuple` in `params` with `Unpack[tvt]`.
@@ -160,7 +391,7 @@ fn unpack_typevartuples(it: &mut Interp, params: &Value) -> R<Value> {
 }
 
 fn is_typevartuple(v: &Value) -> bool {
-    with_opaque::<TypeVarTupleData, _>(v, |_| ()).is_some()
+    with_opaque::<TypeVarTuple, _>(v, |_| ()).is_some()
 }
 
 fn unpack(it: &mut Interp, tvt: &Value) -> R<Value> {
@@ -169,86 +400,55 @@ fn unpack(it: &mut Interp, tvt: &Value) -> R<Value> {
     it.getitem(&u, tvt)
 }
 
-fn bool_kw(it: &mut Interp, v: &Option<Value>) -> R<bool> {
-    match v {
-        Some(v) => it.truthy(v),
-        None => Ok(false),
-    }
+fn no_subclass(it: &mut Interp, what: &str) -> Obj {
+    it.type_error(&format!("Cannot subclass an instance of {what}"))
 }
 
-fn noop_init(_it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Ok(Value::None)
-}
-
-fn idfunc(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    it.no_kwargs("_idfunc", kw)?;
-    it.check_args("_idfunc", a, 1, 1)?;
-    Ok(a[0].clone())
-}
-
-fn set_final(t: &Obj) {
-    if let Kind::Type(td) = &t.kind {
-        td.flags.set(td.flags.get() | TF_FINAL);
-    }
+/// `T | other` for a type variable: `typing.Union[...]`.
+fn make_union(it: &mut Interp, a: &Value, b: &Value) -> R<Value> {
+    it.make_union(vec![a.clone(), b.clone()])
 }
 
 // ---- TypeVar ----
 
-fn new_typevar(it: &mut Interp, data: TypeVarData) -> R<Value> {
-    let ty = typing_type(it, "TypeVar")?;
-    Ok(new_opaque(&ty, data))
-}
-
-fn tv<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut TypeVarData) -> X) -> R<X> {
-    with_opaque::<TypeVarData, _>(v, f).ok_or_else(|| it.self_state_err("typing.TypeVar"))
-}
-
-fn typevar_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let rest = a.get(1..).unwrap_or(&[]);
-    let mut name = rest.first().cloned();
-    let constraints: Vec<Value> = rest.iter().skip(1).cloned().collect();
-    let mut opts: [Option<Value>; 4] = Default::default();
-    const NAMES: [&str; 4] = ["bound", "covariant", "contravariant", "infer_variance"];
-    for (k, v) in kw {
-        let kn = k.as_str_kind().unwrap_or("");
-        if kn == "name" && name.is_none() {
-            name = Some(v.clone());
-            continue;
-        }
-        match NAMES.iter().position(|n| *n == kn) {
-            Some(i) => opts[i] = Some(v.clone()),
-            None => {
-                return Err(it.type_error(&format!(
-                    "typevar() got an unexpected keyword argument '{kn}'"
-                )))
+#[lumen_bind::methods]
+impl TypeVar {
+    #[constructor(hint(py(text_signature = "", arg_name = "typevar")))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[varargs] constraints: &[Value],
+        #[kwonly] bound: Option<&Value>,
+        #[kwonly]
+        #[default(false)]
+        covariant: bool,
+        #[kwonly]
+        #[default(false)]
+        contravariant: bool,
+        #[kwonly]
+        #[default(false)]
+        infer_variance: bool,
+        #[kwonly] default: Option<&Value>,
+    ) -> R<Value> {
+        variance_checks(it, covariant, contravariant, infer_variance)?;
+        let default = default_arg(it, default);
+        let bound = match bound {
+            Some(b) => Some(type_check(it, b, "Bound must be a type.")?),
+            None => None,
+        };
+        let constraints = match constraints.len() {
+            0 => None,
+            1 => return Err(it.type_error("A single constraint is not allowed")),
+            _ if bound.is_some() => {
+                return Err(it.type_error("Constraints cannot be combined with bound=..."));
             }
-        }
-    }
-    let Some(name) = name else {
-        return Err(it.type_error("typevar() missing required argument 'name' (pos 1)"));
-    };
-    let name = name_arg(it, "typevar", &name)?;
-    let covariant = bool_kw(it, &opts[1])?;
-    let contravariant = bool_kw(it, &opts[2])?;
-    let infer_variance = bool_kw(it, &opts[3])?;
-    variance_checks(it, covariant, contravariant, infer_variance)?;
-    let bound = match &opts[0] {
-        Some(b) if !b.is_none() => Some(type_check(it, b, "Bound must be a type.")?),
-        _ => None,
-    };
-    let constraints = match constraints.len() {
-        0 => None,
-        1 => return Err(it.type_error("A single constraint is not allowed")),
-        _ if bound.is_some() => {
-            return Err(it.type_error("Constraints cannot be combined with bound=..."))
-        }
-        _ => Some(Value::tuple(constraints)),
-    };
-    let module = caller_module(it);
-    let v = new_typevar(
-        it,
-        TypeVarData {
-            name,
+            _ => Some(Value::tuple(constraints.to_vec())),
+        };
+        let module = caller_module(it);
+        let data = TypeVar {
+            name: name.0.clone(),
             bound,
             evaluate_bound: None,
             constraints,
@@ -256,481 +456,683 @@ fn typevar_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
             covariant,
             contravariant,
             infer_variance,
-        },
-    )?;
-    set_module(it, &v, module);
-    Ok(v)
-}
-
-fn typevar_name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| d.name.clone())
-}
-
-fn typevar_bound(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (bound, eval) = tv(it, &a[0], |d| (d.bound.clone(), d.evaluate_bound.clone()))?;
-    if let Some(b) = bound {
-        return Ok(b);
+            default,
+            evaluate_default: None,
+        };
+        let v = Py::new(it, data).into_value();
+        set_module(it, &v, module);
+        Ok(v)
     }
-    let Some(f) = eval else {
-        return Ok(Value::None);
-    };
-    let b = it.call(&f, Vec::new(), Vec::new())?;
-    tv(it, &a[0], |d| d.bound = Some(b.clone()))?;
-    Ok(b)
-}
 
-fn typevar_constraints(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (cons, eval) = tv(it, &a[0], |d| {
-        (d.constraints.clone(), d.evaluate_constraints.clone())
-    })?;
-    if let Some(c) = cons {
-        return Ok(c);
+    #[getter(name = "__name__")]
+    fn name(&self) -> Value {
+        self.name.clone()
     }
-    let Some(f) = eval else {
-        return Ok(Value::tuple(Vec::new()));
-    };
-    let c = it.call(&f, Vec::new(), Vec::new())?;
-    tv(it, &a[0], |d| d.constraints = Some(c.clone()))?;
-    Ok(c)
-}
 
-fn typevar_covariant(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| Value::Bool(d.covariant))
-}
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
 
-fn typevar_contravariant(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| Value::Bool(d.contravariant))
-}
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
+    }
 
-fn typevar_infer_variance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| Value::Bool(d.infer_variance))
-}
+    #[getter(name = "__bound__")]
+    fn bound(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (bound, eval) = slf
+            .0
+            .with(it, |d| (d.bound.clone(), d.evaluate_bound.clone()))?;
+        if let Some(b) = bound {
+            return Ok(b);
+        }
+        let Some(f) = eval else {
+            return Ok(Value::None);
+        };
+        let b = it.call(&f, Vec::new(), Vec::new())?;
+        slf.0.with(it, |d| d.bound = Some(b.clone()))?;
+        Ok(b)
+    }
 
-fn typevar_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| {
-        variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance)
-    })
-}
+    #[getter(name = "__constraints__")]
+    fn constraints(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (cons, eval) = slf.0.with(it, |d| {
+            (d.constraints.clone(), d.evaluate_constraints.clone())
+        })?;
+        if let Some(c) = cons {
+            return Ok(c);
+        }
+        let Some(f) = eval else {
+            return Ok(Value::tuple(Vec::new()));
+        };
+        let c = it.call(&f, Vec::new(), Vec::new())?;
+        slf.0.with(it, |d| d.constraints = Some(c.clone()))?;
+        Ok(c)
+    }
 
-fn typevar_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__typing_subst__", a, 2, 2)?;
-    tv(it, &a[0], |_| ())?;
-    call_typing(it, "_typevar_subst", a.to_vec(), Vec::new())
-}
+    #[getter(name = "__covariant__")]
+    fn covariant(&self) -> bool {
+        self.covariant
+    }
 
-fn typevar_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tv(it, &a[0], |d| d.name.clone())
-}
+    #[getter(name = "__contravariant__")]
+    fn contravariant(&self) -> bool {
+        self.contravariant
+    }
 
-fn typevar_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Cannot subclass an instance of TypeVar"))
-}
+    #[getter(name = "__infer_variance__")]
+    fn infer_variance(&self) -> bool {
+        self.infer_variance
+    }
 
-fn make_union_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__or__", a, 2, 2)?;
-    call_typing(
-        it,
-        "_make_union",
-        vec![a[0].clone(), a[1].clone()],
-        Vec::new(),
-    )
-}
+    #[proto(repr)]
+    fn repr(&self) -> String {
+        variance_repr(
+            &self.name,
+            self.covariant,
+            self.contravariant,
+            self.infer_variance,
+        )
+    }
 
-fn make_union_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__ror__", a, 2, 2)?;
-    call_typing(
-        it,
-        "_make_union",
-        vec![a[1].clone(), a[0].clone()],
-        Vec::new(),
-    )
+    #[method(name = "__typing_subst__")]
+    fn typing_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] arg: &Value) -> R<Value> {
+        call_typing(
+            it,
+            "_typevar_subst",
+            vec![slf.0.value().clone(), arg.clone()],
+            Vec::new(),
+        )
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> Value {
+        self.name.clone()
+    }
+
+    #[method(name = "__mro_entries__", hint(py(text_signature = "")))]
+    fn mro_entries(slf: This<Py<Self>>, it: &mut Interp, bases: &Value) -> R<Value> {
+        let _ = (slf, bases);
+        Err(no_subclass(it, "TypeVar"))
+    }
+
+    #[proto(or)]
+    fn or(slf: This<&Value>, it: &mut Interp, right: &Value) -> R<Value> {
+        make_union(it, &slf, right)
+    }
+
+    #[proto(ror)]
+    fn ror(slf: This<&Value>, it: &mut Interp, left: &Value) -> R<Value> {
+        make_union(it, left, &slf)
+    }
 }
 
 // ---- ParamSpec ----
 
-fn ps<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut ParamSpecData) -> X) -> R<X> {
-    with_opaque::<ParamSpecData, _>(v, f).ok_or_else(|| it.self_state_err("typing.ParamSpec"))
-}
-
-fn new_paramspec(it: &mut Interp, data: ParamSpecData) -> R<Value> {
-    let ty = typing_type(it, "ParamSpec")?;
-    Ok(new_opaque(&ty, data))
-}
-
-fn paramspec_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args(
-        "paramspec",
-        a.get(1..).unwrap_or(&[]),
-        kw,
-        &[
-            "name",
-            "bound",
-            "covariant",
-            "contravariant",
-            "infer_variance",
-        ],
-        1,
-    )?;
-    if a.len() > 2 {
-        return Err(it.type_error(&format!(
-            "paramspec() takes exactly 1 positional argument ({} given)",
-            a.len() - 1
-        )));
-    }
-    let name = name_arg(it, "paramspec", b[0].as_ref().unwrap_or(&Value::None))?;
-    let covariant = bool_kw(it, &b[2])?;
-    let contravariant = bool_kw(it, &b[3])?;
-    let infer_variance = bool_kw(it, &b[4])?;
-    variance_checks(it, covariant, contravariant, infer_variance)?;
-    let bound = type_check(
-        it,
-        b[1].as_ref().unwrap_or(&Value::None),
-        "Bound must be a type.",
-    )?;
-    let module = caller_module(it);
-    let v = new_paramspec(
-        it,
-        ParamSpecData {
-            name,
+#[lumen_bind::methods]
+impl ParamSpec {
+    #[constructor(hint(py(text_signature = "", arg_name = "paramspec")))]
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[kwonly] bound: Option<&Value>,
+        #[kwonly]
+        #[default(false)]
+        covariant: bool,
+        #[kwonly]
+        #[default(false)]
+        contravariant: bool,
+        #[kwonly]
+        #[default(false)]
+        infer_variance: bool,
+        #[kwonly] default: Option<&Value>,
+    ) -> R<Value> {
+        variance_checks(it, covariant, contravariant, infer_variance)?;
+        let default = default_arg(it, default);
+        let bound = type_check(it, bound.unwrap_or(&Value::None), "Bound must be a type.")?;
+        let module = caller_module(it);
+        let data = ParamSpec {
+            name: name.0.clone(),
             bound: Some(bound),
             covariant,
             contravariant,
             infer_variance,
-        },
-    )?;
-    set_module(it, &v, module);
-    Ok(v)
-}
+            default,
+            evaluate_default: None,
+        };
+        let v = Py::new(it, data).into_value();
+        set_module(it, &v, module);
+        Ok(v)
+    }
 
-fn paramspec_name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| d.name.clone())
-}
+    #[getter(name = "__name__")]
+    fn name(&self) -> Value {
+        self.name.clone()
+    }
 
-fn paramspec_bound(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| d.bound.clone().unwrap_or(Value::None))
-}
+    #[getter(name = "__bound__")]
+    fn bound(&self) -> Value {
+        self.bound.clone().unwrap_or(Value::None)
+    }
 
-fn paramspec_covariant(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| Value::Bool(d.covariant))
-}
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
 
-fn paramspec_contravariant(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| Value::Bool(d.contravariant))
-}
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
+    }
 
-fn paramspec_infer_variance(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| Value::Bool(d.infer_variance))
-}
+    #[getter(name = "__covariant__")]
+    fn covariant(&self) -> bool {
+        self.covariant
+    }
 
-fn paramspec_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| {
-        variance_repr(&d.name, d.covariant, d.contravariant, d.infer_variance)
-    })
-}
+    #[getter(name = "__contravariant__")]
+    fn contravariant(&self) -> bool {
+        self.contravariant
+    }
 
-fn paramspec_args(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |_| ())?;
-    let ty = typing_type(it, "ParamSpecArgs")?;
-    Ok(new_opaque(
-        &ty,
-        ParamSpecAttr {
-            origin: a[0].clone(),
-        },
-    ))
-}
+    #[getter(name = "__infer_variance__")]
+    fn infer_variance(&self) -> bool {
+        self.infer_variance
+    }
 
-fn paramspec_kwargs(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |_| ())?;
-    let ty = typing_type(it, "ParamSpecKwargs")?;
-    Ok(new_opaque(
-        &ty,
-        ParamSpecAttr {
-            origin: a[0].clone(),
-        },
-    ))
-}
+    /// Represents positional arguments.
+    #[getter]
+    fn args(slf: This<Py<Self>>, it: &mut Interp) -> Value {
+        Py::new(
+            it,
+            ParamSpecArgs {
+                origin: slf.0.value().clone(),
+            },
+        )
+        .into_value()
+    }
 
-fn paramspec_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__typing_subst__", a, 2, 2)?;
-    ps(it, &a[0], |_| ())?;
-    call_typing(it, "_paramspec_subst", a.to_vec(), Vec::new())
-}
+    /// Represents keyword arguments.
+    #[getter]
+    fn kwargs(slf: This<Py<Self>>, it: &mut Interp) -> Value {
+        Py::new(
+            it,
+            ParamSpecKwargs {
+                origin: slf.0.value().clone(),
+            },
+        )
+        .into_value()
+    }
 
-fn paramspec_prepare_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__typing_prepare_subst__", a, 3, 3)?;
-    ps(it, &a[0], |_| ())?;
-    call_typing(it, "_paramspec_prepare_subst", a.to_vec(), Vec::new())
-}
+    #[proto(repr)]
+    fn repr(&self) -> String {
+        variance_repr(
+            &self.name,
+            self.covariant,
+            self.contravariant,
+            self.infer_variance,
+        )
+    }
 
-fn paramspec_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ps(it, &a[0], |d| d.name.clone())
-}
+    #[method(name = "__typing_subst__")]
+    fn typing_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] arg: &Value) -> R<Value> {
+        call_typing(
+            it,
+            "_paramspec_subst",
+            vec![slf.0.value().clone(), arg.clone()],
+            Vec::new(),
+        )
+    }
 
-fn paramspec_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Cannot subclass an instance of ParamSpec"))
+    #[method(name = "__typing_prepare_subst__")]
+    fn typing_prepare_subst(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] alias: &Value,
+        #[kw] args: &Value,
+    ) -> R<Value> {
+        call_typing(
+            it,
+            "_paramspec_prepare_subst",
+            vec![slf.0.value().clone(), alias.clone(), args.clone()],
+            Vec::new(),
+        )
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> Value {
+        self.name.clone()
+    }
+
+    #[method(name = "__mro_entries__", hint(py(text_signature = "")))]
+    fn mro_entries(slf: This<Py<Self>>, it: &mut Interp, bases: &Value) -> R<Value> {
+        let _ = (slf, bases);
+        Err(no_subclass(it, "ParamSpec"))
+    }
+
+    #[proto(or)]
+    fn or(slf: This<&Value>, it: &mut Interp, right: &Value) -> R<Value> {
+        make_union(it, &slf, right)
+    }
+
+    #[proto(ror)]
+    fn ror(slf: This<&Value>, it: &mut Interp, left: &Value) -> R<Value> {
+        make_union(it, left, &slf)
+    }
 }
 
 // ---- ParamSpecArgs / ParamSpecKwargs ----
 
-fn psattr_origin(it: &mut Interp, v: &Value) -> R<Value> {
-    with_opaque::<ParamSpecAttr, _>(v, |d| d.origin.clone())
-        .ok_or_else(|| it.self_state_err("typing.ParamSpecArgs"))
-}
-
-fn psattr_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args(
-        "paramspecargs",
-        a.get(1..).unwrap_or(&[]),
-        kw,
-        &["origin"],
-        1,
-    )?;
-    let Some(Value::Obj(cls)) = a.first() else {
-        return Err(it.type_error("__new__ needs a type"));
-    };
-    Ok(new_opaque(
-        cls,
-        ParamSpecAttr {
-            origin: b[0].clone().unwrap_or(Value::None),
-        },
-    ))
-}
-
-fn psattr_origin_get(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    psattr_origin(it, &a[0])
-}
-
-fn psattr_repr(it: &mut Interp, a: &[Value], suffix: &str) -> R<Value> {
-    let origin = psattr_origin(it, &a[0])?;
-    let base = match with_opaque::<ParamSpecData, _>(&origin, |d| d.name.clone()) {
+/// `P.args` / `P.kwargs` (the name of a `ParamSpec` origin, else its repr).
+fn psattr_repr(it: &mut Interp, origin: &Value, suffix: &str) -> R<String> {
+    let base = match with_opaque::<ParamSpec, _>(origin, |d| d.name.clone()) {
         Some(n) => n.as_str().unwrap_or("").to_string(),
-        None => it.repr_of(&origin)?,
+        None => it.repr_of(origin)?,
     };
-    Ok(Value::string(format!("{base}.{suffix}")))
+    Ok(format!("{base}.{suffix}"))
 }
 
-fn psargs_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    psattr_repr(it, a, "args")
-}
-
-fn pskwargs_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    psattr_repr(it, a, "kwargs")
-}
-
-fn psattr_cmp(it: &mut Interp, a: &[Value], negate: bool) -> R<Value> {
-    it.check_args("__eq__", a, 2, 2)?;
-    let (t1, t2) = (it.type_of(&a[0]), it.type_of(&a[1]));
+/// `==` / `!=` of two `ParamSpecArgs` (or two `ParamSpecKwargs`): their origins compared.
+fn psattr_cmp(
+    it: &mut Interp,
+    a: &Value,
+    b: &Value,
+    origin: fn(&Value) -> Option<Value>,
+    negate: bool,
+) -> R<Value> {
+    let (t1, t2) = (it.type_of(a), it.type_of(b));
     if !std::rc::Rc::ptr_eq(&t1, &t2) {
         return Ok(Value::NotImplemented);
     }
-    let o1 = psattr_origin(it, &a[0])?;
-    let o2 = psattr_origin(it, &a[1])?;
+    let (Some(o1), Some(o2)) = (origin(a), origin(b)) else {
+        return Ok(Value::NotImplemented);
+    };
     let eq = it.values_eq(&o1, &o2)?;
     Ok(Value::Bool(eq != negate))
 }
 
-fn psattr_eq(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    psattr_cmp(it, a, false)
+fn args_origin(v: &Value) -> Option<Value> {
+    with_opaque::<ParamSpecArgs, _>(v, |d| d.origin.clone())
 }
 
-fn psattr_ne(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    psattr_cmp(it, a, true)
+fn kwargs_origin(v: &Value) -> Option<Value> {
+    with_opaque::<ParamSpecKwargs, _>(v, |d| d.origin.clone())
 }
 
-fn psargs_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Cannot subclass an instance of ParamSpecArgs"))
+#[lumen_bind::methods]
+impl ParamSpecArgs {
+    #[constructor(hint(py(text_signature = "", arg_name = "paramspecargs")))]
+    fn new(#[kw] origin: &Value) -> ParamSpecArgs {
+        ParamSpecArgs {
+            origin: origin.clone(),
+        }
+    }
+
+    #[getter(name = "__origin__")]
+    fn origin(&self) -> Value {
+        self.origin.clone()
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
+        let origin = slf.0.borrow(it)?.origin.clone();
+        psattr_repr(it, &origin, "args")
+    }
+
+    #[proto(eq)]
+    fn eq(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        psattr_cmp(it, &slf, value, args_origin, false)
+    }
+
+    #[proto(ne)]
+    fn ne(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        psattr_cmp(it, &slf, value, args_origin, true)
+    }
+
+    #[method(name = "__mro_entries__", hint(py(text_signature = "")))]
+    fn mro_entries(slf: This<Py<Self>>, it: &mut Interp, bases: &Value) -> R<Value> {
+        let _ = (slf, bases);
+        Err(no_subclass(it, "ParamSpecArgs"))
+    }
 }
 
-fn pskwargs_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Cannot subclass an instance of ParamSpecKwargs"))
+#[lumen_bind::methods]
+impl ParamSpecKwargs {
+    #[constructor(hint(py(text_signature = "", arg_name = "paramspeckwargs")))]
+    fn new(#[kw] origin: &Value) -> ParamSpecKwargs {
+        ParamSpecKwargs {
+            origin: origin.clone(),
+        }
+    }
+
+    #[getter(name = "__origin__")]
+    fn origin(&self) -> Value {
+        self.origin.clone()
+    }
+
+    #[proto(repr)]
+    fn repr(slf: This<Py<Self>>, it: &mut Interp) -> R<String> {
+        let origin = slf.0.borrow(it)?.origin.clone();
+        psattr_repr(it, &origin, "kwargs")
+    }
+
+    #[proto(eq)]
+    fn eq(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        psattr_cmp(it, &slf, value, kwargs_origin, false)
+    }
+
+    #[proto(ne)]
+    fn ne(slf: This<&Value>, it: &mut Interp, value: &Value) -> R<Value> {
+        psattr_cmp(it, &slf, value, kwargs_origin, true)
+    }
+
+    #[method(name = "__mro_entries__", hint(py(text_signature = "")))]
+    fn mro_entries(slf: This<Py<Self>>, it: &mut Interp, bases: &Value) -> R<Value> {
+        let _ = (slf, bases);
+        Err(no_subclass(it, "ParamSpecKwargs"))
+    }
 }
 
 // ---- TypeVarTuple ----
 
-fn tvt_name_of(it: &mut Interp, v: &Value) -> R<Value> {
-    with_opaque::<TypeVarTupleData, _>(v, |d| d.name.clone())
-        .ok_or_else(|| it.self_state_err("typing.TypeVarTuple"))
-}
+#[lumen_bind::methods]
+impl TypeVarTuple {
+    #[constructor(hint(py(text_signature = "", arg_name = "typevartuple")))]
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[kwonly] default: Option<&Value>,
+    ) -> R<Value> {
+        let module = caller_module(it);
+        let default = default_arg(it, default);
+        let v = Py::new(
+            it,
+            TypeVarTuple {
+                name: name.0.clone(),
+                default,
+                evaluate_default: None,
+            },
+        )
+        .into_value();
+        set_module(it, &v, module);
+        Ok(v)
+    }
 
-fn new_typevartuple(it: &mut Interp, name: Value) -> R<Value> {
-    let ty = typing_type(it, "TypeVarTuple")?;
-    Ok(new_opaque(&ty, TypeVarTupleData { name }))
-}
+    #[getter(name = "__name__")]
+    fn name(&self) -> Value {
+        self.name.clone()
+    }
 
-fn tvt_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let b = it.bind_args("typevartuple", a.get(1..).unwrap_or(&[]), kw, &["name"], 1)?;
-    let name = name_arg(it, "typevartuple", b[0].as_ref().unwrap_or(&Value::None))?;
-    let module = caller_module(it);
-    let v = new_typevartuple(it, name)?;
-    set_module(it, &v, module);
-    Ok(v)
-}
+    #[getter(name = "__default__")]
+    fn default(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (d, e) = slf
+            .0
+            .with(it, |d| (d.default.clone(), d.evaluate_default.clone()))?;
+        let (v, evaluated) = default_of(it, d, e)?;
+        if evaluated {
+            slf.0.with(it, |d| d.default = Some(v.clone()))?;
+        }
+        Ok(v)
+    }
 
-fn tvt_name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tvt_name_of(it, &a[0])
-}
+    fn has_default(&self) -> bool {
+        self.default.is_some() || self.evaluate_default.is_some()
+    }
 
-fn tvt_iter(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    tvt_name_of(it, &a[0])?;
-    let u = unpack(it, &a[0])?;
-    it.native_get_iter(&Value::tuple(vec![u]))
-}
+    #[proto(repr)]
+    fn repr(&self) -> Value {
+        self.name.clone()
+    }
 
-fn tvt_subst(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Substitution of bare TypeVarTuple is not supported"))
-}
+    #[proto(iter)]
+    fn iter(slf: This<&Value>, it: &mut Interp) -> R<Value> {
+        let u = unpack(it, &slf)?;
+        it.native_get_iter(&Value::tuple(vec![u]))
+    }
 
-fn tvt_prepare_subst(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__typing_prepare_subst__", a, 3, 3)?;
-    tvt_name_of(it, &a[0])?;
-    call_typing(it, "_typevartuple_prepare_subst", a.to_vec(), Vec::new())
-}
+    #[method(name = "__typing_subst__")]
+    fn typing_subst(slf: This<Py<Self>>, it: &mut Interp, #[kw] arg: &Value) -> R<Value> {
+        let _ = (slf, arg);
+        Err(it.type_error("Substitution of bare TypeVarTuple is not supported"))
+    }
 
-fn tvt_mro_entries(it: &mut Interp, _a: &[Value], _kw: Kw) -> R<Value> {
-    Err(it.type_error("Cannot subclass an instance of TypeVarTuple"))
+    #[method(name = "__typing_prepare_subst__")]
+    fn typing_prepare_subst(
+        slf: This<Py<Self>>,
+        it: &mut Interp,
+        #[kw] alias: &Value,
+        #[kw] args: &Value,
+    ) -> R<Value> {
+        call_typing(
+            it,
+            "_typevartuple_prepare_subst",
+            vec![slf.0.value().clone(), alias.clone(), args.clone()],
+            Vec::new(),
+        )
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> Value {
+        self.name.clone()
+    }
+
+    #[method(name = "__mro_entries__", hint(py(text_signature = "")))]
+    fn mro_entries(slf: This<Py<Self>>, it: &mut Interp, bases: &Value) -> R<Value> {
+        let _ = (slf, bases);
+        Err(no_subclass(it, "TypeVarTuple"))
+    }
 }
 
 // ---- TypeAliasType ----
 
-fn ta<X>(it: &mut Interp, v: &Value, f: impl FnOnce(&mut TypeAliasData) -> X) -> R<X> {
-    with_opaque::<TypeAliasData, _>(v, f).ok_or_else(|| it.self_state_err("typing.TypeAliasType"))
-}
-
-fn new_typealias(it: &mut Interp, data: TypeAliasData) -> R<Value> {
-    let ty = typing_type(it, "TypeAliasType")?;
-    let module = match (&data.module, &data.compute_value) {
-        (Some(m), _) => Some(m.clone()),
+fn new_typealias(it: &mut Interp, data: TypeAliasType, module: Option<Value>) -> R<Value> {
+    let module = match (module, &data.compute_value) {
+        (Some(m), _) => Some(m),
         (None, Some(f)) => Some(it.get_attr_str(f, "__module__")?),
         (None, None) => None,
     };
-    let v = new_opaque(&ty, data);
+    let v = Py::new(it, data).into_value();
     if let Some(m) = module {
         set_module(it, &v, m);
     }
     Ok(v)
 }
 
-fn typealias_new(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    let pos = a.get(1..).unwrap_or(&[]);
-    if pos.len() > 2 {
-        return Err(it.type_error(&format!(
-            "typealias() takes exactly 2 positional arguments ({} given)",
-            pos.len()
-        )));
-    }
-    let b = it.bind_args("typealias", pos, kw, &["name", "value", "type_params"], 2)?;
-    let name = name_arg(it, "typealias", b[0].as_ref().unwrap_or(&Value::None))?;
-    let type_params = match &b[2] {
-        None | Some(Value::None) => None,
-        Some(tp) if tp.tuple_items().is_some() => Some(tp.clone()),
-        Some(_) => return Err(it.type_error("type_params must be a tuple")),
-    };
-    let module = caller_module(it);
-    new_typealias(
-        it,
-        TypeAliasData {
-            name,
+#[lumen_bind::methods]
+impl TypeAliasType {
+    #[constructor(hint(py(text_signature = "", arg_name = "typealias")))]
+    fn new(
+        _cls: This<Value>,
+        it: &mut Interp,
+        #[kw] name: StrRef<'_>,
+        #[kw] value: &Value,
+        #[kwonly] type_params: Option<&Value>,
+    ) -> R<Value> {
+        let type_params = match type_params {
+            None => None,
+            Some(tp) if tp.tuple_items().is_some() => Some(tp.clone()),
+            Some(_) => return Err(it.type_error("type_params must be a tuple")),
+        };
+        let module = caller_module(it);
+        let data = TypeAliasType {
+            name: name.0.clone(),
             type_params,
             compute_value: None,
-            value: b[1].clone(),
-            module: Some(module),
-        },
-    )
-}
-
-fn typealias_name(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ta(it, &a[0], |d| d.name.clone())
-}
-
-fn typealias_value(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    let (value, compute) = ta(it, &a[0], |d| (d.value.clone(), d.compute_value.clone()))?;
-    if let Some(v) = value {
-        return Ok(v);
+            value: Some(value.clone()),
+        };
+        new_typealias(it, data, Some(module))
     }
-    let Some(f) = compute else {
-        return Ok(Value::None);
-    };
-    let v = it.call(&f, Vec::new(), Vec::new())?;
-    ta(it, &a[0], |d| d.value = Some(v.clone()))?;
-    Ok(v)
-}
 
-fn typealias_type_params(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ta(it, &a[0], |d| {
-        d.type_params
+    #[getter(name = "__name__")]
+    fn name(&self) -> Value {
+        self.name.clone()
+    }
+
+    #[getter(name = "__value__")]
+    fn value(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        let (value, compute) = slf
+            .0
+            .with(it, |d| (d.value.clone(), d.compute_value.clone()))?;
+        if let Some(v) = value {
+            return Ok(v);
+        }
+        let Some(f) = compute else {
+            return Ok(Value::None);
+        };
+        let v = it.call(&f, Vec::new(), Vec::new())?;
+        slf.0.with(it, |d| d.value = Some(v.clone()))?;
+        Ok(v)
+    }
+
+    #[getter(name = "__type_params__")]
+    fn type_params(&self) -> Value {
+        self.type_params
             .clone()
             .unwrap_or_else(|| Value::tuple(Vec::new()))
-    })
-}
+    }
 
-fn typealias_parameters(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    match ta(it, &a[0], |d| d.type_params.clone())? {
-        Some(tp) => unpack_typevartuples(it, &tp),
-        None => Ok(Value::tuple(Vec::new())),
+    #[getter(name = "__parameters__")]
+    fn parameters(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
+        match slf.0.borrow(it)?.type_params.clone() {
+            Some(tp) => unpack_typevartuples(it, &tp),
+            None => Ok(Value::tuple(Vec::new())),
+        }
+    }
+
+    #[proto(repr)]
+    fn repr(&self) -> Value {
+        self.name.clone()
+    }
+
+    #[proto(getitem)]
+    fn getitem(slf: This<Py<Self>>, it: &mut Interp, key: &Value) -> R<Value> {
+        if slf.0.borrow(it)?.type_params.is_none() {
+            return Err(it.type_error("Only generic type aliases are subscriptable"));
+        }
+        Ok(it.make_alias(slf.0.value().clone(), key))
+    }
+
+    #[proto(or)]
+    fn or(slf: This<&Value>, it: &mut Interp, right: &Value) -> R<Value> {
+        Ok(it
+            .union_binop(&slf, right)?
+            .unwrap_or(Value::NotImplemented))
+    }
+
+    #[proto(ror)]
+    fn ror(slf: This<&Value>, it: &mut Interp, left: &Value) -> R<Value> {
+        Ok(it.union_binop(left, &slf)?.unwrap_or(Value::NotImplemented))
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> Value {
+        self.name.clone()
+    }
+
+    // CPython's alias objects have no `__dict__` and read-only members; `__module__` lives in
+    // the instance dict here, so every assignment is refused explicitly.
+    #[proto(setattr)]
+    fn setattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value, value: &Value) -> R<()> {
+        let _ = (slf, value);
+        Err(alias_attr_error(it, name))
+    }
+
+    #[proto(delattr)]
+    fn delattr(slf: This<Py<Self>>, it: &mut Interp, name: &Value) -> R<()> {
+        let _ = slf;
+        Err(alias_attr_error(it, name))
     }
 }
 
-fn typealias_repr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ta(it, &a[0], |d| d.name.clone())
-}
-
-fn typealias_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__getitem__", a, 2, 2)?;
-    if ta(it, &a[0], |d| d.type_params.is_none())? {
-        return Err(it.type_error("Only generic type aliases are subscriptable"));
-    }
-    Ok(it.make_alias(a[0].clone(), &a[1]))
-}
-
-fn typealias_or(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__or__", a, 2, 2)?;
-    Ok(it
-        .union_binop(&a[0], &a[1])?
-        .unwrap_or(Value::NotImplemented))
-}
-
-fn typealias_ror(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__ror__", a, 2, 2)?;
-    Ok(it
-        .union_binop(&a[1], &a[0])?
-        .unwrap_or(Value::NotImplemented))
-}
-
-fn typealias_reduce(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    ta(it, &a[0], |d| d.name.clone())
-}
-
-fn typealias_setattr(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__setattr__", a, 3, 3)?;
-    let name = a[1].as_str().unwrap_or("").to_string();
-    let msg = match name.as_str() {
+fn alias_attr_error(it: &mut Interp, name: &Value) -> Obj {
+    let name = name.as_str().unwrap_or("");
+    let msg = match name {
         "__name__" | "__type_params__" => "readonly attribute".to_string(),
         "__value__" | "__parameters__" | "__module__" => {
             format!("attribute '{name}' of 'typing.TypeAliasType' objects is not writable")
         }
         _ => format!("'typing.TypeAliasType' object has no attribute '{name}'"),
     };
-    Err(it.new_exc_str("AttributeError", &msg))
+    it.new_exc_str("AttributeError", &msg)
+}
+
+#[lumen_bind::methods]
+impl NoDefaultType {
+    #[constructor(hint(py(text_signature = "")))]
+    fn new(_cls: This<Value>, it: &mut Interp) -> Value {
+        no_default(it)
+    }
+
+    #[proto(repr)]
+    fn repr(&self) -> &'static str {
+        "typing.NoDefault"
+    }
+
+    #[method(name = "__reduce__")]
+    fn reduce(&self) -> &'static str {
+        "NoDefault"
+    }
 }
 
 // ---- Generic ----
 
-fn generic_class_getitem(it: &mut Interp, a: &[Value], _kw: Kw) -> R<Value> {
-    it.check_args("__class_getitem__", a, 2, 2)?;
-    call_typing(it, "_generic_class_getitem", a.to_vec(), Vec::new())
-}
+#[lumen_bind::methods]
+impl Generic {
+    /// Parameterizes a generic class.
+    ///
+    /// At least, parameterizing a generic class is the *main* thing this
+    /// method does. For example, for some generic class `Foo`, this is called
+    /// when we do `Foo[int]` - there, with `cls=Foo` and `params=int`.
+    ///
+    /// However, note that this method is also called when defining generic
+    /// classes in the first place with `class Foo[T]: ...`.
+    ///
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, params: &Value) -> R<Value> {
+        call_typing(
+            it,
+            "_generic_class_getitem",
+            vec![cls.0, params.clone()],
+            Vec::new(),
+        )
+    }
 
-fn generic_init_subclass(it: &mut Interp, a: &[Value], kw: Kw) -> R<Value> {
-    call_typing(it, "_generic_init_subclass", a.to_vec(), kw.to_vec())
+    /// Function to initialize subclasses.
+    #[classmethod(name = "__init_subclass__", hint(py(text_signature = "")))]
+    fn init_subclass(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<Value> {
+        let mut all = vec![cls.0];
+        all.extend_from_slice(args);
+        call_typing(it, "_generic_init_subclass", all, kwargs.to_vec())
+    }
 }
 
 // ---- intrinsics ----
 
 pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
     match k {
-        INTRINSIC1_TYPEVAR => new_typevar(
+        INTRINSIC1_TYPEVAR => Ok(Py::new(
             it,
-            TypeVarData {
+            TypeVar {
                 name: v,
                 bound: None,
                 evaluate_bound: None,
@@ -739,22 +1141,35 @@ pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
                 covariant: false,
                 contravariant: false,
                 infer_variance: true,
+                default: None,
+                evaluate_default: None,
             },
-        ),
-        INTRINSIC1_PARAMSPEC => new_paramspec(
-            it,
-            ParamSpecData {
+        )
+        .into_value()),
+        INTRINSIC1_PARAMSPEC => {
+            let data = ParamSpec {
                 name: v,
                 bound: None,
                 covariant: false,
                 contravariant: false,
                 infer_variance: true,
+                default: None,
+                evaluate_default: None,
+            };
+            Ok(Py::new(it, data).into_value())
+        }
+        INTRINSIC1_TYPEVARTUPLE => Ok(Py::new(
+            it,
+            TypeVarTuple {
+                name: v,
+                default: None,
+                evaluate_default: None,
             },
-        ),
-        INTRINSIC1_TYPEVARTUPLE => new_typevartuple(it, v),
+        )
+        .into_value()),
         INTRINSIC1_SUBSCRIPT_GENERIC => {
             let params = unpack_typevartuples(it, &v)?;
-            let generic = typing_type(it, "Generic")?;
+            let generic = generic_type(it);
             call_typing(
                 it,
                 "_GenericAlias",
@@ -766,16 +1181,13 @@ pub fn intrinsic1(it: &mut Interp, k: u32, v: Value) -> R<Value> {
             let items = v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
             let [name, type_params, compute] = <[Value; 3]>::try_from(items)
                 .map_err(|_| it.new_exc_str("SystemError", "bad type alias intrinsic argument"))?;
-            new_typealias(
-                it,
-                TypeAliasData {
-                    name,
-                    type_params: (!type_params.is_none()).then_some(type_params),
-                    compute_value: Some(compute),
-                    value: None,
-                    module: None,
-                },
-            )
+            let data = TypeAliasType {
+                name,
+                type_params: (!type_params.is_none()).then_some(type_params),
+                compute_value: Some(compute),
+                value: None,
+            };
+            new_typealias(it, data, None)
         }
         _ => Err(it.new_exc_str("SystemError", "unknown intrinsic")),
     }
@@ -785,19 +1197,19 @@ pub fn intrinsic2(it: &mut Interp, k: u32, a: Value, b: Value) -> R<Value> {
     match k {
         INTRINSIC2_TYPEVAR_WITH_BOUND | INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS => {
             let constraints = k == INTRINSIC2_TYPEVAR_WITH_CONSTRAINTS;
-            new_typevar(
-                it,
-                TypeVarData {
-                    name: a,
-                    bound: None,
-                    evaluate_bound: (!constraints).then(|| b.clone()),
-                    constraints: None,
-                    evaluate_constraints: constraints.then_some(b),
-                    covariant: false,
-                    contravariant: false,
-                    infer_variance: true,
-                },
-            )
+            let data = TypeVar {
+                name: a,
+                bound: None,
+                evaluate_bound: (!constraints).then(|| b.clone()),
+                constraints: None,
+                evaluate_constraints: constraints.then_some(b),
+                covariant: false,
+                contravariant: false,
+                infer_variance: true,
+                default: None,
+                evaluate_default: None,
+            };
+            Ok(Py::new(it, data).into_value())
         }
         INTRINSIC2_SET_FUNCTION_TYPE_PARAMS => {
             if let Value::Obj(f) = &a {
@@ -827,138 +1239,80 @@ impl Interp {
     }
 }
 
-pub fn make(it: &mut Interp) -> Obj {
-    let m = it.new_module("_typing");
-    let d = it.module_dict(&m);
-    it.register_module("_typing", &m);
-    set_fn(it, &d, "_idfunc", idfunc);
+/// `typing.Generic`: an ordinary class (its subclasses are plain Python classes), created once
+/// per interpreter with the native members installed.
+fn generic_type(it: &mut Interp) -> Obj {
+    if let Some(t) = it.native_types.get(&std::any::TypeId::of::<Generic>()) {
+        return t.clone();
+    }
+    let t = new_type(it, "typing", "Generic", None, Layout::Object);
+    crate::bind::extend_type_documented::<Generic>(it, &t);
+    t
+}
 
-    let typevar = new_type(it, "typing", "TypeVar", None, Layout::Other);
-    it.reg_new(&typevar, typevar_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("__init__", noop_init),
-        ("__repr__", typevar_repr),
-        ("__typing_subst__", typevar_subst),
-        ("__reduce__", typevar_reduce),
-        ("__mro_entries__", typevar_mro_entries),
-        ("__or__", make_union_or),
-        ("__ror__", make_union_ror),
-    ];
-    for (n, f) in methods {
-        it.reg(&typevar, n, *f);
-    }
-    for (n, f) in [
-        ("__name__", typevar_name as NativeFn),
-        ("__bound__", typevar_bound),
-        ("__constraints__", typevar_constraints),
-        ("__covariant__", typevar_covariant),
-        ("__contravariant__", typevar_contravariant),
-        ("__infer_variance__", typevar_infer_variance),
-    ] {
-        it.reg_prop(&typevar, n, f);
-    }
-    set_final(&typevar);
-    set_type(&d, "TypeVar", &typevar);
+/// Accelerators for the typing module.
+///
+#[lumen_bind::module(name = "_typing")]
+pub mod _typing {
+    use super::*;
 
-    let paramspec = new_type(it, "typing", "ParamSpec", None, Layout::Other);
-    it.reg_new(&paramspec, paramspec_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("__init__", noop_init),
-        ("__repr__", paramspec_repr),
-        ("__typing_subst__", paramspec_subst),
-        ("__typing_prepare_subst__", paramspec_prepare_subst),
-        ("__reduce__", paramspec_reduce),
-        ("__mro_entries__", paramspec_mro_entries),
-        ("__or__", make_union_or),
-        ("__ror__", make_union_ror),
-    ];
-    for (n, f) in methods {
-        it.reg(&paramspec, n, *f);
+    #[op(name = "_idfunc")]
+    fn idfunc(x: &Value) -> Value {
+        x.clone()
     }
-    for (n, f) in [
-        ("__name__", paramspec_name as NativeFn),
-        ("__bound__", paramspec_bound),
-        ("__covariant__", paramspec_covariant),
-        ("__contravariant__", paramspec_contravariant),
-        ("__infer_variance__", paramspec_infer_variance),
-        ("args", paramspec_args),
-        ("kwargs", paramspec_kwargs),
-    ] {
-        it.reg_prop(&paramspec, n, f);
-    }
-    set_final(&paramspec);
-    set_type(&d, "ParamSpec", &paramspec);
 
-    for (name, repr, mro) in [
-        (
-            "ParamSpecArgs",
-            psargs_repr as NativeFn,
-            psargs_mro_entries as NativeFn,
-        ),
-        ("ParamSpecKwargs", pskwargs_repr, pskwargs_mro_entries),
-    ] {
-        let ty = new_type(it, "typing", name, None, Layout::Other);
-        it.reg_new(&ty, psattr_new);
-        it.reg(&ty, "__init__", noop_init);
-        it.reg(&ty, "__repr__", repr);
-        it.reg(&ty, "__eq__", psattr_eq);
-        it.reg(&ty, "__ne__", psattr_ne);
-        it.reg(&ty, "__mro_entries__", mro);
-        it.reg_prop(&ty, "__origin__", psattr_origin_get);
-        if let Some(td) = ty.dict.borrow().as_ref() {
-            dict_set_str(td, "__hash__", Value::None);
+    #[init]
+    fn init(it: &mut Interp, m: &Value) {
+        use crate::builtins::descr::install_getsets;
+        let Value::Obj(m) = m else { return };
+        let d = it.module_dict(m);
+        let tv = type_object::<TypeVar>(it);
+        install_getsets::<TypeVar>(
+            it,
+            &tv,
+            &[
+                "__name__",
+                "__covariant__",
+                "__contravariant__",
+                "__infer_variance__",
+            ],
+        );
+        let ps = type_object::<ParamSpec>(it);
+        install_getsets::<ParamSpec>(
+            it,
+            &ps,
+            &[
+                "__name__",
+                "__bound__",
+                "__covariant__",
+                "__contravariant__",
+                "__infer_variance__",
+            ],
+        );
+        let psa = type_object::<ParamSpecArgs>(it);
+        install_getsets::<ParamSpecArgs>(it, &psa, &["__origin__"]);
+        let psk = type_object::<ParamSpecKwargs>(it);
+        install_getsets::<ParamSpecKwargs>(it, &psk, &["__origin__"]);
+        let tvt = type_object::<TypeVarTuple>(it);
+        install_getsets::<TypeVarTuple>(it, &tvt, &["__name__"]);
+        let ta = type_object::<TypeAliasType>(it);
+        install_getsets::<TypeAliasType>(it, &ta, &["__name__"]);
+        let generic = generic_type(it);
+        let union = type_object::<crate::builtins::alias::UnionData>(it);
+        let no_default_type = type_object::<NoDefaultType>(it);
+        let _ = no_default_type;
+        dict_set_str(&d, "NoDefault", no_default(it));
+        for (n, t) in [
+            ("Union", union),
+            ("TypeVar", tv),
+            ("ParamSpec", ps),
+            ("ParamSpecArgs", psa),
+            ("ParamSpecKwargs", psk),
+            ("TypeVarTuple", tvt),
+            ("TypeAliasType", ta),
+            ("Generic", generic),
+        ] {
+            dict_set_str(&d, n, Value::Obj(t));
         }
-        set_final(&ty);
-        set_type(&d, name, &ty);
     }
-
-    let tvt = new_type(it, "typing", "TypeVarTuple", None, Layout::Other);
-    it.reg_new(&tvt, tvt_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("__init__", noop_init),
-        ("__repr__", tvt_name),
-        ("__iter__", tvt_iter),
-        ("__typing_subst__", tvt_subst),
-        ("__typing_prepare_subst__", tvt_prepare_subst),
-        ("__reduce__", tvt_name),
-        ("__mro_entries__", tvt_mro_entries),
-    ];
-    for (n, f) in methods {
-        it.reg(&tvt, n, *f);
-    }
-    it.reg_prop(&tvt, "__name__", tvt_name);
-    set_final(&tvt);
-    set_type(&d, "TypeVarTuple", &tvt);
-
-    let alias = new_type(it, "typing", "TypeAliasType", None, Layout::Other);
-    it.reg_new(&alias, typealias_new);
-    let methods: &[(&'static str, NativeFn)] = &[
-        ("__init__", noop_init),
-        ("__repr__", typealias_repr),
-        ("__getitem__", typealias_getitem),
-        ("__or__", typealias_or),
-        ("__ror__", typealias_ror),
-        ("__reduce__", typealias_reduce),
-        ("__setattr__", typealias_setattr),
-        ("__delattr__", typealias_setattr),
-    ];
-    for (n, f) in methods {
-        it.reg(&alias, n, *f);
-    }
-    for (n, f) in [
-        ("__name__", typealias_name as NativeFn),
-        ("__value__", typealias_value),
-        ("__type_params__", typealias_type_params),
-        ("__parameters__", typealias_parameters),
-    ] {
-        it.reg_prop(&alias, n, f);
-    }
-    set_final(&alias);
-    set_type(&d, "TypeAliasType", &alias);
-
-    let generic = new_type(it, "typing", "Generic", None, Layout::Object);
-    it.reg_class(&generic, "__class_getitem__", generic_class_getitem);
-    it.reg_class(&generic, "__init_subclass__", generic_init_subclass);
-    set_type(&d, "Generic", &generic);
-    m
 }

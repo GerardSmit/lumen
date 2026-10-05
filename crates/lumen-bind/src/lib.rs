@@ -141,9 +141,11 @@
 mod convert;
 mod desc;
 mod host;
+mod trace;
 
 pub use convert::{
-    CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, OneOrNumberPair, Passed,
+    CtorRet, Elem, Flag, FromArg, FromRest, FromVarKw, IntoError, IntoRet, Lenient, NextRet,
+    OneOrNumberPair, Passed,
 };
 pub use desc::{
     camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner,
@@ -155,13 +157,50 @@ pub use host::{
 };
 pub use lumen_bind_macros::{class, methods, module, op};
 pub use lumen_common::bigint::BigInt;
-pub use lumen_common::native::{ErrorKind, NativeError, NativeResult};
+pub use lumen_common::native::{Data, ErrorKind, NativeError, NativeResult};
+pub use trace::{Trace, Visit};
 
 /// Support for generated code. Not a stable API.
 #[doc(hidden)]
 pub mod __private {
     use super::*;
     pub use crate::host::__this as this;
+
+    /// Autoref probes behind the `gc_trace` / `gc_clear` a `#[class]` generates: a field whose
+    /// type implements [`Trace`] is reported, any other field is skipped (no trait bound on the
+    /// struct's field types).
+    pub struct Probe<'a, T: ?Sized>(pub &'a T);
+    pub struct ProbeMut<'a, T: ?Sized>(pub &'a mut T);
+
+    pub trait ViaTrace {
+        fn __lumen_trace(&self, v: &mut dyn Visit);
+    }
+    impl<T: Trace + ?Sized> ViaTrace for Probe<'_, T> {
+        #[inline]
+        fn __lumen_trace(&self, v: &mut dyn Visit) {
+            self.0.trace(v)
+        }
+    }
+    pub trait ViaNone {
+        #[inline]
+        fn __lumen_trace(&self, _v: &mut dyn Visit) {}
+    }
+    impl<T: ?Sized> ViaNone for &Probe<'_, T> {}
+
+    pub trait ViaTraceMut {
+        fn __lumen_clear(&mut self);
+    }
+    impl<T: Trace + ?Sized> ViaTraceMut for ProbeMut<'_, T> {
+        #[inline]
+        fn __lumen_clear(&mut self) {
+            self.0.clear()
+        }
+    }
+    pub trait ViaNoneMut {
+        #[inline]
+        fn __lumen_clear(&mut self) {}
+    }
+    impl<T: ?Sized> ViaNoneMut for &mut ProbeMut<'_, T> {}
 
     #[inline(always)]
     pub fn arg<'a, H: Host, T: FromArg<'a, H>>(

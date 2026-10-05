@@ -37,10 +37,78 @@ pub enum Conv {
 /// The protocols CPython reaches through a type slot (their argument errors come from the slot
 /// wrapper).
 const SLOT_PROTOS: &[&str] = &[
-    "len", "getitem", "setitem", "delitem", "contains", "iter", "next", "repr", "str", "hash",
-    "bool", "eq", "ne", "lt", "le", "gt", "ge", "add", "radd", "iadd", "sub", "rsub", "isub",
-    "mul", "rmul", "imul", "and", "rand", "iand", "or", "ror", "ior", "xor", "rxor", "ixor",
-    "index", "int", "float", "neg", "pos", "abs", "invert", "await", "aiter", "anext", "call",
+    "len",
+    "getitem",
+    "setitem",
+    "delitem",
+    "contains",
+    "iter",
+    "next",
+    "repr",
+    "str",
+    "hash",
+    "bool",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "add",
+    "radd",
+    "iadd",
+    "sub",
+    "rsub",
+    "isub",
+    "mul",
+    "rmul",
+    "imul",
+    "and",
+    "rand",
+    "iand",
+    "or",
+    "ror",
+    "ior",
+    "xor",
+    "rxor",
+    "ixor",
+    "index",
+    "int",
+    "float",
+    "neg",
+    "pos",
+    "abs",
+    "invert",
+    "await",
+    "aiter",
+    "anext",
+    "call",
+    "truediv",
+    "rtruediv",
+    "itruediv",
+    "floordiv",
+    "rfloordiv",
+    "ifloordiv",
+    "mod",
+    "rmod",
+    "imod",
+    "pow",
+    "rpow",
+    "ipow",
+    "lshift",
+    "rlshift",
+    "ilshift",
+    "rshift",
+    "rrshift",
+    "irshift",
+    "matmul",
+    "rmatmul",
+    "imatmul",
+    "divmod",
+    "rdivmod",
+    "getattribute",
+    "setattr",
+    "delattr",
 ];
 
 /// Whether CPython exposes the member as a slot wrapper (`<slot wrapper '__init__' ..>`), whose
@@ -59,7 +127,10 @@ fn dunder(p: &'static str) -> &'static str {
     table!("init" "len" "getitem" "setitem" "delitem" "contains" "iter" "next" "reversed" "repr" "str" "hash"
         "bool" "eq" "ne" "lt" "le" "gt" "ge" "add" "radd" "iadd" "sub" "rsub" "isub" "mul" "rmul" "imul"
         "and" "rand" "iand" "or" "ror" "ior" "xor" "rxor" "ixor" "neg" "pos" "abs" "invert" "index" "int"
-        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext")
+        "float" "call" "copy" "deepcopy" "reduce" "sizeof" "enter" "exit" "await" "aiter" "anext"
+        "truediv" "rtruediv" "itruediv" "floordiv" "rfloordiv" "ifloordiv" "mod" "rmod" "imod" "pow" "rpow" "ipow"
+        "lshift" "rlshift" "ilshift" "rshift" "rrshift" "irshift" "matmul" "rmatmul" "imatmul" "divmod" "rdivmod"
+        "getattribute" "setattr" "delattr")
 }
 
 /// The attribute name a fn gets in Python.
@@ -282,7 +353,7 @@ pub fn arity_error(it: &mut Interp, sig: &PySig, given: usize) -> Obj {
         }
         Conv::Keywords => {
             return keywords_error(it, sig, given, 0)
-                .unwrap_or_else(|| it.type_error("invalid arguments"))
+                .unwrap_or_else(|| it.type_error("invalid arguments"));
         }
         Conv::Slot => {
             let (min, max) = (sig.minpos, sig.maxpos);
@@ -505,7 +576,12 @@ pub fn bad_argument(it: &mut Interp, d: &'static FnDesc, i: usize, what: &str, v
             None => "argument".to_string(),
         }
     };
-    let t = it.type_name_of(v);
+    // `_PyArg_BadArgument` names `None` itself rather than its type.
+    let t = if v.is_none() {
+        "None".to_string()
+    } else {
+        it.type_name_of(v)
+    };
     it.type_error(&format!(
         "{}() {} must be {}, not {}",
         sig.name, display, what, t
@@ -558,6 +634,9 @@ fn slot_text_sig(name: &str, nargs: usize) -> String {
     let names: &[&str] = match name {
         "__getitem__" | "__delitem__" | "__contains__" => &["key"],
         "__setitem__" => &["key", "value"],
+        "__getattribute__" | "__delattr__" => &["name"],
+        "__setattr__" => &["name", "value"],
+        "__pow__" | "__rpow__" => &["value", "mod=None"],
         _ => &["value"],
     };
     let mut parts = vec!["$self"];
@@ -610,12 +689,40 @@ fn slot_doc(name: &str) -> Option<&'static str> {
         "__bool__" => "True if self else False",
         "__int__" => "int(self)",
         "__float__" => "float(self)",
-        "__index__" => "Return self converted to an integer, if self is suitable for use as an index into a list.",
+        "__index__" => {
+            "Return self converted to an integer, if self is suitable for use as an index into a list."
+        }
         "__len__" => "Return len(self).",
         "__getitem__" => "Return self[key].",
         "__setitem__" => "Set self[key] to value.",
         "__delitem__" => "Delete self[key].",
         "__contains__" => "Return bool(key in self).",
+        "__truediv__" => "Return self/value.",
+        "__rtruediv__" => "Return value/self.",
+        "__itruediv__" => "Return self/=value.",
+        "__floordiv__" => "Return self//value.",
+        "__rfloordiv__" => "Return value//self.",
+        "__ifloordiv__" => "Return self//=value.",
+        "__mod__" => "Return self%value.",
+        "__rmod__" => "Return value%self.",
+        "__imod__" => "Return self%=value.",
+        "__pow__" => "Return pow(self, value, mod).",
+        "__rpow__" => "Return pow(value, self, mod).",
+        "__ipow__" => "Return self**=value.",
+        "__lshift__" => "Return self<<value.",
+        "__rlshift__" => "Return value<<self.",
+        "__ilshift__" => "Return self<<=value.",
+        "__rshift__" => "Return self>>value.",
+        "__rrshift__" => "Return value>>self.",
+        "__irshift__" => "Return self>>=value.",
+        "__matmul__" => "Return self@value.",
+        "__rmatmul__" => "Return value@self.",
+        "__imatmul__" => "Return self@=value.",
+        "__divmod__" => "Return divmod(self, value).",
+        "__rdivmod__" => "Return divmod(value, self).",
+        "__getattribute__" => "Return getattr(self, name).",
+        "__setattr__" => "Implement setattr(self, name, value).",
+        "__delattr__" => "Implement delattr(self, name).",
         _ => return None,
     })
 }
@@ -623,6 +730,9 @@ fn slot_doc(name: &str) -> Option<&'static str> {
 /// `__doc__` of the native bound as `name`: its own doc, else the one CPython gives every
 /// `__new__` and slot wrapper.
 pub fn py_doc(d: &'static FnDesc, name: &str) -> Option<&'static str> {
+    if let Some(doc) = d.hint(HOST, "doc") {
+        return Some(doc);
+    }
     if d.doc.is_some() {
         return d.doc;
     }

@@ -535,13 +535,14 @@ pub mod _json {
             #[kw] _current_indent_level: &Value,
         ) -> R<Value> {
             let cfg = slf.0.borrow(it)?.clone();
-            it.index_of(_current_indent_level)?;
             let mut w = Writer {
                 key_sep: cfg.key_separator.as_str().unwrap_or_default().to_string(),
                 item_sep: cfg.item_separator.as_str().unwrap_or_default().to_string(),
                 cfg: &cfg,
                 out: String::new(),
                 depth: 0,
+                indent: cfg.indent.as_str().map(str::to_string),
+                level: it.index_of(_current_indent_level)?.max(0) as usize,
             };
             w.obj(it, obj)?;
             Ok(Value::tuple(vec![Value::string(w.out)]))
@@ -596,9 +597,22 @@ pub mod _json {
         item_sep: String,
         out: String,
         depth: usize,
+        indent: Option<String>,
+        level: usize,
     }
 
     impl Writer<'_> {
+        fn newline(&self, level: usize) -> Option<String> {
+            self.indent.as_ref().map(|i| format!("\n{}", i.repeat(level)))
+        }
+
+        fn separator_at(&self, level: usize) -> String {
+            match self.newline(level) {
+                Some(nl) => format!("{}{nl}", self.item_sep),
+                None => self.item_sep.clone(),
+            }
+        }
+
         fn obj(&mut self, it: &mut Interp, v: &Value) -> R<()> {
             match v {
                 Value::None => self.out.push_str("null"),
@@ -720,15 +734,24 @@ pub mod _json {
             }
             let mark = self.mark(it, v)?;
             self.out.push('[');
+            self.level += 1;
+            if let Some(nl) = self.newline(self.level) {
+                self.out.push_str(&nl);
+            }
+            let sep = self.separator_at(self.level);
             let mut i = 0;
             while let Some(x) = item(i) {
                 if i > 0 {
-                    self.out.push_str(&self.item_sep);
+                    self.out.push_str(&sep);
                 }
                 self.obj(it, &x)?;
                 i += 1;
             }
+            self.level -= 1;
             self.unmark(it, mark)?;
+            if let Some(nl) = self.newline(self.level) {
+                self.out.push_str(&nl);
+            }
             self.out.push(']');
             Ok(())
         }
@@ -743,6 +766,10 @@ pub mod _json {
             }
             let mark = self.mark(it, v)?;
             self.out.push('{');
+            self.level += 1;
+            if let Some(nl) = self.newline(self.level) {
+                self.out.push_str(&nl);
+            }
             let mut first = true;
             if self.cfg.sort_keys || o.cls.is_some() {
                 let items = it.call_method(v, "items", Vec::new())?;
@@ -777,7 +804,11 @@ pub mod _json {
                     self.member(it, &mut first, key, value)?;
                 }
             }
+            self.level -= 1;
             self.unmark(it, mark)?;
+            if let Some(nl) = self.newline(self.level) {
+                self.out.push_str(&nl);
+            }
             self.out.push('}');
             Ok(())
         }
@@ -819,7 +850,8 @@ pub mod _json {
             if *first {
                 *first = false;
             } else {
-                self.out.push_str(&self.item_sep);
+                let sep = self.separator_at(self.level);
+                self.out.push_str(&sep);
             }
             let s = key.as_pystr().expect("a str key");
             self.string(it, &key, s)?;

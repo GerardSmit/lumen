@@ -119,6 +119,7 @@ pub fn compare_digest(it: &mut Interp, a: &Value, b: &Value) -> R<bool> {
     Ok(lumen_common::hash::constant_time_eq(&x, &y))
 }
 
+/// OpenSSL interface for hashlib module
 #[lumen_bind::module(name = "_hashlib")]
 pub mod _hashlib {
     use super::*;
@@ -727,7 +728,7 @@ pub mod _hashlib {
     }
 }
 
-/// `_md5`.
+// `_md5`.
 #[lumen_bind::module(name = "_md5")]
 pub mod _md5 {
     use super::*;
@@ -746,7 +747,7 @@ pub mod _md5 {
     }
 }
 
-/// `_sha1`.
+// `_sha1`.
 #[lumen_bind::module(name = "_sha1")]
 pub mod _sha1 {
     use super::*;
@@ -765,7 +766,7 @@ pub mod _sha1 {
     }
 }
 
-/// `_sha2`.
+// `_sha2`.
 #[lumen_bind::module(name = "_sha2")]
 pub mod _sha2 {
     use super::*;
@@ -823,7 +824,7 @@ pub mod _sha2 {
     }
 }
 
-/// `_sha3`.
+// `_sha3`.
 #[lumen_bind::module(name = "_sha3")]
 pub mod _sha3 {
     use super::*;
@@ -972,7 +973,7 @@ fn blake2_new(it: &mut Interp, wide: bool, a: Blake2Args) -> R<Blake2> {
     Ok(b)
 }
 
-/// `_blake2`.
+// `_blake2`.
 #[lumen_bind::module(name = "_blake2")]
 pub mod _blake2 {
     #![allow(clippy::too_many_arguments, clippy::new_ret_no_self)]

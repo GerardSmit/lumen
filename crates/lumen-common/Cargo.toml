@@ -19,14 +19,20 @@ mem-stats = []
 native-signing = ["dep:ed25519-dalek"]
 native-sidecar = ["dep:sha2"]
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
-hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt"]
-# `compress`: zlib / gzip / raw deflate, Brotli and Zstandard over maintained crates.
-compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:wuff"]
+hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt", "dep:subtle"]
+# `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
+compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2", "dep:wuff"]
+# `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) in pure Rust:
+# the decoder is written in `compress::xz`, the encoders come from `lzma-rust2`.
+lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
+# `crypt`: bcrypt password hashes (`$2b$` text and raw digest).
+crypt = ["dep:bcrypt"]
 
 [dependencies]
 encoding_rs = { version = "=0.8.42", default-features = false, optional = true }
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
+bcrypt = { version = "0.17", default-features = false, optional = true }
 unicode-linebreak = { version = "=0.1.5", default-features = false }
 unicode-segmentation = { version = "=1.12.0", default-features = false }
 unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"] }
@@ -38,6 +44,7 @@ md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 sha3 = { version = "0.10", optional = true }
+subtle = { version = "2.4", default-features = false, optional = true }
 ripemd = { version = "0.1", optional = true }
 blake2 = { version = "0.10", optional = true }
 sm3 = { version = "0.4", optional = true }
@@ -47,15 +54,14 @@ pbkdf2 = { version = "0.12", default-features = false, optional = true }
 scrypt = { version = "0.11", default-features = false, optional = true }
 libz-rs-sys = { version = "0.6", default-features = false, features = ["std", "rust-allocator"], optional = true }
 brotli = { version = "8", optional = true }
+# bzip2 over the pure-Rust libbz2-rs-sys backend (the crate's default), so it also builds for wasm.
+bzip2 = { version = "0.6", optional = true }
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder"], optional = true }
 wuff = { path = "../../vendor/wuff", default-features = false, optional = true }
 shiguredo_mp4 = { version = "=2026.3.0", default-features = false, optional = true }
 rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["libm"], optional = true }
 rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["libm"], optional = true }
 rusty_aac = { version = "=0.5.0", default-features = false, optional = true }
-
-[dev-dependencies]
-# Used only to create real encoded MP4 fixtures for the video decoder tests.
-rusty_h264 = { version = "=0.16.0", default-features = false, features = ["std"] }
 
 # zstd's C library does not build for wasm32-unknown-unknown without a wasm-capable clang;
 # browser and bare-metal builds use the pure-Rust ruzstd.
@@ -64,6 +70,12 @@ zstd = { version = "0.13", optional = true }
 
 [target.'cfg(any(target_arch = "wasm32", target_os = "none"))'.dependencies]
 ruzstd = { version = "0.8", optional = true }
+
+[dev-dependencies]
+# Used only to create real encoded MP4 fixtures for the video decoder tests.
+rusty_h264 = { version = "=0.16.0", default-features = false, features = ["std"] }
+# The xz container writer, as an independent encoder for the decoder tests.
+lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder", "xz"] }
 
 [lints]
 workspace = true

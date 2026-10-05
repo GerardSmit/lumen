@@ -43,6 +43,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let module = c.module.unwrap_or("builtins");
     let base = c.hint(HOST, "base").and_then(|path| python_base(it, path));
     let ty = new_type(it, module, c.name_for(HOST), base.as_ref(), Layout::Other);
+    crate::gc_traverse::register::<T>();
     it.native_types.insert(TypeId::of::<T>(), ty.clone());
     // Like CPython's extension types, native classes reject attribute assignment unless they are
     // declared `mutable` (`ast.AST`, whose node classes are mutable heap types there too).
@@ -65,6 +66,7 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
     let mut members = Vec::new();
     T::members(&mut members);
     install_members(&ty, &members, None);
+    set_text_signature(it, &ty, &members);
     if let Some(d) = ty.dict.borrow().as_ref() {
         if c.hint(HOST, "unhashable").is_some() {
             dict_set_str(d, "__hash__", Value::None);
@@ -72,15 +74,6 @@ pub fn type_object<T: Methods<PyHost>>(it: &mut Interp) -> Obj {
         if dict_get_str(d, "__doc__").is_none() {
             dict_set_str(d, "__doc__", c.doc.map_or(Value::None, Value::str));
         }
-        let sig = members
-            .iter()
-            .find(|m| m.desc.role == Role::Constructor)
-            .and_then(|m| args::text_signature(m.desc));
-        dict_set_str(
-            d,
-            "__text_signature__",
-            sig.map_or(Value::None, Value::string),
-        );
         if !members.iter().any(|m| m.desc.role == Role::Constructor) {
             let f = Value::Obj(Object::new(Kind::Native(NativeData {
                 name: "__new__",
@@ -119,6 +112,49 @@ pub fn extend_type<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
     install_members(ty, &members, None);
 }
 
+/// The `__text_signature__` of the native types that have one, by type object address (CPython
+/// derives it from the type's docstring; native types live as long as the interpreter).
+#[derive(Default)]
+struct TextSigs(std::collections::HashMap<usize, Value>);
+
+fn set_text_signature(it: &mut Interp, ty: &Obj, members: &[FnItem<PyHost>]) {
+    let sig = members
+        .iter()
+        .find(|m| m.desc.role == Role::Constructor)
+        .and_then(|m| args::text_signature(m.desc));
+    if let Some(sig) = sig {
+        set_type_text_signature(it, ty, Value::string(sig));
+    }
+}
+
+pub fn set_type_text_signature(it: &mut Interp, ty: &Obj, sig: Value) {
+    it.native_state::<TextSigs>()
+        .0
+        .insert(std::rc::Rc::as_ptr(ty) as usize, sig);
+}
+
+/// `type.__text_signature__`: the signature of a native type, else `None`.
+pub fn type_text_signature(it: &mut Interp, ty: &Obj) -> Value {
+    it.native_state::<TextSigs>()
+        .0
+        .get(&(std::rc::Rc::as_ptr(ty) as usize))
+        .cloned()
+        .unwrap_or(Value::None)
+}
+
+/// [`extend_type`], plus the class docstring and `__text_signature__` of `T`: a core type whose
+/// marker carries CPython's class doc (`int`, `float`, ...).
+pub fn extend_type_documented<T: Methods<PyHost>>(it: &mut Interp, ty: &Obj) {
+    it.native_types.insert(TypeId::of::<T>(), ty.clone());
+    let mut members = Vec::new();
+    T::members(&mut members);
+    install_members(ty, &members, None);
+    if let Some(d) = ty.dict.borrow().as_ref() {
+        dict_set_str(d, "__doc__", T::DESC.doc.map_or(Value::None, Value::str));
+    }
+    set_text_signature(it, ty, &members);
+}
+
 /// The class `module.name` of a `base` hint, imported on first use of the native class.
 fn python_base(it: &mut Interp, path: &str) -> Option<Obj> {
     let (module, name) = path.rsplit_once('.')?;
@@ -135,6 +171,14 @@ pub fn install_into<T: Methods<PyHost>>(ty: &Obj, only: &[&str]) {
     let mut members = Vec::new();
     T::members(&mut members);
     install_members(ty, &members, Some(only));
+}
+
+/// Install all of `T`'s members into the existing type `ty`, which keeps its own identity: a
+/// second type whose instances hold the same native state (`CallableProxyType`).
+pub fn install_all<T: Methods<PyHost>>(ty: &Obj) {
+    let mut members = Vec::new();
+    T::members(&mut members);
+    install_members(ty, &members, None);
 }
 
 fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) {
@@ -179,6 +223,7 @@ fn install_members(ty: &Obj, members: &[FnItem<PyHost>], only: Option<&[&str]>) 
                         fset,
                         fdel: Value::None,
                         doc,
+                        name: Default::default(),
                     })))
                 }
                 _ => f,
@@ -223,15 +268,16 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(doc) = desc.doc {
         dict_set_str(&d, "__doc__", Value::str(doc));
     }
+    install_module::<M>(it, &m)?;
+    Ok(m)
+}
+
+/// Install everything `M` declares (functions, classes, constants, then its init hook) into the
+/// existing module `m`: one module assembled from several declarations.
+pub fn install_module<M: Module<PyHost>>(it: &mut Interp, m: &Obj) -> R<()> {
+    let d = it.module_dict(m);
+    install_functions::<M>(&d);
     let items = ModuleItems::<PyHost>::of::<M>();
-    for f in &items.functions {
-        if !f.desc.exposed_to(HOST) {
-            continue;
-        }
-        for n in std::iter::once(py_name(f.desc)).chain(args::aliases(f.desc)) {
-            dict_set_str(&d, n, native_value(f));
-        }
-    }
     for c in &items.classes {
         if !c.desc.exposed_to(HOST) {
             continue;
@@ -246,7 +292,30 @@ pub fn module_object<M: Module<PyHost>>(it: &mut Interp) -> R<Obj> {
     if let Some(init) = items.init {
         init(it, &Value::Obj(m.clone()))?;
     }
-    Ok(m)
+    Ok(())
+}
+
+/// Install the functions `M` declares into the existing namespace `d` (the `builtins` functions
+/// live in the interpreter's own builtins dict).
+pub fn install_functions<M: Module<PyHost>>(d: &Obj) {
+    for (n, v) in function_values::<M>() {
+        dict_set_str(d, n, v);
+    }
+}
+
+/// The functions `M` declares, by Python name (aliases included), as native values.
+pub fn function_values<M: Module<PyHost>>() -> Vec<(&'static str, Value)> {
+    let items = ModuleItems::<PyHost>::of::<M>();
+    let mut out = Vec::new();
+    for f in &items.functions {
+        if !f.desc.exposed_to(HOST) {
+            continue;
+        }
+        for n in std::iter::once(py_name(f.desc)).chain(args::aliases(f.desc)) {
+            out.push((n, native_value(f)));
+        }
+    }
+    out
 }
 
 /// `__module__`/`__qualname__` owner of a bound native: the module of a function, the qualified
@@ -346,6 +415,12 @@ impl<T: Class> Py<T> {
 
     pub fn into_value(self) -> Value {
         self.v
+    }
+
+    /// Drops the handle's reference (the cycle collector breaking a cycle); the handle must not be
+    /// used afterwards.
+    pub(crate) fn release(&mut self) {
+        self.v = Value::None;
     }
 
     fn cell(&self) -> &RefCell<Box<dyn Any>> {

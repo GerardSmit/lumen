@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// `$262.agent` wiring. The main agent holds a broadcast sender per spawned agent plus the report
 /// receiver; a spawned agent holds its broadcast receiver and a clone of the report sender.
@@ -187,7 +187,7 @@ pub fn monotonic_now_ms() -> f64 {
 
 /// A futex-like wait table for `Atomics.wait`/`notify`, keyed by `(shared-memory id, byte index)`.
 /// Each blocked waiter registers an individual wake handle so `notify` can wake an exact count.
-pub type Waiter = Arc<(Mutex<bool>, Condvar)>;
+pub type Waiter = Arc<lumen_common::wait::Waiter>;
 fn wait_table() -> &'static Mutex<HashMap<(u64, usize), Vec<Waiter>>> {
     static T: OnceLock<Mutex<HashMap<(u64, usize), Vec<Waiter>>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(Default::default()))
@@ -215,7 +215,7 @@ pub enum AtomicsWaitPhase {
 /// Check the expected memory value and register while holding the waiter-list lock.
 /// A concurrent notification cannot slip between the check and registration.
 pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) -> Option<Waiter> {
-    let waiter: Waiter = Arc::new((Mutex::new(false), Condvar::new()));
+    let waiter: Waiter = lumen_common::wait::Waiter::new();
     let mut table = wait_table().lock().unwrap();
     if !matches() {
         return None;
@@ -223,8 +223,6 @@ pub fn futex_register_if(id: u64, index: usize, matches: impl FnOnce() -> bool) 
     table.entry((id, index)).or_default().push(waiter.clone());
     Some(waiter)
 }
-/// How often a blocked `Atomics.wait` looks at the embedder's interrupt.
-const FUTEX_INTERRUPT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Block on an already-registered waiter. With `interrupt` the wait gives up (returning `false`)
 /// once the flag is set, so the caller can unwind with the termination.
@@ -235,40 +233,7 @@ pub fn futex_block(
     timeout: Option<std::time::Duration>,
     interrupt: Option<&std::sync::atomic::AtomicBool>,
 ) -> bool {
-    let (lock, cvar) = &**waiter;
-    let mut woken = lock.lock().unwrap();
-    let deadline = timeout.map(|dur| std::time::Instant::now() + dur);
-    let result = loop {
-        if *woken {
-            break true;
-        }
-        if interrupt.is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)) {
-            break false;
-        }
-        let left = match deadline {
-            Some(deadline) => {
-                let now = std::time::Instant::now();
-                // The loop head decides the timeout, not `timed_out()`: a platform wait can end
-                // a little before the deadline (Windows condition variables count whole
-                // milliseconds), and a wait must never report "timed-out" before its time.
-                if now >= deadline {
-                    break false;
-                }
-                Some(deadline - now)
-            }
-            None => None,
-        };
-        woken = match (left, interrupt) {
-            (Some(left), Some(_)) => {
-                cvar.wait_timeout(woken, left.min(FUTEX_INTERRUPT_POLL))
-                    .unwrap()
-                    .0
-            }
-            (Some(left), None) => cvar.wait_timeout(woken, left).unwrap().0,
-            (None, Some(_)) => cvar.wait_timeout(woken, FUTEX_INTERRUPT_POLL).unwrap().0,
-            (None, None) => cvar.wait(woken).unwrap(),
-        };
-    };
+    let result = waiter.block(timeout, interrupt);
     // On timeout, remove ourselves from the table (a notify may have already pulled us out).
     if !result {
         let mut table = wait_table().lock().unwrap();
@@ -302,9 +267,7 @@ pub fn futex_notify(id: u64, index: usize, max: i64) -> u64 {
     };
     let count = to_wake.len() as u64;
     for w in to_wake {
-        let (lock, cvar) = &*w;
-        *lock.lock().unwrap() = true;
-        cvar.notify_all();
+        w.wake();
     }
     count
 }

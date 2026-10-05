@@ -239,3 +239,13 @@ fn ctrl_c_becomes_keyboard_interrupt() {
     assert_eq!(r.code, Some(130), "{}", r.err);
     assert!(r.err.contains("KeyboardInterrupt"), "{}", r.err);
 }
+
+#[test]
+fn dash_c_command_is_dedented() {
+    let out = Command::new(env!("CARGO_BIN_EXE_lumen-py"))
+        .args(["-c", "  import sys\n  if True:\n      print('ok', len(sys.argv))\n", "x"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "ok 2\n", "{}", String::from_utf8_lossy(&out.stderr));
+}

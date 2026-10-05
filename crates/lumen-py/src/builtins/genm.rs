@@ -68,7 +68,7 @@ impl Interp {
     }
 }
 
-/// `send`, `throw` and `close`, shared by generators, coroutines and async generators.
+// `send`, `throw` and `close`, shared by generators, coroutines and async generators.
 #[lumen_bind::class(name = "generator", hint(py(shared)))]
 pub struct GenMethods;
 
@@ -129,7 +129,7 @@ impl Generator {
     }
 }
 
-/// `coroutine.__await__`.
+// `coroutine.__await__`.
 #[lumen_bind::class(name = "coroutine")]
 pub struct Coroutine;
 
@@ -177,7 +177,7 @@ fn agen_init_hooks(it: &mut Interp, g: &Obj) -> R<()> {
     Ok(())
 }
 
-/// `async_generator`'s own members.
+// `async_generator`'s own members.
 #[lumen_bind::class(name = "async_generator")]
 pub struct AsyncGenerator;
 
@@ -323,7 +323,7 @@ fn asend_step(it: &mut Interp, this: &Value, send: Value, throw: Option<Obj>) ->
     }
 }
 
-/// The awaitable `__anext__`, `asend`, `athrow` and `aclose` return.
+// The awaitable `__anext__`, `asend`, `athrow` and `aclose` return.
 #[lumen_bind::class(name = "async_generator_asend")]
 pub struct AsyncGenAsend;
 

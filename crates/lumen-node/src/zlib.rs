@@ -4,11 +4,12 @@
 
 use std::collections::HashMap;
 
+use lumen_bind::{Data, NativeError};
 use lumen_host::codec::{
     self, BrotliDecoder, BrotliEncoder, BrotliStatus, ZStream, Z_BUF_ERROR, Z_DATA_ERROR, Z_FINISH,
     Z_NEED_DICT, Z_OK, Z_STREAM_END, Z_STREAM_ERROR,
 };
-use lumen_host::{Ctx, Value};
+use lumen_host::Ctx;
 
 const DEFLATE: u32 = 1;
 const INFLATE: u32 = 2;
@@ -84,10 +85,6 @@ fn zlib_code(errno: i32) -> String {
         other => return format!("Z_UNKNOWN_ERROR_{other}"),
     }
     .to_string()
-}
-
-fn arg_num(a: &[Value], i: usize, default: f64) -> f64 {
-    a.get(i).and_then(Value::as_num_opt).unwrap_or(default)
 }
 
 impl ZlibCtx {
@@ -386,176 +383,193 @@ fn u32_pairs(bytes: &[u8]) -> Vec<(u32, u32)> {
     words.chunks_exact(2).map(|p| (p[0], p[1])).collect()
 }
 
-/// `(mode, windowBits, level, memLevel, strategy, dictionary?)` for the zlib modes (Node's
-/// `DEFLATE` = 1 … `UNZIP` = 7), or `(mode, Uint32Array of [parameter, value] pairs)` for Brotli;
-/// returns the handle id.
-pub(crate) fn op_handle_open(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let mode = arg_num(a, 0, 0.0) as u32;
-    let handle = match mode {
-        BROTLI_ENCODE => {
-            let pairs = a
-                .get(1)
-                .and_then(|v| ctx.typed_array_bytes(v))
-                .map(|b| u32_pairs(&b));
-            Handle::BrotliEncode(BrotliEncoder::new(&pairs.unwrap_or_default()))
-        }
-        BROTLI_DECODE => Handle::BrotliDecode(BrotliDecoder::new()),
-        DEFLATE..=UNZIP => {
-            let dictionary = a
-                .get(5)
-                .and_then(|v| ctx.typed_array_bytes(v))
-                .unwrap_or_default();
-            Handle::Zlib(ZlibCtx::new(
-                mode,
-                arg_num(a, 1, 15.0) as i32,
-                arg_num(a, 2, -1.0) as i32,
-                arg_num(a, 3, 8.0) as i32,
-                arg_num(a, 4, 0.0) as i32,
-                dictionary,
-            ))
-        }
-        _ => return Err(ctx.make_error("TypeError", format!("unknown zlib mode {mode}"))),
-    };
-    let reg = ctx.host_mut::<ZlibHandles>().expect("registry");
-    reg.next += 1;
-    let id = reg.next;
-    reg.handles.insert(id, handle);
-    Ok(Value::Num(id as f64))
-}
+pub(crate) use bindings::Module;
 
-fn handle_id(a: &[Value]) -> u64 {
-    a.first().and_then(Value::as_num_opt).unwrap_or(0.0) as u64
-}
-
-fn error_value(ctx: &mut Ctx, e: CodecError) -> Value {
-    ctx.make_array(vec![
-        Value::from_string(e.message),
-        Value::Num(e.errno as f64),
-        Value::from_string(e.code),
+fn error_data(e: CodecError) -> Data {
+    Data::List(vec![
+        Data::Str(e.message),
+        Data::Int(e.errno as i64),
+        Data::Str(e.code),
     ])
 }
 
-/// `(id, flush, in, inOff, inLen, out, outOff, outLen)` — one codec step over the given windows,
-/// filling `out` in place. Returns `[availOutAfter, availInAfter]`, or `[message, errno, code]`
-/// when the codec failed.
-pub(crate) fn op_handle_write(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = handle_id(a);
-    let flush = arg_num(a, 1, 0.0) as i32;
-    let (in_off, in_len) = (arg_num(a, 3, 0.0) as usize, arg_num(a, 4, 0.0) as usize);
-    let (out_off, out_len) = (arg_num(a, 6, 0.0) as usize, arg_num(a, 7, 0.0) as usize);
-    let in_raw = a.get(2).and_then(|v| ctx.typed_array_raw(v));
-    let out_raw = a.get(5).and_then(|v| ctx.typed_array_raw(v));
-    let Some((_, out_total, out_ptr)) = out_raw else {
-        return Err(ctx.make_error("TypeError", "zlib expects Buffer/TypedArray windows"));
-    };
-    if out_off
-        .checked_add(out_len)
-        .is_none_or(|end| end > out_total)
-    {
-        return Err(ctx.make_error("RangeError", "zlib output window out of range"));
+#[lumen_bind::module(name = "__zlib")]
+mod bindings {
+    use super::*;
+
+    fn register(ctx: &mut Ctx, handle: Handle) -> f64 {
+        let reg = ctx.host_mut::<ZlibHandles>().expect("registry");
+        reg.next += 1;
+        let id = reg.next;
+        reg.handles.insert(id, handle);
+        id as f64
     }
-    let input: &[u8] = match in_raw {
-        Some((_, total, ptr)) => {
-            if in_off.checked_add(in_len).is_none_or(|end| end > total) {
-                return Err(ctx.make_error("RangeError", "zlib input window out of range"));
-            }
-            // SAFETY: the window lies inside the live typed array, which nothing resizes during
-            // this synchronous call.
-            unsafe { std::slice::from_raw_parts(ptr.add(in_off), in_len) }
+
+    /// `(mode, windowBits, level, memLevel, strategy, dictionary?)` for the zlib modes (Node's
+    /// `DEFLATE` = 1 .. `UNZIP` = 7); returns the handle id.
+    #[op(name = "handleOpen")]
+    fn op_handle_open(
+        ctx: &mut Ctx,
+        mode: f64,
+        window_bits: Option<f64>,
+        level: Option<f64>,
+        mem_level: Option<f64>,
+        strategy: Option<f64>,
+        dictionary: Option<Vec<u8>>,
+    ) -> Result<f64, NativeError> {
+        let mode = mode as u32;
+        if !(DEFLATE..=UNZIP).contains(&mode) {
+            return Err(NativeError::type_error(format!("unknown zlib mode {mode}")));
         }
-        None => &[],
-    };
-    // SAFETY: as above; input and output are distinct buffers (the caller owns both).
-    let out = unsafe { std::slice::from_raw_parts_mut(out_ptr.add(out_off), out_len) };
-    let Some(handle) = ctx
-        .host_mut::<ZlibHandles>()
-        .and_then(|r| r.handles.get_mut(&id))
-    else {
-        let e = CodecError {
-            message: "zlib binding closed".into(),
-            errno: Z_STREAM_ERROR,
-            code: zlib_code(Z_STREAM_ERROR),
+        let handle = Handle::Zlib(ZlibCtx::new(
+            mode,
+            window_bits.unwrap_or(15.0) as i32,
+            level.unwrap_or(-1.0) as i32,
+            mem_level.unwrap_or(8.0) as i32,
+            strategy.unwrap_or(0.0) as i32,
+            dictionary.unwrap_or_default(),
+        ));
+        Ok(register(ctx, handle))
+    }
+
+    /// `(mode, pairs?)` for Brotli: `pairs` is a Uint32Array of `[parameter, value]` pairs for the
+    /// encoder; returns the handle id.
+    #[op(name = "brotliOpen")]
+    fn op_brotli_open(
+        ctx: &mut Ctx,
+        mode: f64,
+        pairs: Option<Vec<u8>>,
+    ) -> Result<f64, NativeError> {
+        let handle = match mode as u32 {
+            BROTLI_ENCODE => {
+                Handle::BrotliEncode(BrotliEncoder::new(&u32_pairs(&pairs.unwrap_or_default())))
+            }
+            BROTLI_DECODE => Handle::BrotliDecode(BrotliDecoder::new()),
+            other => {
+                return Err(NativeError::type_error(format!(
+                    "unknown zlib mode {other}"
+                )));
+            }
         };
-        return Ok(error_value(ctx, e));
-    };
-    let op = flush as u32;
-    let result = match handle {
-        Handle::Zlib(c) => c.write(flush, input, out),
-        Handle::BrotliEncode(enc) => brotli_encode_write(enc, op, input, out),
-        Handle::BrotliDecode(dec) => brotli_decode_write(dec, op, input, out),
-    };
-    match result {
-        Ok((avail_out, avail_in)) => Ok(ctx.make_array(vec![
-            Value::Num(avail_out as f64),
-            Value::Num(avail_in as f64),
-        ])),
-        Err(e) => Ok(error_value(ctx, e)),
+        Ok(register(ctx, handle))
     }
-}
 
-/// `(id, level, strategy)` — zlib's `deflateParams`; returns `[message, errno, code]` on failure.
-pub(crate) fn op_handle_params(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = handle_id(a);
-    let (level, strategy) = (arg_num(a, 1, -1.0) as i32, arg_num(a, 2, 0.0) as i32);
-    let error = match ctx
-        .host_mut::<ZlibHandles>()
-        .and_then(|r| r.handles.get_mut(&id))
-    {
-        Some(Handle::Zlib(c)) => c.params(level, strategy),
-        _ => None,
-    };
-    Ok(match error {
-        Some(e) => error_value(ctx, e),
-        None => Value::Undefined,
-    })
-}
-
-/// `(id)` — `zlib.reset()`: a fresh stream with the same options.
-pub(crate) fn op_handle_reset(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = handle_id(a);
-    match ctx
-        .host_mut::<ZlibHandles>()
-        .and_then(|r| r.handles.get_mut(&id))
-    {
-        Some(Handle::Zlib(c)) => c.reset(),
-        Some(Handle::BrotliEncode(enc)) => enc.reset(),
-        Some(Handle::BrotliDecode(dec)) => dec.reset(),
-        None => {}
+    /// `(id, flush, in, inOff, inLen, out, outOff, outLen)` - one codec step over the given
+    /// windows, filling `out` in place. Returns `[availOutAfter, availInAfter]`, or
+    /// `[message, errno, code]` when the codec failed.
+    #[op(name = "handleWrite")]
+    #[allow(clippy::too_many_arguments)]
+    fn op_handle_write(
+        ctx: &mut Ctx,
+        id: f64,
+        flush: f64,
+        input: Option<&[u8]>,
+        in_off: f64,
+        in_len: f64,
+        out: &mut [u8],
+        out_off: f64,
+        out_len: f64,
+    ) -> Result<Data, NativeError> {
+        let (in_off, in_len, out_off, out_len) = (
+            in_off as usize,
+            in_len as usize,
+            out_off as usize,
+            out_len as usize,
+        );
+        if out_off
+            .checked_add(out_len)
+            .is_none_or(|end| end > out.len())
+        {
+            return Err(NativeError::value_error("zlib output window out of range"));
+        }
+        let input: &[u8] = match input {
+            Some(bytes) => {
+                if in_off
+                    .checked_add(in_len)
+                    .is_none_or(|end| end > bytes.len())
+                {
+                    return Err(NativeError::value_error("zlib input window out of range"));
+                }
+                &bytes[in_off..in_off + in_len]
+            }
+            None => &[],
+        };
+        let out = &mut out[out_off..out_off + out_len];
+        let flush = flush as i32;
+        let Some(handle) = ctx
+            .host_mut::<ZlibHandles>()
+            .and_then(|r| r.handles.get_mut(&(id as u64)))
+        else {
+            let e = CodecError {
+                message: "zlib binding closed".into(),
+                errno: Z_STREAM_ERROR,
+                code: zlib_code(Z_STREAM_ERROR),
+            };
+            return Ok(error_data(e));
+        };
+        let op = flush as u32;
+        let result = match handle {
+            Handle::Zlib(c) => c.write(flush, input, out),
+            Handle::BrotliEncode(enc) => brotli_encode_write(enc, op, input, out),
+            Handle::BrotliDecode(dec) => brotli_decode_write(dec, op, input, out),
+        };
+        Ok(match result {
+            Ok((avail_out, avail_in)) => Data::List(vec![
+                Data::Int(avail_out as i64),
+                Data::Int(avail_in as i64),
+            ]),
+            Err(e) => error_data(e),
+        })
     }
-    Ok(Value::Undefined)
-}
 
-pub(crate) fn op_handle_close(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let id = handle_id(a);
-    if let Some(reg) = ctx.host_mut::<ZlibHandles>() {
-        reg.handles.remove(&id);
+    /// `(id, level, strategy)` - zlib's `deflateParams`; returns `[message, errno, code]` on failure.
+    #[op(name = "handleParams")]
+    fn op_handle_params(ctx: &mut Ctx, id: f64, level: Option<f64>, strategy: Option<f64>) -> Data {
+        let (level, strategy) = (level.unwrap_or(-1.0) as i32, strategy.unwrap_or(0.0) as i32);
+        let error = match ctx
+            .host_mut::<ZlibHandles>()
+            .and_then(|r| r.handles.get_mut(&(id as u64)))
+        {
+            Some(Handle::Zlib(c)) => c.params(level, strategy),
+            _ => None,
+        };
+        error.map_or(Data::None, error_data)
     }
-    Ok(Value::Undefined)
-}
 
-fn bytes_arg(ctx: &mut Ctx, a: &[Value]) -> Result<Vec<u8>, Value> {
-    match a.first().and_then(|v| ctx.typed_array_bytes(v)) {
-        Some(bytes) => Ok(bytes),
-        None => Err(ctx.make_error("TypeError", "zlib expects a Buffer/TypedArray")),
+    /// `(id)` - `zlib.reset()`: a fresh stream with the same options.
+    #[op(name = "handleReset")]
+    fn op_handle_reset(ctx: &mut Ctx, id: f64) {
+        match ctx
+            .host_mut::<ZlibHandles>()
+            .and_then(|r| r.handles.get_mut(&(id as u64)))
+        {
+            Some(Handle::Zlib(c)) => c.reset(),
+            Some(Handle::BrotliEncode(enc)) => enc.reset(),
+            Some(Handle::BrotliDecode(dec)) => dec.reset(),
+            None => {}
+        }
     }
-}
 
-pub(crate) fn op_zstd_compress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = bytes_arg(ctx, a)?;
-    ctx.make_uint8array(&codec::zstd_compress(&bytes))
-}
-
-pub(crate) fn op_zstd_decompress(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = bytes_arg(ctx, a)?;
-    match codec::zstd_decompress(&bytes) {
-        Ok(out) => ctx.make_uint8array(&out),
-        Err(e) => Err(ctx.make_error("Error", e)),
+    #[op(name = "handleClose")]
+    fn op_handle_close(ctx: &mut Ctx, id: f64) {
+        if let Some(reg) = ctx.host_mut::<ZlibHandles>() {
+            reg.handles.remove(&(id as u64));
+        }
     }
-}
 
-/// `__zlib.crc32(bytes, seed)` — CRC-32 of `bytes`, optionally continued from `seed`.
-pub(crate) fn op_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = bytes_arg(ctx, a)?;
-    let seed = arg_num(a, 1, 0.0) as u32;
-    Ok(Value::Num(codec::crc32_from(seed, &bytes) as f64))
+    #[op(name = "zstdCompress")]
+    fn op_zstd_compress(bytes: &[u8]) -> Vec<u8> {
+        codec::zstd_compress(bytes)
+    }
+
+    #[op(name = "zstdDecompress")]
+    fn op_zstd_decompress(bytes: &[u8]) -> Result<Vec<u8>, NativeError> {
+        codec::zstd_decompress(bytes).map_err(NativeError::runtime)
+    }
+
+    /// `(bytes, seed)` - CRC-32 of `bytes`, optionally continued from `seed`.
+    #[op(name = "crc32")]
+    fn op_crc32(bytes: &[u8], seed: Option<f64>) -> u32 {
+        codec::crc32_from(seed.unwrap_or(0.0) as u32, bytes)
+    }
 }

@@ -47,7 +47,7 @@ use lumen_bind::{
     flags,
 };
 use lumen_common::buffer::StoreSlot;
-use lumen_common::native::NativeError;
+use lumen_common::native::{Data, NativeError};
 use std::any::{Any, TypeId};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -1327,6 +1327,11 @@ impl Host for JsHost {
     }
 
     #[inline]
+    fn is_true(v: &Value) -> bool {
+        matches!(v, Value::Bool(true))
+    }
+
+    #[inline]
     fn to_bool(cx: &ArgCx<'_>, v: &Value, at: Slot) -> Result<bool, Value> {
         match v {
             Value::Bool(b) => Ok(*b),
@@ -1393,9 +1398,10 @@ impl Host for JsHost {
         Value::Undefined
     }
 
+    /// `Option::None` is `undefined`; return [`Null`] for a JS `null`.
     #[inline(always)]
     fn none(_: &mut Interp) -> Value {
-        Value::Null
+        Value::Undefined
     }
 
     #[inline(always)]
@@ -1582,6 +1588,19 @@ impl<'a> FromArg<'a, JsHost> for BigU64 {
     }
 }
 
+/// A result that is JS `null` (`Option::None` is `undefined`); `Option<Null>` is `null` or
+/// `undefined`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Null;
+
+impl IntoRet<JsHost> for Null {
+    const MAY_RUN: bool = false;
+    #[inline(always)]
+    fn into_ret(self, _: &mut Interp) -> Result<Value, Value> {
+        Ok(Value::Null)
+    }
+}
+
 /// Any JS object (functions included).
 #[derive(Clone)]
 pub struct JsObject(Value);
@@ -1684,6 +1703,7 @@ impl IntoRet<JsHost> for &Value {
 pub struct JsArrayBuffer(pub Vec<u8>);
 
 impl Elem for Value {}
+impl Elem for Null {}
 impl Elem for JsObject {}
 impl Elem for JsFunction {}
 impl Elem for BigI64 {}
@@ -1722,6 +1742,7 @@ enum OpErrorRepr {
         class: &'static str,
         message: Cow<'static, str>,
         code: Option<Cow<'static, str>>,
+        props: Vec<(Cow<'static, str>, Data)>,
     },
     Thrown(Value),
 }
@@ -1740,6 +1761,7 @@ impl OpError {
             class,
             message: message.into(),
             code: None,
+            props: Vec::new(),
         }))
     }
     pub fn error(message: impl Into<Cow<'static, str>>) -> OpError {
@@ -1765,6 +1787,17 @@ impl OpError {
         }
         self
     }
+    /// Attach an own property to the error object (`err.errno`, `err.syscall`, ...).
+    pub fn with_prop(
+        mut self,
+        name: impl Into<Cow<'static, str>>,
+        value: impl Into<Data>,
+    ) -> OpError {
+        if let OpErrorRepr::New { props, .. } = &mut *self.0 {
+            props.push((name.into(), value.into()));
+        }
+        self
+    }
     /// The error class (`"Thrown"` for a propagated JS value).
     pub fn class(&self) -> &str {
         match &*self.0 {
@@ -1787,6 +1820,7 @@ impl OpError {
                 class,
                 message,
                 code,
+                props,
             } => {
                 let message = message.into_owned();
                 let dom = matches!(
@@ -1836,10 +1870,17 @@ impl OpError {
                 } else {
                     ctx.make_error(class, message)
                 };
-                if let (Some(code), Value::Obj(o)) = (code, &e) {
-                    o.borrow_mut()
-                        .props
-                        .insert("code", Property::plain(Value::str(&*code)));
+                if let Value::Obj(o) = &e {
+                    if let Some(code) = code {
+                        o.borrow_mut()
+                            .props
+                            .insert("code", Property::plain(Value::str(&*code)));
+                    }
+                    for (name, data) in props {
+                        if let Ok(v) = <Data as IntoRet<JsHost>>::into_ret(data, ctx) {
+                            o.borrow_mut().props.insert(&*name, Property::plain(v));
+                        }
+                    }
                 }
                 e
             }
@@ -2147,6 +2188,7 @@ pub struct SendError {
     pub class: &'static str,
     pub message: String,
     pub code: Option<Cow<'static, str>>,
+    pub props: Vec<(Cow<'static, str>, Data)>,
 }
 
 impl SendError {
@@ -2155,6 +2197,7 @@ impl SendError {
             class,
             message: message.into(),
             code: None,
+            props: Vec::new(),
         }
     }
     pub fn with_code(mut self, c: impl Into<Cow<'static, str>>) -> SendError {
@@ -2165,7 +2208,10 @@ impl SendError {
 
 impl From<SendError> for OpError {
     fn from(e: SendError) -> OpError {
-        let err = OpError::new(e.class, e.message);
+        let mut err = OpError::new(e.class, e.message);
+        if let OpErrorRepr::New { props, .. } = &mut *err.0 {
+            *props = e.props;
+        }
         match e.code {
             Some(c) => err.with_code(c),
             None => err,
@@ -2181,6 +2227,7 @@ fn native_error_class(kind: lumen_common::native::ErrorKind) -> &'static str {
         K::Type | K::Buffer => "TypeError",
         K::Value | K::Overflow | K::Index | K::ZeroDivision | K::Memory => "RangeError",
         K::Key | K::Runtime | K::Os(_) | K::NotImplemented => "Error",
+        K::Named(class) => class,
     }
 }
 
@@ -2190,6 +2237,7 @@ impl From<NativeError> for SendError {
             class: native_error_class(e.kind),
             message: e.message.into_owned(),
             code: e.code,
+            props: e.props,
         }
     }
 }

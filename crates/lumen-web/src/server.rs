@@ -34,7 +34,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use lumen_host::{Ctx, SpawnHandle, Value};
+use lumen_bind::NativeError;
+use lumen_host::{Ctx, OpError, SpawnHandle, Value};
 
 use crate::http::{read_body_exact, read_capped_line, read_chunked};
 use crate::read_header_pairs;
@@ -88,134 +89,116 @@ struct Accepted {
 
 // ---- native ops -------------------------------------------------------------------------------
 
-/// `__http_server.listen(hostname, port, dispatch)` -> `[serverId, boundPort]`. Binds, registers
-/// the server, and arms the first accept. Throws if the bind fails.
-pub(crate) fn op_server_listen(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let host = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let port = match args.get(1) {
-        Some(Value::Num(n)) if *n >= 0.0 && *n <= 65535.0 => *n as u16,
-        _ => return Err(ctx.make_error("TypeError", "listen: port must be 0..=65535")),
-    };
-    let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
-        _ => return Err(ctx.make_error("TypeError", "listen: dispatch must be a function")),
-    };
+pub(crate) use bindings::Module;
 
-    let listener = TcpListener::bind((host.as_str(), port))
-        .map_err(|e| ctx.make_error("Error", format!("listen {host}:{port}: {e}")))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|e| ctx.make_error("Error", format!("local_addr: {e}")))?;
-    let listener = Arc::new(listener);
-    let closed = Arc::new(AtomicBool::new(false));
+#[lumen_bind::module(name = "__http_server")]
+mod bindings {
+    use super::*;
 
-    let id = {
-        let reg = ctx
-            .host_mut::<ServerRegistry>()
-            .expect("web installs ServerRegistry");
-        let id = reg.next;
-        reg.next += 1;
-        reg.servers.insert(
-            id,
-            ServerEntry {
-                listener: Arc::clone(&listener),
-                local_addr,
-                closed: Arc::clone(&closed),
-                dispatch: dispatch.clone(),
-            },
-        );
-        id
-    };
-
-    arm_accept(ctx, id, listener, closed, local_addr, dispatch);
-
-    Ok(ctx.make_array(vec![
-        Value::Num(id as f64),
-        Value::Num(local_addr.port() as f64),
-    ]))
-}
-
-/// `__http_server.respond(connId, status, statusText, headers, body, resolve, reject)`.
-/// Serializes the response and writes it on the pool; the promise settles when the write
-/// finishes (or the client hung up). The socket is taken out of the resource table here, so a
-/// second respond on the same connection rejects.
-pub(crate) fn op_server_respond(
-    ctx: &mut Ctx,
-    _this: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let conn_id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u32,
-        _ => return Err(ctx.make_error("TypeError", "respond: bad connection id")),
-    };
-    let status = match args.get(1) {
-        Some(Value::Num(n)) if *n >= 100.0 && *n <= 599.0 => *n as u16,
-        _ => return Err(ctx.make_error("TypeError", "respond: status must be 100..=599")),
-    };
-    let status_text = ctx
-        .coerce_string(args.get(2).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let headers = read_header_pairs(ctx, args.get(3).unwrap_or(&Value::Undefined))?;
-    let body = match args.get(4) {
-        None | Some(Value::Undefined) | Some(Value::Null) => Vec::new(),
-        Some(v) => ctx.typed_array_bytes(v).unwrap_or_default(),
-    };
-    let (resolve, reject) = match (args.get(5), args.get(6)) {
-        (Some(res), Some(rej)) if res.is_callable() && rej.is_callable() => {
-            (res.clone(), rej.clone())
+    /// `__http_server.listen(hostname, port, dispatch)` -> `[serverId, boundPort]`. Binds,
+    /// registers the server, and arms the first accept. Throws if the bind fails.
+    #[op(coerce)]
+    fn listen(ctx: &mut Ctx, host: String, port: u16, dispatch: Value) -> Result<Vec<f64>, NativeError> {
+        if !dispatch.is_callable() {
+            return Err(NativeError::type_error("listen: dispatch must be a function"));
         }
-        _ => return Err(ctx.make_error("TypeError", "respond expects (resolve, reject)")),
-    };
 
-    // Take ownership of the socket (removing it from the table); `Rc::try_unwrap` succeeds
-    // because the table held the only reference.
-    let stream = ctx
-        .resource_table()
-        .close(conn_id)
-        .and_then(|rc| rc.downcast::<TcpStream>().ok())
-        .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
-    let Some(stream) = stream else {
-        return Err(ctx.make_error(
-            "TypeError",
-            "respond: unknown or already-answered connection",
-        ));
-    };
+        let listener = TcpListener::bind((host.as_str(), port))
+            .map_err(|e| NativeError::runtime(format!("listen {host}:{port}: {e}")))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| NativeError::runtime(format!("local_addr: {e}")))?;
+        let listener = Arc::new(listener);
+        let closed = Arc::new(AtomicBool::new(false));
 
-    let bytes = build_response(status, &status_text, &headers, &body);
+        let id = {
+            let reg = ctx
+                .host_mut::<ServerRegistry>()
+                .expect("web installs ServerRegistry");
+            let id = reg.next;
+            reg.next += 1;
+            reg.servers.insert(
+                id,
+                ServerEntry {
+                    listener: Arc::clone(&listener),
+                    local_addr,
+                    closed: Arc::clone(&closed),
+                    dispatch: dispatch.clone(),
+                },
+            );
+            id
+        };
 
-    let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(id, move || Box::new(write_all_and_close(stream, &bytes)));
+        arm_accept(ctx, id, listener, closed, local_addr, dispatch);
 
-    Ok(Value::Undefined)
-}
-
-/// `__http_server.close(serverId)`. Flags the listener closed and pokes it with a throwaway
-/// connection so the blocked `accept()` wakes, sees the flag, and stops re-arming.
-pub(crate) fn op_server_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) if *n >= 0.0 => *n as u64,
-        _ => return Ok(Value::Undefined),
-    };
-    let target = ctx
-        .host_mut::<ServerRegistry>()
-        .and_then(|reg| reg.servers.get(&id))
-        .map(|e| (Arc::clone(&e.closed), e.local_addr));
-    if let Some((closed, local_addr)) = target {
-        closed.store(true, Ordering::SeqCst);
-        wake_accept(local_addr);
+        Ok(vec![id as f64, local_addr.port() as f64])
     }
-    Ok(Value::Undefined)
+
+    /// `__http_server.respond(connId, status, statusText, headers, body, resolve, reject)`.
+    /// Serializes the response and writes it on the pool; the promise settles when the write
+    /// finishes (or the client hung up). The socket is taken out of the resource table here, so a
+    /// second respond on the same connection rejects.
+    #[op(coerce)]
+    #[allow(clippy::too_many_arguments)]
+    fn respond(
+        ctx: &mut Ctx,
+        conn_id: u32,
+        status: u16,
+        status_text: String,
+        headers: Value,
+        body: Option<&[u8]>,
+        resolve: Value,
+        reject: Value,
+    ) -> Result<(), OpError> {
+        if !(100..=599).contains(&status) {
+            return Err(NativeError::type_error("respond: status must be 100..=599").into());
+        }
+        let headers = read_header_pairs(ctx, &headers)?;
+        let (resolve, reject) = crate::callbacks(resolve, reject, "respond")?;
+
+        // Take ownership of the socket (removing it from the table); `Rc::try_unwrap` succeeds
+        // because the table held the only reference.
+        let stream = ctx
+            .resource_table()
+            .close(conn_id)
+            .and_then(|rc| rc.downcast::<TcpStream>().ok())
+            .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
+        let Some(stream) = stream else {
+            return Err(NativeError::type_error("respond: unknown or already-answered connection").into());
+        };
+
+        let bytes = build_response(status, &status_text, &headers, body.unwrap_or_default());
+
+        let id = lumen_host::register_task(ctx, resolve, Some(reject), decode_write);
+        let spawn = ctx
+            .op_state()
+            .get::<SpawnHandle>()
+            .expect("runtime installs the spawn handle")
+            .clone();
+        spawn.spawn_blocking(id, move || Box::new(write_all_and_close(stream, &bytes)));
+        Ok(())
+    }
+
+    /// `__http_server.close(serverId)`. Flags the listener closed and pokes it with a throwaway
+    /// connection so the blocked `accept()` wakes, sees the flag, and stops re-arming.
+    #[op]
+    fn close(ctx: &mut Ctx, id: Option<f64>) {
+        let Some(id) = id.filter(|n| *n >= 0.0).map(|n| n as u64) else { return };
+        let target = ctx
+            .host_mut::<ServerRegistry>()
+            .and_then(|reg| reg.servers.get(&id))
+            .map(|e| (Arc::clone(&e.closed), e.local_addr));
+        if let Some((closed, local_addr)) = target {
+            closed.store(true, Ordering::SeqCst);
+            wake_accept(local_addr);
+        }
+    }
+
+    /// `__http_server.version()` -> the runtime version string (backs `Lumen.version`).
+    #[op]
+    fn version() -> String {
+        env!("CARGO_PKG_VERSION").to_string()
+    }
 }
 
 /// Close every listener the realm still holds, waking their blocked `accept`s.
@@ -241,15 +224,6 @@ fn wake_accept(local_addr: SocketAddr) {
         local_addr
     };
     let _ = TcpStream::connect_timeout(&wake_addr, Duration::from_millis(250));
-}
-
-/// `__http_server.version()` -> the runtime version string (backs `Lumen.version`).
-pub(crate) fn op_server_version(
-    _ctx: &mut Ctx,
-    _this: Value,
-    _args: &[Value],
-) -> Result<Value, Value> {
-    Ok(Value::from_string(env!("CARGO_PKG_VERSION").to_string()))
 }
 
 // ---- completion decoders (run on the loop thread with &mut Ctx) --------------------------------

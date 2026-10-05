@@ -1,0 +1,9 @@
+True False True
+False False True
+False False False False False
+False False
+True True True
+True
+ValueError: generation parameter cannot be negative
+ValueError: generation parameter must be less than the number of available generations (3)
+True

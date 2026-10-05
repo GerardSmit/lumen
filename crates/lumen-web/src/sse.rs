@@ -10,10 +10,11 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use lumen_bind::NativeError;
 use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::url;
@@ -71,60 +72,67 @@ fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
         .expect("web installs SseRegistry")
 }
 
-/// `__sse.connect(url, lastEventId, dispatch)` → id. Opens the stream on the pool; the JS side
-/// then receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), or
-/// `("drop", message)` (reconnect per the retry interval).
-pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let target = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let last_event_id = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
-        _ => return Err(ctx.make_error("TypeError", "connect: dispatch must be a function")),
-    };
+pub(crate) use bindings::Module;
 
-    let u = url::parse(&target, None).map_err(|e| ctx.make_error("SyntaxError", e))?;
-    match u.scheme.as_str() {
-        "http" | "https" => {}
-        other => {
-            return Err(ctx.make_error(
-                "SyntaxError",
-                format!("EventSource: unsupported scheme '{other}'"),
-            ));
+#[lumen_bind::module(name = "__sse")]
+mod bindings {
+    use super::*;
+
+    /// `__sse.connect(url, lastEventId, dispatch)` -> id. Opens the stream on the pool; the JS side
+    /// then receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), or
+    /// `("drop", message)` (reconnect per the retry interval).
+    #[op(coerce)]
+    fn connect(ctx: &mut Ctx, target: String, last_event_id: String, dispatch: Value) -> Result<f64, NativeError> {
+        if !dispatch.is_callable() {
+            return Err(NativeError::type_error("connect: dispatch must be a function"));
         }
+
+        let u = url::parse(&target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
+        match u.scheme.as_str() {
+            "http" | "https" => {}
+            other => {
+                return Err(NativeError::named("SyntaxError", format!("EventSource: unsupported scheme '{other}'")))
+            }
+        }
+
+        let id = {
+            let reg = sse_registry(ctx);
+            let id = reg.next;
+            reg.next += 1;
+            reg.conns.insert(
+                id,
+                SseEntry {
+                    closed: Arc::new(AtomicBool::new(false)),
+                    dispatch: dispatch.clone(),
+                    dead: false,
+                },
+            );
+            id
+        };
+
+        let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
+        let spawn = ctx
+            .op_state()
+            .get::<SpawnHandle>()
+            .expect("runtime installs the spawn handle")
+            .clone();
+        spawn.spawn_blocking(task, move || {
+            Box::new(ConnectResult {
+                id,
+                outcome: open_stream(&target, &last_event_id),
+            })
+        });
+        Ok(id as f64)
     }
 
-    let id = {
-        let reg = sse_registry(ctx);
-        let id = reg.next;
-        reg.next += 1;
-        reg.conns.insert(
-            id,
-            SseEntry {
-                closed: Arc::new(AtomicBool::new(false)),
-                dispatch: dispatch.clone(),
-                dead: false,
-            },
-        );
-        id
-    };
-
-    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(task, move || {
-        Box::new(ConnectResult {
-            id,
-            outcome: open_stream(&target, &last_event_id),
-        })
-    });
-    Ok(Value::Num(id as f64))
+    /// `__sse.close(id)` - flip the closed flag; the reader loop tears down and reports `closed`.
+    #[op]
+    fn close(ctx: &mut Ctx, id: f64) {
+        if let Some(e) = sse_registry(ctx).conns.get_mut(&(id as u64)) {
+            e.dead = true;
+            e.closed.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 /// GET `target` with the SSE request headers, following redirects, and validate the response is
@@ -230,12 +238,12 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
             204 | 205 => {
                 return Err(ConnectError::Fatal(format!(
                     "server returned {status} (stop)"
-                )));
+                )))
             }
             _ => {
                 return Err(ConnectError::Fatal(format!(
                     "server returned HTTP {status}"
-                )));
+                )))
             }
         }
     }
@@ -255,7 +263,7 @@ fn decode_connect(
                     return Ok(vec![
                         Value::from_string("fatal".into()),
                         Value::from_string("closed".into()),
-                    ]);
+                    ])
                 }
             };
             arm_read(ctx, id, StreamReader { stream, closed });
@@ -353,19 +361,6 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
             }
         }
     }
-}
-
-/// `__sse.close(id)` — flip the closed flag; the reader loop tears down and reports `closed`.
-pub(crate) fn op_sse_close(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "close: bad connection id")),
-    };
-    if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {
-        e.dead = true;
-        e.closed.store(true, Ordering::SeqCst);
-    }
-    Ok(Value::Undefined)
 }
 
 // ---- test support -------------------------------------------------------------------------------

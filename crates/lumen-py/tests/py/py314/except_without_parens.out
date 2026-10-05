@@ -1,0 +1,9 @@
+value-or-type
+value-or-type
+key
+paren EOFError
+star caught value/type
+star caught key
+Tuple(elts=[Name(id='A', ctx=Load()), Name(id='B', ctx=Load())], ctx=Load())
+multiple exception types must be parenthesized when using 'as' 3 8
+multiple exception types must be parenthesized when using 'as' 3 9

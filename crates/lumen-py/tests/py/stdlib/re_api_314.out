@@ -1,0 +1,212 @@
+re.NOFLAG 0 re.IGNORECASE
+re.Pattern[str] re.Match[bytes]
+True Exception
+pattern error attrs EXC PatternError missing ), unterminated subpattern at position 0
+missing ), unterminated subpattern a(b 1 1 2
+[^\s\S] 'ab' []
+[\s\S]+ 'a\nb' [((0, 3), 'a\nb')]
+[\S\s] '\n' [((0, 1), '\n')]
+(?:[^\s\S]|a)b 'ab' [((0, 2), 'ab')]
+a*+a 'aaa' []
+(?>a*)a 'aaa' []
+a++b 'aaab' [((0, 4), 'aaab')]
+(a|ab)*+c 'abac' [((2, 4), 'ac')]
+(?>(a+))b 'aab' [((0, 3), 'aab')]
+x?+x 'x' []
+a{2,3}+a 'aaaa' [((0, 4), 'aaaa')]
+(?i:A)b 'aB' []
+(?i:A)b 'ab' [((0, 2), 'ab')]
+(?-i:a)B 'AB' []
+(?s:.) '\n' [((0, 1), '\n')]
+(?a:\w) 'é' []
+(?u:\w) 'é' [((0, 1), 'é')]
+\B '' [((0, 0), '')]
+\b '' []
+\B 'a' []
+a\B 'a' []
+\B$ 'a ' [((2, 2), '')]
+\Ba 'a' []
+(?a)\B '' [((0, 0), '')]
+empty at pos None
+empty at endpos <re.Match object; span=(0, 0), match=''>
+bytes \B empty <re.Match object; span=(0, 0), match=b''>
+sub '\\g<0>' 'abc def'
+expand '\\g<0>' 'abc'
+sub '\\g<w>' 'a d'
+expand '\\g<w>' 'a'
+sub '\\g<1>-\\2' 'a-bc d-ef'
+expand '\\g<1>-\\2' 'a-bc'
+sub '\\1\\3\\2' 'abc def'
+expand '\\1\\3\\2' 'abc'
+sub '\\\\' '\\ \\'
+expand '\\\\' '\\'
+sub '\\n' '\n \n'
+expand '\\n' '\n'
+sub '\\t\\a\\b\\f\\v\\r' '\t\x07\x08\x0c\x0b\r \t\x07\x08\x0c\x0b\r'
+expand '\\t\\a\\b\\f\\v\\r' '\t\x07\x08\x0c\x0b\r'
+sub '\\0' '\x00 \x00'
+expand '\\0' '\x00'
+sub '\\01' '\x01 \x01'
+expand '\\01' '\x01'
+sub '\\x41' EXC PatternError bad escape \x at position 0
+expand '\\x41' EXC PatternError bad escape \x at position 0
+sub '\\g<w' EXC PatternError missing >, unterminated name at position 3
+expand '\\g<w' EXC PatternError missing >, unterminated name at position 3
+sub '\\g<>' EXC PatternError missing group name at position 3
+expand '\\g<>' EXC PatternError missing group name at position 3
+sub '\\g<3>' ' '
+expand '\\g<3>' ''
+sub '\\g<4>' EXC PatternError invalid group reference 4 at position 3
+expand '\\g<4>' EXC PatternError invalid group reference 4 at position 3
+sub '\\g<-1>' EXC PatternError bad character in group name '-1' at position 3
+expand '\\g<-1>' EXC PatternError bad character in group name '-1' at position 3
+sub '\\4' EXC PatternError invalid group reference 4 at position 1
+expand '\\4' EXC PatternError invalid group reference 4 at position 1
+sub '\\g<nope>' EXC IndexError unknown group name 'nope'
+expand '\\g<nope>' EXC IndexError unknown group name 'nope'
+sub '\\q' EXC PatternError bad escape \q at position 0
+expand '\\q' EXC PatternError bad escape \q at position 0
+sub '\\u1234' EXC PatternError bad escape \u at position 0
+expand '\\u1234' EXC PatternError bad escape \u at position 0
+sub '\\8' EXC PatternError invalid group reference 8 at position 1
+expand '\\8' EXC PatternError invalid group reference 8 at position 1
+sub '\\1\\1\\1' 'aaa ddd'
+expand '\\1\\1\\1' 'aaa'
+sub '' ' '
+expand '' ''
+sub 'plain' 'plain plain'
+expand 'plain' 'plain'
+sub '\\g< w>' EXC PatternError bad character in group name ' w' at position 3
+expand '\\g< w>' EXC PatternError bad character in group name ' w' at position 3
+sub '\\g<1x>' EXC PatternError bad character in group name '1x' at position 3
+expand '\\g<1x>' EXC PatternError bad character in group name '1x' at position 3
+sub '\\18' EXC PatternError invalid group reference 18 at position 1
+expand '\\18' EXC PatternError invalid group reference 18 at position 1
+sub '\\400' EXC PatternError octal escape value \400 outside of range 0-0o377 at position 0
+expand '\\400' EXC PatternError octal escape value \400 outside of range 0-0o377 at position 0
+sub '\\777' EXC PatternError octal escape value \777 outside of range 0-0o377 at position 0
+expand '\\777' EXC PatternError octal escape value \777 outside of range 0-0o377 at position 0
+sub '\\\n' '\\\n \\\n'
+expand '\\\n' '\\\n'
+sub bytes b'b[a]n[a]n[a]'
+sub bytes mixed EXC TypeError sequence item 1: expected str instance, bytes found
+sub str mixed EXC TypeError sequence item 1: expected a bytes-like object, str found
+sub callable 'bAnAna'
+sub callable bad EXC TypeError sequence item 1: expected str instance, int found
+sub empty '-a-b--d-'
+sub empty 2 '-a-b-'
+subn ('<><b><><b>', 4)
+sub count kw 'Z def'
+sub count pos 'Z def'
+sub unmatched group '[][b]'
+split maxsplit ['a', ',', 'b', None, 'c,d']
+split empty ['', 'a', '', 'b', 'c', '']
+split pos maxsplit ['a', 'b,c']
+<re.Match object; span=(1, 2), match='1'> 1 ('1', None) 1 1 1 ('1', None, None) ('1', 'd', 'd') {'a': '1', 'c': None} {'a': '1', 'c': 'd'}
+1 2 (1, 2) 1 -1 (-1, -1) 1 a ((1, 2), (1, 2), (-1, -1), (-1, -1)) 0 5 True z1 23
+bad group EXC IndexError no such group
+bad group name EXC IndexError no such group
+bad getitem EXC IndexError no such group
+group float EXC IndexError no such group
+group big EXC IndexError no such group
+start neg EXC IndexError no such group
+span bool (1, 2)
+copy match True
+deepcopy match True
+copy pattern True
+deepcopy pattern True
+pickle pattern True
+pickle match EXC TypeError cannot pickle 're.Match' object
+hash eq (True, True, False, True)
+lt EXC TypeError '<' not supported between instances of 're.Pattern' and 're.Pattern'
+re.compile('(?P<a>\\d)(\\d)?(?P<c>x)?') re.compile('a', re.IGNORECASE|re.VERBOSE) re.compile(b'a', re.ASCII) re.compile('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa') re.compile('\n')
+<re.Match object; span=(1, 2), match='1'> <re.Match object; span=(0, 2), match='1x'> <re.Match object; span=(0, 0), match=''>
+(?P<a>\d)(\d)?(?P<c>x)? 32 3 {'a': 1, 'c': 3} {'a': 1, 'c': 3}
+groupindex immutable EXC AttributeError 'mappingproxy' object has no attribute '__setitem__'
+findall 'abcabc' 0 6 ['b', 'c', 'b', 'c']
+search 'abcabc' 0 6 <re.Match object; span=(5, 6), match='c'>
+findall 'abcabc' 2 5 ['c', 'b']
+search 'abcabc' 2 5 None
+findall 'abcabc' -5 100 ['b', 'c', 'b', 'c']
+search 'abcabc' -5 100 <re.Match object; span=(5, 6), match='c'>
+findall 'abcabc' 4 2 []
+search 'abcabc' 4 2 None
+findall 'abcabc' 7 9 []
+search 'abcabc' 7 9 None
+findall 'abc' None None ['b', 'c']
+search 'abc' None None <re.Match object; span=(2, 3), match='c'>
+search kw <re.Match object; span=(1, 2), match='b'>
+search no args EXC TypeError search() missing required argument 'string' (pos 1)
+search bad type EXC TypeError expected string or bytes-like object, got 'int'
+search bytes on str pattern EXC TypeError cannot use a string pattern on a bytes-like object
+search str on bytes pattern EXC TypeError cannot use a bytes pattern on a string-like object
+search bytearray <re.Match object; span=(1, 2), match=b'b'>
+search memoryview <re.Match object; span=(1, 2), match=b'b'>
+pos float EXC TypeError 'float' object cannot be interpreted as an integer
+pos huge EXC OverflowError Python int too large to convert to C ssize_t
+findall bad EXC TypeError 'str' object cannot be interpreted as an integer
+[<re.Match object; span=(0, 1), match='1'>, <re.Match object; span=(1, 2), match='a'>, None, None, None]
+scanner pattern True
+[<re.Match object; span=(0, 0), match=''>, <re.Match object; span=(1, 1), match=''>, <re.Match object; span=(2, 2), match=''>, <re.Match object; span=(3, 3), match=''>, None]
+[<re.Match object; span=(1, 2), match='a'>, <re.Match object; span=(2, 2), match=''>, None]
+scanner type 'SRE_Scanner'
+scanner new EXC TypeError cannot create '_sre.SRE_Scanner' instances
+finditer type 'callable_iterator'
+<re.Match object; span=(0, 1), match='a'> <re.Match object; span=(1, 2), match='a'>
+finditer end EXC StopIteration 
+module sub flags pos 'bb'
+module split ['Words', 'words', 'words', '']
+module split capture ['Words', ', ', 'words', '.', '']
+escape 'a\\.b\\*c\\\n\x00\\-_\\ é'
+escape bytes b'a\\.b\xff'
+purge None
+fullmatch (0, 2)
+compile pattern flags EXC ValueError cannot process flags argument with a compiled pattern
+compile bad type EXC TypeError first argument must be string or compiled pattern
+compile str flags bytes EXC ValueError cannot use UNICODE flag with a bytes pattern
+compile ascii unicode EXC ValueError ASCII and UNICODE flags are incompatible
+compile locale str EXC ValueError cannot use LOCALE flag with a str pattern
+compile locale ascii EXC ValueError ASCII and LOCALE flags are incompatible
+flags repr re.IGNORECASE|re.MULTILINE
+flags all [re.ASCII, re.IGNORECASE, re.LOCALE, re.UNICODE, re.MULTILINE, re.DOTALL, re.VERBOSE, re.DEBUG]
+flags value 346
+flags debug 32
+template flag False
+sre flag template False
+code [^\s\S] [INFO, 4, 0, 1, 1, FAILURE, SUCCESS]
+compile code [^\s\S] 1
+code [\s\S] [INFO, 4, 0, 1, 1, ANY_ALL, SUCCESS]
+compile code [\s\S] 1
+code [] EXC PatternError unterminated character set at position 0
+compile code [] EXC PatternError unterminated character set at position 0
+code [^] EXC PatternError unterminated character set at position 0
+compile code [^] EXC PatternError unterminated character set at position 0
+code [\d\D] [INFO, 4, 0, 1, 1, ANY_ALL, SUCCESS]
+compile code [\d\D] 1
+code a|b [INFO, 8, 4, 1, 1, RANGE, 97, 98, FAILURE, IN, 5, RANGE, 97, 98, FAILURE, SUCCESS]
+compile code a|b 1
+code (?:) [INFO, 4, 0, 0, 0, SUCCESS]
+compile code (?:) 1
+code a++ [INFO, 4, 0, 1, 4294967295, POSSESSIVE_REPEAT_ONE, 6, 1, MAXREPEAT, LITERAL, 97, SUCCESS, SUCCESS]
+compile code a++ 1
+code (?>a) [INFO, 4, 0, 1, 1, ATOMIC_GROUP, 4, LITERAL, 97, SUCCESS, SUCCESS]
+compile code (?>a) 1
+code (?i:a) [INFO, 4, 0, 1, 1, LITERAL_UNI_IGNORE, 97, SUCCESS]
+compile code (?i:a) 1
+code [a-c] [INFO, 8, 4, 1, 1, RANGE, 97, 99, FAILURE, IN, 5, RANGE, 97, 99, FAILURE, SUCCESS]
+compile code [a-c] 1
+code [^a] [INFO, 4, 0, 1, 1, NOT_LITERAL, 97, SUCCESS]
+compile code [^a] 1
+code \B [INFO, 4, 0, 0, 0, AT, AT_UNI_NON_BOUNDARY, SUCCESS]
+compile code \B 1
+code x{2,5} [INFO, 4, 0, 2, 5, REPEAT_ONE, 6, 2, 5, LITERAL, 120, SUCCESS, SUCCESS]
+compile code x{2,5} 1
+code (?P<n>a)(?(n)b|c) [INFO, 8, 1, 2, 2, 1, 0, 97, 0, MARK, 0, LITERAL, 97, MARK, 1, GROUPREF_EXISTS, 0, 6, LITERAL, 98, JUMP, 3, LITERAL, 99, SUCCESS]
+compile code (?P<n>a)(?(n)b|c) 1
+_sre.template 'SRE_Template'
+_sre.template empty EXC TypeError invalid template
+_sre.template bad EXC TypeError template() argument 2 must be list, not int
+_sre.template odd EXC TypeError invalid template
+_sre.compile bad code EXC RuntimeError invalid SRE code
+_sre.getcodesize 4
+_sre.ascii_iscased (True, False, True, 97, 233)

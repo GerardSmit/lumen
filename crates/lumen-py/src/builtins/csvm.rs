@@ -414,6 +414,10 @@ pub mod _csv {
             let fields = r.with(it, |s| s.parser.take_fields())?;
             let mut out = Vec::with_capacity(fields.len());
             for f in fields {
+                if f.null {
+                    out.push(Value::None);
+                    continue;
+                }
                 let v = Value::string(f.text);
                 out.push(match f.numeric {
                     true => {
@@ -649,7 +653,6 @@ pub mod _csv {
         dict_set_str(&d, "Error", Value::Obj(error));
         let reg = registry(it);
         dict_set_str(&d, "_dialects", Value::Obj(reg));
-        dict_set_str(&d, "__version__", Value::str("1.0"));
         for (name, q) in Quoting::NAMES {
             dict_set_str(&d, name, Value::Int(q as i64));
         }

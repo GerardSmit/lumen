@@ -7,6 +7,9 @@ use crate::vm::Interp;
 use lumen_common::smuggle::{code_points, push_code_point};
 
 /// Text I/O implementation using an in-memory buffer.
+///
+/// The initial_value argument sets the value of object.  The newline
+/// argument is like the one of TextIOWrapper's constructor.
 #[lumen_bind::class(module = "_io", name = "StringIO")]
 pub struct StringIO {
     buf: Vec<u32>,
@@ -144,7 +147,7 @@ fn st<X>(it: &mut Interp, slf: &Py<StringIO>, f: impl FnOnce(&mut StringIO) -> X
 
 #[lumen_bind::methods]
 impl StringIO {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(initial_value='', newline='\\n')")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> StringIO {
         let _ = (args, kwargs);
         StringIO::blank()
@@ -215,6 +218,10 @@ impl StringIO {
     }
 
     /// Read at most size characters, returned as a string.
+    ///
+    /// If the argument is negative or omitted, read until EOF
+    /// is reached. Return an empty string at EOF.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<String> {
         let n = super::size_arg(it, size)?;
         st(it, &slf.0, |s| {
@@ -231,12 +238,18 @@ impl StringIO {
     }
 
     /// Read until newline or EOF.
+    ///
+    /// Returns an empty string if EOF is hit immediately.
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn readline(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<String> {
         let n = super::size_arg(it, size)?;
         st(it, &slf.0, |s| s.read_line(n))
     }
 
     /// Write string to file.
+    ///
+    /// Returns the number of characters written, which is always equal to
+    /// the length of the string.
     fn write(slf: This<Py<Self>>, it: &mut Interp, s: &Value) -> R<usize> {
         let Some(text) = s.as_str() else {
             let t = it.type_name_of(s);
@@ -246,6 +259,12 @@ impl StringIO {
     }
 
     /// Change stream position.
+    ///
+    /// Seek to character offset pos relative to position indicated by whence:
+    ///     0  Start of stream (the default).  pos should be >= 0;
+    ///     1  Current position - pos must be 0;
+    ///     2  End of stream - pos must be 0.
+    /// Returns the new absolute position.
     fn seek(slf: This<Py<Self>>, it: &mut Interp, pos: i64, #[default(0)] whence: i32) -> R<usize> {
         let len = st(it, &slf.0, |s| s.buf.len())?;
         if !(0..=2).contains(&whence) {
@@ -275,6 +294,10 @@ impl StringIO {
     }
 
     /// Truncate size to pos.
+    ///
+    /// The pos argument defaults to the current file position, as
+    /// returned by tell().  The current file position is unchanged.
+    /// Returns the new absolute position.
     fn truncate(slf: This<Py<Self>>, it: &mut Interp, pos: Option<&Value>) -> R<i64> {
         let cur = st(it, &slf.0, |s| s.pos as i64)?;
         let size = match pos {
@@ -304,6 +327,11 @@ impl StringIO {
     }
 
     /// Close the IO object.
+    ///
+    /// Attempting any further operation after the object is closed
+    /// will raise a ValueError.
+    ///
+    /// This method has no effect if the file is already closed.
     fn close(&mut self) {
         self.closed = true;
         self.buf = Vec::new();
@@ -352,6 +380,7 @@ impl StringIO {
         Ok((line.as_str() != Some("")).then_some(line))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __getstate__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let (value, readnl, pos) = st(it, &slf.0, |s| (text_of(&s.buf), s.readnl.clone(), s.pos))?;
         let Value::Obj(o) = slf.0.value() else {
@@ -371,6 +400,7 @@ impl StringIO {
         ]))
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn __setstate__(slf: This<Py<Self>>, it: &mut Interp, state: &Value) -> R<()> {
         let items = match state.tuple_items() {
             Some(t) if t.len() >= 4 => t.to_vec(),

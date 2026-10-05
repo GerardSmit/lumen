@@ -40,7 +40,7 @@ pub fn group_text(e: &Obj) -> String {
     )
 }
 
-/// `BaseExceptionGroup`'s members (installed into the core type).
+// `BaseExceptionGroup`'s members (installed into the core type).
 #[lumen_bind::class(name = "BaseExceptionGroup")]
 pub struct BaseExceptionGroup;
 
@@ -180,6 +180,7 @@ fn copy_meta(it: &mut Interp, from: &Obj, to: &Value) {
         let f = f.borrow();
         let mut d = d.borrow_mut();
         d.tb = f.tb.clone();
+        d.tb_cache = None;
         d.cause = f.cause.clone();
         d.context = f.context.clone();
         d.suppress_context = f.suppress_context;

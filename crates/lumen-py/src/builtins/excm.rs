@@ -25,7 +25,7 @@ fn keyword_fields(it: &mut Interp, d: &Obj, kw: KwArgs, allowed: &[&str], cls: &
     Ok(())
 }
 
-/// `BaseException`'s members.
+// `BaseException`'s members.
 #[lumen_bind::class(name = "BaseException")]
 pub struct BaseException;
 
@@ -145,7 +145,7 @@ impl BaseException {
     }
 }
 
-/// `StopIteration.value`.
+// `StopIteration.value`.
 #[lumen_bind::class(name = "StopIteration")]
 pub struct StopIteration;
 
@@ -167,7 +167,7 @@ impl StopIteration {
     }
 }
 
-/// `SystemExit.code`.
+// `SystemExit.code`.
 #[lumen_bind::class(name = "SystemExit")]
 pub struct SystemExit;
 
@@ -196,7 +196,7 @@ impl SystemExit {
     }
 }
 
-/// `ImportError(*args, name=None, path=None)`.
+// `ImportError(*args, name=None, path=None)`.
 #[lumen_bind::class(name = "ImportError")]
 pub struct ImportError;
 
@@ -220,7 +220,7 @@ impl ImportError {
     }
 }
 
-/// `AttributeError(*args, name=None, obj=None)`.
+// `AttributeError(*args, name=None, obj=None)`.
 #[lumen_bind::class(name = "AttributeError")]
 pub struct AttributeError;
 
@@ -246,7 +246,7 @@ impl AttributeError {
     }
 }
 
-/// `NameError(*args, name=None)`.
+// `NameError(*args, name=None)`.
 #[lumen_bind::class(name = "NameError")]
 pub struct NameError;
 
@@ -270,72 +270,221 @@ impl NameError {
     }
 }
 
-fn unicode_field(e: &Obj, name: &str) -> Option<Value> {
-    e.dict.borrow().as_ref().and_then(|d| dict_get_str(d, name))
+#[derive(Clone, Copy, PartialEq)]
+enum UnicodeKind {
+    Encode,
+    Decode,
+    Translate,
+}
+
+/// `\xe9`, `€` or `\U0001f600`: a code point as `UnicodeError` messages show it.
+pub(crate) fn char_escape(cp: u32) -> String {
+    if cp <= 0xff {
+        format!("\\x{:02x}", cp)
+    } else if cp <= 0xffff {
+        format!("\\u{:04x}", cp)
+    } else {
+        format!("\\U{:08x}", cp)
+    }
+}
+
+/// `UnicodeEncodeError.__init__` and friends: `(encoding, object, start, end, reason)`, or
+/// without `encoding` for `UnicodeTranslateError`.
+fn unicode_init(
+    it: &mut Interp,
+    e: &Obj,
+    args: &[Value],
+    kwargs: &KwArgs,
+    kind: UnicodeKind,
+) -> R<()> {
+    set_args(e, args);
+    if !kwargs.is_empty() {
+        let name = it.type_name_of(&Value::Obj(e.clone()));
+        return Err(it.type_error(&format!("{}() takes no keyword arguments", name)));
+    }
+    let with_encoding = kind != UnicodeKind::Translate;
+    let want = if with_encoding { 5 } else { 4 };
+    if args.len() != want {
+        return Err(it.type_error(&format!(
+            "function takes exactly {} arguments ({} given)",
+            want,
+            args.len()
+        )));
+    }
+    let not_str = |it: &mut Interp, n: usize, v: &Value| {
+        let t = it.type_name_of(v);
+        it.type_error(&format!("argument {} must be str, not {}", n, t))
+    };
+    let off = with_encoding as usize;
+    let encoding = if with_encoding {
+        if args[0].as_str().is_none() {
+            return Err(not_str(it, 1, &args[0]));
+        }
+        args[0].clone()
+    } else {
+        Value::None
+    };
+    let object = if kind == UnicodeKind::Decode {
+        match &args[off] {
+            Value::Obj(o) if matches!(o.kind, Kind::Bytes(_)) => args[off].clone(),
+            Value::Obj(o) if matches!(o.kind, Kind::ByteArray(_)) => {
+                Value::bytes(it.bytes_of(&args[off])?)
+            }
+            v => {
+                let t = it.type_name_of(v);
+                return Err(it.type_error(&format!("a bytes-like object is required, not '{}'", t)));
+            }
+        }
+    } else {
+        if args[off].as_str().is_none() {
+            return Err(not_str(it, off + 1, &args[off]));
+        }
+        args[off].clone()
+    };
+    let start = it.index_of(&args[off + 1])?;
+    let end = it.index_of(&args[off + 2])?;
+    if args[off + 3].as_str().is_none() {
+        return Err(not_str(it, off + 4, &args[off + 3]));
+    }
+    let d = it.instance_dict(e);
+    dict_set_str(&d, "encoding", encoding);
+    dict_set_str(&d, "object", object);
+    dict_set_str(&d, "start", Value::Int(start));
+    dict_set_str(&d, "end", Value::Int(end));
+    dict_set_str(&d, "reason", args[off + 3].clone());
+    Ok(())
+}
+
+/// `str()` of a `Unicode{Encode,Decode,Translate}Error` from its `encoding`, `object`, `start`,
+/// `end` and `reason` attributes (empty before `__init__` set them).
+fn unicode_text(it: &mut Interp, e: &Obj, kind: UnicodeKind) -> R<String> {
+    let d = it.instance_dict(e);
+    let Some(object) = dict_get_str(&d, "object") else {
+        return Ok(String::new());
+    };
+    let get = |n: &str| dict_get_str(&d, n).unwrap_or(Value::None);
+    let (sv, ev, rv, encv) = (get("start"), get("end"), get("reason"), get("encoding"));
+    let start = it.index_of(&sv)?;
+    let end = it.index_of(&ev)?;
+    let reason = it.str_of(&rv)?;
+    let prefix = match kind {
+        UnicodeKind::Translate => "can't translate".to_string(),
+        UnicodeKind::Encode => format!("'{}' codec can't encode", it.str_of(&encv)?),
+        UnicodeKind::Decode => format!("'{}' codec can't decode", it.str_of(&encv)?),
+    };
+    let single = if kind == UnicodeKind::Decode {
+        let b = it.bytes_of(&object)?;
+        (start >= 0 && (start as usize) < b.len() && end == start + 1)
+            .then(|| format!("byte 0x{:02x}", b[start as usize]))
+    } else {
+        let c = object
+            .as_pystr()
+            .filter(|s| start >= 0 && (start as usize) < s.nchars && end == start + 1)
+            .and_then(|s| s.char_at(start as usize));
+        c.map(|c| format!("character '{}'", char_escape(c)))
+    };
+    Ok(match single {
+        Some(what) => format!("{} {} in position {}: {}", prefix, what, start, reason),
+        None => {
+            let what = if kind == UnicodeKind::Decode {
+                "bytes"
+            } else {
+                "characters"
+            };
+            format!(
+                "{} {} in position {}-{}: {}",
+                prefix,
+                what,
+                start,
+                end - 1,
+                reason
+            )
+        }
+    })
 }
 
 impl Interp {
-    /// `str()` of a `UnicodeEncodeError` / `UnicodeDecodeError` / `UnicodeTranslateError`, from its
-    /// `encoding`, `object`, `start`, `end` and `reason` attributes.
+    /// `str()` of a `UnicodeEncodeError` / `UnicodeDecodeError` / `UnicodeTranslateError`.
     pub fn unicode_exc_str(&mut self, e: &Obj) -> R<Option<String>> {
-        let (Some(obj), Some(Value::Int(start)), Some(Value::Int(end)), Some(reason)) = (
-            unicode_field(e, "object"),
-            unicode_field(e, "start"),
-            unicode_field(e, "end"),
-            unicode_field(e, "reason"),
-        ) else {
+        let kind = if self.exc_is(e, "UnicodeEncodeError") {
+            UnicodeKind::Encode
+        } else if self.exc_is(e, "UnicodeDecodeError") {
+            UnicodeKind::Decode
+        } else if self.exc_is(e, "UnicodeTranslateError") {
+            UnicodeKind::Translate
+        } else {
             return Ok(None);
         };
-        let reason = self.str_of(&reason)?;
-        let encoding = match unicode_field(e, "encoding") {
-            Some(v) if !v.is_none() => self.str_of(&v)?,
-            _ => String::new(),
-        };
-        let (start, end) = (start.max(0) as usize, end.max(0) as usize);
-        let single = end == start + 1;
-        if let Value::Obj(o) = &obj {
-            if let Kind::Bytes(b) = &o.kind {
-                return Ok(Some(match b.get(start) {
-                    Some(byte) if single => format!(
-                        "'{}' codec can't decode byte 0x{:02x} in position {}: {}",
-                        encoding, byte, start, reason
-                    ),
-                    _ => format!(
-                        "'{}' codec can't decode bytes in position {}-{}: {}",
-                        encoding,
-                        start,
-                        end.saturating_sub(1),
-                        reason
-                    ),
-                }));
-            }
-        }
-        let what = if encoding.is_empty() {
-            "can't translate".to_string()
-        } else {
-            format!("'{}' codec can't encode", encoding)
-        };
-        Ok(Some(
-            match obj
-                .as_str()
-                .and_then(|s| lumen_common::smuggle::code_points(s).nth(start))
-            {
-                Some(c) if single => {
-                    let shown = crate::builtins::codecsm::char_escape(c);
-                    format!(
-                        "{} character '{}' in position {}: {}",
-                        what, shown, start, reason
-                    )
-                }
-                _ => format!(
-                    "{} characters in position {}-{}: {}",
-                    what,
-                    start,
-                    end.saturating_sub(1),
-                    reason
-                ),
-            },
-        ))
+        unicode_text(self, e, kind).map(Some)
+    }
+}
+
+/// Unicode encoding error.
+#[lumen_bind::class(name = "UnicodeEncodeError")]
+pub struct UnicodeEncodeError;
+
+#[lumen_bind::methods]
+impl UnicodeEncodeError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
+        unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Encode)
+    }
+
+    #[proto(str)]
+    fn str(slf: This<Exc<'_>>, it: &mut Interp) -> R<String> {
+        unicode_text(it, slf.0 .0, UnicodeKind::Encode)
+    }
+}
+
+/// Unicode decoding error.
+#[lumen_bind::class(name = "UnicodeDecodeError")]
+pub struct UnicodeDecodeError;
+
+#[lumen_bind::methods]
+impl UnicodeDecodeError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
+        unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Decode)
+    }
+
+    #[proto(str)]
+    fn str(slf: This<Exc<'_>>, it: &mut Interp) -> R<String> {
+        unicode_text(it, slf.0 .0, UnicodeKind::Decode)
+    }
+}
+
+/// Unicode translation error.
+#[lumen_bind::class(name = "UnicodeTranslateError")]
+pub struct UnicodeTranslateError;
+
+#[lumen_bind::methods]
+impl UnicodeTranslateError {
+    /// Initialize self.  See help(type(self)) for accurate signature.
+    #[proto(init)]
+    fn init(
+        slf: This<Exc<'_>>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[varkw] kwargs: KwArgs,
+    ) -> R<()> {
+        unicode_init(it, slf.0 .0, args, &kwargs, UnicodeKind::Translate)
+    }
+
+    #[proto(str)]
+    fn str(slf: This<Exc<'_>>, it: &mut Interp) -> R<String> {
+        unicode_text(it, slf.0 .0, UnicodeKind::Translate)
     }
 }
 
@@ -349,7 +498,7 @@ const SYNTAX_FIELDS: [&str; 7] = [
     "print_file_and_line",
 ];
 
-/// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
+// `SyntaxError(msg, (filename, lineno, offset, text[, end_lineno[, end_offset]]))`.
 #[lumen_bind::class(name = "SyntaxError")]
 pub struct SyntaxError;
 
@@ -437,4 +586,10 @@ pub fn init(it: &mut Interp) {
     extend_type::<NameError>(it, &ne);
     let sy = it.exc_type("SyntaxError");
     extend_type::<SyntaxError>(it, &sy);
+    let ue = it.exc_type("UnicodeEncodeError");
+    extend_type::<UnicodeEncodeError>(it, &ue);
+    let ud = it.exc_type("UnicodeDecodeError");
+    extend_type::<UnicodeDecodeError>(it, &ud);
+    let ut = it.exc_type("UnicodeTranslateError");
+    extend_type::<UnicodeTranslateError>(it, &ut);
 }

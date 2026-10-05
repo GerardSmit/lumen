@@ -2,6 +2,11 @@
 //! elements encoded by the shared codecs in `lumen_common::buffer::format`. The store is
 //! exported to `memoryview`, `struct` and every bytes-like consumer through `memview::export`.
 
+/// This module defines an object type which can efficiently represent
+/// an array of basic values: characters, integers, floating-point
+/// numbers.  Arrays are sequence types and behave very much like lists,
+/// except that the type of objects stored in them is constrained.
+///
 #[lumen_bind::module(name = "array")]
 pub mod array {
     #![allow(clippy::new_ret_no_self)]
@@ -18,7 +23,11 @@ pub mod array {
     use lumen_common::smuggle;
     use std::rc::Rc;
 
-    const TYPECODES: &str = "bBuhHiIlLqQfd";
+    const TYPECODES: &str = "bBuwhHiIlLqQfd";
+
+    fn is_unicode(tc: u8) -> bool {
+        matches!(tc, b'u' | b'w')
+    }
 
     /// One element type: its typecode, codec kind and size.
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,7 +39,7 @@ pub mod array {
 
     impl Spec {
         pub fn of(tc: u8) -> Option<Spec> {
-            if tc == b'u' {
+            if is_unicode(tc) {
                 return Some(Spec {
                     tc,
                     kind: ElemKind::U32,
@@ -53,7 +62,7 @@ pub mod array {
             match self.tc {
                 b'b' => "b",
                 b'B' => "B",
-                b'u' => "w",
+                b'u' | b'w' => "w",
                 b'h' => "h",
                 b'H' => "H",
                 b'i' => "i",
@@ -74,7 +83,7 @@ pub mod array {
         /// The machine format code `__reduce_ex__` pickles (little-endian, IEEE floats).
         fn mformat(self) -> i64 {
             match (self.tc, self.size) {
-                (b'u', _) => 20,
+                (b'u' | b'w', _) => 20,
                 (b'f', _) => 14,
                 (b'd', _) => 16,
                 (tc, size) => {
@@ -210,20 +219,27 @@ pub mod array {
     pub fn encode(it: &mut Interp, spec: Spec, v: &Value) -> R<[u8; 8]> {
         let mut out = [0u8; 8];
         let buf = &mut out[..spec.size];
-        if spec.tc == b'u' {
+        if is_unicode(spec.tc) {
             let cp = match v {
                 Value::Obj(o) if matches!(o.kind, Kind::Str(_)) => {
                     let s = v.as_str().unwrap_or("");
                     let mut cps = smuggle::code_points(s);
                     match (cps.next(), cps.next()) {
-                        (Some(c), None) => Some(c),
-                        _ => None,
+                        (Some(c), None) => c,
+                        _ => {
+                            let n = smuggle::code_points(s).count();
+                            return Err(it.type_error(&format!(
+                                "array item must be a unicode character, not a string of length {n}"
+                            )));
+                        }
                     }
                 }
-                _ => None,
-            };
-            let Some(cp) = cp else {
-                return Err(it.type_error("array item must be unicode character"));
+                _ => {
+                    let t = it.type_name_of(v);
+                    return Err(
+                        it.type_error(&format!("array item must be a unicode character, not {t}"))
+                    );
+                }
             };
             buf.copy_from_slice(&cp.to_ne_bytes());
         } else if spec.is_float() {
@@ -238,7 +254,7 @@ pub mod array {
 
     /// The Python value of one encoded item.
     pub fn decode(it: &mut Interp, spec: Spec, b: &[u8]) -> R<Value> {
-        if spec.tc == b'u' {
+        if is_unicode(spec.tc) {
             let cp = u32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
             let mut s = String::new();
             if cp > 0x10FFFF || !smuggle::push_code_point(&mut s, cp) {
@@ -320,7 +336,7 @@ pub mod array {
     }
 
     fn bad_typecode(it: &mut Interp) -> Obj {
-        it.value_error("bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)")
+        it.value_error("bad typecode (must be b, B, u, w, h, H, i, I, l, L, q, Q, f or d)")
     }
 
     /// Appends `items` one by one (earlier items stay when a later one fails, as in CPython).
@@ -352,8 +368,10 @@ pub mod array {
     }
 
     fn from_unicode(it: &mut Interp, spec: Spec, store: &ByteStore, s: &str) -> R<()> {
-        if spec.tc != b'u' {
-            return Err(it.value_error("fromunicode() may only be called on unicode type arrays"));
+        if !is_unicode(spec.tc) {
+            return Err(it.value_error(
+                "fromunicode() may only be called on unicode type arrays ('u' or 'w')",
+            ));
         }
         let mut data = Vec::new();
         for cp in smuggle::code_points(s) {
@@ -363,10 +381,20 @@ pub mod array {
     }
 
     fn to_unicode(it: &mut Interp, spec: Spec, store: &ByteStore) -> R<Value> {
-        if spec.tc != b'u' {
-            return Err(it.value_error("tounicode() may only be called on unicode type arrays"));
+        if !is_unicode(spec.tc) {
+            return Err(it.value_error(
+                "tounicode() may only be called on unicode type arrays ('u' or 'w')",
+            ));
         }
         let data = store.to_vec();
+        if spec.tc == b'w' {
+            let enc = if cfg!(target_endian = "little") {
+                "utf-32-le"
+            } else {
+                "utf-32-be"
+            };
+            return it.call_method(&Value::bytes(data), "decode", vec![Value::str(enc)]);
+        }
         let mut s = String::new();
         for c in data.chunks_exact(4) {
             let cp = u32::from_ne_bytes([c[0], c[1], c[2], c[3]]);
@@ -385,7 +413,7 @@ pub mod array {
         if let Value::Obj(o) = init {
             match &o.kind {
                 Kind::Str(_) => {
-                    if spec.tc != b'u' {
+                    if !is_unicode(spec.tc) {
                         return Err(it.type_error(&format!(
                             "cannot use a str to initialize an array with typecode '{}'",
                             spec.tc as char
@@ -410,7 +438,7 @@ pub mod array {
             }
         }
         if let Some((other, data)) = array_of(it, init) {
-            if other.tc == b'u' && spec.tc != b'u' {
+            if is_unicode(other.tc) && !is_unicode(spec.tc) {
                 return Err(it.type_error(&format!(
                     "cannot use a unicode array to initialize an array with typecode '{}'",
                     spec.tc as char
@@ -428,6 +456,10 @@ pub mod array {
     }
 
     fn instance_dict(it: &mut Interp, v: &Value) -> R<Value> {
+        let base = type_object::<Array>(it);
+        if Rc::ptr_eq(&it.type_of(v), &base) {
+            return Ok(Value::None);
+        }
         match it.get_attr_str(v, "__dict__") {
             Ok(d) => Ok(d),
             Err(e) if it.exc_is(&e, "AttributeError") => Ok(Value::None),
@@ -435,6 +467,63 @@ pub mod array {
         }
     }
 
+    /// array(typecode [, initializer]) -> array
+    ///
+    /// Return a new array whose items are restricted by typecode, and
+    /// initialized from the optional initializer value, which must be a list,
+    /// string or iterable over elements of the appropriate type.
+    ///
+    /// Arrays represent basic values and behave very much like lists, except
+    /// the type of objects stored in them is constrained. The type is specified
+    /// at object creation time by using a type code, which is a single character.
+    /// The following type codes are defined:
+    ///
+    ///     Type code   C Type             Minimum size in bytes
+    ///     'b'         signed integer     1
+    ///     'B'         unsigned integer   1
+    ///     'u'         Unicode character  2 (see note)
+    ///     'h'         signed integer     2
+    ///     'H'         unsigned integer   2
+    ///     'i'         signed integer     2
+    ///     'I'         unsigned integer   2
+    ///     'l'         signed integer     4
+    ///     'L'         unsigned integer   4
+    ///     'q'         signed integer     8 (see note)
+    ///     'Q'         unsigned integer   8 (see note)
+    ///     'f'         floating-point     4
+    ///     'd'         floating-point     8
+    ///
+    /// NOTE: The 'u' typecode corresponds to Python's unicode character. On
+    /// narrow builds this is 2-bytes on wide builds this is 4-bytes.
+    ///
+    /// NOTE: The 'q' and 'Q' type codes are only available if the platform
+    /// C compiler used to build Python supports 'long long', or, on Windows,
+    /// '__int64'.
+    ///
+    /// Methods:
+    ///
+    /// append() -- append a new item to the end of the array
+    /// buffer_info() -- return information giving the current memory info
+    /// byteswap() -- byteswap all the items of the array
+    /// count() -- return number of occurrences of an object
+    /// extend() -- extend array by appending multiple elements from an iterable
+    /// fromfile() -- read items from a file object
+    /// fromlist() -- append items from the list
+    /// frombytes() -- append items from the string
+    /// index() -- return index of first occurrence of an object
+    /// insert() -- insert a new item into the array at a provided position
+    /// pop() -- remove and return item (default last)
+    /// remove() -- remove first occurrence of an object
+    /// reverse() -- reverse the order of the items in the array
+    /// tofile() -- write all items to a file object
+    /// tolist() -- return the array converted to an ordinary list
+    /// tobytes() -- return the array converted to a string
+    ///
+    /// Attributes:
+    ///
+    /// typecode -- the typecode character used to create the array
+    /// itemsize -- the length in bytes of one array item
+    ///
     #[class(name = "array", module = "array", generic, hint(py(unhashable)))]
     pub struct Array {
         spec: Spec,
@@ -555,7 +644,7 @@ pub mod array {
 
     #[methods]
     impl Array {
-        #[constructor]
+        #[constructor(hint(py(text_signature = "")))]
         fn new(
             cls: This<Value>,
             it: &mut Interp,
@@ -576,6 +665,14 @@ pub mod array {
                 )));
             }
             let tc = typecode_of(it, &args[0], "array() argument 1")?;
+            if tc == b'u' {
+                crate::builtins::warningsm::warn_category(
+                    it,
+                    "DeprecationWarning",
+                    "The 'u' type code is deprecated and will be removed in Python 3.16",
+                    1,
+                )?;
+            }
             let Some(spec) = Spec::of(tc) else {
                 return Err(bad_typecode(it));
             };
@@ -586,25 +683,36 @@ pub mod array {
             Ok(opaque_instance(&cls, arr))
         }
 
+        /// the typecode character used to create the array
         #[getter]
         fn typecode(&self) -> String {
             (self.spec.tc as char).to_string()
         }
 
+        /// the size, in bytes, of one array item
         #[getter]
         fn itemsize(&self) -> usize {
             self.spec.size
         }
 
+        /// Append new value v to the end of the array.
         fn append(slf: This<Py<Self>>, it: &mut Interp, v: &Value) -> R<()> {
             let (spec, store) = get(it, &slf.0)?;
             append_values(it, spec, &store, std::slice::from_ref(v))
         }
 
+        /// Return a tuple (address, length) giving the current memory address and the length in items of the buffer used to hold array's contents.
+        ///
+        /// The length should be multiplied by the itemsize attribute to calculate
+        /// the buffer length in bytes.
         fn buffer_info(&self) -> (usize, usize) {
             (self.store.as_ptr() as usize, self.len())
         }
 
+        /// Byteswap all items of the array.
+        ///
+        /// If the items in the array are not 1, 2, 4, or 8 bytes in size, RuntimeError is
+        /// raised.
         fn byteswap(&self, it: &mut Interp) -> R<()> {
             let size = self.spec.size;
             let mut b = self
@@ -617,6 +725,7 @@ pub mod array {
             Ok(())
         }
 
+        /// Return number of occurrences of v in the array.
         fn count(slf: This<Py<Self>>, it: &mut Interp, v: &Value) -> R<usize> {
             let mut n = 0;
             let mut i = 0;
@@ -627,6 +736,7 @@ pub mod array {
             Ok(n)
         }
 
+        /// Append items to the end of the array.
         fn extend(slf: This<Py<Self>>, it: &mut Interp, bb: &Value) -> R<()> {
             let (spec, store) = get(it, &slf.0)?;
             if let Some((ospec, ostore)) = array_of(it, bb) {
@@ -639,10 +749,12 @@ pub mod array {
             extend_iter(it, spec, &store, bb)
         }
 
+        /// Appends items from the string, interpreting it as an array of machine values, as if it had been read from a file using the fromfile() method.
         fn frombytes(&self, it: &mut Interp, buffer: &[u8]) -> R<()> {
             from_bytes(it, self.spec, &self.store, buffer)
         }
 
+        /// Read n objects from the file object f and append them to the end of the array.
         fn fromfile(slf: This<Py<Self>>, it: &mut Interp, f: &Value, n: i64) -> R<()> {
             let (spec, store) = get(it, &slf.0)?;
             if n < 0 {
@@ -670,6 +782,7 @@ pub mod array {
             Ok(())
         }
 
+        /// Append items to array from list.
         fn fromlist(slf: This<Py<Self>>, it: &mut Interp, list: &Value) -> R<()> {
             let is_list = matches!(list, Value::Obj(o) if matches!(o.kind, Kind::List(_)));
             if !is_list {
@@ -685,6 +798,11 @@ pub mod array {
             from_bytes(it, spec, &store, &data)
         }
 
+        /// Extends this array with data from the unicode string ustr.
+        ///
+        /// The array must be a unicode type array; otherwise a ValueError is raised.
+        /// Use array.frombytes(ustr.encode(...)) to append Unicode data to an array of
+        /// some other type.
         fn fromunicode(&self, it: &mut Interp, ustr: &Value) -> R<()> {
             let Some(s) = ustr.as_str() else {
                 let t = it.type_name_of(ustr);
@@ -696,6 +814,9 @@ pub mod array {
             from_unicode(it, self.spec, &self.store, &s)
         }
 
+        /// Return index of first occurrence of v in the array.
+        ///
+        /// Raise ValueError if the value is not present.
         fn index(
             slf: This<Py<Self>>,
             it: &mut Interp,
@@ -717,6 +838,7 @@ pub mod array {
             }
         }
 
+        /// Insert a new item v into the array before position i.
         fn insert(slf: This<Py<Self>>, it: &mut Interp, i: isize, v: &Value) -> R<()> {
             let (spec, store) = get(it, &slf.0)?;
             let b = encode(it, spec, v)?;
@@ -728,6 +850,9 @@ pub mod array {
             })
         }
 
+        /// Return the i-th element and delete it from the array.
+        ///
+        /// i defaults to -1.
         fn pop(slf: This<Py<Self>>, it: &mut Interp, #[default(-1)] i: isize) -> R<Value> {
             let (spec, store) = get(it, &slf.0)?;
             let n = (store.len() / spec.size) as isize;
@@ -743,6 +868,7 @@ pub mod array {
             Ok(v)
         }
 
+        /// Remove the first occurrence of v in the array.
         fn remove(slf: This<Py<Self>>, it: &mut Interp, v: &Value) -> R<()> {
             match find(it, &slf.0, v, 0, usize::MAX)? {
                 Some(i) => {
@@ -753,6 +879,15 @@ pub mod array {
             }
         }
 
+        /// Remove all items from the array.
+        fn clear(&self, it: &mut Interp) -> R<()> {
+            if self.store.len() == 0 {
+                return Ok(());
+            }
+            edit(it, &self.store, |v| v.clear())
+        }
+
+        /// Reverse the order of the items in the array.
         fn reverse(&self, it: &mut Interp) -> R<()> {
             let size = self.spec.size;
             let mut b = self
@@ -769,10 +904,12 @@ pub mod array {
             Ok(())
         }
 
+        /// Convert the array to an array of machine values and return the bytes representation.
         fn tobytes(&self) -> Value {
             Value::bytes(self.store.to_vec())
         }
 
+        /// Write all items (as machine values) to the file object f.
         fn tofile(slf: This<Py<Self>>, it: &mut Interp, f: &Value) -> R<()> {
             const BLOCKSIZE: usize = 64 * 1024;
             let (_, store) = get(it, &slf.0)?;
@@ -783,16 +920,23 @@ pub mod array {
             Ok(())
         }
 
+        /// Convert array to an ordinary list with the same items.
         fn tolist(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (spec, store) = get(it, &slf.0)?;
             Ok(Value::list(decode_all(it, spec, &store.to_vec())?))
         }
 
+        /// Extends this array with data from the unicode string ustr.
+        ///
+        /// Convert the array to a unicode string.  The array must be a unicode type array;
+        /// otherwise a ValueError is raised.  Use array.tobytes().decode() to obtain a
+        /// unicode string from an array of some other type.
         fn tounicode(&self, it: &mut Interp) -> R<Value> {
             to_unicode(it, self.spec, &self.store)
         }
 
-        #[method(name = "__reduce_ex__")]
+        /// Return state information for pickling.
+        #[method(name = "__reduce_ex__", hint(py(text_signature = "($self, value, /)")))]
         fn reduce_ex(slf: This<Py<Self>>, it: &mut Interp, protocol: &Value) -> R<Value> {
             let slf = slf.0;
             let is_int = matches!(protocol, Value::Int(_) | Value::Bool(_))
@@ -820,12 +964,14 @@ pub mod array {
             Ok(Value::tuple(vec![recon, args, dict]))
         }
 
+        /// Return a copy of the array.
         #[proto(copy)]
         fn __copy__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (spec, store) = get(it, &slf.0)?;
             Ok(new_array(it, spec, store.to_vec()))
         }
 
+        /// Return a copy of the array.
         #[proto(deepcopy)]
         fn __deepcopy__(slf: This<Py<Self>>, it: &mut Interp, unused: &Value) -> R<Value> {
             let _ = unused;
@@ -833,6 +979,7 @@ pub mod array {
             Ok(new_array(it, spec, store.to_vec()))
         }
 
+        /// Size of the array in memory, in bytes.
         #[proto(sizeof)]
         fn __sizeof__(&self) -> usize {
             64 + self.store.len()
@@ -977,7 +1124,7 @@ pub mod array {
             if store.is_empty() {
                 return Ok(Value::string(format!("{}('{}')", name, tc)));
             }
-            let body = if spec.tc == b'u' {
+            let body = if is_unicode(spec.tc) {
                 to_unicode(it, spec, &store)?
             } else {
                 Value::list(decode_all(it, spec, &store.to_vec())?)
@@ -1104,6 +1251,7 @@ pub mod array {
             Ok(None)
         }
 
+        /// Return state information for pickling.
         #[proto(reduce)]
         fn __reduce__(&self, it: &mut Interp) -> R<Value> {
             let builtins = Value::Obj(it.import_module("builtins")?);
@@ -1118,6 +1266,7 @@ pub mod array {
             })
         }
 
+        /// Set state information for unpickling.
         fn __setstate__(&mut self, it: &mut Interp, state: &Value) -> R<()> {
             let i = it.index_of(state)?;
             if let Some(a) = &self.arr {
@@ -1128,6 +1277,7 @@ pub mod array {
         }
     }
 
+    /// Internal. Used for pickling support.
     #[op]
     fn _array_reconstructor(
         it: &mut Interp,
@@ -1217,7 +1367,7 @@ pub mod array {
                 for c in TYPECODES.bytes() {
                     if let Some(s) = Spec::of(c) {
                         let s_signed = matches!(c, b'b' | b'h' | b'i' | b'l' | b'q');
-                        if c != b'u' && !s.is_float() && s.size == size && s_signed == signed {
+                        if !is_unicode(c) && !s.is_float() && s.size == size && s_signed == signed {
                             spec = s;
                         }
                     }

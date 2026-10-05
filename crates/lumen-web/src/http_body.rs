@@ -1,6 +1,22 @@
 //! Typed body handle over the shared incremental transport decoder.
-use lumen::embed::{Ctx, OpResult, Promise, SendError};
+use lumen::embed::{Ctx, JsHost, OpResult, Promise, SendError, Value};
 use std::sync::{Arc, Mutex};
+
+/// A body read: the next chunk's bytes, or `null` at the end of the body (what fetch.js tests).
+pub(crate) enum Chunk {
+    Bytes(Vec<u8>),
+    End,
+}
+
+impl lumen_bind::IntoRet<JsHost> for Chunk {
+    const MAY_RUN: bool = false;
+    fn into_ret(self, ctx: &mut Ctx) -> Result<Value, Value> {
+        match self {
+            Chunk::Bytes(bytes) => ctx.make_uint8array(&bytes),
+            Chunk::End => Ok(Value::Null),
+        }
+    }
+}
 
 #[lumen_bind::class(name = "HttpResponseBody")]
 pub(crate) struct ResponseBody {
@@ -19,7 +35,7 @@ impl ResponseBody {
 
 #[lumen_bind::methods]
 impl ResponseBody {
-    fn read(&self, ctx: &mut Ctx) -> Promise<Result<Option<Vec<u8>>, SendError>> {
+    fn read(&self, ctx: &mut Ctx) -> Promise<Result<Chunk, SendError>> {
         let body = self.body.clone();
         ctx.spawn_thread(move || {
             let mut guard = body.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -27,9 +43,11 @@ impl ResponseBody {
             if !matches!(result, Ok(Some(_))) {
                 *guard = None;
             }
-            result.map_err(|error| {
-                SendError::new("TypeError", format!("HTTP body read failed: {error}"))
-            })
+            result
+                .map(|chunk| chunk.map_or(Chunk::End, Chunk::Bytes))
+                .map_err(|error| {
+                    SendError::new("TypeError", format!("HTTP body read failed: {error}"))
+                })
         })
     }
 

@@ -9,6 +9,7 @@ members = [
     "crates/lumen-bind",
     "crates/lumen-bind/macros",
     "crates/lumen-common",
+    "crates/lumen-crypto",
     "crates/lumen-difftest",
     "crates/lumen-exe-runtime",
     "crates/lumen-host",

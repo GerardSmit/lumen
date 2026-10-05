@@ -410,11 +410,8 @@ fixed_digests!(define_hkdf);
 /// Equality of two byte strings in time that depends only on their lengths (`timingSafeEqual`,
 /// `hmac.compare_digest`).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() != b.len()) as u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    std::hint::black_box(diff) == 0
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// Whether HMAC/PBKDF2/HKDF are defined over `algo`.

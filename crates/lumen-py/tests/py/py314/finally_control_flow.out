@@ -1,0 +1,11 @@
+[("'return' in a 'finally' block", 'SyntaxWarning', 5, '<case>')]
+[("'break' in a 'finally' block", 'SyntaxWarning', 5, '<case>')]
+[("'continue' in a 'finally' block", 'SyntaxWarning', 5, '<case>')]
+[]
+[]
+[]
+[("'return' in a 'finally' block", 'SyntaxWarning', 7, '<case>')]
+[]
+[("'return' in a 'finally' block", 'SyntaxWarning', 8, '<case>')]
+SyntaxError 'return' in a 'finally' block 5 9 None
+1

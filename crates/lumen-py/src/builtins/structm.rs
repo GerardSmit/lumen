@@ -39,7 +39,7 @@ pub mod _struct {
     use lumen_common::buffer::{
         load, store_f64, store_float_checked, store_int_checked, store_int_wrapping, struct_code,
     };
-    use lumen_common::buffer::{ElemKind, PackError, StructMode, ViewDesc};
+    use lumen_common::buffer::{ElemKind, PackError, Scalar, StructMode, ViewDesc};
     use lumen_common::fasthash::FastMap;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -90,6 +90,19 @@ pub mod _struct {
 
     thread_local! {
         static CACHE: RefCell<FastMap<Vec<u8>, Rc<Fmt>>> = RefCell::new(FastMap::default());
+    }
+
+    /// The format cache, moved out of this thread's slot when the thread gives up the GIL (its
+    /// `Rc`s are not atomic, so they must follow the interpreter, not the OS thread).
+    pub(crate) fn tls_take() -> Box<dyn std::any::Any> {
+        Box::new(CACHE.with(|c| std::mem::take(&mut *c.borrow_mut())))
+    }
+
+    pub(crate) fn tls_put(state: Box<dyn std::any::Any>) {
+        if let Ok(v) = state.downcast::<FastMap<Vec<u8>, Rc<Fmt>>>() {
+            let old = CACHE.with(|c| std::mem::replace(&mut *c.borrow_mut(), *v));
+            drop(old);
+        }
     }
 
     #[init]
@@ -157,6 +170,33 @@ pub mod _struct {
                     }
                     num = num * 10 + d;
                 }
+            }
+            let complex = match c {
+                b'F' => Some(8usize),
+                b'D' => Some(16),
+                _ => None,
+            };
+            if let Some(csize) = complex {
+                let align = if mode.is_native() { csize / 2 } else { 1 };
+                size = match size.checked_add(align - 1) {
+                    Some(s) => s / align * align,
+                    None => return Err(too_long(it)),
+                };
+                if num > 0 {
+                    if num > (max - size) / csize {
+                        return Err(too_long(it));
+                    }
+                    codes.push(Code {
+                        ch: c,
+                        kind: None,
+                        offset: size,
+                        size: csize,
+                        repeat: num,
+                    });
+                    nvalues += num;
+                    size += csize * num;
+                }
+                continue;
             }
             let Some(sc) = struct_code(c, mode) else {
                 return Err(struct_error(it, "bad char in struct format"));
@@ -275,6 +315,29 @@ pub mod _struct {
             match c.kind {
                 None if c.ch == b's' => {
                     out.push(Value::bytes(data[c.offset..c.offset + c.size].to_vec()))
+                }
+                None if matches!(c.ch, b'F' | b'D') => {
+                    let half = c.size / 2;
+                    for k in 0..c.repeat {
+                        let at = c.offset + k * c.size;
+                        let part = |b: &[u8]| match load(
+                            if half == 4 {
+                                ElemKind::F32
+                            } else {
+                                ElemKind::F64
+                            },
+                            b,
+                            order,
+                        ) {
+                            Scalar::Float(x) => x,
+                            _ => 0.0,
+                        };
+                        let (re, im) = (
+                            part(&data[at..at + half]),
+                            part(&data[at + half..at + c.size]),
+                        );
+                        out.push(Value::Obj(Object::new(Kind::Complex(re, im))));
+                    }
                 }
                 None => {
                     let n = c.size;
@@ -423,6 +486,25 @@ pub mod _struct {
         let mut next = 0;
         for c in &f.codes {
             match c.kind {
+                None if matches!(c.ch, b'F' | b'D') => {
+                    let half = c.size / 2;
+                    let kind = if half == 4 {
+                        ElemKind::F32
+                    } else {
+                        ElemKind::F64
+                    };
+                    for k in 0..c.repeat {
+                        let at = c.offset + k * c.size;
+                        let v = &args[next];
+                        next += 1;
+                        let (re, im) = it
+                            .complex_arg(v)
+                            .map_err(|_| struct_error(it, "required argument is not a complex"))?;
+                        let order = f.mode.order();
+                        store_f64(kind, re, &mut buf[at..at + half], order);
+                        store_f64(kind, im, &mut buf[at + half..at + c.size], order);
+                    }
+                }
                 None => {
                     let v = &args[next];
                     next += 1;
@@ -637,6 +719,7 @@ pub mod _struct {
             Ok(())
         }
 
+        /// struct format string
         #[getter]
         fn format(&self) -> Value {
             self.fmt
@@ -644,28 +727,54 @@ pub mod _struct {
                 .map_or(Value::None, |f| Value::string(f.text.clone()))
         }
 
+        /// struct size in bytes
         #[getter]
         fn size(&self) -> i64 {
             self.fmt.as_ref().map_or(-1, |f| f.size as i64)
         }
 
+        /// S.pack(v1, v2, ...) -> bytes
+        ///
+        /// Return a bytes object containing values v1, v2, ... packed according
+        /// to the format string S.format.  See help(struct) for more on format
+        /// strings.
         #[method(hint(py(text_signature = "")))]
         fn pack(&self, it: &mut Interp, #[varargs] values: &[Value]) -> R<Value> {
             let f = self.fmt(it)?;
             Ok(Value::bytes(pack_values(it, &f, "pack", values)?))
         }
 
+        /// S.pack_into(buffer, offset, v1, v2, ...)
+        ///
+        /// Pack the values v1, v2, ... according to the format string S.format
+        /// and write the packed bytes into the writable buffer buf starting at
+        /// offset.  Note that the offset is a required argument.  See
+        /// help(struct) for more on format strings.
         #[method(hint(py(text_signature = "")))]
         fn pack_into(&self, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
             let f = self.fmt(it)?;
             do_pack_into(it, &f, args)
         }
 
+        /// Return a tuple containing unpacked values.
+        ///
+        /// Unpack according to the format string Struct.format. The buffer's size
+        /// in bytes must be Struct.size.
+        ///
+        /// See help(struct) for more on format strings.
         fn unpack(&self, it: &mut Interp, buffer: &[u8]) -> R<Value> {
             let f = self.fmt(it)?;
             do_unpack(it, &f, buffer)
         }
 
+        /// Return a tuple containing unpacked values.
+        ///
+        /// Values are unpacked according to the format string Struct.format.
+        ///
+        /// The buffer's size in bytes, starting at position offset, must be
+        /// at least Struct.size.
+        ///
+        /// See help(struct) for more on format strings.
         fn unpack_from(
             &self,
             it: &mut Interp,
@@ -678,11 +787,18 @@ pub mod _struct {
             do_unpack_from(it, &f, buffer, offset)
         }
 
+        /// Return an iterator yielding tuples.
+        ///
+        /// Tuples are unpacked from the given bytes source, like a repeated
+        /// invocation of unpack_from().
+        ///
+        /// Requires that the bytes length be a multiple of the struct size.
         fn iter_unpack(&self, it: &mut Interp, buffer: &Value) -> R<Value> {
             let f = self.fmt(it)?;
             make_iter(it, f, buffer)
         }
 
+        /// S.__sizeof__() -> size of S in memory, in bytes
         #[method(hint(py(text_signature = "")))]
         fn __sizeof__(&self) -> i64 {
             56 + 32 * (self.fmt.as_ref().map_or(0, |f| f.codes.len()) as i64 + 1)
@@ -733,11 +849,16 @@ pub mod _struct {
         }
     }
 
+    /// Return size in bytes of the struct described by the format string.
     #[op]
     fn calcsize(it: &mut Interp, format: &Value) -> R<i64> {
         Ok(cached_fmt(it, format)?.size as i64)
     }
 
+    /// pack(format, v1, v2, ...) -> bytes
+    ///
+    /// Return a bytes object containing the values v1, v2, ... packed according
+    /// to the format string.  See help(struct) for more on format strings.
     #[op(hint(py(text_signature = "")))]
     fn pack(it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
         let Some(fv) = args.first() else {
@@ -747,6 +868,12 @@ pub mod _struct {
         Ok(Value::bytes(pack_values(it, &f, "pack", &args[1..])?))
     }
 
+    /// pack_into(format, buffer, offset, v1, v2, ...)
+    ///
+    /// Pack the values v1, v2, ... according to the format string and write
+    /// the packed bytes into the writable buffer buf starting at offset.  Note
+    /// that the offset is a required argument.  See help(struct) for more
+    /// on format strings.
     #[op(hint(py(text_signature = "")))]
     fn pack_into(it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
         let Some(fv) = args.first() else {
@@ -756,12 +883,22 @@ pub mod _struct {
         do_pack_into(it, &f, &args[1..])
     }
 
+    /// Return a tuple containing values unpacked according to the format string.
+    ///
+    /// The buffer's size in bytes must be calcsize(format).
+    ///
+    /// See help(struct) for more on format strings.
     #[op]
     fn unpack(it: &mut Interp, format: &Value, buffer: &[u8]) -> R<Value> {
         let f = cached_fmt(it, format)?;
         do_unpack(it, &f, buffer)
     }
 
+    /// Return a tuple containing values unpacked according to the format string.
+    ///
+    /// The buffer's size, minus offset, must be at least calcsize(format).
+    ///
+    /// See help(struct) for more on format strings.
     #[op]
     fn unpack_from(
         it: &mut Interp,
@@ -775,12 +912,19 @@ pub mod _struct {
         do_unpack_from(it, &f, buffer, offset)
     }
 
+    /// Return an iterator yielding tuples unpacked from the given bytes.
+    ///
+    /// The bytes are unpacked according to the format string, like
+    /// a repeated invocation of unpack_from().
+    ///
+    /// Requires that the bytes length be a multiple of the format struct size.
     #[op]
     fn iter_unpack(it: &mut Interp, format: &Value, buffer: &Value) -> R<Value> {
         let f = cached_fmt(it, format)?;
         make_iter(it, f, buffer)
     }
 
+    /// Clear the internal cache.
     #[op]
     fn _clearcache() {
         CACHE.with(|c| c.borrow_mut().clear());

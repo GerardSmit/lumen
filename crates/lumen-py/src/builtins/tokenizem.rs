@@ -18,12 +18,18 @@ pub mod _tokenize {
     const INDENT: i64 = 5;
     const DEDENT: i64 = 6;
     const OP: i64 = 55;
-    const FSTRING_START: i64 = 61;
-    const FSTRING_MIDDLE: i64 = 62;
-    const FSTRING_END: i64 = 63;
-    const COMMENT: i64 = 64;
-    const NL: i64 = 65;
-    const ERRORTOKEN: i64 = 66;
+    const FSTRING_START: i64 = 59;
+    const FSTRING_MIDDLE: i64 = 60;
+    const FSTRING_END: i64 = 61;
+    #[allow(dead_code)]
+    const TSTRING_START: i64 = 62;
+    #[allow(dead_code)]
+    const TSTRING_MIDDLE: i64 = 63;
+    #[allow(dead_code)]
+    const TSTRING_END: i64 = 64;
+    const COMMENT: i64 = 65;
+    const NL: i64 = 66;
+    const ERRORTOKEN: i64 = 67;
 
     /// `token.EXACT_TOKEN_TYPES`.
     const EXACT: &[(&str, i64)] = &[
@@ -116,9 +122,15 @@ pub mod _tokenize {
             Tok::EndMarker => String::new(),
             _ => lines_of(lines, rt.start.0, end.0),
         };
+        let (mut text, mut end) = (rt.text.clone(), end);
+        // The lexer sees `\r\n` as `\n`; `tokenize` reports the newline as written.
+        if ty == NEWLINE && text == "\n" && line.ends_with("\r\n") {
+            text = "\r\n".into();
+            end.1 += 1;
+        }
         Value::tuple(vec![
             Value::Int(ty),
-            Value::str(&rt.text),
+            Value::string(text),
             pos(rt.start),
             pos(end),
             Value::string(line),
@@ -126,7 +138,7 @@ pub mod _tokenize {
     }
 
     fn syntax_error(it: &mut Interp, e: &SyntaxError, lines: &[&str]) -> Obj {
-        if e.msg == "unexpected EOF in multi-line statement" {
+        if e.msg == "unexpected EOF in multi-line statement" && e.col == 0 {
             let exc = it.new_exc_str("SyntaxError", &e.msg);
             it.set_exc_attr(&exc, "msg", Value::str(&e.msg));
             it.set_exc_attr(&exc, "lineno", Value::Int(e.line as i64));
@@ -168,8 +180,7 @@ pub mod _tokenize {
                 None => line,
             };
             let Some(s) = line.as_str() else {
-                let t = it.type_name_of(&line);
-                return Err(it.type_error(&format!("readline() returned a non-string object: {t}")));
+                return Err(it.type_error("readline() returned a non-string object"));
             };
             if s.is_empty() {
                 break;

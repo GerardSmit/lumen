@@ -18,8 +18,6 @@ pub fn extension() -> Extension {
     Extension {
         name: "web-streams",
         modules: &[],
-        globals: &[],
-        namespaces: &[],
         state_init: None,
         js_init: Some(JS_GLUE),
         js_init_snapshot: Some(JS_GLUE_AOT),

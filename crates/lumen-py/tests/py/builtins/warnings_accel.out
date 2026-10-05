@@ -1,0 +1,18 @@
+True True True
+_Lock True
+default True
+1 True 7 hello
+2
+3
+raised hello
+[('x', 'DeprecationWarning', 0), ('y', 'UserWarning', 0)]
+foo.py 12 RuntimeWarning
+category must be a Warning subclass, not 'int'
+warn() argument 'skip_file_prefixes' must be tuple, not str
+The 'u' type code is deprecated and will be removed in Python 3.16 True
+5
+['bar']
+f.py:3: UserWarning: m
+  line
+
+['_acquire_lock', '_defaultaction', '_filters_mutated_lock_held', '_onceregistry', '_release_lock', '_warnings_context', 'filters', 'warn', 'warn_explicit']

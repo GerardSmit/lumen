@@ -40,25 +40,25 @@ impl Interp {
                     return Ok(self.mk_iter(IterState::List {
                         list: o.clone(),
                         idx: 0,
-                    }))
+                    }));
                 }
                 Kind::Tuple(_) => {
                     return Ok(self.mk_iter(IterState::Tuple {
                         tup: o.clone(),
                         idx: 0,
-                    }))
+                    }));
                 }
                 Kind::Str(_) => {
                     return Ok(self.mk_iter(IterState::Str {
                         s: o.clone(),
                         pos: 0,
-                    }))
+                    }));
                 }
                 Kind::Bytes(_) | Kind::ByteArray(_) => {
                     return Ok(self.mk_iter(IterState::Bytes {
                         b: o.clone(),
                         idx: 0,
-                    }))
+                    }));
                 }
                 Kind::Range(r) => {
                     return Ok(self.mk_iter(IterState::Range {
@@ -71,7 +71,7 @@ impl Interp {
                     return Ok(self.mk_iter(IterState::Seq {
                         obj: v.clone(),
                         idx: 0,
-                    }))
+                    }));
                 }
                 Kind::Dict(d) => {
                     let len = d.borrow().len();
@@ -141,6 +141,37 @@ impl Interp {
             return Err(self.type_error(&format!("iter() returned non-iterator of type '{}'", t)));
         }
         Ok(it)
+    }
+
+    /// The `strict=True` check of `zip` / `map` when iterator `n` of `its` is exhausted: a
+    /// `ValueError` unless every iterator ends together.
+    fn strict_exhausted(&mut self, name: &str, its: &[Value], n: usize) -> R<()> {
+        let range = |m: usize| {
+            if m > 1 {
+                format!("s 1-{m}")
+            } else {
+                " 1".to_string()
+            }
+        };
+        if n > 0 {
+            let msg = format!(
+                "{name}() argument {} is shorter than argument{}",
+                n + 1,
+                range(n)
+            );
+            return Err(self.value_error(&msg));
+        }
+        for (m, other) in its.iter().enumerate().skip(1) {
+            if self.iter_next(other)?.is_some() {
+                let msg = format!(
+                    "{name}() argument {} is longer than argument{}",
+                    m + 1,
+                    range(m)
+                );
+                return Err(self.value_error(&msg));
+            }
+        }
+        Ok(())
     }
 
     /// Next item, or `None` when exhausted (StopIteration is swallowed).
@@ -451,34 +482,7 @@ impl Interp {
                         Some(v) => out.push(v),
                         None => {
                             if strict {
-                                if n > 0 {
-                                    let msg = format!(
-                                        "zip() argument {} is shorter than argument{} 1{}",
-                                        n + 1,
-                                        if n > 1 { "s" } else { "" },
-                                        if n > 1 {
-                                            format!("-{}", n)
-                                        } else {
-                                            String::new()
-                                        }
-                                    );
-                                    return Err(self.value_error(&msg));
-                                }
-                                for (m, other) in its.iter().enumerate().skip(1) {
-                                    if self.iter_next(other)?.is_some() {
-                                        let msg = format!(
-                                            "zip() argument {} is longer than argument{} 1{}",
-                                            m + 1,
-                                            if m > 1 { "s" } else { "" },
-                                            if m > 1 {
-                                                format!("-{}", m)
-                                            } else {
-                                                String::new()
-                                            }
-                                        );
-                                        return Err(self.value_error(&msg));
-                                    }
-                                }
+                                self.strict_exhausted("zip", &its, n)?;
                             }
                             return Ok(None);
                         }
@@ -486,14 +490,19 @@ impl Interp {
                 }
                 Ok(Some(Value::tuple(out)))
             }
-            IterState::Map { f, its } => {
-                let (f, its) = (f.clone(), its.clone());
+            IterState::Map { f, its, strict } => {
+                let (f, its, strict) = (f.clone(), its.clone(), *strict);
                 drop(s);
                 let mut args = Vec::with_capacity(its.len());
-                for it in &its {
+                for (n, it) in its.iter().enumerate() {
                     match self.iter_next(it)? {
                         Some(v) => args.push(v),
-                        None => return Ok(None),
+                        None => {
+                            if strict {
+                                self.strict_exhausted("map", &its, n)?;
+                            }
+                            return Ok(None);
+                        }
                     }
                 }
                 Ok(Some(self.call(&f, args, Vec::new())?))
@@ -574,7 +583,7 @@ impl Interp {
                     None => {
                         return Err(
                             self.overflow_err("Python int too large to convert to C ssize_t")
-                        )
+                        );
                     }
                 },
                 _ => 0,

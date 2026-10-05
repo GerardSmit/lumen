@@ -17,8 +17,6 @@
 //! Return types (mapped in `js/bun.js`): 64-bit families return a JS `bigint`, 32-bit families a
 //! JS `number` — exactly Bun's split.
 
-use lumen_host::{Ctx, Value};
-
 // ---- little-endian reads ----------------------------------------------------------------------
 
 #[inline]
@@ -1140,79 +1138,77 @@ pub fn rapidhash(seed: u64, input: &[u8]) -> u64 {
 // ================================================================================================
 // Native ops — `__bunhash.<name>(bytes, seed)`. The JS glue normalises the input to a
 // Uint8Array and the seed to a `BigInt.asUintN(64, ...)` BigInt before calling; 64-bit families
-// come back as a BigInt built from the raw bits (i64 reinterpretation, normalised back to
-// unsigned with `BigInt.asUintN(64, ...)` on the JS side), 32-bit families as a Number.
+// come back as a BigInt, 32-bit families as a Number.
 // ================================================================================================
 
-fn arg_bytes(ctx: &mut Ctx, a: &[Value], who: &str) -> Result<Vec<u8>, Value> {
-    let v = a.first().unwrap_or(&Value::Undefined);
-    ctx.typed_array_bytes(v)
-        .ok_or_else(|| ctx.make_error("TypeError", format!("{who} expects a Buffer/TypedArray")))
-}
+pub(crate) use bindings::Module;
 
-fn arg_seed(a: &[Value]) -> u64 {
-    match a.get(1) {
-        Some(v) => v
-            .bigint_as_i64()
-            .map(|x| x as u64)
-            .or_else(|| v.as_num_opt().map(|n| n as i64 as u64))
-            .unwrap_or(0),
-        None => 0,
+#[lumen_bind::module(name = "__bunhash")]
+mod bindings {
+    use super::*;
+    use lumen::embed::BigU64;
+
+    #[op(name = "wyhash")]
+    fn op_wyhash(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(wyhash(seed.0, bytes))
     }
-}
 
-#[inline]
-fn u64_big(v: u64) -> Value {
-    Value::bigint_from_i64(v as i64)
-}
+    #[op(name = "cityHash64")]
+    fn op_city_hash64(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(city_hash64(seed.0, bytes))
+    }
 
-macro_rules! hash_op64 {
-    ($name:ident, $who:literal, $call:expr) => {
-        pub fn $name(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-            let bytes = arg_bytes(ctx, a, $who)?;
-            let f: fn(u64, &[u8]) -> u64 = $call;
-            Ok(u64_big(f(arg_seed(a), &bytes)))
-        }
-    };
-}
-macro_rules! hash_op32 {
-    ($name:ident, $who:literal, $call:expr) => {
-        pub fn $name(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-            let bytes = arg_bytes(ctx, a, $who)?;
-            let f: fn(u32, &[u8]) -> u32 = $call;
-            Ok(Value::Num(f(arg_seed(a) as u32, &bytes) as f64))
-        }
-    };
-}
+    #[op(name = "xxHash64")]
+    fn op_xx_hash64(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(xx_hash64(seed.0, bytes))
+    }
 
-hash_op64!(op_wyhash, "Bun.hash.wyhash", wyhash);
-hash_op64!(op_city_hash64, "Bun.hash.cityHash64", city_hash64);
-hash_op64!(op_xx_hash64, "Bun.hash.xxHash64", xx_hash64);
-hash_op64!(op_murmur64v2, "Bun.hash.murmur64v2", murmur64v2);
-hash_op64!(op_rapidhash, "Bun.hash.rapidhash", rapidhash);
+    #[op(name = "murmur64v2")]
+    fn op_murmur64v2(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(murmur64v2(seed.0, bytes))
+    }
 
-hash_op32!(op_xx_hash32, "Bun.hash.xxHash32", xx_hash32);
-hash_op32!(op_murmur32v3, "Bun.hash.murmur32v3", murmur32v3);
-hash_op32!(op_murmur32v2, "Bun.hash.murmur32v2", murmur32v2);
+    #[op(name = "rapidhash")]
+    fn op_rapidhash(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(rapidhash(seed.0, bytes))
+    }
 
-/// cityHash32 ignores the seed entirely (Bun-observable behavior).
-pub fn op_city_hash32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a, "Bun.hash.cityHash32")?;
-    Ok(Value::Num(city_hash32(&bytes) as f64))
-}
-/// crc32 and adler32 ignore the seed too.
-pub fn op_crc32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a, "Bun.hash.crc32")?;
-    Ok(Value::Num(lumen_host::codec::crc32_from(0, &bytes) as f64))
-}
-pub fn op_adler32(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a, "Bun.hash.adler32")?;
-    Ok(Value::Num(lumen_host::codec::adler32_from(1, &bytes) as f64))
-}
-/// xxHash3 uses only the low 32 bits of the seed (Bun's wrapper narrows to u32).
-pub fn op_xx_hash3(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
-    let bytes = arg_bytes(ctx, a, "Bun.hash.xxHash3")?;
-    Ok(u64_big(xx_hash3(arg_seed(a) as u32, &bytes)))
+    /// xxHash3 uses only the low 32 bits of the seed (Bun's wrapper narrows to u32).
+    #[op(name = "xxHash3")]
+    fn op_xx_hash3(bytes: &[u8], seed: BigU64) -> BigU64 {
+        BigU64(xx_hash3(seed.0 as u32, bytes))
+    }
+
+    #[op(name = "xxHash32")]
+    fn op_xx_hash32(bytes: &[u8], seed: BigU64) -> u32 {
+        xx_hash32(seed.0 as u32, bytes)
+    }
+
+    #[op(name = "murmur32v3")]
+    fn op_murmur32v3(bytes: &[u8], seed: BigU64) -> u32 {
+        murmur32v3(seed.0 as u32, bytes)
+    }
+
+    #[op(name = "murmur32v2")]
+    fn op_murmur32v2(bytes: &[u8], seed: BigU64) -> u32 {
+        murmur32v2(seed.0 as u32, bytes)
+    }
+
+    /// cityHash32, crc32 and adler32 ignore the seed entirely (Bun-observable behavior).
+    #[op(name = "cityHash32")]
+    fn op_city_hash32(bytes: &[u8]) -> u32 {
+        city_hash32(bytes)
+    }
+
+    #[op(name = "crc32")]
+    fn op_crc32(bytes: &[u8]) -> u32 {
+        lumen_host::codec::crc32_from(0, bytes)
+    }
+
+    #[op(name = "adler32")]
+    fn op_adler32(bytes: &[u8]) -> u32 {
+        lumen_host::codec::adler32_from(1, bytes)
+    }
 }
 
 // ================================================================================================

@@ -75,6 +75,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             } else if spec == "int_max_str_digits" {
                 return Err(invalid_digits_limit("-X int_max_str_digits"));
             }
+        } else if matches!(a, "-I" | "-E" | "-s" | "-B" | "-u" | "-q") {
         } else if a == "--" {
             i += 1;
             break;
@@ -170,9 +171,12 @@ pub fn run_main(args: &[String]) -> i32 {
             let mut argv = vec!["-c".to_string()];
             argv.extend(opts.script_args[2..].iter().cloned());
             it.set_argv(&argv);
-            it.run_source(src, "<string>")
+            it.run_source(&lumen_common::dedent::dedent(src), "<string>")
         }
     };
+    if !it.interrupt.is_interrupted() {
+        it.finalize_modules();
+    }
     it.flush_out();
     let ms = TIMED_OUT_AFTER.load(Ordering::SeqCst);
     if ms != 0 && it.was_interrupted() {

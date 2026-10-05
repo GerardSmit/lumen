@@ -724,26 +724,11 @@ pub struct StatFs {
     pub ffree: u64,
 }
 
-#[allow(clippy::unnecessary_cast)] // the statvfs field widths differ per platform
 pub fn statfs(path: &str) -> R<StatFs> {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
     {
-        let c = cpath(path)?;
-        let mut buf: std::mem::MaybeUninit<libc::statvfs> = std::mem::MaybeUninit::zeroed();
-        // SAFETY: NUL-terminated path and a zeroed out-struct of the platform's `statvfs`.
-        if unsafe { libc::statvfs(c.as_ptr(), buf.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: statvfs succeeded and filled the struct.
-        let s = unsafe { buf.assume_init() };
-        Ok(StatFs {
-            bsize: s.f_bsize as u64,
-            blocks: s.f_blocks as u64,
-            bfree: s.f_bfree as u64,
-            bavail: s.f_bavail as u64,
-            files: s.f_files as u64,
-            ffree: s.f_ffree as u64,
-        })
+        let s = crate::posix::statvfs(path)?;
+        Ok(StatFs { bsize: s.bsize, blocks: s.blocks, bfree: s.bfree, bavail: s.bavail, files: s.files, ffree: s.ffree })
     }
     #[cfg(windows)]
     {

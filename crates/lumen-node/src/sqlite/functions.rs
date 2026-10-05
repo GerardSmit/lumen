@@ -209,40 +209,32 @@ impl Drop for Active {
         self.0.set(self.0.get() - 1)
     }
 }
-pub(super) fn busy_error(ctx: &mut Ctx) -> Value {
-    let error = ctx.make_error(
-        "Error",
-        "Cannot modify or close an executing SQLite statement or close its database",
-    );
-    let _ = ctx.set_member(&error, "code", Value::str("ERR_INVALID_STATE"));
-    error
+pub(super) fn busy_error() -> NativeError {
+    NativeError::runtime("Cannot modify or close an executing SQLite statement or close its database")
+        .with_prop("code", "ERR_INVALID_STATE")
 }
-pub(super) fn op_function(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = arg_u32(args, 0);
-    let name = ctx
-        .coerce_string(args.get(1).unwrap_or(&Value::Undefined))?
-        .to_string();
-    let callback = args.get(2).cloned().unwrap_or(Value::Undefined);
-    let count = arg_i32(args, 3);
-    let flags = arg_i32(args, 4);
-    let bigints = arg_bool(args, 5);
+pub(super) fn register(
+    ctx: &mut Ctx,
+    id: u32,
+    name: String,
+    callback: Value,
+    count: i32,
+    flags: i32,
+    bigints: bool,
+) -> Result<Value, OpError> {
     let db = db_ptr(ctx, id)?;
     let key = (name.to_ascii_lowercase(), count);
     if state(ctx).dbs.get(&id).unwrap().functions.len() >= 256
         && !state(ctx).dbs.get(&id).unwrap().functions.contains(&key)
     {
-        return Err(ctx.make_error(
-            "RangeError",
-            "SQLite scalar function registry exceeds 256 entries",
-        ));
+        return Err(NativeError::value_error("SQLite scalar function registry exceeds 256 entries",
+        ).into());
     }
     let name = std::ffi::CString::new(name)
-        .map_err(|_| ctx.make_error("TypeError", "SQLite function name contains NUL"))?;
+        .map_err(|_| NativeError::type_error("SQLite function name contains NUL"))?;
     if name.as_bytes().len() > 255 || !(-1..=1000).contains(&count) {
-        return Err(ctx.make_error(
-            "RangeError",
-            "Invalid SQLite function name or argument count",
-        ));
+        return Err(NativeError::value_error("Invalid SQLite function name or argument count",
+        ).into());
     }
     let api = state(ctx).api.as_ref().unwrap().clone();
     let pending = state(ctx).dbs.get(&id).unwrap().pending.clone();
@@ -268,7 +260,7 @@ pub(super) fn op_function(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result
         )
     };
     if rc != SQLITE_OK {
-        return Err(db_error(ctx, db, "function registration failed"));
+        return Err(db_error(ctx, db, "function registration failed").into());
     }
     state(ctx).dbs.get_mut(&id).unwrap().functions.insert(key);
     Ok(Value::Undefined)

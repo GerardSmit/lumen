@@ -1,0 +1,14 @@
+(None, {'a': 1})
+False
+Ellipsis NotImplemented
+ellipsis
+method_descriptor
+wrapper_descriptor
+method-wrapper
+builtin_function_or_method
+classmethod_descriptor
+cannot use a closure with this code object
+list[int]
+dict[str, int]
+str not subscriptable
+True

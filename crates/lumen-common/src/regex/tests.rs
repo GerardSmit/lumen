@@ -305,7 +305,7 @@ fn python_word_boundary() {
     assert_eq!(find(&b(Flavor::PyUnicode), "\u{e9}x"), None);
     assert_eq!(find(&b(Flavor::PyAscii), "\u{e9}x"), Some((1, 2)));
     let not_b = py(Node::WordB(false, Flavor::PyUnicode), 0);
-    assert_eq!(find(&not_b, ""), None);
+    assert_eq!(find(&not_b, ""), Some((0, 0)));
     assert_eq!(find(&not_b, "ab"), Some((1, 1)));
     let boundary = py(Node::WordB(true, Flavor::PyUnicode), 0);
     assert_eq!(find(&boundary, ""), None);

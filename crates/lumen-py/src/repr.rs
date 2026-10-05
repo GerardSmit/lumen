@@ -282,6 +282,14 @@ impl Interp {
                 if let Value::Obj(fo) = f {
                     if let Kind::Native(n) = &fo.kind {
                         let t = self.type_of(this);
+                        if n.desc.is_some_and(crate::bind::args::is_slot_wrapper) {
+                            return Ok(format!(
+                                "<method-wrapper '{}' of {} object at {:#x}>",
+                                n.name,
+                                self.type_display(&t),
+                                self.id_of(this)
+                            ));
+                        }
                         return Ok(format!(
                             "<built-in method {} of {} object at {:#x}>",
                             n.name,
@@ -397,9 +405,16 @@ impl Interp {
                 c.first_line
             )),
             Kind::Super(t, _, ot) => {
-                let t = self.repr_of(t)?;
-                let ot = self.repr_of(ot)?;
-                Ok(format!("<super: {}, <{} object>>", t, ot))
+                let t = match t {
+                    Value::Obj(c) if matches!(c.kind, Kind::Type(_)) => {
+                        format!("<class '{}'>", self.type_name(c))
+                    }
+                    _ => self.repr_of(t)?,
+                };
+                match ot {
+                    Value::Obj(c) => Ok(format!("<super: {}, <{} object>>", t, self.type_name(c))),
+                    _ => Ok(format!("<super: {}, NULL>", t)),
+                }
             }
             Kind::Cell(c) => {
                 let inner = c.borrow().clone();

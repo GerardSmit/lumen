@@ -112,6 +112,7 @@ impl Interp {
                 false => format!("{l}\n"),
             });
         let text = text.map_or(Value::None, Value::string);
+        let col = col.or((line > 0).then_some(0));
         let offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 1));
         let end_offset = col.map_or(Value::None, |c| Value::Int(c as i64 + 2));
         let detail = Value::tuple(vec![
@@ -200,10 +201,30 @@ impl Interp {
             Ok(m) => m,
             Err(e) => return Err(self.syntax_error(&e.msg, filename, e.line, Some(e.col), src)),
         };
-        match crate::compile::compile_module(&module, filename, interactive) {
+        let mut warnings = Vec::new();
+        let compiled = crate::compile::compile_module(&module, filename, interactive, &mut warnings);
+        self.emit_syntax_warnings(&warnings, filename, src)?;
+        match compiled {
             Ok(c) => Ok(c),
             Err(e) => Err(self.syntax_error(&e.msg, filename, e.line, None, src)),
         }
+    }
+
+    /// `_PyErr_EmitSyntaxWarning` for each warning; one that the filters turn into an error is
+    /// raised as a `SyntaxError` at its location.
+    pub fn emit_syntax_warnings(&mut self, warnings: &[crate::compile::CompileWarning], filename: &str, src: &str) -> R<()> {
+        for w in warnings {
+            match crate::builtins::warningsm::warn_explicit_category(self, "SyntaxWarning", &w.msg, filename, w.line) {
+                Ok(()) => {}
+                Err(e) if self.exc_is(&e, "SyntaxWarning") => {
+                    // CPython reads the line back from the file, so code compiled from a string has no text.
+                    let text = if filename.starts_with('<') { "" } else { src };
+                    return Err(self.syntax_error(&w.msg, filename, w.line, Some(w.col), text));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     fn sys_dict(&self) -> Option<Obj> {
@@ -310,6 +331,7 @@ impl Interp {
     }
 
     fn run_exit_hooks(&mut self) {
+        self.wait_for_thread_shutdown();
         self.run_atexit();
         crate::builtins::iom::flush_std_streams(self);
         self.flush_out();
@@ -360,6 +382,11 @@ impl Interp {
         let (dirs, parent_mod) = match parent_name {
             Some(p) => {
                 let pm = self.import_module(p)?;
+                // Importing the parent may itself register the child (`collections.abc` is
+                // `_collections_abc` since 3.14).
+                if let Some(Value::Obj(m)) = dict_get_str(&self.modules, full) {
+                    return Ok(m);
+                }
                 let pd = self.module_dict(&pm);
                 let path = match dict_get_str(&pd, "__path__") {
                     Some(v) => v,

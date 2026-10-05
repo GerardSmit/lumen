@@ -52,9 +52,11 @@ const EXC_TABLE: &[(&str, &str)] = &[
     ("RuntimeError", "Exception"),
     ("NotImplementedError", "RuntimeError"),
     ("RecursionError", "RuntimeError"),
+    ("PythonFinalizationError", "RuntimeError"),
     ("SyntaxError", "Exception"),
     ("IndentationError", "SyntaxError"),
     ("TabError", "IndentationError"),
+    ("_IncompleteInputError", "SyntaxError"),
     ("SystemError", "Exception"),
     ("TypeError", "Exception"),
     ("ValueError", "Exception"),
@@ -105,6 +107,10 @@ impl Interp {
             (t.function.clone(), obj.clone()),
             (t.method.clone(), obj.clone()),
             (t.builtin_function.clone(), obj.clone()),
+            (t.method_descriptor.clone(), obj.clone()),
+            (t.wrapper_descriptor.clone(), obj.clone()),
+            (t.classmethod_descriptor.clone(), obj.clone()),
+            (t.method_wrapper.clone(), obj.clone()),
             (t.module.clone(), obj.clone()),
             (t.cell.clone(), obj.clone()),
             (t.code.clone(), obj.clone()),
@@ -186,6 +192,40 @@ impl Interp {
         }
     }
 
+    /// `type.__bases__ = ...`: the new bases, and the MROs of the class and of every subclass
+    /// rebuilt from them.
+    pub fn reassign_bases(&mut self, ty: &Obj, bases: Vec<Obj>) {
+        self.set_bases(ty, bases);
+        let affected: Vec<Obj> = self
+            .subclass_registry
+            .iter()
+            .filter_map(|w| w.upgrade())
+            .filter(|t| !Rc::ptr_eq(t, ty) && self.is_subtype(t, ty))
+            .collect();
+        for _ in 0..=affected.len() {
+            let mut changed = false;
+            for t in &affected {
+                let Kind::Type(td) = &t.kind else { continue };
+                let bases = td.bases.borrow().clone();
+                if let Some(mro) = self.compute_mro(t, &bases) {
+                    let same = mro.len() == td.mro.borrow().len()
+                        && mro
+                            .iter()
+                            .zip(td.mro.borrow().iter())
+                            .all(|(a, b)| Rc::ptr_eq(a, b));
+                    if !same {
+                        *td.mro.borrow_mut() = mro;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.type_epoch += 1;
+    }
+
     pub fn compute_mro(&self, ty: &Obj, bases: &[Obj]) -> Option<Vec<Obj>> {
         let mut seqs: Vec<Vec<Obj>> = Vec::new();
         for b in bases {
@@ -239,6 +279,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
         )
     }
@@ -329,11 +370,23 @@ impl Interp {
             Kind::ByteArray(_) => t.bytearray.clone(),
             Kind::Type(_) => t.type_.clone(),
             Kind::Function(_) => t.function.clone(),
+            Kind::Method(Value::Obj(f), _) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some_and(crate::bind::args::is_slot_wrapper)) => {
+                t.method_wrapper.clone()
+            }
             Kind::Method(Value::Obj(f), _) if matches!(f.kind, Kind::Native(_)) => {
                 t.builtin_function.clone()
             }
             Kind::Method(..) => t.method.clone(),
+            Kind::Native(n)
+                if n.method && n.desc.is_some_and(crate::bind::args::is_slot_wrapper) =>
+            {
+                t.wrapper_descriptor.clone()
+            }
+            Kind::Native(n) if n.method => t.method_descriptor.clone(),
             Kind::Native(_) => t.builtin_function.clone(),
+            Kind::ClassMethod(Value::Obj(f)) if matches!(&f.kind, Kind::Native(n) if n.desc.is_some()) => {
+                t.classmethod_descriptor.clone()
+            }
             Kind::Module => t.module.clone(),
             Kind::Cell(_) => t.cell.clone(),
             Kind::Code(_) => t.code.clone(),
@@ -445,6 +498,7 @@ impl Interp {
     pub fn lookup_mro(&self, cls: &Obj, name: &str) -> Option<Value> {
         let h = hash_str(name);
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -465,6 +519,7 @@ impl Interp {
             _ => return None,
         };
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -483,6 +538,7 @@ impl Interp {
     pub fn lookup_mro_with_owner(&self, cls: &Obj, name: &str) -> Option<(Obj, Value)> {
         let h = hash_str(name);
         if let Kind::Type(td) = &cls.kind {
+            crate::watch::touch(td);
             for c in td.mro.borrow().iter() {
                 if let Some(d) = c.dict.borrow().as_ref() {
                     if let Kind::Dict(dd) = &d.kind {
@@ -837,6 +893,12 @@ impl Interp {
         if nm == "__class__" {
             return Ok(Value::Obj(self.types.super_.clone()));
         }
+        if matches!(nm.as_str(), "__thisclass__" | "__self__" | "__self_class__") {
+            let super_ = self.types.super_.clone();
+            if let Some(v) = self.lookup_mro_name(&super_, name) {
+                return self.bind_descr(&v, obj, &super_);
+            }
+        }
         let start_cls = match &objtype {
             Value::Obj(c) => c.clone(),
             _ => return Err(self.attr_error(obj, &nm)),
@@ -871,8 +933,10 @@ impl Interp {
                 return self.bind_descr(&v, &inst, &start_cls);
             }
         }
-        let t = self.type_name(&typ_obj);
-        let _ = t;
+        let super_ = self.types.super_.clone();
+        if let Some(v) = self.lookup_mro_name(&super_, name) {
+            return self.bind_descr(&v, obj, &super_);
+        }
         Err(self.new_exc_str(
             "AttributeError",
             &format!("'super' object has no attribute '{}'", nm),
@@ -889,7 +953,7 @@ impl Interp {
                     "denominator" => Some(Value::Int(1)),
                     "__class__" => Some(Value::Obj(self.type_of(obj))),
                     _ => None,
-                })
+                });
             }
             Value::Float(f) => {
                 return Ok(match nm {
@@ -897,40 +961,40 @@ impl Interp {
                     "imag" => Some(Value::Float(0.0)),
                     "__class__" => Some(Value::Obj(self.type_of(obj))),
                     _ => None,
-                })
+                });
             }
             _ => {
                 return Ok(if nm == "__class__" {
                     Some(Value::Obj(self.type_of(obj)))
                 } else {
                     None
-                })
+                });
             }
         };
         match &o.kind {
             Kind::Exception(d) => {
+                if nm == "__traceback__" {
+                    return Ok(Some(self.exc_tb(d)));
+                }
                 let d = d.borrow();
                 match nm {
                     "args" => return Ok(Some(d.args.clone())),
                     "__cause__" => {
-                        return Ok(Some(d.cause.clone().map(Value::Obj).unwrap_or(Value::None)))
+                        return Ok(Some(d.cause.clone().map(Value::Obj).unwrap_or(Value::None)));
                     }
                     "__context__" => {
                         return Ok(Some(
                             d.context.clone().map(Value::Obj).unwrap_or(Value::None),
-                        ))
+                        ));
                     }
                     "__suppress_context__" => return Ok(Some(Value::Bool(d.suppress_context))),
-                    "__traceback__" => {
-                        return Ok(Some(self.make_tb(&d.tb)));
-                    }
                     _ => {}
                 }
             }
             Kind::Function(f) => match nm {
                 "__name__" => return Ok(Some(Value::str(&f.name.borrow()))),
                 "__qualname__" => return Ok(Some(Value::str(&f.qualname.borrow()))),
-                "__doc__" => return Ok(Some(f.code.doc.clone().unwrap_or(Value::None))),
+                "__doc__" => return Ok(Some(f.code.borrow().doc.clone().unwrap_or(Value::None))),
                 "__module__" => {
                     return Ok(Some(
                         dict_get_str(&f.globals, "__name__").unwrap_or(Value::None),
@@ -960,7 +1024,11 @@ impl Interp {
                     return Ok(Some(Value::dict(pd)));
                 }
                 "__globals__" => return Ok(Some(Value::Obj(f.globals.clone()))),
-                "__code__" => return Ok(Some(Value::Obj(Object::new(Kind::Code(f.code.clone()))))),
+                "__code__" => {
+                    return Ok(Some(Value::Obj(crate::bytecode::Code::object(
+                        &f.code.borrow(),
+                    ))));
+                }
                 "__closure__" => {
                     if f.closure.is_empty() {
                         return Ok(Some(Value::None));
@@ -1006,12 +1074,12 @@ impl Interp {
                         } else {
                             Err(e)
                         }
-                    })
+                    });
                 }
                 // Other attributes not defined by the method type come from the function.
                 _ => {
                     let mt = self.type_of_obj(o);
-                    if !nm.starts_with("__") && self.lookup_mro(&mt, nm).is_none() {
+                    if nm != "__class__" && self.lookup_mro(&mt, nm).is_none() {
                         let f = f.clone();
                         return self.get_attr_str(&f, nm).map(Some);
                     }
@@ -1046,7 +1114,7 @@ impl Interp {
                         crate::bind::args::py_doc(d, n.name)
                             .map(Value::str)
                             .unwrap_or(Value::None),
-                    ))
+                    ));
                 }
                 ("__doc__", None) => return Ok(Some(Value::None)),
                 ("__text_signature__", d) => {
@@ -1054,10 +1122,10 @@ impl Interp {
                         d.and_then(crate::bind::args::native_text_signature)
                             .map(Value::string)
                             .unwrap_or(Value::None),
-                    ))
+                    ));
                 }
                 ("__module__", Some(d)) if d.class().is_none() && d.module().is_some() => {
-                    return Ok(Some(Value::str(d.module().unwrap_or("builtins"))))
+                    return Ok(Some(Value::str(d.module().unwrap_or("builtins"))));
                 }
                 ("__module__", None) if matches!(n.owner, Some(NativeOwner::Module(_))) => {
                     if let Some(NativeOwner::Module(m)) = &n.owner {
@@ -1065,6 +1133,11 @@ impl Interp {
                     }
                 }
                 ("__module__", _) => return Ok(Some(Value::str("builtins"))),
+                ("__self__", Some(d)) if d.role == lumen_bind::Role::Constructor => {
+                    if let Some(NativeOwner::Class(c)) = &n.owner {
+                        return Ok(Some(Value::Obj(c.clone())));
+                    }
+                }
                 ("__self__", d) if d.is_none_or(|d| d.class().is_none()) => {
                     let own = match &n.owner {
                         Some(NativeOwner::Module(m)) => Some(&**m),
@@ -1086,21 +1159,23 @@ impl Interp {
                     return Ok(Some(Value::Bool(matches!(
                         *g.state.borrow(),
                         GenState::Running
-                    ))))
+                    ))));
                 }
                 "gi_frame" | "cr_frame" | "ag_frame" => {
-                    return Ok(Some(match *g.state.borrow() {
-                        GenState::Done => Value::None,
-                        _ => Value::Obj(Object::new(Kind::Frame)),
-                    }))
+                    let done = matches!(*g.state.borrow(), GenState::Done);
+                    return Ok(Some(if done {
+                        Value::None
+                    } else {
+                        self.gen_frame_object(o)
+                    }));
                 }
                 "gi_code" | "cr_code" | "ag_code" => {
                     return Ok(Some(match &*g.state.borrow() {
                         GenState::Created(f) | GenState::Suspended(f) => {
-                            Value::Obj(Object::new(Kind::Code(f.code.clone())))
+                            Value::Obj(crate::bytecode::Code::object(&f.code))
                         }
                         _ => Value::None,
-                    }))
+                    }));
                 }
                 "gi_yieldfrom" | "cr_await" | "ag_await" => return Ok(Some(Value::None)),
                 _ => {}
@@ -1117,24 +1192,25 @@ impl Interp {
                 "co_cellvars" => {
                     return Ok(Some(Value::tuple(
                         c.cellvars.iter().map(|n| Value::str(n)).collect(),
-                    )))
+                    )));
                 }
                 "co_freevars" => {
                     return Ok(Some(Value::tuple(
                         c.freevars.iter().map(|n| Value::str(n)).collect(),
-                    )))
+                    )));
                 }
                 "co_names" => {
                     return Ok(Some(Value::tuple(
                         c.names.iter().map(|n| Value::Obj(n.clone())).collect(),
-                    )))
+                    )));
                 }
                 "co_varnames" => {
                     return Ok(Some(Value::tuple(
                         c.varnames.iter().map(|n| Value::str(n)).collect(),
-                    )))
+                    )));
                 }
                 "co_flags" => return Ok(Some(Value::Int(c.flags as i64))),
+                "co_consts" => return Ok(Some(Value::tuple(c.consts.clone()))),
                 _ => {}
             },
             Kind::Slice(a, b, c) => match nm {
@@ -1172,12 +1248,23 @@ impl Interp {
                 _ => {}
             },
             Kind::StaticMethod(f) | Kind::ClassMethod(f) => {
-                if nm == "__func__" {
+                if nm == "__func__" || nm == "__wrapped__" {
                     return Ok(Some(f.clone()));
                 }
                 if nm == "__isabstractmethod__" {
                     let f = f.clone();
                     return Ok(Some(Value::Bool(self.is_abstract_value(&f)?)));
+                }
+                if matches!(
+                    nm,
+                    "__module__" | "__name__" | "__qualname__" | "__annotations__" | "__doc__"
+                ) {
+                    let f = f.clone();
+                    match self.get_attr_str(&f, nm) {
+                        Ok(v) => return Ok(Some(v)),
+                        Err(e) if self.exc_is(&e, "AttributeError") => {}
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             Kind::Complex(re, im) => match nm {
@@ -1303,7 +1390,8 @@ impl Interp {
                     .filter_map(|b| b.as_obj().cloned())
                     .collect();
                 self.set_bases(o, items);
-                self.type_epoch += 1;
+                self.bump_type_epoch();
+                self.type_modified(o);
                 return Ok(());
             }
             "__abstractmethods__" => {
@@ -1316,6 +1404,7 @@ impl Interp {
                 } else {
                     f & !TF_ABSTRACT
                 });
+                self.type_modified(o);
                 return Ok(());
             }
             _ => {}
@@ -1323,8 +1412,12 @@ impl Interp {
         let d = self.instance_dict(o);
         dict_set_name(&d, name, v);
         if nm.starts_with("__") {
-            self.type_epoch += 1;
+            self.bump_type_epoch();
         }
+        if nm == "__call__" {
+            self.type_call_changed(o);
+        }
+        self.type_modified(o);
         Ok(())
     }
 
@@ -1342,6 +1435,30 @@ impl Interp {
         Ok(())
     }
 
+    pub fn set_function_code(&mut self, o: &Obj, v: &Value) -> R<()> {
+        let Kind::Function(f) = &o.kind else {
+            return Err(self.type_error("__code__ is only settable on functions"));
+        };
+        let Value::Obj(c) = v else {
+            return Err(self.type_error("__code__ must be set to a code object"));
+        };
+        let Kind::Code(code) = &c.kind else {
+            return Err(self.type_error("__code__ must be set to a code object"));
+        };
+        if code.freevars.len() != f.closure.len() {
+            let msg = format!(
+                "{}() requires a code object with {} free vars, not {}",
+                f.name.borrow(),
+                f.closure.len(),
+                code.freevars.len()
+            );
+            return Err(self.value_error(&msg));
+        }
+        *f.code.borrow_mut() = code.clone();
+        self.func_event(crate::watch::FuncEvent::ModifyCode, o, Some(v));
+        Ok(())
+    }
+
     pub fn generic_setattr(&mut self, obj: &Value, cls: &Obj, name: &Obj, v: Value) -> R<()> {
         let nm = name.as_str_kind().unwrap_or("").to_string();
         self.check_mutable_type(obj, &nm)?;
@@ -1355,7 +1472,7 @@ impl Interp {
                         self.tp_name_of(obj),
                         nm
                     ),
-                ))
+                ));
             }
         };
         if let Some(d) = self.lookup_mro_name(cls, name) {
@@ -1410,7 +1527,9 @@ impl Interp {
                     "__suppress_context__" => d.borrow_mut().suppress_context = self.truthy(&v)?,
                     "__traceback__" => {
                         if v.is_none() {
-                            d.borrow_mut().tb.clear();
+                            let mut dm = d.borrow_mut();
+                            dm.tb.clear();
+                            dm.tb_cache = None;
                         }
                     }
                     _ => {
@@ -1425,9 +1544,31 @@ impl Interp {
                     "__name__" => *f.name.borrow_mut() = v.as_str().unwrap_or("").into(),
                     "__qualname__" => *f.qualname.borrow_mut() = v.as_str().unwrap_or("").into(),
                     "__defaults__" => {
+                        if !v.is_none() && v.tuple_items().is_none() {
+                            return Err(
+                                self.type_error("__defaults__ must be set to a tuple object")
+                            );
+                        }
                         *f.defaults.borrow_mut() =
                             v.tuple_items().map(|t| t.to_vec()).unwrap_or_default();
+                        self.func_event(crate::watch::FuncEvent::ModifyDefaults, o, Some(&v));
                     }
+                    "__kwdefaults__" => {
+                        let pairs = match &v {
+                            Value::None => Vec::new(),
+                            Value::Obj(d) if matches!(d.kind, Kind::Dict(_)) => {
+                                self.dict_to_kwargs(&v)?
+                            }
+                            _ => {
+                                return Err(
+                                    self.type_error("__kwdefaults__ must be set to a dict object")
+                                );
+                            }
+                        };
+                        *f.kwdefaults.borrow_mut() = pairs;
+                        self.func_event(crate::watch::FuncEvent::ModifyKwDefaults, o, Some(&v));
+                    }
+                    "__code__" => self.set_function_code(o, &v)?,
                     "__annotations__" => *f.annotations.borrow_mut() = v.as_obj().cloned(),
                     "__type_params__" => {
                         if v.tuple_items().is_none() {
@@ -1467,6 +1608,10 @@ impl Interp {
                     let dd = self.instance_dict(o);
                     dict_set_name(&dd, name, v);
                     Ok(())
+                } else if matches!(o.kind, Kind::ClassMethod(_) | Kind::StaticMethod(_)) {
+                    let dd = self.instance_dict(o);
+                    dict_set_name(&dd, name, v);
+                    Ok(())
                 } else if matches!(o.kind, Kind::Cell(_)) && nm == "cell_contents" {
                     if let Kind::Cell(c) = &o.kind {
                         *c.borrow_mut() = Some(v);
@@ -1486,19 +1631,36 @@ impl Interp {
         }
     }
 
+    /// The traceback chain of an exception; the chain built earlier is reused and only entries
+    /// added since are put on top of it.
+    pub fn exc_tb(&self, d: &RefCell<ExcData>) -> Value {
+        let mut d = d.borrow_mut();
+        let n = d.tb.len();
+        let (done, head) = match d.tb_cache.take() {
+            Some((k, head)) if k <= n => (k, head),
+            _ => (0, Value::None),
+        };
+        let head = self.make_tb_onto(head, &d.tb[done..]);
+        d.tb_cache = Some((n, head.clone()));
+        head
+    }
+
     /// Builds a traceback chain; entries are stored innermost first.
     pub fn make_tb(&self, entries: &[TbEntry]) -> Value {
-        let mut next = Value::None;
+        self.make_tb_onto(Value::None, entries)
+    }
+
+    fn make_tb_onto(&self, mut next: Value, entries: &[TbEntry]) -> Value {
         for e in entries {
             let o = Object::with_cls(self.types.traceback.clone(), Kind::Instance);
             let d = self.instance_dict(&o);
             dict_set_str(&d, "tb_lineno", Value::Int(e.line as i64));
             dict_set_str(&d, "tb_next", next);
-            dict_set_str(
-                &d,
-                "tb_frame",
-                self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti),
-            );
+            let frame = match &e.frame {
+                Some(f) => Value::Obj(f.clone()),
+                None => self.dead_frame_object(e.code.clone(), e.globals.clone(), e.line, e.lasti),
+            };
+            dict_set_str(&d, "tb_frame", frame);
             dict_set_str(&d, "tb_lasti", Value::Int(2 * e.lasti as i64));
             next = Value::Obj(o);
         }
@@ -1606,7 +1768,13 @@ impl Interp {
             if let Some(dd) = dd {
                 if dict_del_name(&dd, name).is_some() {
                     if matches!(o.kind, Kind::Type(_)) && nm.starts_with("__") {
-                        self.type_epoch += 1;
+                        self.bump_type_epoch();
+                    }
+                    if matches!(o.kind, Kind::Type(_)) {
+                        if nm == "__call__" {
+                            self.type_call_changed(o);
+                        }
+                        self.type_modified(o);
                     }
                     return Ok(());
                 }
@@ -1706,6 +1874,13 @@ impl Interp {
     }
 
     pub fn alloc_instance(&mut self, cls: &Obj) -> R<Value> {
+        if let Some(nm) = self.nomemory.as_mut() {
+            // An instance takes two allocations in CPython: the object and its values.
+            let failed = nm.request() | nm.request();
+            if failed {
+                return Err(self.memory_error());
+            }
+        }
         if matches!(&cls.kind, Kind::Type(td) if td.flags.get() & TF_ABSTRACT != 0) {
             self.check_abstract(cls)?;
         }
@@ -1725,6 +1900,7 @@ impl Interp {
                 suppress_context: false,
                 ctx_set: false,
                 tb: Vec::new(),
+                tb_cache: None,
             })),
             Layout::Int => Kind::Int(crate::pyint::BigInt::zero()),
             Layout::Float => Kind::Float(0.0),
@@ -1798,7 +1974,12 @@ impl Interp {
     ) -> R<Value> {
         let name = match args[0].as_str() {
             Some(s) => s.to_string(),
-            None => return Err(self.type_error("type.__new__() argument 1 must be str")),
+            None => {
+                let t = self.type_name_of(&args[0]);
+                return Err(
+                    self.type_error(&format!("type.__new__() argument 1 must be str, not {t}"))
+                );
+            }
         };
         let bases: Vec<Obj> = match args[1].tuple_items() {
             Some(t) => {
@@ -1934,10 +2115,11 @@ impl Interp {
         } else {
             Some(meta.clone())
         };
-        let ty = Rc::new(Object {
+        let ty = Object::alloc(Object {
             cls: cls_field,
             dict: RefCell::new(Some(dict.clone())),
             id: std::cell::Cell::new(0),
+            gc: GcCell::new(),
             kind: Kind::Type(TypeData {
                 name: RefCell::new(name.into()),
                 qualname: RefCell::new(qualname),
@@ -1947,6 +2129,9 @@ impl Interp {
                 flags: Cell::new(TF_HEAP),
                 hooks: Cell::new((u64::MAX, 0)),
                 slots: RefCell::new(slots),
+                version: Cell::new(0),
+                watched: Cell::new(0),
+                del_cache: Cell::new((u64::MAX, false)),
             }),
         });
         match self.compute_mro(&ty, &bases) {
@@ -1962,8 +2147,20 @@ impl Interp {
                 ));
             }
         }
-        self.type_epoch += 1;
+        self.bump_type_epoch();
         self.subclass_registry.push(Rc::downgrade(&ty));
+        if let Kind::Type(td) = &ty.kind {
+            let inherits = td
+                .bases
+                .borrow()
+                .first()
+                .and_then(|b| b.type_data().map(|d| d.flags.get() & TF_VECTORCALL != 0))
+                .unwrap_or(false);
+            let own_call = matches!(&dict.kind, Kind::Dict(d) if d.borrow().find_str(hash_str("__call__"), "__call__").is_some());
+            if inherits && !own_call {
+                td.flags.set(td.flags.get() | TF_VECTORCALL);
+            }
+        }
         let entries: Vec<(Value, Value)> = match &dict.kind {
             Kind::Dict(d) => d
                 .borrow()
@@ -1974,7 +2171,7 @@ impl Interp {
         };
         for (k, v) in &entries {
             if let (Some(kn), Value::Obj(vo)) = (k.as_str(), v) {
-                if matches!(vo.kind, Kind::Instance) {
+                if matches!(vo.kind, Kind::Instance | Kind::Property(_)) {
                     let vc = self.type_of_obj(vo);
                     if let Some(sn) = self.lookup_mro(&vc, "__set_name__") {
                         let b = self.bind_descr(&sn, v, &vc)?;
@@ -2230,68 +2427,6 @@ impl Interp {
             desc: None,
             owner: None,
         })))
-    }
-
-    /// A module-level function of module `module`.
-    pub fn new_module_native(&self, module: &str, name: &'static str, f: NativeFn) -> Value {
-        let owner = Some(NativeOwner::Module(module.into()));
-        Value::Obj(Object::new(Kind::Native(NativeData {
-            name,
-            f,
-            method: false,
-            desc: None,
-            owner,
-        })))
-    }
-
-    pub fn reg(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let owner = Some(NativeOwner::Class(ty.clone()));
-        let v = Value::Obj(Object::new(Kind::Native(NativeData {
-            name,
-            f,
-            method: true,
-            desc: None,
-            owner,
-        })));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_static(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let n = self.new_native(name, f, false);
-        let v = Value::Obj(Object::new(Kind::StaticMethod(n)));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_class(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let n = self.new_native(name, f, false);
-        let v = Value::Obj(Object::new(Kind::ClassMethod(n)));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, v);
-        }
-    }
-
-    pub fn reg_new(&mut self, ty: &Obj, f: NativeFn) {
-        let n = self.new_native("__new__", f, false);
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, "__new__", n);
-        }
-    }
-
-    pub fn reg_prop(&mut self, ty: &Obj, name: &'static str, f: NativeFn) {
-        let g = self.new_native(name, f, false);
-        let p = Value::Obj(Object::new(Kind::Property(PropData {
-            fget: g,
-            fset: Value::None,
-            fdel: Value::None,
-            doc: Value::None,
-        })));
-        if let Some(d) = ty.dict.borrow().as_ref() {
-            dict_set_str(d, name, p);
-        }
     }
 
     pub fn module_globals(&self) -> Obj {

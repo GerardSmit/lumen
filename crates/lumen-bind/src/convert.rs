@@ -5,7 +5,7 @@
 use crate::desc::Slot;
 use crate::host::{Class, Host};
 use lumen_common::bigint::BigInt;
-use lumen_common::native::{ErrorKind, NativeError};
+use lumen_common::native::{Data, ErrorKind, NativeError};
 use std::borrow::Cow;
 
 /// A parameter type. `'a` is the lifetime of the call context: `&'a str`, byte slices and class
@@ -252,6 +252,41 @@ impl<'a, H: Host, T: FromArg<'a, H>> FromArg<'a, H> for Option<T> {
     }
 }
 
+/// A parameter that never fails: a value that does not convert (wrong type, out of range)
+/// becomes `T::default()` (`Lenient<Option<String>>`: `None`, `Lenient<f64>`: `0.0`). For
+/// natives with a dynamically typed argument list, where each operation reads the arguments it
+/// needs and ignores the rest.
+pub struct Lenient<T>(pub T);
+
+impl<'a, H: Host, T: FromArg<'a, H> + Default> FromArg<'a, H> for Lenient<T> {
+    #[inline]
+    fn from_arg(cx: &'a H::Cx<'_>, v: &'a H::Value, at: Slot) -> Result<Self, H::Error> {
+        Ok(Lenient(T::from_arg(cx, v, at).unwrap_or_default()))
+    }
+
+    #[inline]
+    fn from_missing(_: &'a H::Cx<'_>, _: Slot) -> Result<Self, H::Error> {
+        Ok(Lenient(T::default()))
+    }
+}
+
+/// A flag that is true only for the host's own `true` / `True`: never fails, and never applies
+/// the host's truthiness coercion, even under `#[op(coerce)]` (`bool` does).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flag(pub bool);
+
+impl<'a, H: Host> FromArg<'a, H> for Flag {
+    #[inline]
+    fn from_arg(_: &'a H::Cx<'_>, v: &'a H::Value, _: Slot) -> Result<Self, H::Error> {
+        Ok(Flag(H::is_true(v)))
+    }
+
+    #[inline]
+    fn from_missing(_: &'a H::Cx<'_>, _: Slot) -> Result<Self, H::Error> {
+        Ok(Flag(false))
+    }
+}
+
 impl<'a, H: Host, T: FromArg<'a, H> + Elem> FromArg<'a, H> for Vec<T> {
     /// A sequence, element by element.
     fn from_arg(cx: &'a H::Cx<'_>, v: &'a H::Value, at: Slot) -> Result<Self, H::Error> {
@@ -438,6 +473,27 @@ impl<H: Host, T: IntoRet<H>> IntoRet<H> for Option<T> {
     }
 }
 
+impl<H: Host> IntoRet<H> for Data {
+    const MAY_RUN: bool = false;
+    fn into_ret(self, ctx: &mut H::Ctx) -> Result<H::Value, H::Error> {
+        match self {
+            Data::None => Ok(H::none(ctx)),
+            Data::Bool(b) => Ok(H::from_bool(ctx, b)),
+            Data::Int(n) => H::from_int(ctx, n as i128),
+            Data::Float(x) => Ok(H::from_f64(ctx, x)),
+            Data::Str(s) => Ok(H::from_string(ctx, s)),
+            Data::Bytes(b) => Ok(H::from_bytes(ctx, b)),
+            Data::List(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    out.push(<Data as IntoRet<H>>::into_ret(item, ctx)?);
+                }
+                Ok(H::from_list(ctx, out))
+            }
+        }
+    }
+}
+
 impl<H: Host, T: IntoRet<H>, E: IntoError<H>> IntoRet<H> for Result<T, E> {
     const MAY_RUN: bool = T::MAY_RUN;
     #[inline]
@@ -563,6 +619,7 @@ macro_rules! elem {
     ($($t:ty),*) => {$( impl Elem for $t {} )*};
 }
 elem!(
+    Data,
     f64,
     f32,
     i8,

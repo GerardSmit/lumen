@@ -131,7 +131,7 @@ pub fn build(module: &Module) -> Result<SymTable, SymError> {
         ids: b.ids,
     };
     let empty = BTreeSet::new();
-    analyze(&mut t, 0, &empty, None)?;
+    analyze(&mut t, 0, &empty, None, &empty)?;
     Ok(t)
 }
 
@@ -153,7 +153,7 @@ pub fn build_expr(e: &Expr) -> Result<SymTable, SymError> {
         ids: b.ids,
     };
     let empty = BTreeSet::new();
-    analyze(&mut t, 0, &empty, None)?;
+    analyze(&mut t, 0, &empty, None, &empty)?;
     Ok(t)
 }
 
@@ -163,8 +163,13 @@ fn analyze(
     id: usize,
     bound: &BTreeSet<Rc<str>>,
     class_entry: Option<usize>,
+    type_params: &BTreeSet<Rc<str>>,
 ) -> Result<BTreeSet<Rc<str>>, SymError> {
     let kind = t.scopes[id].kind;
+    let mut type_params = type_params.clone();
+    type_params.extend(
+        t.scopes[id].syms.iter().filter(|(_, s)| s.flags & DEF_TYPE_PARAM != 0).map(|(n, _)| n.clone()),
+    );
     let mut local: BTreeSet<Rc<str>> = BTreeSet::new();
     let mut free: BTreeSet<Rc<str>> = BTreeSet::new();
     let line = t.scopes[id].line;
@@ -186,6 +191,9 @@ fn analyze(
                     msg: format!("no binding for nonlocal '{}' found", name),
                     line,
                 });
+            }
+            if type_params.contains(name) && f & DEF_TYPE_PARAM == 0 {
+                return Err(SymError { msg: format!("nonlocal binding not allowed for type parameter '{}'", name), line });
             }
             sym.scope = Sc::Free;
             free.insert(name.clone());
@@ -226,7 +234,7 @@ fn analyze(
         } else {
             class_entry
         };
-        let cf = analyze(t, c, &newbound, child_class)?;
+        let cf = analyze(t, c, &newbound, child_class, &type_params)?;
         for name in cf {
             let s = &mut t.scopes[id];
             if kind == ScopeKind::Function && local.contains(&name) {
@@ -493,6 +501,15 @@ impl Builder {
             None => return,
         };
         self.error(msg);
+    }
+
+    /// Annotation scopes inside a class see its namespace through `__classdict__`; a lambda or
+    /// comprehension nested in one could not resolve names the same way.
+    fn check_nested_scope(&mut self, what: &str) {
+        let s = &self.scopes[self.cur];
+        if s.ann.is_some() && s.can_see_class_scope {
+            self.error(format!("Cannot use {what} in annotation scope within class scope"));
+        }
     }
 
     fn visit_stmt(&mut self, s: &Stmt) {
@@ -789,6 +806,7 @@ impl Builder {
         is_genexp: bool,
     ) {
         self.visit_expr(&gens[0].iter);
+        self.check_nested_scope("comprehension");
         let key = e as *const Expr as usize;
         let id = self.new_scope(ScopeKind::Function, name.into(), Some(key), true);
         self.scopes[id].is_genexp = is_genexp;
@@ -834,8 +852,12 @@ impl Builder {
                         c = self.parent_of(c);
                     }
                     let target_kind = self.scopes[c].kind;
+                    let declared_global = {
+                        let key = mangle(&self.scopes[c].private, id);
+                        self.scopes[c].index.get(&key).is_some_and(|&i| self.scopes[c].syms[i].1.flags & DEF_GLOBAL != 0)
+                    };
                     for p in &path {
-                        if target_kind == ScopeKind::Function {
+                        if target_kind == ScopeKind::Function && !declared_global {
                             self.add(*p, id, DEF_NONLOCAL);
                         } else {
                             self.add(*p, id, DEF_GLOBAL);
@@ -860,6 +882,7 @@ impl Builder {
             ExprKind::UnaryOp { operand, .. } => self.visit_expr(operand),
             ExprKind::Lambda { args, body } => {
                 self.visit_arg_exprs(args);
+                self.check_nested_scope("lambda");
                 let key = e as *const Expr as usize;
                 let id = self.new_scope(ScopeKind::Function, "<lambda>".into(), Some(key), false);
                 self.scopes[id].is_lambda = true;

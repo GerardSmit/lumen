@@ -1,0 +1,15 @@
+False True True
+False
+False
+can't specify a timeout for a non-blocking call
+ValueError
+OverflowError
+release unlocked lock
+['waiting', 'releasing', True]
+True 2
+False
+cannot release un-acquired lock
+[False]
+[0, 1, 2, 3, 4]
+True
+True

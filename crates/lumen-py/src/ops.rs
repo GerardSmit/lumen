@@ -88,7 +88,12 @@ impl Interp {
             Value::None => false,
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
-            Value::NotImplemented | Value::Ellipsis => true,
+            Value::Ellipsis => true,
+            Value::NotImplemented => {
+                return Err(
+                    self.type_error("NotImplemented should not be used in a boolean context")
+                );
+            }
             Value::Obj(o) => {
                 if o.cls.is_some() {
                     if let Some(m) = self.user_special(v, "__bool__") {
@@ -163,10 +168,10 @@ impl Interp {
                         None => {
                             Err(self.overflow_err("Python int too large to convert to C ssize_t"))
                         }
-                    }
+                    };
                 }
                 Kind::DictView(d, _) => {
-                    return Ok(pydict_of(d).map(|p| p.borrow().len()).unwrap_or(0))
+                    return Ok(pydict_of(d).map(|p| p.borrow().len()).unwrap_or(0));
                 }
                 _ => {}
             }
@@ -318,7 +323,7 @@ impl Interp {
                 return Ok(Value::Bool(match x.partial_cmp(y) {
                     Some(o) => ord_matches(op, o),
                     None => op == CmpOp::NotEq,
-                }))
+                }));
             }
             _ => {}
         }
@@ -384,7 +389,7 @@ impl Interp {
             CmpOp::Eq => Ok(Value::Bool(a.is(b))),
             CmpOp::NotEq => Ok(Value::Bool(!a.is(b))),
             _ => {
-                let (ta, tb) = (self.type_name_of(a), self.type_name_of(b));
+                let (ta, tb) = (self.tp_name_of(a), self.tp_name_of(b));
                 Err(self.type_error(&format!(
                     "'{}' not supported between instances of '{}' and '{}'",
                     sym, ta, tb
@@ -395,6 +400,12 @@ impl Interp {
 
     /// Comparison implemented by the builtin types; `None` means NotImplemented.
     pub fn native_compare(&mut self, op: CmpOp, a: &Value, b: &Value) -> R<Option<bool>> {
+        if lumen_common::stack::exhausted() {
+            return Err(self.new_exc_str(
+                "RecursionError",
+                "maximum recursion depth exceeded in comparison",
+            ));
+        }
         if op == CmpOp::Eq || op == CmpOp::NotEq {
             let cx = |v: &Value| match v {
                 Value::Obj(o) => match &o.kind {
@@ -676,7 +687,7 @@ impl Interp {
 
     pub fn binop_error(&mut self, op: BinOp, a: &Value, b: &Value, inplace: bool) -> Obj {
         let (_, _, _, sym) = binop_info(op);
-        let (ta, tb) = (self.type_name_of(a), self.type_name_of(b));
+        let (ta, tb) = (self.tp_name_of(a), self.tp_name_of(b));
         if op == BinOp::Add && !inplace || op == BinOp::Add {
             let seq_left = matches!(
                 ta.as_str(),
@@ -737,7 +748,7 @@ impl Interp {
             if self.exc_is(&e, "TypeError") {
                 let msg = self.exc_message(&e);
                 if msg.starts_with("unsupported operand type(s) for ") {
-                    let (ta, tb) = (self.type_name_of(&a), self.type_name_of(b));
+                    let (ta, tb) = (self.tp_name_of(&a), self.tp_name_of(b));
                     let (_, _, _, sym) = binop_info(op);
                     let sym = if sym == "** or pow()" { "**" } else { sym };
                     return self.type_error(&format!(
@@ -896,7 +907,7 @@ impl Interp {
                         Err(_) => {
                             return Err(
                                 self.value_error("memoryview: invalid character in bytes format")
-                            )
+                            );
                         }
                     }
                 }
@@ -952,7 +963,15 @@ impl Interp {
                         v.extend_from_slice(&y.bytes());
                         Ok(Some(Value::bytes(v)))
                     }
-                    _ => Ok(None),
+                    _ => match crate::builtins::memview::contiguous_bytes(self, b)? {
+                        Some(y) => {
+                            self.check_bytes_len(x.len() + y.len())?;
+                            let mut v = x.clone();
+                            v.extend_from_slice(&y);
+                            Ok(Some(Value::bytes(v)))
+                        }
+                        None => Ok(None),
+                    },
                 },
                 _ => Ok(None),
             },
@@ -962,7 +981,10 @@ impl Interp {
                     match &ob.kind {
                         Kind::Bytes(y) => v.extend_from_slice(y),
                         Kind::ByteArray(y) => v.extend_from_slice(&y.bytes()),
-                        _ => return Ok(None),
+                        _ => match crate::builtins::memview::contiguous_bytes(self, b)? {
+                            Some(y) => v.extend_from_slice(&y),
+                            None => return Ok(None),
+                        },
                     }
                     Ok(Some(Value::Obj(Object::new(Kind::ByteArray(ba_store(v))))))
                 }
@@ -1161,45 +1183,78 @@ impl Interp {
     }
 
     fn complex_binop(&mut self, op: BinOp, a: &Value, b: &Value) -> R<Option<Value>> {
-        let get = |v: &Value| -> Option<Result<(f64, f64), ()>> {
+        /// An operand: a complex, or a real that mixed-mode arithmetic uses without promoting it.
+        enum Operand {
+            Complex(Complex),
+            Real(f64),
+        }
+        let get = |v: &Value| -> Option<Result<Operand, ()>> {
             Some(Ok(match v {
                 Value::Obj(o) => match &o.kind {
-                    Kind::Complex(r, i) => (*r, *i),
-                    Kind::Int(b) => return Some(b.to_float().map(|f| (f, 0.0)).ok_or(())),
-                    Kind::Float(f) => (*f, 0.0),
+                    Kind::Complex(r, i) => Operand::Complex(Complex::new(*r, *i)),
+                    Kind::Int(b) => return Some(b.to_float().map(Operand::Real).ok_or(())),
+                    Kind::Float(f) => Operand::Real(*f),
                     _ => return None,
                 },
-                Value::Int(i) => (*i as f64, 0.0),
-                Value::Bool(b) => (*b as i64 as f64, 0.0),
-                Value::Float(f) => (*f, 0.0),
+                Value::Int(i) => Operand::Real(*i as f64),
+                Value::Bool(b) => Operand::Real(*b as i64 as f64),
+                Value::Float(f) => Operand::Real(*f),
                 _ => return None,
             }))
         };
-        let ((a1, b1), (a2, b2)) = match (get(a), get(b)) {
+        let (x, y) = match (get(a), get(b)) {
             (Some(Ok(x)), Some(Ok(y))) => (x, y),
             (Some(_), Some(_)) => {
-                return Err(self.overflow_err("int too large to convert to float"))
+                return Err(self.overflow_err("int too large to convert to float"));
             }
             _ => return Ok(None),
         };
-        let mk = |r: f64, i: f64| Some(Value::Obj(Object::new(Kind::Complex(r, i))));
-        Ok(match op {
-            BinOp::Add => mk(a1 + a2, b1 + b2),
-            BinOp::Sub => mk(a1 - a2, b1 - b2),
-            BinOp::Mult => mk(a1 * a2 - b1 * b2, a1 * b2 + b1 * a2),
-            BinOp::Div => match complex::quot(Complex::new(a1, b1), Complex::new(a2, b2)) {
-                Some(z) => mk(z.re, z.im),
-                None => return Err(self.zero_div("complex division by zero")),
-            },
-            BinOp::Pow => match complex::pow(Complex::new(a1, b1), Complex::new(a2, b2)) {
-                Ok(z) => mk(z.re, z.im),
+        let mk = |z: Complex| Some(Value::Obj(Object::new(Kind::Complex(z.re, z.im))));
+        let as_complex = |o: &Operand| match o {
+            Operand::Complex(z) => *z,
+            Operand::Real(r) => Complex::new(*r, 0.0),
+        };
+        if op == BinOp::Pow {
+            return Ok(match complex::pow(as_complex(&x), as_complex(&y)) {
+                Ok(z) => mk(z),
                 Err(MathError::Domain) => {
-                    return Err(self.zero_div("0.0 to a negative or complex power"))
+                    return Err(self.zero_div("0.0 to a negative or complex power"));
                 }
                 Err(MathError::Range) => return Err(self.overflow_err("complex exponentiation")),
-            },
-            _ => None,
-        })
+            });
+        }
+        let z = match (op, &x, &y) {
+            (BinOp::Add, Operand::Complex(p), Operand::Complex(q)) => {
+                Some(Complex::new(p.re + q.re, p.im + q.im))
+            }
+            (BinOp::Add, Operand::Complex(p), Operand::Real(q))
+            | (BinOp::Add, Operand::Real(q), Operand::Complex(p)) => {
+                Some(complex::sum_real(*p, *q))
+            }
+            (BinOp::Sub, Operand::Complex(p), Operand::Complex(q)) => {
+                Some(Complex::new(p.re - q.re, p.im - q.im))
+            }
+            (BinOp::Sub, Operand::Complex(p), Operand::Real(q)) => Some(complex::diff_real(*p, *q)),
+            (BinOp::Sub, Operand::Real(p), Operand::Complex(q)) => Some(complex::real_diff(*p, *q)),
+            (BinOp::Mult, Operand::Complex(p), Operand::Complex(q)) => Some(complex::prod(*p, *q)),
+            (BinOp::Mult, Operand::Complex(p), Operand::Real(q))
+            | (BinOp::Mult, Operand::Real(q), Operand::Complex(p)) => {
+                Some(complex::prod_real(*p, *q))
+            }
+            (BinOp::Div, Operand::Complex(p), Operand::Complex(q)) => complex::quot(*p, *q),
+            (BinOp::Div, Operand::Complex(p), Operand::Real(q)) => complex::quot_real(*p, *q),
+            (BinOp::Div, Operand::Real(p), Operand::Complex(q)) => complex::real_quot(*p, *q),
+            (
+                BinOp::Add | BinOp::Sub | BinOp::Mult | BinOp::Div,
+                Operand::Real(_),
+                Operand::Real(_),
+            ) => return Ok(None),
+            _ => return Ok(None),
+        };
+        match z {
+            Some(z) => Ok(mk(z)),
+            None => Err(self.zero_div("division by zero")),
+        }
     }
 
     pub fn unary_op(&mut self, op: UnOp, a: &Value) -> R<Value> {
@@ -1223,7 +1278,7 @@ impl Interp {
                 return Ok(match i.checked_neg() {
                     Some(n) => Value::Int(n),
                     None => Value::big(BigInt::from_i64(*i).neg()),
-                })
+                });
             }
             (UnOp::Neg, Value::Bool(b)) => return Ok(Value::Int(-(*b as i64))),
             (UnOp::Neg, Value::Float(f)) => return Ok(Value::Float(-f)),
@@ -1241,10 +1296,10 @@ impl Interp {
                 (Kind::Float(f), UnOp::Neg) => return Ok(Value::Float(-f)),
                 (Kind::Float(f), UnOp::Pos) => return Ok(Value::Float(*f)),
                 (Kind::Complex(r, i), UnOp::Neg) => {
-                    return Ok(Value::Obj(Object::new(Kind::Complex(-r, -i))))
+                    return Ok(Value::Obj(Object::new(Kind::Complex(-r, -i))));
                 }
                 (Kind::Complex(r, i), UnOp::Pos) => {
-                    return Ok(Value::Obj(Object::new(Kind::Complex(*r, *i))))
+                    return Ok(Value::Obj(Object::new(Kind::Complex(*r, *i))));
                 }
                 _ => {}
             }
@@ -1522,7 +1577,7 @@ impl Interp {
                 }
                 let i = match self.index_of(key) {
                     Err(e) if self.exc_is(&e, "OverflowError") => {
-                        return Err(self.seq_index_error("range object"))
+                        return Err(self.seq_index_error("range object"));
                     }
                     r => r?,
                 };
@@ -1569,20 +1624,7 @@ impl Interp {
     }
 
     fn is_builtin_generic(&self, t: &Obj) -> bool {
-        !self.is_heap(t)
-            && matches!(
-                self.type_name(t).as_str(),
-                "list"
-                    | "dict"
-                    | "set"
-                    | "frozenset"
-                    | "tuple"
-                    | "type"
-                    | "str"
-                    | "int"
-                    | "float"
-                    | "bytes"
-            )
+        Rc::ptr_eq(t, &self.types.type_)
     }
 
     pub fn is_slice(&self, v: &Value) -> bool {
@@ -1729,8 +1771,12 @@ impl Interp {
         items: Vec<Value>,
     ) -> R<()> {
         if step == 1 {
-            let stop = stop.max(start) as usize;
-            l.borrow_mut().splice(start as usize..stop, items);
+            let mut lm = l.borrow_mut();
+            let start = (start.max(0) as usize).min(lm.len());
+            let stop = (stop.max(0) as usize).clamp(start, lm.len());
+            let old: Vec<Value> = lm.splice(start..stop, items).collect();
+            drop(lm);
+            drop(old);
             return Ok(());
         }
         let n = slice_len(start, stop, step);
@@ -1741,10 +1787,18 @@ impl Interp {
                 n
             )));
         }
-        let mut lm = l.borrow_mut();
         let mut i = start;
         for it in items {
-            lm[i as usize] = it;
+            let old = {
+                let mut lm = l.borrow_mut();
+                match lm.get_mut(i as usize) {
+                    Some(slot) => std::mem::replace(slot, it),
+                    None => {
+                        return Err(self.value_error("list changed size during slice assignment"));
+                    }
+                }
+            };
+            drop(old);
             i += step;
         }
         Ok(())

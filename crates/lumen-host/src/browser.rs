@@ -16,15 +16,26 @@ use std::any::Any;
 use std::sync::OnceLock;
 
 use crate::{Ctx, Value};
+use lumen_bind::{Data, IntoRet, NativeError};
 
-/// One value crossing from the browser into the realm.
+/// One value crossing from the browser into the realm: a neutral [`Data`] or an explicit `null`
+/// (`Data::None` is `undefined`).
 #[derive(Debug, Clone)]
 pub enum Arg {
     Null,
-    Bool(bool),
-    Num(f64),
-    Str(String),
-    Bytes(Vec<u8>),
+    Data(Data),
+}
+
+impl<T: Into<Data>> From<T> for Arg {
+    fn from(v: T) -> Arg {
+        Arg::Data(v.into())
+    }
+}
+
+/// The error of an API with no browser counterpart (`code` `ERR_NOT_SUPPORTED_IN_BROWSER`).
+pub fn unsupported(what: &str) -> NativeError {
+    NativeError::runtime(format!("{what} is not supported in the browser"))
+        .with_code("ERR_NOT_SUPPORTED_IN_BROWSER")
 }
 
 /// A message from the browser to a registered task (a fetch response, a WebSocket event):
@@ -44,15 +55,12 @@ impl Event {
     }
 }
 
-/// An [`Arg`] as the JS value it stands for (`Bytes` become a `Uint8Array`).
+/// An [`Arg`] as the JS value it stands for (bytes become a `Uint8Array`).
 pub fn arg_value(ctx: &mut Ctx, arg: Arg) -> Result<Value, Value> {
-    Ok(match arg {
-        Arg::Null => Value::Null,
-        Arg::Bool(b) => Value::Bool(b),
-        Arg::Num(n) => Value::Num(n),
-        Arg::Str(s) => Value::from_string(s),
-        Arg::Bytes(b) => ctx.make_uint8array(&b)?,
-    })
+    match arg {
+        Arg::Null => Ok(Value::Null),
+        Arg::Data(d) => IntoRet::<lumen::embed::JsHost>::into_ret(d, ctx),
+    }
 }
 
 /// A [`crate::TaskDecoder`] that hands the event to the task's callback as `(kind, ...args)` —

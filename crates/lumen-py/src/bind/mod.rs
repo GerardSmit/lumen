@@ -29,8 +29,9 @@ pub use crate::object::{Obj, Value, R};
 pub use crate::pyint::BigInt;
 pub use crate::vm::Interp;
 pub use class::{
-    extend_type, install_into, is_instance, module_object, native_value, opaque_instance, owner_of,
-    type_object, NativeIter, Py,
+    extend_type, extend_type_documented, function_values, install_all, install_functions,
+    install_into, install_module, is_instance, module_object, native_value, opaque_instance,
+    owner_of, set_type_text_signature, type_object, type_text_signature, NativeIter, Py,
 };
 pub use convert::{buffer_error, index, native_error};
 pub use lumen_bind::{ErrorKind, NativeError, NativeResult, This};
@@ -420,6 +421,11 @@ impl Host for PyHost {
     }
 
     #[inline]
+    fn is_true(v: &Value) -> bool {
+        matches!(v, Value::Bool(true))
+    }
+
+    #[inline]
     fn to_bool(cx: &PyCx<'_>, v: &Value, _: Slot) -> Result<bool, Obj> {
         match v {
             Value::Bool(b) => Ok(*b),
@@ -500,6 +506,15 @@ impl Host for PyHost {
                 // range is unaliased until the guard drops with `cx`.
                 return cx
                     .lend(unsafe { &*store }, None, true)
+                    .map(|p| unsafe { &mut *p });
+            }
+            if let Some((store, range)) = crate::builtins::memview::writable_part(cx.it(), v)? {
+                let s = cx.scratch();
+                s.stores.push(store);
+                let store: *const crate::object::ByteStore = &**s.stores.last().unwrap();
+                // SAFETY: as for arrays above.
+                return cx
+                    .lend(unsafe { &*store }, Some(range), true)
                     .map(|p| unsafe { &mut *p });
             }
         }

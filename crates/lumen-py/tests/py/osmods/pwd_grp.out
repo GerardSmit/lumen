@@ -1,0 +1,13 @@
+root 0 7 struct_passwd
+True
+True True
+True
+KeyError "getpwnam(): name not found: 'no-such-user-xyz'"
+KeyError 'getpwuid(): uid not found: 54321987'
+ValueError embedded null byte
+0 4 struct_group True
+True
+True
+KeyError "getgrnam(): name not found: 'no-such-group-xyz'"
+KeyError 'getgrgid(): gid not found: 54321987'
+TypeError

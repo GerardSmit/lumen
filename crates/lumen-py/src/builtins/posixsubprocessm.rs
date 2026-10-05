@@ -83,9 +83,7 @@ pub mod _posixsubprocess {
         uid: &Value,
         child_umask: i32,
         preexec_fn: &Value,
-        allow_vfork: bool,
     ) -> R<i32> {
-        let _ = allow_vfork;
         let Some(keep) = tuple_items(pass_fds) else {
             let n = it.type_name_of(pass_fds);
             return Err(it.type_error(&format!("fork_exec() argument 4 must be tuple, not {n}")));

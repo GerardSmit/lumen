@@ -1418,9 +1418,7 @@ function passwordHash(input, options) {
   } catch (error) {
     return Promise.reject(error);
   }
-  return new Promise((resolve, reject) => {
-    __password.hash(bytes, p.algorithm, p.memoryCost, p.timeCost, p.cost, resolve, reject);
-  });
+  return __password.hash(bytes, p.algorithm, p.memoryCost, p.timeCost, p.cost);
 }
 function passwordVerifySync(input, hash) {
   return __password.verifySync(toU8(input), String(hash));
@@ -1433,7 +1431,7 @@ function passwordVerify(input, hash) {
   } catch (error) {
     return Promise.reject(error);
   }
-  return new Promise((resolve, reject) => __password.verify(bytes, hash, resolve, reject));
+  return __password.verify(bytes, hash);
 }
 const password = {
   hash: passwordHash,

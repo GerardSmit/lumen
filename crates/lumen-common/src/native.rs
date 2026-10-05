@@ -22,6 +22,7 @@ use std::fmt;
 /// | `Memory`        | `MemoryError`       | `RangeError` |
 /// | `Os(errno)`     | `OSError` subclass  | `Error`      |
 /// | `NotImplemented`| `NotImplementedError` | `Error`    |
+/// | `Named(n)`      | `RuntimeError`      | the error class `n` (`SyntaxError`, `DataCloneError`, ...) |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     Type,
@@ -36,15 +37,63 @@ pub enum ErrorKind {
     /// An OS error with its `errno`.
     Os(i32),
     NotImplemented,
+    /// An error class a language knows by name (a JS `DOMException` / `Error` subtype such as
+    /// `SyntaxError` or `DataCloneError`); languages without it use their generic runtime error.
+    Named(&'static str),
 }
 
-/// A native error: a kind, a message, and an optional machine-readable code (Node's
-/// `err.code`, e.g. `ERR_OUT_OF_RANGE`; ignored by Python).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A neutral value: what a dynamically shaped native result or an error property holds. Every
+/// language maps it to its own value (`None` is JS `undefined` / Python `None`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub enum Data {
+    #[default]
+    None,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Bytes(Vec<u8>),
+    List(Vec<Data>),
+}
+
+macro_rules! data_from {
+    ($($t:ty => $v:ident $(as $c:ty)?),* $(,)?) => {$(
+        impl From<$t> for Data {
+            fn from(x: $t) -> Data {
+                Data::$v(x $(as $c)?)
+            }
+        }
+    )*};
+}
+data_from!(bool => Bool, i64 => Int, i32 => Int as i64, u32 => Int as i64, f64 => Float, String => Str, Vec<u8> => Bytes);
+
+impl From<&str> for Data {
+    fn from(s: &str) -> Data {
+        Data::Str(s.to_owned())
+    }
+}
+
+impl<T: Into<Data>> From<Option<T>> for Data {
+    fn from(o: Option<T>) -> Data {
+        o.map_or(Data::None, Into::into)
+    }
+}
+
+impl From<Vec<Data>> for Data {
+    fn from(v: Vec<Data>) -> Data {
+        Data::List(v)
+    }
+}
+
+/// A native error: a kind, a message, an optional machine-readable code (Node's `err.code`, e.g.
+/// `ERR_OUT_OF_RANGE`; ignored by Python) and further named properties (JS: own properties of
+/// the error object; Python: attributes of the exception), e.g. `errno`, `syscall`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct NativeError {
     pub kind: ErrorKind,
     pub message: Cow<'static, str>,
     pub code: Option<Cow<'static, str>>,
+    pub props: Vec<(Cow<'static, str>, Data)>,
 }
 
 macro_rules! ctors {
@@ -64,6 +113,7 @@ impl NativeError {
             kind,
             message: message.into(),
             code: None,
+            props: Vec::new(),
         }
     }
 
@@ -86,6 +136,21 @@ impl NativeError {
 
     pub fn with_code(mut self, code: impl Into<Cow<'static, str>>) -> NativeError {
         self.code = Some(code.into());
+        self
+    }
+
+    /// A named class of error (see [`ErrorKind::Named`]).
+    pub fn named(class: &'static str, message: impl Into<Cow<'static, str>>) -> NativeError {
+        NativeError::new(ErrorKind::Named(class), message)
+    }
+
+    /// Attach a property (`err.errno`, `err.syscall`, ...).
+    pub fn with_prop(
+        mut self,
+        name: impl Into<Cow<'static, str>>,
+        value: impl Into<Data>,
+    ) -> NativeError {
+        self.props.push((name.into(), value.into()));
         self
     }
 }
@@ -125,6 +190,7 @@ impl From<std::io::Error> for NativeError {
             kind: ErrorKind::Os(e.raw_os_error().unwrap_or(0)),
             message: e.to_string().into(),
             code: code.map(Cow::Borrowed),
+            props: Vec::new(),
         }
     }
 }

@@ -180,6 +180,34 @@ pub mod _heapq {
         Ok(top)
     }
 
+    /// Push item onto max heap, maintaining the heap invariant.
+    #[op]
+    fn heappush_max(it: &mut Interp, heap: &Value, item: &Value) -> R<()> {
+        let l = list(it, heap, "heappush_max")?;
+        l.borrow_mut().push(item.clone());
+        let n = l.borrow().len();
+        sift_down(it, l, 0, n - 1, true)
+    }
+
+    /// Maxheap variant of heappushpop.
+    #[op]
+    fn heappushpop_max(it: &mut Interp, heap: &Value, item: &Value) -> R<Value> {
+        let l = list(it, heap, "heappushpop_max")?;
+        let top = match l.borrow().first() {
+            Some(v) => v.clone(),
+            None => return Ok(item.clone()),
+        };
+        if !less(it, &top, item, true)? {
+            return Ok(item.clone());
+        }
+        if l.borrow().is_empty() {
+            return Err(it.new_exc_str("IndexError", "index out of range"));
+        }
+        let top = std::mem::replace(&mut l.borrow_mut()[0], item.clone());
+        sift_up(it, l, 0, true)?;
+        Ok(top)
+    }
+
     /// Transform list into a heap, in-place, in O(len(heap)) time.
     #[op]
     fn heapify(it: &mut Interp, heap: &Value) -> R<()> {
@@ -188,19 +216,19 @@ pub mod _heapq {
 
     /// Maxheap variant of heappop.
     #[op]
-    fn _heappop_max(it: &mut Interp, heap: &Value) -> R<Value> {
-        pop(it, heap, "_heappop_max", true)
+    fn heappop_max(it: &mut Interp, heap: &Value) -> R<Value> {
+        pop(it, heap, "heappop_max", true)
     }
 
     /// Maxheap variant of heapreplace.
     #[op]
-    fn _heapreplace_max(it: &mut Interp, heap: &Value, item: &Value) -> R<Value> {
-        replace(it, heap, item, "_heapreplace_max", true)
+    fn heapreplace_max(it: &mut Interp, heap: &Value, item: &Value) -> R<Value> {
+        replace(it, heap, item, "heapreplace_max", true)
     }
 
     /// Maxheap variant of heapify.
     #[op]
-    fn _heapify_max(it: &mut Interp, heap: &Value) -> R<()> {
-        heapify_with(it, heap, "_heapify_max", true)
+    fn heapify_max(it: &mut Interp, heap: &Value) -> R<()> {
+        heapify_with(it, heap, "heapify_max", true)
     }
 }

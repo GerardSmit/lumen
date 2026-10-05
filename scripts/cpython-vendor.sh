@@ -15,6 +15,7 @@ GIT=/usr/bin/git
 
 TAG="$($GIT -C "$SRC" describe --tags --exact-match HEAD)"
 COMMIT="$($GIT -C "$SRC" rev-parse HEAD)"
+DATE="$($GIT -C "$SRC" log -1 --format=%cs HEAD)"
 
 FILES=()
 while IFS= read -r line; do
@@ -39,6 +40,7 @@ cp "$SRC/LICENSE" "$DEST/LICENSE"
   echo
   echo "- Tag: \`$TAG\`"
   echo "- Commit: \`$COMMIT\`"
+  echo "- Commit date: $DATE"
   echo "- License: \`LICENSE\` (PSF)"
   echo
   echo "## Files"

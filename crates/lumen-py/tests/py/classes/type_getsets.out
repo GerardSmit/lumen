@@ -1,0 +1,23 @@
+__name__ getset_descriptor
+__qualname__ getset_descriptor
+__doc__ getset_descriptor
+__module__ getset_descriptor
+__bases__ getset_descriptor
+__abstractmethods__ getset_descriptor
+__dict__ getset_descriptor
+A
+B A
+cannot delete '__name__' attribute of immutable type 'B'
+can only assign string to B.__name__, not 'int'
+cannot set '__name__' attribute of immutable type 'int'
+__abstractmethods__
+frozenset()
+static doc class doc
+int str base
+2.9802322387695312e-08
+0 I 5 L [1, 2]
+1 I 5 L [1, 2]
+2 I 5 L [1, 2]
+3 I 5 L [1, 2]
+4 I 5 L [1, 2]
+5 I 5 L [1, 2]

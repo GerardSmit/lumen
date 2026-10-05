@@ -1110,7 +1110,7 @@ class TLSWrap {
   }
 
   getServername() { return this._op("servername"); }
-  getProtocol() { return this._op("protocol"); }
+  getProtocol() { return this._op("protocol") ?? null; }
   getALPNNegotiatedProtocol() { return alpnName(this._op("alpnSelected")); }
   isSessionReused() { return this._op("isSessionReused"); }
   getSession() {
@@ -1128,7 +1128,7 @@ class TLSWrap {
   }
   getCipher() {
     const cipher = this._op("cipher");
-    if (cipher === null) return undefined;
+    if (cipher === undefined) return undefined;
     return { name: cipher[0], standardName: cipher[1], version: cipher[2] };
   }
   getSharedSigalgs() {

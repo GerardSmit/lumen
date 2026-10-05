@@ -92,7 +92,10 @@ pub use format::{
 pub use store::{
     after_gc, gc_pressure, tracked_bytes, ByteStore, Bytes, BytesMut, Export, Lend, StoreSlot,
 };
-pub use view::{adjust_slice, c_strides, f_strides, shape_product, span_len, CastError, ViewDesc};
+pub use view::{
+    adjust_slice, adjust_slice_bounds, c_strides, f_strides, shape_product, span_len, CastError,
+    ViewDesc,
+};
 
 /// Why a buffer operation was refused; each language facade maps it to its own exception (see
 /// the table in the module docs).

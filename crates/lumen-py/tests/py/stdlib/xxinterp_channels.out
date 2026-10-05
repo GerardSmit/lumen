@@ -1,0 +1,10 @@
+ChannelID both
+b'abc' text 42 None
+empty
+dflt
+not shareable
+not shareable
+not shareable
+True False
+True
+failed <class 'ValueError'>: boom

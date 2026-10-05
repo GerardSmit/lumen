@@ -17,13 +17,27 @@ doctest = false
 name = "lumen-py"
 path = "src/main.rs"
 
+[features]
+# Embed every vendored stdlib module, ignoring `stdlib-exclude.txt`.
+py-stdlib-full = []
+# Keep comments in the embedded stdlib sources (they are stripped by default, so
+# `inspect.getsource` of a stdlib function omits them; line numbers are unchanged either way).
+py-stdlib-comments = []
+# Embed no stdlib: read it from a directory at run time (`LUMEN_PY_STDLIB`, or
+# `frozen::set_external_dir`).
+py-stdlib-external = []
+
 [lints]
 workspace = true
 
 [dependencies]
-lumen-common = { path = "../lumen-common", features = ["hash", "compress"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "compress", "lzma"] }
 lumen-os = { path = "../lumen-os" }
 lumen-bind = { path = "../lumen-bind" }
+lumen-tls = { path = "../lumen-tls" }
+
+[build-dependencies]
+lumen-common = { path = "../lumen-common", features = ["compress"] }
 
 [dev-dependencies]
 # Only for tests/dual_lang.rs: one `#[op]` bound into both engines.

@@ -28,19 +28,42 @@ fn native_global_callable_from_js() {
     assert_eq!(eval_str(&mut engine, "hostAdd.length"), "2");
 }
 
+struct Counter(u32);
+
+#[lumen_bind::module(name = "counterGlobals")]
+mod counter_globals {
+    use super::*;
+
+    #[op]
+    pub fn bump(ctx: &mut Ctx) -> f64 {
+        bump_state(ctx)
+    }
+}
+
+#[lumen_bind::module(name = "counterNs")]
+mod counter_ns {
+    use super::*;
+
+    #[op(name = "bumpToo")]
+    pub fn bump_too(ctx: &mut Ctx) -> f64 {
+        bump_state(ctx)
+    }
+}
+
+fn bump_state(ctx: &mut Ctx) -> f64 {
+    let c = ctx.host_mut::<Counter>().expect("state_init ran");
+    c.0 += 1;
+    c.0 as f64
+}
+
 #[test]
 fn extension_installs_state_globals_and_namespaces() {
-    struct Counter(u32);
-    fn bump(ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-        let c = ctx.host_mut::<Counter>().expect("state_init ran");
-        c.0 += 1;
-        Ok(Value::Num(c.0 as f64))
-    }
     static EXT: Extension = Extension {
         name: "counter",
-        modules: &[],
-        globals: ops!["bump" (0) => bump],
-        namespaces: &[("counterNs", ops!["bumpToo" (0) => bump])],
+        modules: &[
+            globals::<counter_globals::Module>,
+            namespace::<counter_ns::Module>,
+        ],
         state_init: Some(|state| state.put(Counter(0))),
         js_init: None,
         js_init_snapshot: None,

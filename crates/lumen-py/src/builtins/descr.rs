@@ -192,9 +192,22 @@ impl ProxyOf {
     }
 }
 
+// `__class_getitem__` of the core types PEP 585 makes subscriptable.
+#[lumen_bind::class(name = "generic", hint(py(shared)))]
+pub struct ClassGetitem;
+
+#[lumen_bind::methods]
+impl ClassGetitem {
+    /// See PEP 585
+    #[classmethod(name = "__class_getitem__", hint(py(text_signature = "")))]
+    fn class_getitem(cls: This<Value>, it: &mut Interp, item: &Value) -> Value {
+        it.make_alias(cls.0, item)
+    }
+}
+
 // ---- function, method, builtin_function_or_method and module ------------------------------------
 
-/// `__call__` of the callable core types.
+// `__call__` of the callable core types.
 #[lumen_bind::class(name = "callable", hint(py(shared)))]
 pub struct CallSlot;
 
@@ -213,13 +226,12 @@ impl CallSlot {
     // `meth_reduce`, `method_reduce` and `descr_reduce`: a bound method pickles as
     // `getattr(self, name)`, a method descriptor as `getattr(type, name)`, a module function as
     // its name.
-    #[method(name = "__reduce__")]
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
     fn reduce(slf: This<&Value>, it: &mut Interp) -> R<Value> {
         let bound_to = match &*slf {
             Value::Obj(o) => match &o.kind {
                 Kind::Method(_, this) => Some(this.clone()),
                 Kind::Native(NativeData {
-                    method: true,
                     owner: Some(NativeOwner::Class(c)),
                     ..
                 }) => Some(Value::Obj(c.clone())),
@@ -238,12 +250,13 @@ impl CallSlot {
     }
 }
 
+/// Create a bound instance method object.
 #[lumen_bind::class(name = "method")]
 pub struct MethodType;
 
 #[lumen_bind::methods]
 impl MethodType {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(function, instance, /)")))]
     fn new(it: &mut Interp, function: &Value, instance: &Value) -> R<Value> {
         if !it.is_callable(function) {
             return Err(it.type_error("first argument must be callable"));
@@ -275,12 +288,15 @@ impl<'a> lumen_bind::FromArg<'a, crate::bind::PyHost> for ModuleRef<'a> {
     }
 }
 
+/// Create a module object.
+///
+/// The name must be a string; the optional doc argument can have any type.
 #[lumen_bind::class(name = "module")]
 pub struct ModuleType;
 
 #[lumen_bind::methods]
 impl ModuleType {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(name, doc=None)")))]
     fn new(
         cls: This<Value>,
         it: &mut Interp,
@@ -334,7 +350,7 @@ impl ModuleType {
 
 // ---- getset / member descriptors ----------------------------------------------------------------
 
-/// The data descriptors of `function` that CPython exposes as getset/member descriptors.
+// The data descriptors of `function` that CPython exposes as getset/member descriptors.
 #[lumen_bind::class(name = "function")]
 pub struct FunctionType;
 
@@ -343,6 +359,14 @@ impl FunctionType {
     #[getter(name = "__code__")]
     fn code(slf: This<&Value>, it: &mut Interp) -> R<Value> {
         Ok(it.special_attr(&slf, "__code__")?.unwrap_or(Value::None))
+    }
+
+    #[setter(name = "__code__")]
+    fn set_code(slf: This<&Value>, it: &mut Interp, v: &Value) -> R<()> {
+        match &*slf {
+            Value::Obj(o) => it.set_function_code(o, v),
+            _ => Err(it.type_error("__code__ is only settable on functions")),
+        }
     }
 
     #[getter(name = "__globals__")]
@@ -356,7 +380,7 @@ impl FunctionType {
     }
 }
 
-/// `__repr__` of `getset_descriptor` and `member_descriptor`.
+// `__repr__` of `getset_descriptor` and `member_descriptor`.
 #[lumen_bind::class(name = "descriptor", hint(py(shared)))]
 pub struct DescriptorRepr;
 
@@ -368,7 +392,7 @@ impl DescriptorRepr {
         let name = it.str_of(&name)?;
         let owner = it.get_attr_str(&slf, "__objclass__")?;
         let owner = match &owner {
-            Value::Obj(o) => it.type_name(o),
+            Value::Obj(o) => it.type_display(o),
             _ => String::new(),
         };
         let is_member = matches!(&*slf, Value::Obj(o) if o.cls.as_ref().is_some_and(|c| it.type_name(c) == "member_descriptor"));
@@ -384,21 +408,47 @@ pub fn init(it: &mut Interp) {
     let method_ty = it.types.method.clone();
     extend_type::<MethodType>(it, &method_ty);
     for ty in [
+        it.types.list.clone(),
+        it.types.tuple.clone(),
+        it.types.dict.clone(),
+        it.types.set.clone(),
+        it.types.frozenset.clone(),
+        it.types.generator.clone(),
+        it.types.coroutine.clone(),
+        it.types.async_generator.clone(),
+    ] {
+        install_into::<ClassGetitem>(&ty, &["__class_getitem__"]);
+    }
+    let native_descr = [
+        it.types.method_descriptor.clone(),
+        it.types.wrapper_descriptor.clone(),
+        it.types.classmethod_descriptor.clone(),
+        it.types.method_wrapper.clone(),
+    ];
+    for ty in [
         it.types.function.clone(),
         it.types.method.clone(),
         it.types.builtin_function.clone(),
-    ] {
-        install_into::<CallSlot>(&ty, &["__call__"]);
+    ]
+    .iter()
+    .chain(&native_descr)
+    {
+        install_into::<CallSlot>(ty, &["__call__"]);
     }
-    for ty in [it.types.method.clone(), it.types.builtin_function.clone()] {
-        install_into::<CallSlot>(&ty, &["__reduce__"]);
+    for ty in [it.types.method.clone(), it.types.builtin_function.clone()]
+        .iter()
+        .chain(&native_descr)
+    {
+        install_into::<CallSlot>(ty, &["__reduce__"]);
+    }
+    for ty in &native_descr[..3] {
+        super::objectm::install_descr_methods_get(ty);
     }
     super::memview::init(it);
     let getset = new_type(it, "builtins", "getset_descriptor", None, Layout::Other);
     let member = new_type(it, "builtins", "member_descriptor", None, Layout::Other);
     for ty in [&getset, &member] {
-        it.reg(ty, "__get__", super::objectm::prop_get);
-        it.reg(ty, "__set__", super::objectm::prop_set);
+        super::objectm::install_descr_methods(ty);
         install_into::<DescriptorRepr>(ty, &["__repr__"]);
     }
     *it.native_state::<DescrTypes>() = DescrTypes {
@@ -407,10 +457,7 @@ pub fn init(it: &mut Interp) {
     };
     let func = it.types.function.clone();
     install_getsets::<FunctionType>(it, &func, &["__globals__", "__closure__"]);
-    let type_ = it.types.type_.clone();
-    for (name, get, set) in super::objectm::TYPE_GETSETS {
-        add_getset(it, &type_, name, *get, *set, false);
-    }
+    super::objectm::install_getset_descriptors(it);
 }
 
 #[derive(Default)]
@@ -419,38 +466,80 @@ struct DescrTypes {
     member: Option<Obj>,
 }
 
-/// Installs the getters `T` declares into the builtin class `owner` as CPython's
-/// `getset_descriptor`s (`member_descriptor`s for the names in `members`).
+/// Installs the getters (with their setters) `T` declares into the builtin class `owner` as
+/// CPython's `getset_descriptor`s (`member_descriptor`s for the names in `members`).
 pub fn install_getsets<T: lumen_bind::Methods<crate::bind::PyHost>>(
     it: &mut Interp,
     owner: &Obj,
     members: &[&str],
 ) {
+    use crate::bind::args::py_name;
+    use lumen_bind::Role;
     let mut items = Vec::new();
     T::members(&mut items);
     for item in &items {
-        if item.desc.role != lumen_bind::Role::Getter {
+        if item.desc.role != Role::Getter {
             continue;
         }
-        let name = crate::bind::args::py_name(item.desc);
+        let name = py_name(item.desc);
         let fget = crate::bind::native_value(item);
-        put_descriptor(it, owner, name, fget, Value::None, members.contains(&name));
+        let setter = items
+            .iter()
+            .find(|s| s.desc.role == Role::Setter && py_name(s.desc) == name);
+        let fset = setter.map_or(Value::None, crate::bind::native_value);
+        let doc = item.desc.doc.map_or(Value::None, Value::str);
+        put_descriptor(it, owner, name, fget, fset, doc, members.contains(&name));
     }
 }
 
-/// Puts a native attribute on a builtin class as CPython's `getset_descriptor` (or
-/// `member_descriptor`) that names its owner.
-pub fn add_getset(
-    it: &mut Interp,
-    owner: &Obj,
-    name: &'static str,
-    get: NativeFn,
-    set: Option<NativeFn>,
-    member: bool,
-) {
-    let fget = it.new_native(name, get, false);
-    let fset = set.map_or(Value::None, |f| it.new_native(name, f, false));
-    put_descriptor(it, owner, name, fget, fset, member);
+/// Installs `fget` into the builtin class `owner` as the read-only `member_descriptor` `name` (a
+/// plain property while the descriptor types do not exist yet).
+pub fn install_member(it: &mut Interp, owner: &Obj, name: &'static str, fget: Value) {
+    if it.native_state::<DescrTypes>().member.is_none() {
+        let p = Value::Obj(Object::new(Kind::Property(PropData {
+            fget,
+            fset: Value::None,
+            fdel: Value::None,
+            doc: Value::None,
+            name: Default::default(),
+        })));
+        if let Some(d) = owner.dict.borrow().as_ref() {
+            dict_set_str(d, name, p);
+        }
+        return;
+    }
+    put_descriptor(it, owner, name, fget, Value::None, Value::None, true);
+}
+
+/// Gives the getset descriptors `name` of the builtin class `owner` the deleter `f` (CPython's
+/// setters double as deleters; ours are separate natives).
+pub fn install_deleters(it: &mut Interp, owner: &Obj, deleters: &[(&'static str, NativeFn)]) {
+    let Some(od) = owner.dict.borrow().clone() else {
+        return;
+    };
+    for &(name, f) in deleters {
+        let Some(Value::Obj(old)) = dict_get_str(&od, name) else {
+            continue;
+        };
+        let Kind::Property(p) = &old.kind else {
+            continue;
+        };
+        let fdel = it.new_native(name, f, false);
+        let cls = old.cls.clone().unwrap_or_else(|| it.types.property.clone());
+        let new = Object::with_cls(
+            cls,
+            Kind::Property(PropData {
+                fget: p.fget.clone(),
+                fset: p.fset.clone(),
+                fdel,
+                doc: p.doc.clone(),
+                name: p.name.clone(),
+            }),
+        );
+        let dict = old.dict.borrow().clone();
+        *new.dict.borrow_mut() = dict;
+        dict_set_str(&od, name, Value::Obj(new));
+    }
 }
 
 fn put_descriptor(
@@ -459,6 +548,7 @@ fn put_descriptor(
     name: &'static str,
     fget: Value,
     fset: Value,
+    doc: Value,
     member: bool,
 ) {
     let types = it.native_state::<DescrTypes>();
@@ -475,7 +565,8 @@ fn put_descriptor(
             fget,
             fset,
             fdel: Value::None,
-            doc: Value::None,
+            doc,
+            name: Default::default(),
         }),
     );
     let d = it.instance_dict(&p);

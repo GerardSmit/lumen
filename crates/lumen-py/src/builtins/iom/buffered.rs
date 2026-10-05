@@ -19,6 +19,7 @@ pub struct Buffered {
     raw: Option<Value>,
     ok: bool,
     detached: bool,
+    finalizing: bool,
     readable: bool,
     writable: bool,
     buffer_size: usize,
@@ -69,15 +70,23 @@ impl Drop for Buffered {
     }
 }
 
-/// A buffered reader for a readable, sequential raw stream.
+/// Create a new buffered reader using the given readable raw IO object.
 #[lumen_bind::class(module = "_io", name = "BufferedReader")]
 pub struct BufferedReader(Buffered);
 
-/// A buffer for a writeable sequential raw stream.
+/// A buffer for a writeable sequential RawIO object.
+///
+/// The constructor creates a BufferedWriter for the given writeable raw
+/// stream. If the buffer_size is not given, it defaults to
+/// DEFAULT_BUFFER_SIZE.
 #[lumen_bind::class(module = "_io", name = "BufferedWriter")]
 pub struct BufferedWriter(Buffered);
 
 /// A buffered interface to random access streams.
+///
+/// The constructor creates a reader and writer for a seekable stream,
+/// raw, given in the first argument. If the buffer_size is omitted it
+/// defaults to DEFAULT_BUFFER_SIZE.
 #[lumen_bind::class(module = "_io", name = "BufferedRandom")]
 pub struct BufferedRandom(Buffered);
 
@@ -139,7 +148,7 @@ fn check_closed(it: &mut Interp, v: &Value, msg: &str) -> R<Value> {
 fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
     if let Some((fd, true, _)) = native_fd(it, raw) {
         let mut buf = vec![0u8; n];
-        return match read_fd(it, fd, &mut buf) {
+        return match read_fd(it, fd, &mut buf)? {
             Ok(k) => {
                 buf.truncate(k);
                 Ok(Some(buf))
@@ -171,7 +180,7 @@ fn raw_read(it: &mut Interp, raw: &Value, n: usize) -> R<Option<Vec<u8>>> {
 /// One raw write; `None` when it would block.
 fn raw_write(it: &mut Interp, raw: &Value, data: &[u8]) -> R<Option<usize>> {
     if let Some((fd, _, true)) = native_fd(it, raw) {
-        return match it.fd_write(fd, data) {
+        return match it.fd_write(fd, data)? {
             Ok(n) => Ok(Some(n)),
             Err(e) if is_eagain(&e) => Ok(None),
             Err(e) => Err(it.os_error_io(&e, None)),
@@ -683,6 +692,9 @@ fn close(it: &mut Interp, v: &Value) -> R<()> {
     if raw_closed(it, &raw)? {
         return Ok(());
     }
+    if with_b(it, v, |b| b.finalizing)? {
+        super::dealloc_warn(it, &raw, v);
+    }
     let r = it.call_method(v, "flush", Vec::new());
     let c = it.call_method(&raw, "close", Vec::new());
     with_b(it, v, Buffered::reset_read)?;
@@ -825,7 +837,7 @@ pub fn flush_native(it: &mut Interp, v: &Value) -> R<()> {
 
 #[lumen_bind::methods]
 impl BufferedReader {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(raw, buffer_size=DEFAULT_BUFFER_SIZE)")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BufferedReader {
         let _ = (args, kwargs);
         BufferedReader(Buffered::default())
@@ -837,12 +849,13 @@ impl BufferedReader {
         it: &mut Interp,
         #[kw] raw: &Value,
         #[kw]
-        #[default(8192)]
+        #[default(131072)]
         buffer_size: i64,
     ) -> R<()> {
         init(it, slf.0.value(), Mode::Reader, raw, buffer_size)
     }
 
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         read(it, slf.0.value(), size)
     }
@@ -864,6 +877,7 @@ impl BufferedReader {
         readinto(it, slf.0.value(), buffer, true)
     }
 
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn readline(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Vec<u8>> {
         let n = size_arg(it, size)?;
         readline(it, slf.0.value(), n)
@@ -892,6 +906,25 @@ impl BufferedReader {
 
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         close(it, slf.0.value())
+    }
+
+    #[getter]
+    fn _finalizing(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+        with_b(it, slf.0.value(), |b| b.finalizing)
+    }
+
+    #[setter(name = "_finalizing")]
+    fn set_finalizing(slf: This<Py<Self>>, it: &mut Interp, v: bool) -> R<()> {
+        with_b(it, slf.0.value(), |b| b.finalizing = v)
+    }
+
+    fn _dealloc_warn(slf: This<Py<Self>>, it: &mut Interp, source: &Value) -> R<()> {
+        let ok = with_b(it, slf.0.value(), |b| b.ok)?;
+        if ok {
+            let raw = raw_of(it, slf.0.value())?;
+            super::dealloc_warn(it, &raw, source);
+        }
+        Ok(())
     }
 
     fn detach(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
@@ -951,7 +984,7 @@ impl BufferedReader {
 
 #[lumen_bind::methods]
 impl BufferedWriter {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(raw, buffer_size=DEFAULT_BUFFER_SIZE)")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BufferedWriter {
         let _ = (args, kwargs);
         BufferedWriter(Buffered::default())
@@ -963,7 +996,7 @@ impl BufferedWriter {
         it: &mut Interp,
         #[kw] raw: &Value,
         #[kw]
-        #[default(8192)]
+        #[default(131072)]
         buffer_size: i64,
     ) -> R<()> {
         init(it, slf.0.value(), Mode::Writer, raw, buffer_size)
@@ -996,6 +1029,25 @@ impl BufferedWriter {
 
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         close(it, slf.0.value())
+    }
+
+    #[getter]
+    fn _finalizing(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+        with_b(it, slf.0.value(), |b| b.finalizing)
+    }
+
+    #[setter(name = "_finalizing")]
+    fn set_finalizing(slf: This<Py<Self>>, it: &mut Interp, v: bool) -> R<()> {
+        with_b(it, slf.0.value(), |b| b.finalizing = v)
+    }
+
+    fn _dealloc_warn(slf: This<Py<Self>>, it: &mut Interp, source: &Value) -> R<()> {
+        let ok = with_b(it, slf.0.value(), |b| b.ok)?;
+        if ok {
+            let raw = raw_of(it, slf.0.value())?;
+            super::dealloc_warn(it, &raw, source);
+        }
+        Ok(())
     }
 
     fn detach(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
@@ -1050,7 +1102,7 @@ impl BufferedWriter {
 
 #[lumen_bind::methods]
 impl BufferedRandom {
-    #[constructor]
+    #[constructor(hint(py(text_signature = "(raw, buffer_size=DEFAULT_BUFFER_SIZE)")))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BufferedRandom {
         let _ = (args, kwargs);
         BufferedRandom(Buffered::default())
@@ -1062,12 +1114,13 @@ impl BufferedRandom {
         it: &mut Interp,
         #[kw] raw: &Value,
         #[kw]
-        #[default(8192)]
+        #[default(131072)]
         buffer_size: i64,
     ) -> R<()> {
         init(it, slf.0.value(), Mode::Random, raw, buffer_size)
     }
 
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         read(it, slf.0.value(), size)
     }
@@ -1089,6 +1142,7 @@ impl BufferedRandom {
         readinto(it, slf.0.value(), buffer, true)
     }
 
+    #[method(hint(py(text_signature = "($self, size=-1, /)")))]
     fn readline(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Vec<u8>> {
         let n = size_arg(it, size)?;
         readline(it, slf.0.value(), n)
@@ -1121,6 +1175,25 @@ impl BufferedRandom {
 
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         close(it, slf.0.value())
+    }
+
+    #[getter]
+    fn _finalizing(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
+        with_b(it, slf.0.value(), |b| b.finalizing)
+    }
+
+    #[setter(name = "_finalizing")]
+    fn set_finalizing(slf: This<Py<Self>>, it: &mut Interp, v: bool) -> R<()> {
+        with_b(it, slf.0.value(), |b| b.finalizing = v)
+    }
+
+    fn _dealloc_warn(slf: This<Py<Self>>, it: &mut Interp, source: &Value) -> R<()> {
+        let ok = with_b(it, slf.0.value(), |b| b.ok)?;
+        if ok {
+            let raw = raw_of(it, slf.0.value())?;
+            super::dealloc_warn(it, &raw, source);
+        }
+        Ok(())
     }
 
     fn detach(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
@@ -1183,6 +1256,14 @@ impl BufferedRandom {
 }
 
 /// A buffered reader and writer object together.
+///
+/// A buffered reader object and buffered writer object put together to
+/// form a sequential IO object that can read and write. This is typically
+/// used with a socket or two-way pipe.
+///
+/// reader and writer are RawIOBase objects that are readable and
+/// writeable respectively. If the buffer_size is omitted it defaults to
+/// DEFAULT_BUFFER_SIZE.
 #[lumen_bind::class(module = "_io", name = "BufferedRWPair")]
 pub struct BufferedRWPair {
     reader: Option<Value>,
@@ -1213,7 +1294,9 @@ fn forward(
 
 #[lumen_bind::methods]
 impl BufferedRWPair {
-    #[constructor]
+    #[constructor(hint(py(
+        text_signature = "(reader, writer, buffer_size=DEFAULT_BUFFER_SIZE, /)"
+    )))]
     fn new(#[varargs] args: &[Value], #[varkw] kwargs: KwArgs) -> BufferedRWPair {
         let _ = (args, kwargs);
         BufferedRWPair {
@@ -1228,7 +1311,7 @@ impl BufferedRWPair {
         it: &mut Interp,
         reader: &Value,
         writer: &Value,
-        #[default(8192)] buffer_size: i64,
+        #[default(131072)] buffer_size: i64,
     ) -> R<()> {
         check_raw(it, reader, "readable", "File or stream is not readable.")?;
         check_raw(it, writer, "writable", "File or stream is not writable.")?;
@@ -1247,43 +1330,53 @@ impl BufferedRWPair {
         Ok(())
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn read(slf: This<Py<Self>>, it: &mut Interp, size: Option<&Value>) -> R<Value> {
         let a = size.cloned().unwrap_or(Value::None);
         forward(it, &slf.0, false, "read", vec![a])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn peek(slf: This<Py<Self>>, it: &mut Interp, #[default(0)] size: i64) -> R<Value> {
         forward(it, &slf.0, false, "peek", vec![Value::Int(size)])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn read1(slf: This<Py<Self>>, it: &mut Interp, #[default(-1)] size: i64) -> R<Value> {
         forward(it, &slf.0, false, "read1", vec![Value::Int(size)])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn readinto(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, false, "readinto", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn readinto1(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, false, "readinto1", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "")))]
     fn write(slf: This<Py<Self>>, it: &mut Interp, buffer: &Value) -> R<Value> {
         forward(it, &slf.0, true, "write", vec![buffer.clone()])
     }
 
+    #[method(hint(py(text_signature = "($self, /)")))]
     fn flush(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, true, "flush", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "($self, /)")))]
     fn readable(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, false, "readable", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "($self, /)")))]
     fn writable(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         forward(it, &slf.0, true, "writable", Vec::new())
     }
 
+    #[method(hint(py(text_signature = "($self, /)")))]
     fn close(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         let w = forward(it, &slf.0, true, "close", Vec::new());
         let r = forward(it, &slf.0, false, "close", Vec::new());
@@ -1297,6 +1390,7 @@ impl BufferedRWPair {
         }
     }
 
+    #[method(hint(py(text_signature = "($self, /)")))]
     fn isatty(slf: This<Py<Self>>, it: &mut Interp) -> R<bool> {
         let w = forward(it, &slf.0, true, "isatty", Vec::new())?;
         if it.truthy(&w)? {

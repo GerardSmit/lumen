@@ -4,7 +4,8 @@
 
 use cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use der::{Decode, Encode};
-use lumen_common::codec::{self, Padding};
+use lumen_common::codec;
+use lumen_common::pem::{self, PemBlock};
 
 use super::asn1::{self, Reader};
 use super::model::{self, AsymKey, EcKey};
@@ -24,74 +25,6 @@ pub const ENC_SEC1: u32 = 3;
 
 /// The largest passphrase OpenSSL's PEM password callback accepts.
 const MAX_PASSPHRASE: usize = 1024;
-
-/// One `-----BEGIN label-----` block: its RFC 1421 headers and decoded body.
-pub struct PemBlock {
-    pub label: String,
-    pub headers: Vec<(String, String)>,
-    pub data: Vec<u8>,
-}
-
-/// Every well-formed PEM block in `text`, in order (text outside blocks is skipped, as OpenSSL does).
-pub fn pem_blocks(text: &[u8]) -> Vec<PemBlock> {
-    let text = String::from_utf8_lossy(text);
-    let mut out = Vec::new();
-    let mut rest: &str = &text;
-    while let Some(start) = rest.find("-----BEGIN ") {
-        let after = &rest[start + 11..];
-        let Some(label_end) = after.find("-----") else {
-            break;
-        };
-        let label = after[..label_end].to_string();
-        let body_start = &after[label_end + 5..];
-        let end_marker = format!("-----END {label}-----");
-        let Some(end) = body_start.find(&end_marker) else {
-            rest = body_start;
-            continue;
-        };
-        let body = &body_start[..end];
-        rest = &body_start[end + end_marker.len()..];
-        let mut headers = Vec::new();
-        let mut b64 = String::new();
-        for line in body.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some((k, v)) = line.split_once(':') {
-                headers.push((k.trim().to_string(), v.trim().to_string()));
-                continue;
-            }
-            b64.push_str(line);
-        }
-        if let Ok(data) = codec::base64_decode_strict(b64.as_bytes(), false, Padding::Required) {
-            out.push(PemBlock {
-                label,
-                headers,
-                data,
-            });
-        }
-    }
-    out
-}
-
-/// PEM text with 64-column base64 lines.
-pub fn pem_encode(label: &str, headers: &[(&str, String)], data: &[u8]) -> String {
-    let b64 = codec::base64_encode(data, false, true);
-    let mut out = format!("-----BEGIN {label}-----\n");
-    for (k, v) in headers {
-        out.push_str(&format!("{k}: {v}\n"));
-    }
-    if !headers.is_empty() {
-        out.push('\n');
-    }
-    for chunk in b64.as_bytes().chunks(64) {
-        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
-        out.push('\n');
-    }
-    out.push_str(&format!("-----END {label}-----\n"));
-    out
-}
 
 /// A CBC cipher usable for key encryption, by OpenSSL name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -345,7 +278,7 @@ pub fn import_private(
     passphrase: Option<&[u8]>,
 ) -> KResult<AsymKey> {
     if format == FORMAT_PEM {
-        let blocks = pem_blocks(data);
+        let blocks = pem::well_formed(data);
         let block = blocks
             .iter()
             .find(|b| PRIVATE_LABELS.contains(&b.label.as_str()))
@@ -383,7 +316,7 @@ pub fn import_public(
     passphrase: Option<&[u8]>,
 ) -> KResult<AsymKey> {
     if format == FORMAT_PEM {
-        let blocks = pem_blocks(data);
+        let blocks = pem::well_formed(data);
         if let Some(b) = blocks.iter().find(|b| b.label == "PUBLIC KEY") {
             return AsymKey::from_spki_der(&b.data);
         }
@@ -424,7 +357,7 @@ impl Exported {
 
 fn wrap(format: u32, label: &str, der: Vec<u8>) -> Exported {
     if format == FORMAT_PEM {
-        Exported::Pem(pem_encode(label, &[], &der))
+        Exported::Pem(pem::encode(label, &[], &der))
     } else {
         Exported::Der(der)
     }
@@ -456,7 +389,7 @@ fn legacy_pem(
     pass: Option<&[u8]>,
 ) -> KResult<Exported> {
     let Some(cipher) = cipher else {
-        return Ok(Exported::Pem(pem_encode(label, &[], der)));
+        return Ok(Exported::Pem(pem::encode(label, &[], der)));
     };
     let pass = check_passphrase(pass)?;
     let iv = random(cipher.iv_len());
@@ -469,7 +402,7 @@ fn legacy_pem(
             format!("{},{}", cipher.pem_name(), codec::hex_encode_upper(&iv)),
         ),
     ];
-    Ok(Exported::Pem(pem_encode(label, &headers, &body)))
+    Ok(Exported::Pem(pem::encode(label, &headers, &body)))
 }
 
 /// `WritePrivateKey`: `enc` is `ENC_PKCS1` (RSA), `ENC_PKCS8` or `ENC_SEC1` (EC).

@@ -35,7 +35,8 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::rc::Rc;
 
-use lumen_host::{Ctx, NativeClosure, Value};
+use lumen_bind::NativeError;
+use lumen_host::{Ctx, NativeClosure, OpError, Value};
 
 use crate::dylib::DynLib;
 
@@ -341,26 +342,30 @@ fn decode_slot(handle: *mut c_void) -> Option<usize> {
     }
 }
 
-/// `__node.loadNativeAddon(path)` — dlopen a `.node` addon, run its N-API registration, and
-/// return the exports object.
-pub fn op_load_addon(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let args = args.to_vec();
-    ctx.on_driver(move |ctx| load_addon_on_driver(ctx, &args))
+pub(crate) use bindings::Module;
+
+#[lumen_bind::module(name = "__node")]
+mod bindings {
+    use super::*;
+
+    /// `__node.loadNativeAddon(path)` - dlopen a `.node` addon, run its N-API registration, and
+    /// return the exports object.
+    #[op(coerce, name = "loadNativeAddon")]
+    fn load_native_addon(ctx: &mut Ctx, path: String) -> Result<Value, OpError> {
+        ctx.on_driver(move |ctx| load_addon_on_driver(ctx, &path).map_err(|e| e.to_value(ctx)))
+            .map_err(OpError::from)
+    }
 }
-fn load_addon_on_driver(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
+
+fn load_addon_on_driver(ctx: &mut Ctx, path: &str) -> Result<Value, OpError> {
     keep_napi_exports();
 
-    let path = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-
-    let lib = DynLib::open(&path)
-        .map_err(|e| ctx.make_error("Error", format!("cannot load native addon '{path}': {e}")))?;
+    let lib = DynLib::open(path)
+        .map_err(|e| NativeError::runtime(format!("cannot load native addon '{path}': {e}")))?;
     let sym = lib.symbol("napi_register_module_v1").ok_or_else(|| {
-        ctx.make_error(
-            "Error",
-            format!("'{path}' is not an N-API addon (no napi_register_module_v1)"),
-        )
+        NativeError::runtime(format!(
+            "'{path}' is not an N-API addon (no napi_register_module_v1)"
+        ))
     })?;
 
     type Register = unsafe extern "C" fn(napi_env, napi_value) -> napi_value;
@@ -386,7 +391,7 @@ fn load_addon_on_driver(ctx: &mut Ctx, args: &[Value]) -> Result<Value, Value> {
     ctx.host_mut::<AddonRegistry>().unwrap().libs.push(lib);
 
     match pending {
-        Some(err) => Err(err),
+        Some(err) => Err(err.into()),
         None => Ok(result),
     }
 }

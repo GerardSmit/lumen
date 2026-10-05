@@ -1,0 +1,7 @@
+('comp', 'from_inner', 'loop', 'rest', 'x', 'y')
+('nested_only',)
+6 7
+() 36
+43 50
+True True
+['__module__', '__firstlineno__', '__init__', '__static_attributes__', '__doc__']

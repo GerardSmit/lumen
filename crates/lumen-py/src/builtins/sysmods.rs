@@ -33,21 +33,7 @@ pub fn make_builtins(it: &mut Interp) -> Obj {
 #[lumen_bind::module(name = "gc")]
 pub mod gc {
     use super::*;
-
-    /// The collector's settings (reference counting frees everything; nothing else to tune).
-    struct GcState {
-        debug: i64,
-        threshold: (i64, i64, i64),
-    }
-
-    impl Default for GcState {
-        fn default() -> GcState {
-            GcState {
-                debug: 0,
-                threshold: (700, 10, 10),
-            }
-        }
-    }
+    use crate::gc::GcState;
 
     #[constant(name = "DEBUG_STATS")]
     const DEBUG_STATS: i64 = 1;
@@ -60,11 +46,11 @@ pub mod gc {
     #[constant(name = "DEBUG_LEAK")]
     const DEBUG_LEAK: i64 = 38;
 
-    fn generation(it: &mut Interp, g: i64) -> R<()> {
+    fn generation(it: &mut Interp, g: i64) -> R<usize> {
         if !(0..3).contains(&g) {
             return Err(it.value_error("invalid generation"));
         }
-        Ok(())
+        Ok(g as usize)
     }
 
     /// Run the garbage collector.
@@ -81,39 +67,40 @@ pub mod gc {
         #[default(2)]
         generation: i64,
     ) -> R<i64> {
-        self::generation(it, generation)?;
-        it.run_weak_callbacks();
-        Ok(0)
+        let g = self::generation(it, generation)?;
+        Ok(it.gc_collect_checked(g) as i64)
     }
 
     /// Enable automatic garbage collection.
     #[op]
-    fn enable(it: &mut Interp) {
-        it.gc_enabled = true;
+    fn enable() {
+        crate::gc::set_enabled(true);
     }
 
     /// Disable automatic garbage collection.
     #[op]
-    fn disable(it: &mut Interp) {
-        it.gc_enabled = false;
+    fn disable() {
+        crate::gc::set_enabled(false);
     }
 
     /// Returns true if automatic garbage collection is enabled.
     #[op]
-    fn isenabled(it: &mut Interp) -> bool {
-        it.gc_enabled
+    fn isenabled() -> bool {
+        crate::gc::enabled()
     }
 
     /// Return a three-tuple of the current collection counts.
     #[op]
     fn get_count() -> (i64, i64, i64) {
-        (0, 0, 0)
+        let c = crate::gc::counts();
+        (c[0] as i64, c[1] as i64, c[2] as i64)
     }
 
     /// Return the current collection thresholds.
     #[op]
-    fn get_threshold(it: &mut Interp) -> (i64, i64, i64) {
-        it.native_state::<GcState>().threshold
+    fn get_threshold() -> (i64, i64, i64) {
+        let t = crate::gc::thresholds();
+        (t[0] as i64, t[1] as i64, t[2] as i64)
     }
 
     /// set_threshold(threshold0, [threshold1, threshold2]) -> None
@@ -123,19 +110,16 @@ pub mod gc {
     ///
     #[op(hint(py(arg_style = "parse", text_signature = "")))]
     fn set_threshold(
-        it: &mut Interp,
         threshold0: i32,
         threshold1: lumen_bind::Passed<i32>,
         threshold2: lumen_bind::Passed<i32>,
     ) {
-        let st = it.native_state::<GcState>();
-        st.threshold.0 = threshold0 as i64;
-        if let Some(t) = threshold1.0 {
-            st.threshold.1 = t as i64;
-        }
-        if let Some(t) = threshold2.0 {
-            st.threshold.2 = t as i64;
-        }
+        let t = |v: i32| v.max(0) as usize;
+        crate::gc::set_thresholds([
+            Some(t(threshold0)),
+            threshold1.0.map(t),
+            threshold2.0.map(t),
+        ]);
     }
 
     /// Set the garbage collection debugging flags.
@@ -152,13 +136,13 @@ pub mod gc {
     /// Debugging information is written to sys.stderr.
     #[op]
     fn set_debug(it: &mut Interp, flags: i32) {
-        it.native_state::<GcState>().debug = flags as i64;
+        it.native_state::<GcState>().debug = flags as u32;
     }
 
     /// Get the garbage collection debugging flags.
     #[op]
     fn get_debug(it: &mut Interp) -> i64 {
-        it.native_state::<GcState>().debug
+        it.native_state::<GcState>().debug as i64
     }
 
     /// Freeze all current tracked objects and ignore them for future collections.
@@ -167,18 +151,22 @@ pub mod gc {
     /// Note: collection before a POSIX fork() call may free pages for future allocation
     /// which can cause copy-on-write.
     #[op]
-    fn freeze() {}
+    fn freeze() {
+        crate::gc::freeze();
+    }
 
     /// Unfreeze all objects in the permanent generation.
     ///
     /// Put all objects in the permanent generation back into oldest generation.
     #[op]
-    fn unfreeze() {}
+    fn unfreeze() {
+        crate::gc::unfreeze();
+    }
 
     /// Return the number of objects in the permanent generation.
     #[op]
     fn get_freeze_count() -> i64 {
-        0
+        crate::gc::generation_sizes().1 as i64
     }
 
     /// Return a list of objects tracked by the collector (excluding the list returned).
@@ -190,40 +178,54 @@ pub mod gc {
     /// that are in that generation.
     #[op]
     fn get_objects(it: &mut Interp, #[kw] generation: Option<i64>) -> R<Vec<Value>> {
-        match generation {
-            Some(g) if g >= 3 => Err(it.value_error(
+        let g = match generation {
+            Some(g) if g >= 3 => return Err(it.value_error(
                 "generation parameter must be less than the number of available generations (3)",
             )),
-            Some(g) if g < 0 => Err(it.value_error("generation parameter cannot be negative")),
-            _ => Ok(Vec::new()),
-        }
+            Some(g) if g < 0 => {
+                return Err(it.value_error("generation parameter cannot be negative"));
+            }
+            Some(g) => Some(g as usize),
+            None => None,
+        };
+        Ok(crate::gc::objects(g).into_iter().map(Value::Obj).collect())
     }
 
     /// get_referrers(*objs) -> list
     /// Return the list of objects that directly refer to any of objs.
     #[op(hint(py(text_signature = "")))]
     fn get_referrers(#[varargs] objs: &[Value]) -> Vec<Value> {
-        let _ = objs;
-        Vec::new()
+        crate::gc::referrers(objs)
+            .into_iter()
+            .map(Value::Obj)
+            .collect()
     }
 
     /// get_referents(*objs) -> list
     /// Return the list of objects that are directly referred to by objs.
     #[op(hint(py(text_signature = "")))]
     fn get_referents(#[varargs] objs: &[Value]) -> Vec<Value> {
-        let _ = objs;
-        Vec::new()
+        let mut out = Vec::new();
+        for v in objs {
+            if let Value::Obj(o) = v {
+                if o.gc.idx.get() != 0 {
+                    out.extend(crate::gc_traverse::referents(o).into_iter().map(Value::Obj));
+                }
+            }
+        }
+        out
     }
 
     /// Return a list of dictionaries containing per-generation statistics.
     #[op]
     fn get_stats(it: &mut Interp) -> Vec<Value> {
-        (0..3)
-            .map(|_| {
+        crate::gc::stats()
+            .iter()
+            .map(|s| {
                 let d = it.new_dict();
-                for k in ["collections", "collected", "uncollectable"] {
-                    dict_set_str(&d, k, Value::Int(0));
-                }
+                dict_set_str(&d, "collections", Value::Int(s.collections as i64));
+                dict_set_str(&d, "collected", Value::Int(s.collected as i64));
+                dict_set_str(&d, "uncollectable", Value::Int(s.uncollectable as i64));
                 Value::Obj(d)
             })
             .collect()
@@ -234,23 +236,26 @@ pub mod gc {
     /// Simple atomic objects will return false.
     #[op]
     fn is_tracked(obj: &Value) -> bool {
-        let _ = obj;
-        false
+        matches!(obj, Value::Obj(o) if crate::gc::is_tracked(o))
     }
 
     /// Returns true if the object has been already finalized by the GC.
     #[op]
     fn is_finalized(obj: &Value) -> bool {
-        let _ = obj;
-        false
+        matches!(obj, Value::Obj(o) if crate::gc::is_finalized(o))
     }
 
     #[init]
     fn init(it: &mut Interp, m: &Value) {
         let Value::Obj(m) = m else { return };
         let d = it.module_dict(m);
-        dict_set_str(&d, "garbage", Value::list(Vec::new()));
-        dict_set_str(&d, "callbacks", Value::list(Vec::new()));
+        let garbage = Value::list(Vec::new());
+        let callbacks = Value::list(Vec::new());
+        dict_set_str(&d, "garbage", garbage.clone());
+        dict_set_str(&d, "callbacks", callbacks.clone());
+        let st = it.native_state::<GcState>();
+        st.garbage = Some(garbage);
+        st.callbacks = Some(callbacks);
     }
 }
 
@@ -340,14 +345,7 @@ impl Interp {
     pub fn run_atexit(&mut self) {
         while let Some((f, args, kw)) = self.atexit.pop() {
             if let Err(e) = self.call(&f, args, kw) {
-                if self.exc_is(&e, "SystemExit") {
-                    continue;
-                }
-                self.flush_out();
-                let repr = self.repr_of(&f).unwrap_or_default();
-                self.write_stderr(&format!("Exception ignored in atexit callback {}:\n", repr));
-                let text = self.format_exception(&e);
-                self.write_stderr(&text);
+                self.write_unraisable(&e, Some("Exception ignored in atexit callback"), Some(&f));
             }
         }
     }

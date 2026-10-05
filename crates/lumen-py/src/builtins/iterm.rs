@@ -1,6 +1,6 @@
 //! `range`, `slice`, `enumerate`, `zip`, `map`, `filter`, `reversed` and the iterator types.
 
-use super::numeric::reg_compare;
+use super::slots::reg_compare;
 use super::slots::{reg_iterator, reg_slots};
 use crate::bind::{Inst, PyCx, PyHost, This};
 use crate::object::*;
@@ -36,6 +36,14 @@ fn new_iter(it: &Interp, cls: &Value, base: &Obj, st: IterState) -> Value {
     }
 }
 
+/// range(stop) -> range object
+/// range(start, stop[, step]) -> range object
+///
+/// Return an object that produces a sequence of integers from start (inclusive)
+/// to stop (exclusive) by step.  range(i, j) produces i, i+1, i+2, ..., j-1.
+/// start defaults to 0, and stop is omitted!  range(4) produces 0, 1, 2, 3.
+/// These are exactly the valid indices for a list of 4 elements.
+/// When step is given, it specifies the increment (or decrement).
 #[lumen_bind::class(name = "range")]
 pub struct Range;
 
@@ -147,6 +155,10 @@ impl Range {
     }
 }
 
+/// slice(stop)
+/// slice(start, stop[, step])
+///
+/// Create a slice object.  This is used for extended slicing (e.g. a[0:10:2]).
 #[lumen_bind::class(name = "slice")]
 pub struct Slice;
 
@@ -199,12 +211,22 @@ fn start_stop_step_reduce(it: &mut Interp, v: &Value) -> R<Value> {
     Ok(Value::tuple(vec![Value::Obj(t), Value::tuple(parts)]))
 }
 
+/// Return an enumerate object.
+///
+///   iterable
+///     an object supporting iteration
+///
+/// The enumerate object yields pairs containing a count (from start, which
+/// defaults to zero) and a value yielded by the iterable argument.
+///
+/// enumerate is useful for obtaining an indexed list:
+///     (0, seq[0]), (1, seq[1]), (2, seq[2]), ...
 #[lumen_bind::class(name = "enumerate")]
 pub struct Enumerate;
 
 #[lumen_bind::methods]
 impl Enumerate {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(iterable, start=0)")))]
     fn new(
         cls: This<Value>,
         it: &mut Interp,
@@ -232,6 +254,18 @@ impl Enumerate {
     }
 }
 
+/// zip(*iterables, strict=False) --> Yield tuples until an input is exhausted.
+///
+///    >>> list(zip('abcdefg', range(3), range(4)))
+///    [('a', 0, 0), ('b', 1, 1), ('c', 2, 2)]
+///
+/// The zip object yields n-length tuples, where n is the number of iterables
+/// passed as positional arguments to zip().  The i-th element in every tuple
+/// comes from the i-th iterable argument to zip().  This continues until the
+/// shortest argument is exhausted.
+///
+/// If strict is true and one of the arguments is exhausted before the others,
+/// raise a ValueError.
 #[lumen_bind::class(name = "zip")]
 pub struct Zip;
 
@@ -267,16 +301,30 @@ impl Zip {
     }
 }
 
+/// Make an iterator that computes the function using arguments from
+/// each of the iterables.  Stops when the shortest iterable is exhausted.
+///
+/// If strict is true and one of the arguments is exhausted before the others,
+/// raise a ValueError.
 #[lumen_bind::class(name = "map")]
 pub struct Map;
 
 #[lumen_bind::methods]
 impl Map {
-    #[constructor(hint(py(text_signature = "")))]
-    fn new(cls: This<Value>, it: &mut Interp, #[varargs] args: &[Value]) -> R<Value> {
+    #[constructor(hint(py(text_signature = "(function, iterable, /, *iterables, strict=False)")))]
+    fn new(
+        cls: This<Value>,
+        it: &mut Interp,
+        #[varargs] args: &[Value],
+        #[kwonly] strict: Option<&Value>,
+    ) -> R<Value> {
         if args.len() < 2 {
             return Err(it.type_error("map() must have at least two arguments."));
         }
+        let strict = match strict {
+            Some(v) => it.truthy(v)?,
+            None => false,
+        };
         let mut its = Vec::with_capacity(args.len() - 1);
         for v in &args[1..] {
             its.push(it.get_iter(v)?);
@@ -289,11 +337,26 @@ impl Map {
             IterState::Map {
                 f: args[0].clone(),
                 its,
+                strict,
             },
         ))
     }
+
+    /// Set state information for unpickling.
+    #[method(name = "__setstate__", hint(py(text_signature = "")))]
+    fn setstate(slf: This<IterRef<'_>>, it: &mut Interp, state: &Value) -> R<()> {
+        let flag = it.truthy(state)?;
+        if let IterState::Map { strict, .. } = &mut *slf.0 .1.borrow_mut() {
+            *strict = flag;
+        }
+        Ok(())
+    }
 }
 
+/// filter(function or None, iterable) --> filter object
+///
+/// Return an iterator yielding those items of iterable for which function(item)
+/// is true. If function is None, return the items that are true.
 #[lumen_bind::class(name = "filter")]
 pub struct Filter;
 
@@ -315,12 +378,13 @@ impl Filter {
     }
 }
 
+/// Return a reverse iterator over the values of the given sequence.
 #[lumen_bind::class(name = "reversed")]
 pub struct Reversed;
 
 #[lumen_bind::methods]
 impl Reversed {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(sequence, /)")))]
     fn new(cls: This<Value>, it: &mut Interp, sequence: &Value) -> R<Value> {
         let seq = sequence;
         let base = it.types.reversed.clone();
@@ -425,6 +489,7 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Range(i64, i64, i64),
         Args(&'static str, Vec<Value>),
         Zip(Vec<Value>, bool),
+        Map(Vec<Value>, bool),
         Unpicklable,
     }
     let plan = match &*st.borrow() {
@@ -476,10 +541,10 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
             Plan::Args("enumerate", vec![inner.clone(), Value::Int(*idx)])
         }
         IterState::Zip { its, strict } => Plan::Zip(its.clone(), *strict),
-        IterState::Map { f, its } => {
+        IterState::Map { f, its, strict } => {
             let mut args = vec![f.clone()];
             args.extend(its.iter().cloned());
-            Plan::Args("map", args)
+            Plan::Map(args, *strict)
         }
         IterState::Filter { f, it: inner } => Plan::Args("filter", vec![f.clone(), inner.clone()]),
         IterState::Empty => Plan::Done("iter", Value::tuple(Vec::new())),
@@ -508,6 +573,14 @@ fn iter_reduce(it: &mut Interp, IterRef(o, st): IterRef<'_>) -> R<Value> {
         Plan::Args(f, args) => {
             let f = builtin_fn(it, f)?;
             Value::tuple(vec![f, Value::tuple(args)])
+        }
+        Plan::Map(args, strict) => {
+            let f = builtin_fn(it, "map")?;
+            let mut out = vec![f, Value::tuple(args)];
+            if strict {
+                out.push(Value::Bool(true));
+            }
+            Value::tuple(out)
         }
         Plan::Zip(its, strict) => {
             let zip = Value::Obj(it.types.zip.clone());

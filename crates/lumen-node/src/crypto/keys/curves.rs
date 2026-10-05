@@ -144,7 +144,7 @@ impl EcCurve {
     pub fn generate(self) -> (Vec<u8>, Vec<u8>) {
         use elliptic_curve::sec1::ToEncodedPoint;
         with_ec_curve!(self, C => {
-            let sk = elliptic_curve::SecretKey::<C>::random(&mut rand_core::OsRng);
+            let sk = elliptic_curve::SecretKey::<C>::random(&mut lumen_crypto::SysRng);
             (sk.to_bytes().to_vec(), sk.public_key().to_encoded_point(false).as_bytes().to_vec())
         })
     }

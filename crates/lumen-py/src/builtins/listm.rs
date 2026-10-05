@@ -1,7 +1,6 @@
 //! `list` and `tuple` methods, and the stable sort shared with `sorted()`.
 
-use super::numeric::{reg_binops, reg_compare};
-use super::slots::{reg_method_forms, reg_slots};
+use super::slots::{reg_binops, reg_compare, reg_method_forms, reg_slots};
 use crate::ast::CmpOp;
 use crate::bind::{KwArgs, PyCx, PyHost, This};
 use crate::object::*;
@@ -189,12 +188,16 @@ impl<'a> FromArg<'a, PyHost> for TupleRef<'a> {
     }
 }
 
+/// Built-in mutable sequence.
+///
+/// If no argument is given, the constructor creates a new empty list.
+/// The argument must be an iterable if specified.
 #[lumen_bind::class(name = "list")]
 pub struct List;
 
 #[lumen_bind::methods]
 impl List {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(iterable=(), /)")))]
     fn new(
         cls: This<Value>,
         it: &mut Interp,
@@ -419,12 +422,18 @@ fn seq_count(it: &mut Interp, items: &[Value], x: &Value) -> R<i64> {
 
 // ---- tuple -------------------------------------------------------------------------------------
 
+/// Built-in immutable sequence.
+///
+/// If no argument is given, the constructor returns an empty tuple.
+/// If iterable is specified the tuple is initialized from iterable's items.
+///
+/// If the argument is a tuple, the return value is the same object.
 #[lumen_bind::class(name = "tuple")]
 pub struct Tuple;
 
 #[lumen_bind::methods]
 impl Tuple {
-    #[constructor(hint(py(text_signature = "")))]
+    #[constructor(hint(py(text_signature = "(iterable=(), /)")))]
     fn new(cls: This<Value>, it: &mut Interp, iterable: Passed<&Value>) -> R<Value> {
         let Value::Obj(cls) = &*cls else {
             unreachable!("checked by the entry")

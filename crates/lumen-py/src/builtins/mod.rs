@@ -9,16 +9,20 @@ pub mod astnodes;
 pub mod binasciim;
 pub mod bisectm;
 pub mod bytesm;
+pub mod bz2m;
 pub mod cmathm;
 pub mod codecsm;
 pub mod collectionsm;
 pub mod contextvarsm;
 pub mod csvm;
+pub mod decimalm;
+pub mod decompressor;
 pub mod descr;
 pub mod dictm;
 pub mod errnom;
 pub mod excgroup;
 pub mod excm;
+pub mod fcntlm;
 pub mod format;
 pub mod funcs;
 pub mod functoolsm;
@@ -26,43 +30,67 @@ pub mod genm;
 pub mod hashlibm;
 pub mod heapqm;
 pub mod impm;
+pub mod interpchanm;
 pub mod iom;
 pub mod iterm;
 pub mod itertools;
 pub mod jsonm;
 pub mod listm;
+pub mod lsprofm;
+pub mod lzmam;
 pub mod marshalm;
 pub mod mathm;
 pub mod memview;
+pub mod mmapm;
 pub mod modules;
+pub mod monitoringm;
+pub mod multiprocessingm;
 pub mod native;
 pub mod numeric;
 pub mod objectm;
+pub mod opcodem;
 pub mod operatorm;
 pub mod oserror;
+pub mod picklem;
 pub mod posixm;
 pub mod posixsubprocessm;
+pub mod pwdm;
+pub mod pyexpatm;
 pub mod randomm;
+pub mod readlinem;
+pub mod resourcem;
 pub mod scproxym;
 pub mod selectm;
 pub mod signalm;
+pub mod singlephasem;
 pub mod slots;
 pub mod socketm;
 pub mod sre;
+#[cfg(all(unix, not(target_os = "android")))]
+pub mod sslm;
 pub mod statisticsm;
 pub mod stringm;
 pub mod strm;
 pub mod structm;
+pub mod subinterpm;
 pub mod sysextra;
+pub mod syslogm;
 pub mod sysm;
 pub mod sysmods;
+pub mod termiosm;
+pub mod testbufferm;
+pub mod testcapi;
+pub mod testextm;
 pub mod threadm;
 pub mod timem;
 pub mod tokenizem;
 pub mod typingm;
 pub mod unicodedatam;
+pub mod unraisable;
 pub mod warningsm;
 pub mod weakm;
+pub mod xid;
+pub mod xxlimitedm;
 pub mod zlibm;
 pub mod zoneinfom;
 
@@ -79,12 +107,14 @@ pub fn init(it: &mut Interp) {
     iterm::init(it);
     genm::init(it);
     excm::init(it);
-    codecsm::init(it);
     excgroup::init(it);
     funcs::init(it);
     sysextra::init_frame_type(it);
     sysextra::init_code_type(it);
     descr::init(it);
+    numeric::init_descriptors(it);
+    dictm::init_descriptors(it);
+    alias::init(it);
     modules::init(it);
     register_names(it);
 }
@@ -119,13 +149,6 @@ fn register_names(it: &mut Interp) {
         ("filter", t.filter.clone()),
         ("reversed", t.reversed.clone()),
     ];
-    if let Some(d) = it.types.object.dict.borrow().as_ref() {
-        dict_set_str(
-            d,
-            "__doc__",
-            Value::str("The base class of the class hierarchy."),
-        );
-    }
     for (n, o) in named {
         dict_set_str(&b, n, Value::Obj(o));
     }

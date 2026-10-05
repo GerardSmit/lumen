@@ -5,13 +5,21 @@ use crate::bytecode::*;
 use crate::object::*;
 use crate::pyint::{BigInt, PyInt};
 use crate::symtable::{self, mangle, type_params_key, AnnKind, Sc, SymTable};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct CompileError {
     pub msg: String,
     pub line: u32,
+}
+
+/// A `SyntaxWarning` found while compiling, in the order CPython reports it.
+#[derive(Debug, Clone)]
+pub struct CompileWarning {
+    pub msg: String,
+    pub line: u32,
+    pub col: u32,
 }
 
 type Label = u32;
@@ -60,6 +68,9 @@ struct Unit<'a> {
     labels: Vec<u32>,
     consts: Vec<Value>,
     const_keys: BTreeMap<ConstKey, u32>,
+    /// `LoadConst` placeholders (op index, value) whose constants are appended after all others,
+    /// the order CPython's folding of constant tuples leaves them in.
+    deferred_consts: Vec<(usize, Value)>,
     names: Vec<Obj>,
     name_idx: BTreeMap<Rc<str>, u32>,
     varnames: Vec<Rc<str>>,
@@ -72,6 +83,8 @@ struct Unit<'a> {
     private: Option<Rc<str>>,
     is_async: bool,
     is_gen: bool,
+    /// Class units: the `self.X` attributes assigned in nested functions (`__static_attributes__`).
+    static_attrs: BTreeSet<Rc<str>>,
 }
 
 struct Compiler<'a> {
@@ -84,7 +97,15 @@ struct Compiler<'a> {
 
 type CResult<T> = Result<T, CompileError>;
 
-pub fn compile_module(m: &Module, filename: &str, interactive: bool) -> CResult<Rc<Code>> {
+/// Compiles a module; the syntax warnings found on the way are appended to `warnings` (also when
+/// compiling fails).
+pub fn compile_module(
+    m: &Module,
+    filename: &str,
+    interactive: bool,
+    warnings: &mut Vec<CompileWarning>,
+) -> CResult<Rc<Code>> {
+    finally_flow::check(&m.body, warnings);
     let st = symtable::build(m).map_err(|e| CompileError {
         msg: e.msg,
         line: e.line,
@@ -127,19 +148,7 @@ pub fn compile_eval(e: &Expr, filename: &str) -> CResult<Rc<Code>> {
 }
 
 fn label_of(op: &Op) -> Option<u32> {
-    match op {
-        Op::Jump(t)
-        | Op::JumpIfFalse(t)
-        | Op::JumpIfTrue(t)
-        | Op::JumpIfFalseKeep(t)
-        | Op::JumpIfTrueKeep(t)
-        | Op::ForIter(t)
-        | Op::SetupBlock(t)
-        | Op::SetupWith(t)
-        | Op::WithExceptEnd(t)
-        | Op::EndAsyncFor(t) => Some(*t),
-        _ => None,
-    }
+    op.jump_target()
 }
 
 fn with_label(op: Op, t: u32) -> Op {
@@ -207,9 +216,36 @@ fn docstring(body: &[Stmt]) -> Option<Rc<str>> {
                     ..
                 }),
             ..
-        }) => Some(s.clone()),
+        }) => Some(clean_doc(s).into()),
         _ => None,
     }
+}
+
+/// `_PyCompile_CleanDoc`: tabs expanded, leading spaces of the first line dropped and the
+/// common indentation of the later non-blank lines removed from every later line.
+fn clean_doc(doc: &str) -> String {
+    let doc = lumen_common::text::expand_tabs(doc, 8, |_| Ok::<(), ()>(())).unwrap_or_default();
+    let b = doc.as_bytes();
+    let mut lines = doc.split_inclusive('\n');
+    let first = lines.next().unwrap_or("");
+    let margin = lines
+        .filter_map(|l| {
+            let n = l.bytes().take_while(|&c| c == b' ').count();
+            (n < l.len() && l.as_bytes()[n] != b'\n').then_some(n)
+        })
+        .min()
+        .unwrap_or(0);
+    let lead = b.iter().take_while(|&&c| c == b' ').count();
+    if lead == 0 && margin == 0 {
+        return doc;
+    }
+    let mut out = String::with_capacity(doc.len());
+    out.push_str(&first[lead.min(first.len())..]);
+    for l in doc[first.len()..].split_inclusive('\n') {
+        let n = l.bytes().take(margin).take_while(|&c| c == b' ').count();
+        out.push_str(&l[n..]);
+    }
+    out
 }
 
 impl<'a> Compiler<'a> {
@@ -285,6 +321,7 @@ impl<'a> Compiler<'a> {
             labels: Vec::new(),
             consts: Vec::new(),
             const_keys: BTreeMap::new(),
+            deferred_consts: Vec::new(),
             names: Vec::new(),
             name_idx: BTreeMap::new(),
             varnames,
@@ -297,11 +334,16 @@ impl<'a> Compiler<'a> {
             private,
             is_async,
             is_gen,
+            static_attrs: BTreeSet::new(),
         });
     }
 
     fn pop_unit(&mut self, args: &Arguments, first_line: u32) -> Rc<Code> {
         let mut u = self.units.pop().unwrap();
+        for (at, v) in std::mem::take(&mut u.deferred_consts) {
+            u.consts.push(v);
+            u.ops[at] = Op::LoadConst((u.consts.len() - 1) as u32);
+        }
         let labels = std::mem::take(&mut u.labels);
         for op in u.ops.iter_mut() {
             if let Some(l) = label_of(op) {
@@ -358,6 +400,8 @@ impl<'a> Compiler<'a> {
             flags,
             cell_args,
             doc,
+            pyobj: Default::default(),
+            info: Default::default(),
         })
     }
 
@@ -1141,10 +1185,25 @@ impl<'a> Compiler<'a> {
                 return self.err(
                     "illegal expression for augmented assignment",
                     target.pos.line,
-                )
+                );
             }
         }
         Ok(())
+    }
+
+    /// Records `self.<attr> = ...` in the nearest enclosing class for `__static_attributes__`.
+    fn note_static_attr(&mut self, value: &Expr, attr: &Rc<str>) {
+        if !matches!(&value.kind, ExprKind::Name { id, .. } if &**id == "self") {
+            return;
+        }
+        if let Some(u) = self
+            .units
+            .iter_mut()
+            .rev()
+            .find(|u| u.kind == UnitKind::Class)
+        {
+            u.static_attrs.insert(attr.clone());
+        }
     }
 
     fn store_target(&mut self, t: &'a Expr) -> CResult<()> {
@@ -1152,6 +1211,7 @@ impl<'a> Compiler<'a> {
         match &t.kind {
             ExprKind::Name { id, .. } => self.name_store(id),
             ExprKind::Attribute { value, attr, .. } => {
+                self.note_static_attr(value, attr);
                 self.expr(value)?;
                 let ai = self.attr_idx(attr);
                 self.emit(Op::StoreAttr(ai));
@@ -1492,6 +1552,9 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::FormatValue(conv, format_spec.is_some()));
             }
             ExprKind::Attribute { value, attr, ctx } => {
+                if *ctx == Ctx::Store {
+                    self.note_static_attr(value, attr);
+                }
                 self.expr(value)?;
                 let ai = self.attr_idx(attr);
                 self.u().line = e.pos.line;
@@ -1834,6 +1897,11 @@ impl<'a> Compiler<'a> {
         if self.st.scopes[p.scope].ann == Some(AnnKind::TypeParams) && self.units.len() >= 2 {
             p = &self.units[self.units.len() - 2];
         }
+        if p.kind != UnitKind::Module
+            && self.st.scopes[p.scope].sym_scope(&mangle(&p.private, name)) == Sc::GlobalExplicit
+        {
+            return name.into();
+        }
         match p.kind {
             UnitKind::Module => name.into(),
             UnitKind::Class => format!("{}.{}", p.qualname, name).into(),
@@ -1854,7 +1922,7 @@ impl<'a> Compiler<'a> {
             self.emit(Op::BuildTuple(code.freevars.len() as u32));
             flags |= MF_CLOSURE;
         }
-        let ci = self.const_idx(Value::Obj(Object::new(Kind::Code(code))));
+        let ci = self.const_idx(Value::Obj(Code::object(&code)));
         self.emit(Op::LoadConst(ci));
         self.emit(Op::MakeFunction(flags));
         Ok(())
@@ -1865,6 +1933,7 @@ impl<'a> Compiler<'a> {
             self.expr(d)?;
         }
         let key = f as *const FunctionDef as usize;
+        let first_line = f.decorators.first().map_or(line, |d| d.pos.line);
         if f.type_params.is_empty() {
             self.make_function(
                 f.name.clone(),
@@ -1873,7 +1942,7 @@ impl<'a> Compiler<'a> {
                 FnBody::Stmts(&f.body),
                 key,
                 None,
-                line,
+                first_line,
             )?;
         } else {
             let flags = self.function_defaults(&f.args)?;
@@ -1894,7 +1963,7 @@ impl<'a> Compiler<'a> {
                 FnBody::Stmts(&f.body),
                 key,
                 Some(flags),
-                line,
+                first_line,
             )?;
             self.emit(Op::Swap(2));
             self.emit(Op::CallIntrinsic2(INTRINSIC2_SET_FUNCTION_TYPE_PARAMS));
@@ -2002,9 +2071,15 @@ impl<'a> Compiler<'a> {
         }
         match body {
             FnBody::Stmts(stmts) => {
-                if let Some(d) = docstring(stmts) {
-                    doc = Some(Value::str(&d));
-                }
+                let first_const = match docstring(stmts) {
+                    Some(d) => {
+                        let v = Value::str(&d);
+                        doc = Some(v.clone());
+                        v
+                    }
+                    None => Value::None,
+                };
+                self.const_idx(first_const);
                 self.stmts(stmts)?;
                 self.load_const(Value::None);
                 self.emit(Op::ReturnValue);
@@ -2033,10 +2108,23 @@ impl<'a> Compiler<'a> {
     fn function_defaults(&mut self, args: &'a Arguments) -> CResult<u32> {
         let mut flags = 0;
         if !args.defaults.is_empty() {
-            for d in &args.defaults {
-                self.expr(d)?;
+            let folded: Option<Vec<Value>> = args
+                .defaults
+                .iter()
+                .map(|d| match &d.kind {
+                    ExprKind::Constant(c) => Some(const_value(c)),
+                    _ => None,
+                })
+                .collect();
+            if let Some(items) = folded {
+                let at = self.emit(Op::LoadConst(0));
+                self.u().deferred_consts.push((at, Value::tuple(items)));
+            } else {
+                for d in &args.defaults {
+                    self.expr(d)?;
+                }
+                self.emit(Op::BuildTuple(args.defaults.len() as u32));
             }
-            self.emit(Op::BuildTuple(args.defaults.len() as u32));
             flags |= MF_DEFAULTS;
         }
         let kwd: Vec<(&Arg, &Expr)> = args
@@ -2160,6 +2248,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn class_def(&mut self, c: &'a ClassDef, line: u32) -> CResult<()> {
+        let first_line = c.decorators.first().map_or(line, |d| d.pos.line);
         for d in &c.decorators {
             self.expr(d)?;
         }
@@ -2181,6 +2270,9 @@ impl<'a> Compiler<'a> {
         self.load_const(Value::str(&qual));
         let qi = self.name_idx("__qualname__");
         self.emit(Op::StoreName(qi));
+        self.load_const(Value::Int(first_line as i64));
+        let fi = self.name_idx("__firstlineno__");
+        self.emit(Op::StoreName(fi));
         if let Some(d) = docstring(&c.body) {
             self.load_const(Value::str(&d));
             let di = self.name_idx("__doc__");
@@ -2201,6 +2293,15 @@ impl<'a> Compiler<'a> {
             self.emit(Op::SetupAnnotations);
         }
         self.stmts(&c.body)?;
+        let attrs: Vec<Value> = self
+            .u()
+            .static_attrs
+            .iter()
+            .map(|a| Value::str(a))
+            .collect();
+        self.load_const(Value::tuple(attrs));
+        let si = self.name_idx("__static_attributes__");
+        self.emit(Op::StoreName(si));
         let has_cell = self.st.scopes[sid].has_class_cell;
         if has_cell {
             let ci = self.u().cell_idx["__class__"];
@@ -2216,7 +2317,7 @@ impl<'a> Compiler<'a> {
         }
         self.load_const(Value::None);
         self.emit(Op::ReturnValue);
-        let code = self.pop_unit(&Arguments::default(), line);
+        let code = self.pop_unit(&Arguments::default(), first_line);
         self.emit_closure_function(code, 0)?;
         self.load_const(Value::str(&c.name));
         if generic {
@@ -2483,4 +2584,82 @@ enum CompKind {
 enum FnBody<'a> {
     Stmts(&'a [Stmt]),
     Expr(&'a Expr),
+}
+
+/// PEP 765: `return`, `break` and `continue` that leave a `finally` block are `SyntaxWarning`s
+/// (CPython checks this while preprocessing the AST, before compiling).
+mod finally_flow {
+    use super::CompileWarning;
+    use crate::ast::*;
+
+    #[derive(Clone, Copy)]
+    enum Ctx {
+        Finally,
+        Function,
+        Loop,
+    }
+
+    pub fn check(body: &[Stmt], out: &mut Vec<CompileWarning>) {
+        stmts(body, &mut Vec::new(), out);
+    }
+
+    fn stmts(body: &[Stmt], stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        for s in body {
+            stmt(s, stack, out);
+        }
+    }
+
+    fn within(ctx: Ctx, body: &[Stmt], stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        stack.push(ctx);
+        stmts(body, stack, out);
+        stack.pop();
+    }
+
+    fn warn(kw: &str, s: &Stmt, out: &mut Vec<CompileWarning>) {
+        out.push(CompileWarning {
+            msg: format!("'{kw}' in a 'finally' block"),
+            line: s.pos.line,
+            col: s.pos.col,
+        });
+    }
+
+    fn stmt(s: &Stmt, stack: &mut Vec<Ctx>, out: &mut Vec<CompileWarning>) {
+        let in_finally = matches!(stack.last(), Some(Ctx::Finally));
+        match &s.kind {
+            StmtKind::FunctionDef(f) => within(Ctx::Function, &f.body, stack, out),
+            StmtKind::ClassDef(c) => stmts(&c.body, stack, out),
+            StmtKind::Return(_) if in_finally => warn("return", s, out),
+            StmtKind::Break if in_finally => warn("break", s, out),
+            StmtKind::Continue if in_finally => warn("continue", s, out),
+            StmtKind::For { body, orelse, .. } | StmtKind::While { body, orelse, .. } => {
+                within(Ctx::Loop, body, stack, out);
+                stmts(orelse, stack, out);
+            }
+            StmtKind::If { body, orelse, .. } => {
+                stmts(body, stack, out);
+                stmts(orelse, stack, out);
+            }
+            StmtKind::With { body, .. } => stmts(body, stack, out),
+            StmtKind::Try {
+                body,
+                handlers,
+                orelse,
+                finalbody,
+                ..
+            } => {
+                stmts(body, stack, out);
+                for h in handlers {
+                    stmts(&h.body, stack, out);
+                }
+                stmts(orelse, stack, out);
+                within(Ctx::Finally, finalbody, stack, out);
+            }
+            StmtKind::Match { cases, .. } => {
+                for c in cases {
+                    stmts(&c.body, stack, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }

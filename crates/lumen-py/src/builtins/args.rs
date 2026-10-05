@@ -149,10 +149,19 @@ impl Interp {
             let r = self.call(&b, Vec::new(), Vec::new())?;
             return match r {
                 Value::Float(f) => Ok(f),
-                Value::Obj(o) if matches!(o.kind, Kind::Float(_)) => match &o.kind {
-                    Kind::Float(f) => Ok(*f),
-                    _ => Ok(0.0),
-                },
+                Value::Obj(o) if matches!(o.kind, Kind::Float(_)) => {
+                    if o.cls.is_some() {
+                        let (tn, t) = (self.type_name_of(v), self.type_name_of(&Value::Obj(o.clone())));
+                        let msg = format!(
+                            "{tn}.__float__ returned non-float (type {t}).  The ability to return an instance of a strict subclass of float is deprecated, and may be removed in a future version of Python."
+                        );
+                        crate::builtins::warningsm::warn_category(self, "DeprecationWarning", &msg, 1)?;
+                    }
+                    match &o.kind {
+                        Kind::Float(f) => Ok(*f),
+                        _ => Ok(0.0),
+                    }
+                }
                 _ => {
                     let t = self.type_name_of(&r);
                     Err(self.type_error(&format!(

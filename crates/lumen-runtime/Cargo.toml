@@ -13,7 +13,7 @@ publish = false
 [dependencies]
 lumen-common = { path = "../lumen-common" }
 lumen-bind = { path = "../lumen-bind" }
-lumen = { path = "../lumen", default-features = false }
+lumen = { path = "../lumen", default-features = false, features = ["embed"] }
 lumen-host = { path = "../lumen-host", default-features = false }
 lumen-node = { path = "../lumen-node", default-features = false }
 lumen-os = { path = "../lumen-os" }
@@ -28,7 +28,7 @@ lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 # lumen-node's optional builtins (see its Cargo.toml), all on by default.
 [features]
-default = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi"]
+default = ["compiler", "jit", "aot-native", "intl", "typed", "bun", "http2", "cluster", "dgram", "wasi", "crypto-openssl", "crypto-apple", "crypto-cng", "crypto-rustcrypto"]
 compiler = ["lumen/compiler", "lumen-host/compiler", "lumen-node/compiler", "lumen-web/compiler"]
 jit = ["compiler", "lumen/jit", "lumen-host/jit", "lumen-node/jit", "lumen-web/jit"]
 aot-native = ["lumen/aot-native", "lumen-host/aot-native", "lumen-node/aot-native", "lumen-web/aot-native"]
@@ -41,6 +41,10 @@ http2 = ["lumen-node/http2"]
 cluster = ["lumen-node/cluster"]
 dgram = ["lumen-node/dgram"]
 wasi = ["lumen-node/wasi"]
+crypto-openssl = ["lumen-node/crypto-openssl"]
+crypto-apple = ["lumen-node/crypto-apple"]
+crypto-cng = ["lumen-node/crypto-cng"]
+crypto-rustcrypto = ["lumen-node/crypto-rustcrypto"]
 
 [lints]
 workspace = true

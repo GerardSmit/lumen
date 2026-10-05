@@ -31,12 +31,15 @@
 //!   Other transferable types/resizable buffers remain explicitly unsupported.
 //! - Reuses the full [`Runtime`] per worker (own 4-thread pool). Heavy but correct.
 
+use lumen_bind::NativeError;
+use lumen_host::OpError;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use lumen_host::{ops, CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
+use lumen::embed::JsFunction;
+use lumen_host::{CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
 
 use crate::clone_transfer::{self, CloneMessage};
 use crate::Runtime;
@@ -265,163 +268,6 @@ struct WorkerSpec {
     /// Node mode: the worker's ends of the public (`parentPort`) and internal channels.
     ports: Option<(crate::ports::PortTransfer, crate::ports::PortTransfer)>,
     limits: WorkerLimits,
-}
-
-/// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
-/// thread and arms the worker→main inbox. `dispatch(kind, ...)` receives `("online")`,
-/// `("message", u8array)`, `("error", string)`, or `("exit", code)`. `opts` (node mode):
-/// `{ node: true, eval: bool, init: Uint8Array }`; the web Worker adapter supplies its owner
-/// origin so native startup can enforce same-origin independently of the JS constructor.
-pub(crate) fn op_worker_spawn(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let raw_entry = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let is_module = matches!(args.get(1), Some(Value::Bool(true)));
-    let dispatch = match args.get(2) {
-        Some(v) if v.is_callable() => v.clone(),
-        _ => return Err(ctx.make_error("TypeError", "spawn: dispatch must be a function")),
-    };
-    let opts = args.get(3).cloned().unwrap_or(Value::Undefined);
-    let has_opts = opts.as_obj().is_some();
-    let opt_bool = |ctx: &mut Ctx, name: &str| -> bool {
-        has_opts && matches!(ctx.get_member(&opts, name), Ok(Value::Bool(true)))
-    };
-    let is_node = opt_bool(ctx, "node");
-    let is_web = opt_bool(ctx, "web");
-    let is_eval = opt_bool(ctx, "eval");
-    let name = if has_opts {
-        ctx.get_member(&opts, "name")
-            .ok()
-            .map(|value| ctx.coerce_string(&value).map(|value| value.to_string()))
-            .transpose()?
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    let (entry, is_remote, origin, location_href) = if is_web {
-        if is_eval || is_node {
-            return Err(ctx.make_error("TypeError", "web Worker cannot use eval or node options"));
-        }
-        let owner_origin = ctx
-            .get_member(&opts, "ownerOrigin")
-            .ok()
-            .and_then(|value| ctx.coerce_string(&value).ok())
-            .map(|value| value.to_string())
-            .unwrap_or_default();
-        prepare_web_worker_entry(ctx, &raw_entry, &owner_origin)?
-    } else {
-        (raw_entry, false, None, None)
-    };
-    let init = if has_opts {
-        ctx.get_member(&opts, "init")
-            .ok()
-            .and_then(|v| ctx.typed_array_bytes(&v))
-    } else {
-        None
-    };
-
-    let limits = if is_node && has_opts {
-        let number = |ctx: &mut Ctx, name: &str| {
-            ctx.get_member(&opts, name)
-                .ok()
-                .and_then(|v| v.as_num_opt())
-                .filter(|n| n.is_finite())
-        };
-        WorkerLimits {
-            max_old_mb: number(ctx, "maxOldMb"),
-            stack_mb: number(ctx, "stackMb"),
-        }
-    } else {
-        WorkerLimits::default()
-    };
-
-    let shared_env = if is_node && opt_bool(ctx, "shareEnv") {
-        Some(crate::process_env::backing(ctx))
-    } else {
-        None
-    };
-    let init = init.map(|bytes| clone_transfer::take_message(ctx, bytes));
-    let (to_worker_tx, to_worker_rx) = channel::<ToWorker>();
-    let (to_main_tx, to_main_rx) = channel::<ToMain>();
-    let stop = Arc::new(AtomicBool::new(false));
-    let kill = Arc::new(AtomicBool::new(false));
-    let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
-
-    let id = {
-        let reg = registry(ctx);
-        let id = reg.next;
-        reg.next += 1;
-        reg.workers.insert(
-            id,
-            WorkerEntry {
-                to_worker: Some(to_worker_tx),
-                dispatch: dispatch.clone(),
-                stop: Arc::clone(&stop),
-                kill: Arc::clone(&kill),
-                keep_alive: true,
-                inbox_task: None,
-            },
-        );
-        id
-    };
-
-    let embedding = ctx.op_state().get::<crate::WorkerEmbedding>().cloned();
-    let fetch_config = ctx
-        .op_state()
-        .get::<lumen_web::FetchConfig>()
-        .cloned()
-        .unwrap_or_default();
-    let mut parent_ports = None;
-    let ports = is_node.then(|| {
-        let (public_main, public_worker) = crate::ports::new_pair();
-        let (internal_main, internal_worker) = crate::ports::new_pair();
-        parent_ports = Some((
-            crate::ports::adopt(ctx, public_main),
-            crate::ports::adopt(ctx, internal_main),
-        ));
-        (public_worker, internal_worker)
-    });
-    let spec = WorkerSpec {
-        entry,
-        is_module,
-        is_node,
-        is_shared: false,
-        is_remote,
-        is_eval,
-        location_href,
-        name,
-        init,
-        thread_id,
-        embedding,
-        fetch_config,
-        origin,
-        shared_key: None,
-        shared_host: None,
-        shared_env,
-        ports,
-        limits,
-    };
-    let worker_stop = Arc::clone(&stop);
-    std::thread::Builder::new()
-        .name(format!("lumen-worker-{thread_id}"))
-        // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
-        // build's frames overflow the 2 MiB default long before the depth guard trips.
-        .stack_size(lumen::THREAD_STACK_SIZE)
-        .spawn(move || {
-            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
-            run_worker(spec, to_worker_rx, to_main_tx, worker_stop, kill)
-        })
-        .expect("spawn worker thread");
-
-    arm_main_inbox(ctx, MainInbox { id, rx: to_main_rx });
-    let o = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&o, "id", Value::Num(id as f64));
-    let _ = ctx.set_member(&o, "threadId", Value::Num(thread_id as f64));
-    if let Some((public, internal)) = parent_ports {
-        let _ = ctx.set_member(&o, "port", Value::Num(public as f64));
-        let _ = ctx.set_member(&o, "internal", Value::Num(internal as f64));
-    }
-    Ok(o)
 }
 
 /// Normalize a web Worker constructor URL and enforce the same-origin rule before starting its
@@ -933,44 +779,6 @@ fn decode_shared_inbox(
     })
 }
 
-/// `__worker.post(id, u8array)` — enqueue an already-serialized message for the worker.
-pub(crate) fn op_worker_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "post: bad worker id")),
-    };
-    let bytes = ctx
-        .typed_array_bytes(args.get(1).unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "post: expected a Uint8Array"))?;
-    let message = clone_transfer::take_message(ctx, bytes);
-    if let Some(w) = registry(ctx).workers.get(&id) {
-        if let Some(tx) = &w.to_worker {
-            let _ = tx.send(ToWorker::Data(message));
-        }
-    }
-    Ok(Value::Undefined)
-}
-
-/// `__worker.terminate(id)` — set the shared stop flag and drop the worker's inbox sender (so a
-/// blocked receive unblocks). The worker loop exits at its next poll and posts `Exited`, which is
-/// still delivered (the registry entry lives until then) so `'exit'` fires with the code.
-pub(crate) fn op_worker_terminate(
-    ctx: &mut Ctx,
-    _t: Value,
-    args: &[Value],
-) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "terminate: bad worker id")),
-    };
-    if let Some(w) = registry(ctx).workers.get_mut(&id) {
-        w.stop.store(true, Ordering::SeqCst);
-        w.kill.store(true, Ordering::SeqCst);
-        w.to_worker = None; // drops the sender, unblocking the worker's inbox receive
-    }
-    Ok(Value::Undefined)
-}
-
 /// Stop every worker this realm started: its loop, any JS it is running, and its inbox thread.
 /// Used when the realm itself is being interrupted or dropped, so no worker outlives it.
 pub(crate) fn terminate_all(ctx: &mut Ctx) {
@@ -1003,31 +811,6 @@ pub(crate) fn terminate_all(ctx: &mut Ctx) {
             registry.cancel(task);
         }
     }
-}
-
-/// `__worker.setRef(id, keep)` — `worker.ref()/unref()`: whether this worker's inbox keeps the
-/// main loop alive. Applies to the in-flight inbox task and every re-arm after it.
-pub(crate) fn op_worker_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let id = match args.first() {
-        Some(Value::Num(n)) => *n as u64,
-        _ => return Err(ctx.make_error("TypeError", "setRef: bad worker id")),
-    };
-    let keep = matches!(args.get(1), Some(Value::Bool(true)));
-    let task = match registry(ctx).workers.get_mut(&id) {
-        Some(w) => {
-            w.keep_alive = keep;
-            w.inbox_task
-        }
-        None => return Ok(Value::Undefined),
-    };
-    if let (Some(task), Some(reg)) = (task, ctx.host_mut::<TaskRegistry>()) {
-        if keep {
-            reg.set_ref(task);
-        } else {
-            reg.set_unref(task);
-        }
-    }
-    Ok(Value::Undefined)
 }
 
 fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
@@ -1576,163 +1359,360 @@ fn decode_worker_inbox(
     }
 }
 
-/// `__wself.post(u8array)` — send an already-serialized message to the main thread.
-fn op_wself_post(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let bytes = ctx
-        .typed_array_bytes(args.first().unwrap_or(&Value::Undefined))
-        .ok_or_else(|| ctx.make_error("TypeError", "post: expected a Uint8Array"))?;
-    let message = clone_transfer::take_message(ctx, bytes);
-    if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        let _ = w.to_main.send(ToMain::Message(message));
-    }
-    Ok(Value::Undefined)
-}
+#[lumen_bind::module(name = "__wself")]
+mod worker_scope_ops {
+    use super::*;
 
-/// `__wself.close()` — request the worker loop to stop.
-fn op_wself_close(ctx: &mut Ctx, _t: Value, _args: &[Value]) -> Result<Value, Value> {
-    if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        w.stop.store(true, Ordering::SeqCst);
-    }
-    Ok(Value::Undefined)
-}
-
-/// `__wself.exit(code)` — node `process.exit(code)` inside a worker: record the code and stop the
-/// loop. With the realm's own interrupt available the calling JS unwinds now (every later safe
-/// point throws again); an embedded parent's worker stops cooperatively at the next loop poll.
-fn op_wself_exit(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let code = args.first().and_then(Value::as_num_opt).unwrap_or(0.0) as i32;
-    let mut kill = None;
-    if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        w.exit_code.get_or_insert(code);
-        w.stop.store(true, Ordering::SeqCst);
-        kill = w.kill.clone();
-    }
-    match kill {
-        Some(kill) => {
-            kill.store(true, Ordering::SeqCst);
-            ctx.terminate_for_host();
-            Err(ctx.make_error("Error", format!("process.exit({code})")))
-        }
-        None => Ok(Value::Undefined),
-    }
-}
-
-/// `__wself.setRef(keep)` — whether the armed inbox keeps this worker alive (parentPort ref
-/// semantics: on while a 'message' listener exists, off otherwise).
-fn op_wself_set_ref(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let keep = matches!(args.first(), Some(Value::Bool(true)));
-    let task = match ctx.host_mut::<WorkerSelf>() {
-        Some(w) => {
-            w.keep_alive = keep;
-            w.inbox_task
-        }
-        None => None,
-    };
-    if let (Some(task), Some(reg)) = (task, ctx.host_mut::<TaskRegistry>()) {
-        if keep {
-            reg.set_ref(task);
-        } else {
-            reg.set_unref(task);
+    /// `__wself.post(u8array)` — send an already-serialized message to the main thread.
+    #[op(name = "post")]
+    fn op_wself_post(ctx: &mut Ctx, bytes: &[u8]) {
+        let message = clone_transfer::take_message(ctx, bytes.to_vec());
+        if let Some(w) = ctx.host_mut::<WorkerSelf>() {
+            let _ = w.to_main.send(ToMain::Message(message));
         }
     }
-    Ok(Value::Undefined)
-}
 
-/// `__wself.report(message)` — forward a worker-side uncaught error to the main thread (wired to
-/// the worker's global `onerror` in the bootstrap).
-fn op_wself_report(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    let msg = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    if let Some(w) = ctx.host_mut::<WorkerSelf>() {
-        let _ = w.to_main.send(ToMain::Error(msg));
+    /// `__wself.close()` — request the worker loop to stop.
+    #[op(name = "close")]
+    fn op_wself_close(ctx: &mut Ctx) {
+        if let Some(w) = ctx.host_mut::<WorkerSelf>() {
+            w.stop.store(true, Ordering::SeqCst);
+        }
     }
-    Ok(Value::Undefined)
-}
 
-/// Synchronously fetch one classic `importScripts()` resource with the worker's captured route
-/// and trust configuration. Cross-origin imports are intentionally allowed; the HTML algorithm
-/// requires a successful response and a JavaScript MIME type but does not apply the initial
-/// Worker constructor's same-origin restriction here.
-fn op_wself_load_classic_script(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<Value, Value> {
-    if ctx
-        .op_state()
-        .get::<WorkerSelf>()
-        .is_some_and(|worker| worker.is_module)
-    {
-        return Err(ctx.make_error(
-            "TypeError",
-            "importScripts is unavailable in module workers",
-        ));
+    /// `__wself.exit(code)` — node `process.exit(code)` inside a worker: record the code and stop the
+    /// loop. With the realm's own interrupt available the calling JS unwinds now (every later safe
+    /// point throws again); an embedded parent's worker stops cooperatively at the next loop poll.
+    #[op(name = "exit", coerce)]
+    fn op_wself_exit(ctx: &mut Ctx, code: Option<f64>) -> Result<(), OpError> {
+        let code = code.unwrap_or(0.0) as i32;
+        let mut kill = None;
+        if let Some(w) = ctx.host_mut::<WorkerSelf>() {
+            w.exit_code.get_or_insert(code);
+            w.stop.store(true, Ordering::SeqCst);
+            kill = w.kill.clone();
+        }
+        match kill {
+            Some(kill) => {
+                kill.store(true, Ordering::SeqCst);
+                ctx.terminate_for_host();
+                Err(NativeError::runtime(format!("process.exit({code})")).into())
+            }
+            None => Ok(()),
+        }
     }
-    let raw_url = ctx
-        .coerce_string(args.first().unwrap_or(&Value::Undefined))?
-        .to_string();
-    let mut url = lumen_common::url::parse(&raw_url, None)
-        .map_err(|error| ctx.make_error("NetworkError", error))?;
-    if !matches!(url.scheme.as_str(), "http" | "https") {
-        return Err(ctx.make_error(
-            "NetworkError",
-            format!(
-                "unsupported importScripts URL scheme '{}'; expected HTTP(S)",
-                url.scheme
-            ),
-        ));
+
+    /// `__wself.setRef(keep)` — whether the armed inbox keeps this worker alive (parentPort ref
+    /// semantics: on while a 'message' listener exists, off otherwise).
+    #[op(name = "setRef", coerce)]
+    fn op_wself_set_ref(ctx: &mut Ctx, keep: Option<bool>) {
+        let keep = keep.unwrap_or(false);
+        let task = match ctx.host_mut::<WorkerSelf>() {
+            Some(w) => {
+                w.keep_alive = keep;
+                w.inbox_task
+            }
+            None => None,
+        };
+        if let (Some(task), Some(reg)) = (task, ctx.host_mut::<TaskRegistry>()) {
+            if keep {
+                reg.set_ref(task);
+            } else {
+                reg.set_unref(task);
+            }
+        }
     }
-    if !url.username.is_empty() || !url.password.is_empty() {
-        return Err(ctx.make_error(
-            "NetworkError",
-            "importScripts URL cannot contain credentials",
-        ));
+
+    /// `__wself.report(message)` — forward a worker-side uncaught error to the main thread (wired to
+    /// the worker's global `onerror` in the bootstrap).
+    #[op(name = "report", coerce)]
+    fn op_wself_report(ctx: &mut Ctx, message: String) {
+        if let Some(w) = ctx.host_mut::<WorkerSelf>() {
+            let _ = w.to_main.send(ToMain::Error(message));
+        }
     }
-    // Fragments are not part of Fetch's request or response URL.
-    url.fragment = None;
-    let config = ctx
-        .op_state()
-        .get::<lumen_web::FetchConfig>()
-        .cloned()
-        .unwrap_or_default();
-    let resource = lumen_web::load_module_resource_with_config(&url.href(), &config)
-        .map_err(|error| ctx.make_error("NetworkError", error))?;
-    if !lumen_web::is_javascript_module_mime(resource.content_type.as_deref()) {
-        return Err(ctx.make_error(
-            "NetworkError",
-            format!(
-                "importScripts resource has a non-JavaScript MIME type: {}",
-                resource.content_type.as_deref().unwrap_or("(missing)")
-            ),
-        ));
+
+    /// Synchronously fetch one classic `importScripts()` resource with the worker's captured route
+    /// and trust configuration. Cross-origin imports are intentionally allowed; the HTML algorithm
+    /// requires a successful response and a JavaScript MIME type but does not apply the initial
+    /// Worker constructor's same-origin restriction here.
+    #[op(name = "loadClassicScript", coerce)]
+    fn op_wself_load_classic_script(ctx: &mut Ctx, raw_url: String) -> Result<Value, Value> {
+        if ctx
+            .op_state()
+            .get::<WorkerSelf>()
+            .is_some_and(|worker| worker.is_module)
+        {
+            return Err(ctx.make_error(
+                "TypeError",
+                "importScripts is unavailable in module workers",
+            ));
+        }
+        let mut url = lumen_common::url::parse(&raw_url, None)
+            .map_err(|error| ctx.make_error("NetworkError", error))?;
+        if !matches!(url.scheme.as_str(), "http" | "https") {
+            return Err(ctx.make_error(
+                "NetworkError",
+                format!(
+                    "unsupported importScripts URL scheme '{}'; expected HTTP(S)",
+                    url.scheme
+                ),
+            ));
+        }
+        if !url.username.is_empty() || !url.password.is_empty() {
+            return Err(ctx.make_error(
+                "NetworkError",
+                "importScripts URL cannot contain credentials",
+            ));
+        }
+        // Fragments are not part of Fetch's request or response URL.
+        url.fragment = None;
+        let config = ctx
+            .op_state()
+            .get::<lumen_web::FetchConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let resource = lumen_web::load_module_resource_with_config(&url.href(), &config)
+            .map_err(|error| ctx.make_error("NetworkError", error))?;
+        if !lumen_web::is_javascript_module_mime(resource.content_type.as_deref()) {
+            return Err(ctx.make_error(
+                "NetworkError",
+                format!(
+                    "importScripts resource has a non-JavaScript MIME type: {}",
+                    resource.content_type.as_deref().unwrap_or("(missing)")
+                ),
+            ));
+        }
+        let source = String::from_utf8_lossy(&resource.bytes).into_owned();
+        let result = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&result, "source", Value::from_string(source));
+        let _ = ctx.set_member(&result, "url", Value::from_string(resource.url));
+        Ok(result)
     }
-    let source = String::from_utf8_lossy(&resource.bytes).into_owned();
-    let result = Value::Obj(ctx.new_object());
-    let _ = ctx.set_member(&result, "source", Value::from_string(source));
-    let _ = ctx.set_member(&result, "url", Value::from_string(resource.url));
-    Ok(result)
 }
 
 fn worker_scope_extension(include_browser_script_op: bool) -> Extension {
     Extension {
         name: "worker-scope",
         modules: if include_browser_script_op {
-            &[lumen_host::namespace::<worker_script_bindings::Module>]
+            &[
+                lumen_host::namespace::<worker_script_bindings::Module>,
+                lumen_host::namespace::<worker_scope_ops::Module>,
+            ]
         } else {
-            &[]
+            &[lumen_host::namespace::<worker_scope_ops::Module>]
         },
-        globals: &[],
-        namespaces: &[(
-            "__wself",
-            ops![
-                "post" (1) => op_wself_post,
-                "close" (0) => op_wself_close,
-                "exit" (1) => op_wself_exit,
-                "setRef" (1) => op_wself_set_ref,
-                "report" (1) => op_wself_report,
-                "loadClassicScript" (1) => op_wself_load_classic_script,
-            ],
-        )],
         state_init: None,
         js_init: None,
         js_init_snapshot: None,
+    }
+}
+
+#[lumen_bind::module(name = "__worker")]
+mod worker_ops {
+    use super::*;
+
+    /// `__worker.spawn(path, isModule, dispatch, opts?)` → `{ id, threadId }`. Spawns the worker
+    /// thread and arms the worker→main inbox. `dispatch(kind, ...)` receives `("online")`,
+    /// `("message", u8array)`, `("error", string)`, or `("exit", code)`. `opts` (node mode):
+    /// `{ node: true, eval: bool, init: Uint8Array }`.
+    #[op(name = "spawn", coerce)]
+    fn op_worker_spawn(
+        ctx: &mut Ctx,
+        raw_entry: String,
+        is_module: Option<bool>,
+        dispatch: JsFunction,
+        opts: Option<Value>,
+    ) -> Result<Value, Value> {
+        let is_module = is_module.unwrap_or(false);
+        let dispatch = dispatch.into_value();
+        let opts = opts.unwrap_or(Value::Undefined);
+        let has_opts = opts.as_obj().is_some();
+        let opt_bool = |ctx: &mut Ctx, name: &str| -> bool {
+            has_opts && matches!(ctx.get_member(&opts, name), Ok(Value::Bool(true)))
+        };
+        let is_node = opt_bool(ctx, "node");
+        let is_web = opt_bool(ctx, "web");
+        let is_eval = opt_bool(ctx, "eval");
+        let name = if has_opts {
+            ctx.get_member(&opts, "name")
+                .ok()
+                .map(|value| ctx.coerce_string(&value).map(|value| value.to_string()))
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let (entry, is_remote, origin, location_href) = if is_web {
+            if is_eval || is_node {
+                return Err(
+                    ctx.make_error("TypeError", "web Worker cannot use eval or node options")
+                );
+            }
+            let owner_origin = ctx
+                .get_member(&opts, "ownerOrigin")
+                .ok()
+                .and_then(|value| ctx.coerce_string(&value).ok())
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            prepare_web_worker_entry(ctx, &raw_entry, &owner_origin)?
+        } else {
+            (raw_entry, false, None, None)
+        };
+        let init = if has_opts {
+            ctx.get_member(&opts, "init")
+                .ok()
+                .and_then(|v| ctx.typed_array_bytes(&v))
+        } else {
+            None
+        };
+
+        let limits = if is_node && has_opts {
+            let number = |ctx: &mut Ctx, name: &str| {
+                ctx.get_member(&opts, name)
+                    .ok()
+                    .and_then(|v| v.as_num_opt())
+                    .filter(|n| n.is_finite())
+            };
+            WorkerLimits {
+                max_old_mb: number(ctx, "maxOldMb"),
+                stack_mb: number(ctx, "stackMb"),
+            }
+        } else {
+            WorkerLimits::default()
+        };
+
+        let shared_env = if is_node && opt_bool(ctx, "shareEnv") {
+            Some(crate::process_env::backing(ctx))
+        } else {
+            None
+        };
+        let init = init.map(|bytes| clone_transfer::take_message(ctx, bytes));
+        let (to_worker_tx, to_worker_rx) = channel::<ToWorker>();
+        let (to_main_tx, to_main_rx) = channel::<ToMain>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let kill = Arc::new(AtomicBool::new(false));
+        let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
+
+        let id = {
+            let reg = registry(ctx);
+            let id = reg.next;
+            reg.next += 1;
+            reg.workers.insert(
+                id,
+                WorkerEntry {
+                    to_worker: Some(to_worker_tx),
+                    dispatch: dispatch.clone(),
+                    stop: Arc::clone(&stop),
+                    kill: Arc::clone(&kill),
+                    keep_alive: true,
+                    inbox_task: None,
+                },
+            );
+            id
+        };
+
+        let embedding = ctx.op_state().get::<crate::WorkerEmbedding>().cloned();
+        let fetch_config = ctx
+            .op_state()
+            .get::<lumen_web::FetchConfig>()
+            .cloned()
+            .unwrap_or_default();
+        let mut parent_ports = None;
+        let ports = is_node.then(|| {
+            let (public_main, public_worker) = crate::ports::new_pair();
+            let (internal_main, internal_worker) = crate::ports::new_pair();
+            parent_ports = Some((
+                crate::ports::adopt(ctx, public_main),
+                crate::ports::adopt(ctx, internal_main),
+            ));
+            (public_worker, internal_worker)
+        });
+        let spec = WorkerSpec {
+            entry,
+            is_module,
+            is_node,
+            is_shared: false,
+            is_remote,
+            is_eval,
+            location_href,
+            name,
+            init,
+            thread_id,
+            embedding,
+            fetch_config,
+            origin,
+            shared_key: None,
+            shared_host: None,
+            shared_env,
+            ports,
+            limits,
+        };
+        let worker_stop = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name(format!("lumen-worker-{thread_id}"))
+            // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
+            // build's frames overflow the 2 MiB default long before the depth guard trips.
+            .stack_size(lumen::THREAD_STACK_SIZE)
+            .spawn(move || {
+                lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
+                run_worker(spec, to_worker_rx, to_main_tx, worker_stop, kill)
+            })
+            .expect("spawn worker thread");
+
+        arm_main_inbox(ctx, MainInbox { id, rx: to_main_rx });
+        let o = Value::Obj(ctx.new_object());
+        let _ = ctx.set_member(&o, "id", Value::Num(id as f64));
+        let _ = ctx.set_member(&o, "threadId", Value::Num(thread_id as f64));
+        if let Some((public, internal)) = parent_ports {
+            let _ = ctx.set_member(&o, "port", Value::Num(public as f64));
+            let _ = ctx.set_member(&o, "internal", Value::Num(internal as f64));
+        }
+        Ok(o)
+    }
+
+    /// `__worker.post(id, u8array)` — enqueue an already-serialized message for the worker.
+    #[op(name = "post", coerce)]
+    fn op_worker_post(ctx: &mut Ctx, id: f64, bytes: &[u8]) {
+        let message = clone_transfer::take_message(ctx, bytes.to_vec());
+        if let Some(w) = registry(ctx).workers.get(&(id as u64)) {
+            if let Some(tx) = &w.to_worker {
+                let _ = tx.send(ToWorker::Data(message));
+            }
+        }
+    }
+
+    /// `__worker.terminate(id)` — set the shared stop flag and drop the worker's inbox sender (so a
+    /// blocked receive unblocks). The worker loop exits at its next poll and posts `Exited`, which is
+    /// still delivered (the registry entry lives until then) so `'exit'` fires with the code.
+    #[op(name = "terminate", coerce)]
+    fn op_worker_terminate(ctx: &mut Ctx, id: f64) {
+        if let Some(w) = registry(ctx).workers.get_mut(&(id as u64)) {
+            w.stop.store(true, Ordering::SeqCst);
+            w.kill.store(true, Ordering::SeqCst);
+            w.to_worker = None; // drops the sender, unblocking the worker's inbox receive
+        }
+    }
+
+    /// `__worker.setRef(id, keep)` — `worker.ref()/unref()`: whether this worker's inbox keeps the
+    /// main loop alive. Applies to the in-flight inbox task and every re-arm after it.
+    #[op(name = "setRef", coerce)]
+    fn op_worker_set_ref(ctx: &mut Ctx, id: f64, keep: Option<bool>) {
+        let keep = keep.unwrap_or(false);
+        let task = match registry(ctx).workers.get_mut(&(id as u64)) {
+            Some(w) => {
+                w.keep_alive = keep;
+                w.inbox_task
+            }
+            None => return,
+        };
+        if let (Some(task), Some(reg)) = (task, ctx.host_mut::<TaskRegistry>()) {
+            if keep {
+                reg.set_ref(task);
+            } else {
+                reg.set_unref(task);
+            }
+        }
     }
 }
 
@@ -1740,17 +1720,10 @@ fn worker_scope_extension(include_browser_script_op: bool) -> Extension {
 pub(crate) fn extension() -> Extension {
     Extension {
         name: "worker",
-        modules: &[lumen_host::namespace::<shared_worker_bindings::Module>],
-        globals: &[],
-        namespaces: &[(
-            "__worker",
-            ops![
-                "spawn" (4) => op_worker_spawn,
-                "post" (2) => op_worker_post,
-                "terminate" (1) => op_worker_terminate,
-                "setRef" (2) => op_worker_set_ref,
-            ],
-        )],
+        modules: &[
+            lumen_host::namespace::<worker_ops::Module>,
+            lumen_host::namespace::<shared_worker_bindings::Module>,
+        ],
         state_init: Some(|state| state.put(WorkerRegistry::default())),
         js_init: None,
         js_init_snapshot: Some(WORKER_AOT),

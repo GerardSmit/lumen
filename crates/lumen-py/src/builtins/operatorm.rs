@@ -82,6 +82,18 @@ pub mod _operator {
         !a.is(b)
     }
 
+    /// Same as a is None.
+    #[op]
+    fn is_none(a: &Value) -> bool {
+        matches!(a, Value::None)
+    }
+
+    /// Same as a is not None.
+    #[op]
+    fn is_not_none(a: &Value) -> bool {
+        !matches!(a, Value::None)
+    }
+
     /// Same as abs(a).
     #[op]
     fn abs(it: &mut Interp, a: &Value) -> R<Value> {
@@ -520,7 +532,8 @@ pub mod _operator {
             ))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let attrs = slf.0.borrow(it)?.attrs.clone();
             let cls = Value::Obj(it.type_of(slf.0.value()));
@@ -584,7 +597,8 @@ pub mod _operator {
             ))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let items = slf.0.borrow(it)?.items.clone();
             let cls = Value::Obj(it.type_of(slf.0.value()));
@@ -660,7 +674,8 @@ pub mod _operator {
             Ok(format!("operator.methodcaller({})", parts.join(", ")))
         }
 
-        #[proto(reduce)]
+        /// Return state information for pickling
+        #[proto(reduce, hint(py(text_signature = "")))]
         fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
             let (name, args, kwargs) = {
                 let me = slf.0.borrow(it)?;

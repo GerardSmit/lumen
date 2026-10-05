@@ -44,16 +44,6 @@ pub fn with_opaque<T: Any, X>(v: &Value, f: impl FnOnce(&mut T) -> X) -> Option<
     b.downcast_mut::<T>().map(f)
 }
 
-/// Sets module function `name` in module dict `d` (its `__module__` is the dict's `__name__`).
-pub fn set_fn(it: &mut Interp, d: &Obj, name: &'static str, f: NativeFn) {
-    let module = dict_get_str(d, "__name__").and_then(|m| m.as_str().map(str::to_string));
-    let v = match module {
-        Some(m) if m != "builtins" => it.new_module_native(&m, name, f),
-        _ => it.new_native(name, f, false),
-    };
-    dict_set_str(d, name, v);
-}
-
 pub fn set_type(d: &Obj, name: &str, ty: &Obj) {
     dict_set_str(d, name, Value::Obj(ty.clone()));
 }

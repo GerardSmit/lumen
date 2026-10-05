@@ -1,0 +1,1288 @@
+b'a' f0 91 a3c9b455 
+b'a' f26 91 ec03d557 
+'ab+c' f0 91 e132ba3e 
+'ab+c' f26 91 75c11a0e 
+'.' f0 91 6eb54819 
+'.' f26 91 e72a5b1e 
+'(?P<quote>)(?(quote))' f0 91 d07228a7 
+'(?P<quote>)(?(quote))' f26 91 8ea7099f 
+'(?P<a>x)(?P=a)(?(a)y)' f0 91 29224d9d 
+'(?P<a>x)(?P=a)(?(a)y)' f26 91 b61e8160 
+'(?P<a1>x)(?P=a1)(?(a1)y)' f0 91 0530f047 
+'(?P<a1>x)(?P=a1)(?(a1)y)' f26 91 e6cc8d64 
+'(?P<a1>x)\\1(?(1)y)' f0 91 ba2a4ccd 
+'(?P<a1>x)\\1(?(1)y)' f26 91 37e3fbc4 
+b'(?P<a1>x)(?P=a1)(?(a1)y)' f0 91 b74aafbb 
+b'(?P<a1>x)(?P=a1)(?(a1)y)' f26 91 ad1cc7ca 
+'(?P<µ>x)(?P=µ)(?(µ)y)' f0 91 690b501a 
+'(?P<µ>x)(?P=µ)(?(µ)y)' f26 91 3f461478 
+'(?P<𝔘𝔫𝔦𝔠𝔬𝔡𝔢>x)(?P=𝔘𝔫𝔦𝔠𝔬𝔡𝔢)(?(𝔘𝔫𝔦𝔠𝔬𝔡𝔢)y)' f0 91 88e60b13 
+'(?P<𝔘𝔫𝔦𝔠𝔬𝔡𝔢>x)(?P=𝔘𝔫𝔦𝔠𝔬𝔡𝔢)(?(𝔘𝔫𝔦𝔠𝔬𝔡𝔢)y)' f26 91 8ee824b2 
+'((a)|(b))(c)?' f0 91 4615bac7 
+'((a)|(b))(c)?' f26 91 f43d32fa 
+'(?:(?P<a1>a)|(?P<b2>b))(?P<c3>c)?' f0 91 88a593f9 
+'(?:(?P<a1>a)|(?P<b2>b))(?P<c3>c)?' f26 91 d21b288d 
+'(a)(b)' f0 91 f4d80dd0 
+'(a)(b)' f26 91 50423a12 
+'a' f0 91 4cda1fd6 
+'a' f26 91 eca07946 
+'ac' f0 91 de48ac6b 
+'ac' f26 91 77c24e5b 
+'(?P<g1>a)(?P<g2>b)?((?(g2)c|d))' f0 91 b55808ed 
+'(?P<g1>a)(?P<g2>b)?((?(g2)c|d))' f26 91 e935b3dd 
+'(?i)(?P<first>a)(?P<other>b)' f0 91 c908849b 
+'(?i)(?P<first>a)(?P<other>b)' f26 91 c711ff8b 
+'a(?:b|(c|e){1,2}?|d)+?(.)' f0 91 2a4c1ce1 
+'a(?:b|(c|e){1,2}?|d)+?(.)' f26 91 298a3f5b 
+'(?P<int>\\d+)(?:\\.(?P<frac>\\d*))?' f0 91 d9ad2fa7 
+'(?P<int>\\d+)(?:\\.(?P<frac>\\d*))?' f26 91 f2be6d4a 
+'12.34' f0 91 ef88b58e 
+'12.34' f26 91 9095b8ac 
+':+' f0 91 9c97af4d 
+':+' f26 91 3fcbd1df 
+'a:b::c:::d' f0 91 c93c3a4e 
+'a:b::c:::d' f26 91 4cab9299 
+'\\s' f0 91 5914fed8 
+'\\s' f26 91 83873b1f 
+'.*' f0 91 609c14a1 
+'.*' f26 91 b58935e0 
+'$' f0 91 a55eb854 
+'$' f26 91 665760c1 
+b'.' f0 91 4f47bc8f 
+b'.' f26 91 00235d86 
+'À' f0 91 d62d3372 
+'À' f26 91 9840a138 
+'(?a)À' f0 91 75d64316 
+'(?a)À' f26 91 cde7de98 
+'\\w' f0 91 2d35418f 
+'\\w' f26 91 ab310eec 
+'(?a)\\w' f0 91 b0e73e67 
+'(?a)\\w' f26 91 ed465331 
+b'\\w' f0 91 961c3711 
+b'\\w' f26 91 6067855b 
+b'(?L)\\w' f0 91 c5bc2230 
+b'(?L)\\w' f26 91 8d40a6ef 
+'a(\\w)' f0 91 7586005d 
+'a(\\w)' f26 91 e6adb9b6 
+'a(.)' f0 91 05a58326 
+'a(.)' f26 91 d07bf1a8 
+'..' f0 91 2ba52d8c 
+'..' f26 91 35aff51f 
+b'a(\\w)' f0 91 d420071b 
+b'a(\\w)' f26 91 84a7ffe9 
+b'a(.)' f0 91 587b693d 
+b'a(.)' f26 91 5c7d3c87 
+b'..' f0 91 813a1bb8 
+b'..' f26 91 abab8ece 
+'random pattern' f0 91 dfa12640 
+'random pattern' f26 91 73a44857 
+'' f0 91 3b4262a7 
+'' f26 91 095c8bea 
+'(ab)' f0 91 19472342 
+'(ab)' f26 91 48f8933d 
+b'\xc5\xe5' f0 91 eda706df 
+b'\xc5\xe5' f26 91 8d17221d 
+b'[a\xc5][a\xe5]' f0 91 3ae30510 
+b'[a\xc5][a\xe5]' f26 91 5c1f74c6 
+b'[az\xc5][az\xe5]' f0 91 51908eee 
+b'[az\xc5][az\xe5]' f26 91 640ec8c2 
+b'[^\xc5][^\xe5]' f0 91 9670749a 
+b'[^\xc5][^\xe5]' f26 91 ce716f76 
+'abc' f0 91 83abc7e3 
+'abc' f26 91 d1c9c2f4 
+'XYZ' f0 91 881d0fea 
+'XYZ' f26 91 376414d2 
+b'abc' f0 91 8551326e 
+b'abc' f26 91 da23dfb4 
+b'[a-h]+' f0 91 660f30ee 
+b'[a-h]+' f26 91 14d07ef1 
+b'[e-h]+' f0 91 8e85dc51 
+b'[e-h]+' f26 91 a467645c 
+'((?!(ab)c)(.))*' f0 91 524f9287 
+'((?!(ab)c)(.))*' f26 91 03d1ac1c 
+'a(?>bc|b)c' f0 91 f576d20c 
+'a(?>bc|b)c' f26 91 fbcb847d 
+'QabbbcR' f0 91 5eab7ef8 
+'QabbbcR' f26 91 a5f46490 
+'x' f0 91 726b293e 
+'x' f26 91 94b21424 
+'a+' f0 91 1f468a53 
+'a+' f26 91 eb3d7a58 
+'y' f0 91 1d60ac29 
+'y' f26 91 d8db2b3a 
+b'y' f0 91 47f43b90 
+b'y' f26 91 2be96e34 
+'(?i)b+' f0 91 1ed4a82d 
+'(?i)b+' f26 91 b9688385 
+'\\d+' f0 91 33e67da7 
+'\\d+' f26 91 09776a9a 
+'(.)' f0 91 4f704ce7 
+'(.)' f26 91 8c396b41 
+'(?P<a>x)' f0 91 7780963d 
+'(?P<a>x)' f26 91 9df8ebcd 
+'(?P<unk>x)' f0 91 1b17c8fa 
+'(?P<unk>x)' f26 91 c31800de 
+'()x' f0 91 faae4491 
+'()x' f26 91 d754561c 
+'^\\s*' f0 91 14715ada 
+'^\\s*' f26 91 b79f4a8a 
+'\\r\\n' f0 91 26cfc42f 
+'\\r\\n' f26 91 9894cda2 
+'\r\n' f0 91 cda44319 
+'\r\n' f26 91 247ec864 
+'(((((((((((x)))))))))))' f0 91 7e4249ce 
+'(((((((((((x)))))))))))' f26 91 ddbfabdf 
+'((((((((((y))))))))))(.)' f0 91 fec94cf1 
+'((((((((((y))))))))))(.)' f26 91 acb168f0 
+'b*' f0 91 b47d6130 
+'b*' f26 91 54d67464 
+':' f0 91 6f381d85 
+':' f26 91 7ab7fb80 
+'(\\S)\\s+(\\S)' f0 91 39beb52c 
+'(\\S)\\s+(\\S)' f26 91 f1f94b03 
+'(?P<a>x)|(?P<b>y)' f0 91 effa8c20 
+'(?P<a>x)|(?P<b>y)' f26 91 acdcc89c 
+b'(?P<a1>x)' f0 91 b3206a01 
+b'(?P<a1>x)' f26 91 98b3be94 
+'(?P<µ>x)' f0 91 bcac9364 
+'(?P<µ>x)' f26 91 2831f2b6 
+'(?P<𝔘𝔫𝔦𝔠𝔬𝔡𝔢>x)' f0 91 4a0f22f3 
+'(?P<𝔘𝔫𝔦𝔠𝔬𝔡𝔢>x)' f26 91 4a77e446 
+'b+' f0 91 77f4ae4c 
+'b+' f26 91 f7f084cb 
+'(?::+)' f0 91 b8a51b8c 
+'(?::+)' f26 91 e1cc7d36 
+'(:)+' f0 91 0be32bad 
+'(:)+' f26 91 7c85eade 
+'([b:]+)' f0 91 11d0e9d7 
+'([b:]+)' f26 91 7fd9cdf6 
+'(b)|(:+)' f0 91 2ef9d440 
+'(b)|(:+)' f26 91 e65f6757 
+'(?:b)|(?::+)' f0 91 82a6f9d5 
+'(?:b)|(?::+)' f26 91 c7eb7359 
+'(:)' f0 91 16247023 
+'(:)' f26 91 ba48d3de 
+'(:+)' f0 91 df1bd993 
+'(:+)' f26 91 3044e495 
+'(:*)' f0 91 706a6955 
+'(:*)' f26 91 7ed8aaf1 
+'(a|(b))' f0 91 7e4bf2f1 
+'(a|(b))' f26 91 cc95d620 
+'abc$' f0 91 f5065c5d 
+'abc$' f26 91 0d2613a6 
+'abc\\z' f0 91 eb31ae53 
+'abc\\z' f26 91 a90c27a6 
+'abc\\Z' f0 91 42707828 
+'abc\\Z' f26 91 dae7e089 
+'(?m)abc$' f0 91 6399c5e5 
+'(?m)abc$' f26 91 aa1daeb4 
+'^(\\()?([^()]+)(?(1)\\))$' f0 91 c3b856fd 
+'^(\\()?([^()]+)(?(1)\\))$' f26 91 e59647be 
+'abd' f0 91 8391194a 
+'abd' f26 91 92e723da 
+'^(\\|)?([^()]+)\\1$' f0 91 0821c57e 
+'^(\\|)?([^()]+)\\1$' f26 91 d699bf1b 
+'^(\\w){1}$' f0 91 7db1b1c1 
+'^(\\w){1}$' f26 91 311de2eb 
+'^(\\w){1}?$' f0 91 bcfd2da5 
+'^(\\w){1}?$' f26 91 cfc5e0ac 
+'^(\\w){1,2}$' f0 91 dc431645 
+'^(\\w){1,2}$' f26 91 4c142cb9 
+'^(\\w){1,2}?$' f0 91 b6fff856 
+'^(\\w){1,2}?$' f26 91 e11af2d0 
+'^x{1}$' f0 91 9a453004 
+'^x{1}$' f26 91 2fb0c9c3 
+'^x{1}?$' f0 91 d1a3e2b4 
+'^x{1}?$' f26 91 2e59bf27 
+'^x{1,2}$' f0 91 fa0141ce 
+'^x{1,2}$' f26 91 fadf6692 
+'^x{1,2}?$' f0 91 aa728d6b 
+'^x{1,2}?$' f26 91 32e0b1ea 
+'^x{3}$' f0 91 71970e21 
+'^x{3}$' f26 91 ebfe74d5 
+'^x{1,3}$' f0 91 6250ddfc 
+'^x{1,3}$' f26 91 98f83819 
+'^x{3,3}$' f0 91 4bc2fb62 
+'^x{3,3}$' f26 91 31b086b1 
+'^x{1,4}$' f0 91 1d0605e0 
+'^x{1,4}$' f26 91 6d7da7e9 
+'^x{3,4}?$' f0 91 61ddab85 
+'^x{3,4}?$' f26 91 2d04d8fb 
+'^x{3}?$' f0 91 9a4ce4cd 
+'^x{3}?$' f26 91 da4944cb 
+'^x{1,3}?$' f0 91 623d8d77 
+'^x{1,3}?$' f26 91 48e8cc1c 
+'^x{1,4}?$' f0 91 764387e0 
+'^x{1,4}?$' f26 91 f5a0bb9f 
+'^x{}$' f0 91 40158432 
+'^x{}$' f26 91 ed21eed7 
+'^\\Aabc\\z$' f0 91 84e2c2bf 
+'^\\Aabc\\z$' f26 91 734e6b38 
+'^\\Aabc\\Z$' f0 91 439c2bdd 
+'^\\Aabc\\Z$' f26 91 53691e5d 
+b'^\\Aabc\\z$' f0 91 1776e8ac 
+b'^\\Aabc\\z$' f26 91 90d95bc4 
+b'^\\Aabc\\Z$' f0 91 5f8dc4db 
+b'^\\Aabc\\Z$' f26 91 d8f562d9 
+'\\(' f0 91 05c4feb3 
+'\\(' f26 91 bd1fe431 
+'[\\]]' f0 91 ec7c5f9c 
+'[\\]]' f26 91 de5b12e6 
+'[a\\-c]' f0 91 bf7dcdf0 
+'[a\\-c]' f26 91 1f893768 
+'[\\^a]+' f0 91 8dff566a 
+'[\\^a]+' f26 91 e3d7f71f 
+'\\N{LESS-THAN SIGN}' f0 91 3952049c 
+'\\N{LESS-THAN SIGN}' f26 91 6248f629 
+'\\N{less-than sign}' f0 91 369ff69d 
+'\\N{less-than sign}' f26 91 27312428 
+'\\N{SNAKE}' f0 91 fc3561b0 
+'\\N{SNAKE}' f26 91 edc609c7 
+'\\N{ARABIC LIGATURE UIGHUR KIRGHIZ YEH WITH HAMZA ABOVE WITH ALEF MAKSURA ISOLATED FORM}' f0 91 c7d628d7 
+'\\N{ARABIC LIGATURE UIGHUR KIRGHIZ YEH WITH HAMZA ABOVE WITH ALEF MAKSURA ISOLATED FORM}' f26 91 7f3edae2 
+'[\\N{LESS-THAN SIGN}-\\N{GREATER-THAN SIGN}]' f0 91 f466633a 
+'[\\N{LESS-THAN SIGN}-\\N{GREATER-THAN SIGN}]' f26 91 df1e58bc 
+'\\b(ьюя)\\b' f0 91 5258a2b1 
+'\\b(ьюя)\\b' f26 91 80e2a640 
+'.\\b' f0 91 6f80b92e 
+'.\\b' f26 91 bdcd180e 
+b'.\\b' f0 91 99a43806 
+b'.\\b' f26 91 08f23168 
+'.\\B' f0 91 1a9a7e76 
+'.\\B' f26 91 7e131fd1 
+b'.\\B' f0 91 0e5f11cc 
+b'.\\B' f26 91 b8cb5c21 
+'\\b' f0 91 617defd3 
+'\\b' f26 91 b8abb0c2 
+b'\\b' f0 91 9d84516a 
+b'\\b' f26 91 df01e11d 
+'.+\\b' f0 91 38e220c2 
+'.+\\b' f26 91 f3429dea 
+b'.+\\b' f0 91 d682ec68 
+b'.+\\b' f26 91 5d0221ad 
+'\\B' f0 91 17144318 
+'\\B' f26 91 9e6382db 
+b'\\B' f0 91 dbf4aa2e 
+b'\\B' f26 91 546d59e4 
+'.+\\B' f0 91 0dd18581 
+'.+\\B' f26 91 3dec03de 
+b'.+\\B' f0 91 1ff1a485 
+b'.+\\B' f26 91 e3f3bace 
+'1000' f0 91 f7aa4e93 
+'1000' f26 91 5678c284 
+'9999' f0 91 665771eb 
+'9999' f26 91 f208a572 
+'(a)b(?=\\1)a' f0 91 73623ddd 
+'(a)b(?=\\1)a' f26 91 335e3b81 
+'(a)b(?=\\1)c' f0 91 ea1b3b2a 
+'(a)b(?=\\1)c' f26 91 5f82b140 
+'(?:(a)|(x))b(?=(?(2)x|c))c' f0 91 9f987d30 
+'(?:(a)|(x))b(?=(?(2)x|c))c' f26 91 950722fe 
+'(?:(a)|(x))b(?=(?(2)c|x))c' f0 91 aabfef5b 
+'(?:(a)|(x))b(?=(?(2)c|x))c' f26 91 93bc797e 
+'(?:(a)|(x))b(?=(?(1)b|x))c' f0 91 e5f5dd34 
+'(?:(a)|(x))b(?=(?(1)b|x))c' f26 91 da5fd4f4 
+'(?:(a)|(x))b(?=(?(1)c|x))c' f0 91 eeda653e 
+'(?:(a)|(x))b(?=(?(1)c|x))c' f26 91 2fc9461a 
+'(a)b(?=(?(2)x|c))(c)' f0 91 ef8358f4 
+'(a)b(?=(?(2)x|c))(c)' f26 91 25f94b0f 
+'(a)b(?=(?(2)b|x))(c)' f0 91 a90a6498 
+'(a)b(?=(?(2)b|x))(c)' f26 91 637ae381 
+'(a)b(?=(?(1)c|x))(c)' f0 91 51ff5f31 
+'(a)b(?=(?(1)c|x))(c)' f26 91 4f28f81a 
+'ab(?<=b)c' f0 91 c3c38f61 
+'ab(?<=b)c' f26 91 edf6a37f 
+'ab(?<=c)c' f0 91 87b7dc25 
+'ab(?<=c)c' f26 91 fff8dc3f 
+'ab(?<!b)c' f0 91 4e1e6a4b 
+'ab(?<!b)c' f26 91 056d567b 
+'ab(?<!c)c' f0 91 cb9580c5 
+'ab(?<!c)c' f26 91 207c001f 
+'(a)a(?<=\\1)c' f0 91 7e2308fc 
+'(a)a(?<=\\1)c' f26 91 ed2f4719 
+'(a)b(?<=\\1)a' f0 91 6599716b 
+'(a)b(?<=\\1)a' f26 91 5ab684b7 
+'(a)a(?<!\\1)c' f0 91 f81f8012 
+'(a)a(?<!\\1)c' f26 91 72604de2 
+'(a)b(?<!\\1)a' f0 91 e76a1de5 
+'(a)b(?<!\\1)a' f26 91 d063da20 
+'(?:(a)|(x))b(?<=(?(2)x|c))c' f0 91 d7357699 
+'(?:(a)|(x))b(?<=(?(2)x|c))c' f26 91 de6706fb 
+'(?:(a)|(x))b(?<=(?(2)b|x))c' f0 91 5a8ad417 
+'(?:(a)|(x))b(?<=(?(2)b|x))c' f26 91 ca92f891 
+'(?:(a)|(x))b(?<=(?(2)x|b))c' f0 91 03b373e6 
+'(?:(a)|(x))b(?<=(?(2)x|b))c' f26 91 cae73b66 
+'(?:(a)|(x))b(?<=(?(1)c|x))c' f0 91 15c0e678 
+'(?:(a)|(x))b(?<=(?(1)c|x))c' f26 91 8371551b 
+'(?:(a)|(x))b(?<=(?(1)b|x))c' f0 91 700f2403 
+'(?:(a)|(x))b(?<=(?(1)b|x))c' f26 91 cb85873f 
+'(a)b(?<=(?(1)c|x))(c)' f0 91 c9844c7c 
+'(a)b(?<=(?(1)c|x))(c)' f26 91 e7fc9ad6 
+'(a)b(?<=(?(1)b|x))(c)' f0 91 4193520e 
+'(a)b(?<=(?(1)b|x))(c)' f26 91 605ab791 
+'K' f0 91 09607458 
+'K' f26 91 66d779ac 
+'k' f0 91 857ae832 
+'k' f26 91 5dbcb160 
+'\\u212a' f0 91 004f6e27 
+'\\u212a' f26 91 297fdfd5 
+'S' f0 91 81d31e57 
+'S' f26 91 75b86ff9 
+'s' f0 91 0dc9823d 
+'s' f26 91 4ed3a735 
+'\\u017f' f0 91 7d3e48f3 
+'\\u017f' f26 91 46ad968c 
+'\\u0412' f0 91 b4c5e579 
+'\\u0412' f26 91 86c9c8a6 
+'\\u0432' f0 91 68cdffbc 
+'\\u0432' f26 91 a93e665f 
+'\\u1c80' f0 91 66b7961f 
+'\\u1c80' f26 91 7e5b99c6 
+'\\ufb05' f0 91 dd492d01 
+'\\ufb05' f26 91 f6f81d7b 
+'\\ufb06' f0 91 6c55a238 
+'\\ufb06' f26 91 22435c59 
+'[19A]' f0 91 ac1fa7b1 
+'[19A]' f26 91 1f386602 
+'[19a]' f0 91 fcc04102 
+'[19a]' f26 91 067f914d 
+b'[19A]' f0 91 570c5076 
+b'[19A]' f26 91 63e23cff 
+b'[19a]' f0 91 7f5bd55d 
+b'[19a]' f26 91 37da11cd 
+'[19\\xc7]' f0 91 1e92de47 
+'[19\\xc7]' f26 91 2527bbac 
+'[19\\xe7]' f0 91 3d527d48 
+'[19\\xe7]' f26 91 fd08ebff 
+'[19\\u0400]' f0 91 799bdd3d 
+'[19\\u0400]' f26 91 5b78ec56 
+'[19\\u0450]' f0 91 a603ac95 
+'[19\\u0450]' f26 91 02f8970c 
+'[19\\U00010400]' f0 91 0b2d6424 
+'[19\\U00010400]' f26 91 ecb52af0 
+'[19\\U00010428]' f0 91 81b3b9aa 
+'[19\\U00010428]' f26 91 6adafa9e 
+'[19K]' f0 91 82a596f0 
+'[19K]' f26 91 917ff6c7 
+'[19k]' f0 91 09636c20 
+'[19k]' f26 91 a8997906 
+'[19\\u212a]' f0 91 98cd7127 
+'[19\\u212a]' f26 91 f5930303 
+'[19S]' f0 91 e5b7552c 
+'[19S]' f26 91 1891d067 
+'[19s]' f0 91 6e71affc 
+'[19s]' f26 91 21775fa6 
+'[19\\u017f]' f0 91 4665427a 
+'[19\\u017f]' f26 91 d728cf79 
+'[19\\u0412]' f0 91 2510030d 
+'[19\\u0412]' f26 91 3a348dc9 
+'[19\\u0432]' f0 91 8d7f6037 
+'[19\\u0432]' f26 91 c4febfc7 
+'[19\\u1c80]' f0 91 330b792c 
+'[19\\u1c80]' f26 91 82771277 
+'[19\\ufb05]' f0 91 ff733a72 
+'[19\\ufb05]' f26 91 a63ecec8 
+'[19\\ufb06]' f0 91 1e29e129 
+'[19\\ufb06]' f26 91 b7030a1c 
+'[9-a]' f0 91 0f6f65ed 
+'[9-a]' f26 91 b6102c7a 
+'[9-A]' f0 91 a8ed92a0 
+'[9-A]' f26 91 3b6028ee 
+b'[9-a]' f0 91 aa8d5f46 
+b'[9-a]' f26 91 970d38d1 
+b'[9-A]' f0 91 f628dcd2 
+b'[9-A]' f26 91 6a553e50 
+'[\\xc0-\\xde]' f0 91 9d496c84 
+'[\\xc0-\\xde]' f26 91 1c6135ca 
+'[\\xe0-\\xfe]' f0 91 add258d8 
+'[\\xe0-\\xfe]' f26 91 748ddac0 
+'[\\u0430-\\u045f]' f0 91 c18661aa 
+'[\\u0430-\\u045f]' f26 91 e4ce8f8d 
+'[\\u0400-\\u042f]' f0 91 b1c4c1c2 
+'[\\u0400-\\u042f]' f26 91 cd7af3ce 
+'[\\U00010428-\\U0001044f]' f0 91 2c3e79a6 
+'[\\U00010428-\\U0001044f]' f26 91 ab56f293 
+'[\\U00010400-\\U00010427]' f0 91 051dc56a 
+'[\\U00010400-\\U00010427]' f26 91 0592caa6 
+'[N-\\x7f]' f0 91 71ce7885 
+'[N-\\x7f]' f26 91 12f9f7b9 
+'[n-\\x7f]' f0 91 42650b3c 
+'[n-\\x7f]' f26 91 a50288e8 
+'[N-\\uffff]' f0 91 eb2e3bab 
+'[N-\\uffff]' f26 91 d0127f56 
+'[n-\\uffff]' f0 91 07ce936d 
+'[n-\\uffff]' f26 91 06aa1101 
+'[N-\\U00010000]' f0 91 63035305 
+'[N-\\U00010000]' f26 91 788cd48b 
+'[n-\\U00010000]' f0 91 450f6ea5 
+'[n-\\U00010000]' f26 91 2201e15f 
+'[J-M]' f0 91 51d78dc7 
+'[J-M]' f26 91 51ad7acf 
+'[j-m]' f0 91 99ea6d0b 
+'[j-m]' f26 91 82b21515 
+'[\\u2129-\\u212b]' f0 91 21992689 
+'[\\u2129-\\u212b]' f26 91 dafc3560 
+'[R-T]' f0 91 847a8bd0 
+'[R-T]' f26 91 0bbc0366 
+'[r-t]' f0 91 ac7b7d5b 
+'[r-t]' f26 91 9dbccdff 
+'[\\u017e-\\u0180]' f0 91 c4c63e43 
+'[\\u017e-\\u0180]' f26 91 d5600a8b 
+'[\\u0411-\\u0413]' f0 91 fdba232f 
+'[\\u0411-\\u0413]' f26 91 34b42c27 
+'[\\u0431-\\u0433]' f0 91 1c704d52 
+'[\\u0431-\\u0433]' f26 91 67242c13 
+'[\\u1c80-\\u1c82]' f0 91 2dfeb92d 
+'[\\u1c80-\\u1c82]' f26 91 854b47ac 
+'[\\ufb04-\\ufb05]' f0 91 5803120d 
+'[\\ufb04-\\ufb05]' f26 91 d268e97c 
+'[\\ufb06-\\ufb07]' f0 91 9cf57746 
+'[\\ufb06-\\ufb07]' f26 91 f1fbed8e 
+'[0-9--1]' f0 91 45b9d45f 
+'[0-9--1]' f26 91 ad4df986 
+'[--1]' f0 91 1b6aec7a 
+'[--1]' f26 91 9815ab44 
+'[%--1]' f0 91 4a363a5a 
+'[%--1]' f26 91 d6494060 
+'[%--]' f0 91 3253bfe0 
+'[%--]' f26 91 24145851 
+'[0-9&&1]' f0 91 d67bc02c 
+'[0-9&&1]' f26 91 21e454d6 
+'[\\d&&1]' f0 91 633d7735 
+'[\\d&&1]' f26 91 6eded1e4 
+'[&&1]' f0 91 cf2201a9 
+'[&&1]' f26 91 06d4c32e 
+'[0-9||a]' f0 91 5e08bb48 
+'[0-9||a]' f26 91 f8364e2c 
+'[\\d||a]' f0 91 69e5057a 
+'[\\d||a]' f26 91 cbbf5ffd 
+'[||1]' f0 91 b51ba59f 
+'[||1]' f26 91 327540c3 
+'[0-9~~1]' f0 91 934d7632 
+'[0-9~~1]' f26 91 9f8f2bd0 
+'[\\d~~1]' f0 91 260bc12b 
+'[\\d~~1]' f26 91 d0b5aee2 
+'[~~1]' f0 91 dbd07074 
+'[~~1]' f26 91 2bf995f8 
+'[[0-9]|]' f0 91 93a82c4c 
+'[[0-9]|]' f26 91 dab068ed 
+'[[:digit:]|]' f0 91 00b81c76 
+'[[:digit:]|]' f26 91 79080c39 
+'\\0' f0 91 8d7794bc 
+'\\0' f26 91 ae70f264 
+'\\08' f0 91 3461a9c0 
+'\\08' f26 91 517695f3 
+'\\01' f0 91 95d408ed 
+'\\01' f26 91 13c558de 
+'\\018' f0 91 28156b3e 
+'\\018' f26 91 7a7f7acb 
+'[\\U0001d49c-\\U0001d4b5]' f0 91 0a6836e7 
+'[\\U0001d49c-\\U0001d4b5]' f26 91 6ed79aa5 
+b'\\0' f0 91 c06bc7f8 
+b'\\0' f26 91 8fed1f8e 
+b'\\08' f0 91 4f89b281 
+b'\\08' f26 91 fa660a4c 
+b'\\01' f0 91 c1b99dc0 
+b'\\01' f26 91 0c3b1e4a 
+b'\\018' f0 91 678ad845 
+b'\\018' f26 91 66ecdae4 
+'(?:a?)*y' f0 91 724d1fb6 
+'(?:a?)*y' f26 91 098b56e6 
+'(?:a?)+y' f0 91 f1f191f4 
+'(?:a?)+y' f26 91 f3c802ba 
+'(?:a?){2,}y' f0 91 5b2af7c0 
+'(?:a?){2,}y' f26 91 f0c5aa80 
+'(?:a?)*?y' f0 91 47cbcb2c 
+'(?:a?)*?y' f26 91 e6631d31 
+'(?:a?)+?y' f0 91 df9a571e 
+'(?:a?)+?y' f26 91 844443ba 
+'(?:a?){2,}?y' f0 91 fe8478cd 
+'(?:a?){2,}?y' f26 91 424b97a0 
+'xyz' f0 91 cf47d102 
+'xyz' f26 91 6c16d0e6 
+'bug_926075' f0 91 b77afeb0 
+'bug_926075' f26 91 21d48d47 
+b'bug_926075' f0 91 e440549b 
+b'bug_926075' f26 91 9262c11d 
+'a.b.c' f0 91 e04bbd3f 
+'a.b.c' f26 91 90194a3f 
+'#' f0 91 8880f29d 
+'#' f26 91 25b1d2cb 
+'à' f0 91 5a37af18 
+'à' f26 91 a32b69f4 
+b'\xc0' f0 91 177f32d2 
+b'\xc0' f26 91 97e4ed73 
+b'[bc]' f0 91 ad38d8c0 
+b'[bc]' f26 91 93d3f9e6 
+b'[^bc]' f0 91 8498050e 
+b'[^bc]' f26 91 eb3a1f55 
+b'[^b-c]' f0 91 3e8021c0 
+b'[^b-c]' f26 91 859c597b 
+b'[^b]' f0 91 672e9c72 
+b'[^b]' f26 91 d94dbbe2 
+b'[^\\wq]' f0 91 3ea06975 
+b'[^\\wq]' f26 91 fa78b66c 
+b'[ace]' f0 91 d3f18527 
+b'[ace]' f26 91 10ad73e9 
+b'[^ace]' f0 91 c4fbb56e 
+b'[^ace]' f26 91 b57d6d60 
+b'(?:a|[^bc])' f0 91 2052f3fe 
+b'(?:a|[^bc])' f26 91 3a9a241e 
+b'\\w(?<!b)' f0 91 cca74552 
+b'\\w(?<!b)' f26 91 2ab8100f 
+'(?i:a)b' f0 91 6347ceb6 
+'(?i:a)b' f26 91 0a27a861 
+'(?-i:a)b' f0 91 61a76ea1 
+'(?-i:a)b' f26 91 c0cdc572 
+'(?i:(?-i:a)b)' f0 91 4deedcf5 
+'(?i:(?-i:a)b)' f26 91 f5fdf6dd 
+'\\w(?a:\\W)\\w' f0 91 6205eab5 
+'\\w(?a:\\W)\\w' f26 91 51ee22cf 
+'(?a:\\W(?u:\\w)\\W)' f0 91 86b3e29f 
+'(?a:\\W(?u:\\w)\\W)' f26 91 4c04c4e8 
+'\\W(?u:\\w)\\W' f0 91 68e69f48 
+'\\W(?u:\\w)\\W' f26 91 835a0c48 
+'(?x) a' f0 91 6e8a1d98 
+'(?x) a' f26 91 7be01802 
+' (?x) a' f0 1 cb9d704d ERR PatternError global flags not at the start of the expres
+' (?x) a' f26 1 cb9d704d ERR PatternError global flags not at the start of the expres
+'(?x) (?x) a' f0 91 495afa07 
+'(?x) (?x) a' f26 91 4828d820 
+' a(?x: b) c' f0 91 03edcea7 
+' a(?x: b) c' f26 91 7e7c70ba 
+' a(?-x: b) c' f0 91 ceecec7f 
+' a(?-x: b) c' f26 91 0b9828ec 
+'(?x) a(?-x: b) c' f0 91 905073e1 
+'(?x) a(?-x: b) c' f26 91 0d0e5dd3 
+'(?x) a| b' f0 91 8742175a 
+'(?x) a| b' f26 91 67ba36da 
+'#x\na' f0 91 18698721 
+'#x\na' f26 91 7be56689 
+b'#x\na' f0 91 2eef35da 
+b'#x\na' f26 91 ca117cd6 
+'(?x)#x\na' f0 91 617f7956 
+'(?x)#x\na' f26 91 79dde323 
+'#x\n(?x)#y\na' f0 1 25b2d45f ERR PatternError global flags not at the start of the expres
+'#x\n(?x)#y\na' f26 1 25b2d45f ERR PatternError global flags not at the start of the expres
+'(?x)#x\n(?x)#y\na' f0 91 131f9767 
+'(?x)#x\n(?x)#y\na' f26 91 31233608 
+'#x\na(?x:#y\nb)#z\nc' f0 91 c67c4b07 
+'#x\na(?x:#y\nb)#z\nc' f26 91 2d7fca86 
+'#x\na(?-x:#y\nb)#z\nc' f0 91 f8c716d0 
+'#x\na(?-x:#y\nb)#z\nc' f26 91 3b4573c6 
+'(?x)#x\na(?-x:#y\nb)#z\nc' f0 91 75e3f36f 
+'(?x)#x\na(?-x:#y\nb)#z\nc' f26 91 ddb826b8 
+'(?x)#x\na|#y\nb' f0 91 1df25e7c 
+'(?x)#x\na|#y\nb' f26 91 5c34aa94 
+'b\\1' f0 1 c510e2c5 ERR PatternError invalid group reference 1 at position 2 2
+'b\\1' f26 1 c510e2c5 ERR PatternError invalid group reference 1 at position 2 2
+b'b\\1' f0 1 c510e2c5 ERR PatternError invalid group reference 1 at position 2 2
+b'b\\1' f26 1 c510e2c5 ERR PatternError invalid group reference 1 at position 2 2
+'123.*-' f0 91 ba1f89e8 
+'123.*-' f26 91 f49da6ec 
+'(?i)(a)\\1' f0 91 52bb9175 
+'(?i)(a)\\1' f26 91 f81e9fd1 
+'(.+)(.*?)\\1' f0 91 d8c072e1 
+'(.+)(.*?)\\1' f26 91 7e4deb08 
+b'(.+)(.*?)\\1' f0 91 22537c6b 
+b'(.+)(.*?)\\1' f26 91 f5616619 
+'(aa)|(bb)' f0 91 74169eb1 
+'(aa)|(bb)' f26 91 1f86c070 
+'\\b|:+' f0 91 f14986ca 
+'\\b|:+' f26 91 26f2c830 
+'(?<!\\w)(?=\\w)|:+' f0 91 576cd17a 
+'(?<!\\w)(?=\\w)|:+' f26 91 e98eef75 
+'(?<=\\w)(?!\\w)|:+' f0 91 4b81b3e2 
+'(?<=\\w)(?!\\w)|:+' f26 91 475082eb 
+'(\\b|:+)' f0 91 344bf346 
+'(\\b|:+)' f26 91 d7e42c73 
+'\\b|\\w+' f0 91 36276b5f 
+'\\b|\\w+' f26 91 3a4a267d 
+b'\xc5' f0 91 853f97d2 
+b'\xc5' f26 91 302e3c30 
+b'\xe5' f0 91 85dc1714 
+b'\xe5' f26 91 335dad5d 
+b'(?Li)\xc5\xe5' f0 91 cf1131c8 
+b'(?Li)\xc5\xe5' f26 91 0a43fb87 
+b'(?Li)\xc5' f0 91 68286c60 
+b'(?Li)\xc5' f26 91 ff64ead3 
+b'(?Li)\xe5' f0 91 22134113 
+b'(?Li)\xe5' f26 91 15a4bf80 
+b'\xe5\xc5' f0 91 cdec43a0 
+b'\xe5\xc5' f26 91 97a00387 
+b'\xe5\xe5' f0 91 cd0fc366 
+b'\xe5\xe5' f26 91 94d392ea 
+b'\xc5\xc5' f0 91 ed448619 
+b'\xc5\xc5' f26 91 8e64b370 
+'(€))' f0 1 1f4c0237 ERR PatternError unbalanced parenthesis at position 3 3
+'(€))' f26 1 1f4c0237 ERR PatternError unbalanced parenthesis at position 3 3
+b'(\xa4))' f0 1 1f4c0237 ERR PatternError unbalanced parenthesis at position 3 3
+b'(\xa4))' f26 1 1f4c0237 ERR PatternError unbalanced parenthesis at position 3 3
+'\n                (\n                    abc\n                )\n                )\n                (\n                ' f0 1 826d8605 ERR PatternError unbalanced parenthesis at position 77 (line
+'\n                (\n                    abc\n                )\n                )\n                (\n                ' f26 1 826d8605 ERR PatternError unbalanced parenthesis at position 77 (line
+'x*' f0 91 41a35619 
+'x*' f26 91 0906d989 
+'e*+e' f0 91 1a80608f 
+'e*+e' f26 91 dfa8d243 
+'(.)++.' f0 91 a0e36965 
+'(.)++.' f26 91 6ee67053 
+'a++' f0 91 a583214b 
+'a++' f26 91 5a86f679 
+'^(\\w){1}+$' f0 91 642dd324 
+'^(\\w){1}+$' f26 91 49346ca7 
+'^(\\w){1,2}+$' f0 91 497d5bb8 
+'^(\\w){1,2}+$' f26 91 d5e82b64 
+'^x{1}+$' f0 91 e4371812 
+'^x{1}+$' f26 91 d57a935c 
+'^x{1,2}+$' f0 91 9fe677cd 
+'^x{1,2}+$' f26 91 c9c39d91 
+'^x{3}+$' f0 91 afd81e6b 
+'^x{3}+$' f26 91 216a68b0 
+'^x{1,3}+$' f0 91 57a977d1 
+'^x{1,3}+$' f26 91 b3cbe067 
+'^x{1,4}+$' f0 91 43d77d46 
+'^x{1,4}+$' f26 91 0e8397e4 
+'^x{}+$' f0 91 2b57dd3f 
+'^x{}+$' f26 91 cf62d606 
+'a*+' f0 91 86f1b136 
+'a*+' f26 91 b134aecc 
+'a?+' f0 91 34acf275 
+'a?+' f26 91 209c14fb 
+'a{1,3}+' f0 91 ce6fc629 
+'a{1,3}+' f26 91 b1e79049 
+'a++b' f0 91 8a73d8e5 
+'a++b' f26 91 bf41609d 
+'a*+b' f0 91 44a1dc42 
+'a*+b' f26 91 b57bf656 
+'a?+b' f0 91 ab5d6ea1 
+'a?+b' f26 91 3f65eee0 
+'a{1,3}+b' f0 91 805a40f6 
+'a{1,3}+b' f26 91 599cd39a 
+'(?:ab)++' f0 91 cd4cf9d1 
+'(?:ab)++' f26 91 7c337b16 
+'(?:ab)*+' f0 91 7209b641 
+'(?:ab)*+' f26 91 958ee57d 
+'(?:ab)?+' f0 91 cf698fa2 
+'(?:ab)?+' f26 91 7d1fd658 
+'(?:ab){1,3}+' f0 91 b95a82cf 
+'(?:ab){1,3}+' f26 91 6039162c 
+'(?:ab)++c' f0 91 249df843 
+'(?:ab)++c' f26 91 91c0960e 
+'(?:ab)*+c' f0 91 b0423670 
+'(?:ab)*+c' f26 91 4ee73839 
+'(?:ab)?+c' f0 91 e1c5fb31 
+'(?:ab)?+c' f26 91 c4acffaa 
+'(?:ab){1,3}+c' f0 91 30964a1a 
+'(?:ab){1,3}+c' f26 91 fbbb7c5a 
+'abcc' f0 91 a68f648b 
+'abcc' f26 91 46cbfd11 
+'(?>.*).' f0 91 8388f912 
+'(?>.*).' f26 91 ae3a6ba0 
+'(?>x)++' f0 91 01210166 
+'(?>x)++' f26 91 08f63ae0 
+'(?>x++)' f0 91 34e4356d 
+'(?>x++)' f26 91 546af9ca 
+'(?>x)++x' f0 91 91affa0a 
+'(?>x)++x' f26 91 cdd2c59a 
+'(?>x++)x' f0 91 0648e6b6 
+'(?>x++)x' f26 91 1635908f 
+'(?>a+)' f0 91 4164df7e 
+'(?>a+)' f26 91 4fc1b286 
+'(?>a*)' f0 91 48474b6c 
+'(?>a*)' f26 91 d952d4a1 
+'(?>a?)' f0 91 915d16ec 
+'(?>a?)' f26 91 b7bf3bd7 
+'(?>a{1,3})' f0 91 268213f2 
+'(?>a{1,3})' f26 91 77fc3eaa 
+'(?>a+)b' f0 91 0cf87255 
+'(?>a+)b' f26 91 a81a2855 
+'(?>a*)b' f0 91 8ddd1594 
+'(?>a*)b' f26 91 86b71dd1 
+'(?>a?)b' f0 91 6221a777 
+'(?>a?)b' f26 91 0ca90567 
+'(?>a{1,3})b' f0 91 1d758f1f 
+'(?>a{1,3})b' f26 91 5c64bd2d 
+'(?>(?:ab)+)' f0 91 c7f65407 
+'(?>(?:ab)+)' f26 91 512ac47b 
+'(?>(?:ab)*)' f0 91 c834d31f 
+'(?>(?:ab)*)' f26 91 c91360c9 
+'(?>(?:ab)?)' f0 91 d76bd0f4 
+'(?>(?:ab)?)' f26 91 b8c051a7 
+'(?>(?:ab){1,3})' f0 91 5b7beaa6 
+'(?>(?:ab){1,3})' f26 91 3aec429d 
+'(?>(?:ab)+)c' f0 91 92060f6d 
+'(?>(?:ab)+)c' f26 91 9b494c8f 
+'(?>(?:ab)*)c' f0 91 330883d9 
+'(?>(?:ab)*)c' f26 91 446ee2b8 
+'(?>(?:ab)?)c' f0 91 628f4e98 
+'(?>(?:ab)?)c' f26 91 ce25252b 
+'(?>(?:ab){1,3})c' f0 91 d400b3b8 
+'(?>(?:ab){1,3})c' f26 91 1873976b 
+'(?s:(?>.*?\\.).*)\\z' f0 91 450290ec 
+'(?s:(?>.*?\\.).*)\\z' f26 91 77f6f37a 
+'(?s:(?=(?P<g0>.*?\\.))(?P=g0).*)\\z' f0 91 0e4e724e 
+'(?s:(?=(?P<g0>.*?\\.))(?P=g0).*)\\z' f26 91 d86fc096 
+b':' f0 91 3de3395f 
+b':' f26 91 41b61c78 
+b':+' f0 91 ef9775f7 
+b':+' f26 91 b82a4794 
+b'(:+)' f0 91 7f9ed21b 
+b'(:+)' f26 91 f0c4ae1c 
+'(:)(:*)' f0 91 652753d0 
+'(:)(:*)' f26 91 a3d2e415 
+b'(:)(:*)' f0 91 e79e162a 
+b'(:)(:*)' f26 91 8d6475c7 
+'(?i)(a)(b)' f0 91 60544386 
+'(?i)(a)(b)' f26 91 95b7c3c3 
+'(a)' f0 91 58b7b41d 
+'(a)' f26 91 f992ec88 
+'[0-9--2]' f0 91 2833a37a 
+'[0-9--2]' f26 91 1a458e2c 
+'[0-8&&1]' f0 91 51d83d34 
+'[0-8&&1]' f26 91 48223e28 
+'[[0-8]|]' f0 91 38f6e6dd 
+'[[0-8]|]' f26 91 1a18687e 
+'^pattern$' f0 91 764fde8c 
+'^pattern$' f26 91 3727e07e 
+b'^pattern$' f0 91 414c738f 
+b'^pattern$' f26 91 35e27400 
+'(a)?a' f0 91 6c9653bf 
+'(a)?a' f26 91 47361988 
+'(a)(b)?b' f0 91 51d7a6a4 
+'(a)(b)?b' f26 91 7fdf92fb 
+'(?P<a>a)(?P<b>b)?b' f0 91 bc43e525 
+'(?P<a>a)(?P<b>b)?b' f26 91 b0118303 
+'(?P<a>a(b))' f0 91 555743f7 
+'(?P<a>a(b))' f26 91 c5b4a18f 
+'((a))' f0 91 cdc0d534 
+'((a))' f26 91 56943cd0 
+'^\\d$' f0 91 723bb133 
+'^\\d$' f26 91 0e549b4e 
+b'\xe0' f0 91 179cb214 
+b'\xe0' f26 91 94977c1e 
+'xyyzy' f0 91 92f9d656 
+'xyyzy' f26 91 aeb5c33d 
+'12(?!)|3' f0 91 e2328607 
+'12(?!)|3' f26 91 fbc07281 
+'x+' f0 91 c039967d 
+'x+' f26 91 ee9eb3c1 
+'a*' f0 91 d03d59d4 
+'a*' f26 91 1cb302c4 
+'(ab|ba)' f0 91 c76abf55 
+'(ab|ba)' f26 91 afe629b6 
+'(abc|bac|ca|cb)' f0 91 ed4bd9f4 
+'(abc|bac|ca|cb)' f26 91 4cdcb782 
+'((a)|(b)|(c))' f0 91 de0f1ae8 
+'((a)|(b)|(c))' f26 91 231177b0 
+'b' f0 91 8566b454 
+'b' f26 91 4244de95 
+'bc' f0 91 63c15a99 
+'bc' f26 91 ae45f73c 
+'.*?$' f0 91 a2ffd2b3 
+'.*?$' f26 91 f1c9e1bf 
+'.*?' f0 91 99eaf0fc 
+'.*?' f26 91 75a135fa 
+'a.*?b' f0 91 129d8aff 
+'a.*?b' f26 91 7497b9e1 
+'ab(?=c)cd' f0 91 31c5ae62 
+'ab(?=c)cd' f26 91 49f04b60 
+'ab(?<=b)cd' f0 91 595f04f3 
+'ab(?<=b)cd' f26 91 58fb95a3 
+'(?=a|ab)ab' f0 91 07df9864 
+'(?=a|ab)ab' f26 91 2e372258 
+'abcd' f0 91 70ccf9af 
+'abcd' f26 91 78a5460a 
+'^(?:(a)|c)((?(1)b|d))$' f0 91 d4309c61 
+'^(?:(a)|c)((?(1)b|d))$' f26 91 e5eef997 
+'^(?:(a)|c)((?(1)|d))$' f0 91 c5a58bd7 
+'^(?:(a)|c)((?(1)|d))$' f26 91 a0d2b55b 
+'ad' f0 91 080b314f 
+'ad' f26 91 49acf540 
+'^(\\|)?([^()]+)\\1?$' f0 91 49d212f5 
+'^(\\|)?([^()]+)\\1?$' f26 91 25bb7779 
+'^(?:(a)|c)(\\1)$' f0 91 5ae6bdff 
+'^(?:(a)|c)(\\1)$' f26 91 71fb4fe5 
+'^(?:(a)|c)(\\1)?$' f0 91 588f1980 
+'^(?:(a)|c)(\\1)?$' f26 91 09c12303 
+'(?P<first>first) (?P<second>second)' f0 91 453cf57b 
+'(?P<first>first) (?P<second>second)' f26 91 285ff1c9 
+'(?P<first>first)|(?P<second>second)' f0 91 e023ccd1 
+'(?P<first>first)|(?P<second>second)' f26 91 bf78d534 
+'^(\\w){3}$' f0 91 47f82dc8 
+'^(\\w){3}$' f26 91 a345bdff 
+'^(\\w){1,3}$' f0 91 dab33af8 
+'^(\\w){1,3}$' f26 91 774a63f6 
+'^(\\w){1,4}$' f0 91 d5ab4582 
+'^(\\w){1,4}$' f26 91 d74da3cb 
+'^(\\w){3,4}?$' f0 91 35226847 
+'^(\\w){3,4}?$' f26 91 b62570b3 
+'^(\\w){3}?$' f0 91 6121535a 
+'^(\\w){3}?$' f26 91 20f2e931 
+'^(\\w){1,3}?$' f0 91 69a6e391 
+'^(\\w){1,3}?$' f26 91 475c6aac 
+'^(\\w){1,4}?$' f0 91 07013b2f 
+'^(\\w){1,4}?$' f26 91 3387c810 
+'\\b(b.)\\b' f0 91 eba4080f 
+'\\b(b.)\\b' f26 91 b978a51b 
+'\\B(b.)\\B' f0 91 112bf2fa 
+'\\B(b.)\\B' f26 91 3c38be3e 
+'^abc$' f0 91 0e5cd74d 
+'^abc$' f26 91 20c3a409 
+b'\\b(b.)\\b' f0 91 08dc6da4 
+b'\\b(b.)\\b' f26 91 d83323f8 
+b'\\B(b.)\\B' f0 91 07e3bab4 
+b'\\B(b.)\\B' f26 91 15f6407f 
+b'^abc$' f0 91 ba1838ac 
+b'^abc$' f26 91 d4d512f6 
+'\\d\\D\\w\\W\\s\\S' f0 91 29818421 
+'\\d\\D\\w\\W\\s\\S' f26 91 b483576d 
+b'\\d\\D\\w\\W\\s\\S' f0 91 fd4355ec 
+b'\\d\\D\\w\\W\\s\\S' f26 91 6647f50c 
+'\\\\' f0 91 bae4fc9f 
+'\\\\' f26 91 4e9f9899 
+'\\b(abc)\\b' f0 91 d58b0bbf 
+'\\b(abc)\\b' f26 91 599d4132 
+b'\\b(abc)\\b' f0 91 43e6bfd8 
+b'\\b(abc)\\b' f26 91 93967f78 
+'([∢∣])' f0 91 0184fbf7 
+'([∢∣])' f26 91 be8ab14d 
+'a.b' f0 91 1fdc76d1 
+'a.b' f26 91 202acd33 
+'a.*b' f0 91 a01f83aa 
+'a.*b' f26 91 bf1ec80b 
+'(a(?=\\s[^a]))' f0 91 78a313a7 
+'(a(?=\\s[^a]))' f26 91 823c6f7e 
+'(a(?=\\s[^a]*))' f0 91 7a23857d 
+'(a(?=\\s[^a]*))' f26 91 f4e00e11 
+'(a(?=\\s[abc]))' f0 91 547e212c 
+'(a(?=\\s[abc]))' f26 91 ece94824 
+'(a(?=\\s[abc]*))' f0 91 006502e7 
+'(a(?=\\s[abc]*))' f26 91 7f3063dc 
+'(a)(?=\\s\\1)' f0 91 5d86c611 
+'(a)(?=\\s\\1)' f26 91 87ee500d 
+'(a)(?=\\s\\1*)' f0 91 f2c27db9 
+'(a)(?=\\s\\1*)' f26 91 002dc8c3 
+'(a)(?=\\s(abc|a))' f0 91 57edd47c 
+'(a)(?=\\s(abc|a))' f26 91 688bd406 
+'(a(?!\\s[^a]))' f0 91 89540e99 
+'(a(?!\\s[^a]))' f26 91 2f5b9d61 
+'(a(?!\\s[abc]))' f0 91 33239207 
+'(a(?!\\s[abc]))' f26 91 af42cc65 
+'(a)(?!\\s\\1)' f0 91 70332daf 
+'(a)(?!\\s\\1)' f26 91 ea8e9e48 
+'(a)(?!\\s(abc|a))' f0 91 51906d0f 
+'(a)(?!\\s(abc|a))' f26 91 9077962c 
+'(a\\s[^a])' f0 91 ce151deb 
+'(a\\s[^a])' f26 91 45fb45df 
+'(a\\s[^a]*)' f0 91 cd93904c 
+'(a\\s[^a]*)' f26 91 1d7cf748 
+'(a\\s[abc])' f0 91 149c7b2e 
+'(a\\s[abc])' f26 91 571390ca 
+'(a\\s[abc]*)' f0 91 1bc14a1e 
+'(a\\s[abc]*)' f26 91 a7b50c25 
+'((a)\\s\\2)' f0 91 94a8ae88 
+'((a)\\s\\2)' f26 91 4b71be83 
+'((a)\\s\\2*)' f0 91 66def0bc 
+'((a)\\s\\2*)' f26 91 4e1a4d6d 
+'((a)\\s(abc|a))' f0 91 5450af22 
+'((a)\\s(abc|a))' f26 91 7d7c9949 
+'((a)\\s(abc|a)*)' f0 91 c189ec7c 
+'((a)\\s(abc|a)*)' f26 91 be4b1857 
+'(\\s)' f0 91 4039a239 
+'(\\s)' f26 91 e578699f 
+'\\s([^a])' f0 91 e0510c2b 
+'\\s([^a])' f26 91 bd4f84fc 
+'\\s([^a]*)' f0 91 1ca93e86 
+'\\s([^a]*)' f26 91 eb67dd91 
+'\\s(b)' f0 91 c44de2b9 
+'\\s(b)' f26 91 37e6209d 
+'a\\s' f0 91 7a7c5507 
+'a\\s' f26 91 d259263c 
+'(a)|(b)' f0 91 d8154bae 
+'(a)|(b)' f26 91 06cf7e6f 
+'.*?c' f0 91 0b689802 
+'.*?c' f26 91 e602b777 
+'.*?cd' f0 91 8e67ad22 
+'.*?cd' f26 91 0a33701d 
+'(a|b)*?c' f0 91 8ad3b1df 
+'(a|b)*?c' f26 91 39105934 
+'(x)*' f0 91 3b91e41d 
+'(x)*' f26 91 8a18fef1 
+'(x)*y' f0 91 31053562 
+'(x)*y' f26 91 30ef6cca 
+'(x)*?y' f0 91 19a6c9b4 
+'(x)*?y' f26 91 7a6f3a6f 
+'^((a)|b)*' f0 91 83e06e89 
+'^((a)|b)*' f26 91 b0a78ae3 
+'^(([ab])|c)*' f0 91 63ad0469 
+'^(([ab])|c)*' f26 91 e728a75f 
+'^((d)|[ab])*' f0 91 8745992d 
+'^((d)|[ab])*' f26 91 603b1599 
+'^((a)c|[ab])*' f0 91 02e37d87 
+'^((a)c|[ab])*' f26 91 059fa671 
+'^((a)|b)*?c' f0 91 813585fa 
+'^((a)|b)*?c' f26 91 771ae7da 
+'^(([ab])|c)*?d' f0 91 af582d20 
+'^(([ab])|c)*?d' f26 91 0ae63925 
+'^((d)|[ab])*?c' f0 91 8713a0fb 
+'^((d)|[ab])*?c' f26 91 27d63971 
+'^((a)c|[ab])*?c' f0 91 a53b4e5b 
+'^((a)c|[ab])*?c' f26 91 95e8c335 
+'(a)(?:(?=(b)*)c)*' f0 91 e717fb2b 
+'(a)(?:(?=(b)*)c)*' f26 91 380a6845 
+'(a)((?!(b)*))*' f0 91 715bc534 
+'(a)((?!(b)*))*' f26 91 3bf5cc1d 
+'(?s).{1,3}' f0 91 06c52ed3 
+'(?s).{1,3}' f26 91 fa0e1d46 
+'.{65535}' f0 91 91203538 
+'.{65535}' f26 91 5fdfeb34 
+'.{,65535}' f0 91 910f6b6d 
+'.{,65535}' f26 91 9e0f60d1 
+'.{65535,}?' f0 91 433e877a 
+'.{65535,}?' f26 91 4c259373 
+'.{65536}' f0 91 ce94a1bf 
+'.{65536}' f26 91 8a6b1191 
+'.{,65536}' f0 91 718f942a 
+'.{,65536}' f26 91 dcf6baeb 
+'.{65536,}?' f0 91 c09e811f 
+'.{65536,}?' f26 91 c23d1569 
+b'xyz' f0 91 6d3115db 
+b'xyz' f26 91 8b3753ae 
+'[a-c]+' f0 91 2497b4b2 
+'[a-c]+' f26 91 2da3b4d2 
+'(ab|a)*?b' f0 91 dee31aac 
+'(ab|a)*?b' f26 91 31bb6a35 
+'(ab|a)+?b' f0 91 1f81b63c 
+'(ab|a)+?b' f26 91 05731921 
+'(ab|a){0,2}?b' f0 91 708fb30a 
+'(ab|a){0,2}?b' f26 91 564b3258 
+'(.b|a)*?b' f0 91 a4a07cd2 
+'(.b|a)*?b' f26 91 95129ada 
+'(ab?)*?b' f0 91 4ac9267e 
+'(ab?)*?b' f26 91 50b6aa68 
+'(?!(..)c)' f0 91 076f777a 
+'(?!(..)c)' f26 91 1810b868 
+'e++a' f0 91 e58eeea0 
+'e++a' f26 91 575a76f1 
+'e?+a' f0 91 55bf6574 
+'e?+a' f26 91 07e3846b 
+'e{2,4}+a' f0 91 91f93eac 
+'e{2,4}+a' f26 91 ca637652 
+'(ae)*+a' f0 91 759d4182 
+'(ae)*+a' f26 91 538ba7bf 
+'([ae][ae])?+a' f0 91 65fb4ebb 
+'([ae][ae])?+a' f26 91 b0c4098a 
+'(e?){2,4}+a' f0 91 3596566d 
+'(e?){2,4}+a' f26 91 0e86543d 
+'()*+a' f0 91 c086401d 
+'()*+a' f26 91 30a7b39f 
+'x*+' f0 91 aa841990 
+'x*+' f26 91 52047fec 
+'x++' f0 91 2f5ed4e8 
+'x++' f26 91 3e848991 
+'^(\\w){3}+$' f0 91 777e3d88 
+'^(\\w){3}+$' f26 91 c1bffda1 
+'^(\\w){1,3}+$' f0 91 ea90b45a 
+'^(\\w){1,3}+$' f26 91 2d1f4f4e 
+'^(\\w){1,4}+$' f0 91 5df6b17b 
+'^(\\w){1,4}+$' f26 91 99593ad1 
+'(?>(?:.(?!D))+)' f0 91 906b3757 
+'(?>(?:.(?!D))+)' f26 91 865eb0b9 
+'(?:.(?!D))++' f0 91 a7f11d87 
+'(?:.(?!D))++' f26 91 fe1a642f 
+'(?>(?:.(?!D))*)' f0 91 9129f93c 
+'(?>(?:.(?!D))*)' f26 91 8832f0da 
+'(?:.(?!D))*+' f0 91 e8ce6116 
+'(?:.(?!D))*+' f26 91 8b008f8b 
+'(?>(?:.(?!D))?)' f0 91 f2e5ee1f 
+'(?>(?:.(?!D))?)' f26 91 43f35622 
+'(?:.(?!D))?+' f0 91 13334d16 
+'(?:.(?!D))?+' f26 91 be9a8aa4 
+'(?>(?:.(?!D)){1,3})' f0 91 af9cbf0a 
+'(?>(?:.(?!D)){1,3})' f26 91 a7197b00 
+'(?:.(?!D)){1,3}+' f0 91 617f55ae 
+'(?:.(?!D)){1,3}+' f26 91 af75f9e7 
+'(?>(?:ab?c)+)' f0 91 40f8f641 
+'(?>(?:ab?c)+)' f26 91 be19004f 
+'(?:ab?c)++' f0 91 d189abaf 
+'(?:ab?c)++' f26 91 7c94c191 
+'(?>(?:ab?c)*)' f0 91 318b88ac 
+'(?>(?:ab?c)*)' f26 91 eafbe216 
+'(?:ab?c)*+' f0 91 09f4a889 
+'(?:ab?c)*+' f26 91 30875060 
+'(?>(?:ab?c)?)' f0 91 9330c3f9 
+'(?>(?:ab?c)?)' f26 91 6991bc68 
+'(?:ab?c)?+' f0 91 ab4fe3dc 
+'(?:ab?c)?+' f26 91 b3ed0e1e 
+'(?>(?:ab?c){1,3})' f0 91 da140d6f 
+'(?>(?:ab?c){1,3})' f26 91 3f6e2fd4 
+'(?:ab?c){1,3}+' f0 91 af399284 
+'(?:ab?c){1,3}+' f26 91 366b1cb7 
+'((x)|y|z)*+' f0 91 17df14a7 
+'((x)|y|z)*+' f26 91 e0de0102 
+'((x)|y|z){3}+' f0 91 4c76997c 
+'((x)|y|z){3}+' f26 91 3043b318 
+'((x)|y|z){3,}+' f0 91 348ddc4c 
+'((x)|y|z){3,}+' f26 91 3b2be597 
+b'(a)' f0 91 f18e23f9 
+b'(a)' f26 91 e5b4fbd0 
+'a|ab' f0 91 e32f8811 
+'a|ab' f26 91 91b87968 
+b'a|ab' f0 91 524f9d83 
+b'a|ab' f26 91 f7ca5704 
+b'bla' f0 91 adcb4885 
+b'bla' f26 91 71a6563a 
+b'' f0 91 49be44a1 
+b'' f26 91 9651d780 
+'a+?' f0 91 54ad79b0 
+'a+?' f26 91 e6fca388 
+'a{2,3}+' f0 91 31a8a49e 
+'a{2,3}+' f26 91 e9049c5f 
+'(?>a|ab)c' f0 91 67b90661 
+'(?>a|ab)c' f26 91 5fd653d2 
+'(?-i:a)B' f0 91 d74cb2c8 
+'(?-i:a)B' f26 91 bcd5c89a 
+'(?s:.)' f0 91 c0f8b744 
+'(?s:.)' f26 91 18911f41 
+'(?a:\\w)' f0 91 3b88758d 
+'(?a:\\w)' f26 91 938ed49a 
+'(?u:\\w)' f0 91 d70f7661 
+'(?u:\\w)' f26 91 933f2e2e 
+'(?i)a' f0 91 81018a82 
+'(?i)a' f26 91 e1560eb8 
+'a(?i)' f0 1 cb9d704d ERR PatternError global flags not at the start of the expres
+'a(?i)' f26 1 cb9d704d ERR PatternError global flags not at the start of the expres
+'(?x) a b c' f0 91 b967fc76 
+'(?x) a b c' f26 91 f28f0c1d 
+'[\\s\\S]' f0 91 194893fc 
+'[\\s\\S]' f26 91 2bee7bd4 
+'[\\S\\s]' f0 91 1472a219 
+'[\\S\\s]' f26 91 892d7d69 
+'[^\\s\\S]' f0 91 1240fe74 
+'[^\\s\\S]' f26 91 ddae9cf7 
+'[]]' f0 91 4ebc0312 
+'[]]' f26 91 f08c11a6 
+'[^]]' f0 91 4104a140 
+'[^]]' f26 91 ded278a1 
+'[a-z&&[^b]]' f0 91 5f81c34d 
+'[a-z&&[^b]]' f26 91 16ad3b07 
+'[[:alpha:]]' f0 91 5e92c003 
+'[[:alpha:]]' f26 91 911a3722 
+'[\\d\\D]' f0 91 7b786665 
+'[\\d\\D]' f26 91 72812855 
+'[\\w\\W]x' f0 91 0667d0b2 
+'[\\w\\W]x' f26 91 7ed94f5c 
+'(a)|b' f0 91 9ec2bbef 
+'(a)|b' f26 91 085775bb 
+'(?:a|b)+' f0 91 2caa37be 
+'(?:a|b)+' f26 91 109e1d33 
+'(a)(b)?' f0 91 d2440ee0 
+'(a)(b)?' f26 91 731be19d 
+'(?P<n>a)(?P=n)' f0 91 f151bafe 
+'(?P<n>a)(?P=n)' f26 91 8b9c4639 
+'(?P<n>a)\\g<n>' f0 1 8d17527b ERR PatternError bad escape \g at position 8 8
+'(?P<n>a)\\g<n>' f26 1 8d17527b ERR PatternError bad escape \g at position 8 8
+'(a)\\1' f0 91 957f5d14 
+'(a)\\1' f26 91 d46c543e 
+'(a)(?(1)b|c)' f0 91 7678a396 
+'(a)(?(1)b|c)' f26 91 19ab5cf9 
+'(?(1)a|b)' f0 1 b3d5b864 ERR PatternError invalid group reference 1 at position 3 3
+'(?(1)a|b)' f26 1 b3d5b864 ERR PatternError invalid group reference 1 at position 3 3
+'(?P<a>x)(?(a)y|z)' f0 91 0ac2f17b 
+'(?P<a>x)(?(a)y|z)' f26 91 bb62bc6a 
+'\\A' f0 91 7eeb0c3f 
+'\\A' f26 91 683f370a 
+'\\Z' f0 91 d62448a0 
+'\\Z' f26 91 1bac8914 
+'\\z' f0 91 09f8380b 
+'\\z' f26 91 84833853 
+'^' f0 91 2af1023a 
+'^' f26 91 8c18ca3a 
+'(?m)^a$' f0 91 cb7d75bf 
+'(?m)^a$' f26 91 fe4a27c7 
+'(?s).' f0 91 5b614c1a 
+'(?s).' f26 91 36b8c620 
+'\\w+' f0 91 750fcced 
+'\\w+' f26 91 43c5d0c7 
+'\\s+' f0 91 adbb977a 
+'\\s+' f26 91 82b65ccb 
+'\\D' f0 91 a9da6834 
+'\\D' f26 91 71c72435 
+'\\W' f0 91 9d424377 
+'\\W' f26 91 690ec8e4 
+'\\S' f0 91 3d936c08 
+'\\S' f26 91 1ed25461 
+'a|' f0 91 4bfb1e57 
+'a|' f26 91 f84435f2 
+'|a' f0 91 42dce827 
+'|a' f26 91 05d5aefb 
+'()' f0 91 17858ec3 
+'()' f26 91 e39fb775 
+'(?:)' f0 91 24f1b09f 
+'(?:)' f26 91 2110eb6a 
+'(?=a)' f0 91 6381f9ab 
+'(?=a)' f26 91 14083049 
+'(?!a)' f0 91 441e0ace 
+'(?!a)' f26 91 3dd3af2a 
+'(?<=a)b' f0 91 c3b3b62b 
+'(?<=a)b' f26 91 b694087c 
+'(?<!a)b' f0 91 19328f3c 
+'(?<!a)b' f26 91 60f68dc1 
+'(?<=ab|c)d' f0 1 3433b2a8 ERR PatternError look-behind requires fixed-width pattern No
+'(?<=ab|c)d' f26 1 3433b2a8 ERR PatternError look-behind requires fixed-width pattern No
+'(?<=a+)b' f0 1 3433b2a8 ERR PatternError look-behind requires fixed-width pattern No
+'(?<=a+)b' f26 1 3433b2a8 ERR PatternError look-behind requires fixed-width pattern No
+'(a' f0 1 64145afa ERR PatternError missing ), unterminated subpattern at posit
+'(a' f26 1 64145afa ERR PatternError missing ), unterminated subpattern at posit
+'a)' f0 1 f2c6b775 ERR PatternError unbalanced parenthesis at position 1 1
+'a)' f26 1 f2c6b775 ERR PatternError unbalanced parenthesis at position 1 1
+'[a' f0 1 96d3d113 ERR PatternError unterminated character set at position 0 0
+'[a' f26 1 96d3d113 ERR PatternError unterminated character set at position 0 0
+'a{' f0 91 56fbc664 
+'a{' f26 91 64ad580e 
+'a{1' f0 91 1d07de59 
+'a{1' f26 91 be680d32 
+'a{1,' f0 91 c5c39355 
+'a{1,' f26 91 240e6792 
+'a{,2}' f0 91 7fbb1b58 
+'a{,2}' f26 91 ee4a2f5e 
+'a{3,2}' f0 1 4f885839 ERR PatternError min repeat greater than max repeat at posit
+'a{3,2}' f26 1 4f885839 ERR PatternError min repeat greater than max repeat at posit
+'*a' f0 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'*a' f26 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'+a' f0 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'+a' f26 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'?a' f0 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'?a' f26 1 6789aaf1 ERR PatternError nothing to repeat at position 0 0
+'(?P<1a>x)' f0 1 80fc4f45 ERR PatternError bad character in group name '1a' at positio
+'(?P<1a>x)' f26 1 80fc4f45 ERR PatternError bad character in group name '1a' at positio
+'(?P<n>a)(?P<n>b)' f0 1 c691e7c0 ERR PatternError redefinition of group name 'n' as group 2; 
+'(?P<n>a)(?P<n>b)' f26 1 c691e7c0 ERR PatternError redefinition of group name 'n' as group 2; 
+'\\g<0>' f0 1 8ddf8bf1 ERR PatternError bad escape \g at position 0 0
+'\\g<0>' f26 1 8ddf8bf1 ERR PatternError bad escape \g at position 0 0
+'(a)\\g<2>' f0 1 16906412 ERR PatternError bad escape \g at position 3 3
+'(a)\\g<2>' f26 1 16906412 ERR PatternError bad escape \g at position 3 3
+'\\1' f0 1 5e5f0d26 ERR PatternError invalid group reference 1 at position 1 1
+'\\1' f26 1 5e5f0d26 ERR PatternError invalid group reference 1 at position 1 1
+'(a)\\2' f0 1 7b6460c6 ERR PatternError invalid group reference 2 at position 4 4
+'(a)\\2' f26 1 7b6460c6 ERR PatternError invalid group reference 2 at position 4 4
+'\\8' f0 1 3fe989fb ERR PatternError invalid group reference 8 at position 1 1
+'\\8' f26 1 3fe989fb ERR PatternError invalid group reference 8 at position 1 1
+'\\777' f0 1 831cd67f ERR PatternError octal escape value \777 outside of range 0-
+'\\777' f26 1 831cd67f ERR PatternError octal escape value \777 outside of range 0-
+'\\x4' f0 1 a4ce1b3f ERR PatternError incomplete escape \x4 at position 0 0
+'\\x4' f26 1 a4ce1b3f ERR PatternError incomplete escape \x4 at position 0 0
+'\\u12' f0 1 8b14a348 ERR PatternError incomplete escape \u12 at position 0 0
+'\\u12' f26 1 8b14a348 ERR PatternError incomplete escape \u12 at position 0 0
+'\\N{DIGIT ONE}' f0 91 c67360f5 
+'\\N{DIGIT ONE}' f26 91 b281fef3 
+'(?#comment)a' f0 91 cb528629 
+'(?#comment)a' f26 91 8bf5b7b4 
+'(?x) a # comment\n b' f0 91 f8c5c49e 
+'(?x) a # comment\n b' f26 91 e98d0af1 
+'\\Qabc' f0 1 1319977e ERR PatternError bad escape \Q at position 0 0
+'\\Qabc' f26 1 1319977e ERR PatternError bad escape \Q at position 0 0
+'\\p{L}' f0 1 ba1c6ec7 ERR PatternError bad escape \p at position 0 0
+'\\p{L}' f26 1 ba1c6ec7 ERR PatternError bad escape \p at position 0 0
+'(?<n>a)' f0 1 e7ee7194 ERR PatternError unknown extension ?<n at position 1 1
+'(?<n>a)' f26 1 e7ee7194 ERR PatternError unknown extension ?<n at position 1 1
+'(?P>a)' f0 1 56cb3c47 ERR PatternError unknown extension ?P> at position 1 1
+'(?P>a)' f26 1 56cb3c47 ERR PatternError unknown extension ?P> at position 1 1
+'(?' f0 1 324d722c ERR PatternError unexpected end of pattern at position 2 2
+'(?' f26 1 324d722c ERR PatternError unexpected end of pattern at position 2 2
+'(?P' f0 1 4488288d ERR PatternError unexpected end of pattern at position 3 3
+'(?P' f26 1 4488288d ERR PatternError unexpected end of pattern at position 3 3
+'(?P<' f0 1 df98ebf0 ERR PatternError missing group name at position 4 4
+'(?P<' f26 1 df98ebf0 ERR PatternError missing group name at position 4 4
+'(?P<n' f0 1 fc99094b ERR PatternError missing >, unterminated name at position 4 
+'(?P<n' f26 1 fc99094b ERR PatternError missing >, unterminated name at position 4 
+'(?Px)' f0 1 acb9eebb ERR PatternError unknown extension ?Px at position 1 1
+'(?Px)' f26 1 acb9eebb ERR PatternError unknown extension ?Px at position 1 1
+'(?z)' f0 1 a55babbd ERR PatternError unknown extension ?z at position 1 1
+'(?z)' f26 1 a55babbd ERR PatternError unknown extension ?z at position 1 1
+'(?i-s:a)' f0 91 ff544b11 
+'(?i-s:a)' f26 91 ce2069ef 
+'(?i-i:a)' f0 1 e450d39f ERR PatternError bad inline flags: flag turned on and off at
+'(?i-i:a)' f26 1 e450d39f ERR PatternError bad inline flags: flag turned on and off at
+'(?a:(?u:a))' f0 91 85efbbdc 
+'(?a:(?u:a))' f26 91 37d1831a 
+'(?aL)' f0 1 9d8a0337 ERR PatternError bad inline flags: cannot use 'L' flag with 
+'(?aL)' f26 1 9d8a0337 ERR PatternError bad inline flags: cannot use 'L' flag with 
+'(?au)' f0 1 2ddfcd9a ERR PatternError bad inline flags: flags 'a', 'u' and 'L' ar
+'(?au)' f26 1 2ddfcd9a ERR PatternError bad inline flags: flags 'a', 'u' and 'L' ar
+'(?-a:a)' f0 1 314939fb ERR PatternError bad inline flags: cannot turn off flags 'a'
+'(?-a:a)' f26 1 314939fb ERR PatternError bad inline flags: cannot turn off flags 'a'
+'(?ix-s:a)' f0 91 1caf9f56 
+'(?ix-s:a)' f26 91 ed1362d4 
+'(?i:a' f0 1 64145afa ERR PatternError missing ), unterminated subpattern at posit
+'(?i:a' f26 1 64145afa ERR PatternError missing ), unterminated subpattern at posit
+'x*?y' f0 91 594fc87b 
+'x*?y' f26 91 3f8bbb6d 
+'x{2}?' f0 91 38b1a774 
+'x{2}?' f26 91 eb0f444b 
+'x{2,}?' f0 91 4dd555cb 
+'x{2,}?' f26 91 ddae7270 
+'x{,}' f0 91 ab367f0d 
+'x{,}' f26 91 36c37d09 
+'x{ 1}' f0 91 d860326e 
+'x{ 1}' f26 91 4b17cbfd 
+'(*)' f0 1 114cf050 ERR PatternError nothing to repeat at position 1 1
+'(*)' f26 1 114cf050 ERR PatternError nothing to repeat at position 1 1
+'(?:*)' f0 1 fcc64512 ERR PatternError nothing to repeat at position 3 3
+'(?:*)' f26 1 fcc64512 ERR PatternError nothing to repeat at position 3 3
+'a**' f0 1 04591185 ERR PatternError multiple repeat at position 2 2
+'a**' f26 1 04591185 ERR PatternError multiple repeat at position 2 2
+'a*{2}' f0 1 04591185 ERR PatternError multiple repeat at position 2 2
+'a*{2}' f26 1 04591185 ERR PatternError multiple repeat at position 2 2
+'a{1}{2}' f0 1 e9b7c802 ERR PatternError multiple repeat at position 4 4
+'a{1}{2}' f26 1 e9b7c802 ERR PatternError multiple repeat at position 4 4
+'a\\' f0 1 42e1bba5 ERR PatternError bad escape (end of pattern) at position 1 1
+'a\\' f26 1 42e1bba5 ERR PatternError bad escape (end of pattern) at position 1 1
+'\\ ' f0 91 322f3aaf 
+'\\ ' f26 91 a2f90686 
+'\\-' f0 91 0d9069b9 
+'\\-' f26 91 1ba32116 
+'\\_' f0 91 dad48f5d 
+'\\_' f26 91 d378e218 
+'\\é' f0 91 beafb4e7 
+'\\é' f26 91 d60250ac 
+'[\\é]' f0 91 06a6a221 
+'[\\é]' f26 91 d1773e56 
+'[a-\\d]' f0 1 7269cf74 ERR PatternError bad character range a-\d at position 1 1
+'[a-\\d]' f26 1 7269cf74 ERR PatternError bad character range a-\d at position 1 1
+'[\\d-z]' f0 1 dd060040 ERR PatternError bad character range \d-z at position 1 1
+'[\\d-z]' f26 1 dd060040 ERR PatternError bad character range \d-z at position 1 1
+'[z-a]' f0 1 01970916 ERR PatternError bad character range z-a at position 1 1
+'[z-a]' f26 1 01970916 ERR PatternError bad character range z-a at position 1 1
+'[\\w-a]' f0 1 cfc93084 ERR PatternError bad character range \w-a at position 1 1
+'[\\w-a]' f26 1 cfc93084 ERR PatternError bad character range \w-a at position 1 1
+'[--a]' f0 91 85a328d5 
+'[--a]' f26 91 253da081 
+'[a--]' f0 1 707ca495 ERR PatternError bad character range a-- at position 1 1
+'[a--]' f26 1 707ca495 ERR PatternError bad character range a-- at position 1 1
+'é+' f0 91 5762a6d2 
+'é+' f26 91 2de717d0 
+'(?i)é' f0 91 c48fa0e8 
+'(?i)é' f26 91 0bdd12dd 
+'(?i)ß' f0 91 ae973f27 
+'(?i)ß' f26 91 5f04ba72 
+'(?i)ſ' f0 91 ae5a2e22 
+'(?i)ſ' f26 91 147781b5 
+'(?i)K' f0 91 fd938297 
+'(?i)K' f26 91 f6264428 
+'(?i)İ' f0 91 d67be3bc 
+'(?i)İ' f26 91 de809cc1 
+'(?i)ı' f0 91 b3c7bebc 
+'(?i)ı' f26 91 92e9a3df 
+b'(?i)a+' f0 91 627fb6f4 
+b'(?i)a+' f26 91 88fac218 
+b'\\xff' f0 91 c6d9c214 
+b'\\xff' f26 91 75e8e135 
+b'[\\xff]' f0 91 ac1b8470 
+b'[\\xff]' f26 91 8b69a89b 
+b'(?a)\\w' f0 91 7075f27d 
+b'(?a)\\w' f26 91 70b2d12f 
+b'\\d' f0 91 3afad5b7 
+b'\\d' f26 91 3918ff91 
+b'(?P<n>a)' f0 91 7872af0d 
+b'(?P<n>a)' f26 91 a523cfff 

@@ -14,7 +14,8 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_ast", bound::<super::astm::_ast::Module>),
     ("_bisect", bound::<super::bisectm::_bisect::Module>),
     ("_blake2", bound::<super::hashlibm::_blake2::Module>),
-    ("_codecs", |it| Some(super::codecsm::make(it))),
+    ("_bz2", bound::<super::bz2m::_bz2::Module>),
+    ("_codecs", bound::<super::codecsm::_codecs::Module>),
     (
         "_collections",
         bound::<super::collectionsm::_collections::Module>,
@@ -24,14 +25,27 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
         bound::<super::contextvarsm::_contextvars::Module>,
     ),
     ("_csv", bound::<super::csvm::_csv::Module>),
+    ("_decimal", bound::<super::decimalm::_decimal::Module>),
     ("_functools", bound::<super::functoolsm::_functools::Module>),
     ("_hashlib", bound::<super::hashlibm::_hashlib::Module>),
     ("_heapq", bound::<super::heapqm::_heapq::Module>),
     ("_imp", bound::<super::impm::_imp::Module>),
     ("_io", bound::<super::iom::_io::Module>),
     ("_json", bound::<super::jsonm::_json::Module>),
+    ("_lsprof", bound::<super::lsprofm::_lsprof::Module>),
+    ("_lzma", bound::<super::lzmam::_lzma::Module>),
     ("_md5", bound::<super::hashlibm::_md5::Module>),
+    (
+        "_multiprocessing",
+        bound::<super::multiprocessingm::multiprocessing::Module>,
+    ),
+    ("_opcode", bound::<super::opcodem::_opcode::Module>),
     ("_operator", bound::<super::operatorm::_operator::Module>),
+    (
+        "_posixshmem",
+        bound::<super::multiprocessingm::posixshmem::Module>,
+    ),
+    ("_pickle", bound::<super::picklem::_pickle::Module>),
     (
         "_posixsubprocess",
         bound::<super::posixsubprocessm::_posixsubprocess::Module>,
@@ -43,18 +57,57 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("_sha3", bound::<super::hashlibm::_sha3::Module>),
     ("_signal", bound::<super::signalm::_signal::Module>),
     ("_socket", bound::<super::socketm::_socket::Module>),
-    ("_sre", |it| Some(super::sre::make(it))),
+    ("_sre", bound::<super::sre::_sre::Module>),
+    #[cfg(all(unix, not(target_os = "android")))]
+    ("_ssl", bound::<super::sslm::_ssl::Module>),
     (
         "_statistics",
         bound::<super::statisticsm::_statistics::Module>,
     ),
     ("_string", bound::<super::stringm::_string::Module>),
     ("_struct", bound::<super::structm::_struct::Module>),
+    (
+        "_testbuffer",
+        bound::<super::testbufferm::testbuffer::Module>,
+    ),
+    ("_testcapi", bound::<super::testcapi::_testcapi::Module>),
+    (
+        "_testimportmultiple",
+        bound::<super::testextm::_testimportmultiple::Module>,
+    ),
+    (
+        "_testimportmultiple_bar",
+        bound::<super::testextm::_testimportmultiple_bar::Module>,
+    ),
+    (
+        "_testimportmultiple_foo",
+        bound::<super::testextm::_testimportmultiple_foo::Module>,
+    ),
+    (
+        "_testinternalcapi",
+        bound::<super::testcapi::internal::_testinternalcapi::Module>,
+    ),
+    (
+        "_testmultiphase",
+        bound::<super::testextm::_testmultiphase::Module>,
+    ),
+    (
+        "_testsinglephase",
+        bound::<super::singlephasem::_testsinglephase::Module>,
+    ),
     ("_thread", bound::<super::threadm::_thread::Module>),
     ("_tokenize", bound::<super::tokenizem::_tokenize::Module>),
-    ("_typing", |it| Some(super::typingm::make(it))),
+    ("_typing", bound::<super::typingm::_typing::Module>),
     ("_warnings", bound::<super::warningsm::_warnings::Module>),
-    ("_weakref", |it| Some(super::weakm::make(it))),
+    ("_weakref", bound::<super::weakm::_weakref::Module>),
+    (
+        "_xxinterpchannels",
+        bound::<super::interpchanm::_xxinterpchannels::Module>,
+    ),
+    (
+        "_xxsubinterpreters",
+        bound::<super::subinterpm::_xxsubinterpreters::Module>,
+    ),
     ("_zoneinfo", bound::<super::zoneinfom::_zoneinfo::Module>),
     ("array", bound::<super::arraym::array::Module>),
     ("atexit", bound::<super::sysmods::atexit::Module>),
@@ -62,17 +115,35 @@ const BUILTIN_MODULES: &[(&str, MakeModule)] = &[
     ("builtins", |it| Some(super::sysmods::make_builtins(it))),
     ("cmath", bound::<super::cmathm::cmath::Module>),
     ("errno", bound::<super::errnom::errno::Module>),
+    ("fcntl", bound::<super::fcntlm::fcntl::Module>),
     ("gc", bound::<super::sysmods::gc::Module>),
+    ("grp", bound::<super::pwdm::grp::Module>),
     ("itertools", bound::<super::itertools::itertools::Module>),
     ("marshal", bound::<super::marshalm::marshal::Module>),
     ("math", bound::<super::mathm::math::Module>),
+    ("mmap", bound::<super::mmapm::mmap::Module>),
     ("posix", bound::<super::posixm::posix::Module>),
+    ("pyexpat", bound::<super::pyexpatm::pyexpat::Module>),
+    ("pwd", bound::<super::pwdm::pwd::Module>),
+    ("readline", bound::<super::readlinem::readline::Module>),
+    ("resource", bound::<super::resourcem::resource::Module>),
     ("select", bound::<super::selectm::select::Module>),
     ("sys", |it| it.sys_module.clone()),
+    ("syslog", bound::<super::syslogm::syslog::Module>),
+    ("termios", bound::<super::termiosm::termios::Module>),
+    (
+        "sys.monitoring",
+        bound::<super::monitoringm::sys_monitoring::Module>,
+    ),
     ("time", bound::<super::timem::time::Module>),
     (
         "unicodedata",
         bound::<super::unicodedatam::unicodedata::Module>,
+    ),
+    ("xxlimited", bound::<super::xxlimitedm::xxlimited::Module>),
+    (
+        "xxlimited_35",
+        bound::<super::xxlimitedm::xxlimited_35::Module>,
     ),
     ("zlib", bound::<super::zlibm::zlib::Module>),
 ];
@@ -94,7 +165,11 @@ pub fn init(it: &mut Interp) {
 
 /// `sys.builtin_module_names`.
 pub fn builtin_module_names() -> Vec<&'static str> {
-    BUILTIN_MODULES.iter().map(|(n, _)| *n).collect()
+    BUILTIN_MODULES
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !n.contains('.'))
+        .collect()
 }
 
 /// `_sysconfigdata_*`, the build-time configuration `sysconfig` reads (generated when CPython is
@@ -110,11 +185,11 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
             "/usr/share/zoneinfo:/usr/lib/zoneinfo:/usr/share/lib/zoneinfo:/etc/zoneinfo"
                 .to_string(),
         ),
-        ("VERSION", "3.12".to_string()),
+        ("VERSION", "3.14".to_string()),
         ("ABIFLAGS", String::new()),
         ("MACHDEP", platform.clone()),
-        ("SOABI", format!("cpython-312-{platform}")),
-        ("EXT_SUFFIX", format!(".cpython-312-{platform}.so")),
+        ("SOABI", format!("cpython-314-{platform}")),
+        ("EXT_SUFFIX", format!(".cpython-314-{platform}.so")),
         ("SHLIB_SUFFIX", ".so".to_string()),
     ];
     for (k, v) in strs {
@@ -125,6 +200,7 @@ fn sysconfig_data(it: &mut Interp, name: &str) -> Obj {
         ("Py_ENABLE_SHARED", 0),
         ("WITH_DOC_STRINGS", 1),
         ("SIZEOF_VOID_P", 8),
+        ("PY_HAVE_PERF_TRAMPOLINE", 0),
     ] {
         dict_set_str(&vars, k, Value::Int(v));
     }

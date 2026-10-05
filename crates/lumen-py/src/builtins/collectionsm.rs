@@ -59,7 +59,7 @@ impl TupleGetter {
         self.doc = v.clone();
     }
 
-    #[method(name = "__reduce__")]
+    #[method(name = "__reduce__", hint(py(text_signature = "")))]
     fn reduce(slf: This<Value>, it: &mut Interp) -> R<Value> {
         let Some((index, doc)) =
             with_opaque::<TupleGetter, _>(&slf.0, |g| (g.index, g.doc.clone()))
@@ -76,6 +76,9 @@ impl TupleGetter {
 
 const MUTATED: &str = "deque mutated during iteration";
 
+/// deque([iterable[, maxlen]]) --> deque object
+///
+/// A list-like sequence optimized for data accesses near its endpoints.
 #[lumen_bind::class(name = "deque", module = "collections", generic, hint(py(unhashable)))]
 pub struct Deque {
     items: VecDeque<Value>,
@@ -267,16 +270,19 @@ impl Deque {
         Ok(())
     }
 
+    /// Add an element to the right side of the deque.
     #[method(hint(py(text_signature = "")))]
     fn append(&mut self, item: Value) {
         self.push_back(item);
     }
 
+    /// Add an element to the left side of the deque.
     #[method(hint(py(text_signature = "")))]
     fn appendleft(&mut self, item: Value) {
         self.push_front(item);
     }
 
+    /// Remove and return the rightmost element.
     #[method(hint(py(text_signature = "")))]
     fn pop(&mut self) -> NativeResult<Value> {
         self.state += 1;
@@ -285,6 +291,7 @@ impl Deque {
             .ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
+    /// Remove and return the leftmost element.
     #[method(hint(py(text_signature = "")))]
     fn popleft(&mut self) -> NativeResult<Value> {
         self.state += 1;
@@ -293,18 +300,21 @@ impl Deque {
             .ok_or_else(|| NativeError::index_error("pop from an empty deque"))
     }
 
+    /// Extend the right side of the deque with elements from the iterable
     #[method(hint(py(text_signature = "")))]
     fn extend(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
         let slf = slf.0;
         Self::extend_with(&slf, it, iterable, false)
     }
 
+    /// Extend the left side of the deque with elements from the iterable
     #[method(hint(py(text_signature = "")))]
     fn extendleft(slf: This<Py<Self>>, it: &mut Interp, iterable: &Value) -> R<()> {
         let slf = slf.0;
         Self::extend_with(&slf, it, iterable, true)
     }
 
+    /// Remove all elements from the deque.
     #[method(hint(py(text_signature = "")))]
     fn clear(slf: This<Py<Self>>, it: &mut Interp) -> R<()> {
         let slf = slf.0;
@@ -317,6 +327,7 @@ impl Deque {
         Ok(())
     }
 
+    /// Return a shallow copy of a deque.
     #[method(hint(py(aliases = "__copy__", text_signature = "")))]
     fn copy(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
         let slf = slf.0;
@@ -341,6 +352,7 @@ impl Deque {
         it.call(&Value::Obj(ty), args, Vec::new())
     }
 
+    /// D.count(value) -- return number of occurrences of value
     #[method(hint(py(text_signature = "")))]
     fn count(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<i64> {
         let slf = slf.0;
@@ -363,6 +375,8 @@ impl Deque {
         Ok(count)
     }
 
+    /// D.index(value, [start, [stop]]) -- return first index of value.
+    /// Raises ValueError if the value is not present.
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
     fn index(
         slf: This<Py<Self>>,
@@ -388,6 +402,7 @@ impl Deque {
         Err(it.value_error(&format!("{} is not in deque", r)))
     }
 
+    /// D.insert(index, object) -- insert object before index
     #[method(hint(py(text_signature = "", arg_style = "parse")))]
     fn insert(&mut self, index: isize, value: Value) -> NativeResult<()> {
         if self.maxlen.is_some_and(|m| self.items.len() >= m) {
@@ -406,6 +421,7 @@ impl Deque {
         Ok(())
     }
 
+    /// D.remove(value) -- remove first occurrence of value.
     #[method(hint(py(text_signature = "")))]
     fn remove(slf: This<Py<Self>>, it: &mut Interp, value: &Value) -> R<()> {
         let slf = slf.0;
@@ -423,12 +439,14 @@ impl Deque {
         Err(it.value_error(&format!("{} is not in deque", r)))
     }
 
+    /// D.reverse() -- reverse *IN PLACE*
     #[method(hint(py(text_signature = "")))]
     fn reverse(&mut self) {
         self.items.make_contiguous().reverse();
         self.state += 1;
     }
 
+    /// Rotate the deque n steps to the right (default n=1).  If n is negative, rotates left.
     #[method(hint(py(text_signature = "", arg_name = "deque.rotate")))]
     fn rotate(&mut self, #[default(1)] n: isize) {
         let len = self.items.len() as isize;
@@ -438,6 +456,7 @@ impl Deque {
         self.state += 1;
     }
 
+    /// maximum size of a deque or None if unbounded
     #[getter]
     fn maxlen(&self) -> Option<usize> {
         self.maxlen
@@ -498,6 +517,7 @@ impl Deque {
         DequeIter::over(slf, it)
     }
 
+    /// D.__reversed__() -- return a reverse iterator over the deque
     #[proto(reversed)]
     #[method(hint(py(text_signature = "")))]
     fn __reversed__(slf: This<Py<Self>>, it: &mut Interp) -> R<DequeRevIter> {
@@ -632,6 +652,7 @@ impl Deque {
         Ok(slf.into_value())
     }
 
+    /// Return state information for pickling.
     #[proto(reduce)]
     #[method(hint(py(text_signature = "")))]
     fn __reduce__(slf: This<Py<Self>>, it: &mut Interp) -> R<Value> {
@@ -646,6 +667,7 @@ impl Deque {
         Ok(Value::tuple(vec![ty, args, Value::None, items]))
     }
 
+    /// D.__sizeof__() -- size of D in memory, in bytes
     #[proto(sizeof)]
     #[method(hint(py(text_signature = "")))]
     fn __sizeof__(&self) -> usize {
@@ -720,6 +742,8 @@ impl DequeIter {
         self.step(it, false)
     }
 
+    /// Private method returning an estimate of len(list(it)).
+    #[method(hint(py(text_signature = "")))]
     fn __length_hint__(&self) -> usize {
         self.remaining
     }
@@ -740,6 +764,8 @@ impl DequeRevIter {
         self.0.step(it, true)
     }
 
+    /// Private method returning an estimate of len(list(it)).
+    #[method(hint(py(text_signature = "")))]
     fn __length_hint__(&self) -> usize {
         self.0.remaining
     }
@@ -804,6 +830,18 @@ impl DefaultDict {
         rest.extend(args.iter().skip(1).cloned());
         it.call(&init, rest, kwargs.to_vec())?;
         Ok(())
+    }
+
+    /// Factory called by `__missing__` to make the default value.
+    #[getter]
+    fn default_factory(slf: This<Dd<'_>>, it: &mut Interp) -> Value {
+        factory_of(it, slf.0 .0)
+    }
+
+    #[setter]
+    fn set_default_factory(slf: This<Dd<'_>>, it: &mut Interp, value: &Value) {
+        let d = it.instance_dict(slf.0 .0);
+        dict_set_str(&d, "default_factory", value.clone());
     }
 
     /// __missing__(key) # Called by __getitem__ for missing key; pseudo-code:

@@ -1,12 +1,44 @@
 //! POSIX `node:path` operations the module loader needs, natively, so a program that never
 //! requires `path` does not load its JS. Ports of the POSIX half of Node's `lib/path.js`.
 
-use lumen_host::{Ctx, Value};
+use lumen_bind::NativeError;
+use lumen_host::Ctx;
 
-fn arg(ctx: &mut Ctx, args: &[Value], i: usize) -> Result<String, Value> {
-    Ok(ctx
-        .coerce_string(args.get(i).unwrap_or(&Value::Undefined))?
-        .to_string())
+pub(crate) use bindings::Module;
+
+#[lumen_bind::module(name = "__node")]
+mod bindings {
+    use super::*;
+
+    /// `(...paths) -> string` - `path.posix.resolve`.
+    #[op(coerce, name = "pathResolve")]
+    fn path_resolve(ctx: &mut Ctx, #[varargs] paths: Vec<String>) -> Result<String, NativeError> {
+        resolve(ctx, &paths)
+    }
+
+    /// `(...paths) -> string` - `path.posix.join`.
+    #[op(coerce, name = "pathJoin")]
+    fn path_join(#[varargs] paths: Vec<String>) -> String {
+        join(&paths)
+    }
+
+    /// `(path) -> string` - `path.posix.dirname`.
+    #[op(coerce, name = "pathDirname")]
+    fn path_dirname(path: &str) -> String {
+        dirname(path).into()
+    }
+
+    /// `(path, suffix?) -> string` - `path.posix.basename`.
+    #[op(coerce, name = "pathBasename")]
+    fn path_basename(path: &str, suffix: Option<&str>) -> String {
+        basename(path, suffix).into()
+    }
+
+    /// `(path) -> string` - `path.posix.extname`.
+    #[op(coerce, name = "pathExtname")]
+    fn path_extname(path: &str) -> String {
+        extname(path).into()
+    }
 }
 
 /// Node's `normalizeString` for POSIX separators.
@@ -108,27 +140,26 @@ fn normalize(path: &str) -> String {
     out
 }
 
-fn cwd(ctx: &mut Ctx) -> Result<String, Value> {
+fn cwd(ctx: &mut Ctx) -> Result<String, NativeError> {
     if let Some(realm) = ctx.op_state().get::<lumen_host::RealmProcess>() {
         return Ok(realm.cwd.to_string_lossy().into_owned());
     }
     match std::env::current_dir() {
         Ok(p) => Ok(p.to_string_lossy().into_owned()),
-        Err(e) => Err(ctx.make_error("Error", format!("cwd unavailable: {e}"))),
+        Err(e) => Err(NativeError::runtime(format!("cwd unavailable: {e}"))),
     }
 }
 
-/// `(...paths) -> string` — `path.posix.resolve`.
-pub(crate) fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn resolve(ctx: &mut Ctx, args: &[String]) -> Result<String, NativeError> {
     let only_cwd = match args {
         [] => true,
-        [_] => matches!(arg(ctx, args, 0)?.as_str(), "" | "."),
+        [p] => matches!(p.as_str(), "" | "."),
         _ => false,
     };
     if only_cwd {
         let cwd = cwd(ctx)?;
         if cwd.starts_with('/') {
-            return Ok(Value::from_string(cwd));
+            return Ok(cwd);
         }
     }
     let mut resolved = String::new();
@@ -136,7 +167,7 @@ pub(crate) fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
     let mut i = args.len() as isize - 1;
     while i >= -1 && !absolute {
         let p = if i >= 0 {
-            arg(ctx, args, i as usize)?
+            args[i as usize].clone()
         } else {
             cwd(ctx)?
         };
@@ -148,31 +179,27 @@ pub(crate) fn op_resolve(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<
         absolute = p.starts_with('/');
     }
     let out = normalize_string(&resolved, !absolute);
-    Ok(Value::from_string(if absolute {
+    Ok(if absolute {
         format!("/{out}")
     } else if out.is_empty() {
         ".".into()
     } else {
         out
-    }))
+    })
 }
 
-/// `(...paths) -> string` — `path.posix.join`.
-pub(crate) fn op_join(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
+fn join(args: &[String]) -> String {
     let mut joined: Option<String> = None;
-    for i in 0..args.len() {
-        let p = arg(ctx, args, i)?;
+    for p in args {
         if p.is_empty() {
             continue;
         }
         joined = Some(match joined {
-            None => p,
+            None => p.clone(),
             Some(j) => format!("{j}/{p}"),
         });
     }
-    Ok(Value::from_string(
-        joined.map_or_else(|| ".".into(), |j| normalize(&j)),
-    ))
+    joined.map_or_else(|| ".".into(), |j| normalize(&j))
 }
 
 fn dirname(path: &str) -> &str {
@@ -204,12 +231,6 @@ fn dirname(path: &str) -> &str {
         Some(1) if has_root => "//",
         Some(end) => &path[..end],
     }
-}
-
-/// `(path) -> string` — `path.posix.dirname`.
-pub(crate) fn op_dirname(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg(ctx, args, 0)?;
-    Ok(Value::from_string(dirname(&p).into()))
 }
 
 fn basename<'a>(path: &'a str, suffix: Option<&str>) -> &'a str {
@@ -274,16 +295,6 @@ fn basename<'a>(path: &'a str, suffix: Option<&str>) -> &'a str {
     }
 }
 
-/// `(path, suffix?) -> string` — `path.posix.basename`.
-pub(crate) fn op_basename(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg(ctx, args, 0)?;
-    let suffix = match args.get(1) {
-        None | Some(Value::Undefined) => None,
-        Some(v) => Some(ctx.coerce_string(v)?.to_string()),
-    };
-    Ok(Value::from_string(basename(&p, suffix.as_deref()).into()))
-}
-
 fn extname(path: &str) -> &str {
     let b = path.as_bytes();
     let mut start_dot: isize = -1;
@@ -322,12 +333,6 @@ fn extname(path: &str) -> &str {
         return "";
     }
     &path[start_dot as usize..end as usize]
-}
-
-/// `(path) -> string` — `path.posix.extname`.
-pub(crate) fn op_extname(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value, Value> {
-    let p = arg(ctx, args, 0)?;
-    Ok(Value::from_string(extname(&p).into()))
 }
 
 #[cfg(test)]
