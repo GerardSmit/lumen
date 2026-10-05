@@ -1102,76 +1102,9 @@ fn ascii_lowercase(value: &str) -> Cow<'_, str> {
     }
 }
 
-/// Longest named reference at the start of `input` (bytes after `&`), as
-/// (consumed length, replacement). Walks the sorted table one byte at a time,
-/// narrowing the candidate range instead of searching per prefix.
-fn longest_entity(input: &[u8]) -> Option<(usize, &'static str)> {
-    use crate::entities::{ENTRIES, NAMES, VALUES};
-    let names = NAMES.as_bytes();
-    let mut range = ENTRIES;
-    let mut best = None;
-    for (depth, &byte) in input.iter().take(32).enumerate() {
-        if !byte.is_ascii_alphanumeric() && byte != b';' {
-            break;
-        }
-        let at = |entry: &(u16, u8, u16, u8)| names[entry.0 as usize + depth];
-        // Candidates share input[..depth]; the one equal to it (if any) sorts first.
-        let first = range.partition_point(|entry| entry.1 as usize <= depth || at(entry) < byte);
-        let rest = &range[first..];
-        let count = rest.partition_point(|entry| at(entry) == byte);
-        if count == 0 {
-            break;
-        }
-        range = &rest[..count];
-        let head = range[0];
-        if head.1 as usize == depth + 1 {
-            best = Some((
-                depth + 1,
-                &VALUES[head.2 as usize..head.2 as usize + head.3 as usize],
-            ));
-        }
-        if byte == b';' {
-            break;
-        }
-    }
-    best
-}
-
 fn numeric_entity(input: &str) -> Option<(char, usize)> {
-    let rest = input.strip_prefix('#')?;
-    let (radix, rest, prefix) =
-        if let Some(hex) = rest.strip_prefix('x').or_else(|| rest.strip_prefix('X')) {
-            (16, hex, 2)
-        } else {
-            (10, rest, 1)
-        };
-    let digits = rest
-        .bytes()
-        .take_while(|byte| {
-            if radix == 16 {
-                byte.is_ascii_hexdigit()
-            } else {
-                byte.is_ascii_digit()
-            }
-        })
-        .count();
-    if digits == 0 {
-        return None;
-    }
-    let mut value = u32::from_str_radix(&rest[..digits], radix).unwrap_or(0xfffd);
-    const C1: [u32; 32] = [
-        0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039,
-        0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
-        0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
-    ];
-    if (0x80..=0x9f).contains(&value) {
-        value = C1[(value - 0x80) as usize];
-    }
-    let value = char::from_u32(value)
-        .filter(|&value| value != '\0')
-        .unwrap_or('\u{fffd}');
-    let consumed = prefix + digits + usize::from(rest.as_bytes().get(digits) == Some(&b';'));
-    Some((value, consumed))
+    let reference = lumen_common::entities::char_ref(input)?;
+    Some((lumen_common::entities::html_char(reference.value), reference.len))
 }
 
 fn decode_entities(input: &str, attribute: bool) -> Cow<'_, str> {
@@ -1189,7 +1122,7 @@ fn decode_entities(input: &str, attribute: bool) -> Cow<'_, str> {
             remaining = &after_amp[consumed..];
             continue;
         }
-        if let Some((end, value)) = longest_entity(after_amp.as_bytes()) {
+        if let Some((end, value)) = lumen_common::entities::longest_named(after_amp.as_bytes()) {
             let bytes = after_amp.as_bytes();
             if !(attribute
                 && bytes[end - 1] != b';'
@@ -1217,7 +1150,7 @@ fn leading_lf_character_token(input: &str) -> Option<usize> {
     if let Some((value, consumed)) = numeric_entity(reference) {
         return (value == '\n').then_some(consumed + 1);
     }
-    let (consumed, value) = longest_entity(reference.as_bytes())?;
+    let (consumed, value) = lumen_common::entities::longest_named(reference.as_bytes())?;
     value.starts_with('\n').then_some(consumed + 1)
 }
 

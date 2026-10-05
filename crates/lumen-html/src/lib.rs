@@ -6,7 +6,6 @@ extern crate alloc;
 pub mod animation;
 pub mod css;
 pub mod debug;
-mod entities;
 pub mod font_display;
 pub mod forms;
 pub mod html;
