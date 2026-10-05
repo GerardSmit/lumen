@@ -59,8 +59,15 @@
 //! `only(js, ..)` / `skip(py, ..)` (rare), `coerce` (the host's lenient conversions), `async`
 //! (run off the script thread, return a promise; [`SpawnHost`] hosts only),
 //! `hint(py(key = "..", flag))`: opaque per-host data the macro passes through unread ([`Hints`]).
-//! Classes also take `module = ".."` (the public module) and `generic`. `skip(host)` on a class
-//! keeps it usable as a value type while hiding it from that host's module listing.
+//! Classes also take `module = ".."` (the public module), `generic` and `extends = Base`.
+//! `skip(host)` on a class keeps it usable as a value type while hiding it from that host's
+//! module listing.
+//!
+//! `extends = Base` makes the class a subclass of another `#[class]`: the struct must hold the
+//! base instance in a field named `base`, and receivers of the base's methods accept the
+//! subclass. The JS host links the class to the base class (prototype chain, `instanceof`);
+//! the Python host does not read it yet and uses `hint(py(base = ".."))` instead. Example: `DomPermissionStatus` (`extends = DomEventTarget`) in
+//! `lumen-html-js/src/browser_services.rs`.
 //!
 //! The macros validate only the shape of a hint (`flag` or `key = "value"`); the keys are the
 //! host's. The Python host reads, on an op / member: `text_signature = ".."` (`""`: no
@@ -136,7 +143,7 @@ mod desc;
 mod host;
 
 pub use convert::{
-    CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, Passed,
+    CtorRet, Elem, FromArg, FromRest, FromVarKw, IntoError, IntoRet, NextRet, OneOrNumberPair, Passed,
 };
 pub use desc::{
     camel_case, flags, setter_property, ClassDesc, CodePtr, FnDesc, Hints, ModuleDesc, Owner,

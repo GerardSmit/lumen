@@ -1,24 +1,44 @@
-// TextEncoder/TextDecoder: native UTF-8 and WHATWG Windows-1252, base64 globals, structuredClone.
+// TextEncoder/TextDecoder: shared native WHATWG codecs, base64 globals, structuredClone.
+
+const encoderBrand = new WeakSet();
+const encodeNativeText = __encoding.encode;
+const encodingToString = String;
+const encoderArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+const encoderArrayBrand = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(encoderArrayPrototype, Symbol.toStringTag).get);
+const encoderArrayLength = Function.prototype.call.bind(Object.getOwnPropertyDescriptor(encoderArrayPrototype, 'length').get);
+const encoderArraySet = Function.prototype.call.bind(Uint8Array.prototype.set);
+function requireEncoder(value) {
+  if (!encoderBrand.has(value)) throw new TypeError('TextEncoder receiver has an invalid brand');
+}
+function encodingString(value) {
+  if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol value to a string');
+  return encodingToString(value);
+}
 
 class TextEncoder {
+  constructor() { encoderBrand.add(this); }
   get encoding() {
+    requireEncoder(this);
     return "utf-8";
   }
   encode(input = "") {
-    return __encoding.encode(String(input));
+    requireEncoder(this);
+    return encodeNativeText(encodingString(input));
   }
   // Encoding §8.1.2: as much of `source` as fits, whole UTF-8 sequences only; `read` counts
   // UTF-16 code units (a lone surrogate encodes as U+FFFD).
   encodeInto(source, destination) {
-    if (!(destination instanceof Uint8Array)) {
+    requireEncoder(this);
+    const s = encodingString(source);
+    if (encoderArrayBrand(destination) !== 'Uint8Array') {
       throw new TypeError("TextEncoder.encodeInto: destination must be a Uint8Array");
     }
-    const s = String(source);
-    const n = destination.length;
+    const n = encoderArrayLength(destination);
+    if (n === 0) return { read: 0, written: 0 };
     if (s.length <= n) {
-      const b = __encoding.encode(s);
+      const b = encodeNativeText(s);
       if (b.length <= n) {
-        destination.set(b);
+        encoderArraySet(destination, b);
         return { read: s.length, written: b.length };
       }
     }
@@ -60,25 +80,44 @@ class TextEncoder {
     return { read, written };
   }
 }
+Object.defineProperties(TextEncoder.prototype, {
+  encoding: { enumerable: true },
+  encode: { enumerable: true },
+  encodeInto: { enumerable: true },
+  [Symbol.toStringTag]: { value: 'TextEncoder', configurable: true },
+});
 
-// Encoding Standard labels and single-byte index. All 256 Windows-1252 bytes have
-// mappings, including C1 control bytes 81/8D/8F/90/9D; fatal mode does not reject them.
-const WINDOWS_1252_LABELS = new Set([
-  "ansi_x3.4-1968", "ascii", "cp1252", "cp819", "csisolatin1", "ibm819", "iso-8859-1",
-  "iso-ir-100", "iso8859-1", "iso88591", "iso_8859-1", "iso_8859-1:1987", "l1",
-  "latin1", "us-ascii", "windows-1252", "x-cp1252",
-]);
-const WINDOWS_1252_C1 = [
-  0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021,
-  0x2c6, 0x2030, 0x160, 0x2039, 0x152, 0x8d, 0x17d, 0x8f,
-  0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
-  0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
-];
-const UTF8_LABELS = new Set([
-  "utf-8", "utf8", "unicode-1-1-utf-8", "unicode11utf8", "unicode20utf8", "x-unicode20utf8",
-]);
-const UTF16LE_LABELS = new Set(["csunicode", "iso-10646-ucs-2", "ucs-2", "unicode", "unicodefeff", "utf-16", "utf-16le"]);
-const UTF16BE_LABELS = new Set(["unicodefffe", "utf-16be"]);
+const NativeTextDecoder = __lumenEncoding.Decoder;
+const decodeNativeBytes = Function.prototype.call.bind(NativeTextDecoder.prototype.decode);
+const nativeEncodingLabel = __lumenEncoding.label;
+const decoderBytes = Uint8Array;
+const decoderIsView = ArrayBuffer.isView;
+const decoderGetter = (prototype, name) => Function.prototype.call.bind(Object.getOwnPropertyDescriptor(prototype, name).get);
+const decoderBufferLength = decoderGetter(ArrayBuffer.prototype, 'byteLength');
+const decoderSharedLength = typeof SharedArrayBuffer === 'undefined' ? null : decoderGetter(SharedArrayBuffer.prototype, 'byteLength');
+const decoderViewBuffer = decoderGetter(encoderArrayPrototype, 'buffer');
+const decoderViewOffset = decoderGetter(encoderArrayPrototype, 'byteOffset');
+const decoderViewLength = decoderGetter(encoderArrayPrototype, 'byteLength');
+const decoderDataBuffer = decoderGetter(DataView.prototype, 'buffer');
+const decoderDataOffset = decoderGetter(DataView.prototype, 'byteOffset');
+const decoderDataLength = decoderGetter(DataView.prototype, 'byteLength');
+
+function decoderBufferSource(input) {
+  if (input === undefined) return new decoderBytes(0);
+  if (decoderIsView(input)) {
+    if (encoderArrayBrand(input) !== undefined) {
+      return new decoderBytes(decoderViewBuffer(input), decoderViewOffset(input), decoderViewLength(input));
+    }
+    return new decoderBytes(decoderDataBuffer(input), decoderDataOffset(input), decoderDataLength(input));
+  }
+  let length;
+  try { length = decoderBufferLength(input); }
+  catch {
+    if (decoderSharedLength === null) throw new TypeError('TextDecoder input must be a BufferSource');
+    length = decoderSharedLength(input);
+  }
+  return new decoderBytes(input, 0, length);
+}
 
 function codedError(Ctor, code, message) {
   const err = new Ctor(message);
@@ -113,147 +152,46 @@ function fatalDecodeError(encoding) {
   return codedError(TypeError, "ERR_ENCODING_INVALID_ENCODED_DATA", `The encoded data was not valid for encoding ${encoding}`);
 }
 
-function unitsToString(units) {
-  let out = "";
-  for (let i = 0; i < units.length; i += 4096) {
-    out += String.fromCharCode.apply(null, units.slice(i, i + 4096));
-  }
-  return out;
-}
-
 class TextDecoder {
   constructor(label = "utf-8", options = {}) {
-    const l = String(label).replace(/^[\x09\x0a\x0c\x0d\x20]+|[\x09\x0a\x0c\x0d\x20]+$/g, "").toLowerCase();
-    let encoding;
-    if (UTF8_LABELS.has(l)) encoding = "utf-8";
-    else if (UTF16LE_LABELS.has(l)) encoding = "utf-16le";
-    else if (UTF16BE_LABELS.has(l)) encoding = "utf-16be";
-    else if (WINDOWS_1252_LABELS.has(l)) encoding = "windows-1252";
-    else throw codedError(RangeError, "ERR_ENCODING_NOT_SUPPORTED", `The "${label}" encoding is not supported`);
+    const labelText = encodingString(label);
+    const encoding = nativeEncodingLabel(labelText);
+    if (encoding === undefined || encoding === null) {
+      throw codedError(RangeError, "ERR_ENCODING_NOT_SUPPORTED", `The "${labelText}" encoding is not supported`);
+    }
     if (options !== null && typeof options !== "object" && typeof options !== "function") {
       throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", `The "options" argument must be of type object.${receivedSuffix(options)}`);
     }
     options = options ?? {};
+    const fatal = !!options.fatal;
+    const ignoreBOM = !!options.ignoreBOM;
     decoderState.set(this, {
-      encoding,
-      fatal: !!options.fatal,
-      ignoreBOM: !!options.ignoreBOM,
-      pending: null, // an incomplete trailing sequence held back by a streaming decode
-      lead: -1, // a UTF-16 high surrogate awaiting its pair
-      bomSeen: false, // the stream's first bytes have been decoded (BOM handled)
+      encoding, fatal, ignoreBOM,
+      native: new NativeTextDecoder(encoding, fatal, ignoreBOM),
     });
   }
-  get encoding() {
-    return decoderOf(this).encoding;
-  }
-  get fatal() {
-    return decoderOf(this).fatal;
-  }
-  get ignoreBOM() {
-    return decoderOf(this).ignoreBOM;
-  }
+  get encoding() { return decoderOf(this).encoding; }
+  get fatal() { return decoderOf(this).fatal; }
+  get ignoreBOM() { return decoderOf(this).ignoreBOM; }
   [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) {
     const state = decoderOf(this);
     if (typeof depth === "number" && depth < 0) return this;
     const shown = { encoding: state.encoding, fatal: state.fatal, ignoreBOM: state.ignoreBOM };
     return `${this.constructor.name} ${inspect ? inspect(shown, options) : JSON.stringify(shown)}`;
   }
-  decode(input, options) {
+  decode(input = undefined, options = {}) {
     const state = decoderOf(this);
+    const bytes = decoderBufferSource(input);
     if (options !== undefined && options !== null && typeof options !== "object" && typeof options !== "function") {
       throw codedError(TypeError, "ERR_INVALID_ARG_TYPE", `The "options" argument must be of type object.${receivedSuffix(options)}`);
     }
     const stream = !!(options && options.stream);
-    let bytes;
-    if (input === undefined) bytes = new Uint8Array(0);
-    else if (input instanceof ArrayBuffer || (typeof SharedArrayBuffer !== "undefined" && input instanceof SharedArrayBuffer)) bytes = new Uint8Array(input);
-    else if (ArrayBuffer.isView(input)) bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-    else {
-      throw codedError(TypeError, "ERR_INVALID_ARG_TYPE",
-        `The "input" argument must be an instance of ArrayBuffer or ArrayBufferView.${receivedSuffix(input)}`);
+    try {
+      return decodeNativeBytes(state.native, bytes, stream);
+    } catch (error) {
+      if (state.fatal && error instanceof TypeError) throw fatalDecodeError(state.encoding);
+      throw error;
     }
-    const { encoding } = state;
-    if (encoding === "windows-1252") {
-      let result = "";
-      for (let j = 0; j < bytes.length; j++) {
-        const byte = bytes[j];
-        result += String.fromCharCode(byte >= 0x80 && byte <= 0x9f ? WINDOWS_1252_C1[byte - 0x80] : byte);
-      }
-      // A single-byte encoding has no pending multibyte tail or BOM to remove.
-      return result;
-    }
-    if (state.pending !== null) {
-      const joined = new Uint8Array(state.pending.length + bytes.length);
-      joined.set(state.pending);
-      joined.set(bytes, state.pending.length);
-      bytes = joined;
-      state.pending = null;
-    }
-    let s;
-    if (encoding === "utf-8") {
-      if (stream) {
-        const keep = incompleteUtf8Tail(bytes);
-        if (keep > 0) {
-          state.pending = bytes.slice(bytes.length - keep);
-          bytes = bytes.subarray(0, bytes.length - keep);
-        }
-      }
-      try {
-        s = bytes.length === 0 ? "" : __encoding.decode(bytes, state.fatal);
-      } catch (e) {
-        state.pending = null;
-        state.bomSeen = false;
-        throw state.fatal ? fatalDecodeError(encoding) : e;
-      }
-    } else {
-      s = this._decodeUtf16(state, bytes, stream);
-    }
-    if (!state.bomSeen && s.length !== 0) {
-      if (!state.ignoreBOM && s.charCodeAt(0) === 0xfeff) s = s.slice(1);
-      state.bomSeen = true;
-    }
-    // A non-streaming call ends the stream: the next decode starts a new one.
-    if (!stream) state.bomSeen = false;
-    return s;
-  }
-  _decodeUtf16(state, bytes, stream) {
-    const be = state.encoding === "utf-16be";
-    const units = [];
-    const bad = () => {
-      if (state.fatal) {
-        state.pending = null;
-        state.lead = -1;
-        state.bomSeen = false;
-        throw fatalDecodeError(state.encoding);
-      }
-      units.push(0xfffd);
-    };
-    const even = bytes.length & ~1;
-    for (let k = 0; k < even; k += 2) {
-      const u = be ? (bytes[k] << 8) | bytes[k + 1] : (bytes[k + 1] << 8) | bytes[k];
-      if (state.lead !== -1) {
-        if (u >= 0xdc00 && u <= 0xdfff) {
-          units.push(state.lead, u);
-          state.lead = -1;
-          continue;
-        }
-        state.lead = -1;
-        bad();
-      }
-      if (u >= 0xd800 && u <= 0xdbff) state.lead = u;
-      else if (u >= 0xdc00 && u <= 0xdfff) bad();
-      else units.push(u);
-    }
-    if (stream) {
-      if (even !== bytes.length) state.pending = bytes.slice(even);
-    } else {
-      if (state.lead !== -1) {
-        state.lead = -1;
-        bad();
-      }
-      if (even !== bytes.length) bad();
-    }
-    return unitsToString(units);
   }
 }
 Object.defineProperties(TextDecoder.prototype, {
@@ -263,29 +201,6 @@ Object.defineProperties(TextDecoder.prototype, {
   decode: { enumerable: true },
   [Symbol.toStringTag]: { value: "TextDecoder", configurable: true },
 });
-
-// The length of a trailing UTF-8 sequence that is a valid but incomplete prefix (0 if none).
-function incompleteUtf8Tail(bytes) {
-  const n = bytes.length;
-  for (let k = 1; k <= 3 && k <= n; k++) {
-    const lead = bytes[n - k];
-    if (lead >= 0x80 && lead <= 0xbf) continue; // a continuation byte: look further back
-    let need;
-    if (lead >= 0xc2 && lead <= 0xdf) need = 2;
-    else if (lead >= 0xe0 && lead <= 0xef) need = 3;
-    else if (lead >= 0xf0 && lead <= 0xf4) need = 4;
-    else return 0;
-    if (need <= k) return 0;
-    if (k >= 2) {
-      const second = bytes[n - k + 1];
-      const lo = lead === 0xe0 ? 0xa0 : lead === 0xf0 ? 0x90 : 0x80;
-      const hi = lead === 0xed ? 0x9f : lead === 0xf4 ? 0x8f : 0xbf;
-      if (second < lo || second > hi) return 0;
-    }
-    return k;
-  }
-  return 0;
-}
 
 function btoa(data) {
   if (arguments.length === 0) throw codedError(TypeError, "ERR_MISSING_ARGS", 'The "input" argument must be specified');

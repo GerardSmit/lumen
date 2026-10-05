@@ -1,6 +1,29 @@
 //! DOM queries backed by the cascade's selector matcher.
-use crate::{Document, Error, NodeId, NodeKind, css};
+use crate::{css, Document, Error, NodeId, NodeKind};
+use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
+
+const SELECTOR_CACHE_ENTRIES: usize = 32;
+
+fn cached_selector_list(
+    document: &Document,
+    source: &str,
+) -> Result<Rc<Vec<css::Selector>>, css::CssError> {
+    let mut cache = document.selector_cache.borrow_mut();
+    if let Some(position) = cache.iter().position(|(text, _)| text == source) {
+        let entry = cache.remove(position);
+        let parsed = entry.1.clone();
+        cache.push(entry);
+        return Ok(parsed);
+    }
+    let parsed = Rc::new(css::parse_selector_list(source, 0)?);
+    if cache.len() >= SELECTOR_CACHE_ENTRIES {
+        cache.remove(0);
+    }
+    cache.push((String::from(source), parsed.clone()));
+    Ok(parsed)
+}
 
 #[derive(Debug, PartialEq)]
 pub enum SelectorError {
@@ -20,7 +43,8 @@ impl From<css::CssError> for SelectorError {
     }
 }
 
-pub(crate) fn document_element(document: &Document) -> Option<NodeId> {
+/// Return the first element directly under the document root.
+pub fn document_element(document: &Document) -> Option<NodeId> {
     let mut child = document.first_child(document.root()).ok().flatten();
     while let Some(id) = child {
         if matches!(document.kind(id), Ok(NodeKind::Element { .. })) {
@@ -29,6 +53,23 @@ pub(crate) fn document_element(document: &Document) -> Option<NodeId> {
         child = document.next_sibling(id).ok().flatten();
     }
     None
+}
+
+/// A plain `#ident` selector queried from the document root, where the id index applies.
+/// Quirks mode matches ids case-insensitively, so it keeps the walk.
+fn pure_id_selector<'a>(document: &Document, root: NodeId, selector: &'a str) -> Option<&'a str> {
+    if root != document.root() || document.document_mode() == crate::DocumentMode::Quirks {
+        return None;
+    }
+    let name = selector.trim().strip_prefix('#')?;
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_' || !first.is_ascii())
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || !c.is_ascii())
+    {
+        return None;
+    }
+    Some(name)
 }
 
 fn query_scope_root(document: &Document, root: NodeId) -> Option<NodeId> {
@@ -40,11 +81,20 @@ fn query_scope_root(document: &Document, root: NodeId) -> Option<NodeId> {
 }
 
 pub fn matches(document: &Document, node: NodeId, selector: &str) -> Result<bool, SelectorError> {
-    let selector = css::parse_selector_list(selector, 0)?;
+    matches_with_validity(document, node, selector, &crate::forms::NoValidityOverrides)
+}
+
+pub fn matches_with_validity(
+    document: &Document,
+    node: NodeId,
+    selector: &str,
+    validity: &dyn crate::forms::ValidityStateView,
+) -> Result<bool, SelectorError> {
+    let selector = cached_selector_list(document, selector)?;
     let scope_root = matches!(document.kind(node)?, NodeKind::Element { .. }).then_some(node);
-    Ok(selector
-        .iter()
-        .any(|selector| selector.matches_node_in_scope(document, node, scope_root)))
+    Ok(selector.iter().any(|selector| {
+        selector.matches_node_in_scope_with_validity(document, node, scope_root, validity)
+    }))
 }
 
 pub fn closest(
@@ -52,14 +102,22 @@ pub fn closest(
     node: NodeId,
     selector: &str,
 ) -> Result<Option<NodeId>, SelectorError> {
-    let selector = css::parse_selector_list(selector, 0)?;
+    closest_with_validity(document, node, selector, &crate::forms::NoValidityOverrides)
+}
+
+pub fn closest_with_validity(
+    document: &Document,
+    node: NodeId,
+    selector: &str,
+    validity: &dyn crate::forms::ValidityStateView,
+) -> Result<Option<NodeId>, SelectorError> {
+    let selector = cached_selector_list(document, selector)?;
     let scope_root = matches!(document.kind(node)?, NodeKind::Element { .. }).then_some(node);
     let mut current = Some(node);
     while let Some(id) = current {
-        if selector
-            .iter()
-            .any(|selector| selector.matches_node_in_scope(document, id, scope_root))
-        {
+        if selector.iter().any(|selector| {
+            selector.matches_node_in_scope_with_validity(document, id, scope_root, validity)
+        }) {
             return Ok(Some(id));
         }
         current = document.parent(id)?;
@@ -72,15 +130,29 @@ pub fn query_selector(
     root: NodeId,
     selector: &str,
 ) -> Result<Option<NodeId>, SelectorError> {
+    query_selector_with_validity(document, root, selector, &crate::forms::NoValidityOverrides)
+}
+
+pub fn query_selector_with_validity(
+    document: &Document,
+    root: NodeId,
+    selector: &str,
+    validity: &dyn crate::forms::ValidityStateView,
+) -> Result<Option<NodeId>, SelectorError> {
     document.kind(root)?;
-    let selector = css::parse_selector_list(selector, 0)?;
+    let wanted_id = pure_id_selector(document, root, selector);
+    let selector = cached_selector_list(document, selector)?;
     let scope_root = query_scope_root(document, root);
+    if let Some(wanted) = wanted_id {
+        if let Some(found) = document.indexed_element_by_id(wanted) {
+            return Ok(found);
+        }
+    }
     let mut current = document.first_child(root)?;
     while let Some(id) = current {
-        if selector
-            .iter()
-            .any(|selector| selector.matches_node_in_scope(document, id, scope_root))
-        {
+        if selector.iter().any(|selector| {
+            selector.matches_node_in_scope_with_validity(document, id, scope_root, validity)
+        }) {
             return Ok(Some(id));
         }
         current = next_descendant(document, root, id)?;
@@ -93,22 +165,59 @@ pub fn query_selector_all(
     root: NodeId,
     selector: &str,
 ) -> Result<Vec<NodeId>, SelectorError> {
+    query_selector_all_with_validity(document, root, selector, &crate::forms::NoValidityOverrides)
+}
+
+pub fn query_selector_all_with_validity(
+    document: &Document,
+    root: NodeId,
+    selector: &str,
+    validity: &dyn crate::forms::ValidityStateView,
+) -> Result<Vec<NodeId>, SelectorError> {
     document.kind(root)?;
-    let selector = css::parse_selector_list(selector, 0)?;
+    let selector = cached_selector_list(document, selector)?;
     let scope_root = query_scope_root(document, root);
     let mut result = Vec::new();
     let mut current = document.first_child(root)?;
     while let Some(id) = current {
-        if selector
-            .iter()
-            .any(|selector| selector.matches_node_in_scope(document, id, scope_root))
-        {
+        if selector.iter().any(|selector| {
+            selector.matches_node_in_scope_with_validity(document, id, scope_root, validity)
+        }) {
             result.try_reserve(1).map_err(|_| Error::LimitExceeded)?;
             result.push(id);
         }
         current = next_descendant(document, root, id)?;
     }
     Ok(result)
+}
+
+/// Find the first ordinary descendant with a nonempty, null-namespace ID.
+/// Document fragments and shadow roots use the same bounded tree-order walk;
+/// neither shadow trees nor template contents are crossed implicitly.
+pub fn get_element_by_id(
+    document: &Document,
+    root: NodeId,
+    wanted: &str,
+) -> Result<Option<NodeId>, Error> {
+    document.kind(root)?;
+    if wanted.is_empty() {
+        return Ok(None);
+    }
+    if root == document.root() {
+        if let Some(found) = document.indexed_element_by_id(wanted) {
+            return Ok(found);
+        }
+    }
+    let mut current = document.first_child(root)?;
+    while let Some(id) = current {
+        if matches!(document.kind(id)?, NodeKind::Element { .. })
+            && document.get_attribute_ns_ref(id, None, "id")? == Some(wanted)
+        {
+            return Ok(Some(id));
+        }
+        current = next_descendant(document, root, id)?;
+    }
+    Ok(None)
 }
 
 /// Advance in tree order within `root` without allocating a traversal stack.
@@ -120,6 +229,25 @@ pub fn next_descendant(
     next_tree_node(document, root, id, false)
 }
 
+/// Advance to the next node after `id`'s subtree, bounded by `root`, without
+/// allocating a traversal stack.
+pub fn next_after_subtree(
+    document: &Document,
+    root: NodeId,
+    id: NodeId,
+) -> Result<Option<NodeId>, Error> {
+    let mut cursor = id;
+    loop {
+        if cursor == root {
+            return Ok(None);
+        }
+        if let Some(next) = document.next_sibling(cursor)? {
+            return Ok(Some(next));
+        }
+        cursor = document.parent(cursor)?.ok_or(Error::InvalidNode)?;
+    }
+}
+
 /// Advance in shadow-including tree order without allocating a traversal
 /// stack. Native shadow roots (including closed roots) precede light children;
 /// detached template contents are not descendants of their template element.
@@ -129,6 +257,96 @@ pub fn next_shadow_including_descendant(
     id: NodeId,
 ) -> Result<Option<NodeId>, Error> {
     next_tree_node(document, root, id, true)
+}
+
+/// Return the parent used when tracing cached native DOM identities.
+///
+/// The walk follows ordinary parents, shadow hosts, template-content owners,
+/// and the owner element of an attached `Attr`. It does not follow slot
+/// assignment: assigned nodes already belong to the host's light tree.
+pub fn native_identity_parent(document: &Document, id: NodeId) -> Result<Option<NodeId>, Error> {
+    if let NodeKind::Attribute { owner_element, .. } = document.kind(id)? {
+        if let Some(owner) = owner_element.as_deref() {
+            return Ok(Some(*owner));
+        }
+    }
+    document.host_including_parent(id)
+}
+
+/// Find the root of the native identity component containing `id`.
+///
+/// The component is a tree over DOM parent/child links plus shadow hosts,
+/// template-content ownership, and attached attributes. The node-count bound
+/// turns corrupted cyclic links into a reported DOM error rather than an
+/// unbounded walk during garbage collection.
+pub fn native_identity_root(document: &Document, id: NodeId) -> Result<NodeId, Error> {
+    document.kind(id)?;
+    let mut cursor = id;
+    for _ in 0..=document.node_count() {
+        let Some(parent) = native_identity_parent(document, cursor)? else {
+            return Ok(cursor);
+        };
+        if parent == cursor {
+            return Err(Error::LimitExceeded);
+        }
+        cursor = parent;
+    }
+    Err(Error::LimitExceeded)
+}
+
+/// Advance through the native identity component in depth-first order without
+/// allocating a traversal stack. Closed shadow roots and detached template
+/// contents are included. Materialized `Attr` identities are emitted by the
+/// owner-element visitor and are intentionally not part of this node walk.
+pub fn next_native_identity_descendant(
+    document: &Document,
+    root: NodeId,
+    id: NodeId,
+) -> Result<Option<NodeId>, Error> {
+    if let Some(child) = native_identity_first_child(document, id)? {
+        return Ok(Some(child));
+    }
+    let mut cursor = id;
+    for _ in 0..=document.node_count() {
+        if cursor == root {
+            return Ok(None);
+        }
+        let Some(parent) = native_identity_parent(document, cursor)? else {
+            return Err(Error::InvalidNode);
+        };
+        if let Some(next) = native_identity_next_sibling(document, parent, cursor)? {
+            return Ok(Some(next));
+        }
+        cursor = parent;
+    }
+    Err(Error::LimitExceeded)
+}
+
+fn native_identity_first_child(document: &Document, id: NodeId) -> Result<Option<NodeId>, Error> {
+    if let Some(shadow) = document.shadow_root(id)? {
+        return Ok(Some(shadow));
+    }
+    if let Some(content) = document.template_content(id)? {
+        return Ok(Some(content));
+    }
+    document.first_child(id)
+}
+
+fn native_identity_next_sibling(
+    document: &Document,
+    parent: NodeId,
+    child: NodeId,
+) -> Result<Option<NodeId>, Error> {
+    if document.shadow_host(child)? == Some(parent) {
+        if let Some(content) = document.template_content(parent)? {
+            return Ok(Some(content));
+        }
+        return document.first_child(parent);
+    }
+    if document.template_content(parent)? == Some(child) {
+        return document.first_child(parent);
+    }
+    document.next_sibling(child)
 }
 
 fn next_tree_node(
@@ -144,6 +362,9 @@ fn next_tree_node(
     }
     if let Some(child) = document.first_child(id)? {
         return Ok(Some(child));
+    }
+    if !shadow_including {
+        return next_after_subtree(document, root, id);
     }
     let mut cursor = id;
     loop {
@@ -171,6 +392,119 @@ fn next_tree_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::{string::String, vec::Vec};
+
+    #[derive(Default)]
+    struct LiveValidity {
+        values: Vec<(NodeId, String)>,
+        custom: Vec<(NodeId, String)>,
+        checked: Vec<(NodeId, bool)>,
+        selected: Vec<(NodeId, bool)>,
+    }
+
+    impl LiveValidity {
+        fn set<T>(values: &mut Vec<(NodeId, T)>, node: NodeId, value: T) {
+            if let Some((_, current)) = values.iter_mut().find(|(id, _)| *id == node) {
+                *current = value;
+            } else {
+                values.push((node, value));
+            }
+        }
+
+        fn set_value(&mut self, node: NodeId, value: &str) {
+            Self::set(&mut self.values, node, String::from(value));
+        }
+
+        fn set_custom(&mut self, node: NodeId, value: &str) {
+            Self::set(&mut self.custom, node, String::from(value));
+        }
+
+        fn set_checked(&mut self, node: NodeId, value: bool) {
+            Self::set(&mut self.checked, node, value);
+        }
+
+        fn set_selected(&mut self, node: NodeId, value: bool) {
+            Self::set(&mut self.selected, node, value);
+        }
+    }
+
+    impl crate::forms::ValidityStateView for LiveValidity {
+        fn value_override(&self, node: NodeId) -> Option<&str> {
+            self.values
+                .iter()
+                .find(|(id, _)| *id == node)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn custom_message(&self, node: NodeId) -> Option<&str> {
+            self.custom
+                .iter()
+                .find(|(id, _)| *id == node)
+                .map(|(_, value)| value.as_str())
+        }
+
+        fn checkedness(&self, node: NodeId) -> Option<bool> {
+            self.checked
+                .iter()
+                .find(|(id, _)| *id == node)
+                .map(|(_, value)| *value)
+        }
+
+        fn selectedness(&self, node: NodeId) -> Option<bool> {
+            self.selected
+                .iter()
+                .find(|(id, _)| *id == node)
+                .map(|(_, value)| *value)
+        }
+    }
+
+    #[test]
+    fn id_lookup_is_nonempty_tree_ordered_and_scoped_to_fragments_and_shadow_roots() {
+        let mut document = crate::html::parse_with_declarative_shadow_roots(
+            "<div id='outside'><template shadowrootmode=open><b id='same'></b></template><span id='same'></span><i id=''></i></div>",
+            64,
+            true,
+        ).unwrap();
+        let root = document.root();
+        let host = get_element_by_id(&document, root, "outside")
+            .unwrap()
+            .unwrap();
+        let shadow = document.shadow_root(host).unwrap().unwrap();
+        let light = get_element_by_id(&document, root, "same").unwrap().unwrap();
+        let shadow_element = get_element_by_id(&document, shadow, "same")
+            .unwrap()
+            .unwrap();
+        assert_ne!(light, shadow_element);
+        assert_eq!(get_element_by_id(&document, root, "").unwrap(), None);
+        assert_eq!(
+            get_element_by_id(&document, shadow, "outside").unwrap(),
+            None
+        );
+        let fragment = document.create(NodeKind::DocumentFragment).unwrap();
+        document.append(fragment, light).unwrap();
+        let later = document
+            .create(NodeKind::Element {
+                namespace: crate::Namespace::Html,
+                name: "em".into(),
+                attributes: alloc::vec![("id".into(), "same".into())],
+            })
+            .unwrap();
+        document.append(fragment, later).unwrap();
+        assert_eq!(
+            get_element_by_id(&document, fragment, "same").unwrap(),
+            Some(light)
+        );
+        assert_eq!(get_element_by_id(&document, root, "same").unwrap(), None);
+        document.set_attribute(light, "id", "renamed").unwrap();
+        assert_eq!(
+            get_element_by_id(&document, fragment, "same").unwrap(),
+            Some(later)
+        );
+        assert_eq!(
+            get_element_by_id(&document, fragment, "renamed").unwrap(),
+            Some(light)
+        );
+    }
 
     #[test]
     fn shadow_including_walk_is_ordered_bounded_and_leaves_templates_inert() {
@@ -216,20 +550,72 @@ mod tests {
             collect_ids(host),
             ["a", "shadow", "nested", "inner", "innerLight", "light"]
         );
-        assert!(
-            query_selector(&document, document.root(), "#shadow")
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            query_selector(&document, document.root(), "#inert")
-                .unwrap()
-                .is_none()
-        );
+        assert!(query_selector(&document, document.root(), "#shadow")
+            .unwrap()
+            .is_none());
+        assert!(query_selector(&document, document.root(), "#inert")
+            .unwrap()
+            .is_none());
         assert_eq!(
             query_selector_all(&document, host, "[id]").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn validity_pseudos_use_live_control_state_and_aggregate_forms() {
+        let document = crate::html::parse(
+            "<form id=form><fieldset id=group><input id=required required><input id=check type=checkbox required><input id=pattern pattern='[0-9]+' value=letters><select id=choice required><option id=placeholder value=''>Choose</option><option id=chosen value=ready>Ready</option></select></fieldset></form>",
+            64,
+        )
+        .unwrap();
+        let id = |selector| {
+            query_selector(&document, document.root(), selector)
+                .unwrap()
+                .unwrap()
+        };
+        let form = id("#form");
+        let group = id("#group");
+        let required = id("#required");
+        let check = id("#check");
+        let pattern = id("#pattern");
+        let placeholder = id("#placeholder");
+        let chosen = id("#chosen");
+        let choice = id("#choice");
+
+        assert!(
+            matches_with_validity(&document, required, ":invalid", &LiveValidity::default())
+                .unwrap()
+        );
+        assert!(
+            matches_with_validity(&document, pattern, ":invalid", &LiveValidity::default())
+                .unwrap()
+        );
+        assert!(
+            matches_with_validity(&document, group, ":invalid", &LiveValidity::default()).unwrap()
+        );
+        assert!(
+            matches_with_validity(&document, form, ":invalid", &LiveValidity::default()).unwrap()
+        );
+
+        let mut live = LiveValidity::default();
+        live.set_value(required, "filled");
+        live.set_value(pattern, "123");
+        live.set_checked(check, true);
+        live.set_selected(placeholder, false);
+        live.set_selected(chosen, true);
+        assert!(matches_with_validity(&document, required, ":is(:valid)", &live).unwrap());
+        assert!(matches_with_validity(&document, pattern, ":valid", &live).unwrap());
+        assert!(matches_with_validity(&document, check, ":valid", &live).unwrap());
+        assert!(matches_with_validity(&document, choice, ":valid", &live).unwrap());
+        assert!(matches_with_validity(&document, group, ":valid", &live).unwrap());
+        assert!(matches_with_validity(&document, form, ":valid", &live).unwrap());
+
+        live.set_custom(required, "host error");
+        assert!(matches_with_validity(&document, required, ":invalid", &live).unwrap());
+        assert!(matches_with_validity(&document, group, ":invalid", &live).unwrap());
+        assert!(matches_with_validity(&document, form, ":invalid", &live).unwrap());
+        assert!(!matches_with_validity(&document, form, ":not(:invalid)", &live).unwrap());
     }
 
     #[test]
@@ -251,11 +637,9 @@ mod tests {
         assert_eq!(query_selector(&doc, first, ".outer").unwrap(), None);
         let second = doc.next_sibling(first).unwrap().unwrap();
         assert_eq!(query_selector_all(&doc, div, "p").unwrap(), [first, second]);
-        assert!(
-            query_selector_all(&doc, first, ".outer")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(query_selector_all(&doc, first, ".outer")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -399,11 +783,9 @@ mod tests {
         ));
         let foreign = crate::html::parse("<svg id='foreign' viewBox='0 0 1 1'></svg>", 8).unwrap();
         let foreign_root = foreign.root();
-        assert!(
-            query_selector(&foreign, foreign_root, "svg[viewBox]")
-                .unwrap()
-                .is_some()
-        );
+        assert!(query_selector(&foreign, foreign_root, "svg[viewBox]")
+            .unwrap()
+            .is_some());
         assert_eq!(
             query_selector(&foreign, foreign_root, "svg[viewbox]").unwrap(),
             None
@@ -499,11 +881,9 @@ mod tests {
             query_selector(&xml, xml.root(), "input[type=text]").unwrap(),
             None
         );
-        assert!(
-            query_selector(&xml, xml.root(), "input[type=TEXT]")
-                .unwrap()
-                .is_some()
-        );
+        assert!(query_selector(&xml, xml.root(), "input[type=TEXT]")
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -546,11 +926,9 @@ mod tests {
         .unwrap();
         let scope = query_selector(&doc, doc.root(), "#scope").unwrap().unwrap();
         let child = query_selector(&doc, doc.root(), "#child").unwrap().unwrap();
-        assert!(
-            query_selector_all(&doc, scope, ":has(:scope)")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(query_selector_all(&doc, scope, ":has(:scope)")
+            .unwrap()
+            .is_empty());
         assert_eq!(
             query_selector_all(&doc, scope, ".a:has(:scope) .c").unwrap(),
             [child]

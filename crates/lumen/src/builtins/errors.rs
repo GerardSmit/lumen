@@ -74,7 +74,7 @@ pub(super) fn install_errors(it: &mut Interp) {
                 return Err(i.make_error(
                     "TypeError",
                     "Error.prototype.stack setter requires an object",
-                ))
+                ));
             }
         };
         // The value must be a String.

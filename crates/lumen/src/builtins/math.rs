@@ -29,11 +29,7 @@ unary_fn!(nf_math_round, |x: f64| {
     } else {
         let f = x.floor();
         let r = if x - f >= 0.5 { f + 1.0 } else { f };
-        if r == 0.0 && x < 0.0 {
-            -0.0
-        } else {
-            r
-        }
+        if r == 0.0 && x < 0.0 { -0.0 } else { r }
     }
 });
 

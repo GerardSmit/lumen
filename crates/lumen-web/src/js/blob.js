@@ -18,8 +18,8 @@ function clampSlice(value, size) {
 function partToBytes(part) {
   if (part instanceof Blob) return part[kBlobBytes];
   if (typeof part === "string") return new TextEncoder().encode(part);
-  if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
-  if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+  if (part instanceof ArrayBuffer) return new Uint8Array(part);
+  if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer, part.byteOffset, part.byteLength);
   return new TextEncoder().encode(String(part));
 }
 
@@ -30,16 +30,25 @@ class Blob {
     }
     const chunks = [];
     let size = 0;
+    let shareable = false;
     for (const part of parts ?? []) {
       const bytes = partToBytes(part);
+      shareable = part instanceof Blob || typeof part === "string";
       chunks.push(bytes);
       size += bytes.length;
     }
-    const all = new Uint8Array(size);
-    let off = 0;
-    for (const c of chunks) {
-      all.set(c, off);
-      off += c.length;
+    // Blob and string parts are immutable or freshly encoded, so a lone one is shared.
+    const sole = chunks.length === 1 && shareable;
+    let all;
+    if (sole) {
+      all = chunks[0];
+    } else {
+      all = new Uint8Array(size);
+      let off = 0;
+      for (const c of chunks) {
+        all.set(c, off);
+        off += c.length;
+      }
     }
     this[kBlobBytes] = all;
     const type = options && options.type ? String(options.type) : "";
@@ -61,7 +70,7 @@ class Blob {
     if (file) {
       makeFileBacked(b, { size: e - s, read: (from, to) => file.read(s + from, s + to) });
     } else {
-      b[kBlobBytes] = this[kBlobBytes].slice(s, e);
+      b[kBlobBytes] = this[kBlobBytes].subarray(s, e);
     }
     return b;
   }
@@ -177,6 +186,19 @@ function toEntryValue(value, filename) {
 }
 
 class FormData {
+  #formDataBrand;
+  static {
+    const hasFormDataBrand = value => {
+      if ((typeof value !== 'object' || value === null) && typeof value !== 'function') return false;
+      return #formDataBrand in value;
+    };
+    Object.defineProperty(globalThis, "__lumenIsFormData", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: hasFormDataBrand,
+    });
+  }
   constructor(...args) {
     this[kEntries] = [];
     const [form, submitter] = args;
@@ -345,7 +367,7 @@ Object.defineProperty(globalThis, "__lumenSnapshotFormData", {
   enumerable: false,
   writable: false,
   value(form) {
-    if (!(form instanceof FormData)) throw new TypeError("expected FormData");
+    if (!globalThis.__lumenIsFormData(form)) throw new TypeError("expected FormData");
     return form[kEntries].map(([name, value]) => {
       if (value instanceof Blob) {
         const file = value instanceof File ? value : new File([value], "blob", { type: value.type });

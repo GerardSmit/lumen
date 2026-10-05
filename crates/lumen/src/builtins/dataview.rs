@@ -1,7 +1,7 @@
 //! Split out of builtins/mod.rs (behavior-preserving move).
 
 use super::*;
-use lumen_common::buffer::{self, span_len, ByteOrder};
+use lumen_common::buffer::{self, ByteOrder, span_len};
 
 fn dv_info(i: &mut Interp, this: &Value) -> Result<(usize, usize, usize, bool), Value> {
     let ptr =
@@ -79,6 +79,8 @@ fn dv_get(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     let order = ByteOrder::little_if(i.to_boolean(&arg(args, 1)));
     let elem = kind.elem();
     let start = dv_locate(i, view, byte_off, elem.size())?;
+    // with_buffer_bytes selects the shared registry for a SharedArrayBuffer and holds its mutex
+    // for this complete read; the metadata-only ByteStore is used only for view lengths.
     let v = i.with_buffer_bytes(view.0, |b| {
         let b = b.get(start..start + elem.size())?;
         Some(if elem.is_64bit_int() {
@@ -110,14 +112,21 @@ fn dv_set(i: &mut Interp, this: &Value, args: &[Value], kind: TaKind) -> Result<
     let order = ByteOrder::little_if(i.to_boolean(&arg(args, 2)));
     // Coercing the index/value can detach or resize the buffer — re-derive the view length.
     let start = dv_locate(i, view, byte_off, elem.size())?;
-    i.with_buffer_bytes_mut(view.0, |b| {
-        if let Some(dst) = b.get_mut(start..start + elem.size()) {
+    // with_buffer_bytes_mut selects the shared registry and holds its mutex for the complete
+    // write. Recheck the actual backing range inside that synchronized access as well.
+    let wrote = i
+        .with_buffer_bytes_mut(view.0, |b| {
+            let dst = b.get_mut(start..start + elem.size())?;
             match value {
                 Ok(n) => buffer::store_f64(elem, n, dst, order),
                 Err(n) => buffer::store_int_wrapping(elem, n, dst, order),
             }
-        }
-    });
+            Some(())
+        })
+        .flatten();
+    if wrote.is_none() {
+        return Err(i.make_error("TypeError", "detached buffer"));
+    }
     Ok(Value::Undefined)
 }
 
@@ -367,8 +376,21 @@ pub(super) fn install_dataview(it: &mut Interp) {
         if offset > buflen {
             return Err(i.make_error("RangeError", "DataView byteOffset is out of bounds"));
         }
-        let rv = ab(i.get_member(&bv, "resizable"))?;
-        let resizable = i.to_boolean(&rv);
+        // ArrayBuffer and SharedArrayBuffer use different public names (`resizable` and
+        // `growable`), but both carry the same engine-private resizable-backing marker. Read the
+        // internal slot directly: the DataView constructor's tracking mode must not depend on
+        // user-overridable accessors, and shared bytes remain behind `with_buffer_bytes` locks.
+        let resizable = matches!(
+            &bv,
+            Value::Obj(o)
+                if matches!(
+                    o.borrow()
+                        .props
+                        .get("\u{0}ab_resizable")
+                        .map(|property| property.value()),
+                    Some(Value::Bool(true))
+                )
+        );
         if let Some(l) = len_arg {
             if offset + l > buflen {
                 return Err(i.make_error("RangeError", "DataView byteLength is out of bounds"));
@@ -393,8 +415,9 @@ pub(super) fn install_dataview(it: &mut Interp) {
             }
             None => buflen - offset,
         };
-        // A length-tracking DataView (no explicit byteLength) over a resizable buffer follows the
-        // buffer's current length; its stored `len` is only the initial snapshot.
+        // A length-tracking DataView (no explicit byteLength) over a resizable ArrayBuffer or
+        // growable SharedArrayBuffer follows the buffer's current length; its stored `len` is
+        // only the initial snapshot.
         let track = !has_len && resizable;
         let p = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);

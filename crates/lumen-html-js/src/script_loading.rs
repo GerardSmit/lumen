@@ -268,8 +268,38 @@ impl ScriptLoader {
 pub(crate) enum ScriptKind {
     ClassicInline(String),
     SuppressedClassic,
+    InvalidSource,
     Unhandled(UnhandledScriptReason, Option<String>),
     DataBlock,
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    use super::*;
+
+    #[test]
+    fn source_preparation_rejects_only_empty_html_whitespace_classic_and_module_urls() {
+        let mut document = Document::new(64);
+        let script = crate::html_element(&mut document, "script").unwrap();
+        for kind in ["", "module"] {
+            document.set_attribute(script, "type", kind).unwrap();
+            for source in ["", " ", "\t\n\r\u{000c} "] {
+                document.set_attribute(script, "src", source).unwrap();
+                assert!(matches!(prepare_kind(&document, script, true), Some(ScriptKind::InvalidSource)));
+                assert_eq!(source_attribute(&document, script, true).as_deref(), Some(source));
+            }
+            for source in ["\u{00a0}", "\u{000b}", " \tvalid.js\r\n"] {
+                document.set_attribute(script, "src", source).unwrap();
+                assert!(matches!(prepare_kind(&document, script, true), Some(ScriptKind::Unhandled(_, _))));
+            }
+        }
+        document.set_attribute(script, "src", "   ").unwrap();
+        document.set_attribute(script, "type", "application/json").unwrap();
+        assert!(matches!(prepare_kind(&document, script, true), Some(ScriptKind::DataBlock)));
+        document.set_attribute(script, "type", "").unwrap();
+        document.set_attribute(script, "nomodule", "").unwrap();
+        assert!(matches!(prepare_kind(&document, script, true), Some(ScriptKind::SuppressedClassic)));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -423,6 +453,9 @@ pub(crate) fn prepare_kind(
     match type_from_document(document, node, is_html_document) {
         DeclaredScriptType::SuppressedClassic => return Some(ScriptKind::SuppressedClassic),
         DeclaredScriptType::Module => {
+            if source.as_deref().is_some_and(lumen_common::scan::is_ascii_whitespace_only) {
+                return Some(ScriptKind::InvalidSource);
+            }
             return Some(ScriptKind::Unhandled(UnhandledScriptReason::Module, source));
         }
         DeclaredScriptType::ImportMap => {
@@ -441,6 +474,9 @@ pub(crate) fn prepare_kind(
         DeclaredScriptType::Classic => {}
     }
     if source.is_some() {
+        if source.as_deref().is_some_and(lumen_common::scan::is_ascii_whitespace_only) {
+            return Some(ScriptKind::InvalidSource);
+        }
         return Some(ScriptKind::Unhandled(
             UnhandledScriptReason::ExternalSource,
             source,
@@ -453,7 +489,7 @@ pub(crate) fn script_child_text(document: &Document, node: NodeId) -> String {
     let mut text = String::new();
     let mut child = document.first_child(node).ok().flatten();
     while let Some(id) = child {
-        if let Ok(NodeKind::Text(value)) = document.kind(id) {
+        if let Ok(NodeKind::Text(value) | NodeKind::CData(value)) = document.kind(id) {
             text.push_str(value);
         }
         child = document.next_sibling(id).ok().flatten();

@@ -13,10 +13,44 @@ pub struct DomStyle {
 }
 
 impl DomStyle {
+    fn declaration_value(&self, name: &str) -> OpResult<Option<(String, bool)>> {
+        let session = self.realm.session.borrow();
+        match session.document().kind(self.node).map_err(dom_error)? {
+            NodeKind::Element { .. } => {
+                let raw = session
+                    .document()
+                    .get_attribute_ns_ref(self.node, None, "style")
+                    .map_err(dom_error)?
+                    .unwrap_or("");
+                css::declaration_value(raw, name).map_err(css_error)
+            }
+            _ => Err(OpError::new("TypeError", "style requires an element")),
+        }
+    }
+
     pub(crate) fn adopt_node(&mut self, realm: Rc<DomRealm>, node: NodeId) {
         self.realm = realm;
         self.node = node;
     }
+}
+
+pub(crate) fn computed_property_value(
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    property: &str,
+) -> OpResult<String> {
+    let property = if property.starts_with("--") {
+        property.to_owned()
+    } else {
+        property.to_ascii_lowercase()
+    };
+    DomStyle {
+        realm: realm.clone(),
+        node,
+        computed: true,
+        _owner: Value::Undefined,
+    }
+    .get_property_value(&property)
 }
 
 fn css_error(error: css::CssError) -> OpError {
@@ -25,6 +59,95 @@ fn css_error(error: css::CssError) -> OpError {
         format!("CSS error at {}: {}", error.offset, error.message),
     )
 }
+
+pub(crate) fn canonical_content_property(name: &str, value: String) -> String {
+    // CSS-wide keywords and deferred variable values use the shared declaration
+    // parser's validated representation rather than generated-content grammar.
+    css::serialize_cssom_property_value(name, &value).unwrap_or(value)
+}
+
+/// Install camel-case CSSStyleDeclaration aliases from the shared CSS
+/// property registry. Accessors delegate through the receiver's CSSOM methods,
+/// so stylesheet rule declarations and inline styles use the same path.
+pub(crate) fn install_css_property_aliases(ctx: &mut Ctx) -> OpResult<()> {
+    static ALIASES: std::sync::OnceLock<Vec<(&'static str, Option<String>)>> =
+        std::sync::OnceLock::new();
+    let aliases = ALIASES.get_or_init(|| {
+        css::cssom_property_names()
+            .into_iter()
+            .filter(|property| !property.starts_with("--"))
+            .map(|property| (property, camel_case_alias(property)))
+            .collect()
+    });
+    let constructor = ctx.class_constructor::<DomStyle>();
+    let prototype = ctx
+        .get_member(&constructor, "prototype")
+        .map_err(|_| OpError::new("Error", "CSSStyleDeclaration prototype unavailable"))?;
+    for (property, camel) in aliases {
+        define_css_property_accessor(ctx, &prototype, property, property);
+        if let Some(camel) = camel {
+            define_css_property_accessor(ctx, &prototype, camel, property);
+        }
+    }
+    Ok(())
+}
+
+fn camel_case_alias(property: &str) -> Option<String> {
+    let mut out = String::with_capacity(property.len());
+    let mut chars = property.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '-' && matches!(chars.peek(), Some('a'..='z')) {
+            out.push(chars.next().unwrap().to_ascii_uppercase());
+        } else {
+            out.push(c);
+        }
+    }
+    (out != property).then_some(out)
+}
+
+fn define_css_property_accessor(
+    ctx: &mut Ctx,
+    prototype: &Value,
+    name: &str,
+    property: &'static str,
+) {
+    let getter = ctx.new_native_fn(
+        "get",
+        0,
+        std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, _args: &[Value]| {
+            let method = ctx
+                .get_member(&this, "getPropertyValue")
+                .map_err(lumen::embed::abrupt_value)?;
+            ctx.invoke(method, this, &[Value::str(property)])
+        }),
+    );
+    let setter = ctx.new_native_fn(
+        "set",
+        1,
+        std::rc::Rc::new(move |ctx: &mut Ctx, this: Value, args: &[Value]| {
+            let method = ctx
+                .get_member(&this, "setProperty")
+                .map_err(lumen::embed::abrupt_value)?;
+            let value = args.first().cloned().unwrap_or(Value::Undefined);
+            ctx.invoke(method, this, &[Value::str(property), value])?;
+            Ok(Value::Undefined)
+        }),
+    );
+    ctx.define_accessor_value(prototype, name, Some(getter), Some(setter), true);
+}
+
+fn counter_value(
+    property: css::CounterProperty,
+    directives: Option<&[css::CounterDirective]>,
+) -> OpResult<String> {
+    css::serialize_counter_directives(property, directives).ok_or_else(|| {
+        OpError::new(
+            "InvalidStateError",
+            "computed counter declaration is invalid",
+        )
+    })
+}
+
 fn color(value: Rgba) -> String {
     if value.a == 255 {
         format!("rgb({}, {}, {})", value.r, value.g, value.b)
@@ -89,10 +212,12 @@ impl DomStyle {
     fn raw(&self) -> OpResult<String> {
         let session = self.realm.session.borrow();
         match session.document().kind(self.node).map_err(dom_error)? {
-            NodeKind::Element { attributes, .. } => Ok(attributes
-                .iter()
-                .find(|(name, _)| name == "style")
-                .map_or(String::new(), |(_, value)| value.clone())),
+            NodeKind::Element { .. } => Ok(session
+                .document()
+                .get_attribute_ns_ref(self.node, None, "style")
+                .map_err(dom_error)?
+                .unwrap_or("")
+                .to_owned()),
             _ => Err(OpError::new("TypeError", "style requires an element")),
         }
     }
@@ -107,7 +232,7 @@ impl DomStyle {
             .session
             .borrow_mut()
             .document_mut()
-            .set_attribute(self.node, "style", value)
+            .set_attribute_ns(self.node, None, "style", value)
             .map_err(dom_error)
     }
 }
@@ -143,11 +268,15 @@ impl DomStyle {
             return Ok(match name {
                 "display" => match style.display {
                     css::Display::Block => "block",
+                    css::Display::FlowRoot => "flow-root",
                     css::Display::Inline => "inline",
                     css::Display::InlineBlock => "inline-block",
+                    css::Display::Contents => "contents",
+                    css::Display::ListItem => "list-item",
                     css::Display::Flex => "flex",
                     css::Display::Grid => "grid",
                     css::Display::Table => "table",
+                    css::Display::TableCaption => "table-caption",
                     css::Display::TableRowGroup => "table-row-group",
                     css::Display::TableRow => "table-row",
                     css::Display::TableCell => "table-cell",
@@ -163,9 +292,41 @@ impl DomStyle {
                     .height
                     .map_or("auto".into(), |value| format!("{value}px")),
                 "margin" => format!("{}px", style.margin),
+                "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => {
+                    let side = match name {
+                        "margin-top" => 0,
+                        "margin-right" => 1,
+                        "margin-bottom" => 2,
+                        _ => 3,
+                    };
+                    if style.margin_auto[side] {
+                        "auto".into()
+                    } else {
+                        format!("{}px", style.margin_sides[side])
+                    }
+                }
                 "padding" => format!("{}px", style.padding),
                 "font-size" => format!("{}px", style.font_size),
                 "font-size-adjust" => computed_font_size_adjust(&self.realm, &style),
+                "content" => css::serialize_generated_content(&style.generated_content()),
+                "color-scheme" => style.color_scheme.as_deref().unwrap_or("normal").to_owned(),
+                "transition-duration" => {
+                    css::serialize_transition_time_values(style.transition_duration.as_deref())
+                }
+                "transition-delay" => {
+                    css::serialize_transition_time_values(style.transition_delay.as_deref())
+                }
+                "quotes" => css::serialize_quotes(style.quotes()),
+                "counter-reset" => {
+                    counter_value(css::CounterProperty::Reset, style.counter_reset.as_deref())?
+                }
+                "counter-increment" => counter_value(
+                    css::CounterProperty::Increment,
+                    style.counter_increment.as_deref(),
+                )?,
+                "counter-set" => {
+                    counter_value(css::CounterProperty::Set, style.counter_set.as_deref())?
+                }
                 "font-family" => style.font.families.as_ref().map_or_else(
                     || "sans-serif".into(),
                     |families| {
@@ -195,6 +356,7 @@ impl DomStyle {
                 "border-color" => color(style.border_color),
                 "overflow-x" => overflow(style.overflow_x).into(),
                 "overflow-y" => overflow(style.overflow_y).into(),
+                "pointer-events" => if style.pointer_events_auto { "auto" } else { "none" }.into(),
                 "overflow" => {
                     if style.overflow_x == style.overflow_y {
                         overflow(style.overflow_x).into()
@@ -253,6 +415,13 @@ impl DomStyle {
                     },
                 ),
                 "opacity" => style.opacity.to_string(),
+                property if property.starts_with("--") => style
+                    .custom_properties()
+                    .iter()
+                    .find(|(name, _)| name == property)
+                    .and_then(|(_, value)| value.as_deref())
+                    .unwrap_or("")
+                    .to_owned(),
                 "line-height" => match style.line_height {
                     css::LineHeight::Normal => "normal".into(),
                     css::LineHeight::Number(value) => value.to_string(),
@@ -261,17 +430,19 @@ impl DomStyle {
                 _ => String::new(),
             });
         }
-        Ok(css::declaration_value(&self.raw()?, name)
-            .map_err(css_error)?
-            .map_or(String::new(), |(value, _)| value))
+        Ok(self
+            .declaration_value(name)?
+            .map_or(String::new(), |(value, _)| {
+                canonical_content_property(name, value)
+            }))
     }
     #[method(coerce)]
     fn get_property_priority(&self, name: &str) -> OpResult<String> {
         if self.computed {
             return Ok(String::new());
         }
-        Ok(if css::declaration_value(&self.raw()?, name)
-            .map_err(css_error)?
+        Ok(if self
+            .declaration_value(name)?
             .is_some_and(|(_, important)| important)
         {
             "important"
@@ -350,6 +521,46 @@ impl DomStyle {
         self.set_property("display", value, None)
     }
     #[getter]
+    fn content(&self) -> OpResult<String> {
+        self.get_property_value("content")
+    }
+    #[setter(coerce)]
+    fn set_content(&self, value: &str) -> OpResult<()> {
+        self.set_property("content", value, None)
+    }
+    #[getter]
+    fn counter_reset(&self) -> OpResult<String> {
+        self.get_property_value("counter-reset")
+    }
+    #[setter(coerce)]
+    fn set_counter_reset(&self, value: &str) -> OpResult<()> {
+        self.set_property("counter-reset", value, None)
+    }
+    #[getter]
+    fn counter_increment(&self) -> OpResult<String> {
+        self.get_property_value("counter-increment")
+    }
+    #[setter(coerce)]
+    fn set_counter_increment(&self, value: &str) -> OpResult<()> {
+        self.set_property("counter-increment", value, None)
+    }
+    #[getter]
+    fn counter_set(&self) -> OpResult<String> {
+        self.get_property_value("counter-set")
+    }
+    #[setter(coerce)]
+    fn set_counter_set(&self, value: &str) -> OpResult<()> {
+        self.set_property("counter-set", value, None)
+    }
+    #[getter]
+    fn quotes(&self) -> OpResult<String> {
+        self.get_property_value("quotes")
+    }
+    #[setter(coerce)]
+    fn set_quotes(&self, value: &str) -> OpResult<()> {
+        self.set_property("quotes", value, None)
+    }
+    #[getter]
     fn font_size(&self) -> OpResult<String> {
         self.get_property_value("font-size")
     }
@@ -423,6 +634,154 @@ pub fn get_computed_style(ctx: &mut Ctx, node: &DomNode) -> OpResult<DomStyle> {
 mod tests {
     use super::*;
     use lumen::Engine;
+
+    #[test]
+    fn computed_margin_sides_follow_live_native_style_and_animation_values() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<div style='margin:1px 2px 3px 4px'></div>", 128).unwrap();
+        let result = engine.eval_value(r#"(() => {
+            const element=document.querySelector('div'), style=getComputedStyle(element);
+            function expect(actual, expected, label) {
+                if (actual!==expected) throw new Error(label+': '+actual+' !== '+expected);
+            }
+            expect(style.marginTop,'1px','top');
+            expect(style.getPropertyValue('margin-right'),'2px','right');
+            expect(style.marginBottom,'3px','bottom');
+            expect(style.marginLeft,'4px','left');
+            element.style.marginLeft='-7.5px';
+            expect(style.marginLeft,'-7.5px','live left');
+            const animation=element.animate({marginLeft:['0px','300px']},{duration:1000,fill:'both'});
+            animation.currentTime=500;
+            expect(style.marginLeft,'150px','native animation interpolation');
+            animation.cancel();
+            expect(style.marginLeft,'-7.5px','underlying left restored');
+            element.style.cssText='display:none;font-size:20px;margin:1em auto';
+            expect(style.marginTop,'20px','shared font-relative computed length');
+            expect(style.marginRight,'auto','unboxed computed automatic margin');
+            expect(style.marginLeft,'auto','automatic margin preserved');
+            return true;
+        })()"#).unwrap().unwrap_or_else(|error| {
+            let message=match engine.ctx().member_get(&error,"message") {
+                Ok(Value::Str(message)) => message.to_string(),
+                _ => "non-string script exception".into(),
+            };
+            panic!("computed margin contract: {message}");
+        });
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn counter_cssom_canonicalizes_defaults_and_keeps_computed_values_live() {
+        let mut runtime = lumen_runtime::Runtime::new();
+        let engine = runtime.engine();
+        install(engine.ctx(), "<main><div></div></main>", 128).unwrap();
+        let result = engine.eval_value(r#"(() => {
+            const element=document.querySelector('main'), style=element.style;
+            function expect(actual, expected, label) {
+                if (actual!==expected) throw new Error(label+': '+actual+' !== '+expected);
+            }
+            const computed=getComputedStyle(element);
+            expect(computed.counterReset,'none','initial reset');
+            expect(computed.counterIncrement,'none','initial increment');
+            expect(computed.counterSet,'none','initial set');
+            style.counterReset='chapter section -2';
+            style.counterIncrement='chapter section 2';
+            style.counterSet='chapter 9 section';
+            expect(style.counterReset,'chapter 0 section -2','reset defaults');
+            expect(style.counterIncrement,'chapter 1 section 2','increment defaults');
+            expect(style.counterSet,'chapter 9 section 0','set defaults');
+            expect(computed.counterReset,style.counterReset,'computed reset');
+            expect(computed.counterIncrement,style.counterIncrement,'computed increment');
+            expect(computed.counterSet,style.counterSet,'computed set');
+            expect(getComputedStyle(element.firstElementChild).counterReset,'none','counter reset not inherited');
+            style.setProperty('counter-increment','chapter 3','important');
+            expect(style.getPropertyPriority('counter-increment'),'important','priority survives canonicalization');
+            expect(computed.counterIncrement,'chapter 3','live computed increment');
+            style.counterIncrement='none 2';
+            expect(style.counterIncrement,'chapter 3','invalid value keeps prior declaration');
+            expect(style.removeProperty('counter-reset'),'chapter 0 section -2','removed canonical value');
+            expect(computed.counterReset,'none','removal updates computed reset');
+            return true;
+        })()"#).unwrap().unwrap_or_else(|error| {
+            let message=match engine.ctx().member_get(&error,"message") {
+                Ok(Value::Str(message)) => message.to_string(),
+                _ => "non-string script exception".into(),
+            };
+            panic!("counter CSSOM contract: {message}");
+        });
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn generated_content_cssom_reflects_canonical_values_and_live_computed_styles() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<main style='display:none'></main>", 128).unwrap();
+        let result = engine
+            .eval_value(
+                r#"(() => {
+            const el=document.querySelector('main'), style=el.style;
+            function expect(value, wanted, label) {
+                if (value!==wanted) throw new Error(label+': '+value+' !== '+wanted);
+            }
+            style.content="open-quote 'hello' counter(chapter, DECIMAL) / 'alt'";
+            const content='open-quote "hello" counter(chapter) / "alt"';
+            expect(style.content,content,'content IDL');
+            expect(style.getPropertyValue('content'),content,'content declaration');
+            style.quotes="'outer' 'close' 'inner' 'end'";
+            expect(style.quotes,'"outer" "close" "inner" "end"','quotes IDL');
+            const computed=getComputedStyle(el);
+            expect(computed.content,content,'computed content');
+            expect(computed.quotes,style.quotes,'computed quotes');
+            style.content='counter(';
+            expect(style.content,content,'invalid content preserves old value');
+            style.content="'changed'";
+            expect(computed.content,'"changed"','live computed content');
+            style.quotes='none';
+            expect(computed.quotes,'none','live computed quotes');
+            return true;
+        })()"#,
+            )
+            .unwrap()
+            .unwrap_or_else(|error| {
+                let message = match engine.ctx().member_get(&error, "message") {
+                    Ok(Value::Str(message)) => message.to_string(),
+                    _ => "non-string script exception".into(),
+                };
+                panic!("generated-content CSSOM regression: {message}");
+            });
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn inline_styles_and_token_lists_use_only_null_namespace_attributes() {
+        let mut engine = Engine::new();
+        install(engine.ctx(), "<main></main>", 128).unwrap();
+        let result = engine.eval_value(r#"(() => {
+            const ns = 'https://example.test/attributes';
+            for (const el of [document.createElement('div'), document.createElementNS('http://www.w3.org/2000/svg', 'g')]) {
+                el.setAttributeNS(ns, 'style', 'color: red');
+                el.setAttributeNS(null, 'style', 'color: green');
+                el.setAttributeNS(ns, 'style', 'color: blue');
+                if (el.style.color !== 'green') return false;
+                el.style.color = 'purple';
+                if (el.getAttributeNS(ns, 'style') !== 'color: blue' || !el.getAttributeNS(null, 'style').includes('purple')) return false;
+                el.setAttributeNS(ns, 'class', 'foreign');
+                el.classList.add('native');
+                if (el.classList.contains('foreign') || !el.classList.contains('native') || el.getAttributeNS(ns, 'class') !== 'foreign') return false;
+                document.querySelector('main').append(el);
+                if (document.getElementsByClassName('foreign').length !== 0) return false;
+                const observer = new MutationObserver(() => {});
+                observer.observe(el, {attributes: true});
+                if (el.classList.toggle('native', true) !== true || el.classList.toggle('absent', false) !== false || observer.takeRecords().length !== 0) return false;
+                el.classList.toggle('native', false);
+                const records = observer.takeRecords();
+                if (records.length !== 1 || records[0].attributeNamespace !== null) return false;
+                observer.disconnect();
+            }
+            return document.getElementsByClassName('native').length === 0;
+        })()"#).unwrap().ok().unwrap();
+        assert!(matches!(result, Value::Bool(true)));
+    }
 
     #[test]
     fn cssom_setters_ignore_invalid_values_and_priorities_atomically() {

@@ -95,14 +95,16 @@ pub(crate) fn coll_fast_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::Tier, Completion, Engine};
+    use crate::{Completion, Engine, bytecode::Tier};
 
     fn check(source: &str) {
         for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let script = format!("function assert(x) {{ if(!x) throw new Error('assertion'); }} function drive() {{ {source} }} drive(); 'passed'");
+            let script = format!(
+                "function assert(x) {{ if(!x) throw new Error('assertion'); }} function drive() {{ {source} }} drive(); 'passed'"
+            );
             let result = engine.eval(&script, false).unwrap();
             match result {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),

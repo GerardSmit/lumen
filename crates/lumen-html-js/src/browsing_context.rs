@@ -121,11 +121,85 @@ pub struct FrameNavigationRequest {
     pub unsupported: Option<FrameUnsupportedReason>,
 }
 
+/// An iframe response whose DOM and host realm are ready but whose stable
+/// WindowProxy has not yet been retargeted. The embedder installs its realm
+/// providers before committing this token.
+pub struct PreparedFrameResponse {
+    context: Rc<BrowsingContext>,
+    request: FrameNavigationRequest,
+    realm: RealmHandle,
+    parsed_document: Option<lumen_html::Document>,
+    details_controller: Rc<super::dialog_popover::DetailsController>,
+    document: Option<Rc<DomRealm>>,
+    mime: String,
+    is_html: bool,
+    final_url: String,
+    inherited_base: Option<String>,
+    metadata: Rc<RealmMetadata>,
+    inherits_creator: bool,
+    committed: bool,
+}
+
+impl PreparedFrameResponse {
+    /// Realm that the trusted embedder should populate before commit.
+    pub fn realm_handle(&self) -> RealmHandle {
+        self.realm.clone()
+    }
+
+    pub fn document_url(&self) -> &str {
+        &self.final_url
+    }
+
+    pub fn content_type(&self) -> &str {
+        &self.mime
+    }
+
+    /// The response's trusted origin metadata, independent of its base URL.
+    pub fn origin(&self) -> Origin {
+        self.metadata.origin.borrow().clone()
+    }
+
+    /// Fallback base before any parsed `<base href>` is applied.
+    pub fn fallback_base_url(&self) -> &str {
+        self.inherited_base.as_deref().unwrap_or(&self.final_url)
+    }
+
+    /// The installed native document, if DOM initialization has completed.
+    pub fn document_realm(&self) -> Option<Rc<DomRealm>> {
+        self.document.clone()
+    }
+
+    /// Discard an uncommitted response. The embedder must cancel its queued work
+    /// and dispose the returned realms after leaving them.
+    pub fn discard(self, ctx: &mut Ctx) -> Vec<RealmHandle> {
+        if self.committed {
+            return Vec::new();
+        }
+        let mut retired = Vec::new();
+        if let Some(document) = self.document {
+            document.retire_all_frame_contexts(ctx, &mut retired);
+        }
+        retired.push(self.realm);
+        retired
+    }
+}
+
+/// Results of publishing a prepared iframe response. The host must cancel
+/// tasks for and dispose `retired_realms` after it has left those realms.
+pub struct FrameCommitResult {
+    pub document: Rc<DomRealm>,
+    pub retired_realms: Vec<RealmHandle>,
+}
+
 #[derive(Debug)]
 pub enum FrameInstallError {
     StaleRequest,
+    WrongFrame,
+    AlreadyCommitted,
+    NotInitialized,
     Unsupported(FrameUnsupportedReason),
     UnsupportedContentType(String),
+    Document(lumen_html::Error),
     Parse(InstallError),
     HostRealm,
 }
@@ -149,9 +223,12 @@ struct RealmMetadataRegistry {
 impl RealmMetadataRegistry {
     fn register(&self, metadata: &Rc<RealmMetadata>) {
         let key = metadata.key.get();
-        self.realms
-            .borrow_mut()
-            .insert(key, Rc::downgrade(metadata));
+        let mut realms = self.realms.borrow_mut();
+        // Navigation can prepare and discard many realms without ever reading
+        // their metadata again. Sweep dead weak keys at this write boundary,
+        // while preserving entries retained by old live realms/functions.
+        realms.retain(|_, known| known.strong_count() != 0);
+        realms.insert(key, Rc::downgrade(metadata));
     }
 
     fn for_realm(&self, realm: &RealmHandle) -> Option<Rc<RealmMetadata>> {
@@ -251,8 +328,12 @@ pub(crate) struct BrowsingContext {
     owner_realm: Option<std::rc::Weak<DomRealm>>,
     owner_node: Option<NodeId>,
     inherit_about_origin: Cell<bool>,
+    /// A Location API navigation takes precedence over reflected `src`/`srcdoc`
+    /// until one of those author-controlled iframe inputs changes.
+    location_navigation: RefCell<Option<String>>,
     active: Cell<bool>,
     navigation_generation: Cell<u64>,
+    initial_blank_load_dispatched: Cell<bool>,
 }
 
 struct BrowsingContextService {
@@ -267,11 +348,60 @@ pub struct FrameContext {
     inner: Rc<BrowsingContext>,
 }
 
+/// Non-owning identity for a frame, independent of its owner node and URL.
+/// Queued host tasks can reject a replacement context without retaining its
+/// document, scripts or resource caches.
+#[derive(Clone)]
+pub struct WeakFrameIdentity {
+    inner: std::rc::Weak<BrowsingContext>,
+}
+
+impl WeakFrameIdentity {
+    pub fn matches(&self, frame: &FrameContext) -> bool {
+        self.inner.ptr_eq(&Rc::downgrade(&frame.inner))
+    }
+}
+
 impl FrameContext {
+    pub fn weak_identity(&self) -> WeakFrameIdentity {
+        WeakFrameIdentity {
+            inner: Rc::downgrade(&self.inner),
+        }
+    }
+
     pub fn owner_node(&self) -> NodeId {
         self.inner
             .owner_node
             .expect("frame browsing contexts have an owner iframe")
+    }
+
+    /// Measure the iframe's current content-box viewport after refreshing its
+    /// owner document's layout. CSS borders and padding are excluded, and an
+    /// owner with no rendered box has a zero-sized viewport.
+    pub fn content_viewport_size(&self) -> OpResult<(u32, u32)> {
+        let owner = self
+            .inner
+            .owner_realm
+            .as_ref()
+            .and_then(std::rc::Weak::upgrade)
+            .ok_or_else(|| OpError::new("InvalidStateError", "iframe owner document is gone"))?;
+        owner.flush_layout()?;
+        let session_handle = owner.session_handle();
+        let size = {
+            let mut session = session_handle.borrow_mut();
+            crate::geometry::content_box_size(&mut session, self.owner_node())
+        }
+        .unwrap_or((0.0, 0.0));
+        let round_dimension = |value: f32| {
+            if !value.is_finite() || value < 0.0 || value.round() > u32::MAX as f32 {
+                return Err(OpError::new(
+                    "InvalidStateError",
+                    "iframe content viewport dimensions are invalid",
+                ));
+            }
+            Ok(value.round() as u32)
+        };
+        Ok((round_dimension(size.0)?, round_dimension(size.1)?))
     }
 
     pub fn origin(&self) -> Origin {
@@ -306,6 +436,21 @@ impl FrameContext {
         request_for_frame(&self.inner)
     }
 
+    /// Request a host-controlled navigation for this iframe without changing
+    /// its reflected `src` or `srcdoc` attributes. The returned snapshot carries
+    /// the new generation so a host can reject a response after later source,
+    /// base, or ownership mutations.
+    pub fn request_host_navigation(&self, input: &str) -> OpResult<FrameNavigationRequest> {
+        let entry_base_url = self
+            .inner
+            .document()
+            .map(|document| document.base_url())
+            .unwrap_or_else(|| self.inner.current_document_url());
+        self.inner
+            .request_location_navigation_from(input, &entry_base_url)?;
+        Ok(self.navigation_request())
+    }
+
     /// Check a captured fetch request before installing its response. A later
     /// source/base mutation invalidates an older request without retargeting the
     /// WindowProxy until a current response is ready.
@@ -317,6 +462,26 @@ impl FrameContext {
         self.inner.navigation_generation.get()
     }
 
+    /// True after the synchronous post-connection load steps for the initial
+    /// about:blank document have run. Later navigations still queue their own
+    /// iframe load event.
+    pub fn initial_blank_load_dispatched(&self) -> bool {
+        self.inner.initial_blank_load_dispatched.get()
+    }
+
+    /// Claim the one synchronous initial-blank load event for a connected
+    /// iframe. This is limited to a generation-zero blank source; srcdoc and
+    /// real URL navigations complete through their normal load path.
+    pub(crate) fn claim_initial_blank_load(&self) -> bool {
+        if !self.inner.active.get() || self.navigation_generation() != 0 {
+            return false;
+        }
+        if !matches!(self.navigation_request().source, FrameSource::Blank) {
+            return false;
+        }
+        !self.inner.initial_blank_load_dispatched.replace(true)
+    }
+
     pub fn install_response_for_request(
         &self,
         ctx: &mut Ctx,
@@ -326,6 +491,47 @@ impl FrameContext {
         source: &str,
         max_nodes: usize,
     ) -> Result<Rc<DomRealm>, FrameInstallError> {
+        let mut prepared = self.prepare_response_for_request(
+            ctx,
+            request,
+            final_url,
+            content_type,
+            source,
+            max_nodes,
+        )?;
+        if let Err(error) = self.initialize_prepared_document(ctx, &mut prepared) {
+            for realm in prepared.discard(ctx) {
+                dispose_compat_realm(ctx, &realm);
+            }
+            return Err(error);
+        }
+        let committed = match self.commit_prepared_response(ctx, &mut prepared) {
+            Ok(committed) => committed,
+            Err(error) => {
+                for realm in prepared.discard(ctx) {
+                    dispose_compat_realm(ctx, &realm);
+                }
+                return Err(error);
+            }
+        };
+        for realm in committed.retired_realms {
+            dispose_compat_realm(ctx, &realm);
+        }
+        Ok(committed.document)
+    }
+
+    /// Parse a response and create a fresh, unpublished realm. The embedder
+    /// installs runtime providers first, calls `initialize_prepared_document`
+    /// to install the DOM against those providers, then commits the result.
+    pub fn prepare_response_for_request(
+        &self,
+        ctx: &mut Ctx,
+        request: &FrameNavigationRequest,
+        final_url: &str,
+        content_type: &str,
+        source: impl Into<String>,
+        max_nodes: usize,
+    ) -> Result<PreparedFrameResponse, FrameInstallError> {
         if !self.inner.active.get() || !self.request_is_current(request) {
             return Err(FrameInstallError::StaleRequest);
         }
@@ -333,19 +539,39 @@ impl FrameContext {
             return Err(FrameInstallError::Unsupported(reason.clone()));
         }
 
-        let (mime, document, is_html) = parse_frame_document(source, content_type, max_nodes)?;
-        let old_realm = self.inner.realm.borrow().clone();
-        let old_document = self.inner.document.borrow().clone();
-        let old_metadata = self.inner.metadata.borrow().clone();
-        let group = self
+        let _group = self
             .inner
             .group
             .upgrade()
             .ok_or(FrameInstallError::HostRealm)?;
+        let _proxy = self.window_proxy().ok_or(FrameInstallError::HostRealm)?;
         let new_realm = ctx.create_host_realm();
-        let proxy = self.window_proxy().ok_or(FrameInstallError::HostRealm)?;
+        let source = source.into();
+        let parsed = ctx.with_host_realm(&new_realm, |ctx| {
+            let controller = super::dialog_popover::DetailsController::prepare(ctx)
+                .map_err(|_| FrameInstallError::HostRealm)?;
+            let document = parse_frame_document(source, content_type, final_url, max_nodes, &controller)?;
+            Ok::<_, FrameInstallError>((document, controller))
+        });
+        let ((mime, document, is_html), details_controller) = match parsed {
+            Ok(Ok(parsed)) => parsed,
+            Ok(Err(error)) => {
+                dispose_compat_realm(ctx, &new_realm);
+                return Err(error);
+            }
+            Err(_) => {
+                dispose_compat_realm(ctx, &new_realm);
+                return Err(FrameInstallError::HostRealm);
+            }
+        };
+        let explicit_about_blank = matches!(
+            &request.source,
+            FrameSource::Url(source_url)
+                if is_about_blank_url(source_url) && is_about_blank_url(final_url)
+        );
         let inherits_creator =
-            matches!(request.source, FrameSource::Blank | FrameSource::SrcDoc(_));
+            matches!(request.source, FrameSource::Blank | FrameSource::SrcDoc(_))
+                || explicit_about_blank;
         let origin = if inherits_creator {
             self.inner
                 .parent_context()
@@ -362,70 +588,162 @@ impl FrameContext {
                 .map(|document| document.base_url())
                 .unwrap_or_else(|| "about:blank".to_owned())
         });
-        *self.inner.metadata.borrow_mut() = new_metadata.clone();
-        *self.inner.proxy_metadata.borrow_mut() = new_metadata.clone();
-        if ctx.retarget_window_proxy(&proxy, &new_realm).is_err() {
-            *self.inner.metadata.borrow_mut() = old_metadata.clone();
-            *self.inner.proxy_metadata.borrow_mut() = old_metadata;
-            let _ = ctx.dispose_host_realm(&new_realm);
-            return Err(FrameInstallError::HostRealm);
-        }
-        group.unregister_active(&old_realm);
-        *self.inner.realm.borrow_mut() = new_realm.clone();
-        group.register(&self.inner);
+        Ok(PreparedFrameResponse {
+            context: self.inner.clone(),
+            request: request.clone(),
+            realm: new_realm,
+            parsed_document: Some(document),
+            details_controller,
+            document: None,
+            mime,
+            is_html,
+            final_url: final_url.to_owned(),
+            inherited_base,
+            metadata: new_metadata,
+            inherits_creator,
+            committed: false,
+        })
+    }
 
-        let result = ctx.with_host_realm(&new_realm, |ctx| {
-            register_context_service(ctx, self.inner.clone());
-            super::install_document(
+    /// Install native DOM bindings into a prepared realm after the host has
+    /// installed that realm's runtime providers. This does not publish the
+    /// realm or retarget the stable WindowProxy.
+    pub fn initialize_prepared_document(
+        &self,
+        ctx: &mut Ctx,
+        prepared: &mut PreparedFrameResponse,
+    ) -> Result<Rc<DomRealm>, FrameInstallError> {
+        if prepared.committed {
+            return Err(FrameInstallError::AlreadyCommitted);
+        }
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(FrameInstallError::WrongFrame);
+        }
+        if let Some(document) = &prepared.document {
+            return Ok(document.clone());
+        }
+        if !self.inner.active.get() || !self.request_is_current(&prepared.request) {
+            return Err(FrameInstallError::StaleRequest);
+        }
+        let document = prepared
+            .parsed_document
+            .take()
+            .ok_or(FrameInstallError::HostRealm)?;
+        let staged_context = self.inner.clone();
+        let metadata = prepared.metadata.clone();
+        let mime = prepared.mime.clone();
+        let final_url = prepared.final_url.clone();
+        let inherited_base = prepared.inherited_base.clone();
+        let is_html = prepared.is_html;
+        let details_controller = prepared.details_controller.clone();
+        let result = ctx.with_host_realm(&prepared.realm, |ctx| {
+            super::install_document_staged(
                 ctx,
                 document,
                 &mime,
                 is_html,
-                true,
-                Some(self.inner.clone()),
-                Some(final_url.to_owned()),
+                staged_context,
+                metadata,
+                final_url,
                 inherited_base,
+                details_controller,
             )
         });
-        let realm = match result {
-            Ok(Ok(realm)) => realm,
-            _ => {
-                let _ = ctx.retarget_window_proxy(&proxy, &old_realm);
-                group.unregister_active(&new_realm);
-                *self.inner.realm.borrow_mut() = old_realm.clone();
-                *self.inner.metadata.borrow_mut() = old_metadata.clone();
-                *self.inner.proxy_metadata.borrow_mut() = old_metadata;
-                group.register(&self.inner);
-                let _ = ctx.dispose_host_realm(&new_realm);
-                return Err(FrameInstallError::HostRealm);
-            }
+        let document = match result {
+            Ok(Ok(document)) => document,
+            _ => return Err(FrameInstallError::HostRealm),
         };
+        prepared.document = Some(document.clone());
+        Ok(document)
+    }
 
-        self.inner.inherit_about_origin.set(inherits_creator);
-        let old_document = self
-            .inner
+    /// Publish a prepared response if its captured request is still current.
+    /// On error the token remains available to `PreparedFrameResponse::discard`.
+    pub fn commit_prepared_response(
+        &self,
+        ctx: &mut Ctx,
+        prepared: &mut PreparedFrameResponse,
+    ) -> Result<FrameCommitResult, FrameInstallError> {
+        if prepared.committed {
+            return Err(FrameInstallError::AlreadyCommitted);
+        }
+        if !Rc::ptr_eq(&self.inner, &prepared.context) {
+            return Err(FrameInstallError::WrongFrame);
+        }
+        if !self.inner.active.get() || !self.request_is_current(&prepared.request) {
+            return Err(FrameInstallError::StaleRequest);
+        }
+        let document = prepared
             .document
-            .replace(Some(realm.clone()))
-            .or(old_document);
+            .as_ref()
+            .ok_or(FrameInstallError::NotInitialized)?
+            .clone();
+
+        let group = self
+            .inner
+            .group
+            .upgrade()
+            .ok_or(FrameInstallError::HostRealm)?;
+        let proxy = self.window_proxy().ok_or(FrameInstallError::HostRealm)?;
+        let old_realm = self.inner.realm.borrow().clone();
+        let old_proxy_metadata = self.inner.proxy_metadata.borrow().clone();
+
+        *self.inner.proxy_metadata.borrow_mut() = prepared.metadata.clone();
+        if ctx.retarget_window_proxy(&proxy, &prepared.realm).is_err() {
+            *self.inner.proxy_metadata.borrow_mut() = old_proxy_metadata;
+            return Err(FrameInstallError::HostRealm);
+        }
+        if ctx
+            .set_host_global_this(&prepared.realm, proxy.clone())
+            .is_err()
+        {
+            let _ = ctx.retarget_window_proxy(&proxy, &old_realm);
+            *self.inner.proxy_metadata.borrow_mut() = old_proxy_metadata;
+            return Err(FrameInstallError::HostRealm);
+        }
+
+        group.unregister_active(&old_realm);
+        *self.inner.realm.borrow_mut() = prepared.realm.clone();
+        *self.inner.metadata.borrow_mut() = prepared.metadata.clone();
+        *self.inner.proxy_metadata.borrow_mut() = prepared.metadata.clone();
+        group.register(&self.inner);
+        self.inner
+            .inherit_about_origin
+            .set(prepared.inherits_creator);
+        let old_document = self.inner.document.replace(Some(document.clone()));
         self.inner
             .navigation_generation
             .set(self.inner.navigation_generation.get().wrapping_add(1));
+
+        let mut retired_realms = Vec::new();
         if let Some(old_document) = old_document {
-            let mut retired = Vec::new();
-            old_document.retire_all_frame_contexts(ctx, &mut retired);
-            for retired_realm in retired {
-                let _ = ctx.dispose_host_realm(&retired_realm);
-            }
+            old_document.retire_all_frame_contexts(ctx, &mut retired_realms);
         }
-        let _ = ctx.dispose_host_realm(&old_realm);
-        Ok(realm)
+        retired_realms.push(old_realm);
+        prepared.committed = true;
+        Ok(FrameCommitResult {
+            document,
+            retired_realms,
+        })
     }
 }
 
+fn is_about_blank_url(value: &str) -> bool {
+    lumen_common::url::parse(value, None)
+        .is_ok_and(|url| url.scheme.eq_ignore_ascii_case("about") && url.path == "blank")
+}
+
+fn dispose_compat_realm(ctx: &mut Ctx, realm: &RealmHandle) {
+    super::scheduling::cancel_tasks_for_realm(ctx, realm);
+    let _ = ctx.dispose_host_realm(realm);
+}
+
 fn parse_frame_document(
-    source: &str,
+    source: String,
     content_type: &str,
+    final_url: &str,
     max_nodes: usize,
+    controller: &Rc<super::dialog_popover::DetailsController>,
 ) -> Result<(String, lumen_html::Document, bool), FrameInstallError> {
     let essence = content_type
         .split(';')
@@ -435,22 +753,97 @@ fn parse_frame_document(
         .to_ascii_lowercase();
     match essence.as_str() {
         "text/html" => {
-            let document = html::parse_with_declarative_shadow_roots(source, max_nodes, true)
+            let document = html::parse_with_options_initialized(&source, max_nodes,
+                html::ParseOptions { allow_declarative_shadow_roots: true, ..Default::default() },
+                |document| controller.attach(document))
                 .map_err(|error| FrameInstallError::Parse(InstallError::Parse(error)))?;
             Ok((essence, document, true))
         }
         "application/xhtml+xml" => {
-            let document = lumen_html::xml::parse(source, max_nodes)
+            let document = lumen_html::xml::parse_initialized(&source, max_nodes, |document| controller.attach(document))
                 .map_err(|error| FrameInstallError::Parse(InstallError::XmlParse(error)))?;
             Ok((essence, document, false))
         }
         "application/xml" | "text/xml" | "image/svg+xml" => {
-            let document = lumen_html::xml::parse(source, max_nodes)
+            let document = lumen_html::xml::parse_initialized(&source, max_nodes, |document| controller.attach(document))
                 .map_err(|error| FrameInstallError::Parse(InstallError::XmlParse(error)))?;
             Ok((essence, document, false))
         }
+        "text/plain" | "text/css" => {
+            let source = html::normalize_plaintext(source)
+                .map_err(|error| FrameInstallError::Parse(InstallError::Parse(error)))?;
+            let mut document = lumen_html::Document::new(max_nodes);
+            controller.attach(&mut document);
+            document.set_html_document(true);
+            let root = document.root();
+            let html = create_html_element(&mut document, "html")?;
+            let head = create_html_element(&mut document, "head")?;
+            let body = create_html_element(&mut document, "body")?;
+            let pre = create_html_element(&mut document, "pre")?;
+            document
+                .append(root, html)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(html, head)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(html, body)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(body, pre)
+                .map_err(FrameInstallError::Document)?;
+            if !source.is_empty() {
+                let text = document
+                    .create(lumen_html::NodeKind::Text(source))
+                    .map_err(FrameInstallError::Document)?;
+                document
+                    .append(pre, text)
+                    .map_err(FrameInstallError::Document)?;
+            }
+            Ok((essence, document, true))
+        }
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/bmp"
+        | "image/x-ms-bmp" => {
+            let mut document = lumen_html::Document::new(max_nodes);
+            controller.attach(&mut document);
+            document.set_html_document(true);
+            let root = document.root();
+            let html = create_html_element(&mut document, "html")?;
+            let head = create_html_element(&mut document, "head")?;
+            let body = create_html_element(&mut document, "body")?;
+            let image = create_html_element(&mut document, "img")?;
+            document
+                .set_attribute_ns(image, None, "src", final_url)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(root, html)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(html, head)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(html, body)
+                .map_err(FrameInstallError::Document)?;
+            document
+                .append(body, image)
+                .map_err(FrameInstallError::Document)?;
+            Ok((essence, document, true))
+        }
         _ => Err(FrameInstallError::UnsupportedContentType(essence)),
     }
+}
+
+fn create_html_element(
+    document: &mut lumen_html::Document,
+    local_name: &str,
+) -> Result<NodeId, FrameInstallError> {
+    document
+        .create(lumen_html::NodeKind::Element {
+            namespace: lumen_html::Namespace::Html,
+            name: lumen_html::Name::new(local_name),
+            attributes: Vec::new(),
+        })
+        .map_err(FrameInstallError::Document)
 }
 
 fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
@@ -468,7 +861,11 @@ fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
             unsupported: Some(FrameUnsupportedReason::InvalidSourceUrl),
         };
     };
-    let base_url = owner_realm.base_url();
+    let location_navigation = context.location_navigation.borrow().clone();
+    let base_url = location_navigation
+        .as_ref()
+        .map(|_| context.current_document_url())
+        .unwrap_or_else(|| owner_realm.base_url());
     let (srcdoc, src, sandbox) = {
         let session = owner_realm.session.borrow();
         let document = session.document();
@@ -483,9 +880,11 @@ fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
             .flatten();
         (srcdoc, src, sandbox)
     };
-    let source = if let Some(srcdoc) = srcdoc {
+    let source = if let Some(url) = location_navigation {
+        FrameSource::Url(url)
+    } else if let Some(srcdoc) = srcdoc {
         FrameSource::SrcDoc(srcdoc)
-    } else if let Some(src) = src {
+    } else if let Some(src) = src.filter(|src| !src.is_empty()) {
         match lumen_common::url::parse(&src, Some(&base_url)) {
             Ok(url) => FrameSource::Url(url.href()),
             Err(_) => FrameSource::InvalidUrl(src),
@@ -552,8 +951,10 @@ impl BrowsingContext {
             owner_realm: None,
             owner_node: None,
             inherit_about_origin: Cell::new(false),
+            location_navigation: RefCell::new(None),
             active: Cell::new(true),
             navigation_generation: Cell::new(0),
+            initial_blank_load_dispatched: Cell::new(false),
         });
         context
             .make_window_proxy(ctx)
@@ -604,6 +1005,53 @@ impl BrowsingContext {
         }
         self.inherit_about_origin.set(false);
         self.metadata.borrow().origin.replace(Origin::from_url(url));
+    }
+
+    pub(crate) fn invalidate_navigation_request(&self) {
+        if self.active.get() {
+            self.navigation_generation
+                .set(self.navigation_generation.get().wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn invalidate_owner_navigation_request(&self) {
+        self.location_navigation.borrow_mut().take();
+        self.invalidate_navigation_request();
+    }
+
+    pub(crate) fn current_document_url(&self) -> String {
+        self.document()
+            .and_then(|document| document.document_url())
+            .unwrap_or_else(|| "about:blank".to_owned())
+    }
+
+    pub(crate) fn request_location_navigation(&self, input: &str) -> OpResult<()> {
+        self.request_location_navigation_from(input, &self.current_document_url())
+    }
+
+    pub(crate) fn request_location_navigation_from(
+        &self,
+        input: &str,
+        entry_base_url: &str,
+    ) -> OpResult<()> {
+        if !self.active.get() {
+            return Err(OpError::new(
+                "InvalidStateError",
+                "browsing context is no longer active",
+            ));
+        }
+        if self.parent.is_none() {
+            return Err(OpError::new(
+                "NotSupportedError",
+                "top-level navigation is not supported by this host",
+            ));
+        }
+        let url = lumen_common::url::parse(input, Some(entry_base_url))
+            .map_err(|_| OpError::new("SyntaxError", "invalid Location URL"))?;
+        *self.location_navigation.borrow_mut() = Some(url.href());
+        self.navigation_generation
+            .set(self.navigation_generation.get().wrapping_add(1));
+        Ok(())
     }
 
     fn realm_handle(&self) -> RealmHandle {
@@ -838,7 +1286,8 @@ impl DomRealm {
                         namespace: Namespace::Html,
                         name,
                         ..
-                    }) if name == "iframe"
+                    }) if lumen_html::xml::split_qname(name.as_str())
+                        .is_some_and(|(_, local_name)| local_name == "iframe")
                 )
             {
                 out.push(node);
@@ -855,7 +1304,6 @@ impl DomRealm {
         ctx: &mut Ctx,
         node: NodeId,
     ) -> OpResult<FrameContext> {
-        self.retire_detached_frame_contexts(ctx);
         let connected = {
             let session = self.session.borrow();
             script_loading::is_connected(session.document(), node)
@@ -863,11 +1311,13 @@ impl DomRealm {
         if !self.has_browsing_context || !connected {
             return Err(OpError::type_error("iframe has no active browsing context"));
         }
+        self.retire_pending_frame_context_for_node(ctx, node);
         if let Some(context) = self
             .frame_contexts
             .borrow()
             .get(&node)
             .and_then(std::rc::Weak::upgrade)
+            .filter(|context| context.active.get())
         {
             return Ok(FrameContext { inner: context });
         }
@@ -893,8 +1343,6 @@ impl DomRealm {
             Some(source) => (source, "about:srcdoc"),
             None => (String::new(), "about:blank"),
         };
-        let document = html::parse_with_declarative_shadow_roots(&source, 65_536, true)
-            .map_err(|error| OpError::error(format!("{error:?}")))?;
         let origin = if sandboxed && !sandbox_allows_same_origin {
             Origin::opaque()
         } else {
@@ -905,6 +1353,25 @@ impl DomRealm {
             .upgrade()
             .ok_or_else(|| OpError::type_error("browsing context group has retired"))?;
         let child_realm = ctx.create_host_realm();
+        let parsed = ctx.with_host_realm(&child_realm, |ctx| {
+            let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
+            let document = html::parse_with_options_initialized(&source, 65_536,
+                html::ParseOptions { allow_declarative_shadow_roots: true, ..Default::default() },
+                |document| controller.attach(document))
+                .map_err(|error| OpError::error(format!("{error:?}")))?;
+            Ok::<_, OpError>((document, controller))
+        });
+        let (document, details_controller) = match parsed {
+            Ok(Ok(parsed)) => parsed,
+            Ok(Err(error)) => {
+                dispose_compat_realm(ctx, &child_realm);
+                return Err(error);
+            }
+            Err(_) => {
+                dispose_compat_realm(ctx, &child_realm);
+                return Err(OpError::error("failed to parse iframe initial document"));
+            }
+        };
         let parent_proxy = parent.proxy();
         let top_proxy = parent.top_context().proxy();
         let metadata = Rc::new(RealmMetadata {
@@ -933,29 +1400,32 @@ impl DomRealm {
             owner_realm: Some(Rc::downgrade(self)),
             owner_node: Some(node),
             inherit_about_origin: Cell::new(true),
+            location_navigation: RefCell::new(None),
             active: Cell::new(true),
             navigation_generation: Cell::new(0),
+            initial_blank_load_dispatched: Cell::new(false),
         });
         let proxy = match child.make_window_proxy(ctx) {
             Ok(proxy) => proxy,
             Err(_) => {
-                let _ = ctx.dispose_host_realm(&child_realm);
+                dispose_compat_realm(ctx, &child_realm);
                 return Err(OpError::error("failed to create iframe WindowProxy"));
             }
         };
         *metadata.self_proxy.borrow_mut() = ctx.weak_value(&proxy);
         group.register(&child);
-        let frame = FrameContext {
-            inner: child.clone(),
-        };
-        self.frame_contexts
-            .borrow_mut()
-            .insert(node, Rc::downgrade(&child));
-
         let inherited_base = self.base_url();
         let install = ctx.with_host_realm(&child_realm, |ctx| {
             register_context_service(ctx, child.clone());
-            super::install_document(
+            ctx.set_host_global_this(&child_realm, proxy.clone())
+                .map_err(|_| OpError::error("failed to publish iframe WindowProxy"))?;
+            let global = ctx.global_object();
+            for name in ["window", "self"] {
+                ctx.set_member(&global, name, proxy.clone())
+                    .map_err(|_| OpError::error("failed to initialize iframe global"))?;
+            }
+            lumen_host::install_registered_host_realm(ctx, &child_realm).map_err(OpError::error)?;
+            super::install_document_with_context_metadata(
                 ctx,
                 document,
                 "text/html",
@@ -964,28 +1434,53 @@ impl DomRealm {
                 Some(child.clone()),
                 Some(url.to_owned()),
                 Some(inherited_base),
+                None,
+                true,
+                Some(details_controller),
             )
+            .map_err(|error| {
+                OpError::error(format!(
+                    "failed to install iframe initial document: {error:?}"
+                ))
+            })
         });
         match install {
             Ok(Ok(realm)) => {
                 *child.document.borrow_mut() = Some(realm);
+                self.frame_contexts
+                    .borrow_mut()
+                    .insert(node, Rc::downgrade(&child));
+                let frame = FrameContext {
+                    inner: child.clone(),
+                };
                 let _ = proxy;
                 Ok(frame)
             }
-            _ => {
-                self.frame_contexts.borrow_mut().remove(&node);
+            Ok(Err(error)) => {
+                RealmServices::<BrowsingContextService>::remove_for_global(
+                    ctx,
+                    &child_realm.global(),
+                );
                 group.unregister_active(&child_realm);
-                let _ = ctx.dispose_host_realm(&child_realm);
+                dispose_compat_realm(ctx, &child_realm);
+                Err(error)
+            }
+            Err(_) => {
+                RealmServices::<BrowsingContextService>::remove_for_global(
+                    ctx,
+                    &child_realm.global(),
+                );
+                group.unregister_active(&child_realm);
+                dispose_compat_realm(ctx, &child_realm);
                 Err(OpError::error("failed to install iframe initial document"))
             }
         }
     }
 
     /// Materialize connected iframe children in tree order for an embedder's
-    /// navigation and load-event pump. A contentWindow getter is not required
-    /// for host lifecycle processing.
+    /// navigation and load-event pump. Detached child realms remain queued for
+    /// explicit host cleanup; this method never silently disposes their work.
     pub fn frame_contexts(self: &Rc<Self>, ctx: &mut Ctx) -> OpResult<Vec<FrameContext>> {
-        self.retire_detached_frame_contexts(ctx);
         let nodes = self.connected_iframe_nodes();
         nodes
             .into_iter()
@@ -994,33 +1489,72 @@ impl DomRealm {
     }
 
     /// Release host ownership of iframe navigables whose owner element has been detached.
-    /// Called from the host's frame/load pump so document mutations need no engine callback.
+    /// Compatibility helper for embedders without Runtime-owned tasks. Production
+    /// hosts should use `take_detached_frame_realms` and cancel their own work first.
     pub fn retire_detached_frame_contexts(&self, ctx: &mut Ctx) -> usize {
+        let (count, realms) = self.collect_detached_frame_realms(ctx);
+        for realm in realms {
+            dispose_compat_realm(ctx, &realm);
+        }
+        count
+    }
+
+    /// Remove detached or synchronously removed-and-reinserted child navigables
+    /// and return their realms for host task cancellation and disposal. The host
+    /// should call this before `frame_contexts` in its lifecycle pump.
+    pub fn take_detached_frame_realms(&self, ctx: &mut Ctx) -> Vec<RealmHandle> {
+        self.collect_detached_frame_realms(ctx).1
+    }
+
+    fn collect_detached_frame_realms(&self, ctx: &mut Ctx) -> (usize, Vec<RealmHandle>) {
         let connected = self.connected_iframe_nodes();
-        let retired: Vec<Rc<BrowsingContext>> = {
+        let mut retired_contexts = std::mem::take(&mut *self.pending_frame_contexts.borrow_mut());
+        {
             let mut cache = self.frame_contexts.borrow_mut();
-            let mut retired = Vec::new();
             cache.retain(|node, weak| {
                 let Some(context) = weak.upgrade() else {
                     return false;
                 };
-                if connected.contains(node) && context.active.get() {
+                if connected.contains(node)
+                    && context.active.get()
+                    && !retired_contexts.contains_key(node)
+                {
                     return true;
                 }
-                retired.push(context);
+                retired_contexts.entry(*node).or_insert(context);
                 false
             });
-            retired
-        };
-        let count = retired.len();
-        let mut realm_handles = Vec::new();
-        for context in retired {
+        }
+
+        let count = retired_contexts
+            .values()
+            .filter(|context| context.active.get())
+            .count();
+        let mut realm_handles = std::mem::take(&mut *self.pending_frame_realms.borrow_mut());
+        for context in retired_contexts.into_values() {
             context.retire(ctx, &mut realm_handles);
         }
-        for realm in realm_handles {
-            let _ = ctx.dispose_host_realm(&realm);
+        (count, realm_handles)
+    }
+
+    fn retire_pending_frame_context_for_node(&self, ctx: &mut Ctx, node: NodeId) {
+        let context = self.pending_frame_contexts.borrow_mut().remove(&node);
+        let Some(context) = context else {
+            return;
+        };
+        {
+            let mut contexts = self.frame_contexts.borrow_mut();
+            let is_same = contexts
+                .get(&node)
+                .and_then(std::rc::Weak::upgrade)
+                .is_some_and(|current| Rc::ptr_eq(&current, &context));
+            if is_same {
+                contexts.remove(&node);
+            }
         }
-        count
+        let mut retired = Vec::new();
+        context.retire(ctx, &mut retired);
+        self.pending_frame_realms.borrow_mut().extend(retired);
     }
 
     fn retire_all_frame_contexts(&self, ctx: &mut Ctx, retired: &mut Vec<RealmHandle>) {
@@ -1033,6 +1567,13 @@ impl DomRealm {
         for context in contexts {
             context.retire(ctx, retired);
         }
+        let pending: Vec<_> = std::mem::take(&mut *self.pending_frame_contexts.borrow_mut())
+            .into_values()
+            .collect();
+        for context in pending {
+            context.retire(ctx, retired);
+        }
+        retired.extend(std::mem::take(&mut *self.pending_frame_realms.borrow_mut()));
     }
 
     /// Retire this top-level context and its child navigables. The host must call
@@ -1106,6 +1647,19 @@ pub(crate) fn context_origin(context: &BrowsingContext) -> Origin {
     context.root_or_child_origin()
 }
 
+pub(crate) fn metadata_origin(metadata: &RealmMetadata) -> Origin {
+    metadata.origin.borrow().clone()
+}
+
+pub(crate) fn is_active_document(context: &BrowsingContext, document: &DomRealm) -> bool {
+    context.active.get()
+        && context
+            .document
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| core::ptr::eq(active.as_ref(), document))
+}
+
 pub(crate) fn context_parent_or_self(context: &Rc<BrowsingContext>) -> Rc<BrowsingContext> {
     context.parent_context().unwrap_or_else(|| context.clone())
 }
@@ -1126,6 +1680,33 @@ pub(crate) fn context_document(context: &BrowsingContext) -> Option<Rc<DomRealm>
     context.document()
 }
 
+pub(crate) fn active_child_realm_handle(
+    context: &BrowsingContext,
+    document: &DomRealm,
+) -> OpResult<Option<RealmHandle>> {
+    if context.parent.is_none() {
+        return Ok(None);
+    }
+    if !context.active.get() {
+        return Err(OpError::new(
+            "InvalidStateError",
+            "document belongs to an inactive browsing context",
+        ));
+    }
+    let active_document = context.document.borrow();
+    if active_document
+        .as_ref()
+        .is_some_and(|active| core::ptr::eq(active.as_ref(), document))
+    {
+        Ok(Some(context.realm_handle()))
+    } else {
+        Err(OpError::new(
+            "InvalidStateError",
+            "document is no longer the active document of its browsing context",
+        ))
+    }
+}
+
 pub(crate) fn update_document_origin(context: &BrowsingContext, url: &str) {
     context.set_document_origin_from_url(url);
 }
@@ -1137,6 +1718,24 @@ pub(crate) fn bind_context_document(context: &Rc<BrowsingContext>, realm: &Rc<Do
 
 pub(crate) fn register_context_service(ctx: &mut Ctx, context: Rc<BrowsingContext>) {
     RealmServices::replace_current(ctx, context_service(context));
+}
+
+pub(crate) fn register_context_service_with_metadata(
+    ctx: &mut Ctx,
+    context: Rc<BrowsingContext>,
+    metadata: Rc<RealmMetadata>,
+) {
+    let registry = context
+        .metadata_registry()
+        .expect("active browsing context group");
+    RealmServices::replace_current(
+        ctx,
+        BrowsingContextService {
+            context: Rc::downgrade(&context),
+            metadata,
+            registry,
+        },
+    );
 }
 
 pub(crate) fn current_context(ctx: &mut Ctx) -> Option<Rc<BrowsingContext>> {
@@ -1330,6 +1929,159 @@ mod tests {
         });
     }
 
+    fn node_by_id(realm: &Rc<DomRealm>, wanted: &str) -> NodeId {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let root = document.root();
+        let mut current = document.first_child(root).expect("root child lookup");
+        while let Some(node) = current {
+            if document
+                .get_attribute_ns(node, None, "id")
+                .expect("id lookup")
+                .as_deref()
+                == Some(wanted)
+            {
+                return node;
+            }
+            current = lumen_html::selector::next_descendant(document, root, node)
+                .expect("document traversal");
+        }
+        panic!("no element with id {wanted}");
+    }
+
+    fn active_child_handle(document: &DomRealm) -> RealmHandle {
+        match document.child_realm_handle() {
+            Ok(Some(handle)) => handle,
+            Ok(None) => panic!("expected child browsing context"),
+            Err(_) => panic!("expected active child document"),
+        }
+    }
+
+    #[test]
+    fn frame_details_adoption_survives_source_retirement_gc_and_keeps_task_order() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(),
+            "<iframe id='child' srcdoc='<details id=\"moving\"></details>'></iframe>", 128).unwrap();
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let child = frame.current_document().unwrap();
+        let child_handle = active_child_handle(&child);
+        eval(&mut engine, "globalThis.frameAdoptionSteps=[];globalThis.normalChildTaskRan=false;globalThis.recordFrameAdoptionStep=step=>frameAdoptionSteps.push(step);");
+        let queue_parent_step = |engine: &mut Engine, step: &'static str| {
+            super::super::scheduling::queue_task(engine.ctx(), move |ctx| {
+                let global = ctx.global_object();
+                let record = ctx.member_get(&global, "recordFrameAdoptionStep").map_err(OpError::thrown)?;
+                lumen::embed::JsFunction::from_value(record).unwrap().call(ctx, global, &[Value::str(step)])?;
+                Ok(())
+            }).unwrap();
+        };
+        queue_parent_step(&mut engine, "before");
+        assert!(engine.eval_value_in_host_realm(&child_handle, r#"(() => {
+            const d = document.getElementById('moving');
+            d.ontoggle = function(e) {
+                const parentWindow = this.ownerDocument.defaultView;
+                parentWindow.frameAdoptionSteps.push(e instanceof parentWindow.ToggleEvent && e.isTrusted &&
+                    e.target === this && e.currentTarget === this &&
+                    e.oldState === 'closed' && e.newState === 'open' ? 'toggle' : 'bad-toggle');
+            };
+            d.open = true;
+        })()"#, false).unwrap().is_ok());
+        let parent_global = engine.ctx().global_object();
+        engine.ctx().with_host_realm(&child_handle, |ctx| {
+            super::super::scheduling::queue_task(ctx, move |ctx| {
+                ctx.member_set(&parent_global, "normalChildTaskRan", Value::Bool(true)).map_err(OpError::thrown)
+            }).unwrap();
+        }).unwrap();
+        assert!(matches!(eval(&mut engine, "globalThis.adoptedFrameDetailsProbe=document.adoptNode(document.getElementById('child').contentDocument.getElementById('moving'));adoptedFrameDetailsProbe.ownerDocument===document"), Value::Bool(true)));
+        let value = eval(&mut engine, "adoptedFrameDetailsProbe");
+        let target = engine.ctx().weak_value(&value).unwrap();
+        drop(value);
+        eval(&mut engine, "adoptedFrameDetailsProbe=null");
+        queue_parent_step(&mut engine, "after");
+        parent.with_session(|session| session.document_mut().remove(frame.owner_node()).unwrap());
+        let retired = parent.take_detached_frame_realms(engine.ctx());
+        assert_eq!(retired.len(), 1);
+        assert!(frame.current_document().is_none(), "source frame document is retired");
+        for realm in retired { dispose_compat_realm(engine.ctx(), &realm); }
+        drop(child_handle);
+        drop(child);
+        drop(frame);
+        engine.collect_garbage();
+        assert!(target.upgrade().is_some(), "transferred native task retains target through GC");
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(eval(&mut engine, "!normalChildTaskRan&&frameAdoptionSteps.join(',')==='before,toggle,after'"), Value::Bool(true)));
+        assert!(!super::super::scheduling::task_pending(engine.ctx()));
+        engine.collect_garbage();
+        assert!(target.upgrade().is_none(), "delivered adopted target is released");
+    }
+
+    #[test]
+    fn frame_details_initial_and_staged_parser_transitions_use_child_tasks() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(),
+            "<iframe id='child' srcdoc='<details open></details>'></iframe>", 128).unwrap();
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let initial = frame.current_document().unwrap();
+        let script = "globalThis.frameToggles=[];document.querySelector('details').addEventListener('toggle',e=>frameToggles.push(e instanceof ToggleEvent&&e.isTrusted&&e.oldState==='closed'&&e.newState==='open'&&e.target.ownerDocument===document));";
+        let initial_handle = active_child_handle(&initial);
+        assert!(engine.eval_value_in_host_realm(&initial_handle, script, false).unwrap().is_ok());
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(engine.eval_value_in_host_realm(&initial_handle,
+            "frameToggles.length===1&&frameToggles[0]", false).unwrap().ok().unwrap(), Value::Bool(true)));
+        for (mime, source) in [
+            ("text/html", "<details open></details>"),
+            ("application/xhtml+xml", "<details xmlns='http://www.w3.org/1999/xhtml' open=''/>")
+        ] {
+            let request = frame.navigation_request();
+            let child = frame.install_response_for_request(engine.ctx(), &request,
+                "about:srcdoc", mime, source, 128).unwrap();
+            let handle = active_child_handle(&child);
+            assert!(engine.eval_value_in_host_realm(&handle, script, false).unwrap().is_ok());
+            engine.collect_garbage();
+            assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+            assert!(matches!(engine.eval_value_in_host_realm(&handle,
+                "frameToggles.length===1&&frameToggles[0]", false).unwrap().ok().unwrap(), Value::Bool(true)));
+        }
+    }
+
+    #[test]
+    fn frame_details_failed_parse_and_retirement_preserve_parent_work() {
+        let mut engine = Engine::new();
+        let parent = crate::install(engine.ctx(), "<iframe id='child'></iframe>", 128).unwrap();
+        let frame = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let request = frame.navigation_request();
+        assert!(matches!(frame.prepare_response_for_request(engine.ctx(), &request,
+            "about:blank", "application/xhtml+xml",
+            "<details xmlns='http://www.w3.org/1999/xhtml' open=''><bad></details>", 128),
+            Err(FrameInstallError::Parse(_))));
+        assert!(!super::super::scheduling::task_pending(engine.ctx()));
+        let mut prepared = frame.prepare_response_for_request(engine.ctx(), &request,
+            "about:blank", "text/html", "<details open></details>", 128).unwrap();
+        assert!(!super::super::scheduling::task_pending(engine.ctx()));
+        // A host is allowed to pump while providers/document remain staged.
+        // The already admitted real notification must wait for its native lease.
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(!super::super::scheduling::task_pending(engine.ctx()));
+        frame.initialize_prepared_document(engine.ctx(), &mut prepared).unwrap();
+        assert!(super::super::scheduling::task_pending(engine.ctx()));
+        let handle = prepared.realm_handle();
+        assert!(engine.eval_value_in_host_realm(&handle,
+            "globalThis.stagedDetailsCount=0;document.querySelector('details').addEventListener('toggle',()=>stagedDetailsCount++);",
+            false).unwrap().is_ok());
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(engine.eval_value_in_host_realm(&handle,
+            "stagedDetailsCount===1", false).unwrap().ok().unwrap(), Value::Bool(true)));
+        assert!(engine.eval_value_in_host_realm(&handle,
+            "document.querySelector('details').removeAttribute('open');", false).unwrap().is_ok());
+        super::super::scheduling::queue_task(engine.ctx(), |ctx| {
+            let global = ctx.global_object();
+            ctx.member_set(&global, "parentDetailsWork", Value::Bool(true)).map_err(OpError::thrown)
+        }).unwrap();
+        for realm in prepared.discard(engine.ctx()) { dispose_compat_realm(engine.ctx(), &realm); }
+        assert!(super::super::scheduling::run_tasks(&mut engine, 16).is_empty());
+        assert!(matches!(eval(&mut engine, "parentDetailsWork===true"), Value::Bool(true)));
+        assert!(!super::super::scheduling::task_pending(engine.ctx()));
+    }
+
     #[test]
     fn origins_use_tuple_identity_and_distinct_opaque_tokens() {
         assert_eq!(
@@ -1383,6 +2135,91 @@ mod tests {
     }
 
     #[test]
+    fn explicit_about_blank_response_inherits_origin_and_base_but_keeps_its_url() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<head><base href='https://assets.example.test/app/'></head><body><iframe id='child'></iframe></body>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        let expected_base = parent.base_url();
+        let parent_origin = Origin::from_url("https://parent.example.test/page");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize connected iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+
+        set_attribute(&parent, frame.owner_node(), "src", "about:blank#child");
+        let request = frame.navigation_request();
+        assert!(matches!(
+            &request.source,
+            FrameSource::Url(url) if is_about_blank_url(url)
+        ));
+        let mut prepared = frame
+            .prepare_response_for_request(
+                engine.ctx(),
+                &request,
+                "about:blank#child",
+                "text/html",
+                "",
+                128,
+            )
+            .expect("prepare explicit about:blank response");
+        assert_eq!(prepared.origin(), parent_origin);
+        frame
+            .initialize_prepared_document(engine.ctx(), &mut prepared)
+            .expect("initialize blank document");
+        let committed = frame
+            .commit_prepared_response(engine.ctx(), &mut prepared)
+            .expect("commit current blank response");
+        assert_eq!(
+            committed.document.document_url().as_deref(),
+            Some("about:blank#child")
+        );
+        assert_eq!(committed.document.base_url(), expected_base);
+        assert_eq!(frame.origin(), parent_origin);
+    }
+
+    #[test]
+    fn initial_frame_realm_installs_runtime_providers_before_dom() {
+        let mut runtime = lumen_runtime::Runtime::new();
+        let engine = runtime.engine();
+        let parent = crate::install(
+            engine.ctx(),
+            "<body><iframe id='child'></iframe></body>",
+            128,
+        )
+        .unwrap();
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let handle = frame.realm_handle();
+        let completion = match engine.ctx().with_host_realm(&handle, |ctx| {
+                let global = ctx.global_object();
+                ctx.eval_in_realm(
+                    &global,
+                    "globalThis === window && self === window && typeof URL === 'function' && typeof TextDecoder === 'function' && typeof FormData === 'function' && document instanceof Document",
+                )
+            })
+        {
+            Ok(completion) => completion,
+            Err(_) => panic!("enter initialized iframe realm"),
+        };
+        let value = match completion {
+            Ok(value) => value,
+            Err(_) => panic!("child bootstrap did not throw"),
+        };
+        assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
     fn navigation_retargets_stable_proxy_and_detach_preserves_retained_proxy() {
         let mut engine = Engine::new();
         let parent =
@@ -1396,6 +2233,16 @@ mod tests {
             .expect("one iframe");
         let initial_handle = frame.realm_handle();
         let proxy = frame.window_proxy().expect("initial WindowProxy");
+        let initial_document = frame
+            .current_document()
+            .expect("initial child document is active");
+        assert!(matches!(parent.child_realm_handle(), Ok(None)));
+        assert_eq!(
+            active_child_handle(&initial_document)
+                .global()
+                .object_identity(),
+            initial_handle.global().object_identity()
+        );
         assert_eq!(
             frame.origin(),
             Origin::from_url("https://parent.example.test/page")
@@ -1404,7 +2251,7 @@ mod tests {
         assert!(matches!(
             eval(
                 &mut engine,
-                "window.savedChild = document.getElementById('child').contentWindow; savedChild.marker = 17; true",
+                "window.savedChild = document.getElementById('child').contentWindow; window.savedChildDocument = document.getElementById('child').contentDocument; savedChild.marker = 17; true",
             ),
             Value::Bool(true)
         ));
@@ -1425,6 +2272,11 @@ mod tests {
                 128,
             )
             .expect("install same-origin response");
+        assert!(initial_document.child_realm_handle().is_err());
+        assert_eq!(
+            active_child_handle(&child).global().object_identity(),
+            frame.realm_handle().global().object_identity()
+        );
         let current_proxy = frame.window_proxy().expect("retargeted WindowProxy");
         assert!(engine.ctx().values_strict_equal(&proxy, &current_proxy));
         assert_ne!(
@@ -1439,6 +2291,13 @@ mod tests {
             eval(
                 &mut engine,
                 "savedChild === document.getElementById('child').contentWindow && savedChild.marker === undefined",
+            ),
+            Value::Bool(true)
+        ));
+        assert!(matches!(
+            eval(
+                &mut engine,
+                "document.location === window.location && savedChildDocument.location === null && document.getElementById('child').contentDocument.location !== null",
             ),
             Value::Bool(true)
         ));
@@ -1474,6 +2333,454 @@ mod tests {
             ),
             Value::Bool(true)
         ));
+    }
+
+    #[test]
+    fn prepared_responses_stay_unpublished_until_current_request_commits() {
+        let mut engine = Engine::new();
+        let parent =
+            crate::install(engine.ctx(), "<body><iframe id=child></iframe></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let active_realm = frame.realm_handle();
+        let active_document = frame.current_document().expect("initial document");
+        let proxy = frame.window_proxy().expect("stable WindowProxy");
+
+        set_attribute(
+            &parent,
+            frame.owner_node(),
+            "src",
+            "https://parent.example.test/child-a",
+        );
+        let request_a = frame.navigation_request();
+        let mut stale = frame
+            .prepare_response_for_request(
+                engine.ctx(),
+                &request_a,
+                "https://parent.example.test/child-a",
+                "text/html",
+                "<body>stale</body>",
+                128,
+            )
+            .expect("prepare response without publishing it");
+        let staged_realm = stale.realm_handle();
+        assert_ne!(
+            active_realm.global().object_identity(),
+            staged_realm.global().object_identity()
+        );
+        assert!(stale.document_realm().is_none());
+        assert!(Rc::ptr_eq(
+            &active_document,
+            &frame.current_document().expect("active document unchanged")
+        ));
+        assert!(engine
+            .ctx()
+            .values_strict_equal(&proxy, &frame.window_proxy().expect("same proxy")));
+        assert!(matches!(
+            frame.commit_prepared_response(engine.ctx(), &mut stale),
+            Err(FrameInstallError::NotInitialized)
+        ));
+        assert!(Rc::ptr_eq(
+            &active_document,
+            &frame
+                .current_document()
+                .expect("uninitialized response is unpublished")
+        ));
+
+        frame
+            .initialize_prepared_document(engine.ctx(), &mut stale)
+            .expect("initialize after the host-provider phase");
+        assert!(stale.document_realm().is_some());
+        assert!(Rc::ptr_eq(
+            &active_document,
+            &frame
+                .current_document()
+                .expect("initial document still active")
+        ));
+
+        set_attribute(
+            &parent,
+            frame.owner_node(),
+            "src",
+            "https://parent.example.test/child-b",
+        );
+        assert!(matches!(
+            frame.commit_prepared_response(engine.ctx(), &mut stale),
+            Err(FrameInstallError::StaleRequest)
+        ));
+        let discarded = stale.discard(engine.ctx());
+        assert!(discarded.iter().any(|realm| {
+            realm.global().object_identity() == staged_realm.global().object_identity()
+        }));
+        for realm in discarded {
+            let _ = engine.ctx().dispose_host_realm(&realm);
+        }
+        assert!(Rc::ptr_eq(
+            &active_document,
+            &frame
+                .current_document()
+                .expect("stale response did not replace document")
+        ));
+        assert_eq!(
+            active_realm.global().object_identity(),
+            frame.realm_handle().global().object_identity()
+        );
+
+        let current = frame.navigation_request();
+        let mut prepared = frame
+            .prepare_response_for_request(
+                engine.ctx(),
+                &current,
+                "https://parent.example.test/child-b",
+                "text/html",
+                "<body>current</body>",
+                128,
+            )
+            .expect("prepare current response");
+        frame
+            .initialize_prepared_document(engine.ctx(), &mut prepared)
+            .expect("initialize current document");
+        let committed = frame
+            .commit_prepared_response(engine.ctx(), &mut prepared)
+            .expect("publish current response");
+        assert!(Rc::ptr_eq(
+            &committed.document,
+            &frame.current_document().expect("new document is active")
+        ));
+        assert!(committed.retired_realms.iter().any(|realm| {
+            realm.global().object_identity() == active_realm.global().object_identity()
+        }));
+        assert!(engine.ctx().values_strict_equal(
+            &proxy,
+            &frame.window_proxy().expect("proxy identity retained")
+        ));
+        assert_eq!(
+            frame.realm_handle().global().object_identity(),
+            prepared.realm_handle().global().object_identity()
+        );
+        drop(prepared);
+        for realm in committed.retired_realms {
+            let _ = engine.ctx().dispose_host_realm(&realm);
+        }
+    }
+
+    #[test]
+    fn discarded_prepared_realms_do_not_accumulate_weak_metadata_entries() {
+        let mut engine = Engine::new();
+        let parent =
+            crate::install(engine.ctx(), "<body><iframe id=child></iframe></body>", 128).unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let group = frame.inner.group.upgrade().expect("live context group");
+        let live_metadata_count = group.metadata.realms.borrow().len();
+
+        for _ in 0..24 {
+            let request = frame.navigation_request();
+            let prepared = frame
+                .prepare_response_for_request(
+                    engine.ctx(),
+                    &request,
+                    "about:blank",
+                    "text/html",
+                    "<body>discarded</body>",
+                    128,
+                )
+                .expect("prepare transient child realm");
+            for realm in prepared.discard(engine.ctx()) {
+                super::scheduling::cancel_tasks_for_realm(engine.ctx(), &realm);
+                let _ = engine.ctx().dispose_host_realm(&realm);
+            }
+            assert!(
+                group.metadata.realms.borrow().len() <= live_metadata_count + 1,
+                "only the latest discarded metadata entry may remain until the next registration"
+            );
+        }
+    }
+
+    #[test]
+    fn host_cleanup_before_reinserted_frame_materialization_preserves_the_live_context() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<body><main id=main><iframe id=child></iframe></main></body>",
+            128,
+        )
+        .unwrap();
+        let old = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        let identity = old.weak_identity();
+        let owner = old.owner_node();
+        let main = node_by_id(&parent, "main");
+        parent.with_session(|session| {
+            session.document_mut().remove(owner).unwrap();
+            session.document_mut().append(main, owner).unwrap();
+        });
+        let retired = parent.take_detached_frame_realms(engine.ctx());
+        assert_eq!(retired.len(), 1);
+        let replacement = parent.frame_contexts(engine.ctx()).unwrap().remove(0);
+        assert!(!identity.matches(&replacement));
+        assert!(replacement.current_document().is_some());
+        assert!(replacement.request_is_current(&replacement.navigation_request()));
+        assert!(old.current_document().is_none());
+        assert!(parent.take_detached_frame_realms(engine.ctx()).is_empty());
+        for realm in retired {
+            dispose_compat_realm(engine.ctx(), &realm);
+        }
+    }
+
+    #[test]
+    fn synchronous_frame_detach_and_reinsert_retires_one_navigable() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<body><main id=main><iframe id=child></iframe></main></body>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://parent.example.test/page");
+        let old_frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let old_realm = old_frame.realm_handle();
+        let old_proxy = old_frame.window_proxy().expect("old WindowProxy");
+        let old_identity = old_frame.weak_identity();
+        assert!(old_identity.matches(&old_frame));
+        let owner = old_frame.owner_node();
+        let pre_detach_request = old_frame.navigation_request();
+        assert!(matches!(
+            eval(
+                &mut engine,
+                "window.retainedFrame = document.getElementById('child').contentWindow; true",
+            ),
+            Value::Bool(true)
+        ));
+
+        let main = node_by_id(&parent, "main");
+        parent.with_session(|session| {
+            session.document_mut().remove(owner).expect("detach iframe");
+            session
+                .document_mut()
+                .append(main, owner)
+                .expect("reinsert iframe in the same script turn");
+        });
+        assert!(!old_frame.request_is_current(&pre_detach_request));
+
+        let new_frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize the new iframe navigable")
+            .into_iter()
+            .next()
+            .expect("one reinserted iframe");
+        assert!(old_frame.current_document().is_none());
+        assert!(!old_identity.matches(&new_frame));
+        assert_ne!(
+            old_realm.global().object_identity(),
+            new_frame.realm_handle().global().object_identity()
+        );
+        let new_proxy = new_frame.window_proxy().expect("new WindowProxy");
+        assert!(!engine.ctx().values_strict_equal(&old_proxy, &new_proxy));
+
+        let retired = parent.take_detached_frame_realms(engine.ctx());
+        assert_eq!(retired.len(), 1);
+        assert_eq!(
+            retired[0].global().object_identity(),
+            old_realm.global().object_identity()
+        );
+        assert!(parent.take_detached_frame_realms(engine.ctx()).is_empty());
+        assert!(matches!(
+            eval(&mut engine, "retainedFrame.parent === window"),
+            Value::Bool(true)
+        ));
+        for realm in retired {
+            super::scheduling::cancel_tasks_for_realm(engine.ctx(), &realm);
+            let _ = engine.ctx().dispose_host_realm(&realm);
+        }
+        drop(old_frame);
+        drop(new_frame);
+        assert!(matches!(
+            eval(&mut engine, "retainedFrame.parent === window"),
+            Value::Bool(true)
+        ));
+    }
+
+    #[test]
+    fn navigation_input_epochs_reject_a_to_b_to_a_and_ignore_namespaced_attributes() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<head><base id=active href='/one/'><base id=inactive href='/unused/'></head><body><iframe id=child src='page.html'></iframe></body>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://parent.example.test/index.html");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let owner = frame.owner_node();
+        let initial = frame.navigation_request();
+        let initial_source = initial.source.clone();
+
+        set_attribute(&parent, owner, "src", "other.html");
+        assert!(!frame.request_is_current(&initial));
+        set_attribute(&parent, owner, "src", "page.html");
+        let returned_to_initial_source = frame.navigation_request();
+        assert_eq!(returned_to_initial_source.source, initial_source);
+        assert_ne!(returned_to_initial_source.generation, initial.generation);
+        assert!(!frame.request_is_current(&initial));
+
+        let before_namespaced = frame.navigation_request();
+        parent.with_session(|session| {
+            session
+                .document_mut()
+                .set_attribute_ns(owner, Some("urn:custom"), "src", "custom.html")
+                .expect("set namespaced lookalike");
+        });
+        assert_eq!(frame.navigation_generation(), before_namespaced.generation);
+        assert!(frame.request_is_current(&before_namespaced));
+
+        set_attribute(&parent, owner, "sandbox", "");
+        assert!(!frame.request_is_current(&before_namespaced));
+        let sandbox_request = frame.navigation_request();
+        set_attribute(&parent, owner, "srcdoc", "");
+        assert!(!frame.request_is_current(&sandbox_request));
+        assert_eq!(
+            frame.navigation_request().source,
+            FrameSource::SrcDoc(String::new())
+        );
+    }
+
+    #[test]
+    fn host_navigation_uses_document_base_and_preserves_iframe_source_attributes() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<head><base href='/forms/'></head><body><iframe id=child></iframe></body>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://forms.example.test/dir/index.html");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let owner = frame.owner_node();
+        let before_generation = frame.navigation_generation();
+        let before_attributes = parent.with_session(|session| {
+            let document = session.document();
+            (
+                document
+                    .get_attribute_ns(owner, None, "src")
+                    .expect("read src"),
+                document
+                    .get_attribute_ns(owner, None, "srcdoc")
+                    .expect("read srcdoc"),
+            )
+        });
+
+        let first = frame
+            .request_host_navigation("submit?result=ok")
+            .expect("resolve relative host navigation");
+        assert_eq!(
+            first.source,
+            FrameSource::Url("https://forms.example.test/forms/submit?result=ok".into())
+        );
+        assert_ne!(first.generation, before_generation);
+        assert!(frame.request_is_current(&first));
+        let after_attributes = parent.with_session(|session| {
+            let document = session.document();
+            (
+                document
+                    .get_attribute_ns(owner, None, "src")
+                    .expect("read src"),
+                document
+                    .get_attribute_ns(owner, None, "srcdoc")
+                    .expect("read srcdoc"),
+            )
+        });
+        assert_eq!(after_attributes, before_attributes);
+
+        set_attribute(&parent, owner, "src", "fallback.html");
+        assert!(!frame.request_is_current(&first));
+        assert_eq!(
+            frame.navigation_request().source,
+            FrameSource::Url("https://forms.example.test/forms/fallback.html".into())
+        );
+
+        let second = frame
+            .request_host_navigation("second")
+            .expect("request a later host navigation");
+        assert!(!frame.request_is_current(&first));
+        assert!(frame.request_is_current(&second));
+        frame.inner.active.set(false);
+        assert!(frame.request_host_navigation("inactive").is_err());
+    }
+
+    #[test]
+    fn effective_base_and_detach_reinsert_mutations_advance_frame_request_epoch() {
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<head><base id=active href='/one/'><base id=inactive href='/ignored/'></head><body><main id=main><iframe id=child src='page.html'></iframe></main></body>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://parent.example.test/index.html");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .expect("materialize iframe")
+            .into_iter()
+            .next()
+            .expect("one iframe");
+        let original = frame.navigation_request();
+
+        set_attribute(&parent, node_by_id(&parent, "active"), "href", "/two/");
+        assert!(!frame.request_is_current(&original));
+        let second_base = frame.navigation_request();
+        set_attribute(&parent, node_by_id(&parent, "active"), "href", "/one/");
+        assert!(!frame.request_is_current(&second_base));
+        let back_to_original = frame.navigation_request();
+        assert_eq!(back_to_original.source, original.source);
+        assert_ne!(back_to_original.generation, original.generation);
+
+        parent.set_document_url("https://parent.example.test/new-location/document.html");
+        assert!(frame.request_is_current(&back_to_original));
+        let after_document_url_change = frame.navigation_request();
+        set_attribute(&parent, node_by_id(&parent, "inactive"), "href", "/three/");
+        assert!(frame.request_is_current(&after_document_url_change));
+
+        let owner = frame.owner_node();
+        let before_detach = frame.navigation_request();
+        parent.with_session(|session| {
+            session.document_mut().remove(owner).expect("detach iframe");
+        });
+        assert!(!frame.request_is_current(&before_detach));
+        let detached_request = frame.navigation_request();
+        let container = node_by_id(&parent, "main");
+        parent.with_session(|session| {
+            session
+                .document_mut()
+                .append(container, owner)
+                .expect("reinsert iframe");
+        });
+        assert!(!frame.request_is_current(&detached_request));
+        assert_eq!(frame.navigation_request().source, detached_request.source);
     }
 
     #[test]

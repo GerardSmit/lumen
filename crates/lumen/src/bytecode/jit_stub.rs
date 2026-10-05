@@ -17,6 +17,8 @@ pub(super) fn track_chunk(chunk: Rc<Chunk>) -> Rc<Chunk> {
     chunk
 }
 
+pub(crate) fn prune_dead_chunks() {}
+
 pub unsafe fn evict_quiescent_code() -> usize {
     0
 }

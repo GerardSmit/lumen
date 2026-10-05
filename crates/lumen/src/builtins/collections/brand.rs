@@ -22,23 +22,21 @@ pub(in crate::builtins) fn coll_ptr_kind(
         Some(name) => kind.name() == name,
         None => matches!(kind, CollectionKind::Map | CollectionKind::Set),
     };
-    if valid {
-        Ok(ptr)
-    } else {
-        Err(err())
-    }
+    if valid { Ok(ptr) } else { Err(err()) }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::Tier, Completion, Engine};
+    use crate::{Completion, Engine, bytecode::Tier};
 
     fn check(source: &str) {
         for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let script=format!("function assert(x) {{if(!x)throw new Error('assertion');}} function rejects(f) {{let yes=false;try{{f();}}catch(e){{yes=e instanceof TypeError;}}assert(yes);}} function drive() {{{source}}} drive();'passed'");
+            let script = format!(
+                "function assert(x) {{if(!x)throw new Error('assertion');}} function rejects(f) {{let yes=false;try{{f();}}catch(e){{yes=e instanceof TypeError;}}assert(yes);}} function drive() {{{source}}} drive();'passed'"
+            );
             match engine.eval(&script, false).unwrap() {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),

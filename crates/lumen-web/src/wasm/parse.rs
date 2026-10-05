@@ -40,6 +40,7 @@ pub struct Import {
 pub struct Limits {
     pub min: u32,
     pub max: Option<u32>,
+    pub shared: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -248,11 +249,31 @@ fn limits(r: &mut Reader) -> Result<Limits, String> {
     if max.is_some_and(|max| max < min) {
         return Err("wasm: limits maximum is below the minimum".into());
     }
-    Ok(Limits { min, max })
+    Ok(Limits {
+        min,
+        max,
+        shared: false,
+    })
 }
 
-fn memory_limits(r: &mut Reader) -> Result<Limits, String> {
-    let l = limits(r)?;
+fn memory_limits(r: &mut Reader, allow_shared_import: bool) -> Result<Limits, String> {
+    let flag = r.byte()?;
+    if flag & !3 != 0 {
+        return Err(format!("wasm: unsupported memory limits flag {flag}"));
+    }
+    let shared = flag & 2 != 0;
+    if shared && !allow_shared_import {
+        return Err("wasm: defined shared memories are not supported".into());
+    }
+    let min = r.u32()?;
+    let max = if flag & 1 != 0 { Some(r.u32()?) } else { None };
+    if max.is_some_and(|max| max < min) {
+        return Err("wasm: limits maximum is below the minimum".into());
+    }
+    if shared && max.is_none() {
+        return Err("wasm: shared memory must declare a maximum".into());
+    }
+    let l = Limits { min, max, shared };
     if l.min > MAX_MEMORY_PAGES || l.max.is_some_and(|max| max > MAX_MEMORY_PAGES) {
         return Err("wasm: memory size must be at most 65536 pages (4GiB)".into());
     }
@@ -373,7 +394,7 @@ pub fn decode(data: &[u8]) -> Result<Rc<Module>, String> {
             }
             5 => {
                 for _ in 0..r.u32()? {
-                    m.memories.push(memory_limits(&mut r)?);
+                    m.memories.push(memory_limits(&mut r, false)?);
                 }
             }
             6 => decode_globals(&mut r, &mut m)?,
@@ -440,7 +461,7 @@ fn decode_imports(r: &mut Reader, m: &mut Module) -> Result<(), String> {
             }
             0x02 => {
                 m.imported_mem_count += 1;
-                ImportKind::Memory(memory_limits(r)?)
+                ImportKind::Memory(memory_limits(r, true)?)
             }
             0x03 => {
                 m.imported_global_count += 1;

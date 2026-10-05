@@ -27,6 +27,8 @@ pub struct MediaSnapshot {
     pub current_time: f64,
     pub duration: f64,
     pub volume: f64,
+    pub playback_rate: f64,
+    pub default_playback_rate: f64,
     pub muted: bool,
     pub paused: bool,
     pub ended: bool,
@@ -56,6 +58,8 @@ impl Default for MediaSnapshot {
             current_time: 0.0,
             duration: f64::NAN,
             volume: 1.0,
+            playback_rate: 1.0,
+            default_playback_rate: 1.0,
             muted: false,
             paused: true,
             ended: false,
@@ -74,6 +78,7 @@ impl Default for MediaSnapshot {
 #[derive(Default)]
 struct State {
     snapshot: MediaSnapshot,
+    muted_override: Option<bool>,
     promises: Vec<Deferred>,
     video_frame: Option<VideoFrameSnapshot>,
 }
@@ -99,6 +104,40 @@ impl MediaController {
             .get(&node)
             .map(|state| state.snapshot.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn muted(&self, node: NodeId, default_muted: bool) -> bool {
+        self.states
+            .get(&node)
+            .and_then(|state| state.muted_override)
+            .unwrap_or(default_muted)
+    }
+
+    pub(crate) fn adopt_nodes_into(&mut self, target: &mut Self, mapping: &[(NodeId, NodeId)]) {
+        if self.states.is_empty() && self.detached.is_empty() && self.events.is_empty() {
+            return;
+        }
+        for &(old, new) in mapping {
+            if let Some(state) = self.states.remove(&old) {
+                target.states.insert(new, state);
+            }
+            if self.detached.remove(&old) {
+                target.detached.insert(new);
+            }
+        }
+        if !self.events.is_empty() {
+            let nodes = mapping.iter().copied().collect::<HashMap<_, _>>();
+            self.events.retain_mut(|(node, generation, kind)| {
+                if let Some(&new) = nodes.get(node) {
+                    target
+                        .events
+                        .push_back((new, *generation, std::mem::take(kind)));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
     }
 
     pub(crate) fn video_frame(&self, node: NodeId) -> Option<VideoFrameSnapshot> {
@@ -194,10 +233,37 @@ impl MediaController {
         Ok(())
     }
 
-    pub(crate) fn set_muted(&mut self, node: NodeId, muted: bool) {
+    pub(crate) fn set_default_playback_rate(&mut self, node: NodeId, rate: f64) -> OpResult<()> {
+        if !rate.is_finite() {
+            return Err(OpError::type_error("defaultPlaybackRate must be a finite number"));
+        }
         let state = self.states.entry(node).or_default();
-        if state.snapshot.muted != muted {
-            state.snapshot.muted = muted;
+        if state.snapshot.default_playback_rate != rate {
+            state.snapshot.default_playback_rate = rate;
+            self.events
+                .push_back((node, state.snapshot.generation, "ratechange".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_playback_rate(&mut self, node: NodeId, rate: f64) -> OpResult<()> {
+        if !rate.is_finite() {
+            return Err(OpError::type_error("playbackRate must be a finite number"));
+        }
+        let state = self.states.entry(node).or_default();
+        if state.snapshot.playback_rate != rate {
+            state.snapshot.playback_rate = rate;
+            self.events
+                .push_back((node, state.snapshot.generation, "ratechange".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_muted(&mut self, node: NodeId, muted: bool, previous: bool) {
+        let state = self.states.entry(node).or_default();
+        state.muted_override = Some(muted);
+        state.snapshot.muted = muted;
+        if previous != muted {
             self.events
                 .push_back((node, state.snapshot.generation, "volumechange".into()));
         }
@@ -219,6 +285,11 @@ impl MediaController {
             state.snapshot.error = None;
             state.snapshot.ended = false;
             state.snapshot.paused = true;
+            if state.snapshot.playback_rate != state.snapshot.default_playback_rate {
+                state.snapshot.playback_rate = state.snapshot.default_playback_rate;
+                self.events
+                    .push_back((node, state.snapshot.generation, "ratechange".into()));
+            }
             self.events
                 .push_back((node, state.snapshot.generation, "loadstart".into()));
         }
@@ -246,6 +317,11 @@ impl MediaController {
         state.snapshot.ended = false;
         state.snapshot.paused = true;
         state.snapshot.wants_play = false;
+        if state.snapshot.playback_rate != state.snapshot.default_playback_rate {
+            state.snapshot.playback_rate = state.snapshot.default_playback_rate;
+            self.events
+                .push_back((node, state.snapshot.generation, "ratechange".into()));
+        }
         self.events
             .push_back((node, state.snapshot.generation, "loadstart".into()));
         state.snapshot.generation
@@ -342,8 +418,40 @@ pub struct DomHtmlMediaElement {
     pub(super) base: DomHtmlElement,
 }
 
+impl DomHtmlMediaElement {
+    fn node(&self) -> &DomNode {
+        &self.base.base.base
+    }
+}
+
 #[lumen_bind::methods]
-impl DomHtmlMediaElement {}
+impl DomHtmlMediaElement {
+    #[getter(rename(js = "defaultPlaybackRate"))]
+    fn default_playback_rate(&self) -> f64 {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node).default_playback_rate
+    }
+
+    #[setter(rename(js = "defaultPlaybackRate"), coerce)]
+    fn set_default_playback_rate(&self, value: f64) -> OpResult<()> {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        let result = realm.media.borrow_mut().set_default_playback_rate(node, value);
+        result
+    }
+
+    #[getter(rename(js = "playbackRate"))]
+    fn playback_rate(&self) -> f64 {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node).playback_rate
+    }
+
+    #[setter(rename(js = "playbackRate"), coerce)]
+    fn set_playback_rate(&self, value: f64) -> OpResult<()> {
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        let result = realm.media.borrow_mut().set_playback_rate(node, value);
+        result
+    }
+}
 
 #[lumen_bind::class(name = "HTMLAudioElement", extends = DomHtmlMediaElement, hint(js(webidl)))]
 pub struct DomHtmlAudioElement {
@@ -356,7 +464,8 @@ impl DomHtmlAudioElement {
     }
 
     fn snapshot(&self) -> MediaSnapshot {
-        self.node().realm.media.borrow().snapshot(self.node().id)
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node)
     }
 
     fn create(realm: Rc<DomRealm>, source: Option<&str>) -> OpResult<Self> {
@@ -406,7 +515,8 @@ impl DomHtmlVideoElement {
     }
 
     fn snapshot(&self) -> MediaSnapshot {
-        self.node().realm.media.borrow().snapshot(self.node().id)
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_snapshot(node)
     }
 }
 
@@ -415,10 +525,9 @@ impl DomHtmlVideoElement {
     #[constructor]
     fn new(
         ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
         #[default(0)] width: u32,
         #[default(0)] height: u32,
-    ) -> OpResult<Self> {
+    ) -> OpResult<crate::NodeConstructorResult<Self>> {
         let global = ctx.global_object();
         let document_value = ctx
             .get_member(&global, "document")
@@ -468,15 +577,7 @@ impl DomHtmlVideoElement {
                 },
             },
         };
-        if let Some(weak) = ctx.weak_value(&this.0) {
-            video
-                .node()
-                .realm
-                .wrappers
-                .borrow_mut()
-                .insert(video.node().id, weak);
-        }
-        Ok(video)
+        Ok(crate::NodeConstructorResult::from_native(video, realm, id))
     }
 
     #[getter]
@@ -595,11 +696,8 @@ impl DomHtmlVideoElement {
     }
     #[setter(coerce)]
     fn set_muted(&self, value: bool) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .set_muted(self.node().id, value);
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_set_muted(node, value);
     }
     #[getter]
     fn error(&self) -> Value {
@@ -638,7 +736,11 @@ impl DomHtmlVideoElement {
                 return "";
             }
         }
-        if has_avc { "maybe" } else { "" }
+        if has_avc {
+            "maybe"
+        } else {
+            ""
+        }
     }
 }
 
@@ -647,9 +749,8 @@ impl DomHtmlAudioElement {
     #[constructor]
     fn new(
         ctx: &mut Ctx,
-        this: lumen_bind::This<Value>,
         #[default("")] source: &str,
-    ) -> OpResult<Self> {
+    ) -> OpResult<crate::NodeConstructorResult<Self>> {
         let global = ctx.global_object();
         let document_value = ctx
             .get_member(&global, "document")
@@ -660,15 +761,10 @@ impl DomHtmlAudioElement {
             })
             .map_err(|_| OpError::new("TypeError", "Audio has no active document"))?;
         let audio = Self::create(realm, Some(source))?;
-        if let Some(weak) = ctx.weak_value(&this.0) {
-            audio
-                .node()
-                .realm
-                .wrappers
-                .borrow_mut()
-                .insert(audio.node().id, weak);
-        }
-        Ok(audio)
+        let node = audio.node();
+        let realm = node.realm.clone();
+        let id = node.id;
+        Ok(crate::NodeConstructorResult::from_native(audio, realm, id))
     }
 
     #[getter]
@@ -799,11 +895,8 @@ impl DomHtmlAudioElement {
 
     #[setter(coerce)]
     fn set_muted(&self, value: bool) {
-        self.node()
-            .realm
-            .media
-            .borrow_mut()
-            .set_muted(self.node().id, value);
+        let (realm, node) = self.node().realm.resolve_adopted_node(self.node().id);
+        realm.media_set_muted(node, value);
     }
 
     #[getter]
@@ -829,7 +922,96 @@ impl DomHtmlAudioElement {
 
 #[cfg(test)]
 mod tests {
-    use lumen::{Engine, embed::Value};
+    use lumen::{embed::Value, Engine};
+
+    #[test]
+    fn muted_defaults_follow_content_attributes_until_explicit_override_and_survive_adoption() {
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<audio id='audio' muted></audio><video id='video' muted></video>",
+            128,
+        )
+        .unwrap();
+        let evaluate = |engine: &mut Engine, source: &str| {
+            engine
+                .eval_value(source)
+                .expect("valid muted-state script")
+                .ok()
+                .expect("muted-state script threw")
+        };
+        let result = evaluate(
+            &mut engine,
+            r#"
+            globalThis.mediaElements = [document.getElementById('audio'), document.getElementById('video')];
+            globalThis.volumeChanges = 0;
+            for (const element of mediaElements) {
+                element.onvolumechange = () => volumeChanges++;
+                if (!element.muted) throw new Error('parser default missing');
+                element.volume = 0.5;
+                element.removeAttribute('muted');
+                if (element.muted) throw new Error('default ignored after volume state allocation');
+                element.setAttribute('muted', '');
+                if (!element.muted) throw new Error('default missing');
+                element.muted = true;
+                element.removeAttribute('muted');
+                if (!element.muted) throw new Error('same-value IDL setter did not preserve override');
+                element.muted = false;
+                element.setAttribute('muted', '');
+                if (element.muted) throw new Error('content attribute overwrote explicit false');
+                element.load();
+                if (element.muted) throw new Error('load reset explicit override');
+                const destination = document.implementation.createHTMLDocument('adopted');
+                destination.adoptNode(element);
+                if (element.muted) throw new Error('adoption lost explicit false');
+                element.muted = true;
+                element.removeAttribute('muted');
+                if (!element.muted) throw new Error('adopted setter lost explicit true');
+            }
+            true;
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+        // Adoption moves controller state rather than leaving an old-owner copy.
+        assert!(realm.media.borrow().states.is_empty());
+    }
+
+    #[test]
+    fn muted_content_changes_are_silent_and_native_snapshots_match_effective_gain() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<audio id='audio' muted></audio>", 64).unwrap();
+        let evaluate = |engine: &mut Engine, source: &str| {
+            engine
+                .eval_value(source)
+                .expect("valid muted snapshot script")
+                .ok()
+                .expect("muted snapshot script threw")
+        };
+        let element = evaluate(
+            &mut engine,
+            "globalThis.audio=document.getElementById('audio');audio",
+        );
+        let node = engine
+            .ctx()
+            .with_instance::<crate::DomNode, _>(&element, |node| node.id)
+            .unwrap();
+        assert!(realm.media_snapshot(node).muted);
+        evaluate(&mut engine,
+            "globalThis.events=0;audio.onvolumechange=()=>events++;audio.removeAttribute('muted');audio.setAttribute('muted','');audio.muted=true");
+        assert_eq!(realm.queue_media_tasks(engine.ctx()).unwrap(), 0);
+        assert!(realm.media_snapshot(node).muted);
+        evaluate(
+            &mut engine,
+            "audio.muted=false;audio.setAttribute('muted','')",
+        );
+        assert!(!realm.media_snapshot(node).muted);
+        assert_eq!(realm.queue_media_tasks(engine.ctx()).unwrap(), 1);
+        assert!(crate::scheduling::run_tasks(&mut engine, 64).is_empty());
+        assert!(matches!(
+            evaluate(&mut engine, "events===1"),
+            Value::Bool(true)
+        ));
+    }
 
     #[test]
     fn audio_elements_inherit_media_interface_and_report_only_wav_support() {

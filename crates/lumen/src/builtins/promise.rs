@@ -740,7 +740,7 @@ pub(crate) fn make_aggregate_error_value(i: &mut Interp, errors: Value) -> Resul
 /// escape. Any other element (a thenable, a patched promise) takes the full observable path
 /// with real element functions over the same state.
 fn combinator_fast(i: &mut Interp, t: &Value, iterable: Value, mode: u8) -> Result<Value, Value> {
-    use crate::eval::promise_fast::{Combinator, Reaction, REACT_ANY, REACT_RACE};
+    use crate::eval::promise_fast::{Combinator, REACT_ANY, REACT_RACE, Reaction};
     let result = i.new_promise();
     if let Value::Obj(ro) = &result {
         if let Callable::Promise(s) = &mut ro.borrow_mut().call {

@@ -3,11 +3,11 @@
 
 use std::rc::Rc;
 
-use super::exec::{Host, Imports, MemEntity, Store, Val, PAGE_SIZE};
+use super::exec::{Host, Imports, MemEntity, PAGE_SIZE, Store, Val};
 use super::parse::{self, ValType};
 use super::translate::{self, *};
 use lumen_codegen::interp::{self, Env};
-use lumen_codegen::{opt, ExtFunc, Function, Signature};
+use lumen_codegen::{ExtFunc, Function, Signature, opt};
 
 // ---- a tiny module assembler ------------------------------------------------------------------
 

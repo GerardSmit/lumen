@@ -10,7 +10,7 @@ use lumen_html::{
 use lumen_html_text::{FontFace, FontProvider, GlyphCoverage};
 use std::collections::HashMap;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     io::{Cursor, Read},
     path::PathBuf,
     sync::Arc,
@@ -102,17 +102,43 @@ pub fn render_with_mode_cached(
 pub struct FileImages {
     base: PathBuf,
     root: Option<PathBuf>,
-    cache: RefCell<HashMap<String, Option<Arc<ImageData>>>>,
+    cache: RefCell<HashMap<String, Result<Arc<ImageData>, ImageFailure>>>,
     cached_bytes: RefCell<usize>,
+    decoded_bytes: Cell<u64>,
+    generation: Cell<u64>,
+}
+
+/// Compact cached failures avoid retaining parser trees or capability diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageFailure {
+    Resource,
+    Decode,
+    Limit,
+    UnsupportedDrawing,
 }
 
 impl FileImages {
+    /// Cumulative pixel bytes produced by image decodes; unchanged images are
+    /// served from the cache and never add to it.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes.get()
+    }
+
+    pub fn failure(&self, source: &str) -> Option<ImageFailure> {
+        self.cache
+            .borrow()
+            .get(source)
+            .and_then(|entry| entry.as_ref().err().copied())
+    }
+
     pub fn new(base: impl Into<PathBuf>) -> Self {
         Self {
             base: base.into(),
             root: None,
             cache: RefCell::new(HashMap::new()),
             cached_bytes: RefCell::new(0),
+            decoded_bytes: Cell::new(0),
+            generation: Cell::new(0),
         }
     }
 
@@ -157,6 +183,10 @@ impl FileImages {
 }
 
 impl lumen_html::layout::ImageResolver for FileImages {
+    fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
     fn resolve(&self, source: &str) -> ImageState {
         if let Some(cached) = self.cache.borrow().get(source) {
             return cached.clone().map_or(ImageState::Failed, ImageState::Ready);
@@ -197,11 +227,16 @@ impl lumen_html::layout::ImageResolver for FileImages {
                 })
         };
         let decoded = bytes
+            .ok_or(ImageFailure::Resource)
             .and_then(|bytes| {
                 if bytes.len() as u64 > MAX_PNG_FILE_BYTES {
-                    return None;
+                    return Err(ImageFailure::Limit);
                 }
-                decode_raster_image_bounded(&bytes, true, remaining_bytes).ok()
+                decode_image_with_limit(&bytes, remaining_bytes).map_err(|error| match error {
+                    ImageError::TooLarge => ImageFailure::Limit,
+                    ImageError::UnsupportedSvg(_) => ImageFailure::UnsupportedDrawing,
+                    _ => ImageFailure::Decode,
+                })
             })
             .map(|image| {
                 Arc::new(ImageData {
@@ -211,6 +246,9 @@ impl lumen_html::layout::ImageResolver for FileImages {
                 })
             });
         let bytes = source.len() + decoded.as_ref().map_or(0, |image| image.pixels.len());
+        self.decoded_bytes.set(self.decoded_bytes.get().saturating_add(
+            decoded.as_ref().map_or(0, |image| image.pixels.len() as u64),
+        ));
         let mut cached_bytes = self.cached_bytes.borrow_mut();
         if *cached_bytes + bytes > ASSET_CACHE_BYTES {
             return ImageState::Failed;
@@ -219,6 +257,7 @@ impl lumen_html::layout::ImageResolver for FileImages {
         self.cache
             .borrow_mut()
             .insert(source.to_owned(), decoded.clone());
+        self.generation.set(self.generation.get().wrapping_add(1));
         decoded.map_or(ImageState::Failed, ImageState::Ready)
     }
 }
@@ -236,6 +275,9 @@ pub enum ImageError {
     TooLarge,
     DisplayList(ReplayError),
     Html(lumen_html::html::ParseError),
+    Xml(lumen_html::xml::ParseError),
+    Svg(&'static str),
+    UnsupportedSvg(Vec<lumen_html::layout::SvgUnsupportedFeature>),
     Layout(lumen_html::layout::LayoutError),
     Font(&'static str),
     Png(&'static str),
@@ -259,8 +301,21 @@ impl Default for SettleOptions {
 
 #[derive(Default)]
 pub struct GlyphCache {
-    glyphs: HashMap<(u64, u16, u32), GlyphCoverage>,
+    glyphs: HashMap<(u64, u16, u32), (GlyphCoverage, u64)>,
+    recency: std::collections::BTreeMap<u64, (u64, u16, u32)>,
+    tick: u64,
     bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+/// Cumulative glyph coverage cache counters; callers diff two reads for a frame.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GlyphCacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl GlyphCache {
@@ -268,18 +323,57 @@ impl GlyphCache {
         self.bytes
     }
 
+    pub fn stats(&self) -> GlyphCacheStats {
+        GlyphCacheStats {
+            entries: self.glyphs.len(),
+            bytes: self.bytes,
+            hits: self.hits,
+            misses: self.misses,
+        }
+    }
+
+    fn lookup(&mut self, key: &(u64, u16, u32)) -> Option<&GlyphCoverage> {
+        let Some((coverage, used)) = self.glyphs.get_mut(key) else {
+            self.misses += 1;
+            return None;
+        };
+        self.hits += 1;
+        self.tick += 1;
+        self.recency.remove(used);
+        *used = self.tick;
+        self.recency.insert(self.tick, *key);
+        Some(&*coverage)
+    }
+
     pub fn clear(&mut self) {
         self.glyphs.clear();
+        self.recency.clear();
         self.bytes = 0;
+    }
+
+    fn evict_oldest(&mut self) -> bool {
+        let Some((_, key)) = self.recency.pop_first() else {
+            return false;
+        };
+        if let Some((coverage, _)) = self.glyphs.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(coverage.alpha.len());
+        }
+        true
     }
 
     fn insert(&mut self, key: (u64, u16, u32), coverage: GlyphCoverage) {
         let bytes = coverage.alpha.len();
-        if self.bytes + bytes > GLYPH_CACHE_BYTES || self.glyphs.len() >= GLYPH_CACHE_ENTRIES {
-            self.clear();
+        if let Some((old, used)) = self.glyphs.remove(&key) {
+            self.recency.remove(&used);
+            self.bytes = self.bytes.saturating_sub(old.alpha.len());
         }
+        while (self.bytes + bytes > GLYPH_CACHE_BYTES || self.glyphs.len() >= GLYPH_CACHE_ENTRIES)
+            && self.evict_oldest()
+        {}
+        self.tick += 1;
         self.bytes += bytes;
-        self.glyphs.insert(key, coverage);
+        self.recency.insert(self.tick, key);
+        self.glyphs.insert(key, (coverage, self.tick));
     }
 }
 
@@ -734,7 +828,7 @@ impl ReplaySink for Raster<'_> {
                 scaled_size.to_bits(),
             );
             let origin = (origin_x + glyph.x, baseline_y - glyph.y);
-            if let Some(coverage) = self.cache.glyphs.get(&key) {
+            if let Some(coverage) = self.cache.lookup(&key) {
                 if let Some(clip) = self.clips.last().copied() {
                     blit_glyph(self.image, self.scale, clip, origin, color, coverage);
                 }
@@ -1039,16 +1133,22 @@ impl ReplaySink for Raster<'_> {
         surface.state_mut().fill_gradient = make_gradient(fill);
         surface.state_mut().stroke_gradient = make_gradient(stroke);
         if lumen_html::paint::svg_paint_has_ink(fill) {
-            surface.fill_path(
+            if let Err(error) = surface.fill_path(
                 &path,
                 match fill_rule {
                     PaintSvgFillRule::NonZero => tiny_skia::FillRule::Winding,
                     PaintSvgFillRule::EvenOdd => tiny_skia::FillRule::EvenOdd,
                 },
-            );
+            ) {
+                self.error = Some(error);
+                return;
+            }
         }
         if lumen_html::paint::svg_paint_has_ink(stroke) && stroke_width > 0.0 {
-            surface.stroke_path(&path);
+            if let Err(error) = surface.stroke_path(&path) {
+                self.error = Some(error);
+                return;
+            }
         }
         let output = surface.snapshot();
         for row in 0..height as usize {
@@ -1272,7 +1372,7 @@ fn resolve_layers(
     cache: &mut GlyphCache,
     bytes: &mut usize,
 ) -> Result<DisplayList, ImageError> {
-    let mut output = DisplayList::default();
+    let mut output = DisplayList(Vec::with_capacity(list.len()));
     let mut index = 0;
     while index < list.len() {
         if let Command::MaskedBackground(mask) = &list[index] {
@@ -1521,8 +1621,30 @@ fn resolve_layers(
         let bottom = clip_top + rect.height * scale;
         let row_len = image.width as usize * 4;
         if clip {
+            let inset_x = match corners {
+                Some(corners) => corners
+                    .iter()
+                    .map(|r| r[0] * scale)
+                    .fold(0.0f32, f32::max),
+                None => radius
+                    .max(0.0)
+                    .min((right - clip_left) * 0.5)
+                    .min((bottom - clip_top) * 0.5),
+            };
+            let interior_start = clip_left + inset_x;
+            let interior_end = right - inset_x;
             for (py, row) in image.pixels.chunks_exact_mut(row_len).enumerate() {
+                let row_inside = py as f32 >= clip_top && (py + 1) as f32 <= bottom;
                 for (px, pixel) in row.chunks_exact_mut(4).enumerate() {
+                    if row_inside
+                        && px as f32 >= interior_start
+                        && (px + 1) as f32 <= interior_end
+                    {
+                        if opacity != 1.0 {
+                            pixel[3] = (pixel[3] as f32 * opacity).round() as u8;
+                        }
+                        continue;
+                    }
                     let coverage = if let Some(corners) = corners {
                         coverage::rounded_corners(
                             px as f32,
@@ -1644,7 +1766,7 @@ fn paint_bounds(
                         glyph.id,
                         (size * glyph.size_scale * scale).to_bits(),
                     );
-                    let (x_min, y_min, width, height) = if let Some(c) = cache.glyphs.get(&key) {
+                    let (x_min, y_min, width, height) = if let Some(c) = cache.lookup(&key) {
                         (c.x_min, c.y_min, c.width, c.height)
                     } else {
                         let coverage = font
@@ -2178,11 +2300,109 @@ fn decode_png_basic(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
 }
 
 /// Decode one still raster image through the shared image crate. PNG keeps the
-/// bounded decoder used by the existing HTML image path; JPEG, WebP and GIF
+/// bounded decoder used by the existing HTML image path; JPEG, WebP, GIF and BMP
 /// are decoded by their upstream image codecs. Animated formats yield their
 /// first frame because this API returns a static raster.
 pub fn decode_raster_image(bytes: &[u8]) -> Result<Rgba8Image, ImageError> {
     decode_raster_image_with_orientation(bytes, true)
+}
+
+/// Decode a still raster within the caller's remaining decoded-pixel budget.
+/// The shared decoder rejects oversized dimensions before allocating pixels;
+/// the global image ceiling also applies when a caller supplies a larger budget.
+pub fn decode_raster_image_with_limit(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<Rgba8Image, ImageError> {
+    decode_raster_image_bounded(bytes, true, max_bytes.min(MAX_IMAGE_BYTES))
+}
+
+/// Decode a still image, using the shared XML/cascade/vector renderer for SVG.
+/// The output allocation must fit both the caller's budget and the global ceiling.
+pub fn decode_image_with_limit(bytes: &[u8], max_bytes: usize) -> Result<Rgba8Image, ImageError> {
+    let prefix = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    if prefix
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'<')
+    {
+        decode_svg_image_with_limit(bytes, max_bytes)
+    } else {
+        decode_raster_image_with_limit(bytes, max_bytes)
+    }
+}
+
+/// Rasterize an SVG image without an interactive document or external fetches.
+/// Reuses the renderer's capability checks so unsupported drawing is never
+/// silently accepted as a successfully decoded image.
+pub fn decode_svg_image_with_limit(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<Rgba8Image, ImageError> {
+    let source = std::str::from_utf8(bytes).map_err(|_| ImageError::Svg("SVG is not UTF-8"))?;
+    let document = lumen_html::xml::parse(source, 16_384).map_err(|error| match error.message {
+        "XML input too large"
+        | "XML node limit exceeded"
+        | "XML nesting limit exceeded"
+        | "XML entity output too large" => ImageError::TooLarge,
+        _ => ImageError::Xml(error),
+    })?;
+    let mut current = document
+        .first_child(document.root())
+        .map_err(|_| ImageError::Svg("invalid SVG tree"))?;
+    let root = loop {
+        let node = current.ok_or(ImageError::Svg("SVG document has no root element"))?;
+        if matches!(
+            document.kind(node),
+            Ok(lumen_html::NodeKind::Element { .. })
+        ) {
+            break node;
+        }
+        current = document
+            .next_sibling(node)
+            .map_err(|_| ImageError::Svg("invalid SVG tree"))?;
+    };
+    if !matches!(document.kind(root), Ok(lumen_html::NodeKind::Element { namespace: lumen_html::Namespace::Svg, name, .. }) if lumen_html::svg::local_name(name) == "svg")
+    {
+        return Err(ImageError::Svg("image root is not an SVG element"));
+    }
+    let mut session = lumen_html::session::RenderSession::new(document);
+    session.set_canvas_background(None);
+    let style = session.computed_style(root).map_err(ImageError::Layout)?;
+    let attributes = match session.document().kind(root) {
+        Ok(lumen_html::NodeKind::Element { attributes, .. }) => attributes,
+        _ => return Err(ImageError::Svg("invalid SVG root")),
+    };
+    let (width, height) =
+        lumen_html::svg::root_size(attributes, style.width, style.height, 300.0, Some(150.0));
+    let (width, height) = (f64::from(width).ceil(), f64::from(height).ceil());
+    if !width.is_finite() || !height.is_finite() || width < 1.0 || height < 1.0 {
+        return Err(ImageError::InvalidViewport);
+    }
+    if width > u32::MAX as f64 || height > u32::MAX as f64 {
+        return Err(ImageError::TooLarge);
+    }
+    let (width, height) = (width as u32, height as u32);
+    let pixels = lumen_common::limits::size::repeat(
+        width as usize,
+        height as usize,
+        max_bytes.min(MAX_IMAGE_BYTES) / 4,
+    )
+    .map_err(|_| ImageError::TooLarge)?;
+    lumen_common::limits::size::repeat(pixels, 4, max_bytes.min(MAX_IMAGE_BYTES))
+        .map_err(|_| ImageError::TooLarge)?;
+    let unsupported = session
+        .unsupported_svg_features()
+        .map_err(ImageError::Layout)?;
+    if !unsupported.is_empty() {
+        return Err(ImageError::UnsupportedSvg(unsupported));
+    }
+    let font = default_font()?;
+    let list = session
+        .display_list(width, height, font)
+        .map_err(ImageError::Layout)?;
+    render_with_font(list, width, height, 1.0, true, font)
 }
 
 pub fn decode_raster_image_with_orientation(
@@ -2342,6 +2562,7 @@ fn decode_raster_image_bounded(
             | image::ImageFormat::Jpeg
             | image::ImageFormat::WebP
             | image::ImageFormat::Gif
+            | image::ImageFormat::Bmp
     ) {
         return Err(ImageError::Png("unsupported raster image format"));
     }
@@ -2396,16 +2617,14 @@ pub fn render_html(
     height_css: u32,
     scale: f32,
 ) -> Result<Rgba8Image, ImageError> {
+    render_html_with_font(html, width_css, height_css, scale, default_font()?)
+}
+
+fn default_font() -> Result<&'static FontFace, ImageError> {
     static FONT: std::sync::OnceLock<Result<FontFace, &'static str>> = std::sync::OnceLock::new();
-    let font = FONT
-        .get_or_init(|| FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)));
-    render_html_with_font(
-        html,
-        width_css,
-        height_css,
-        scale,
-        font.as_ref().map_err(|&error| ImageError::Font(error))?,
-    )
+    FONT.get_or_init(|| FontFace::new(std::sync::Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)))
+        .as_ref()
+        .map_err(|&error| ImageError::Font(error))
 }
 
 pub fn render_html_with_font(
@@ -2557,6 +2776,118 @@ fn settle_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn svg_image_decode_reuses_cascade_viewbox_and_preserves_transparency() {
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" viewBox="0 0 2 1"><style><![CDATA[rect { fill: red }]]></style><rect width="1" height="1" fill="green"/><script>throw new Error('inert image script')</script></svg>"#;
+        let decoded = decode_image_with_limit(source, 32).unwrap();
+        assert_eq!((decoded.width, decoded.height), (4, 2));
+        assert_eq!(&decoded.pixels[..4], &[255, 0, 0, 255]);
+        assert_eq!(&decoded.pixels[12..16], &[0, 0, 0, 0]);
+        let encoded = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%3E%3Crect%20width='1'%20height='1'%20fill='green'/%3E%3C/svg%3E";
+        let images = FileImages::new(".");
+        let ImageState::Ready(first) = lumen_html::layout::ImageResolver::resolve(&images, encoded)
+        else {
+            panic!("SVG data URL should decode through the shared file resolver");
+        };
+        assert_eq!(first.pixels, [0, 128, 0, 255]);
+        let ImageState::Ready(second) =
+            lumen_html::layout::ImageResolver::resolve(&images, encoded)
+        else {
+            panic!("cached SVG data URL should remain ready");
+        };
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(lumen_html::layout::ImageResolver::generation(&images), 1);
+        let unsupported = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='1'%20height='1'%3E%3Crect%20width='1'%20height='1'%20filter='url(%23missing)'/%3E%3C/svg%3E";
+        assert_eq!(
+            lumen_html::layout::ImageResolver::resolve(&images, unsupported),
+            ImageState::Failed
+        );
+        assert_eq!(
+            images.failure(unsupported),
+            Some(ImageFailure::UnsupportedDrawing)
+        );
+        assert_eq!(lumen_html::layout::ImageResolver::generation(&images), 2);
+    }
+
+    #[test]
+    fn bmp_decode_preserves_pixel_order_and_rejects_insufficient_budget() {
+        let mut encoded = Vec::new();
+        image::codecs::bmp::BmpEncoder::new(&mut encoded)
+            .encode(
+                &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255],
+                2,
+                2,
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        assert!(decode_raster_image_with_limit(&encoded, 15).is_err());
+        let decoded = decode_image_with_limit(&encoded, 16).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert_eq!(
+            decoded.pixels,
+            vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255]
+        );
+        let mut oversized = encoded;
+        oversized[18..22].copy_from_slice(&i32::MAX.to_le_bytes());
+        assert!(decode_raster_image_with_limit(&oversized, 16).is_err());
+    }
+
+    #[test]
+    fn svg_image_decode_checks_budget_and_reports_unimplemented_drawing() {
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2"/></svg>"#;
+        assert!(matches!(
+            decode_svg_image_with_limit(source, 15),
+            Err(ImageError::TooLarge)
+        ));
+        assert!(decode_svg_image_with_limit(source, 16).is_ok());
+        let oversized =
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="4294967295" height="4294967295"/>"#;
+        assert!(matches!(
+            decode_svg_image_with_limit(oversized, usize::MAX),
+            Err(ImageError::TooLarge)
+        ));
+        let unsupported = br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" filter="url(#missing)"/></svg>"#;
+        assert!(matches!(
+            decode_svg_image_with_limit(unsupported, 16),
+            Err(ImageError::UnsupportedSvg(_))
+        ));
+        assert!(matches!(
+            decode_svg_image_with_limit(b"<svg/>", 64),
+            Err(ImageError::Svg(_))
+        ));
+        assert!(matches!(
+            decode_svg_image_with_limit(b"<svg", 64),
+            Err(ImageError::Xml(_))
+        ));
+    }
+
+    #[test]
+    fn raster_decode_respects_remaining_pixel_budget_before_allocation() {
+        let pixels = vec![17, 34, 51, 255].repeat(4);
+        let encoded = encode_png(&Rgba8Image {
+            width: 2,
+            height: 2,
+            pixels: pixels.clone(),
+        });
+        assert!(matches!(
+            decode_raster_image_with_limit(&encoded, 15),
+            Err(ImageError::TooLarge)
+        ));
+        assert_eq!(
+            decode_raster_image_with_limit(&encoded, 16).unwrap().pixels,
+            pixels
+        );
+
+        // Deliberately invalid CRC: the size guard must fire before decompression
+        // or validation can allocate storage for the advertised dimensions.
+        let mut oversized = encoded;
+        oversized[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_raster_image_with_limit(&oversized, usize::MAX),
+            Err(ImageError::TooLarge)
+        ));
+    }
 
     #[test]
     fn html_inline_svg_maps_viewbox_and_rasterizes_primitive_fill() {

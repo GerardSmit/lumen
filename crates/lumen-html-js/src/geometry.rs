@@ -2,6 +2,92 @@
 use super::*;
 use lumen_html::{paint::Rect, session::RenderSession, NodeId};
 
+/// Resolve one visible element without allocating a result list or dedup table.
+pub(crate) fn element_from_point_in_tree(
+    realm: &Rc<DomRealm>,
+    tree_root: Option<NodeId>,
+    x: f64,
+    y: f64,
+) -> OpResult<Option<NodeId>> {
+    let mut found = None;
+    visit_elements_from_point(realm, tree_root, x, y, |node, _| {
+        found = Some(node);
+        false
+    })?;
+    Ok(found)
+}
+
+pub(crate) fn elements_from_point(realm: &Rc<DomRealm>, x: f64, y: f64) -> OpResult<Vec<NodeId>> {
+    elements_from_point_in_tree(realm, None, x, y)
+}
+
+/// Resolve retained paint hits without cloning the layout or hit regions.
+pub(crate) fn elements_from_point_in_tree(
+    realm: &Rc<DomRealm>,
+    tree_root: Option<NodeId>,
+    x: f64,
+    y: f64,
+) -> OpResult<Vec<NodeId>> {
+    let mut elements = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    visit_elements_from_point(realm, tree_root, x, y, |node, root_fallback| {
+        if if root_fallback {
+            elements.last() != Some(&node)
+        } else {
+            seen.insert(node)
+        } {
+            elements.push(node);
+        }
+        true
+    })?;
+    Ok(elements)
+}
+
+/// Shared validation, layout, shadow retargeting and root fallback. A false
+/// visitor result stops immediately, including before the root fallback.
+fn visit_elements_from_point(
+    realm: &Rc<DomRealm>,
+    tree_root: Option<NodeId>,
+    x: f64,
+    y: f64,
+    mut visit: impl FnMut(NodeId, bool) -> bool,
+) -> OpResult<()> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err(OpError::type_error("Point coordinates must be finite"));
+    }
+    if x < 0.0 || y < 0.0 {
+        return Ok(());
+    }
+    if realm.layout_flusher.borrow().is_none() && realm.session.borrow().viewport_size().is_none() {
+        return Ok(());
+    }
+    realm.flush_layout()?;
+    let session = realm.session.borrow();
+    let document = session.document();
+    let Some((width, height)) = session.viewport_size() else {
+        return Ok(());
+    };
+    if x > f64::from(width) || y > f64::from(height) {
+        return Ok(());
+    }
+    let mut stopped = false;
+    session.for_each_hit_test(x as f32, y as f32, |node| {
+        let Ok(node) = document.retarget(node, Some(tree_root.unwrap_or(document.root()))) else {
+            return true;
+        };
+        if matches!(document.kind(node), Ok(NodeKind::Element { .. })) {
+            stopped = !visit(node, false);
+        }
+        !stopped
+    });
+    if !stopped {
+        if let Some(root) = lumen_html::selector::document_element(document) {
+            visit(root, true);
+        }
+    }
+    Ok(())
+}
+
 /// CSSOM-facing geometry values for one element. Coordinates and lengths use
 /// CSS pixels, independent of the renderer's device scale.
 #[derive(Clone, Debug, PartialEq)]
@@ -215,8 +301,10 @@ pub fn client_rects_value(ctx: &mut Ctx, rects: &[Rect]) -> Value {
 }
 
 pub fn bounding_client_rect_value(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> Value {
-    let rect = snapshot(&mut realm.session.borrow_mut(), node)
-        .map(|geometry| geometry.bounding_client_rect)
+    let rect = realm
+        .session
+        .borrow()
+        .bounding_client_rect(node)
         .unwrap_or(Rect {
             x: 0.0,
             y: 0.0,
@@ -290,6 +378,80 @@ fn used_border_widths(style: &lumen_html::css::Style) -> [f32; 4] {
     })
 }
 
+#[derive(Clone, Copy)]
+struct BoxMetrics {
+    border: [f32; 4],
+    padding: [f32; 4],
+    client_width: f32,
+    client_height: f32,
+    content_width: f32,
+    content_height: f32,
+}
+
+fn box_metrics(layout_box: Rect, style: &lumen_html::css::Style) -> BoxMetrics {
+    let border = used_border_widths(style);
+    let padding = style.padding_sides();
+    let client_width = (layout_box.width - border[1] - border[3]).max(0.0);
+    let client_height = (layout_box.height - border[0] - border[2]).max(0.0);
+    BoxMetrics {
+        border,
+        padding,
+        client_width,
+        client_height,
+        content_width: (client_width - padding[1] - padding[3]).max(0.0),
+        content_height: (client_height - padding[0] - padding[2]).max(0.0),
+    }
+}
+
+/// The untransformed content-box size from the current layout snapshot.
+/// Unlike `snapshot`, this avoids materializing client rects and is useful to
+/// host code that needs a replaced element's viewport dimensions.
+pub(crate) fn content_box_size(session: &mut RenderSession, node: NodeId) -> Option<(f32, f32)> {
+    let style = session.computed_style(node).ok()?;
+    if style.display == lumen_html::css::Display::None {
+        return Some((0.0, 0.0));
+    }
+    let layout_box = session.layout_rect(node)?;
+    let metrics = box_metrics(layout_box, &style);
+    Some((metrics.content_width, metrics.content_height))
+}
+
+/// The target's padding-edge origin in untransformed viewport coordinates.
+/// MouseEvent offsets use the retained box directly and need no rect-list allocation.
+pub(crate) fn event_padding_origin(
+    session: &mut RenderSession,
+    mut node: NodeId,
+) -> Option<(f32, f32)> {
+    if matches!(
+        session.document().kind(node),
+        Ok(NodeKind::Element {
+            namespace: lumen_html::Namespace::Svg,
+            ..
+        })
+    ) {
+        let mut current = Some(node);
+        while let Some(candidate) = current {
+            match session.document().kind(candidate).ok()? {
+                NodeKind::Element {
+                    namespace: lumen_html::Namespace::Svg,
+                    name,
+                    ..
+                } => {
+                    if name.as_str() == "svg" {
+                        node = candidate;
+                    }
+                }
+                _ => break,
+            }
+            current = session.document().composed_parent(candidate).ok()?;
+        }
+    }
+    let rect = session.layout_rect(node)?;
+    let style = session.computed_style(node).ok()?;
+    let border = used_border_widths(&style);
+    Some((rect.x + border[3], rect.y + border[0]))
+}
+
 /// Read layout geometry without forcing a layout pass. A missing snapshot means
 /// the renderer has not completed layout for the current document version.
 pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySnapshot> {
@@ -314,12 +476,7 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
     let border_box = union(&client_rects);
     let layout_box = session.layout_rect(node).unwrap_or(border_box);
     let style = session.computed_style(node).ok()?;
-    let padding = style.padding_sides();
-    let border = used_border_widths(&style);
-    let client_width = (layout_box.width - border[1] - border[3]).max(0.0);
-    let client_height = (layout_box.height - border[0] - border[2]).max(0.0);
-    let content_width = (client_width - padding[1] - padding[3]).max(0.0);
-    let content_height = (client_height - padding[0] - padding[2]).max(0.0);
+    let metrics = box_metrics(layout_box, &style);
     let (overflow_x, overflow_y) = session.scroll_extent(node).unwrap_or((0.0, 0.0));
     let (scroll_left, scroll_top) = session.scroll_offset(node);
 
@@ -356,10 +513,10 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
         client_rects,
         bounding_client_rect: border_box,
         content_rect: Rect {
-            x: layout_box.x + border[3] + padding[3],
-            y: layout_box.y + border[0] + padding[0],
-            width: content_width,
-            height: content_height,
+            x: layout_box.x + metrics.border[3] + metrics.padding[3],
+            y: layout_box.y + metrics.border[0] + metrics.padding[0],
+            width: metrics.content_width,
+            height: metrics.content_height,
         },
         offset_parent,
         offset_left,
@@ -367,12 +524,12 @@ pub fn snapshot(session: &mut RenderSession, node: NodeId) -> Option<GeometrySna
         offset_width: layout_box.width.round(),
         offset_height: layout_box.height.round(),
         border_box_size: (layout_box.width, layout_box.height),
-        client_width: client_width.round(),
-        client_height: client_height.round(),
-        content_width,
-        content_height,
-        scroll_width: (client_width + overflow_x.max(0.0)).round(),
-        scroll_height: (client_height + overflow_y.max(0.0)).round(),
+        client_width: metrics.client_width.round(),
+        client_height: metrics.client_height.round(),
+        content_width: metrics.content_width,
+        content_height: metrics.content_height,
+        scroll_width: (metrics.client_width + overflow_x.max(0.0)).round(),
+        scroll_height: (metrics.client_height + overflow_y.max(0.0)).round(),
         scroll_left,
         scroll_top,
     })
@@ -396,6 +553,70 @@ mod tests {
         }
         fn line_height(&self, size: f32) -> f32 {
             size * 1.2
+        }
+    }
+
+    #[test]
+    fn document_point_queries_use_live_layout_pointer_events_and_root_fallback() {
+        let mut engine = lumen::Engine::new();
+        let realm = super::super::install(engine.ctx(), "<style>body{margin:0}#outer{width:20px;height:20px}#inner{width:5px;height:5px}</style><div id=outer><div id=inner></div></div>", 128).unwrap();
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(30, 30, &NoText)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        let result = engine.eval_value(r#"
+            if (window.innerWidth !== 30 || window.innerHeight !== 30) throw new Error('live viewport dimensions');
+            const outer = document.getElementById('outer');
+            const inner = document.getElementById('inner');
+            const first = document.elementsFromPoint(2, 2);
+            if (first.map(e => e.localName).join(',') !== 'div,div,body,html' || first[0] !== inner || document.elementFromPoint(2, 2) !== inner) throw new Error('paint order');
+            outer.style.pointerEvents = 'none';
+            if (document.elementsFromPoint(2, 2).includes(inner) || getComputedStyle(inner).pointerEvents !== 'none' || inner.getBoundingClientRect().width !== 5) throw new Error('inherited pointer eligibility');
+            inner.style.pointerEvents = 'auto';
+            if (document.elementFromPoint(2, 2) !== inner) throw new Error('override');
+            if (document.elementsFromPoint(-1, 0).length || document.elementsFromPoint(-Number.MIN_VALUE, 0).length || document.elementFromPoint(31, 2) !== null) throw new Error('outside');
+            if (document.elementFromPoint(30, 2) !== document.documentElement) throw new Error('viewport edge fallback');
+            if (document.elementFromPoint(29, 29) !== document.documentElement) throw new Error('root fallback');
+            let threw = false; try { document.elementsFromPoint(NaN, 0); } catch(e) { threw = e instanceof TypeError; }
+            const host = document.createElement('div');
+            host.style.cssText = 'width:10px;height:10px';
+            document.body.appendChild(host);
+            const shadow = host.attachShadow({mode:'closed'});
+            const box = document.createElement('div');
+            box.style.cssText = 'width:10px;height:10px';
+            shadow.appendChild(box);
+            const bounds = box.getBoundingClientRect();
+            if (document.elementFromPoint(bounds.left + 2, bounds.top + 2) !== host || shadow.elementFromPoint(bounds.left + 2, bounds.top + 2) !== box) throw new Error('shadow retarget');
+            threw
+        "#).expect("valid point-query script");
+        match result {
+            Ok(Value::Bool(true)) => (),
+            Ok(_) => panic!("point-query guard returned false"),
+            Err(error) => {
+                let message = engine.ctx().get_member(&error, "message").ok();
+                panic!(
+                    "point-query script failed: {}",
+                    message
+                        .and_then(|value| if let Value::Str(text) = value {
+                            Some(text.to_string())
+                        } else {
+                            None
+                        })
+                        .unwrap_or_default()
+                );
+            }
+        }
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(60, 45, &NoText)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        match engine.eval_value("window.innerWidth === 60 && window.innerHeight === 45") {
+            Ok(Ok(Value::Bool(true))) => (),
+            _ => panic!("window dimensions did not follow the resized viewport"),
         }
     }
 

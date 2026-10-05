@@ -340,6 +340,17 @@ pub enum Completion {
     Throw { name: String, message: String },
 }
 
+#[cfg(feature = "embed")]
+fn promise_realm_key(promise: &embed::Value) -> Option<usize> {
+    let embed::Value::Obj(object) = promise else {
+        return None;
+    };
+    match &object.borrow().call {
+        crate::value::Callable::Promise(slot) => Some(slot.realm_key),
+        _ => None,
+    }
+}
+
 /// A module graph whose evaluation is still owned by the engine's normal job queue. Hosts such as
 /// a browser can retain this handle while pumping their own tasks, without asking the engine to
 /// run its agent timer loop to completion.
@@ -473,6 +484,22 @@ impl Default for Engine {
     }
 }
 
+/// With the last engine on this thread gone, drop the thread-local caches that still hold strong
+/// handles to its strings, symbols, layouts and parsed sources, so the final collection is not
+/// pinned by them. All of them are pure caches or registries that a new engine resets.
+fn release_thread_realm_roots() {
+    interpreter::sym_for_reset();
+    interpreter::clear_str_key_ic();
+    interpreter::bindings::clear_copy_layouts();
+    drop(interpreter::stack_trace::take_parsed_source());
+}
+
+/// After the final collection, free the allocations that dead `Weak` registry entries pin.
+fn release_thread_dead_weaks() {
+    value::scope_registry_prune();
+    bytecode::jit::prune_dead_chunks();
+}
+
 thread_local! {
     static LIVE_ENGINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -492,7 +519,9 @@ impl Drop for Engine {
             return;
         }
         drop(std::mem::replace(&mut self.interp, Interp::uninitialized()));
+        release_thread_realm_roots();
         self.interp.gc_collect();
+        release_thread_dead_weaks();
         value::gc_trim_quiescent_heap();
         // Native owning cores stay online after their final worker exits. Return
         // cached free blocks now rather than waiting for nonexistent thread exit.
@@ -1003,8 +1032,11 @@ impl Engine {
         self.interp.heap_fatal = fatal;
     }
 
-    /// Bytes currently allocated through [`fastalloc::ClassAlloc`] by the whole process, or
-    /// `None` when it is not the global allocator (a heap limit then has no effect).
+    /// Process-wide bytes held from the system by [`fastalloc::ClassAlloc`]: rounded
+    /// live blocks plus cached free-list blocks, including this thread's pending delta.
+    /// This is neither requested payload nor an isolated engine/JS heap or RSS measurement.
+    /// Returns `None` before allocator accounting becomes active (and when it is not
+    /// the global allocator; a heap limit then has no effect).
     pub fn heap_bytes() -> Option<usize> {
         #[cfg(not(target_arch = "wasm32"))]
         return fastalloc::heap_bytes();
@@ -1120,6 +1152,7 @@ pub mod embed {
     };
     pub use crate::host::{OpState, ResourceId, ResourceTable};
     pub use crate::interpreter::SharedBufferHandle;
+    pub use crate::interpreter::MAX_BUFFER_BYTES;
     /// The context a [`NativeFn`] receives: a curated view of the interpreter. Only the
     /// audited embedder-safe methods are `pub`; the rest of the interpreter is `pub(crate)`.
     pub use crate::interpreter::{abrupt_value, Interp as Ctx};
@@ -1127,13 +1160,13 @@ pub mod embed {
     /// internals stay opaque — an object handle is only usable through [`Ctx`] methods.
     /// A data-carrying native callable, unlike the bare-`fn` [`NativeFn`]. Register one with
     /// [`Ctx::new_native_fn`] when the host function must capture state (N-API callbacks).
-    pub use crate::value::{NativeClosure, NativeFn, Value};
+    pub use crate::value::{NativeClosure, NativeFn, TaKind, Value};
 
     // The JS host of `lumen-bind`, errors, promises and async work (see `embed_convert`).
     pub use crate::embed_convert::{
         class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
         JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
-        WeakValue,
+        NativeIdentityOwner, WeakValue,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};
@@ -1168,7 +1201,7 @@ impl Engine {
         bytes: &'static [u8],
     ) -> Result<Result<embed::Value, String>, embed::HostRealmScopeError> {
         self.interp
-            .with_host_realm(realm, |ctx| native_aot::load_static_glue_engine(ctx, bytes))
+            .load_native_glue_value_in_host_realm(realm, bytes)
     }
 
     #[cfg(feature = "aot-native")]
@@ -1328,21 +1361,7 @@ impl Engine {
         src: &str,
         strict: bool,
     ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
-        if native_ops::dynamic_code_disabled() {
-            return Err(embed::HostRealmEvalError::Parse(ParseError {
-                message: "dynamic code is unavailable in native execution".into(),
-                line: 0,
-                at_eof: false,
-            }));
-        }
-        let body = parser::parse_script(src, strict).map_err(|error| {
-            embed::HostRealmEvalError::Parse(ParseError {
-                message: error.message,
-                line: error.line,
-                at_eof: error.at_eof,
-            })
-        })?;
-        self.run_script_body_in_host_realm(realm, body, strict)
+        self.interp.eval_value_in_host_realm(realm, src, strict)
     }
 
     /// Decode and execute a classic Script snapshot in a registered host realm without running
@@ -1368,45 +1387,8 @@ impl Engine {
         src: std::rc::Rc<str>,
         strict: bool,
     ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
-        if native_ops::dynamic_code_disabled() {
-            return Err(embed::HostRealmEvalError::Parse(ParseError {
-                message: "source snapshots are unavailable in the Aot profile".into(),
-                line: 0,
-                at_eof: false,
-            }));
-        }
-        let body = snapshot::decode_shared(bytes, src).map_err(|message| {
-            embed::HostRealmEvalError::Parse(ParseError {
-                message,
-                line: 0,
-                at_eof: false,
-            })
-        })?;
-        self.run_script_body_in_host_realm(realm, body, strict)
-    }
-
-    fn run_script_body_in_host_realm(
-        &mut self,
-        realm: &embed::RealmHandle,
-        body: Vec<ast::Stmt>,
-        strict: bool,
-    ) -> Result<Result<embed::Value, embed::Value>, embed::HostRealmEvalError> {
-        let directive_strict = matches!(
-            body.first(),
-            Some(ast::Stmt::Expr(ast::Expr::Str(s))) if &**s == "use strict"
-        );
         self.interp
-            .with_host_realm(realm, |ctx| {
-                let old_strict = ctx.strict;
-                ctx.strict = strict || directive_strict;
-                let result = ctx.run_program_parsed(&body).map(|value| match value {
-                    Value::Empty => Value::Undefined,
-                    value => value,
-                });
-                ctx.strict = old_strict;
-                result
-            })
-            .map_err(embed::HostRealmEvalError::Scope)
+            .eval_snapshot_shared_source_in_host_realm(realm, bytes, src, strict)
     }
 
     /// Define `globalThis.<name>` as a native function (non-enumerable, like built-ins).
@@ -1485,8 +1467,56 @@ impl Engine {
         rejections.sort_unstable_by_key(|r| r.2);
         rejections
             .into_iter()
-            .map(|(promise, reason, _)| (promise, reason))
+            .map(|(promise, reason, _, _)| (promise, reason))
             .collect()
+    }
+
+    /// Take unhandled rejections with their creating realm. Browser hosts dispatch each event to
+    /// that realm's Window even when the rejection was observed during another realm's turn.
+    #[cfg(feature = "embed")]
+    pub fn take_unhandled_rejections_with_realm(
+        &mut self,
+    ) -> Vec<(embed::RealmHandle, embed::Value, embed::Value)> {
+        let mut rejections: Vec<_> = std::mem::take(&mut self.interp.unhandled_rejections)
+            .into_values()
+            .collect();
+        rejections.sort_unstable_by_key(|record| record.2);
+        rejections
+            .into_iter()
+            .filter_map(|(promise, reason, _, realm_key)| {
+                self.interp
+                    .host_realm_for_key(realm_key)
+                    .map(|realm| (realm, promise, reason))
+            })
+            .collect()
+    }
+
+    /// Drop unhandled and late-handled rejection bookkeeping for a document being retired.
+    /// The promise itself contains only a numeric realm key, so this does not retain the old
+    /// global or its document graph.
+    #[cfg(feature = "embed")]
+    pub fn discard_rejections_for_realm(&mut self, realm: &embed::RealmHandle) -> usize {
+        if !realm.belongs_to(&self.interp) {
+            return 0;
+        }
+        let key = realm.key();
+        let before = self.interp.unhandled_rejections.len();
+        self.interp
+            .unhandled_rejections
+            .retain(|_, (_, _, _, owner)| *owner != key);
+        let mut removed = before - self.interp.unhandled_rejections.len();
+        if let Some(late) = &mut self.interp.late_handled_rejections {
+            let before = late.len();
+            late.retain(|promise| promise_realm_key(promise) != Some(key));
+            removed += before - late.len();
+        }
+        removed
+    }
+
+    /// Recover a live realm handle for a registered global identity.
+    #[cfg(feature = "embed")]
+    pub fn host_realm_for_key(&mut self, key: usize) -> Option<embed::RealmHandle> {
+        self.interp.host_realm_for_key(key)
     }
 
     /// Start recording rejections that get a handler after being reported unhandled (see

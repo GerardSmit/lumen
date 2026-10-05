@@ -12,7 +12,7 @@ use super::dense::DenseIndex;
 use super::index::Index;
 use super::key_hash;
 use crate::builtins::same_value_zero;
-use crate::value::{PackedValue, Value, PACK_EMPTY};
+use crate::value::{PACK_EMPTY, PackedValue, Value};
 use std::cell::Cell;
 
 const MIN_BUCKETS: usize = 8;

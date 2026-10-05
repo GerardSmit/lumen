@@ -1,7 +1,63 @@
 use super::*;
 use crate::realm_services::RealmServices;
+use lumen::embed::Promise;
+use lumen_bind::OneOrNumberPair;
+
+fn scroll_window_receiver(
+    ctx: &mut Ctx,
+    receiver: &Value,
+    args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    relative: bool,
+) -> OpResult<Promise<()>> {
+    // The browser global is published through its WindowProxy. Generated
+    // `&DomWindow` projection only recognizes a WindowProxy while an internal
+    // property Get/Set scope is active; a method call occurs after that scope
+    // has ended. Resolve the actual receiver through the checked native Window
+    // path so its brand and original-caller security policy are preserved.
+    let realm = ctx
+        .with_instance::<DomWindow, _>(receiver, |window| window.base.associated_realm())?
+        .ok_or_else(|| OpError::new("InvalidStateError", "Window document is unavailable"))?;
+    let node = realm.session.borrow().document().root();
+    Ok(scroll_node(ctx, realm, node, args, relative))
+}
+
+pub(crate) fn scroll_node(
+    ctx: &mut Ctx,
+    realm: Rc<DomRealm>,
+    node: NodeId,
+    args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    relative: bool,
+) -> Promise<()> {
+    let (current_x, current_y) = match scrolling::position(&realm, node) {
+        Ok(position) => position,
+        Err(error) => return Promise::rejected(error),
+    };
+    let (x, y, behavior) = match args {
+        OneOrNumberPair::Pair(x, y) if relative => (
+            current_x + x,
+            current_y + y,
+            scrolling::ScrollBehavior::Auto,
+        ),
+        OneOrNumberPair::Pair(x, y) => (x, y, scrolling::ScrollBehavior::Auto),
+        OneOrNumberPair::One(options) if relative => (
+            current_x + options.left.unwrap_or(0.0),
+            current_y + options.top.unwrap_or(0.0),
+            options.behavior,
+        ),
+        OneOrNumberPair::One(options) => (
+            options.left.unwrap_or(current_x),
+            options.top.unwrap_or(current_y),
+            options.behavior,
+        ),
+    };
+    scrolling::set_offset(ctx, &realm, node, x, y, behavior)
+}
 
 struct WindowRealm(std::rc::Weak<DomRealm>);
+
+pub(crate) fn current_dom_realm(ctx: &mut Ctx) -> Option<Rc<DomRealm>> {
+    RealmServices::<WindowRealm>::current(ctx).and_then(|state| state.0.upgrade())
+}
 
 #[lumen_bind::class(name = "Window", extends = DomEventTarget, hint(js(webidl)))]
 pub(crate) struct DomWindow {
@@ -12,10 +68,89 @@ impl DomWindow {
     pub(crate) fn from_target(base: DomEventTarget) -> Self {
         Self { base }
     }
+
+    fn viewport_size(&self) -> OpResult<(u32, u32)> {
+        let Some(realm) = self.base.associated_realm() else {
+            return Ok((0, 0));
+        };
+        if realm.layout_flusher.borrow().is_none()
+            && realm.session.borrow().viewport_size().is_none()
+        {
+            return Ok((0, 0));
+        }
+        realm.flush_layout()?;
+        let size = realm.session.borrow().viewport_size().unwrap_or((0, 0));
+        Ok(size)
+    }
+
+    fn scroll_position(&self) -> OpResult<(f64, f64)> {
+        let Some(realm) = self.base.associated_realm() else {
+            return Ok((0.0, 0.0));
+        };
+        let node = realm.session.borrow().document().root();
+        scrolling::position(&realm, node)
+    }
 }
 
 #[lumen_bind::methods]
 impl DomWindow {
+    #[getter]
+    fn inner_width(&self) -> OpResult<u32> {
+        self.viewport_size().map(|size| size.0)
+    }
+
+    #[getter]
+    fn inner_height(&self) -> OpResult<u32> {
+        self.viewport_size().map(|size| size.1)
+    }
+
+    #[getter]
+    fn scroll_x(&self) -> OpResult<f64> {
+        self.scroll_position().map(|position| position.0)
+    }
+
+    #[getter]
+    fn scroll_y(&self) -> OpResult<f64> {
+        self.scroll_position().map(|position| position.1)
+    }
+
+    #[getter]
+    fn page_x_offset(&self) -> OpResult<f64> {
+        self.scroll_x()
+    }
+
+    #[getter]
+    fn page_y_offset(&self) -> OpResult<f64> {
+        self.scroll_y()
+    }
+
+    #[method(coerce)]
+    fn scroll(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    ) -> OpResult<Promise<()>> {
+        scroll_window_receiver(ctx, &this.0, args, false)
+    }
+
+    #[method(coerce)]
+    fn scroll_to(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    ) -> OpResult<Promise<()>> {
+        scroll_window_receiver(ctx, &this.0, args, false)
+    }
+
+    #[method(coerce)]
+    fn scroll_by(
+        ctx: &mut Ctx,
+        this: lumen_bind::This<Value>,
+        #[varargs] args: OneOrNumberPair<scrolling::ScrollToOptions>,
+    ) -> OpResult<Promise<()>> {
+        scroll_window_receiver(ctx, &this.0, args, true)
+    }
+
     #[getter]
     fn parent(&self, ctx: &mut Ctx) -> Value {
         match browsing_context::current_realm_context(ctx) {
@@ -50,6 +185,24 @@ impl DomWindow {
     fn length(&self, ctx: &mut Ctx) -> u32 {
         browsing_context::current_realm_context(ctx)
             .map_or(0, |context| browsing_context::window_length(&context))
+    }
+
+    #[getter]
+    fn location(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let context = browsing_context::current_realm_context(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "Window has no active context"))?;
+        let realm = RealmServices::<WindowRealm>::current(ctx)
+            .and_then(|state| state.0.upgrade())
+            .ok_or_else(|| OpError::new("InvalidStateError", "Window document is unavailable"))?;
+        location_value(ctx, &realm, &context)
+    }
+
+    #[setter(coerce)]
+    fn set_location(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        let context = browsing_context::current_realm_context(ctx)
+            .ok_or_else(|| OpError::new("InvalidStateError", "Window has no active context"))?;
+        let entry_base = entry_base_url(ctx, &context);
+        context.request_location_navigation_from(value, &entry_base)
     }
 
     #[getter(name = "frameElement")]
@@ -126,6 +279,234 @@ impl DomWindow {
         self.base
             .set_handler(ctx, &this.0, "rejectionhandled", callback);
     }
+}
+
+#[lumen_bind::class(name = "Location", hint(js(webidl)))]
+pub(crate) struct DomLocation {
+    context: std::rc::Weak<browsing_context::BrowsingContext>,
+    owner: std::rc::Weak<DomRealm>,
+}
+
+impl DomLocation {
+    fn active_owner_and_context(
+        &self,
+    ) -> OpResult<(Rc<DomRealm>, Rc<browsing_context::BrowsingContext>)> {
+        let context = self
+            .context
+            .upgrade()
+            .ok_or_else(|| OpError::new("InvalidStateError", "Location context is unavailable"))?;
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or_else(|| OpError::new("InvalidStateError", "Location document is unavailable"))?;
+        let current = browsing_context::context_document(&context);
+        if !current
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, &owner))
+        {
+            return Err(OpError::new(
+                "InvalidStateError",
+                "Location belongs to a retired document",
+            ));
+        }
+        Ok((owner, context))
+    }
+
+    fn url(&self) -> OpResult<lumen_common::url::Url> {
+        let (owner, _) = self.active_owner_and_context()?;
+        let url = owner
+            .document_url()
+            .unwrap_or_else(|| "about:blank".to_owned());
+        lumen_common::url::parse(&url, None)
+            .map_err(|_| OpError::new("InvalidStateError", "document URL is invalid"))
+    }
+
+    fn navigate(&self, ctx: &mut Ctx, input: &str) -> OpResult<()> {
+        let (_, context) = self.active_owner_and_context()?;
+        let entry_base = entry_base_url(ctx, &context);
+        context.request_location_navigation_from(input, &entry_base)
+    }
+
+    fn update(
+        &self,
+        ctx: &mut Ctx,
+        change: impl FnOnce(&mut lumen_common::url::Url) -> bool,
+    ) -> OpResult<()> {
+        let mut url = self.url()?;
+        if change(&mut url) {
+            self.navigate(ctx, &url.href())?;
+        }
+        Ok(())
+    }
+}
+
+#[lumen_bind::methods]
+impl DomLocation {
+    #[getter]
+    fn href(&self) -> OpResult<String> {
+        Ok(self.url()?.href())
+    }
+
+    #[setter(coerce)]
+    fn set_href(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.navigate(ctx, value)
+    }
+
+    #[getter]
+    fn origin(&self) -> OpResult<String> {
+        let (_, context) = self.active_owner_and_context()?;
+        Ok(browsing_context::context_origin(&context).serialize())
+    }
+
+    #[getter]
+    fn protocol(&self) -> OpResult<String> {
+        Ok(format!("{}:", self.url()?.scheme))
+    }
+
+    #[setter(coerce)]
+    fn set_protocol(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| url.set_protocol(value))
+    }
+
+    #[getter]
+    fn host(&self) -> OpResult<String> {
+        let url = self.url()?;
+        let mut host = url.host.unwrap_or_default();
+        if let Some(port) = url.port {
+            host.push(':');
+            host.push_str(&port.to_string());
+        }
+        Ok(host)
+    }
+
+    #[setter(coerce)]
+    fn set_host(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| url.set_host(value))
+    }
+
+    #[getter]
+    fn hostname(&self) -> OpResult<String> {
+        Ok(self.url()?.host.unwrap_or_default())
+    }
+
+    #[setter(coerce)]
+    fn set_hostname(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| url.set_hostname(value))
+    }
+
+    #[getter]
+    fn port(&self) -> OpResult<String> {
+        Ok(self
+            .url()?
+            .port
+            .map(|port| port.to_string())
+            .unwrap_or_default())
+    }
+
+    #[setter(coerce)]
+    fn set_port(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| url.set_port(value))
+    }
+
+    #[getter]
+    fn pathname(&self) -> OpResult<String> {
+        Ok(self.url()?.path)
+    }
+
+    #[setter(coerce)]
+    fn set_pathname(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| url.set_pathname(value))
+    }
+
+    #[getter]
+    fn search(&self) -> OpResult<String> {
+        Ok(self
+            .url()?
+            .query
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default())
+    }
+
+    #[setter(coerce)]
+    fn set_search(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| {
+            url.set_search(value);
+            true
+        })
+    }
+
+    #[getter]
+    fn hash(&self) -> OpResult<String> {
+        Ok(self
+            .url()?
+            .fragment
+            .map(|fragment| format!("#{fragment}"))
+            .unwrap_or_default())
+    }
+
+    #[setter(coerce)]
+    fn set_hash(&self, ctx: &mut Ctx, value: &str) -> OpResult<()> {
+        self.update(ctx, |url| {
+            url.set_hash(value);
+            true
+        })
+    }
+
+    #[method]
+    fn assign(&self, ctx: &mut Ctx, url: &str) -> OpResult<()> {
+        self.navigate(ctx, url)
+    }
+
+    #[method]
+    fn replace(&self, ctx: &mut Ctx, url: &str) -> OpResult<()> {
+        self.navigate(ctx, url)
+    }
+
+    #[method]
+    fn reload(&self, ctx: &mut Ctx) -> OpResult<()> {
+        self.navigate(ctx, &self.url()?.href())
+    }
+
+    #[method(name = "toString")]
+    fn to_string(&self) -> OpResult<String> {
+        self.href()
+    }
+}
+
+pub(crate) fn location_value(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    context: &Rc<browsing_context::BrowsingContext>,
+) -> OpResult<Value> {
+    if let Some(location) = realm
+        .location_wrapper
+        .borrow()
+        .as_ref()
+        .and_then(WeakValue::upgrade)
+    {
+        return Ok(location);
+    }
+    let location = ctx.new_instance(DomLocation {
+        context: Rc::downgrade(context),
+        owner: Rc::downgrade(realm),
+    });
+    *realm.location_wrapper.borrow_mut() = ctx.weak_value(&location);
+    Ok(location)
+}
+
+pub(crate) fn entry_base_url(
+    ctx: &mut Ctx,
+    target: &Rc<browsing_context::BrowsingContext>,
+) -> String {
+    let caller = ctx.invocation_host_realm();
+    ctx.with_host_realm(&caller, |ctx| {
+        RealmServices::<WindowRealm>::current(ctx)
+            .and_then(|state| state.0.upgrade())
+            .map(|realm| realm.base_url())
+    })
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| target.current_document_url())
 }
 
 #[lumen_bind::op(name = "getSelection")]
@@ -290,10 +671,68 @@ fn install_named_properties(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()>
     Ok(())
 }
 
+fn install_performance_event_target(ctx: &mut Ctx, global: &Value) -> OpResult<()> {
+    // Keep the runtime's Performance implementation and clock. Replacing the
+    // DOM EventTarget interface must also give this existing singleton a native
+    // receiver; changing its prototype alone leaves native methods unbranded.
+    let performance = ctx
+        .member_get(global, "performance")
+        .map_err(OpError::thrown)?;
+    if !matches!(performance, Value::Obj(_)) {
+        return Ok(());
+    }
+    if ctx.instance_data::<DomEventTarget>(&performance).is_some() {
+        return Ok(());
+    }
+    let prototype = ctx.prototype_of(&performance);
+    if !matches!(prototype, Value::Obj(_)) {
+        return Ok(());
+    }
+    let performance_constructor = ctx
+        .member_get(global, "Performance")
+        .map_err(OpError::thrown)?;
+    if !performance_constructor.is_callable() {
+        return Ok(());
+    }
+    let declared_prototype = ctx
+        .member_get(&performance_constructor, "prototype")
+        .map_err(OpError::thrown)?;
+    if !matches!((&prototype, &declared_prototype),
+        (Value::Obj(actual), Value::Obj(declared)) if std::ptr::eq(&**actual, &**declared))
+    {
+        return Ok(());
+    }
+    let constructor = ctx.class_constructor::<DomEventTarget>();
+    let event_target_prototype = ctx
+        .member_get(&constructor, "prototype")
+        .map_err(OpError::thrown)?;
+    let object = ctx.member_get(global, "Object").map_err(OpError::thrown)?;
+    let set_prototype = ctx
+        .member_get(&object, "setPrototypeOf")
+        .map_err(OpError::thrown)?;
+    ctx.invoke(
+        set_prototype.clone(),
+        object.clone(),
+        &[prototype.clone(), event_target_prototype],
+    )
+    .map_err(OpError::thrown)?;
+    ctx.invoke(
+        set_prototype.clone(),
+        object.clone(),
+        &[performance_constructor, constructor],
+    )
+    .map_err(OpError::thrown)?;
+    ctx.attach_instance(&performance, DomEventTarget::new())?;
+    ctx.invoke(set_prototype, object, &[performance, prototype])
+        .map_err(OpError::thrown)?;
+    Ok(())
+}
+
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     RealmServices::replace_current(ctx, WindowRealm(Rc::downgrade(realm)));
     let function = ctx.bound_function(&lumen_bind::FnItem::of::<get_selection::Op>());
     let global = ctx.global_object();
+    install_performance_event_target(ctx, &global)?;
     // The general runtime exposes data properties for its Node-style error shim.
     // Transfer existing callbacks to the native Window handler slots so those
     // properties cannot shadow the browser's event-handler accessors.
@@ -343,6 +782,90 @@ mod tests {
                 panic!("{message}");
             }
         }
+    }
+
+    #[test]
+    fn performance_singleton_keeps_its_clock_and_uses_native_event_target() {
+        let mut engine = Engine::new();
+        script(
+            &mut engine,
+            r#"
+            class ExistingEventTarget {}
+            class Performance extends ExistingEventTarget {
+              now() { return 23.5; }
+              get timeOrigin() { return 1000; }
+              toJSON() { return {timeOrigin:this.timeOrigin}; }
+            }
+            globalThis.Performance = Performance;
+            globalThis.performance = new Performance();
+            globalThis.originalPerformance = performance;
+            globalThis.originalPerformancePrototype = Performance.prototype;
+            globalThis.originalNow = performance.now;
+            performance.extra = {value:73};
+        "#,
+        );
+        crate::install(engine.ctx(), "<main></main>", 96).unwrap();
+        let result = script(
+            &mut engine,
+            r#"
+            let calls = 0;
+            let sameReceiver = false;
+            const listener = function(event) {
+              ++calls;
+              sameReceiver = this === performance && event.target === performance &&
+                event.currentTarget === performance;
+              event.preventDefault();
+            };
+            performance.addEventListener('clock-event', listener, {once:true});
+            const first = performance.dispatchEvent(new Event('clock-event', {cancelable:true}));
+            const second = performance.dispatchEvent(new Event('clock-event', {cancelable:true}));
+            let rejectsUnbranded = false;
+            try { EventTarget.prototype.addEventListener.call({}, 'x', listener); }
+            catch(error) { rejectsUnbranded = error instanceof TypeError; }
+            performance === originalPerformance &&
+              Object.getPrototypeOf(performance) === originalPerformancePrototype &&
+              performance instanceof Performance && performance instanceof EventTarget &&
+              performance.now === originalNow && performance.now() === 23.5 &&
+              performance.toJSON().timeOrigin === 1000 && performance.extra.value === 73 &&
+              calls === 1 && sameReceiver && first === false && second === true && rejectsUnbranded
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn performance_web_glue_inherits_native_event_target_and_rejects_construction() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        script(
+            &mut engine,
+            "const __perf = {now:()=>23.5,timeOrigin:()=>1000};",
+        );
+        let platform = format!(
+            "(() => {{ {} }})()",
+            include_str!("../../lumen-web/src/js/platform.js")
+        );
+        script(&mut engine, &platform);
+        let result = script(
+            &mut engine,
+            r#"
+            let rejected = false;
+            try { new Performance(); } catch(error) { rejected = error instanceof TypeError; }
+            let count = 0;
+            performance.addEventListener('clock', () => ++count, {once:true});
+            performance.dispatchEvent(new Event('clock'));
+            performance.dispatchEvent(new Event('clock'));
+            rejected && Performance.length === 0 && count === 1 &&
+              Object.getPrototypeOf(Performance) === EventTarget &&
+              Object.getPrototypeOf(Performance.prototype) === EventTarget.prototype &&
+              performance instanceof Performance && performance instanceof EventTarget &&
+              Object.getOwnPropertyDescriptor(globalThis,'Performance').enumerable === false &&
+              Object.prototype.toString.call(performance) === '[object Performance]' &&
+              Object.getOwnPropertyDescriptor(Performance.prototype,'now').enumerable === true &&
+              performance.now() === 23.5 && performance.toJSON().timeOrigin === 1000
+        "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
     }
 
     #[test]
@@ -504,5 +1027,226 @@ mod tests {
             ),
             Ok(Value::Bool(true))
         ));
+    }
+
+    #[test]
+    fn location_is_document_backed_and_rejects_unsupported_top_level_navigation() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<main></main>", 32).unwrap();
+        realm.set_document_url("https://origin.example.test/dir/page.html?x=1#top");
+        let result = script(
+            &mut engine,
+            r#"
+            const locationIsShared = window.location === document.location;
+            const initial = location.href === document.URL &&
+              location.href === 'https://origin.example.test/dir/page.html?x=1#top' &&
+              location.origin === 'https://origin.example.test' &&
+              location.pathname === '/dir/page.html' && location.search === '?x=1' && location.hash === '#top';
+            let rejected = false;
+            try { location.assign('/next.html'); }
+            catch (error) { rejected = error.name === 'NotSupportedError'; }
+            locationIsShared && initial && rejected && location.href === document.URL
+            "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn window_scroll_api_uses_root_session_and_typed_overloads() {
+        struct NoText;
+        impl lumen_html::paint::TextShaper for NoText {
+            fn shape(&self, _: &str, _: f32) -> Result<lumen_html::paint::ShapedRun, ()> {
+                Err(())
+            }
+            fn ascent(&self, size: f32) -> f32 {
+                size * 0.8
+            }
+            fn line_height(&self, size: f32) -> f32 {
+                size * 1.2
+            }
+        }
+
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<style>html,body{margin:0}body{width:400px;height:300px}</style><main></main>",
+            32,
+        )
+        .unwrap();
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(100, 80, &NoText)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+
+        let result = script(
+            &mut engine,
+            r#"
+            const same = () => window.scrollX === window.pageXOffset &&
+              window.scrollY === window.pageYOffset;
+            if (!same() || window.scrollX !== 0 || window.scrollY !== 0)
+              throw new Error('initial viewport offset aliases');
+
+            let conversion = [];
+            const options = {
+              get behavior() { conversion.push('behavior'); return 'instant'; },
+              get left() { conversion.push('left'); return { valueOf() { conversion.push('left-number'); return 30; } }; },
+              get top() { conversion.push('top'); return { valueOf() { conversion.push('top-number'); return 40; } }; }
+            };
+            const first = window.scroll(options);
+            if (!(first instanceof Promise) || conversion.join(',') !== 'behavior,left,left-number,top,top-number' ||
+                window.scrollX !== 30 || window.scrollY !== 40 || !same())
+              throw new Error('dictionary conversion order or scroll()');
+
+            const second = window.scrollTo(10, 15);
+            if (!(second instanceof Promise) || window.scrollX !== 10 || window.scrollY !== 15)
+              throw new Error('two-number scrollTo overload');
+            const third = window.scrollBy(5, 6);
+            if (!(third instanceof Promise) || window.scrollX !== 15 || window.scrollY !== 21)
+              throw new Error('two-number scrollBy overload');
+
+            const numericOrder = [];
+            window.scrollTo(
+              { valueOf() { numericOrder.push('x'); return 20; } },
+              { valueOf() { numericOrder.push('y'); return 25; } },
+              { valueOf() { throw new Error('extra argument converted'); } });
+            if (numericOrder.join(',') !== 'x,y' || window.scrollX !== 20 || window.scrollY !== 25)
+              throw new Error('coordinate conversion order');
+            window.scrollTo('15', '21');
+            if (window.scrollX !== 15 || window.scrollY !== 21)
+              throw new Error('coordinate string conversion');
+            window.scroll();
+            if (window.scrollX !== 15 || window.scrollY !== 21 || window.scroll.length !== 0)
+              throw new Error('missing dictionary or Web IDL arity');
+            let invalidDictionary = false;
+            try { window.scrollTo(20); } catch(error) { invalidDictionary = error.name === 'TypeError'; }
+            if (!invalidDictionary) throw new Error('primitive dictionary accepted');
+
+            window.scrollTo({left: 12});
+            if (window.scrollX !== 12 || window.scrollY !== 21)
+              throw new Error('omitted absolute axis must preserve its current position');
+            window.scrollBy({top: 9});
+            if (window.scrollX !== 12 || window.scrollY !== 30)
+              throw new Error('omitted relative axis must contribute zero');
+            window.scrollTo(Infinity, NaN);
+            if (window.scrollX !== 0 || window.scrollY !== 0)
+              throw new Error('non-finite scroll coordinates must normalize to zero');
+            window.scrollTo(10000, 10000);
+            if (!same() || window.scrollX > 1000 || window.scrollY > 1000)
+              throw new Error('root scroll offsets must be clamped to layout extent');
+            true
+            "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn window_scroll_methods_use_the_receiver_window_realm() {
+        struct NoText;
+        impl lumen_html::paint::TextShaper for NoText {
+            fn shape(&self, _: &str, _: f32) -> Result<lumen_html::paint::ShapedRun, ()> {
+                Err(())
+            }
+            fn ascent(&self, size: f32) -> f32 {
+                size * 0.8
+            }
+            fn line_height(&self, size: f32) -> f32 {
+                size * 1.2
+            }
+        }
+
+        let mut engine = Engine::new();
+        let parent = crate::install(
+            engine.ctx(),
+            "<iframe id='child' srcdoc=\"<style>html,body{margin:0}body{height:300px}</style>\"></iframe>",
+            32,
+        )
+        .unwrap();
+        let iframe = {
+            let session = parent.session.borrow();
+            lumen_html::selector::get_element_by_id(
+                session.document(),
+                session.document().root(),
+                "child",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let frame = parent
+            .ensure_frame_context(engine.ctx(), iframe)
+            .expect("create the same-origin iframe realm");
+        let child = frame.current_document().expect("install srcdoc");
+        child.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(100, 80, &NoText)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+
+        let result = script(
+            &mut engine,
+            r#"
+            const childWindow = document.getElementById('child').contentWindow;
+            const borrowedScrollTo = window.scrollTo;
+            borrowedScrollTo.call(childWindow, 0, 25);
+            const foreignWindowReceiver = childWindow.scrollY === 25 && window.scrollY === 0;
+            let rejectsUnbrandedReceiver = false;
+            try { borrowedScrollTo.call({}, 0, 40); }
+            catch (error) { rejectsUnbrandedReceiver = error instanceof TypeError; }
+            foreignWindowReceiver && rejectsUnbrandedReceiver
+            "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn element_scroll_methods_update_only_the_receiving_node() {
+        struct NoText;
+        impl lumen_html::paint::TextShaper for NoText {
+            fn shape(&self, _: &str, _: f32) -> Result<lumen_html::paint::ShapedRun, ()> {
+                Err(())
+            }
+            fn ascent(&self, size: f32) -> f32 {
+                size * 0.8
+            }
+            fn line_height(&self, size: f32) -> f32 {
+                size * 1.2
+            }
+        }
+
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<style>html,body{margin:0}#scroller{width:20px;height:20px;overflow:auto}#content{width:200px;height:200px}</style><div id=scroller><div id=content></div></div>",
+            32,
+        )
+        .unwrap();
+        realm.set_layout_flusher(Rc::new(|session| {
+            session
+                .display_list(100, 80, &NoText)
+                .map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+
+        let result = script(
+            &mut engine,
+            r#"
+            const scroller = document.getElementById('scroller');
+            const first = scroller.scrollTo(12, 15);
+            if (!(first instanceof Promise) || scroller.scrollLeft !== 12 || scroller.scrollTop !== 15 ||
+                window.scrollX !== 0 || window.scrollY !== 0)
+              throw new Error('Element.scrollTo must update only its own scroll node');
+            const second = scroller.scrollBy({top: 7});
+            if (!(second instanceof Promise) || scroller.scrollLeft !== 12 || scroller.scrollTop !== 22)
+              throw new Error('Element.scrollBy dictionary overload');
+            scroller.scroll({left: 5});
+            if (scroller.scrollLeft !== 5 || scroller.scrollTop !== 22)
+              throw new Error('Element.scroll dictionary overload');
+            scroller.scrollTo({behavior: 'instant', top: 4});
+            scroller.scrollLeft === 5 && scroller.scrollTop === 4 && window.scrollX === 0 && window.scrollY === 0
+            "#,
+        );
+        assert!(matches!(result, Value::Bool(true)));
     }
 }

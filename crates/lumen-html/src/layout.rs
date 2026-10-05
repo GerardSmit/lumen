@@ -1,23 +1,32 @@
 //! Block formatting into a typed display list in CSS pixels.
 use crate::{
-    Document, Namespace, NodeId, NodeKind,
     css::{
         self, AlignItems, BorderStyle, BoxSizing, Clear, Direction, Display, FlexDirection, Float,
-        JustifyContent, LineHeight, Position, Style, StyleIndex, TextAlign, WhiteSpace,
+        JustifyContent, LineHeight, Overflow, Position, Style, StyleIndex, TextAlign, WhiteSpace,
     },
     paint::{
         Affine, BackgroundBox, BackgroundImage, BackgroundLayer, BackgroundPaint, BackgroundRepeat,
-        BackgroundSize, BackgroundSizeKind, Command, DisplayList, FontSpec, ImageData,
-        LengthPercentage, MAX_BACKGROUND_LAYERS, Rect, Rgba, TextShaper,
+        BackgroundSize, BackgroundSizeKind, Command, DisplayList, FontSpec, Glyph, ImageData,
+        FontRelativeMetrics, LengthPercentage, Rect, Rgba, ShapedRun, TextShaper, MAX_BACKGROUND_LAYERS,
     },
+    Document, Namespace, NodeId, NodeKind,
 };
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::ops::Range;
+
+pub(crate) const DEFAULT_CANVAS_BACKGROUND: Rgba = Rgba {
+    r: 255,
+    g: 255,
+    b: 255,
+    a: 255,
+};
 
 pub trait ImageResolver {
     fn resolve(&self, source: &str) -> ImageState;
@@ -95,6 +104,25 @@ fn resolve_element_image(
             }
         })
     })
+}
+
+fn replacement_content_url(style: &Style) -> Result<Option<Arc<str>>, LayoutError> {
+    match style.generated_content() {
+        css::GeneratedContent::Normal | css::GeneratedContent::None => Ok(None),
+        css::GeneratedContent::Items(items) => {
+            let Some(css::GeneratedContentItem::Url(source)) = items.first() else {
+                return Err(LayoutError::UnsupportedGeneratedContent);
+            };
+            if items.len() > 2
+                || items.get(1).is_some_and(|item| {
+                    !matches!(item, css::GeneratedContentItem::AlternativeText(_))
+                })
+            {
+                return Err(LayoutError::UnsupportedGeneratedContent);
+            }
+            Ok(Some(source.clone()))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -698,7 +726,9 @@ fn svg_clip_reference_supported(
                 attributes,
             } => (name, attributes),
             NodeKind::Element { .. } => return Ok(false),
-            NodeKind::Text(text) if !text.trim().is_empty() => return Ok(false),
+            NodeKind::Text(text) | NodeKind::CData(text) if !text.trim().is_empty() => {
+                return Ok(false);
+            }
             _ => continue,
         };
         let tag = crate::svg::local_name(name);
@@ -954,7 +984,7 @@ fn svg_use_target_supported(
                 ) {
                     continue;
                 }
-            } else if let NodeKind::Text(text) = &kind {
+            } else if let NodeKind::Text(text) | NodeKind::CData(text) = &kind {
                 if !text.trim().is_empty() {
                     return Ok(false);
                 }
@@ -1129,7 +1159,9 @@ struct RetainedFragmentKey {
     depth: usize,
     parent_height: Option<f32>,
     containing_block: Option<Rect>,
+    containing_block_node: Option<NodeId>,
     fixed_containing_block: Option<Rect>,
+    fixed_containing_block_node: Option<NodeId>,
     sticky_bounds: Option<Rect>,
     cull: Rect,
     viewport: Rect,
@@ -1149,21 +1181,132 @@ struct RetainedFragment {
     advance: f32,
     collapsed_bottom: Option<f32>,
     was_through: Option<f32>,
+    overflow: OverflowMetrics,
     commands: Arc<[Command]>,
     hits: Arc<[HitRegion]>,
     transforms: Arc<[HitTransform]>,
     rounded_clips: Arc<[HitClip]>,
     scroll_extents: Arc<[ScrollOffset]>,
+    scroll_ports: Arc<[ScrollPort]>,
+    viewport_fixed_nodes: Arc<[NodeId]>,
     scroll_regions: Arc<[ScrollRegion]>,
     control_text_runs: Arc<[ControlTextRun]>,
+    /// Layout of this subtree consulted the text shaper, so its commands and
+    /// geometry depend on loaded fonts.
+    has_text: bool,
     bytes: usize,
     last_used: u64,
 }
 
+/// Counts font-dependent queries so retained fragments can record whether
+/// their subtree depended on fonts.
+struct CountingShaper<'a> {
+    inner: &'a dyn TextShaper,
+    uses: core::cell::Cell<u64>,
+}
+
+impl CountingShaper<'_> {
+    fn bump(&self) {
+        self.uses.set(self.uses.get().wrapping_add(1));
+    }
+}
+
+impl TextShaper for CountingShaper<'_> {
+    fn generation(&self) -> u64 {
+        self.inner.generation()
+    }
+    fn shape(&self, text: &str, size: f32) -> Result<ShapedRun, ()> {
+        self.bump();
+        self.inner.shape(text, size)
+    }
+    fn shape_directional(&self, text: &str, size: f32, rtl: bool) -> Result<ShapedRun, ()> {
+        self.bump();
+        self.inner.shape_directional(text, size, rtl)
+    }
+    fn measure(&self, text: &str, size: f32) -> Result<f32, ()> {
+        self.bump();
+        self.inner.measure(text, size)
+    }
+    fn shape_styled(
+        &self,
+        text: &str,
+        size: f32,
+        rtl: bool,
+        font: &FontSpec,
+    ) -> Result<ShapedRun, ()> {
+        self.bump();
+        self.inner.shape_styled(text, size, rtl, font)
+    }
+    fn shape_resolved(
+        &self,
+        text: &str,
+        size: f32,
+        rtl: bool,
+        font: &FontSpec,
+    ) -> Result<ShapedRun, ()> {
+        self.bump();
+        self.inner.shape_resolved(text, size, rtl, font)
+    }
+    fn measure_styled(&self, text: &str, size: f32, font: &FontSpec) -> Result<f32, ()> {
+        self.bump();
+        self.inner.measure_styled(text, size, font)
+    }
+    fn ascent_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        self.bump();
+        self.inner.ascent_styled(size, font)
+    }
+    fn line_height_styled(&self, size: f32, font: &FontSpec) -> f32 {
+        self.bump();
+        self.inner.line_height_styled(size, font)
+    }
+    fn underline_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
+        self.bump();
+        self.inner.underline_metrics_styled(size, font)
+    }
+    fn strike_metrics_styled(&self, size: f32, font: &FontSpec) -> (f32, f32) {
+        self.bump();
+        self.inner.strike_metrics_styled(size, font)
+    }
+    fn font_relative_metrics_styled(&self, size: f32, font: &FontSpec) -> FontRelativeMetrics {
+        self.bump();
+        self.inner.font_relative_metrics_styled(size, font)
+    }
+    fn ascent(&self, size: f32) -> f32 {
+        self.bump();
+        self.inner.ascent(size)
+    }
+    fn line_height(&self, size: f32) -> f32 {
+        self.bump();
+        self.inner.line_height(size)
+    }
+    fn underline_metrics(&self, size: f32) -> (f32, f32) {
+        self.bump();
+        self.inner.underline_metrics(size)
+    }
+    fn strike_metrics(&self, size: f32) -> (f32, f32) {
+        self.bump();
+        self.inner.strike_metrics(size)
+    }
+}
+
+type RetainedNodeKey = (u64, u32, u32);
+
+fn retained_node_key(node: NodeId) -> RetainedNodeKey {
+    (node.document, node.index, node.generation)
+}
+
+/// Bytes charged per entry for its slot-index and recency-index nodes.
+const RETAINED_INDEX_ENTRY_BYTES: usize = 2
+    * (core::mem::size_of::<(RetainedNodeKey, usize)>() + core::mem::size_of::<usize>() * 4);
+
 /// Bounded command/geometry fragments retained between RenderSession frames.
+/// `index` maps a node to its slot and `lru` orders slots by last use; both are
+/// charged to the byte budget through `RETAINED_INDEX_ENTRY_BYTES`.
 #[derive(Default)]
 pub(crate) struct RetainedLayoutCache {
     entries: Vec<RetainedFragment>,
+    index: BTreeMap<RetainedNodeKey, usize>,
+    lru: BTreeMap<u64, RetainedNodeKey>,
     bytes: usize,
     clock: u64,
     hits: usize,
@@ -1173,6 +1316,8 @@ pub(crate) struct RetainedLayoutCache {
 impl RetainedLayoutCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+        self.index.clear();
+        self.lru.clear();
         self.bytes = 0;
         self.hits = 0;
         self.misses = 0;
@@ -1193,13 +1338,24 @@ impl RetainedLayoutCache {
         }
     }
 
+    /// Drops fragments whose layout consulted the text shaper; they include
+    /// every ancestor of a text-bearing fragment because ancestors replay
+    /// their descendants' commands.
+    pub(crate) fn invalidate_fonts(&mut self) {
+        if !self.entries.iter().any(|entry| entry.has_text) {
+            return;
+        }
+        self.entries.retain(|entry| !entry.has_text);
+        self.rebuild_indexes();
+    }
+
     pub(crate) fn invalidate_text_targets(&mut self, document: &Document, targets: &[NodeId]) {
         self.entries.retain(|entry| {
             !targets
                 .iter()
                 .any(|target| document_is_ancestor(document, entry.key.node, *target))
         });
-        self.recount_bytes();
+        self.rebuild_indexes();
     }
 
     pub(crate) fn invalidate_subtree_targets(&mut self, document: &Document, targets: &[NodeId]) {
@@ -1210,65 +1366,78 @@ impl RetainedLayoutCache {
                         || document_is_ancestor(document, *target, entry.key.node)
                 })
         });
-        self.recount_bytes();
+        self.rebuild_indexes();
     }
 
     fn lookup(&mut self, key: &RetainedFragmentKey) -> Option<RetainedFragment> {
         self.clock = self.clock.saturating_add(1);
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.key.node == key.node);
-        if let Some(index) = index {
-            if self.entries[index].key == *key {
-                self.entries[index].last_used = self.clock;
+        let node = retained_node_key(key.node);
+        if let Some(&slot) = self.index.get(&node) {
+            if self.entries[slot].key == *key {
+                let previous = core::mem::replace(&mut self.entries[slot].last_used, self.clock);
+                self.lru.remove(&previous);
+                self.lru.insert(self.clock, node);
                 self.hits = self.hits.saturating_add(1);
-                return Some(self.entries[index].clone());
+                return Some(self.entries[slot].clone());
             }
-            self.misses = self.misses.saturating_add(1);
-        } else {
-            self.misses = self.misses.saturating_add(1);
         }
+        self.misses = self.misses.saturating_add(1);
         None
     }
 
+    fn remove_slot(&mut self, slot: usize) {
+        let removed = self.entries.swap_remove(slot);
+        self.bytes = self.bytes.saturating_sub(removed.bytes);
+        self.index.remove(&retained_node_key(removed.key.node));
+        self.lru.remove(&removed.last_used);
+        if let Some(moved) = self.entries.get(slot) {
+            self.index.insert(retained_node_key(moved.key.node), slot);
+        }
+    }
+
     fn store(&mut self, mut fragment: RetainedFragment) {
-        if fragment.bytes == 0 || fragment.bytes > MAX_RETAINED_FRAGMENT_BYTES {
+        let Some(charged) = fragment.bytes.checked_add(RETAINED_INDEX_ENTRY_BYTES) else {
+            return;
+        };
+        if fragment.bytes == 0 || charged > MAX_RETAINED_FRAGMENT_BYTES {
             return;
         }
+        fragment.bytes = charged;
         self.clock = self.clock.saturating_add(1);
         fragment.last_used = self.clock;
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.key.node == fragment.key.node)
-        {
-            self.bytes = self.bytes.saturating_sub(self.entries[index].bytes);
-            self.entries.remove(index);
+        let node = retained_node_key(fragment.key.node);
+        if let Some(&slot) = self.index.get(&node) {
+            self.remove_slot(slot);
         }
         while self.entries.len() >= MAX_RETAINED_FRAGMENT_ENTRIES
             || self.bytes.saturating_add(fragment.bytes) > MAX_RETAINED_FRAGMENT_BYTES
         {
-            let Some((index, _)) = self
-                .entries
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used)
-            else {
+            let Some(oldest) = self.lru.values().next().copied() else {
                 return;
             };
-            self.bytes = self.bytes.saturating_sub(self.entries[index].bytes);
-            self.entries.remove(index);
+            let Some(&slot) = self.index.get(&oldest) else {
+                return;
+            };
+            self.remove_slot(slot);
         }
         if self.entries.try_reserve(1).is_err() {
             return;
         }
         self.bytes += fragment.bytes;
+        self.index.insert(node, self.entries.len());
+        self.lru.insert(fragment.last_used, node);
         self.entries.push(fragment);
     }
 
-    fn recount_bytes(&mut self) {
-        self.bytes = self.entries.iter().map(|entry| entry.bytes).sum();
+    fn rebuild_indexes(&mut self) {
+        self.index.clear();
+        self.lru.clear();
+        self.bytes = 0;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            self.index.insert(retained_node_key(entry.key.node), slot);
+            self.lru.insert(entry.last_used, retained_node_key(entry.key.node));
+            self.bytes += entry.bytes;
+        }
     }
 }
 
@@ -1326,6 +1495,8 @@ fn retained_fragment_bytes(
     transforms: &[HitTransform],
     clips: &[HitClip],
     extents: &[ScrollOffset],
+    scroll_ports: &[ScrollPort],
+    viewport_fixed_nodes: &[NodeId],
     scroll_regions: &[ScrollRegion],
     control_runs: &[ControlTextRun],
 ) -> Option<usize> {
@@ -1374,6 +1545,18 @@ fn retained_fragment_bytes(
     )?;
     add_retained_bytes(
         &mut bytes,
+        scroll_ports
+            .len()
+            .checked_mul(core::mem::size_of::<ScrollPort>())?,
+    )?;
+    add_retained_bytes(
+        &mut bytes,
+        viewport_fixed_nodes
+            .len()
+            .checked_mul(core::mem::size_of::<NodeId>())?,
+    )?;
+    add_retained_bytes(
+        &mut bytes,
         scroll_regions
             .len()
             .checked_mul(core::mem::size_of::<ScrollRegion>())?,
@@ -1396,7 +1579,7 @@ fn retained_fragment_bytes(
     // Each retained slice owns one Arc allocation; charge its header as well
     // as the payload. The style/font Arcs above are charged by reference.
     let arc_header = 2 * core::mem::size_of::<usize>();
-    for _ in 0..7 {
+    for _ in 0..9 {
         add_retained_bytes(&mut bytes, arc_header)?;
     }
     Some(bytes)
@@ -1443,6 +1626,26 @@ struct TableRowGroup {
     first_row: usize,
     end_row: usize,
     style: Style,
+}
+
+struct TableRow {
+    /// Anonymous rows have no DOM node or hit region.
+    node: Option<NodeId>,
+    style: Style,
+    cells: Range<usize>,
+}
+
+/// A table cell in the CSS table box tree. `Anonymous` retains only a bounded
+/// range of already flattened DOM children; it never adds wrappers to the
+/// document tree or invents a persistent node identity.
+#[derive(Clone)]
+enum TableCellContent {
+    Node(NodeId),
+    Anonymous {
+        parent: NodeId,
+        children: Range<usize>,
+        style: Style,
+    },
 }
 
 struct TableColumnSpan {
@@ -1670,6 +1873,20 @@ fn append_bounded_control_text(value: &mut String, part: &str) -> Result<(), Lay
     Ok(())
 }
 
+fn append_bounded_input_placeholder(value: &mut String, part: &str) -> Result<(), LayoutError> {
+    let remaining = MAX_CONTROL_TEXT_BYTES.saturating_sub(value.len());
+    let bytes = crate::forms::characters_without_newlines(part)
+        .map(char::len_utf8)
+        .try_fold(0usize, |total, bytes| total.checked_add(bytes))
+        .filter(|bytes| *bytes <= remaining)
+        .ok_or(LayoutError::CommandLimit)?;
+    value
+        .try_reserve(bytes)
+        .map_err(|_| LayoutError::CommandLimit)?;
+    value.extend(crate::forms::characters_without_newlines(part));
+    Ok(())
+}
+
 fn control_grapheme_ranges(value: &str) -> Result<Vec<Range<usize>>, LayoutError> {
     let count = lumen_common::ucd::graphemes(value).count();
     let mut ranges = Vec::new();
@@ -1775,7 +1992,7 @@ pub(crate) fn stylesheet_identity(
         .first_child(owner)
         .map_err(|_| LayoutError::InvalidTree)?;
     while let Some(current) = child {
-        if let NodeKind::Text(value) = document
+        if let NodeKind::Text(value) | NodeKind::CData(value) = document
             .kind(current)
             .map_err(|_| LayoutError::InvalidTree)?
         {
@@ -1813,6 +2030,7 @@ pub(crate) fn stylesheets_with_sources(
 ) -> Result<(StyleIndex, Vec<css::FontFaceRule>), LayoutError> {
     let mut rules = Vec::new();
     let mut sheets = Vec::new();
+    let mut scoped_keyframes = Vec::new();
     let mut pending = alloc::vec![document.root()];
     while let Some(id) = pending.pop() {
         if let NodeKind::Element {
@@ -1869,6 +2087,11 @@ pub(crate) fn stylesheets_with_sources(
                                 conditions.push(Arc::from(media));
                                 face.media = conditions.into();
                             }
+                            for keyframes in &mut parsed.keyframes {
+                                let mut conditions = keyframes.media.to_vec();
+                                conditions.push(Arc::from(media));
+                                keyframes.media = conditions.into();
+                            }
                         }
                         assign_css_font_face_identities(
                             &mut parsed,
@@ -1917,6 +2140,11 @@ pub(crate) fn stylesheets_with_sources(
                             conditions.push(Arc::from(media));
                             face.media = conditions.into();
                         }
+                        for keyframes in &mut parsed.keyframes {
+                            let mut conditions = keyframes.media.to_vec();
+                            conditions.push(Arc::from(media));
+                            keyframes.media = conditions.into();
+                        }
                     }
                 }
                 assign_css_font_face_identities(&mut parsed, css::FontFaceOwnerId::Element(id));
@@ -1960,7 +2188,7 @@ pub(crate) fn stylesheets_with_sources(
                             .first_child(id)
                             .map_err(|_| LayoutError::InvalidTree)?;
                         while let Some(current) = child {
-                            if let NodeKind::Text(value) = document
+                            if let NodeKind::Text(value) | NodeKind::CData(value) = document
                                 .kind(current)
                                 .map_err(|_| LayoutError::InvalidTree)?
                             {
@@ -1970,15 +2198,16 @@ pub(crate) fn stylesheets_with_sources(
                                 .next_sibling(current)
                                 .map_err(|_| LayoutError::InvalidTree)?;
                         }
-                        let parsed =
-                            css::parse_scoped(&text, Some(root)).map_err(LayoutError::Css)?;
-                        if rules.len() + parsed.len() > css::MAX_RULES {
+                        let mut parsed = css::parse_scoped_stylesheet(&text, Some(root))
+                            .map_err(LayoutError::Css)?;
+                        if rules.len() + parsed.rules.len() > css::MAX_RULES {
                             return Err(LayoutError::Css(css::CssError {
                                 offset: 0,
                                 message: "too many rules",
                             }));
                         }
-                        rules.extend(parsed);
+                        rules.extend(parsed.rules);
+                        scoped_keyframes.append(&mut parsed.keyframes);
                         false
                     } else {
                         true
@@ -2032,6 +2261,18 @@ pub(crate) fn stylesheets_with_sources(
             }
         }
     }
+    let mut keyframes = Vec::new();
+    for sheet in &sheets {
+        for keyframe in &sheet.keyframes {
+            let mut keyframe = keyframe.clone();
+            keyframe.source_order = keyframes.len();
+            keyframes.push(keyframe);
+        }
+    }
+    keyframes.extend(scoped_keyframes);
+    for (order, keyframe) in keyframes.iter_mut().enumerate() {
+        keyframe.source_order = order;
+    }
     let faces = css::canonicalize_font_faces(&mut sheets)
         .into_iter()
         .map(|mut face| {
@@ -2045,19 +2286,24 @@ pub(crate) fn stylesheets_with_sources(
             face
         })
         .collect();
-    Ok((
-        StyleIndex::new_with_document_base_url(rules, document_base),
-        faces,
-    ))
+    let mut style_index = StyleIndex::new_with_document_base_url(rules, document_base);
+    style_index.keyframes = keyframes;
+    Ok((style_index, faces))
 }
 
 struct Layout<'a> {
     document: &'a Document,
     text: &'a dyn TextShaper,
+    text_uses: &'a core::cell::Cell<u64>,
     rules: &'a StyleIndex,
     images: Option<&'a dyn ImageResolver>,
     commands: Vec<Command>,
     command_bytes: usize,
+    /// One bounded arena; each independent formatting context owns a suffix.
+    floats: Vec<(Rect, Float)>,
+    float_start: usize,
+    /// Visual relative/sticky displacement, excluded from normal-flow float geometry.
+    float_offset: (f32, f32),
     body_background_on_canvas: bool,
     viewport: Rect,
     geometry: Option<&'a mut LayoutGeometry>,
@@ -2070,7 +2316,11 @@ struct Layout<'a> {
     /// uniformly (out-of-flow, sticky, multicol); such scrollers relayout.
     scroll_hazards: usize,
     containing_block: Option<Rect>,
+    containing_block_node: Option<NodeId>,
     fixed_containing_block: Option<Rect>,
+    fixed_containing_block_node: Option<NodeId>,
+    root_scroll: (f32, f32),
+    overflow_frames: Vec<OverflowFrame>,
     sticky_bounds: Option<Rect>,
     transform_depth: usize,
     parent_height: Option<f32>,
@@ -2097,6 +2347,12 @@ struct Layout<'a> {
     intrinsic_cache: core::cell::RefCell<Vec<Option<(Style, (f32, f32))>>>,
     /// Cascade results for this run, keyed by node and parent style.
     style_cache: &'a core::cell::RefCell<css::StyleCache>,
+    /// Quote nesting depths computed in one composed-tree preorder for all
+    /// generated pseudo content in this display-list pass.
+    quote_positions: Vec<QuotePosition>,
+    /// Only pseudo-elements that reference a counter retain resolved output;
+    /// active counter maps are never cloned per DOM node.
+    counter_positions: Vec<CounterNodeValues>,
     /// Session-owned bounded subtree command/geometry cache.
     retained_fragments: Option<&'a mut RetainedLayoutCache>,
     /// Cell borders are painted once by the collapsed-border conflict pass.
@@ -2122,6 +2378,152 @@ fn is_svg_root_element(kind: &NodeKind) -> bool {
 }
 
 impl Layout<'_> {
+    fn finish_root_scroll_extent(&mut self) -> Result<(), LayoutError> {
+        if self.overflow_frames.is_empty() {
+            return Ok(());
+        }
+        if self.overflow_frames.len() != 1 || self.overflow_frames[0].node != self.document.root() {
+            return Err(LayoutError::InvalidTree);
+        }
+        let frame = self.overflow_frames.pop().ok_or(LayoutError::InvalidTree)?;
+        let extent = frame.extent.unwrap_or(self.viewport);
+        let max_x = (extent.x + extent.width - (self.viewport.x + self.viewport.width)).max(0.0);
+        let max_y = (extent.y + extent.height - (self.viewport.y + self.viewport.height)).max(0.0);
+        if let Some(geometry) = self.geometry.as_deref_mut() {
+            if max_x > 0.0 || max_y > 0.0 {
+                if geometry.scroll_extents.len() >= MAX_DISPLAY_COMMANDS {
+                    return Err(LayoutError::CommandLimit);
+                }
+                geometry
+                    .scroll_extents
+                    .try_reserve(1)
+                    .map_err(|_| LayoutError::CommandLimit)?;
+                geometry.scroll_extents.push(ScrollOffset {
+                    node: self.document.root(),
+                    x: max_x,
+                    y: max_y,
+                });
+            }
+            if geometry.scroll_ports.len() >= MAX_DISPLAY_COMMANDS {
+                return Err(LayoutError::CommandLimit);
+            }
+            geometry
+                .scroll_ports
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            geometry.scroll_ports.push(ScrollPort {
+                node: self.document.root(),
+                rect: self.viewport,
+                owner_hit: None,
+            });
+        }
+        Ok(())
+    }
+
+    fn include_overflow(&mut self, rect: Option<Rect>, route: OverflowRoute) {
+        let Some(rect) = rect else {
+            return;
+        };
+        let target = match route {
+            OverflowRoute::Parent => self.overflow_frames.len().checked_sub(1),
+            OverflowRoute::ContainingBlock(node) => self
+                .overflow_frames
+                .iter()
+                .rposition(|frame| frame.node == node),
+            OverflowRoute::Root => self
+                .overflow_frames
+                .iter()
+                .position(|frame| frame.node == self.document.root()),
+            OverflowRoute::ViewportFixed => None,
+        };
+        if let Some(frame) = target.and_then(|index| self.overflow_frames.get_mut(index)) {
+            frame.include_child(rect);
+        }
+    }
+
+    fn prepare_quote_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
+        if !self.rules.has_quote_content() && !contains_html_quote_element(self.document, root, 0)?
+        {
+            return Ok(());
+        }
+        let node_count = self.document.node_count();
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(node_count)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        positions.resize_with(node_count, QuotePosition::default);
+        let mut quote_depth = 0usize;
+        let mut visited = 0usize;
+        collect_quote_positions(
+            self.document,
+            self.rules,
+            self.text,
+            self.style_cache,
+            root,
+            None,
+            None,
+            &QuoteSystem::Auto(None),
+            &mut quote_depth,
+            &mut visited,
+            &mut positions,
+            0,
+        )?;
+        self.quote_positions = positions;
+        Ok(())
+    }
+
+    fn prepare_counter_positions(&mut self, root: NodeId) -> Result<(), LayoutError> {
+        if !self.rules.has_counter_data()
+            && !self.rules.has_list_item_data()
+            && !contains_list_item_candidate(self.document, root)?
+        {
+            return Ok(());
+        }
+        let mut active = Vec::new();
+        active
+            .try_reserve(32)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        let mut positions = Vec::new();
+        let mut visited = 0usize;
+        let mut replacement_count = 0usize;
+        let mut output_bytes = 0usize;
+        collect_counter_positions(
+            self.document,
+            self.rules,
+            self.text,
+            self.style_cache,
+            root,
+            None,
+            self.document.root(),
+            &mut active,
+            &mut positions,
+            &mut visited,
+            &mut replacement_count,
+            &mut output_bytes,
+            0,
+        )?;
+        positions.sort_unstable_by_key(|position| position.node.index());
+        self.counter_positions = positions;
+        Ok(())
+    }
+
+    fn counter_replacements(
+        &self,
+        node: NodeId,
+        pseudo: css::PseudoElement,
+    ) -> Option<Arc<[CounterReplacement]>> {
+        let index = self
+            .counter_positions
+            .binary_search_by_key(&node.index(), |position| position.node.index())
+            .ok()?;
+        let position = &self.counter_positions[index];
+        match pseudo {
+            css::PseudoElement::Marker => position.marker.clone(),
+            css::PseudoElement::Before => position.before.clone(),
+            css::PseudoElement::After => position.after.clone(),
+        }
+    }
+
     fn computed_style(&self, node: NodeId, parent: Option<&Style>) -> Result<Style, css::CssError> {
         css::compute_node_cached_with_text(
             self.document,
@@ -2131,6 +2533,821 @@ impl Layout<'_> {
             &mut self.style_cache.borrow_mut(),
             self.text,
         )
+    }
+
+    fn flattened_box_children(
+        &self,
+        parent: NodeId,
+        parent_style: &Style,
+        available: f32,
+        depth: usize,
+    ) -> Result<Vec<FlattenedBoxChild>, LayoutError> {
+        self.flattened_box_children_with_options(parent, parent_style, available, depth, true, true)
+    }
+
+    fn flattened_box_children_with_options(
+        &self,
+        parent: NodeId,
+        parent_style: &Style,
+        available: f32,
+        depth: usize,
+        include_contents_pseudos: bool,
+        resolve_percentages: bool,
+    ) -> Result<Vec<FlattenedBoxChild>, LayoutError> {
+        let mut children = Vec::new();
+        self.append_flattened_box_children(
+            parent,
+            parent_style,
+            available,
+            depth,
+            include_contents_pseudos,
+            resolve_percentages,
+            &mut children,
+        )?;
+        Ok(children)
+    }
+
+    fn append_flattened_box_children(
+        &self,
+        parent: NodeId,
+        parent_style: &Style,
+        available: f32,
+        depth: usize,
+        include_contents_pseudos: bool,
+        resolve_percentages: bool,
+        output: &mut Vec<FlattenedBoxChild>,
+    ) -> Result<(), LayoutError> {
+        if depth > 512 {
+            return Err(LayoutError::DepthLimit);
+        }
+        let anonymous_style = (parent_style.display == Display::Contents)
+            .then(|| parent_style.display_contents_child_style());
+        let mut children = self
+            .document
+            .composed_children_iter(parent)
+            .map_err(|_| LayoutError::InvalidTree)?;
+        while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+            let kind = self
+                .document
+                .kind(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            match kind {
+                NodeKind::Element { .. } => {
+                    let computed = self
+                        .computed_style(node, Some(parent_style))
+                        .map_err(LayoutError::Css)?;
+                    if computed.display == Display::None {
+                        continue;
+                    }
+                    if computed.display == Display::Contents {
+                        let pseudo_style = computed.clone();
+                        if include_contents_pseudos {
+                            if let Some(before) = self.virtual_generated_child(
+                                node,
+                                &pseudo_style,
+                                css::PseudoElement::Before,
+                                available,
+                            )? {
+                                if output.len() >= MAX_DISPLAY_COMMANDS {
+                                    return Err(LayoutError::CommandLimit);
+                                }
+                                output
+                                    .try_reserve(1)
+                                    .map_err(|_| LayoutError::CommandLimit)?;
+                                output.push(FlattenedBoxChild {
+                                    kind: FlattenedBoxChildKind::Generated(before),
+                                    parent: node,
+                                    parent_style: pseudo_style.clone(),
+                                    computed_style: None,
+                                });
+                            }
+                        }
+                        // A boxless element still supplies its complete computed
+                        // style for explicit `inherit` on descendant elements.
+                        // Only anonymous text boxes need the neutral box style.
+                        self.append_flattened_box_children(
+                            node,
+                            &computed,
+                            available,
+                            depth + 1,
+                            include_contents_pseudos,
+                            resolve_percentages,
+                            output,
+                        )?;
+                        if include_contents_pseudos {
+                            if let Some(after) = self.virtual_generated_child(
+                                node,
+                                &pseudo_style,
+                                css::PseudoElement::After,
+                                available,
+                            )? {
+                                if output.len() >= MAX_DISPLAY_COMMANDS {
+                                    return Err(LayoutError::CommandLimit);
+                                }
+                                output
+                                    .try_reserve(1)
+                                    .map_err(|_| LayoutError::CommandLimit)?;
+                                output.push(FlattenedBoxChild {
+                                    kind: FlattenedBoxChildKind::Generated(after),
+                                    parent: node,
+                                    parent_style: pseudo_style,
+                                    computed_style: None,
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    let mut resolved = computed;
+                    if resolve_percentages
+                        && !matches!(resolved.position, Position::Absolute | Position::Fixed)
+                    {
+                        resolved = resolved.resolve_percentages(available, self.parent_height);
+                    }
+                    if output.len() >= MAX_DISPLAY_COMMANDS {
+                        return Err(LayoutError::CommandLimit);
+                    }
+                    output
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    output.push(FlattenedBoxChild {
+                        kind: FlattenedBoxChildKind::Node(node),
+                        parent,
+                        parent_style: parent_style.clone(),
+                        computed_style: Some(resolved),
+                    });
+                }
+                NodeKind::Text(_) | NodeKind::CData(_) => {
+                    if output.len() >= MAX_DISPLAY_COMMANDS {
+                        return Err(LayoutError::CommandLimit);
+                    }
+                    output
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    output.push(FlattenedBoxChild {
+                        kind: FlattenedBoxChildKind::Node(node),
+                        parent,
+                        parent_style: anonymous_style.as_ref().unwrap_or(parent_style).clone(),
+                        computed_style: None,
+                    });
+                }
+                NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. } => {}
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn flattened_box_child_inline_eligible(
+        &self,
+        child: &FlattenedBoxChild,
+        available: f32,
+        depth: usize,
+    ) -> Result<bool, LayoutError> {
+        match &child.kind {
+            FlattenedBoxChildKind::Node(node) => self.paragraph_inline_eligible(
+                *node,
+                &child.parent_style,
+                child.computed_style.as_ref(),
+                available,
+                depth,
+            ),
+            FlattenedBoxChildKind::Generated(generated) => Ok(generated.style.display
+                == Display::Inline
+                && Self::paragraph_inline_style(&generated.style, &child.parent_style)),
+        }
+    }
+
+    fn append_flattened_box_child_inline(
+        &mut self,
+        child: &FlattenedBoxChild,
+        available: f32,
+        paragraph: &mut InlineParagraph,
+        frame_path: &mut Vec<usize>,
+        depth: usize,
+    ) -> Result<(), LayoutError> {
+        match &child.kind {
+            FlattenedBoxChildKind::Node(node) => self.collect_inline_paragraph_node(
+                *node,
+                child.parent,
+                &child.parent_style,
+                child.computed_style.clone(),
+                available,
+                paragraph,
+                frame_path,
+                depth,
+            ),
+            FlattenedBoxChildKind::Generated(generated) => self.append_virtual_generated_child(
+                generated,
+                &child.parent_style,
+                paragraph,
+                frame_path,
+            ),
+        }
+    }
+
+    fn append_inline_paragraph(
+        target: &mut InlineParagraph,
+        mut source: InlineParagraph,
+    ) -> Result<(), LayoutError> {
+        let text_offset = target.text.len();
+        let frame_offset = target.frames.len();
+        if text_offset
+            .checked_add(source.text.len())
+            .filter(|end| *end <= lumen_common::bidi::MAX_TEXT_BYTES)
+            .is_none()
+        {
+            return Err(LayoutError::Text);
+        }
+        if target.frames.len().saturating_add(source.frames.len()) > MAX_DISPLAY_COMMANDS
+            || target.spans.len().saturating_add(source.spans.len()) > MAX_DISPLAY_COMMANDS
+            || target.atoms.len().saturating_add(source.atoms.len()) > MAX_DISPLAY_COMMANDS
+            || target.advances.len().saturating_add(source.advances.len()) > MAX_DISPLAY_COMMANDS
+            || target
+                .hard_breaks
+                .len()
+                .saturating_add(source.hard_breaks.len())
+                > MAX_DISPLAY_COMMANDS
+        {
+            return Err(LayoutError::CommandLimit);
+        }
+        target
+            .text
+            .try_reserve(source.text.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        target
+            .frames
+            .try_reserve(source.frames.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        target
+            .spans
+            .try_reserve(source.spans.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        target
+            .atoms
+            .try_reserve(source.atoms.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        target
+            .advances
+            .try_reserve(source.advances.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        target
+            .hard_breaks
+            .try_reserve(source.hard_breaks.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+
+        for span in &mut source.spans {
+            span.range.start += text_offset;
+            span.range.end += text_offset;
+            for frame in &mut span.frames {
+                *frame += frame_offset;
+            }
+        }
+        for frame in &mut source.frames {
+            if let Some(parent) = &mut frame.parent {
+                *parent += frame_offset;
+            }
+        }
+        for atom in &mut source.atoms {
+            atom.range.start += text_offset;
+            atom.range.end += text_offset;
+            for frame in &mut atom.frames {
+                *frame += frame_offset;
+            }
+        }
+        for advance in &mut source.advances {
+            advance.offset += text_offset;
+            advance.frame += frame_offset;
+        }
+        for offset in &mut source.hard_breaks {
+            *offset += text_offset;
+        }
+        target.text.push_str(&source.text);
+        target.frames.append(&mut source.frames);
+        target.spans.append(&mut source.spans);
+        target.atoms.append(&mut source.atoms);
+        target.advances.append(&mut source.advances);
+        target.hard_breaks.append(&mut source.hard_breaks);
+        target.collapse_space = source.collapse_space;
+        Ok(())
+    }
+
+    fn inline_split_paragraph_has_content(paragraph: &InlineParagraph) -> bool {
+        !paragraph.frames.is_empty()
+            || !paragraph.atoms.is_empty()
+            || !paragraph.hard_breaks.is_empty()
+            || paragraph.text.chars().any(|character| {
+                !character.is_whitespace()
+                    && !matches!(character, '\u{200b}' | '\u{2029}' | '\u{fffc}')
+            })
+    }
+
+    fn push_block_flow_item(
+        output: &mut Vec<BlockFlowItem>,
+        item: BlockFlowItem,
+    ) -> Result<(), LayoutError> {
+        if output.len() >= MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        output
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        output.push(item);
+        Ok(())
+    }
+
+    fn flush_inline_split_paragraph(
+        output: &mut Vec<BlockFlowItem>,
+        paragraph: &mut InlineParagraph,
+        frame_path: &mut Vec<usize>,
+        has_preceding_content: bool,
+        preserve_decorated_empty: bool,
+        frame_budget: &mut usize,
+    ) -> Result<(), LayoutError> {
+        let split_storage_budget = paragraph.split_storage_budget.clone();
+        // A split can leave an empty inline fragment at the start or end of
+        // an inline box. A default empty inline fragment does not keep its
+        // line box alive; CSS 2.1 treats that line as zero-height. Nonzero
+        // margins, padding, or borders keep an edge fragment, but must not
+        // create another decoration-only line between sibling block runs.
+        let has_decorated_empty_frame = paragraph.frames.iter().any(|frame| {
+            frame.style.margin_sides.iter().any(|value| *value != 0.0)
+                || frame.style.padding_sides.iter().any(|value| *value != 0.0)
+                || border_widths(&frame.style).iter().any(|value| *value != 0.0)
+        });
+        let has_visible_text = paragraph.text.chars().any(|character| {
+            !matches!(
+                character,
+                ' ' | '\t' | '\n' | '\r' | '\x0c' | '\u{200b}' | '\u{2029}' | '\u{fffc}'
+            )
+        });
+        let has_preserved_whitespace = paragraph.spans.iter().any(|span| {
+            matches!(
+                span.style.white_space,
+                WhiteSpace::Pre | WhiteSpace::PreWrap | WhiteSpace::BreakSpaces
+            ) && paragraph.text[span.range.clone()]
+                .chars()
+                .any(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+        });
+        if has_visible_text
+            || has_preserved_whitespace
+            || (preserve_decorated_empty && has_decorated_empty_frame)
+            || !paragraph.atoms.is_empty()
+            || !paragraph.hard_breaks.is_empty()
+        {
+            *frame_budget = (*frame_budget)
+                .checked_add(paragraph.frames.len())
+                .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+                .ok_or(LayoutError::CommandLimit)?;
+            Self::push_block_flow_item(
+                output,
+                BlockFlowItem::Paragraph(core::mem::take(paragraph)),
+            )?;
+        }
+        *paragraph = InlineParagraph {
+            has_preceding_content,
+            split_storage_budget,
+            ..InlineParagraph::default()
+        };
+        frame_path.clear();
+        Ok(())
+    }
+
+    fn ensure_inline_split_frames(
+        paragraph: &mut InlineParagraph,
+        frames: &[InlineSplitFrame],
+        frame_path: &mut Vec<usize>,
+        frame_budget: usize,
+    ) -> Result<(), LayoutError> {
+        if frame_path.len() > frames.len() {
+            frame_path.truncate(frames.len());
+        }
+        while frame_path.len() < frames.len() {
+            if frame_budget
+                .checked_add(paragraph.frames.len())
+                .and_then(|count| count.checked_add(1))
+                .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+                .is_none()
+            {
+                return Err(LayoutError::CommandLimit);
+            }
+            paragraph
+                .frames
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            frame_path
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            let frame = paragraph.frames.len();
+            let source = &frames[frame_path.len()];
+            paragraph.frames.push(InlineFrame {
+                node: source.node,
+                parent: frame_path.last().copied(),
+                style: source.style.clone(),
+                virtual_pseudo: None,
+                hit: None,
+                bounds: None,
+            });
+            frame_path.push(frame);
+        }
+        Ok(())
+    }
+
+    fn check_inline_split_frame_budget(
+        paragraph: &InlineParagraph,
+        frame_budget: usize,
+    ) -> Result<(), LayoutError> {
+        if frame_budget
+            .checked_add(paragraph.frames.len())
+            .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(LayoutError::CommandLimit)
+        }
+    }
+
+    fn append_inline_split_node(
+        &mut self,
+        node: NodeId,
+        parent: NodeId,
+        parent_style: &Style,
+        computed: Option<Style>,
+        available: f32,
+        depth: usize,
+        ancestors: &mut Vec<InlineSplitFrame>,
+        paragraph: &mut InlineParagraph,
+        frame_path: &mut Vec<usize>,
+        has_preceding_content: &mut bool,
+        saw_in_flow_block: &mut bool,
+        frame_budget: &mut usize,
+        output: &mut Vec<BlockFlowItem>,
+    ) -> Result<(), LayoutError> {
+        if depth > 512 {
+            return Err(LayoutError::DepthLimit);
+        }
+        if self.paragraph_inline_eligible(
+            node,
+            parent_style,
+            computed.as_ref(),
+            available,
+            depth,
+        )? {
+            Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+            self.collect_inline_paragraph_node(
+                node,
+                parent,
+                parent_style,
+                computed,
+                available,
+                paragraph,
+                frame_path,
+                depth,
+            )?;
+            Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            *has_preceding_content |= Self::inline_split_paragraph_has_content(paragraph);
+            return Ok(());
+        }
+
+        let (is_element, is_html_element) = match self
+            .document
+            .kind(node)
+            .map_err(|_| LayoutError::InvalidTree)?
+        {
+            NodeKind::Element { namespace, .. } => (true, *namespace == Namespace::Html),
+            _ => (false, false),
+        };
+        if !is_element {
+            Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+            return self.collect_inline_paragraph_node(
+                node,
+                parent,
+                parent_style,
+                computed,
+                available,
+                paragraph,
+                frame_path,
+                depth,
+            );
+        };
+        let mut node_style = match computed {
+            Some(style) => style,
+            None => self
+                .computed_style(node, Some(parent_style))
+                .map_err(LayoutError::Css)?,
+        }
+        .resolve_percentages(available, self.parent_height);
+        if node_style.display == Display::None {
+            return Ok(());
+        }
+        if !is_html_element {
+            Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+            return self.collect_inline_paragraph_node(
+                node,
+                parent,
+                parent_style,
+                Some(node_style),
+                available,
+                paragraph,
+                frame_path,
+                depth,
+            );
+        };
+
+        if node_style.display == Display::Contents {
+            if let Some(before) = self.virtual_generated_child(
+                node,
+                &node_style,
+                css::PseudoElement::Before,
+                available,
+            )? {
+                Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+                self.append_virtual_generated_child(&before, &node_style, paragraph, frame_path)?;
+                Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            }
+            let mut children = self
+                .document
+                .composed_children_iter(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+                let child_style = if matches!(
+                    self.document
+                        .kind(child)
+                        .map_err(|_| LayoutError::InvalidTree)?,
+                    NodeKind::Element { .. }
+                ) {
+                    Some(
+                        self.computed_style(child, Some(&node_style))
+                            .map_err(LayoutError::Css)?
+                            .resolve_percentages(available, self.parent_height),
+                    )
+                } else {
+                    None
+                };
+                self.append_inline_split_node(
+                    child,
+                    node,
+                    &node_style,
+                    child_style,
+                    available,
+                    depth + 1,
+                    ancestors,
+                    paragraph,
+                    frame_path,
+                    has_preceding_content,
+                    saw_in_flow_block,
+                    frame_budget,
+                    output,
+                )?;
+            }
+            if let Some(after) = self.virtual_generated_child(
+                node,
+                &node_style,
+                css::PseudoElement::After,
+                available,
+            )? {
+                Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+                self.append_virtual_generated_child(&after, &node_style, paragraph, frame_path)?;
+                Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            }
+            return Ok(());
+        }
+
+        let in_flow = !matches!(node_style.position, Position::Absolute | Position::Fixed)
+            && node_style.float == Float::None;
+        if node_style.display == Display::Inline
+            && node_style.position == Position::Static
+            && node_style.float == Float::None
+            && !Self::inline_split_creates_group(&node_style)
+        {
+            let content_start = (
+                paragraph.text.len(),
+                paragraph.atoms.len(),
+                paragraph.hard_breaks.len(),
+                output.len(),
+            );
+            ancestors
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            ancestors.push(InlineSplitFrame {
+                node,
+                style: node_style.clone(),
+            });
+            if let Some(before) = self.virtual_generated_child(
+                node,
+                &node_style,
+                css::PseudoElement::Before,
+                available,
+            )? {
+                Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+                self.append_virtual_generated_child(&before, &node_style, paragraph, frame_path)?;
+                Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            }
+            let mut children = self
+                .document
+                .composed_children_iter(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+                let child_style = if matches!(
+                    self.document
+                        .kind(child)
+                        .map_err(|_| LayoutError::InvalidTree)?,
+                    NodeKind::Element { .. }
+                ) {
+                    Some(
+                        self.computed_style(child, Some(&node_style))
+                            .map_err(LayoutError::Css)?
+                            .resolve_percentages(available, self.parent_height),
+                    )
+                } else {
+                    None
+                };
+                self.append_inline_split_node(
+                    child,
+                    node,
+                    &node_style,
+                    child_style,
+                    available,
+                    depth + 1,
+                    ancestors,
+                    paragraph,
+                    frame_path,
+                    has_preceding_content,
+                    saw_in_flow_block,
+                    frame_budget,
+                    output,
+                )?;
+            }
+            if let Some(after) = self.virtual_generated_child(
+                node,
+                &node_style,
+                css::PseudoElement::After,
+                available,
+            )? {
+                Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+                self.append_virtual_generated_child(&after, &node_style, paragraph, frame_path)?;
+                Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            }
+            if paragraph.text.len() == content_start.0
+                && paragraph.atoms.len() == content_start.1
+                && paragraph.hard_breaks.len() == content_start.2
+                && output.len() == content_start.3
+            {
+                // Decorated inline ancestors are materialized lazily while
+                // collecting text. An empty inline has no text span to make
+                // that frame, so create its fragment explicitly before
+                // recording the horizontal advance from its box edges.
+                Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+                Self::paragraph_append_empty_inline_advance(paragraph, frame_path, &node_style)?;
+                Self::check_inline_split_frame_budget(paragraph, *frame_budget)?;
+            }
+            ancestors.pop();
+            frame_path.truncate(ancestors.len());
+            return Ok(());
+        }
+
+        let in_flow_block = in_flow
+            && !matches!(
+                node_style.display,
+                Display::Inline | Display::InlineBlock | Display::Contents | Display::None
+            );
+        let has_inline_content = Self::inline_split_paragraph_has_content(paragraph);
+        // The inline ancestors may have no text before this first block
+        // child, but a decorated empty fragment still contributes a line box
+        // and paint geometry. Materialize their frames before deciding
+        // whether the prefix paragraph is empty.
+        Self::ensure_inline_split_frames(paragraph, ancestors, frame_path, *frame_budget)?;
+        Self::flush_inline_split_paragraph(
+            output,
+            paragraph,
+            frame_path,
+            *has_preceding_content,
+            !*saw_in_flow_block && !*has_preceding_content,
+            frame_budget,
+        )?;
+        Self::push_block_flow_item(
+            output,
+            BlockFlowItem::Child(FlattenedBoxChild {
+                kind: FlattenedBoxChildKind::Node(node),
+                parent,
+                parent_style: parent_style.clone(),
+                computed_style: Some(node_style),
+            }),
+        )?;
+        if in_flow_block {
+            *saw_in_flow_block = true;
+            *has_preceding_content = false;
+            paragraph.has_preceding_content = false;
+        } else {
+            *has_preceding_content |= has_inline_content;
+            paragraph.has_preceding_content = *has_preceding_content;
+        }
+        Ok(())
+    }
+
+    /// Opacity and transforms group the whole inline box, including block
+    /// children, so they cannot be painted per split fragment.
+    fn inline_split_creates_group(style: &Style) -> bool {
+        style.opacity < 1.0 || style.transforms.is_some()
+    }
+
+    fn split_inline_flow_child(
+        &mut self,
+        child: &FlattenedBoxChild,
+        available: f32,
+        has_preceding_content: bool,
+        depth: usize,
+    ) -> Result<Option<Vec<BlockFlowItem>>, LayoutError> {
+        let FlattenedBoxChildKind::Node(node) = &child.kind else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.document
+                .kind(*node)
+                .map_err(|_| LayoutError::InvalidTree)?,
+            NodeKind::Element {
+                namespace: Namespace::Html,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        let Some(root_style) = child.computed_style.as_ref() else {
+            return Ok(None);
+        };
+        if root_style.display != Display::Inline
+            || root_style.position != Position::Static
+            || root_style.float != Float::None
+            || Self::inline_split_creates_group(root_style)
+            || self.paragraph_inline_eligible(
+                *node,
+                &child.parent_style,
+                Some(root_style),
+                available,
+                depth,
+            )?
+        {
+            return Ok(None);
+        }
+
+        let mut output = Vec::new();
+        let mut paragraph = InlineParagraph {
+            has_preceding_content,
+            split_storage_budget: Some(Rc::new(RefCell::new(InlineSplitStorageBudget::default()))),
+            ..InlineParagraph::default()
+        };
+        let mut frames = Vec::new();
+        let mut frame_path = Vec::new();
+        let mut preceding = has_preceding_content;
+        let mut saw_in_flow_block = false;
+        let mut frame_budget = 0;
+        self.append_inline_split_node(
+            *node,
+            child.parent,
+            &child.parent_style,
+            Some(root_style.clone()),
+            available,
+            depth,
+            &mut frames,
+            &mut paragraph,
+            &mut frame_path,
+            &mut preceding,
+            &mut saw_in_flow_block,
+            &mut frame_budget,
+            &mut output,
+        )?;
+        Self::flush_inline_split_paragraph(
+            &mut output,
+            &mut paragraph,
+            &mut frame_path,
+            preceding,
+            true,
+            &mut frame_budget,
+        )?;
+        let has_inline_advance = output.iter().any(|item| {
+            matches!(item, BlockFlowItem::Paragraph(paragraph) if !paragraph.advances.is_empty())
+        });
+        if saw_in_flow_block || has_inline_advance {
+            Ok(Some(output))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_block_flow_item(
+        split_walks: &mut Vec<alloc::vec::IntoIter<BlockFlowItem>>,
+        children: &mut Option<alloc::vec::IntoIter<FlattenedBoxChild>>,
+    ) -> Option<BlockFlowItem> {
+        while let Some(walk) = split_walks.last_mut() {
+            if let Some(item) = walk.next() {
+                return Some(item);
+            }
+            split_walks.pop();
+        }
+        children
+            .as_mut()
+            .and_then(|walk| walk.next())
+            .map(BlockFlowItem::Child)
     }
 
     fn find_svg_id(&self, id: &str) -> Result<Option<NodeId>, LayoutError> {
@@ -2147,7 +3364,7 @@ impl Layout<'_> {
             ancestors.push(id);
             current = self
                 .document
-                .parent(id)
+                .composed_parent(id)
                 .map_err(|_| LayoutError::InvalidTree)?;
         }
         if current.is_some() {
@@ -2683,6 +3900,7 @@ impl Layout<'_> {
         y: f32,
         available: f32,
         depth: usize,
+        marker: Option<&VirtualGeneratedChild>,
     ) -> Result<f32, LayoutError> {
         let resolved_style = style.resolve_percentages(available, self.parent_height);
         let style = &resolved_style;
@@ -2713,7 +3931,7 @@ impl Layout<'_> {
             width: outer_width,
             height: outer_height,
         };
-        let hit = self.begin_hit(id)?;
+        let hit = self.begin_hit(id, style.pointer_events_auto && style.visibility_visible)?;
         self.finish_hit(hit, outer);
         let opacity_layer = style.opacity < 1.0;
         if opacity_layer {
@@ -2750,6 +3968,14 @@ impl Layout<'_> {
             width: content_width,
             height: content_height,
         };
+        if let Some(marker) = marker {
+            if marker.style.list_style_position != css::ListStylePosition::Outside {
+                return Err(LayoutError::UnsupportedGeneratedContent);
+            }
+            let marker_y =
+                viewport.y + (viewport.height - self.line_height(&marker.style)).max(0.0);
+            self.paint_outside_list_marker(marker, style, viewport.x, marker_y, viewport.width)?;
+        }
         if style.visibility_visible
             && style.opacity > 0.0
             && (self.transform_depth > 0 || viewport.intersection(self.cull).is_some())
@@ -2927,15 +4153,11 @@ impl Layout<'_> {
                     if !text.is_empty() {
                         let x = crate::svg::number_attribute(attributes, "x").unwrap_or(0.0);
                         let y = crate::svg::number_attribute(attributes, "y").unwrap_or(0.0);
-                        let shaped = self
-                            .text
-                            .shape_styled(
-                                &text,
-                                style.font_size,
-                                style.direction == Direction::Rtl,
-                                &style.font,
-                            )
-                            .map_err(|_| LayoutError::Text)?;
+                        let shaped = self.shape_styled_text(
+                            &text,
+                            &style,
+                            style.direction == Direction::Rtl,
+                        )?;
                         if !shaped.glyphs.is_empty() {
                             let color =
                                 svg_style_color(&style.svg_fill, style.color, inherited_opacity);
@@ -3196,7 +4418,7 @@ impl Layout<'_> {
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?
             {
-                NodeKind::Text(value) => {
+                NodeKind::Text(value) | NodeKind::CData(value) => {
                     if output.len().saturating_add(value.len()) > 64 * 1024 {
                         return Err(LayoutError::Text);
                     }
@@ -3236,6 +4458,7 @@ impl Layout<'_> {
 struct BlockChild {
     first_cmd: usize,
     first_hit: usize,
+    first_float: usize,
     border_top: f32,
     margin_top: f32,
     margin_bottom: f32,
@@ -3246,9 +4469,36 @@ struct BlockChild {
     break_before: bool,
 }
 
+/// A box-tree child after transparent `display: contents` ancestors have been
+/// removed. The immediate DOM parent and its style are retained so inherited
+/// values, selectors, text spans, and virtual pseudo hit targets keep their
+/// real origins without allocating wrapper boxes.
+struct FlattenedBoxChild {
+    kind: FlattenedBoxChildKind,
+    parent: NodeId,
+    parent_style: Style,
+    computed_style: Option<Style>,
+}
+
+enum FlattenedBoxChildKind {
+    Node(NodeId),
+    Generated(VirtualGeneratedChild),
+}
+
+enum BlockFlowItem {
+    Child(FlattenedBoxChild),
+    Paragraph(InlineParagraph),
+}
+
+struct InlineSplitFrame {
+    node: NodeId,
+    style: Style,
+}
+
 struct FlexItem {
     node: NodeId,
     generated: Option<VirtualGeneratedChild>,
+    anonymous_text: Option<InlineParagraph>,
     style: Style,
     main: f32,
     min_main: f32,
@@ -3261,6 +4511,12 @@ struct FlexItem {
     last_command: usize,
     first_hit: usize,
     last_hit: usize,
+}
+
+struct PendingFlexText {
+    node: NodeId,
+    style: Style,
+    paragraph: InlineParagraph,
 }
 
 /// Position in the command and hit lists where the current line began.
@@ -3279,6 +4535,7 @@ struct InlineTextSpan {
 
 struct InlineFrame {
     node: NodeId,
+    parent: Option<usize>,
     style: Style,
     virtual_pseudo: Option<css::PseudoElement>,
     hit: Option<usize>,
@@ -3294,7 +4551,834 @@ struct VirtualGeneratedChild {
     style: Style,
     unresolved_style: Style,
     items: Arc<[css::GeneratedContentItem]>,
+    counter_replacements: Option<Arc<[CounterReplacement]>>,
+    quote_depth: usize,
+    quotes: QuoteSystem,
     text: Arc<str>,
+    /// `true` only for `::marker { content: normal }`. In that case the
+    /// inherited list-style-image may replace the generated type marker.
+    marker_content_is_default: bool,
+    marker_image: Option<Arc<ImageData>>,
+}
+
+#[derive(Clone)]
+enum QuoteSystem {
+    None,
+    Auto(Option<Arc<str>>),
+    Pairs(Arc<[(Arc<str>, Arc<str>)]>),
+}
+
+struct QuotePosition {
+    marker: usize,
+    before: usize,
+    after: usize,
+    system: QuoteSystem,
+}
+
+#[derive(Clone, Debug)]
+struct CounterReplacement {
+    item_index: usize,
+    value: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+struct CounterNodeValues {
+    node: NodeId,
+    marker: Option<Arc<[CounterReplacement]>>,
+    before: Option<Arc<[CounterReplacement]>>,
+    after: Option<Arc<[CounterReplacement]>>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveCounter {
+    name: Arc<str>,
+    scope: NodeId,
+    value: i64,
+    reversed: bool,
+}
+
+impl Default for QuotePosition {
+    fn default() -> Self {
+        Self {
+            marker: 0,
+            before: 0,
+            after: 0,
+            system: QuoteSystem::Auto(None),
+        }
+    }
+}
+
+fn automatic_quote_pairs(language: Option<&str>) -> &'static [(&'static str, &'static str)] {
+    let language = language.unwrap_or("en");
+    let mut parts = language.split('-');
+    let primary = parts.next().unwrap_or("");
+    let second = parts.next().unwrap_or("");
+    match (primary, second) {
+        (p, s) if p.eq_ignore_ascii_case("fr") && s.eq_ignore_ascii_case("ch") => {
+            &[("«", "»"), ("‹", "›")]
+        }
+        (p, s) if p.eq_ignore_ascii_case("zh") && s.eq_ignore_ascii_case("hant") => {
+            &[("「", "」"), ("『", "』")]
+        }
+        (p, s) if p.eq_ignore_ascii_case("zh") && s.eq_ignore_ascii_case("hans") => {
+            &[("“", "”"), ("‘", "’")]
+        }
+        (p, _) if p.eq_ignore_ascii_case("am") => &[("«", "»"), ("‹", "›")],
+        (p, _) if p.eq_ignore_ascii_case("ar") => &[("”", "“"), ("’", "‘")],
+        (p, _) if p.eq_ignore_ascii_case("bn") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("chr") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("de") => &[("„", "“")],
+        (p, _) if p.eq_ignore_ascii_case("el") => &[("«", "»"), ("“", "”")],
+        (p, _) if p.eq_ignore_ascii_case("fa") => &[("«", "»"), ("‹", "›")],
+        (p, _) if p.eq_ignore_ascii_case("fi") => &[("”", "”")],
+        (p, _) if p.eq_ignore_ascii_case("fr") => &[("«", "»")],
+        (p, _) if p.eq_ignore_ascii_case("gu") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("he") => &[("”", "“"), ("’", "‘")],
+        (p, _) if p.eq_ignore_ascii_case("hi") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("hu") => &[("„", "”"), ("»", "«")],
+        (p, _) if p.eq_ignore_ascii_case("ja") => &[("「", "」"), ("『", "』")],
+        (p, _) if p.eq_ignore_ascii_case("km") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("ko") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("lo") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("my") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("nl") => &[("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("pa") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("ta") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("th") => &[("“", "”"), ("‘", "’")],
+        (p, _) if p.eq_ignore_ascii_case("zh") => &[("“", "”"), ("‘", "’")],
+        _ => &[("“", "”"), ("‘", "’"), ("«", "»"), ("‹", "›")],
+    }
+}
+
+fn quote_mark(system: &QuoteSystem, depth: usize, opening: bool) -> Option<&str> {
+    match system {
+        QuoteSystem::None => None,
+        QuoteSystem::Auto(language) => {
+            let pairs = automatic_quote_pairs(language.as_deref());
+            let pair = pairs.get(depth.min(pairs.len().saturating_sub(1)))?;
+            Some(if opening { pair.0 } else { pair.1 })
+        }
+        QuoteSystem::Pairs(pairs) => {
+            let pair = pairs.get(depth.min(pairs.len().saturating_sub(1)))?;
+            Some(if opening { &pair.0 } else { &pair.1 })
+        }
+    }
+}
+
+fn quote_system_for_node(
+    setting: &css::Quotes,
+    parent: &QuoteSystem,
+    parent_language: Option<&Arc<str>>,
+) -> QuoteSystem {
+    match setting {
+        css::Quotes::Auto => QuoteSystem::Auto(parent_language.cloned()),
+        css::Quotes::None => QuoteSystem::None,
+        css::Quotes::MatchParent => parent.clone(),
+        css::Quotes::Pairs(pairs) => QuoteSystem::Pairs(pairs.clone()),
+    }
+}
+
+fn quote_system_for_pseudo(setting: &css::Quotes, origin: &QuoteSystem) -> QuoteSystem {
+    match setting {
+        css::Quotes::None => QuoteSystem::None,
+        css::Quotes::Pairs(pairs) => QuoteSystem::Pairs(pairs.clone()),
+        css::Quotes::Auto | css::Quotes::MatchParent => origin.clone(),
+    }
+}
+
+fn advance_quote_depth(
+    items: &[css::GeneratedContentItem],
+    depth: &mut usize,
+) -> Result<(), LayoutError> {
+    for item in items {
+        match item {
+            css::GeneratedContentItem::OpenQuote | css::GeneratedContentItem::NoOpenQuote => {
+                *depth = depth.checked_add(1).ok_or(LayoutError::CommandLimit)?;
+            }
+            css::GeneratedContentItem::CloseQuote | css::GeneratedContentItem::NoCloseQuote => {
+                *depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn quote_language(document: &Document, node: NodeId) -> Result<Option<Arc<str>>, LayoutError> {
+    let html_language = document
+        .get_attribute_ns_ref(node, None, "lang")
+        .map_err(|_| LayoutError::InvalidTree)?
+        .filter(|value| !value.trim().is_empty());
+    let language = if let Some(language) = html_language {
+        Some(language)
+    } else {
+        document
+            .get_attribute_ns_ref(node, Some("http://www.w3.org/XML/1998/namespace"), "lang")
+            .map_err(|_| LayoutError::InvalidTree)?
+            .filter(|value| !value.trim().is_empty())
+    };
+    Ok(language.map(|language| Arc::from(language.trim())))
+}
+
+fn contains_html_quote_element(
+    document: &Document,
+    node: NodeId,
+    depth: usize,
+) -> Result<bool, LayoutError> {
+    if depth > 512 {
+        return Err(LayoutError::DepthLimit);
+    }
+    if matches!(
+        document.kind(node),
+        Ok(NodeKind::Element { name, namespace: Namespace::Html, .. })
+            if crate::svg::local_name(name) == "q"
+    ) {
+        return Ok(true);
+    }
+    let mut children = document
+        .composed_children_iter(node)
+        .map_err(|_| LayoutError::InvalidTree)?;
+    while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+        if contains_html_quote_element(document, child, depth + 1)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_quote_positions(
+    document: &Document,
+    rules: &StyleIndex,
+    text: &dyn TextShaper,
+    style_cache: &core::cell::RefCell<css::StyleCache>,
+    node: NodeId,
+    parent_style: Option<&Style>,
+    parent_language: Option<&Arc<str>>,
+    parent_quotes: &QuoteSystem,
+    quote_depth: &mut usize,
+    visited: &mut usize,
+    positions: &mut [QuotePosition],
+    tree_depth: usize,
+) -> Result<(), LayoutError> {
+    if tree_depth > 512 || *visited >= document.node_count() {
+        return Err(LayoutError::DepthLimit);
+    }
+    *visited += 1;
+    let kind = document.kind(node).map_err(|_| LayoutError::InvalidTree)?;
+    let is_element = matches!(kind, NodeKind::Element { .. });
+    let style = if is_element {
+        Some(
+            css::compute_node_cached_with_text(
+                document,
+                node,
+                parent_style,
+                rules,
+                &mut style_cache.borrow_mut(),
+                text,
+            )
+            .map_err(LayoutError::Css)?,
+        )
+    } else {
+        None
+    };
+    if style
+        .as_ref()
+        .is_some_and(|style| style.display == Display::None)
+    {
+        return Ok(());
+    }
+    let language = if is_element {
+        quote_language(document, node)?.or_else(|| parent_language.cloned())
+    } else {
+        parent_language.cloned()
+    };
+    let quotes = style.as_ref().map_or_else(
+        || parent_quotes.clone(),
+        |style| quote_system_for_node(style.quotes(), parent_quotes, parent_language),
+    );
+    let mut marker_quote_depth = *quote_depth;
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(
+                document,
+                node,
+                style,
+                css::PseudoElement::Marker,
+                Some(text),
+            )
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            if let css::GeneratedContent::Items(items) = generated.content {
+                marker_quote_depth = *quote_depth;
+                advance_quote_depth(&items, quote_depth)?;
+            }
+        }
+    }
+
+    let position = positions
+        .get_mut(node.index())
+        .ok_or(LayoutError::InvalidTree)?;
+    position.marker = marker_quote_depth;
+    position.before = *quote_depth;
+    position.system = quotes.clone();
+
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(
+                document,
+                node,
+                style,
+                css::PseudoElement::Before,
+                Some(text),
+            )
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            if let css::GeneratedContent::Items(items) = generated.content {
+                advance_quote_depth(&items, quote_depth)?;
+            }
+        }
+    }
+
+    let child_parent_style = style.as_ref().or(parent_style);
+    let mut children = document
+        .composed_children_iter(node)
+        .map_err(|_| LayoutError::InvalidTree)?;
+    while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+        collect_quote_positions(
+            document,
+            rules,
+            text,
+            style_cache,
+            child,
+            child_parent_style,
+            language.as_ref(),
+            &quotes,
+            quote_depth,
+            visited,
+            positions,
+            tree_depth + 1,
+        )?;
+    }
+
+    let position = positions
+        .get_mut(node.index())
+        .ok_or(LayoutError::InvalidTree)?;
+    position.after = *quote_depth;
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(document, node, style, css::PseudoElement::After, Some(text))
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            if let css::GeneratedContent::Items(items) = generated.content {
+                advance_quote_depth(&items, quote_depth)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+const MAX_COUNTER_TREE_DEPTH: usize = 512;
+const MAX_ACTIVE_COUNTERS: usize = 4096;
+const MAX_COUNTER_REPLACEMENTS: usize = 65_536;
+const MAX_COUNTER_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn clamp_counter(value: i64) -> i64 {
+    value.clamp(-css::MAX_COUNTER_VALUE, css::MAX_COUNTER_VALUE)
+}
+
+fn install_counter(
+    name: &Arc<str>,
+    value: i64,
+    reversed: bool,
+    scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+) -> Result<(), LayoutError> {
+    // A same-name reset in the current sibling scope obscures a previous
+    // sibling's instance, while ancestor scopes remain nested and visible.
+    active.retain(|counter| counter.scope != scope || counter.name != *name);
+    if active.len() >= MAX_ACTIVE_COUNTERS {
+        return Err(LayoutError::UnsupportedGeneratedContent);
+    }
+    active
+        .try_reserve(1)
+        .map_err(|_| LayoutError::CommandLimit)?;
+    active.push(ActiveCounter {
+        name: name.clone(),
+        scope,
+        value: clamp_counter(value),
+        reversed,
+    });
+    Ok(())
+}
+
+fn ensure_counter(
+    name: &Arc<str>,
+    scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+) -> Result<usize, LayoutError> {
+    if let Some(index) = active.iter().rposition(|counter| counter.name == *name) {
+        return Ok(index);
+    }
+    install_counter(name, 0, false, scope, active)?;
+    active
+        .iter()
+        .rposition(|counter| counter.name == *name)
+        .ok_or(LayoutError::InvalidTree)
+}
+
+fn apply_counter_operations(
+    style: &Style,
+    scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+) -> Result<(), LayoutError> {
+    if let Some(resets) = style.counter_reset.as_deref() {
+        for reset in resets {
+            install_counter(&reset.name, reset.value, reset.reversed, scope, active)?;
+        }
+    }
+    if let Some(increments) = style.counter_increment.as_deref() {
+        for increment in increments {
+            let index = ensure_counter(&increment.name, scope, active)?;
+            let counter = active.get_mut(index).ok_or(LayoutError::InvalidTree)?;
+            counter.value = clamp_counter(counter.value.saturating_add(increment.value));
+        }
+    }
+    if let Some(sets) = style.counter_set.as_deref() {
+        for set in sets {
+            let index = ensure_counter(&set.name, scope, active)?;
+            let counter = active.get_mut(index).ok_or(LayoutError::InvalidTree)?;
+            counter.value = clamp_counter(set.value);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn contains_list_item_candidate(
+    document: &Document,
+    root: NodeId,
+) -> Result<bool, LayoutError> {
+    let mut pending = Vec::new();
+    pending
+        .try_reserve(16)
+        .map_err(|_| LayoutError::CommandLimit)?;
+    pending.push(root);
+    let mut visited = 0usize;
+    while let Some(node) = pending.pop() {
+        visited += 1;
+        if visited > document.node_count() {
+            return Err(LayoutError::InvalidTree);
+        }
+        if let NodeKind::Element {
+            name,
+            namespace,
+            attributes,
+        } = document.kind(node).map_err(|_| LayoutError::InvalidTree)?
+        {
+            if (*namespace == Namespace::Html && crate::svg::local_name(name) == "li")
+                || attributes.iter().any(|(name, value)| {
+                    name.eq_ignore_ascii_case("style")
+                        && value
+                            .as_bytes()
+                            .windows(b"list-item".len())
+                            .any(|token| token.eq_ignore_ascii_case(b"list-item"))
+                })
+            {
+                return Ok(true);
+            }
+        }
+        let mut children = document
+            .composed_children_iter(node)
+            .map_err(|_| LayoutError::InvalidTree)?;
+        while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+            pending
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            pending.push(child);
+        }
+    }
+    Ok(false)
+}
+
+fn decimal_counter(value: i64) -> String {
+    alloc::format!("{value}")
+}
+
+fn roman_counter(value: i64, lower: bool) -> Option<String> {
+    if !(1..=3999).contains(&value) {
+        return None;
+    }
+    let mut remaining = value;
+    let mut output = String::new();
+    for (amount, symbol) in [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ] {
+        while remaining >= amount {
+            output.push_str(symbol);
+            remaining -= amount;
+        }
+    }
+    if lower {
+        output.make_ascii_lowercase();
+    }
+    Some(output)
+}
+
+fn alphabetic_counter(value: i64, lower: bool) -> Option<String> {
+    if value <= 0 {
+        return None;
+    }
+    let mut remaining = value as u64;
+    let mut reversed = String::new();
+    while remaining != 0 {
+        remaining -= 1;
+        let offset = (remaining % 26) as u8;
+        let base = if lower { b'a' } else { b'A' };
+        reversed.push((base + offset) as char);
+        remaining /= 26;
+    }
+    Some(reversed.chars().rev().collect())
+}
+
+fn format_counter(value: i64, style: &str) -> Result<String, LayoutError> {
+    if style.eq_ignore_ascii_case("none") {
+        return Ok(String::new());
+    }
+    if style
+        .get(..8)
+        .is_some_and(|function| function.eq_ignore_ascii_case("symbols("))
+    {
+        return Err(LayoutError::UnsupportedGeneratedContent);
+    }
+    if style.eq_ignore_ascii_case("decimal") {
+        return Ok(decimal_counter(value));
+    }
+    if style.eq_ignore_ascii_case("decimal-leading-zero") {
+        return Ok(if (-9..=9).contains(&value) {
+            if value < 0 {
+                alloc::format!("-0{}", value.unsigned_abs())
+            } else {
+                alloc::format!("0{value}")
+            }
+        } else {
+            decimal_counter(value)
+        });
+    }
+    if style.eq_ignore_ascii_case("upper-roman") {
+        return Ok(roman_counter(value, false).unwrap_or_else(|| decimal_counter(value)));
+    }
+    if style.eq_ignore_ascii_case("lower-roman") {
+        return Ok(roman_counter(value, true).unwrap_or_else(|| decimal_counter(value)));
+    }
+    if style.eq_ignore_ascii_case("upper-alpha") || style.eq_ignore_ascii_case("upper-latin") {
+        return Ok(alphabetic_counter(value, false).unwrap_or_else(|| decimal_counter(value)));
+    }
+    if style.eq_ignore_ascii_case("lower-alpha") || style.eq_ignore_ascii_case("lower-latin") {
+        return Ok(alphabetic_counter(value, true).unwrap_or_else(|| decimal_counter(value)));
+    }
+    Err(LayoutError::UnsupportedGeneratedContent)
+}
+
+fn append_counter_output(
+    output: &mut String,
+    value: &str,
+    total_bytes: usize,
+) -> Result<(), LayoutError> {
+    total_bytes
+        .checked_add(output.len())
+        .and_then(|length| length.checked_add(value.len()))
+        .filter(|length| *length <= MAX_COUNTER_OUTPUT_BYTES)
+        .ok_or(LayoutError::UnsupportedGeneratedContent)?;
+    output
+        .try_reserve(value.len())
+        .map_err(|_| LayoutError::CommandLimit)?;
+    output.push_str(value);
+    Ok(())
+}
+
+fn append_counter_instance(
+    output: &mut String,
+    counter: &ActiveCounter,
+    style: &str,
+    total_bytes: usize,
+) -> Result<(), LayoutError> {
+    if counter.reversed {
+        return Err(LayoutError::UnsupportedGeneratedContent);
+    }
+    let formatted = format_counter(counter.value, style)?;
+    append_counter_output(output, &formatted, total_bytes)
+}
+
+fn counter_item_text(
+    name: &Arc<str>,
+    style: &str,
+    separator: Option<&str>,
+    scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+    total_bytes: usize,
+) -> Result<String, LayoutError> {
+    let mut output = String::new();
+    if let Some(separator) = separator {
+        let mut found = false;
+        for counter in active.iter().filter(|counter| counter.name == *name) {
+            if found {
+                append_counter_output(&mut output, separator, total_bytes)?;
+            }
+            append_counter_instance(&mut output, counter, style, total_bytes)?;
+            found = true;
+        }
+        if !found {
+            let index = ensure_counter(name, scope, active)?;
+            let counter = active.get(index).ok_or(LayoutError::InvalidTree)?;
+            append_counter_instance(&mut output, counter, style, total_bytes)?;
+        }
+    } else {
+        let index = ensure_counter(name, scope, active)?;
+        let counter = active.get(index).ok_or(LayoutError::InvalidTree)?;
+        append_counter_instance(&mut output, counter, style, total_bytes)?;
+    }
+    Ok(output)
+}
+
+fn resolve_counter_replacements(
+    items: &[css::GeneratedContentItem],
+    scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+    replacement_count: &mut usize,
+    output_bytes: &mut usize,
+) -> Result<Option<Arc<[CounterReplacement]>>, LayoutError> {
+    let reference_count = items
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                css::GeneratedContentItem::Counter { .. }
+                    | css::GeneratedContentItem::Counters { .. }
+            )
+        })
+        .count();
+    if reference_count == 0 {
+        return Ok(None);
+    }
+    if replacement_count.saturating_add(reference_count) > MAX_COUNTER_REPLACEMENTS {
+        return Err(LayoutError::UnsupportedGeneratedContent);
+    }
+    let mut replacements = Vec::new();
+    replacements
+        .try_reserve_exact(reference_count)
+        .map_err(|_| LayoutError::CommandLimit)?;
+    for (item_index, item) in items.iter().enumerate() {
+        let value = match item {
+            css::GeneratedContentItem::Counter { name, style } => Some(counter_item_text(
+                name,
+                style,
+                None,
+                scope,
+                active,
+                *output_bytes,
+            )?),
+            css::GeneratedContentItem::Counters {
+                name,
+                separator,
+                style,
+            } => Some(counter_item_text(
+                name,
+                style,
+                Some(separator),
+                scope,
+                active,
+                *output_bytes,
+            )?),
+            _ => None,
+        };
+        if let Some(value) = value {
+            *output_bytes = output_bytes
+                .checked_add(value.len())
+                .filter(|bytes| *bytes <= MAX_COUNTER_OUTPUT_BYTES)
+                .ok_or(LayoutError::UnsupportedGeneratedContent)?;
+            *replacement_count += 1;
+            replacements.push(CounterReplacement {
+                item_index,
+                value: Arc::from(value),
+            });
+        }
+    }
+    Ok(Some(replacements.into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_counter_positions(
+    document: &Document,
+    rules: &StyleIndex,
+    text: &dyn TextShaper,
+    style_cache: &core::cell::RefCell<css::StyleCache>,
+    node: NodeId,
+    parent_style: Option<&Style>,
+    sibling_scope: NodeId,
+    active: &mut Vec<ActiveCounter>,
+    positions: &mut Vec<CounterNodeValues>,
+    visited: &mut usize,
+    replacement_count: &mut usize,
+    output_bytes: &mut usize,
+    tree_depth: usize,
+) -> Result<(), LayoutError> {
+    if tree_depth > MAX_COUNTER_TREE_DEPTH || *visited >= document.node_count() {
+        return Err(LayoutError::UnsupportedGeneratedContent);
+    }
+    *visited += 1;
+    let kind = document.kind(node).map_err(|_| LayoutError::InvalidTree)?;
+    let style = if matches!(kind, NodeKind::Element { .. }) {
+        Some(
+            css::compute_node_cached_with_text(
+                document,
+                node,
+                parent_style,
+                rules,
+                &mut style_cache.borrow_mut(),
+                text,
+            )
+            .map_err(LayoutError::Css)?,
+        )
+    } else {
+        None
+    };
+    if style
+        .as_ref()
+        .is_some_and(|style| style.display == Display::None)
+    {
+        return Ok(());
+    }
+    if let Some(style) = style
+        .as_ref()
+        .filter(|style| style.display != Display::Contents)
+    {
+        apply_counter_operations(style, sibling_scope, active)?;
+    }
+    let mut marker = None;
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(
+                document,
+                node,
+                style,
+                css::PseudoElement::Marker,
+                Some(text),
+            )
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            apply_counter_operations(&generated.style, node, active)?;
+            if let css::GeneratedContent::Items(items) = generated.content {
+                marker = resolve_counter_replacements(
+                    &items,
+                    node,
+                    active,
+                    replacement_count,
+                    output_bytes,
+                )?;
+            }
+        }
+    }
+    let mut before = None;
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(
+                document,
+                node,
+                style,
+                css::PseudoElement::Before,
+                Some(text),
+            )
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            apply_counter_operations(&generated.style, node, active)?;
+            if let css::GeneratedContent::Items(items) = generated.content {
+                before = resolve_counter_replacements(
+                    &items,
+                    node,
+                    active,
+                    replacement_count,
+                    output_bytes,
+                )?;
+            }
+        }
+    }
+
+    let child_parent_style = style.as_ref().or(parent_style);
+    let mut children = document
+        .composed_children_iter(node)
+        .map_err(|_| LayoutError::InvalidTree)?;
+    while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+        collect_counter_positions(
+            document,
+            rules,
+            text,
+            style_cache,
+            child,
+            child_parent_style,
+            node,
+            active,
+            positions,
+            visited,
+            replacement_count,
+            output_bytes,
+            tree_depth + 1,
+        )?;
+    }
+
+    let mut after = None;
+    if let Some(style) = style.as_ref() {
+        if let Some(generated) = rules
+            .compute_pseudo(document, node, style, css::PseudoElement::After, Some(text))
+            .map_err(LayoutError::Css)?
+            .filter(|generated| generated.style.display != Display::None)
+        {
+            apply_counter_operations(&generated.style, node, active)?;
+            if let css::GeneratedContent::Items(items) = generated.content {
+                after = resolve_counter_replacements(
+                    &items,
+                    node,
+                    active,
+                    replacement_count,
+                    output_bytes,
+                )?;
+            }
+        }
+    }
+    // Resets created by before/children/after are scoped to this element's
+    // child list. Counter changes to outer instances remain for following
+    // elements in tree order.
+    while active.last().is_some_and(|counter| counter.scope == node) {
+        let _ = active.pop();
+    }
+    if marker.is_some() || before.is_some() || after.is_some() {
+        positions
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        positions.push(CounterNodeValues {
+            node,
+            marker,
+            before,
+            after,
+        });
+    }
+    Ok(())
 }
 
 struct InlineAtom {
@@ -3305,6 +5389,7 @@ struct InlineAtom {
     frames: Vec<usize>,
     width: f32,
     height: f32,
+    image: Option<Arc<ImageData>>,
 }
 
 #[derive(Default)]
@@ -3313,6 +5398,7 @@ struct InlineParagraph {
     spans: Vec<InlineTextSpan>,
     frames: Vec<InlineFrame>,
     atoms: Vec<InlineAtom>,
+    advances: Vec<InlineAdvance>,
     hard_breaks: Vec<usize>,
     collapse_space: bool,
     has_preceding_content: bool,
@@ -3321,6 +5407,103 @@ struct InlineParagraph {
     control_placeholder: bool,
     control_password: bool,
     control_source_ranges: Option<Vec<Range<usize>>>,
+    split_storage_budget: Option<Rc<RefCell<InlineSplitStorageBudget>>>,
+    first_line_indent: f32,
+}
+
+/// A decorated inline box with no text or atomic child still contributes its
+/// horizontal box edges to the line. `paint_start..paint_end` excludes margins
+/// while `width` includes them for subsequent inline positioning.
+struct InlineAdvance {
+    offset: usize,
+    frame: usize,
+    width: f32,
+    paint_start: f32,
+    paint_end: f32,
+    extra_height: f32,
+}
+
+/// Aggregate bounds for paragraphs retained by one inline/block split walk.
+/// Per-paragraph limits alone multiply by the number of split events, so the
+/// walk also caps the payload it keeps before the parent block layout consumes
+/// those events.
+#[derive(Default)]
+struct InlineSplitStorageBudget {
+    text_bytes: usize,
+    spans: usize,
+    atoms: usize,
+    advances: usize,
+    hard_breaks: usize,
+    frame_path_refs: usize,
+}
+
+impl InlineSplitStorageBudget {
+    fn charge(
+        &mut self,
+        text_bytes: usize,
+        spans: usize,
+        atoms: usize,
+        advances: usize,
+        hard_breaks: usize,
+        frame_path_refs: usize,
+    ) -> Result<(), LayoutError> {
+        let text_bytes = self
+            .text_bytes
+            .checked_add(text_bytes)
+            .filter(|count| *count <= MAX_DISPLAY_LIST_BYTES)
+            .ok_or(LayoutError::CommandLimit)?;
+        let spans = self
+            .spans
+            .checked_add(spans)
+            .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+            .ok_or(LayoutError::CommandLimit)?;
+        let atoms = self
+            .atoms
+            .checked_add(atoms)
+            .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+            .ok_or(LayoutError::CommandLimit)?;
+        let advances = self
+            .advances
+            .checked_add(advances)
+            .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+            .ok_or(LayoutError::CommandLimit)?;
+        let hard_breaks = self
+            .hard_breaks
+            .checked_add(hard_breaks)
+            .filter(|count| *count <= MAX_DISPLAY_COMMANDS)
+            .ok_or(LayoutError::CommandLimit)?;
+        let frame_path_refs = self
+            .frame_path_refs
+            .checked_add(frame_path_refs)
+            .filter(|count| *count <= MAX_DISPLAY_LIST_BYTES / core::mem::size_of::<usize>())
+            .ok_or(LayoutError::CommandLimit)?;
+
+        self.text_bytes = text_bytes;
+        self.spans = spans;
+        self.atoms = atoms;
+        self.advances = advances;
+        self.hard_breaks = hard_breaks;
+        self.frame_path_refs = frame_path_refs;
+        Ok(())
+    }
+}
+
+fn charge_inline_split_storage(
+    paragraph: &InlineParagraph,
+    text_bytes: usize,
+    spans: usize,
+    atoms: usize,
+    advances: usize,
+    hard_breaks: usize,
+    frame_path_refs: usize,
+) -> Result<(), LayoutError> {
+    if let Some(budget) = &paragraph.split_storage_budget {
+        budget
+            .try_borrow_mut()
+            .map_err(|_| LayoutError::CommandLimit)?
+            .charge(text_bytes, spans, atoms, advances, hard_breaks, frame_path_refs)?;
+    }
+    Ok(())
 }
 
 struct InlineToken {
@@ -3332,6 +5515,9 @@ struct InlineToken {
     source_range: Option<Range<usize>>,
     rtl: bool,
     width: f32,
+    frame_bounds: Option<(f32, f32)>,
+    extra_height: f32,
+    advance_frame: Option<usize>,
     x: f32,
     command: Option<usize>,
     hit: Option<usize>,
@@ -3347,6 +5533,31 @@ struct FormText {
 enum InlinePart {
     Text { span: usize, range: Range<usize> },
     Atom(usize),
+    Advance(usize),
+}
+
+#[derive(Clone, Copy)]
+struct TextClusterShift {
+    start: u32,
+    shift: f32,
+    word_gap: f32,
+}
+
+fn is_word_separator(grapheme: &str) -> bool {
+    let mut characters = grapheme.chars();
+    let is_separator = matches!(
+        characters.next(),
+        Some(
+            ' '
+                | '\u{00a0}'
+                | '\u{1361}'
+                | '\u{10100}'
+                | '\u{10101}'
+                | '\u{1039f}'
+                | '\u{1091f}'
+        )
+    );
+    is_separator
 }
 
 #[derive(Clone, PartialEq)]
@@ -3364,12 +5575,199 @@ pub(crate) struct ScrollOffset {
     pub y: f32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ScrollPort {
+    pub node: NodeId,
+    pub rect: Rect,
+    pub owner_hit: Option<usize>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct OverflowMetrics {
+    /// The same overflow after this box's own clip and transform, ready for
+    /// inclusion in its containing block's scrollable overflow.
+    parent: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+enum OverflowRoute {
+    Parent,
+    ContainingBlock(NodeId),
+    Root,
+    ViewportFixed,
+}
+
+struct OverflowFrame {
+    node: NodeId,
+    extent: Option<Rect>,
+    padding_box: Option<Rect>,
+    clip_x: bool,
+    clip_y: bool,
+    scroll_adjust: (f32, f32),
+    route: OverflowRoute,
+}
+
+impl OverflowFrame {
+    fn new(
+        node: NodeId,
+        clip_x: bool,
+        clip_y: bool,
+        scroll_adjust: (f32, f32),
+        route: OverflowRoute,
+    ) -> Self {
+        Self {
+            node,
+            extent: None,
+            padding_box: None,
+            clip_x,
+            clip_y,
+            scroll_adjust,
+            route,
+        }
+    }
+
+    fn viewport(node: NodeId, viewport: Rect, scroll_adjust: (f32, f32)) -> Self {
+        Self {
+            node,
+            extent: Some(viewport),
+            padding_box: Some(viewport),
+            clip_x: false,
+            clip_y: false,
+            scroll_adjust,
+            route: OverflowRoute::Root,
+        }
+    }
+
+    fn include_child(&mut self, rect: Rect) {
+        self.include(Rect {
+            x: rect.x + self.scroll_adjust.0,
+            y: rect.y + self.scroll_adjust.1,
+            ..rect
+        });
+    }
+
+    fn include(&mut self, rect: Rect) {
+        if rect.is_valid() {
+            self.extent = Some(
+                self.extent
+                    .map_or(rect, |current| union_rect(current, rect)),
+            );
+        }
+    }
+
+    fn set_padding_box(&mut self, rect: Rect) {
+        if rect.is_valid() {
+            self.padding_box = Some(rect);
+            self.include(rect);
+        }
+    }
+
+    fn translate(&mut self, dx: f32, dy: f32) {
+        let translate = |rect: Rect| Rect {
+            x: rect.x + dx,
+            y: rect.y + dy,
+            ..rect
+        };
+        self.extent = self.extent.map(translate);
+        self.padding_box = self.padding_box.map(translate);
+    }
+
+    fn metrics(&self, transform: Option<crate::paint::Affine>) -> OverflowMetrics {
+        let Some(mut parent) = self.extent else {
+            return OverflowMetrics::default();
+        };
+        if self.clip_x || self.clip_y {
+            let Some(padding) = self.padding_box else {
+                return OverflowMetrics { parent: None };
+            };
+            let clip = overflow_clip_rect(padding, self.clip_x, self.clip_y);
+            let Some(clipped) = parent.intersection(clip) else {
+                return OverflowMetrics { parent: None };
+            };
+            parent = clipped;
+        }
+        if let Some(matrix) = transform {
+            let Some(transformed) = transformed_bounds(parent, core::iter::once(matrix)) else {
+                return OverflowMetrics { parent: None };
+            };
+            parent = transformed;
+        }
+        OverflowMetrics {
+            parent: Some(parent),
+        }
+    }
+}
+
+fn union_rect(left: Rect, right: Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let right_edge = (left.x + left.width).max(right.x + right.width);
+    let bottom_edge = (left.y + left.height).max(right.y + right.height);
+    Rect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom_edge - y,
+    }
+}
+
+pub(crate) fn transformed_bounds(
+    rect: Rect,
+    transforms: impl Iterator<Item = crate::paint::Affine>,
+) -> Option<Rect> {
+    if !rect.is_valid() {
+        return None;
+    }
+    let mut corners = [
+        (rect.x, rect.y),
+        (rect.x + rect.width, rect.y),
+        (rect.x, rect.y + rect.height),
+        (rect.x + rect.width, rect.y + rect.height),
+    ];
+    for transform in transforms {
+        for point in &mut corners {
+            *point = transform.apply(point.0, point.1);
+        }
+    }
+    let left = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::INFINITY, f32::min);
+    let top = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::INFINITY, f32::min);
+    let right = corners
+        .iter()
+        .map(|point| point.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = corners
+        .iter()
+        .map(|point| point.1)
+        .fold(f32::NEG_INFINITY, f32::max);
+    Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+    .is_valid()
+    .then_some(Rect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
 #[derive(Default)]
 pub(crate) struct LayoutGeometry {
     pub transforms: Vec<HitTransform>,
     pub hits: Vec<HitRegion>,
     pub rounded_clips: Vec<HitClip>,
     pub scroll_extents: Vec<ScrollOffset>,
+    pub scroll_ports: Vec<ScrollPort>,
+    pub viewport_fixed_nodes: Vec<NodeId>,
     pub scroll_regions: Vec<ScrollRegion>,
     pub control_text_runs: Vec<ControlTextRun>,
 }
@@ -3434,6 +5832,9 @@ pub(crate) struct HitTransform {
 
 impl LayoutGeometry {
     pub(crate) fn contains_hit(&self, index: usize, x: f32, y: f32) -> bool {
+        if !self.hits.get(index).is_some_and(|hit| hit.hit_testable) {
+            return false;
+        }
         if self.transforms.is_empty()
             && !self
                 .hits
@@ -3526,6 +5927,7 @@ impl LayoutGeometry {
             hit.rect.x += dx;
             hit.rect.y += dy;
         }
+        self.move_scrollports_for_hits(&hits, dx, dy);
         for transform in &mut self.transforms[transforms] {
             transform.matrix = transform.matrix.translated_space(dx, dy);
         }
@@ -3554,6 +5956,7 @@ impl LayoutGeometry {
             hit.rect.x += x;
             hit.rect.y += y;
         }
+        self.move_scrollports_for_hits(&range, x, y);
         for clip in &mut self.rounded_clips {
             if range.start <= clip.hits.start && clip.hits.end <= range.end {
                 clip.rect.x += x;
@@ -3568,6 +5971,17 @@ impl LayoutGeometry {
             }
         }
         self.refresh_control_run_transforms(range);
+    }
+
+    fn move_scrollports_for_hits(&mut self, range: &core::ops::Range<usize>, x: f32, y: f32) {
+        // The owner hit sits outside its own scroll region, so its padding-box
+        // port stays fixed while ports owned by scrolled descendants move.
+        for port in &mut self.scroll_ports {
+            if port.owner_hit.is_some_and(|index| range.contains(&index)) {
+                port.rect.x += x;
+                port.rect.y += y;
+            }
+        }
     }
 
     fn refresh_control_run_transforms(&mut self, hits: Range<usize>) {
@@ -3591,6 +6005,7 @@ pub(crate) struct HitRegion {
     pub node: NodeId,
     pub rect: Rect,
     pub virtual_generated: bool,
+    pub hit_testable: bool,
 }
 
 /// Resolve percentages on the original border box, then subtract each
@@ -3786,186 +6201,433 @@ fn background_bleed_inset(style: &Style) -> f32 {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GridTrackContribution {
+    start: usize,
+    span: usize,
+    min_content: f32,
+    max_content: f32,
+}
+
+fn push_grid_track_contribution(
+    contributions: &mut Vec<GridTrackContribution>,
+    contribution: GridTrackContribution,
+) -> Result<(), LayoutError> {
+    if contributions.len() == css::MAX_GRID_TRACKS * css::MAX_GRID_TRACKS {
+        return Ok(());
+    }
+    contributions
+        .try_reserve(1)
+        .map_err(|_| LayoutError::CommandLimit)?;
+    contributions.push(contribution);
+    Ok(())
+}
+
+/// Grow a contiguous track range to a requested total, splitting growth among
+/// eligible tracks and respecting each track's current base/growth ceiling.
+/// The repeated water-fill pass redistributes space left by capped tracks.
+fn distribute_grid_track_range(
+    values: &mut [f32; css::MAX_GRID_TRACKS],
+    ceilings: &[f32; css::MAX_GRID_TRACKS],
+    start: usize,
+    span: usize,
+    target: f32,
+    gap: f32,
+    eligible: impl Fn(usize) -> bool,
+) {
+    let current = values[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
+    let mut extra = (target - current).max(0.0);
+    for _ in 0..span {
+        if extra <= 0.0 {
+            break;
+        }
+        let growing = (start..start + span)
+            .filter(|&index| eligible(index) && values[index] < ceilings[index])
+            .count();
+        if growing == 0 {
+            break;
+        }
+        let share = extra / growing as f32;
+        let mut distributed = 0.0;
+        for index in start..start + span {
+            if eligible(index) && values[index] < ceilings[index] {
+                let added = share.min(ceilings[index] - values[index]);
+                values[index] += added;
+                distributed += added;
+            }
+        }
+        if distributed <= 0.0 {
+            break;
+        }
+        extra = (extra - distributed).max(0.0);
+    }
+}
+
 fn grid_track_sizes(
     definitions: &[css::GridTrack],
     count: usize,
     available: Option<f32>,
     gap: f32,
     stretch: bool,
-    contributions: impl Iterator<Item = (usize, usize, f32, f32)>,
-) -> [f32; css::MAX_GRID_TRACKS] {
+    contributions: impl Iterator<Item = GridTrackContribution> + Clone,
+) -> Result<[f32; css::MAX_GRID_TRACKS], LayoutError> {
     use css::{GridBreadth as B, GridTrack as T, MAX_GRID_TRACKS};
+
+    if count > MAX_GRID_TRACKS {
+        return Err(LayoutError::GridLimit);
+    }
+    let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
+    let available = available
+        .filter(|value| value.is_finite())
+        .map(|value| value.max(0.0));
+    // Spans that overflow the grid clamp to its last line (CSS Grid §8.5 and
+    // §9 subgrid overflow); malformed intrinsic sizes degrade to zero.
+    let contributions = contributions.filter_map(move |contribution| {
+        if contribution.start >= count {
+            return None;
+        }
+        let span = contribution.span.clamp(1, count - contribution.start);
+        let min_content = if contribution.min_content.is_finite() {
+            contribution.min_content.max(0.0)
+        } else {
+            0.0
+        };
+        let max_content = if contribution.max_content.is_finite() {
+            contribution.max_content.max(min_content)
+        } else {
+            min_content
+        };
+        Some(GridTrackContribution {
+            start: contribution.start,
+            span,
+            min_content,
+            max_content,
+        })
+    });
+
     let mut sizes = [0.0f32; MAX_GRID_TRACKS];
-    let mut limits = [f32::INFINITY; MAX_GRID_TRACKS];
+    let mut base_caps = [f32::INFINITY; MAX_GRID_TRACKS];
     let fixed = |breadth| match breadth {
-        B::Pixels(v) => Some(v),
-        B::Percentage(v) => available.map(|size| size * v / 100.0),
-        B::Length(px, pct) => available.map(|size| px + size * pct / 100.0),
+        B::Pixels(value) => Some(value.max(0.0)),
+        B::Percentage(value) => available.map(|basis| (value * basis / 100.0).max(0.0)),
+        B::Length(pixels, percent) if percent == 0.0 => Some(pixels.max(0.0)),
+        B::Length(pixels, percent) => {
+            available.map(|basis| (pixels + basis * percent / 100.0).max(0.0))
+        }
         _ => None,
     };
-    for i in 0..count {
-        let track = definitions.get(i).copied().unwrap_or(T::Auto);
-        sizes[i] = fixed(track.minimum()).unwrap_or(0.0);
-        limits[i] = fixed(track.maximum())
-            .unwrap_or(f32::INFINITY)
-            .max(sizes[i]);
+    let fit_cap = |track| match track {
+        T::FitContent(limit) if limit.is_finite() && limit >= 0.0 => Some(limit),
+        T::FitContentLength(limit)
+            if limit.pixels.is_finite()
+                && limit.percent.is_finite()
+                && limit.pixels >= 0.0
+                && limit.percent >= 0.0 =>
+        {
+            if limit.percent == 0.0 {
+                Some(limit.pixels)
+            } else {
+                available.and_then(|basis| {
+                    css::definite_breadth(B::Length(limit.pixels, limit.percent), basis)
+                })
+            }
+        }
+        _ => None,
+    };
+
+    for index in 0..count {
+        let track = definitions.get(index).copied().unwrap_or(T::Auto);
+        let minimum = track.minimum();
+        sizes[index] = fixed(minimum).unwrap_or(0.0);
+        if let Some(cap) = fixed(track.maximum()) {
+            base_caps[index] = cap.max(sizes[index]);
+        }
     }
-    for (start, span, min, max) in contributions {
-        for maximum in [false, true] {
-            let eligible = |i: usize| {
-                let track = definitions.get(i).copied().unwrap_or(T::Auto);
-                let breadth = if maximum {
-                    track.maximum()
-                } else {
-                    track.minimum()
-                };
-                if maximum {
-                    matches!(breadth, B::MaxContent | B::Auto | B::MinContent)
-                        && !matches!(track, T::MinMax(_, B::Fraction(_)))
-                } else {
-                    matches!(breadth, B::Auto | B::MinContent | B::MaxContent)
-                        || matches!(breadth, B::Percentage(_)) && available.is_none()
-                }
-            };
-            let current = sizes[start..start + span].iter().sum::<f32>() + gap * (span - 1) as f32;
-            let breadth = if maximum {
-                definitions.get(start).copied().unwrap_or(T::Auto).maximum()
-            } else {
-                definitions.get(start).copied().unwrap_or(T::Auto).minimum()
-            };
-            let target = if span == 1 && matches!(breadth, B::MinContent) {
-                min
-            } else if maximum || span == 1 && matches!(breadth, B::MaxContent) {
-                max
-            } else {
-                min
-            };
-            let mut extra = (target - current).max(0.0);
-            for _ in 0..span {
-                let eligible_count = (start..start + span)
-                    .filter(|i| eligible(*i) && sizes[*i] < limits[*i])
-                    .count();
-                if eligible_count == 0 || extra <= 0.0 {
-                    break;
-                }
-                let share = extra / eligible_count as f32;
-                for i in start..start + span {
-                    if eligible(i) && sizes[i] < limits[i] {
-                        let added = share.min(limits[i] - sizes[i]);
-                        sizes[i] += added;
-                        extra -= added;
+
+    // Establish base sizes in increasing span order. Auto/min-content tracks
+    // honor min-content contributions; a max-content minimum is deliberately
+    // resolved from the item's max-content contribution. Definite lengths are
+    // already in the base and percentages on an indefinite axis act intrinsic.
+    for span in 1..=count {
+        for contribution in contributions
+            .clone()
+            .filter(|contribution| contribution.span == span)
+        {
+            let start = contribution.start;
+            let end = start + span;
+            distribute_grid_track_range(
+                &mut sizes,
+                &base_caps,
+                start,
+                span,
+                contribution.min_content,
+                gap,
+                |index| {
+                    let track = definitions.get(index).copied().unwrap_or(T::Auto);
+                    index >= start
+                        && index < end
+                        && (matches!(track.minimum(), B::Auto | B::MinContent)
+                            || matches!(track.minimum(), B::Percentage(_))
+                                && available.is_none()
+                            || matches!(track.minimum(), B::Length(_, percent)
+                                if available.is_none() && percent != 0.0))
+                },
+            );
+            distribute_grid_track_range(
+                &mut sizes,
+                &base_caps,
+                start,
+                span,
+                contribution.max_content,
+                gap,
+                |index| {
+                    index >= start
+                        && index < end
+                        && matches!(
+                            definitions.get(index).copied().unwrap_or(T::Auto).minimum(),
+                            B::MaxContent
+                        )
+                },
+            );
+        }
+    }
+
+    // Growth limits start at the resolved base. Intrinsic maximum functions
+    // then absorb max-content (or min-content for min-content maxima) span
+    // constraints, while fixed and fit-content maxima remain hard ceilings.
+    let mut growth_limits = sizes;
+    for index in 0..count {
+        let track = definitions.get(index).copied().unwrap_or(T::Auto);
+        if let Some(cap) = fixed(track.maximum()) {
+            growth_limits[index] = cap.max(sizes[index]);
+        }
+        if let Some(cap) = fit_cap(track) {
+            growth_limits[index] = cap.max(sizes[index]);
+        }
+    }
+    let mut intrinsic_caps = [f32::INFINITY; MAX_GRID_TRACKS];
+    for index in 0..count {
+        let track = definitions.get(index).copied().unwrap_or(T::Auto);
+        if fixed(track.maximum()).is_some() {
+            intrinsic_caps[index] = growth_limits[index];
+        }
+        if let Some(cap) = fit_cap(track) {
+            intrinsic_caps[index] = cap.max(sizes[index]);
+        }
+    }
+    for span in 1..=count {
+        for contribution in contributions
+            .clone()
+            .filter(|contribution| contribution.span == span)
+        {
+            let start = contribution.start;
+            let end = start + span;
+            distribute_grid_track_range(
+                &mut growth_limits,
+                &intrinsic_caps,
+                start,
+                span,
+                contribution.min_content,
+                gap,
+                |index| {
+                    index >= start
+                        && index < end
+                        && matches!(
+                            definitions.get(index).copied().unwrap_or(T::Auto).maximum(),
+                            B::MinContent
+                        )
+                },
+            );
+            distribute_grid_track_range(
+                &mut growth_limits,
+                &intrinsic_caps,
+                start,
+                span,
+                contribution.max_content,
+                gap,
+                |index| {
+                    if index < start || index >= end {
+                        return false;
                     }
+                    let track = definitions.get(index).copied().unwrap_or(T::Auto);
+                    match track {
+                        T::FitContent(_) | T::FitContentLength(_) => true,
+                        _ => matches!(track.maximum(), B::Auto | B::MaxContent)
+                            || matches!(track.maximum(), B::Percentage(_))
+                                && available.is_none()
+                            || matches!(track.maximum(), B::Length(_, percent)
+                                if available.is_none() && percent != 0.0),
+                    }
+                },
+            );
+            for index in start..end {
+                if let Some(cap) = fit_cap(definitions.get(index).copied().unwrap_or(T::Auto)) {
+                    growth_limits[index] = growth_limits[index].min(cap.max(sizes[index]));
                 }
-            }
-        }
-        for i in start..start + span {
-            let limit = match definitions.get(i) {
-                Some(T::FitContent(limit)) => Some(*limit),
-                Some(T::FitContentLength(limit)) => Some(available.map_or(limit.pixels, |basis| {
-                    limit.pixels + limit.percent * basis / 100.0
-                })),
-                _ => None,
-            };
-            if let Some(limit) = limit {
-                sizes[i] = sizes[i].min(limit.max(min / span as f32));
             }
         }
     }
+
     if let Some(available) = available {
-        let mut extra =
-            (available - sizes[..count].iter().sum::<f32>() - gap * count.saturating_sub(1) as f32)
-                .max(0.0);
-        for _ in 0..count {
-            let growing = (0..count)
-                .filter(|i| limits[*i].is_finite() && sizes[*i] < limits[*i])
-                .count();
-            if growing == 0 || extra <= 0.0 {
-                break;
-            }
-            let share = extra / growing as f32;
-            for i in 0..count {
-                if limits[i].is_finite() && sizes[i] < limits[i] {
-                    let added = share.min(limits[i] - sizes[i]);
-                    sizes[i] += added;
-                    extra -= added;
-                }
-            }
+        // Maximize intrinsic tracks up to their content-based growth limits.
+        // This is the grid track-sizing water-fill step, separate from the
+        // later flexible-track and auto-stretch steps.
+        let free = (available
+            - sizes[..count].iter().sum::<f32>()
+            - gap * count.saturating_sub(1) as f32)
+            .max(0.0);
+        if count > 0 && free > 0.0 {
+            distribute_grid_track_range(
+                &mut sizes,
+                &growth_limits,
+                0,
+                count,
+                available,
+                gap,
+                |index| {
+                    !matches!(
+                        definitions.get(index).copied().unwrap_or(T::Auto).maximum(),
+                        B::Fraction(value) if value > 0.0
+                    )
+                },
+            );
         }
+
         let mut frozen = [false; MAX_GRID_TRACKS];
         for _ in 0..=count {
             let mut used = gap * count.saturating_sub(1) as f32;
-            let mut fractions = 0.0;
-            for i in 0..count {
-                match definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
-                    B::Fraction(v) if !frozen[i] => fractions += v,
-                    _ => used += sizes[i],
+            let mut fraction_sum = 0.0;
+            for index in 0..count {
+                match definitions.get(index).copied().unwrap_or(T::Auto).maximum() {
+                    B::Fraction(value) if value > 0.0 && !frozen[index] => {
+                        fraction_sum += value;
+                    }
+                    _ => used += sizes[index],
                 }
             }
-            if fractions == 0.0 {
+            if fraction_sum == 0.0 {
                 break;
             }
-            let unit = ((available - used).max(0.0) / fractions.max(1.0)).max(0.0);
+            let unit = ((available - used).max(0.0) / fraction_sum.max(1.0)).max(0.0);
             let mut changed = false;
-            for i in 0..count {
-                if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
-                    if !frozen[i] && sizes[i] > unit * v {
-                        frozen[i] = true;
+            for index in 0..count {
+                if let B::Fraction(value) =
+                    definitions.get(index).copied().unwrap_or(T::Auto).maximum()
+                {
+                    if value > 0.0 && !frozen[index] && sizes[index] > unit * value {
+                        frozen[index] = true;
                         changed = true;
                     }
                 }
             }
             if !changed {
-                for i in 0..count {
-                    if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum()
+                for index in 0..count {
+                    if let B::Fraction(value) =
+                        definitions.get(index).copied().unwrap_or(T::Auto).maximum()
                     {
-                        if !frozen[i] {
-                            sizes[i] = unit * v;
+                        if value > 0.0 && !frozen[index] {
+                            sizes[index] = sizes[index].max(unit * value);
                         }
                     }
                 }
                 break;
             }
         }
+
         if stretch {
-            let extra = (available
+            let free = (available
                 - sizes[..count].iter().sum::<f32>()
                 - gap * count.saturating_sub(1) as f32)
                 .max(0.0);
-            let autos = (0..count)
-                .filter(|i| {
-                    matches!(
-                        definitions.get(*i).copied().unwrap_or(T::Auto),
-                        T::Auto | T::MinMax(_, B::Auto)
-                    )
+            let stretchable = (0..count)
+                .filter(|&index| {
+                    let track = definitions.get(index).copied().unwrap_or(T::Auto);
+                    !matches!(track, T::FitContent(_) | T::FitContentLength(_))
+                        && matches!(track.maximum(), B::Auto)
                 })
                 .count();
-            if autos > 0 {
-                for i in 0..count {
-                    if matches!(
-                        definitions.get(i).copied().unwrap_or(T::Auto),
-                        T::Auto | T::MinMax(_, B::Auto)
-                    ) {
-                        sizes[i] += extra / autos as f32;
+            if stretchable > 0 && free > 0.0 {
+                let share = free / stretchable as f32;
+                for index in 0..count {
+                    let track = definitions.get(index).copied().unwrap_or(T::Auto);
+                    if !matches!(track, T::FitContent(_) | T::FitContentLength(_))
+                        && matches!(track.maximum(), B::Auto)
+                    {
+                        sizes[index] += share;
                     }
                 }
             }
         }
     } else {
-        let unit = (0..count)
-            .filter_map(
-                |i| match definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
-                    B::Fraction(v) if v > 0.0 => Some(sizes[i] / v.max(1.0)),
-                    _ => None,
-                },
-            )
+        // An indefinite axis has no free-space maximization. Intrinsic tracks
+        // take their content-based limits, while fr tracks resolve from the
+        // largest compatible intrinsic fraction, including spanning items.
+        for index in 0..count {
+            let track = definitions.get(index).copied().unwrap_or(T::Auto);
+            if !matches!(track.maximum(), B::Fraction(value) if value > 0.0) {
+                sizes[index] = sizes[index].max(growth_limits[index]);
+            }
+        }
+        let mut unit = (0..count)
+            .filter_map(|index| match definitions
+                .get(index)
+                .copied()
+                .unwrap_or(T::Auto)
+                .maximum()
+            {
+                B::Fraction(value) if value > 0.0 => Some(sizes[index] / value),
+                _ => None,
+            })
             .fold(0.0f32, f32::max);
-        for i in 0..count {
-            if let B::Fraction(v) = definitions.get(i).copied().unwrap_or(T::Auto).maximum() {
-                sizes[i] = sizes[i].max(unit * v);
+        for contribution in contributions.clone() {
+            let start = contribution.start;
+            let end = start + contribution.span;
+            let fraction_sum = (start..end)
+                .filter_map(|index| match definitions
+                    .get(index)
+                    .copied()
+                    .unwrap_or(T::Auto)
+                    .maximum()
+                {
+                    B::Fraction(value) if value > 0.0 => Some(value),
+                    _ => None,
+                })
+                .sum::<f32>();
+            if fraction_sum == 0.0 {
+                continue;
+            }
+            let non_flexible = (start..end)
+                .filter(|&index| {
+                    !matches!(
+                        definitions.get(index).copied().unwrap_or(T::Auto).maximum(),
+                        B::Fraction(value) if value > 0.0
+                    )
+                })
+                .map(|index| sizes[index])
+                .sum::<f32>();
+            let required = (contribution.max_content
+                - non_flexible
+                - gap * contribution.span.saturating_sub(1) as f32)
+                .max(0.0);
+            unit = unit.max(required / fraction_sum);
+        }
+        for index in 0..count {
+            if let B::Fraction(value) =
+                definitions.get(index).copied().unwrap_or(T::Auto).maximum()
+            {
+                if value > 0.0 {
+                    sizes[index] = sizes[index].max(unit * value);
+                }
             }
         }
     }
-    sizes
+
+    for size in &mut sizes[..count] {
+        if !size.is_finite() || *size < 0.0 {
+            *size = 0.0;
+        }
+    }
+    Ok(sizes)
 }
 
 fn has_background(style: &Style) -> bool {
@@ -4071,27 +6733,19 @@ fn auto_repeat_count(
     available: Option<f32>,
     gap: f32,
 ) -> Result<usize, LayoutError> {
-    use css::{GridTrack, MAX_GRID_TRACKS, definite_breadth};
+    use css::{definite_breadth, GridTrack, MAX_GRID_TRACKS};
     let pattern_tracks = auto.tracks.len();
     if pattern_tracks == 0 {
-        return Err(LayoutError::GridLimit);
+        return Ok(0);
     }
     let outside_tracks = auto
         .prefix_tracks
         .len()
-        .checked_add(auto.suffix_tracks.len())
-        .ok_or(LayoutError::GridLimit)?;
-    let capacity = MAX_GRID_TRACKS.saturating_sub(outside_tracks) / pattern_tracks;
-    let maximum_repetitions = capacity;
-    let gap = if gap.is_finite() {
-        gap.max(0.0)
-    } else {
-        return Err(LayoutError::GridLimit);
-    };
-    let Some(available) = available else {
-        return (maximum_repetitions >= 1)
-            .then_some(1)
-            .ok_or(LayoutError::GridLimit);
+        .saturating_add(auto.suffix_tracks.len());
+    let maximum_repetitions = MAX_GRID_TRACKS.saturating_sub(outside_tracks) / pattern_tracks;
+    let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
+    let Some(available) = available.filter(|value| value.is_finite()) else {
+        return Ok(maximum_repetitions.min(1));
     };
     let extent = |track: GridTrack| {
         definite_breadth(track.maximum(), available)
@@ -4122,15 +6776,14 @@ fn auto_repeat_count(
     let outside_gap = gap * (outside_tracks as f32 - 1.0);
     let per_repeat = pattern_size + gap * pattern_tracks as f32;
     if !outside_size.is_finite() || !outside_gap.is_finite() || !per_repeat.is_finite() {
-        return Err(LayoutError::GridLimit);
+        return Ok(maximum_repetitions.min(1));
     }
     let room = (available - outside_size - outside_gap).max(0.0);
-    if !room.is_finite() {
-        return Err(LayoutError::GridLimit);
-    }
+    // A repetition count beyond the implementation limit clamps to it
+    // (CSS Grid §7.6) rather than failing layout.
     let repetitions = (room / per_repeat).floor().max(1.0);
-    if !repetitions.is_finite() || repetitions > maximum_repetitions as f32 {
-        return Err(LayoutError::GridLimit);
+    if !repetitions.is_finite() || repetitions >= maximum_repetitions as f32 {
+        return Ok(maximum_repetitions);
     }
     Ok(repetitions as usize)
 }
@@ -4730,6 +7383,12 @@ fn shift_region(range: &mut core::ops::Range<usize>, first: usize, last: usize, 
 /// Remap a subtree range when `[first,last)` is raised to the end of
 /// `[first,end)`. Enclosing scopes retain their bounds.
 fn raise_range(range: &mut core::ops::Range<usize>, first: usize, last: usize, end: usize) {
+    // An empty chunk moves no entries. Its former boundary may lie beyond
+    // the current stream after an empty transform/opacity wrapper is removed.
+    // Empty recorded ranges likewise have no entries to remap.
+    if first == last || range.is_empty() {
+        return;
+    }
     if range.start >= first && range.end <= last {
         let offset = end - last;
         range.start += offset;
@@ -4813,7 +7472,45 @@ fn float_edges(floats: &[(Rect, Float)], left: f32, width: f32, y: f32, height: 
     (start, (end - start).max(0.0))
 }
 
+fn establishes_formatting_context(style: &Style, parent: &Style) -> bool {
+    overflow_scroll_container(style)
+        || style.contain_paint
+        || style.contain_layout
+        || style.float != Float::None
+        || matches!(style.position, Position::Absolute | Position::Fixed)
+        || matches!(
+            style.display,
+            Display::FlowRoot
+                | Display::InlineBlock
+                | Display::Table
+                | Display::TableCell
+                | Display::TableCaption
+                | Display::Flex
+                | Display::Grid
+        )
+        || matches!(parent.display, Display::Flex | Display::Grid)
+        || style.column_count.is_some_and(|count| count > 1)
+}
+
 impl Layout<'_> {
+    fn context_float_edges(
+        &self,
+        start: usize,
+        left: f32,
+        width: f32,
+        y: f32,
+        height: f32,
+    ) -> (f32, f32) {
+        let (left, width) = float_edges(
+            &self.floats[start..],
+            left - self.float_offset.0,
+            width,
+            y - self.float_offset.1,
+            height,
+        );
+        (left + self.float_offset.0, width)
+    }
+
     fn decorate_text(
         &mut self,
         x: f32,
@@ -5061,30 +7758,105 @@ impl Layout<'_> {
         &self,
         id: NodeId,
         style: &Style,
-        rows: &mut Vec<(NodeId, Style)>,
+        rows: &mut Vec<TableRow>,
+        row_cells: &mut Vec<TableCellContent>,
+        cell_children: &mut Vec<Option<FlattenedBoxChild>>,
         groups: &mut Vec<TableRowGroup>,
+        available: f32,
         depth: usize,
     ) -> Result<(), LayoutError> {
         if depth > 512 {
             return Err(LayoutError::DepthLimit);
         }
-        let mut children = self
-            .document
-            .composed_children_iter(id)
-            .map_err(|_| LayoutError::InvalidTree)?;
-        while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
-            if matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
-                let computed = self
-                    .computed_style(node, Some(style))
-                    .map_err(LayoutError::Css)?;
-                if computed.display == Display::TableRow {
-                    if rows.len() == 4096 {
-                        return Err(LayoutError::CommandLimit);
+        let children = self.flattened_box_children_with_options(
+            id,
+            style,
+            available,
+            depth + 1,
+            true,
+            false,
+        )?;
+        let mut anonymous_start = None;
+        let mut anonymous_cell = Vec::new();
+        let is_table = style.display == Display::Table;
+        for child in children {
+            let structural = match &child.kind {
+                FlattenedBoxChildKind::Node(node) => {
+                    let computed = child.computed_style.as_ref();
+                    let kind = self
+                        .document
+                        .kind(*node)
+                        .map_err(|_| LayoutError::InvalidTree)?;
+                    match kind {
+                        NodeKind::Element { name, .. } => {
+                            let display = computed.map_or(Display::Block, |style| style.display);
+                            let is_caption_or_column = is_table
+                                && (display == Display::TableCaption
+                                    || matches!(name.as_str(), "caption" | "col" | "colgroup"));
+                            if is_caption_or_column {
+                                Some((None, None))
+                            } else if display == Display::TableRow
+                                && (is_table || style.display == Display::TableRowGroup)
+                            {
+                                Some((Some(*node), Some(display)))
+                            } else if display == Display::TableRowGroup && is_table {
+                                Some((Some(*node), Some(display)))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
                     }
-                    rows.push((node, computed));
-                } else if computed.display == Display::TableRowGroup {
+                }
+                FlattenedBoxChildKind::Generated(_) => None,
+            };
+            if let Some((node, display)) = structural {
+                self.flush_anonymous_table_cell(
+                    id,
+                    style,
+                    &mut anonymous_cell,
+                    row_cells,
+                    cell_children,
+                )?;
+                if let Some(first_cell) = anonymous_start.take() {
+                    self.push_anonymous_table_row(rows, row_cells, first_cell, style)?;
+                }
+                let (Some(node), Some(display)) = (node, display) else {
+                    // Captions and columns participate in separate table
+                    // passes. Their flattened pseudo/content boxes are not
+                    // row children.
+                    continue;
+                };
+                if display == Display::TableRow {
+                    let row_style = child
+                        .computed_style
+                        .clone()
+                        .ok_or(LayoutError::InvalidTree)?;
+                    self.push_explicit_table_row(
+                        node,
+                        row_style,
+                        rows,
+                        row_cells,
+                        cell_children,
+                        available,
+                        depth + 1,
+                    )?;
+                } else if display == Display::TableRowGroup {
+                    let group_style = child
+                        .computed_style
+                        .clone()
+                        .ok_or(LayoutError::InvalidTree)?;
                     let first_row = rows.len();
-                    self.table_rows(node, &computed, rows, groups, depth + 1)?;
+                    self.table_rows(
+                        node,
+                        &group_style,
+                        rows,
+                        row_cells,
+                        cell_children,
+                        groups,
+                        available,
+                        depth + 1,
+                    )?;
                     let end_row = rows.len();
                     if end_row > first_row {
                         if groups.len() == 4096 {
@@ -5096,12 +7868,215 @@ impl Layout<'_> {
                         groups.push(TableRowGroup {
                             first_row,
                             end_row,
-                            style: computed,
+                            style: group_style,
                         });
                     }
                 }
+            } else {
+                anonymous_start.get_or_insert(row_cells.len());
+                self.append_table_row_cell(
+                    id,
+                    style,
+                    child,
+                    &mut anonymous_cell,
+                    row_cells,
+                    cell_children,
+                )?;
             }
         }
+        self.flush_anonymous_table_cell(
+            id,
+            style,
+            &mut anonymous_cell,
+            row_cells,
+            cell_children,
+        )?;
+        if let Some(first_cell) = anonymous_start {
+            self.push_anonymous_table_row(rows, row_cells, first_cell, style)?;
+        }
+        Ok(())
+    }
+
+    fn append_table_row_cell(
+        &self,
+        parent: NodeId,
+        parent_style: &Style,
+        child: FlattenedBoxChild,
+        anonymous_children: &mut Vec<FlattenedBoxChild>,
+        row_cells: &mut Vec<TableCellContent>,
+        cell_children: &mut Vec<Option<FlattenedBoxChild>>,
+    ) -> Result<(), LayoutError> {
+        let explicit_cell = match &child.kind {
+            FlattenedBoxChildKind::Node(node)
+                if matches!(self.document.kind(*node), Ok(NodeKind::Element { .. })) =>
+            {
+                child
+                    .computed_style
+                    .as_ref()
+                    .is_some_and(|style| style.display == Display::TableCell)
+                    .then_some(*node)
+            }
+            _ => None,
+        };
+        if let Some(node) = explicit_cell {
+            self.flush_anonymous_table_cell(
+                parent,
+                parent_style,
+                anonymous_children,
+                row_cells,
+                cell_children,
+            )?;
+            if row_cells.len() >= 4096 {
+                return Err(LayoutError::CommandLimit);
+            }
+            row_cells
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            row_cells.push(TableCellContent::Node(node));
+        } else {
+            // Collapsible whitespace-only text between table structures does
+            // not create an anonymous cell box. Preserved spaces and breaks
+            // remain content and are laid out by the normal inline flow.
+            if let FlattenedBoxChildKind::Node(node) = &child.kind {
+                if let Ok(NodeKind::Text(value) | NodeKind::CData(value)) = self.document.kind(*node)
+                {
+                    if !matches!(
+                        child.parent_style.white_space,
+                        css::WhiteSpace::Pre
+                            | css::WhiteSpace::PreWrap
+                            | css::WhiteSpace::PreLine
+                            | css::WhiteSpace::BreakSpaces
+                    ) && value
+                        .chars()
+                        .all(|character| matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0c'))
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            if cell_children
+                .len()
+                .saturating_add(anonymous_children.len())
+                >= MAX_DISPLAY_COMMANDS
+            {
+                return Err(LayoutError::CommandLimit);
+            }
+            anonymous_children
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            anonymous_children.push(child);
+        }
+        Ok(())
+    }
+
+    fn flush_anonymous_table_cell(
+        &self,
+        parent: NodeId,
+        parent_style: &Style,
+        anonymous_children: &mut Vec<FlattenedBoxChild>,
+        row_cells: &mut Vec<TableCellContent>,
+        cell_children: &mut Vec<Option<FlattenedBoxChild>>,
+    ) -> Result<(), LayoutError> {
+        if anonymous_children.is_empty() {
+            return Ok(());
+        }
+        let end = cell_children
+            .len()
+            .checked_add(anonymous_children.len())
+            .filter(|end| *end <= MAX_DISPLAY_COMMANDS)
+            .ok_or(LayoutError::CommandLimit)?;
+        if row_cells.len() >= 4096 {
+            return Err(LayoutError::CommandLimit);
+        }
+        cell_children
+            .try_reserve(anonymous_children.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        row_cells
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        let first = cell_children.len();
+        cell_children.extend(anonymous_children.drain(..).map(Some));
+        let mut cell_style = parent_style.display_contents_child_style();
+        cell_style.display = Display::TableCell;
+        row_cells.push(TableCellContent::Anonymous {
+            parent,
+            children: first..end,
+            style: cell_style,
+        });
+        Ok(())
+    }
+
+    fn push_anonymous_table_row(
+        &self,
+        rows: &mut Vec<TableRow>,
+        row_cells: &[TableCellContent],
+        first_cell: usize,
+        style: &Style,
+    ) -> Result<(), LayoutError> {
+        let end_cell = row_cells.len();
+        if first_cell >= end_cell {
+            return Ok(());
+        }
+        if rows.len() >= 4096 {
+            return Err(LayoutError::CommandLimit);
+        }
+        rows.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+        let mut row_style = style.display_contents_child_style();
+        row_style.display = Display::TableRow;
+        rows.push(TableRow {
+            node: None,
+            style: row_style,
+            cells: first_cell..end_cell,
+        });
+        Ok(())
+    }
+
+    fn push_explicit_table_row(
+        &self,
+        node: NodeId,
+        style: Style,
+        rows: &mut Vec<TableRow>,
+        row_cells: &mut Vec<TableCellContent>,
+        cell_children: &mut Vec<Option<FlattenedBoxChild>>,
+        available: f32,
+        depth: usize,
+    ) -> Result<(), LayoutError> {
+        if rows.len() >= 4096 {
+            return Err(LayoutError::CommandLimit);
+        }
+        let first_cell = row_cells.len();
+        let children = self.flattened_box_children_with_options(
+            node,
+            &style,
+            available,
+            depth + 1,
+            true,
+            false,
+        )?;
+        let mut anonymous_children = Vec::new();
+        for child in children {
+            self.append_table_row_cell(
+                node,
+                &style,
+                child,
+                &mut anonymous_children,
+                row_cells,
+                cell_children,
+            )?;
+        }
+        self.flush_anonymous_table_cell(
+            node,
+            &style,
+            &mut anonymous_children,
+            row_cells,
+            cell_children,
+        )?;
+        rows.try_reserve(1).map_err(|_| LayoutError::CommandLimit)?;
+        rows.push(TableRow {
+            node: Some(node),
+            style,
+            cells: first_cell..row_cells.len(),
+        });
         Ok(())
     }
 
@@ -5124,7 +8099,7 @@ impl Layout<'_> {
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?
             {
-                NodeKind::Text(text) => {
+                NodeKind::Text(text) | NodeKind::CData(text) => {
                     let has_line_content = if matches!(
                         style.white_space,
                         css::WhiteSpace::NoWrap
@@ -5177,6 +8152,198 @@ impl Layout<'_> {
         Ok(None)
     }
 
+    fn intrinsic_size_flattened_children(
+        &self,
+        children: &[Option<FlattenedBoxChild>],
+        depth: usize,
+    ) -> Result<(f32, f32), LayoutError> {
+        if depth > 512 {
+            return Err(LayoutError::DepthLimit);
+        }
+        if children.len() > MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        let (mut width, mut height, mut inline_width, mut inline_height) =
+            (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for child in children.iter().flatten() {
+            let (child_width, child_height, inline) = match &child.kind {
+                FlattenedBoxChildKind::Node(node) => {
+                    let kind = self
+                        .document
+                        .kind(*node)
+                        .map_err(|_| LayoutError::InvalidTree)?;
+                    let child_style = child.computed_style.as_ref().unwrap_or(&child.parent_style);
+                    let (width, height) =
+                        self.intrinsic_size_mode(*node, child_style, depth + 1, false)?;
+                    (
+                        width,
+                        height,
+                        matches!(kind, NodeKind::Text(_) | NodeKind::CData(_))
+                            || matches!(
+                                child_style.display,
+                                Display::Inline | Display::InlineBlock
+                            ),
+                    )
+                }
+                FlattenedBoxChildKind::Generated(generated) => {
+                    let width = if let Some(image) = &generated.marker_image {
+                        let space = self
+                            .text
+                            .measure_styled(" ", generated.style.font_size, &generated.style.font)
+                            .map_err(|_| LayoutError::Text)?;
+                        image.width as f32 + space.max(0.0)
+                    } else if generated.text.is_empty() {
+                        0.0
+                    } else {
+                        self.text
+                            .measure_styled(
+                                &generated.text,
+                                generated.style.font_size,
+                                &generated.style.font,
+                            )
+                            .map_err(|_| LayoutError::Text)?
+                    };
+                    let height = if generated.marker_image.is_some() {
+                        generated
+                            .marker_image
+                            .as_ref()
+                            .map_or(0.0, |image| image.height as f32)
+                            .max(self.line_height(&generated.style))
+                    } else {
+                        self.line_height(&generated.style)
+                    };
+                    (
+                        width,
+                        height,
+                        matches!(
+                            generated.style.display,
+                            Display::Inline | Display::InlineBlock
+                        ),
+                    )
+                }
+            };
+            if inline {
+                inline_width += child_width;
+                inline_height = inline_height.max(child_height);
+            } else {
+                width = width.max(inline_width).max(child_width);
+                height += inline_height + child_height;
+                inline_width = 0.0;
+                inline_height = 0.0;
+            }
+        }
+        Ok((width.max(inline_width), height + inline_height))
+    }
+
+    fn first_flattened_table_cell_baseline_style(
+        &self,
+        children: &[Option<FlattenedBoxChild>],
+        depth: usize,
+    ) -> Result<Option<(Style, f32)>, LayoutError> {
+        if depth > 512 {
+            return Err(LayoutError::DepthLimit);
+        }
+        for child in children.iter().flatten() {
+            match &child.kind {
+                FlattenedBoxChildKind::Node(node) => match self
+                    .document
+                    .kind(*node)
+                    .map_err(|_| LayoutError::InvalidTree)?
+                {
+                    NodeKind::Text(text) | NodeKind::CData(text) => {
+                        let text_style = &child.parent_style;
+                        let has_line_content = if matches!(
+                            text_style.white_space,
+                            css::WhiteSpace::NoWrap
+                                | css::WhiteSpace::Pre
+                                | css::WhiteSpace::PreWrap
+                                | css::WhiteSpace::BreakSpaces
+                        ) {
+                            !text.is_empty()
+                        } else {
+                            !collapsed_text(text).trim_matches(' ').is_empty()
+                        };
+                        if has_line_content {
+                            return Ok(Some((text_style.clone(), 0.0)));
+                        }
+                    }
+                    NodeKind::Element { name, .. } => {
+                        let child_style = child
+                            .computed_style
+                            .as_ref()
+                            .unwrap_or(&child.parent_style);
+                        if child_style.display == Display::None
+                            || matches!(child_style.position, Position::Absolute | Position::Fixed)
+                            || child_style.float != Float::None
+                        {
+                            continue;
+                        }
+                        if crate::svg::local_name(name) == "br" {
+                            return Ok(Some((child_style.clone(), 0.0)));
+                        }
+                        let inset = if matches!(
+                            child_style.display,
+                            Display::Inline | Display::InlineBlock
+                        ) {
+                            0.0
+                        } else {
+                            child_style.margin_sides[0]
+                                + child_style.padding_sides[0]
+                                + border_widths(child_style)[0]
+                        };
+                        if let Some((baseline_style, offset)) =
+                            self.first_table_cell_baseline_style(*node, child_style, depth + 1)?
+                        {
+                            return Ok(Some((baseline_style, inset + offset)));
+                        }
+                    }
+                    _ => {}
+                },
+                FlattenedBoxChildKind::Generated(generated) => {
+                    if generated.marker_image.is_some() || !generated.text.is_empty() {
+                        return Ok(Some((generated.style.clone(), 0.0)));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve_flattened_table_cell_children(
+        &self,
+        children: &mut [FlattenedBoxChild],
+        available: f32,
+    ) -> Result<(), LayoutError> {
+        for child in children {
+            match &mut child.kind {
+                FlattenedBoxChildKind::Node(node)
+                    if matches!(
+                        self.document.kind(*node),
+                        Ok(NodeKind::Element { .. })
+                    ) =>
+                {
+                    let computed = self
+                        .computed_style(*node, Some(&child.parent_style))
+                        .map_err(LayoutError::Css)?;
+                    child.computed_style = Some(
+                        if matches!(computed.position, Position::Absolute | Position::Fixed) {
+                            computed
+                        } else {
+                            computed.resolve_percentages(available, self.parent_height)
+                        },
+                    );
+                }
+                FlattenedBoxChildKind::Generated(generated) => {
+                    generated.style = generated
+                        .unresolved_style
+                        .resolve_percentages(available, self.parent_height);
+                }
+                FlattenedBoxChildKind::Node(_) => {}
+            }
+        }
+        Ok(())
+    }
+
     fn table(
         &mut self,
         id: NodeId,
@@ -5187,7 +8354,7 @@ impl Layout<'_> {
         depth: usize,
     ) -> Result<f32, LayoutError> {
         struct Cell {
-            node: NodeId,
+            source: TableCellContent,
             style: Style,
             row: usize,
             col: usize,
@@ -5199,23 +8366,33 @@ impl Layout<'_> {
             baseline_offset: Option<f32>,
         }
         let mut rows = Vec::new();
+        let mut row_cells = Vec::new();
+        let mut cell_children = Vec::new();
         let mut row_groups = Vec::new();
-        self.table_rows(id, style, &mut rows, &mut row_groups, depth)?;
+        self.table_rows(
+            id,
+            style,
+            &mut rows,
+            &mut row_cells,
+            &mut cell_children,
+            &mut row_groups,
+            available,
+            depth,
+        )?;
         let mut caption = None;
         let mut direct = self
             .document
             .composed_children_iter(id)
             .map_err(|_| LayoutError::InvalidTree)?;
         while let Some(node) = direct.next().map_err(|_| LayoutError::InvalidTree)? {
-            if matches!(
-                self.document.kind(node),
-                Ok(NodeKind::Element { name, .. }) if name == "caption"
-            ) {
-                caption = Some((
-                    node,
-                    self.computed_style(node, Some(style))
-                        .map_err(LayoutError::Css)?,
-                ));
+            let Ok(NodeKind::Element { name, .. }) = self.document.kind(node) else {
+                continue;
+            };
+            let computed = self
+                .computed_style(node, Some(style))
+                .map_err(LayoutError::Css)?;
+            if name == "caption" || computed.display == Display::TableCaption {
+                caption = Some((node, computed));
                 break;
             }
         }
@@ -5231,98 +8408,127 @@ impl Layout<'_> {
                 style.border_spacing[1].max(0.0),
             ]
         };
-        for (row, (node, parent)) in rows.iter().enumerate() {
+        for (row, table_row) in rows.iter().enumerate() {
+            let parent = &table_row.style;
             let mut col = 0;
-            let mut children = self
-                .document
-                .composed_children_iter(*node)
-                .map_err(|_| LayoutError::InvalidTree)?;
-            while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
-                if let Ok(NodeKind::Element { attributes, .. }) = self.document.kind(node) {
-                    let computed = self
-                        .computed_style(node, Some(parent))
-                        .map_err(LayoutError::Css)?;
-                    if computed.display == Display::TableCell {
-                        let span = |key: &str, limit: usize| {
+            for source in row_cells[table_row.cells.clone()].iter().cloned() {
+                let (attributes, computed) = match &source {
+                    TableCellContent::Node(node) => {
+                        let NodeKind::Element { attributes, .. } = self
+                            .document
+                            .kind(*node)
+                            .map_err(|_| LayoutError::InvalidTree)?
+                        else {
+                            continue;
+                        };
+                        let computed = self
+                            .computed_style(*node, Some(parent))
+                            .map_err(LayoutError::Css)?;
+                        if computed.display != Display::TableCell {
+                            continue;
+                        }
+                        (Some(attributes), computed)
+                    }
+                    TableCellContent::Anonymous { style, .. } => (None, style.clone()),
+                };
+                let span = |key: &str, limit: usize| {
+                    attributes
+                        .and_then(|attributes| {
                             attributes
                                 .iter()
                                 .find(|(name, _)| name == key)
-                                .and_then(|(_, v)| v.parse::<usize>().ok())
-                                .unwrap_or(1)
-                                .max(1)
-                                .min(limit)
-                        };
-                        let cols = span("colspan", 256);
-                        while col + cols <= 256
-                            && occupied[col..col + cols].iter().any(|end| *end > row)
-                        {
-                            col += 1;
+                                .and_then(|(_, value)| value.parse::<usize>().ok())
+                        })
+                        .unwrap_or(1)
+                        .max(1)
+                        .min(limit)
+                };
+                let cols = span("colspan", 256);
+                while col + cols <= 256 && occupied[col..col + cols].iter().any(|end| *end > row)
+                {
+                    col += 1;
+                }
+                if col + cols > 256 || cells.len() == 4096 {
+                    return Err(LayoutError::CommandLimit);
+                }
+                cells
+                    .try_reserve(1)
+                    .map_err(|_| LayoutError::CommandLimit)?;
+                let rowspan = if attributes.is_some_and(|attributes| {
+                    attributes
+                        .iter()
+                        .any(|(name, value)| name == "rowspan" && value == "0")
+                }) {
+                    rows.len() - row
+                } else {
+                    span("rowspan", rows.len() - row)
+                };
+                for slot in &mut occupied[col..col + cols] {
+                    *slot = row + rowspan;
+                }
+                let (width, height, baseline_style) = match &source {
+                    TableCellContent::Node(node) => {
+                        let (width, height) =
+                            self.intrinsic_size(*node, &computed, depth + 1)?;
+                        let baseline = self.first_table_cell_baseline_style(
+                            *node,
+                            &computed,
+                            depth + 1,
+                        )?;
+                        (width, height, baseline)
+                    }
+                    TableCellContent::Anonymous { children, .. } => {
+                        let content = cell_children
+                            .get(children.clone())
+                            .ok_or(LayoutError::InvalidTree)?;
+                        let (width, height) = self.intrinsic_size_flattened_children(
+                            content,
+                            depth + 1,
+                        )?;
+                        let baseline = self.first_flattened_table_cell_baseline_style(
+                            content,
+                            depth + 1,
+                        )?;
+                        (width, height, baseline)
+                    }
+                };
+                let natural_width = if style.border_collapse {
+                    let borders = border_widths(&computed);
+                    (width - borders[1] - borders[3]).max(0.0)
+                } else {
+                    width
+                };
+                if !style.border_collapse && (!style.table_fixed || style.width.is_none() || row == 0)
+                {
+                    let width = if style.table_fixed && style.width.is_some() {
+                        computed.width.unwrap_or(0.0)
+                    } else {
+                        width
+                    };
+                    if style.table_fixed && style.width.is_some() {
+                        let per_column = width / cols as f32;
+                        for slot in &mut widths[col..col + cols] {
+                            *slot = slot.max(per_column);
                         }
-                        if col + cols > 256 || cells.len() == 4096 {
-                            return Err(LayoutError::CommandLimit);
-                        }
-                        let rowspan = if attributes
-                            .iter()
-                            .any(|(name, v)| name == "rowspan" && v == "0")
-                        {
-                            rows.len() - row
-                        } else {
-                            span("rowspan", rows.len() - row)
-                        };
-                        for slot in &mut occupied[col..col + cols] {
-                            *slot = row + rowspan;
-                        }
-                        let (width, height) = self.intrinsic_size(node, &computed, depth + 1)?;
-                        let baseline_style =
-                            self.first_table_cell_baseline_style(node, &computed, depth + 1)?;
-                        let natural_width = if style.border_collapse {
-                            let borders = border_widths(&computed);
-                            (width - borders[1] - borders[3]).max(0.0)
-                        } else {
-                            width
-                        };
-                        if !style.border_collapse
-                            && (!style.table_fixed || style.width.is_none() || row == 0)
-                        {
-                            let width = if style.table_fixed && style.width.is_some() {
-                                computed.width.unwrap_or(0.0)
-                            } else {
-                                width
-                            };
-                            if style.table_fixed && style.width.is_some() {
-                                // CSS 2.1 §17.5.2.1 divides a first-row
-                                // spanning-cell width across its columns.
-                                let per_column = width / cols as f32;
-                                for slot in &mut widths[col..col + cols] {
-                                    *slot = slot.max(per_column);
-                                }
-                            } else {
-                                // In auto layout, the cell's intrinsic width
-                                // includes the spacing between the columns it
-                                // spans. That spacing is not a track width.
-                                // Keep the spanning constraint on its first
-                                // track; distributing it evenly can make a
-                                // later empty cell consume half the table.
-                                let track_width = (width - spacing_x * (cols - 1) as f32).max(0.0);
-                                widths[col] = widths[col].max(track_width);
-                            }
-                        }
-                        cells.push(Cell {
-                            node,
-                            style: computed,
-                            row,
-                            col,
-                            cols,
-                            rows: rowspan,
-                            natural_width,
-                            height,
-                            baseline_style,
-                            baseline_offset: None,
-                        });
-                        col += cols;
-                        columns = columns.max(col);
+                    } else {
+                        let track_width = (width - spacing_x * (cols - 1) as f32).max(0.0);
+                        widths[col] = widths[col].max(track_width);
                     }
                 }
+                cells.push(Cell {
+                    source,
+                    style: computed,
+                    row,
+                    col,
+                    cols,
+                    rows: rowspan,
+                    natural_width,
+                    height,
+                    baseline_style,
+                    baseline_offset: None,
+                });
+                col += cols;
+                columns = columns.max(col);
             }
         }
         let mut column_spans = Vec::new();
@@ -5352,6 +8558,9 @@ impl Layout<'_> {
                 let column_style = self
                     .computed_style(node, Some(style))
                     .map_err(LayoutError::Css)?;
+                if column_spans.len() >= 8192 {
+                    return Err(LayoutError::CommandLimit);
+                }
                 column_spans
                     .try_reserve(1)
                     .map_err(|_| LayoutError::CommandLimit)?;
@@ -5396,6 +8605,9 @@ impl Layout<'_> {
                     let column_style = self
                         .computed_style(column, Some(&group_style))
                         .map_err(LayoutError::Css)?;
+                    if column_spans.len() >= 8192 {
+                        return Err(LayoutError::CommandLimit);
+                    }
                     column_spans
                         .try_reserve(2)
                         .map_err(|_| LayoutError::CommandLimit)?;
@@ -5411,6 +8623,9 @@ impl Layout<'_> {
                     next_column = group_start + span;
                 }
                 if next_column > group_start {
+                    if column_spans.len() >= 8192 {
+                        return Err(LayoutError::CommandLimit);
+                    }
                     column_spans.push(TableColumnSpan {
                         first_column: group_start,
                         end_column: next_column,
@@ -5485,7 +8700,8 @@ impl Layout<'_> {
                     &mut offered,
                 )?;
             }
-            for (row, (_, row_style)) in rows.iter().enumerate() {
+            for (row, table_row) in rows.iter().enumerate() {
+                let row_style = &table_row.style;
                 offer_collapsed_border_rect(
                     &mut horizontal[row][..],
                     row_style,
@@ -5742,9 +8958,26 @@ impl Layout<'_> {
             .max(initial_used);
         if style.table_fixed && style.width.is_some() {
             // CSS 2.1 §17.5.2.1: in fixed layout, first-row cell widths
-            // establish the columns. Percentage cell widths resolve against
-            // the table's track area after border spacing is removed.
+            // establish columns that were not already sized by a COL. Column
+            // widths take precedence; percentage widths resolve against the
+            // table's track area after border spacing is removed.
             let track_width = (initial_width - gaps - collapsed_edge_sum).max(0.0);
+            let mut explicit_columns = [false; 256];
+            for span in column_spans.iter().filter(|span| span.origin_rank == 3) {
+                let first = span.first_column.min(columns);
+                let end = span.end_column.min(columns);
+                let Some(column_width) = span
+                    .style
+                    .resolve_percentages(track_width, self.parent_height)
+                    .width
+                else {
+                    continue;
+                };
+                for slot in first..end {
+                    widths[slot] = column_width.max(0.0);
+                    explicit_columns[slot] = true;
+                }
+            }
             for cell in cells.iter().filter(|cell| cell.row == 0) {
                 let resolved = cell
                     .style
@@ -5763,9 +8996,24 @@ impl Layout<'_> {
                     } else {
                         cell_width
                     };
-                    let per_column = cell_width / cell.cols as f32;
-                    for slot in &mut widths[cell.col..cell.col + cell.cols] {
-                        *slot = slot.max(per_column);
+                    let first = cell.col.min(columns);
+                    let end = (cell.col + cell.cols).min(columns);
+                    let explicitly_sized_width = (first..end)
+                        .filter(|slot| explicit_columns[*slot])
+                        .map(|slot| widths[slot])
+                        .sum::<f32>();
+                    let unspecified = explicit_columns[first..end]
+                        .iter()
+                        .filter(|specified| !**specified)
+                        .count();
+                    if unspecified > 0 {
+                        let per_column =
+                            (cell_width - explicitly_sized_width).max(0.0) / unspecified as f32;
+                        for slot in first..end {
+                            if !explicit_columns[slot] {
+                                widths[slot] = widths[slot].max(per_column);
+                            }
+                        }
                     }
                 }
             }
@@ -5879,8 +9127,9 @@ impl Layout<'_> {
         }
         for row in 0..rows.len() {
             heights[row] = heights[row].max(baseline_ascent[row] + baseline_descent[row]);
-            if let Some(row_height) = rows[row].1.height {
-                heights[row] = heights[row].max(content_height_dimension(&rows[row].1, row_height));
+            if let Some(row_height) = rows[row].style.height {
+                heights[row] =
+                    heights[row].max(content_height_dimension(&rows[row].style, row_height));
             }
         }
         for cell in &cells {
@@ -5925,7 +9174,7 @@ impl Layout<'_> {
             width: width + inset * 2.0,
             height: height + inset * 2.0,
         };
-        let hit = self.begin_hit(id)?;
+        let hit = self.begin_hit(id, style.pointer_events_auto && style.visibility_visible)?;
         self.finish_hit(hit, rect);
         if has_background(style) {
             self.push_background(rect, style)?;
@@ -5945,7 +9194,11 @@ impl Layout<'_> {
             // Row heights likewise include their collapsed-border shares.
             ys.push(ys.last().copied().unwrap_or(0.0) + height + spacing_y);
         }
-        for (row, (node, computed)) in rows.iter().enumerate() {
+        for (row, table_row) in rows.iter().enumerate() {
+            let Some(node) = table_row.node else {
+                continue;
+            };
+            let computed = &table_row.style;
             let (row_x, row_y, row_width, row_height) = if style.border_collapse {
                 let x_edges = collapsed_x_widths.as_deref().unwrap();
                 let y_edges = collapsed_y_widths.as_deref().unwrap();
@@ -5974,7 +9227,10 @@ impl Layout<'_> {
                 width: row_width,
                 height: row_height,
             };
-            let hit = self.begin_hit(*node)?;
+            let hit = self.begin_hit(
+                node,
+                computed.pointer_events_auto && computed.visibility_visible,
+            )?;
             self.finish_hit(hit, rect);
             if has_background(computed) {
                 self.push_background(rect, computed)?;
@@ -6045,10 +9301,45 @@ impl Layout<'_> {
                 _ => 0.0,
             };
             let saved_suppressed_border = self.suppressed_border_node;
-            if style.border_collapse {
-                self.suppressed_border_node = Some(cell.node);
-            }
-            let result = self.box_for(cell.node, style, Some(computed), cx, cy, cw, depth + 1);
+            let result = match cell.source {
+                TableCellContent::Node(node) => {
+                    if style.border_collapse {
+                        self.suppressed_border_node = Some(node);
+                    }
+                    self.box_for(node, style, Some(computed), cx, cy, cw, depth + 1)
+                }
+                TableCellContent::Anonymous {
+                    parent,
+                    children,
+                    style: cell_style,
+                } => {
+                    let mut virtual_children = Vec::new();
+                    let source = cell_children
+                        .get_mut(children)
+                        .ok_or(LayoutError::InvalidTree)?;
+                    virtual_children
+                        .try_reserve(source.len())
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    for child in source {
+                        virtual_children.push(child.take().ok_or(LayoutError::InvalidTree)?);
+                    }
+                    self.resolve_flattened_table_cell_children(&mut virtual_children, cw)?;
+                    if style.border_collapse {
+                        self.suppressed_border_node = Some(parent);
+                    }
+                    self.box_content_with_flattened_children(
+                        parent,
+                        &cell_style,
+                        Some(computed),
+                        Some(cell_style.clone()),
+                        cx,
+                        cy,
+                        cw,
+                        depth + 1,
+                        Some(virtual_children),
+                    )
+                }
+            };
             self.suppressed_border_node = saved_suppressed_border;
             result?;
         }
@@ -6154,7 +9445,7 @@ impl Layout<'_> {
             .document
             .kind(id)
             .map_err(|_| LayoutError::InvalidTree)?;
-        if let NodeKind::Text(value) = kind {
+        if let NodeKind::Text(value) | NodeKind::CData(value) = kind {
             let text = collapsed_text(value);
             if minimum
                 && !matches!(
@@ -6315,33 +9606,83 @@ impl Layout<'_> {
         let slot = id.index() * 2 + usize::from(minimum);
         if let Some(Some((cached_style, size))) = self.intrinsic_cache.borrow().get(slot) {
             if cached_style == style {
+                self.text_uses.set(self.text_uses.get().wrapping_add(1));
                 return Ok(*size);
             }
         }
         let (mut width, mut height, mut inline_width, mut inline_height) =
             (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        let mut has_children = false;
-        let mut children = self
-            .document
-            .composed_children_iter(id)
-            .map_err(|_| LayoutError::InvalidTree)?;
-        while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
-            has_children = true;
+        let available = style
+            .width
+            .map(|value| content_dimension(style, value))
+            .unwrap_or(self.viewport.width);
+        // Intrinsic contributions follow the same flattened child sequence as
+        // painting. In particular, a `display: contents` descendant stays in
+        // the surrounding inline accumulator instead of becoming a synthetic
+        // block boundary. Generated contents pseudos remain outside this pass,
+        // matching the existing intrinsic treatment of generated content.
+        let children = self.flattened_box_children_with_options(
+            id,
+            style,
+            available,
+            depth + 1,
+            false,
+            false,
+        )?;
+        let mut has_children = !children.is_empty();
+        if style.display == Display::ListItem {
+            let available = style
+                .width
+                .map(|value| content_dimension(style, value))
+                .unwrap_or(self.viewport.width);
+            // Intrinsic sizing can enter a list item through an anonymous
+            // table/inline formatting parent. Resolve the marker against the
+            // real composed-tree cascade, just as the painting path does.
+            let marker_origin_style = self
+                .computed_style_from_tree(id)?
+                .resolve_percentages(available, self.parent_height);
+            if let Some(marker) =
+                self.virtual_list_marker_child(id, &marker_origin_style, available)?
+            {
+                if marker.style.list_style_position == css::ListStylePosition::Inside {
+                    if let Some(image) = &marker.marker_image {
+                        let space = self
+                            .text
+                            .measure_styled(" ", marker.style.font_size, &marker.style.font)
+                            .map_err(|_| LayoutError::Text)?
+                            .max(0.0);
+                        inline_width = image.width as f32 + space;
+                        inline_height = (image.height as f32).max(self.line_height(&marker.style));
+                        has_children = true;
+                    } else if !marker.text.is_empty() {
+                        inline_width = self
+                            .text
+                            .measure_styled(
+                                &marker.text,
+                                marker.style.font_size,
+                                &marker.style.font,
+                            )
+                            .map_err(|_| LayoutError::Text)?
+                            .max(0.0);
+                        inline_height = self.line_height(&marker.style);
+                        has_children = true;
+                    }
+                }
+            }
+        }
+        for child in children {
+            let FlattenedBoxChildKind::Node(node) = child.kind else {
+                continue;
+            };
             let child_kind = self
                 .document
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
-            let element_style;
-            let child_style = if matches!(child_kind, NodeKind::Element { .. }) {
-                element_style = self
-                    .computed_style(node, Some(style))
-                    .map_err(LayoutError::Css)?;
-                &element_style
-            } else {
-                style
-            };
+            let child_style = child.computed_style.as_ref().unwrap_or(&child.parent_style);
             let (w, h) = self.intrinsic_size_mode(node, child_style, depth + 1, minimum)?;
-            if matches!(child_kind, NodeKind::Text(_)) || child_style.display == Display::Inline {
+            if matches!(child_kind, NodeKind::Text(_) | NodeKind::CData(_))
+                || child_style.display == Display::Inline
+            {
                 inline_width += w;
                 inline_height = inline_height.max(h);
             } else {
@@ -6396,7 +9737,7 @@ impl Layout<'_> {
             cols: usize,
             rows: usize,
             natural: (f32, f32),
-            minimum: f32,
+            minimum: (f32, f32),
             commands: core::ops::Range<usize>,
             hits: core::ops::Range<usize>,
         }
@@ -6441,11 +9782,8 @@ impl Layout<'_> {
             row_auto_count = auto_repeat_count(auto, available, row_gap)?;
             (row_tracks_storage, row_names_storage) = expand_auto_repeat(auto, row_auto_count)?;
         }
-        if column_tracks_storage.len() > MAX_GRID_TRACKS
-            || row_tracks_storage.len() > MAX_GRID_TRACKS
-        {
-            return Err(LayoutError::GridLimit);
-        }
+        column_tracks_storage.truncate(MAX_GRID_TRACKS);
+        row_tracks_storage.truncate(MAX_GRID_TRACKS);
         let explicit_column_count = if column_auto.is_some() {
             column_tracks_storage.len()
         } else {
@@ -6460,27 +9798,43 @@ impl Layout<'_> {
         let mut rows = explicit_row_count.max(1);
         if let Some(areas) = &style.grid_areas {
             for area in areas.iter() {
-                columns = columns.max(area.column + area.columns);
-                rows = rows.max(area.row + area.rows);
+                columns = columns.max(area.column + area.columns).min(MAX_GRID_TRACKS);
+                rows = rows.max(area.row + area.rows).min(MAX_GRID_TRACKS);
             }
         }
-        let mut children = self
-            .document
-            .composed_children_iter(parent)
-            .map_err(|_| LayoutError::InvalidTree)?;
-        while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+        let flattened = self.flattened_box_children(parent, style, width, depth + 1)?;
+        let mut flattened_generated = Vec::new();
+        for flattened_child in flattened {
+            let FlattenedBoxChild {
+                kind: flattened_kind,
+                parent_style: flattened_parent_style,
+                computed_style: flattened_computed_style,
+                ..
+            } = flattened_child;
+            let node = match flattened_kind {
+                FlattenedBoxChildKind::Generated(generated) => {
+                    flattened_generated
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    flattened_generated.push((generated, source_order));
+                    source_order += 1;
+                    continue;
+                }
+                FlattenedBoxChildKind::Node(node) => node,
+            };
             let kind = self
                 .document
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
             let anonymous_text = match &kind {
-                NodeKind::Text(value) => !collapsed_text(value).trim_matches(' ').is_empty(),
+                NodeKind::Text(value) | NodeKind::CData(value) => {
+                    !collapsed_text(value).trim_matches(' ').is_empty()
+                }
                 _ => false,
             };
             if matches!(kind, NodeKind::Element { .. }) || anonymous_text {
-                let mut computed = self
-                    .computed_style(node, Some(style))
-                    .map_err(LayoutError::Css)?;
+                let mut computed =
+                    flattened_computed_style.unwrap_or_else(|| flattened_parent_style.clone());
                 if computed.display != Display::None {
                     if matches!(computed.position, Position::Absolute | Position::Fixed) {
                         if positioned.len() >= MAX_DISPLAY_COMMANDS {
@@ -6516,7 +9870,7 @@ impl Layout<'_> {
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         true,
                     )
-                    .ok_or(LayoutError::GridLimit)?;
+                    .unwrap_or(css::GridPlacement { start: None, span: 1 });
                     computed.grid_row = css::resolve_grid_placement(
                         computed.grid_row,
                         computed.grid_row_spec.as_deref(),
@@ -6525,21 +9879,20 @@ impl Layout<'_> {
                         style.grid_areas.as_deref().unwrap_or(&[]),
                         false,
                     )
-                    .ok_or(LayoutError::GridLimit)?;
+                    .unwrap_or(css::GridPlacement { start: None, span: 1 });
                     if items.len() == MAX_GRID_TRACKS * MAX_GRID_TRACKS {
                         return Err(LayoutError::GridLimit);
                     }
                     columns = columns
-                        .max(computed.grid_column.start.unwrap_or(0) + computed.grid_column.span);
-                    rows = rows.max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span);
-                    if columns > MAX_GRID_TRACKS || rows > MAX_GRID_TRACKS {
-                        return Err(LayoutError::GridLimit);
-                    }
+                        .max(computed.grid_column.start.unwrap_or(0) + computed.grid_column.span)
+                        .min(MAX_GRID_TRACKS);
+                    rows = rows
+                        .max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span)
+                        .min(MAX_GRID_TRACKS);
                     let sizing_style = computed.resolve_percentages(width, self.parent_height);
                     let natural = self.intrinsic_size(node, &sizing_style, depth + 1)?;
-                    let minimum = self
-                        .intrinsic_size_mode(node, &sizing_style, depth + 1, true)?
-                        .0;
+                    let minimum =
+                        self.intrinsic_size_mode(node, &sizing_style, depth + 1, true)?;
                     items.push(Item {
                         node,
                         style: computed,
@@ -6559,12 +9912,21 @@ impl Layout<'_> {
                 }
             }
         }
-        for child in [generated_before, generated_after].into_iter().flatten() {
-            let pseudo_source_order = if child.pseudo == css::PseudoElement::Before {
-                0
-            } else {
-                source_order
-            };
+        let mut generated_children = Vec::new();
+        if let Some(before) = generated_before {
+            generated_children
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            generated_children.push((before, 0));
+        }
+        generated_children
+            .try_reserve(flattened_generated.len() + usize::from(generated_after.is_some()))
+            .map_err(|_| LayoutError::CommandLimit)?;
+        generated_children.extend(flattened_generated);
+        if let Some(after) = generated_after {
+            generated_children.push((after, source_order));
+        }
+        for (child, pseudo_source_order) in generated_children {
             let mut computed = child.style.clone();
             if computed.position != Position::Static
                 || computed.grid_columns_subgrid
@@ -6598,7 +9960,7 @@ impl Layout<'_> {
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 true,
             )
-            .ok_or(LayoutError::GridLimit)?;
+            .unwrap_or(css::GridPlacement { start: None, span: 1 });
             computed.grid_row = css::resolve_grid_placement(
                 computed.grid_row,
                 computed.grid_row_spec.as_deref(),
@@ -6607,21 +9969,19 @@ impl Layout<'_> {
                 style.grid_areas.as_deref().unwrap_or(&[]),
                 false,
             )
-            .ok_or(LayoutError::GridLimit)?;
+            .unwrap_or(css::GridPlacement { start: None, span: 1 });
             if items.len() == MAX_GRID_TRACKS * MAX_GRID_TRACKS {
                 return Err(LayoutError::GridLimit);
             }
-            columns =
-                columns.max(computed.grid_column.start.unwrap_or(0) + computed.grid_column.span);
-            rows = rows.max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span);
-            if columns > MAX_GRID_TRACKS || rows > MAX_GRID_TRACKS {
-                return Err(LayoutError::GridLimit);
-            }
+            columns = columns
+                .max(computed.grid_column.start.unwrap_or(0) + computed.grid_column.span)
+                .min(MAX_GRID_TRACKS);
+            rows = rows
+                .max(computed.grid_row.start.unwrap_or(0) + computed.grid_row.span)
+                .min(MAX_GRID_TRACKS);
             let sizing_style = computed.resolve_percentages(width, self.parent_height);
             let natural = self.intrinsic_virtual_generated_size(&child, &sizing_style, false)?;
-            let minimum = self
-                .intrinsic_virtual_generated_size(&child, &sizing_style, true)?
-                .0;
+            let minimum = self.intrinsic_virtual_generated_size(&child, &sizing_style, true)?;
             items
                 .try_reserve(1)
                 .map_err(|_| LayoutError::CommandLimit)?;
@@ -6668,8 +10028,8 @@ impl Layout<'_> {
                 {
                     continue;
                 }
-                item.cols = cp.span;
-                item.rows = rp.span;
+                item.cols = cp.span.clamp(1, MAX_GRID_TRACKS);
+                item.rows = rp.span.clamp(1, MAX_GRID_TRACKS);
                 let mut found = None;
                 for index in if phase < 2 || style.grid_auto_flow.dense {
                     0
@@ -6719,7 +10079,12 @@ impl Layout<'_> {
                         break;
                     }
                 }
-                let (col, row, mask) = found.ok_or(LayoutError::GridLimit)?;
+                // A full bounded grid overlaps the last cells instead of failing.
+                let (col, row, mask) = found.unwrap_or_else(|| {
+                    let col = cp.start.unwrap_or(0).min(MAX_GRID_TRACKS - item.cols);
+                    let row = rp.start.unwrap_or(MAX_GRID_TRACKS).min(MAX_GRID_TRACKS - item.rows);
+                    (col, row, (u64::MAX >> (64 - item.cols)) << col)
+                });
                 for value in &mut occupied[row..row + item.rows] {
                     *value |= mask;
                 }
@@ -6853,19 +10218,37 @@ impl Layout<'_> {
                 },
                 items.iter().map(|item| {
                     if horizontal {
-                        (item.col, item.cols, item.minimum, item.natural.0)
+                        GridTrackContribution {
+                            start: item.col,
+                            span: item.cols,
+                            min_content: item.minimum.0,
+                            max_content: item.natural.0,
+                        }
                     } else {
-                        (item.row, item.rows, item.natural.1, item.natural.1)
+                        GridTrackContribution {
+                            start: item.row,
+                            span: item.rows,
+                            min_content: item.minimum.1,
+                            max_content: item.natural.1,
+                        }
                     }
                 }),
             )
         };
-        let widths = tracks(&items, &column_definitions, columns, Some(width), true);
+        let widths = tracks(&items, &column_definitions, columns, Some(width), true)?;
         let mut row_contributions = Vec::new();
         let mut subgrid_contributions = Vec::new();
         for item in &items {
             if !item.style.grid_rows_subgrid {
-                row_contributions.push((item.row, item.rows, item.natural.1, item.natural.1));
+                push_grid_track_contribution(
+                    &mut row_contributions,
+                    GridTrackContribution {
+                        start: item.row,
+                        span: item.rows,
+                        min_content: item.minimum.1,
+                        max_content: item.natural.1,
+                    },
+                )?;
                 continue;
             }
             let mut subgrid_row_names: Vec<css::GridNamedLine> = row_names_storage
@@ -6896,7 +10279,9 @@ impl Layout<'_> {
                     .kind(node)
                     .map_err(|_| LayoutError::InvalidTree)?;
                 let anonymous_text = match &kind {
-                    NodeKind::Text(value) => !collapsed_text(value).trim_matches(' ').is_empty(),
+                    NodeKind::Text(value) | NodeKind::CData(value) => {
+                        !collapsed_text(value).trim_matches(' ').is_empty()
+                    }
                     _ => false,
                 };
                 if !matches!(kind, NodeKind::Element { .. }) && !anonymous_text {
@@ -6918,16 +10303,29 @@ impl Layout<'_> {
                     &[],
                     false,
                 )
-                .ok_or(LayoutError::GridLimit)?;
+                .unwrap_or(css::GridPlacement { start: None, span: 1 });
                 let row = placement.start.unwrap_or(auto_index / item.cols.max(1));
-                let span = placement.span.max(1);
                 auto_index += 1;
-                if item.row + row >= rows || item.row + row + span > MAX_GRID_TRACKS {
+                if item.row + row >= rows {
                     continue;
                 }
+                // A span overflowing the subgrid clamps to the subgrid's last row.
+                let span = placement
+                    .span
+                    .clamp(1, (item.rows.saturating_sub(row)).max(1))
+                    .min(rows - item.row - row);
                 let natural = self.intrinsic_size(node, &child, depth + 1)?.1;
-                row_contributions.push((item.row + row, span, natural, natural));
-                subgrid_contributions.push((item.row + row, span, natural, natural));
+                let minimum = self
+                    .intrinsic_size_mode(node, &child, depth + 1, true)?
+                    .1;
+                let contribution = GridTrackContribution {
+                    start: item.row + row,
+                    span,
+                    min_content: minimum,
+                    max_content: natural,
+                };
+                push_grid_track_contribution(&mut row_contributions, contribution)?;
+                push_grid_track_contribution(&mut subgrid_contributions, contribution)?;
             }
         }
         let distribute = |count: usize, free: f32, alignment: JustifyContent| match alignment {
@@ -6955,7 +10353,7 @@ impl Layout<'_> {
             row_gap,
             style.align_content.is_none(),
             row_contributions.iter().copied(),
-        );
+        )?;
         // Lay out once at the final column width; retain commands and move them after row sizing.
         for item in &mut items {
             let mut cx = x
@@ -7110,7 +10508,7 @@ impl Layout<'_> {
                     ((if alignment == AlignItems::Stretch {
                         cw
                     } else {
-                        item.natural.0.min(cw).max(item.minimum)
+                        item.natural.0.min(cw).max(item.minimum.0)
                     }) - margin
                         - box_edges(&computed, true))
                     .max(0.0),
@@ -7158,7 +10556,7 @@ impl Layout<'_> {
                     cx,
                     y,
                     cw,
-                    &[],
+                    self.floats.len(),
                     depth + 1,
                 )?
             } else if item.anonymous_text {
@@ -7178,9 +10576,14 @@ impl Layout<'_> {
             items
                 .iter()
                 .filter(|item| !item.style.grid_rows_subgrid)
-                .map(|item| (item.row, item.rows, item.natural.1, item.natural.1))
+                .map(|item| GridTrackContribution {
+                    start: item.row,
+                    span: item.rows,
+                    min_content: item.minimum.1,
+                    max_content: item.natural.1,
+                })
                 .chain(subgrid_contributions.iter().copied()),
-        );
+        )?;
         // Percentage row gaps are cyclic while an auto-height grid is being
         // sized, so they contribute zero to the intrinsic height. Once that
         // size is known, place the tracks using the resolved gap; it may
@@ -7566,6 +10969,7 @@ impl Layout<'_> {
         Ok(FlexItem {
             node: child.origin,
             generated: Some(child),
+            anonymous_text: None,
             style: item_style,
             main,
             min_main,
@@ -7579,6 +10983,292 @@ impl Layout<'_> {
             first_hit: 0,
             last_hit: 0,
         })
+    }
+
+    fn flex_intrinsic_size(
+        &self,
+        node: NodeId,
+        style: &Style,
+        anonymous_text: Option<&InlineParagraph>,
+        depth: usize,
+        minimum: bool,
+    ) -> Result<(f32, f32), LayoutError> {
+        let Some(paragraph) = anonymous_text else {
+            return self.intrinsic_size_mode(node, style, depth, minimum);
+        };
+        if paragraph.text.is_empty() {
+            return Ok((0.0, self.line_height(style)));
+        }
+        let bidi =
+            lumen_common::bidi::resolve(&paragraph.text, Some(style.direction == Direction::Rtl))
+                .map_err(|_| LayoutError::Text)?;
+        let unbreakable = paragraph
+            .spans
+            .iter()
+            .any(|span| matches!(span.style.white_space, WhiteSpace::NoWrap | WhiteSpace::Pre));
+        let mut width = 0.0f32;
+        for (paragraph_index, bidi_paragraph) in bidi.paragraphs.iter().enumerate() {
+            let range = bidi_paragraph.range.clone();
+            if range.start >= range.end {
+                continue;
+            }
+            if !minimum || unbreakable {
+                width = width.max(self.inline_paragraph_width(
+                    paragraph,
+                    &bidi,
+                    paragraph_index,
+                    range,
+                )?);
+                continue;
+            }
+            let text = paragraph.text.get(range.clone()).ok_or(LayoutError::Text)?;
+            let mut segment_start = range.start;
+            for (offset, opportunity) in lumen_common::ucd::line_breaks(text) {
+                if !matches!(
+                    opportunity,
+                    lumen_common::ucd::BreakOpportunity::Allowed
+                        | lumen_common::ucd::BreakOpportunity::Mandatory
+                ) {
+                    continue;
+                }
+                let segment_end = range.start.checked_add(offset).ok_or(LayoutError::Text)?;
+                if segment_end <= segment_start {
+                    continue;
+                }
+                let segment = segment_start..segment_end;
+                let visible_end = Self::paragraph_visible_end(paragraph, segment.clone(), true);
+                width = width.max(self.inline_paragraph_width(
+                    paragraph,
+                    &bidi,
+                    paragraph_index,
+                    segment.start..visible_end,
+                )?);
+                segment_start = segment_end;
+            }
+            if segment_start < range.end {
+                let visible_end =
+                    Self::paragraph_visible_end(paragraph, segment_start..range.end, true);
+                width = width.max(self.inline_paragraph_width(
+                    paragraph,
+                    &bidi,
+                    paragraph_index,
+                    segment_start..visible_end,
+                )?);
+            }
+        }
+        let line_height = paragraph
+            .spans
+            .iter()
+            .map(|span| self.line_height(&span.style))
+            .fold(self.line_height(style), f32::max);
+        let lines = paragraph.hard_breaks.len().saturating_add(1) as f32;
+        Ok((width, line_height * lines))
+    }
+
+    fn push_flex_item(
+        &mut self,
+        items: &mut Vec<FlexItem>,
+        positioned: &mut Vec<(NodeId, Style, f32, f32)>,
+        node: NodeId,
+        item_style: Style,
+        anonymous_text: Option<InlineParagraph>,
+        container_style: &Style,
+        row: bool,
+        width: f32,
+        source_order: &mut usize,
+        depth: usize,
+    ) -> Result<(), LayoutError> {
+        let (w, h) =
+            self.flex_intrinsic_size(node, &item_style, anonymous_text.as_ref(), depth + 1, false)?;
+        if matches!(item_style.position, Position::Absolute | Position::Fixed) {
+            if positioned.len() >= MAX_DISPLAY_COMMANDS {
+                return Err(LayoutError::CommandLimit);
+            }
+            positioned
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            positioned.push((node, item_style, w, h));
+            return Ok(());
+        }
+        let edges = box_edges(&item_style, row);
+        let cross_edges = box_edges(&item_style, !row);
+        let content_basis = if item_style.flex_basis_content {
+            let mut content_style = item_style.clone();
+            if row {
+                content_style.width = None;
+            } else {
+                content_style.height = None;
+            }
+            let content_size = self.flex_intrinsic_size(
+                node,
+                &content_style,
+                anonymous_text.as_ref(),
+                depth + 1,
+                false,
+            )?;
+            Some(if row { content_size.0 } else { content_size.1 })
+        } else {
+            None
+        };
+        let intrinsic_content_basis = if let Some(kind) = item_style.flex_basis_intrinsic {
+            let mut sizing_style = item_style.clone();
+            if row {
+                sizing_style.width = None;
+            } else {
+                sizing_style.height = None;
+            }
+            sizing_style.flex_basis = None;
+            sizing_style.flex_basis_content = false;
+            sizing_style.flex_basis_intrinsic = None;
+            let minimum = self.flex_intrinsic_size(
+                node,
+                &sizing_style,
+                anonymous_text.as_ref(),
+                depth + 1,
+                true,
+            )?;
+            let min_content = if row { minimum.0 } else { minimum.1 };
+            match kind {
+                css::IntrinsicSizing::MinContent => Some(min_content),
+                css::IntrinsicSizing::MaxContent => {
+                    let maximum = self.flex_intrinsic_size(
+                        node,
+                        &sizing_style,
+                        anonymous_text.as_ref(),
+                        depth + 1,
+                        false,
+                    )?;
+                    Some(if row { maximum.0 } else { maximum.1 })
+                }
+                css::IntrinsicSizing::FitContent => {
+                    let maximum = self.flex_intrinsic_size(
+                        node,
+                        &sizing_style,
+                        anonymous_text.as_ref(),
+                        depth + 1,
+                        false,
+                    )?;
+                    let max_content = if row { maximum.0 } else { maximum.1 };
+                    let available_main = if row {
+                        Some(width)
+                    } else {
+                        container_style
+                            .height
+                            .map(|height| content_height_dimension(container_style, height))
+                            .or(self.parent_height)
+                    };
+                    Some(available_main.map_or(max_content, |available| {
+                        available.max(min_content).min(max_content)
+                    }))
+                }
+            }
+        } else {
+            None
+        };
+        let main = intrinsic_content_basis.unwrap_or_else(|| {
+            item_style.flex_basis.map_or_else(
+                || content_basis.unwrap_or(if row { w } else { h }),
+                |basis| {
+                    if row {
+                        content_dimension(&item_style, basis) + edges
+                    } else {
+                        content_height_dimension(&item_style, basis) + edges
+                    }
+                },
+            )
+        });
+        let mut main = if row {
+            constrained_width(&item_style, (main - edges).max(0.0)) + edges
+        } else {
+            constrained_height(&item_style, (main - edges).max(0.0)) + edges
+        };
+        let min_main =
+            if row && item_style.min_width_auto && !item_style.overflow_x.scroll_container()
+                || !row && item_style.min_height_auto && !item_style.overflow_y.scroll_container()
+            {
+                let mut minimum_style = item_style.clone();
+                let specified_suggestion = if row {
+                    minimum_style.width = None;
+                    item_style
+                        .width
+                        .map(|value| content_dimension(&item_style, value) + edges)
+                } else {
+                    minimum_style.height = None;
+                    item_style
+                        .height
+                        .map(|value| content_height_dimension(&item_style, value) + edges)
+                };
+                let minimum = self.flex_intrinsic_size(
+                    node,
+                    &minimum_style,
+                    anonymous_text.as_ref(),
+                    depth + 1,
+                    true,
+                )?;
+                let content_minimum = if row { minimum.0 } else { minimum.1 };
+                specified_suggestion.map_or(content_minimum, |suggestion| {
+                    content_minimum.min(suggestion)
+                })
+            } else {
+                0.0
+            };
+        main = main.max(min_main);
+        if items.len() >= MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        items
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        items.push(FlexItem {
+            node,
+            generated: None,
+            anonymous_text,
+            style: item_style,
+            main,
+            min_main,
+            source_order: *source_order,
+            cross: if row { h } else { w },
+            edges,
+            cross_edges,
+            frozen: false,
+            first_command: 0,
+            last_command: 0,
+            first_hit: 0,
+            last_hit: 0,
+        });
+        *source_order += 1;
+        Ok(())
+    }
+
+    fn flush_flex_text_run(
+        &mut self,
+        pending: &mut Option<PendingFlexText>,
+        items: &mut Vec<FlexItem>,
+        positioned: &mut Vec<(NodeId, Style, f32, f32)>,
+        container_style: &Style,
+        row: bool,
+        width: f32,
+        source_order: &mut usize,
+        depth: usize,
+    ) -> Result<(), LayoutError> {
+        let Some(run) = pending.take() else {
+            return Ok(());
+        };
+        if run.paragraph.text.is_empty() {
+            return Ok(());
+        }
+        self.push_flex_item(
+            items,
+            positioned,
+            run.node,
+            run.style,
+            Some(run.paragraph),
+            container_style,
+            row,
+            width,
+            source_order,
+            depth,
+        )
     }
 
     fn flex_children(
@@ -7632,21 +11322,52 @@ impl Layout<'_> {
             )?);
             source_order += 1;
         }
-        let mut children = self
-            .document
-            .composed_children_iter(parent)
-            .map_err(|_| LayoutError::InvalidTree)?;
-        while let Some(node) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+        let children = self.flattened_box_children(parent, style, width, depth + 1)?;
+        let mut pending_text = None;
+        for child in children {
+            let FlattenedBoxChild {
+                kind: child_kind,
+                parent: child_parent,
+                parent_style,
+                computed_style,
+                ..
+            } = child;
+            let node = match child_kind {
+                FlattenedBoxChildKind::Generated(generated) => {
+                    self.flush_flex_text_run(
+                        &mut pending_text,
+                        &mut items,
+                        &mut positioned,
+                        style,
+                        row,
+                        width,
+                        &mut source_order,
+                        depth + 1,
+                    )?;
+                    if items.len() >= MAX_DISPLAY_COMMANDS {
+                        return Err(LayoutError::CommandLimit);
+                    }
+                    items
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    items.push(self.virtual_flex_item(
+                        generated,
+                        style,
+                        row,
+                        width,
+                        source_order,
+                        depth + 1,
+                    )?);
+                    source_order += 1;
+                    continue;
+                }
+                FlattenedBoxChildKind::Node(node) => node,
+            };
             let kind = self
                 .document
                 .kind(node)
                 .map_err(|_| LayoutError::InvalidTree)?;
-            let mut item_style = if matches!(kind, NodeKind::Element { .. }) {
-                self.computed_style(node, Some(style))
-                    .map_err(LayoutError::Css)?
-            } else {
-                style.clone()
-            };
+            let mut item_style = computed_style.unwrap_or(parent_style);
             let basis = item_style.resolve_flex_basis_percentage(if row {
                 Some(width)
             } else {
@@ -7654,147 +11375,107 @@ impl Layout<'_> {
             });
             item_style = item_style.resolve_percentages(width, self.parent_height);
             item_style.flex_basis = basis;
-            if !matches!(kind, NodeKind::Text(value) if collapsed_text(value).trim_matches(' ').is_empty())
-                && (matches!(kind, NodeKind::Text(_))
-                    || matches!(kind, NodeKind::Element { name, namespace: Namespace::Html, .. }
-                    if !matches!(name.as_str(), "head" | "style" | "script" | "meta" | "link" | "template")))
-                && item_style.display != Display::None
-            {
-                let (w, h) = self.intrinsic_size(node, &item_style, depth + 1)?;
-                if matches!(item_style.position, Position::Absolute | Position::Fixed) {
-                    if positioned.len() >= MAX_DISPLAY_COMMANDS {
-                        return Err(LayoutError::CommandLimit);
-                    }
-                    positioned
-                        .try_reserve(1)
-                        .map_err(|_| LayoutError::CommandLimit)?;
-                    positioned.push((node, item_style, w, h));
+            if let NodeKind::Text(value) | NodeKind::CData(value) = kind {
+                if item_style.display == Display::None {
                     continue;
                 }
-                let edges = box_edges(&item_style, row);
-                let cross_edges = box_edges(&item_style, !row);
-                let content_basis = if item_style.flex_basis_content {
-                    let mut content_style = item_style.clone();
-                    if row {
-                        content_style.width = None;
-                    } else {
-                        content_style.height = None;
+                let positioned_text =
+                    matches!(item_style.position, Position::Absolute | Position::Fixed);
+                if !positioned_text {
+                    let whitespace_only = collapsed_text(value).trim_matches(' ').is_empty();
+                    if pending_text.is_none() && whitespace_only {
+                        continue;
                     }
-                    let content_size = self.intrinsic_size(node, &content_style, depth + 1)?;
-                    Some(if row { content_size.0 } else { content_size.1 })
-                } else {
-                    None
-                };
-                let intrinsic_content_basis = if let Some(kind) = item_style.flex_basis_intrinsic {
-                    let mut sizing_style = item_style.clone();
-                    if row {
-                        sizing_style.width = None;
-                    } else {
-                        sizing_style.height = None;
+                    if pending_text.is_none() {
+                        pending_text = Some(PendingFlexText {
+                            node,
+                            style: style.display_contents_child_style(),
+                            paragraph: InlineParagraph::default(),
+                        });
                     }
-                    sizing_style.flex_basis = None;
-                    sizing_style.flex_basis_content = false;
-                    sizing_style.flex_basis_intrinsic = None;
-                    let minimum = self.intrinsic_size_mode(node, &sizing_style, depth + 1, true)?;
-                    let min_content = if row { minimum.0 } else { minimum.1 };
-                    match kind {
-                        css::IntrinsicSizing::MinContent => Some(min_content),
-                        css::IntrinsicSizing::MaxContent => {
-                            let maximum =
-                                self.intrinsic_size_mode(node, &sizing_style, depth + 1, false)?;
-                            Some(if row { maximum.0 } else { maximum.1 })
-                        }
-                        css::IntrinsicSizing::FitContent => {
-                            let maximum =
-                                self.intrinsic_size_mode(node, &sizing_style, depth + 1, false)?;
-                            let max_content = if row { maximum.0 } else { maximum.1 };
-                            let available_main = if row {
-                                Some(width)
-                            } else {
-                                style
-                                    .height
-                                    .map(|height| content_height_dimension(style, height))
-                                    .or(self.parent_height)
-                            };
-                            Some(available_main.map_or(max_content, |available| {
-                                available.max(min_content).min(max_content)
-                            }))
-                        }
-                    }
-                } else {
-                    None
-                };
-                let main = intrinsic_content_basis.unwrap_or_else(|| {
-                    item_style.flex_basis.map_or_else(
-                        || content_basis.unwrap_or(if row { w } else { h }),
-                        |basis| {
-                            if row {
-                                content_dimension(&item_style, basis) + edges
-                            } else {
-                                content_height_dimension(&item_style, basis) + edges
-                            }
-                        },
-                    )
-                });
-                let mut main = if row {
-                    constrained_width(&item_style, (main - edges).max(0.0)) + edges
-                } else {
-                    constrained_height(&item_style, (main - edges).max(0.0)) + edges
-                };
-                let min_main = if row
-                    && item_style.min_width_auto
-                    && !item_style.overflow_x.scroll_container()
-                    || !row
-                        && item_style.min_height_auto
-                        && !item_style.overflow_y.scroll_container()
-                {
-                    let mut minimum_style = item_style.clone();
-                    let specified_suggestion = if row {
-                        minimum_style.width = None;
-                        item_style
-                            .width
-                            .map(|value| content_dimension(&item_style, value) + edges)
-                    } else {
-                        minimum_style.height = None;
-                        item_style
-                            .height
-                            .map(|value| content_height_dimension(&item_style, value) + edges)
-                    };
-                    let minimum =
-                        self.intrinsic_size_mode(node, &minimum_style, depth + 1, true)?;
-                    let content_minimum = if row { minimum.0 } else { minimum.1 };
-                    specified_suggestion.map_or(content_minimum, |suggestion| {
-                        content_minimum.min(suggestion)
-                    })
-                } else {
-                    0.0
-                };
-                main = main.max(min_main);
-                if items.len() >= MAX_DISPLAY_COMMANDS {
-                    return Err(LayoutError::CommandLimit);
+                    let run = pending_text.as_mut().ok_or(LayoutError::InvalidTree)?;
+                    Self::paragraph_append_text(
+                        &mut run.paragraph,
+                        value,
+                        child_parent,
+                        &item_style,
+                        &[],
+                    )?;
+                    continue;
                 }
-                items
-                    .try_reserve(1)
-                    .map_err(|_| LayoutError::CommandLimit)?;
-                items.push(FlexItem {
-                    node,
-                    generated: None,
-                    style: item_style,
-                    main,
-                    min_main,
-                    source_order,
-                    cross: if row { h } else { w },
-                    edges,
-                    cross_edges,
-                    frozen: false,
-                    first_command: 0,
-                    last_command: 0,
-                    first_hit: 0,
-                    last_hit: 0,
-                });
-                source_order += 1;
+                self.flush_flex_text_run(
+                    &mut pending_text,
+                    &mut items,
+                    &mut positioned,
+                    style,
+                    row,
+                    width,
+                    &mut source_order,
+                    depth + 1,
+                )?;
+                if !collapsed_text(value).trim_matches(' ').is_empty() {
+                    self.push_flex_item(
+                        &mut items,
+                        &mut positioned,
+                        node,
+                        item_style,
+                        None,
+                        style,
+                        row,
+                        width,
+                        &mut source_order,
+                        depth + 1,
+                    )?;
+                }
+                continue;
             }
+            if !matches!(
+                kind,
+                NodeKind::Element {
+                    name,
+                    namespace: Namespace::Html,
+                    ..
+                } if !matches!(
+                    crate::svg::local_name(name),
+                    "head" | "style" | "script" | "meta" | "link" | "template"
+                )
+            ) || item_style.display == Display::None
+            {
+                continue;
+            }
+            self.flush_flex_text_run(
+                &mut pending_text,
+                &mut items,
+                &mut positioned,
+                style,
+                row,
+                width,
+                &mut source_order,
+                depth + 1,
+            )?;
+            self.push_flex_item(
+                &mut items,
+                &mut positioned,
+                node,
+                item_style,
+                None,
+                style,
+                row,
+                width,
+                &mut source_order,
+                depth + 1,
+            )?;
         }
+        self.flush_flex_text_run(
+            &mut pending_text,
+            &mut items,
+            &mut positioned,
+            style,
+            row,
+            width,
+            &mut source_order,
+            depth + 1,
+        )?;
         if let Some(child) = generated_after {
             if items.len() >= MAX_DISPLAY_COMMANDS {
                 return Err(LayoutError::CommandLimit);
@@ -8061,7 +11742,7 @@ impl Layout<'_> {
                         child_x,
                         child_y,
                         if row { item.main } else { width },
-                        &[],
+                        self.floats.len(),
                         depth + 1,
                     )?;
                     if row {
@@ -8081,7 +11762,37 @@ impl Layout<'_> {
                             .max(0.0)
                             + item.cross_edges
                     }
-                } else if let NodeKind::Text(value) = self
+                } else if let Some(paragraph) = item.anonymous_text.as_mut() {
+                    let (mut text_y, mut advance, mut height) = (child_y, 0.0, 0.0);
+                    let mut first = self.line_start();
+                    let mut trailing = 0.0;
+                    self.flow_inline_paragraph(
+                        paragraph,
+                        &computed,
+                        child_x,
+                        if row { item.main } else { width },
+                        &mut text_y,
+                        &mut advance,
+                        &mut height,
+                        self.floats.len(),
+                        &mut first,
+                        &mut trailing,
+                        depth + 1,
+                    )?;
+                    self.align_line(
+                        first,
+                        child_x,
+                        if row { item.main } else { width },
+                        advance - trailing,
+                        &computed,
+                        true,
+                    );
+                    if row {
+                        text_y - child_y + height
+                    } else {
+                        advance
+                    }
+                } else if let NodeKind::Text(value) | NodeKind::CData(value) = self
                     .document
                     .kind(item.node)
                     .map_err(|_| LayoutError::InvalidTree)?
@@ -8097,7 +11808,7 @@ impl Layout<'_> {
                         &mut text_y,
                         &mut advance,
                         &mut height,
-                        &[],
+                        self.floats.len(),
                         &mut first,
                         &mut trailing,
                     )?;
@@ -8427,6 +12138,19 @@ impl Layout<'_> {
         let css::GeneratedContent::Items(items) = generated.content else {
             return Ok(None);
         };
+        let quote_position = self.quote_positions.get(origin.index());
+        let quote_depth = quote_position.map_or(0, |position| match pseudo {
+            css::PseudoElement::Marker => position.marker,
+            css::PseudoElement::Before => position.before,
+            css::PseudoElement::After => position.after,
+        });
+        let default_quotes = QuoteSystem::Auto(None);
+        let inherited_quotes = quote_position
+            .map(|position| &position.system)
+            .unwrap_or(&default_quotes);
+        let quotes = quote_system_for_pseudo(generated.style.quotes(), inherited_quotes);
+        let marker_content_is_default = pseudo == css::PseudoElement::Marker
+            && matches!(generated.style.generated_content(), css::GeneratedContent::Normal);
         let mut child = VirtualGeneratedChild {
             origin,
             pseudo,
@@ -8435,11 +12159,188 @@ impl Layout<'_> {
                 .resolve_percentages(available, self.parent_height),
             unresolved_style: generated.style,
             items,
+            counter_replacements: self.counter_replacements(origin, pseudo),
+            quote_depth,
+            quotes,
             text: Arc::from(""),
+            marker_content_is_default,
+            marker_image: None,
         };
+        if marker_content_is_default && child.style.list_style_image.is_some() {
+            match self.resolve_list_marker_image(&child) {
+                Some(ImageState::Ready(image)) if image.is_valid() => {
+                    child.marker_image = Some(image);
+                    child.text = Arc::from("");
+                    return Ok(Some(child));
+                }
+                Some(ImageState::Pending) => return Err(LayoutError::ImagePending),
+                Some(ImageState::Ready(_)) | Some(ImageState::Failed) | None => {}
+            }
+        }
         let text = self.resolve_generated_text(&child)?;
         child.text = Arc::from(text);
         Ok(Some(child))
+    }
+
+    fn virtual_list_marker_child(
+        &self,
+        origin: NodeId,
+        origin_style: &Style,
+        available: f32,
+    ) -> Result<Option<VirtualGeneratedChild>, LayoutError> {
+        if origin_style.display != Display::ListItem {
+            return Ok(None);
+        }
+        let Some(mut marker) = self.virtual_generated_child(
+            origin,
+            origin_style,
+            css::PseudoElement::Marker,
+            available,
+        )?
+        else {
+            return Ok(None);
+        };
+        if marker.style.display != Display::Inline {
+            return Err(LayoutError::UnsupportedGeneratedContent);
+        }
+        // An inside marker is the first inline child of the list-item box. Its
+        // marker box keeps the conventional delimiter spacing while sharing
+        // the same shaping and line-wrapping path as authored text.
+        if marker.marker_image.is_none()
+            && marker.style.list_style_position == css::ListStylePosition::Inside
+            && !marker.text.is_empty()
+        {
+            let length = marker
+                .text
+                .len()
+                .checked_add(1)
+                .filter(|length| *length <= css::MAX_GENERATED_CONTENT_BYTES)
+                .ok_or(LayoutError::CommandLimit)?;
+            let mut text = String::new();
+            text.try_reserve_exact(length)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            text.push_str(&marker.text);
+            text.push(' ');
+            marker.text = Arc::from(text);
+        }
+        Ok(Some(marker))
+    }
+
+    fn paint_outside_list_marker(
+        &mut self,
+        marker: &VirtualGeneratedChild,
+        origin_style: &Style,
+        content_x: f32,
+        cursor: f32,
+        content_width: f32,
+    ) -> Result<(), LayoutError> {
+        if origin_style.writing_mode != css::WritingMode::HorizontalTb {
+            return Err(LayoutError::UnsupportedGeneratedContent);
+        }
+        let marker_line_height = self.line_height(&marker.style);
+        let (line_left, line_width) = self.context_float_edges(
+            self.float_start,
+            content_x,
+            content_width,
+            cursor,
+            marker_line_height.max(1.0),
+        );
+        match marker.marker_image.as_ref() {
+            Some(image) => {
+                let marker_width = image.width as f32;
+                let marker_height = image.height as f32;
+                let measured_gap = self
+                    .text
+                    .measure_styled(" ", marker.style.font_size, &marker.style.font)
+                    .map_err(|_| LayoutError::Text)?
+                    .max(0.0);
+                let gap = if measured_gap > 0.0 {
+                    measured_gap
+                } else {
+                    marker.style.font_size * 0.25
+                };
+                let left = if marker.style.direction == Direction::Rtl {
+                    line_left + line_width + gap
+                } else {
+                    line_left - marker_width - gap
+                };
+                let rect = Rect {
+                    x: left,
+                    y: cursor + (self.line_height(&marker.style) - marker_height).max(0.0),
+                    width: marker_width,
+                    height: marker_height,
+                };
+                if marker.style.visibility_visible
+                    && (self.transform_depth > 0 || rect.intersection(self.cull).is_some())
+                {
+                    self.push_command(Command::Image {
+                        rect,
+                        image: image.clone(),
+                    })?;
+                }
+                return Ok(());
+            }
+            None => {}
+        }
+        if marker.text.is_empty() {
+            return Ok(());
+        }
+        let marker_width = self
+            .text
+            .measure_styled(&marker.text, marker.style.font_size, &marker.style.font)
+            .map_err(|_| LayoutError::Text)?
+            .max(0.0);
+        let measured_gap = self
+            .text
+            .measure_styled(" ", marker.style.font_size, &marker.style.font)
+            .map_err(|_| LayoutError::Text)?
+            .max(0.0);
+        // Some host shapers omit a standalone whitespace glyph and therefore
+        // report a zero advance. Outside markers still reserve the UA marker
+        // gap in that case; use the conventional quarter-em inline gap.
+        let gap = if measured_gap > 0.0 {
+            measured_gap
+        } else {
+            marker.style.font_size * 0.25
+        };
+        let left = if marker.style.direction == Direction::Rtl {
+            line_left + line_width + gap
+        } else {
+            line_left - marker_width - gap
+        };
+        let width = (marker_width + gap).max(1.0);
+        let mut marker_cursor = cursor;
+        let mut marker_advance = 0.0;
+        let mut marker_height = 0.0;
+        let mut line = self.line_start();
+        let mut trailing = 0.0;
+        self.flow_virtual_generated_child(
+            marker,
+            origin_style,
+            left,
+            width,
+            &mut marker_cursor,
+            &mut marker_advance,
+            &mut marker_height,
+            self.floats.len(),
+            &mut line,
+            &mut trailing,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn resolve_list_marker_image(&self, marker: &VirtualGeneratedChild) -> Option<ImageState> {
+        let source = marker
+            .marker_content_is_default
+            .then_some(marker.style.list_style_image.as_deref())
+            .flatten()?;
+        let images = self.images?;
+        Some(if let Some(base) = self.rules.document_base_url() {
+            images.resolve_from(base, source)
+        } else {
+            images.resolve(source)
+        })
     }
 
     fn generated_attribute(
@@ -8482,7 +12383,8 @@ impl Layout<'_> {
 
     fn resolve_generated_text(&self, child: &VirtualGeneratedChild) -> Result<String, LayoutError> {
         let mut output = String::new();
-        for item in child.items.iter() {
+        let mut quote_depth = child.quote_depth;
+        for (item_index, item) in child.items.iter().enumerate() {
             let value = match item {
                 css::GeneratedContentItem::String(value) => Some(Cow::Borrowed(value.as_ref())),
                 css::GeneratedContentItem::Attribute { name, fallback } => self
@@ -8492,13 +12394,48 @@ impl Layout<'_> {
                 // Alternative text describes the generated image for
                 // nonvisual consumers; it is not part of its painted output.
                 css::GeneratedContentItem::AlternativeText(_) => None,
+                css::GeneratedContentItem::OpenQuote => {
+                    let mark = quote_mark(&child.quotes, quote_depth, true).map(Cow::Borrowed);
+                    quote_depth = quote_depth
+                        .checked_add(1)
+                        .ok_or(LayoutError::CommandLimit)?;
+                    mark
+                }
+                css::GeneratedContentItem::NoOpenQuote => {
+                    quote_depth = quote_depth
+                        .checked_add(1)
+                        .ok_or(LayoutError::CommandLimit)?;
+                    None
+                }
+                css::GeneratedContentItem::CloseQuote => {
+                    if quote_depth == 0 {
+                        None
+                    } else {
+                        quote_depth -= 1;
+                        quote_mark(&child.quotes, quote_depth, false).map(Cow::Borrowed)
+                    }
+                }
+                css::GeneratedContentItem::NoCloseQuote => {
+                    quote_depth = quote_depth.saturating_sub(1);
+                    None
+                }
+                css::GeneratedContentItem::Counter { .. }
+                | css::GeneratedContentItem::Counters { .. } => {
+                    let replacement = child
+                        .counter_replacements
+                        .as_deref()
+                        .and_then(|replacements| {
+                            replacements
+                                .binary_search_by_key(&item_index, |replacement| {
+                                    replacement.item_index
+                                })
+                                .ok()
+                                .and_then(|index| replacements.get(index))
+                        })
+                        .ok_or(LayoutError::UnsupportedGeneratedContent)?;
+                    Some(Cow::Borrowed(replacement.value.as_ref()))
+                }
                 css::GeneratedContentItem::Url(_)
-                | css::GeneratedContentItem::Counter { .. }
-                | css::GeneratedContentItem::Counters { .. }
-                | css::GeneratedContentItem::OpenQuote
-                | css::GeneratedContentItem::CloseQuote
-                | css::GeneratedContentItem::NoOpenQuote
-                | css::GeneratedContentItem::NoCloseQuote
                 | css::GeneratedContentItem::UnsupportedFunction { .. } => {
                     return Err(LayoutError::UnsupportedGeneratedContent);
                 }
@@ -8556,6 +12493,7 @@ impl Layout<'_> {
         let frame = paragraph.frames.len();
         paragraph.frames.push(InlineFrame {
             node: child.origin,
+            parent: frame_path.last().copied(),
             style: style.clone(),
             virtual_pseudo: Some(child.pseudo),
             hit: None,
@@ -8565,7 +12503,55 @@ impl Layout<'_> {
             .try_reserve(1)
             .map_err(|_| LayoutError::CommandLimit)?;
         frame_path.push(frame);
-        Self::paragraph_append_text(paragraph, text, child.origin, style, frame_path)?;
+        if let Some(image) = child.marker_image.as_ref() {
+            if paragraph.atoms.len() >= MAX_DISPLAY_COMMANDS {
+                return Err(LayoutError::CommandLimit);
+            }
+            let start = paragraph.text.len();
+            let end = start
+                .checked_add('\u{fffc}'.len_utf8())
+                .filter(|end| *end <= lumen_common::bidi::MAX_TEXT_BYTES)
+                .ok_or(LayoutError::Text)?;
+            charge_inline_split_storage(
+                paragraph,
+                '\u{fffc}'.len_utf8(),
+                0,
+                1,
+                0,
+                0,
+                frame_path.len(),
+            )?;
+            paragraph
+                .text
+                .try_reserve('\u{fffc}'.len_utf8())
+                .map_err(|_| LayoutError::CommandLimit)?;
+            paragraph.text.push('\u{fffc}');
+            let mut atom_frames = Vec::new();
+            atom_frames
+                .try_reserve(frame_path.len())
+                .map_err(|_| LayoutError::CommandLimit)?;
+            atom_frames.extend_from_slice(frame_path);
+            paragraph
+                .atoms
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            paragraph.atoms.push(InlineAtom {
+                range: start..end,
+                node: child.origin,
+                parent_style: style.clone(),
+                style: style.clone(),
+                frames: atom_frames,
+                width: image.width as f32,
+                height: image.height as f32,
+                image: Some(image.clone()),
+            });
+            paragraph.collapse_space = false;
+            if child.style.list_style_position == css::ListStylePosition::Inside {
+                Self::paragraph_append_text(paragraph, " ", child.origin, style, frame_path)?;
+            }
+        } else {
+            Self::paragraph_append_text(paragraph, text, child.origin, style, frame_path)?;
+        }
         frame_path.pop();
         Ok(())
     }
@@ -8622,7 +12608,7 @@ impl Layout<'_> {
         x: f32,
         y: f32,
         available: f32,
-        floats: &[(Rect, Float)],
+        float_start: usize,
         depth: usize,
     ) -> Result<f32, LayoutError> {
         if depth > 512 {
@@ -8634,10 +12620,14 @@ impl Layout<'_> {
             || style.clear != Clear::None
             || style.opacity != 1.0
             || style.transforms.is_some()
-            || style.overflow_clip
-            || overflow_scroll_container(style)
-            || overflow_clips_x(style)
-            || overflow_clips_y(style)
+            || matches!(
+                style.overflow_x,
+                css::Overflow::Auto | css::Overflow::Scroll
+            )
+            || matches!(
+                style.overflow_y,
+                css::Overflow::Auto | css::Overflow::Scroll
+            )
             || style.contain_paint
             || style.contain_layout
         {
@@ -8645,6 +12635,9 @@ impl Layout<'_> {
         }
 
         let [border_top, border_right, border_bottom, border_left] = border_widths(style);
+        let border_width = [border_top, border_right, border_bottom, border_left]
+            .into_iter()
+            .fold(0.0f32, f32::max);
         let [margin_top, margin_right, margin_bottom, margin_left] = style.margin_sides;
         let [padding_top, padding_right, padding_bottom, padding_left] = style.padding_sides;
         let left_auto = style.margin_auto[3];
@@ -8729,12 +12722,42 @@ impl Layout<'_> {
         } else {
             None
         };
-        let hit = self.begin_virtual_hit(child.origin)?;
+        let clip_x = overflow_clips_x(style);
+        let clip_y = overflow_clips_y(style);
+        let clip_index = if clip_x || clip_y {
+            let index = self.commands.len();
+            self.push_command(Command::PushClip(Rect {
+                x: outer_x + border_left,
+                y: outer_y + border_top,
+                width: content_width + padding_left + padding_right,
+                height: 0.0,
+            }))?;
+            Some(index)
+        } else {
+            None
+        };
+        let hit = self.begin_virtual_hit(
+            child.origin,
+            style.pointer_events_auto && style.visibility_visible,
+        )?;
+        let first_clipped_hit = self
+            .geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.hits.len());
+        let first_clip_transform = self
+            .geometry
+            .as_ref()
+            .map_or(0, |geometry| geometry.transforms.len());
         let saved_decorations = self.decorations.len();
         self.begin_decoration(style)?;
         let mut paragraph = InlineParagraph::default();
-        let mut frame_path = Vec::new();
-        self.append_virtual_generated_frame(child, style, &mut paragraph, &mut frame_path)?;
+        // The generated pseudo already has this block's box and hit region.
+        // Add its text directly as a paragraph span instead of wrapping it in
+        // a second pseudo frame, which would paint duplicate decorations and
+        // create a zero-width hit for empty content.
+        if !child.text.is_empty() {
+            Self::paragraph_append_text(&mut paragraph, &child.text, child.origin, style, &[])?;
+        }
         let content_x = outer_x + border_left + padding_left;
         let content_y = outer_y + border_top + padding_top;
         let mut cursor = content_y;
@@ -8748,7 +12771,7 @@ impl Layout<'_> {
             &mut cursor,
             &mut advance,
             &mut line_height,
-            floats,
+            float_start,
             &mut line,
             &mut trailing,
             depth + 1,
@@ -8794,6 +12817,57 @@ impl Layout<'_> {
                 }),
             )?;
         }
+        if let Some(index) = clip_index {
+            let padding_box = Rect {
+                x: outer_x + border_left,
+                y: outer_y + border_top,
+                width: content_width + padding_left + padding_right,
+                height: content_height + padding_top + padding_bottom,
+            };
+            let clip = overflow_clip_rect(padding_box, clip_x, clip_y);
+            let clip_radius = if clip_x && clip_y {
+                (style.border_radius - border_width).max(0.0)
+            } else {
+                0.0
+            };
+            let clip_corners = if clip_x && clip_y {
+                clipped_corners(outer_rect, padding_box, style)
+            } else {
+                None
+            };
+            if clip_radius > 0.0 || clip_corners.is_some() {
+                self.replace_command(
+                    index,
+                    Command::PushLayer {
+                        corners: clip_corners.clone(),
+                        rect: clip,
+                        radius: clip_radius,
+                        opacity: 1.0,
+                        clip: true,
+                    },
+                )?;
+                self.push_command(Command::PopLayer)?;
+            } else {
+                self.replace_command(index, Command::PushClip(clip))?;
+                self.push_command(Command::PopClip)?;
+            }
+            if let Some(geometry) = self.geometry.as_mut() {
+                if geometry.rounded_clips.len() >= MAX_DISPLAY_COMMANDS {
+                    return Err(LayoutError::CommandLimit);
+                }
+                geometry
+                    .rounded_clips
+                    .try_reserve(1)
+                    .map_err(|_| LayoutError::CommandLimit)?;
+                geometry.rounded_clips.push(HitClip {
+                    corners: clip_corners,
+                    first_transform: first_clip_transform,
+                    hits: first_clipped_hit..geometry.hits.len(),
+                    rect: clip,
+                    radius: clip_radius,
+                });
+            }
+        }
         if let Some(index) = border_index {
             self.replace_command(index, border(outer_rect, style))?;
         } else if style.visibility_visible && has_nonuniform_border(style) {
@@ -8813,7 +12887,7 @@ impl Layout<'_> {
         cursor: &mut f32,
         inline_width: &mut f32,
         inline_height: &mut f32,
-        floats: &[(Rect, Float)],
+        float_start: usize,
         line: &mut LineStart,
         trailing: &mut f32,
         previous_margin: &mut f32,
@@ -8823,7 +12897,7 @@ impl Layout<'_> {
         content_extent_width: &mut f32,
         depth: usize,
     ) -> Result<(), LayoutError> {
-        if child.style.display != Display::Block || !floats.is_empty() {
+        if child.style.display != Display::Block || !self.floats[float_start..].is_empty() {
             return Err(LayoutError::UnsupportedGeneratedContent);
         }
         self.align_line(
@@ -8861,7 +12935,7 @@ impl Layout<'_> {
             left,
             child_y,
             width,
-            floats,
+            float_start,
             depth + 1,
         )?;
         if block_children.len() >= 4096 {
@@ -8873,6 +12947,7 @@ impl Layout<'_> {
         block_children.push(BlockChild {
             first_cmd: first_command,
             first_hit,
+            first_float: self.floats.len(),
             border_top: child_y + margin_top,
             margin_top,
             margin_bottom,
@@ -8911,7 +12986,7 @@ impl Layout<'_> {
         cursor: &mut f32,
         advance: &mut f32,
         line_height: &mut f32,
-        floats: &[(Rect, Float)],
+        float_start: usize,
         line: &mut LineStart,
         trailing: &mut f32,
         depth: usize,
@@ -8932,6 +13007,7 @@ impl Layout<'_> {
             .map_err(|_| LayoutError::CommandLimit)?;
         paragraph.frames.push(InlineFrame {
             node: child.origin,
+            parent: None,
             style: child.style.clone(),
             virtual_pseudo: Some(child.pseudo),
             hit: None,
@@ -8957,7 +13033,7 @@ impl Layout<'_> {
             cursor,
             advance,
             line_height,
-            floats,
+            float_start,
             line,
             trailing,
             depth,
@@ -8983,7 +13059,10 @@ impl Layout<'_> {
             .kind(node)
             .map_err(|_| LayoutError::InvalidTree)?
         {
-            NodeKind::Text(_) | NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. } => {
+            NodeKind::Text(_)
+            | NodeKind::CData(_)
+            | NodeKind::Comment(_)
+            | NodeKind::ProcessingInstruction { .. } => {
                 return Ok(true);
             }
             NodeKind::Element {
@@ -9026,6 +13105,49 @@ impl Layout<'_> {
         };
         let tag = crate::svg::local_name(name);
         let svg_root = *namespace == Namespace::Svg && tag == "svg";
+        if style.display == Display::Contents {
+            for pseudo in [css::PseudoElement::Before, css::PseudoElement::After] {
+                if let Some(generated) =
+                    self.virtual_generated_child(node, &style, pseudo, available)?
+                {
+                    if generated.style.display != Display::Inline
+                        || !Self::paragraph_inline_style(&generated.style, &style)
+                    {
+                        return Ok(false);
+                    }
+                }
+            }
+            let mut children = self
+                .document
+                .composed_children_iter(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+                let child_style = if matches!(
+                    self.document
+                        .kind(child)
+                        .map_err(|_| LayoutError::InvalidTree)?,
+                    NodeKind::Element { .. }
+                ) {
+                    Some(
+                        self.computed_style(child, Some(&style))
+                            .map_err(LayoutError::Css)?
+                            .resolve_percentages(available, self.parent_height),
+                    )
+                } else {
+                    None
+                };
+                if !self.paragraph_inline_eligible(
+                    child,
+                    &style,
+                    child_style.as_ref(),
+                    available,
+                    depth + 1,
+                )? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
         if tag == "br" {
             for pseudo in [css::PseudoElement::Before, css::PseudoElement::After] {
                 if let Some(generated) =
@@ -9113,20 +13235,30 @@ impl Layout<'_> {
             .checked_add(text.len())
             .filter(|end| *end <= lumen_common::bidi::MAX_TEXT_BYTES)
             .ok_or(LayoutError::Text)?;
+        let merge_previous = paragraph.spans.last().is_some_and(|previous| {
+            previous.range.end == paragraph.text.len()
+                && previous.style_node == style_node
+                && previous.frames.as_slice() == frames
+        });
+        charge_inline_split_storage(
+            paragraph,
+            text.len(),
+            if merge_previous { 0 } else { 1 },
+            0,
+            0,
+            0,
+            if merge_previous { 0 } else { frames.len() },
+        )?;
         paragraph
             .text
             .try_reserve(text.len())
             .map_err(|_| LayoutError::CommandLimit)?;
         let start = paragraph.text.len();
-        if let Some(previous) = paragraph.spans.last_mut() {
-            if previous.range.end == start
-                && previous.style_node == style_node
-                && previous.frames.as_slice() == frames
-            {
-                paragraph.text.push_str(text);
-                previous.range.end = end;
-                return Ok(());
-            }
+        if merge_previous {
+            let previous = paragraph.spans.last_mut().ok_or(LayoutError::InvalidTree)?;
+            paragraph.text.push_str(text);
+            previous.range.end = end;
+            return Ok(());
         }
         if paragraph.spans.len() >= MAX_DISPLAY_COMMANDS {
             return Err(LayoutError::CommandLimit);
@@ -9174,7 +13306,8 @@ impl Layout<'_> {
             }
             let newline = matches!(character, '\n' | '\r');
             if newline && preserve_newline {
-                output.push('\u{200b}');
+                charge_inline_split_storage(paragraph, 0, 0, 0, 0, 1, 0)?;
+                Self::paragraph_output_push(paragraph, &mut output, '\u{200b}')?;
                 local_breaks
                     .try_reserve(1)
                     .map_err(|_| LayoutError::CommandLimit)?;
@@ -9189,13 +13322,13 @@ impl Layout<'_> {
                         || paragraph.has_preceding_content
                     {
                         if !previous_is_break {
-                            output.push(' ');
+                            Self::paragraph_output_push(paragraph, &mut output, ' ')?;
                         }
                     }
                 }
                 paragraph.collapse_space = true;
             } else {
-                output.push(character);
+                Self::paragraph_output_push(paragraph, &mut output, character)?;
                 paragraph.collapse_space = false;
             }
         }
@@ -9224,6 +13357,89 @@ impl Layout<'_> {
         Ok(())
     }
 
+    fn paragraph_append_empty_inline_advance(
+        paragraph: &mut InlineParagraph,
+        frame_path: &[usize],
+        style: &Style,
+    ) -> Result<(), LayoutError> {
+        if paragraph.advances.len() >= MAX_DISPLAY_COMMANDS {
+            return Err(LayoutError::CommandLimit);
+        }
+        let [padding_top, padding_right, padding_bottom, padding_left] = style.padding_sides;
+        let [margin_top, margin_right, margin_bottom, margin_left] = style.margin_sides;
+        let [border_top, border_right, border_bottom, border_left] = border_widths(style);
+        let has_edges = [
+            padding_top,
+            padding_right,
+            padding_bottom,
+            padding_left,
+            margin_top,
+            margin_right,
+            margin_bottom,
+            margin_left,
+            border_top,
+            border_right,
+            border_bottom,
+            border_left,
+        ]
+        .into_iter()
+        .any(|value| value != 0.0);
+        if !has_edges {
+            return Ok(());
+        }
+        let paint_width = padding_left + border_left + border_right + padding_right;
+        let paint_start = margin_left;
+        let paint_end = paint_start + paint_width;
+        let width = paint_end + margin_right;
+        let extra_height = padding_top + border_top + border_bottom + padding_bottom;
+        if !width.is_finite()
+            || !paint_start.is_finite()
+            || !paint_end.is_finite()
+            || !extra_height.is_finite()
+        {
+            return Err(LayoutError::Text);
+        }
+        let frame = frame_path.last().copied().ok_or(LayoutError::InvalidTree)?;
+        charge_inline_split_storage(paragraph, 0, 0, 0, 1, 0, 0)?;
+        paragraph
+            .advances
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        paragraph.advances.push(InlineAdvance {
+            offset: paragraph.text.len(),
+            frame,
+            width,
+            paint_start,
+            paint_end,
+            extra_height,
+        });
+        Ok(())
+    }
+
+    fn paragraph_output_push(
+        paragraph: &InlineParagraph,
+        output: &mut String,
+        character: char,
+    ) -> Result<(), LayoutError> {
+        let width = character.len_utf8();
+        if paragraph.split_storage_budget.is_some()
+            && output
+                .len()
+                .checked_add(width)
+                .filter(|length| *length <= lumen_common::bidi::MAX_TEXT_BYTES)
+                .is_none()
+        {
+            return Err(LayoutError::Text);
+        }
+        if paragraph.split_storage_budget.is_some() {
+            output
+                .try_reserve(width)
+                .map_err(|_| LayoutError::CommandLimit)?;
+        }
+        output.push(character);
+        Ok(())
+    }
+
     fn paragraph_append_break(
         paragraph: &mut InlineParagraph,
         style_node: NodeId,
@@ -9234,6 +13450,7 @@ impl Layout<'_> {
             return Err(LayoutError::CommandLimit);
         }
         Self::paragraph_push_span(paragraph, "\u{200b}", style_node, style, frames)?;
+        charge_inline_split_storage(paragraph, 0, 0, 0, 0, 1, 0)?;
         paragraph
             .hard_breaks
             .try_reserve(1)
@@ -9262,7 +13479,7 @@ impl Layout<'_> {
             .kind(node)
             .map_err(|_| LayoutError::InvalidTree)?;
         match kind {
-            NodeKind::Text(value) => {
+            NodeKind::Text(value) | NodeKind::CData(value) => {
                 return Self::paragraph_append_text(
                     paragraph,
                     value,
@@ -9325,6 +13542,49 @@ impl Layout<'_> {
             }
             return Ok(());
         }
+        if style.display == Display::Contents {
+            if let Some(before) =
+                self.virtual_generated_child(node, &style, css::PseudoElement::Before, available)?
+            {
+                self.append_virtual_generated_child(&before, &style, paragraph, frame_path)?;
+            }
+            let mut children = self
+                .document
+                .composed_children_iter(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(child) = children.next().map_err(|_| LayoutError::InvalidTree)? {
+                let child_style = if matches!(
+                    self.document
+                        .kind(child)
+                        .map_err(|_| LayoutError::InvalidTree)?,
+                    NodeKind::Element { .. }
+                ) {
+                    Some(
+                        self.computed_style(child, Some(&style))
+                            .map_err(LayoutError::Css)?
+                            .resolve_percentages(available, self.parent_height),
+                    )
+                } else {
+                    None
+                };
+                self.collect_inline_paragraph_node(
+                    child,
+                    node,
+                    &style,
+                    child_style,
+                    available,
+                    paragraph,
+                    frame_path,
+                    depth + 1,
+                )?;
+            }
+            if let Some(after) =
+                self.virtual_generated_child(node, &style, css::PseudoElement::After, available)?
+            {
+                self.append_virtual_generated_child(&after, &style, paragraph, frame_path)?;
+            }
+            return Ok(());
+        }
         if svg_root || tag == "img" || tag == "canvas" || style.display == Display::InlineBlock {
             if paragraph.atoms.len() >= MAX_DISPLAY_COMMANDS {
                 return Err(LayoutError::CommandLimit);
@@ -9337,6 +13597,15 @@ impl Layout<'_> {
             if end > lumen_common::bidi::MAX_TEXT_BYTES {
                 return Err(LayoutError::Text);
             }
+            charge_inline_split_storage(
+                paragraph,
+                '\u{fffc}'.len_utf8(),
+                0,
+                1,
+                0,
+                0,
+                frame_path.len(),
+            )?;
             paragraph
                 .text
                 .try_reserve('\u{fffc}'.len_utf8())
@@ -9359,6 +13628,7 @@ impl Layout<'_> {
                 frames,
                 width,
                 height,
+                image: None,
             });
             paragraph.collapse_space = false;
             return Ok(());
@@ -9376,6 +13646,7 @@ impl Layout<'_> {
         let frame_index = paragraph.frames.len();
         paragraph.frames.push(InlineFrame {
             node,
+            parent: frame_path.last().copied(),
             style: style.clone(),
             virtual_pseudo: None,
             hit: None,
@@ -9385,6 +13656,11 @@ impl Layout<'_> {
             .try_reserve(1)
             .map_err(|_| LayoutError::CommandLimit)?;
         frame_path.push(frame_index);
+        let content_start = (
+            paragraph.text.len(),
+            paragraph.atoms.len(),
+            paragraph.hard_breaks.len(),
+        );
         if let Some(before) =
             self.virtual_generated_child(node, &style, css::PseudoElement::Before, available)?
         {
@@ -9425,8 +13701,49 @@ impl Layout<'_> {
         {
             self.append_virtual_generated_child(&after, &style, paragraph, frame_path)?;
         }
+        if paragraph.text.len() == content_start.0
+            && paragraph.atoms.len() == content_start.1
+            && paragraph.hard_breaks.len() == content_start.2
+        {
+            Self::paragraph_append_empty_inline_advance(paragraph, frame_path, &style)?;
+        }
         frame_path.pop();
         Ok(())
+    }
+
+    fn extend_inline_token_bounds(
+        paragraph: &InlineParagraph,
+        token: &InlineToken,
+        token_x: f32,
+        bounds: &mut [Option<(f32, f32)>],
+    ) {
+        let (start_offset, end_offset) = token.frame_bounds.unwrap_or((0.0, token.width));
+        let start = token_x + start_offset.min(end_offset);
+        let end = token_x + start_offset.max(end_offset);
+        if end <= start {
+            return;
+        }
+        if let Some(mut frame) = token.advance_frame {
+            loop {
+                if let Some(current) = bounds.get_mut(frame) {
+                    *current = Some(current.map_or((start, end), |prior| {
+                        (prior.0.min(start), prior.1.max(end))
+                    }));
+                }
+                let Some(parent) = paragraph.frames.get(frame).and_then(|frame| frame.parent) else {
+                    break;
+                };
+                frame = parent;
+            }
+        } else {
+            for &frame in &token.frames {
+                if let Some(current) = bounds.get_mut(frame) {
+                    *current = Some(current.map_or((start, end), |prior| {
+                        (prior.0.min(start), prior.1.max(end))
+                    }));
+                }
+            }
+        }
     }
 
     fn inline_paragraph_tokens(
@@ -9472,6 +13789,27 @@ impl Layout<'_> {
                     ));
                 }
                 atom_index += 1;
+            }
+            for (advance_index, advance) in paragraph.advances.iter().enumerate() {
+                let in_line_range = advance.offset >= range.start
+                    && (advance.offset < range.end
+                        || advance.offset == range.end && range.end == paragraph.text.len());
+                let in_run = advance.offset >= run.start
+                    && (advance.offset < run.end
+                        || advance.offset == run.end && run.end == info.range.end);
+                if in_line_range && in_run {
+                    if parts.len() >= MAX_DISPLAY_COMMANDS {
+                        return Err(LayoutError::CommandLimit);
+                    }
+                    parts
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    parts.push((
+                        advance.offset,
+                        advance.offset,
+                        InlinePart::Advance(advance_index),
+                    ));
+                }
             }
             let mut span_index = paragraph
                 .spans
@@ -9539,10 +13877,7 @@ impl Layout<'_> {
                             return Err(LayoutError::Text);
                         };
                         let span = paragraph.spans.get(span).ok_or(LayoutError::Text)?;
-                        let shaped = self
-                            .text
-                            .shape_resolved(source, span.style.font_size, rtl, &span.style.font)
-                            .map_err(|_| LayoutError::Text)?;
+                        let shaped = self.shape_resolved_text(source, &span.style, rtl)?;
                         let mut frames = Vec::new();
                         frames
                             .try_reserve(span.frames.len())
@@ -9560,6 +13895,9 @@ impl Layout<'_> {
                             frames,
                             atom: None,
                             width: shaped.width,
+                            frame_bounds: None,
+                            extra_height: 0.0,
+                            advance_frame: None,
                             shaped: Some(shaped),
                             source_range: Some(range),
                             rtl,
@@ -9590,6 +13928,37 @@ impl Layout<'_> {
                             source_range: None,
                             rtl,
                             width: atom.width,
+                            frame_bounds: None,
+                            extra_height: 0.0,
+                            advance_frame: None,
+                            x: 0.0,
+                            command: None,
+                            hit: None,
+                        });
+                    }
+                    InlinePart::Advance(advance_index) => {
+                        let advance = paragraph
+                            .advances
+                            .get(advance_index)
+                            .ok_or(LayoutError::Text)?;
+                        if tokens.len() >= MAX_DISPLAY_COMMANDS {
+                            return Err(LayoutError::CommandLimit);
+                        }
+                        tokens
+                            .try_reserve(1)
+                            .map_err(|_| LayoutError::CommandLimit)?;
+                        tokens.push(InlineToken {
+                            style: None,
+                            style_node: None,
+                            frames: Vec::new(),
+                            atom: None,
+                            shaped: None,
+                            source_range: None,
+                            rtl,
+                            width: advance.width,
+                            frame_bounds: Some((advance.paint_start, advance.paint_end)),
+                            extra_height: advance.extra_height,
+                            advance_frame: Some(advance.frame),
                             x: 0.0,
                             command: None,
                             hit: None,
@@ -9652,7 +14021,7 @@ impl Layout<'_> {
         cursor: &mut f32,
         advance: &mut f32,
         line_height: &mut f32,
-        floats: &[(Rect, Float)],
+        float_start: usize,
         line: &mut LineStart,
         trailing: &mut f32,
         depth: usize,
@@ -9661,45 +14030,89 @@ impl Layout<'_> {
             if paragraph.frames.is_empty() {
                 return Ok(());
             }
-            let x = left + *advance;
+            let x = left + *advance + paragraph.first_line_indent;
             let mut height = self.line_height(block_style);
+            // A decoration-only prefix can be kept by an inline ancestor even
+            // though it has no shaped advance. Its own line-height still
+            // participates in the empty line box; the block strut alone would
+            // incorrectly collapse a `line-height:40px` wrapper to the
+            // parent's default line-height.
             for frame in &paragraph.frames {
                 height = height.max(self.line_height(&frame.style));
+            }
+            let mut bounds: Vec<Option<(f32, f32)>> = Vec::new();
+            bounds
+                .try_reserve(paragraph.frames.len())
+                .map_err(|_| LayoutError::CommandLimit)?;
+            bounds.resize(paragraph.frames.len(), None);
+            let mut total_width = 0.0;
+            for advance in &paragraph.advances {
+                let start = x + total_width + advance.paint_start.min(advance.paint_end);
+                let end = x + total_width + advance.paint_start.max(advance.paint_end);
+                if end > start {
+                    let mut frame = Some(advance.frame);
+                    while let Some(index) = frame {
+                        if let Some(frame_bounds) = bounds.get_mut(index) {
+                            *frame_bounds = Some(frame_bounds.map_or((start, end), |prior| {
+                                (prior.0.min(start), prior.1.max(end))
+                            }));
+                        }
+                        frame = paragraph.frames.get(index).and_then(|frame| frame.parent);
+                    }
+                }
+                let advance_line_height = paragraph
+                    .frames
+                    .get(advance.frame)
+                    .map_or(self.line_height(block_style), |frame| {
+                        self.line_height(&frame.style)
+                    });
+                height = height.max(advance_line_height + advance.extra_height);
+                total_width += advance.width;
+            }
+            if !total_width.is_finite() {
+                return Err(LayoutError::Text);
             }
             for index in 0..paragraph.frames.len() {
                 let node = paragraph.frames[index].node;
                 let hit = if paragraph.frames[index].virtual_pseudo.is_some() {
-                    self.begin_virtual_hit(node)?
+                    self.begin_virtual_hit(
+                        node,
+                        paragraph.frames[index].style.pointer_events_auto
+                            && paragraph.frames[index].style.visibility_visible,
+                    )?
                 } else {
-                    self.begin_hit(node)?
+                    self.begin_hit(
+                        node,
+                        paragraph.frames[index].style.pointer_events_auto
+                            && paragraph.frames[index].style.visibility_visible,
+                    )?
                 };
                 paragraph.frames[index].hit = hit;
                 let frame_style = &paragraph.frames[index].style;
-                if frame_style.visibility_visible
-                    && has_background(frame_style)
-                    && (*cursor < self.cull_bottom() && x < self.cull_right()
-                        || self.transform_depth > 0)
-                {
-                    self.push_background(
-                        Rect {
-                            x,
-                            y: *cursor,
-                            width: 0.0,
-                            height,
-                        },
-                        frame_style,
-                    )?;
-                }
-                self.finish_hit(
-                    hit,
+                let rect = bounds[index].map_or(
                     Rect {
                         x,
                         y: *cursor,
                         width: 0.0,
                         height,
                     },
+                    |(start, end)| Rect {
+                        x: start,
+                        y: *cursor,
+                        width: end - start,
+                        height,
+                    },
                 );
+                if frame_style.visibility_visible
+                    && has_background(frame_style)
+                    && (*cursor < self.cull_bottom() && rect.x < self.cull_right()
+                        || self.transform_depth > 0)
+                {
+                    self.push_background(rect, frame_style)?;
+                }
+                self.finish_hit(hit, rect);
             }
+            *advance += paragraph.first_line_indent + total_width;
             *line_height = (*line_height).max(height);
             return Ok(());
         }
@@ -9750,6 +14163,7 @@ impl Layout<'_> {
             deduplicated.push((offset, mandatory));
         }
         let breaks = deduplicated;
+        let mut first_line_indent = paragraph.first_line_indent;
         let wrap = !matches!(
             block_style.white_space,
             WhiteSpace::NoWrap | WhiteSpace::Pre
@@ -9765,8 +14179,9 @@ impl Layout<'_> {
                 let first_width =
                     self.inline_paragraph_width(paragraph, &bidi, 0, 0..visible_end)?;
                 let height = (*line_height).max(self.line_height(block_style));
-                let (_, available) = float_edges(floats, left, width, *cursor, height);
-                if (*advance - *trailing).max(0.0) + first_width > available {
+                let (_, available) =
+                    self.context_float_edges(float_start, left, width, *cursor, height);
+                if (*advance - *trailing).max(0.0) + first_line_indent + first_width > available {
                     self.align_line(
                         *line,
                         left,
@@ -9790,9 +14205,17 @@ impl Layout<'_> {
             .map_or(0, |geometry| geometry.hits.len());
         for index in 0..paragraph.frames.len() {
             let hit = if paragraph.frames[index].virtual_pseudo.is_some() {
-                self.begin_virtual_hit(paragraph.frames[index].node)?
+                self.begin_virtual_hit(
+                    paragraph.frames[index].node,
+                    paragraph.frames[index].style.pointer_events_auto
+                        && paragraph.frames[index].style.visibility_visible,
+                )?
             } else {
-                self.begin_hit(paragraph.frames[index].node)?
+                self.begin_hit(
+                    paragraph.frames[index].node,
+                    paragraph.frames[index].style.pointer_events_auto
+                        && paragraph.frames[index].style.visibility_visible,
+                )?
             };
             paragraph.frames[index].hit = hit;
         }
@@ -9830,8 +14253,10 @@ impl Layout<'_> {
                     break;
                 }
                 let mut height = (*line_height).max(self.line_height(block_style));
-                let mut available = float_edges(floats, left, width, *cursor, height).1;
-                let existing_visible = (*advance - *trailing).max(0.0);
+                let mut available = self
+                    .context_float_edges(float_start, left, width, *cursor, height)
+                    .1;
+                let existing_visible = (*advance - *trailing).max(0.0) + first_line_indent;
                 let capacity = (available - existing_visible).max(0.0);
                 let mut chosen = forced_end;
                 if wrap {
@@ -9896,33 +14321,41 @@ impl Layout<'_> {
                     )?
                 };
                 for token in &tokens {
-                    let token_height = match token.atom {
-                        Some(atom) => paragraph.atoms[atom].height,
-                        None => token
-                            .style
-                            .as_ref()
-                            .map_or(self.line_height(block_style), |style| {
-                                self.line_height(style)
-                            }),
-                    };
+                let token_height = match token.atom {
+                    Some(atom) => paragraph.atoms[atom].height,
+                    None => token.advance_frame.map_or_else(
+                        || {
+                            token.style.as_ref().map_or(
+                                self.line_height(block_style),
+                                |style| self.line_height(style),
+                            )
+                        },
+                        |frame| self.line_height(&paragraph.frames[frame].style),
+                    ),
+                } + token.extra_height;
                     height = height.max(token_height);
                 }
                 let (mut line_left, next_available) =
-                    float_edges(floats, left, width, *cursor, height);
+                    self.context_float_edges(float_start, left, width, *cursor, height);
                 available = next_available;
-                while wrap && *advance == 0.0 && available < visible_width && !floats.is_empty() {
-                    let next = floats
+                while wrap
+                    && *advance == 0.0
+                    && available < visible_width + first_line_indent
+                    && !self.floats[float_start..].is_empty()
+                {
+                    let next = self.floats[float_start..]
                         .iter()
-                        .map(|(rect, _)| rect.y + rect.height)
+                        .map(|(rect, _)| rect.y + rect.height + self.float_offset.1)
                         .filter(|end| *end > *cursor)
                         .min_by(f32::total_cmp);
                     let Some(next) = next else {
                         break;
                     };
                     *cursor = next;
-                    (line_left, available) = float_edges(floats, left, width, *cursor, height);
+                    (line_left, available) =
+                        self.context_float_edges(float_start, left, width, *cursor, height);
                 }
-                let mut x = line_left + *advance;
+                let mut x = line_left + *advance + first_line_indent;
                 for token in &mut tokens {
                     token.x = x;
                     x += token.width;
@@ -9933,14 +14366,7 @@ impl Layout<'_> {
                     .map_err(|_| LayoutError::CommandLimit)?;
                 frame_line.resize(paragraph.frames.len(), None);
                 for token in &tokens {
-                    for frame in &token.frames {
-                        if let Some(bounds) = frame_line.get_mut(*frame) {
-                            *bounds =
-                                Some(bounds.map_or((token.x, token.x + token.width), |prior| {
-                                    (prior.0.min(token.x), prior.1.max(token.x + token.width))
-                                }));
-                        }
-                    }
+                    Self::extend_inline_token_bounds(paragraph, token, token.x, &mut frame_line);
                 }
                 for (index, bounds) in frame_line.iter().enumerate() {
                     let Some((start_x, end_x)) = bounds else {
@@ -9971,32 +14397,51 @@ impl Layout<'_> {
                 for token in &mut tokens {
                     if let Some(atom_index) = token.atom {
                         let atom = &paragraph.atoms[atom_index];
-                        let hit_start = self
-                            .geometry
-                            .as_ref()
-                            .map_or(0, |geometry| geometry.hits.len());
-                        let decoration_depth = self.decorations.len();
-                        for frame in &token.frames {
-                            self.begin_decoration(&paragraph.frames[*frame].style)?;
-                        }
-                        let (actual_width, actual_height) = self.inline_for(
-                            atom.node,
-                            &atom.parent_style,
-                            Some(atom.style.clone()),
-                            token.x,
-                            *cursor,
-                            width,
-                            depth + 1,
-                        )?;
-                        self.decorations.truncate(decoration_depth);
-                        token.width = actual_width;
-                        height = height.max(actual_height);
-                        token.hit = (hit_start
-                            ..self
+                        if let Some(image) = atom.image.as_ref() {
+                            let rect = Rect {
+                                x: token.x,
+                                y: *cursor + self.baseline(&atom.parent_style) - atom.height,
+                                width: atom.width,
+                                height: atom.height,
+                            };
+                            if atom.style.visibility_visible
+                                && (self.transform_depth > 0
+                                    || rect.intersection(self.cull).is_some())
+                            {
+                                self.push_command(Command::Image {
+                                    rect,
+                                    image: image.clone(),
+                                })?;
+                            }
+                            token.width = atom.width;
+                        } else {
+                            let hit_start = self
                                 .geometry
                                 .as_ref()
-                                .map_or(hit_start, |geometry| geometry.hits.len()))
-                            .next();
+                                .map_or(0, |geometry| geometry.hits.len());
+                            let decoration_depth = self.decorations.len();
+                            for frame in &token.frames {
+                                self.begin_decoration(&paragraph.frames[*frame].style)?;
+                            }
+                            let (actual_width, actual_height) = self.inline_for(
+                                atom.node,
+                                &atom.parent_style,
+                                Some(atom.style.clone()),
+                                token.x,
+                                *cursor,
+                                width,
+                                depth + 1,
+                            )?;
+                            self.decorations.truncate(decoration_depth);
+                            token.width = actual_width;
+                            height = height.max(actual_height);
+                            token.hit = (hit_start
+                                ..self
+                                    .geometry
+                                    .as_ref()
+                                    .map_or(hit_start, |geometry| geometry.hits.len()))
+                                .next();
+                        }
                     } else if let (Some(style), Some(shaped)) = (&token.style, &token.shaped) {
                         if style.visibility_visible
                             && (self.transform_depth > 0
@@ -10029,7 +14474,7 @@ impl Layout<'_> {
                         }
                     }
                 }
-                let used = (*advance - *trailing).max(0.0) + visible_width;
+                let used = (*advance - *trailing).max(0.0) + first_line_indent + visible_width;
                 let auto_wrapped = chosen < forced_end;
                 let hard_break = paragraph.hard_breaks.contains(&chosen)
                     || breaks
@@ -10135,14 +14580,12 @@ impl Layout<'_> {
                             }
                         }
                     }
-                    for frame in &token.frames {
-                        if let Some(bounds) = final_frame_line.get_mut(*frame) {
-                            *bounds =
-                                Some(bounds.map_or((token_x, token_x + token.width), |prior| {
-                                    (prior.0.min(token_x), prior.1.max(token_x + token.width))
-                                }));
-                        }
-                    }
+                    Self::extend_inline_token_bounds(
+                        paragraph,
+                        token,
+                        token_x,
+                        &mut final_frame_line,
+                    );
                 }
                 for (index, bounds) in final_frame_line.into_iter().enumerate() {
                     let Some((start_x, end_x)) = bounds else {
@@ -10171,10 +14614,11 @@ impl Layout<'_> {
                     *trailing = 0.0;
                     *line = self.line_start();
                 } else {
-                    *advance += line_width;
+                    *advance += first_line_indent + line_width;
                     *line_height = (*line_height).max(height);
                     *trailing = (line_width - visible_width).max(0.0);
                 }
+                first_line_indent = 0.0;
                 start = chosen;
                 if chosen == paragraph_range.end {
                     break;
@@ -10216,18 +14660,27 @@ impl Layout<'_> {
         }
     }
 
-    fn begin_hit(&mut self, node: NodeId) -> Result<Option<usize>, LayoutError> {
-        self.begin_hit_with_kind(node, false)
+    fn begin_hit(
+        &mut self,
+        node: NodeId,
+        hit_testable: bool,
+    ) -> Result<Option<usize>, LayoutError> {
+        self.begin_hit_with_kind(node, false, hit_testable)
     }
 
-    fn begin_virtual_hit(&mut self, node: NodeId) -> Result<Option<usize>, LayoutError> {
-        self.begin_hit_with_kind(node, true)
+    fn begin_virtual_hit(
+        &mut self,
+        node: NodeId,
+        hit_testable: bool,
+    ) -> Result<Option<usize>, LayoutError> {
+        self.begin_hit_with_kind(node, true, hit_testable)
     }
 
     fn begin_hit_with_kind(
         &mut self,
         node: NodeId,
         virtual_generated: bool,
+        hit_testable: bool,
     ) -> Result<Option<usize>, LayoutError> {
         let Some(geometry) = self.geometry.as_mut() else {
             return Ok(None);
@@ -10247,6 +14700,7 @@ impl Layout<'_> {
                 height: 0.0,
             },
             virtual_generated,
+            hit_testable,
         });
         Ok(Some(index))
     }
@@ -10298,6 +14752,159 @@ impl Layout<'_> {
         Ok(list)
     }
 
+    fn text_spacing_delta(&self, text: &str, style: &Style) -> Result<f32, LayoutError> {
+        let letter = style.letter_spacing.unwrap_or(0.0);
+        let word = style.word_spacing;
+        if letter == 0.0 && word.pixels == 0.0 && word.fraction == 0.0 {
+            return Ok(0.0);
+        }
+        let mut clusters = 0usize;
+        let mut word_spacing = 0.0f32;
+        for (_, grapheme) in lumen_common::ucd::graphemes(text) {
+            clusters = clusters.saturating_add(1);
+            if is_word_separator(grapheme) {
+                word_spacing += word.pixels;
+                if word.fraction != 0.0 {
+                    let advance = self
+                        .text
+                        .measure_styled(grapheme, style.font_size, &style.font)
+                        .map_err(|_| LayoutError::Text)?;
+                    word_spacing += word.fraction * advance;
+                }
+            }
+        }
+        let delta = letter * clusters.saturating_sub(1) as f32 + word_spacing;
+        if delta.is_finite() {
+            Ok(delta)
+        } else {
+            Err(LayoutError::Text)
+        }
+    }
+
+    fn apply_text_spacing(
+        &self,
+        shaped: ShapedRun,
+        text: &str,
+        style: &Style,
+        rtl: bool,
+    ) -> Result<ShapedRun, LayoutError> {
+        let letter = style.letter_spacing.unwrap_or(0.0);
+        let word = style.word_spacing;
+        if letter == 0.0 && word.pixels == 0.0 && word.fraction == 0.0 {
+            return Ok(shaped);
+        }
+
+        let count = lumen_common::ucd::graphemes(text).count();
+        let mut clusters = Vec::new();
+        let scratch_bytes = count
+            .checked_mul(core::mem::size_of::<TextClusterShift>())
+            .and_then(|bytes| {
+                shaped
+                    .glyphs
+                    .len()
+                    .checked_mul(core::mem::size_of::<Glyph>())
+                    .and_then(|glyph_bytes| bytes.checked_add(glyph_bytes))
+            })
+            .ok_or(LayoutError::CommandLimit)?;
+        lumen_common::limits::size::check(scratch_bytes, MAX_DISPLAY_LIST_BYTES)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        clusters
+            .try_reserve_exact(count)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        for (start, grapheme) in lumen_common::ucd::graphemes(text) {
+            let start = u32::try_from(start).map_err(|_| LayoutError::Text)?;
+            let word_gap = if is_word_separator(grapheme) {
+                let advance = if word.fraction != 0.0 {
+                    self.text
+                        .measure_styled(grapheme, style.font_size, &style.font)
+                        .map_err(|_| LayoutError::Text)?
+                } else {
+                    0.0
+                };
+                word.pixels + word.fraction * advance
+            } else {
+                0.0
+            };
+            clusters.push(TextClusterShift {
+                start,
+                shift: 0.0,
+                word_gap,
+            });
+        }
+        let mut total_spacing = 0.0;
+        if rtl {
+            for index in (0..clusters.len()).rev() {
+                clusters[index].shift = total_spacing;
+                if index > 0 {
+                    total_spacing += letter;
+                }
+                total_spacing += clusters[index].word_gap;
+            }
+        } else {
+            for index in 0..clusters.len() {
+                clusters[index].shift = total_spacing;
+                if index + 1 < clusters.len() {
+                    total_spacing += letter;
+                }
+                total_spacing += clusters[index].word_gap;
+            }
+        }
+        if !total_spacing.is_finite() || !(shaped.width + total_spacing).is_finite() {
+            return Err(LayoutError::Text);
+        }
+        let mut glyphs = Vec::new();
+        glyphs
+            .try_reserve_exact(shaped.glyphs.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        for glyph in shaped.glyphs.iter() {
+            let mut glyph = *glyph;
+            let index = match clusters.binary_search_by_key(&glyph.cluster, |cluster| cluster.start)
+            {
+                Ok(index) => Some(index),
+                Err(0) => None,
+                Err(index) => Some(index - 1),
+            };
+            if let Some(shift) = index.and_then(|index| clusters.get(index)).map(|item| item.shift)
+            {
+                glyph.x += shift;
+                if !glyph.x.is_finite() {
+                    return Err(LayoutError::Text);
+                }
+            }
+            glyphs.push(glyph);
+        }
+        Ok(ShapedRun {
+            glyphs: Arc::from(glyphs),
+            width: shaped.width + total_spacing,
+        })
+    }
+
+    fn shape_styled_text(
+        &self,
+        text: &str,
+        style: &Style,
+        rtl: bool,
+    ) -> Result<ShapedRun, LayoutError> {
+        let shaped = self
+            .text
+            .shape_styled(text, style.font_size, rtl, &style.font)
+            .map_err(|_| LayoutError::Text)?;
+        self.apply_text_spacing(shaped, text, style, rtl)
+    }
+
+    fn shape_resolved_text(
+        &self,
+        text: &str,
+        style: &Style,
+        rtl: bool,
+    ) -> Result<ShapedRun, LayoutError> {
+        let shaped = self
+            .text
+            .shape_resolved(text, style.font_size, rtl, &style.font)
+            .map_err(|_| LayoutError::Text)?;
+        self.apply_text_spacing(shaped, text, style, rtl)
+    }
+
     fn text_flow(
         &mut self,
         value: &str,
@@ -10307,7 +14914,7 @@ impl Layout<'_> {
         cursor: &mut f32,
         advance: &mut f32,
         line_height: &mut f32,
-        floats: &[(Rect, Float)],
+        float_start: usize,
         line: &mut LineStart,
         trailing: &mut f32,
     ) -> Result<(), LayoutError> {
@@ -10331,30 +14938,31 @@ impl Layout<'_> {
             *line_height = (*line_height).max(height);
             return Ok(());
         }
-        if floats.is_empty()
+        if self.floats[float_start..].is_empty()
             && !style.text_align.justifies()
             && !(*advance == 0.0 && value.starts_with(' '))
             && !value
                 .bytes()
                 .any(|byte| matches!(byte, b'\n' | b'\r' | b'\t'))
         {
-            let shaped = self
-                .text
-                .shape_styled(value, size, style.direction == Direction::Rtl, &style.font)
-                .map_err(|_| LayoutError::Text)?;
+            let shaped = self.shape_styled_text(value, style, style.direction == Direction::Rtl)?;
             if !wrap || *advance + shaped.width <= width {
-                let tail = if collapse {
-                    value.len() - value.trim_end_matches(' ').len()
-                } else {
-                    0
-                };
-                *trailing = if tail == 0 {
-                    0.0
-                } else {
-                    self.text
-                        .measure_styled(&value[value.len() - tail..], size, &style.font)
-                        .map_err(|_| LayoutError::Text)?
-                };
+            let tail = if collapse {
+                value.len() - value.trim_end_matches(' ').len()
+            } else {
+                0
+            };
+            *trailing = if tail == 0 {
+                0.0
+            } else {
+                let visible = &value[..value.len() - tail];
+                let visible_width = self
+                    .text
+                    .measure_styled(visible, size, &style.font)
+                    .map_err(|_| LayoutError::Text)?
+                    + self.text_spacing_delta(visible, style)?;
+                shaped.width - visible_width
+            };
                 if style.visibility_visible
                     && left + *advance < self.cull_right()
                     && *cursor < self.cull_bottom()
@@ -10393,11 +15001,9 @@ impl Layout<'_> {
             let newline = part.ends_with('\n');
             let tab = part.ends_with('\t');
             let part = part.trim_end_matches(['\n', '\t']);
-            let shaped = self
-                .text
-                .shape_styled(part, size, style.direction == Direction::Rtl, &style.font)
-                .map_err(|_| LayoutError::Text)?;
-            let (mut line_left, mut space) = float_edges(floats, left, width, *cursor, height);
+            let shaped = self.shape_styled_text(part, style, style.direction == Direction::Rtl)?;
+            let (mut line_left, mut space) =
+                self.context_float_edges(float_start, left, width, *cursor, height);
             let hang = collapse || style.white_space == WhiteSpace::PreWrap;
             let visible_width = if hang && part.ends_with(' ') {
                 let visible = part.trim_end_matches(' ');
@@ -10407,6 +15013,7 @@ impl Layout<'_> {
                     self.text
                         .measure_styled(visible, size, &style.font)
                         .map_err(|_| LayoutError::Text)?
+                        + self.text_spacing_delta(visible, style)?
                 }
             } else {
                 shaped.width
@@ -10421,19 +15028,25 @@ impl Layout<'_> {
                 if collapse && part.trim_matches(' ').is_empty() {
                     continue;
                 }
-                (line_left, space) = float_edges(floats, left, width, *cursor, height);
+                (line_left, space) =
+                    self.context_float_edges(float_start, left, width, *cursor, height);
             }
-            while wrap && *advance == 0.0 && space < visible_width && !floats.is_empty() {
-                let next = floats
+            while wrap
+                && *advance == 0.0
+                && space < visible_width
+                && !self.floats[float_start..].is_empty()
+            {
+                let next = self.floats[float_start..]
                     .iter()
-                    .map(|(rect, _)| rect.y + rect.height)
+                    .map(|(rect, _)| rect.y + rect.height + self.float_offset.1)
                     .filter(|end| *end > *cursor)
                     .min_by(f32::total_cmp);
                 let Some(next) = next else {
                     break;
                 };
                 *cursor = next;
-                (line_left, space) = float_edges(floats, left, width, *cursor, height);
+                (line_left, space) =
+                    self.context_float_edges(float_start, left, width, *cursor, height);
             }
             if style.visibility_visible
                 && !part.is_empty()
@@ -10606,9 +15219,33 @@ impl Layout<'_> {
         available: f32,
         depth: usize,
     ) -> Result<(f32, f32), LayoutError> {
-        let computed = self
+        let mut computed = self
             .opacity_style(id, parent_style, computed)?
             .map(|style| style.resolve_percentages(available, self.parent_height));
+        if let Some(style) = computed
+            .as_mut()
+            .filter(|style| style.display == Display::InlineBlock && style.width.is_none())
+        {
+            // A non-replaced inline-block with auto width uses shrink-to-fit
+            // sizing. Its intrinsic contributions include child margins,
+            // padding, and borders; using the available line width directly
+            // here makes an auto-width block child fill the viewport and
+            // incorrectly expands the inline-block around it.
+            let minimum = self.intrinsic_size_mode(id, style, depth + 1, true)?.0;
+            let preferred = self.intrinsic_size_mode(id, style, depth + 1, false)?.0;
+            let shrink_to_fit = available.max(0.0).min(preferred).max(minimum);
+            let borders = border_widths(style);
+            let non_content_edges = style.margin_sides[1]
+                + style.margin_sides[3]
+                + style.padding_sides[1]
+                + style.padding_sides[3]
+                + borders[1]
+                + borders[3];
+            style.width = Some(specified_dimension(
+                style,
+                (shrink_to_fit - non_content_edges).max(0.0),
+            ));
+        }
         if computed
             .as_ref()
             .is_some_and(|style| matches!(style.position, Position::Absolute | Position::Fixed))
@@ -10716,7 +15353,11 @@ impl Layout<'_> {
         let layer = self.begin_opacity(computed.as_ref().filter(|style| {
             !matches!(
                 style.display,
-                Display::Block | Display::Flex | Display::Grid
+                Display::Block
+                    | Display::FlowRoot
+                    | Display::ListItem
+                    | Display::Flex
+                    | Display::Grid
             )
         }))?;
         let result = self.inline_content(
@@ -10751,7 +15392,7 @@ impl Layout<'_> {
             .document
             .kind(id)
             .map_err(|_| LayoutError::InvalidTree)?;
-        if let NodeKind::Text(value) = kind {
+        if let NodeKind::Text(value) | NodeKind::CData(value) = kind {
             let normalized = formatted_text(value, parent_style.white_space);
             let value = normalized.as_ref();
             if value.is_empty() {
@@ -10762,15 +15403,11 @@ impl Layout<'_> {
             if self.transform_depth == 0 && (x >= self.cull_right() || y >= self.cull_bottom()) {
                 return Ok((0.0, height));
             }
-            let shaped = self
-                .text
-                .shape_styled(
-                    value,
-                    size,
-                    parent_style.direction == Direction::Rtl,
-                    &parent_style.font,
-                )
-                .map_err(|_| LayoutError::Text)?;
+            let shaped = self.shape_styled_text(
+                value,
+                parent_style,
+                parent_style.direction == Direction::Rtl,
+            )?;
             let width = shaped.width;
             if parent_style.visibility_visible {
                 self.push_command(Command::GlyphRun {
@@ -10813,7 +15450,7 @@ impl Layout<'_> {
         }
         if matches!(
             style.display,
-            Display::Block | Display::Flex | Display::Grid
+            Display::Block | Display::FlowRoot | Display::ListItem | Display::Flex | Display::Grid
         ) {
             let height = self.box_for(id, parent_style, Some(style), x, y, available, depth)?;
             return Ok((available, height));
@@ -10826,7 +15463,7 @@ impl Layout<'_> {
                 return Err(LayoutError::UnsupportedGeneratedContent);
             }
         }
-        let hit = self.begin_hit(id)?;
+        let hit = self.begin_hit(id, style.pointer_events_auto && style.visibility_visible)?;
         let margin = style.margin.max(0.0);
         let padding = style.padding.max(0.0);
         let border_width = border_widths(&style).into_iter().fold(0.0f32, f32::max);
@@ -11038,9 +15675,13 @@ impl Layout<'_> {
             let (commands, hits) = chunks[index].clone();
             let command_end = self.commands.len();
             let hit_end = self.geometry.as_ref().map_or(0, |g| g.hits.len());
-            self.commands[commands.start..command_end].rotate_left(commands.len());
+            if !commands.is_empty() {
+                self.commands[commands.start..command_end].rotate_left(commands.len());
+            }
             if let Some(geometry) = self.geometry.as_mut() {
-                geometry.hits[hits.start..hit_end].rotate_left(hits.len());
+                if !hits.is_empty() {
+                    geometry.hits[hits.start..hit_end].rotate_left(hits.len());
+                }
                 for transform in &mut geometry.transforms {
                     raise_range(&mut transform.hits, hits.start, hits.end, hit_end);
                 }
@@ -11244,7 +15885,8 @@ impl Layout<'_> {
         // boxes at an exact layout position are independent of formatting
         // context bookkeeping. More complex formatting stays on the normal
         // layout path and can still reuse safe block descendants.
-        if depth == 0
+        if self.floats.len() != self.float_start
+            || depth == 0
             || matches!(name.as_str(), "html" | "body")
             || parent_style.display != Display::Block
             || style.display != Display::Block
@@ -11282,7 +15924,9 @@ impl Layout<'_> {
             depth,
             parent_height: self.parent_height,
             containing_block: self.containing_block,
+            containing_block_node: self.containing_block_node,
             fixed_containing_block: self.fixed_containing_block,
+            fixed_containing_block_node: self.fixed_containing_block_node,
             sticky_bounds: self.sticky_bounds,
             cull: self.cull,
             viewport: self.viewport,
@@ -11325,6 +15969,14 @@ impl Layout<'_> {
             .try_reserve(fragment.scroll_extents.len())
             .map_err(|_| LayoutError::CommandLimit)?;
         geometry
+            .scroll_ports
+            .try_reserve(fragment.scroll_ports.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        geometry
+            .viewport_fixed_nodes
+            .try_reserve(fragment.viewport_fixed_nodes.len())
+            .map_err(|_| LayoutError::CommandLimit)?;
+        geometry
             .scroll_regions
             .try_reserve(fragment.scroll_regions.len())
             .map_err(|_| LayoutError::CommandLimit)?;
@@ -11352,6 +16004,17 @@ impl Layout<'_> {
         for extent in fragment.scroll_extents.iter() {
             geometry.scroll_extents.push(*extent);
         }
+        for port in fragment.scroll_ports.iter() {
+            let mut port = *port;
+            port.owner_hit = port
+                .owner_hit
+                .map(|index| hit_base.checked_add(index).ok_or(LayoutError::InvalidTree))
+                .transpose()?;
+            geometry.scroll_ports.push(port);
+        }
+        geometry
+            .viewport_fixed_nodes
+            .extend_from_slice(&fragment.viewport_fixed_nodes);
         for region in fragment.scroll_regions.iter() {
             let mut region = region.clone();
             region.commands = rebase_range(region.commands, command_base)?;
@@ -11378,6 +16041,7 @@ impl Layout<'_> {
         }
         self.collapsed_bottom = fragment.collapsed_bottom;
         self.was_through = fragment.was_through;
+        self.include_overflow(fragment.overflow.parent, OverflowRoute::Parent);
         Ok(())
     }
 
@@ -11385,17 +16049,30 @@ impl Layout<'_> {
         &self,
         key: RetainedFragmentKey,
         command_start: usize,
-        starts: (usize, usize, usize, usize, usize, usize),
+        starts: (usize, usize, usize, usize, usize, usize, usize, usize),
         advance: f32,
+        overflow: OverflowMetrics,
+        has_text: bool,
     ) -> Option<RetainedFragment> {
         let geometry = self.geometry.as_deref()?;
-        let (hit_start, transform_start, clip_start, extent_start, region_start, run_start) =
-            starts;
+        let (
+            hit_start,
+            transform_start,
+            clip_start,
+            extent_start,
+            port_start,
+            viewport_fixed_start,
+            region_start,
+            run_start,
+        ) = starts;
         let commands = clone_arc_slice(self.commands.get(command_start..)?)?;
         let hits = clone_arc_slice(geometry.hits.get(hit_start..)?)?;
         let mut transforms = clone_vec(geometry.transforms.get(transform_start..)?)?;
         let mut rounded_clips = clone_vec(geometry.rounded_clips.get(clip_start..)?)?;
         let scroll_extents = clone_arc_slice(geometry.scroll_extents.get(extent_start..)?)?;
+        let mut scroll_ports = clone_vec(geometry.scroll_ports.get(port_start..)?)?;
+        let viewport_fixed_nodes =
+            clone_arc_slice(geometry.viewport_fixed_nodes.get(viewport_fixed_start..)?)?;
         let mut scroll_regions = clone_vec(geometry.scroll_regions.get(region_start..)?)?;
         let mut control_text_runs = clone_vec(geometry.control_text_runs.get(run_start..)?)?;
 
@@ -11405,6 +16082,11 @@ impl Layout<'_> {
         for clip in &mut rounded_clips {
             clip.hits = relative_range(clip.hits.clone(), hit_start)?;
             clip.first_transform = clip.first_transform.checked_sub(transform_start)?;
+        }
+        for port in &mut scroll_ports {
+            if let Some(index) = port.owner_hit {
+                port.owner_hit = Some(index.checked_sub(hit_start)?);
+            }
         }
         for region in &mut scroll_regions {
             region.commands = relative_range(region.commands.clone(), command_start)?;
@@ -11422,6 +16104,7 @@ impl Layout<'_> {
         }
         let transforms: Arc<[HitTransform]> = Arc::from(transforms.into_boxed_slice());
         let rounded_clips: Arc<[HitClip]> = Arc::from(rounded_clips.into_boxed_slice());
+        let scroll_ports: Arc<[ScrollPort]> = Arc::from(scroll_ports.into_boxed_slice());
         let scroll_regions: Arc<[ScrollRegion]> = Arc::from(scroll_regions.into_boxed_slice());
         let control_text_runs: Arc<[ControlTextRun]> =
             Arc::from(control_text_runs.into_boxed_slice());
@@ -11433,6 +16116,8 @@ impl Layout<'_> {
             &transforms,
             &rounded_clips,
             &scroll_extents,
+            &scroll_ports,
+            &viewport_fixed_nodes,
             &scroll_regions,
             &control_text_runs,
         )?;
@@ -11441,13 +16126,17 @@ impl Layout<'_> {
             advance,
             collapsed_bottom: self.collapsed_bottom,
             was_through: self.was_through,
+            overflow,
             commands,
             hits,
             transforms,
             rounded_clips,
             scroll_extents,
+            scroll_ports,
+            viewport_fixed_nodes,
             scroll_regions,
             control_text_runs,
+            has_text,
             bytes,
             last_used: 0,
         })
@@ -11484,33 +16173,119 @@ impl Layout<'_> {
             .and_then(|key| self.retained_fragments.as_deref_mut()?.lookup(key))
         {
             self.replay_retained_fragment(&fragment)?;
+            if fragment.has_text {
+                self.text_uses.set(self.text_uses.get().wrapping_add(1));
+            }
             return Ok(fragment.advance);
         }
 
+        let overflow_depth = self.overflow_frames.len();
+        let mut overflow_route = OverflowRoute::Parent;
+        if self.geometry.is_some() {
+            if let Some(style) = computed.as_ref() {
+                let display_contents = style.display == Display::Contents;
+                overflow_route = match style.position {
+                    Position::Absolute => self
+                        .containing_block_node
+                        .map_or(OverflowRoute::Root, OverflowRoute::ContainingBlock),
+                    Position::Fixed => self
+                        .fixed_containing_block_node
+                        .map_or(OverflowRoute::ViewportFixed, OverflowRoute::ContainingBlock),
+                    _ => OverflowRoute::Parent,
+                };
+                let (scroll_x, scroll_y) = if !display_contents && overflow_scroll_container(style)
+                {
+                    self.scrolls
+                        .iter()
+                        .find(|scroll| scroll.node == id)
+                        .map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y))
+                } else {
+                    (0.0, 0.0)
+                };
+                self.overflow_frames
+                    .try_reserve(1)
+                    .map_err(|_| LayoutError::CommandLimit)?;
+                self.overflow_frames.push(OverflowFrame::new(
+                    id,
+                    !display_contents && overflow_clips_x(style),
+                    !display_contents && overflow_clips_y(style),
+                    (scroll_x, scroll_y),
+                    overflow_route,
+                ));
+            }
+        }
+
         let command_start = self.commands.len();
+        let text_uses_before = self.text_uses.get();
         let geometry_start = self.geometry.as_deref().map(|geometry| {
             (
                 geometry.hits.len(),
                 geometry.transforms.len(),
                 geometry.rounded_clips.len(),
                 geometry.scroll_extents.len(),
+                geometry.scroll_ports.len(),
+                geometry.viewport_fixed_nodes.len(),
                 geometry.scroll_regions.len(),
                 geometry.control_text_runs.len(),
             )
         });
-        let pending_before = self.pending_escapes.clone();
-        let positioned_before = self.positioned_flow_paints.clone();
-        let stacking_before = self.stacking_roots.clone();
+        let pending_before = key.as_ref().map(|_| self.pending_escapes.clone());
+        let positioned_before = key.as_ref().map(|_| self.positioned_flow_paints.clone());
+        let stacking_before = key.as_ref().map(|_| self.stacking_roots.clone());
         let next_paint_before = self.next_paint_order;
         let hazards_before = self.scroll_hazards;
 
-        let advance = self.box_for_uncached(id, parent_style, computed, x, y, available, depth)?;
+        let saved_float_start = self.float_start;
+        let saved_float_offset = self.float_offset;
+        let floats_before = self.floats.len();
+        let isolated = computed.as_ref().is_some_and(|style| {
+            style.display != Display::Contents
+                && (depth == 0 || establishes_formatting_context(style, parent_style))
+        });
+        if isolated {
+            self.float_start = floats_before;
+            self.float_offset = (0.0, 0.0);
+        }
+        let result = self.box_for_uncached(id, parent_style, computed, x, y, available, depth);
+        if isolated || result.is_err() {
+            self.floats.truncate(floats_before);
+        }
+        self.float_start = saved_float_start;
+        self.float_offset = saved_float_offset;
+        if result.is_err() {
+            self.overflow_frames.truncate(overflow_depth);
+        }
+        let (advance, overflow) = result?;
+        let viewport_fixed_box = matches!(overflow_route, OverflowRoute::ViewportFixed)
+            && geometry_start.is_some_and(|starts| {
+                self.geometry.as_deref().is_some_and(|geometry| {
+                    geometry.hits.get(starts.0..).is_some_and(|hits| {
+                        hits.iter()
+                            .any(|hit| hit.node == id && !hit.virtual_generated)
+                    })
+                })
+            });
+        if viewport_fixed_box {
+            let geometry = self
+                .geometry
+                .as_deref_mut()
+                .ok_or(LayoutError::InvalidTree)?;
+            if geometry.viewport_fixed_nodes.len() >= MAX_DISPLAY_COMMANDS {
+                return Err(LayoutError::CommandLimit);
+            }
+            geometry
+                .viewport_fixed_nodes
+                .try_reserve(1)
+                .map_err(|_| LayoutError::CommandLimit)?;
+            geometry.viewport_fixed_nodes.push(id);
+        }
         if let (Some(key), Some(starts)) = (key, geometry_start) {
-            let stable = self.next_paint_order == next_paint_before
+            let stable = self.floats.len() == floats_before
+                && self.next_paint_order == next_paint_before
                 && self.scroll_hazards == hazards_before
-                && self.pending_escapes == pending_before
-                && self.positioned_flow_paints == positioned_before
-                && self.stacking_roots == stacking_before
+                && pending_before.as_ref() == Some(&self.pending_escapes)
+                && positioned_before.as_ref() == Some(&self.positioned_flow_paints)
+                && stacking_before.as_ref() == Some(&self.stacking_roots)
                 && self.parent_height == key.parent_height
                 && self.containing_block == key.containing_block
                 && self.fixed_containing_block == key.fixed_containing_block
@@ -11521,7 +16296,14 @@ impl Layout<'_> {
                 && self.decorations == key.decorations;
             if stable {
                 if let Some(fragment) =
-                    self.capture_retained_fragment(key, command_start, starts, advance)
+                    self.capture_retained_fragment(
+                        key,
+                        command_start,
+                        starts,
+                        advance,
+                        overflow,
+                        self.text_uses.get() != text_uses_before,
+                    )
                 {
                     if let Some(cache) = self.retained_fragments.as_deref_mut() {
                         cache.store(fragment);
@@ -11541,13 +16323,25 @@ impl Layout<'_> {
         y: f32,
         available: f32,
         depth: usize,
-    ) -> Result<f32, LayoutError> {
+    ) -> Result<(f32, OverflowMetrics), LayoutError> {
+        let contents_origin = computed
+            .as_ref()
+            .filter(|style| style.display == Display::Contents)
+            .cloned();
+        if let Some(style) = computed
+            .as_mut()
+            .filter(|style| style.display == Display::Contents)
+        {
+            *style = style.display_contents_child_style();
+        }
         let relative_flow_order = computed
             .as_ref()
             .filter(|style| style.position == Position::Relative && style.z_index.is_none())
             .map(|_| self.next_paint_order());
         let saved = self.containing_block;
+        let saved_containing_block_node = self.containing_block_node;
         let saved_fixed = self.fixed_containing_block;
+        let saved_fixed_containing_block_node = self.fixed_containing_block_node;
         let saved_sticky = self.sticky_bounds;
         let saved_height = self.parent_height;
         let saved_decorations = self.decorations.len();
@@ -11579,7 +16373,11 @@ impl Layout<'_> {
                 && !matches!(parent_style.display, Display::Flex | Display::Grid)
                 && matches!(
                     style.display,
-                    Display::Block | Display::Flex | Display::Grid
+                    Display::Block
+                        | Display::FlowRoot
+                        | Display::ListItem
+                        | Display::Flex
+                        | Display::Grid
                 )
             {
                 let left_auto = style.margin_auto[3];
@@ -11629,6 +16427,13 @@ impl Layout<'_> {
                 }
             }
             if out_of_flow {
+                let root_positioned_scroll = if style.position == Position::Absolute
+                    && saved_containing_block_node.is_none()
+                {
+                    self.root_scroll
+                } else {
+                    (0.0, 0.0)
+                };
                 let containing = if style.position == Position::Fixed {
                     saved_fixed.unwrap_or(self.viewport)
                 } else {
@@ -11657,12 +16462,16 @@ impl Layout<'_> {
                         ));
                     }
                 }
-                origin.0 = style.left.map_or(x, |left| containing.x + left);
-                origin.1 = style.top.map_or(y, |top| containing.y + top);
+                origin.0 = style
+                    .left
+                    .map_or(x, |left| containing.x + left - root_positioned_scroll.0);
+                origin.1 = style
+                    .top
+                    .map_or(y, |top| containing.y + top - root_positioned_scroll.1);
                 if style.left.is_none() {
-                    trailing.0 = style
-                        .right
-                        .map(|right| containing.x + containing.width - right);
+                    trailing.0 = style.right.map(|right| {
+                        containing.x + containing.width - right - root_positioned_scroll.0
+                    });
                     if let Some(edge) = trailing.0 {
                         origin.0 = edge
                             - content_dimension(style, style.width.unwrap_or(0.0))
@@ -11670,9 +16479,9 @@ impl Layout<'_> {
                     }
                 }
                 if style.top.is_none() {
-                    trailing.1 = style
-                        .bottom
-                        .map(|bottom| containing.y + containing.height - bottom);
+                    trailing.1 = style.bottom.map(|bottom| {
+                        containing.y + containing.height - bottom - root_positioned_scroll.1
+                    });
                     if let Some(edge) = trailing.1 {
                         let height = if let Some(height) = style.height {
                             content_height_dimension(style, height) + box_edges(style, false)
@@ -11711,6 +16520,10 @@ impl Layout<'_> {
                         .min(containing.x + containing.width - right - width);
                 }
             }
+            if matches!(style.position, Position::Relative | Position::Sticky) {
+                self.float_offset.0 += origin.0 - x;
+                self.float_offset.1 += origin.1 - y;
+            }
             if style.position != Position::Static
                 || style.transforms.is_some()
                 || style.contain_layout
@@ -11737,8 +16550,10 @@ impl Layout<'_> {
                         + style.padding_sides[0]
                         + style.padding_sides[2],
                 });
+                self.containing_block_node = Some(id);
                 if style.transforms.is_some() {
                     self.fixed_containing_block = self.containing_block;
+                    self.fixed_containing_block_node = Some(id);
                 }
             }
             if overflow_scroll_container(&style) && style.height.is_some() {
@@ -11804,13 +16619,16 @@ impl Layout<'_> {
             id,
             parent_style,
             computed,
+            contents_origin,
             origin.0,
             origin.1,
             available,
             depth,
         );
         self.containing_block = saved;
+        self.containing_block_node = saved_containing_block_node;
         self.fixed_containing_block = saved_fixed;
+        self.fixed_containing_block_node = saved_fixed_containing_block_node;
         self.sticky_bounds = saved_sticky;
         self.parent_height = saved_height;
         self.decorations.truncate(saved_decorations);
@@ -11819,6 +16637,7 @@ impl Layout<'_> {
         }
         let result = result?;
         self.end_opacity(layer)?;
+        let mut overflow_transform = None;
         if let (Some(index), Some(style)) = (transform_command, transform_style.as_ref()) {
             let fallback = Rect {
                 x: origin.0 + style.margin_sides[3],
@@ -11838,6 +16657,7 @@ impl Layout<'_> {
                     offset: 0,
                     message: "invalid computed transform",
                 }))?;
+            overflow_transform = Some(matrix);
             self.replace_command(index, Command::PushTransform(matrix))?;
             if self.commands.len() == index + 1 {
                 self.pop_command();
@@ -11869,6 +16689,13 @@ impl Layout<'_> {
             if let Some(geometry) = self.geometry.as_mut() {
                 geometry.move_hits(first_hit..geometry.hits.len(), dx, dy);
             }
+            if let Some(frame) = self
+                .overflow_frames
+                .last_mut()
+                .filter(|frame| frame.node == id)
+            {
+                frame.translate(dx, dy);
+            }
         }
         if let Some(order) = relative_flow_order {
             let commands = first_command..self.commands.len();
@@ -11890,7 +16717,29 @@ impl Layout<'_> {
                 hits,
             });
         }
-        Ok(if out_of_flow { 0.0 } else { result })
+        let overflow = if self
+            .overflow_frames
+            .last()
+            .is_some_and(|frame| frame.node == id)
+        {
+            let mut frame = self.overflow_frames.pop().ok_or(LayoutError::InvalidTree)?;
+            if let Some(hit) = self.geometry.as_deref().and_then(|geometry| {
+                geometry.hits[first_hit..]
+                    .iter()
+                    .find(|hit| hit.node == id && !hit.virtual_generated)
+            }) {
+                frame.include(hit.rect);
+                if frame.padding_box.is_none() {
+                    frame.padding_box = Some(hit.rect);
+                }
+            }
+            let metrics = frame.metrics(overflow_transform);
+            self.include_overflow(metrics.parent, frame.route);
+            metrics
+        } else {
+            OverflowMetrics::default()
+        };
+        Ok((if out_of_flow { 0.0 } else { result }, overflow))
     }
 
     fn form_control_text<N: AsRef<str>>(
@@ -11915,7 +16764,7 @@ impl Layout<'_> {
                     .first_child(id)
                     .map_err(|_| LayoutError::InvalidTree)?;
                 while let Some(current) = child {
-                    if let NodeKind::Text(value) = self
+                    if let NodeKind::Text(value) | NodeKind::CData(value) = self
                         .document
                         .kind(current)
                         .map_err(|_| LayoutError::InvalidTree)?
@@ -11944,7 +16793,11 @@ impl Layout<'_> {
         let mut placeholder = false;
         if value.is_empty() {
             if let Some(placeholder_text) = attr("placeholder") {
-                append_bounded_control_text(&mut value, placeholder_text)?;
+                if multiline {
+                    append_bounded_control_text(&mut value, placeholder_text)?;
+                } else {
+                    append_bounded_input_placeholder(&mut value, placeholder_text)?;
+                }
                 placeholder = true;
             }
         }
@@ -12122,7 +16975,7 @@ impl Layout<'_> {
             &mut cursor,
             &mut advance,
             &mut height,
-            &[],
+            self.floats.len(),
             &mut line,
             &mut trailing,
             depth,
@@ -12141,20 +16994,39 @@ impl Layout<'_> {
         id: NodeId,
         parent_style: &Style,
         computed: Option<Style>,
+        contents_origin: Option<Style>,
         x: f32,
         y: f32,
         available: f32,
         depth: usize,
     ) -> Result<f32, LayoutError> {
+        self.box_content_with_flattened_children(
+            id, parent_style, computed, contents_origin, x, y, available, depth, None,
+        )
+    }
+
+    fn box_content_with_flattened_children(
+        &mut self,
+        id: NodeId,
+        parent_style: &Style,
+        computed: Option<Style>,
+        contents_origin: Option<Style>,
+        x: f32,
+        y: f32,
+        available: f32,
+        depth: usize,
+        virtual_children: Option<Vec<FlattenedBoxChild>>,
+    ) -> Result<f32, LayoutError> {
         if depth > 512 {
             return Err(LayoutError::DepthLimit);
         }
+        let virtual_parent = virtual_children.is_some();
         let positioned_flow_start = self.positioned_flow_paints.len();
         let kind = self
             .document
             .kind(id)
             .map_err(|_| LayoutError::InvalidTree)?;
-        if let NodeKind::Text(value) = kind {
+        if let NodeKind::Text(value) | NodeKind::CData(value) = kind {
             if value.is_empty() {
                 return Ok(0.0);
             }
@@ -12167,15 +17039,11 @@ impl Layout<'_> {
             {
                 return Ok(line_height);
             }
-            let shaped = self
-                .text
-                .shape_styled(
-                    value,
-                    size,
-                    parent_style.direction == Direction::Rtl,
-                    &parent_style.font,
-                )
-                .map_err(|_| LayoutError::Text)?;
+            let shaped = self.shape_styled_text(
+                value,
+                parent_style,
+                parent_style.direction == Direction::Rtl,
+            )?;
             if parent_style.visibility_visible {
                 self.push_command(Command::GlyphRun {
                     origin_x: x,
@@ -12196,11 +17064,12 @@ impl Layout<'_> {
             return Ok(0.0);
         };
         let svg_root = *namespace == Namespace::Svg && crate::svg::local_name(name) == "svg";
-        if *namespace != Namespace::Html && !svg_root {
+        if !virtual_parent && *namespace != Namespace::Html && !svg_root {
             return Ok(0.0);
         }
         let tag = crate::svg::local_name(name);
-        if *namespace == Namespace::Html
+        if !virtual_parent
+            && *namespace == Namespace::Html
             && matches!(
                 tag,
                 "head" | "style" | "script" | "meta" | "link" | "template"
@@ -12217,21 +17086,60 @@ impl Layout<'_> {
         if style.display == Display::None {
             return Ok(0.0);
         }
-        let generated_before =
-            self.virtual_generated_child(id, &style, css::PseudoElement::Before, available)?;
-        let generated_after =
-            self.virtual_generated_child(id, &style, css::PseudoElement::After, available)?;
-        let is_form_control = matches!(tag, "input" | "textarea");
+        let display_contents = contents_origin.is_some();
+        let pseudo_style = contents_origin.as_ref().unwrap_or(&style);
+        let replacement_source = if virtual_parent {
+            None
+        } else {
+            replacement_content_url(&style)?
+        };
+        let generated_before = if virtual_parent {
+            None
+        } else {
+            self.virtual_generated_child(id, pseudo_style, css::PseudoElement::Before, available)?
+        };
+        let generated_after = if virtual_parent {
+            None
+        } else {
+            self.virtual_generated_child(id, pseudo_style, css::PseudoElement::After, available)?
+        };
+        // CSS inheritance follows the element's composed-tree parent chain,
+        // while table and inline formatting may invoke this box through an
+        // anonymous layout parent. Recompute the marker origin through the
+        // shared StyleIndex cascade so inherited list properties keep their
+        // actual parent values in those formatting contexts.
+        let marker_origin_style = if !virtual_parent && style.display == Display::ListItem {
+            self.computed_style_from_tree(id)?
+                .resolve_percentages(available, self.parent_height)
+        } else {
+            pseudo_style.clone()
+        };
+        let list_marker = if virtual_parent {
+            None
+        } else {
+            self.virtual_list_marker_child(id, &marker_origin_style, available)?
+        };
+        let is_form_control = !virtual_parent && matches!(tag, "input" | "textarea");
         if (generated_before.is_some() || generated_after.is_some())
             && (svg_root
                 || is_form_control
+                || replacement_source.is_some()
                 || matches!(style.display, Display::Table)
                 || matches!(tag, "img" | "canvas" | "video"))
         {
             return Err(LayoutError::UnsupportedGeneratedContent);
         }
-        if svg_root {
-            return self.paint_svg_root(id, attributes, &style, x, y, available, depth + 1);
+        if !virtual_parent && svg_root {
+            return self.paint_svg_root(
+                id,
+                attributes,
+                &style,
+                x,
+                y,
+                available,
+                depth + 1,
+                list_marker.as_ref(),
+            );
         }
         let form_text = if is_form_control {
             self.form_control_text(id, tag, attributes)?
@@ -12246,7 +17154,7 @@ impl Layout<'_> {
             // viewport positioning area while the element's clip moves.
             self.scroll_hazards += 1;
         }
-        if style.display == Display::Table {
+        if !virtual_parent && style.display == Display::Table {
             return self.table(id, &style, x, y, available, depth);
         }
         // CSS Sizing §6.1: aspect-ratio derives the auto dimension from the
@@ -12264,7 +17172,11 @@ impl Layout<'_> {
                 _ => {}
             }
         }
-        let hit = self.begin_hit(id)?;
+        let hit = if display_contents {
+            None
+        } else {
+            self.begin_hit(id, style.pointer_events_auto && style.visibility_visible)?
+        };
         let border_sides = border_widths(&style);
         let [border_top, border_right, border_bottom, border_left] = border_sides;
         let border_width = border_sides.into_iter().fold(0.0f32, f32::max);
@@ -12290,7 +17202,9 @@ impl Layout<'_> {
                 .max(0.0),
         );
         let box_width = content_width + padding_left + padding_right + border_left + border_right;
-        if tag == "img" || tag == "canvas" || tag == "video" {
+        if !virtual_parent
+            && (tag == "img" || tag == "canvas" || tag == "video" || replacement_source.is_some())
+        {
             let dimension = |key: &str| {
                 if tag == "canvas" {
                     let raw = crate::svg::attribute(attributes, key);
@@ -12304,11 +17218,23 @@ impl Layout<'_> {
             };
             let specified_width = style
                 .width
-                .or_else(|| dimension("width"))
+                .or_else(|| {
+                    if replacement_source.is_none() {
+                        dimension("width")
+                    } else {
+                        None
+                    }
+                })
                 .map(|width| content_dimension(&style, width));
             let specified_height = style
                 .height
-                .or_else(|| dimension("height"))
+                .or_else(|| {
+                    if replacement_source.is_none() {
+                        dimension("height")
+                    } else {
+                        None
+                    }
+                })
                 .map(|height| content_height_dimension(&style, height));
             if self.transform_depth == 0 && outer_y >= self.cull_bottom() {
                 if let Some(height) = specified_height {
@@ -12320,8 +17246,29 @@ impl Layout<'_> {
                         + margin_bottom);
                 }
             }
-            let source = crate::svg::attribute(attributes, "src");
-            let resolved = if tag == "canvas" || tag == "video" {
+            let source = replacement_source
+                .as_deref()
+                .or_else(|| crate::svg::attribute(attributes, "src"));
+            let resolved = if replacement_source.is_some() {
+                match (source, self.images) {
+                    (Some(source), Some(images)) => {
+                        let base = self.rules.document_base_url().unwrap_or("");
+                        Some(
+                            images
+                                .resolve_node_from(id, base, source)
+                                .unwrap_or_else(|| {
+                                    if self.rules.document_base_url().is_some() {
+                                        images.resolve_from(base, source)
+                                    } else {
+                                        images.resolve(source)
+                                    }
+                                }),
+                        )
+                    }
+                    (Some(_), None) => Some(ImageState::Failed),
+                    _ => None,
+                }
+            } else if tag == "canvas" || tag == "video" {
                 self.images.and_then(|images| images.resolve_node(id))
             } else {
                 match (source, self.images) {
@@ -12334,21 +17281,34 @@ impl Layout<'_> {
             };
             let image = match resolved {
                 Some(ImageState::Ready(image)) if image.is_valid() => Some(image),
+                Some(ImageState::Ready(_)) if replacement_source.is_some() => None,
                 Some(ImageState::Ready(_)) => return Err(LayoutError::ImageFailed),
                 Some(ImageState::Pending) => return Err(LayoutError::ImagePending),
+                Some(ImageState::Failed) if replacement_source.is_some() => None,
                 Some(ImageState::Failed) => return Err(LayoutError::ImageFailed),
                 None => None,
             };
-            if let Some(image) = image {
-                let (image_width, image_height) = match (specified_width, specified_height) {
-                    (Some(width), Some(height)) => (width, height),
-                    (Some(width), None) => {
-                        (width, width * image.height as f32 / image.width as f32)
+            if image.is_some() || replacement_source.is_some() {
+                // A failed content-replacement image remains a replaced
+                // element. CSS Images gives invalid images zero natural
+                // dimensions and transparent pixels; importantly, the
+                // originating element's children stay suppressed.
+                let (image_width, image_height) = if let Some(image) = image.as_ref() {
+                    match (specified_width, specified_height) {
+                        (Some(width), Some(height)) => (width, height),
+                        (Some(width), None) => {
+                            (width, width * image.height as f32 / image.width as f32)
+                        }
+                        (None, Some(height)) => {
+                            (height * image.width as f32 / image.height as f32, height)
+                        }
+                        (None, None) => (image.width as f32, image.height as f32),
                     }
-                    (None, Some(height)) => {
-                        (height * image.width as f32 / image.height as f32, height)
-                    }
-                    (None, None) => (image.width as f32, image.height as f32),
+                } else {
+                    (
+                        specified_width.unwrap_or(0.0),
+                        specified_height.unwrap_or(0.0),
+                    )
                 };
                 let rect = Rect {
                     x: outer_x + border_width + padding_left,
@@ -12376,10 +17336,20 @@ impl Layout<'_> {
                 {
                     self.push_command(border(outer_rect, &style))?;
                 }
-                if style.visibility_visible
-                    && (self.transform_depth > 0 || rect.intersection(self.cull).is_some())
-                {
-                    self.push_command(Command::Image { rect, image })?;
+                if let Some(image) = image {
+                    if style.visibility_visible
+                        && (self.transform_depth > 0 || rect.intersection(self.cull).is_some())
+                    {
+                        self.push_command(Command::Image { rect, image })?;
+                    }
+                }
+                if let Some(marker) = list_marker.as_ref() {
+                    if marker.style.list_style_position != css::ListStylePosition::Outside {
+                        return Err(LayoutError::UnsupportedGeneratedContent);
+                    }
+                    let marker_y =
+                        rect.y + (rect.height - self.line_height(&marker.style)).max(0.0);
+                    self.paint_outside_list_marker(marker, &style, rect.x, marker_y, rect.width)?;
                 }
                 return Ok(image_height
                     + padding_top
@@ -12400,7 +17370,7 @@ impl Layout<'_> {
             || style.contain_paint
             || style.contain_layout;
         let mut negatives_laid: Vec<NodeId> = Vec::new();
-        if !self_is_stacking_context && self.rules.has_z_index {
+        if !virtual_parent && !self_is_stacking_context && self.rules.has_z_index {
             self.pre_layout_negative_z(
                 id,
                 &style,
@@ -12557,7 +17527,7 @@ impl Layout<'_> {
             .as_ref()
             .map_or(0, |geometry| geometry.rounded_clips.len());
         let mut sc_root = None;
-        if self_is_stacking_context && self.rules.has_z_index {
+        if !virtual_parent && self_is_stacking_context && self.rules.has_z_index {
             let insert = (
                 self.commands.len(),
                 self.geometry
@@ -12584,6 +17554,15 @@ impl Layout<'_> {
         let content_x = outer_x + border_left + padding_left - scroll_x;
         let mut cursor =
             outer_y + border_top + padding_top + style.table_cell_content_offset - scroll_y;
+        let mut list_marker_inside_pending = list_marker.as_ref().is_some_and(|marker| {
+            marker.style.list_style_position == css::ListStylePosition::Inside
+        });
+        if let Some(marker) = list_marker
+            .as_ref()
+            .filter(|marker| marker.style.list_style_position == css::ListStylePosition::Outside)
+        {
+            self.paint_outside_list_marker(marker, &style, content_x, cursor, content_width)?;
+        }
         let vertical_block_flow = matches!(
             style.writing_mode,
             css::WritingMode::VerticalRl | css::WritingMode::VerticalLr
@@ -12597,9 +17576,10 @@ impl Layout<'_> {
         let mut content_extent_width = content_width;
         let mut inline_width = 0.0;
         let mut inline_height: f32 = 0.0;
+        let mut first_line_indent_pending = true;
         let mut line_start = self.line_start();
         let mut trailing_space = 0.0;
-        let mut floats: Vec<(Rect, Float)> = Vec::new();
+        let float_start = self.float_start;
         let mut positioned: Vec<(NodeId, Style, f32, f32, u64)> = Vec::new();
         let column_count = style.column_count.unwrap_or(1).clamp(1, 64);
         let column_gap = resolved_gap(
@@ -12612,29 +17592,41 @@ impl Layout<'_> {
         } else {
             content_width
         };
+        let virtual_children_are_flex_grid = matches!(style.display, Display::Flex | Display::Grid);
+        let flattened_block_children = if let Some(children) = virtual_children {
+            children
+        } else if is_form_control || virtual_children_are_flex_grid {
+            Vec::new()
+        } else {
+            self.flattened_box_children(id, &style, content_width, depth + 1)?
+        };
         let mut multicol_items = 0usize;
         let mut multicol_first_height = None;
         if column_count > 1 {
-            let mut scan = self
-                .document
-                .composed_children_iter(id)
-                .map_err(|_| LayoutError::InvalidTree)?;
-            while let Some(node) = scan.next().map_err(|_| LayoutError::InvalidTree)? {
-                if !matches!(
-                    self.document.kind(node),
-                    Ok(NodeKind::Element {
-                        namespace: Namespace::Html,
-                        ..
-                    })
-                ) {
-                    continue;
-                }
-                let child = self
-                    .computed_style(node, Some(&style))
-                    .map_err(LayoutError::Css)?;
-                if child.display != Display::None
+            for item in &flattened_block_children {
+                let (html_element, child) = match (&item.kind, &item.computed_style) {
+                    (FlattenedBoxChildKind::Node(node), computed) => {
+                        let kind = self
+                            .document
+                            .kind(*node)
+                            .map_err(|_| LayoutError::InvalidTree)?;
+                        (
+                            matches!(
+                                kind,
+                                NodeKind::Element {
+                                    namespace: Namespace::Html,
+                                    ..
+                                }
+                            ),
+                            computed.as_ref().unwrap_or(&item.parent_style),
+                        )
+                    }
+                    (FlattenedBoxChildKind::Generated(generated), _) => (true, &generated.style),
+                };
+                if html_element
                     && !matches!(child.position, Position::Absolute | Position::Fixed)
                     && child.display != Display::Inline
+                    && child.display != Display::None
                 {
                     multicol_items += 1;
                     if multicol_first_height.is_none() {
@@ -12677,7 +17669,6 @@ impl Layout<'_> {
         let mut non_block_since = false;
         let mut last_was_block = false;
         let mut saw_non_block = false;
-        let virtual_children_are_flex_grid = matches!(style.display, Display::Flex | Display::Grid);
         let mut generated_before_pending =
             generated_before.is_some() && !virtual_children_are_flex_grid;
         let mut generated_after_pending =
@@ -12694,7 +17685,7 @@ impl Layout<'_> {
                 depth + 1,
             )?;
         }
-        let mut children: Option<crate::shadow::ComposedChildren<'_>> = if is_form_control {
+        let mut children: Option<alloc::vec::IntoIter<FlattenedBoxChild>> = if is_form_control {
             None
         } else if style.display == Display::Grid {
             let (extent_width, height) =
@@ -12709,85 +17700,110 @@ impl Layout<'_> {
             content_extent_width = content_extent_width.max(extent_width);
             None
         } else {
-            Some(
-                self.document
-                    .composed_children_iter(id)
-                    .map_err(|_| LayoutError::InvalidTree)?,
-            )
+            Some(flattened_block_children.into_iter())
         };
-        let mut pending_child = None;
+        let mut pending_child: Option<BlockFlowItem> = None;
+        let mut split_walks: Vec<alloc::vec::IntoIter<BlockFlowItem>> = Vec::new();
         loop {
-            let current = match pending_child.take() {
-                Some(node) => Some(node),
-                None => match &mut children {
-                    Some(walk) => walk.next().map_err(|_| LayoutError::InvalidTree)?,
-                    None => None,
-                },
-            };
-            let Some(current) = current else {
+            let current_child = pending_child
+                .take()
+                .or_else(|| Self::next_block_flow_item(&mut split_walks, &mut children));
+            let Some(current_child) = current_child else {
                 break;
             };
-            let kind = self
-                .document
-                .kind(current)
-                .map_err(|_| LayoutError::InvalidTree)?;
-            let computed = if matches!(kind, NodeKind::Element { .. }) {
-                Some(
-                    self.computed_style(current, Some(&style))
-                        .map_err(LayoutError::Css)
-                        .map(|child| {
-                            if matches!(child.position, Position::Absolute | Position::Fixed) {
-                                child
-                            } else {
-                                child.resolve_percentages(content_width, self.parent_height)
-                            }
-                        })?,
-                )
-            } else {
-                None
+            let current_inline = match &current_child {
+                BlockFlowItem::Paragraph(_) => true,
+                BlockFlowItem::Child(child) => {
+                    self.flattened_box_child_inline_eligible(child, content_width, depth + 1)?
+                }
             };
-            if generated_before_pending {
-                let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
-                if before.style.display != Display::Inline {
-                    if vertical_block_flow
-                        || column_count > 1
-                        || before.style.display != Display::Block
-                    {
-                        return Err(LayoutError::UnsupportedGeneratedContent);
+            if !current_inline {
+                if let BlockFlowItem::Child(child) = &current_child {
+                    if let Some(split) = self.split_inline_flow_child(
+                        child,
+                        content_width,
+                        inline_width > 0.0,
+                        depth + 1,
+                    )? {
+                        split_walks
+                            .try_reserve(1)
+                            .map_err(|_| LayoutError::CommandLimit)?;
+                        split_walks.push(split.into_iter());
+                        continue;
                     }
-                    self.flow_virtual_generated_block_child(
-                        before,
+                }
+            }
+            if generated_before_pending
+                && generated_before
+                    .as_ref()
+                    .is_some_and(|before| before.style.display != Display::Inline)
+            {
+                if list_marker_inside_pending {
+                    let marker = list_marker.as_ref().ok_or(LayoutError::InvalidTree)?;
+                    self.flow_virtual_generated_child(
+                        marker,
                         &style,
                         content_x,
                         content_width,
                         &mut cursor,
                         &mut inline_width,
                         &mut inline_height,
-                        &floats,
+                        float_start,
                         &mut line_start,
                         &mut trailing_space,
-                        &mut previous_margin,
-                        &mut block_children,
-                        &mut non_block_since,
-                        &mut last_was_block,
-                        &mut content_extent_width,
                         depth + 1,
                     )?;
-                    generated_before_pending = false;
+                    list_marker_inside_pending = false;
+                    non_block_since = true;
+                    last_was_block = false;
+                    saw_non_block = true;
                 }
+                let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
+                if vertical_block_flow || column_count > 1 || before.style.display != Display::Block
+                {
+                    return Err(LayoutError::UnsupportedGeneratedContent);
+                }
+                self.flow_virtual_generated_block_child(
+                    before,
+                    &style,
+                    content_x,
+                    content_width,
+                    &mut cursor,
+                    &mut inline_width,
+                    &mut inline_height,
+                    float_start,
+                    &mut line_start,
+                    &mut trailing_space,
+                    &mut previous_margin,
+                    &mut block_children,
+                    &mut non_block_since,
+                    &mut last_was_block,
+                    &mut content_extent_width,
+                    depth + 1,
+                )?;
+                generated_before_pending = false;
             }
-            if self.paragraph_inline_eligible(
-                current,
-                &style,
-                computed.as_ref(),
-                content_width,
-                depth + 1,
-            )? {
+            if current_inline {
                 let mut paragraph = InlineParagraph {
                     has_preceding_content: inline_width > 0.0,
+                    first_line_indent: if first_line_indent_pending {
+                        style.text_indent.pixels + style.text_indent.fraction * content_width
+                    } else {
+                        0.0
+                    },
                     ..InlineParagraph::default()
                 };
                 let mut frame_path = Vec::new();
+                if list_marker_inside_pending {
+                    let marker = list_marker.as_ref().ok_or(LayoutError::InvalidTree)?;
+                    self.append_virtual_generated_child(
+                        marker,
+                        &style,
+                        &mut paragraph,
+                        &mut frame_path,
+                    )?;
+                    list_marker_inside_pending = false;
+                }
                 if generated_before_pending {
                     let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
                     self.append_virtual_generated_child(
@@ -12798,68 +17814,49 @@ impl Layout<'_> {
                     )?;
                     generated_before_pending = false;
                 }
-                self.collect_inline_paragraph_node(
-                    current,
-                    id,
-                    &style,
-                    computed.clone(),
-                    content_width,
-                    &mut paragraph,
-                    &mut frame_path,
-                    depth + 1,
-                )?;
-                let mut reached_end = false;
-                loop {
-                    let next = match &mut children {
-                        Some(walk) => walk.next().map_err(|_| LayoutError::InvalidTree)?,
-                        None => None,
-                    };
-                    let Some(next) = next else {
-                        reached_end = true;
-                        break;
-                    };
-                    let next_kind = self
-                        .document
-                        .kind(next)
-                        .map_err(|_| LayoutError::InvalidTree)?;
-                    let next_style = if matches!(next_kind, NodeKind::Element { .. }) {
-                        Some(
-                            self.computed_style(next, Some(&style))
-                                .map_err(LayoutError::Css)
-                                .map(|child| {
-                                    if matches!(
-                                        child.position,
-                                        Position::Absolute | Position::Fixed
-                                    ) {
-                                        child
-                                    } else {
-                                        child.resolve_percentages(content_width, self.parent_height)
-                                    }
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    if !self.paragraph_inline_eligible(
-                        next,
-                        &style,
-                        next_style.as_ref(),
-                        content_width,
-                        depth + 1,
-                    )? {
-                        pending_child = Some(next);
-                        break;
+                match current_child {
+                    BlockFlowItem::Paragraph(source) => {
+                        Self::append_inline_paragraph(&mut paragraph, source)?;
                     }
-                    self.collect_inline_paragraph_node(
-                        next,
-                        id,
-                        &style,
-                        next_style,
+                    BlockFlowItem::Child(child) => self.append_flattened_box_child_inline(
+                        &child,
                         content_width,
                         &mut paragraph,
                         &mut frame_path,
                         depth + 1,
-                    )?;
+                    )?,
+                }
+                let mut reached_end = false;
+                loop {
+                    let next = Self::next_block_flow_item(&mut split_walks, &mut children);
+                    let Some(next) = next else {
+                        reached_end = true;
+                        break;
+                    };
+                    let next_inline = match &next {
+                        BlockFlowItem::Paragraph(_) => true,
+                        BlockFlowItem::Child(child) => self.flattened_box_child_inline_eligible(
+                            child,
+                            content_width,
+                            depth + 1,
+                        )?,
+                    };
+                    if !next_inline {
+                        pending_child = Some(next);
+                        break;
+                    }
+                    match next {
+                        BlockFlowItem::Paragraph(source) => {
+                            Self::append_inline_paragraph(&mut paragraph, source)?;
+                        }
+                        BlockFlowItem::Child(child) => self.append_flattened_box_child_inline(
+                            &child,
+                            content_width,
+                            &mut paragraph,
+                            &mut frame_path,
+                            depth + 1,
+                        )?,
+                    }
                 }
                 if reached_end
                     && generated_after_pending
@@ -12891,18 +17888,39 @@ impl Layout<'_> {
                     &mut cursor,
                     &mut inline_width,
                     &mut inline_height,
-                    &floats,
+                    float_start,
                     &mut line_start,
                     &mut trailing_space,
                     depth + 1,
                 )?;
                 if has_inline_content {
+                    first_line_indent_pending = false;
                     non_block_since = true;
                     last_was_block = false;
                     saw_non_block = true;
                 }
                 content_extent_width = content_extent_width.max(inline_width);
                 continue;
+            }
+            if list_marker_inside_pending {
+                let marker = list_marker.as_ref().ok_or(LayoutError::InvalidTree)?;
+                self.flow_virtual_generated_child(
+                    marker,
+                    &style,
+                    content_x,
+                    content_width,
+                    &mut cursor,
+                    &mut inline_width,
+                    &mut inline_height,
+                    float_start,
+                    &mut line_start,
+                    &mut trailing_space,
+                    depth + 1,
+                )?;
+                list_marker_inside_pending = false;
+                non_block_since = true;
+                last_was_block = false;
+                saw_non_block = true;
             }
             if generated_before_pending {
                 let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -12915,7 +17933,7 @@ impl Layout<'_> {
                         &mut cursor,
                         &mut inline_width,
                         &mut inline_height,
-                        &floats,
+                        float_start,
                         &mut line_start,
                         &mut trailing_space,
                         depth + 1,
@@ -12939,7 +17957,7 @@ impl Layout<'_> {
                         &mut cursor,
                         &mut inline_width,
                         &mut inline_height,
-                        &floats,
+                        float_start,
                         &mut line_start,
                         &mut trailing_space,
                         &mut previous_margin,
@@ -12952,6 +17970,65 @@ impl Layout<'_> {
                 }
                 generated_before_pending = false;
             }
+            let current_child = match current_child {
+                BlockFlowItem::Child(child) => child,
+                BlockFlowItem::Paragraph(_) => return Err(LayoutError::InvalidTree),
+            };
+            let current = match current_child.kind {
+                FlattenedBoxChildKind::Node(node) => node,
+                FlattenedBoxChildKind::Generated(generated) => {
+                    if generated.style.display == Display::Inline {
+                        if self.flow_virtual_generated_child(
+                            &generated,
+                            &style,
+                            content_x,
+                            content_width,
+                            &mut cursor,
+                            &mut inline_width,
+                            &mut inline_height,
+                            float_start,
+                            &mut line_start,
+                            &mut trailing_space,
+                            depth + 1,
+                        )? {
+                            non_block_since = true;
+                            last_was_block = false;
+                            saw_non_block = true;
+                        }
+                    } else {
+                        if vertical_block_flow
+                            || column_count > 1
+                            || generated.style.display != Display::Block
+                        {
+                            return Err(LayoutError::UnsupportedGeneratedContent);
+                        }
+                        self.flow_virtual_generated_block_child(
+                            &generated,
+                            &style,
+                            content_x,
+                            content_width,
+                            &mut cursor,
+                            &mut inline_width,
+                            &mut inline_height,
+                            float_start,
+                            &mut line_start,
+                            &mut trailing_space,
+                            &mut previous_margin,
+                            &mut block_children,
+                            &mut non_block_since,
+                            &mut last_was_block,
+                            &mut content_extent_width,
+                            depth + 1,
+                        )?;
+                    }
+                    continue;
+                }
+            };
+            let computed = current_child.computed_style;
+            let kind = self
+                .document
+                .kind(current)
+                .map_err(|_| LayoutError::InvalidTree)?;
             let raised_count = raised_flow.len();
             if let Some(child_style) = &computed {
                 // Geometry remains in flow; its paint chunk is raised after
@@ -13025,20 +18102,79 @@ impl Layout<'_> {
                 });
                 floated.width = Some(width);
                 let outer_width = content_dimension(&floated, width) + box_edges(&floated, true);
-                let mut float_y = cursor;
+                let mut float_y = self.floats[float_start..]
+                    .last()
+                    .map_or(cursor, |(rect, _)| cursor.max(rect.y + self.float_offset.1));
+                for (rect, side) in &self.floats[float_start..] {
+                    if floated.clear == Clear::Both
+                        || floated.clear == Clear::Left && *side == Float::Left
+                        || floated.clear == Clear::Right && *side == Float::Right
+                    {
+                        float_y = float_y.max(rect.y + rect.height + self.float_offset.1);
+                    }
+                }
                 let (mut left, mut space) =
-                    float_edges(&floats, content_x, content_width, float_y, 1.0);
-                while outer_width > space && !floats.is_empty() {
-                    let next = floats
+                    self.context_float_edges(float_start, content_x, content_width, float_y, 1.0);
+                // A float wider than its normal containing block may
+                // overhang that block. Move it down only when an existing
+                // float actually intersects its candidate margin box, or a
+                // same-side float triggers the CSS 2.1 same-side edge rule.
+                loop {
+                    let candidate_x = if floated.float == Float::Right {
+                        left + space - outer_width
+                    } else {
+                        left
+                    };
+                    let next = self.floats[float_start..]
                         .iter()
-                        .map(|(r, _)| r.y + r.height)
-                        .filter(|end| *end > float_y)
+                        .filter_map(|(rect, side)| {
+                            let rect_left = rect.x + self.float_offset.0;
+                            let rect_right = rect_left + rect.width;
+                            let top = rect.y + self.float_offset.1;
+                            let bottom = top + rect.height;
+                            if top >= float_y + 1.0 || bottom <= float_y {
+                                return None;
+                            }
+                            let candidate_right = candidate_x + outer_width;
+                            let intersects = candidate_x < rect_right
+                                && candidate_right > rect_left;
+                            let opposite_float_intersects = intersects
+                                && ((floated.float == Float::Left && *side == Float::Right)
+                                    || (floated.float == Float::Right
+                                        && *side == Float::Left));
+                            // CSS 2.2 float rule 7 is about the ordering of
+                            // same-side floats, even when an earlier float is
+                            // entirely outside this nested containing block.
+                            // Requiring horizontal overlap with the current
+                            // container incorrectly let a later overhanging
+                            // float remain at the top of the BFC.
+                            let same_side_precedes = *side == floated.float
+                                && if floated.float == Float::Left {
+                                    rect_right <= candidate_x
+                                } else {
+                                    rect_left >= candidate_right
+                                };
+                            let same_side_edge_rule_blocks = same_side_precedes
+                                && (if floated.float == Float::Left {
+                                    candidate_right > content_x + content_width
+                                } else {
+                                    candidate_x < content_x
+                                });
+                            (opposite_float_intersects || same_side_edge_rule_blocks)
+                                .then_some(bottom)
+                        })
                         .min_by(f32::total_cmp);
                     let Some(next) = next else {
                         break;
                     };
                     float_y = next;
-                    (left, space) = float_edges(&floats, content_x, content_width, float_y, 1.0);
+                    (left, space) = self.context_float_edges(
+                        float_start,
+                        content_x,
+                        content_width,
+                        float_y,
+                        1.0,
+                    );
                 }
                 let side = floated.float;
                 let float_x = if side == Float::Right {
@@ -13055,16 +18191,18 @@ impl Layout<'_> {
                     outer_width,
                     depth + 1,
                 )?;
-                if floats.len() == 4096 {
+                if self.floats.len() - float_start >= 4096
+                    || self.floats.len() >= MAX_DISPLAY_COMMANDS
+                {
                     return Err(LayoutError::CommandLimit);
                 }
-                floats
+                self.floats
                     .try_reserve(1)
                     .map_err(|_| LayoutError::CommandLimit)?;
-                floats.push((
+                self.floats.push((
                     Rect {
-                        x: float_x,
-                        y: float_y,
+                        x: float_x - self.float_offset.0,
+                        y: float_y - self.float_offset.1,
                         width: outer_width,
                         height,
                     },
@@ -13094,7 +18232,7 @@ impl Layout<'_> {
                 non_block_since = true;
                 last_was_block = false;
                 saw_non_block = true;
-            } else if let NodeKind::Text(value) = kind {
+            } else if let NodeKind::Text(value) | NodeKind::CData(value) = kind {
                 self.text_flow(
                     value,
                     &style,
@@ -13103,7 +18241,7 @@ impl Layout<'_> {
                     &mut cursor,
                     &mut inline_width,
                     &mut inline_height,
-                    &floats,
+                    float_start,
                     &mut line_start,
                     &mut trailing_space,
                 )?;
@@ -13199,7 +18337,7 @@ impl Layout<'_> {
                 trailing_space = 0.0;
                 let multicol_column = (column_count > 1
                     && computed.as_ref().is_some_and(|child| {
-                        child.display == Display::Block
+                        matches!(child.display, Display::Block | Display::ListItem)
                             && !matches!(child.position, Position::Absolute | Position::Fixed)
                     }))
                 .then(|| (multicol_item_index / multicol_per_column).min(column_count - 1));
@@ -13212,26 +18350,47 @@ impl Layout<'_> {
                 let (margin, margin_bottom, through_candidate) = match &computed {
                     Some(child_style) => {
                         if child_style.clear != Clear::None {
-                            let before_clear = cursor;
-                            for (rect, side) in &floats {
-                                if child_style.clear == Clear::Both
-                                    || child_style.clear == Clear::Left && *side == Float::Left
-                                    || child_style.clear == Clear::Right && *side == Float::Right
-                                {
-                                    cursor = cursor.max(rect.y + rect.height);
+                            let margin_top = if vertical_block_flow {
+                                0.0
+                            } else {
+                                child_style.margin_sides[0]
+                            };
+                            let collapsed_top = previous_margin.max(margin_top).max(0.0)
+                                + previous_margin.min(margin_top).min(0.0);
+                            let hypothetical_border_top = cursor + collapsed_top - previous_margin;
+                            let float_bottom = self.floats[float_start..]
+                                .iter()
+                                .filter_map(|(rect, side)| {
+                                    (child_style.clear == Clear::Both
+                                        || child_style.clear == Clear::Left
+                                            && *side == Float::Left
+                                        || child_style.clear == Clear::Right
+                                            && *side == Float::Right)
+                                        .then_some(rect.y + rect.height + self.float_offset.1)
+                                })
+                                .max_by(f32::total_cmp);
+                            if let Some(float_bottom) = float_bottom {
+                                if hypothetical_border_top < float_bottom {
+                                    // Clearance is introduced only when the
+                                    // hypothetical border edge would overlap a
+                                    // relevant float. Margins then stop
+                                    // collapsing and clearance is added above
+                                    // this child's top margin. CSS 2.2 permits
+                                    // either placing the border at the float
+                                    // bottom or preserving its hypothetical
+                                    // position; use the greater of the two.
+                                    let border_top = hypothetical_border_top.max(float_bottom);
+                                    cursor = border_top - margin_top;
+                                    non_block_since = true;
+                                    previous_margin = 0.0;
                                 }
                             }
-                            // Actual clearance interrupts parent/child margin
-                            // collapse; otherwise the final collapse pass can
-                            // pull this child back up into the float (CSS 2.1 §9.5.2).
-                            non_block_since |= cursor > before_clear;
-                            previous_margin = 0.0;
                         }
                         let borderless = !child_style.border_solid
                             && child_style.padding_sides[0] == 0.0
                             && child_style.padding_sides[2] == 0.0;
                         let candidate = borderless
-                            && child_style.display == Display::Block
+                            && matches!(child_style.display, Display::Block | Display::ListItem)
                             && child_style.position == Position::Static
                             && child_style.float == Float::None
                             && child_style.clear == Clear::None
@@ -13259,14 +18418,64 @@ impl Layout<'_> {
                 if previous_margin != 0.0 {
                     cursor += collapsed - previous_margin - margin;
                 }
-                let child_y = cursor;
-                let (mut child_x, child_width) =
+                let (mut child_x, mut child_width) =
                     multicol_column.map_or((content_x, content_width), |column| {
                         (
                             content_x + column as f32 * (column_width + column_gap),
                             column_width,
                         )
                     });
+                if !vertical_block_flow && multicol_column.is_none() {
+                    if let Some(child) = computed.as_ref().filter(|child| {
+                        establishes_formatting_context(child, &style)
+                            && self.floats.len() > float_start
+                    }) {
+                        // Independent formatting contexts cannot overlap floats
+                        // in their parent's context. Auto width fits the space;
+                        // a fixed width moves below floats until it fits.
+                        let required_width = child
+                            .width
+                            .map_or(box_edges(child, true), |width| {
+                                content_dimension(child, width) + box_edges(child, true)
+                            })
+                            .max(0.0);
+                        let height = child
+                            .height
+                            .map_or(1.0, |height| {
+                                content_height_dimension(child, height) + box_edges(child, false)
+                            })
+                            .max(1.0);
+                        let (mut left, mut space) = self.context_float_edges(
+                            float_start,
+                            content_x,
+                            content_width,
+                            cursor,
+                            height,
+                        );
+                        while required_width > space {
+                            let next = self.floats[float_start..]
+                                .iter()
+                                .map(|(rect, _)| rect.y + rect.height + self.float_offset.1)
+                                .filter(|end| *end > cursor)
+                                .min_by(f32::total_cmp);
+                            let Some(next) = next else {
+                                break;
+                            };
+                            cursor = next;
+                            non_block_since = true;
+                            (left, space) = self.context_float_edges(
+                                float_start,
+                                content_x,
+                                content_width,
+                                cursor,
+                                height,
+                            );
+                        }
+                        child_x = left;
+                        child_width = space;
+                    }
+                }
+                let child_y = cursor;
                 let vertical_outer_width = if vertical_block_flow {
                     computed.as_ref().map_or(content_width, |child| {
                         let border = if child.border_solid {
@@ -13294,6 +18503,7 @@ impl Layout<'_> {
                 }
                 let first_cmd = self.commands.len();
                 let first_hit = self.geometry.as_ref().map_or(0, |g| g.hits.len());
+                let first_float = self.floats.len();
                 self.was_through = None;
                 self.collapsed_bottom = None;
                 let child_inline_extent = computed.as_ref().map_or(0.0, |child| {
@@ -13368,6 +18578,7 @@ impl Layout<'_> {
                 block_children.push(BlockChild {
                     first_cmd,
                     first_hit,
+                    first_float,
                     border_top: child_y + margin,
                     margin_top: margin,
                     margin_bottom,
@@ -13386,12 +18597,22 @@ impl Layout<'_> {
             }
             content_extent_width = content_extent_width.max(inline_width);
         }
-        if generated_before_pending || generated_after_pending {
+        if list_marker_inside_pending || generated_before_pending || generated_after_pending {
             let mut paragraph = InlineParagraph {
                 has_preceding_content: inline_width > 0.0,
                 ..InlineParagraph::default()
             };
             let mut frame_path = Vec::new();
+            if list_marker_inside_pending {
+                let marker = list_marker.as_ref().ok_or(LayoutError::InvalidTree)?;
+                self.append_virtual_generated_child(
+                    marker,
+                    &style,
+                    &mut paragraph,
+                    &mut frame_path,
+                )?;
+                list_marker_inside_pending = false;
+            }
             if generated_before_pending {
                 let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
                 if before.style.display == Display::Inline {
@@ -13408,6 +18629,26 @@ impl Layout<'_> {
                     {
                         return Err(LayoutError::UnsupportedGeneratedContent);
                     }
+                    if !paragraph.frames.is_empty() || !paragraph.atoms.is_empty() {
+                        self.flow_inline_paragraph(
+                            &mut paragraph,
+                            &style,
+                            content_x,
+                            content_width,
+                            &mut cursor,
+                            &mut inline_width,
+                            &mut inline_height,
+                            float_start,
+                            &mut line_start,
+                            &mut trailing_space,
+                            depth + 1,
+                        )?;
+                        non_block_since = true;
+                        last_was_block = false;
+                        saw_non_block = true;
+                        paragraph = InlineParagraph::default();
+                        frame_path.clear();
+                    }
                     self.flow_virtual_generated_block_child(
                         before,
                         &style,
@@ -13416,7 +18657,7 @@ impl Layout<'_> {
                         &mut cursor,
                         &mut inline_width,
                         &mut inline_height,
-                        &floats,
+                        float_start,
                         &mut line_start,
                         &mut trailing_space,
                         &mut previous_margin,
@@ -13454,7 +18695,7 @@ impl Layout<'_> {
                             &mut cursor,
                             &mut inline_width,
                             &mut inline_height,
-                            &floats,
+                            float_start,
                             &mut line_start,
                             &mut trailing_space,
                             depth + 1,
@@ -13473,7 +18714,7 @@ impl Layout<'_> {
                         &mut cursor,
                         &mut inline_width,
                         &mut inline_height,
-                        &floats,
+                        float_start,
                         &mut line_start,
                         &mut trailing_space,
                         &mut previous_margin,
@@ -13494,7 +18735,7 @@ impl Layout<'_> {
                     &mut cursor,
                     &mut inline_width,
                     &mut inline_height,
-                    &floats,
+                    float_start,
                     &mut line_start,
                     &mut trailing_space,
                     depth + 1,
@@ -13502,6 +18743,22 @@ impl Layout<'_> {
                 non_block_since = true;
                 last_was_block = false;
                 saw_non_block = true;
+            }
+        }
+        if let Some(marker) = list_marker
+            .as_ref()
+            .filter(|marker| marker.style.list_style_position == css::ListStylePosition::Outside)
+        {
+            if inline_height == 0.0
+                && inline_width == 0.0
+                && !saw_non_block
+                && block_children.is_empty()
+            {
+                // An outside marker does not consume inline width, but its
+                // line box still gives an otherwise-empty list item a stable
+                // line height so adjacent markers do not collapse onto one
+                // baseline.
+                inline_height = self.line_height(&marker.style);
             }
         }
         self.align_line(
@@ -13513,27 +18770,14 @@ impl Layout<'_> {
             true,
         );
         cursor += inline_height;
-        if overflow_scroll_container(&style)
-            || style.contain_paint
-            || style.float != Float::None
-            || matches!(style.position, Position::Absolute | Position::Fixed)
-        {
-            for (rect, _) in &floats {
-                cursor = cursor.max(rect.y + rect.height);
+        let bfc_root = depth == 0 || establishes_formatting_context(&style, parent_style);
+        if bfc_root {
+            for (rect, _) in &self.floats[float_start..] {
+                cursor = cursor.max(rect.y + rect.height + self.float_offset.1);
             }
         }
-        // CSS 2.1 §8.3.1: the container's own top/bottom margins collapse with
-        // its first/last in-flow children when no border, padding or BFC root
-        // separates them. Boxes that establish a new formatting context (BFC
-        // roots) never collapse through with their children.
-        let bfc_root = overflow_scroll_container(&style)
-            || style.contain_paint
-            || style.contain_layout
-            || style.float != Float::None
-            || !matches!(style.position, Position::Static)
-            || style.transforms.is_some()
-            || style.clear != Clear::None
-            || !matches!(parent_style.display, Display::Block);
+        // A formatting context contains descendant floats and prevents margin
+        // collapse with its children; relative position/transform alone do not.
         let top_edge = !bfc_root && padding_top == 0.0 && border_width == 0.0;
         let bottom_edge = !bfc_root && padding_bottom == 0.0 && border_width == 0.0;
         let mut m_top = margin_top;
@@ -13571,11 +18815,6 @@ impl Layout<'_> {
             && block_children
                 .iter()
                 .all(|child| child.through.is_some() && !child.break_before);
-        let bottom_collapses = bottom_edge && last_was_block;
-        if bottom_collapses {
-            m_bottom = margin_bottom.max(previous_margin);
-            self.collapsed_bottom = Some(m_bottom);
-        }
         let chain_out_top =
             top_edge && (top_chain_child.is_some() || (all_through && !saw_non_block));
         let mut content_extent_height = if vertical_block_flow {
@@ -13592,6 +18831,23 @@ impl Layout<'_> {
             (cursor + scroll_y - outer_y - border_width - padding_top).max(0.0)
         }
         .max(0.0);
+        // A definite minimum only blocks bottom-margin collapse when it
+        // actually increases the used content box. Compare against the
+        // laid-out content extent before subtracting the candidate margin;
+        // this keeps a small min-height from enclosing an otherwise taller
+        // child and its collapsing margin.
+        let content_extent_without_last_margin =
+            (content_extent_height - previous_margin).max(0.0);
+        let min_height_affects_used_size = style.min_height_intrinsic.is_some()
+            || style.min_height > content_extent_without_last_margin;
+        let bottom_collapses = bottom_edge
+            && last_was_block
+            && style.height.is_none()
+            && !min_height_affects_used_size;
+        if bottom_collapses {
+            m_bottom = margin_bottom.max(previous_margin);
+            self.collapsed_bottom = Some(m_bottom);
+        }
         if bottom_collapses {
             // The bottom chain propagates below the border box, so the
             // height excludes it.
@@ -13660,6 +18916,9 @@ impl Layout<'_> {
                     let last_hit = geometry.hits.len();
                     geometry.move_hits(first.first_hit..last_hit, 0.0, shift);
                 }
+                for (rect, _) in &mut self.floats[first.first_float..] {
+                    rect.y += shift;
+                }
             }
         }
         if style.position != Position::Static || style.transforms.is_some() {
@@ -13669,8 +18928,10 @@ impl Layout<'_> {
                 width: box_width - 2.0 * border_width,
                 height: box_height - 2.0 * border_width,
             });
+            self.containing_block_node = Some(id);
             if style.transforms.is_some() {
                 self.fixed_containing_block = self.containing_block;
+                self.fixed_containing_block_node = Some(id);
             }
         }
         // Appendix E layer 8: in-flow positioned/transformed/opacity contexts
@@ -13841,6 +19102,11 @@ impl Layout<'_> {
                     radius: clip_radius,
                 });
                 if scroll_container {
+                    if geometry.scroll_extents.len() >= MAX_DISPLAY_COMMANDS
+                        || geometry.scroll_ports.len() >= MAX_DISPLAY_COMMANDS
+                    {
+                        return Err(LayoutError::CommandLimit);
+                    }
                     geometry
                         .scroll_extents
                         .try_reserve(1)
@@ -13858,6 +19124,15 @@ impl Layout<'_> {
                             0.0
                         },
                     });
+                    geometry
+                        .scroll_ports
+                        .try_reserve(1)
+                        .map_err(|_| LayoutError::CommandLimit)?;
+                    geometry.scroll_ports.push(ScrollPort {
+                        node: id,
+                        rect: padding,
+                        owner_hit: hit,
+                    });
                 }
             }
         }
@@ -13870,6 +19145,25 @@ impl Layout<'_> {
                 height: box_height,
             },
         );
+        if let Some(frame) = self
+            .overflow_frames
+            .last_mut()
+            .filter(|frame| frame.node == id)
+        {
+            let padding_box = Rect {
+                x: outer_x + border_left,
+                y: paint_y + border_top,
+                width: content_width + padding_left + padding_right,
+                height: content_height + padding_top + padding_bottom,
+            };
+            frame.set_padding_box(padding_box);
+            frame.include(Rect {
+                x: padding_box.x + padding_left,
+                y: padding_box.y + padding_top,
+                width: content_extent_width.max(content_width),
+                height: content_extent_height.max(content_height),
+            });
+        }
         if let Some(index) = background_index {
             self.finish_background(
                 index,
@@ -14044,6 +19338,7 @@ pub(crate) fn display_list_with_retained_layout(
         style_cache,
         retained_fragments,
         None,
+        Some(DEFAULT_CANVAS_BACKGROUND),
     )
 }
 
@@ -14059,6 +19354,7 @@ pub(crate) fn display_list_with_retained_layout_and_root(
     style_cache: &core::cell::RefCell<css::StyleCache>,
     retained_fragments: Option<&mut RetainedLayoutCache>,
     presentation_root: Option<NodeId>,
+    canvas_background: Option<Rgba>,
 ) -> Result<DisplayList, LayoutError> {
     let root = document.root();
     let mut html = None;
@@ -14092,20 +19388,45 @@ pub(crate) fn display_list_with_retained_layout_and_root(
             ..
         }) if crate::svg::local_name(name) == "svg"
     );
+    let tracks_root_scroll = geometry.is_some() && !standalone_svg && presentation_root.is_none();
+    let root_scroll = if tracks_root_scroll {
+        scrolls
+            .iter()
+            .find(|scroll| scroll.node == root)
+            .map_or((0.0, 0.0), |scroll| (scroll.x, scroll.y))
+    } else {
+        (0.0, 0.0)
+    };
+    let viewport = Rect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    };
+    let mut overflow_frames = Vec::new();
+    if tracks_root_scroll {
+        overflow_frames
+            .try_reserve(1)
+            .map_err(|_| LayoutError::CommandLimit)?;
+        overflow_frames.push(OverflowFrame::viewport(root, viewport, root_scroll));
+    }
+    let counting = CountingShaper {
+        inner: text,
+        uses: core::cell::Cell::new(0),
+    };
     let mut layout = Layout {
         document,
-        text,
+        text: &counting,
+        text_uses: &counting.uses,
         rules,
         images,
         commands: Vec::new(),
         command_bytes: 0,
+        floats: Vec::new(),
+        float_start: 0,
+        float_offset: (0.0, 0.0),
         body_background_on_canvas: false,
-        viewport: Rect {
-            x: 0.0,
-            y: 0.0,
-            width: width as f32,
-            height: height as f32,
-        },
+        viewport,
         geometry,
         scrolls,
         cull: Rect {
@@ -14116,7 +19437,11 @@ pub(crate) fn display_list_with_retained_layout_and_root(
         },
         scroll_hazards: 0,
         containing_block: None,
+        containing_block_node: None,
         fixed_containing_block: None,
+        fixed_containing_block_node: None,
+        root_scroll,
+        overflow_frames,
         sticky_bounds: None,
         transform_depth: 0,
         parent_height: None,
@@ -14129,32 +19454,42 @@ pub(crate) fn display_list_with_retained_layout_and_root(
         next_paint_order: 0,
         intrinsic_cache: core::cell::RefCell::new(Vec::new()),
         style_cache,
+        quote_positions: Vec::new(),
+        counter_positions: Vec::new(),
         retained_fragments,
         suppressed_border_node: None,
     };
-    layout.push_command(Command::FillRect {
-        rect: Rect {
-            x: 0.0,
-            y: 0.0,
-            width: width as f32,
-            height: height as f32,
-        },
-        color: Rgba {
-            r: 255,
-            g: 255,
-            b: 255,
-            a: 255,
-        },
-    })?;
-    let initial = layout
+    layout.prepare_quote_positions(html)?;
+    layout.prepare_counter_positions(html)?;
+    if let Some(color) = canvas_background {
+        layout.push_command(Command::FillRect {
+            rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+            },
+            color,
+        })?;
+    }
+    let mut initial = layout
         .computed_style(html, None)
         .map_err(LayoutError::Css)?;
     if initial.display == Display::None {
         return layout.finish_display_list();
     }
-    let root_hit = layout.begin_hit(html)?;
-    layout.finish_hit(root_hit, layout.viewport);
-    if has_background(&initial) {
+    let root_has_box = initial.display != Display::Contents;
+    if !root_has_box {
+        initial = initial.display_contents_child_style();
+    }
+    if root_has_box {
+        let root_hit = layout.begin_hit(
+            html,
+            initial.pointer_events_auto && initial.visibility_visible,
+        )?;
+        layout.finish_hit(root_hit, layout.viewport);
+    }
+    if root_has_box && has_background(&initial) {
         layout.push_background(layout.viewport, &initial)?;
     }
     if standalone_svg {
@@ -14172,7 +19507,7 @@ pub(crate) fn display_list_with_retained_layout_and_root(
         }
         let parent_height = layout.parent_height;
         layout.parent_height = Some(height as f32);
-        layout.paint_svg_root(html, attributes, &style, 0.0, 0.0, width as f32, 0)?;
+        layout.paint_svg_root(html, attributes, &style, 0.0, 0.0, width as f32, 0, None)?;
         layout.parent_height = parent_height;
         return layout.finish_display_list();
     }
@@ -14239,7 +19574,15 @@ pub(crate) fn display_list_with_retained_layout_and_root(
                     .map_or(0, |geometry| geometry.hits.len()),
             );
             layout.stacking_roots.push(root_target);
-            layout.box_for(current, &initial, None, 0.0, 0.0, width as f32, 0)?;
+            layout.box_for(
+                current,
+                &initial,
+                None,
+                -root_scroll.0,
+                -root_scroll.1,
+                width as f32,
+                0,
+            )?;
             layout.stacking_roots.pop();
             layout.rotate_stacking_escapes(root_target.0, root_target.1);
         }
@@ -14247,6 +19590,7 @@ pub(crate) fn display_list_with_retained_layout_and_root(
             .next_sibling(current)
             .map_err(|_| LayoutError::InvalidTree)?;
     }
+    layout.finish_root_scroll_extent()?;
     layout.finish_display_list()
 }
 
@@ -14338,12 +19682,10 @@ mod tests {
             crate::html::parse("<div style='height:100px'></div><p>below viewport</p>", 64)
                 .unwrap();
         let list = display_list(&document, 20, 10, &NoShape).unwrap();
-        assert!(
-            !list
-                .0
-                .iter()
-                .any(|command| matches!(command, Command::GlyphRun { .. }))
-        );
+        assert!(!list
+            .0
+            .iter()
+            .any(|command| matches!(command, Command::GlyphRun { .. })));
     }
 
     #[test]
@@ -14369,6 +19711,118 @@ mod tests {
         assert_eq!(
             display_list_with_images(&document, 100, 100, &FixedText, &images),
             Err(LayoutError::CommandLimit)
+        );
+    }
+
+    #[test]
+    fn content_url_replaces_element_children_with_the_resolved_image() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}#target{content:url(replacement.png);width:8px;height:6px}</style><div id='target'>hidden child text</div>",
+            64,
+        )
+        .unwrap();
+        let image = Arc::new(ImageData {
+            width: 2,
+            height: 3,
+            pixels: alloc::vec![255; 2 * 3 * 4],
+        });
+        let images = |source: &str| {
+            if source == "replacement.png" {
+                ImageState::Ready(image.clone())
+            } else {
+                ImageState::Failed
+            }
+        };
+        let text = RecordingText::default();
+        let list = display_list_with_images(&document, 40, 30, &text, &images).unwrap();
+        assert!(text.0.borrow().is_empty());
+        assert!(list.0.iter().any(|command| matches!(
+            command,
+            Command::Image { rect, image: painted }
+                if (rect.width - 8.0).abs() < 0.01
+                    && (rect.height - 6.0).abs() < 0.01
+                    && Arc::ptr_eq(painted, &image)
+        )));
+
+        let unsupported = crate::html::parse(
+            "<style>#target{content:'replacement text'}</style><div id='target'>original text</div>",
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            display_list(&unsupported, 40, 30, &NoShape),
+            Err(LayoutError::UnsupportedGeneratedContent)
+        );
+    }
+
+    #[test]
+    fn failed_content_replacement_keeps_box_and_suppresses_alt_and_children() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}#target{content:url(broken);width:12px;height:8px;padding:2px;border:1px solid blue;background:red}</style><div id='target' alt='Alt text'>FAIL</div>",
+            64,
+        )
+        .unwrap();
+        let target = crate::selector::query_selector(&document, document.root(), "#target")
+            .unwrap()
+            .unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        let text = RecordingText::default();
+        let images = |_: &str| ImageState::Failed;
+        let list = display_list_with_styles(
+            &document,
+            40,
+            30,
+            &text,
+            &rules,
+            Some(&images),
+            Some(&mut geometry),
+            &[],
+        )
+        .expect("an invalid replacement image is transparent replaced content");
+
+        let shaped = text.0.borrow();
+        assert!(
+            shaped
+                .iter()
+                .all(|run| !run.contains("FAIL") && !run.contains("Alt text")),
+            "replacement child or alt text was painted: {shaped:?}"
+        );
+        assert!(
+            !list
+                .0
+                .iter()
+                .any(|command| matches!(command, Command::Image { .. })),
+            "a failed image must render as transparent pixels"
+        );
+        assert!(
+            list.0.iter().any(|command| matches!(
+                command,
+                Command::FillRect { rect, color }
+                    if color.r == 255
+                        && color.g == 0
+                        && color.b == 0
+                        && rect.x == 0.0
+                        && rect.y == 0.0
+                        && rect.width == 18.0
+                        && rect.height == 14.0
+            )),
+            "authored background did not retain the replaced box size: {:?}",
+            list.0
+        );
+        let hit = geometry
+            .hits
+            .iter()
+            .find(|hit| hit.node == target && !hit.virtual_generated)
+            .expect("replacement retains the originating element hit region");
+        assert_eq!(
+            hit.rect,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 18.0,
+                height: 14.0,
+            }
         );
     }
 
@@ -14577,6 +20031,25 @@ mod tests {
     }
 
     #[test]
+    fn block_child_background_mask_is_not_stretched_to_the_container() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}</style><div style='height:80px;width:100px'><div style='width:40px;background:red;background-clip:text'>text</div></div>",
+            64,
+        )
+        .unwrap();
+        let list = crate::layout::display_list(&document, 100, 100, &FixedText).unwrap();
+        let mask = list
+            .0
+            .iter()
+            .find_map(|command| match command {
+                Command::MaskedBackground(mask) => Some(mask),
+                _ => None,
+            })
+            .expect("masked background");
+        assert!(mask.rect.height < 80.0);
+    }
+
+    #[test]
     fn stretched_background_masks_resolve_final_border_geometry() {
         for display in ["flex", "grid"] {
             for background in ["red", "linear-gradient(red,blue)"] {
@@ -14660,13 +20133,12 @@ mod tests {
             .first()
             .expect("ordinary descendant scroll region")
             .clone();
-        assert!(
-            list.0
-                .iter()
-                .enumerate()
-                .any(|(index, command)| !region.commands.contains(&index)
-                    && matches!(command,Command::MaskedBackground(mask) if mask.text_clipped))
-        );
+        assert!(list
+            .0
+            .iter()
+            .enumerate()
+            .any(|(index, command)| !region.commands.contains(&index)
+                && matches!(command,Command::MaskedBackground(mask) if mask.text_clipped)));
         let before = list.0.clone();
         assert!(!geometry.scroll_region(&mut list.0, region.node, (0.0, 0.0), (0.0, 1.0)));
         assert_eq!(
@@ -14854,6 +20326,126 @@ mod tests {
                 (21.0, 8.0, 17.0, 4.0),
                 (2.0, 14.0, 36.0, 6.0)
             ]
+        );
+    }
+
+    #[test]
+    fn fixed_table_column_widths_override_first_row_cell_widths() {
+        let document = crate::html::parse(
+            "<style>html,body{margin:0}td{height:10px;padding:0}</style><table style='width:100px;table-layout:fixed;border-spacing:0'><col style='width:60px'><col style='width:40px'><tr><td style='width:10px;background:#ff0000'></td><td style='width:90px;background:#00ff00'></td></tr></table>",
+            32,
+        )
+        .unwrap();
+        let list = display_list(&document, 160, 40, &FixedText).unwrap();
+        let rect_for = |rgb| {
+            list.0.iter().find_map(|command| match command {
+                Command::FillRect { rect, color } if (color.r, color.g, color.b) == rgb => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(
+            rect_for((255, 0, 0)),
+            Some(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 60.0,
+                height: 10.0,
+            })
+        );
+        assert_eq!(
+            rect_for((0, 255, 0)),
+            Some(Rect {
+                x: 60.0,
+                y: 0.0,
+                width: 40.0,
+                height: 10.0,
+            })
+        );
+    }
+
+    #[test]
+    fn direct_table_cells_share_an_anonymous_row() {
+        let boxes = colored_boxes(
+            "<div style='display:table;width:30px;table-layout:fixed;border-spacing:0'><div style='display:table-cell;height:6px;background:red'></div><div style='display:table-cell;height:10px;background:green'></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0, 15.0, 10.0), (15.0, 0.0, 15.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn table_anonymous_fixup_lays_out_mixed_children_without_tree_mutation() {
+        let style = "<style>body{margin:0;font:12px monospace;line-height:16px}.table{display:table;width:180px;table-layout:fixed;border-spacing:0}.row{display:table-row}.group{display:table-row-group}.cell{display:table-cell;padding:0;border:0}.block{display:block}</style>";
+        let actual = alloc::format!(
+            "{style}<div class='table'><span class='block'>A</span>X<span class='cell'>B</span><div class='block'>C</div><div style='display:contents'><div class='row'><span class='block'>D</span><span class='cell'>E</span></div></div><div class='group'><span class='block'>F</span><span class='cell'>G</span></div></div>"
+        );
+        let reference = alloc::format!(
+            "{style}<div class='table'><div class='row'><div class='cell'><span class='block'>A</span>X</div><span class='cell'>B</span><div class='cell'><div class='block'>C</div></div></div><div class='row'><div class='cell'><span class='block'>D</span></div><span class='cell'>E</span></div><div class='group'><div class='row'><div class='cell'><span class='block'>F</span></div><span class='cell'>G</span></div></div></div>"
+        );
+        let actual_document = crate::html::parse(&actual, 128).unwrap();
+        let actual_node_count = actual_document.node_count();
+        let actual = display_list(&actual_document, 240, 180, &FixedText).unwrap();
+        assert_eq!(
+            actual_document.node_count(),
+            actual_node_count,
+            "table box fixup must stay virtual and leave the DOM arena unchanged"
+        );
+        let reference = crate::html::parse(&reference, 128).unwrap();
+        let reference = display_list(&reference, 240, 180, &FixedText).unwrap();
+        let glyphs = |list: &DisplayList| {
+            list.0
+                .iter()
+                .filter_map(|command| match command {
+                    Command::GlyphRun {
+                        origin_x,
+                        baseline_y,
+                        size,
+                        color,
+                        glyphs,
+                    } => Some((*origin_x, *baseline_y, *size, *color, glyphs.to_vec())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            glyphs(&actual),
+            glyphs(&reference),
+            "table, row-group, and row fixup should preserve the same ordered cell content as explicit anonymous-box equivalents"
+        );
+    }
+
+    #[test]
+    fn nowrap_whitespace_between_table_rows_does_not_create_anonymous_rows() {
+        let style = "<style>html,body{margin:0;white-space:nowrap;font:12px monospace;line-height:16px}.table{display:table;width:30px;table-layout:fixed;border-spacing:0}.row{display:table-row}.cell{display:table-cell;padding:0}</style>";
+        let indented = alloc::format!(
+            "{style}<div class='table'>\n  <div class='row'><div class='cell'>A</div></div>\n  <div class='row'><div class='cell'>B</div></div>\n</div>"
+        );
+        let compact = alloc::format!(
+            "{style}<div class='table'><div class='row'><div class='cell'>A</div></div><div class='row'><div class='cell'>B</div></div></div>"
+        );
+        let indented = crate::html::parse(&indented, 128).unwrap();
+        let indented = display_list(&indented, 80, 80, &FixedText).unwrap();
+        let compact = crate::html::parse(&compact, 128).unwrap();
+        let compact = display_list(&compact, 80, 80, &FixedText).unwrap();
+        let baselines = |list: &DisplayList| {
+            list.0
+                .iter()
+                .filter_map(|command| match command {
+                    Command::GlyphRun { baseline_y, .. } => Some(*baseline_y),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            baselines(&indented),
+            baselines(&compact),
+            "white-space:nowrap collapses indentation; it must not add empty anonymous table rows"
         );
     }
 
@@ -15084,11 +20676,9 @@ mod tests {
             }),
             "the cell border wins the equal-width table border: {fills:?}"
         );
-        assert!(
-            !fills
-                .iter()
-                .any(|(_, color)| (color.r, color.g, color.b) == (23, 78, 166))
-        );
+        assert!(!fills
+            .iter()
+            .any(|(_, color)| (color.r, color.g, color.b) == (23, 78, 166)));
     }
 
     #[test]
@@ -15420,6 +21010,99 @@ mod tests {
     }
 
     #[test]
+    fn grid_track_solver_applies_span_min_and_max_content_constraints() {
+        let definitions = [css::GridTrack::Auto, css::GridTrack::Auto];
+        let contributions = [GridTrackContribution {
+            start: 0,
+            span: 2,
+            min_content: 30.0,
+            max_content: 70.0,
+        }];
+        let sizes = grid_track_sizes(
+            &definitions,
+            definitions.len(),
+            Some(70.0),
+            0.0,
+            false,
+            contributions.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(&sizes[..2], &[35.0, 35.0]);
+    }
+
+    #[test]
+    fn grid_track_solver_preserves_fit_content_floor_and_cap() {
+        let definitions = [css::GridTrack::FitContent(25.0)];
+        let contributions = [GridTrackContribution {
+            start: 0,
+            span: 1,
+            min_content: 10.0,
+            max_content: 60.0,
+        }];
+        let sizes = grid_track_sizes(
+            &definitions,
+            definitions.len(),
+            None,
+            0.0,
+            false,
+            contributions.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(sizes[0], 25.0);
+
+        let contributions = [GridTrackContribution {
+            min_content: 40.0,
+            max_content: 60.0,
+            ..contributions[0]
+        }];
+        let sizes = grid_track_sizes(
+            &definitions,
+            definitions.len(),
+            None,
+            0.0,
+            false,
+            contributions.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(sizes[0], 40.0, "the min-content floor can exceed the cap");
+    }
+
+    #[test]
+    fn grid_track_solver_freezes_intrinsic_minimum_before_flex_distribution() {
+        let definitions = [
+            css::GridTrack::MinMax(
+                css::GridBreadth::Pixels(80.0),
+                css::GridBreadth::Fraction(1.0),
+            ),
+            css::GridTrack::Fraction(1.0),
+        ];
+        let sizes = grid_track_sizes(&definitions, 2, Some(100.0), 0.0, false, [].into_iter())
+            .unwrap();
+        assert_eq!(&sizes[..2], &[80.0, 20.0]);
+    }
+
+    #[test]
+    fn grid_track_solver_clamps_out_of_range_span_constraints() {
+        let definitions = [css::GridTrack::Auto; css::MAX_GRID_TRACKS];
+        let contributions = [GridTrackContribution {
+            start: css::MAX_GRID_TRACKS - 1,
+            span: 2,
+            min_content: 1.0,
+            max_content: 1.0,
+        }];
+        let sizes = grid_track_sizes(
+            &definitions,
+            definitions.len(),
+            None,
+            0.0,
+            false,
+            contributions.iter().copied(),
+        )
+        .unwrap();
+        assert_eq!(sizes[css::MAX_GRID_TRACKS - 1], 1.0);
+    }
+
+    #[test]
     fn grid_fraction_tracks_gaps_spans_and_sparse_auto_placement() {
         let boxes = colored_boxes(
             "<div style='display:grid;width:100px;grid-template-columns:20px 1fr 2fr;grid-template-rows:10px 20px;gap:5px'><div style='grid-column:2 / span 2;background:red'></div><div style='background:green'></div><div style='background:red'></div></div>",
@@ -15640,16 +21323,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(
-            rects
-                .iter()
-                .any(|rect| rect.width == 120.0 && rect.height == 60.0)
-        );
-        assert!(
-            rects
-                .iter()
-                .any(|rect| rect.width == 20.0 && rect.height == 40.0)
-        );
+        assert!(rects
+            .iter()
+            .any(|rect| rect.width == 120.0 && rect.height == 60.0));
+        assert!(rects
+            .iter()
+            .any(|rect| rect.width == 20.0 && rect.height == 40.0));
     }
 
     #[test]
@@ -15955,29 +21634,23 @@ mod tests {
     }
 
     #[test]
-    fn grid_auto_repeat_respects_the_total_explicit_track_bound() {
+    fn grid_auto_repeat_clamps_to_the_total_explicit_track_bound() {
         let document = crate::html::parse(
             "<main style='display:grid;width:100px;grid-template-columns:repeat(64,1px) repeat(auto-fill,1px)'></main>",
             32,
         )
         .unwrap();
-        assert_eq!(
-            display_list(&document, 100, 100, &FixedText),
-            Err(LayoutError::GridLimit)
-        );
+        assert!(display_list(&document, 100, 100, &FixedText).is_ok());
 
         // A wide definite box whose auto-fill would need more than the
-        // remaining explicit-track budget must fail instead of truncating the
-        // repeat count at the implementation limit.
+        // remaining explicit-track budget clamps the repeat count to the
+        // implementation limit (CSS Grid §7.6).
         let document = crate::html::parse(
             "<style>body{margin:0}</style><main style='display:grid;width:1000px;grid-template-columns:repeat(auto-fill,1px)'></main>",
             32,
         )
         .unwrap();
-        assert_eq!(
-            display_list(&document, 1000, 100, &FixedText),
-            Err(LayoutError::GridLimit)
-        );
+        assert!(display_list(&document, 1000, 100, &FixedText).is_ok());
     }
 
     #[test]
@@ -15994,11 +21667,11 @@ mod tests {
         assert_eq!(auto_repeat_count(&auto, Some(20.0), 0.0), Ok(20));
         assert_eq!(auto_repeat_count(&auto, Some(20.0), 2.0), Ok(7));
         // An overflowing first repetition still yields one repetition per
-        // §7.2.3.2, while a count beyond the bounded explicit grid errors.
+        // §7.2.3.2, while a count beyond the bounded explicit grid clamps.
         assert_eq!(auto_repeat_count(&auto, Some(0.25), 0.0), Ok(1));
         assert_eq!(
             auto_repeat_count(&auto, Some((css::MAX_GRID_TRACKS + 1) as f32), 0.0),
-            Err(LayoutError::GridLimit)
+            Ok(css::MAX_GRID_TRACKS)
         );
     }
 
@@ -16076,15 +21749,280 @@ mod tests {
     }
 
     #[test]
-    fn grid_rejects_placement_beyond_bounded_tracks() {
+    fn grid_clamps_placement_beyond_bounded_tracks() {
         let document = crate::html::parse(
             "<div style='display:grid'><div style='grid-column:64 / span 2'></div></div>",
             8,
         )
         .unwrap();
+        assert!(display_list(&document, 100, 100, &FixedText).is_ok());
+    }
+
+    #[test]
+    fn flex_anonymous_text_runs_collapse_across_contents_and_stop_at_boxes() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}</style><div style='display:flex;align-items:flex-start;font-size:10px;color:#ff0000'>A <span style='display:contents;color:#00ff00'>x</span> <span style='display:contents;color:#0000ff'>y</span></div>",
+            64,
+        )
+        .unwrap();
+        let text = RecordingText::default();
+        let list = display_list(&document, 80, 30, &text).unwrap();
+        let mut glyphs = Vec::new();
+        for command in &list.0 {
+            if let Command::GlyphRun {
+                origin_x,
+                color,
+                glyphs: run,
+                ..
+            } = command
+            {
+                glyphs.extend(run.iter().filter_map(|glyph| {
+                    char::from_u32(glyph.id as u32).map(|character| {
+                        (character, (color.r, color.g, color.b), *origin_x + glyph.x)
+                    })
+                }));
+            }
+        }
         assert_eq!(
-            display_list(&document, 100, 100, &FixedText),
-            Err(LayoutError::GridLimit)
+            glyphs
+                .iter()
+                .map(|(character, _, _)| *character)
+                .collect::<Vec<_>>(),
+            ['A', ' ', 'x', ' ', 'y']
+        );
+        let x = glyphs
+            .iter()
+            .find(|(character, _, _)| *character == 'x')
+            .unwrap();
+        let y = glyphs
+            .iter()
+            .find(|(character, _, _)| *character == 'y')
+            .unwrap();
+        assert_eq!(x.1, (0, 255, 0));
+        assert_eq!(y.1, (0, 0, 255));
+        assert!(y.2 - x.2 >= 12.0, "collapsed spaces advance the later span");
+
+        let document = crate::html::parse(
+            "<style>body{margin:0}</style><div style='display:flex;align-items:flex-start;font-size:10px;color:#ff0000'>A<div style='width:5px;height:5px;background:#00ff00'></div>B</div>",
+            64,
+        )
+        .unwrap();
+        let list = display_list(&document, 80, 30, &RecordingText::default()).unwrap();
+        let mut a = None;
+        let mut b = None;
+        let mut green_box = None;
+        for (index, command) in list.0.iter().enumerate() {
+            match command {
+                Command::GlyphRun {
+                    origin_x, glyphs, ..
+                } => {
+                    for glyph in glyphs.iter() {
+                        match char::from_u32(glyph.id as u32) {
+                            Some('A') => a = Some((index, *origin_x + glyph.x)),
+                            Some('B') => b = Some((index, *origin_x + glyph.x)),
+                            _ => {}
+                        }
+                    }
+                }
+                Command::FillRect { rect, color } if (color.r, color.g, color.b) == (0, 255, 0) => {
+                    green_box = Some((index, *rect));
+                }
+                _ => {}
+            }
+        }
+        let (a_command, a_x) = a.expect("text before the flex item is painted");
+        let (box_command, rect) = green_box.expect("intervening flex item is painted");
+        let (b_command, b_x) = b.expect("text after the flex item is painted");
+        assert!(a_command < box_command && box_command < b_command);
+        assert!(a_x < rect.x && b_x >= rect.x + rect.width);
+    }
+
+    #[test]
+    fn contents_intrinsic_size_keeps_descendants_in_the_parent_inline_run() {
+        let geometry = |contents_display: &str| {
+            let markup = alloc::format!(
+                "<style>body{{margin:0}}.flex{{display:flex;width:200px}}.item{{flex:0 0 max-content;background:#ff0000;font-size:10px;line-height:10px}}.inline{{display:inline}}.contents{{display:{contents_display}}}</style><div class=flex><div class=item><div class=inline>2a<div>2<div class=contents>b<span>b</span></div></div></div></div></div>"
+            );
+            let document = crate::html::parse(&markup, 128).unwrap();
+            let list = display_list(&document, 240, 80, &RecordingText::default()).unwrap();
+            let mut glyphs = Vec::new();
+            let mut item_boxes = Vec::new();
+            for command in &list.0 {
+                match command {
+                    Command::GlyphRun {
+                        origin_x,
+                        baseline_y,
+                        glyphs: run,
+                        ..
+                    } => glyphs.extend(run.iter().filter_map(|glyph| {
+                        char::from_u32(u32::from(glyph.id))
+                            .map(|character| (character, *origin_x + glyph.x, *baseline_y))
+                    })),
+                    Command::FillRect { rect, color }
+                        if (color.r, color.g, color.b, color.a) == (255, 0, 0, 255) =>
+                    {
+                        item_boxes.push(*rect)
+                    }
+                    _ => {}
+                }
+            }
+            (glyphs, item_boxes)
+        };
+
+        let (contents, contents_boxes) = geometry("contents");
+        let (equivalent_inline, inline_boxes) = geometry("inline");
+        assert_eq!(
+            contents.iter().map(|glyph| glyph.0).collect::<Vec<_>>(),
+            ['2', 'a', '2', 'b', 'b']
+        );
+        assert_eq!(
+            equivalent_inline
+                .iter()
+                .map(|glyph| glyph.0)
+                .collect::<Vec<_>>(),
+            ['2', 'a', '2', 'b', 'b']
+        );
+        for (label, glyphs) in [
+            ("display: contents", contents.as_slice()),
+            ("equivalent inline wrapper", equivalent_inline.as_slice()),
+        ] {
+            let same_line = &glyphs[glyphs.len() - 3..];
+            assert!(
+                same_line
+                    .iter()
+                    .all(|glyph| (glyph.2 - same_line[0].2).abs() < 0.01),
+                "the inner 2bb contribution should occupy one line for {label}: {glyphs:?}"
+            );
+            assert!(
+                same_line.windows(2).all(|pair| pair[0].1 < pair[1].1),
+                "the inner 2bb glyphs should advance in source order for {label}: {glyphs:?}"
+            );
+        }
+        assert_eq!(contents_boxes.len(), 1);
+        assert_eq!(inline_boxes.len(), 1);
+        assert!(
+            (contents_boxes[0].width - 18.0).abs() < 0.01,
+            "display: contents should preserve the 18px max-content width of 2bb: {contents_boxes:?}"
+        );
+        assert!(
+            (contents_boxes[0].width - inline_boxes[0].width).abs() < 0.01,
+            "contents flattening and an equivalent inline wrapper should have equal intrinsic width: {contents_boxes:?} vs {inline_boxes:?}"
+        );
+        for (contents, inline) in contents.iter().zip(&equivalent_inline) {
+            assert_eq!(contents.0, inline.0);
+            assert!(
+                (contents.1 - inline.1).abs() < 0.01
+                    && (contents.2 - inline.2).abs() < 0.01,
+                "contents and inline geometry should match glyph-for-glyph: {contents:?} vs {inline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_descendants_split_inline_flex_wrappers_into_anonymous_flow() {
+        fn glyph_geometry(reference: bool) -> Vec<(char, f32, f32)> {
+            let item = if reference {
+                "<div class='inline c2'><div class='inline'>2a<div>2<div class='inline c2'>b<span class='b'>b</span></div></div></div></div>"
+            } else {
+                "<div class='contents c2'><div class='inline'>2a<div>2<div class='contents c2'>b<span class='b'>b</span></div></div></div></div>"
+            };
+            let markup = alloc::format!(
+                "<style>html,body{{margin:0;padding:0}}.flex{{display:flex;width:200px;font-size:10px;line-height:10px}}.inline{{display:inline}}.contents{{display:contents}}.c2{{background:blue;color:pink}}.b{{background:inherit}}.ref .c2{{background:transparent}}.ref .b{{background:blue}}</style>{}",
+                if reference {
+                    alloc::format!("<div class=ref><div class=flex>{item}</div></div>")
+                } else {
+                    alloc::format!("<div class=flex>{item}</div>")
+                }
+            );
+            let document = crate::html::parse(&markup, 128).unwrap();
+            let list = display_list(&document, 240, 80, &RecordingText::default()).unwrap();
+            let mut glyphs = Vec::new();
+            for command in &list.0 {
+                let Command::GlyphRun {
+                    origin_x,
+                    baseline_y,
+                    glyphs: run,
+                    ..
+                } = command
+                else {
+                    continue;
+                };
+                glyphs.extend(run.iter().filter_map(|glyph| {
+                    char::from_u32(u32::from(glyph.id))
+                        .map(|character| (character, *origin_x + glyph.x, *baseline_y))
+                }));
+            }
+            glyphs
+        }
+
+        let target = glyph_geometry(false);
+        let reference = glyph_geometry(true);
+        let expected = ['2', 'a', '2', 'b', 'b'];
+        assert_eq!(
+            target.iter().map(|glyph| glyph.0).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            reference.iter().map(|glyph| glyph.0).collect::<Vec<_>>(),
+            expected
+        );
+        for (label, glyphs) in [("display: contents", &target), ("reference", &reference)] {
+            let before_block = &glyphs[..2];
+            let block_line = &glyphs[2..];
+            assert!(
+                (before_block[0].2 - before_block[1].2).abs() < 0.01,
+                "the inline fragment before the block stays on one line for {label}: {glyphs:?}"
+            );
+            assert!(
+                block_line
+                    .iter()
+                    .all(|glyph| (glyph.2 - block_line[0].2).abs() < 0.01),
+                "the block's inline content stays on the next line for {label}: {glyphs:?}"
+            );
+            assert!(
+                block_line[0].2 > before_block[0].2,
+                "the in-flow block starts below the preceding anonymous inline fragment for {label}: {glyphs:?}"
+            );
+            assert!(
+                (block_line[0].1 - before_block[0].1).abs() < 0.01,
+                "the block starts at the containing block's inline start for {label}: {glyphs:?}"
+            );
+        }
+        for (target, reference) in target.iter().zip(&reference) {
+            assert_eq!(target.0, reference.0);
+            assert!(
+                (target.1 - reference.1).abs() < 0.01
+                    && (target.2 - reference.2).abs() < 0.01,
+                "contents and reference geometry should match glyph-for-glyph: {target:?} vs {reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_split_storage_budget_bounds_aggregate_retained_payload() {
+        let mut budget = InlineSplitStorageBudget::default();
+        assert!(budget
+            .charge(
+                MAX_DISPLAY_LIST_BYTES,
+                MAX_DISPLAY_COMMANDS,
+                MAX_DISPLAY_COMMANDS,
+                MAX_DISPLAY_COMMANDS,
+                MAX_DISPLAY_COMMANDS,
+                MAX_DISPLAY_LIST_BYTES / core::mem::size_of::<usize>(),
+            )
+            .is_ok());
+        assert!(matches!(
+            budget.charge(1, 0, 0, 0, 0, 0),
+            Err(LayoutError::CommandLimit)
+        ));
+        assert_eq!(budget.text_bytes, MAX_DISPLAY_LIST_BYTES);
+        assert_eq!(budget.spans, MAX_DISPLAY_COMMANDS);
+        assert_eq!(budget.atoms, MAX_DISPLAY_COMMANDS);
+        assert_eq!(budget.advances, MAX_DISPLAY_COMMANDS);
+        assert_eq!(budget.hard_breaks, MAX_DISPLAY_COMMANDS);
+        assert_eq!(
+            budget.frame_path_refs,
+            MAX_DISPLAY_LIST_BYTES / core::mem::size_of::<usize>()
         );
     }
 
@@ -16484,7 +22422,19 @@ mod tests {
         fn shape(&self, text: &str, _: f32) -> Result<ShapedRun, ()> {
             self.0.borrow_mut().push(String::from(text));
             Ok(ShapedRun {
-                glyphs: Arc::from([]),
+                glyphs: text
+                    .char_indices()
+                    .enumerate()
+                    .map(|(index, (cluster, character))| crate::paint::Glyph {
+                        id: u16::try_from(character as u32).unwrap_or(0xfffd),
+                        face: 0,
+                        cluster: cluster as u32,
+                        x: index as f32 * 6.0,
+                        y: 0.0,
+                        size_scale: 1.0,
+                    })
+                    .collect::<Vec<_>>()
+                    .into(),
                 width: text.chars().count() as f32 * 6.0,
             })
         }
@@ -16498,11 +22448,548 @@ mod tests {
         }
     }
 
-    fn recorded_shapes(markup: &str) -> Vec<String> {
+    #[test]
+    fn empty_decorated_inline_advance_matches_word_spacing_reference() {
+        let markup = "<style>body{margin:0}p{margin:0;font:10px/10px monospace}.control span{background:blue;color:blue}.spacer{padding-left:40px}.test span{background:orange;color:orange;word-spacing:40px}</style><p class=control><span>A <span class=spacer></span>B</span></p><p class=test><span>A B</span></p>";
+        let document = crate::html::parse(markup, 128).unwrap();
+        let list = display_list(&document, 160, 80, &RecordingText::default()).unwrap();
+        let mut blue_width = 0.0f32;
+        let mut orange_width = 0.0f32;
+        for command in &list.0 {
+            let Command::FillRect { rect, color } = command else {
+                continue;
+            };
+            if (color.r, color.g, color.b) == (0, 0, 255) {
+                blue_width = blue_width.max(rect.width);
+            } else if (color.r, color.g, color.b) == (255, 165, 0) {
+                orange_width = orange_width.max(rect.width);
+            }
+        }
+        assert!(blue_width >= 40.0, "empty padded inline lost its box advance: {blue_width}");
+        assert!(
+            (blue_width - orange_width).abs() < 0.01,
+            "empty inline padding should match the equivalent word spacing: {blue_width} vs {orange_width}"
+        );
+    }
+
+    #[test]
+    fn text_indent_applies_to_first_line_only_with_signed_and_percentage_values() {
+        let markup = "<style>body{margin:0}p{margin:0;width:100px;font:10px/10px monospace}#positive{text-indent:20px}#negative{text-indent:-10px}#percent{text-indent:10%}</style><p id=positive>a<br>b</p><p id=negative>c</p><p id=percent>d</p>";
+        let document = crate::html::parse(markup, 128).unwrap();
+        let list = display_list(&document, 160, 100, &RecordingText::default()).unwrap();
+        let mut glyphs = Vec::new();
+        for command in &list.0 {
+            let Command::GlyphRun {
+                origin_x,
+                baseline_y,
+                glyphs: run,
+                ..
+            } = command
+            else {
+                continue;
+            };
+            for glyph in run.iter() {
+                if let Some(character) = char::from_u32(u32::from(glyph.id)) {
+                    glyphs.push((character, *origin_x + glyph.x, *baseline_y));
+                }
+            }
+        }
+        let first = glyphs.iter().find(|(character, _, _)| *character == 'a').unwrap();
+        let second = glyphs.iter().find(|(character, _, _)| *character == 'b').unwrap();
+        let negative = glyphs.iter().find(|(character, _, _)| *character == 'c').unwrap();
+        let percentage = glyphs.iter().find(|(character, _, _)| *character == 'd').unwrap();
+        assert!((first.1 - 20.0).abs() < 0.01, "positive first-line indent: {first:?}");
+        assert!((second.1 - 0.0).abs() < 0.01, "forced second line must not inherit the indent: {second:?}");
+        assert!((negative.1 + 10.0).abs() < 0.01, "negative first-line indent: {negative:?}");
+        assert!((percentage.1 - 10.0).abs() < 0.01, "percentage indent uses containing width: {percentage:?}");
+    }
+
+    fn painted_text_runs(markup: &str) -> Vec<String> {
         let document = crate::html::parse(markup, 128).unwrap();
         let text = RecordingText::default();
-        display_list(&document, 320, 200, &text).unwrap();
-        text.0.into_inner()
+        let list = display_list(&document, 320, 200, &text).unwrap();
+        list.0
+            .into_iter()
+            .filter_map(|command| {
+                let Command::GlyphRun { glyphs, .. } = command else {
+                    return None;
+                };
+                Some(
+                    glyphs
+                        .iter()
+                        .filter_map(|glyph| char::from_u32(u32::from(glyph.id)))
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_markers_paint_counters_inside_flow_and_empty_item_lines() {
+        let markup = "<style>body,ol,ul{margin:0}ol,ul{padding-left:24px}li{font-size:10px;line-height:10px}#inside{list-style-position:inside}#inside li::marker{content:'[' counter(list-item) ']';color:red}</style><ol start='7'><li></li><li value='12'></li><li></li></ol><ul id='inside'><li>entry</li></ul>";
+        let document = crate::html::parse(markup, 128).unwrap();
+        let text = RecordingText::default();
+        let list = display_list(&document, 320, 200, &text).unwrap();
+        let marker_runs: Vec<_> = list
+            .0
+            .iter()
+            .filter_map(|command| {
+                let Command::GlyphRun {
+                    origin_x,
+                    baseline_y,
+                    glyphs,
+                    ..
+                } = command
+                else {
+                    return None;
+                };
+                let text: String = glyphs
+                    .iter()
+                    .filter_map(|glyph| char::from_u32(u32::from(glyph.id)))
+                    .collect();
+                matches!(text.as_str(), "7." | "12." | "13.").then_some((
+                    text,
+                    *origin_x,
+                    *baseline_y,
+                ))
+            })
+            .collect();
+        assert_eq!(
+            marker_runs
+                .iter()
+                .map(|run| run.0.as_str())
+                .collect::<Vec<_>>(),
+            ["7.", "12.", "13."]
+        );
+        let marker_origins: Vec<_> = marker_runs
+            .iter()
+            .map(|run| (run.0.as_str(), run.1))
+            .collect();
+        assert_eq!(
+            marker_origins,
+            [("7.", 6.0), ("12.", 0.0), ("13.", 0.0)],
+            "outside markers align by their right edge before the marker gap: {marker_origins:?}"
+        );
+        assert!(marker_runs[0].2 < marker_runs[1].2 && marker_runs[1].2 < marker_runs[2].2);
+        let painted: Vec<_> = list
+            .0
+            .iter()
+            .filter_map(|command| match command {
+                Command::GlyphRun { glyphs, color, .. } => {
+                    let text: String = glyphs
+                        .iter()
+                        .filter_map(|glyph| char::from_u32(u32::from(glyph.id)))
+                        .collect();
+                    Some((text, *color))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted
+                .iter()
+                .any(|(text, color)| text.starts_with("[1]") && color.r == 255),
+            "inside marker should paint its counter in red: {painted:?}"
+        );
+        assert!(painted.iter().any(|(text, _)| text == "entry"));
+    }
+
+    #[test]
+    fn inline_block_split_does_not_keep_an_empty_prefix_line_box() {
+        fn marker_rect(markup: &str) -> Rect {
+            let document = crate::html::parse(markup, 64).unwrap();
+            let item = crate::selector::query_selector(&document, document.root(), "#item")
+                .unwrap()
+                .unwrap();
+            let mut rules = stylesheets(&document).unwrap();
+            rules.environment = css::MediaEnvironment {
+                width: 800.0,
+                height: 600.0,
+                ..Default::default()
+            };
+            let mut geometry = LayoutGeometry::default();
+            display_list_with_styles(
+                &document,
+                800,
+                600,
+                &SizedText,
+                &rules,
+                None,
+                Some(&mut geometry),
+                &[],
+            )
+            .unwrap();
+            geometry
+                .hits
+                .iter()
+                .find(|hit| hit.node == item && hit.virtual_generated)
+                .expect("list marker hit region")
+                .rect
+        }
+
+        let outside_split = marker_rect(
+            "<style>html,body{margin:0}p{margin:0}.wrapper{display:inline;list-style:square}.item{display:list-item;margin-left:96px}</style><p>preceding line</p><div class='wrapper'><span id='item' class='item'></span></div>",
+        );
+        let outside_reference = marker_rect(
+            "<style>html,body{margin:0}p{margin:0}.item{display:list-item;list-style:square;margin-left:96px}</style><p>preceding line</p><div id='item' class='item'>&nbsp;</div>",
+        );
+        assert_eq!(outside_split.y, outside_reference.y);
+
+        let inside_split = marker_rect(
+            "<style>html,body{margin:0}p{margin:0}.wrapper{display:inline;list-style-position:inside}.item{display:list-item;margin-left:96px;background:orange}</style><p>preceding line</p><div class='wrapper'><span id='item' class='item'></span></div>",
+        );
+        let inside_reference = marker_rect(
+            "<style>html,body{margin:0}p{margin:0}.item{display:list-item;list-style-position:inside;margin-left:96px;background:orange}</style><p>preceding line</p><div id='item' class='item'></div>",
+        );
+        assert_eq!(inside_split.y, inside_reference.y);
+    }
+
+    #[test]
+    fn inline_block_split_preserves_a_decorated_empty_prefix_line_box() {
+        fn marker_y(wrapper_style: &str) -> f32 {
+            let markup = alloc::format!(
+                "<style>html,body{{margin:0}}.wrapper{{display:inline;{wrapper_style}}}.block{{display:block;height:10px}}.item{{display:list-item;list-style:square}}</style><div class='wrapper'><div class='block'></div><span id='item' class='item'>x</span></div>"
+            );
+            let document = crate::html::parse(&markup, 64).unwrap();
+            let item = crate::selector::query_selector(&document, document.root(), "#item")
+                .unwrap()
+                .unwrap();
+            let mut rules = stylesheets(&document).unwrap();
+            rules.environment = css::MediaEnvironment {
+                width: 800.0,
+                height: 600.0,
+                ..Default::default()
+            };
+            let mut geometry = LayoutGeometry::default();
+            display_list_with_styles(
+                &document,
+                800,
+                600,
+                &SizedText,
+                &rules,
+                None,
+                Some(&mut geometry),
+                &[],
+            )
+            .unwrap();
+            geometry
+                .hits
+                .iter()
+                .find(|hit| hit.node == item && hit.virtual_generated)
+                .expect("list marker hit region")
+                .rect
+                .y
+        }
+
+        let plain_empty_fragment = marker_y("line-height:40px");
+        let padded_empty_fragment = marker_y("line-height:40px;padding:1px");
+        assert_eq!(plain_empty_fragment, 10.0);
+        assert_eq!(
+            padded_empty_fragment, 50.0,
+            "nonzero inline padding keeps the empty prefix line box and its line-height"
+        );
+    }
+
+    #[test]
+    fn list_style_images_paint_inside_and_outside_and_failed_images_fall_back() {
+        let image = Arc::new(ImageData {
+            width: 8,
+            height: 4,
+            pixels: alloc::vec![255; 8 * 4 * 4],
+        });
+        for position in ["inside", "outside"] {
+            let document = crate::html::parse(
+                &alloc::format!(
+                    "<style>body,ul{{margin:0;padding:0}}ul{{padding-left:20px;list-style-image:url(marker.png);list-style-type:square;list-style-position:{position}}}</style><ul><li>entry</li></ul>"
+                ),
+                64,
+            )
+            .unwrap();
+            let images = |source: &str| {
+                if source == "marker.png" {
+                    ImageState::Ready(image.clone())
+                } else {
+                    ImageState::Failed
+                }
+            };
+            let text = RecordingText::default();
+            let list = display_list_with_images(&document, 160, 80, &text, &images).unwrap();
+            let markers = list
+                .0
+                .iter()
+                .filter_map(|command| match command {
+                    Command::Image {
+                        rect,
+                        image: painted,
+                    } if Arc::ptr_eq(painted, &image) => Some(*rect),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(markers.len(), 1, "{position} image marker: {markers:?}");
+            assert_eq!((markers[0].width, markers[0].height), (8.0, 4.0));
+            assert!(text
+                .0
+                .borrow()
+                .iter()
+                .all(|run| !run.contains('▪')));
+            assert!(text.0.borrow().iter().any(|run| run == "entry"));
+
+            let failed = |_: &str| ImageState::Failed;
+            let fallback_text = RecordingText::default();
+            let fallback = display_list_with_images(
+                &document,
+                160,
+                80,
+                &fallback_text,
+                &failed,
+            )
+            .unwrap();
+            assert!(!fallback
+                .0
+                .iter()
+                .any(|command| matches!(command, Command::Image { .. })));
+            assert!(
+                fallback_text.0.borrow().iter().any(|run| run.contains('▪')),
+                "failed {position} image should use list-style-type fallback: {:?}",
+                fallback_text.0.borrow()
+            );
+        }
+
+        let image_over_none = crate::html::parse(
+            "<style>body,ul{margin:0;padding:0}ul{padding-left:20px;list-style:none url(marker.png) inside}</style><ul><li>entry</li></ul>",
+            64,
+        )
+        .unwrap();
+        let images = |_: &str| ImageState::Ready(image.clone());
+        let text = RecordingText::default();
+        let list = display_list_with_images(&image_over_none, 160, 80, &text, &images).unwrap();
+        assert_eq!(
+            list.0
+                .iter()
+                .filter(|command| matches!(command, Command::Image { image: painted, .. } if Arc::ptr_eq(painted, &image)))
+                .count(),
+            1,
+            "a specified marker image is used even when list-style-type is none"
+        );
+        assert!(text.0.borrow().iter().all(|run| !run.contains('▪')));
+
+        for position in ["inside", "outside"] {
+            let document = crate::html::parse(
+                &alloc::format!(
+                    "<style>body,ul{{margin:0;padding:0}}ul{{list-style-image:url(marker.png);list-style-position:{position}}}</style><ul><li>entry</li></ul>"
+                ),
+                64,
+            )
+            .unwrap();
+            let pending = |_: &str| ImageState::Pending;
+            assert_eq!(
+                display_list_with_images(&document, 160, 80, &FixedText, &pending),
+                Err(LayoutError::ImagePending),
+                "pending {position} list marker"
+            );
+        }
+    }
+
+    #[test]
+    fn outside_list_marker_uses_the_first_line_edge_next_to_a_float() {
+        let document = crate::html::parse(
+            "<style>html,body,p{margin:0}p{line-height:18px}</style><p>before float</p><div style='float:left;width:96px;height:96px'></div><div id='item' style='display:list-item;list-style:square'></div>",
+            64,
+        )
+        .unwrap();
+        let item = crate::selector::query_selector(&document, document.root(), "#item")
+            .unwrap()
+            .unwrap();
+        let mut rules = stylesheets(&document).unwrap();
+        rules.environment = css::MediaEnvironment {
+            width: 200.0,
+            height: 160.0,
+            ..Default::default()
+        };
+        let mut geometry = LayoutGeometry::default();
+        display_list_with_styles(
+            &document,
+            200,
+            160,
+            &SizedText,
+            &rules,
+            None,
+            Some(&mut geometry),
+            &[],
+        )
+        .unwrap();
+        let marker = geometry
+            .hits
+            .iter()
+            .find(|hit| hit.node == item && hit.virtual_generated)
+            .expect("outside marker geometry");
+        assert!(
+            marker.rect.x >= 80.0 && marker.rect.x < 96.0,
+            "marker should use the line's float-reduced start edge: {:?}",
+            marker.rect
+        );
+    }
+
+    #[test]
+    fn inside_marker_contributes_empty_list_item_height_in_table_cells() {
+        let markup = "<style>body{margin:0}#table{display:table;margin-left:1in}#test{display:table-row-group;list-style-position:inside}#row{display:table-row}#cell{display:table-cell}#cell div{background:orange;display:list-item}</style><p>Test passes if there is a black dot inside an orange box below.</p><div id='table'><div id='test'><div id='row'><div id='cell'><div id='item'></div></div></div></div></div>";
+        let document = crate::html::parse(markup, 256).unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let item = crate::selector::query_selector(&document, document.root(), "#item")
+            .unwrap()
+            .unwrap();
+
+        // Inspect the canonical StyleIndex cascade independently of the
+        // table's intrinsic sizing pass: the real DOM/composed-tree ancestors
+        // give both the item and its marker `inside`.
+        let mut ancestors = Vec::new();
+        let mut current = Some(item);
+        while let Some(node) = current {
+            if matches!(document.kind(node), Ok(NodeKind::Element { .. })) {
+                ancestors.push(node);
+            }
+            current = document.composed_parent(node).unwrap();
+        }
+        let mut parent_style = None;
+        let mut item_style = None;
+        for node in ancestors.into_iter().rev() {
+            let computed =
+                css::compute_node(&document, node, parent_style.as_ref(), &rules).unwrap();
+            if node == item {
+                item_style = Some(computed.clone());
+            }
+            parent_style = Some(computed);
+        }
+        let item_style = item_style.unwrap();
+        assert_eq!(item_style.display, Display::ListItem);
+        assert_eq!(
+            item_style.list_style_position,
+            css::ListStylePosition::Inside
+        );
+        let marker = rules
+            .compute_pseudo(
+                &document,
+                item,
+                &item_style,
+                css::PseudoElement::Marker,
+                Some(&RecordingText::default()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            marker.style.list_style_position,
+            css::ListStylePosition::Inside
+        );
+
+        let list = display_list(&document, 800, 600, &RecordingText::default()).unwrap();
+        let orange = list.0.iter().find_map(|command| match command {
+            Command::FillRect { rect, color }
+                if color.r == 255 && color.g == 165 && color.b == 0 && rect.height > 0.0 =>
+            {
+                Some(*rect)
+            }
+            _ => None,
+        });
+        let orange = orange.expect("inside marker line must give the empty item a painted box");
+        assert!(orange.height >= 10.0, "table intrinsic height: {orange:?}");
+        let marker_origin = list.0.iter().find_map(|command| match command {
+            Command::GlyphRun {
+                origin_x, glyphs, ..
+            } if glyphs
+                .iter()
+                .any(|glyph| char::from_u32(u32::from(glyph.id)) == Some('•')) =>
+            {
+                Some(*origin_x)
+            }
+            _ => None,
+        });
+        let marker_origin = marker_origin.expect("default list marker glyph must paint");
+        assert!(
+            marker_origin >= orange.x && marker_origin < orange.x + orange.width,
+            "marker should remain inside its orange item: {marker_origin}, {orange:?}"
+        );
+    }
+
+    #[test]
+    fn css_table_caption_display_is_painted_as_a_caption_box() {
+        let markup = "<style>body{margin:0}#table{display:table;margin-left:1in}#test{display:table-caption;list-style-position:inside}#row{display:table-row}#cell{display:table-cell}#cell div{background:orange;display:list-item}</style><p>Test passes if there is a black dot inside an orange box below.</p><div id='table'><div id='test'><div id='row'><div id='cell'><div id='item'></div></div></div></div><div id='row'><div id='cell'></div></div></div>";
+        let document = crate::html::parse(markup, 256).unwrap();
+        let list = display_list(&document, 800, 600, &RecordingText::default()).unwrap();
+        assert!(
+            list.0.iter().any(|command| matches!(
+                command,
+                Command::FillRect { rect, color }
+                    if color.r == 255 && color.g == 165 && color.b == 0 && rect.height > 0.0
+            )),
+            "CSS display:table-caption must not be discarded from a table"
+        );
+    }
+
+    #[test]
+    fn outside_markers_are_painted_for_svg_and_replaced_list_items() {
+        let document = crate::html::parse(
+            "<style>body,ol{margin:0}ol{padding-left:24px}</style><ol><svg style='display:list-item' width='4' height='4'></svg><img style='display:list-item' src='pixel.png' width='4' height='4'></ol>",
+            128,
+        )
+        .unwrap();
+        let image = Arc::new(ImageData {
+            width: 4,
+            height: 4,
+            pixels: alloc::vec![255; 4 * 4 * 4],
+        });
+        let images = |source: &str| {
+            if source == "pixel.png" {
+                ImageState::Ready(image.clone())
+            } else {
+                ImageState::Failed
+            }
+        };
+        let text = RecordingText::default();
+        let list = display_list_with_images(&document, 120, 80, &text, &images).unwrap();
+        let marker_runs: Vec<_> = list
+            .0
+            .iter()
+            .filter_map(|command| match command {
+                Command::GlyphRun { glyphs, .. } => Some(
+                    glyphs
+                        .iter()
+                        .filter_map(|glyph| char::from_u32(u32::from(glyph.id)))
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marker_runs,
+            ["1.", "2."],
+            "ordered list-item markers must be painted on SVG and replaced boxes"
+        );
+        assert!(list.0.iter().any(|command| matches!(
+            command,
+            Command::Image { image: painted, .. } if Arc::ptr_eq(painted, &image)
+        )));
+
+        let inside = crate::html::parse(
+            "<ol><img style='display:list-item;list-style-position:inside' src='pixel.png' width='4' height='4'></ol>",
+            64,
+        )
+        .unwrap();
+        assert_eq!(
+            display_list_with_images(&inside, 40, 40, &NoShape, &images),
+            Err(LayoutError::UnsupportedGeneratedContent)
+        );
+    }
+
+    #[test]
+    fn list_item_counter_operations_change_the_marker_sequence() {
+        let markup = "<style>body,ol{margin:0}ol{padding-left:24px}</style><ol><li></li><li style='counter-increment:list-item 3'></li><li></li><fieldset style='display:list-item;counter-set:list-item 42'></fieldset><li></li></ol>";
+        let runs = painted_text_runs(markup);
+        for marker in ["1.", "4.", "5.", "42.", "43."] {
+            assert!(
+                runs.iter().any(|run| run == marker),
+                "missing {marker:?}: {runs:?}"
+            );
+        }
     }
 
     #[test]
@@ -16534,13 +23021,464 @@ mod tests {
     }
 
     #[test]
+    fn generated_counters_keep_sibling_scope_and_nested_instances() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}#root{counter-reset:n}#root::before{counter-increment:n;content:counter(n)}#container::before{counter-increment:n;content:counter(n)}#nested{counter-reset:n 40}#nested::before{counter-increment:n;content:counters(n,'.')}#empty::before{counter-increment:n;content:none}#hidden{display:none;counter-increment:n}#after::before{counter-increment:n;content:counter(n)}#siblings{counter-reset:s}#siblings>.reset{counter-reset:s 7}#siblings>.reset-last{counter-reset:s 2}#siblings>.item::before{counter-increment:s;content:counters(s,'.')}</style><div id='root'><div id='container'><div id='nested'></div></div><div id='empty'></div><div id='hidden'></div><div id='after'></div><div id='siblings'><div class='item reset'></div><div class='item'></div><div class='item reset-last'></div><div class='item'></div></div></div>",
+        );
+        let rendered = shaped.concat();
+        assert_eq!(rendered, "122.4130.80.90.30.4", "shapes: {shaped:?}");
+    }
+
+    #[test]
+    fn generated_counter_increment_precedes_set_and_sibling_value_is_inherited() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}#list{counter-reset:item}#list>.item::before{counter-increment:item;content:counter(item)}#list>.set::before{counter-set:item 15}#list>.compound::before{counter-increment:item 2 item -1}</style><div id='list'><div class='item'></div><div class='item set'></div><div class='item'></div><div class='item compound'></div></div>",
+        );
+        assert_eq!(shaped.concat(), "1151617", "shapes: {shaped:?}");
+    }
+
+    #[test]
+    fn display_contents_counter_operations_do_not_create_boxes() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}.start{counter-reset:x 6}.contents{display:contents}.reset{counter-reset:x 666}.set{counter-set:x 666}.inc{counter-increment:x}.result::before{content:counter(x)}</style><div><span class='start'></span><span class='contents reset inc'></span><span class='contents set'></span><span class='inc result'></span></div>",
+        );
+        assert_eq!(shaped.concat(), "7", "shapes: {shaped:?}");
+    }
+
+    #[test]
+    fn display_contents_inline_descendants_join_the_parent_paragraph() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}#contents{display:contents;color:red;background:blue;border:5px solid green;padding:9px;width:80px}#contents::before{content:'['}#contents::after{content:']'}#child{font-size:10px}</style><div id='contents'>a<span id='child'>b</span>c</div><span>d</span>",
+            128,
+        )
+        .unwrap();
+        let contents = crate::selector::query_selector(&document, document.root(), "#contents")
+            .unwrap()
+            .unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        let list = display_list_with_styles(
+            &document,
+            120,
+            60,
+            &RecordingText::default(),
+            &rules,
+            None,
+            Some(&mut geometry),
+            &[],
+        )
+        .unwrap();
+        let emitted: String = list
+            .0
+            .iter()
+            .filter_map(|command| {
+                let Command::GlyphRun { glyphs, .. } = command else {
+                    return None;
+                };
+                Some(
+                    glyphs
+                        .iter()
+                        .filter_map(|glyph| char::from_u32(u32::from(glyph.id)))
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        assert_eq!(emitted, "[abc]d");
+        let contents_hits: Vec<_> = geometry
+            .hits
+            .iter()
+            .filter(|hit| hit.node == contents)
+            .collect();
+        // ::before and ::after hit regions target their originating element,
+        // including when it has display:contents (pinned WPT:
+        // css/css-display/display-contents-pseudo-click-target.html). Those
+        // virtual regions are excluded from the element's principal geometry.
+        assert!(contents_hits.iter().all(|hit| hit.virtual_generated));
+        assert!(contents_hits.iter().any(|hit| hit.virtual_generated));
+        assert!(list.0.iter().any(|command| matches!(
+            command,
+            Command::GlyphRun { color, .. }
+                if (color.r, color.g, color.b) == (255, 0, 0)
+        )));
+        assert!(!list.0.iter().any(|command| matches!(
+            command,
+            Command::FillRect { color, .. }
+                if (color.r, color.g, color.b) == (0, 0, 255)
+        )));
+    }
+
+    #[test]
+    fn display_contents_block_group_has_no_background_border_or_hit_box() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}#contents{display:contents;width:80px;height:80px;margin:7px;padding:9px;border:5px solid red;background:red}#item{display:block;width:12px;height:8px;background:green}</style><div id='contents'><div id='item'></div></div>",
+            128,
+        )
+        .unwrap();
+        let contents = crate::selector::query_selector(&document, document.root(), "#contents")
+            .unwrap()
+            .unwrap();
+        let item = crate::selector::query_selector(&document, document.root(), "#item")
+            .unwrap()
+            .unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let mut geometry = LayoutGeometry::default();
+        let list = display_list_with_styles(
+            &document,
+            120,
+            60,
+            &FixedText,
+            &rules,
+            None,
+            Some(&mut geometry),
+            &[],
+        )
+        .unwrap();
+        let green: Vec<_> = list
+            .0
+            .iter()
+            .filter_map(|command| match command {
+                Command::FillRect { rect, color } if (color.r, color.g, color.b) == (0, 128, 0) => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            green,
+            [Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 12.0,
+                height: 8.0
+            }]
+        );
+        assert!(!list.0.iter().any(|command| matches!(
+            command,
+            Command::FillRect { color, .. }
+                if color.r == 255 && color.g == 0 && color.b == 0
+        )));
+        assert!(geometry.hits.iter().all(|hit| hit.node != contents));
+        assert!(geometry.hits.iter().any(|hit| hit.node == item));
+    }
+
+    #[test]
+    fn display_contents_flex_descendants_and_pseudos_are_ordered_items() {
+        let boxes = colored_boxes(
+            "<div style='display:flex;width:70px;height:10px'><div style='width:20px;height:10px;background:red'></div><div id='contents' style='display:contents'><div style='display:contents'><div style='width:20px;height:10px;background:red'></div></div></div><div style='width:20px;height:10px;background:red'></div></div><style>#contents::before{content:'';display:block;width:10px;height:10px;background:green}</style>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.width))
+                .collect::<Vec<_>>(),
+            [(0.0, 20.0), (20.0, 10.0), (30.0, 20.0), (50.0, 20.0)]
+        );
+    }
+
+    #[test]
+    fn display_contents_descendants_inherit_from_the_boxless_dom_parent() {
+        for display in ["flex", "grid"] {
+            let document = crate::html::parse(&alloc::format!(
+                "<style>body{{margin:0}}</style><div style='display:{display};width:100px'><div style='display:contents;background:red;padding:40px;border:20px solid red'><div style='display:contents;background:blue'><span style='display:block;width:12px;height:8px;background:inherit'></span></div></div></div>"
+            ), 32).unwrap();
+            let fills: Vec<_> = display_list(&document, 100, 100, &FixedText)
+                .unwrap()
+                .0
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::FillRect { rect, color }
+                        if color.a == 255 && color.g == 0 && (color.r == 255 || color.b == 255) =>
+                    {
+                        Some((rect, color))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                fills.len(),
+                1,
+                "boxless backgrounds must not paint: {display}"
+            );
+            assert_eq!(
+                fills[0].0,
+                Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 12.0,
+                    height: 8.0
+                }
+            );
+            assert_eq!(
+                fills[0].1.b, 255,
+                "explicit inherit uses the DOM parent: {display}"
+            );
+            assert_eq!(fills[0].1.r, 0);
+        }
+    }
+
+    #[test]
+    fn display_contents_grid_descendants_use_flattened_auto_placement_order() {
+        let boxes = colored_boxes(
+            "<div style='display:grid;width:40px;grid-template-columns:20px 20px;grid-template-rows:10px 10px'><div style='display:contents'><div style='width:20px;height:10px;background:red'></div><div style='display:contents'><div style='width:20px;height:10px;background:green'></div></div></div><div style='width:20px;height:10px;background:red'></div></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [
+                (0.0, 0.0, 20.0, 10.0),
+                (20.0, 0.0, 20.0, 10.0),
+                (0.0, 10.0, 20.0, 10.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn float_context_crosses_ordinary_blocks_and_preserves_source_order() {
+        let boxes = colored_boxes_in(
+            "<style>.f{float:left;width:20px;height:20px;background:red}</style><main style='width:60px'><div><i class=f></i><i class=f></i><i class=f></i></div><div><i class=f></i><i class=f></i><i class=f></i></div><div><i class=f></i></div></main>",
+            100, 100,
+        );
+        assert_eq!(
+            boxes.iter().map(|r| (r.x, r.y)).collect::<Vec<_>>(),
+            [
+                (0.0, 0.0),
+                (20.0, 0.0),
+                (40.0, 0.0),
+                (0.0, 20.0),
+                (20.0, 20.0),
+                (40.0, 20.0),
+                (0.0, 40.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn float_context_flow_root_contains_and_isolates_descendant_floats() {
+        let boxes = colored_boxes_in(
+            "<main style='width:60px'><div style='display:flow-root'><div><i style='float:left;width:20px;height:20px;background:red'></i></div></div><div style='height:10px;background:green'></div></main>",
+            100, 100,
+        );
+        assert_eq!(
+            boxes.iter().map(|r| (r.y, r.height)).collect::<Vec<_>>(),
+            [(0.0, 20.0), (20.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn float_context_independent_blocks_fit_or_clear_parent_floats() {
+        let boxes = colored_boxes_in(
+            "<main style='width:60px'><i style='float:left;width:20px;height:30px;background:red'></i><div style='display:flow-root;height:10px;background:green'></div><div style='display:flow-root;width:60px;height:10px;background:red'></div></main>",
+            100, 100,
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|r| (r.x, r.y, r.width, r.height))
+                .collect::<Vec<_>>(),
+            [
+                (0.0, 0.0, 20.0, 30.0),
+                (20.0, 0.0, 40.0, 10.0),
+                (0.0, 30.0, 60.0, 10.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn float_context_clear_and_relative_offsets_use_normal_flow_geometry() {
+        let boxes = colored_boxes_in(
+            "<main style='width:60px'><div style='position:relative;left:7px;top:5px'><i style='float:left;width:20px;height:20px;background:red'></i></div><div><i style='float:left;clear:left;width:20px;height:10px;background:green'></i></div><div style='clear:both;height:10px;background:red'></div></main>",
+            100, 100,
+        );
+        let mut positions = boxes
+            .iter()
+            .map(|r| (r.x, r.y, r.height))
+            .collect::<Vec<_>>();
+        positions.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert_eq!(
+            positions,
+            [(7.0, 5.0, 20.0), (0.0, 20.0, 10.0), (0.0, 30.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn float_rule_three_allows_overhang_until_an_opposing_float_intersects() {
+        let left = colored_boxes_in(
+            "<div style='float:left;width:500px;height:500px'><div style='float:right;width:50px;height:300px'></div><div style='margin-right:100px'><div style='float:left;width:425px;height:10px;background:green'></div></div></div>",
+            600,
+            550,
+        );
+        assert_eq!(
+            left.iter()
+                .map(|rect| (rect.x, rect.y, rect.width))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0, 425.0)],
+            "the overhanging left float fits before the opposing float"
+        );
+
+        let right = colored_boxes_in(
+            "<div style='float:right;width:500px;height:500px'><div style='float:left;width:50px;height:300px'></div><div style='margin-left:100px'><div style='float:right;width:425px;height:10px;background:green'></div></div></div>",
+            600,
+            550,
+        );
+        assert_eq!(
+            right
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width))
+                .collect::<Vec<_>>(),
+            [(175.0, 0.0, 425.0)],
+            "the overhanging right float fits after the opposing float"
+        );
+    }
+
+    #[test]
+    fn float_rule_seven_repositions_same_side_float_outside_its_containing_block() {
+        fn blue_boxes(markup: &str) -> Vec<Rect> {
+            let markup = alloc::format!("<style>body{{margin:0}}</style>{markup}");
+            let document = crate::html::parse(&markup, 32).unwrap();
+            display_list(&document, 600, 550, &FixedText)
+                .unwrap()
+                .0
+                .into_iter()
+                .filter_map(|command| match command {
+                    Command::FillRect { rect, color }
+                        if (color.r, color.g, color.b) == (0, 0, 255) =>
+                    {
+                        Some(rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let left = blue_boxes(
+            "<div style='float:left;width:500px;height:500px'><div style='float:left;width:50px;height:300px'></div><div style='margin-left:100px'><div style='float:left;width:425px;height:10px;background:blue'></div></div></div>",
+        );
+        assert_eq!(
+            left.iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(100.0, 300.0, 425.0, 10.0)],
+            "a left float that would overhang its containing block moves below the preceding left float"
+        );
+
+        let right = blue_boxes(
+            "<div style='float:left;width:500px;height:500px'><div style='float:right;width:50px;height:300px'></div><div style='margin-right:100px'><div style='float:right;width:425px;height:10px;background:blue'></div></div></div>",
+        );
+        assert_eq!(
+            right.iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(-25.0, 300.0, 425.0, 10.0)],
+            "the right-float rule is symmetric even when the candidate overhangs left"
+        );
+    }
+
+    #[test]
+    fn clearance_uses_the_hypothetical_border_edge_after_top_margin() {
+        for (margin, expected_y) in [(150, 150.0), (20, 100.0)] {
+            let markup = alloc::format!(
+                "<div style='float:left;width:10px;height:100px'></div><div style='clear:left;margin-top:{margin}px;width:10px;height:5px;background:green'></div>"
+            );
+            let boxes = colored_boxes_in(&markup, 100, 250);
+            assert_eq!(
+                boxes.iter().map(|rect| (rect.y, rect.height)).collect::<Vec<_>>(),
+                [(expected_y, 5.0)],
+                "margin-top {margin}px should place the cleared border at {expected_y}px"
+            );
+        }
+    }
+
+    #[test]
+    fn nonzero_min_height_keeps_last_child_margin_inside_parent() {
+        let boxes = colored_boxes_in(
+            "<div style='min-height:200px;width:100px;background:green'><div style='height:30px;margin-bottom:100px'></div><div style='outline:3px solid orange'></div></div><div style='height:50px;background:green'></div>",
+            120,
+            300,
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.y, rect.height))
+                .collect::<Vec<_>>(),
+            [(0.0, 200.0), (200.0, 50.0)]
+        );
+    }
+
+    #[test]
+    fn min_height_below_content_does_not_block_last_child_margin_collapse() {
+        let boxes = colored_boxes_in(
+            "<div style='min-height:5px;width:100px;background:green'><div style='height:30px;margin-bottom:50px'></div></div><div style='width:100px;height:50px;background:green'></div>",
+            120,
+            180,
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(0.0, 0.0, 100.0, 30.0), (0.0, 80.0, 100.0, 50.0)],
+            "the child margin collapses through a parent whose min-height does not increase its used height"
+        );
+    }
+
+    #[test]
+    fn display_contents_block_descendants_share_sibling_margin_collapse() {
+        let boxes = colored_boxes(
+            "<div style='height:10px;margin-bottom:6px;background:red'></div><div style='display:contents;margin:2000px'><div style='height:10px;margin-top:10px;margin-bottom:12px;background:green'></div></div><div style='height:10px;margin-top:8px;background:red'></div>",
+        );
+        assert_eq!(
+            boxes
+                .iter()
+                .map(|rect| (rect.y, rect.height))
+                .collect::<Vec<_>>(),
+            [(0.0, 10.0), (20.0, 10.0), (42.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn xml_cdata_is_visible_text_and_prevents_empty_pseudo_content() {
+        let document = crate::xml::parse(
+            "<html xmlns='http://www.w3.org/1999/xhtml'><head><style>body{margin:0}p:empty::before{content:'wrong'}</style></head><body><p><![CDATA[cdata-text]]></p></body></html>",
+            128,
+        )
+        .unwrap();
+        let text = RecordingText::default();
+        display_list(&document, 120, 60, &text).unwrap();
+        let shaped = text.0.into_inner();
+        assert!(shaped.iter().any(|run| run == "cdata-text"));
+        assert!(!shaped.iter().any(|run| run == "wrong"));
+    }
+
+    #[test]
+    fn generated_counters_start_at_zero_and_none_style_emits_no_text() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}#first::before{content:counter(step)}#second::before{content:counter(step,none)}</style><div id='first'></div><div id='second'></div>",
+        );
+        assert_eq!(shaped.concat(), "0", "shapes: {shaped:?}");
+    }
+
+    #[test]
+    fn generated_counter_styles_format_and_clamp_values() {
+        let shaped = painted_text_runs(
+            "<style>body{margin:0}#roman{counter-reset:n 3998}#roman::before{counter-increment:n;content:counter(n,upper-roman)}#alpha{counter-reset:a 25}#alpha::before{counter-increment:a;content:counter(a,lower-alpha)}#padded{counter-reset:p -2}#padded::before{counter-increment:p;content:counter(p,decimal-leading-zero)}#clamped{counter-reset:c 2147483647}#clamped::before{counter-increment:c;content:counter(c)}</style><div id='roman'></div><div id='alpha'></div><div id='padded'></div><div id='clamped'></div>",
+        );
+        assert_eq!(
+            shaped.concat(),
+            "MMMCMXCIXz-012100000000",
+            "shapes: {shaped:?}"
+        );
+    }
+
+    #[test]
     fn generated_before_renders_for_an_empty_block_origin_and_attr_fallback() {
-        let empty_origin = recorded_shapes(
+        let empty_origin = painted_text_runs(
             "<style>body{margin:0}#blank:empty::before{content:'empty-origin'}</style><div id='blank'></div>",
         );
         assert!(empty_origin.iter().any(|run| run == "empty-origin"));
 
-        let fallback = recorded_shapes(
+        let fallback = painted_text_runs(
             "<style>body{margin:0}#target::before{content:attr(data-missing, 'fallback')}</style><div id='target'></div>",
         );
         assert!(fallback.iter().any(|run| run == "fallback"));
@@ -16548,7 +23486,7 @@ mod tests {
 
     #[test]
     fn generated_attr_uses_html_case_rules_and_null_attribute_namespace() {
-        let html = recorded_shapes(
+        let html = painted_text_runs(
             "<style>body{margin:0}#target::before{content:attr(DATA-LABEL, 'fallback')}</style><div id='target' data-label='html-value'></div>",
         );
         assert!(html.iter().any(|run| run == "html-value"));
@@ -16562,11 +23500,9 @@ mod tests {
         display_list(&xml, 120, 60, &text).unwrap();
         let shaped = text.0.into_inner();
         assert!(shaped.iter().any(|run| run == "fallback"));
-        assert!(
-            !shaped
-                .iter()
-                .any(|run| run == "plain-value" || run == "namespaced-value")
-        );
+        assert!(!shaped
+            .iter()
+            .any(|run| run == "plain-value" || run == "namespaced-value"));
     }
 
     #[test]
@@ -16600,18 +23536,14 @@ mod tests {
                 "missing {expected:?}"
             );
         }
-        assert!(
-            geometry
-                .hits
-                .iter()
-                .any(|hit| hit.node == target && hit.virtual_generated)
-        );
-        assert!(
-            geometry
-                .hits
-                .iter()
-                .any(|hit| hit.node == target && !hit.virtual_generated)
-        );
+        assert!(geometry
+            .hits
+            .iter()
+            .any(|hit| hit.node == target && hit.virtual_generated));
+        assert!(geometry
+            .hits
+            .iter()
+            .any(|hit| hit.node == target && !hit.virtual_generated));
     }
 
     #[test]
@@ -16659,12 +23591,114 @@ mod tests {
         });
         assert_eq!(red.map(|rect| (rect.y, rect.height)), Some((0.0, 10.0)));
         assert!(blue.is_some_and(|rect| rect.y >= 10.0 && rect.height == 12.0));
+        assert!(geometry
+            .hits
+            .iter()
+            .any(|hit| hit.node == target && hit.virtual_generated));
+    }
+
+    #[test]
+    fn generated_block_overflow_clips_to_padding_box_after_its_shadow() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}#target::before{content:'generated text that overflows';display:block;width:10px;height:8px;margin:4px 0 0 5px;border:2px solid red;padding:3px 4px 5px 6px;overflow:hidden;box-shadow:0 0 0 2px blue}</style><div id='target'></div>",
+            128,
+        )
+        .unwrap();
+        let mut rules = stylesheets(&document).unwrap();
+        rules.environment = css::MediaEnvironment {
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let target = crate::selector::query_selector(&document, document.root(), "#target")
+            .unwrap()
+            .unwrap();
+        let text = RecordingText::default();
+        let mut geometry = LayoutGeometry::default();
+        let list = display_list_with_styles(
+            &document,
+            100,
+            100,
+            &text,
+            &rules,
+            None,
+            Some(&mut geometry),
+            &[],
+        )
+        .unwrap();
+        list.validate().unwrap();
+
+        let clip_index = list
+            .0
+            .iter()
+            .position(|command| {
+                matches!(
+                    command,
+                    Command::PushClip(Rect {
+                        x: 7.0,
+                        y: 6.0,
+                        width: 20.0,
+                        height: 16.0,
+                    })
+                )
+            })
+            .expect("generated block padding-box clip");
+        let pop_index = list
+            .0
+            .iter()
+            .enumerate()
+            .skip(clip_index + 1)
+            .find_map(|(index, command)| matches!(command, Command::PopClip).then_some(index))
+            .expect("generated block clip end");
+        let shadow_index = list
+            .0
+            .iter()
+            .position(|command| {
+                matches!(command, Command::BoxShadow { shadow, .. } if shadow.color.b == 255 && !shadow.inset)
+            })
+            .expect("generated block shadow");
+        let glyph_index = list
+            .0
+            .iter()
+            .position(|command| matches!(command, Command::GlyphRun { .. }))
+            .expect("generated block text");
         assert!(
-            geometry
-                .hits
-                .iter()
-                .any(|hit| hit.node == target && hit.virtual_generated)
+            shadow_index < clip_index,
+            "the box shadow is outside the content clip"
         );
+        assert!(clip_index < glyph_index && glyph_index < pop_index);
+        assert!(text.0.borrow().iter().any(|run| run.contains("generated")));
+        let expected_clip = Rect {
+            x: 7.0,
+            y: 6.0,
+            width: 20.0,
+            height: 16.0,
+        };
+        let hit_clip = geometry
+            .rounded_clips
+            .iter()
+            .find(|clip| clip.rect == expected_clip)
+            .expect("generated block hit clip");
+        // The pseudo's own border box remains hittable outside its padding
+        // clip. Its direct text span no longer creates a duplicate hit box.
+        let own_hit = geometry
+            .hits
+            .iter()
+            .position(|hit| hit.node == target && hit.virtual_generated)
+            .expect("generated border-box hit");
+        assert!(!hit_clip.hits.contains(&own_hit));
+        assert_eq!(
+            geometry.hits[own_hit].rect,
+            Rect {
+                x: 5.0,
+                y: 4.0,
+                width: 24.0,
+                height: 20.0
+            }
+        );
+        assert!(geometry.hits[hit_clip.hits.clone()]
+            .iter()
+            .all(|hit| hit.node == target && hit.virtual_generated));
     }
 
     #[test]
@@ -16703,10 +23737,115 @@ mod tests {
     }
 
     #[test]
+    fn automatic_quotes_follow_parent_language_and_nested_tree_depth() {
+        let shaped = painted_text_runs(
+            r#"<html lang="en"><body><p>One <q>two <q lang="ja">three <q lang="fr">four</q></q></q></p></body></html>"#,
+        );
+        let rendered = shaped.concat();
+        assert!(
+            rendered.contains("One “two ‘three 『four』’”"),
+            "automatic quotes did not use parent language/depth: {shaped:?}"
+        );
+    }
+
+    #[test]
+    fn quotes_none_and_auto_reset_preserve_quote_depth() {
+        let shaped = painted_text_runs(
+            r#"<html lang="en"><style>body{quotes:none}.inner{quotes:auto}</style><body><p>One <q>two</q> <span class="inner"><q>three <q>four</q></q></span> <q>five</q></p></body></html>"#,
+        );
+        let rendered = shaped.concat();
+        assert!(
+            rendered.contains("One two “three ‘four’” five"),
+            "quotes:none or auto reset changed generated depth incorrectly: {shaped:?}"
+        );
+    }
+
+    #[test]
+    fn custom_quotes_and_no_open_quote_use_the_shared_depth() {
+        let shaped = painted_text_runs(
+            r#"<style>body{quotes:"<" ">" "[" "]"}#skip::before{content:no-open-quote}#outer::before{content:open-quote}#outer::after{content:close-quote}#inner::before{content:open-quote}#inner::after{content:close-quote}</style><div id="skip"></div><div id="outer">outer <span id="inner">inner</span></div>"#,
+        );
+        let rendered = shaped.concat();
+        assert!(
+            rendered.contains("[outer [inner]]"),
+            "custom pair selection or no-open-quote depth was wrong: {shaped:?}"
+        );
+    }
+
+    #[test]
+    fn nested_q_quote_positions_use_parent_language_at_each_depth() {
+        let document = crate::html::parse(
+            r#"<html lang="en" id="root"><body><p><q id="outer">two <q id="middle" lang="ja">three <q id="inner" lang="fr">four</q></q></q></p></body></html>"#,
+            128,
+        )
+        .unwrap();
+        let rules = stylesheets(&document).unwrap();
+        let text = RecordingText::default();
+        let style_cache = core::cell::RefCell::new(css::StyleCache::default());
+        let mut positions = Vec::new();
+        positions.resize_with(document.node_count(), QuotePosition::default);
+        let mut quote_depth = 0;
+        let mut visited = 0;
+        let root = crate::selector::query_selector(&document, document.root(), "#root")
+            .unwrap()
+            .unwrap();
+        collect_quote_positions(
+            &document,
+            &rules,
+            &text,
+            &style_cache,
+            root,
+            None,
+            None,
+            &QuoteSystem::Auto(None),
+            &mut quote_depth,
+            &mut visited,
+            &mut positions,
+            0,
+        )
+        .unwrap();
+        let node = |id| {
+            crate::selector::query_selector(&document, root, &alloc::format!("#{id}"))
+                .unwrap()
+                .unwrap()
+        };
+        let outer = &positions[node("outer").index()];
+        let middle = &positions[node("middle").index()];
+        let inner = &positions[node("inner").index()];
+        assert_eq!(outer.before, 0);
+        assert_eq!(middle.before, 1);
+        assert_eq!(inner.before, 2);
+        assert_eq!(quote_mark(&outer.system, outer.before, true), Some("“"));
+        assert_eq!(quote_mark(&middle.system, middle.before, true), Some("‘"));
+        assert_eq!(quote_mark(&inner.system, inner.before, true), Some("『"));
+        assert_eq!(
+            quote_mark(&inner.system, inner.after - 1, false),
+            Some("』")
+        );
+        assert_eq!(
+            quote_mark(&middle.system, middle.after - 1, false),
+            Some("’")
+        );
+        assert_eq!(quote_mark(&outer.system, outer.after - 1, false), Some("”"));
+    }
+
+    #[test]
+    fn q_default_generated_quotes_reach_the_text_shaper() {
+        let shaped = painted_text_runs("<main lang='en'>one <q>two <q>three</q></q></main>");
+        assert!(
+            shaped.iter().any(|run| run.contains('“'))
+                && shaped.iter().any(|run| run.contains('‘'))
+                && shaped.iter().any(|run| run.contains('’'))
+                && shaped.iter().any(|run| run.contains('”')),
+            "q default quote marks were not shaped: {shaped:?}"
+        );
+    }
+
+    #[test]
     fn unsupported_generated_content_and_item_layout_fail_explicitly() {
         for markup in [
-            "<style>div::before{content:counter(chapter)}</style><div></div>",
-            "<style>div::before{content:open-quote}</style><div></div>",
+            "<style>div{counter-reset:reversed(chapter)}div::before{content:counter(chapter)}</style><div></div>",
+            "<style>div::before{content:counter(chapter,symbols(cyclic 'x' 'y'))}</style><div></div>",
             "<style>div::before{content:url(icon.svg)}</style><div></div>",
             "<style>div::before{content:'x';display:inline-block}</style><div></div>",
         ] {
@@ -16723,7 +23862,7 @@ mod tests {
 
     #[test]
     fn form_controls_paint_live_values_placeholders_and_textarea_content() {
-        let shaped = recorded_shapes(
+        let shaped = painted_text_runs(
             "<style>body{margin:0}input,textarea{width:160px;height:40px;padding:0;border:0}</style><input value='live value'><input placeholder='hint text'><textarea>default text</textarea><textarea value='live textarea'>stale default</textarea><textarea placeholder='draft text'></textarea>",
         );
         for expected in [
@@ -16742,8 +23881,39 @@ mod tests {
     }
 
     #[test]
+    fn input_placeholders_strip_newlines_without_changing_textarea_lines_or_attributes() {
+        let styled = "<style>body{margin:0}input,textarea{width:240px;height:80px;padding:0;border:0}</style>";
+        let actual = painted_text_runs(&alloc::format!(
+            "{styled}<input placeholder='a&#13;b&#10;c&#13;&#10;'><textarea placeholder='first&#10;second'></textarea>"
+        ));
+        let expected = painted_text_runs(&alloc::format!(
+            "{styled}<input placeholder='abc'><textarea placeholder='first&#10;second'></textarea>"
+        ));
+        assert_eq!(actual, expected);
+        assert!(actual.iter().any(|text| text == "abc"), "shaped runs: {actual:?}");
+        assert!(!actual.iter().any(|text| text == "firstsecond"));
+        let document = crate::html::parse("<input placeholder='a&#13;b&#10;c'>", 32).unwrap();
+        let node = crate::selector::query_selector(&document, document.root(), "input")
+            .unwrap()
+            .unwrap();
+        display_list(&document, 300, 80, &FixedText).unwrap();
+        assert_eq!(
+            document.get_attribute_ns_ref(node, None, "placeholder").unwrap(),
+            Some("a\rb\nc")
+        );
+        let mut limited = "x".repeat(MAX_CONTROL_TEXT_BYTES - 4);
+        append_bounded_input_placeholder(&mut limited, "\r\n😀\n\r").unwrap();
+        assert_eq!(limited.len(), MAX_CONTROL_TEXT_BYTES);
+        assert_eq!(
+            append_bounded_input_placeholder(&mut limited, "a"),
+            Err(LayoutError::CommandLimit)
+        );
+        assert_eq!(limited.len(), MAX_CONTROL_TEXT_BYTES);
+    }
+
+    #[test]
     fn password_is_masked_by_grapheme_and_nontext_control_values_stay_private() {
-        let shaped = recorded_shapes(
+        let shaped = painted_text_runs(
             "<style>body{margin:0}</style><input type='password' value='á👩‍❤️‍💋‍👨'><input type='checkbox' checked value='must-not-leak'><input type='hidden' value='also-private'>",
         );
         assert_eq!(shaped, ["••"]);
@@ -16930,6 +24100,30 @@ mod tests {
     }
 
     #[test]
+    fn text_spacing_preserves_grapheme_clusters_and_adds_word_gaps() {
+        let document = crate::html::parse(
+            "<style>html,body{margin:0}p{margin:0;white-space:pre;font-size:10px;line-height:12px;letter-spacing:2px;word-spacing:3px}</style><p>a e\u{301} z</p>",
+            32,
+        )
+        .unwrap();
+        let text = RecordingText::default();
+        let list = display_list(&document, 200, 30, &text).unwrap();
+        let glyphs = list.0.iter().find_map(|command| match command {
+            Command::GlyphRun { glyphs, .. } => Some(glyphs.as_ref()),
+            _ => None,
+        });
+        let glyphs = glyphs.expect("the paragraph paints one text run");
+        let x = glyphs.iter().map(|glyph| glyph.x).collect::<Vec<_>>();
+        assert_eq!(x.len(), 6);
+        assert_eq!(x, [0.0, 8.0, 19.0, 25.0, 33.0, 44.0]);
+        assert_eq!(
+            glyphs[3].x - glyphs[2].x,
+            6.0,
+            "a combining mark remains in its grapheme's spacing cluster"
+        );
+    }
+
+    #[test]
     fn inline_backgrounds_paint_one_fragment_per_wrapped_line() {
         let document = crate::html::parse(
             "<style>body{margin:0}</style><p style='margin:0;width:8px;line-height:3px'><span style='background:#ff0000'>ab cd</span></p>",
@@ -16971,6 +24165,35 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(runs, [0.0, 9.0]);
+    }
+
+    #[test]
+    fn auto_inline_blocks_shrink_to_fit_list_items_but_explicit_width_is_kept() {
+        let document = crate::html::parse(
+            "<style>html,body{margin:0}</style><div style='display:inline-block'><span style='display:list-item;list-style-position:inside;margin-left:96px;background:orange'></span></div><div style='display:inline-block;width:160px'><span style='display:list-item;list-style-position:inside;margin-left:96px;background:orange'></span></div>",
+            32,
+        )
+        .unwrap();
+        let orange = display_list(&document, 800, 80, &FixedText)
+            .unwrap()
+            .0
+            .into_iter()
+            .filter_map(|command| match command {
+                Command::FillRect { rect, color }
+                    if (color.r, color.g, color.b, color.a) == (255, 165, 0, 255) =>
+                {
+                    Some(rect)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(orange.len(), 2);
+        assert!(
+            orange[0].width < 32.0,
+            "auto inline-block retained the child's 96px margin without filling the viewport: {:?}",
+            orange[0]
+        );
+        assert_eq!(orange[1].width, 64.0);
     }
 
     #[test]
@@ -17033,12 +24256,10 @@ mod tests {
                 "{border}"
             );
             assert_eq!(radius, 6.0 - inset, "{border}");
-            assert!(
-                !list
-                    .0
-                    .iter()
-                    .any(|command| matches!(command, Command::PushLayer { .. }))
-            );
+            assert!(!list
+                .0
+                .iter()
+                .any(|command| matches!(command, Command::PushLayer { .. })));
         }
     }
 

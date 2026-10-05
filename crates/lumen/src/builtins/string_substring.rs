@@ -38,7 +38,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::Tier, Completion, Engine};
+    use crate::{Completion, Engine, bytecode::Tier};
 
     fn check(source: &str, ascii: bool) {
         for tier in [Tier::Interp, Tier::Bytecode] {
@@ -47,7 +47,9 @@ mod tests {
             engine.set_tier_threshold(0);
             super::ASCII_CALLS.with(|n| n.set(0));
             super::UTF16_CALLS.with(|n| n.set(0));
-            let script=format!("function assert(v){{if(!v)throw new Error('substring');}} function sub(s,a,b){{return s.substring(a,b);}} {source}");
+            let script = format!(
+                "function assert(v){{if(!v)throw new Error('substring');}} function sub(s,a,b){{return s.substring(a,b);}} {source}"
+            );
             match engine.eval(&script, false).unwrap() {
                 Completion::Value(_) => {}
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),

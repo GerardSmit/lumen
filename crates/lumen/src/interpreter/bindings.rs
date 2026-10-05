@@ -74,6 +74,14 @@ thread_local! {
     static COPY_LAYOUTS: std::cell::RefCell<Vec<Rc<BindingLayout>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Forget the recently shared per-iteration layouts (a pure reuse cache).
+pub(crate) fn clear_copy_layouts() {
+    COPY_LAYOUTS.with(|c| {
+        let layouts = std::mem::take(&mut *c.borrow_mut());
+        drop(layouts);
+    });
+}
+
 /// A layout for exactly `entries`' names, in order — reused while the same names (the same
 /// interned `Rc`s: a loop's declarations) come back, so a loop's per-iteration copies share
 /// one.

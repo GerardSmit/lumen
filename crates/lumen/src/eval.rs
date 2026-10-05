@@ -3590,6 +3590,17 @@ impl Interp {
         // Await → PromiseResolve(%Promise%, v): the `constructor` read on a native promise is
         // observable, and its abrupt completion is the await's.
         self.get_member(&v, "constructor")?;
+        if let Some(target) = Self::promise_target(&v) {
+            let tracked = {
+                let mut object = target.borrow_mut();
+                let Callable::Promise(slot) = &mut object.call else { unreachable!() };
+                slot.handled = true;
+                std::mem::replace(&mut slot.tracked, false)
+            };
+            if tracked {
+                self.note_rejection_handled(&target);
+            }
+        }
         self.drain_microtasks();
         use crate::eval::promise_fast::{FULFILLED, REJECTED};
         match crate::eval::promise_fast::promise_state(&v) {
@@ -3603,28 +3614,83 @@ impl Interp {
     // State lives in the promise object (`Callable::Promise`, see `eval::promise_fast`).
 
     pub(crate) fn new_promise(&mut self) -> Value {
+        self.new_promise_registered(|_, promise| promise)
+    }
+
+    pub(crate) fn new_promise_registered<R>(
+        &mut self,
+        register: impl FnOnce(&mut Self, Value) -> R,
+    ) -> R {
         let obj = Object::new_bare(self.promise_proto());
-        obj.borrow_mut().call = Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed());
+        let realm_key = Gc::as_ptr(&self.global) as usize;
+        obj.borrow_mut().call = Callable::Promise(crate::eval::promise_fast::PromiseSlot::boxed(
+            realm_key,
+        ));
         let p = Value::Obj(obj);
+        let registered = register(self, p.clone());
         if self.promise_hooks.is_some() {
             self.run_promise_hook(crate::eval::promise_fast::HOOK_INIT, &p, &Value::Undefined);
         }
-        p
+        registered
     }
 
-    /// The promise whose state `promise` holds: itself, or the subclass instance a native
-    /// `super()` grafted its state onto. `None`: not a promise, or not pending.
-    fn pending_promise_target(promise: &Value) -> Option<Gc> {
+    /// Follow native subclass state forwarding without reading author properties.
+    fn promise_target(promise: &Value) -> Option<Gc> {
         let Value::Obj(o) = promise else { return None };
         let b = o.borrow();
         match &b.call {
-            Callable::Promise(s) if s.status == crate::eval::promise_fast::PENDING => {
-                Some(o.clone())
-            }
             Callable::Promise(s) if s.status == crate::eval::promise_fast::FORWARDED => {
                 let target = s.value.clone();
                 drop(b);
-                Self::pending_promise_target(&target)
+                Self::promise_target(&target)
+            }
+            Callable::Promise(_) => Some(o.clone()),
+            _ => None,
+        }
+    }
+
+    /// The actual native promise, only while it is pending.
+    fn pending_promise_target(promise: &Value) -> Option<Gc> {
+        Self::promise_target(promise).filter(|target| {
+            matches!(&target.borrow().call,
+                Callable::Promise(slot) if slot.status == crate::eval::promise_fast::PENDING)
+        })
+    }
+
+    /// Set [[PromiseIsHandled]] for a native internal promise. This creates no
+    /// reaction, dependent promise, hook or late rejection-handled notification.
+    /// Non-promises are ignored without thenable or property coercion.
+    pub fn mark_promise_handled(&mut self, promise: &Value) -> bool {
+        let Some(target) = Self::promise_target(promise) else { return false };
+        {
+            let mut object = target.borrow_mut();
+            let Callable::Promise(slot) = &mut object.call else { unreachable!() };
+            slot.handled = true;
+            slot.tracked = false;
+        }
+        self.unhandled_rejections.remove(&(Gc::as_ptr(&target) as usize));
+        true
+    }
+
+    /// Read the native handled slot without invoking any author operation.
+    pub fn promise_is_handled(&self, promise: &Value) -> Option<bool> {
+        let target = Self::promise_target(promise)?;
+        let object = target.borrow();
+        match &object.call {
+            Callable::Promise(slot) => Some(slot.handled),
+            _ => None,
+        }
+    }
+
+    /// Read a rejected native promise's original result without author property
+    /// access. Browser hosts can retain a weak outstanding identity and recover
+    /// the exact reason only when a later handled notification is queued.
+    pub fn promise_rejection_reason(&self, promise: &Value) -> Option<Value> {
+        let target = Self::promise_target(promise)?;
+        let object = target.borrow();
+        match &object.call {
+            Callable::Promise(slot) if slot.status == crate::eval::promise_fast::REJECTED => {
+                Some(slot.value.clone())
             }
             _ => None,
         }
@@ -3691,7 +3757,7 @@ impl Interp {
     }
 
     fn settle(&mut self, promise: &Gc, value: Value, fulfilled: bool) {
-        let (first, rest) = {
+        let (first, rest, realm_key, unhandled) = {
             let mut b = promise.borrow_mut();
             let Callable::Promise(s) = &mut b.call else {
                 return;
@@ -3706,26 +3772,23 @@ impl Interp {
             };
             s.value = value.clone();
             let first = s.first.take();
-            // A rejection with no reactions attached yet is (so far) unhandled — track it. A
-            // later `.then`/`.catch` clears it (see `promise_then_into`).
-            if !fulfilled && first.is_none() {
-                s.tracked = true;
-            }
+            // Internal algorithms can mark a promise handled without attaching
+            // reactions. Ordinary author subscriptions set the same durable slot.
+            let unhandled = !fulfilled && !s.handled;
+            s.tracked = unhandled;
             let rest = s.rest.take().map_or_else(Vec::new, |v| *v);
-            (first, rest)
+            (first, rest, s.realm_key, unhandled)
         };
-        let Some(first) = first else {
-            if !fulfilled {
-                // Reported in rejection order, not the map's (seeded) hash order.
-                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.unhandled_rejections.insert(
-                    Gc::as_ptr(promise) as usize,
-                    (Value::Obj(promise.clone()), value, seq),
-                );
-            }
-            return;
-        };
+        if unhandled {
+            // Reported in rejection order, not the map's (seeded) hash order.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.unhandled_rejections.insert(
+                Gc::as_ptr(promise) as usize,
+                (Value::Obj(promise.clone()), value.clone(), seq, realm_key),
+            );
+        }
+        let Some(first) = first else { return };
         for r in std::iter::once(first).chain(rest) {
             let job = Self::reaction_job(r, fulfilled, value.clone());
             self.microtasks.push_back(job);
@@ -5328,7 +5391,12 @@ impl Interp {
                         if crate::eval::promise_fast::is_promise_obj(src)
                             && matches!(dst.borrow().call, Callable::None)
                         {
-                            let mut fwd = crate::eval::promise_fast::PromiseSlot::boxed();
+                            let realm_key = match &src.borrow().call {
+                                Callable::Promise(slot) => slot.realm_key,
+                                _ => Gc::as_ptr(&self.global) as usize,
+                            };
+                            let mut fwd =
+                                crate::eval::promise_fast::PromiseSlot::boxed(realm_key);
                             fwd.status = crate::eval::promise_fast::FORWARDED;
                             fwd.value = this.clone();
                             let slot = std::mem::replace(
@@ -5336,6 +5404,25 @@ impl Interp {
                                 Callable::Promise(fwd),
                             );
                             dst.borrow_mut().call = slot;
+                            // The executor can reject synchronously before this
+                            // graft. Reporting and later handling must use the
+                            // public subclass instance whose slot now owns it.
+                            let source_key = Gc::as_ptr(src) as usize;
+                            if let Some((_, reason, sequence, realm_key)) =
+                                self.unhandled_rejections.remove(&source_key)
+                            {
+                                self.unhandled_rejections.insert(
+                                    Gc::as_ptr(dst) as usize,
+                                    (this.clone(), reason, sequence, realm_key),
+                                );
+                            }
+                            if let Some(handled) = self.late_handled_rejections.as_mut() {
+                                for promise in handled {
+                                    if matches!(promise, Value::Obj(object) if Gc::ptr_eq(object, src)) {
+                                        *promise = this.clone();
+                                    }
+                                }
+                            }
                         }
                         let src_call = src.borrow().call.clone();
                         if src_call.is_fn() && matches!(dst.borrow().call, Callable::None) {

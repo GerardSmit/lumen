@@ -1,6 +1,7 @@
 //! DOM Range and Selection bindings backed by the document arena.
 use super::*;
 use core::cmp::Ordering;
+use lumen_bind::{FromArg, Host, Slot};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Boundary {
@@ -12,6 +13,77 @@ pub(crate) struct RangeData {
     start: Cell<Boundary>,
     end: Cell<Boundary>,
     realm: RefCell<Rc<DomRealm>>,
+}
+
+#[derive(Clone)]
+struct StaticEndpoint {
+    point: Boundary,
+    realm: Rc<DomRealm>,
+}
+
+/// StaticRange keeps node identities and offsets exactly as supplied. Unlike
+/// RangeData, these points are deliberately not adjusted by mutation hooks.
+pub(crate) struct StaticRangeData {
+    start: RefCell<StaticEndpoint>,
+    end: RefCell<StaticEndpoint>,
+    // NodeRetention follows the node through adoption and reaps it only after
+    // the last StaticRange wrapper/event releases its reference.
+    _retained: RefCell<[NodeRetention; 2]>,
+}
+
+impl StaticRangeData {
+    fn new(start: StaticEndpoint, end: StaticEndpoint) -> Rc<Self> {
+        let retained = [
+            NodeRetention::new(&start.realm, start.point.container),
+            NodeRetention::new(&end.realm, end.point.container),
+        ];
+        Rc::new(Self {
+            start: RefCell::new(start),
+            end: RefCell::new(end),
+            _retained: RefCell::new(retained),
+        })
+    }
+
+    fn endpoint(&self, start: bool) -> StaticEndpoint {
+        if start {
+            self.start.borrow().clone()
+        } else {
+            self.end.borrow().clone()
+        }
+    }
+
+    /// Remap only endpoint nodes that belong to the source document. Static
+    /// ranges may be invalid and may even refer to nodes in different roots.
+    /// Keep the registry entry in each realm still owning one endpoint.
+    fn adopt_nodes(
+        &self,
+        source: &Rc<DomRealm>,
+        target: &Rc<DomRealm>,
+        mapping: &[(NodeId, NodeId)],
+    ) -> (bool, bool) {
+        let mut moved = false;
+        for endpoint in [&self.start, &self.end] {
+            let mut endpoint = endpoint.borrow_mut();
+            if !Rc::ptr_eq(&endpoint.realm, source) {
+                continue;
+            }
+            if let Some((_, new)) = mapping
+                .iter()
+                .find(|(old, _)| *old == endpoint.point.container)
+            {
+                endpoint.point.container = *new;
+                endpoint.realm = target.clone();
+                moved = true;
+            }
+        }
+        for retention in self._retained.borrow_mut().iter_mut() {
+            retention.adopt_nodes(source, target, mapping);
+        }
+        let remains_in_source = [&self.start, &self.end]
+            .into_iter()
+            .any(|endpoint| Rc::ptr_eq(&endpoint.borrow().realm, source));
+        (moved, remains_in_source)
+    }
 }
 
 impl RangeData {
@@ -106,12 +178,14 @@ impl Drop for RangeData {
 
 pub(crate) struct RangeRegistry {
     ranges: RefCell<Vec<std::rc::Weak<RangeData>>>,
+    static_ranges: RefCell<Vec<std::rc::Weak<StaticRangeData>>>,
 }
 
 impl RangeRegistry {
     pub(crate) fn new() -> Rc<Self> {
         Rc::new(Self {
             ranges: RefCell::new(Vec::new()),
+            static_ranges: RefCell::new(Vec::new()),
         })
     }
     fn register(&self, range: &Rc<RangeData>) {
@@ -120,8 +194,21 @@ impl RangeRegistry {
         ranges.push(Rc::downgrade(range));
     }
 
+    fn register_static(&self, range: &Rc<StaticRangeData>) {
+        let mut ranges = self.static_ranges.borrow_mut();
+        ranges.retain(|entry| entry.strong_count() > 0);
+        if !ranges
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|existing| Rc::ptr_eq(&existing, range))
+        {
+            ranges.push(Rc::downgrade(range));
+        }
+    }
+
     pub(crate) fn adopt_nodes(
         &self,
+        source_realm: &Rc<DomRealm>,
         target: &RangeRegistry,
         target_realm: &Rc<DomRealm>,
         mapping: &[(NodeId, NodeId)],
@@ -136,6 +223,35 @@ impl RangeRegistry {
         }
         ranges.retain(|entry| !migrated.iter().any(|moved| moved.ptr_eq(entry)));
         target.ranges.borrow_mut().extend(migrated);
+
+        let mut static_ranges = self.static_ranges.borrow_mut();
+        static_ranges.retain(|entry| entry.strong_count() > 0);
+        let mut retained_here = Vec::with_capacity(static_ranges.len());
+        let mut moved_to_target = Vec::new();
+        for weak in static_ranges.drain(..) {
+            let Some(range) = weak.upgrade() else {
+                continue;
+            };
+            let (moved, remains_here) = range.adopt_nodes(source_realm, target_realm, mapping);
+            let weak = Rc::downgrade(&range);
+            if moved {
+                moved_to_target.push(weak.clone());
+            }
+            if remains_here || !moved {
+                retained_here.push(weak);
+            }
+        }
+        *static_ranges = retained_here;
+        drop(static_ranges);
+        if !moved_to_target.is_empty() {
+            let mut target_ranges = target.static_ranges.borrow_mut();
+            target_ranges.retain(|entry| entry.strong_count() > 0);
+            for moved in moved_to_target {
+                if !target_ranges.iter().any(|entry| entry.ptr_eq(&moved)) {
+                    target_ranges.push(moved);
+                }
+            }
+        }
     }
 }
 
@@ -166,7 +282,9 @@ fn child_count(document: &lumen_html::Document, node: NodeId) -> OpResult<usize>
 
 fn text_len(kind: &NodeKind) -> Option<usize> {
     match kind {
-        NodeKind::Text(text) | NodeKind::Comment(text) => Some(text.encode_utf16().count()),
+        NodeKind::Text(text) | NodeKind::CData(text) | NodeKind::Comment(text) => {
+            Some(text.encode_utf16().count())
+        }
         NodeKind::ProcessingInstruction { data, .. } => Some(data.encode_utf16().count()),
         _ => None,
     }
@@ -329,7 +447,7 @@ fn string_for_range(document: &lumen_html::Document, data: &RangeData) -> OpResu
     let mut stack = vec![tree_root(document, start.container)?];
     while let Some(node) = stack.pop() {
         let kind = document.kind(node).map_err(dom_error)?;
-        if matches!(kind, NodeKind::Text(_)) {
+        if matches!(kind, NodeKind::Text(_) | NodeKind::CData(_)) {
             let value = text_len(kind).expect("text node length");
             let lo = if start.container == node {
                 start.offset
@@ -353,7 +471,7 @@ fn string_for_range(document: &lumen_html::Document, data: &RangeData) -> OpResu
                 && compare_points(document, node_start, end)? == PointOrder::Before
             {
                 let source = match kind {
-                    NodeKind::Text(s) | NodeKind::Comment(s) => s,
+                    NodeKind::Text(s) | NodeKind::CData(s) | NodeKind::Comment(s) => s,
                     NodeKind::ProcessingInstruction { data, .. } => data,
                     _ => unreachable!(),
                 };
@@ -438,7 +556,9 @@ fn build_contents(
                     };
                     if lo < hi {
                         let source = match &kind {
-                            NodeKind::Text(value) | NodeKind::Comment(value) => value.clone(),
+                            NodeKind::Text(value)
+                            | NodeKind::CData(value)
+                            | NodeKind::Comment(value) => value.clone(),
                             NodeKind::ProcessingInstruction { data, .. } => data.clone(),
                             _ => unreachable!(),
                         };
@@ -448,6 +568,7 @@ fn build_contents(
                             let selected = source[lo_byte..hi_byte].to_owned();
                             let selected_kind = match kind {
                                 NodeKind::Comment(_) => NodeKind::Comment(selected),
+                                NodeKind::CData(_) => NodeKind::CData(selected),
                                 NodeKind::ProcessingInstruction { target, .. } => {
                                     NodeKind::ProcessingInstruction {
                                         target,
@@ -500,8 +621,87 @@ fn build_contents(
     Ok(any)
 }
 
-#[lumen_bind::class(name = "Range", hint(js(webidl)))]
+enum AbstractRangeBacking {
+    Live(Rc<RangeData>),
+    Static(Rc<StaticRangeData>),
+}
+
+impl AbstractRangeBacking {
+    fn endpoint(&self, start: bool) -> StaticEndpoint {
+        match self {
+            Self::Live(data) => StaticEndpoint {
+                point: if start {
+                    data.start.get()
+                } else {
+                    data.end.get()
+                },
+                realm: data.realm.borrow().clone(),
+            },
+            Self::Static(data) => data.endpoint(start),
+        }
+    }
+}
+
+#[lumen_bind::class(name = "AbstractRange", hint(js(webidl)))]
+pub struct DomAbstractRange {
+    backing: AbstractRangeBacking,
+}
+
+impl DomAbstractRange {
+    fn live(data: Rc<RangeData>) -> Self {
+        Self {
+            backing: AbstractRangeBacking::Live(data),
+        }
+    }
+
+    fn static_range(data: Rc<StaticRangeData>) -> Self {
+        Self {
+            backing: AbstractRangeBacking::Static(data),
+        }
+    }
+}
+
+#[lumen_bind::methods]
+impl DomAbstractRange {
+    #[getter]
+    fn start_container(&self, ctx: &mut Ctx) -> Value {
+        let endpoint = self.backing.endpoint(true);
+        let (realm, node) = endpoint
+            .realm
+            .resolve_adopted_node(endpoint.point.container);
+        realm.wrap(ctx, node)
+    }
+
+    #[getter]
+    fn start_offset(&self) -> usize {
+        self.backing.endpoint(true).point.offset
+    }
+
+    #[getter]
+    fn end_container(&self, ctx: &mut Ctx) -> Value {
+        let endpoint = self.backing.endpoint(false);
+        let (realm, node) = endpoint
+            .realm
+            .resolve_adopted_node(endpoint.point.container);
+        realm.wrap(ctx, node)
+    }
+
+    #[getter]
+    fn end_offset(&self) -> usize {
+        self.backing.endpoint(false).point.offset
+    }
+
+    #[getter]
+    fn collapsed(&self) -> bool {
+        let start = self.backing.endpoint(true);
+        let end = self.backing.endpoint(false);
+        Rc::ptr_eq(&start.realm, &end.realm) && start.point == end.point
+    }
+}
+
+#[lumen_bind::class(name = "Range", extends = DomAbstractRange, hint(js(webidl)))]
 pub struct DomRange {
+    base: DomAbstractRange,
     pub(crate) data: Rc<RangeData>,
 }
 
@@ -510,7 +710,14 @@ impl DomRange {
         let root = realm.session.borrow().document().root();
         let data = RangeData::new(root, &realm);
         registry.register(&data);
-        Self { data }
+        Self::from_data(data)
+    }
+
+    fn from_data(data: Rc<RangeData>) -> Self {
+        Self {
+            base: DomAbstractRange::live(data.clone()),
+            data,
+        }
     }
 
     fn set_boundary(&self, point: Boundary, start: bool) -> OpResult<()> {
@@ -555,17 +762,6 @@ impl DomRange {
         Ok(())
     }
 
-    fn boundary_node(&self, ctx: &mut Ctx, start: bool) -> Value {
-        let point = if start {
-            self.data.start.get().container
-        } else {
-            self.data.end.get().container
-        };
-        self.data
-            .current_realm()
-            .map_or(Value::Null, |realm| realm.wrap(ctx, point))
-    }
-
     fn collapse_to(&self, start: bool) {
         let point = if start {
             self.data.start.get()
@@ -579,26 +775,6 @@ impl DomRange {
 
 #[lumen_bind::methods]
 impl DomRange {
-    #[getter]
-    fn start_container(&self, ctx: &mut Ctx) -> Value {
-        self.boundary_node(ctx, true)
-    }
-    #[getter]
-    fn start_offset(&self) -> usize {
-        self.data.start.get().offset
-    }
-    #[getter]
-    fn end_container(&self, ctx: &mut Ctx) -> Value {
-        self.boundary_node(ctx, false)
-    }
-    #[getter]
-    fn end_offset(&self) -> usize {
-        self.data.end.get().offset
-    }
-    #[getter]
-    fn collapsed(&self) -> bool {
-        self.data.start.get() == self.data.end.get()
-    }
     #[getter]
     fn common_ancestor_container(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let realm = self.data.current_realm()?;
@@ -723,7 +899,10 @@ impl DomRange {
             .expect("live Range retains its owning realm");
         let data = self.data.copy(&realm);
         realm.ranges.register(&data);
-        Self { data }
+        Self {
+            base: DomAbstractRange::live(data.clone()),
+            data,
+        }
     }
     fn to_string(&self) -> OpResult<String> {
         let realm = self.data.current_realm()?;
@@ -751,7 +930,7 @@ impl DomRange {
         {
             let len = text_len(document.kind(start.container).map_err(dom_error)?).unwrap();
             let source = match document.kind(start.container).map_err(dom_error)? {
-                NodeKind::Text(s) | NodeKind::Comment(s) => s.clone(),
+                NodeKind::Text(s) | NodeKind::CData(s) | NodeKind::Comment(s) => s.clone(),
                 NodeKind::ProcessingInstruction { data, .. } => data.clone(),
                 _ => unreachable!(),
             };
@@ -761,6 +940,7 @@ impl DomRange {
                 let value = source[lo..hi].to_owned();
                 let kind = match document.kind(start.container).map_err(dom_error)? {
                     NodeKind::Comment(_) => NodeKind::Comment(value),
+                    NodeKind::CData(_) => NodeKind::CData(value),
                     NodeKind::ProcessingInstruction { target, .. } => {
                         NodeKind::ProcessingInstruction {
                             target: target.clone(),
@@ -880,7 +1060,7 @@ impl DomRange {
         let document = session.document_mut();
         if text_len(document.kind(point.container).map_err(dom_error)?).is_some() {
             let source = match document.kind(point.container).map_err(dom_error)? {
-                NodeKind::Text(s) | NodeKind::Comment(s) => s.clone(),
+                NodeKind::Text(s) | NodeKind::CData(s) | NodeKind::Comment(s) => s.clone(),
                 NodeKind::ProcessingInstruction { .. } => {
                     return Err(OpError::new(
                         "HierarchyRequestError",
@@ -900,6 +1080,7 @@ impl DomRange {
             let next = document.next_sibling(point.container).map_err(dom_error)?;
             let trailing_kind = match document.kind(point.container).map_err(dom_error)? {
                 NodeKind::Comment(_) => NodeKind::Comment(suffix),
+                NodeKind::CData(_) => NodeKind::CData(suffix),
                 NodeKind::ProcessingInstruction { target, .. } => NodeKind::ProcessingInstruction {
                     target: target.clone(),
                     data: suffix,
@@ -945,7 +1126,7 @@ impl DomRange {
             && text_len(document.kind(start.container).map_err(dom_error)?).is_some()
         {
             let source = match document.kind(start.container).map_err(dom_error)? {
-                NodeKind::Text(s) | NodeKind::Comment(s) => s.clone(),
+                NodeKind::Text(s) | NodeKind::CData(s) | NodeKind::Comment(s) => s.clone(),
                 NodeKind::ProcessingInstruction { data, .. } => data.clone(),
                 _ => unreachable!(),
             };
@@ -956,6 +1137,7 @@ impl DomRange {
                 let selected = source[a..b].to_owned();
                 let clone = match kind {
                     NodeKind::Comment(_) => NodeKind::Comment(selected),
+                    NodeKind::CData(_) => NodeKind::CData(selected),
                     NodeKind::ProcessingInstruction { target, .. } => {
                         NodeKind::ProcessingInstruction {
                             target,
@@ -1071,6 +1253,140 @@ impl SelectionData {
     }
 }
 
+fn required_static_range_member(
+    ctx: &mut Ctx,
+    init: &Value,
+    name: &'static str,
+) -> Result<Value, Value> {
+    if matches!(init, Value::Null | Value::Undefined) {
+        return Err(ctx.make_error("TypeError", format!("StaticRangeInit.{name} is required")));
+    }
+    let value = ctx.member_get(init, name)?;
+    if matches!(value, Value::Undefined) {
+        Err(ctx.make_error("TypeError", format!("StaticRangeInit.{name} is required")))
+    } else {
+        Ok(value)
+    }
+}
+
+struct StaticRangeNode {
+    endpoint: StaticEndpoint,
+    wrapper: Value,
+}
+
+impl<'a> FromArg<'a, lumen::embed::JsHost> for StaticRangeNode {
+    fn from_arg(
+        cx: &'a lumen::embed::ArgCx<'_>,
+        value: &'a Value,
+        at: Slot,
+    ) -> Result<Self, Value> {
+        let node = <lumen::embed::JsHost as Host>::class_ref::<DomNode>(cx, value, at)?;
+        Ok(Self {
+            endpoint: StaticEndpoint {
+                point: Boundary {
+                    container: node.id,
+                    offset: 0,
+                },
+                realm: node.realm.clone(),
+            },
+            wrapper: value.clone(),
+        })
+    }
+}
+
+struct StaticRangeInit {
+    end_container: StaticRangeNode,
+    end_offset: u32,
+    start_container: StaticRangeNode,
+    start_offset: u32,
+}
+
+impl<'a> FromArg<'a, lumen::embed::JsHost> for StaticRangeInit {
+    fn from_arg(cx: &'a lumen::embed::ArgCx<'_>, init: &'a Value, at: Slot) -> Result<Self, Value> {
+        // StaticRangeInit members are converted in Web IDL dictionary order.
+        // Leave the interpreter context before invoking each typed conversion;
+        // numeric ToUint32 conversion then goes through the shared FromArg impl.
+        let end_container_value = <lumen::embed::JsHost as Host>::with_ctx(cx, |ctx| {
+            required_static_range_member(ctx, init, "endContainer")
+        })?;
+        let end_container = <StaticRangeNode as FromArg<'_, lumen::embed::JsHost>>::from_arg(
+            cx,
+            &end_container_value,
+            at,
+        )?;
+
+        let end_offset_value = <lumen::embed::JsHost as Host>::with_ctx(cx, |ctx| {
+            required_static_range_member(ctx, init, "endOffset")
+        })?;
+        let end_offset =
+            <u32 as FromArg<'_, lumen::embed::JsHost>>::from_arg(cx, &end_offset_value, at)?;
+
+        let start_container_value = <lumen::embed::JsHost as Host>::with_ctx(cx, |ctx| {
+            required_static_range_member(ctx, init, "startContainer")
+        })?;
+        let start_container = <StaticRangeNode as FromArg<'_, lumen::embed::JsHost>>::from_arg(
+            cx,
+            &start_container_value,
+            at,
+        )?;
+
+        let start_offset_value = <lumen::embed::JsHost as Host>::with_ctx(cx, |ctx| {
+            required_static_range_member(ctx, init, "startOffset")
+        })?;
+        let start_offset =
+            <u32 as FromArg<'_, lumen::embed::JsHost>>::from_arg(cx, &start_offset_value, at)?;
+
+        Ok(Self {
+            end_container,
+            end_offset,
+            start_container,
+            start_offset,
+        })
+    }
+}
+
+#[lumen_bind::class(name = "StaticRange", extends = DomAbstractRange, hint(js(webidl)))]
+pub struct DomStaticRange {
+    base: DomAbstractRange,
+}
+
+#[lumen_bind::methods]
+impl DomStaticRange {
+    #[constructor(coerce)]
+    fn new(_ctx: &mut Ctx, init: StaticRangeInit) -> OpResult<Self> {
+        let mut end = init.end_container.endpoint.clone();
+        let end_offset = init.end_offset as usize;
+        let mut start = init.start_container.endpoint.clone();
+        let start_offset = init.start_offset as usize;
+        end.point.offset = end_offset;
+        start.point.offset = start_offset;
+
+        for endpoint in [&start, &end] {
+            let session = endpoint.realm.session.borrow();
+            if matches!(
+                session.document().kind(endpoint.point.container),
+                Ok(NodeKind::Attribute { .. } | NodeKind::DocumentType(_))
+            ) {
+                return Err(OpError::new(
+                    "InvalidNodeTypeError",
+                    "StaticRange boundary containers cannot be Attr or DocumentType nodes",
+                ));
+            }
+        }
+
+        let data = StaticRangeData::new(start.clone(), end.clone());
+        start.realm.ranges.register_static(&data);
+        if !Rc::ptr_eq(&start.realm, &end.realm) {
+            end.realm.ranges.register_static(&data);
+        }
+        // Keep converted Node wrapper values alive until native retention is
+        // established, including when dictionary getters produced temporaries.
+        Ok(Self {
+            base: DomAbstractRange::static_range(data),
+        })
+    }
+}
+
 #[lumen_bind::class(name = "Selection", hint(js(webidl)))]
 pub struct DomSelection {
     pub(crate) realm: Rc<DomRealm>,
@@ -1177,7 +1493,7 @@ impl DomSelection {
             .ok_or_else(|| {
                 OpError::new("IndexSizeError", "selection range index is out of bounds")
             })?;
-        Ok(DomRange { data })
+        Ok(DomRange::from_data(data))
     }
     fn add_range(&self, range: &DomRange) -> OpResult<()> {
         if !Rc::ptr_eq(&self.realm, &range.data.current_realm()?) {
@@ -1351,10 +1667,7 @@ impl DomSelection {
     }
     fn delete_from_document(&self) -> OpResult<()> {
         if let Some(range) = self.data.ranges.borrow().first() {
-            DomRange {
-                data: range.clone(),
-            }
-            .delete_contents()?;
+            DomRange::from_data(range.clone()).delete_contents()?;
         }
         Ok(())
     }
@@ -1428,9 +1741,11 @@ impl DomSelection {
     }
 }
 
-pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 2] {
+pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 4] {
     [
+        ("AbstractRange", ctx.class_constructor::<DomAbstractRange>()),
         ("Range", ctx.class_constructor::<DomRange>()),
+        ("StaticRange", ctx.class_constructor::<DomStaticRange>()),
         ("Selection", ctx.class_constructor::<DomSelection>()),
     ]
 }
@@ -1498,7 +1813,11 @@ pub(crate) fn adjust_ranges(
                     if boundary.container == mutation.target =>
                 {
                     let current = match document.kind(mutation.target) {
-                        Ok(NodeKind::Text(value) | NodeKind::Comment(value)) => value,
+                        Ok(
+                            NodeKind::Text(value)
+                            | NodeKind::CData(value)
+                            | NodeKind::Comment(value),
+                        ) => value,
                         Ok(NodeKind::ProcessingInstruction { data, .. }) => data,
                         _ => continue,
                     };

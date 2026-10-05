@@ -13,6 +13,7 @@ lumen-html = { path = "../lumen-html" }
 lumen-html-image = { path = "../lumen-html-image" }
 lumen-html-text = { path = "../lumen-html-text" }
 lumen-common = { path = "../lumen-common", features = ["cookies"] }
+lumen-timers = { path = "../lumen-timers" }
 tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
 
 [dev-dependencies]

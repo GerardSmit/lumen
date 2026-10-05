@@ -6,7 +6,7 @@
 
 mod arrays;
 mod async_body;
-mod bindings;
+pub(crate) mod bindings;
 pub(crate) mod class_fields;
 mod collect;
 mod constructor_body;
@@ -52,14 +52,104 @@ pub(crate) struct AtomicLease {
 pub struct SharedBufferHandle {
     id: u64,
     backing: SharedMem,
+    /// The length captured by this particular SharedArrayBuffer object. Multiple wrappers over a
+    /// WebAssembly shared memory can have different lengths while aliasing the same backing.
+    byte_len: usize,
+    /// Largest byte length the backing has reserved. Ordinary SharedArrayBuffers set this to
+    /// their current length; WebAssembly can reserve its declared maximum before exposing a raw
+    /// pointer to native code.
+    max_len: usize,
+}
+
+impl SharedBufferHandle {
+    /// Length captured by the SharedArrayBuffer wrapper represented by this handle.
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    /// Current length of the process-shared backing.
+    pub fn current_len(&self) -> usize {
+        self.backing.lock().unwrap().len()
+    }
+
+    /// Maximum length reserved by this capability.
+    pub fn max_len(&self) -> usize {
+        self.max_len
+    }
+
+    /// Reserve stable address space for `max_len` bytes before native code keeps a pointer into
+    /// the backing. This never changes the visible SharedArrayBuffer length.
+    pub fn reserve_to(&mut self, max_len: usize) -> Result<(), ()> {
+        let mut bytes = self.backing.lock().map_err(|_| ())?;
+        let len = bytes.len();
+        if max_len < len {
+            return Err(());
+        }
+        bytes
+            .try_reserve_exact(max_len - len)
+            .map_err(|_| ())?;
+        self.max_len = self.max_len.max(max_len);
+        Ok(())
+    }
+
+    /// Grow the shared backing without moving its allocation. The caller must reserve the final
+    /// length first and must synchronize raw-pointer access with [`Self::lock`].
+    pub fn grow_to(&mut self, new_len: usize) -> Result<usize, ()> {
+        if new_len < self.byte_len || new_len > self.max_len {
+            return Err(());
+        }
+        let mut bytes = self.backing.lock().map_err(|_| ())?;
+        if new_len < bytes.len() || new_len > bytes.capacity() {
+            return Err(());
+        }
+        let old_len = bytes.len();
+        bytes.resize(new_len, 0);
+        self.byte_len = new_len;
+        Ok(old_len)
+    }
+
+    /// Return a handle whose wrapper length captures the backing's current length.
+    pub fn current_view(&self) -> Result<Self, ()> {
+        let byte_len = self.backing.lock().map_err(|_| ())?.len();
+        if byte_len > self.max_len {
+            return Err(());
+        }
+        Ok(Self {
+            id: self.id,
+            backing: self.backing.clone(),
+            byte_len,
+            max_len: self.max_len,
+        })
+    }
+
+    /// Lock the backing while reading or writing through a native memory view.
+    pub fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, Vec<u8>>> {
+        self.backing.lock()
+    }
+
+    /// Stable lock ordering key for code that must lock multiple shared buffers at once.
+    pub fn lock_order_key(&self) -> usize {
+        Arc::as_ptr(&self.backing) as usize
+    }
+
+    /// Whether two handles refer to the same shared bytes.
+    pub fn same_backing(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backing, &other.backing)
+    }
+
+    /// Pointer to the shared bytes. The caller must keep a handle alive, reserve enough capacity
+    /// before using the pointer, and hold [`Self::lock`] whenever the pointer is accessed.
+    pub unsafe fn as_mut_ptr(&self) -> *mut u8 {
+        self.backing.lock().unwrap().as_mut_ptr()
+    }
 }
 #[cfg(feature = "parallel")]
 impl SharedBufferHandle {
     pub(crate) fn adopt_into(&self, interp: &mut Interp, pointer: usize) {
-        let length = self.backing.lock().unwrap().len();
+        let length = self.byte_len;
         interp
             .array_buffers
-            .insert(pointer, ByteStore::zeroed(length).into());
+            .insert(pointer, ByteStore::metadata_only(length).into());
         shared_mem_registry()
             .lock()
             .unwrap()
@@ -1057,8 +1147,8 @@ pub struct Interp {
     /// ArrayBuffer object's pointer; a detached buffer has no entry. Immutable buffers (from
     /// `transferToImmutable`/`sliceToImmutable`) are readonly stores, resizable ones have a max.
     pub(crate) array_buffers: crate::fasthash::FastMap<usize, StoreSlot>,
-    /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps a
-    /// same-length placeholder so detach/length checks still work; the bytes live in the registry).
+    /// SharedArrayBuffer pointers → their global shared-memory id (`array_buffers` keeps only
+    /// length/flag metadata; synchronized bytes live in the registry).
     pub(crate) shared_buffers: crate::fasthash::FastMap<usize, u64>,
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
@@ -1131,7 +1221,7 @@ pub struct Interp {
     /// unhandled rejection the embedder can report (see [`Engine::take_unhandled_rejections`]).
     /// Keyed by the promise object's pointer; holds `(promise, reason)` so the runtime can hand
     /// both to a global `unhandledrejection` handler.
-    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (Value, Value, u64)>,
+    pub(crate) unhandled_rejections: crate::fasthash::FastMap<usize, (Value, Value, u64, usize)>,
     /// Temporal object internal slots, keyed by the object's pointer.
     pub(crate) temporal: crate::fasthash::FastMap<usize, crate::temporal::Temporal>,
     /// The calendar id of a Temporal date-bearing object (default "iso8601"), keyed by object ptr.
@@ -1297,6 +1387,49 @@ pub struct Interp {
     pub(crate) async_gen_busy: std::collections::HashSet<usize>,
     pub(crate) async_gen_queue:
         HashMap<usize, std::collections::VecDeque<(Value, crate::coroutine::Resume)>>,
+}
+
+/// Keeps a native call's stack-local frame alive while `native_top` points at it, and restores
+/// the caller's stack metadata during both ordinary return and Rust unwinding. The reference is
+/// the lifetime proof for the raw address stored in `Interp::native_top`.
+pub(crate) struct NativeFrameScope<'interp, 'frame> {
+    interp: &'interp mut Interp,
+    _frame: &'frame frames::NativeCtx,
+    previous_native_top: usize,
+    previous_site: u32,
+}
+
+impl<'interp, 'frame> NativeFrameScope<'interp, 'frame> {
+    pub(crate) fn enter(
+        interp: &'interp mut Interp,
+        frame: &'frame frames::NativeCtx,
+        site: u32,
+    ) -> Self {
+        let previous_native_top = interp.native_top;
+        let previous_site = interp.cur_site;
+        // SAFETY: `frame` is borrowed for the scope's entire lifetime and is therefore still
+        // alive whenever stack-trace code follows this address. Drop restores the old head before
+        // the borrow can end.
+        interp.native_top = frame as *const frames::NativeCtx as usize;
+        interp.cur_site = site | frames::SITE_NATIVE;
+        Self {
+            interp,
+            _frame: frame,
+            previous_native_top,
+            previous_site,
+        }
+    }
+
+    pub(crate) fn interp(&mut self) -> &mut Interp {
+        self.interp
+    }
+}
+
+impl Drop for NativeFrameScope<'_, '_> {
+    fn drop(&mut self) {
+        self.interp.cur_site = self.previous_site;
+        self.interp.native_top = self.previous_native_top;
+    }
 }
 
 /// A `using x = v` resource: the value plus its captured dispose method.
@@ -2514,6 +2647,8 @@ impl Interp {
             observer.forced_next = true;
         }
         self.gc_collect();
+        #[cfg(feature = "embed")]
+        self.sweep_host_objects();
         before.saturating_sub(crate::value::live_objects())
     }
 
@@ -2838,6 +2973,11 @@ impl Interp {
             .typed_arrays
             .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
+        // A SharedArrayBuffer's real bytes are protected by the shared-backing mutex. The raw
+        // N-API pointer API cannot carry that lock, so it must not expose the metadata-only store.
+        if self.shared_buffers.contains_key(&info.buffer) {
+            return None;
+        }
         let len = self.ta_len(&info)?;
         let code = match info.kind {
             crate::value::TaKind::I8 => 0u8,
@@ -2858,6 +2998,25 @@ impl Interp {
         // SAFETY: `ta_len` succeeded, so `offset` is within the store.
         let ptr = unsafe { buf.as_ptr().add(info.offset) };
         Some((code, byte_len, ptr))
+    }
+
+    /// The internal TypedArray element kind, or `None` when `v` is not a TypedArray.
+    /// The kind is retained even when the underlying buffer is detached.
+    /// Unlike the N-API-compatible code from [`typed_array_raw`], this preserves distinctions
+    /// such as `Uint8Array` versus `Float16Array`.
+    pub fn typed_array_kind(&self, v: &Value) -> Option<crate::value::TaKind> {
+        let obj = v.as_obj()?;
+        self.typed_arrays
+            .get(&(Gc::as_ptr(obj) as usize))
+            .map(|info| info.kind)
+    }
+
+    /// The current byte length of a live TypedArray view, or `None` when `v` is not a live
+    /// TypedArray. Callers can check a byte budget before copying its contents.
+    pub fn typed_array_byte_len(&self, v: &Value) -> Option<usize> {
+        let obj = v.as_obj()?;
+        let info = *self.typed_arrays.get(&(Gc::as_ptr(obj) as usize))?;
+        self.ta_len(&info)?.checked_mul(info.kind.elsize())
     }
 
     /// Build the generator/iterator object whose `next`/`return`/`throw` drive its coroutine (stored
@@ -2912,18 +3071,16 @@ impl Interp {
             recv_kind: frames::recv_kind(&this),
             this: frames::held_ptr(&held),
         };
-        self.native_top = &ctx as *const frames::NativeCtx as usize;
-        self.cur_site = site | frames::SITE_NATIVE;
+        let mut scope = NativeFrameScope::enter(self, &ctx, site);
         let r = match call {
-            Callable::Native(f) => f(self, this, args),
+            Callable::Native(f) => f(scope.interp(), this, args),
             Callable::NativeData(data) => {
                 let f = data.func.clone();
-                f(self, this, args)
+                f(scope.interp(), this, args)
             }
             _ => unreachable!("dispatch_native on a non-native callable"),
         };
-        self.cur_site = site;
-        self.native_top = ctx.prev;
+        drop(scope);
         r
     }
 
@@ -3032,13 +3189,28 @@ impl Interp {
     /// is detached). The embedder's binary bridge: encoders/crypto/fetch move bytes through
     /// this.
     pub fn typed_array_bytes(&self, v: &Value) -> Option<Vec<u8>> {
+        self.with_typed_array_bytes(v, <[u8]>::to_vec)
+    }
+
+    /// Read a live TypedArray's exact byte range without allocating a copy.
+    /// The callback must not execute JavaScript or access the backing buffer again:
+    /// ordinary buffers remain borrowed and shared buffers remain locked until it returns.
+    pub fn with_typed_array_bytes<R>(
+        &self,
+        v: &Value,
+        read: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
         let obj = v.as_obj()?;
         let info = self
             .typed_arrays
             .get(&(Gc::as_ptr(obj) as usize))
             .copied()?;
-        let len = self.ta_len(&info)?;
-        self.ta_read_bytes(&info, 0, len)
+        let bytes = self.ta_len(&info)?.checked_mul(info.kind.elsize())?;
+        let end = info.offset.checked_add(bytes)?;
+        self.with_buffer_bytes(info.buffer, |buffer| {
+            buffer.get(info.offset..end).map(read)
+        })
+        .flatten()
     }
 
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
@@ -3107,17 +3279,34 @@ impl Interp {
                 "SharedArrayBuffer backing store is unavailable",
             )
         })?;
-        Ok(Some(SharedBufferHandle { id, backing }))
+        let byte_len = self
+            .array_buffers
+            .get(&pointer)
+            .map(|buffer| buffer.len())
+            .unwrap_or(0);
+        let max_len = object
+            .borrow()
+            .props
+            .get("\u{0}ab_max_byte_length")
+            .and_then(|property| property.value().as_num_opt())
+            .map(|length| length.max(0.0) as usize)
+            .unwrap_or(byte_len);
+        Ok(Some(SharedBufferHandle {
+            id,
+            backing,
+            byte_len,
+            max_len: max_len.max(byte_len),
+        }))
     }
 
     /// Construct this realm's own SharedArrayBuffer wrapper around an admitted native capability.
     pub fn import_shared_array_buffer(&mut self, handle: &SharedBufferHandle) -> Value {
-        let length = handle.backing.lock().unwrap().len();
+        let length = handle.byte_len;
         let object = Object::new(self.extra_protos.get("SharedArrayBuffer").cloned());
         let pointer = Gc::as_ptr(&object) as usize;
         self.gc_pin(&object);
         self.array_buffers
-            .insert(pointer, ByteStore::zeroed(length).into());
+            .insert(pointer, ByteStore::metadata_only(length).into());
         for (name, value) in [
             ("\u{0}ab_max_byte_length", Value::Num(length as f64)),
             ("\u{0}ab_resizable", Value::Bool(false)),
@@ -6315,11 +6504,9 @@ impl Interp {
             recv_kind: frames::recv_kind(&this),
             this: frames::held_ptr(&held),
         };
-        self.native_top = &ctx as *const frames::NativeCtx as usize;
-        self.cur_site = site | frames::SITE_NATIVE;
-        let mut r = f(self, this, args).map_err(Abrupt::Throw);
-        self.cur_site = site;
-        self.native_top = ctx.prev;
+        let mut scope = NativeFrameScope::enter(self, &ctx, site);
+        let mut r = f(scope.interp(), this, args).map_err(Abrupt::Throw);
+        drop(scope);
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
         // `call`'s trampoline (a native that ran a tail call through `call_inner`).
@@ -9060,6 +9247,11 @@ impl Default for Interp {
 }
 
 const STR_KEY_IC_LEN: usize = 64;
+
+/// Empty the thread's string-key memo (a pure cache keyed by shape ids that die with the realm).
+pub(crate) fn clear_str_key_ic() {
+    STR_KEY_IC.with(|c| c.borrow_mut().fill_with(|| None));
+}
 
 thread_local! {
     /// [`Interp::fast_get_str`]'s own-property memo: `(shape id, key, slot)`.

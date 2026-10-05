@@ -484,6 +484,50 @@ pub fn note_external(delta: isize) {
     HEAP_BYTES.fetch_add(delta, Relaxed);
 }
 
+/// Free-list occupancy of one size class on the calling thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClassCacheStats {
+    /// Rounded size of every block in this class.
+    pub block_bytes: usize,
+    /// Free blocks parked on this thread's list.
+    pub blocks: usize,
+}
+
+/// The calling thread's free-list occupancy, separate from blocks still live.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadCacheStats {
+    /// Sum of `block_bytes * blocks` over all classes.
+    pub cached_bytes: usize,
+    pub cached_blocks: usize,
+    /// Requested bytes this thread allocated and has not freed (see [`thread_live_bytes`]).
+    pub live_requested_bytes: isize,
+    /// Non-empty classes only, ascending by size.
+    pub classes: Vec<ClassCacheStats>,
+}
+
+/// Live versus free-list split of the calling thread's allocator state. The process-wide
+/// [`heap_bytes`] is the sum of every thread's live rounded blocks and cached blocks; a thread
+/// exit returns its cache to the system, so after a join only blocks freed on a surviving
+/// thread (and still live blocks) remain.
+pub fn thread_cache_stats() -> ThreadCacheStats {
+    let cache = cache();
+    let mut stats = ThreadCacheStats {
+        live_requested_bytes: cache.live.get(),
+        ..ThreadCacheStats::default()
+    };
+    for (class, count) in cache.counts.iter().enumerate() {
+        let blocks = count.get();
+        if blocks == 0 {
+            continue;
+        }
+        let block_bytes = (class + 1) * STEP;
+        stats.cached_bytes += block_bytes * blocks;
+        stats.cached_blocks += blocks;
+        stats.classes.push(ClassCacheStats { block_bytes, blocks });
+    }
+    stats
+}
+
 #[doc(hidden)]
 pub fn cached_bytes_for_test() -> usize {
     CACHE.with(|cache| {

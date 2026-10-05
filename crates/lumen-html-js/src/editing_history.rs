@@ -1,5 +1,8 @@
 use super::*;
-use std::{collections::VecDeque, mem::size_of};
+use std::{
+    collections::{HashSet, VecDeque},
+    mem::size_of,
+};
 
 pub(super) const MAX_CONTROL_BYTES: usize = 64 * 1024;
 const MAX_HISTORY_BYTES: usize = 1024 * 1024;
@@ -90,12 +93,14 @@ impl Composition {
 pub(super) struct EditingState {
     controls: Vec<ControlHistory>,
     composition: Option<Composition>,
+    pending_select_events: HashSet<NodeId>,
     sequence: u64,
 }
 
 impl EditingState {
     fn retained_bytes(&self) -> usize {
         size_of::<Self>()
+            + self.pending_select_events.capacity() * size_of::<NodeId>()
             + self.controls.capacity() * size_of::<ControlHistory>()
             + self
                 .controls
@@ -244,6 +249,19 @@ impl EditingState {
         {
             self.composition = None;
         }
+    }
+
+    pub fn begin_select_event(&mut self, node: NodeId) -> Result<bool, ()> {
+        if self.pending_select_events.contains(&node) {
+            return Ok(false);
+        }
+        self.pending_select_events.try_reserve(1).map_err(|_| ())?;
+        self.pending_select_events.insert(node);
+        Ok(true)
+    }
+
+    pub fn finish_select_event(&mut self, node: NodeId) {
+        self.pending_select_events.remove(&node);
     }
 
     pub fn composition(&self, node: NodeId) -> Option<Composition> {

@@ -3,6 +3,13 @@
 
 extern crate alloc;
 
+mod manual_font_registry;
+pub use manual_font_registry::{
+    FontFaceStatus, FontLoadRequest, FontRegistryContext, FontRegistrySnapshot,
+    ManualFontFace, ManualFontFaceState, ManualFontRegistry, ManualFontSource,
+    MAX_MANUAL_FONT_BYTES_PER_FACE,
+};
+
 pub use lumen_common::ucd::{
     BreakOpportunity, graphemes, line_breaks, next_grapheme_boundary, previous_grapheme_boundary,
 };
@@ -396,6 +403,32 @@ pub struct FontRegistration {
     pub descriptors: RegisteredFontDescriptors,
 }
 
+impl FontRegistration {
+    /// Register one decoded CSS face with the same unicode-range and descriptor
+    /// conversion used by document and WPT font snapshots.
+    pub fn from_css_rule(
+        rule: &lumen_html::css::FontFaceRule,
+        face: Arc<FontFace>,
+    ) -> Result<Self, &'static str> {
+        let unicode_range = Some(match rule.unicode_range.as_deref() {
+            Some(raw) => lumen_html::css::parse_unicode_ranges(raw)
+                .ok_or("invalid parsed font unicode-range")?,
+            None => Arc::from([(0, 0x10ffff)]),
+        });
+        Ok(Self {
+            font: RegisteredFont {
+                family: rule.family.clone(),
+                weight: rule.weight,
+                style: rule.style,
+                stretch: rule.stretch,
+                face,
+            },
+            unicode_range,
+            descriptors: RegisteredFontDescriptors::from_css(rule),
+        })
+    }
+}
+
 impl RegisteredFontDescriptors {
     pub fn from_css(rule: &lumen_html::css::FontFaceRule) -> Self {
         Self {
@@ -619,6 +652,75 @@ fn apply_canvas_spacing(text: &str, mut run: ShapedRun, options: &CanvasTextOpti
 }
 
 impl FontSet {
+    /// Build an immutable renderer set from platform fallback registrations
+    /// and one generation-tagged document font snapshot. CSS faces must be
+    /// resolved by the host without initiating loads; manual faces are
+    /// included only after successful decoding. Decoded `FontFace` bytes stay
+    /// shared through `Arc` across sets and registrations.
+    pub fn from_font_registry_snapshot(
+        fallback: &[FontRegistration],
+        css_rules: &[lumen_html::css::FontFaceRule],
+        resolved_css_faces: &[Option<Arc<FontFace>>],
+        manual_faces: &[ManualFontFace],
+    ) -> Result<Self, &'static str> {
+        if css_rules.len() != resolved_css_faces.len() {
+            return Err("CSS font rules need matching resolved faces");
+        }
+        let loaded_css_count = resolved_css_faces.iter().filter(|face| face.is_some()).count();
+        let loaded_manual_count = manual_faces
+            .iter()
+            .filter(|face| face.status == FontFaceStatus::Loaded && face.decoded.is_some())
+            .count();
+        let capacity = fallback
+            .len()
+            .checked_add(loaded_css_count)
+            .and_then(|capacity| capacity.checked_add(loaded_manual_count))
+            .ok_or("too many registered fonts")?;
+        if capacity > MAX_REGISTERED_FONTS {
+            return Err("too many registered fonts");
+        }
+
+        let mut registrations = Vec::new();
+        registrations
+            .try_reserve_exact(capacity)
+            .map_err(|_| "font registration allocation failed")?;
+        registrations.extend_from_slice(fallback);
+        for (rule, face) in css_rules.iter().zip(resolved_css_faces) {
+            if let Some(face) = face {
+                registrations.push(FontRegistration::from_css_rule(rule, face.clone())?);
+            }
+        }
+        for manual in manual_faces {
+            if manual.rule.identity.as_ref() != Some(&manual.identity) {
+                return Err("manual font registration identity does not match its descriptor");
+            }
+            if manual.status == FontFaceStatus::Loaded {
+                if let Some(face) = manual.decoded.clone() {
+                    registrations.push(FontRegistration::from_css_rule(&manual.rule, face)?);
+                }
+            }
+        }
+
+        let mut fonts = Vec::new();
+        let mut unicode_ranges = Vec::new();
+        let mut descriptors = Vec::new();
+        fonts
+            .try_reserve_exact(registrations.len())
+            .map_err(|_| "font registration allocation failed")?;
+        unicode_ranges
+            .try_reserve_exact(registrations.len())
+            .map_err(|_| "font registration allocation failed")?;
+        descriptors
+            .try_reserve_exact(registrations.len())
+            .map_err(|_| "font registration allocation failed")?;
+        for registration in registrations {
+            fonts.push(registration.font);
+            unicode_ranges.push(registration.unicode_range);
+            descriptors.push(registration.descriptors);
+        }
+        Self::new_with_unicode_ranges_and_descriptors(fonts, unicode_ranges, descriptors)
+    }
+
     pub fn new(faces: Vec<RegisteredFont>) -> Result<Self, &'static str> {
         let ranges = alloc::vec![None; faces.len()];
         Self::new_with_unicode_ranges(faces, ranges)
@@ -2407,6 +2509,67 @@ mod tests {
         let overlap =
             include_bytes!("../../../vendor/wuff/tests/fixtures/blocks-overlap-002.woff2");
         assert!(FontFace::new(Arc::from(overlap.as_slice())).is_err());
+    }
+
+    #[test]
+    fn registry_snapshot_builds_loaded_css_and_manual_registrations() {
+        let fallback_set = FontSet::new(vec![registered(
+            "fallback",
+            400,
+            FontStyle::Normal,
+            DEFAULT_FONT_BYTES,
+        )])
+        .unwrap();
+        let fallback = fallback_set.registrations().unwrap();
+        let css_rule = lumen_html::css::parse_font_faces(
+            "@font-face { font-family: Loaded; src: url(loaded.woff2); font-weight: 300 700; font-stretch: 75% 125%; size-adjust: 110%; unicode-range: U+0041; }",
+        )
+        .unwrap()
+        .remove(0);
+        let decoded = Arc::new(FontFace::new(Arc::from(TEST_FONT_BYTES)).unwrap());
+        let mut manual_rule = lumen_html::css::parse_font_faces(
+            "@font-face { font-family: Manual; src: url(manual.woff2); unicode-range: U+0042; }",
+        )
+        .unwrap()
+        .remove(0);
+        let manual_identity = lumen_html::css::FontFaceIdentity::Manual(7);
+        manual_rule.identity = Some(manual_identity.clone());
+        let manual = ManualFontFace {
+            identity: manual_identity,
+            rule: manual_rule,
+            status: FontFaceStatus::Loaded,
+            decoded: Some(decoded.clone()),
+            byte_length: Some(TEST_FONT_BYTES.len()),
+        };
+        let mut unloaded_rule = manual.rule.clone();
+        let unloaded_identity = lumen_html::css::FontFaceIdentity::Manual(8);
+        unloaded_rule.identity = Some(unloaded_identity.clone());
+        unloaded_rule.family = Arc::from("Unloaded");
+        let unloaded = ManualFontFace {
+            identity: unloaded_identity,
+            rule: unloaded_rule,
+            status: FontFaceStatus::Unloaded,
+            decoded: None,
+            byte_length: None,
+        };
+
+        let set = FontSet::from_font_registry_snapshot(
+            &fallback,
+            &[css_rule],
+            &[Some(decoded)],
+            &[manual, unloaded],
+        )
+        .unwrap();
+        let registrations = set.registrations().unwrap();
+        assert_eq!(registrations.len(), 3);
+        assert_eq!(registrations[0].font.family.as_ref(), "fallback");
+        assert_eq!(registrations[1].font.family.as_ref(), "Loaded");
+        assert_eq!(registrations[1].unicode_range.as_deref().unwrap(), &[(0x41, 0x41)]);
+        assert_eq!(registrations[1].descriptors.weight_range, [300, 700]);
+        assert_eq!(registrations[1].descriptors.stretch_range, [75.0, 125.0]);
+        assert!((registrations[1].descriptors.size_adjust - 1.1).abs() < f32::EPSILON);
+        assert_eq!(registrations[2].font.family.as_ref(), "Manual");
+        assert_eq!(registrations[2].unicode_range.as_deref().unwrap(), &[(0x42, 0x42)]);
     }
 
     #[test]

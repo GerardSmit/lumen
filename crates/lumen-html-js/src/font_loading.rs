@@ -12,7 +12,13 @@ use lumen_html::{
     css::{self, FontFaceDescriptors, FontFaceIdentity, FontFaceRule},
     paint::{FontMetric, FontSpec},
 };
-use lumen_html_text::FontFace;
+pub use lumen_html_text::{FontFaceStatus, ManualFontFace};
+use lumen_html_text::{
+    FontFace, FontLoadRequest, FontProvider, FontRegistration, FontRegistryContext,
+    FontRegistrySnapshot, FontSet, ManualFontFaceState, ManualFontRegistry,
+    ManualFontSource,
+    MAX_MANUAL_FONT_BYTES_PER_FACE,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -20,37 +26,6 @@ use std::{
     sync::Arc,
     task::Poll,
 };
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FontFaceStatus {
-    Unloaded,
-    Loading,
-    Loaded,
-    Error,
-}
-
-impl FontFaceStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Unloaded => "unloaded",
-            Self::Loading => "loading",
-            Self::Loaded => "loaded",
-            Self::Error => "error",
-        }
-    }
-}
-
-/// A currently registered, non-CSS `document.fonts` member for the embedder's
-/// renderer. The full current set is pushed on every membership or load-state
-/// change, in the set's insertion order.
-#[derive(Clone)]
-pub struct ManualFontFace {
-    pub identity: FontFaceIdentity,
-    pub rule: FontFaceRule,
-    pub status: FontFaceStatus,
-    pub decoded: Option<Arc<FontFace>>,
-    pub byte_length: Option<usize>,
-}
 
 /// The embedder supplies bounded resource loading and may expose the same
 /// decoded face to layout. It never parses descriptors or manufactures fonts.
@@ -86,14 +61,21 @@ pub trait FontResourceLoader {
             .map(|face| Poll::Ready(Ok(face)))
     }
 
-    /// Current non-CSS members of `document.fonts`. The adapter updates this
-    /// snapshot on add/delete/clear and when a manual face finishes loading.
+    /// Current non-CSS members of this context's `FontFaceSet`. The adapter
+    /// updates the snapshot on membership and load-state changes.
     fn replace_manual_faces(&self, _faces: &[ManualFontFace]) {}
 
     /// Current non-CSS members in insertion order. Renderers append decoded
     /// entries after the live CSS-connected faces in stylesheet order.
     fn manual_faces(&self) -> Vec<ManualFontFace> {
         Vec::new()
+    }
+
+    /// Receive the context's generation-tagged font view. Existing providers
+    /// keep working through the default bridge while newer renderers can use
+    /// CSS descriptors and generation to rebuild their font snapshots.
+    fn replace_font_registry(&self, snapshot: &FontRegistrySnapshot<'_>) {
+        self.replace_manual_faces(snapshot.manual_faces);
     }
 
     /// Metric of the first available font selected by the embedder's actual
@@ -103,20 +85,25 @@ pub trait FontResourceLoader {
     }
 }
 
-enum FaceSource {
-    Url,
-    Binary(Arc<[u8]>),
-}
+type FaceSource = ManualFontSource;
 
-struct FaceData {
+struct CssFaceData {
     identity: FontFaceIdentity,
     rule: RefCell<FontFaceRule>,
-    descriptor_overrides: RefCell<Vec<(String, String)>>,
-    source: FaceSource,
-    invalid_descriptors: RefCell<HashMap<String, String>>,
     status: Cell<FontFaceStatus>,
     decoded: RefCell<Option<Arc<FontFace>>>,
     error: RefCell<Option<String>>,
+}
+
+enum FaceBacking {
+    Css(CssFaceData),
+    Manual(ManualFontFaceState),
+}
+
+struct FaceData {
+    backing: FaceBacking,
+    descriptor_overrides: RefCell<Vec<(String, String)>>,
+    invalid_descriptors: RefCell<HashMap<String, String>>,
     loaded: Value,
     loaded_deferred: RefCell<Option<Deferred>>,
     realm: Weak<DomRealm>,
@@ -124,24 +111,41 @@ struct FaceData {
 }
 
 impl FaceData {
-    fn new(
+    fn new_css(
         ctx: &mut Ctx,
         realm: &Rc<DomRealm>,
         mut rule: FontFaceRule,
-        source: FaceSource,
         identity: FontFaceIdentity,
     ) -> Rc<Self> {
         rule.identity = Some(identity.clone());
         let deferred = Deferred::new(ctx);
         Rc::new(Self {
-            identity,
-            rule: RefCell::new(rule),
+            backing: FaceBacking::Css(CssFaceData {
+                identity,
+                rule: RefCell::new(rule),
+                status: Cell::new(FontFaceStatus::Unloaded),
+                decoded: RefCell::new(None),
+                error: RefCell::new(None),
+            }),
             descriptor_overrides: RefCell::new(Vec::new()),
-            source,
             invalid_descriptors: RefCell::new(HashMap::new()),
-            status: Cell::new(FontFaceStatus::Unloaded),
-            decoded: RefCell::new(None),
-            error: RefCell::new(None),
+            loaded: deferred.promise(),
+            loaded_deferred: RefCell::new(Some(deferred)),
+            realm: Rc::downgrade(realm),
+            wrapper: RefCell::new(None),
+        })
+    }
+
+    fn new_manual(
+        ctx: &mut Ctx,
+        realm: &Rc<DomRealm>,
+        state: ManualFontFaceState,
+    ) -> Rc<Self> {
+        let deferred = Deferred::new(ctx);
+        Rc::new(Self {
+            backing: FaceBacking::Manual(state),
+            descriptor_overrides: RefCell::new(Vec::new()),
+            invalid_descriptors: RefCell::new(HashMap::new()),
             loaded: deferred.promise(),
             loaded_deferred: RefCell::new(Some(deferred)),
             realm: Rc::downgrade(realm),
@@ -158,7 +162,69 @@ impl FaceData {
     }
 
     fn rule(&self) -> FontFaceRule {
-        self.rule.borrow().clone()
+        match &self.backing {
+            FaceBacking::Css(data) => data.rule.borrow().clone(),
+            FaceBacking::Manual(data) => data.rule(),
+        }
+    }
+
+    fn identity(&self) -> FontFaceIdentity {
+        match &self.backing {
+            FaceBacking::Css(data) => data.identity.clone(),
+            FaceBacking::Manual(data) => data.identity(),
+        }
+    }
+
+    fn source(&self) -> FaceSource {
+        match &self.backing {
+            FaceBacking::Css(_) => FaceSource::Url,
+            FaceBacking::Manual(data) => data.source(),
+        }
+    }
+
+    fn status(&self) -> FontFaceStatus {
+        match &self.backing {
+            FaceBacking::Css(data) => data.status.get(),
+            FaceBacking::Manual(data) => data.status(),
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        match &self.backing {
+            FaceBacking::Css(data) => data.error.borrow().clone(),
+            FaceBacking::Manual(data) => data.error().map(|error| error.to_string()),
+        }
+    }
+
+    fn manual_state(&self) -> Option<&ManualFontFaceState> {
+        match &self.backing {
+            FaceBacking::Css(_) => None,
+            FaceBacking::Manual(state) => Some(state),
+        }
+    }
+
+    fn set_css_rule(&self, rule: FontFaceRule) {
+        if let FaceBacking::Css(data) = &self.backing {
+            *data.rule.borrow_mut() = rule;
+        }
+    }
+
+    fn set_css_status(&self, status: FontFaceStatus) {
+        if let FaceBacking::Css(data) = &self.backing {
+            data.status.set(status);
+        }
+    }
+
+    fn set_css_decoded(&self, decoded: Option<Arc<FontFace>>) {
+        if let FaceBacking::Css(data) = &self.backing {
+            *data.decoded.borrow_mut() = decoded;
+        }
+    }
+
+    fn set_css_error(&self, error: Option<String>) {
+        if let FaceBacking::Css(data) = &self.backing {
+            *data.error.borrow_mut() = error;
+        }
     }
 }
 
@@ -169,18 +235,59 @@ struct Batch {
     base: Option<String>,
 }
 
-#[derive(Default)]
+struct OwnedFontRegistrySnapshot {
+    generation: u64,
+    document_css_faces: Vec<FontFaceRule>,
+    manual_faces: Vec<ManualFontFace>,
+}
+
+struct CanvasFontSetCache {
+    registry_generation: u64,
+    resource_generation: u64,
+    document_base: String,
+    fonts: Rc<FontSet>,
+}
+
 pub(crate) struct FontLoading {
     provider: RefCell<Option<Rc<dyn FontResourceLoader>>>,
     dom_exception_constructor: RefCell<Option<Value>>,
     object_freeze: RefCell<Option<JsFunction>>,
     batches: RefCell<Vec<Batch>>,
     sets: RefCell<Vec<Weak<RefCell<FontFaceSetState>>>>,
-    manual_faces: RefCell<Vec<ManualFontFace>>,
-    next_manual: Cell<u64>,
+    manual_registry: RefCell<ManualFontRegistry>,
+    resource_generation: Cell<u64>,
+    canvas_font_set: RefCell<Option<CanvasFontSetCache>>,
+    pub(crate) canvas_css_key: Cell<Option<(u64, lumen_html::css::MediaEnvironment)>>,
+}
+
+impl Default for FontLoading {
+    fn default() -> Self {
+        Self::new(FontRegistryContext::Document)
+    }
 }
 
 impl FontLoading {
+    pub(crate) fn new(context: FontRegistryContext) -> Self {
+        Self {
+            provider: RefCell::new(None),
+            dom_exception_constructor: RefCell::new(None),
+            object_freeze: RefCell::new(None),
+            batches: RefCell::new(Vec::new()),
+            sets: RefCell::new(Vec::new()),
+            manual_registry: RefCell::new(ManualFontRegistry::new(context)),
+            resource_generation: Cell::new(0),
+            canvas_font_set: RefCell::new(None),
+            canvas_css_key: Cell::new(None),
+        }
+    }
+
+    pub(crate) fn has_live_sets(&self) -> bool {
+        self.sets
+            .borrow()
+            .iter()
+            .any(|state| state.strong_count() != 0)
+    }
+
     pub(crate) fn capture_dom_exception(&self, ctx: &mut Ctx) {
         let global = ctx.global_object();
         if self.dom_exception_constructor.borrow().is_none() {
@@ -205,62 +312,302 @@ impl FontLoading {
     }
 
     pub(crate) fn set_provider(&self, provider: Rc<dyn FontResourceLoader>) {
-        provider.replace_manual_faces(&self.manual_faces.borrow());
         *self.provider.borrow_mut() = Some(provider);
+        self.advance_resource_generation();
+        self.sync_manual_faces();
     }
 
     pub(crate) fn primary_metric(&self, font: &FontSpec, metric: FontMetric) -> Option<f32> {
-        self.provider
-            .borrow()
-            .as_ref()
-            .and_then(|provider| provider.primary_metric(font, metric))
+        let provider = self.provider.borrow().clone()?;
+        provider.primary_metric(font, metric)
     }
 
-    fn allocate_manual_id(&self) -> OpResult<u64> {
-        let next = self.next_manual.get().checked_add(1).ok_or_else(|| {
-            OpError::new("QuotaExceededError", "FontFace identity space exhausted")
-        })?;
-        self.next_manual.set(next);
-        Ok(next)
+    fn invalidate_canvas_font_set(&self) {
+        self.canvas_font_set.borrow_mut().take();
+    }
+
+    fn advance_resource_generation(&self) {
+        self.resource_generation
+            .set(self.resource_generation.get().wrapping_add(1));
+        self.invalidate_canvas_font_set();
     }
 
     fn register_set(&self, state: &Rc<RefCell<FontFaceSetState>>) {
         self.sets.borrow_mut().push(Rc::downgrade(state));
     }
 
-    fn publish_manual_faces(&self, faces: Vec<ManualFontFace>) {
-        *self.manual_faces.borrow_mut() = faces;
-        if let Some(provider) = self.provider.borrow().as_ref() {
-            provider.replace_manual_faces(&self.manual_faces.borrow());
+    fn registry_error(error: &'static str) -> OpError {
+        let name = if error.contains("different registry") {
+            "InvalidModificationError"
+        } else if error.contains("worker") || error.contains("CSS identity") {
+            "InvalidStateError"
+        } else {
+            "QuotaExceededError"
+        };
+        OpError::new(name, error)
+    }
+
+    fn create_manual_face(
+        &self,
+        ctx: &mut Ctx,
+        realm: &Rc<DomRealm>,
+        rule: FontFaceRule,
+        source: FaceSource,
+    ) -> OpResult<Rc<FaceData>> {
+        let state = self
+            .manual_registry
+            .borrow_mut()
+            .create_manual_face(rule, source)
+            .map_err(Self::registry_error)?;
+        self.invalidate_canvas_font_set();
+        Ok(FaceData::new_manual(ctx, realm, state))
+    }
+
+    fn update_manual_rule(
+        &self,
+        face: &FaceData,
+        rule: FontFaceRule,
+    ) -> OpResult<()> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        self.manual_registry
+            .borrow_mut()
+            .update_manual_rule(state, rule)
+            .map_err(Self::registry_error)?;
+        self.invalidate_canvas_font_set();
+        Ok(())
+    }
+
+    fn begin_manual_load(&self, face: &FaceData) -> OpResult<Option<FontLoadRequest>> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        let request = self.manual_registry
+            .borrow_mut()
+            .begin_load(state)
+            .map_err(Self::registry_error)?;
+        if request.is_some() {
+            self.invalidate_canvas_font_set();
         }
+        Ok(request)
+    }
+
+    fn complete_manual_load(
+        &self,
+        face: &FaceData,
+        result: Result<Arc<FontFace>, Arc<str>>,
+    ) -> OpResult<FontFaceStatus> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        let status = self.manual_registry
+            .borrow_mut()
+            .complete_load(state, result)
+            .map_err(Self::registry_error)?;
+        self.invalidate_canvas_font_set();
+        Ok(status)
+    }
+
+    fn fail_manual_face(&self, face: &FaceData, error: String) -> OpResult<()> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        self.manual_registry
+            .borrow_mut()
+            .fail_manual_face(state, Arc::from(error))
+            .map_err(Self::registry_error)?;
+        self.invalidate_canvas_font_set();
+        Ok(())
+    }
+
+    fn add_manual_face(&self, face: &FaceData) -> OpResult<bool> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        let added = self.manual_registry
+            .borrow_mut()
+            .add_manual_face(state)
+            .map_err(Self::registry_error)?;
+        if added {
+            self.invalidate_canvas_font_set();
+        }
+        Ok(added)
+    }
+
+    fn delete_manual_face(&self, face: &FaceData) -> OpResult<bool> {
+        let state = face
+            .manual_state()
+            .ok_or_else(|| OpError::new("InvalidStateError", "CSS font state is not manual"))?;
+        let deleted = self.manual_registry
+            .borrow_mut()
+            .delete_manual_face(state)
+            .map_err(Self::registry_error)?;
+        if deleted {
+            self.invalidate_canvas_font_set();
+        }
+        Ok(deleted)
+    }
+
+    fn clear_manual_faces(&self) -> bool {
+        let cleared = self.manual_registry.borrow_mut().clear_manual_faces();
+        if cleared {
+            self.invalidate_canvas_font_set();
+        }
+        cleared
+    }
+
+    pub(crate) fn replace_document_css_faces(&self, faces: &[FontFaceRule]) -> OpResult<()> {
+        let changed = self
+            .manual_registry
+            .borrow_mut()
+            .replace_document_css_faces(faces)
+            .map_err(Self::registry_error)?;
+        if changed {
+            self.invalidate_canvas_font_set();
+            self.sync_manual_faces();
+        }
+        Ok(())
+    }
+
+    fn manual_member_identities(&self) -> OpResult<Vec<FontFaceIdentity>> {
+        let mut registry = self.manual_registry.borrow_mut();
+        let members = registry.member_identities();
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(members.len())
+            .map_err(|_| OpError::new("QuotaExceededError", "font registry allocation failed"))?;
+        identities.extend_from_slice(members);
+        Ok(identities)
+    }
+
+    pub(crate) fn with_font_registry_snapshot<R>(
+        &self,
+        callback: impl FnOnce(&FontRegistrySnapshot<'_>) -> R,
+    ) -> OpResult<R> {
+        let mut registry = self.manual_registry.borrow_mut();
+        let snapshot = registry.snapshot().map_err(Self::registry_error)?;
+        Ok(callback(&snapshot))
+    }
+
+    pub(crate) fn has_canvas_font_source(&self) -> Result<bool, &'static str> {
+        if self.provider.borrow().is_some() {
+            return Ok(true);
+        }
+        let has_manual_face = self.with_font_registry_snapshot(|snapshot| {
+            snapshot.manual_faces.iter().any(|face| {
+                face.status == FontFaceStatus::Loaded && face.decoded.is_some()
+            })
+        })
+        .map_err(|_| "font registry snapshot failed")?;
+        if !has_manual_face {
+            self.invalidate_canvas_font_set();
+        }
+        Ok(has_manual_face)
+    }
+
+    fn copy_font_registry_snapshot(&self) -> Result<OwnedFontRegistrySnapshot, &'static str> {
+        let mut registry = self.manual_registry.borrow_mut();
+        let snapshot = registry.snapshot().map_err(|_| "font registry allocation failed")?;
+        let mut document_css_faces = Vec::new();
+        document_css_faces
+            .try_reserve_exact(snapshot.document_css_faces.len())
+            .map_err(|_| "font registry allocation failed")?;
+        document_css_faces.extend_from_slice(snapshot.document_css_faces);
+        let mut manual_faces = Vec::new();
+        manual_faces
+            .try_reserve_exact(snapshot.manual_faces.len())
+            .map_err(|_| "font registry allocation failed")?;
+        manual_faces.extend_from_slice(snapshot.manual_faces);
+        Ok(OwnedFontRegistrySnapshot {
+            generation: snapshot.generation,
+            document_css_faces,
+            manual_faces,
+        })
+    }
+
+    /// Return the realm's shared renderer snapshot. Resource callbacks run
+    /// only after the registry borrow has ended, and a cache hit clones only
+    /// the `Rc` handle rather than face data.
+    pub(crate) fn canvas_font_set(
+        &self,
+        fallback: &FontSet,
+        document_base: &str,
+    ) -> Result<Rc<FontSet>, &'static str> {
+        let registry_generation = self
+            .with_font_registry_snapshot(|snapshot| snapshot.generation)
+            .map_err(|_| "font registry snapshot failed")?;
+        let resource_generation = self.resource_generation.get();
+        if let Some(cache) = self.canvas_font_set.borrow().as_ref() {
+            if cache.registry_generation == registry_generation
+                && cache.resource_generation == resource_generation
+                && cache.document_base == document_base
+            {
+                return Ok(cache.fonts.clone());
+            }
+        }
+        self.invalidate_canvas_font_set();
+
+        let snapshot = self.copy_font_registry_snapshot()?;
+        let provider = self.provider.borrow().clone();
+        let mut resolved_css_faces = Vec::new();
+        resolved_css_faces
+            .try_reserve_exact(snapshot.document_css_faces.len())
+            .map_err(|_| "font registry allocation failed")?;
+        for rule in &snapshot.document_css_faces {
+            resolved_css_faces.push(
+                provider
+                    .as_ref()
+                    .and_then(|provider| provider.loaded(rule, document_base)),
+            );
+        }
+        let fallback_registrations = fallback
+            .registrations()
+            .ok_or("fallback font registrations are unavailable")?;
+        let fonts = Rc::new(FontSet::from_font_registry_snapshot(
+            &fallback_registrations,
+            &snapshot.document_css_faces,
+            &resolved_css_faces,
+            &snapshot.manual_faces,
+        )?);
+        let current_registry_generation = self
+            .with_font_registry_snapshot(|snapshot| snapshot.generation)
+            .map_err(|_| "font registry snapshot failed")?;
+        let current_resource_generation = self.resource_generation.get();
+        if current_registry_generation == snapshot.generation
+            && current_resource_generation == resource_generation
+        {
+            let mut key = String::new();
+            key.try_reserve_exact(document_base.len())
+                .map_err(|_| "font registry allocation failed")?;
+            key.push_str(document_base);
+            *self.canvas_font_set.borrow_mut() = Some(CanvasFontSetCache {
+                registry_generation: snapshot.generation,
+                resource_generation,
+                document_base: key,
+                fonts: fonts.clone(),
+            });
+        }
+        Ok(fonts)
     }
 
     pub(crate) fn manual_faces(&self) -> Vec<ManualFontFace> {
-        self.manual_faces.borrow().clone()
+        self.with_font_registry_snapshot(|snapshot| snapshot.manual_faces.to_vec())
+            .unwrap_or_default()
     }
 
     fn sync_manual_faces(&self) {
-        let mut faces = Vec::new();
-        let mut sets = self.sets.borrow_mut();
-        sets.retain(|weak| {
-            let Some(state) = weak.upgrade() else {
-                return false;
-            };
-            let state = state.borrow();
-            faces.extend(state.manual.iter().map(|(data, _)| ManualFontFace {
-                identity: data.identity.clone(),
-                rule: data.rule(),
-                status: data.status.get(),
-                decoded: data.decoded.borrow().clone(),
-                byte_length: match &data.source {
-                    FaceSource::Binary(bytes) => Some(bytes.len()),
-                    FaceSource::Url => None,
-                },
-            }));
-            true
+        let Some(provider) = self.provider.borrow().clone() else {
+            return;
+        };
+        let Ok(snapshot) = self.copy_font_registry_snapshot() else {
+            return;
+        };
+        provider.replace_font_registry(&FontRegistrySnapshot {
+            generation: snapshot.generation,
+            document_css_faces: &snapshot.document_css_faces,
+            manual_faces: &snapshot.manual_faces,
         });
-        drop(sets);
-        self.publish_manual_faces(faces);
     }
 
     fn notify_started(&self, ctx: &mut Ctx, face: &Rc<FaceData>) {
@@ -286,6 +633,9 @@ impl FontLoading {
             true
         });
         drop(sets);
+        if face.manual_state().is_none() {
+            self.advance_resource_generation();
+        }
         self.sync_manual_faces();
     }
 
@@ -301,11 +651,36 @@ impl FontLoading {
             let mut pending = false;
             let mut changed = false;
             for (face, value) in batch.faces.iter().zip(&batch.values) {
+                let prior_status = face.status();
                 if matches!(
-                    face.status.get(),
+                    prior_status,
                     FontFaceStatus::Unloaded | FontFaceStatus::Loading
                 ) {
-                    if face.status.replace(FontFaceStatus::Loading) != FontFaceStatus::Loading {
+                    let source = if face.manual_state().is_some() {
+                        match self.begin_manual_load(face) {
+                            Ok(Some(request)) => request.source,
+                            Ok(None) => face.source(),
+                            Err(error) => {
+                                let message = format!("{error:?}");
+                                let _ = self.fail_manual_face(face, message.clone());
+                                if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                                    deferred.reject(
+                                        ctx,
+                                        OpError::new("NetworkError", message.clone()),
+                                    );
+                                }
+                                failure = Some(message);
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    } else {
+                        if prior_status == FontFaceStatus::Unloaded {
+                            face.set_css_status(FontFaceStatus::Loading);
+                        }
+                        face.source()
+                    };
+                    if prior_status == FontFaceStatus::Unloaded {
                         self.notify_started(ctx, face);
                         changed = true;
                     }
@@ -314,10 +689,10 @@ impl FontLoading {
                     let result = if let Some(message) = invalid_descriptor {
                         Err(("SyntaxError", message))
                     } else {
-                        match &face.source {
+                        match &source {
                             FaceSource::Binary(bytes) => FontFace::new(bytes.clone())
                                 .and_then(|font| {
-                                    let rule = face.rule();
+                            let rule = face.rule();
                                     font.with_metric_overrides(
                                         rule.ascent_override,
                                         rule.descent_override,
@@ -345,18 +720,49 @@ impl FontLoading {
                     };
                     match result {
                         Ok(decoded) => {
-                            changed = true;
-                            *face.decoded.borrow_mut() = Some(decoded);
-                            face.status.set(FontFaceStatus::Loaded);
-                            if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
-                                deferred.resolve(ctx, value.clone());
+                            let manual = face.manual_state().is_some();
+                            if manual {
+                                if let Err(error) = self.complete_manual_load(face, Ok(decoded.clone())) {
+                                    let message = format!("{error:?}");
+                                    let _ = self.fail_manual_face(face, message);
+                                }
+                            } else {
+                                face.set_css_decoded(Some(decoded));
+                                face.set_css_status(FontFaceStatus::Loaded);
                             }
-                            self.notify_completed(face, true);
+                            changed = true;
+                            if face.status() == FontFaceStatus::Loaded {
+                                if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                                    deferred.resolve(ctx, value.clone());
+                                }
+                                self.notify_completed(face, true);
+                            } else {
+                                let message = face
+                                    .error()
+                                    .unwrap_or_else(|| "manual font byte budget exceeded".into());
+                                failure = Some(message.clone());
+                                if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                                    deferred.reject(ctx, OpError::new("NetworkError", message));
+                                }
+                                self.notify_completed(face, false);
+                            }
                         }
                         Err((name, message)) => {
                             changed = true;
-                            *face.error.borrow_mut() = Some(message.clone());
-                            face.status.set(FontFaceStatus::Error);
+                            if face.manual_state().is_some() {
+                                if self
+                                    .complete_manual_load(
+                                        face,
+                                        Err(Arc::<str>::from(message.as_str())),
+                                    )
+                                    .is_err()
+                                {
+                                    let _ = self.fail_manual_face(face, message.clone());
+                                }
+                            } else {
+                                face.set_css_error(Some(message.clone()));
+                                face.set_css_status(FontFaceStatus::Error);
+                            }
                             if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
                                 let error = if name == "SyntaxError" {
                                     font_dom_exception(ctx, Some(self), name, &message)
@@ -369,8 +775,8 @@ impl FontLoading {
                         }
                     }
                 }
-                if face.status.get() == FontFaceStatus::Error {
-                    failure = face.error.borrow().clone();
+                if face.status() == FontFaceStatus::Error {
+                    failure = face.error();
                 }
             }
             count += usize::from(changed);
@@ -508,11 +914,11 @@ fn descriptor_entries(ctx: &mut Ctx, value: Option<Value>) -> OpResult<Vec<(Stri
 }
 
 fn update_rule_descriptor(data: &FaceData, name: &str, value: &str, ctx: &mut Ctx) -> OpResult<()> {
-    let identity = data.identity.clone();
+    let identity = data.identity();
     let realm = data.realm.upgrade();
     let font_loading = realm.as_deref().map(|realm| &realm.font_loading);
     let (new, descriptors, canonical) = {
-        let old = data.rule.borrow();
+        let old = data.rule();
         let mut descriptors = old.descriptors.clone();
         descriptors
             .set(name, value)
@@ -549,7 +955,15 @@ fn update_rule_descriptor(data: &FaceData, name: &str, value: &str, ctx: &mut Ct
         None
     };
 
-    *data.rule.borrow_mut() = new;
+    if let Some(realm) = &realm {
+        if matches!(&identity, FontFaceIdentity::Css(_)) {
+            data.set_css_rule(new);
+        } else {
+            realm.font_loading.update_manual_rule(data, new)?;
+        }
+    } else if matches!(&identity, FontFaceIdentity::Css(_)) {
+        data.set_css_rule(new);
+    }
     {
         let mut overrides = data.descriptor_overrides.borrow_mut();
         overrides.retain(|(old_name, _)| old_name != name);
@@ -588,7 +1002,7 @@ fn descriptor_value(data: &FaceData, name: &str) -> String {
         return String::new();
     }
     drop(invalid);
-    data.rule.borrow().descriptors.get(name).unwrap_or_default()
+    data.rule().descriptors.get(name).unwrap_or_default()
 }
 
 fn set_descriptor_value(data: &FaceData, name: &str, ctx: &mut Ctx, value: &str) -> OpResult<()> {
@@ -597,9 +1011,9 @@ fn set_descriptor_value(data: &FaceData, name: &str, ctx: &mut Ctx, value: &str)
 
 fn create_css_face(ctx: &mut Ctx, realm: &Rc<DomRealm>, rule: FontFaceRule) -> Rc<FaceData> {
     let identity = rule.identity.clone().unwrap_or_else(|| {
-        FontFaceIdentity::Manual(realm.font_loading.allocate_manual_id().unwrap_or(0))
+        FontFaceIdentity::Manual(0)
     });
-    FaceData::new(ctx, realm, rule, FaceSource::Url, identity)
+    FaceData::new_css(ctx, realm, rule, identity)
 }
 
 fn ensure_face_wrapper(ctx: &mut Ctx, face: &Rc<FaceData>) -> Value {
@@ -627,9 +1041,13 @@ impl DomFontFace {
         descriptors: Option<Value>,
     ) -> OpResult<Self> {
         let realm = active_realm(ctx)?;
-        let id = realm.font_loading.allocate_manual_id()?;
+        let loading = &realm.font_loading;
+        let base = realm.base_url();
         let entries = descriptor_entries(ctx, descriptors)?;
         let bytes = ctx.buffer_source_bytes(&source);
+        let oversized_binary = bytes
+            .as_ref()
+            .is_some_and(|bytes| bytes.len() > MAX_MANUAL_FONT_BYTES_PER_FACE);
         let source_text = if bytes.is_some() {
             None
         } else {
@@ -640,7 +1058,7 @@ impl DomFontFace {
             )
         };
         let mut descriptors = FontFaceDescriptors::parse(&family, &[])
-            .map_err(|error| css_syntax_error(ctx, Some(&realm.font_loading), error))?;
+            .map_err(|error| css_syntax_error(ctx, Some(&loading), error))?;
         let mut invalid_descriptors = HashMap::new();
         for (name, value) in &entries {
             if let Err(error) = descriptors.set(name, value) {
@@ -664,35 +1082,35 @@ impl DomFontFace {
                 );
             }
         }
-        let base = realm.base_url();
-        let mut rule = descriptors.to_rule(Some(Arc::from(base)));
-        let identity = FontFaceIdentity::Manual(id);
-        rule.identity = Some(identity.clone());
-        let data = FaceData::new(
-            ctx,
-            &realm,
-            rule,
+        let rule = descriptors.to_rule(Some(Arc::from(base.clone())));
+        let source = if oversized_binary {
+            FaceSource::Url
+        } else {
             bytes.map_or(FaceSource::Url, |bytes| {
                 FaceSource::Binary(Arc::from(bytes))
-            }),
-            identity,
-        );
+            })
+        };
+        let initial_error = invalid_descriptors.values().next().cloned();
+        let data = loading.create_manual_face(ctx, &realm, rule, source)?;
         *data.invalid_descriptors.borrow_mut() = invalid_descriptors;
+        if oversized_binary {
+            data.invalid_descriptors
+                .borrow_mut()
+                .insert("__fontTooLarge".into(), "font too large".into());
+        }
         data.set_wrapper(ctx, &this.0);
-        if let Some(message) = data.invalid_descriptors.borrow().values().next().cloned() {
-            data.status.set(FontFaceStatus::Error);
-            *data.error.borrow_mut() = Some(message.clone());
+        if let Some(message) = initial_error {
+            loading.fail_manual_face(&data, message.clone())?;
             if let Some(deferred) = data.loaded_deferred.borrow_mut().take() {
-                let error =
-                    font_dom_exception(ctx, Some(&realm.font_loading), "SyntaxError", &message);
+                let error = font_dom_exception(ctx, Some(&loading), "SyntaxError", &message);
                 deferred.reject(ctx, error);
             }
-        } else if matches!(&data.source, FaceSource::Binary(_)) {
-            realm.font_loading.batches.borrow_mut().push(Batch {
+        } else if oversized_binary || matches!(data.source(), FaceSource::Binary(_)) {
+            loading.batches.borrow_mut().push(Batch {
                 faces: vec![data.clone()],
                 values: vec![this.0.clone()],
                 promise: None,
-                base: Some(realm.base_url()),
+                base: Some(base),
             });
         }
         Ok(Self { data })
@@ -700,12 +1118,11 @@ impl DomFontFace {
 
     #[getter]
     fn family(&self) -> String {
-        self.data
-            .rule
-            .borrow()
+        let rule = self.data.rule();
+        rule
             .descriptors
             .get("family")
-            .unwrap_or_else(|| self.data.rule.borrow().family.to_string())
+            .unwrap_or_else(|| rule.family.to_string())
     }
 
     #[setter(coerce)]
@@ -721,27 +1138,33 @@ impl DomFontFace {
     fn load(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
         // BufferSource faces begin their decode in the constructor's queued
         // task. FontFace.load() only starts URL-backed faces.
-        if matches!(&self.data.source, FaceSource::Binary(_)) {
+        if matches!(self.data.source(), FaceSource::Binary(_)) {
             return Ok(self.data.loaded.clone());
         }
-        if self.data.status.get() == FontFaceStatus::Unloaded {
+        if self.data.status() == FontFaceStatus::Unloaded {
             let realm = self.data.realm.upgrade().ok_or_else(|| {
                 OpError::new("InvalidStateError", "font document is no longer available")
             })?;
+            let loading = &realm.font_loading;
             let value = this.0;
             self.data.set_wrapper(ctx, &value);
-            self.data.status.set(FontFaceStatus::Loading);
-            realm.font_loading.notify_started(ctx, &self.data);
-            realm
-                .font_loading
-                .enqueue_load(ctx, vec![(self.data.clone(), value)], None);
+            let started = if self.data.manual_state().is_some() {
+                loading.begin_manual_load(&self.data)?.is_some()
+            } else {
+                self.data.set_css_status(FontFaceStatus::Loading);
+                true
+            };
+            if started {
+                loading.notify_started(ctx, &self.data);
+                loading.enqueue_load(ctx, vec![(self.data.clone(), value)], None);
+            }
         }
         Ok(self.data.loaded.clone())
     }
 
     #[getter]
     fn status(&self) -> &'static str {
-        self.data.status.get().as_str()
+        self.data.status().as_str()
     }
 
     #[getter]
@@ -868,7 +1291,11 @@ struct FontFaceSetState {
     owner: Option<WeakValue>,
     css: HashMap<FontFaceIdentity, (Rc<FaceData>, Value)>,
     css_order: Vec<FontFaceIdentity>,
-    manual: Vec<(Rc<FaceData>, Value)>,
+    css_sync_key: Option<(u64, lumen_html::css::MediaEnvironment)>,
+    // Strong JavaScript roots for registry members. The shared registry owns
+    // membership and insertion order; this map exists only to keep wrappers
+    // alive while the set contains them.
+    manual_roots: HashMap<FontFaceIdentity, (Rc<FaceData>, Value)>,
     member_order: HashMap<FontFaceIdentity, u64>,
     next_member_order: u64,
     status: bool,
@@ -887,7 +1314,8 @@ impl FontFaceSetState {
             owner: None,
             css: HashMap::new(),
             css_order: Vec::new(),
-            manual: Vec::new(),
+            css_sync_key: None,
+            manual_roots: HashMap::new(),
             member_order: HashMap::new(),
             next_member_order: 0,
             status: false,
@@ -924,33 +1352,25 @@ impl FontFaceSetState {
     }
 
     fn contains(&self, identity: &FontFaceIdentity) -> bool {
-        self.css.contains_key(identity)
-            || self
-                .manual
-                .iter()
-                .any(|(data, _)| &data.identity == identity)
+        self.css.contains_key(identity) || self.manual_roots.contains_key(identity)
     }
 
     fn find_value(&self, identity: &FontFaceIdentity) -> Option<Value> {
         self.css
             .get(identity)
             .map(|(_, value)| value.clone())
-            .or_else(|| {
-                self.manual
-                    .iter()
-                    .find(|(face, _)| &face.identity == identity)
-                    .map(|(_, value)| value.clone())
-            })
+            .or_else(|| self.manual_roots.get(identity).map(|(_, value)| value.clone()))
     }
 
     fn face_started(&mut self, ctx: &mut Ctx, face: &Rc<FaceData>) {
-        if !self.contains(&face.identity) {
+        let identity = face.identity();
+        if !self.contains(&identity) {
             return;
         }
-        let Some(value) = self.find_value(&face.identity) else {
+        let Some(value) = self.find_value(&identity) else {
             return;
         };
-        self.pending.insert(face.identity.clone(), value);
+        self.pending.insert(identity, value);
         if !self.status {
             self.status = true;
             self.initial_layout_pending = false;
@@ -977,13 +1397,14 @@ impl FontFaceSetState {
     }
 
     fn face_completed(&mut self, face: &Rc<FaceData>, success: bool) {
-        if !self.contains(&face.identity) {
+        let identity = face.identity();
+        if !self.contains(&identity) {
             return;
         }
         let value = self
             .pending
-            .remove(&face.identity)
-            .or_else(|| self.find_value(&face.identity));
+            .remove(&identity)
+            .or_else(|| self.find_value(&identity));
         if let Some(value) = value {
             let entries = if success {
                 &mut self.succeeded
@@ -997,22 +1418,29 @@ impl FontFaceSetState {
         self.lifecycle_queued = false;
     }
 
-    fn ordered(&self) -> Vec<(Rc<FaceData>, Value)> {
+    fn ordered(&self, manual_members: &[FontFaceIdentity]) -> Vec<(Rc<FaceData>, Value)> {
         let mut entries = self
             .css_order
             .iter()
             .filter_map(|identity| self.css.get(identity).cloned())
             .collect::<Vec<_>>();
-        entries.extend(self.manual.iter().cloned());
+        entries.extend(
+            manual_members
+                .iter()
+                .filter_map(|identity| self.manual_roots.get(identity).cloned()),
+        );
         entries
     }
 
-    fn ordered_with_order(&mut self) -> Vec<(u64, Rc<FaceData>, Value)> {
-        let entries = self.ordered();
+    fn ordered_with_order(
+        &mut self,
+        manual_members: &[FontFaceIdentity],
+    ) -> Vec<(u64, Rc<FaceData>, Value)> {
+        let entries = self.ordered(manual_members);
         entries
             .into_iter()
             .map(|(face, value)| {
-                let order = self.register_member(&face.identity);
+                let order = self.register_member(&face.identity());
                 (order, face, value)
             })
             .collect()
@@ -1071,7 +1499,8 @@ impl DomFontFaceSet {
     fn snapshot_entries(&self, ctx: &mut Ctx) -> OpResult<Vec<(Rc<FaceData>, Value)>> {
         let realm = self.realm()?;
         self.sync_css(ctx, &realm)?;
-        Ok(self.state.borrow().ordered())
+        let manual_members = realm.font_loading.manual_member_identities()?;
+        Ok(self.state.borrow().ordered(&manual_members))
     }
 
     fn publish_manual_snapshot(&self) {
@@ -1088,12 +1517,23 @@ impl DomFontFaceSet {
         value: Value,
     ) {
         if matches!(
-            face.status.get(),
+            face.status(),
             FontFaceStatus::Loaded | FontFaceStatus::Error
         ) {
             return;
         }
-        if face.status.get() == FontFaceStatus::Unloaded {
+        if face.status() == FontFaceStatus::Unloaded {
+            if !face.invalid_descriptors.borrow().is_empty() {
+                if face.manual_state().is_some() {
+                    if realm.font_loading.begin_manual_load(&face).ok().flatten().is_none() {
+                        return;
+                    }
+                } else {
+                    face.set_css_status(FontFaceStatus::Loading);
+                }
+                realm.font_loading.notify_started(ctx, &face);
+                return;
+            }
             let cached = realm
                 .font_loading
                 .provider
@@ -1101,17 +1541,52 @@ impl DomFontFaceSet {
                 .as_ref()
                 .and_then(|provider| provider.loaded(&face.rule(), &realm.base_url()));
             if let Some(decoded) = cached {
-                face.status.set(FontFaceStatus::Loading);
-                realm.font_loading.notify_started(ctx, &face);
-                *face.decoded.borrow_mut() = Some(decoded);
-                face.status.set(FontFaceStatus::Loaded);
-                if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
-                    deferred.resolve(ctx, value.clone());
+                if face.manual_state().is_some() {
+                    if realm.font_loading.begin_manual_load(&face).ok().flatten().is_none() {
+                        return;
+                    }
+                } else {
+                    face.set_css_status(FontFaceStatus::Loading);
                 }
-                realm.font_loading.notify_completed(&face, true);
+                realm.font_loading.notify_started(ctx, &face);
+                if face.manual_state().is_some() {
+                    if realm
+                        .font_loading
+                        .complete_manual_load(&face, Ok(decoded))
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else {
+                    face.set_css_decoded(Some(decoded));
+                    face.set_css_status(FontFaceStatus::Loaded);
+                }
+                if face.status() == FontFaceStatus::Loaded {
+                    if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                        deferred.resolve(ctx, value.clone());
+                    }
+                    realm.font_loading.notify_completed(&face, true);
+                } else {
+                    if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                        deferred.reject(
+                            ctx,
+                            OpError::new(
+                                "NetworkError",
+                                face.error().unwrap_or_else(|| "font load failed".into()),
+                            ),
+                        );
+                    }
+                    realm.font_loading.notify_completed(&face, false);
+                }
                 return;
             }
-            face.status.set(FontFaceStatus::Loading);
+            if face.manual_state().is_some() {
+                if realm.font_loading.begin_manual_load(&face).ok().flatten().is_none() {
+                    return;
+                }
+            } else {
+                face.set_css_status(FontFaceStatus::Loading);
+            }
             realm.font_loading.notify_started(ctx, &face);
         }
     }
@@ -1132,12 +1607,25 @@ impl DomFontFaceSet {
 fn sync_css_state(
     ctx: &mut Ctx,
     realm: &Rc<DomRealm>,
-    state: &Rc<RefCell<FontFaceSetState>>,
+    set: &Rc<RefCell<FontFaceSetState>>,
 ) -> OpResult<()> {
+    let state = set;
+    let key = {
+        let mut session = realm.session.borrow_mut();
+        let generation = session.font_face_generation().map_err(|error| {
+            OpError::new("InvalidStateError", format!("font stylesheet: {error:?}"))
+        })?;
+        (generation, session.media_environment())
+    };
+    if state.borrow().css_sync_key == Some(key) {
+        return Ok(());
+    }
     let rules = DomFontFaceSet::descriptors(realm)?;
     let mut state = state.borrow_mut();
-    let mut order = Vec::with_capacity(rules.len());
-    let mut next = HashMap::with_capacity(rules.len());
+    let mut order = Vec::new();
+    order
+        .try_reserve_exact(rules.len())
+        .map_err(|_| OpError::new("QuotaExceededError", "font registry allocation failed"))?;
     for rule in rules {
         let identity = rule.identity.clone().ok_or_else(|| {
             OpError::new(
@@ -1145,52 +1633,57 @@ fn sync_css_state(
                 "CSS font face is missing its stable identity",
             )
         })?;
-        let (face, value) = if let Some((face, value)) = state.css.remove(&identity) {
-            let mut rule = rule.clone();
+        if let Some((face, _)) = state.css.get(&identity) {
+            let mut rule = rule;
             for (name, value) in face.descriptor_overrides.borrow().iter() {
                 if let Err(error) = rule.descriptors.set(name, value) {
                     return Err(css_syntax_error(ctx, Some(&realm.font_loading), error));
                 }
             }
-            *face.rule.borrow_mut() = rule;
-            (face, value)
+            face.set_css_rule(rule);
         } else {
-            let face = create_css_face(ctx, realm, rule.clone());
+            let face = create_css_face(ctx, realm, rule);
             let value = ensure_face_wrapper(ctx, &face);
-            (face, value)
-        };
+            state.css.insert(identity.clone(), (face, value));
+        }
         state.register_member(&identity);
-        order.push(identity.clone());
-        next.insert(identity, (face, value));
+        order.push(identity);
     }
-    let live = next
-        .keys()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    let removed = state
-        .css
-        .keys()
-        .filter(|identity| !live.contains(*identity))
-        .cloned()
-        .filter_map(|identity| {
+    if state.css.len() > order.len() {
+        let live = order
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let removed = state
+            .css
+            .iter()
+            .filter(|(identity, _)| !live.contains(*identity))
+            .map(|(identity, (_, value))| (identity.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        for (identity, removed_value) in removed {
+            state.css.remove(&identity);
+            state.pending.remove(&identity);
             state
-                .css
-                .get(&identity)
-                .map(|(_, value)| (identity, value.clone()))
-        })
-        .collect::<Vec<_>>();
-    state.css = next;
-    state.css_order = order;
-    for (identity, removed_value) in removed {
-        state.pending.remove(&identity);
-        state
-            .succeeded
-            .retain(|item| !same_js_value(item, &removed_value));
-        state
-            .failed
-            .retain(|item| !same_js_value(item, &removed_value));
-        state.member_order.remove(&identity);
+                .succeeded
+                .retain(|item| !same_js_value(item, &removed_value));
+            state
+                .failed
+                .retain(|item| !same_js_value(item, &removed_value));
+            state.member_order.remove(&identity);
+        }
     }
+    state.css_order = order;
+    let mut css_faces = Vec::new();
+    css_faces
+        .try_reserve_exact(state.css_order.len())
+        .map_err(|_| OpError::new("QuotaExceededError", "font registry allocation failed"))?;
+    css_faces.extend(state.css_order.iter().filter_map(|identity| {
+        state.css.get(identity).map(|(face, _)| face.rule())
+    }));
+    drop(state);
+    realm.font_loading.replace_document_css_faces(&css_faces)?;
+    realm.font_loading.canvas_css_key.set(Some(key));
+    set.borrow_mut().css_sync_key = Some(key);
     Ok(())
 }
 
@@ -1201,8 +1694,9 @@ fn next_live_entry(
     seen: &mut std::collections::HashSet<u64>,
 ) -> OpResult<Option<(u64, Value)>> {
     sync_css_state(ctx, realm, state)?;
+    let manual_members = realm.font_loading.manual_member_identities()?;
     let mut state = state.borrow_mut();
-    for (generation, _face, value) in state.ordered_with_order() {
+    for (generation, _face, value) in state.ordered_with_order(&manual_members) {
         if seen.insert(generation) {
             return Ok(Some((generation, value)));
         }
@@ -1238,13 +1732,15 @@ impl DomFontFaceSet {
 
     fn has(&self, ctx: &mut Ctx, face: Value) -> OpResult<bool> {
         let identity = ctx
-            .with_instance::<DomFontFace, _>(&face, |face| face.data.identity.clone())
+            .with_instance::<DomFontFace, _>(&face, |face| face.data.identity())
             .ok();
         let Some(identity) = identity else {
             return Ok(false);
         };
-        let _ = self.snapshot_entries(ctx)?;
-        Ok(self.state.borrow().contains(&identity))
+        Ok(self
+            .snapshot_entries(ctx)?
+            .iter()
+            .any(|(face, _)| face.identity() == identity))
     }
 
     fn add(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>, face: Value) -> OpResult<Value> {
@@ -1252,7 +1748,8 @@ impl DomFontFaceSet {
             .with_instance::<DomFontFace, _>(&face, |face| face.data.clone())
             .map_err(|_| OpError::type_error("FontFaceSet.add requires a FontFace"))?;
         let realm = self.realm()?;
-        if matches!(data.identity, FontFaceIdentity::Css(_)) {
+        let identity = data.identity();
+        if matches!(identity, FontFaceIdentity::Css(_)) {
             return Err(font_dom_exception(
                 ctx,
                 Some(&realm.font_loading),
@@ -1272,16 +1769,20 @@ impl DomFontFaceSet {
         }
         {
             let mut state = self.state.borrow_mut();
-            if !state
-                .manual
-                .iter()
-                .any(|(existing, _)| Rc::ptr_eq(existing, &data))
-            {
-                state.manual.push((data.clone(), face.clone()));
-                state.register_member(&data.identity);
+            if !state.manual_roots.contains_key(&identity) {
+                state
+                    .manual_roots
+                    .try_reserve(1)
+                    .map_err(|_| OpError::new("QuotaExceededError", "font set allocation failed"))?;
             }
+            realm.font_loading.add_manual_face(&data)?;
+            state
+                .manual_roots
+                .entry(identity.clone())
+                .or_insert_with(|| (data.clone(), face.clone()));
+            state.register_member(&identity);
         }
-        if data.status.get() == FontFaceStatus::Loading {
+        if data.status() == FontFaceStatus::Loading {
             self.state.borrow_mut().face_started(ctx, &data);
         }
         self.publish_manual_snapshot();
@@ -1289,26 +1790,28 @@ impl DomFontFaceSet {
     }
 
     fn delete(&self, ctx: &mut Ctx, face: Value) -> OpResult<bool> {
-        let identity = ctx
-            .with_instance::<DomFontFace, _>(&face, |face| face.data.identity.clone())
+        let data = ctx
+            .with_instance::<DomFontFace, _>(&face, |face| face.data.clone())
             .ok();
-        let Some(identity) = identity else {
+        let Some(data) = data else {
             return Ok(false);
         };
         let _ = self.snapshot_entries(ctx)?;
+        let identity = data.identity();
         if matches!(identity, FontFaceIdentity::Css(_)) {
             return Ok(false);
         }
+        let realm = self.realm()?;
+        let Some(face_realm) = data.realm.upgrade() else {
+            return Ok(false);
+        };
+        if !Rc::ptr_eq(&realm, &face_realm) {
+            return Ok(false);
+        }
+        let removed = realm.font_loading.delete_manual_face(&data)?;
         let mut state = self.state.borrow_mut();
-        let removed_value = state
-            .manual
-            .iter()
-            .find(|(data, _)| data.identity == identity)
-            .map(|(_, value)| value.clone());
-        let length = state.manual.len();
-        state.manual.retain(|(data, _)| data.identity != identity);
-        let removed = state.manual.len() != length;
-        if removed {
+        let removed_value = state.manual_roots.remove(&identity).map(|(_, value)| value);
+        if removed || removed_value.is_some() {
             state.member_order.remove(&identity);
             state.pending.remove(&identity);
             if let Some(value) = removed_value {
@@ -1325,15 +1828,12 @@ impl DomFontFaceSet {
 
     fn clear(&self, ctx: &mut Ctx) -> OpResult<()> {
         let _ = self.snapshot_entries(ctx)?;
+        let realm = self.realm()?;
+        realm.font_loading.clear_manual_faces();
         {
             let mut state = self.state.borrow_mut();
-            let identities = state
-                .manual
-                .iter()
-                .map(|(face, value)| (face.identity.clone(), value.clone()))
-                .collect::<Vec<_>>();
-            state.manual.clear();
-            for (identity, value) in identities {
+            let roots = std::mem::take(&mut state.manual_roots);
+            for (identity, (_, value)) in roots {
                 state.member_order.remove(&identity);
                 state.pending.remove(&identity);
                 state.succeeded.retain(|item| !same_js_value(item, &value));
@@ -1370,10 +1870,11 @@ impl DomFontFaceSet {
         let base = realm.base_url();
         Ok(indices.into_iter().all(|index| {
             let face = &faces[index].0;
-            face.status.get() == FontFaceStatus::Loaded
-                || provider
-                    .as_ref()
-                    .is_some_and(|provider| provider.loaded(&rules[index], &base).is_some())
+            face.status() == FontFaceStatus::Loaded
+                || face.invalid_descriptors.borrow().is_empty()
+                    && provider
+                        .as_ref()
+                        .is_some_and(|provider| provider.loaded(&rules[index], &base).is_some())
         }))
     }
 
@@ -1698,10 +2199,18 @@ impl FontLoading {
                 continue;
             };
             sync_css_state(ctx, &realm, state)?;
+            let manual_members = self.manual_member_identities()?;
             let base = realm.base_url();
-            let entries = state.borrow().ordered().into_iter().collect::<Vec<_>>();
+            let entries = state
+                .borrow()
+                .ordered(&manual_members)
+                .into_iter()
+                .collect::<Vec<_>>();
             for (face, value) in entries {
-                if face.status.get() != FontFaceStatus::Unloaded {
+                if face.status() != FontFaceStatus::Unloaded {
+                    continue;
+                }
+                if !face.invalid_descriptors.borrow().is_empty() {
                     continue;
                 }
                 let Some(result) = provider
@@ -1710,18 +2219,38 @@ impl FontLoading {
                 else {
                     continue;
                 };
-                face.status.set(FontFaceStatus::Loading);
+                if face.manual_state().is_some() {
+                    if self.begin_manual_load(&face)?.is_none() {
+                        continue;
+                    }
+                } else {
+                    face.set_css_status(FontFaceStatus::Loading);
+                }
                 self.notify_started(ctx, &face);
                 let Poll::Ready(Ok(decoded)) = result else {
                     self.enqueue_load(ctx, vec![(face, value)], None);
                     continue;
                 };
-                *face.decoded.borrow_mut() = Some(decoded);
-                face.status.set(FontFaceStatus::Loaded);
-                if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
-                    deferred.resolve(ctx, value);
+                if face.manual_state().is_some() {
+                    self.complete_manual_load(&face, Ok(decoded))?;
+                } else {
+                    face.set_css_decoded(Some(decoded));
+                    face.set_css_status(FontFaceStatus::Loaded);
                 }
-                self.notify_completed(&face, true);
+                if face.status() == FontFaceStatus::Loaded {
+                    if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                        deferred.resolve(ctx, value);
+                    }
+                    self.notify_completed(&face, true);
+                } else {
+                    let message = face
+                        .error()
+                        .unwrap_or_else(|| "manual font byte budget exceeded".into());
+                    if let Some(deferred) = face.loaded_deferred.borrow_mut().take() {
+                        deferred.reject(ctx, OpError::new("NetworkError", message));
+                    }
+                    self.notify_completed(&face, false);
+                }
             }
         }
         let mut quiescent = true;
@@ -1774,6 +2303,63 @@ mod tests {
                 .map_err(|error| format!("{error:?}"))
         }));
         realm
+    }
+
+    #[test]
+    fn canvas_font_set_cache_tracks_registry_generation_and_reclaims_replaced_set() {
+        let fallback = FontSet::new(vec![lumen_html_text::RegisteredFont {
+            family: Arc::from("fallback"),
+            weight: 400,
+            style: lumen_html::paint::FontStyle::Normal,
+            stretch: 100.0,
+            face: Arc::new(FontFace::new(Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap()),
+        }])
+        .unwrap();
+        let loading = FontLoading::default();
+        let first = loading
+            .canvas_font_set(&fallback, "https://fonts.example.test/page.html")
+            .unwrap();
+        let cache_hit = loading
+            .canvas_font_set(&fallback, "https://fonts.example.test/page.html")
+            .unwrap();
+        assert!(Rc::ptr_eq(&first, &cache_hit));
+        let retired = Rc::downgrade(&first);
+        drop(first);
+        drop(cache_hit);
+
+        let decoded = Arc::new(FontFace::new(Arc::from(lumen_html_text::TEST_FONT_BYTES)).unwrap());
+        let manual_state = {
+            let mut registry = loading.manual_registry.borrow_mut();
+            let rule = lumen_html::css::parse_font_faces(
+                "@font-face { font-family: \"Manual Canvas\"; src: url(manual.woff2); unicode-range: U+0041; }",
+            )
+            .unwrap()
+            .remove(0);
+            let state = registry
+                .create_manual_face(
+                    rule,
+                    ManualFontSource::Binary(Arc::from(lumen_html_text::TEST_FONT_BYTES)),
+                )
+                .unwrap();
+            assert!(registry.add_manual_face(&state).unwrap());
+            assert!(registry.begin_load(&state).unwrap().is_some());
+            assert_eq!(
+                registry.complete_load(&state, Ok(decoded.clone())).unwrap(),
+                FontFaceStatus::Loaded
+            );
+            state
+        };
+
+        let current = loading
+            .canvas_font_set(&fallback, "https://fonts.example.test/page.html")
+            .unwrap();
+        assert!(retired.upgrade().is_none());
+        let registrations = current.registrations().unwrap();
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(registrations[1].font.family.as_ref(), "Manual Canvas");
+        assert!(Arc::ptr_eq(&registrations[1].font.face, &decoded));
+        assert_eq!(registrations[1].unicode_range.as_deref().unwrap(), &[(0x41, 0x41)]);
+        drop(manual_state);
     }
 
     #[test]
@@ -1885,6 +2471,29 @@ mod tests {
         boolean(engine, "badDescriptorLoad.name === 'SyntaxError'");
         boolean(engine, "badDescriptorLoad.code === 12");
         boolean(engine, "badDescriptorLoad.dom");
+    }
+
+    #[test]
+    fn font_settlement_skips_unobserved_layout_but_ready_requires_a_provider() {
+        let mut runtime = Runtime::new();
+        let engine = runtime.engine();
+        let realm = crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(realm.settle_font_loading(engine.ctx()).unwrap());
+        boolean(engine, "globalThis.readySettled=false;document.fonts.ready.then(()=>readySettled=true);!readySettled");
+        assert!(
+            realm.settle_font_loading(engine.ctx()).is_err(),
+            "observed ready must wait for the host's layout provider"
+        );
+        let calls = Rc::new(Cell::new(0));
+        let observed = calls.clone();
+        realm.set_layout_flusher(Rc::new(move |_| {
+            observed.set(observed.get() + 1);
+            Ok(())
+        }));
+        assert!(realm.settle_font_loading(engine.ctx()).unwrap());
+        engine.ctx().drain_microtasks_for_host();
+        assert_eq!(calls.get(), 1);
+        boolean(engine, "readySettled");
     }
 
     #[test]

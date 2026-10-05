@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::super::parse::{decode, FuncType, ValType};
+use super::super::parse::{FuncType, ValType, decode};
 use super::*;
 use crate::wasm::test_util::{self as t, I32};
 

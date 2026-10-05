@@ -30,6 +30,151 @@
 use lumen_host::SpawnHandle;
 use lumen_host::{ops, Ctx, Extension, OpState, Value};
 
+#[lumen_bind::module(name = "__http_policy")]
+mod http_policy {
+    use super::*;
+
+    #[lumen_bind::op(name = "policyHandledByHost")]
+    pub fn policy_handled_by_host() -> bool {
+        cfg!(target_arch = "wasm32")
+    }
+
+    #[lumen_bind::op(name = "requestSync")]
+    pub fn request_sync(
+        ctx: &mut Ctx,
+        method: String,
+        url: String,
+        headers: Value,
+        body: Option<Value>,
+        options: Value,
+    ) -> lumen::embed::OpResult<Value> {
+        use lumen::embed::OpError;
+
+        let headers = read_header_pairs(ctx, &headers).map_err(OpError::thrown)?;
+        let body = body
+            .map(|value| {
+                ctx.typed_array_bytes(&value)
+                    .ok_or_else(|| OpError::new("TypeError", "HTTP body must be bytes"))
+            })
+            .transpose()?;
+        let option_string = |ctx: &mut Ctx, name: &str, default: &str| -> Result<String, OpError> {
+            let value = ctx.member_get(&options, name).map_err(OpError::thrown)?;
+            if matches!(value, Value::Undefined) {
+                Ok(default.to_owned())
+            } else {
+                Ok(ctx
+                    .coerce_string(&value)
+                    .map_err(OpError::thrown)?
+                    .to_string())
+            }
+        };
+        let mode = option_string(ctx, "mode", "cors")?;
+        let credentials = option_string(ctx, "credentials", "same-origin")?;
+        let redirect = option_string(ctx, "redirect", "follow")?;
+        let force_preflight = matches!(
+            ctx.member_get(&options, "forcePreflight")
+                .map_err(OpError::thrown)?,
+            Value::Bool(true)
+        );
+        let timeout_ms = match ctx
+            .member_get(&options, "timeout")
+            .map_err(OpError::thrown)?
+        {
+            Value::Undefined | Value::Null => 0,
+            value => {
+                let timeout = ctx.coerce_number(&value).map_err(OpError::thrown)?;
+                if !timeout.is_finite() || timeout < 0.0 || timeout > u32::MAX as f64 {
+                    return Err(OpError::new("TypeError", "invalid synchronous XHR timeout"));
+                }
+                timeout as u32
+            }
+        };
+        if !matches!(mode.as_str(), "cors" | "no-cors" | "same-origin") {
+            return Err(OpError::new("TypeError", "invalid fetch mode"));
+        }
+        if !matches!(credentials.as_str(), "omit" | "same-origin" | "include") {
+            return Err(OpError::new("TypeError", "invalid credentials mode"));
+        }
+        if !matches!(redirect.as_str(), "follow" | "manual" | "error") {
+            return Err(OpError::new("TypeError", "invalid transport redirect mode"));
+        }
+        let origin = match ctx
+            .member_get(&options, "origin")
+            .map_err(OpError::thrown)?
+        {
+            Value::Undefined | Value::Null => None,
+            value => Some(
+                ctx.coerce_string(&value)
+                    .map_err(OpError::thrown)?
+                    .to_string(),
+            ),
+        };
+        let request = lumen_common::http_body::SyncHttpRequest {
+            method,
+            url: url.clone(),
+            headers,
+            body,
+            mode,
+            credentials,
+            redirect: redirect.clone(),
+            force_preflight,
+            timeout_ms,
+            origin,
+        };
+        #[cfg(target_arch = "wasm32")]
+        let response = {
+            let encoded = request
+                .encode()
+                .map_err(|error| OpError::new("TypeError", error.0))?;
+            let encoded =
+                lumen_host::browser::sync_call("http.request", &encoded).map_err(|error| {
+                    if let Some(message) = error.strip_prefix("TimeoutError: ") {
+                        OpError::new("TimeoutError", message.to_owned())
+                    } else if let Some(message) = error.strip_prefix("NotSupportedError: ") {
+                        OpError::new("NotSupportedError", message.to_owned())
+                    } else {
+                        OpError::new("NetworkError", error)
+                    }
+                })?;
+            lumen_common::http_body::SyncHttpResponse::decode(&encoded)
+                .map_err(|error| OpError::new("NetworkError", error.0))?
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let response = {
+            sync_http_desktop(&request, &FetchConfig::default()).map_err(|error| match error {
+                http::SyncRequestError::Timeout => {
+                    OpError::new("TimeoutError", "synchronous XMLHttpRequest timed out")
+                }
+                http::SyncRequestError::Transport(error) => OpError::new("NetworkError", error),
+            })?
+        };
+        let output = Value::Obj(ctx.new_object());
+        let set = |ctx: &mut Ctx, name: &str, value: Value| {
+            ctx.member_set(&output, name, value)
+                .map_err(OpError::thrown)
+        };
+        set(ctx, "status", Value::Num(response.status as f64))?;
+        set(ctx, "statusText", Value::from_string(response.status_text))?;
+        set(ctx, "url", Value::from_string(response.url.clone()))?;
+        set(ctx, "redirected", Value::Bool(response.url != url))?;
+        set(ctx, "type", Value::from_string("basic".into()))?;
+        let pairs = response
+            .headers
+            .into_iter()
+            .map(|(key, value)| {
+                ctx.make_array(vec![Value::from_string(key), Value::from_string(value)])
+            })
+            .collect();
+        let pairs = ctx.make_array(pairs);
+        set(ctx, "headers", pairs)?;
+        let bytes = ctx
+            .make_uint8array(&response.body)
+            .map_err(OpError::thrown)?;
+        set(ctx, "body", bytes)?;
+        Ok(output)
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
@@ -45,6 +190,255 @@ mod sse;
 mod url;
 #[cfg(not(target_arch = "wasm32"))]
 mod websocket;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_http_desktop(
+    request: &lumen_common::http_body::SyncHttpRequest,
+    config: &FetchConfig,
+) -> Result<lumen_common::http_body::SyncHttpResponse, http::SyncRequestError> {
+    use lumen_common::cors::{Credentials, FetchPolicy, Mode, Redirect, ResponseType};
+    use std::time::{Duration, Instant};
+
+    let Some(origin) = request.origin.as_deref() else {
+        let mut config = config.clone();
+        config.manual_redirect = request.redirect != "follow";
+        let response = http::request_sync_with_timeout(
+            &request.method,
+            &request.url,
+            &request.headers,
+            request.body.as_deref(),
+            &config,
+            request.timeout_ms,
+        )?;
+        if request.redirect == "error"
+            && matches!(response.status, 301 | 302 | 303 | 307 | 308)
+            && response
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("location"))
+        {
+            return Err(http::SyncRequestError::Transport(
+                "redirect mode is error".into(),
+            ));
+        }
+        return Ok(lumen_common::http_body::SyncHttpResponse {
+            status: response.status,
+            status_text: response.status_text,
+            url: response.url,
+            headers: response.headers,
+            body: response.body,
+        });
+    };
+
+    let mode = match request.mode.as_str() {
+        "cors" => Mode::Cors,
+        "no-cors" => Mode::NoCors,
+        "same-origin" => Mode::SameOrigin,
+        _ => return Err(policy_transport("invalid fetch mode")),
+    };
+    let credentials = match request.credentials.as_str() {
+        "omit" => Credentials::Omit,
+        "same-origin" => Credentials::SameOrigin,
+        "include" => Credentials::Include,
+        _ => return Err(policy_transport("invalid credentials mode")),
+    };
+    let redirect = match request.redirect.as_str() {
+        "follow" => Redirect::Follow,
+        "error" => Redirect::Error,
+        "manual" => Redirect::Manual,
+        _ => return Err(policy_transport("invalid redirect mode")),
+    };
+    let parsed = lumen_common::url::parse_url(&request.url, None)
+        .ok_or_else(|| policy_transport("invalid request URL"))?;
+    let mut policy = FetchPolicy::new(
+        origin,
+        &request.method,
+        &request.url,
+        &parsed.origin(),
+        request.headers.clone(),
+        request.body.clone(),
+        mode,
+        credentials,
+        redirect,
+    )
+    .map_err(|error| policy_transport(&format!("request policy rejected request: {error:?}")))?;
+    policy.set_force_preflight(request.force_preflight);
+
+    let started = Instant::now();
+    let remaining = || -> Result<u32, http::SyncRequestError> {
+        if request.timeout_ms == 0 {
+            return Ok(0);
+        }
+        let budget = Duration::from_millis(request.timeout_ms as u64);
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            return Err(http::SyncRequestError::Timeout);
+        }
+        Ok((budget - elapsed).as_millis().clamp(1, u32::MAX as u128) as u32)
+    };
+    let mut config = config.clone();
+    config.manual_redirect = true;
+
+    loop {
+        if let Some(preflight) = policy.preflight_request() {
+            let response = http::request_sync_with_timeout(
+                &preflight.method,
+                &preflight.url,
+                &preflight.headers,
+                preflight.body.as_deref(),
+                &config,
+                remaining()?,
+            )?;
+            policy
+                .validate_preflight(response.status, &response.headers)
+                .map_err(|error| policy_transport(&format!("CORS preflight failed: {error:?}")))?;
+        }
+
+        let head = policy.actual_request();
+        let response = http::request_sync_with_timeout(
+            &head.method,
+            &head.url,
+            &head.headers,
+            head.body.as_deref(),
+            &config,
+            remaining()?,
+        )?;
+        let location = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            .map(|(_, value)| value.as_str());
+        let next = location
+            .and_then(|location| {
+                let base = lumen_common::url::parse_url(policy.current_url(), None)?;
+                lumen_common::url::parse_url(location, Some(&base))
+            })
+            .map(|url| (url.href(), url.origin()));
+        let next_ref = next
+            .as_ref()
+            .map(|(url, origin)| (url.as_str(), origin.as_str()));
+        let follow = policy
+            .response_head(response.status, &response.headers, location, next_ref)
+            .map_err(|error| {
+                policy_transport(&format!("response policy rejected response: {error:?}"))
+            })?;
+        if follow {
+            continue;
+        }
+        let filtered = policy.filter_response(&response.headers);
+        let opaque_redirect = location.is_some()
+            && matches!(response.status, 301 | 302 | 303 | 307 | 308)
+            && redirect == Redirect::Manual;
+        let opaque = filtered.kind == ResponseType::Opaque || opaque_redirect;
+        return Ok(lumen_common::http_body::SyncHttpResponse {
+            status: if opaque { 0 } else { response.status },
+            status_text: if opaque {
+                String::new()
+            } else {
+                response.status_text
+            },
+            url: if opaque { String::new() } else { response.url },
+            headers: if opaque { Vec::new() } else { filtered.headers },
+            body: if opaque { Vec::new() } else { response.body },
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn policy_transport(message: &str) -> http::SyncRequestError {
+    http::SyncRequestError::Transport(message.to_owned())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod sync_http_desktop_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    #[test]
+    fn synchronous_desktop_cors_forces_preflight_and_filters_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (index, status) in [(0, "204 No Content"), (1, "200 OK")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut headers = String::new();
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("content-length:") {
+                        content_length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+                    }
+                    let done = line == "\r\n";
+                    headers.push_str(&line);
+                    if done {
+                        break;
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(headers);
+                let response = if index == 0 {
+                    format!(
+                        "HTTP/1.1 {status}\r\nAccess-Control-Allow-Origin: https://page.test\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: content-type\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://page.test\r\nAccess-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: x-visible\r\nX-Visible: yes\r\nX-Hidden: no\r\nSet-Cookie: secret=1\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+
+        let mut config = FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("api.test", 80, address).unwrap();
+        let request = lumen_common::http_body::SyncHttpRequest {
+            method: "POST".into(),
+            url: "http://api.test/resource".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: Some(b"{}".to_vec()),
+            mode: "cors".into(),
+            credentials: "include".into(),
+            redirect: "follow".into(),
+            force_preflight: true,
+            timeout_ms: 3000,
+            origin: Some("https://page.test".into()),
+        };
+        let response = sync_http_desktop(&request, &config).unwrap();
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("OPTIONS /resource HTTP/1.1\r\n"));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("access-control-request-method: post"));
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("access-control-request-headers: content-type"));
+        assert!(requests[1].starts_with("POST /resource HTTP/1.1\r\n"));
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("origin: https://page.test"));
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"ok");
+        assert!(response
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-visible" && value == "yes"));
+        assert!(!response
+            .headers
+            .iter()
+            .any(|(name, _)| name == "x-hidden" || name == "set-cookie"));
+    }
+}
 
 /// A fetched web resource with the URL that survived HTTP redirects. Runtime module loaders use
 /// this instead of maintaining a second HTTP/TLS implementation.
@@ -248,6 +642,20 @@ pub fn load_resource_with_config(
     http::request_with_config("GET", url, &[], None, config)
 }
 
+/// Send a configured HTTP(S) request while requiring every redirect to stay
+/// on the initial origin. Retains status, headers, body and final URL for
+/// callers which install document responses after their own lifecycle checks.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn request_resource_same_origin_with_config(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &FetchConfig,
+) -> Result<ResourceResponse, String> {
+    http::request_with_config_same_origin(method, url, headers, body, config)
+}
+
 /// Fetch a module resource using the supplied routing and trust snapshot, requiring the initial
 /// URL and every redirect target to have the same HTTP(S) origin. This is used for classic Worker
 /// entry scripts, whose fetch uses same-origin mode; `importScripts()` continues to use the
@@ -315,7 +723,10 @@ mod wasm_ops;
 pub fn extension() -> Extension {
     Extension {
         name: "web",
-        modules: &[],
+        modules: &[
+            lumen_host::namespace::<http_policy::Module>,
+            lumen_host::namespace::<lumen_host::encoding::bindings::Module>,
+        ],
         globals: &[],
         namespaces: &[
             (
@@ -385,7 +796,7 @@ pub fn extension() -> Extension {
                     "compile" (1) => wasm_ops::op_compile,
                     "moduleExports" (1) => wasm_ops::op_module_exports,
                     "moduleImports" (1) => wasm_ops::op_module_imports,
-                    "allocMemory" (2) => wasm_ops::op_alloc_memory,
+                    "allocMemory" (3) => wasm_ops::op_alloc_memory,
                     "allocTable" (2) => wasm_ops::op_alloc_table,
                     "allocGlobal" (3) => wasm_ops::op_alloc_global,
                     "instantiate" (2) => wasm_ops::op_instantiate,
@@ -435,7 +846,7 @@ const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.ao
 const JS_GLUE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
 
 fn op_perf_now(_ctx: &mut Ctx, _this: Value, _args: &[Value]) -> Result<Value, Value> {
-    Ok(Value::Num(lumen_host::perf::now_ms()))
+    Ok(Value::Num(lumen_host::perf::web_now_ms()))
 }
 
 /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
@@ -641,22 +1052,36 @@ fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Result<Value,
         }
         fetch_config.manual_redirect = mode == "manual";
     }
+    let upload_progress = std::sync::Arc::new(lumen_common::http_body::UploadProgress::new(
+        body.as_ref().map(|bytes| bytes.len() as u64),
+    ));
+    let report_upload_progress = args
+        .get(7)
+        .filter(|value| value.as_obj().is_some())
+        .and_then(|value| ctx.get_member(value, "uploadProgress").ok())
+        .is_some_and(|value| matches!(value, Value::Bool(true)));
+    let worker_upload_progress = report_upload_progress.then(|| upload_progress.clone());
     let spawn = ctx
         .op_state()
         .get::<SpawnHandle>()
         .expect("runtime installs the spawn handle")
         .clone();
     spawn.spawn_blocking(id, move || {
-        Box::new(http::open_request_cancellable_with_config(
+        Box::new(http::open_request_cancellable_with_progress(
             &method,
             &target,
             &headers,
             body.as_deref(),
             &worker_cancellation,
             &fetch_config,
+            worker_upload_progress,
         ))
     });
-    Ok(ctx.new_instance(request_control::RequestControl { id, cancellation }))
+    Ok(ctx.new_instance(request_control::RequestControl {
+        id,
+        cancellation,
+        upload_progress,
+    }))
 }
 
 /// A JS `[[k, v], ...]` array into Rust pairs, via the curated member API.

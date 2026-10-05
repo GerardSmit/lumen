@@ -44,8 +44,6 @@ pub(super) struct ShadowTree {
     pub root: NodeId,
     pub mode: ShadowMode,
     pub options: ShadowOptions,
-    /// Explicit slottables assigned by HTMLSlotElement.assign().
-    pub manual_assignments: Vec<(NodeId, Vec<NodeId>)>,
 }
 
 enum ComposedSource {
@@ -141,7 +139,6 @@ impl Document {
             root,
             mode: options.mode,
             options,
-            manual_assignments: Vec::new(),
         });
         self.mark_dirty(host, Dirty::STYLE, MutationKind::FullRebuild);
         Ok(root)
@@ -224,10 +221,9 @@ impl Document {
     }
     fn slot_name(&self, node: NodeId, attribute: &str) -> Result<&str, Error> {
         Ok(match self.kind(node)? {
-            NodeKind::Element { attributes, .. } => attributes
-                .iter()
-                .find(|(name, _)| name == attribute)
-                .map_or("", |(_, value)| value.as_str()),
+            NodeKind::Element { .. } => self
+                .get_attribute_ns_ref(node, None, attribute)?
+                .unwrap_or(""),
             _ => "",
         })
     }
@@ -239,7 +235,7 @@ impl Document {
     pub fn assigned_slot(&self, node: NodeId) -> Result<Option<NodeId>, Error> {
         if !matches!(
             self.kind(node)?,
-            NodeKind::Element { .. } | NodeKind::Text(_)
+            NodeKind::Element { .. } | NodeKind::Text(_) | NodeKind::CData(_)
         ) {
             return Ok(None);
         }
@@ -252,7 +248,7 @@ impl Document {
         if let Some(tree) = self.shadow_trees.iter().find(|tree| tree.root == root) {
             if tree.options.slot_assignment == SlotAssignmentMode::Manual {
                 for slot in self.slots_in_tree(root)? {
-                    if tree
+                    if self
                         .manual_assignments
                         .iter()
                         .find(|(assigned_slot, _)| *assigned_slot == slot)
@@ -284,7 +280,7 @@ impl Document {
         };
         if let Some(tree) = self.shadow_trees.iter().find(|tree| tree.root == root) {
             if tree.options.slot_assignment == SlotAssignmentMode::Manual {
-                let mut nodes = tree
+                let mut nodes = self
                     .manual_assignments
                     .iter()
                     .find(|(assigned_slot, _)| *assigned_slot == slot)
@@ -292,7 +288,10 @@ impl Document {
                     .unwrap_or_default();
                 nodes.retain(|node| {
                     self.parent(*node).ok().flatten() == Some(host)
-                        && matches!(self.kind(*node), Ok(NodeKind::Element { .. } | NodeKind::Text(_)))
+                        && matches!(
+                            self.kind(*node),
+                            Ok(NodeKind::Element { .. } | NodeKind::Text(_) | NodeKind::CData(_))
+                        )
                 });
                 if !flatten || !nodes.is_empty() {
                     return Ok(nodes);
@@ -338,7 +337,7 @@ impl Document {
                 pending.extend(children.into_iter().rev());
             } else if matches!(
                 self.kind(node)?,
-                NodeKind::Element { .. } | NodeKind::Text(_)
+                NodeKind::Element { .. } | NodeKind::Text(_) | NodeKind::CData(_)
             ) {
                 result.try_reserve(1).map_err(|_| Error::LimitExceeded)?;
                 result.push(node);
@@ -359,56 +358,105 @@ impl Document {
         Ok(slots)
     }
 
-    /// Set the manual slottables for a slot. Returns false when this slot is in
-    /// a named-assignment shadow root, where the web API is specified as a no-op.
+    /// Set a slot's manual slottables. Assignment data is retained even while
+    /// the slot is detached or belongs to a named-assignment shadow root.
     pub fn assign_slot(&mut self, slot: NodeId, nodes: &[NodeId]) -> Result<bool, Error> {
         if !self.is_slot(slot)? {
             return Err(Error::WrongKind);
         }
-        let root = self.root_node(slot, false)?;
-        let Some(tree_index) = self.shadow_trees.iter().position(|tree| tree.root == root) else {
-            return Ok(false);
-        };
-        if self.shadow_trees[tree_index].options.slot_assignment != SlotAssignmentMode::Manual {
-            return Ok(false);
-        }
-        let host = self.shadow_trees[tree_index].host;
         let mut unique = Vec::new();
         unique
             .try_reserve(nodes.len())
             .map_err(|_| Error::LimitExceeded)?;
         for &node in nodes {
-            if !matches!(self.kind(node)?, NodeKind::Element { .. } | NodeKind::Text(_))
-                || self.parent(node)? != Some(host)
-            {
-                return Err(Error::Hierarchy);
+            if !matches!(
+                self.kind(node)?,
+                NodeKind::Element { .. } | NodeKind::Text(_) | NodeKind::CData(_)
+            ) {
+                return Err(Error::WrongKind);
             }
             if !unique.contains(&node) {
                 unique.push(node);
             }
         }
-        let assignments = &mut self.shadow_trees[tree_index].manual_assignments;
-        let Some(index) = assignments.iter().position(|(id, _)| *id == slot) else {
-            assignments
-                .try_reserve(1)
-                .map_err(|_| Error::LimitExceeded)?;
-            assignments.push((slot, unique));
-            self.mark_dirty(host, Dirty::STYLE, MutationKind::FullRebuild);
-            self.notify(observe::ObservedMutation {
-                target: slot,
-                kind: observe::ObservedKind::SlotAssignment,
-            });
-            return Ok(true);
-        };
-        if assignments[index].1 == unique {
+        let existing = self
+            .manual_assignments
+            .iter()
+            .position(|(id, _)| *id == slot);
+        if existing.is_some_and(|index| self.manual_assignments[index].1 == unique) {
             return Ok(true);
         }
-        assignments[index].1 = unique;
-        self.mark_dirty(host, Dirty::STYLE, MutationKind::FullRebuild);
-        self.notify(observe::ObservedMutation {
-            target: slot,
-            kind: observe::ObservedKind::SlotAssignment,
-        });
+        if existing.is_none() && !unique.is_empty() {
+            self.manual_assignments
+                .try_reserve(1)
+                .map_err(|_| Error::LimitExceeded)?;
+        }
+        let prior_slots = self
+            .manual_assignments
+            .iter()
+            .filter(|(id, assigned)| {
+                *id != slot && assigned.iter().any(|node| unique.contains(node))
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let mut affected = prior_slots.clone();
+        if !affected.contains(&slot) {
+            affected.push(slot);
+        }
+        let before = affected
+            .iter()
+            .map(|changed_slot| {
+                (
+                    *changed_slot,
+                    self.assigned_nodes(*changed_slot, false)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (id, assigned) in &mut self.manual_assignments {
+            if *id != slot {
+                assigned.retain(|node| !unique.contains(node));
+            }
+        }
+        if let Some(index) = existing {
+            self.manual_assignments[index].1 = unique;
+        } else if !unique.is_empty() {
+            self.manual_assignments.push((slot, unique));
+        }
+        let mut notify = false;
+        let mut changed = Vec::new();
+        for changed_slot in affected {
+            let previous = before
+                .iter()
+                .find(|(id, _)| *id == changed_slot)
+                .map(|(_, nodes)| nodes.as_slice())
+                .unwrap_or(&[]);
+            let current = self.assigned_nodes(changed_slot, false).unwrap_or_default();
+            if previous == current.as_slice() {
+                continue;
+            }
+            let root = self.root_node(changed_slot, false).ok();
+            let host = root.and_then(|root| {
+                self.shadow_trees
+                    .iter()
+                    .find(|tree| tree.root == root)
+                    .filter(|tree| tree.options.slot_assignment == SlotAssignmentMode::Manual)
+                    .map(|tree| tree.host)
+            });
+            if let Some(host) = host {
+                self.mark_dirty(host, Dirty::STYLE, MutationKind::FullRebuild);
+                notify = true;
+                changed.push(changed_slot);
+            }
+        }
+        if notify {
+            for changed_slot in changed {
+                self.notify(crate::observe::ObservedMutation {
+                    target: changed_slot,
+                    kind: crate::observe::ObservedKind::SlotAssignment,
+                });
+            }
+        }
         Ok(true)
     }
     pub fn composed_children(&self, node: NodeId) -> Result<Vec<NodeId>, Error> {
@@ -576,12 +624,128 @@ mod tests {
     }
 
     #[test]
+    fn slot_assignment_ignores_namespaced_slot_and_name_attributes() {
+        let mut document = html::parse("<div><b>child</b></div>", 64).unwrap();
+        let host = find(&document, document.root(), "div");
+        let child = find(&document, host, "b");
+        let root = document.attach_shadow(host, ShadowMode::Open).unwrap();
+        let fragment =
+            html::parse_fragment(&mut document, "<slot name=target></slot><slot></slot>").unwrap();
+        document.append(root, fragment).unwrap();
+        let named = document.first_child(root).unwrap().unwrap();
+        let default = document.next_sibling(named).unwrap().unwrap();
+        let ns = Some("https://example.test/attributes");
+        document
+            .set_attribute_ns(child, ns, "slot", "target")
+            .unwrap();
+        assert_eq!(document.assigned_slot(child), Ok(Some(default)));
+        document
+            .set_attribute_ns(child, None, "slot", "target")
+            .unwrap();
+        assert_eq!(document.assigned_slot(child), Ok(Some(named)));
+        document.remove_attribute_ns(named, None, "name").unwrap();
+        document
+            .set_attribute_ns(named, ns, "name", "target")
+            .unwrap();
+        assert_eq!(document.assigned_slot(child), Ok(None));
+    }
+
+    #[test]
+    fn manual_slots_assign_ordered_slottables_and_ignore_slot_attributes() {
+        let mut document = html::parse("<div><b slot=ignored>A</b>text<i>B</i></div>", 64).unwrap();
+        let host = find(&document, document.root(), "div");
+        let first = find(&document, host, "b");
+        let text = document.next_sibling(first).unwrap().unwrap();
+        let second = document.next_sibling(text).unwrap().unwrap();
+        let root = document
+            .attach_shadow_with_options(
+                host,
+                ShadowOptions {
+                    slot_assignment: SlotAssignmentMode::Manual,
+                    ..ShadowOptions::new(ShadowMode::Open)
+                },
+            )
+            .unwrap();
+        let fragment = html::parse_fragment(&mut document, "<slot></slot><slot></slot>").unwrap();
+        document.append(root, fragment).unwrap();
+        let slot = document.first_child(root).unwrap().unwrap();
+        let next_slot = document.next_sibling(slot).unwrap().unwrap();
+        assert!(document.assigned_nodes(slot, false).unwrap().is_empty());
+        assert_eq!(
+            document.assign_slot(slot, &[second, first, second]),
+            Ok(true)
+        );
+        assert_eq!(
+            document.assigned_nodes(slot, false),
+            Ok(alloc::vec![second, first])
+        );
+        assert_eq!(document.assigned_slot(first), Ok(Some(slot)));
+        assert_eq!(document.assigned_slot(second), Ok(Some(slot)));
+        assert_eq!(document.assigned_slot(text), Ok(None));
+        assert_eq!(
+            document.composed_children(slot),
+            Ok(alloc::vec![second, first])
+        );
+        assert_eq!(document.assign_slot(next_slot, &[first]), Ok(true));
+        assert_eq!(
+            document.assigned_nodes(slot, false),
+            Ok(alloc::vec![second])
+        );
+        assert_eq!(document.assigned_slot(first), Ok(Some(next_slot)));
+        assert_eq!(document.assign_slot(slot, &[]), Ok(true));
+        assert_eq!(document.assigned_slot(first), Ok(Some(next_slot)));
+        assert_eq!(document.assigned_nodes(slot, true), Ok(alloc::vec![]));
+        let detached = document
+            .create(NodeKind::Text(alloc::string::String::from("detached")))
+            .unwrap();
+        assert_eq!(document.assign_slot(slot, &[detached]), Ok(true));
+        assert_eq!(document.assigned_nodes(slot, false), Ok(alloc::vec![]));
+        document.append(host, detached).unwrap();
+        assert_eq!(
+            document.assigned_nodes(slot, false),
+            Ok(alloc::vec![detached])
+        );
+    }
+
+    #[test]
+    fn cdata_nodes_participate_in_named_and_manual_slot_assignment() {
+        for mode in [SlotAssignmentMode::Named, SlotAssignmentMode::Manual] {
+            let mut document = html::parse("<div></div>", 64).unwrap();
+            let host = find(&document, document.root(), "div");
+            let cdata = document.create(NodeKind::CData("content".into())).unwrap();
+            document.append(host, cdata).unwrap();
+            let root = document
+                .attach_shadow_with_options(
+                    host,
+                    ShadowOptions {
+                        slot_assignment: mode,
+                        ..ShadowOptions::new(ShadowMode::Open)
+                    },
+                )
+                .unwrap();
+            let fragment = html::parse_fragment(&mut document, "<slot></slot>").unwrap();
+            document.append(root, fragment).unwrap();
+            let slot = document.first_child(root).unwrap().unwrap();
+            if mode == SlotAssignmentMode::Manual {
+                assert_eq!(document.assigned_slot(cdata), Ok(None));
+                assert_eq!(document.assign_slot(slot, &[cdata]), Ok(true));
+            }
+            assert_eq!(document.assigned_slot(cdata), Ok(Some(slot)));
+            assert_eq!(document.assigned_nodes(slot, true), Ok(alloc::vec![cdata]));
+            document.remove(cdata).unwrap();
+            assert_eq!(document.assigned_slot(cdata), Ok(None));
+            assert!(document.assigned_nodes(slot, true).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn declarative_shadow_root_is_claimed_once_without_replacing_identity() {
         for mode in [ShadowMode::Open, ShadowMode::Closed] {
             let mut document = html::parse("<div></div>", 32).unwrap();
             let host = find(&document, document.root(), "div");
             let options = ShadowOptions {
                 mode,
+                slot_assignment: SlotAssignmentMode::Named,
                 delegates_focus: true,
                 clonable: true,
                 serializable: true,

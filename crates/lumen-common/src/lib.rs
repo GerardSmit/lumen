@@ -3,6 +3,8 @@
 //! `memchr` (vectorized search) only; the `hash` and `compress` features add the RustCrypto / zlib
 //! / Brotli / Zstandard crates, and are off by default so the engine carries no others.
 
+extern crate alloc;
+
 pub mod aot;
 pub mod audio;
 pub mod affine;
@@ -12,6 +14,8 @@ pub mod buffer;
 pub mod bytes;
 pub mod civil;
 pub mod codec;
+#[cfg(feature = "web-encoding")]
+pub mod encoding;
 #[cfg(feature = "compress")]
 pub mod compress;
 #[cfg(feature = "cookies")]
@@ -38,12 +42,15 @@ pub mod memcat;
 pub mod mime;
 pub mod mt19937;
 pub mod native;
+pub mod pointer;
 pub mod regex;
 pub mod scan;
+pub mod scroll;
 pub mod search;
 pub mod siphash;
 pub mod smuggle;
 pub mod stack;
+pub mod toggle_task;
 pub mod strftime;
 pub mod target;
 pub mod tz;

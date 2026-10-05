@@ -60,6 +60,137 @@ fn corners_contains(x: f32, y: f32, bounds: [f32; 4], radii: [[f32; 2]; 4]) -> b
     true
 }
 
+const UNIFORM_MARGIN: f32 = 1e-3;
+
+// Range of `min(|v - a|, |v - b|)` over the unit interval starting at `lo`.
+fn axis_range(lo: f32, a: f32, b: f32) -> (f32, f32) {
+    let hi = lo + 1.0;
+    let at = |v: f32| (v - a).abs().min((v - b).abs());
+    let (d0, d1) = (at(lo), at(hi));
+    let mut max = d0.max(d1);
+    let mid = (a + b) * 0.5;
+    if mid > lo && mid < hi {
+        max = max.max(at(mid));
+    }
+    let min = if (a >= lo && a <= hi) || (b >= lo && b <= hi) {
+        0.0
+    } else {
+        d0.min(d1)
+    };
+    (min, max)
+}
+
+// Square-cornered borders: when every sample of a pixel resolves to the same
+// side, band and dash state, return that outcome without sampling.
+// `Some(Some(slot))` is a uniformly painted pixel, `Some(None)` a uniformly
+// unpainted one and `None` means the pixel needs per-sample evaluation.
+fn uniform_border_pixel(
+    fx: f32,
+    fy: f32,
+    outer: [f32; 4],
+    inner: [f32; 4],
+    middle: [f32; 4],
+    widths: [f32; 4],
+    patterns: [Option<BorderPattern>; 4],
+) -> Option<Option<usize>> {
+    let [left, top, right, bottom] = outer;
+    if fx < left || fy < top || fx + 1.0 > right || fy + 1.0 > bottom {
+        return None;
+    }
+    if !(fy + 1.0 <= inner[1] || fx + 1.0 <= inner[0] || fy >= inner[3] || fx >= inner[2]) {
+        return None;
+    }
+    let mut side = None;
+    for (cx, cy) in [
+        (fx, fy),
+        (fx + 1.0, fy),
+        (fx, fy + 1.0),
+        (fx + 1.0, fy + 1.0),
+    ] {
+        let distances = [cy - top, right - cx, bottom - cy, cx - left];
+        let mut best: Option<(usize, f32)> = None;
+        let mut second = f32::INFINITY;
+        for candidate in 0..4 {
+            if widths[candidate] <= 0.0 {
+                continue;
+            }
+            let ratio = distances[candidate] / widths[candidate];
+            match best {
+                Some((_, current)) if ratio >= current => second = second.min(ratio),
+                _ => {
+                    if let Some((_, current)) = best {
+                        second = second.min(current);
+                    }
+                    best = Some((candidate, ratio));
+                }
+            }
+        }
+        let (winner, ratio) = best?;
+        if !(second - ratio > UNIFORM_MARGIN) || *side.get_or_insert(winner) != winner {
+            return None;
+        }
+    }
+    let side = side?;
+    let width = widths[side];
+    match patterns[side] {
+        Some(BorderPattern::Double | BorderPattern::Dotted) => return None,
+        Some(BorderPattern::Dashed) => {
+            let half = width * 0.5;
+            let (l, t, r, b) = (left + half, top + half, right - half, bottom - half);
+            let (y_min, y_max) = axis_range(fy, t, b);
+            let (x_min, x_max) = axis_range(fx, l, r);
+            let horizontal = if y_max + UNIFORM_MARGIN < x_min {
+                true
+            } else if x_max + UNIFORM_MARGIN < y_min {
+                false
+            } else {
+                return None;
+            };
+            let (length, start, coordinate) = if horizontal {
+                (r - l + width, l, fx)
+            } else {
+                (b - t + width, t, fy)
+            };
+            let (dash, gap) = dash_intervals(length, width, BorderPattern::Dashed, false);
+            if gap > 0.0 {
+                let period = dash + gap;
+                if !period.is_finite() || period <= 0.0 {
+                    return None;
+                }
+                let phase = (coordinate - start + half).rem_euclid(period);
+                if phase + 1.0 + UNIFORM_MARGIN <= dash {
+                } else if phase >= dash + UNIFORM_MARGIN
+                    && phase + 1.0 + UNIFORM_MARGIN <= period
+                {
+                    return Some(None);
+                } else {
+                    return None;
+                }
+            }
+        }
+        _ => {}
+    }
+    let inner_band = if matches!(
+        patterns[side],
+        Some(BorderPattern::Groove | BorderPattern::Ridge)
+    ) {
+        if fx >= middle[0] && fx + 1.0 <= middle[2] && fy >= middle[1] && fy + 1.0 <= middle[3] {
+            true
+        } else if fx + 1.0 <= middle[0]
+            || fx >= middle[2]
+            || fy + 1.0 <= middle[1]
+            || fy >= middle[3]
+        {
+            false
+        } else {
+            return None;
+        }
+    } else {
+        false
+    };
+    Some(Some(side + if inner_band { 4 } else { 0 }))
+}
+
 fn border_tone(color: Rgba, pattern: Option<BorderPattern>, side: usize, outer: bool) -> Rgba {
     let top_left = side == 0 || side == 3;
     let dark = match pattern {
@@ -215,7 +346,17 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
     let has_stroke = patterns
         .iter()
         .any(|pattern| matches!(pattern, Some(BorderPattern::Dashed | BorderPattern::Dotted)));
+    // Each side can have a different stroke width and therefore a different
+    // center-line radius. Measure once per side, outside the pixel loop.
+    let arc_measures: [Option<ArcMeasure>; 4] = core::array::from_fn(|side| {
+        (matches!(patterns[side], Some(BorderPattern::Dashed | BorderPattern::Dotted))
+            && radius > widths[side] * 0.5)
+            .then(|| ArcMeasure::new(radius - widths[side] * 0.5))
+    });
 
+    let square_corners = outer_radii
+        .iter()
+        .all(|corner| corner[0] == 0.0 && corner[1] == 0.0);
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let samples = if raster.antialias { 8 } else { 1 };
     for y in y0..y1 {
@@ -253,6 +394,24 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
                 continue;
             }
             let mut hits = [0u32; 8];
+            let uniform = if square_corners {
+                uniform_border_pixel(
+                    x as f32,
+                    y as f32,
+                    [left, top, right, bottom],
+                    inner,
+                    middle,
+                    widths,
+                    patterns,
+                )
+            } else {
+                None
+            };
+            if let Some(slot) = uniform {
+                if let Some(slot) = slot {
+                    hits[slot] = samples * samples;
+                }
+            } else {
             for sy in 0..samples {
                 for sx in 0..samples {
                     let px = x as f32 + (sx as f32 + 0.5) / samples as f32;
@@ -288,7 +447,7 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
                             (radius - width * 0.5).max(0.0),
                             width,
                             pattern,
-                            None,
+                            arc_measures[side].as_ref(),
                         ) {
                             continue;
                         }
@@ -299,6 +458,7 @@ pub(super) fn draw_box(raster: &mut Raster<'_>, border: &lumen_html::paint::BoxB
                     ) && corners_contains(px, py, middle, middle_radii);
                     hits[side + if inner_band { 4 } else { 0 }] += 1;
                 }
+            }
             }
             let total = hits.iter().sum::<u32>();
             let coverage = if has_double || has_stroke {
@@ -939,6 +1099,29 @@ impl ArcMeasure {
 mod tests {
     use super::*;
     use lumen_html::paint::{Command, DisplayList};
+
+    #[test]
+    fn rounded_box_patterns_measure_each_side_contour() {
+        let rect = Rect { x: 0.0, y: 0.0, width: 32.0, height: 24.0 };
+        let color = Rgba { r: 0, g: 0, b: 0, a: 255 };
+        for pattern in [BorderPattern::Dashed, BorderPattern::Dotted] {
+            let image = crate::render(
+                &DisplayList(vec![Command::StrokeBoxBorder(Box::new(lumen_html::paint::BoxBorder {
+                    rect,
+                    radius: 8.0,
+                    widths: [2.0, 4.0, 6.0, 3.0],
+                    colors: [color; 4],
+                    pattern: Some(pattern),
+                    side_patterns: None,
+                    corners: None,
+                }))]),
+                32, 24, 1.0, true,
+            ).unwrap();
+            assert!(image.pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+            assert_eq!(image.pixels[(12 * 32 + 16) * 4 + 3], 0);
+            assert_eq!(image.pixels[3], 0);
+        }
+    }
 
     #[test]
     fn conic_measure_is_bounded_and_interpolates_tangents() {

@@ -37,7 +37,7 @@ pub(super) fn restore(
     program: &std::rc::Rc<super::NativeProgram>,
     snapshot: &Snapshot,
 ) -> Result<Restored, String> {
-    use crate::interpreter::{new_scope, Binding as RuntimeBinding};
+    use crate::interpreter::{Binding as RuntimeBinding, new_scope};
     use crate::value::{
         AotCallable, BoundCallable, Callable, Exotic, Gc, Object, Property as RuntimeProperty,
         Props, Value,
@@ -360,6 +360,7 @@ pub(super) fn restore(
             5 => Exotic::SymWrap,
             6 => Exotic::BigIntWrap,
             7 => Exotic::Error,
+            10 => Exotic::Date,
             _ => return Err("unsupported snapshot exotic".into()),
         };
         object_ref.extensible = *extensible;
@@ -865,7 +866,7 @@ pub(super) fn decode(bytes: &[u8], functions: usize) -> Result<Snapshot, String>
                 class,
                 ..
             } => {
-                if *exotic > 7 {
+                if *exotic > 7 && *exotic != crate::value::Exotic::Date as u8 {
                     return Err("unsupported snapshot exotic".into());
                 }
                 if let Some(index) = prototype {
@@ -912,7 +913,7 @@ pub(super) fn decode(bytes: &[u8], functions: usize) -> Result<Snapshot, String>
                         NamespaceBinding::Live(env, _)
                             if !matches!(get(*env)?, Node::Environment { .. }) =>
                         {
-                            return Err("invalid snapshot namespace environment".into())
+                            return Err("invalid snapshot namespace environment".into());
                         }
                         NamespaceBinding::Static(value) => {
                             get(*value)?;

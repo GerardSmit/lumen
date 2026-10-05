@@ -25,7 +25,9 @@ pub enum WebRtcHostEvent {
         binary: bool,
         bytes: Vec<u8>,
     },
-    IceCandidate { candidate: Option<String> },
+    IceCandidate {
+        candidate: Option<String>,
+    },
 }
 
 /// Adapter implemented by the browser runtime. Session descriptions are SDP
@@ -101,6 +103,13 @@ struct PeerData {
     closed: Cell<bool>,
 }
 
+struct ParsedIceCandidate {
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_mline_index: Option<usize>,
+    username_fragment: Option<String>,
+}
+
 #[lumen_bind::class(
     name = "RTCPeerConnection",
     extends = crate::events::DomEventTarget,
@@ -120,7 +129,12 @@ impl DomRTCPeerConnection {
                 .member_get(&configuration, "iceServers")
                 .map_err(OpError::thrown)?;
             if !matches!(ice_servers, Value::Undefined | Value::Null) {
-                let length = ctx.member_get(&ice_servers, "length").map_err(OpError::thrown)?;
+                if !ctx.is_array_value(&ice_servers).map_err(OpError::thrown)? {
+                    return Err(OpError::type_error("iceServers must be an array"));
+                }
+                let length = ctx
+                    .member_get(&ice_servers, "length")
+                    .map_err(OpError::thrown)?;
                 match length {
                     Value::Num(length) if length == 0.0 => {}
                     Value::Num(_) => {
@@ -131,6 +145,13 @@ impl DomRTCPeerConnection {
                     }
                     _ => return Err(OpError::type_error("iceServers must be an array")),
                 }
+            }
+            if matches!(ctx.member_get(&configuration, "iceTransportPolicy").map_err(OpError::thrown)?, Value::Str(ref value) if value.as_str() == "relay")
+            {
+                return Err(OpError::new(
+                    "NotSupportedError",
+                    "relay-only ICE transport requires TURN support",
+                ));
             }
         }
         let host = host(ctx)?;
@@ -183,14 +204,48 @@ impl DomRTCPeerConnection {
 
     fn add_ice_candidate(&self, ctx: &mut Ctx, candidate: Option<Value>) -> Promise<()> {
         let result = if self.data.closed.get() {
-            Err(OpError::new("InvalidStateError", "peer connection is closed"))
+            Err(OpError::new(
+                "InvalidStateError",
+                "peer connection is closed",
+            ))
         } else if self.data.pending_remote_description.borrow().is_none()
-            && self.data.current_remote_description.borrow().is_none() {
-            Err(OpError::new("InvalidStateError", "remote description has not been set"))
+            && self.data.current_remote_description.borrow().is_none()
+        {
+            Err(OpError::new(
+                "InvalidStateError",
+                "remote description has not been set",
+            ))
         } else {
             parse_ice_candidate(ctx, candidate.as_ref()).and_then(|candidate| {
-                self.data.host.add_ice_candidate(self.data.id, candidate.as_deref())
-                    .map_err(|_| OpError::new("OperationError", "ICE candidate was rejected"))
+                let remote_sdp = {
+                    let pending_remote = self.data.pending_remote_description.borrow();
+                    let current_remote = self.data.current_remote_description.borrow();
+                    pending_remote
+                        .as_ref()
+                        .or(current_remote.as_ref())
+                        .map(|(_, sdp)| sdp.clone())
+                };
+                let Some(remote_sdp) = remote_sdp else {
+                    return Err(OpError::new(
+                        "InvalidStateError",
+                        "remote description has not been set",
+                    ));
+                };
+                validate_ice_candidate(&remote_sdp, &candidate)?;
+                self.data
+                    .host
+                    .add_ice_candidate(
+                        self.data.id,
+                        (!candidate.candidate.is_empty()).then_some(candidate.candidate.as_str()),
+                    )
+                    .map_err(|_| OpError::new("OperationError", "ICE candidate was rejected"))?;
+                if let Some((_, sdp)) = self.data.pending_remote_description.borrow_mut().as_mut() {
+                    append_candidate_to_sdp(sdp, &candidate);
+                }
+                if let Some((_, sdp)) = self.data.current_remote_description.borrow_mut().as_mut() {
+                    append_candidate_to_sdp(sdp, &candidate);
+                }
+                Ok(())
             })
         };
         Promise::ready(result)
@@ -319,7 +374,7 @@ impl DomRTCPeerConnection {
                     return Err(OpError::new(
                         "TypeError",
                         "description type must be offer or answer",
-                    ))
+                    ));
                 }
             };
             accepted.map(|()| {
@@ -348,9 +403,12 @@ impl DomRTCPeerConnection {
                     "description was not created for this peer",
                 ));
             }
-            self.data.host.start_ice_gathering(self.data.id).map_err(|_| {
-                OpError::new("OperationError", "could not start local ICE gathering")
-            })?;
+            self.data
+                .host
+                .start_ice_gathering(self.data.id)
+                .map_err(|_| {
+                    OpError::new("OperationError", "could not start local ICE gathering")
+                })?;
             *self.data.pending_local_description.borrow_mut() = Some((kind.clone(), sdp));
             if kind == "offer" {
                 self.data.signaling_state.set("have-local-offer");
@@ -438,7 +496,7 @@ impl DomRTCDataChannel {
             _ => {
                 return Err(OpError::type_error(
                     "data channel send accepts strings or TypedArray views",
-                ))
+                ));
             }
         };
         match self
@@ -500,15 +558,202 @@ fn parse_description(ctx: &mut Ctx, value: &Value) -> OpResult<(String, String)>
     Ok((kind.as_str().to_owned(), sdp.as_str().to_owned()))
 }
 
-fn parse_ice_candidate(ctx: &mut Ctx, value: Option<&Value>) -> OpResult<Option<String>> {
-    let Some(value) = value.filter(|value| !matches!(value, Value::Null)) else { return Ok(None); };
-    let candidate = ctx.member_get(value, "candidate").map_err(OpError::thrown)?;
-    let Value::Str(candidate) = candidate else { return Err(OpError::type_error("ICE candidate candidate must be a string")); };
-    if candidate.as_str().is_empty() { return Ok(None); }
-    if !candidate.as_str().starts_with("candidate:") {
-        return Err(OpError::new("TypeError", "ICE candidate must use candidate:<foundation> syntax"));
+fn parse_ice_candidate(ctx: &mut Ctx, value: Option<&Value>) -> OpResult<ParsedIceCandidate> {
+    let Some(value) = value.filter(|value| !matches!(value, Value::Undefined | Value::Null)) else {
+        return Ok(ParsedIceCandidate {
+            candidate: String::new(),
+            sdp_mid: None,
+            sdp_mline_index: None,
+            username_fragment: None,
+        });
+    };
+    let candidate = ctx
+        .member_get(value, "candidate")
+        .map_err(OpError::thrown)?;
+    let Value::Str(candidate) = candidate else {
+        return Err(OpError::type_error(
+            "ICE candidate candidate must be a string",
+        ));
+    };
+    if !candidate.as_str().is_empty() && !candidate.as_str().starts_with("candidate:") {
+        return Err(OpError::new(
+            "TypeError",
+            "ICE candidate must use candidate:<foundation> syntax",
+        ));
     }
-    Ok(Some(candidate.as_str().to_owned()))
+    let sdp_mid = optional_candidate_string(ctx, value, "sdpMid")?;
+    let username_fragment = optional_candidate_string(ctx, value, "usernameFragment")?;
+    let index = ctx
+        .member_get(value, "sdpMLineIndex")
+        .map_err(OpError::thrown)?;
+    let sdp_mline_index = match index {
+        Value::Undefined | Value::Null => None,
+        Value::Num(number)
+            if number >= 0.0 && number.fract() == 0.0 && number <= usize::MAX as f64 =>
+        {
+            Some(number as usize)
+        }
+        _ => {
+            return Err(OpError::type_error(
+                "sdpMLineIndex must be a non-negative integer or null",
+            ));
+        }
+    };
+    if !candidate.as_str().is_empty() && sdp_mid.is_none() && sdp_mline_index.is_none() {
+        return Err(OpError::new(
+            "TypeError",
+            "ICE candidate must include sdpMid or sdpMLineIndex",
+        ));
+    }
+    Ok(ParsedIceCandidate {
+        candidate: candidate.as_str().to_owned(),
+        sdp_mid,
+        sdp_mline_index,
+        username_fragment,
+    })
+}
+
+fn optional_candidate_string(ctx: &mut Ctx, value: &Value, name: &str) -> OpResult<Option<String>> {
+    match ctx.member_get(value, name).map_err(OpError::thrown)? {
+        Value::Undefined | Value::Null => Ok(None),
+        Value::Str(value) => Ok(Some(value.as_str().to_owned())),
+        _ => Err(OpError::type_error(
+            "ICE candidate metadata fields must be strings or null",
+        )),
+    }
+}
+
+fn validate_ice_candidate(sdp: &str, candidate: &ParsedIceCandidate) -> OpResult<()> {
+    let mids: Vec<_> = sdp
+        .lines()
+        .filter_map(|line| line.strip_prefix("a=mid:"))
+        .collect();
+    if let Some(mid) = &candidate.sdp_mid {
+        if !mids.contains(&mid.as_str()) {
+            return Err(OpError::new(
+                "OperationError",
+                "ICE candidate sdpMid does not exist in the remote description",
+            ));
+        }
+    } else if let Some(index) = candidate.sdp_mline_index {
+        if index >= mids.len() {
+            return Err(OpError::new(
+                "OperationError",
+                "ICE candidate media-line index is out of range",
+            ));
+        }
+    }
+    if let Some(ufrag) = &candidate.username_fragment {
+        let lines: Vec<_> = sdp.lines().collect();
+        let first_media = lines
+            .iter()
+            .position(|line| line.starts_with("m="))
+            .unwrap_or(lines.len());
+        let mut allowed: Vec<&str> = lines[..first_media]
+            .iter()
+            .filter_map(|line| line.strip_prefix("a=ice-ufrag:"))
+            .collect();
+        let media_starts: Vec<_> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.starts_with("m=").then_some(index))
+            .collect();
+        let selected = if let Some(mid) = candidate.sdp_mid.as_deref() {
+            media_starts
+                .iter()
+                .enumerate()
+                .find_map(|(media_index, start)| {
+                    let end = media_starts
+                        .get(media_index + 1)
+                        .copied()
+                        .unwrap_or(lines.len());
+                    lines[*start..end]
+                        .iter()
+                        .any(|line| line.strip_prefix("a=mid:") == Some(mid))
+                        .then_some(media_index)
+                })
+        } else {
+            candidate.sdp_mline_index
+        };
+        if let Some(media_index) = selected {
+            if let Some(start) = media_starts.get(media_index).copied() {
+                let end = media_starts
+                    .get(media_index + 1)
+                    .copied()
+                    .unwrap_or(lines.len());
+                allowed.extend(
+                    lines[start..end]
+                        .iter()
+                        .filter_map(|line| line.strip_prefix("a=ice-ufrag:")),
+                );
+            }
+        } else {
+            for (media_index, start) in media_starts.iter().enumerate() {
+                let end = media_starts
+                    .get(media_index + 1)
+                    .copied()
+                    .unwrap_or(lines.len());
+                allowed.extend(
+                    lines[*start..end]
+                        .iter()
+                        .filter_map(|line| line.strip_prefix("a=ice-ufrag:")),
+                );
+            }
+        }
+        if !allowed.contains(&ufrag.as_str()) {
+            return Err(OpError::new(
+                "OperationError",
+                "ICE candidate usernameFragment does not match the remote description",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_candidate_to_sdp(sdp: &mut String, candidate: &ParsedIceCandidate) {
+    let mut lines: Vec<String> = sdp.lines().map(str::to_owned).collect();
+    let media_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("m=").then_some(index))
+        .collect();
+    let target_indices: Vec<usize> = media_starts
+        .iter()
+        .enumerate()
+        .filter_map(|(media_index, start)| {
+            let end = media_starts
+                .get(media_index + 1)
+                .copied()
+                .unwrap_or(lines.len());
+            let mid = lines[*start..end]
+                .iter()
+                .find_map(|line| line.strip_prefix("a=mid:"));
+            let applies = if let Some(candidate_mid) = candidate.sdp_mid.as_deref() {
+                mid == Some(candidate_mid)
+            } else if let Some(candidate_index) = candidate.sdp_mline_index {
+                candidate_index == media_index
+            } else {
+                true
+            };
+            applies.then_some(media_index)
+        })
+        .collect();
+    for media_index in target_indices.into_iter().rev() {
+        let start = media_starts[media_index];
+        let end = media_starts
+            .get(media_index + 1)
+            .copied()
+            .unwrap_or(lines.len());
+        let attribute = if candidate.candidate.is_empty() {
+            "a=end-of-candidates".to_owned()
+        } else {
+            format!("a={}", candidate.candidate)
+        };
+        if !lines[start..end].contains(&attribute) {
+            lines.insert(end, attribute);
+        }
+    }
+    *sdp = lines.join("\r\n") + "\r\n";
 }
 
 fn register_peer(ctx: &mut Ctx, id: u64, value: &Value) {
@@ -579,7 +824,9 @@ pub(crate) fn pump(ctx: &mut Ctx) -> OpResult<()> {
                     let changed = ctx.with_instance::<DomRTCPeerConnection, _>(&peer, |pc| {
                         pc.data.ice_gathering_state.replace(state) != state
                     })?;
-                    if changed { dispatch_host_event(ctx, peer.clone(), "icegatheringstatechange", None)?; }
+                    if changed {
+                        dispatch_host_event(ctx, peer.clone(), "icegatheringstatechange", None)?;
+                    }
                 }
                 WebRtcHostEvent::Connected => {
                     dispatch_host_event(ctx, peer.clone(), "connectionstatechange", None)?;
@@ -589,14 +836,61 @@ pub(crate) fn pump(ctx: &mut Ctx) -> OpResult<()> {
                     if let Some(candidate) = candidate {
                         let init = ctx.new_object();
                         let init = Value::Obj(init);
-                        ctx.member_set(&init, "candidate", Value::str(candidate)).map_err(OpError::thrown)?;
+                        ctx.member_set(&init, "candidate", Value::str(candidate))
+                            .map_err(OpError::thrown)?;
+                        let sdp_mid =
+                            ctx.with_instance::<DomRTCPeerConnection, _>(&peer, |pc| {
+                                let pending = pc.data.pending_local_description.borrow();
+                                let current = pc.data.current_local_description.borrow();
+                                pending.as_ref().or(current.as_ref()).and_then(|(_, sdp)| {
+                                    sdp.lines().find_map(|line| {
+                                        line.strip_prefix("a=mid:").map(str::to_owned)
+                                    })
+                                })
+                            })?;
+                        if let Some(sdp_mid) = sdp_mid {
+                            ctx.member_set(&init, "sdpMid", Value::str(sdp_mid))
+                                .map_err(OpError::thrown)?;
+                        }
+                        ctx.member_set(&init, "sdpMLineIndex", Value::Num(0.0))
+                            .map_err(OpError::thrown)?;
                         let dom_event = crate::events::DomEvent::new(ctx, "icecandidate", None)?;
                         let event = ctx.new_instance(dom_event);
-                        ctx.member_set(&event, "candidate", init).map_err(OpError::thrown)?;
-                        let event = JsObject::from_value(event).ok_or_else(|| OpError::new("TypeError", "could not construct ICE candidate event"))?;
-                        crate::events::DomEventTarget::dispatch_event(ctx, This(peer.clone()), event)?;
+                        ctx.member_set(&event, "candidate", init)
+                            .map_err(OpError::thrown)?;
+                        let event = JsObject::from_value(event).ok_or_else(|| {
+                            OpError::new("TypeError", "could not construct ICE candidate event")
+                        })?;
+                        crate::events::DomEventTarget::dispatch_event(
+                            ctx,
+                            This(peer.clone()),
+                            event,
+                        )?;
                     } else {
-                        dispatch_host_event(ctx, peer.clone(), "icecandidate", Some(("candidate", Value::Null)))?;
+                        ctx.with_instance::<DomRTCPeerConnection, _>(&peer, |pc| {
+                            let end = ParsedIceCandidate {
+                                candidate: String::new(),
+                                sdp_mid: None,
+                                sdp_mline_index: None,
+                                username_fragment: None,
+                            };
+                            if let Some((_, sdp)) =
+                                pc.data.pending_local_description.borrow_mut().as_mut()
+                            {
+                                append_candidate_to_sdp(sdp, &end);
+                            }
+                            if let Some((_, sdp)) =
+                                pc.data.current_local_description.borrow_mut().as_mut()
+                            {
+                                append_candidate_to_sdp(sdp, &end);
+                            }
+                        })?;
+                        dispatch_host_event(
+                            ctx,
+                            peer.clone(),
+                            "icecandidate",
+                            Some(("candidate", Value::Null)),
+                        )?;
                     }
                 }
                 WebRtcHostEvent::Disconnected => {
@@ -704,6 +998,7 @@ mod tests {
         connected: Cell<bool>,
         open: Cell<bool>,
         events: RefCell<HashMap<u64, Vec<WebRtcHostEvent>>>,
+        candidates: RefCell<Vec<Option<String>>>,
     }
 
     impl WebRtcHost for FakeHost {
@@ -733,8 +1028,15 @@ mod tests {
         fn accept_answer(&self, _peer: u64, _answer: &str) -> Result<(), String> {
             Ok(())
         }
-        fn start_ice_gathering(&self, _peer: u64) -> Result<(), String> { Ok(()) }
-        fn add_ice_candidate(&self, _peer: u64, _candidate: Option<&str>) -> Result<(), String> { Ok(()) }
+        fn start_ice_gathering(&self, _peer: u64) -> Result<(), String> {
+            Ok(())
+        }
+        fn add_ice_candidate(&self, _peer: u64, candidate: Option<&str>) -> Result<(), String> {
+            self.candidates
+                .borrow_mut()
+                .push(candidate.map(str::to_owned));
+            Ok(())
+        }
         fn send_data(
             &self,
             _peer: u64,
@@ -848,5 +1150,42 @@ mod tests {
             .eval_value("pc.signalingState === 'stable' && pc.pendingLocalDescription === null && pc.currentLocalDescription.type === 'offer' && pc.currentRemoteDescription.type === 'answer'")
             .expect("check committed offer");
         assert!(matches!(committed_offer, Ok(Value::Bool(true))));
+    }
+
+    #[test]
+    fn add_ice_candidate_updates_remote_sdp_and_passes_trickles_to_host() {
+        let mut engine = Engine::new();
+        let host = Rc::new(FakeHost::default());
+        let _realm = crate::install(engine.ctx(), "", 32).expect("install HTML realm");
+        set_host(engine.ctx(), Some(host.clone()));
+        let script = r#"
+            globalThis.pc = new RTCPeerConnection();
+            pc.setRemoteDescription({type:'offer',sdp:'v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=mid:chat\r\na=ice-ufrag:remote\r\n'})
+              .then(() => pc.addIceCandidate({candidate:'candidate:1 1 udp 1 192.0.2.1 9999 typ host',sdpMid:'chat',sdpMLineIndex:0,usernameFragment:'remote'}))
+              .then(() => pc.addIceCandidate({candidate:'',sdpMid:'chat',sdpMLineIndex:0,usernameFragment:'remote'}));
+            globalThis.iceServerConfigRejected = false;
+            try { new RTCPeerConnection({iceServers:[{urls:'stun:stun.example.test'}]}); }
+            catch (error) { globalThis.iceServerConfigRejected = error.name === 'NotSupportedError'; }
+        "#;
+        match engine.eval_value(script).expect("run ICE candidate setup") {
+            Ok(_) => {}
+            Err(_) => panic!("ICE candidate setup script threw"),
+        }
+        engine.run_microtasks();
+        let updated = engine
+            .eval_value("pc.remoteDescription.sdp.includes('a=candidate:1 1 udp 1 192.0.2.1 9999 typ host') && pc.remoteDescription.sdp.includes('a=end-of-candidates')")
+            .expect("read updated remote SDP");
+        assert!(matches!(updated, Ok(Value::Bool(true))));
+        let config_rejected = engine
+            .eval_value("iceServerConfigRejected")
+            .expect("read unsupported ICE server configuration result");
+        assert!(matches!(config_rejected, Ok(Value::Bool(true))));
+        assert_eq!(
+            *host.candidates.borrow(),
+            vec![
+                Some("candidate:1 1 udp 1 192.0.2.1 9999 typ host".to_owned()),
+                None,
+            ]
+        );
     }
 }

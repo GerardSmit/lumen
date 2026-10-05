@@ -57,14 +57,14 @@ export async function createSyncBridge({ createWorker, config = {}, timeoutMs = 
     worker.postMessage({ type: 'init', sab, config });
   });
 
-  function call(kind, payload = new Uint8Array(0)) {
+  function call(kind, payload = new Uint8Array(0), options = {}) {
     const bytes = typeof payload === 'string' ? encoder.encode(payload) : payload;
     Atomics.store(ctrl, STATE, 0);
     worker.postMessage({ type: 'call', kind, payload: bytes });
     const parts = [];
     let failed = false;
     for (;;) {
-      const waited = Atomics.wait(ctrl, STATE, 0, timeoutMs);
+      const waited = Atomics.wait(ctrl, STATE, 0, options.timeoutMs ?? timeoutMs);
       if (waited === 'timed-out') throw new Error(`host call '${kind}' timed out`);
       const len = ctrl[LEN];
       failed = ctrl[STATUS] === 1;

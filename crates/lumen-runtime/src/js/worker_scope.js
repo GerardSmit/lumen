@@ -4,10 +4,10 @@
   const closeSelf = __wself.close;
   const report = __wself.report;
   const loadClassicScript = __wself.loadClassicScript;
+  const executeClassicScript = __lumenWorkerScript.executeClassicScript;
   const workerType = globalThis.__lumenWorkerType === "module" ? "module" : "classic";
   const workerName = String(globalThis.__lumenWorkerName ?? "");
   const isSharedWorker = globalThis.__lumenWorkerShared === true;
-  const globalEval = globalThis.eval;
   let locationUrl;
   try {
     locationUrl = new URL(globalThis.__lumenWorkerLocationHref || "file:///", "file:///" );
@@ -19,6 +19,7 @@
   delete globalThis.__lumenWorkerShared;
   delete globalThis.__lumenWorkerLocationHref;
   delete globalThis.__wself;
+  delete globalThis.__lumenWorkerScript;
   const serialize = (value, transfer) => globalThis.__serializeForClone(value, transfer, true);
   const deserialize = (bytes) => globalThis.__deserializeClone(bytes);
 
@@ -127,9 +128,7 @@
           }
           let source = String(resource.source);
           if (source.startsWith("\uFEFF")) source = source.slice(1);
-          // Indirect eval runs as a global classic script in this realm. That shares the engine's
-          // normal script evaluator while the native op above reuses lumen-web's HTTP/TLS loader.
-          globalEval(`${source}\n//# sourceURL=${String(resource.url)}`);
+          executeClassicScript(source, String(resource.url));
         }
       },
     },
@@ -231,6 +230,16 @@
     const h = globalThis["on" + type];
     if (typeof h === "function") { try { h.call(globalThis, event); } catch (e) { reportError(e); } }
     target.dispatchEvent(event);
+  };
+
+  // Promise rejection events are tasks of the worker loop; the native policy decides whether
+  // each one is still deliverable and calls this once per event. Returns false when cancelled.
+  globalThis.__workerDispatchRejection = (type, promise, reason) => {
+    const event = new PromiseRejectionEvent(type, {
+      promise, reason, cancelable: type === "unhandledrejection",
+    });
+    fire(type, event);
+    return !event.defaultPrevented;
   };
 
   if (!isSharedWorker) {

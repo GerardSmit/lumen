@@ -209,7 +209,7 @@ thread_local! {
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::Tier, Completion, Engine};
+    use crate::{Completion, Engine, bytecode::Tier};
 
     fn check(source: &str, expected: (usize, usize, usize)) {
         for tier in [Tier::Interp, Tier::Bytecode] {
@@ -222,7 +222,9 @@ mod tests {
             // Existing AST native calls lose the strict caller flag on this path;
             // compiled callers retain it. Keep this optimization neutral to that difference.
             let expected_native_strict = tier != Tier::Interp;
-            let script = format!("function assert(v){{if(!v)throw new Error('iterator state');}} var expectedNativeStrict={expected_native_strict}; var next=Object.getPrototypeOf([].values()).next; {source}; 'passed'");
+            let script = format!(
+                "function assert(v){{if(!v)throw new Error('iterator state');}} var expectedNativeStrict={expected_native_strict}; var next=Object.getPrototypeOf([].values()).next; {source}; 'passed'"
+            );
             match engine.eval(&script, false).unwrap() {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),

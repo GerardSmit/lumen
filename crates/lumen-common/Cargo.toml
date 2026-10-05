@@ -8,6 +8,7 @@ publish = false
 [features]
 # Hash-flooding test helpers (`fasthash::tests`) shared with the engine's own tests.
 test-support = []
+web-encoding = ["dep:encoding_rs"]
 video = ["dep:shiguredo_mp4", "dep:rusty_h264-decoder", "dep:rusty_h264-common"]
 # AAC decoding is isolated because the pinned decoder currently requires std;
 # the portable MP4/H.264 demux path stays available without it.
@@ -23,6 +24,7 @@ hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripem
 compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:wuff"]
 
 [dependencies]
+encoding_rs = { version = "=0.8.42", default-features = false, optional = true }
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
 unicode-linebreak = { version = "=0.1.5", default-features = false }

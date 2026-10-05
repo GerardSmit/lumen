@@ -124,7 +124,7 @@ fn make_date(day: f64, time: f64) -> f64 {
 }
 
 /// TimeClip: NaN outside ±8.64e15 ms; -0 normalizes to +0.
-fn time_clip(t: f64) -> f64 {
+pub(crate) fn time_clip(t: f64) -> f64 {
     if !t.is_finite() || t.abs() > 8.64e15 {
         f64::NAN
     } else {
@@ -143,13 +143,15 @@ fn parts_to_ms(y: i64, mo0: i64, d: i64, h: i64, mi: i64, s: i64, ml: i64) -> f6
 fn date_ms(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisTimeValue: the receiver must be a Date (carry the internal time slot), else TypeError.
     match this {
-        Value::Obj(o) if o.borrow().props.contains("\u{0}date_ms") => {}
+        Value::Obj(o) if o.borrow().date_value().is_some() => {}
         _ => return Err(i.make_error("TypeError", "this is not a Date object")),
     }
-    Ok(match ab(i.get_member(this, "\u{0}date_ms"))? {
-        Value::Num(n) => n,
-        _ => f64::NAN,
-    })
+    let Value::Obj(o) = this else { unreachable!() };
+    Ok(o.borrow().date_value().expect("Date slot was checked"))
+}
+
+fn store_date_value(object: &crate::value::Gc, milliseconds: f64) {
+    object.borrow_mut().set_date_value(milliseconds);
 }
 
 fn date_get(i: &mut Interp, this: &Value, sel: u8, local: bool) -> Result<Value, Value> {
@@ -243,7 +245,7 @@ fn date_set_multi(
         time_clip(make_date(day, time))
     };
     if let Value::Obj(o) = this {
-        set_internal(o, "\u{0}date_ms", Value::Num(ms));
+        store_date_value(o, ms);
     }
     Ok(Value::Num(ms))
 }
@@ -516,11 +518,8 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
         0 => now_ms(),
         1 => match &args[0] {
             // A Date argument clones its time value directly (no valueOf call).
-            Value::Obj(o) if o.borrow().props.contains("\u{0}date_ms") => {
-                match o.borrow().props.get("\u{0}date_ms").map(|p| p.value()) {
-                    Some(Value::Num(n)) => n,
-                    _ => f64::NAN,
-                }
+            Value::Obj(o) if o.borrow().date_value().is_some() => {
+                o.borrow().date_value().expect("Date slot was checked")
             }
             v => {
                 let prim = ab(i.to_primitive(v, crate::eval::Hint::Default))?;
@@ -556,7 +555,8 @@ fn date_ctor(i: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, Value> 
         }
     };
     let obj = new_from_ctor(i, "Date")?;
-    set_internal(&obj, "\u{0}date_ms", Value::Num(ms));
+    obj.borrow_mut()
+        .set_exotic(Exotic::Date, Some(Value::Num(ms)));
     Ok(Value::Obj(obj))
 }
 
@@ -593,7 +593,7 @@ pub(super) fn install_date(it: &mut Interp) {
         date_ms(i, &this)?; // thisTimeValue brand check
         let v = time_clip(ab(i.to_number(&arg(a, 0)))?);
         if let Value::Obj(o) = &this {
-            set_internal(o, "\u{0}date_ms", Value::Num(v));
+            store_date_value(o, v);
         }
         Ok(Value::Num(v))
     });

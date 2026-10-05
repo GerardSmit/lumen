@@ -689,7 +689,7 @@ mod tests {
         assert!(matches!(
             eval(
                 &mut engine,
-                "new Event('plain').movementX === 0 && new Event('plain').movementY === 0"
+                "new MouseEvent('mousemove').movementX === 0 && new PointerEvent('pointermove').movementY === 0"
             ),
             Value::Bool(true)
         ));

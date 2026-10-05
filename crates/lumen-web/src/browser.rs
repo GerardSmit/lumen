@@ -7,7 +7,7 @@
 //! completion.
 
 use js_sys::{Array, Uint8Array};
-use lumen_host::browser::{arg_value, call_host, decode_event, Arg, Event};
+use lumen_host::browser::{Arg, Event, arg_value, call_host, decode_event};
 use lumen_host::{Ctx, Value};
 use wasm_bindgen::JsValue;
 
@@ -63,9 +63,31 @@ pub(crate) fn op_http_request(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Re
             let option = ctx.get_member(value, name)?;
             if !matches!(option, Value::Undefined) {
                 let option = ctx.coerce_string(&option)?.to_string();
-                js_sys::Reflect::set(&options, &JsValue::from_str(name), &JsValue::from_str(&option))
-                    .map_err(|_| ctx.make_error("TypeError", "invalid browser Fetch options"))?;
+                js_sys::Reflect::set(
+                    &options,
+                    &JsValue::from_str(name),
+                    &JsValue::from_str(&option),
+                )
+                .map_err(|_| ctx.make_error("TypeError", "invalid browser Fetch options"))?;
             }
+        }
+        let upload_progress = ctx.get_member(value, "uploadProgress")?;
+        if let Value::Bool(enabled) = upload_progress {
+            js_sys::Reflect::set(
+                &options,
+                &JsValue::from_str("uploadProgress"),
+                &JsValue::from_bool(enabled),
+            )
+            .map_err(|_| ctx.make_error("TypeError", "invalid browser Fetch options"))?;
+        }
+        let force_preflight = ctx.get_member(value, "forcePreflight")?;
+        if let Value::Bool(force) = force_preflight {
+            js_sys::Reflect::set(
+                &options,
+                &JsValue::from_str("forcePreflight"),
+                &JsValue::from_bool(force),
+            )
+            .map_err(|_| ctx.make_error("TypeError", "invalid browser Fetch options"))?;
         }
     }
     let started = call_host(
@@ -103,12 +125,8 @@ fn decode_fetch(
         return Err(ctx.make_error("TypeError", message));
     }
     let mut it = event.args.into_iter().peekable();
-    let (
-        Some(Arg::Num(status)),
-        Some(Arg::Str(status_text)),
-        Some(Arg::Str(url)),
-        Some(body),
-    ) = (it.next(), it.next(), it.next(), it.next())
+    let (Some(Arg::Num(status)), Some(Arg::Str(status_text)), Some(Arg::Str(url)), Some(body)) =
+        (it.next(), it.next(), it.next(), it.next())
     else {
         return Err(ctx.make_error("TypeError", "fetch: malformed response from the host"));
     };
@@ -117,7 +135,9 @@ fn decode_fetch(
             (Some(Arg::Bool(redirected)), Some(Arg::Str(kind))) => Some((redirected, kind)),
             _ => return Err(ctx.make_error("TypeError", "fetch: malformed response metadata")),
         }
-    } else { None };
+    } else {
+        None
+    };
     let mut pairs = Vec::new();
     while let (Some(Arg::Str(k)), Some(Arg::Str(v))) = (it.next(), it.next()) {
         pairs.push(ctx.make_array(vec![Value::from_string(k), Value::from_string(v)]));
@@ -134,10 +154,14 @@ fn decode_fetch(
     let _ = ctx.set_member(&obj, "headers", headers);
     match body {
         Arg::Num(id) if id.is_finite() && id >= 0.0 && id.fract() == 0.0 => {
-            let reader = ctx.new_instance(crate::http_body::ResponseBody { request_id: id as u64 });
+            let reader = ctx.new_instance(crate::http_body::ResponseBody {
+                request_id: id as u64,
+            });
             let _ = ctx.set_member(&obj, "bodyReader", reader);
         }
-        Arg::Null => { let _ = ctx.set_member(&obj, "body", Value::Null); }
+        Arg::Null => {
+            let _ = ctx.set_member(&obj, "body", Value::Null);
+        }
         Arg::Bytes(bytes) => {
             let body = arg_value(ctx, Arg::Bytes(bytes))?;
             let _ = ctx.set_member(&obj, "body", body);

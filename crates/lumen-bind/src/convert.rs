@@ -40,6 +40,28 @@ pub trait FromRest<'a, H: Host>: Sized {
     fn from_rest(cx: &'a H::Cx<'_>, vals: &'a [H::Value], first: u32) -> Result<Self, H::Error>;
 }
 
+/// Typed one-argument/default overload or two-number overload. Conversion is
+/// selected by arity before running either branch's hooks, and extra arguments
+/// are ignored. Used by coordinate APIs with an optional dictionary overload.
+pub enum OneOrNumberPair<T> {
+    One(T),
+    Pair(f64, f64),
+}
+
+impl<'a, H: Host, T: FromArg<'a, H>> FromRest<'a, H> for OneOrNumberPair<T> {
+    fn from_rest(cx: &'a H::Cx<'_>, values: &'a [H::Value], first: u32) -> Result<Self, H::Error> {
+        match values {
+            [] => T::from_missing(cx, Slot::arg(first)).map(Self::One),
+            [value] => T::from_arg(cx, value, Slot::arg(first)).map(Self::One),
+            [x, y, ..] => {
+                let x = <f64 as FromArg<'a, H>>::from_arg(cx, x, Slot::arg(first))?;
+                let y = <f64 as FromArg<'a, H>>::from_arg(cx, y, Slot::arg(first + 1))?;
+                Ok(Self::Pair(x, y))
+            }
+        }
+    }
+}
+
 /// A `#[varkw]` parameter type.
 pub trait FromVarKw<'a, H: Host>: Sized {
     fn from_varkw(cx: &'a H::Cx<'_>) -> Result<Self, H::Error>;

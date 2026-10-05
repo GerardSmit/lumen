@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::MutexGuard;
 
 use lumen_host::{Ctx, Value};
+use lumen::embed::SharedBufferHandle;
 
 use crate::wasm;
 use crate::wasm::exec::{Host, Imports, MemEntity, Store, Val};
@@ -44,9 +46,11 @@ impl Default for WasmStore {
 struct MemBuf {
     addr: usize,
     buf: Value,
-    /// The length the buffer views; when the memory grows, the buffer is replaced by a longer
-    /// view and detached, as `memory.grow` requires.
+    /// The length captured by this buffer. Unshared growth detaches and replaces it; shared
+    /// growth preserves it and makes the next `memory.buffer` a new wrapper over the same bytes.
     len: usize,
+    shared: bool,
+    generation: u64,
 }
 
 fn view(ctx: &mut Ctx, m: &MemEntity) -> Value {
@@ -64,7 +68,23 @@ fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
         .clone();
     for (i, b) in bufs.into_iter().enumerate() {
         let Some(m) = mems.get(b.addr) else { continue };
-        if m.bytes.len() != b.len {
+        if b.shared && m.generation != b.generation {
+            let handle = m
+                .bytes
+                .shared_handle()
+                .expect("shared memory backing")
+                .current_view()
+                .expect("shared memory view");
+            let buf = ctx.import_shared_array_buffer(&handle);
+            let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+            ws.bufs[i] = MemBuf {
+                addr: b.addr,
+                buf,
+                len: m.bytes.len(),
+                shared: true,
+                generation: m.generation,
+            };
+        } else if m.generation != b.generation {
             ctx.array_buffer_detach(&b.buf);
             let buf = view(ctx, m);
             let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
@@ -72,6 +92,8 @@ fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
                 addr: b.addr,
                 buf,
                 len: m.bytes.len(),
+                shared: false,
+                generation: m.generation,
             };
         }
     }
@@ -79,9 +101,74 @@ fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
 
 /// Run `f` on the store (moved out of OpState, so imports can re-enter JS), then refresh the
 /// memory buffers.
-fn with_store<R>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx, &mut Store) -> R) -> R {
+struct SharedMemLock {
+    // Drop the guard before its handle so the Arc-backed mutex outlives the guard.
+    guard: Option<MutexGuard<'static, Vec<u8>>>,
+    handle: SharedBufferHandle,
+}
+
+impl SharedMemLock {
+    fn new(handle: SharedBufferHandle) -> SharedMemLock {
+        let mut lock = SharedMemLock {
+            guard: None,
+            handle,
+        };
+        lock.resume();
+        lock
+    }
+
+    fn suspend(&mut self) {
+        self.guard.take();
+    }
+
+    fn resume(&mut self) {
+        if self.guard.is_none() {
+            let guard = self.handle.lock().expect("shared wasm memory poisoned");
+            // SAFETY: `handle` is stored beside the guard and is dropped after it. The backing
+            // Arc therefore outlives the guard for the entire lease.
+            self.guard = Some(unsafe {
+                std::mem::transmute::<MutexGuard<'_, Vec<u8>>, MutexGuard<'static, Vec<u8>>>(guard)
+            });
+        }
+    }
+}
+
+struct SharedAccess {
+    locks: Vec<SharedMemLock>,
+}
+
+impl SharedAccess {
+    fn new(store: &Store) -> SharedAccess {
+        let mut handles: Vec<SharedBufferHandle> = store
+            .memories
+            .iter()
+            .filter_map(|memory| memory.bytes.shared_handle())
+            .collect();
+        handles.sort_by_key(SharedBufferHandle::lock_order_key);
+        handles.dedup_by(|right, left| right.same_backing(left));
+        SharedAccess {
+            locks: handles.into_iter().map(SharedMemLock::new).collect(),
+        }
+    }
+
+    fn suspend(&mut self) {
+        for lock in self.locks.iter_mut().rev() {
+            lock.suspend();
+        }
+    }
+
+    fn resume(&mut self) {
+        for lock in &mut self.locks {
+            lock.resume();
+        }
+    }
+}
+
+fn with_store<R>(ctx: &mut Ctx, f: impl FnOnce(&mut Ctx, &mut Store, &mut SharedAccess) -> R) -> R {
     let mut store = std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").store);
-    let r = f(ctx, &mut store);
+    let mut shared = SharedAccess::new(&store);
+    let r = f(ctx, &mut store, &mut shared);
+    drop(shared);
     refresh(ctx, &store.memories);
     ctx.host_mut::<WasmStore>().expect("wasm store").store = store;
     r
@@ -130,6 +217,7 @@ fn num(a: &[Value], i: usize) -> f64 {
 struct CtxHost<'a> {
     ctx: &'a mut Ctx,
     host_funcs: &'a [Value],
+    shared: &'a mut SharedAccess,
     error: Option<Value>,
 }
 
@@ -141,6 +229,7 @@ impl Host for CtxHost<'_> {
         results: &[ValType],
         mems: &mut [MemEntity],
     ) -> Result<Vec<Val>, String> {
+        self.shared.suspend();
         refresh(self.ctx, mems);
         let ws = self.ctx.host_mut::<WasmStore>().expect("wasm store");
         let prev = std::mem::replace(&mut ws.active_mems, mems);
@@ -149,7 +238,16 @@ impl Host for CtxHost<'_> {
             .host_mut::<WasmStore>()
             .expect("wasm store")
             .active_mems = prev;
+        self.shared.resume();
         r
+    }
+
+    fn before_memory_grow(&mut self) {
+        self.shared.suspend();
+    }
+
+    fn after_memory_grow(&mut self) {
+        self.shared.resume();
     }
 }
 
@@ -196,10 +294,11 @@ impl CtxHost<'_> {
 fn run_func(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>, Value> {
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     let host_funcs = std::mem::take(&mut ws.host_funcs);
-    let (result, host_err) = with_store(ctx, |ctx, store| {
+    let (result, host_err) = with_store(ctx, |ctx, store, shared| {
         let mut host = CtxHost {
             ctx,
             host_funcs: &host_funcs,
+            shared,
             error: None,
         };
         let r = store.invoke(func_addr, args, &mut host, 0);
@@ -287,6 +386,47 @@ fn alloc_limits(ctx: &mut Ctx, a: &[Value], limit: u32) -> Result<(usize, Option
 
 pub(crate) fn op_alloc_memory(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Value> {
     let (min, max) = alloc_limits(ctx, a, wasm::parse::MAX_MEMORY_PAGES)?;
+    if let Some(buffer) = a.get(2).filter(|value| !matches!(value, Value::Undefined)) {
+        let max = max.ok_or_else(|| {
+            ctx.make_error("TypeError", "WebAssembly shared memory requires a maximum")
+        })?;
+        let bytes = (max as usize)
+            .checked_mul(wasm::exec::PAGE_SIZE)
+            .ok_or_else(|| ctx.make_error("RangeError", "WebAssembly shared memory is too large"))?;
+        if bytes > lumen::embed::MAX_BUFFER_BYTES {
+            return Err(ctx.make_error(
+                "RangeError",
+                "WebAssembly shared memory exceeds the shared buffer limit",
+            ));
+        }
+        let mut handle = ctx
+            .export_shared_array_buffer(buffer)?
+            .ok_or_else(|| ctx.make_error("TypeError", "WebAssembly shared memory requires a SharedArrayBuffer"))?;
+        let initial_bytes = min.saturating_mul(wasm::exec::PAGE_SIZE);
+        if handle.byte_len() != initial_bytes {
+            return Err(ctx.make_error(
+                "RangeError",
+                "WebAssembly shared memory buffer does not match its initial size",
+            ));
+        }
+        handle.reserve_to(bytes).map_err(|_| {
+            ctx.make_error("RangeError", "WebAssembly shared memory reservation failed")
+        })?;
+        let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
+        return match ws.store.alloc_shared_memory(min, max, handle) {
+            Ok(addr) => {
+                ws.bufs.push(MemBuf {
+                    addr,
+                    buf: buffer.clone(),
+                    len: initial_bytes,
+                    shared: true,
+                    generation: 0,
+                });
+                Ok(Value::Num(addr as f64))
+            }
+            Err(error) => Err(ctx.make_error("RangeError", error)),
+        };
+    }
     let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
     match ws.store.alloc_memory(min, max) {
         Ok(addr) => Ok(Value::Num(addr as f64)),
@@ -390,7 +530,7 @@ pub(crate) fn op_instantiate(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Va
         imports
     };
     // Data segments may write into an imported memory, which lives in its JS buffer.
-    let inst_result = with_store(ctx, |_, store| {
+    let inst_result = with_store(ctx, |_, store, _shared| {
         store.instantiate(Rc::clone(&module), imports)
     });
     let inst_idx = inst_result.map_err(|e| ctx.make_error("Error", format!("LinkError: {e}")))?;
@@ -512,10 +652,11 @@ pub(crate) fn op_func(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Value, Va
 fn run_func_js(ctx: &mut Ctx, func_addr: usize, args: Vec<Val>) -> Result<Vec<Val>, Value> {
     let host_funcs =
         std::mem::take(&mut ctx.host_mut::<WasmStore>().expect("wasm store").host_funcs);
-    let (result, host_err) = with_store(ctx, |ctx, store| {
+    let (result, host_err) = with_store(ctx, |ctx, store, shared| {
         let mut host = CtxHost {
             ctx,
             host_funcs: &host_funcs,
+            shared,
             error: None,
         };
         let r = store.invoke(func_addr, args, &mut host, 0);
@@ -547,13 +688,23 @@ pub(crate) fn op_mem_buffer(ctx: &mut Ctx, _t: Value, a: &[Value]) -> Result<Val
     let store = std::mem::take(&mut ws.store);
     let r = match store.memories.get(addr) {
         Some(m) => {
-            let buf = view(ctx, m);
             let len = m.bytes.len();
+            let (buf, shared) = if let Some(handle) = m
+                .bytes
+                .shared_handle()
+                .and_then(|handle| handle.current_view().ok())
+            {
+                (ctx.import_shared_array_buffer(&handle), true)
+            } else {
+                (view(ctx, m), false)
+            };
             let ws = ctx.host_mut::<WasmStore>().expect("wasm store");
             ws.bufs.push(MemBuf {
                 addr,
                 buf: buf.clone(),
                 len,
+                shared,
+                generation: m.generation,
             });
             Ok(buf)
         }

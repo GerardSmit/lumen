@@ -401,11 +401,9 @@ fn call_native_prepared(
         recv_kind: crate::interpreter::frames::recv_kind(this),
         this,
     };
-    i.native_top = &ctx as *const crate::interpreter::frames::NativeCtx as usize;
-    i.cur_site = site | crate::interpreter::frames::SITE_NATIVE;
-    let r = f(i, this.clone(), args).map_err(Abrupt::Throw);
-    i.cur_site = site;
-    i.native_top = ctx.prev;
+    let mut scope = crate::interpreter::NativeFrameScope::enter(i, &ctx, site);
+    let r = f(scope.interp(), this.clone(), args).map_err(Abrupt::Throw);
+    drop(scope);
     i.constructing = saved_ctor;
     drop_value_fast(std::mem::replace(&mut i.new_target, saved_nt));
     finish_call(i, r)

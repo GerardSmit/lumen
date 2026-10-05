@@ -19,14 +19,12 @@ lumen-node = { path = "../lumen-node", default-features = false }
 lumen-os = { path = "../lumen-os" }
 lumen-timers = { path = "../lumen-timers" }
 lumen-web = { path = "../lumen-web", default-features = false }
+lumen-html-js = { path = "../lumen-html-js" }
 
 # Build-only: build.rs precompiles the embedded JS (no runtime dep).
 [build-dependencies]
 lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
-
-[dev-dependencies]
-lumen-html-js = { path = "../lumen-html-js" }
 
 # lumen-node's optional builtins (see its Cargo.toml), all on by default.
 [features]

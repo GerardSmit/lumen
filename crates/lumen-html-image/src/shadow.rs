@@ -18,16 +18,7 @@ pub(super) fn draw(
     else {
         return Ok(());
     };
-    let sigma = shadow.blur as f64 * raster.scale as f64 * 0.5;
-    let window = (sigma * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5)
-        .floor()
-        .max(1.0);
-    if !window.is_finite() || window > MAX_LAYER_BYTES as f64 / 24.0 {
-        return Err(ImageError::TooLarge);
-    }
-    let window = window as usize;
-    let sizes = [window, window, window + usize::from(window % 2 == 0)];
-    let padding = (sizes.iter().sum::<usize>() - 3) / 2;
+    let (sizes, padding) = blur_sizes(shadow.blur, raster.scale)?;
     let left = (visible.x * raster.scale).floor() - padding as f32;
     let top = (visible.y * raster.scale).floor() - padding as f32;
     let width = ((visible.x + visible.width) * raster.scale).ceil() - left + padding as f32;
@@ -39,10 +30,8 @@ pub(super) fn draw(
         return Err(ImageError::TooLarge);
     }
     let (width, height) = (width as usize, height as usize);
-    let ring_bytes = sizes.iter().sum::<usize>() * 8 * LANES;
-    let pixels =
-        lumen_common::limits::size::repeat(width, height, (MAX_LAYER_BYTES - ring_bytes) / 2)
-            .map_err(|_| ImageError::TooLarge)?;
+    let pixels = lumen_common::limits::size::repeat(width, height, MAX_LAYER_BYTES / 2)
+        .map_err(|_| ImageError::TooLarge)?;
     let mut mask = vec![0u8; pixels];
     let spread = if shadow.inset {
         -shadow.spread
@@ -85,26 +74,7 @@ pub(super) fn draw(
                 .round() as u8;
         }
     }
-    if window > 1 {
-        let mut scratch = vec![0u8; pixels];
-        let mut ring = vec![0u64; sizes.iter().sum::<usize>() * LANES];
-        for y in 0..height {
-            scan(
-                &mask[y * width..],
-                &mut scratch[y * width..],
-                width,
-                1,
-                sizes,
-                &mut ring,
-            );
-        }
-        for x0 in (0..width).step_by(LANES) {
-            let lanes = LANES.min(width - x0);
-            scan_columns(
-                &scratch, &mut mask, width, height, x0, lanes, sizes, &mut ring,
-            );
-        }
-    }
+    blur_alpha_mask(&mut mask, width, height, shadow.blur, raster.scale, 0)?;
     let (x0, y0, x1, y1) = raster.pixel_span(visible);
     let transparent = if shadow.inset { 255 } else { 0 };
     for y in y0..y1 {
@@ -139,6 +109,122 @@ pub(super) fn draw(
                 alpha,
             );
         }
+    }
+    Ok(())
+}
+
+/// Return the three box widths and padding used to approximate a Gaussian blur.
+/// The standard deviation for canvas shadows is half the blur value.
+pub(super) fn blur_padding(blur: f32) -> Result<usize, ImageError> {
+    Ok(blur_sizes(blur, 1.0)?.1)
+}
+
+fn blur_sizes(blur: f32, scale: f32) -> Result<([usize; 3], usize), ImageError> {
+    if !blur.is_finite() || blur < 0.0 || !scale.is_finite() || scale <= 0.0 {
+        return Err(ImageError::TooLarge);
+    }
+    let sigma = f64::from(blur) * f64::from(scale) * 0.5;
+    let window = (sigma * 3.0 * (2.0 * std::f64::consts::PI).sqrt() / 4.0 + 0.5)
+        .floor()
+        .max(1.0);
+    if !window.is_finite() || window > MAX_LAYER_BYTES as f64 / 24.0 {
+        return Err(ImageError::TooLarge);
+    }
+    let window = window as usize;
+    let sizes = [window, window, window + usize::from(window % 2 == 0)];
+    let padding = (sizes.iter().sum::<usize>() - 3) / 2;
+    Ok((sizes, padding))
+}
+
+/// Blur an alpha plane in place using the same bounded three-box Gaussian
+/// approximation as CSS box shadows. `reserved_bytes` accounts for storage
+/// owned by the caller while this helper is active (for example the temporary
+/// pixmap from which a canvas alpha plane was extracted).
+pub(super) fn blur_alpha_mask(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    blur: f32,
+    scale: f32,
+    reserved_bytes: usize,
+) -> Result<(), ImageError> {
+    let Some(pixels) = width.checked_mul(height) else {
+        return Err(ImageError::TooLarge);
+    };
+    if pixels != mask.len() {
+        return Err(ImageError::InvalidViewport);
+    }
+    validate_blur_budget(width, height, blur, scale, reserved_bytes)?;
+    let (sizes, _) = blur_sizes(blur, scale)?;
+    if sizes[0] == 1 {
+        return Ok(());
+    }
+    let ring_len = sizes
+        .iter()
+        .try_fold(0usize, |sum, size| sum.checked_add(*size))
+        .and_then(|sum| sum.checked_mul(LANES))
+        .ok_or(ImageError::TooLarge)?;
+    let mut scratch = Vec::new();
+    scratch
+        .try_reserve_exact(pixels)
+        .map_err(|_| ImageError::TooLarge)?;
+    scratch.resize(pixels, 0);
+    let mut ring = Vec::new();
+    ring.try_reserve_exact(ring_len)
+        .map_err(|_| ImageError::TooLarge)?;
+    ring.resize(ring_len, 0);
+    for y in 0..height {
+        let start = y * width;
+        scan(
+            &mask[start..],
+            &mut scratch[start..],
+            width,
+            1,
+            sizes,
+            &mut ring,
+        );
+    }
+    for x0 in (0..width).step_by(LANES) {
+        let lanes = LANES.min(width - x0);
+        scan_columns(&scratch, mask, width, height, x0, lanes, sizes, &mut ring);
+    }
+    Ok(())
+}
+
+pub(super) fn validate_blur_budget(
+    width: usize,
+    height: usize,
+    blur: f32,
+    scale: f32,
+    reserved_bytes: usize,
+) -> Result<(), ImageError> {
+    let pixels = width.checked_mul(height).ok_or(ImageError::TooLarge)?;
+    let (sizes, _) = blur_sizes(blur, scale)?;
+    if sizes[0] == 1 {
+        let total_bytes = pixels
+            .checked_add(reserved_bytes)
+            .ok_or(ImageError::TooLarge)?;
+        return if total_bytes <= MAX_LAYER_BYTES {
+            Ok(())
+        } else {
+            Err(ImageError::TooLarge)
+        };
+    }
+    let ring_len = sizes
+        .iter()
+        .try_fold(0usize, |sum, size| sum.checked_add(*size))
+        .and_then(|sum| sum.checked_mul(LANES))
+        .ok_or(ImageError::TooLarge)?;
+    let ring_bytes = ring_len
+        .checked_mul(core::mem::size_of::<u64>())
+        .ok_or(ImageError::TooLarge)?;
+    let total_bytes = pixels
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(ring_bytes))
+        .and_then(|bytes| bytes.checked_add(reserved_bytes))
+        .ok_or(ImageError::TooLarge)?;
+    if total_bytes > MAX_LAYER_BYTES {
+        return Err(ImageError::TooLarge);
     }
     Ok(())
 }

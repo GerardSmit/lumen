@@ -39,55 +39,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
     }
     it.def_method(&fp, "call", 1, nf_function_call);
     it.def_method(&fp, "apply", 2, nf_function_apply);
-    it.def_method(&fp, "bind", 1, |i, this, args| {
-        // Any callable (including a callable proxy) can be bound.
-        let target = match &this {
-            Value::Obj(o) if this.is_callable() => o.clone(),
-            _ => return Err(i.make_error("TypeError", "bind must be called on a function")),
-        };
-        let bound_this = arg(args, 0);
-        let bound_args = if args.is_empty() {
-            Vec::new()
-        } else {
-            args[1..].to_vec()
-        };
-        // length: 0 unless the target has an OWN `length` (HasOwnProperty — proxy-trapped) whose
-        // Get is a Number; +Infinity stays, -Infinity is 0, and a finite value becomes
-        // max(0, ToIntegerOrInfinity(len) - boundArgs). name = "bound " + Get(target, "name").
-        let has_own_len = has_own_property_trapped(i, &this, "length")?;
-        let l: f64 = if has_own_len {
-            match ab(i.get_member(&this, "length"))? {
-                Value::Num(n) if n == f64::INFINITY => f64::INFINITY,
-                Value::Num(n) if n.is_finite() => (n.trunc() - bound_args.len() as f64).max(0.0),
-                _ => 0.0,
-            }
-        } else {
-            0.0
-        };
-        let target_name = ab(i.get_member(&this, "name"))?;
-        let name = match &target_name {
-            Value::Str(s) => bound_name(s),
-            _ => Value::str("bound "),
-        };
-        // BoundFunctionCreate: the bound function's [[Prototype]] is the target's (via
-        // [[GetPrototypeOf]], so a proxy trap participates) — possibly null.
-        let bound_proto = match js_get_prototype_of(i, &this)? {
-            Value::Obj(p) => Some(p),
-            _ => None,
-        };
-        let obj = Object::new(bound_proto);
-        let target_is_ctor = i.value_is_constructor(&this);
-        obj.borrow_mut().call = Callable::bound(target, bound_this, bound_args);
-        // A bound function is a constructor exactly when its target is.
-        obj.borrow_mut().is_constructor = target_is_ctor;
-        obj.borrow_mut()
-            .props
-            .insert("length", Property::data(Value::Num(l), false, false, true));
-        obj.borrow_mut()
-            .props
-            .insert("name", Property::data(name, false, false, true));
-        Ok(Value::Obj(obj))
-    });
+    it.def_method(&fp, "bind", 1, nf_function_bind);
     it.def_method(&fp, "toString", 0, |i, this, _args| {
         // Function.prototype.toString requires a callable `this` (a function or a callable proxy).
         if !this.is_callable() {
@@ -185,6 +137,64 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         .props
         .insert("constructor", Property::builtin(Value::Obj(ctor.clone())));
     set_builtin(&it.global, "Function", Value::Obj(ctor.clone()));
+}
+
+/// Bind a native host callback without consulting an author-modifiable
+/// Function.prototype.bind property. Reuses the language's bind algorithm.
+impl Interp {
+    pub fn bind_function_this(&mut self, function: Value, receiver: Value) -> Result<Value, Value> {
+        nf_function_bind(self, function, &[receiver])
+    }
+}
+
+fn nf_function_bind(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
+    // Any callable (including a callable proxy) can be bound.
+    let target = match &this {
+        Value::Obj(o) if this.is_callable() => o.clone(),
+        _ => return Err(i.make_error("TypeError", "bind must be called on a function")),
+    };
+    let bound_this = arg(args, 0);
+    let bound_args = if args.is_empty() {
+        Vec::new()
+    } else {
+        args[1..].to_vec()
+    };
+    // length: 0 unless the target has an OWN `length` (HasOwnProperty — proxy-trapped) whose
+    // Get is a Number; +Infinity stays, -Infinity is 0, and a finite value becomes
+    // max(0, ToIntegerOrInfinity(len) - boundArgs). name = "bound " + Get(target, "name").
+    let has_own_len = has_own_property_trapped(i, &this, "length")?;
+    let l: f64 = if has_own_len {
+        match ab(i.get_member(&this, "length"))? {
+            Value::Num(n) if n == f64::INFINITY => f64::INFINITY,
+            Value::Num(n) if n.is_finite() => (n.trunc() - bound_args.len() as f64).max(0.0),
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let target_name = ab(i.get_member(&this, "name"))?;
+    let name = match &target_name {
+        Value::Str(s) => bound_name(s),
+        _ => Value::str("bound "),
+    };
+    // BoundFunctionCreate: the bound function's [[Prototype]] is the target's (via
+    // [[GetPrototypeOf]], so a proxy trap participates) — possibly null.
+    let bound_proto = match js_get_prototype_of(i, &this)? {
+        Value::Obj(p) => Some(p),
+        _ => None,
+    };
+    let obj = Object::new(bound_proto);
+    let target_is_ctor = i.value_is_constructor(&this);
+    obj.borrow_mut().call = Callable::bound(target, bound_this, bound_args);
+    // A bound function is a constructor exactly when its target is.
+    obj.borrow_mut().is_constructor = target_is_ctor;
+    obj.borrow_mut()
+        .props
+        .insert("length", Property::data(Value::Num(l), false, false, true));
+    obj.borrow_mut()
+        .props
+        .insert("name", Property::data(name, false, false, true));
+    Ok(Value::Obj(obj))
 }
 
 pub(crate) fn nf_function_call(
@@ -314,3 +324,18 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
 // ---------------------------------------------------------------------------------------------
 // Object
 // ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod intrinsic_bind_tests {
+    #[test]
+    fn host_binding_reuses_intrinsic_after_public_bind_is_replaced() {
+        let mut engine = crate::Engine::new();
+        let function = engine.eval_value("Function.prototype.bind = function(){throw new Error('author bind')}; (function(){return this.answer})")
+            .ok().expect("parses").ok().expect("function");
+        let receiver = engine.eval_value("({answer:42})").ok().expect("parses").ok().expect("receiver");
+        let bound = engine.ctx().bind_function_this(function, receiver).ok().expect("intrinsic bind");
+        let value = engine.call_function(&bound, crate::Value::Undefined, &[])
+            .ok().expect("bound callback runs");
+        assert!(matches!(value, crate::Value::Num(value) if value == 42.0));
+    }
+}

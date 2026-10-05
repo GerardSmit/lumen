@@ -6,7 +6,8 @@ use alloc::{
     vec::Vec,
 };
 
-const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
+const MAX_INSERTION_DEPTH: usize = 512;
 
 fn normalized_input(input: &str) -> Cow<'_, str> {
     let bytes = input.as_bytes();
@@ -38,7 +39,13 @@ fn replace_nulls(input: &str) -> Cow<'_, str> {
     if !input.as_bytes().contains(&0) {
         return Cow::Borrowed(input);
     }
-    let mut output = String::with_capacity(input.len());
+    Cow::Owned(replace_nulls_into(
+        input,
+        String::with_capacity(input.len()),
+    ))
+}
+
+fn replace_nulls_into(input: &str, mut output: String) -> String {
     let mut start = 0;
     for (index, byte) in input.bytes().enumerate() {
         if byte == 0 {
@@ -48,7 +55,32 @@ fn replace_nulls(input: &str) -> Cow<'_, str> {
         }
     }
     output.push_str(&input[start..]);
-    Cow::Owned(output)
+    output
+}
+
+/// Apply HTML plaintext input preprocessing without parsing markup/entities.
+/// Ordinary text keeps its owned buffer; null replacement is bounded before
+/// allocating its exact output capacity.
+pub fn normalize_plaintext(input: String) -> Result<String, ParseError> {
+    if input.len() > MAX_HTML_BYTES {
+        return Err(error(0, "HTML input too large"));
+    }
+    let input = if input.as_bytes().contains(&b'\r') {
+        normalized_input(&input).into_owned()
+    } else {
+        input
+    };
+    let nulls = input.bytes().filter(|byte| *byte == 0).count();
+    if nulls == 0 {
+        return Ok(input);
+    }
+    let additional = lumen_common::limits::size::repeat(nulls, 2, MAX_HTML_BYTES)
+        .map_err(|_| error(0, "HTML plaintext output too large"))?;
+    let length = lumen_common::limits::size::sum(input.len(), additional, MAX_HTML_BYTES)
+        .map_err(|_| error(0, "HTML plaintext output too large"))?;
+    let output = lumen_common::limits::size::string_with_capacity(length, MAX_HTML_BYTES)
+        .map_err(|_| error(0, "HTML plaintext output too large"))?;
+    Ok(replace_nulls_into(&input, output))
 }
 
 fn remove_nulls(input: &str) -> Cow<'_, str> {
@@ -67,10 +99,224 @@ fn remove_nulls(input: &str) -> Cow<'_, str> {
     Cow::Owned(output)
 }
 
+fn element_local_name(name: &str) -> &str {
+    crate::xml::split_qname(name)
+        .map(|(_, local_name)| local_name)
+        .unwrap_or(name)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub offset: usize,
     pub message: &'static str,
+}
+
+/// Classification used by DOM bindings to choose the platform interface for
+/// an element in the HTML namespace. Custom names remain HTMLElement-derived;
+/// names absent from the HTML element set use HTMLUnknownElement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HtmlElementNameKind {
+    BuiltIn,
+    Custom,
+    Unknown,
+}
+
+pub fn classify_html_element_name(name: &str) -> HtmlElementNameKind {
+    // These legacy names are still handled by the parser, but their HTML
+    // interface is HTMLUnknownElement rather than HTMLElement or a specialized
+    // HTML element interface.
+    if matches!(
+        name,
+        "applet" | "bgsound" | "blink" | "isindex" | "keygen" | "multicol" | "nextid" | "spacer"
+    ) {
+        HtmlElementNameKind::Unknown
+    } else if is_valid_custom_element_name(name) {
+        HtmlElementNameKind::Custom
+    } else if is_known_html_element_name(name) {
+        HtmlElementNameKind::BuiltIn
+    } else {
+        HtmlElementNameKind::Unknown
+    }
+}
+
+/// Whether `name` is a valid custom element name under the HTML syntax rules.
+pub fn is_valid_custom_element_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() || !name.contains('-') {
+        return false;
+    }
+    if !chars.all(|ch| {
+        let cp = ch as u32;
+        ch.is_ascii_lowercase()
+            || ch.is_ascii_digit()
+            || matches!(cp,
+                0x2D | 0x2E | 0x5F | 0xB7 | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x37D |
+                0x37F..=0x1FFF | 0x200C..=0x200D | 0x203F..=0x2040 | 0x2070..=0x218F |
+                0x2C00..=0x2FEF | 0x3001..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD |
+                0x10000..=0xEFFFF)
+    }) {
+        return false;
+    }
+    ![
+        "annotation-xml",
+        "color-profile",
+        "font-face",
+        "font-face-src",
+        "font-face-uri",
+        "font-face-format",
+        "font-face-name",
+        "missing-glyph",
+    ]
+    .contains(&name)
+}
+
+/// Names of standard and legacy HTML elements. Parser aliases such as `image`
+/// are intentionally excluded because they are not element interface names.
+pub fn is_known_html_element_name(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "abbr"
+            | "acronym"
+            | "address"
+            | "applet"
+            | "area"
+            | "article"
+            | "aside"
+            | "audio"
+            | "b"
+            | "base"
+            | "basefont"
+            | "bdi"
+            | "bdo"
+            | "bgsound"
+            | "big"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "button"
+            | "canvas"
+            | "caption"
+            | "center"
+            | "cite"
+            | "code"
+            | "col"
+            | "colgroup"
+            | "data"
+            | "datalist"
+            | "dd"
+            | "del"
+            | "details"
+            | "dfn"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "dt"
+            | "em"
+            | "embed"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "font"
+            | "footer"
+            | "form"
+            | "frame"
+            | "frameset"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "header"
+            | "hgroup"
+            | "hr"
+            | "html"
+            | "i"
+            | "iframe"
+            | "img"
+            | "input"
+            | "ins"
+            | "isindex"
+            | "kbd"
+            | "keygen"
+            | "label"
+            | "legend"
+            | "li"
+            | "link"
+            | "listing"
+            | "main"
+            | "map"
+            | "mark"
+            | "marquee"
+            | "menu"
+            | "menuitem"
+            | "meta"
+            | "meter"
+            | "nav"
+            | "nobr"
+            | "noembed"
+            | "noframes"
+            | "noscript"
+            | "object"
+            | "ol"
+            | "optgroup"
+            | "option"
+            | "output"
+            | "p"
+            | "param"
+            | "picture"
+            | "plaintext"
+            | "pre"
+            | "progress"
+            | "q"
+            | "rb"
+            | "rp"
+            | "rt"
+            | "rtc"
+            | "ruby"
+            | "s"
+            | "samp"
+            | "script"
+            | "search"
+            | "section"
+            | "select"
+            | "selectedcontent"
+            | "slot"
+            | "small"
+            | "source"
+            | "spacer"
+            | "span"
+            | "strike"
+            | "strong"
+            | "style"
+            | "sub"
+            | "summary"
+            | "sup"
+            | "table"
+            | "tbody"
+            | "td"
+            | "template"
+            | "textarea"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "time"
+            | "title"
+            | "tr"
+            | "track"
+            | "tt"
+            | "u"
+            | "ul"
+            | "var"
+            | "video"
+            | "wbr"
+            | "xmp"
+    )
 }
 
 /// Token emitted by the bounded conformance tokenizer used by the corpus gate.
@@ -1084,6 +1330,7 @@ impl Tag {
         match self {
             Tag::Style => "style",
             Tag::Script => "script",
+            Tag::Noscript => "noscript",
             Tag::Iframe => "iframe",
             Tag::Noembed => "noembed",
             Tag::Noframes => "noframes",
@@ -1105,7 +1352,7 @@ fn ascii_lowercase(value: &str) -> Cow<'_, str> {
 /// Longest named reference at the start of `input` (bytes after `&`), as
 /// (consumed length, replacement). Walks the sorted table one byte at a time,
 /// narrowing the candidate range instead of searching per prefix.
-fn longest_entity(input: &[u8]) -> Option<(usize, &'static str)> {
+pub(crate) fn longest_entity(input: &[u8]) -> Option<(usize, &'static str)> {
     use crate::entities::{ENTRIES, NAMES, VALUES};
     let names = NAMES.as_bytes();
     let mut range = ENTRIES;
@@ -1250,7 +1497,7 @@ fn append_doctype_identifier(output: &mut String, identifier: &str) {
     output.push(quote);
 }
 
-fn serializes_void(name: &str) -> bool {
+pub(crate) fn serializes_void(name: &str) -> bool {
     matches!(
         name,
         "area"
@@ -1288,7 +1535,8 @@ fn serialize_into(
     children_only: bool,
     output: &mut String,
 ) -> Result<(), DomError> {
-    let mut pending = Vec::new();
+    let mut pending = Vec::with_capacity(32);
+    output.reserve(256);
     if children_only {
         if matches!(document.kind(root)?, NodeKind::Element { name, .. } if serializes_void(name.as_str()))
         {
@@ -1317,6 +1565,9 @@ fn serialize_into(
         let mut child_raw = raw_text;
         match kind {
             NodeKind::Document | NodeKind::DocumentFragment => {}
+            // Attributes are serialized with their owning element, never as
+            // independent child nodes in an HTML fragment.
+            NodeKind::Attribute { .. } => descend = false,
             NodeKind::DocumentType(name) => {
                 output.push_str("<!DOCTYPE ");
                 output.push_str(name);
@@ -1363,6 +1614,12 @@ fn serialize_into(
                 }
                 descend = false;
             }
+            NodeKind::CData(value) => {
+                output.push_str("<![CDATA[");
+                output.push_str(value);
+                output.push_str("]]>");
+                descend = false;
+            }
             NodeKind::Comment(value) => {
                 output.push_str("<!--");
                 output.push_str(value);
@@ -1403,7 +1660,7 @@ pub fn inner_html(document: &Document, id: NodeId) -> Result<String, DomError> {
 
 /// Parse an application document. Scripts are retained as inert text.
 pub fn parse(input: &str, max_nodes: usize) -> Result<Document, ParseError> {
-    parse_with_declarative_shadow_roots(input, max_nodes, false)
+    parse_with_options(input, max_nodes, ParseOptions::default())
 }
 
 /// Parse a document with the embedding owner's declarative-shadow permission.
@@ -1413,59 +1670,971 @@ pub fn parse_with_declarative_shadow_roots(
     max_nodes: usize,
     allow_declarative_shadow_roots: bool,
 ) -> Result<Document, ParseError> {
-    if input.len() > MAX_HTML_BYTES {
+    parse_with_options(
+        input,
+        max_nodes,
+        ParseOptions {
+            allow_declarative_shadow_roots,
+            ..ParseOptions::default()
+        },
+    )
+}
+
+/// Options for parsing an active HTML document.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ParseOptions {
+    /// Whether the embedding host permits declarative shadow roots.
+    pub allow_declarative_shadow_roots: bool,
+    /// Whether `noscript` uses scripting-enabled parsing and rendering behavior.
+    pub scripting_enabled: bool,
+}
+
+/// Parse an HTML document with explicit embedding options.
+///
+/// The default [`parse`] entry point leaves scripting disabled because it
+/// constructs a document without an active script host.
+pub fn parse_with_options(
+    input: &str,
+    max_nodes: usize,
+    options: ParseOptions,
+) -> Result<Document, ParseError> {
+    parse_with_options_initialized(input, max_nodes, options, |_| {})
+}
+
+/// Parse with document services installed before the parser creates any nodes.
+pub fn parse_with_options_initialized(
+    input: &str,
+    max_nodes: usize,
+    options: ParseOptions,
+    initialize: impl FnOnce(&mut Document),
+) -> Result<Document, ParseError> {
+    let mut document = Document::new(max_nodes);
+    initialize(&mut document);
+    let mut parser = HtmlDocumentParser::open(&mut document, options)?.0;
+    parser.write(&mut document, input)?;
+    parser.close(&mut document)?;
+    Ok(document)
+}
+
+/// Incremental HTML document parser used by `Document.open/write/close` and
+/// the one-shot document parser. It owns tree-builder state and the bounded
+/// source buffer while borrowing the live document only for each feed.
+pub struct HtmlDocumentParser {
+    input: String,
+    source_base: usize,
+    total_input_bytes: usize,
+    state: Option<ParserState>,
+    pending_cr: bool,
+    pending_insertion_cr: bool,
+    pending_insertion_cr_pos: Option<usize>,
+    paused_script: Option<NodeId>,
+    insertion_cursor: Option<usize>,
+    insertion_frames: Vec<InsertionFrame>,
+    finish_requested: bool,
+    closed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct InsertionFrame {
+    writer: NodeId,
+    end: usize,
+}
+
+impl HtmlDocumentParser {
+    /// Start a new document parse in the existing arena, detaching old
+    /// document children but preserving their identities for retained Nodes.
+    pub fn open(
+        document: &mut Document,
+        options: ParseOptions,
+    ) -> Result<(Self, Vec<NodeId>), ParseError> {
+        let root = document.root();
+        let mut removed = Vec::new();
+        while let Some(child) = document
+            .first_child(root)
+            .map_err(|error| dom_error(0, error))?
+        {
+            removed
+                .try_reserve(1)
+                .map_err(|_| error(0, "HTML parser allocation limit exceeded"))?;
+            document
+                .remove(child)
+                .map_err(|error| dom_error(0, error))?;
+            removed.push(child);
+        }
+        document.set_html_document(true);
+        document.set_scripting_enabled(options.scripting_enabled);
+        document.set_allow_declarative_shadow_roots(options.allow_declarative_shadow_roots);
+        // A new HTML input stream starts in quirks mode until its doctype is
+        // processed by the ordinary document tree builder.
+        document.set_document_mode(crate::DocumentMode::Quirks);
+
+        let html = document
+            .create(element("html", Vec::new()))
+            .map_err(|error| dom_error(0, error))?;
+        let head = document
+            .create(element("head", Vec::new()))
+            .map_err(|error| dom_error(0, error))?;
+        let body = document
+            .create(element("body", Vec::new()))
+            .map_err(|error| dom_error(0, error))?;
+        document.attach_detached(root, html);
+        document.attach_detached(html, head);
+        document.attach_detached(html, body);
+
+        Ok((
+            Self {
+                input: String::new(),
+                source_base: 0,
+                total_input_bytes: 0,
+                state: Some(ParserState::document(html, head, body, options)),
+                pending_cr: false,
+                pending_insertion_cr: false,
+                pending_insertion_cr_pos: None,
+                paused_script: None,
+                insertion_cursor: None,
+                insertion_frames: Vec::new(),
+                finish_requested: false,
+                closed: false,
+            },
+            removed,
+        ))
+    }
+
+    /// Append a source chunk and synchronously construct every complete token
+    /// while retaining unfinished tokenizer input for the next call.
+    pub fn write(&mut self, document: &mut Document, chunk: &str) -> Result<(), ParseError> {
+        self.append_chunk(chunk, false)?;
+        self.run_available(document, false, false).map(|_| ())
+    }
+
+    /// Append input and stop after the next parser-inserted HTML script end tag.
+    /// The tree-builder state and unread input remain live for `resume_until_script`.
+    pub fn write_until_script(
+        &mut self,
+        document: &mut Document,
+        chunk: &str,
+    ) -> Result<Option<NodeId>, ParseError> {
+        if self.paused_script.is_some() {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser must resume before appending source",
+            ));
+        }
+        self.append_chunk(chunk, false)?;
+        let script = self.parse_until_script(document)?;
+        Ok(script)
+    }
+
+    /// Append all Web IDL `document.write()` arguments before parsing them as
+    /// one source sequence, yielding at each parser-script boundary.
+    pub fn write_parts_until_script(
+        &mut self,
+        document: &mut Document,
+        chunks: &[String],
+        append_newline: bool,
+    ) -> Result<Option<NodeId>, ParseError> {
+        if self.paused_script.is_some() {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser must resume before appending source",
+            ));
+        }
+        for chunk in chunks {
+            self.append_chunk(chunk, false)?;
+        }
+        if append_newline {
+            self.append_chunk("\n", false)?;
+        }
+        self.parse_until_script(document)
+    }
+
+    fn parse_until_script(
+        &mut self,
+        document: &mut Document,
+    ) -> Result<Option<NodeId>, ParseError> {
+        let script = self.run_available(document, self.finish_requested, true)?;
+        self.pause_at_script(script);
+        if self.finish_requested && script.is_none() {
+            self.closed = true;
+        }
+        Ok(script)
+    }
+
+    /// Resume after the embedder has prepared the yielded parser script.
+    pub fn resume_until_script(
+        &mut self,
+        document: &mut Document,
+    ) -> Result<Option<NodeId>, ParseError> {
+        let Some(finished_script) = self.paused_script.take() else {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser is not paused at a script",
+            ));
+        };
+        self.pop_insertion_frame(finished_script)?;
+        if !self.insertion_frames.is_empty() {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser insertion nesting is unbalanced",
+            ));
+        }
+        self.flush_pending_insertion_cr()?;
+        self.insertion_cursor = None;
+        let final_input = self.finish_requested;
+        let script = self.run_available(document, final_input, true)?;
+        self.pause_at_script(script);
+        if final_input && script.is_none() {
+            self.closed = true;
+        }
+        Ok(script)
+    }
+
+    /// Insert text at the current parser insertion point while a yielded script
+    /// runs. Parsing resumes only after that script returns.
+    pub fn insert_at_script_position(&mut self, chunk: &str) -> Result<(), ParseError> {
+        if self.paused_script.is_none() {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser has no active script insertion point",
+            ));
+        }
+        self.append_chunk(chunk, true)
+    }
+
+    /// Insert a write at the active parser script's insertion point and parse
+    /// only the inserted source before returning. Any parser scripts in that
+    /// source are yielded to the embedder; the currently executing script is
+    /// restored as the paused parser owner when the inserted region is done.
+    pub fn write_at_script_position_until_script(
+        &mut self,
+        document: &mut Document,
+        writer_script: NodeId,
+        chunks: &[String],
+        append_newline: bool,
+    ) -> Result<Option<NodeId>, ParseError> {
+        let paused_script = self.paused_script.ok_or_else(|| {
+            error(
+                self.total_input_bytes,
+                "HTML parser has no active script insertion point",
+            )
+        })?;
+        if paused_script != writer_script {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser insertion writer does not own the current checkpoint",
+            ));
+        }
+        if chunks.is_empty() && !append_newline {
+            return Ok(None);
+        }
+        self.ensure_insertion_frame(writer_script)?;
+        for chunk in chunks {
+            self.append_chunk(chunk, true)?;
+        }
+        if append_newline {
+            self.append_chunk("\n", true)?;
+        }
+        let end = self.insertion_frame_end(writer_script).ok_or_else(|| {
+            error(
+                self.total_input_bytes,
+                "HTML parser insertion region is unavailable",
+            )
+        })?;
+        self.paused_script = None;
+        let script = self.run_available_limited(document, false, true, Some(end))?;
+        if script.is_some() {
+            self.flush_pending_insertion_cr()?;
+        }
+        self.pause_at_script(Some(script.unwrap_or(writer_script)));
+        if script.is_none() {
+            self.insertion_cursor = self.insertion_frame_end(writer_script);
+        }
+        Ok(script)
+    }
+
+    /// Continue parsing an inserted write region after the yielded nested
+    /// parser script finishes. When the region is exhausted, restore its
+    /// caller's still-running parser script without consuming the outer tail.
+    pub fn resume_insertion_until_script(
+        &mut self,
+        document: &mut Document,
+        finished_script: NodeId,
+        parent_script: NodeId,
+    ) -> Result<Option<NodeId>, ParseError> {
+        if self.paused_script != Some(finished_script) {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser is not paused at an inserted script",
+            ));
+        }
+        self.paused_script = None;
+        self.pop_insertion_frame(finished_script)?;
+        self.flush_pending_insertion_cr()?;
+        let end = self.insertion_frame_end(parent_script).ok_or_else(|| {
+            error(
+                self.total_input_bytes,
+                "HTML parser parent insertion region is unavailable",
+            )
+        })?;
+        let script = self.run_available_limited(document, false, true, Some(end))?;
+        if script.is_some() {
+            self.flush_pending_insertion_cr()?;
+        }
+        self.pause_at_script(Some(script.unwrap_or(parent_script)));
+        if script.is_none() {
+            self.insertion_cursor = self.insertion_frame_end(parent_script);
+        }
+        Ok(script)
+    }
+
+    fn ensure_insertion_frame(&mut self, writer: NodeId) -> Result<(), ParseError> {
+        match self.insertion_frames.last() {
+            Some(frame) if frame.writer == writer => return Ok(()),
+            Some(_)
+                if self
+                    .insertion_frames
+                    .iter()
+                    .any(|frame| frame.writer == writer) =>
+            {
+                return Err(error(
+                    self.total_input_bytes,
+                    "HTML parser insertion writer is not the innermost script",
+                ));
+            }
+            _ => {}
+        }
+        if self.insertion_frames.len() >= MAX_INSERTION_DEPTH {
+            return Err(error(
+                self.total_input_bytes,
+                "HTML parser insertion nesting limit exceeded",
+            ));
+        }
+        self.insertion_frames.try_reserve(1).map_err(|_| {
+            error(
+                self.total_input_bytes,
+                "HTML parser allocation limit exceeded",
+            )
+        })?;
+        let end = self.insertion_cursor.ok_or_else(|| {
+            error(
+                self.total_input_bytes,
+                "HTML parser insertion point is unavailable",
+            )
+        })?;
+        self.insertion_frames.push(InsertionFrame { writer, end });
+        Ok(())
+    }
+
+    fn insertion_frame_end(&self, writer: NodeId) -> Option<usize> {
+        self.insertion_frames
+            .iter()
+            .rev()
+            .find(|frame| frame.writer == writer)
+            .map(|frame| frame.end)
+    }
+
+    fn pop_insertion_frame(&mut self, writer: NodeId) -> Result<(), ParseError> {
+        match self.insertion_frames.last() {
+            Some(frame) if frame.writer == writer => {
+                self.insertion_frames.pop();
+                Ok(())
+            }
+            Some(_)
+                if self
+                    .insertion_frames
+                    .iter()
+                    .any(|frame| frame.writer == writer) =>
+            {
+                Err(error(
+                    self.total_input_bytes,
+                    "HTML parser insertion frames returned out of order",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Mark EOF while a parser script is active without re-entering the parser.
+    /// The next resume consumes the remaining source with EOF rules.
+    pub fn request_close(&mut self) -> Result<(), ParseError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.finish_requested = true;
+        self.flush_pending_insertion_cr()?;
+        self.flush_pending_cr()
+    }
+
+    pub fn is_paused_for_script(&self) -> bool {
+        self.paused_script.is_some()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn is_finishing(&self) -> bool {
+        self.finish_requested
+    }
+
+    fn pause_at_script(&mut self, script: Option<NodeId>) {
+        self.paused_script = script;
+        self.insertion_cursor = script.and_then(|_| self.state.as_ref().map(|state| state.pos));
+    }
+
+    fn append_chunk(&mut self, chunk: &str, at_insertion_point: bool) -> Result<(), ParseError> {
+        if self.closed {
+            return Err(error(self.total_input_bytes, "HTML parser is closed"));
+        }
+        let insertion_before = if at_insertion_point {
+            Some(self.insertion_cursor.ok_or_else(|| {
+                error(
+                    self.total_input_bytes,
+                    "HTML parser insertion point is unavailable",
+                )
+            })?)
+        } else {
+            None
+        };
+        let resolves_insertion_cr = at_insertion_point
+            && self.pending_insertion_cr
+            && self.pending_insertion_cr_pos == insertion_before;
+        let pending_cr = if resolves_insertion_cr {
+            true
+        } else if at_insertion_point {
+            false
+        } else {
+            self.pending_cr
+        };
+        let (normalized, next_pending_cr) =
+            normalize_stream_chunk(chunk, pending_cr).map_err(|mut parse_error| {
+                parse_error.offset = self.total_input_bytes.saturating_add(parse_error.offset);
+                parse_error
+            })?;
+        let total_length = lumen_common::limits::size::sum(
+            self.total_input_bytes,
+            normalized.len(),
+            MAX_HTML_BYTES,
+        )
+        .map_err(|_| error(self.total_input_bytes, "HTML input too large"))?;
+        let length =
+            lumen_common::limits::size::sum(self.input.len(), normalized.len(), MAX_HTML_BYTES)
+                .map_err(|_| error(self.total_input_bytes, "HTML input too large"))?;
+        self.input
+            .try_reserve(length.saturating_sub(self.input.len()))
+            .map_err(|_| {
+                error(
+                    self.total_input_bytes,
+                    "HTML parser allocation limit exceeded",
+                )
+            })?;
+        if at_insertion_point {
+            let cursor = self.insertion_cursor.ok_or_else(|| {
+                error(
+                    self.total_input_bytes,
+                    "HTML parser insertion point is unavailable",
+                )
+            })?;
+            self.input.insert_str(cursor, &normalized);
+            self.insertion_cursor = Some(cursor.saturating_add(normalized.len()));
+            for frame in &mut self.insertion_frames {
+                if frame.end >= cursor {
+                    frame.end = frame.end.saturating_add(normalized.len());
+                }
+            }
+            if self.pending_insertion_cr && !resolves_insertion_cr {
+                if let Some(position) = self.pending_insertion_cr_pos.as_mut() {
+                    if *position >= cursor {
+                        *position = position.saturating_add(normalized.len());
+                    }
+                }
+            }
+        } else {
+            self.input.push_str(&normalized);
+        }
+        self.total_input_bytes = total_length;
+        if at_insertion_point {
+            if next_pending_cr {
+                self.pending_insertion_cr = true;
+                self.pending_insertion_cr_pos = Some(
+                    insertion_before
+                        .unwrap_or_default()
+                        .saturating_add(normalized.len()),
+                );
+            } else if resolves_insertion_cr {
+                self.pending_insertion_cr = false;
+                self.pending_insertion_cr_pos = None;
+            }
+        } else {
+            self.pending_cr = next_pending_cr;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_cr(&mut self) -> Result<(), ParseError> {
+        if !self.pending_cr {
+            return Ok(());
+        }
+        self.append_pending_newline(false)?;
+        self.pending_cr = false;
+        Ok(())
+    }
+
+    fn flush_pending_insertion_cr(&mut self) -> Result<(), ParseError> {
+        if !self.pending_insertion_cr {
+            return Ok(());
+        }
+        self.append_pending_newline(true)?;
+        self.pending_insertion_cr = false;
+        self.pending_insertion_cr_pos = None;
+        Ok(())
+    }
+
+    fn append_pending_newline(&mut self, at_insertion_point: bool) -> Result<(), ParseError> {
+        if self.total_input_bytes == MAX_HTML_BYTES {
+            return Err(error(self.total_input_bytes, "HTML input too large"));
+        }
+        let length = lumen_common::limits::size::sum(self.input.len(), 1, MAX_HTML_BYTES)
+            .map_err(|_| error(self.total_input_bytes, "HTML input too large"))?;
+        self.input
+            .try_reserve(length.saturating_sub(self.input.len()))
+            .map_err(|_| {
+                error(
+                    self.total_input_bytes,
+                    "HTML parser allocation limit exceeded",
+                )
+            })?;
+        if at_insertion_point {
+            let position = self.pending_insertion_cr_pos.ok_or_else(|| {
+                error(
+                    self.total_input_bytes,
+                    "HTML parser pending newline position is unavailable",
+                )
+            })?;
+            self.input.insert(position, '\n');
+            if self
+                .insertion_cursor
+                .is_some_and(|cursor| cursor >= position)
+            {
+                self.insertion_cursor =
+                    self.insertion_cursor.map(|cursor| cursor.saturating_add(1));
+            }
+            for frame in &mut self.insertion_frames {
+                if frame.end >= position {
+                    frame.end = frame.end.saturating_add(1);
+                }
+            }
+        } else {
+            self.input.push('\n');
+        }
+        self.total_input_bytes += 1;
+        Ok(())
+    }
+
+    /// Finish the current stream. Incomplete tokenizer states are resolved by
+    /// the same EOF rules as ordinary HTML document parsing.
+    pub fn close(&mut self, document: &mut Document) -> Result<(), ParseError> {
+        if self.closed {
+            return Ok(());
+        }
+        self.flush_pending_insertion_cr()?;
+        self.flush_pending_cr()?;
+        self.finish_requested = true;
+        self.run_available(document, true, false)?;
+        self.closed = true;
+        Ok(())
+    }
+
+    /// Request EOF and yield parser-inserted scripts one at a time. Reentrant
+    /// `close()` calls set the EOF flag and return until the active script exits.
+    pub fn finish_until_script(
+        &mut self,
+        document: &mut Document,
+    ) -> Result<Option<NodeId>, ParseError> {
+        if self.closed {
+            return Ok(None);
+        }
+        self.finish_requested = true;
+        self.flush_pending_insertion_cr()?;
+        self.flush_pending_cr()?;
+        if self.paused_script.is_some() {
+            return Ok(None);
+        }
+        let script = self.run_available(document, true, true)?;
+        self.pause_at_script(script);
+        if script.is_none() {
+            self.closed = true;
+        }
+        Ok(script)
+    }
+
+    fn run_available(
+        &mut self,
+        document: &mut Document,
+        final_input: bool,
+        stop_after_script: bool,
+    ) -> Result<Option<NodeId>, ParseError> {
+        self.run_available_limited(document, final_input, stop_after_script, None)
+    }
+
+    fn run_available_limited(
+        &mut self,
+        document: &mut Document,
+        final_input: bool,
+        stop_after_script: bool,
+        max_end: Option<usize>,
+    ) -> Result<Option<NodeId>, ParseError> {
+        let state = self
+            .state
+            .take()
+            .expect("HTML document parser state is available between feeds");
+        let available_end = max_end.unwrap_or(self.input.len()).min(self.input.len());
+        let safe_end = if final_input {
+            available_end
+        } else {
+            incremental_safe_prefix(&self.input[..available_end], &state, document)
+        };
+        let result = {
+            let input = &self.input[..safe_end];
+            let mut parser = Parser {
+                input,
+                document,
+                state,
+                final_input,
+                stop_after_script,
+                yielded_script: None,
+            };
+            let result = parser.run();
+            let yielded_script = parser.yielded_script;
+            self.state = Some(parser.state);
+            result.map(|()| yielded_script)
+        };
+        let result = result.map_err(|mut parse_error| {
+            parse_error.offset = self.source_base.saturating_add(parse_error.offset);
+            parse_error
+        })?;
+        self.compact_consumed();
+        Ok(result)
+    }
+
+    fn compact_consumed(&mut self) {
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
+        let consumed = state.pos.min(self.input.len());
+        let pending = self.input.len().saturating_sub(consumed);
+        if consumed == 0 || (consumed < 64 * 1024 && consumed < pending) {
+            return;
+        }
+        let tail = self.input[consumed..].to_string();
+        self.input = tail;
+        self.source_base = self.source_base.saturating_add(consumed);
+        state.pos = 0;
+        self.insertion_cursor = self
+            .insertion_cursor
+            .map(|cursor| cursor.saturating_sub(consumed));
+        for frame in &mut self.insertion_frames {
+            frame.end = frame.end.saturating_sub(consumed);
+        }
+        self.pending_insertion_cr_pos = self
+            .pending_insertion_cr_pos
+            .map(|position| position.saturating_sub(consumed));
+    }
+}
+
+fn normalize_stream_chunk(chunk: &str, mut pending_cr: bool) -> Result<(String, bool), ParseError> {
+    if chunk.len() > MAX_HTML_BYTES {
         return Err(error(0, "HTML input too large"));
     }
-    let input = normalized_input(input);
-    let mut document = Document::new(max_nodes);
-    document.set_html_document(true);
-    // HTML documents without a doctype begin in quirks mode; an initial
-    // doctype token below replaces this with the mode selected by the standard.
-    document.set_document_mode(crate::DocumentMode::Quirks);
-    let root = document.root();
-    let html = document
-        .create(element("html", Vec::new()))
-        .map_err(|e| dom_error(0, e))?;
-    let head = document
-        .create(element("head", Vec::new()))
-        .map_err(|e| dom_error(0, e))?;
-    let body = document
-        .create(element("body", Vec::new()))
-        .map_err(|e| dom_error(0, e))?;
-    document.attach_detached(root, html);
-    document.attach_detached(html, head);
-    document.attach_detached(html, body);
-    Parser {
-        input: &input,
-        pos: 0,
-        document: &mut document,
-        html: Some(html),
-        head: Some(head),
-        body,
-        stack: Vec::with_capacity(32),
-        formatting: Vec::new(),
-        scratch: Vec::new(),
-        template_modes: Vec::new(),
-        declarative_roots: Vec::new(),
-        declarative_cleanup_pending: false,
-        allow_declarative_shadow_roots,
-        custom_selects: Vec::new(),
-        fragment_context: None,
-        fragment_context_kind: None,
-        fragment_text_mode: None,
-        form_element: None,
-        conformance_tokens: None,
-        initial_tokenizer_state: None,
-        initial_last_start_tag: None,
-        in_head: false,
-        body_started: false,
-        html_started: false,
-        after_head: false,
-        document_tail: 0,
-        doctype_allowed: true,
+    let mut output = String::new();
+    output
+        .try_reserve(chunk.len())
+        .map_err(|_| error(0, "HTML parser allocation limit exceeded"))?;
+    for character in chunk.chars() {
+        if pending_cr {
+            output.push('\n');
+            pending_cr = false;
+            if character == '\n' {
+                continue;
+            }
+        }
+        if character == '\r' {
+            pending_cr = true;
+        } else {
+            output.push(character);
+        }
     }
-    .run()?;
-    Ok(document)
+    Ok((output, pending_cr))
+}
+
+/// Find the end of the largest prefix whose tokenizer input is complete.
+/// The tree builder only sees this prefix, so a tag, character reference, or
+/// raw-text end tag split across `document.write()` calls cannot be consumed
+/// as EOF and then reparsed with different node identities.
+fn incremental_safe_prefix(input: &str, state: &ParserState, document: &Document) -> usize {
+    let bytes = input.as_bytes();
+    let mut cursor = state.pos.min(bytes.len());
+
+    if let Some(open) = state.stack.last() {
+        if open.tag == Tag::Plaintext {
+            return bytes.len();
+        }
+        let namespace = document.kind(open.id).ok().and_then(|kind| match kind {
+            NodeKind::Element { namespace, .. } => Some(namespace),
+            _ => None,
+        });
+        let raw_name = if open.tag.is_raw_text() {
+            Some(open.tag.raw_text_name())
+        } else if open.tag == Tag::Noscript
+            && state.scripting_enabled
+            && namespace == Some(&Namespace::Html)
+        {
+            Some("noscript")
+        } else {
+            None
+        };
+        if let Some(name) = raw_name {
+            let relative = raw_text_end_in(input, cursor, name);
+            if relative == bytes.len() - cursor {
+                // Raw text itself can be emitted incrementally. Keep only a
+                // suffix that could still become its appropriate end tag.
+                let mut safe_end =
+                    trailing_raw_end_tag_prefix(bytes, cursor, name).unwrap_or(bytes.len());
+                if safe_end == bytes.len() && open.tag.is_rcdata() {
+                    safe_end = trailing_character_reference(input, cursor).unwrap_or(safe_end);
+                }
+                return safe_end;
+            }
+            let close_start = cursor + relative;
+            let Some(close_end) = find_tag_end(bytes, close_start) else {
+                return close_start;
+            };
+            cursor = close_end + 1;
+        }
+    }
+
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'<' {
+            let text_end = bytes[cursor..]
+                .iter()
+                .position(|&byte| byte == b'<')
+                .map_or(bytes.len(), |offset| cursor + offset);
+            if text_end == bytes.len() {
+                return trailing_character_reference(input, cursor).unwrap_or(text_end);
+            }
+            cursor = text_end;
+            continue;
+        }
+
+        let start = cursor;
+        let Some(&next) = bytes.get(cursor + 1) else {
+            return start;
+        };
+        if next == b'!' {
+            let remaining = &bytes[cursor..];
+            if starts_ascii_case_insensitive(remaining, b"<!--") {
+                if remaining.len() < 4 {
+                    return start;
+                }
+                if remaining.get(4) == Some(&b'>') {
+                    cursor += 5;
+                    continue;
+                }
+                if remaining
+                    .get(4..6)
+                    .is_some_and(|delimiter| delimiter == b"->")
+                {
+                    cursor += 6;
+                    continue;
+                }
+                if let Some(end) = comment_end(bytes, cursor + 4) {
+                    cursor = end;
+                    continue;
+                }
+                return start;
+            }
+            if starts_ascii_case_insensitive(remaining, b"<!doctype")
+                || is_prefix_ascii_case_insensitive(remaining, b"<!doctype")
+            {
+                let Some(end) = bytes[cursor..].iter().position(|&byte| byte == b'>') else {
+                    return start;
+                };
+                cursor += end + 1;
+                continue;
+            }
+            if remaining.starts_with(b"<![CDATA[") {
+                let foreign = state
+                    .stack
+                    .last()
+                    .and_then(|open| document.kind(open.id).ok())
+                    .is_some_and(|kind| {
+                        matches!(kind, NodeKind::Element { namespace, .. } if namespace != &Namespace::Html)
+                    });
+                if foreign {
+                    let Some(relative_end) = input[cursor + 9..].find("]]>") else {
+                        return start;
+                    };
+                    cursor += 9 + relative_end + 3;
+                    continue;
+                }
+            }
+            let Some(end) = bytes[cursor..].iter().position(|&byte| byte == b'>') else {
+                return start;
+            };
+            cursor += end + 1;
+            continue;
+        }
+        if next == b'?' {
+            let Some(end) = bytes[cursor..].iter().position(|&byte| byte == b'>') else {
+                return start;
+            };
+            cursor += end + 1;
+            continue;
+        }
+        if next == b'/' {
+            let Some(end) = find_tag_end(bytes, cursor) else {
+                return start;
+            };
+            cursor = end + 1;
+            continue;
+        }
+        if next.is_ascii_alphabetic() {
+            let Some(end) = find_tag_end(bytes, cursor) else {
+                return start;
+            };
+            cursor = end + 1;
+            continue;
+        }
+
+        // A less-than sign that cannot begin markup is character data. Keep
+        // scanning so a later complete token in the same write can be built.
+        cursor += 1;
+    }
+    cursor
+}
+
+fn trailing_character_reference(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    let ampersand = bytes[start..].iter().rposition(|&byte| byte == b'&')? + start;
+    let tail = &bytes[ampersand + 1..];
+    if tail
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'#' | b'x' | b'X'))
+    {
+        Some(ampersand)
+    } else {
+        None
+    }
+}
+
+fn find_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, &byte) in bytes.get(start..)?.iter().enumerate() {
+        match (quote, byte) {
+            (Some(delimiter), current) if delimiter == current => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn comment_end(bytes: &[u8], body_start: usize) -> Option<usize> {
+    let rest = bytes.get(body_start..)?;
+    let mut from = 0;
+    while let Some(found) = rest.get(from..)?.windows(2).position(|pair| pair == b"--") {
+        let delimiter = body_start + from + found;
+        let tail = bytes.get(delimiter + 2..)?;
+        if tail.first() == Some(&b'>') {
+            return Some(delimiter + 3);
+        }
+        if tail.starts_with(b"!>") {
+            return Some(delimiter + 4);
+        }
+        from += found + 1;
+    }
+    None
+}
+
+fn raw_text_end_in(input: &str, start: usize, name: &str) -> usize {
+    let bytes = &input.as_bytes()[start..];
+    let appropriate = |index: usize, prefix: &[u8]| {
+        bytes
+            .get(index..index + prefix.len())
+            .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
+            && bytes
+                .get(index + prefix.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+    };
+    let mut script_state = 0;
+    for index in 0..bytes.len() {
+        if !matches!(bytes[index], b'<' | b'-') {
+            continue;
+        }
+        if name == "script" {
+            if script_state == 0 && bytes[index..].starts_with(b"<!--") {
+                script_state = 1;
+            } else if script_state != 0 && bytes[index..].starts_with(b"-->") {
+                script_state = 0;
+            } else if script_state == 1 && appropriate(index, b"<script") {
+                script_state = 2;
+            } else if script_state == 2 && appropriate(index, b"</script") {
+                script_state = 1;
+                continue;
+            }
+        }
+        if script_state != 2
+            && bytes[index..].starts_with(b"</")
+            && bytes
+                .get(index + 2..index + 2 + name.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(name.as_bytes()))
+            && bytes
+                .get(index + 2 + name.len())
+                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+        {
+            return index;
+        }
+    }
+    bytes.len()
+}
+
+fn trailing_raw_end_tag_prefix(bytes: &[u8], start: usize, name: &str) -> Option<usize> {
+    let candidate = bytes.get(start..)?.iter().rposition(|&byte| byte == b'<')? + start;
+    let suffix = bytes.get(candidate..)?;
+    let expected = name.as_bytes();
+    if suffix.first() != Some(&b'<') {
+        return None;
+    }
+    if suffix.len() == 1 {
+        return Some(candidate);
+    }
+    if suffix.get(1) != Some(&b'/') {
+        return None;
+    }
+    let name_start = 2;
+    let compared = suffix.len().saturating_sub(name_start).min(expected.len());
+    if !suffix[name_start..name_start + compared].eq_ignore_ascii_case(&expected[..compared]) {
+        return None;
+    }
+    if compared < expected.len() {
+        return Some(candidate);
+    }
+    let boundary = name_start + expected.len();
+    if suffix
+        .get(boundary)
+        .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(*byte, b'/' | b'>'))
+    {
+        return None;
+    }
+    if find_tag_end(bytes, candidate).is_none() {
+        return Some(candidate);
+    }
+    None
+}
+
+fn is_prefix_ascii_case_insensitive(bytes: &[u8], word: &[u8]) -> bool {
+    bytes.len() < word.len() && word[..bytes.len()].eq_ignore_ascii_case(bytes)
 }
 
 /// Run the same bounded scanner used by the HTML parser and return its emitted
@@ -1506,32 +2675,38 @@ pub fn tokenize_for_conformance(
     document.attach_detached(html, body);
     let mut parser = Parser {
         input: &input,
-        pos: 0,
         document: &mut document,
-        html: Some(html),
-        head: Some(head),
-        body,
-        stack: Vec::with_capacity(32),
-        formatting: Vec::new(),
-        scratch: Vec::new(),
-        template_modes: Vec::new(),
-        declarative_roots: Vec::new(),
-        declarative_cleanup_pending: false,
-        allow_declarative_shadow_roots: false,
-        custom_selects: Vec::new(),
-        fragment_context: None,
-        fragment_context_kind: None,
-        fragment_text_mode: None,
-        form_element: None,
-        conformance_tokens: Some(Vec::new()),
-        initial_tokenizer_state,
-        initial_last_start_tag: last_start_tag.map(str::to_ascii_lowercase),
-        in_head: false,
-        body_started: false,
-        html_started: false,
-        after_head: false,
-        document_tail: 0,
-        doctype_allowed: true,
+        state: ParserState {
+            pos: 0,
+            html: Some(html),
+            head: Some(head),
+            body,
+            stack: Vec::with_capacity(32),
+            formatting: Vec::new(),
+            scratch: Vec::new(),
+            template_modes: Vec::new(),
+            declarative_roots: Vec::new(),
+            declarative_cleanup_pending: false,
+            allow_declarative_shadow_roots: false,
+            scripting_enabled: false,
+            custom_selects: Vec::new(),
+            fragment_context: None,
+            fragment_context_kind: None,
+            fragment_text_mode: None,
+            form_element: None,
+            conformance_tokens: Some(Vec::new()),
+            initial_tokenizer_state,
+            initial_last_start_tag: last_start_tag.map(str::to_ascii_lowercase),
+            in_head: false,
+            body_started: false,
+            html_started: false,
+            after_head: false,
+            document_tail: 0,
+            doctype_allowed: true,
+        },
+        final_input: true,
+        stop_after_script: false,
+        yielded_script: None,
     };
     parser.run()?;
     Ok(parser.conformance_tokens.take().unwrap_or_default())
@@ -1561,7 +2736,7 @@ pub fn parse_fragment_in(
                 namespace: Namespace::Html,
                 name,
                 ..
-            }) if name == "form"
+            }) if element_local_name(name.as_str()) == "form"
         ) {
             form_element = Some(id);
             break;
@@ -1589,7 +2764,7 @@ fn parse_fragment_context(
             namespace: Namespace::Html,
             name,
             ..
-        }) => Tag::classify(name),
+        }) => Tag::classify(element_local_name(name)),
         _ => Tag::Other,
     };
     let fragment_context = context.as_ref().map(|_| context_tag);
@@ -1598,16 +2773,18 @@ fn parse_fragment_context(
             namespace: Namespace::Html,
             name,
             ..
-        }) => match name.as_str() {
+        }) => match element_local_name(name) {
             "title" | "textarea" => Some(true),
             "style" | "script" | "iframe" | "xmp" | "noembed" | "noframes" | "plaintext" => {
                 Some(false)
             }
+            "noscript" if document.scripting_enabled() => Some(false),
             _ => None,
         },
         _ => None,
     };
     let mut stack = Vec::with_capacity(32);
+    let scripting_enabled = document.scripting_enabled();
     stack.push(Open {
         id: fragment,
         tag: Tag::Html,
@@ -1643,39 +2820,45 @@ fn parse_fragment_context(
     }
     let result = Parser {
         input: &input,
-        pos: 0,
         document,
-        html: None,
-        head,
-        body,
-        stack,
-        formatting: Vec::new(),
-        scratch: Vec::new(),
-        template_modes: if context_tag == Tag::Template {
-            alloc::vec![TemplateMode::InTemplate]
-        } else {
-            Vec::new()
+        state: ParserState {
+            pos: 0,
+            html: None,
+            head,
+            body,
+            stack,
+            formatting: Vec::new(),
+            scratch: Vec::new(),
+            template_modes: if context_tag == Tag::Template {
+                alloc::vec![TemplateMode::InTemplate]
+            } else {
+                Vec::new()
+            },
+            declarative_roots: Vec::new(),
+            declarative_cleanup_pending: false,
+            allow_declarative_shadow_roots: false,
+            scripting_enabled,
+            custom_selects: Vec::new(),
+            // A detached fragment has no context element. Treating `Other` as a
+            // context tag made the first unknown element in a fragment impossible
+            // to close (for example, sibling `<slot>` elements).
+            fragment_context,
+            fragment_context_kind: context.clone(),
+            fragment_text_mode,
+            form_element,
+            conformance_tokens: None,
+            initial_tokenizer_state: None,
+            initial_last_start_tag: None,
+            in_head: false,
+            body_started: false,
+            html_started: true,
+            after_head: false,
+            document_tail: 0,
+            doctype_allowed: false,
         },
-        declarative_roots: Vec::new(),
-        declarative_cleanup_pending: false,
-        allow_declarative_shadow_roots: false,
-        custom_selects: Vec::new(),
-        // A detached fragment has no context element. Treating `Other` as a
-        // context tag made the first unknown element in a fragment impossible
-        // to close (for example, sibling `<slot>` elements).
-        fragment_context,
-        fragment_context_kind: context.clone(),
-        fragment_text_mode,
-        form_element,
-        conformance_tokens: None,
-        initial_tokenizer_state: None,
-        initial_last_start_tag: None,
-        in_head: false,
-        body_started: false,
-        html_started: true,
-        after_head: false,
-        document_tail: 0,
-        doctype_allowed: false,
+        final_input: true,
+        stop_after_script: false,
+        yielded_script: None,
     }
     .run();
     match result {
@@ -1709,8 +2892,15 @@ enum TemplateMode {
 
 struct Parser<'a, 'd> {
     input: &'a str,
-    pos: usize,
     document: &'d mut Document,
+    state: ParserState,
+    final_input: bool,
+    stop_after_script: bool,
+    yielded_script: Option<NodeId>,
+}
+
+struct ParserState {
+    pos: usize,
     html: Option<NodeId>,
     head: Option<NodeId>,
     body: NodeId,
@@ -1723,6 +2913,7 @@ struct Parser<'a, 'd> {
     declarative_roots: Vec<(NodeId, NodeId)>,
     declarative_cleanup_pending: bool,
     allow_declarative_shadow_roots: bool,
+    scripting_enabled: bool,
     custom_selects: Vec<NodeId>,
     fragment_context: Option<Tag>,
     // The HTML fragment algorithm keeps the context element outside the
@@ -1746,6 +2937,53 @@ struct Parser<'a, 'd> {
     doctype_allowed: bool,
 }
 
+impl ParserState {
+    fn document(html: NodeId, head: NodeId, body: NodeId, options: ParseOptions) -> Self {
+        Self {
+            pos: 0,
+            html: Some(html),
+            head: Some(head),
+            body,
+            stack: Vec::with_capacity(32),
+            formatting: Vec::new(),
+            scratch: Vec::new(),
+            template_modes: Vec::new(),
+            declarative_roots: Vec::new(),
+            declarative_cleanup_pending: false,
+            allow_declarative_shadow_roots: options.allow_declarative_shadow_roots,
+            scripting_enabled: options.scripting_enabled,
+            custom_selects: Vec::new(),
+            fragment_context: None,
+            fragment_context_kind: None,
+            fragment_text_mode: None,
+            form_element: None,
+            conformance_tokens: None,
+            initial_tokenizer_state: None,
+            initial_last_start_tag: None,
+            in_head: false,
+            body_started: false,
+            html_started: false,
+            after_head: false,
+            document_tail: 0,
+            doctype_allowed: true,
+        }
+    }
+}
+
+impl core::ops::Deref for Parser<'_, '_> {
+    type Target = ParserState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl core::ops::DerefMut for Parser<'_, '_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
 impl<'a> Parser<'a, '_> {
     fn emit_conformance_token(&mut self, token: ConformanceToken) {
         let Some(tokens) = &mut self.conformance_tokens else {
@@ -1763,6 +3001,22 @@ impl<'a> Parser<'a, '_> {
         } else {
             tokens.push(token);
         }
+    }
+
+    fn active_html_parser_script(&self) -> Option<NodeId> {
+        let open = *self.stack.last()?;
+        if open.tag != Tag::Script {
+            return None;
+        }
+        matches!(
+            self.document.kind(open.id),
+            Ok(NodeKind::Element {
+                namespace: Namespace::Html,
+                name,
+                ..
+            }) if name.as_str() == "script"
+        )
+        .then_some(open.id)
     }
 
     fn initial_text_token(&mut self) -> Result<bool, ParseError> {
@@ -1829,45 +3083,7 @@ impl<'a> Parser<'a, '_> {
     }
 
     fn raw_text_end(&self, name: &str) -> usize {
-        let bytes = self.remaining().as_bytes();
-        let appropriate = |index: usize, prefix: &[u8]| {
-            bytes
-                .get(index..index + prefix.len())
-                .is_some_and(|value| value.eq_ignore_ascii_case(prefix))
-                && bytes
-                    .get(index + prefix.len())
-                    .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-        };
-        let mut script_state = 0;
-        for index in 0..bytes.len() {
-            if !matches!(bytes[index], b'<' | b'-') {
-                continue;
-            }
-            if name == "script" {
-                if script_state == 0 && bytes[index..].starts_with(b"<!--") {
-                    script_state = 1;
-                } else if script_state != 0 && bytes[index..].starts_with(b"-->") {
-                    script_state = 0;
-                } else if script_state == 1 && appropriate(index, b"<script") {
-                    script_state = 2;
-                } else if script_state == 2 && appropriate(index, b"</script") {
-                    script_state = 1;
-                    continue;
-                }
-            }
-            if script_state != 2
-                && bytes[index..].starts_with(b"</")
-                && bytes
-                    .get(index + 2..index + 2 + name.len())
-                    .is_some_and(|value| value.eq_ignore_ascii_case(name.as_bytes()))
-                && bytes
-                    .get(index + 2 + name.len())
-                    .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-            {
-                return index;
-            }
-        }
-        bytes.len()
+        raw_text_end_in(self.input, self.pos, name)
     }
 
     fn reconstruct_formatting(&mut self) -> Result<(), ParseError> {
@@ -2725,8 +3941,8 @@ impl<'a> Parser<'a, '_> {
             .collect();
         if removed_templates != 0 {
             self.declarative_cleanup_pending = !self.declarative_roots.is_empty();
-            self.template_modes
-                .truncate(self.template_modes.len().saturating_sub(removed_templates));
+            let remaining_modes = self.template_modes.len().saturating_sub(removed_templates);
+            self.template_modes.truncate(remaining_modes);
         }
         self.custom_selects
             .retain(|select| !removed_selects.contains(select));
@@ -2876,6 +4092,18 @@ impl<'a> Parser<'a, '_> {
             if self.initial_text_token()? {
                 continue;
             }
+            if self.doctype_allowed
+                && self.document.document_mode() == crate::DocumentMode::NoQuirks
+                && self.initial_token_forces_quirks()
+            {
+                // A script-created parser starts with no-quirks mode, but
+                // still runs the ordinary initial insertion mode. If no
+                // doctype appears before the first non-whitespace,
+                // non-comment token, that mode switches the document to
+                // quirks. One-shot parsing starts in quirks already, so this
+                // only changes the explicit document.open starting state.
+                self.document.set_document_mode(crate::DocumentMode::Quirks);
+            }
             if self.at_fragment_context() {
                 if let Some(rcdata) = self.fragment_text_mode {
                     let raw = replace_nulls(&input[self.pos..]);
@@ -2884,7 +4112,9 @@ impl<'a> Parser<'a, '_> {
                     } else {
                         raw
                     };
-                    self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+                    if self.conformance_tokens.is_some() {
+ self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+ }
                     self.append_text(text, self.pos)?;
                     self.pos = input.len();
                     continue;
@@ -2893,12 +4123,18 @@ impl<'a> Parser<'a, '_> {
             if let Some(&open) = self.stack.last() {
                 if open.tag == Tag::Plaintext {
                     let text = replace_nulls(&input[self.pos..]);
-                    self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+                    if self.conformance_tokens.is_some() {
+ self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+ }
                     self.append_text(text, self.pos)?;
                     self.pos = input.len();
                     continue;
                 }
-                if open.tag.is_raw_text() {
+                if open.tag.is_raw_text()
+                    || (open.tag == Tag::Noscript
+                        && self.scripting_enabled
+                        && self.adjusted_current_namespace() == Namespace::Html)
+                {
                     let end = self.raw_text_end(open.tag.raw_text_name());
                     if end > 0 {
                         let raw = replace_nulls(&input[self.pos..self.pos + end]);
@@ -2907,7 +4143,9 @@ impl<'a> Parser<'a, '_> {
                         } else {
                             raw
                         };
-                        self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+                        if self.conformance_tokens.is_some() {
+ self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+ }
                         self.append_text(text, self.pos)?;
                         self.pos += end;
                         continue;
@@ -2923,7 +4161,16 @@ impl<'a> Parser<'a, '_> {
             } else if bytes.len() >= 9 && bytes[..9].eq_ignore_ascii_case(b"<!doctype") {
                 self.doctype()?;
             } else if rest.starts_with("</") {
+                let parser_script = self
+                    .stop_after_script
+                    .then(|| self.active_html_parser_script())
+                    .flatten();
                 self.end_tag()?;
+                if parser_script
+                    .is_some_and(|script| !self.stack.iter().any(|open| open.id == script))
+                {
+                    self.yielded_script = parser_script;
+                }
             } else if rest.starts_with("<?") {
                 self.processing_instruction()?;
             } else if rest.starts_with("<![CDATA[")
@@ -2940,12 +4187,36 @@ impl<'a> Parser<'a, '_> {
             if self.declarative_cleanup_pending {
                 self.reclaim_declarative_templates(false)?;
             }
+            if self.yielded_script.is_some() {
+                break;
+            }
         }
-        self.refresh_selected_content()?;
-        // The spec's parser-only template stack elements must not retain an
-        // extra template/content pair in the document arena after parsing.
-        self.reclaim_declarative_templates(true)?;
+        if self.final_input && self.yielded_script.is_none() {
+            self.refresh_selected_content()?;
+            // The spec's parser-only template stack elements must not retain an
+            // extra template/content pair in the document arena after parsing.
+            self.reclaim_declarative_templates(true)?;
+        }
         Ok(())
+    }
+
+    fn initial_token_forces_quirks(&self) -> bool {
+        let rest = &self.input[self.pos..];
+        if rest.starts_with("<!--")
+            || rest.starts_with("<?")
+            || rest.starts_with("<!")
+            || starts_ascii_case_insensitive(rest.as_bytes(), b"<!doctype")
+        {
+            return false;
+        }
+        let first_text_end = rest.find('<').unwrap_or(rest.len());
+        rest[..first_text_end]
+            .bytes()
+            .any(|byte| !byte.is_ascii_whitespace())
+            || rest
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte == b'<')
     }
 
     fn reclaim_declarative_templates(&mut self, all: bool) -> Result<(), ParseError> {
@@ -3088,7 +4359,9 @@ impl<'a> Parser<'a, '_> {
             .find('>')
             .map_or(self.input.len(), |end| start + end);
         let data = replace_nulls(&self.input[start..end]).into_owned();
-        self.emit_conformance_token(ConformanceToken::Comment(data.clone()));
+        if self.conformance_tokens.is_some() {
+            self.emit_conformance_token(ConformanceToken::Comment(data.clone()));
+        }
         let id = self
             .document
             .create(NodeKind::Comment(data))
@@ -3107,7 +4380,9 @@ impl<'a> Parser<'a, '_> {
                 (content_start + relative, true)
             });
         let text = replace_nulls(&self.input[content_start..end]);
-        self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+        if self.conformance_tokens.is_some() {
+ self.emit_conformance_token(ConformanceToken::Character(text.to_string()));
+ }
         self.append_text(text, start)?;
         self.pos = end + if closed { 3 } else { 0 };
         Ok(())
@@ -3303,7 +4578,9 @@ impl<'a> Parser<'a, '_> {
             return Ok(());
         };
         self.pos = end + 1;
-        self.emit_conformance_token(ConformanceToken::EndTag(name.to_string()));
+        if self.conformance_tokens.is_some() {
+ self.emit_conformance_token(ConformanceToken::EndTag(name.to_string()));
+ }
         let tag = Tag::classify(&name);
         let namespace = self.adjusted_current_namespace();
         if namespace != Namespace::Html && !self.current_foreign_integration_point() {
@@ -4033,6 +5310,7 @@ impl<'a> Parser<'a, '_> {
                     let has = |expected: &str| attributes.iter().any(|(name, _)| name == expected);
                     Some(crate::shadow::ShadowOptions {
                         mode,
+                        slot_assignment: crate::shadow::SlotAssignmentMode::Named,
                         delegates_focus: has("shadowrootdelegatesfocus"),
                         clonable: has("shadowrootclonable"),
                         serializable: has("shadowrootserializable"),
@@ -4143,9 +5421,11 @@ impl<'a> Parser<'a, '_> {
             .find('<')
             .unwrap_or(input.len() - self.pos);
         let source = &input[start..self.pos];
-        self.emit_conformance_token(ConformanceToken::Character(
-            decode_entities(source, false).into_owned(),
-        ));
+        if self.conformance_tokens.is_some() {
+            self.emit_conformance_token(ConformanceToken::Character(
+                decode_entities(source, false).into_owned(),
+            ));
+        }
         // In the data state, the tokenizer emits U+0000 as a character token.
         // HTML tree construction ignores that token in the in-body and in-table
         // text modes, while foreign-content parsing replaces it with U+FFFD.
@@ -4305,6 +5585,78 @@ impl<'a> Parser<'a, '_> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::borrow::ToOwned;
+    #[test]
+    fn initialized_document_parser_observes_initial_details_transitions() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let capture = events.clone();
+        let mut calls = 0;
+        let document = parse_with_options_initialized(
+            "<details name=g open></details><details name=g open></details>",
+            32,
+            ParseOptions::default(),
+            |document| {
+                calls += 1;
+                assert!(document.first_child(document.root()).unwrap().is_none());
+                document.set_details_transition_sink(Some(Rc::new(move |_, event| {
+                    capture.borrow_mut().push(event);
+                })));
+            },
+        ).unwrap();
+        assert_eq!(calls, 1);
+        let nodes = crate::selector::query_selector_all(&document, document.root(), "details").unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(*events.borrow(), vec![
+            crate::details::DetailsTransition { node: nodes[0], old_open: false, new_open: true },
+            crate::details::DetailsTransition { node: nodes[1], old_open: false, new_open: true },
+            crate::details::DetailsTransition { node: nodes[1], old_open: true, new_open: false },
+        ]);
+        assert_eq!(document.details_open_state(nodes[1]), Some(false));
+    }
+
+    #[test]
+    fn initialized_document_parser_preserves_limits_and_errors() {
+        for (input, max_nodes) in [("<details open>", 1), ("<p>text", 2)] {
+            let mut calls = 0;
+            let actual = parse_with_options_initialized(input, max_nodes, ParseOptions::default(), |_| calls += 1).err().unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(actual, parse(input, max_nodes).err().unwrap());
+        }
+    }
+    #[test]
+    fn html_element_name_classification_distinguishes_builtins_custom_and_unknown() {
+        assert_eq!(
+            classify_html_element_name("button"),
+            HtmlElementNameKind::BuiltIn
+        );
+        assert_eq!(
+            classify_html_element_name("span"),
+            HtmlElementNameKind::BuiltIn
+        );
+        assert_eq!(
+            classify_html_element_name("x-widget"),
+            HtmlElementNameKind::Custom
+        );
+        assert_eq!(
+            classify_html_element_name("unknown"),
+            HtmlElementNameKind::Unknown
+        );
+        assert_eq!(
+            classify_html_element_name("annotation-xml"),
+            HtmlElementNameKind::Unknown
+        );
+        for legacy_unknown in [
+            "applet", "bgsound", "blink", "isindex", "keygen", "multicol", "nextid", "spacer",
+        ] {
+            assert_eq!(
+                classify_html_element_name(legacy_unknown),
+                HtmlElementNameKind::Unknown
+            );
+        }
+    }
+
     #[test]
     fn template_body_mode_does_not_override_a_nested_table() {
         let document = parse(
@@ -4521,6 +5873,62 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_html_namespace_fragment_context_uses_local_name() {
+        let mut doc = Document::new(48);
+        doc.set_html_document(true);
+        let container = doc.create(element("main", Vec::new())).unwrap();
+        doc.append(doc.root(), container).unwrap();
+
+        let table = doc
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: Name::new("p:table"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        doc.append(container, table).unwrap();
+        let fragment = parse_fragment_in(&mut doc, table, "<tr><td>A<td>B").unwrap();
+        doc.append(table, fragment).unwrap();
+        let tbody = doc.first_child(table).unwrap().unwrap();
+        assert!(matches!(
+            doc.kind(tbody),
+            Ok(NodeKind::Element {
+                namespace: Namespace::Html,
+                name,
+                ..
+            }) if name == "tbody"
+        ));
+        assert_eq!(
+            inner_html(&doc, table).unwrap(),
+            "<tbody><tr><td>A</td><td>B</td></tr></tbody>"
+        );
+
+        let textarea = doc
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: Name::new("p:textarea"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        doc.append(container, textarea).unwrap();
+        let fragment = parse_fragment_in(&mut doc, textarea, "<b>&amp;").unwrap();
+        let text = doc.first_child(fragment).unwrap().unwrap();
+        assert_eq!(doc.kind(text).unwrap(), &NodeKind::Text("<b>&".into()));
+
+        let style = doc
+            .create(NodeKind::Element {
+                namespace: Namespace::Html,
+                name: Name::new("p:style"),
+                attributes: Vec::new(),
+            })
+            .unwrap();
+        doc.append(container, style).unwrap();
+        let fragment = parse_fragment_in(&mut doc, style, "<b>&amp;").unwrap();
+        let text = doc.first_child(fragment).unwrap().unwrap();
+        assert_eq!(doc.kind(text).unwrap(), &NodeKind::Text("<b>&amp;".into()));
+    }
+
+    #[test]
     fn fragment_context_preserves_foreign_namespaces_and_integration_points() {
         let mut doc = Document::new(48);
         let svg_context = doc
@@ -4651,8 +6059,10 @@ mod tests {
             32,
         )
         .unwrap();
-        assert_eq!(inner_html(&document, document.root()).unwrap(),
-            "<!--first--><!DOCTYPE html><!--?xml x--><html><!--second--><head><title>T</title></head><body></body></html>");
+        assert_eq!(
+            inner_html(&document, document.root()).unwrap(),
+            "<!--first--><!DOCTYPE html><!--?xml x--><html><!--second--><head><title>T</title></head><body></body></html>"
+        );
         for (source, expected) in [
             ("A<!-->B", "A<!---->B"),
             ("A<!--->B", "A<!---->B"),
@@ -4695,8 +6105,10 @@ mod tests {
     #[test]
     fn processing_instructions_recover_and_follow_document_insertion_modes() {
         let document = parse("<?before?><html><head></head><?between?><body><?good   data??><p><button><div>X</div><button>Y</button></p></body><?after?></html><?last?>", 64).unwrap();
-        assert_eq!(inner_html(&document, document.root()).unwrap(),
-            "<?before ?><html><head></head><?between ?><body><?good data??><p><button><div>X</div></button><button>Y</button></p></body><?after ?></html><?last ?>");
+        assert_eq!(
+            inner_html(&document, document.root()).unwrap(),
+            "<?before ?><html><head></head><?between ?><body><?good data??><p><button><div>X</div></button><button>Y</button></p></body><?after ?></html><?last ?>"
+        );
         let mut document = Document::new(32);
         let fragment =
             parse_fragment(&mut document, "<?xml?>< ?text><?a$><?valid?><?_unfinished").unwrap();
@@ -4761,6 +6173,14 @@ mod tests {
             inner_html(&doc, fragment).unwrap(),
             "<script><!--<script>var a = 1;</script>after</script><p>x</p>"
         );
+    }
+
+    #[test]
+    fn plaintext_normalizes_input_and_bounds_null_expansion_without_parsing_markup() {
+        let text = normalize_plaintext("<tag>&amp;\r\nnext\r\0end".into()).unwrap();
+        assert_eq!(text, "<tag>&amp;\nnext\n\u{fffd}end");
+        assert!(normalize_plaintext("\0".repeat(MAX_HTML_BYTES / 3 + 1)).is_err());
+        assert!(normalize_plaintext("x".repeat(MAX_HTML_BYTES + 1)).is_err());
     }
 
     #[test]
@@ -5065,6 +6485,362 @@ mod tests {
         assert_eq!(
             inner_html(&fragment_doc, fragment).unwrap(),
             "<div>text</div>"
+        );
+    }
+
+    #[test]
+    fn noscript_parsing_and_user_agent_visibility_follow_scripting_mode() {
+        let source = "<!doctype html><html><head></head><body><noscript id=n><span>fallback</span></noscript></body></html>";
+        let disabled = parse(source, 24).unwrap();
+        assert!(!disabled.scripting_enabled());
+        let disabled_noscript =
+            crate::selector::query_selector(&disabled, disabled.root(), "noscript")
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            disabled.kind(disabled.first_child(disabled_noscript).unwrap().unwrap()),
+            Ok(NodeKind::Element { name, .. }) if name == "span"
+        ));
+
+        let enabled = parse_with_options(
+            source,
+            24,
+            ParseOptions {
+                allow_declarative_shadow_roots: false,
+                scripting_enabled: true,
+            },
+        )
+        .unwrap();
+        assert!(enabled.scripting_enabled());
+        let enabled_noscript =
+            crate::selector::query_selector(&enabled, enabled.root(), "noscript")
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            enabled.kind(enabled.first_child(enabled_noscript).unwrap().unwrap()),
+            Ok(NodeKind::Text(text)) if text == "<span>fallback</span>"
+        ));
+
+        let author_important = crate::css::StyleIndex::new(
+            crate::css::parse("noscript { display: block !important }").unwrap(),
+        );
+        assert_eq!(
+            crate::css::compute_node(&enabled, enabled_noscript, None, &author_important)
+                .unwrap()
+                .display,
+            crate::css::Display::None
+        );
+        let disabled_style =
+            crate::css::compute_node(&disabled, disabled_noscript, None, &author_important)
+                .unwrap();
+        assert_eq!(disabled_style.display, crate::css::Display::Block);
+
+        let head_source = "<!doctype html><html><head><noscript><meta name=x></noscript></head><body></body></html>";
+        let active_head = parse_with_options(
+            head_source,
+            24,
+            ParseOptions {
+                allow_declarative_shadow_roots: false,
+                scripting_enabled: true,
+            },
+        )
+        .unwrap();
+        let head_noscript =
+            crate::selector::query_selector(&active_head, active_head.root(), "noscript")
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            active_head.kind(active_head.first_child(head_noscript).unwrap().unwrap()),
+            Ok(NodeKind::Text(text)) if text == "<meta name=x>"
+        ));
+        assert_eq!(
+            crate::css::compute_node(
+                &active_head,
+                head_noscript,
+                None,
+                &crate::css::StyleIndex::new(Vec::new()),
+            )
+            .unwrap()
+            .display,
+            crate::css::Display::None
+        );
+
+        let foreign = parse_with_options(
+            "<!doctype html><html><head></head><body><svg><noscript><circle/></noscript></svg></body></html>",
+            24,
+            ParseOptions {
+                allow_declarative_shadow_roots: false,
+                scripting_enabled: true,
+            },
+        )
+        .unwrap();
+        let svg = crate::selector::query_selector(&foreign, foreign.root(), "svg")
+            .unwrap()
+            .unwrap();
+        let foreign_noscript = foreign.first_child(svg).unwrap().unwrap();
+        assert!(matches!(
+            foreign.kind(foreign_noscript),
+            Ok(NodeKind::Element {
+                namespace: Namespace::Svg,
+                name,
+                ..
+            }) if name == "noscript"
+        ));
+        assert!(matches!(
+            foreign.kind(foreign.first_child(foreign_noscript).unwrap().unwrap()),
+            Ok(NodeKind::Element {
+                namespace: Namespace::Svg,
+                name,
+                ..
+            }) if name == "circle"
+        ));
+        assert_ne!(
+            crate::css::compute_node(
+                &foreign,
+                foreign_noscript,
+                None,
+                &crate::css::StyleIndex::new(Vec::new()),
+            )
+            .unwrap()
+            .display,
+            crate::css::Display::None
+        );
+    }
+
+    #[test]
+    fn incremental_document_parser_preserves_nodes_and_declarative_shadow_permission() {
+        let source = parse_with_options(
+            "<!doctype html><div>old</div>",
+            64,
+            ParseOptions {
+                allow_declarative_shadow_roots: true,
+                scripting_enabled: true,
+            },
+        )
+        .unwrap();
+        let mut document = source.clone_document(true).unwrap();
+        assert!(document.allow_declarative_shadow_roots());
+        let root = document.root();
+        let options = ParseOptions {
+            allow_declarative_shadow_roots: document.allow_declarative_shadow_roots(),
+            scripting_enabled: document.scripting_enabled(),
+        };
+        let (mut parser, removed) = HtmlDocumentParser::open(&mut document, options).unwrap();
+        assert_eq!(document.root(), root);
+        assert_eq!(removed.len(), 2);
+
+        let body = crate::selector::query_selector(&document, root, "body")
+            .unwrap()
+            .unwrap();
+        parser.write(&mut document, "<div id=\"fragment").unwrap();
+        assert!(document.first_child(body).unwrap().is_none());
+        parser.write(&mut document, "\">alpha&amp").unwrap();
+        let host = document.first_child(body).unwrap().unwrap();
+        let text = document.first_child(host).unwrap().unwrap();
+        assert!(matches!(document.kind(text), Ok(NodeKind::Text(value)) if value == "alpha"));
+
+        parser
+            .write(
+                &mut document,
+                ";omega</div><section id=host><template shadowrootmode=open>shadow",
+            )
+            .unwrap();
+        assert_eq!(document.first_child(host).unwrap(), Some(text));
+        parser
+            .write(&mut document, "</template></section>")
+            .unwrap();
+        parser.close(&mut document).unwrap();
+        assert!(parser.close(&mut document).is_ok());
+        assert!(matches!(document.kind(text), Ok(NodeKind::Text(value)) if value == "alpha&omega"));
+
+        let shadow_host = crate::selector::query_selector(&document, root, "#host")
+            .unwrap()
+            .unwrap();
+        let shadow_root = document.shadow_root(shadow_host).unwrap().unwrap();
+        let mut shadow_text = String::new();
+        document
+            .append_descendant_text(shadow_root, &mut shadow_text)
+            .unwrap();
+        assert_eq!(shadow_text, "shadow");
+    }
+
+    #[test]
+    fn incremental_document_parser_compacts_consumed_source() {
+        let mut document = Document::new(16);
+        let (mut parser, _) =
+            HtmlDocumentParser::open(&mut document, ParseOptions::default()).unwrap();
+        let chunk = "x".repeat(128 * 1024);
+        parser.write(&mut document, &chunk).unwrap();
+        assert_eq!(parser.source_base, chunk.len());
+        assert!(parser.input.is_empty());
+        assert_eq!(parser.total_input_bytes, chunk.len());
+        parser.close(&mut document).unwrap();
+    }
+
+    #[test]
+    fn incremental_document_parser_yields_at_script_and_inserts_before_buffered_tail() {
+        let mut document = Document::new(32);
+        let options = ParseOptions {
+            allow_declarative_shadow_roots: false,
+            scripting_enabled: true,
+        };
+        let (mut parser, _) = HtmlDocumentParser::open(&mut document, options).unwrap();
+
+        assert!(parser
+            .write_until_script(&mut document, "<div><script id=writer>1</scr")
+            .unwrap()
+            .is_none());
+        let script = parser
+            .write_until_script(&mut document, "ipt><i id=tail>tail</i></div>\r")
+            .unwrap()
+            .expect("complete parser script should yield a checkpoint");
+        assert!(matches!(
+            document.kind(script),
+            Ok(NodeKind::Element { name, .. }) if name == "script"
+        ));
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#tail")
+                .unwrap()
+                .is_none()
+        );
+
+        let outer_script = script;
+        assert!(parser
+            .write_at_script_position_until_script(
+                &mut document,
+                outer_script,
+                &["<b id=nested>nested</b>A\r".to_owned()],
+                false,
+            )
+            .unwrap()
+            .is_none());
+        let nested_script = parser
+            .write_at_script_position_until_script(
+                &mut document,
+                outer_script,
+                &["\nB<script id=inner>nested script</script>C\r".to_owned()],
+                false,
+            )
+            .unwrap()
+            .expect("inserted parser script should yield synchronously");
+        assert!(matches!(
+            document.kind(nested_script),
+            Ok(NodeKind::Element { name, .. }) if name == "script"
+        ));
+        let nested = crate::selector::query_selector(&document, document.root(), "#nested")
+            .unwrap()
+            .unwrap();
+        assert!(parser
+            .resume_insertion_until_script(&mut document, nested_script, outer_script)
+            .unwrap()
+            .is_none());
+        assert!(parser.is_paused_for_script());
+        assert!(parser.pending_cr);
+        assert!(!parser.pending_insertion_cr);
+        let unread = &parser.input[parser.state.as_ref().unwrap().pos..];
+        assert!(unread.starts_with("<i id=tail>tail</i>"), "unread source: {unread:?}");
+        let text_before_inner = document.next_sibling(nested).unwrap().unwrap();
+        assert!(matches!(
+            document.kind(text_before_inner),
+            Ok(NodeKind::Text(value)) if value == "A\nB"
+        ));
+        let text_after_inner = document.next_sibling(nested_script).unwrap().unwrap();
+        assert!(matches!(
+            document.kind(text_after_inner),
+            Ok(NodeKind::Text(value)) if value == "C\n"
+        ));
+
+        assert!(parser.finish_until_script(&mut document).unwrap().is_none());
+        assert!(parser.resume_until_script(&mut document).unwrap().is_none());
+        assert!(parser.is_closed());
+
+        let script = crate::selector::query_selector(&document, document.root(), "#writer")
+            .unwrap()
+            .unwrap();
+        let nested = crate::selector::query_selector(&document, document.root(), "#nested")
+            .unwrap()
+            .unwrap();
+        let tail = crate::selector::query_selector(&document, document.root(), "#tail")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            document.parent(nested).unwrap(),
+            document.parent(script).unwrap()
+        );
+        assert_eq!(
+            document.parent(tail).unwrap(),
+            document.parent(script).unwrap()
+        );
+        assert_eq!(document.next_sibling(script).unwrap(), Some(nested));
+        assert_eq!(document.next_sibling(nested).unwrap(), Some(text_before_inner));
+        assert_eq!(document.next_sibling(text_before_inner).unwrap(), Some(nested_script));
+        assert_eq!(document.next_sibling(nested_script).unwrap(), Some(text_after_inner));
+        assert_eq!(document.next_sibling(text_after_inner).unwrap(), Some(tail));
+    }
+
+    #[test]
+    fn nested_document_writes_are_bounded_to_the_innermost_insertion_region() {
+        let mut document = Document::new(32);
+        let (mut parser, _) =
+            HtmlDocumentParser::open(&mut document, ParseOptions::default()).unwrap();
+        let outer_script = parser
+            .write_until_script(
+                &mut document,
+                "<script id=outer>outer</script><u id=source-tail>tail</u>",
+            )
+            .unwrap()
+            .expect("outer parser script should yield");
+
+        let inner_script = parser
+            .write_at_script_position_until_script(
+                &mut document,
+                outer_script,
+                &["<script id=inner>inner</script><i id=outer-write-tail>tail</i>".to_owned()],
+                false,
+            )
+            .unwrap()
+            .expect("outer write should synchronously yield its nested script");
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#outer-write-tail")
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(parser
+            .write_at_script_position_until_script(
+                &mut document,
+                inner_script,
+                &["<b id=inner-write>inner write</b>".to_owned()],
+                false,
+            )
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#inner-write")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#outer-write-tail")
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(parser
+            .resume_insertion_until_script(&mut document, inner_script, outer_script)
+            .unwrap()
+            .is_none());
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#outer-write-tail")
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(parser.resume_until_script(&mut document).unwrap().is_none());
+        assert!(
+            crate::selector::query_selector(&document, document.root(), "#source-tail")
+                .unwrap()
+                .is_some()
         );
     }
 }

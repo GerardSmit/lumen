@@ -19,6 +19,7 @@ mod num_fmt;
 use collections::brand::{coll_ptr, coll_ptr_kind};
 pub(crate) mod dataview;
 mod date;
+pub(crate) use date::time_clip;
 mod disposable;
 mod errors;
 mod function_proto;
@@ -2979,7 +2980,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "Number"
             } else if matches!(b.exotic, Exotic::StrWrap) {
                 "String"
-            } else if b.props.contains("\u{0}date_ms") {
+            } else if matches!(b.exotic, Exotic::Date) {
                 "Date"
             } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
                 "RegExp"

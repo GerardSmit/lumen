@@ -69,6 +69,9 @@ const DETACHED: u8 = 4;
 enum Backing {
     Heap(Vec<u8>),
     External(#[allow(dead_code)] Rc<dyn Any>),
+    /// Length-only facade for bytes whose access is mediated elsewhere (for example a
+    /// SharedArrayBuffer backed by a process-shared mutex). Its pointer is never dereferenced.
+    MetadataOnly,
     Detached,
 }
 
@@ -140,6 +143,39 @@ impl ByteStore {
     /// `n` zero bytes.
     pub fn zeroed(n: usize) -> ByteStore {
         ByteStore::new(vec![0u8; n])
+    }
+
+    /// A length-only store for a buffer whose bytes live in a separately synchronized backing.
+    /// It allocates no byte storage and cannot expose a raw pointer or byte slice.
+    pub fn metadata_only(len: usize) -> ByteStore {
+        ByteStore {
+            ptr: Cell::new(std::ptr::NonNull::dangling().as_ptr()),
+            len: Cell::new(len),
+            borrow: Cell::new(0),
+            pins: Cell::new(0),
+            lends: Cell::new(0),
+            mut_lends: Cell::new(0),
+            flags: Cell::new(0),
+            max_len: Cell::new(len),
+            backing: UnsafeCell::new(Backing::MetadataOnly),
+            retired: UnsafeCell::new(Vec::new()),
+            gen: Cell::new(0),
+        }
+    }
+
+    /// Grow a metadata-only store's visible length after its synchronized backing has grown.
+    pub fn grow_metadata_to(&self, len: usize) -> Result<(), BufferError> {
+        if !self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
+        }
+        if len < self.len() {
+            return Err(BufferError::NotResizable);
+        }
+        if len > self.max_len() {
+            return Err(BufferError::TooLarge);
+        }
+        self.len.set(len);
+        Ok(())
     }
 
     /// A fixed-length view of `len` bytes at `ptr`, kept valid by `owner`; no copy.
@@ -219,11 +255,22 @@ impl ByteStore {
         self.max_len.get()
     }
 
-    /// Whether the bytes belong to an external owner (see [`external`](Self::external)).
+    /// Whether bytes are not owned by a heap `Vec` (external or metadata-only).
     pub fn is_external(&self) -> bool {
         // SAFETY: a shared read of the discriminant; `backing` is only replaced by methods of
         // this type, never while a reference to it is live.
-        matches!(unsafe { &*self.backing.get() }, Backing::External(_))
+        matches!(
+            unsafe { &*self.backing.get() },
+            Backing::External(_) | Backing::MetadataOnly
+        )
+    }
+
+    /// Whether this store represents only length and flags, with bytes managed by another
+    /// synchronized backing.
+    pub fn is_metadata_only(&self) -> bool {
+        // SAFETY: a shared read of the discriminant; `backing` is only replaced by methods of
+        // this type, never while a reference to it is live.
+        matches!(unsafe { &*self.backing.get() }, Backing::MetadataOnly)
     }
 
     /// Live exports (pins).
@@ -242,6 +289,9 @@ impl ByteStore {
     pub fn pin(&self) -> Result<(), BufferError> {
         if self.is_detached() {
             return Err(BufferError::Detached);
+        }
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
         }
         self.pins.set(self.pins.get() + 1);
         Ok(())
@@ -271,6 +321,9 @@ impl ByteStore {
 
     #[inline(always)]
     pub fn try_bytes(&self) -> Result<Bytes<'_>, BufferError> {
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
+        }
         let b = self.borrow.get();
         if b < 0 {
             return Err(BufferError::Borrowed);
@@ -294,6 +347,9 @@ impl ByteStore {
 
     #[inline(always)]
     pub fn try_bytes_mut(&self) -> Result<BytesMut<'_>, BufferError> {
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
+        }
         if self.borrow.get() != 0 {
             return Err(BufferError::Borrowed);
         }
@@ -317,6 +373,9 @@ impl ByteStore {
     pub fn lend(&self, mutable: bool) -> Result<Lend<'_>, BufferError> {
         if self.is_detached() {
             return Err(BufferError::Detached);
+        }
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
         }
         let b = self.borrow.get();
         if b < 0 || (mutable && b > 0) {
@@ -427,7 +486,11 @@ impl ByteStore {
     /// reference that overlaps a live guard.
     #[inline(always)]
     pub fn as_ptr(&self) -> *mut u8 {
-        self.ptr.get()
+        if self.is_metadata_only() {
+            std::ptr::NonNull::dangling().as_ptr()
+        } else {
+            self.ptr.get()
+        }
     }
 
     /// A copy of the bytes.
@@ -465,6 +528,9 @@ impl ByteStore {
     fn check_reshape(&self) -> Result<(), BufferError> {
         if self.is_detached() {
             return Err(BufferError::Detached);
+        }
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
         }
         if self.is_readonly() {
             return Err(BufferError::ReadOnly);
@@ -579,7 +645,10 @@ impl ByteStore {
 
     /// Whether detachment can proceed without a live pin or bytes guard.
     pub fn can_detach(&self) -> bool {
-        !self.is_detached() && !self.is_pinned() && self.borrow.get() == 0
+        !self.is_detached()
+            && !self.is_metadata_only()
+            && !self.is_pinned()
+            && self.borrow.get() == 0
     }
 
     /// Detach: hand the bytes out (an external store's are copied) and leave the store empty and
@@ -588,6 +657,9 @@ impl ByteStore {
     pub fn detach(&self) -> Result<Vec<u8>, BufferError> {
         if self.is_detached() {
             return Err(BufferError::Detached);
+        }
+        if self.is_metadata_only() {
+            return Err(BufferError::Borrowed);
         }
         if self.is_pinned() {
             return Err(BufferError::Pinned);
@@ -810,6 +882,24 @@ mod tests {
         assert_eq!(&*s.bytes(), [1, 2, 3]);
         assert!(!s.is_resizable());
         assert_eq!(s.max_len(), 3);
+    }
+
+    #[test]
+    fn metadata_only_store_tracks_length_without_allocating_or_exposing_bytes() {
+        let before = tracked_bytes();
+        let s = ByteStore::metadata_only(16 << 20).with_max_len(32 << 20);
+        assert_eq!(tracked_bytes(), before);
+        assert_eq!(s.len(), 16 << 20);
+        assert_eq!(s.max_len(), 32 << 20);
+        assert!(s.is_metadata_only());
+        assert_eq!(s.try_bytes().err(), Some(BufferError::Borrowed));
+        assert_eq!(s.try_bytes_mut().err(), Some(BufferError::Borrowed));
+        assert_eq!(s.resize(20 << 20), Err(BufferError::Borrowed));
+        assert_eq!(s.grow_metadata_to(20 << 20), Ok(()));
+        assert_eq!(s.len(), 20 << 20);
+        assert_eq!(s.grow_metadata_to(33 << 20), Err(BufferError::TooLarge));
+        assert_eq!(s.detach(), Err(BufferError::Borrowed));
+        assert_eq!(tracked_bytes(), before);
     }
 
     #[test]

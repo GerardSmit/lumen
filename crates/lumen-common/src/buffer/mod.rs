@@ -110,7 +110,8 @@ pub enum BufferError {
     TooLarge,
     /// A range lies outside the store.
     OutOfBounds,
-    /// The bytes are borrowed by a live guard (a re-entrant access).
+    /// The bytes are borrowed by a live guard, or are managed by a separately synchronized
+    /// backing and must be accessed through that backing.
     Borrowed,
 }
 
@@ -124,7 +125,9 @@ impl BufferError {
             BufferError::NotResizable => "buffer is not resizable",
             BufferError::TooLarge => "buffer length exceeds its maximum",
             BufferError::OutOfBounds => "range is outside the buffer",
-            BufferError::Borrowed => "buffer is already borrowed",
+            BufferError::Borrowed => {
+                "buffer bytes are borrowed or require synchronized backing access"
+            }
         }
     }
 }

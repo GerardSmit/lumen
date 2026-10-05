@@ -1,5 +1,5 @@
 use super::super::exec::{Host, Imports, MemEntity, Store, Val};
-use super::super::parse::{decode, validate, ValType};
+use super::super::parse::{ValType, decode, validate};
 use crate::wasm::test_util::{self as t, I32, I64};
 
 fn ok(bytes: &[u8]) {

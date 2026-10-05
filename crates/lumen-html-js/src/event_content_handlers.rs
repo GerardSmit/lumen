@@ -248,7 +248,12 @@ fn handler_attribute(name: &str, html_document: bool) -> Option<(&'static str, &
         ("onkeyup", "keyup"),
         ("onkeypress", "keypress"),
         ("onbeforeinput", "beforeinput"),
+        ("onbeforetoggle", "beforetoggle"),
+        ("ontoggle", "toggle"),
+        ("onclose", "close"),
+        ("oncancel", "cancel"),
         ("onchange", "change"),
+        ("oninvalid", "invalid"),
         ("onfocus", "focus"),
         ("onblur", "blur"),
         ("onfocusin", "focusin"),
@@ -274,6 +279,7 @@ fn handler_attribute(name: &str, html_document: bool) -> Option<(&'static str, &
         ("ontouchend", "touchend"),
         ("ontouchmove", "touchmove"),
         ("ontouchcancel", "touchcancel"),
+        ("onvolumechange", "volumechange"),
         ("oninput", "input"),
         ("onclick", "click"),
         ("onsubmit", "submit"),
@@ -324,6 +330,47 @@ mod tests {
                 _ => unreachable!("describe_throw returns a throw completion"),
             },
         }
+    }
+
+    #[test]
+    fn volumechange_handler_uses_native_slot_receiver_and_queued_event_order() {
+        let mut runtime = Runtime::new();
+        let engine = runtime.engine();
+        let realm = crate::install(engine.ctx(),
+            r#"<audio id="audio" onvolumechange="calls.push('content')"></audio>"#, 64).unwrap();
+        let evaluate = |engine: &mut lumen::Engine, source: &str| {
+            engine.eval_value(source).expect("valid media-handler script")
+                .ok().expect("media-handler script threw")
+        };
+        evaluate(engine, r#"
+            var calls = [], receiverCorrect = false;
+            const audio = document.getElementById('audio');
+            const content = audio.onvolumechange;
+            audio.addEventListener('volumechange', () => calls.push('listener'));
+            audio.onvolumechange = function(event) {
+                calls.push('idl');
+                receiverCorrect = this === audio && event.currentTarget === audio && event.target === audio;
+            };
+            audio.muted = true;
+            Promise.resolve().then(() => calls.push('micro'));
+            if (calls.length) throw new Error('media handler fired synchronously');
+        "#);
+        while engine.run_one_job() {}
+        assert!(matches!(evaluate(engine, "calls.join(',')==='micro'"), Value::Bool(true)));
+        assert_eq!(realm.queue_media_tasks(engine.ctx()).unwrap(), 1);
+        assert!(scheduling::run_tasks(engine, 64).is_empty());
+        assert!(matches!(evaluate(engine,
+            "receiverCorrect && calls.join(',')==='micro,idl,listener'"), Value::Bool(true)));
+        evaluate(engine, "calls=[];audio.onvolumechange=null;audio.muted=false");
+        assert_eq!(realm.queue_media_tasks(engine.ctx()).unwrap(), 1);
+        assert!(scheduling::run_tasks(engine, 64).is_empty());
+        assert!(matches!(evaluate(engine,
+            "audio.onvolumechange===null && calls.join(',')==='listener'"), Value::Bool(true)));
+        evaluate(engine, "calls=[];audio.setAttribute('onvolumechange',\"calls.push('attribute')\");audio.muted=true");
+        assert_eq!(realm.queue_media_tasks(engine.ctx()).unwrap(), 1);
+        assert!(scheduling::run_tasks(engine, 64).is_empty());
+        assert!(matches!(evaluate(engine,
+            "calls.join(',')==='listener,attribute'"), Value::Bool(true)));
     }
 
     #[test]

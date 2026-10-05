@@ -538,7 +538,7 @@ impl Builder {
                 interp.make_error("DataCloneError", "detached ArrayBuffer cannot be cloned")
             );
         }
-        if object.borrow().props.contains("\u{0}date_ms") {
+        if object.borrow().exotic == Exotic::Date {
             return Ok(Intrinsic::Extra("Date"));
         }
         let object = object.borrow();
@@ -844,9 +844,6 @@ impl Builder {
                 }
                 if interp.regexps.contains_key(&pointer) {
                     keys.push("lastIndex");
-                }
-                if source.borrow().props.contains("\u{0}date_ms") {
-                    keys.push("\u{0}date_ms");
                 }
                 keys
             }

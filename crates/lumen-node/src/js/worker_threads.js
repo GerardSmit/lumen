@@ -52,10 +52,17 @@
   const internals = __eventTargetInternals;
   const NodeEvent = internals.Event;
   const NodeEventTarget = internals.NodeEventTarget;
-  class NodeMessageEvent extends NodeEvent {
+  // Events must satisfy `instanceof MessageEvent` whenever the global MessageEvent is built on
+  // the same Event this module uses; a browser adapter may have replaced the global one.
+  const WebMessageEvent = globalThis.MessageEvent;
+  const MessageEventBase =
+    typeof WebMessageEvent === "function" && Object.getPrototypeOf(WebMessageEvent) === NodeEvent
+      ? WebMessageEvent
+      : NodeEvent;
+  class NodeMessageEvent extends MessageEventBase {
     constructor(type, init = {}) {
-      super(type, init);
       init = init && typeof init === "object" ? init : {};
+      super(type, init.bubbles === undefined ? {} : { bubbles: init.bubbles });
       this.data = init.data === undefined ? null : init.data;
       this.origin = init.origin === undefined ? "" : `${init.origin}`;
       this.lastEventId = init.lastEventId === undefined ? "" : `${init.lastEventId}`;

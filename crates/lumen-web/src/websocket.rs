@@ -28,7 +28,7 @@ use std::time::Duration;
 use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::url;
-use lumen_common::hash::{digest, Algo};
+use lumen_common::hash::{Algo, digest};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Bound reads/writes so a dead peer can't pin a pool worker (reads) or the loop (writes).
@@ -373,7 +373,7 @@ pub(crate) fn op_ws_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Resu
             return Err(ctx.make_error(
                 "SyntaxError",
                 format!("WebSocket: unsupported scheme '{other}'"),
-            ))
+            ));
         }
     }
 

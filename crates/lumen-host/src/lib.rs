@@ -115,6 +115,13 @@ struct InitializedExtensionStates(HashSet<&'static str>);
 #[derive(Default)]
 struct SharedExtensionSources(HashMap<ExtensionSourceKey, Rc<str>>);
 
+/// A Ctx-only host initializer that installs providers into one actual registered realm.
+/// Initial document creation can use this without borrowing the owning `Engine` or `Runtime`.
+pub type HostRealmInstaller = Rc<dyn Fn(&mut Ctx, &RealmHandle) -> Result<(), String>>;
+
+#[derive(Default)]
+struct HostRealmInstallers(Vec<HostRealmInstaller>);
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ExtensionSourceKey {
     source_address: usize,
@@ -125,11 +132,7 @@ struct ExtensionSourceKey {
 
 const MAX_SHARED_EXTENSION_SOURCES: usize = 64;
 
-fn shared_extension_source(
-    engine: &mut Engine,
-    extension: &Extension,
-    source: &'static str,
-) -> Rc<str> {
+fn shared_extension_source(ctx: &mut Ctx, extension: &Extension, source: &'static str) -> Rc<str> {
     let (snapshot_address, snapshot_len) = extension
         .js_init_snapshot
         .map(|snapshot| (Some(snapshot.as_ptr() as usize), snapshot.len()))
@@ -140,7 +143,7 @@ fn shared_extension_source(
         snapshot_address,
         snapshot_len,
     };
-    let state = engine.ctx().op_state();
+    let state = ctx.op_state();
     if !state.has::<SharedExtensionSources>() {
         state.put(SharedExtensionSources::default());
     }
@@ -289,11 +292,22 @@ pub fn install_realm(
     realm: &RealmHandle,
     extensions: &[Extension],
 ) -> Result<(), String> {
+    install_realm_in_ctx(engine.ctx(), realm, extensions)
+}
+
+/// Install already-initialized extensions from a native host callback with only the shared
+/// interpreter context. The realm is validated by `with_host_realm`; no engine/runtime alias or
+/// agent checkpoint is needed.
+pub fn install_realm_in_ctx(
+    ctx: &mut Ctx,
+    realm: &RealmHandle,
+    extensions: &[Extension],
+) -> Result<(), String> {
     if extensions
         .iter()
         .any(|extension| extension.state_init.is_some())
     {
-        let state = engine.ctx().op_state();
+        let state = ctx.op_state();
         let initialized = state
             .get::<InitializedExtensionStates>()
             .ok_or_else(|| "base extension state has not been initialized".to_string())?;
@@ -308,8 +322,7 @@ pub fn install_realm(
     }
 
     for extension in extensions {
-        let installed = engine
-            .ctx()
+        let installed = ctx
             .with_host_realm(realm, |ctx| {
                 for module in extension.modules {
                     module(ctx).map_err(|_| {
@@ -339,31 +352,58 @@ pub fn install_realm(
             .map_err(|error| error.to_string())?;
         installed?;
 
-        install_realm_glue(engine, realm, extension)?;
+        install_realm_glue(ctx, realm, extension)?;
+    }
+    Ok(())
+}
+
+/// Register one browser/host realm initializer in shared OpState. The closure is cloned out of
+/// OpState before invocation, so it may safely call other native providers that consult OpState.
+pub fn register_host_realm_installer(ctx: &mut Ctx, installer: HostRealmInstaller) {
+    if !ctx.op_state().has::<HostRealmInstallers>() {
+        ctx.op_state().put(HostRealmInstallers::default());
+    }
+    ctx.op_state()
+        .get_mut::<HostRealmInstallers>()
+        .expect("host realm installer list was just installed")
+        .0
+        .push(installer);
+}
+
+/// Run the registered host-realm initializers synchronously in `realm`. No JavaScript job or
+/// timer checkpoint is performed; the Runtime remains the sole owner of event-loop ordering.
+pub fn install_registered_host_realm(ctx: &mut Ctx, realm: &RealmHandle) -> Result<(), String> {
+    let installers = ctx
+        .op_state()
+        .get::<HostRealmInstallers>()
+        .map(|installers| installers.0.clone())
+        .unwrap_or_default();
+    for installer in installers {
+        installer(ctx, realm)?;
     }
     Ok(())
 }
 
 fn install_realm_glue(
-    engine: &mut Engine,
+    ctx: &mut Ctx,
     realm: &RealmHandle,
     extension: &Extension,
 ) -> Result<(), String> {
     let snapshot = extension.js_init_snapshot;
     let shared_source = extension
         .js_init
-        .map(|source| shared_extension_source(engine, extension, source));
+        .map(|source| shared_extension_source(ctx, extension, source));
     let native_version = lumen_common::aot::NATIVE_FORMAT_VERSION.to_le_bytes();
     let native = snapshot.filter(|bytes| bytes.get(8..12) == Some(native_version.as_slice()));
 
     if let Some(blob) = native {
         #[cfg(feature = "aot-native")]
         {
-            let tier = engine.tier();
-            engine.set_tier(lumen::bytecode::Tier::Interp);
-            let loaded = engine.load_native_glue_value_in_host_realm(realm, blob);
-            engine.set_tier(tier);
-            match loaded.map_err(|error| error.to_string())? {
+            let loaded = ctx.with_host_bootstrap_tier(|ctx| {
+                ctx.load_native_glue_value_in_host_realm(realm, blob)
+            });
+            let loaded = loaded.map_err(|error| error.to_string())?;
+            match loaded {
                 Ok(_) => return Ok(()),
                 Err(error) => {
                     return Err(format!(
@@ -377,7 +417,7 @@ fn install_realm_glue(
         {
             #[cfg(feature = "compiler")]
             if let Some(source) = shared_source.as_deref() {
-                return run_realm_source(engine, realm, extension.name, source);
+                return run_realm_source(ctx, realm, extension.name, source);
             }
             return Err(format!(
                 "extension '{}' native glue is unavailable",
@@ -400,22 +440,21 @@ fn install_realm_glue(
     {
         if std::env::var_os("LUMEN_NO_SNAPSHOT").is_none() {
             if let Some(snapshot) = snapshot.filter(|bytes| bytes.starts_with(b"LUMENAOT")) {
-                let tier = engine.tier();
-                engine.set_tier(lumen::bytecode::Tier::Interp);
-                let result = engine.eval_snapshot_shared_source_in_host_realm(
-                    realm,
-                    snapshot,
-                    shared_source
-                        .as_ref()
-                        .expect("shared source was checked above")
-                        .clone(),
-                    false,
-                );
-                engine.set_tier(tier);
+                let result = ctx.with_host_bootstrap_tier(|ctx| {
+                    ctx.eval_snapshot_shared_source_in_host_realm(
+                        realm,
+                        snapshot,
+                        shared_source
+                            .as_ref()
+                            .expect("shared source was checked above")
+                            .clone(),
+                        false,
+                    )
+                });
                 match result {
                     Ok(Ok(_)) => return Ok(()),
                     Ok(Err(thrown)) => {
-                        return Err(describe_realm_throw(engine, extension.name, thrown));
+                        return Err(describe_realm_throw(ctx, extension.name, thrown));
                     }
                     Err(HostRealmEvalError::Scope(error)) => return Err(error.to_string()),
                     // A stale/corrupt snapshot follows the existing extension contract and
@@ -424,11 +463,11 @@ fn install_realm_glue(
                 }
             }
         }
-        run_realm_source(engine, realm, extension.name, source)
+        run_realm_source(ctx, realm, extension.name, source)
     }
     #[cfg(not(feature = "compiler"))]
     {
-        let _ = (engine, realm, source);
+        let _ = (ctx, realm, source);
         Err(format!(
             "extension '{}' requires native initialization glue",
             extension.name
@@ -438,25 +477,23 @@ fn install_realm_glue(
 
 #[cfg(feature = "compiler")]
 fn run_realm_source(
-    engine: &mut Engine,
+    ctx: &mut Ctx,
     realm: &RealmHandle,
     extension: &str,
     source: &str,
 ) -> Result<(), String> {
-    let tier = engine.tier();
-    engine.set_tier(lumen::bytecode::Tier::Interp);
-    let result = engine.eval_value_in_host_realm(realm, source, false);
-    engine.set_tier(tier);
+    let result =
+        ctx.with_host_bootstrap_tier(|ctx| ctx.eval_value_in_host_realm(realm, source, false));
     match result {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(thrown)) => Err(describe_realm_throw(engine, extension, thrown)),
+        Ok(Err(thrown)) => Err(describe_realm_throw(ctx, extension, thrown)),
         Err(error) => Err(error.to_string()),
     }
 }
 
 #[cfg(not(feature = "compiler"))]
 fn run_realm_source(
-    _engine: &mut Engine,
+    _ctx: &mut Ctx,
     _realm: &RealmHandle,
     extension: &str,
     _source: &str,
@@ -467,13 +504,32 @@ fn run_realm_source(
     ))
 }
 
-fn describe_realm_throw(engine: &mut Engine, extension: &str, thrown: Value) -> String {
-    match engine.describe_throw(thrown) {
-        Completion::Value(_) => format!("extension '{extension}' js_init failed"),
-        Completion::Throw { name, message } => {
-            format!("extension '{extension}' js_init threw {name}: {message}")
-        }
+fn describe_realm_throw(ctx: &mut Ctx, extension: &str, thrown: Value) -> String {
+    let name = host_error_property(ctx, &thrown, "name").or_else(|| {
+        let constructor = ctx.member_get(&thrown, "constructor").ok()?;
+        host_error_property(ctx, &constructor, "name")
+    });
+    let message = if thrown.as_obj().is_some() {
+        host_error_property(ctx, &thrown, "message").unwrap_or_default()
+    } else {
+        ctx.coerce_string(&thrown)
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    };
+    format!(
+        "extension '{extension}' js_init threw {}: {message}",
+        name.unwrap_or_default()
+    )
+}
+
+fn host_error_property(ctx: &mut Ctx, object: &Value, name: &str) -> Option<String> {
+    let value = ctx.member_get(object, name).ok()?;
+    if matches!(value, Value::Undefined | Value::Null) {
+        return None;
     }
+    ctx.coerce_string(&value)
+        .ok()
+        .map(|value| value.to_string())
 }
 
 /// Load build-produced extension glue in its recorded execution format.
@@ -563,11 +619,26 @@ enum Task {
 /// the whole async-I/O story until (if ever) a hand-rolled readiness reactor on raw platform
 /// syscalls is explicitly authorized — never via a crate.
 pub struct ThreadPool {
-    work_tx: Option<mpsc::Sender<Task>>,
-    workers: Vec<std::thread::JoinHandle<()>>,
+    shared: std::sync::Arc<PoolShared>,
+}
+
+/// State shared by the pool and its spawn handles. Worker threads are created by the first
+/// submission, so a runtime that never runs blocking work never starts any.
+struct PoolShared {
+    size: usize,
     completions: mpsc::Sender<TaskCompletion>,
     /// Tasks submitted and not yet finished (queued or running).
     pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    state: std::sync::Mutex<PoolState>,
+}
+
+enum PoolState {
+    Idle,
+    Running {
+        work_tx: mpsc::Sender<Task>,
+        workers: Vec<std::thread::JoinHandle<()>>,
+    },
+    Closed,
 }
 
 /// Spawn a host thread with the engine's thread stack size: work run here may call back into an
@@ -584,38 +655,60 @@ fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<(
 }
 
 impl ThreadPool {
-    /// `size` worker threads sending [`TaskCompletion`]s to `completions` (the loop thread
-    /// holds the receiving end).
+    /// Up to `size` worker threads, started on the first submitted job, sending
+    /// [`TaskCompletion`]s to `completions` (the loop thread holds the receiving end).
     ///
     /// On `wasm32` there are no threads: the pool has no workers and runs each job inline on the
     /// calling (loop) thread, delivering its completion on the same channel.
     pub fn new(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = size;
-            return ThreadPool {
-                work_tx: None,
-                workers: Vec::new(),
+        ThreadPool {
+            shared: std::sync::Arc::new(PoolShared {
+                size,
                 completions,
                 pending: Default::default(),
-            };
+                state: std::sync::Mutex::new(PoolState::Idle),
+            }),
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        Self::with_workers(size, completions)
     }
 
+    /// Run `work` on a pool thread; its return value comes back to the loop as a
+    /// [`TaskCompletion`] tagged with `id`.
+    pub fn spawn_blocking(
+        &self,
+        id: TaskId,
+        work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
+    ) {
+        self.handle().spawn_blocking(id, work);
+    }
+
+    /// A cloneable spawn handle. The runtime puts one in [`OpState`], which is how a native fn
+    /// (holding only `&mut Ctx`) reaches the pool.
+    pub fn handle(&self) -> SpawnHandle {
+        SpawnHandle {
+            shared: std::sync::Arc::clone(&self.shared),
+        }
+    }
+
+    /// Whether any worker thread has been started.
+    pub fn started(&self) -> bool {
+        matches!(
+            *self.shared.state.lock().expect("pool state poisoned"),
+            PoolState::Running { .. }
+        )
+    }
+}
+
+impl PoolShared {
     #[cfg(not(target_arch = "wasm32"))]
-    fn with_workers(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
+    fn start(&self) -> (mpsc::Sender<Task>, Vec<std::thread::JoinHandle<()>>) {
         let (work_tx, work_rx) = mpsc::channel::<Task>();
-        let pool_completions = completions.clone();
-        let pending = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-        let workers = (0..size.max(1))
+        let workers = (0..self.size.max(1))
             .map(|_| {
                 let work_rx = std::sync::Arc::clone(&work_rx);
-                let completions = completions.clone();
-                let pending = std::sync::Arc::clone(&pending);
+                let completions = self.completions.clone();
+                let pending = std::sync::Arc::clone(&self.pending);
                 spawn_thread(move || loop {
                     let task = match work_rx.lock().expect("worker queue poisoned").recv() {
                         Ok(t) => t,
@@ -634,31 +727,32 @@ impl ThreadPool {
                 })
             })
             .collect();
-        ThreadPool {
-            work_tx: Some(work_tx),
-            workers,
-            completions: pool_completions,
-            pending,
+        (work_tx, workers)
+    }
+
+    /// Queue `task`, starting the workers if this is the first submission. `Err` hands the task
+    /// back when the pool is closed or has no threads (`wasm32`).
+    fn submit(&self, task: Task) -> Result<(), Task> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return Err(task);
         }
-    }
-
-    /// Run `work` on a pool thread; its return value comes back to the loop as a
-    /// [`TaskCompletion`] tagged with `id`.
-    pub fn spawn_blocking(
-        &self,
-        id: TaskId,
-        work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
-    ) {
-        self.handle().spawn_blocking(id, work);
-    }
-
-    /// A cloneable spawn handle. The runtime puts one in [`OpState`], which is how a native fn
-    /// (holding only `&mut Ctx`) reaches the pool.
-    pub fn handle(&self) -> SpawnHandle {
-        SpawnHandle {
-            work_tx: self.work_tx.clone(),
-            completions: self.completions.clone(),
-            pending: std::sync::Arc::clone(&self.pending),
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut state = self.state.lock().expect("pool state poisoned");
+            if matches!(*state, PoolState::Idle) {
+                let (work_tx, workers) = self.start();
+                *state = PoolState::Running { work_tx, workers };
+            }
+            match &*state {
+                PoolState::Running { work_tx, .. } => {
+                    self.pending
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    work_tx.send(task).expect("worker threads gone");
+                    Ok(())
+                }
+                _ => Err(task),
+            }
         }
     }
 }
@@ -667,10 +761,7 @@ impl ThreadPool {
 /// blocking work from inside a native fn.
 #[derive(Clone)]
 pub struct SpawnHandle {
-    /// `None` on a pool without workers (`wasm32`): jobs run inline.
-    work_tx: Option<mpsc::Sender<Task>>,
-    completions: mpsc::Sender<TaskCompletion>,
-    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    shared: std::sync::Arc<PoolShared>,
 }
 
 impl SpawnHandle {
@@ -679,19 +770,17 @@ impl SpawnHandle {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        match &self.work_tx {
-            Some(tx) => {
-                self.pending
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tx.send(Task::Tracked {
-                    id,
-                    work: Box::new(work),
-                })
-                .expect("worker threads gone")
-            }
-            None => {
+        let task = Task::Tracked {
+            id,
+            work: Box::new(work),
+        };
+        if let Err(Task::Tracked { id, work }) = self.shared.submit(task) {
+            if cfg!(target_arch = "wasm32") {
                 let result = work();
-                let _ = self.completions.send(TaskCompletion { task: id, result });
+                let _ = self
+                    .shared
+                    .completions
+                    .send(TaskCompletion { task: id, result });
             }
         }
     }
@@ -699,13 +788,10 @@ impl SpawnHandle {
     /// Run `job` on a pool thread; it reports back by itself (e.g. through a
     /// [`lumen::embed::Completer`]), so no completion is sent for it.
     pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
-        match &self.work_tx {
-            Some(tx) => {
-                self.pending
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                tx.send(Task::Detached(job)).expect("worker threads gone")
+        if let Err(Task::Detached(job)) = self.shared.submit(Task::Detached(job)) {
+            if cfg!(target_arch = "wasm32") {
+                job();
             }
-            None => job(),
         }
     }
 }
@@ -796,6 +882,7 @@ pub type TaskDecoder = fn(&mut Ctx, Box<dyn Any + Send>) -> Result<Vec<Value>, V
 pub struct TaskRegistry {
     next: TaskId,
     map: std::collections::HashMap<TaskId, TaskEntry>,
+    unref_count: usize,
 }
 
 /// How to settle one in-flight task: success callback, optional failure callback (a promise's
@@ -807,6 +894,9 @@ pub struct TaskEntry {
     pub decode: TaskDecoder,
     /// Immutable async-context frame captured when the native operation was admitted.
     pub context: Value,
+    /// Realm that admitted a task through [`register_task`]. Direct registry users may leave
+    /// this unset when the work belongs to a host agent rather than one browsing context.
+    pub owner: Option<RealmHandle>,
     /// An `unref`'d task still settles when it completes, but does not by itself keep the event
     /// loop alive (Node's `child.unref()` — e.g. esbuild's persistent service child).
     pub unref: bool,
@@ -827,6 +917,7 @@ impl TaskRegistry {
                 on_err,
                 decode,
                 context: Value::Undefined,
+                owner: None,
                 unref: false,
                 persistent: false,
             },
@@ -851,26 +942,81 @@ impl TaskRegistry {
                     on_err: e.on_err.clone(),
                     decode: e.decode,
                     context: e.context.clone(),
+                    owner: e.owner.clone(),
                     unref: e.unref,
                     persistent: true,
                 });
             }
         }
-        self.map.remove(&id)
+        let entry = self.map.remove(&id);
+        if entry.as_ref().is_some_and(|e| e.unref) {
+            self.unref_count -= 1;
+        }
+        self.release_idle_capacity();
+        entry
+    }
+    fn release_idle_capacity(&mut self) {
+        if self.map.is_empty() {
+            if self.map.capacity() > 64 {
+                self.map = std::collections::HashMap::new();
+            }
+        } else if self.map.capacity() > 256 && self.map.len() * 4 < self.map.capacity() {
+            self.map.shrink_to(self.map.len().max(64) * 2);
+        }
     }
     /// Drop a pending task or stream; late completions for it are ignored.
     pub fn cancel(&mut self, id: TaskId) {
-        self.map.remove(&id);
+        if self.map.remove(&id).is_some_and(|e| e.unref) {
+            self.unref_count -= 1;
+        }
+        self.release_idle_capacity();
+    }
+    /// Drop settlement entries admitted by `realm`. Blocking work may still complete later; its
+    /// completion is ignored because the corresponding task ID is no longer registered.
+    pub fn cancel_realm(&mut self, realm: &RealmHandle) -> usize {
+        let before = self.map.len();
+        let mut unref_removed = 0;
+        self.map.retain(|_, entry| {
+            let keep = entry
+                .owner
+                .as_ref()
+                .map_or(true, |owner| !owner.same_realm(realm));
+            if !keep && entry.unref {
+                unref_removed += 1;
+            }
+            keep
+        });
+        self.unref_count -= unref_removed;
+        self.release_idle_capacity();
+        before - self.map.len()
+    }
+    /// Number of pending settlement entries admitted by `realm`.
+    pub fn pending_for_realm(&self, realm: &RealmHandle) -> usize {
+        self.map
+            .values()
+            .filter(|entry| {
+                entry
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.same_realm(realm))
+            })
+            .count()
     }
     /// Mark a pending task as `unref`'d (see [`TaskEntry::unref`]).
     pub fn set_unref(&mut self, id: TaskId) {
         if let Some(e) = self.map.get_mut(&id) {
+            if !e.unref {
+                self.unref_count += 1;
+            }
             e.unref = true;
         }
     }
     /// Re-`ref` a pending task so it keeps the loop alive again (Node's `handle.ref()`).
     pub fn set_ref(&mut self, id: TaskId) {
         if let Some(e) = self.map.get_mut(&id) {
+            if e.unref {
+                self.unref_count -= 1;
+            }
             e.unref = false;
         }
     }
@@ -880,7 +1026,7 @@ impl TaskRegistry {
     /// Whether any *ref*'d (loop-keeping) task is pending. Unref'd tasks are ignored — they
     /// settle if they complete but must not hold the process open.
     pub fn has_ref_pending(&self) -> bool {
-        self.map.values().any(|e| !e.unref)
+        self.map.len() > self.unref_count
     }
 }
 
@@ -892,12 +1038,15 @@ pub fn register_task(
     on_err: Option<Value>,
     decode: TaskDecoder,
 ) -> TaskId {
+    let owner = ctx.current_host_realm();
     let context = ctx.async_context();
     let registry = ctx
         .host_mut::<TaskRegistry>()
         .expect("runtime task registry");
     let id = registry.register(on_ok, on_err, decode);
-    registry.map.get_mut(&id).unwrap().context = context;
+    let entry = registry.map.get_mut(&id).unwrap();
+    entry.context = context;
+    entry.owner = Some(owner);
     id
 }
 
@@ -910,15 +1059,23 @@ impl Drop for ThreadPool {
         // so none outlives the runtime that owns the completion receiver; a task stuck in a
         // blocking call (a read that never returns) must not hold the drop hostage, so after a
         // grace period the workers are detached and exit when that call does.
-        self.work_tx.take();
+        let state = std::mem::replace(
+            &mut *self.shared.state.lock().expect("pool state poisoned"),
+            PoolState::Closed,
+        );
+        let PoolState::Running { work_tx, workers } = state else {
+            return;
+        };
+        drop(work_tx);
+        let pending = &self.shared.pending;
         let give_up = std::time::Instant::now() + POOL_DRAIN_GRACE;
-        while self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0
+        while pending.load(std::sync::atomic::Ordering::SeqCst) > 0
             && std::time::Instant::now() < give_up
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let stuck = self.pending.load(std::sync::atomic::Ordering::SeqCst) > 0;
-        for w in self.workers.drain(..) {
+        let stuck = pending.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        for w in workers {
             if !stuck || w.is_finished() {
                 let _ = w.join();
             }

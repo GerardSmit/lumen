@@ -1,8 +1,8 @@
 //! Promise fast paths: promise state stored in the promise object itself, cached intrinsics and
 //! resolving-function parts, and allocation-free `await` reactions.
 //!
-//! **Inline state.** A promise's [[PromiseState]], [[PromiseResult]], reactions and
-//! rejection-tracking bit live in a [`PromiseSlot`] boxed into the object's `call` field
+//! **Inline state.** A promise's [[PromiseState]], [[PromiseResult]], [[PromiseIsHandled]],
+//! reactions and rejection-tracking bit live in a [`PromiseSlot`] boxed into its `call` field
 //! ([`Callable::Promise`], which is not callable). Every `then`/resolve reads and writes the
 //! object directly - no pointer-keyed side table, no weak pins, no pruning. The collector traces a
 //! slot's value and reactions as ordinary heap edges (see `gc_edges`). A suspended async
@@ -18,6 +18,9 @@ use crate::interpreter::{Interp, Job};
 use crate::value::{Callable, Gc, Object, Property, Props, Value};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+
+struct NativeRejectionHandledHook(Option<Rc<dyn Fn(&mut Interp, Value) -> bool>>);
+
 
 /// [[PromiseState]] values of [`PromiseSlot::status`].
 pub(crate) const PENDING: u8 = 0;
@@ -125,8 +128,13 @@ pub struct ResolverCell {
 /// A promise's internal slots (see the module docs).
 pub struct PromiseSlot {
     pub(crate) status: u8,
+    /// Realm that created this promise, used by browser hosts to deliver rejection events to
+    /// the matching Window. This is an identity key only; it does not retain the realm global.
+    pub(crate) realm_key: usize,
     /// Listed in `Interp::unhandled_rejections` (cleared when a handler is attached).
     pub(crate) tracked: bool,
+    /// ECMAScript [[PromiseIsHandled]], independent of rejection reporting and reactions.
+    pub(crate) handled: bool,
     pub(crate) value: Value,
     /// The first pending reaction inline (most promises get at most one), the rest spilled.
     pub(crate) first: Option<Reaction>,
@@ -138,7 +146,7 @@ pub struct PromiseSlot {
 }
 
 // Per pending promise / suspended async body / queued job: one small allocation class each.
-const _: () = assert!(std::mem::size_of::<PromiseSlot>() <= 112);
+const _: () = assert!(std::mem::size_of::<PromiseSlot>() <= 120);
 const _: () = assert!(std::mem::size_of::<crate::interpreter::Job>() <= 64);
 const _: () = assert!(std::mem::size_of::<crate::coroutine::Coroutine>() <= 112);
 
@@ -147,7 +155,9 @@ impl Clone for PromiseSlot {
     fn clone(&self) -> Self {
         PromiseSlot {
             status: self.status,
+            realm_key: self.realm_key,
             tracked: false,
+            handled: self.handled,
             value: self.value.clone(),
             first: self.first.clone(),
             rest: self.rest.clone(),
@@ -159,10 +169,12 @@ impl Clone for PromiseSlot {
 
 impl PromiseSlot {
     #[inline]
-    pub(crate) fn boxed() -> Box<PromiseSlot> {
+    pub(crate) fn boxed(realm_key: usize) -> Box<PromiseSlot> {
         Box::new(PromiseSlot {
             status: PENDING,
+            realm_key,
             tracked: false,
+            handled: false,
             value: Value::Undefined,
             first: None,
             rest: None,
@@ -420,6 +432,15 @@ impl Interp {
             let Callable::Promise(s) = &mut b.call else {
                 return;
             };
+            if s.status == FORWARDED {
+                let target = s.value.clone();
+                drop(b);
+                if let Value::Obj(target) = target {
+                    self.perform_then(&target, reaction);
+                }
+                return;
+            }
+            s.handled = true;
             if s.status == PENDING {
                 s.push_reaction(reaction);
                 return;
@@ -709,16 +730,16 @@ impl Interp {
                 if !self.promise_ctor_get_is_silent(o) {
                     return None;
                 }
+                if let Callable::Promise(s) = &mut o.borrow_mut().call {
+                    s.handled = true;
+                    s.tracked = false;
+                }
+                if tracked {
+                    self.note_rejection_handled(o);
+                }
                 if status == 1 {
                     Some(crate::coroutine::Resume::Next(value))
                 } else {
-                    // Subscribing would have marked the rejection handled.
-                    if tracked {
-                        if let Callable::Promise(s) = &mut o.borrow_mut().call {
-                            s.tracked = false;
-                        }
-                        self.note_rejection_handled(o);
-                    }
                     Some(crate::coroutine::Resume::Throw(value))
                 }
             }
@@ -754,10 +775,25 @@ impl Interp {
             .remove(&(Gc::as_ptr(p) as usize))
             .is_none()
         {
+            let hook = self.op_state().get::<NativeRejectionHandledHook>()
+                .and_then(|hook| hook.0.clone());
+            if hook.is_some_and(|hook| hook(self, Value::Obj(p.clone()))) {
+                return;
+            }
             if let Some(list) = self.late_handled_rejections.as_mut() {
                 list.push(Value::Obj(p.clone()));
             }
         }
+    }
+
+    /// Install native HostPromiseRejectionTracker handling admission. This callback
+    /// runs at actual handler attachment, after the Promise borrow is released;
+    /// it must only perform native admission, never invoke author code. Returning
+    /// false preserves the existing late-handled list for the ordinary host.
+    pub fn set_native_rejection_handled_hook(
+        &mut self, hook: Option<Rc<dyn Fn(&mut Interp, Value) -> bool>>,
+    ) {
+        self.op_state().put(NativeRejectionHandledHook(hook));
     }
 
     /// Install (`Some`) or remove the host's promise hooks.
@@ -820,7 +856,8 @@ impl Interp {
     pub(crate) fn new_promise_with_parent(&mut self, parent: &Value) -> Value {
         let p = Value::Obj(Object::new_bare(self.promise_proto()));
         if let Value::Obj(o) = &p {
-            o.borrow_mut().call = Callable::Promise(PromiseSlot::boxed());
+            let realm_key = Gc::as_ptr(&self.global) as usize;
+            o.borrow_mut().call = Callable::Promise(PromiseSlot::boxed(realm_key));
         }
         if self.promise_hooks.is_some() {
             self.run_promise_hook(HOOK_INIT, &p, parent);
@@ -887,5 +924,62 @@ impl Interp {
         };
         self.perform_then(o, reaction);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod native_rejection_handled_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn evaluate(engine: &mut crate::Engine, source: &str) {
+        assert!(engine.eval_value(source).expect("parse").is_ok(), "evaluation failed");
+    }
+
+    #[test]
+    fn native_rejection_handled_hook_is_synchronous_once_and_decline_preserves_default() {
+        for consume in [false, true] {
+            let mut engine = crate::Engine::new();
+            engine.track_late_handled_rejections();
+            evaluate(&mut engine, "globalThis.p = Promise.reject({nativeReason:true});");
+            engine.run_microtasks();
+            assert_eq!(engine.take_unhandled_rejections_full().len(), 1);
+            let calls = Rc::new(Cell::new(0));
+            let captured = calls.clone();
+            engine.ctx().set_native_rejection_handled_hook(Some(Rc::new(move |ctx, promise| {
+                captured.set(captured.get() + 1);
+                // Reenter native state to prove no hook-slot or Promise borrow is held.
+                assert!(ctx.promise_rejection_reason(&promise).is_some());
+                ctx.set_native_rejection_handled_hook(None);
+                consume
+            })));
+            evaluate(&mut engine, "p.catch(() => {});");
+            assert_eq!(calls.get(), 1, "native admission precedes the next microtask checkpoint");
+            assert_eq!(engine.take_late_handled_rejections().len(), usize::from(!consume));
+            evaluate(&mut engine, "p.catch(() => {});");
+            assert_eq!(calls.get(), 1);
+            assert!(engine.take_late_handled_rejections().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_rejection_handled_hook_skips_early_catch_and_default_node_path_is_unchanged() {
+        let mut engine = crate::Engine::new();
+        engine.track_late_handled_rejections();
+        let calls = Rc::new(Cell::new(0));
+        let captured = calls.clone();
+        engine.ctx().set_native_rejection_handled_hook(Some(Rc::new(move |_, _| {
+            captured.set(captured.get() + 1); true
+        })));
+        evaluate(&mut engine, "Promise.reject(1).catch(() => {});");
+        engine.run_microtasks();
+        assert_eq!(calls.get(), 0);
+        assert!(engine.take_unhandled_rejections_full().is_empty());
+        engine.ctx().set_native_rejection_handled_hook(None);
+        evaluate(&mut engine, "globalThis.late = Promise.reject(2);");
+        engine.run_microtasks();
+        assert_eq!(engine.take_unhandled_rejections_full().len(), 1);
+        evaluate(&mut engine, "late.catch(() => {});");
+        assert_eq!(engine.take_late_handled_rejections().len(), 1);
     }
 }

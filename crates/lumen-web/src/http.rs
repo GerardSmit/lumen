@@ -172,6 +172,69 @@ pub(crate) fn request_cancellable_with_config(
     collect_response(response)
 }
 
+#[derive(Debug)]
+pub(crate) enum SyncRequestError {
+    Timeout,
+    Transport(String),
+}
+
+/// Synchronous XHR transport for hosts that own a blocking socket runtime. The
+/// deadline cancels the live socket, interrupting connect/read/write/TLS work.
+pub(crate) fn request_sync_with_timeout(
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &crate::FetchConfig,
+    timeout_ms: u32,
+) -> Result<HttpResponse, SyncRequestError> {
+    let cancellation = lumen_os::net::TcpCancellation::default();
+    let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+    let timer = if timeout_ms == 0 {
+        None
+    } else {
+        let timer_state = state.clone();
+        let timer_cancellation = cancellation.clone();
+        let (finished, wait) = std::sync::mpsc::channel();
+        let timer = std::thread::Builder::new()
+            .name("lumen-xhr-timeout".into())
+            .spawn(move || {
+                if matches!(
+                    wait.recv_timeout(Duration::from_millis(timeout_ms as u64)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) && timer_state
+                    .compare_exchange(
+                        0,
+                        2,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    timer_cancellation.cancel();
+                }
+            })
+            .map_err(|error| SyncRequestError::Transport(format!("XHR timeout timer: {error}")))?;
+        Some((finished, timer))
+    };
+    let result =
+        request_cancellable_with_config(method, target, headers, body, &cancellation, config);
+    let _ = state.compare_exchange(
+        0,
+        1,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+    );
+    if let Some((finished, timer)) = timer {
+        let _ = finished.send(());
+        let _ = timer.join();
+    }
+    if state.load(std::sync::atomic::Ordering::Acquire) == 2 {
+        return Err(SyncRequestError::Timeout);
+    }
+    result.map_err(SyncRequestError::Transport)
+}
+
 fn collect_response(mut response: OpenHttpResponse) -> Result<HttpResponse, String> {
     let mut body = Vec::new();
     while let Some(chunk) = response
@@ -215,6 +278,27 @@ pub(crate) fn open_request_cancellable_with_config(
     cancellation: &lumen_os::net::TcpCancellation,
     config: &crate::FetchConfig,
 ) -> Result<OpenHttpResponse, String> {
+    open_request_cancellable_with_progress(
+        method,
+        target,
+        headers,
+        body,
+        cancellation,
+        config,
+        None,
+    )
+}
+
+/// Request entry point used by the Fetch op to retain and update upload progress.
+pub(crate) fn open_request_cancellable_with_progress(
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    cancellation: &lumen_os::net::TcpCancellation,
+    config: &crate::FetchConfig,
+    upload: Option<std::sync::Arc<lumen_common::http_body::UploadProgress>>,
+) -> Result<OpenHttpResponse, String> {
     open_request_cancellable_with_redirect_origin(
         method,
         target,
@@ -223,6 +307,7 @@ pub(crate) fn open_request_cancellable_with_config(
         cancellation,
         config,
         None,
+        upload,
     )
 }
 
@@ -245,6 +330,7 @@ fn open_request_cancellable_with_config_same_origin(
         cancellation,
         config,
         Some(origin),
+        None,
     )
 }
 
@@ -256,11 +342,12 @@ fn open_request_cancellable_with_redirect_origin(
     cancellation: &lumen_os::net::TcpCancellation,
     config: &crate::FetchConfig,
     required_origin: Option<HttpOrigin>,
+    upload: Option<std::sync::Arc<lumen_common::http_body::UploadProgress>>,
 ) -> Result<OpenHttpResponse, String> {
     let mut method = method.to_ascii_uppercase();
     let mut target = target.to_string();
     let mut headers = headers.to_vec();
-    let mut body = body.map(|b| b.to_vec());
+    let mut body = body;
     for _ in 0..=MAX_REDIRECTS {
         if cancellation.is_cancelled() {
             return Err("fetch: request aborted".into());
@@ -279,7 +366,15 @@ fn open_request_cancellable_with_redirect_origin(
             "http" | "https" => {}
             other => return Err(format!("fetch: unsupported scheme '{other}'")),
         }
-        let result = one_request(&method, &u, &headers, body.as_deref(), cancellation, config);
+        let result = one_request(
+            &method,
+            &u,
+            &headers,
+            body.as_deref(),
+            cancellation,
+            config,
+            upload.as_deref(),
+        );
         let response = match result {
             Ok(response) => response,
             Err(error) => {
@@ -288,7 +383,10 @@ fn open_request_cancellable_with_redirect_origin(
             }
         };
         if config.manual_redirect {
-            return Ok(OpenHttpResponse { url: u.href(), ..response });
+            return Ok(OpenHttpResponse {
+                url: u.href(),
+                ..response
+            });
         }
         match response.status {
             301 | 302 | 303 | 307 | 308 => {
@@ -342,7 +440,7 @@ fn open_request_cancellable_with_redirect_origin(
                 return Ok(OpenHttpResponse {
                     url: u.href(),
                     ..response
-                })
+                });
             }
         }
     }
@@ -389,6 +487,7 @@ fn one_request(
     body: Option<&[u8]>,
     cancellation: &lumen_os::net::TcpCancellation,
     config: &crate::FetchConfig,
+    upload: Option<&lumen_common::http_body::UploadProgress>,
 ) -> Result<OpenHttpResponse, String> {
     if method.is_empty() || !method.bytes().all(http_token_byte) {
         return Err("fetch: invalid HTTP method".into());
@@ -417,6 +516,9 @@ fn one_request(
     .map_err(|e| format!("fetch '{}': connect: {e}", u.href()))?;
     stream.set_read_timeout(Some(TIMEOUT)).ok();
     stream.set_write_timeout(Some(TIMEOUT)).ok();
+    cancellation
+        .attach(&stream)
+        .map_err(|error| format!("fetch '{}': cancellation setup: {error}", u.href()))?;
 
     let req = lumen_common::http_body::request_head(
         method,
@@ -444,8 +546,33 @@ fn one_request(
     };
     stream
         .write_all(req.as_bytes())
-        .and_then(|()| body.map_or(Ok(()), |b| stream.write_all(b)))
         .map_err(|e| format!("fetch '{}': write: {e}", u.href()))?;
+    if let Some(body) = body {
+        for chunk in body.chunks(16 << 10) {
+            let mut written = 0;
+            while written < chunk.len() {
+                let count = stream
+                    .write(&chunk[written..])
+                    .map_err(|e| format!("fetch '{}': write body: {e}", u.href()))?;
+                if count == 0 {
+                    return Err(format!(
+                        "fetch '{}': write body: zero-length write",
+                        u.href()
+                    ));
+                }
+                written += count;
+                if let Some(upload) = upload {
+                    upload.record_written(count);
+                }
+            }
+        }
+    }
+    stream
+        .flush()
+        .map_err(|e| format!("fetch '{}': flush request: {e}", u.href()))?;
+    if let Some(upload) = upload {
+        upload.mark_complete();
+    }
 
     let mut reader = BufReader::new(stream);
     let mut header_budget = MAX_HEADER_BYTES;
@@ -652,10 +779,14 @@ mod tests {
         let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let first_address = first_listener.local_addr().unwrap();
         let second_address = second_listener.local_addr().unwrap();
-        let first = serve_http_once(first_listener,
-            "HTTP/1.1 302 Found\r\nLocation: http://target.test:8000/missing.css?v=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        let second = serve_http_once(second_listener,
-            "HTTP/1.1 404 Not Found\r\nContent-Type: TEXT/CSS; charset=utf-8\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing");
+        let first = serve_http_once(
+            first_listener,
+            "HTTP/1.1 302 Found\r\nLocation: http://target.test:8000/missing.css?v=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let second = serve_http_once(
+            second_listener,
+            "HTTP/1.1 404 Not Found\r\nContent-Type: TEXT/CSS; charset=utf-8\r\nContent-Length: 7\r\nConnection: close\r\n\r\nmissing",
+        );
         let mut config = crate::FetchConfig::default();
         config
             .set_route("origin.test", 8000, first_address)
@@ -670,10 +801,12 @@ mod tests {
         assert_eq!(response.url, "http://target.test:8000/missing.css?v=2");
         assert_eq!(response.content_type().as_deref(), Some("text/css"));
         assert_eq!(response.body, b"missing");
-        assert!(first
-            .join()
-            .unwrap()
-            .contains("\r\nHost: origin.test:8000\r\n"));
+        assert!(
+            first
+                .join()
+                .unwrap()
+                .contains("\r\nHost: origin.test:8000\r\n")
+        );
         let request = second.join().unwrap();
         assert!(request.starts_with("GET /missing.css?v=2 HTTP/1.1\r\n"));
         assert!(request.contains("\r\nHost: target.test:8000\r\n"));
@@ -695,24 +828,205 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             loop {
                 let mut line = String::new();
-                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
             }
             stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://outside.test/final\r\nAccess-Control-Allow-Origin: https://document.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let mut config = crate::FetchConfig::default();
         config.set_require_routes(true);
-        config.set_route("origin.test",80,address).unwrap();
+        config.set_route("origin.test", 80, address).unwrap();
         config.manual_redirect = true;
-        let response = open_request_cancellable_with_config("GET", "http://origin.test/start", &[], None,
-            &lumen_os::net::TcpCancellation::default(), &config).unwrap();
-        assert_eq!(response.status,302);
-        assert_eq!(response.url,"http://origin.test/start");
-        assert_eq!(header(&response.headers,"location").as_deref(),Some("http://outside.test/final"));
-        assert_eq!(header(&response.headers,"access-control-allow-origin").as_deref(),Some("https://document.test"));
+        let response = open_request_cancellable_with_config(
+            "GET",
+            "http://origin.test/start",
+            &[],
+            None,
+            &lumen_os::net::TcpCancellation::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(response.status, 302);
+        assert_eq!(response.url, "http://origin.test/start");
+        assert_eq!(
+            header(&response.headers, "location").as_deref(),
+            Some("http://outside.test/final")
+        );
+        assert_eq!(
+            header(&response.headers, "access-control-allow-origin").as_deref(),
+            Some("https://document.test")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn upload_progress_tracks_first_body_write_and_freezes_across_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut received = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if line.to_ascii_lowercase().starts_with("content-length:") {
+                        content_length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                received.push(body);
+                if index == 0 {
+                    stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap();
+                }
+            }
+            received
+        });
+        let mut config = crate::FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("upload.test", 80, address).unwrap();
+        let body = vec![0x5a; 200_000];
+        let progress = std::sync::Arc::new(lumen_common::http_body::UploadProgress::new(Some(
+            body.len() as u64,
+        )));
+        let response = open_request_cancellable_with_progress(
+            "POST",
+            "http://upload.test/start",
+            &[],
+            Some(&body),
+            &lumen_os::net::TcpCancellation::default(),
+            &config,
+            Some(progress.clone()),
+        )
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert!(progress.complete());
+        assert_eq!(progress.loaded(), body.len() as u64);
+        assert_eq!(progress.total(), body.len() as u64);
+        let uploads = server.join().unwrap();
+        assert_eq!(uploads, vec![body.clone(), body]);
+        assert_eq!(progress.loaded(), progress.total());
+    }
+
+    #[test]
+    fn synchronous_request_codec_reaches_real_http_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    content_length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+                }
+                let done = line == "\r\n";
+                request.push_str(&line);
+                if done {
+                    break;
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted").unwrap();
+            (request, body)
+        });
+        let request = lumen_common::http_body::SyncHttpRequest {
+            method: "POST".into(),
+            url: "http://sync.test/submit".into(),
+            headers: vec![("content-type".into(), "application/octet-stream".into())],
+            body: Some(vec![0, 1, 0xff, b'x']),
+            mode: "cors".into(),
+            credentials: "same-origin".into(),
+            redirect: "follow".into(),
+            force_preflight: true,
+            timeout_ms: 0,
+            origin: None,
+        };
+        let request =
+            lumen_common::http_body::SyncHttpRequest::decode(&request.encode().unwrap()).unwrap();
+        let mut config = crate::FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("sync.test", 80, address).unwrap();
+        let response = request_with_config(
+            &request.method,
+            &request.url,
+            &request.headers,
+            request.body.as_deref(),
+            &config,
+        )
+        .unwrap();
+        let response = lumen_common::http_body::SyncHttpResponse {
+            status: response.status,
+            status_text: response.status_text,
+            url: response.url,
+            headers: response.headers,
+            body: response.body,
+        };
+        let response =
+            lumen_common::http_body::SyncHttpResponse::decode(&response.encode().unwrap()).unwrap();
+        let (wire, body) = server.join().unwrap();
+        assert!(wire.starts_with("POST /submit HTTP/1.1\r\n"));
+        assert_eq!(body, [0, 1, 0xff, b'x']);
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body, b"accepted");
+    }
+
+    #[test]
+    fn synchronous_request_timeout_cancels_the_live_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        });
+        let mut config = crate::FetchConfig::default();
+        config.set_require_routes(true);
+        config.set_route("timeout.test", 80, address).unwrap();
+        let result =
+            request_sync_with_timeout("GET", "http://timeout.test/slow", &[], None, &config, 20);
+        assert!(matches!(result, Err(SyncRequestError::Timeout)));
         server.join().unwrap();
     }
 

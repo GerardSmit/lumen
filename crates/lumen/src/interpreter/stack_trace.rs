@@ -806,11 +806,31 @@ impl Interp {
         eval: bool,
         f: impl FnOnce(&mut Interp) -> T,
     ) -> T {
-        let Some(src) = src else { return f(self) };
-        let depth = self.push_script_frame(Rc::new(ScriptFrame { src, eval }));
-        let r = f(self);
-        self.pop_pushed_frame(depth, 0);
-        r
+        let previous_site = self.cur_site;
+        let previous_native_top = self.native_top;
+        let previous_depth = self.depth;
+        let previous_jit_frames = self.jit_frames;
+        let depth = self.fn_frames.len();
+        if let Some(src) = src {
+            self.push_script_frame(Rc::new(ScriptFrame { src, eval }));
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self))) {
+            Ok(result) => {
+                self.pop_pushed_frame(depth, 0);
+                result
+            }
+            Err(payload) => {
+                // A Rust panic can unwind through several interpreter calls without their
+                // ordinary frame-pop paths. Remove every frame created beneath this Script and
+                // restore the caller's raw native/JIT stack heads before resuming the panic.
+                self.fn_frames.truncate(depth);
+                self.cur_site = previous_site;
+                self.native_top = previous_native_top;
+                self.depth = previous_depth;
+                self.jit_frames = previous_jit_frames;
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 
     fn push_script_frame(&mut self, sf: Rc<ScriptFrame>) -> usize {

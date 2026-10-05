@@ -116,6 +116,33 @@ pub(crate) struct ImageLoader {
     requests: RefCell<HashMap<NodeId, Request>>,
     bitmap_updates: RefCell<HashMap<NodeId, Option<Arc<ImageData>>>>,
     next_generation: Cell<u64>,
+    tree_generation: Cell<u64>,
+    discovery: RefCell<Discovery>,
+    needs_scan: Cell<bool>,
+    has_dirty: Cell<bool>,
+    loading_remaining: Cell<bool>,
+    polled_generation: Cell<Option<u64>>,
+    pending_scratch: RefCell<Vec<NodeId>>,
+}
+
+/// Image discovery results reused while the tree, image attributes and base
+/// URL are unchanged, together with scratch buffers for the completion pump.
+#[derive(Default)]
+struct Discovery {
+    key: Option<(u64, usize)>,
+    base: String,
+    nodes: Vec<NodeId>,
+    seen: HashSet<NodeId>,
+    stale: Vec<NodeId>,
+    pending: Vec<PendingLoad>,
+}
+
+struct PendingLoad {
+    node: NodeId,
+    generation: u64,
+    current_src: String,
+    base: String,
+    force_error: bool,
 }
 
 impl ImageLoader {
@@ -129,6 +156,7 @@ impl ImageLoader {
         }
         *installed = Some(resolver);
         drop(installed);
+        self.mark_scan_needed();
 
         for request in self.requests.borrow_mut().values_mut() {
             if request.current.state == RequestState::Loading {
@@ -144,6 +172,10 @@ impl ImageLoader {
 
     pub(crate) fn on_mutation(&self, document: &Document, mutation: &ObservedMutation) {
         match &mutation.kind {
+            ObservedKind::SlotAssignment => {}
+            ObservedKind::ChildList { .. } | ObservedKind::ChildListMany { .. } => {
+                self.bump_tree_generation();
+            }
             ObservedKind::Attribute {
                 name,
                 old_value,
@@ -154,6 +186,12 @@ impl ImageLoader {
                 }
                 if name.eq_ignore_ascii_case("src") {
                     self.note_source_change(document, mutation.target);
+                } else if ["srcset", "sizes", "referrerpolicy", "decoding", "loading"]
+                    .iter()
+                    .any(|relevant| name.eq_ignore_ascii_case(relevant))
+                {
+                    self.bump_tree_generation();
+                    self.mark_scan_needed();
                 } else if name.eq_ignore_ascii_case("crossorigin")
                     && crossorigin_state(old_value.as_deref())
                         != image_crossorigin(document, mutation.target)
@@ -180,10 +218,41 @@ impl ImageLoader {
         // rather than reusing the previous request's base. Even assigning the
         // same relative src can select a new URL after a base change.
         request.selection_dirty = true;
+        self.has_dirty.set(true);
+        self.bump_tree_generation();
+        self.mark_scan_needed();
         // Invalidate any completion task already queued for the previous
         // selection immediately. The next synchronization either preserves
         // its in-flight request or stages a fresh cached completion.
         request.selection_generation = self.allocate_generation();
+    }
+
+    pub(crate) fn has_dirty_source(&self, node: NodeId) -> bool {
+        self.requests
+            .borrow()
+            .get(&node)
+            .is_some_and(|request| request.selection_dirty)
+    }
+
+    pub(crate) fn has_dirty_requests(&self) -> bool {
+        self.has_dirty.get()
+    }
+
+    /// Selects sources for requests whose src or crossorigin changed, so the
+    /// current bitmap is replaced or cleared before it is next published.
+    pub(crate) fn synchronize_dirty(&self, document: &Document, base: &str) {
+        if !self.has_dirty.replace(false) {
+            return;
+        }
+        let dirty = self
+            .requests
+            .borrow()
+            .iter()
+            .filter_map(|(&node, request)| request.selection_dirty.then_some(node))
+            .collect::<Vec<_>>();
+        for node in dirty {
+            self.synchronize_node(document, node, base);
+        }
     }
 
     fn synchronize_node(&self, document: &Document, node: NodeId, base: &str) -> bool {
@@ -215,6 +284,7 @@ impl ImageLoader {
         base: &str,
     ) {
         request.selection_dirty = false;
+        self.mark_scan_needed();
         let cors_mode_changed = request.selected_crossorigin != Some(crossorigin);
         let Some(source) = source else {
             request.selection_generation = self.allocate_generation();
@@ -273,6 +343,7 @@ impl ImageLoader {
 
         request.selection_generation = self.allocate_generation();
         request.ready_event = None;
+        self.mark_scan_needed();
         request.selected_source = Some(Some(source.clone()));
         request.selected_crossorigin = Some(crossorigin);
         request.base = base.to_owned();
@@ -370,70 +441,90 @@ impl ImageLoader {
         document: &Document,
         base: &str,
     ) -> Vec<QueuedImageEvent> {
-        let mut nodes = active_image_nodes(document);
-        let mut seen: HashSet<_> = nodes.iter().copied().collect();
-        let existing = self.requests.borrow().keys().copied().collect::<Vec<_>>();
-        for node in existing {
-            if is_html_image(document, node) {
-                if seen.insert(node) {
-                    nodes.push(node);
+        let mut discovery = self.discovery.borrow_mut();
+        let discovery = &mut *discovery;
+        let key = (self.tree_generation.get(), document.node_count());
+        if discovery.key != Some(key) || discovery.base != base {
+            collect_image_nodes(document, &mut discovery.nodes);
+            discovery.seen.clear();
+            discovery.seen.extend(discovery.nodes.iter().copied());
+            discovery.stale.clear();
+            for &node in self.requests.borrow().keys() {
+                if is_html_image(document, node) {
+                    if discovery.seen.insert(node) {
+                        discovery.nodes.push(node);
+                    }
+                } else {
+                    discovery.stale.push(node);
                 }
-            } else {
-                self.requests.borrow_mut().remove(&node);
+            }
+            if !discovery.stale.is_empty() {
+                let mut requests = self.requests.borrow_mut();
+                for node in discovery.stale.drain(..) {
+                    requests.remove(&node);
+                }
+            }
+            for &node in &discovery.nodes {
+                self.synchronize_node(document, node, base);
+            }
+            discovery.key = Some(key);
+            discovery.base.clear();
+            discovery.base.push_str(base);
+        }
+
+        let resolver = self.resolver.borrow().clone();
+        let resolver_generation = resolver.as_ref().map_or(0, |resolver| resolver.generation());
+        let scan = self.needs_scan.get()
+            || (self.loading_remaining.get()
+                && (resolver_generation == 0
+                    || self.polled_generation.get() != Some(resolver_generation)));
+        if !scan {
+            return Vec::new();
+        }
+        self.needs_scan.set(false);
+        self.polled_generation.set(Some(resolver_generation));
+        let mut still_loading = false;
+
+        let mut queued = Vec::new();
+        discovery.pending.clear();
+        for (&node, request) in self.requests.borrow_mut().iter_mut() {
+            if let Some(kind) = request.ready_event.take() {
+                queued.push(QueuedImageEvent {
+                    node,
+                    generation: request.selection_generation,
+                    kind,
+                });
+            }
+            let selected = request
+                .pending
+                .as_ref()
+                .filter(|image| image.state == RequestState::Loading)
+                .or_else(|| {
+                    (request.current.state == RequestState::Loading).then_some(&request.current)
+                });
+            if let Some(selected) = selected {
+                discovery.pending.push(PendingLoad {
+                    node,
+                    generation: selected.generation,
+                    current_src: selected.current_src.clone(),
+                    base: request.base.clone(),
+                    force_error: selected.force_error,
+                });
             }
         }
-
-        for node in nodes.iter().copied() {
-            self.synchronize_node(document, node, base);
-        }
-
-        let mut queued = {
-            let mut requests = self.requests.borrow_mut();
-            requests
-                .iter_mut()
-                .filter_map(|(&node, request)| {
-                    let kind = request.ready_event.take()?;
-                    Some(QueuedImageEvent {
-                        node,
-                        generation: request.selection_generation,
-                        kind,
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let pending = self
-            .requests
-            .borrow()
-            .iter()
-            .filter_map(|(node, request)| {
-                let selected = request
-                    .pending
-                    .as_ref()
-                    .filter(|image| image.state == RequestState::Loading)
-                    .or_else(|| {
-                        (request.current.state == RequestState::Loading).then_some(&request.current)
-                    })?;
-                Some((
-                    *node,
-                    selected.generation,
-                    selected.current_src.clone(),
-                    selected.force_error,
-                ))
-            })
-            .collect::<Vec<_>>();
-        let resolver = self.resolver.borrow().clone();
-        for (node, generation, current_src, force_error) in pending {
+        for PendingLoad {
+            node,
+            generation,
+            current_src,
+            base,
+            force_error,
+        } in discovery.pending.drain(..)
+        {
             // An empty src is a broken request, not a URL for the base document.
             // Never let a catch-all resolver turn it into a successful image.
             let state = if force_error {
                 ImageState::Failed
             } else {
-                let base = self
-                    .requests
-                    .borrow()
-                    .get(&node)
-                    .map_or_else(String::new, |request| request.base.clone());
                 resolver.as_ref().map_or(ImageState::Failed, |resolver| {
                     resolver
                         .resolve_node_from(node, &base, &current_src)
@@ -442,14 +533,12 @@ impl ImageLoader {
             };
             let (image, kind) = match state {
                 ImageState::Ready(image) if image.is_valid() => (Some(image), ImageEventKind::Load),
-                ImageState::Pending => continue,
+                ImageState::Pending => {
+                    still_loading = true;
+                    continue;
+                }
                 ImageState::Ready(_) | ImageState::Failed => (None, ImageEventKind::Error),
             };
-            let base = self
-                .requests
-                .borrow()
-                .get(&node)
-                .map_or_else(String::new, |request| request.base.clone());
             let origin_clean = resolver
                 .as_ref()
                 .is_some_and(|resolver| resolver.node_origin_clean(node, &base, &current_src));
@@ -483,7 +572,49 @@ impl ImageLoader {
                 });
             }
         }
+        self.loading_remaining.set(still_loading);
         queued
+    }
+
+    fn mark_scan_needed(&self) {
+        self.needs_scan.set(true);
+        self.loading_remaining.set(true);
+    }
+
+    pub(crate) fn has_pending(&self) -> bool {
+        self.loading_remaining.get()
+    }
+
+    pub(crate) fn is_loading(&self, node: NodeId) -> bool {
+        self.requests.borrow().get(&node).is_some_and(|request| {
+            request.current.state == RequestState::Loading
+                || request
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.state == RequestState::Loading)
+        })
+    }
+
+    /// Loading nodes absent from `known`, collected into a reused buffer.
+    pub(crate) fn take_unknown_pending<V>(&self, known: &HashMap<NodeId, V>) -> Vec<NodeId> {
+        let mut out = std::mem::take(&mut *self.pending_scratch.borrow_mut());
+        out.clear();
+        if self.loading_remaining.get() {
+            out.extend(self.requests.borrow().iter().filter_map(|(&node, request)| {
+                (!known.contains_key(&node)
+                    && (request.current.state == RequestState::Loading
+                        || request
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.state == RequestState::Loading)))
+                .then_some(node)
+            }));
+        }
+        out
+    }
+
+    pub(crate) fn return_pending_scratch(&self, scratch: Vec<NodeId>) {
+        *self.pending_scratch.borrow_mut() = scratch;
     }
 
     pub(crate) fn pending_nodes(&self) -> Vec<NodeId> {
@@ -519,6 +650,13 @@ impl ImageLoader {
             source.remove(&old);
             destination.remove(&new);
         }
+        self.bump_tree_generation();
+        target.bump_tree_generation();
+    }
+
+    fn bump_tree_generation(&self) {
+        self.tree_generation
+            .set(self.tree_generation.get().wrapping_add(1));
     }
 
     fn allocate_generation(&self) -> u64 {
@@ -553,8 +691,8 @@ fn same_image(left: Option<&Arc<ImageData>>, right: Option<&Arc<ImageData>>) -> 
     }
 }
 
-fn active_image_nodes(document: &Document) -> Vec<NodeId> {
-    let mut images = Vec::new();
+fn collect_image_nodes(document: &Document, images: &mut Vec<NodeId>) {
+    images.clear();
     let root = document.root();
     let mut current = Some(root);
     while let Some(node) = current {
@@ -565,7 +703,6 @@ fn active_image_nodes(document: &Document) -> Vec<NodeId> {
             .ok()
             .flatten();
     }
-    images
 }
 
 fn image_source(document: &Document, node: NodeId) -> Option<Option<String>> {

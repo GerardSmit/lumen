@@ -33,13 +33,13 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use lumen_host::{CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value, ops};
+use lumen_host::{ops, CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
 
-use crate::Runtime;
 use crate::clone_transfer::{self, CloneMessage};
+use crate::Runtime;
 
 #[lumen_bind::module(name = "__lumenSharedWorker")]
 pub(crate) mod shared_worker_bindings {
@@ -68,6 +68,43 @@ pub(crate) mod shared_worker_bindings {
     pub fn disconnect(ctx: &mut Ctx, id: u64) -> OpResult<Value> {
         super::op_shared_worker_disconnect(ctx, Value::Undefined, &[Value::Num(id as f64)])
             .map_err(OpError::thrown)
+    }
+}
+
+#[lumen_bind::module(name = "__lumenWorkerScript")]
+pub(crate) mod worker_script_bindings {
+    use lumen::embed::{Ctx, HostRealmEvalError, OpError, OpResult, Value};
+
+    /// Execute one fetched worker import as a global classic Script. Unlike indirect eval, this
+    /// preserves the worker global's lexical environment and records the fetched URL for stacks.
+    #[op(rename(js = "executeClassicScript"))]
+    pub fn execute_classic_script(
+        ctx: &mut Ctx,
+        source: String,
+        source_url: String,
+    ) -> OpResult<Value> {
+        let realm = ctx.current_host_realm();
+        match ctx.eval_value_in_host_realm_named(&realm, &source, false, Some(&source_url)) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(exception)) => Err(OpError::thrown(exception)),
+            Err(HostRealmEvalError::Parse(error)) => {
+                let dynamic_code_unavailable =
+                    error.message == "dynamic code is unavailable in native execution";
+                let exception = if dynamic_code_unavailable {
+                    ctx.make_error("EvalError", error.message)
+                } else {
+                    ctx.make_error(
+                        "SyntaxError",
+                        format!("{}:{}: {}", source_url, error.line, error.message),
+                    )
+                };
+                Err(OpError::thrown(exception))
+            }
+            Err(HostRealmEvalError::Scope(_)) => Err(OpError::thrown(ctx.make_error(
+                "Error",
+                format!("could not enter worker script realm for {source_url}"),
+            ))),
+        }
     }
 }
 
@@ -1117,7 +1154,11 @@ fn run_worker(
         exit.out_of_memory = true;
         return;
     }
-    let mut rt = Runtime::new_worker(spec.embedding.clone());
+    let mut rt = if spec.is_node {
+        Runtime::new_worker(spec.embedding.clone())
+    } else {
+        Runtime::new_browser_worker(spec.embedding.clone())
+    };
     // The extension installs a default FetchConfig in every Runtime. Replace it before any
     // worker bootstrap or module entry can issue requests, using the parent's captured snapshot.
     rt.engine().ctx().op_state().put(spec.fetch_config.clone());
@@ -1143,7 +1184,19 @@ fn run_worker(
     if crate::atomics_wait_trace_enabled() {
         crate::install_atomics_wait_trace(rt.engine(), spec.thread_id);
     }
-    lumen_host::install(rt.engine(), &[worker_scope_extension()]);
+    lumen_host::install(rt.engine(), &[worker_scope_extension(!spec.is_node)]);
+    if !spec.is_node && lumen_html_js::install_css_typed_om(rt.engine().ctx()).is_err() {
+        let _ = to_main_tx.send(ToMain::Error(
+            "worker CSS Typed OM installation failed".to_string(),
+        ));
+        return;
+    }
+    if !spec.is_node && lumen_html_js::install_worker_canvas(rt.engine().ctx()).is_err() {
+        let _ = to_main_tx.send(ToMain::Error(
+            "worker canvas installation failed".to_string(),
+        ));
+        return;
+    }
     rt.engine().ctx().op_state().put(WorkerSelf {
         to_main: to_main_tx.clone(),
         stop: Arc::clone(&stop),
@@ -1266,6 +1319,10 @@ fn run_worker(
             let _ = to_main_tx.send(ToMain::Error("shared worker scope bootstrap failed".into()));
         }
         return;
+    }
+
+    if !spec.is_node {
+        rt.enable_worker_rejection_events();
     }
 
     let _ = to_main_tx.send(ToMain::Online);
@@ -1650,10 +1707,14 @@ fn op_wself_load_classic_script(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Res
     Ok(result)
 }
 
-fn worker_scope_extension() -> Extension {
+fn worker_scope_extension(include_browser_script_op: bool) -> Extension {
     Extension {
         name: "worker-scope",
-        modules: &[],
+        modules: if include_browser_script_op {
+            &[lumen_host::namespace::<worker_script_bindings::Module>]
+        } else {
+            &[]
+        },
         globals: &[],
         namespaces: &[(
             "__wself",

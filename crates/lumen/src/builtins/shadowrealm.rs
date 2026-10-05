@@ -52,7 +52,7 @@ fn shadow_evaluate(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Va
             return Err(i.make_error(
                 "TypeError",
                 "ShadowRealm.prototype.evaluate expects a string",
-            ))
+            ));
         }
     };
     // A parse failure is a SyntaxError of the *calling* realm (not wrapped).

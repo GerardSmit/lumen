@@ -8,27 +8,45 @@ const FILTER_REJECT: u8 = 2;
 const FILTER_SKIP: u8 = 3;
 const MAX_PARSED_NODES: usize = 100_000;
 
-/// A DOMParser instance has no mutable per-instance state.
+/// Capture the relevant Document's live identity without retaining its arena
+/// or Window. Borrowing another realm's method must not change this identity.
 #[lumen_bind::class(name = "DOMParser", hint(js(webidl)))]
-pub struct DomParser;
+pub struct DomParser {
+    document_identity: Rc<DocumentIdentity>,
+}
 
 #[lumen_bind::methods]
 impl DomParser {
     #[constructor]
-    fn new() -> Self {
-        Self
+    fn new(ctx: &mut Ctx) -> Self {
+        let document_identity = window_globals::current_dom_realm(ctx)
+            .map(|realm| realm.document_identity.clone())
+            .unwrap_or_else(|| {
+                Rc::new(DocumentIdentity {
+                    origin: RefCell::new(browsing_context::invocation_origin(ctx)),
+                    url: RefCell::new(None),
+                })
+            });
+        Self { document_identity }
     }
 
+    #[method(coerce)]
     fn parse_from_string(&self, ctx: &mut Ctx, input: &str, mime_type: &str) -> OpResult<Value> {
-        if mime_type.eq_ignore_ascii_case("text/html") {
-            let document = html::parse(input, MAX_PARSED_NODES).map_err(|error| {
+        if mime_type == "text/html" {
+            let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
+            let document = html::parse_with_options_initialized(
+                input, MAX_PARSED_NODES, html::ParseOptions::default(),
+                |document| controller.attach(document),
+            ).map_err(|error| {
                 OpError::new(
                     "SyntaxError",
                     format!("HTML parse error at {}: {}", error.offset, error.message),
                 )
             })?;
             let realm = DomRealm::realm_from_document(document);
+            self.set_parsed_document_identity(&realm);
             super::observers::attach_parsed_realm(ctx, &realm)?;
+            controller.bind(ctx, &realm);
             return Ok(realm.document_value(ctx));
         }
         let xml_type = [
@@ -38,20 +56,83 @@ impl DomParser {
             "image/svg+xml",
         ]
         .iter()
-        .any(|supported| mime_type.eq_ignore_ascii_case(supported));
+        .any(|supported| mime_type == *supported);
         if !xml_type {
             return Err(OpError::new("TypeError", "unsupported DOMParser MIME type"));
         }
-        let document = match lumen_html::xml::parse(input, MAX_PARSED_NODES) {
-            Ok(document) => document,
-            Err(error) => parser_error_document(error.offset, error.message),
+        let prepared = super::dialog_popover::DetailsController::prepare(ctx)?;
+        let (document, controller) = match lumen_html::xml::parse_initialized(
+            input, MAX_PARSED_NODES, |document| prepared.attach(document),
+        ) {
+            Ok(document) => (document, prepared),
+            Err(error) => {
+                // The failed arena's NodeIds must never be rebound to the
+                // parsererror replacement. Its weak queued work becomes inert.
+                drop(prepared);
+                let controller = super::dialog_popover::DetailsController::prepare(ctx)?;
+                let mut document = parser_error_document(error.offset, error.message);
+                controller.attach(&mut document);
+                (document, controller)
+            }
         };
         let realm = DomRealm::realm_from_document_with_metadata(document, mime_type, false, false);
+        self.set_parsed_document_identity(&realm);
         super::observers::attach_parsed_realm(ctx, &realm)?;
+        controller.bind(ctx, &realm);
         // The realm helper constructs the document wrapper and retains it in the
         // realm, so the returned value keeps its arena alive independently.
         // A document parsed this way never aliases the active page's NodeIds.
         Ok(realm.document_value(ctx))
+    }
+}
+
+impl DomParser {
+    fn set_parsed_document_identity(&self, realm: &DomRealm) {
+        realm.set_document_url(
+            self.document_identity
+                .url
+                .borrow()
+                .as_deref()
+                .unwrap_or("about:blank"),
+        );
+        realm.set_document_origin(
+            self.document_identity
+                .origin
+                .borrow()
+                .clone()
+                .unwrap_or_else(browsing_context::Origin::opaque),
+        );
+    }
+}
+
+/// XMLSerializer has no per-instance state; serialization uses the owner
+/// document captured by the passed Node wrapper.
+#[lumen_bind::class(name = "XMLSerializer", hint(js(webidl)))]
+pub struct XmlSerializer;
+
+#[lumen_bind::methods]
+impl XmlSerializer {
+    #[constructor]
+    fn new() -> Self {
+        Self
+    }
+
+    fn serialize_to_string(&self, ctx: &mut Ctx, root: &DomNode) -> OpResult<String> {
+        let result = {
+            let session = root.realm.session.borrow();
+            lumen_html::xml::serialize_xml(session.document(), root.id, false)
+        };
+        result.map_err(|error| {
+            if error == lumen_html::Error::WrongKind {
+                super::error_reporting::dom_exception(
+                    ctx,
+                    "InvalidStateError",
+                    "XML serialization could not represent the supplied node",
+                )
+            } else {
+                dom_error(error)
+            }
+        })
     }
 }
 
@@ -144,7 +225,9 @@ impl Filter {
 fn node_type(kind: &NodeKind) -> u32 {
     match kind {
         NodeKind::Element { .. } => 1,
+        NodeKind::Attribute { .. } => 2,
         NodeKind::Text(_) => 3,
+        NodeKind::CData(_) => 4,
         NodeKind::ProcessingInstruction { .. } => 7,
         NodeKind::Comment(_) => 8,
         NodeKind::Document => 9,
@@ -793,9 +876,10 @@ impl DomNodeIterator {
 
 // Keep the binding declarations rooted here; lib.rs installs these constructors
 // after constructing the page's DOM realm.
-pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 3] {
+pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 4] {
     [
         ("DOMParser", ctx.class_constructor::<DomParser>()),
+        ("XMLSerializer", ctx.class_constructor::<XmlSerializer>()),
         ("TreeWalker", ctx.class_constructor::<DomTreeWalker>()),
         ("NodeIterator", ctx.class_constructor::<DomNodeIterator>()),
     ]
@@ -895,12 +979,165 @@ mod tests {
     }
 
     #[test]
+    fn detached_details_parser_initial_transitions_are_native_and_retained() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"
+            globalThis.parsedDetailsEvents = [];
+            for (const [mime, source] of [
+                ['text/html', '<details open></details>'],
+                ['application/xhtml+xml', '<details xmlns="http://www.w3.org/1999/xhtml" open=""/>']
+            ]) {
+                const parsed = new DOMParser().parseFromString(source, mime);
+                const details = parsed.querySelector('details');
+                details.addEventListener('toggle', event => parsedDetailsEvents.push(
+                    event instanceof ToggleEvent && event.isTrusted && !event.bubbles &&
+                    !event.cancelable && event.oldState === 'closed' && event.newState === 'open' &&
+                    event.target.ownerDocument.defaultView === null));
+            }
+            parsedDetailsEvents.length === 0
+        "#));
+        engine.collect_garbage();
+        assert!(crate::scheduling::run_tasks(&mut engine, 8).is_empty());
+        assert!(eval_bool(&mut engine, "parsedDetailsEvents.length === 2 && parsedDetailsEvents.every(Boolean)"));
+    }
+
+    #[test]
+    fn detached_details_implementation_documents_use_live_transition_sink() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"
+            globalThis.implementationDetailsEvents = [];
+            for (const parsed of [document.implementation.createHTMLDocument('details'),
+                document.implementation.createDocument('http://www.w3.org/1999/xhtml', 'html', null)]) {
+                const details = parsed.createElementNS('http://www.w3.org/1999/xhtml', 'details');
+                parsed.documentElement.appendChild(details);
+                details.addEventListener('toggle', event => implementationDetailsEvents.push(
+                    event instanceof ToggleEvent && event.isTrusted && event.oldState === 'closed' &&
+                    event.newState === 'open' && event.target.ownerDocument.defaultView === null));
+                details.setAttribute('open', '');
+                details.removeAttribute('open');
+                details.setAttribute('open', '');
+            }
+            implementationDetailsEvents.length === 0
+        "#));
+        engine.collect_garbage();
+        assert!(crate::scheduling::run_tasks(&mut engine, 8).is_empty());
+        assert!(eval_bool(&mut engine, "implementationDetailsEvents.length === 2 && implementationDetailsEvents.every(Boolean)"));
+    }
+
+    #[test]
+    fn malformed_xml_details_work_is_abandoned_without_rebinding_stale_nodes() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(&mut engine, r#"
+            globalThis.parserErrorToggles = 0;
+            const failed = new DOMParser().parseFromString(
+                '<details xmlns="http://www.w3.org/1999/xhtml" open=""><broken></details>',
+                'application/xhtml+xml');
+            failed.documentElement.addEventListener('toggle', () => parserErrorToggles++);
+            failed.documentElement.localName === 'parsererror'
+        "#));
+        engine.collect_garbage();
+        assert!(crate::scheduling::run_tasks(&mut engine, 8).is_empty());
+        assert!(eval_bool(&mut engine, "parserErrorToggles === 0"));
+    }
+
+    #[test]
     fn dom_parser_creates_an_independent_document() {
         let mut engine = Engine::new();
         super::super::install(engine.ctx(), "<main>live</main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
             "const ownSelection=document.getSelection(), parsed = new DOMParser().parseFromString('<section><b>parsed</b></section>', 'text/html'); parsed !== document && parsed.querySelector('b').textContent === 'parsed' && parsed.body.innerHTML === '<section><b>parsed</b></section>' && (parsed.querySelector('b') instanceof Node) && document.querySelector('main').textContent === 'live' && ownSelection===document.getSelection() && ownSelection===window.getSelection() && parsed.getSelection()!==ownSelection"
+        ));
+    }
+
+    #[test]
+    fn dom_parser_identity_tracks_its_creation_document_across_methods_and_navigation() {
+        let mut runtime = lumen_runtime::Runtime::new();
+        let engine = runtime.engine();
+        let parent = crate::install(
+            engine.ctx(),
+            "<base href='https://base.test/ignored/'><iframe id=child></iframe>",
+            128,
+        )
+        .unwrap();
+        parent.set_document_url("https://parent.test/dir/page.html");
+        let frame = parent
+            .frame_contexts(engine.ctx())
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(eval_bool(
+            engine,
+            r#"(() => {
+            globalThis.parentParser = new DOMParser();
+            return parentParser.parseFromString('<p>x</p>', 'text/html').URL === document.URL;
+        })()"#
+        ));
+        parent.set_document_url("https://parent.test/dir/updated.html?live=1");
+        assert!(eval_bool(
+            engine,
+            "document.querySelector('iframe').src='https://parent.test/child/one.html'; true"
+        ));
+        let request = frame.navigation_request();
+        let child = frame
+            .install_response_for_request(
+                engine.ctx(),
+                &request,
+                "https://parent.test/child/one.html",
+                "text/html",
+                "<body>one</body>",
+                64,
+            )
+            .unwrap();
+        assert!(eval_bool(
+            engine,
+            r#"(() => {
+            const childWindow = document.querySelector('iframe').contentWindow;
+            globalThis.oldChildParser = new childWindow.DOMParser();
+            for (const mime of ['text/html','text/xml','application/xml','application/xhtml+xml','image/svg+xml']) {
+                for (const text of ['<root/>','<unclosed>']) {
+                    const own = childWindow.DOMParser.prototype.parseFromString.call(parentParser, text, mime);
+                    const foreign = DOMParser.prototype.parseFromString.call(oldChildParser, text, mime);
+                    if (own.URL !== document.URL || own.documentURI !== document.URL || own.baseURI !== document.URL ||
+                        foreign.URL !== childWindow.document.URL || foreign.documentURI !== childWindow.document.URL ||
+                        foreign.baseURI !== childWindow.document.URL || own.defaultView !== null || foreign.defaultView !== null)
+                        throw new Error('parser identity or base follows invocation instead of creation');
+                }
+            }
+            let invalid = false;
+            try { parentParser.parseFromString('', 'TEXT/HTML'); } catch (e) { invalid = e.name === 'TypeError'; }
+            return invalid && parentParser.parseFromString(null, 'text/html').body.textContent === 'null';
+        })()"#
+        ));
+        child.set_document_url("https://parent.test/child/one.html?changed=1");
+        assert!(eval_bool(engine, "oldChildParser.parseFromString('<root/>','application/xml').URL === 'https://parent.test/child/one.html?changed=1'"));
+        assert!(eval_bool(
+            engine,
+            "document.querySelector('iframe').src='https://parent.test/child/two.html'; true"
+        ));
+        let request = frame.navigation_request();
+        frame
+            .install_response_for_request(
+                engine.ctx(),
+                &request,
+                "https://parent.test/child/two.html",
+                "text/html",
+                "<body>two</body>",
+                64,
+            )
+            .unwrap();
+        assert!(eval_bool(
+            engine,
+            r#"(() => {
+            const current = document.querySelector('iframe').contentWindow;
+            const old = current.DOMParser.prototype.parseFromString.call(oldChildParser, '<root/>', 'application/xml');
+            const fresh = new current.DOMParser().parseFromString('<root/>','application/xml');
+            return old.URL === 'https://parent.test/child/one.html?changed=1' && fresh.URL === current.document.URL;
+        })()"#
         ));
     }
 
@@ -920,7 +1157,7 @@ mod tests {
         super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
-            "const parsed=new DOMParser().parseFromString('<root xmlns:x=\"urn:keys\" xmlns:y=\"urn:keys\" x:key=\"old\" plain=\"p\"/>','application/xml'), root=parsed.documentElement; const observer=new MutationObserver(()=>{}); observer.observe(root,{attributes:true,attributeOldValue:true}); const initial=root.getAttributeNS('urn:keys','key')==='old'&&root.hasAttributeNS('urn:keys','key')&&root.getAttributeNS(null,'plain')==='p'; root.setAttributeNS('urn:keys','y:key','new'); const records=observer.takeRecords(); const replaced=root.getAttribute('x:key')===null&&root.getAttribute('y:key')==='new'&&root.getAttributeNS('urn:keys','key')==='new'&&records.length===1&&records[0].attributeName==='y:key'&&records[0].oldValue==='old'; root.removeAttributeNS('urn:keys','key'); initial&&replaced&&!root.hasAttributeNS('urn:keys','key')"
+            "const parsed=new DOMParser().parseFromString('<root xmlns:x=\"urn:keys\" xmlns:y=\"urn:keys\" x:key=\"old\" plain=\"p\"/>','application/xml'), root=parsed.documentElement; const attr=root.getAttributeNodeNS('urn:keys','key'); const observer=new MutationObserver(()=>{}); observer.observe(root,{attributes:true,attributeOldValue:true}); const initial=root.getAttributeNS('urn:keys','key')==='old'&&root.hasAttributeNS('urn:keys','key')&&root.getAttributeNS(null,'plain')==='p'; root.setAttributeNS('urn:keys','y:key','new'); const records=observer.takeRecords(); const retained=root.getAttribute('x:key')==='new'&&root.getAttribute('y:key')===null&&attr===root.getAttributeNodeNS('urn:keys','key')&&attr.name==='x:key'&&root.getAttributeNS('urn:keys','key')==='new'&&records.length===1&&records[0].attributeName==='key'&&records[0].oldValue==='old'; root.removeAttributeNS('urn:keys','key'); initial&&retained&&!root.hasAttributeNS('urn:keys','key')"
         ));
     }
 
@@ -941,6 +1178,72 @@ mod tests {
         assert!(eval_bool(
             &mut engine,
             "const parsed=new DOMParser().parseFromString('<!DOCTYPE root [<!ENTITY e SYSTEM \"file:///etc/passwd\">]><root>&e;</root>','text/xml'); parsed.documentElement.localName==='parsererror'"
+        ));
+    }
+
+    #[test]
+    fn node_constructors_preserve_document_identity_coercion_and_tree_wrappers() {
+        let mut engine = Engine::new();
+        let realm =
+            super::super::install(engine.ctx(), "<main></main><iframe></iframe>", 32).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(() => {
+            const owner = document;
+            const Fragment = DocumentFragment;
+            const text = new Text(null);
+            const empty = new Text();
+            const comment = new Comment({toString() { return 'comment'; }});
+            const fragment = new Fragment();
+            if (text.data !== 'null' || empty.data !== '' || comment.data !== 'comment') throw new Error('constructor data: '+text.data+' / '+empty.data+' / '+comment.data);
+            if (!(fragment instanceof DocumentFragment) || !(text instanceof Text) || !(comment instanceof Comment)) throw new Error('constructor prototypes');
+            if (fragment.ownerDocument !== owner || text.ownerDocument !== owner || comment.ownerDocument !== owner) throw new Error('constructor ownerDocument');
+            if (fragment.appendChild(text) !== text) throw new Error('constructor append return identity');
+            if (fragment.firstChild !== text) throw new Error('constructor firstChild identity');
+            if (fragment.childNodes[0] !== text) throw new Error('constructor childNodes identity');
+            fragment.appendChild(comment);
+            document.querySelector('main').appendChild(fragment);
+            if (fragment.childNodes.length !== 0 || document.querySelector('main').firstChild !== text) throw new Error('fragment consumption identity');
+            class DerivedText extends Text {}
+            const derived = new DerivedText('derived');
+            const derivedFragment = new Fragment();
+            derivedFragment.appendChild(derived);
+            if (!(derived instanceof DerivedText) || derivedFragment.firstChild !== derived) throw new Error('subclass constructor identity');
+            document = {};
+            try { if (new Fragment().ownerDocument !== owner) throw new Error('associated document after global assignment'); return true; }
+            finally { document = owner; }
+        })()"#
+        ));
+        realm.frame_contexts(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(() => {
+            const child = document.querySelector('iframe').contentWindow;
+            const fragment = new child.DocumentFragment();
+            const text = new child.Text('child');
+            return fragment.ownerDocument === child.document && text.ownerDocument === child.document &&
+                fragment.appendChild(text) === text && fragment.firstChild === text;
+        })()"#
+        ));
+    }
+
+    #[test]
+    fn xml_serializer_walks_documents_fragments_and_namespace_fixup() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"const serializer=new XMLSerializer(), parsed=new DOMParser().parseFromString('<!DOCTYPE foo PUBLIC "pub" "sys"><foo/>','application/xml'); const documentText=serializer.serializeToString(parsed); const fragment=document.createDocumentFragment(); fragment.append(document.createElement('div'),document.createElement('span')); const fragmentText=serializer.serializeToString(fragment); const namespaced=parsed.createElementNS('urn:item','x:item'); const attribute=parsed.createAttribute('sample'); const attrRoot=parsed.createElement('root'); attrRoot.setAttribute('gt','>'); const img=document.createElement('img'); img.append(document.createElement('style')); documentText==='<!DOCTYPE foo PUBLIC "pub" "sys"><foo/>'&&fragmentText==='<div xmlns="http://www.w3.org/1999/xhtml"></div><span xmlns="http://www.w3.org/1999/xhtml"></span>'&&serializer.serializeToString(namespaced)==='<x:item xmlns:x="urn:item"/>'&&serializer.serializeToString(attribute)===''&&serializer.serializeToString(attrRoot)==='<root gt="&gt;"/>'&&serializer.serializeToString(img)==='<img xmlns="http://www.w3.org/1999/xhtml"><style></style></img>'"#
+        ));
+    }
+
+    #[test]
+    fn xml_serializer_is_lenient_without_weakening_xml_outer_html() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"const parsed=new DOMParser().parseFromString('<root/>','application/xml'), root=parsed.documentElement, comment=parsed.createComment('bad--comment'); root.appendChild(comment); const serializer=new XMLSerializer(); let strict=false; try{root.outerHTML}catch(error){strict=error.name==='InvalidStateError'} serializer.serializeToString(comment)==='<!--bad--comment-->'&&serializer.serializeToString(root)==='<root><!--bad--comment--></root>'&&strict"#
         ));
     }
 

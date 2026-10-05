@@ -15,9 +15,11 @@
 //! reactor (epoll/kqueue) would need raw syscalls and stays out unless explicitly authorized;
 //! threadpool + completions is libuv's own fs strategy and covers everything we host today.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -25,8 +27,8 @@ use std::time::Duration;
 use lumen_host::time::Instant;
 
 use lumen_host::{
-    install, CallbackQueue, CompletionSender, Engine, TaskCompletion, TaskDecoder, TaskId,
-    TaskRegistry, ThreadPool, Value,
+    install, CallbackQueue, CompletionSender, Engine, Extension, HostRealmInstaller,
+    TaskCompletion, TaskDecoder, TaskId, TaskRegistry, ThreadPool, Value,
 };
 
 mod child_realm;
@@ -168,6 +170,26 @@ pub use lumen::limits::InterruptHandle;
 /// the signal number.
 const SIGNAL_TASK: TaskId = TaskId::MAX - 1;
 
+/// A completion that carries nothing: it only ends a blocking wait so the embedder re-checks
+/// its own channels.
+const WAKE_TASK: TaskId = TaskId::MAX - 2;
+
+/// Wakes a runtime blocked in [`Runtime::wait_for_completion`] from any thread, for work whose
+/// result travels over a channel the embedder owns.
+#[derive(Clone)]
+pub struct RuntimeWaker {
+    wake: mpsc::Sender<TaskCompletion>,
+}
+
+impl RuntimeWaker {
+    pub fn wake(&self) {
+        let _ = self.wake.send(TaskCompletion {
+            task: WAKE_TASK,
+            result: Box::new(()),
+        });
+    }
+}
+
 /// An embedded realm's stop request (its [`InterruptHandle`]), which can also deliver a signal
 /// to the realm's own `process.on` listeners.
 #[derive(Clone)]
@@ -224,8 +246,25 @@ pub fn import_source_text(s: String) -> String {
     lumen_common::smuggle::utf16_text_owned(s)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RootProviders {
+    Node,
+    Browser,
+}
+
+fn browser_extensions() -> Vec<Extension> {
+    vec![
+        lumen_timers::extension(),
+        console::extension(),
+        lumen_web::extension(),
+        clone_transfer::extension(),
+        ports::extension(),
+    ]
+}
+
 pub struct Runtime {
     engine: Engine,
+    root_providers: RootProviders,
     pool: ThreadPool,
     completions: mpsc::Receiver<TaskCompletion>,
     /// The error-reporting shims (see `Runtime::new`): `(error) -> suppressed` for the global
@@ -235,9 +274,9 @@ pub struct Runtime {
     fire_handled: Value,
     /// Browser embedders collect these and dispatch real Window tasks. Node keeps its fatal
     /// rejection policy unless this is explicitly enabled.
-    browser_rejection_events: bool,
-    pending_browser_rejections: Vec<BrowserRejectionEvent>,
-    browser_rejection_reasons: HashMap<usize, (Value, Value)>,
+    browser_rejections: lumen_html_js::BrowserRejectionPolicy,
+    /// Worker globals admit rejection notifications as tasks of their own loop.
+    worker_rejection_tasks: Rc<RefCell<VecDeque<lumen_html_js::BrowserRejectionTask>>>,
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
@@ -274,11 +313,7 @@ pub struct LoopStatus {
     pub halted: bool,
 }
 
-/// A promise rejection notification collected at a runtime checkpoint for a browser host.
-pub enum BrowserRejectionEvent {
-    Unhandled { promise: Value, reason: Value },
-    Handled { promise: Value, reason: Value },
-}
+pub use lumen_html_js::{BrowserRejectionBatch, BrowserRejectionDelivery, BrowserRejectionEvent};
 
 /// Why the entry script did not start cleanly.
 enum StartError {
@@ -300,6 +335,18 @@ impl Drop for Runtime {
         }
         lumen_node::shutdown_native_addons(self.engine.ctx());
         self.release_blocked_io();
+        self.engine.ctx().set_native_rejection_handled_hook(None);
+        // Engine is the first field and performs the last collection when it
+        // drops. Release our independent JS roots first: leaving them alive
+        // during that collection can preserve cycles after their later drop.
+        self.fire_error = Value::Undefined;
+        self.fire_rejection = Value::Undefined;
+        self.fire_handled = Value::Undefined;
+        // Release payloads outside the RefCell borrows; native owners captured
+        // by host sinks can themselves run teardown while being destroyed.
+        self.browser_rejections.release(&mut self.engine);
+        let worker_tasks = std::mem::take(&mut *self.worker_rejection_tasks.borrow_mut());
+        drop(worker_tasks);
     }
 }
 
@@ -352,7 +399,16 @@ impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
     pub fn new() -> Runtime {
-        let mut rt = Self::build(None, None);
+        let mut rt = Self::build(None, None, RootProviders::Node);
+        process_env::own_time_zone(rt.engine().ctx());
+        rt
+    }
+
+    /// Browser globals with the same native async services as child browser realms.
+    /// Node/process providers are excluded. Window rejection task admission remains
+    /// configured by the browser embedder through its existing document sink API.
+    pub fn new_browser() -> Runtime {
+        let mut rt = Self::build(None, None, RootProviders::Browser);
         process_env::own_time_zone(rt.engine().ctx());
         rt
     }
@@ -360,16 +416,26 @@ impl Runtime {
     /// A runtime for a realm inside a host process (see [`Embedding`]). Runs on the calling
     /// thread, which must have a large stack (the CLI uses 256 MiB; the engine recurses natively).
     pub fn new_embedded(embedding: Embedding) -> Runtime {
-        Self::build(Some(embedding), None)
+        Self::build(Some(embedding), None, RootProviders::Node)
     }
 
     /// A child realm's runtime: embedded, and counted in its launcher's realm tree.
     pub(crate) fn new_child(embedding: Embedding, tree: Arc<child_realm::RealmTree>) -> Runtime {
-        Self::build(Some(embedding), Some(tree))
+        Self::build(Some(embedding), Some(tree), RootProviders::Node)
     }
 
     /// A worker's runtime: embedded like its parent when the parent is, else process-backed.
     pub(crate) fn new_worker(parent: Option<WorkerEmbedding>) -> Runtime {
+        Self::new_worker_with_providers(parent, RootProviders::Node)
+    }
+
+    /// A web worker's provider profile; the worker launcher selects this only
+    /// for a genuine web worker, retaining Node workers' existing construction.
+    pub(crate) fn new_browser_worker(parent: Option<WorkerEmbedding>) -> Runtime {
+        Self::new_worker_with_providers(parent, RootProviders::Browser)
+    }
+
+    fn new_worker_with_providers(parent: Option<WorkerEmbedding>, providers: RootProviders) -> Runtime {
         let owned_fds = parent
             .as_ref()
             .map(|p| p.owned_fds.clone())
@@ -388,6 +454,7 @@ impl Runtime {
                 spawner: p.spawner,
             }),
             tree,
+            providers,
         );
         // A worker shares its realm's descriptors: closing one there must not close the host's.
         if let Some(realm) = runtime.engine.ctx().host_mut::<RealmProcess>() {
@@ -396,7 +463,11 @@ impl Runtime {
         runtime
     }
 
-    fn build(embedding: Option<Embedding>, tree: Option<Arc<child_realm::RealmTree>>) -> Runtime {
+    fn build(
+        embedding: Option<Embedding>,
+        tree: Option<Arc<child_realm::RealmTree>>,
+        providers: RootProviders,
+    ) -> Runtime {
         Self::freeze_native_catalog();
         let boot = lumen_host::startup_timing().then(Instant::now);
         lumen_host::perf::start_clock();
@@ -477,26 +548,41 @@ impl Runtime {
         // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
         // unhandled rejection, not a reported exception.
         install_queue_microtask(engine.ctx());
-        install(
-            &mut engine,
-            &[
-                lumen_timers::extension(),
-                console::extension(),
-                process::extension(),
-                process_env::extension(),
-                lumen_web::extension(),
-                // Last: Buffer uses TextEncoder (web), and require() calls process.cwd().
-                lumen_node::extension(),
-                clone_transfer::extension(),
-                ports::extension(),
-                worker::extension(),
-            ],
-        );
+        if providers == RootProviders::Node {
+            install(
+                &mut engine,
+                &[
+                    lumen_timers::extension(),
+                    console::extension(),
+                    process::extension(),
+                    process_env::extension(),
+                    lumen_web::extension(),
+                    // Last: Buffer uses TextEncoder (web), and require() calls process.cwd().
+                    lumen_node::extension(),
+                    clone_transfer::extension(),
+                    ports::extension(),
+                    worker::extension(),
+                ],
+            );
+        } else {
+            install(&mut engine, &browser_extensions());
+            // Preserve the existing genuine root Worker/SharedWorker service.
+            install(&mut engine, &[worker::extension()]);
+        }
+        let browser_extensions: Rc<[Extension]> = browser_extensions().into();
+        let browser_installer: HostRealmInstaller = Rc::new(move |ctx, realm| {
+            lumen_host::install_realm_in_ctx(ctx, realm, &browser_extensions)?;
+            ctx.with_host_realm(realm, install_queue_microtask)
+                .map_err(|error| error.to_string())
+        });
+        lumen_host::register_host_realm_installer(engine.ctx(), browser_installer);
         lumen_host::perf::mark(lumen_host::perf::Milestone::Environment);
         let data = embedded_io
             .as_ref()
             .map(|(argv, env, _, _)| (argv.as_slice(), env.as_slice()));
-        process::install_data_props(&mut engine, data);
+        if providers == RootProviders::Node {
+            process::install_data_props(&mut engine, data);
+        }
         if let Some((_, _, stdout, stderr)) = embedded_io {
             engine.ctx().op_state().put(ConsoleOut {
                 out: Box::new(stdout),
@@ -555,6 +641,7 @@ impl Runtime {
         parallel::install(&mut engine);
         Runtime {
             engine,
+            root_providers: providers,
             pool,
             interrupt,
             child_realms,
@@ -565,9 +652,8 @@ impl Runtime {
             fire_error,
             fire_rejection,
             fire_handled,
-            browser_rejection_events: false,
-            pending_browser_rejections: Vec::new(),
-            browser_rejection_reasons: HashMap::new(),
+            browser_rejections: lumen_html_js::BrowserRejectionPolicy::default(),
+            worker_rejection_tasks: Rc::new(RefCell::new(VecDeque::new())),
             fatal_exit: None,
             #[cfg(feature = "aot-native")]
             native_builtins_installed: false,
@@ -590,21 +676,7 @@ impl Runtime {
         &mut self,
         realm: &lumen::embed::RealmHandle,
     ) -> Result<(), String> {
-        lumen_host::install_realm(
-            &mut self.engine,
-            realm,
-            &[
-                lumen_timers::extension(),
-                console::extension(),
-                lumen_web::extension(),
-                clone_transfer::extension(),
-                ports::extension(),
-            ],
-        )?;
-        self.engine
-            .ctx()
-            .with_host_realm(realm, install_queue_microtask)
-            .map_err(|error| error.to_string())
+        lumen_host::install_registered_host_realm(self.engine.ctx(), realm)
     }
 
     /// Cancel timers owned by a browser realm that is being navigated or discarded.
@@ -620,20 +692,114 @@ impl Runtime {
             .unwrap_or(0)
     }
 
+    /// Cancel pending async settlements admitted by a browser realm being navigated or
+    /// discarded. This releases their JavaScript callbacks immediately; underlying native I/O
+    /// may still finish, but its completion will be ignored by the shared task registry.
+    pub fn cancel_tasks_for_realm(&mut self, realm: &lumen::embed::RealmHandle) -> usize {
+        self.engine
+            .ctx()
+            .host_mut::<TaskRegistry>()
+            .map(|tasks| tasks.cancel_realm(realm))
+            .unwrap_or(0)
+    }
+
     /// Collect browser-style rejection notifications instead of applying Node's fatal rejection
     /// policy. Notifications are returned by [`Self::take_browser_rejection_events`] after a
     /// normal checkpoint so the embedder can enqueue actual `unhandledrejection` and
     /// `rejectionhandled` events on its user-agent task queue.
     pub fn enable_browser_rejection_events(&mut self) {
-        if !self.browser_rejection_events {
-            self.browser_rejection_events = true;
-            self.engine.track_late_handled_rejections();
+        self.browser_rejections.enable(&mut self.engine);
+    }
+
+    /// Register native user-agent task admission for one live browser document.
+    /// The sink should retain its document weakly; no Runtime/Engine is captured.
+    pub fn set_browser_rejection_sink(
+        &mut self, owner: &lumen::embed::RealmHandle,
+        sink: impl Fn(&mut Ctx, Vec<BrowserRejectionEvent>, BrowserRejectionDelivery) -> Vec<Value> + 'static,
+    ) {
+        self.browser_rejections.set_sink(&mut self.engine, owner, Rc::new(sink));
+    }
+
+    /// Register a Window document as the admission target of its creating realm.
+    pub fn register_browser_rejection_document(
+        &mut self, realm: &Rc<lumen_html_js::DomRealm>,
+    ) -> Result<(), String> {
+        lumen_html_js::register_document_rejection_sink(&mut self.browser_rejections, &mut self.engine, realm)
+    }
+
+    /// Admit the document realm's pending rejection notifications as Window tasks.
+    pub fn queue_browser_rejection_document_events(
+        &mut self, realm: &Rc<lumen_html_js::DomRealm>,
+    ) -> Result<(), String> {
+        lumen_html_js::queue_document_rejection_events(&mut self.browser_rejections, &mut self.engine, realm)
+    }
+
+    /// Deliver rejection events to a dedicated or shared worker global as tasks of its own loop.
+    pub(crate) fn enable_worker_rejection_events(&mut self) {
+        let owner = self.engine.ctx().current_host_realm();
+        let tasks = self.worker_rejection_tasks.clone();
+        self.set_browser_rejection_sink(&owner, move |_, events, _| {
+            tasks.borrow_mut().extend(lumen_html_js::group_rejection_tasks(events));
+            Vec::new()
+        });
+    }
+
+    fn take_worker_rejection_tasks(&mut self) -> Vec<lumen_html_js::BrowserRejectionTask> {
+        std::mem::take(&mut *self.worker_rejection_tasks.borrow_mut()).into()
+    }
+
+    fn run_worker_rejection_task(&mut self, task: lumen_html_js::BrowserRejectionTask) {
+        let delivery = self.browser_rejections.delivery();
+        let global = self.engine.global_this();
+        let dispatch = self
+            .engine
+            .ctx()
+            .get_member(&global, "__workerDispatchRejection")
+            .ok()
+            .and_then(lumen::embed::JsFunction::from_value);
+        let Some(dispatch) = dispatch else {
+            return;
+        };
+        let result: Result<(), lumen::embed::OpError> = lumen_html_js::run_rejection_task(self.engine.ctx(), &delivery, task, |ctx, kind, promise, reason| {
+            match dispatch.call(ctx, Value::Undefined, &[Value::str(kind), promise, reason])? {
+                Value::Bool(not_prevented) => Ok(not_prevented),
+                _ => Ok(true),
+            }
+        });
+        if let Err(error) = result {
+            let error = error.to_value(self.engine.ctx());
+            self.report_uncaught(&error);
         }
+        self.checkpoint();
+        self.report_unhandled_rejections();
+    }
+
+    /// Clone the shared delivery handle for tasks that execute after this runtime borrow ends.
+    pub fn browser_rejection_delivery(&self) -> BrowserRejectionDelivery {
+        self.browser_rejections.delivery()
     }
 
     /// Take browser rejection notifications accumulated at the latest checkpoints.
     pub fn take_browser_rejection_events(&mut self) -> Vec<BrowserRejectionEvent> {
-        std::mem::take(&mut self.pending_browser_rejections)
+        self.browser_rejections.take_events()
+    }
+
+    /// Take only notifications belonging to one document realm, leaving other realms' events
+    /// queued for their own host task pumps.
+    pub fn take_browser_rejection_events_for_realm(
+        &mut self,
+        realm: &lumen::embed::RealmHandle,
+    ) -> Vec<BrowserRejectionEvent> {
+        self.browser_rejections.take_events_for_realm(&mut self.engine, realm)
+    }
+
+    /// Cancel pending rejection notifications and tracking for a document realm being retired.
+    /// A weak global marker also suppresses promises that reject after this call.
+    pub fn cancel_browser_rejection_events_for_realm(
+        &mut self,
+        realm: &lumen::embed::RealmHandle,
+    ) -> usize {
+        self.browser_rejections.cancel_for_realm(&mut self.engine, realm)
     }
 
     /// Evaluate a module using this runtime's configured loader while leaving pending top-level
@@ -1116,10 +1282,14 @@ impl Runtime {
                     progressed = true;
                     self.fire(&cb, &args);
                 }
-                let now = Instant::now();
-                while let Some((cb, args)) = self.take_next_due_timer(now) {
+                for task in self.take_worker_rejection_tasks() {
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.run_worker_rejection_task(task);
+                }
+                let now = Instant::now();
+                while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
+                    progressed = true;
+                    self.fire_timer(&cb, &args, &owner);
                 }
                 while let Ok(done) = self.completions.try_recv() {
                     progressed = true;
@@ -1163,6 +1333,9 @@ impl Runtime {
     /// them from the engine would load the builtins). The loader builds a builtin's ESM source
     /// from its list on first import.
     fn builtin_modules(&mut self) -> esm::BuiltinModules {
+        if self.root_providers == RootProviders::Browser {
+            return esm::BuiltinModules(std::collections::HashMap::new());
+        }
         let global = self.engine.global_this();
         let ctx = self.engine.ctx();
         let mut map = std::collections::HashMap::new();
@@ -1211,6 +1384,33 @@ impl Runtime {
         CompletionSender::new(self.wake.clone())
     }
 
+    /// A handle that ends [`Self::wait_for_completion`] when an embedder-owned channel has
+    /// something to read.
+    pub fn waker(&self) -> RuntimeWaker {
+        RuntimeWaker {
+            wake: self.wake.clone(),
+        }
+    }
+
+    /// Block until a completion or wake arrives, or `timeout` passes. The completion is
+    /// dispatched (its JS callback is queued for the next [`Self::run_until_idle`]); returns
+    /// whether one arrived.
+    pub fn wait_for_completion(&mut self, timeout: Duration) -> bool {
+        if cfg!(target_arch = "wasm32") || self.halted() || timeout.is_zero() {
+            return false;
+        }
+        let blocked = Instant::now();
+        let received = self.completions.recv_timeout(timeout);
+        lumen_host::perf::add_idle(blocked.elapsed());
+        match received {
+            Ok(done) => {
+                self.dispatch(done);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Run every turn that is ready now (microtasks, queued callbacks, due timers, delivered
     /// completions) and return without blocking, so a host that owns the thread (a browser tab)
     /// can hand control back and resume when [`LoopStatus::next_timer_ms`] elapses or a
@@ -1228,12 +1428,12 @@ impl Runtime {
                 self.fire(&cb, &args);
             }
             let now = Instant::now();
-            while let Some((cb, args)) = self.take_next_due_timer(now) {
+            while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
                 if self.halted() {
                     break;
                 }
                 progressed = true;
-                self.fire(&cb, &args);
+                self.fire_timer(&cb, &args, &owner);
             }
             while !self.halted() {
                 let Ok(done) = self.completions.try_recv() else {
@@ -1312,12 +1512,12 @@ impl Runtime {
                     self.report_unhandled_rejections();
                 }
                 let now = Instant::now();
-                while let Some((cb, args)) = self.take_next_due_timer(now) {
+                while let Some((cb, args, owner)) = self.take_next_due_timer(now) {
                     if self.halted() {
                         return;
                     }
                     progressed = true;
-                    self.fire(&cb, &args);
+                    self.fire_timer(&cb, &args, &owner);
                 }
                 while !self.halted() {
                     let Ok(done) = self.completions.try_recv() else {
@@ -1601,20 +1801,26 @@ impl Runtime {
         let tasks_pending = state
             .get::<TaskRegistry>()
             .is_some_and(|r| r.has_ref_pending());
-        !callbacks_queued && !timers_pending && !tasks_pending
+        !callbacks_queued
+            && !timers_pending
+            && !tasks_pending
+            && self.worker_rejection_tasks.borrow().is_empty()
     }
 
-    fn take_queued_callbacks(&mut self) -> Vec<(Value, Vec<Value>)> {
+    fn take_queued_callbacks(&mut self) -> VecDeque<(Value, Vec<Value>)> {
         match self.engine.ctx().host_mut::<CallbackQueue>() {
-            Some(q) => std::mem::take(&mut q.queue).into(),
-            None => Vec::new(),
+            Some(q) if !q.queue.is_empty() => std::mem::take(&mut q.queue),
+            _ => VecDeque::new(),
         }
     }
 
     /// One due timer at a time (see `Timers::take_next_due`): each callback runs before the next
     /// is taken, so it can clear or refresh a timer due in the same turn. `now` is fixed for the
     /// turn, so an interval cannot keep itself due forever.
-    fn take_next_due_timer(&mut self, now: Instant) -> Option<(Value, Vec<Value>)> {
+    fn take_next_due_timer(
+        &mut self,
+        now: Instant,
+    ) -> Option<(Value, Vec<Value>, lumen::embed::RealmHandle)> {
         self.engine
             .ctx()
             .host_mut::<lumen_timers::Timers>()?
@@ -1635,6 +1841,9 @@ impl Runtime {
             if let Ok(signal) = done.result.downcast::<i32>() {
                 self.deliver_signal(*signal);
             }
+            return;
+        }
+        if done.task == WAKE_TASK {
             return;
         }
         let entry = self
@@ -1767,10 +1976,25 @@ impl Runtime {
 
     /// One JS callback entry: call, report an uncaught throw, then the microtask checkpoint.
     fn fire(&mut self, callback: &Value, args: &[Value]) {
+        self.fire_with_this(callback, Value::Undefined, args);
+    }
+
+    /// Fire a timer with the registering realm's global-this value. The callback's lexical
+    /// realm is still selected by the engine from the callback object itself.
+    fn fire_timer(&mut self, callback: &Value, args: &[Value], owner: &lumen::embed::RealmHandle) {
+        let this = self
+            .engine
+            .ctx()
+            .with_host_realm(owner, |ctx| ctx.global_this())
+            .expect("live timer owner realm remains registered until cancellation");
+        self.fire_with_this(callback, this, args);
+    }
+
+    fn fire_with_this(&mut self, callback: &Value, this: Value, args: &[Value]) {
         if std::mem::take(&mut self.tick_recovery) {
             self.checkpoint();
         }
-        if let Err(e) = self.engine.call_function(callback, Value::Undefined, args) {
+        if let Err(e) = self.engine.call_function(callback, this, args) {
             self.report_uncaught(&e);
         }
         self.checkpoint();
@@ -1875,30 +2099,9 @@ impl Runtime {
     /// otherwise it is raised as an uncaught exception — which an `'uncaughtException'` listener
     /// may still catch, and which is fatal if nothing does.
     fn report_unhandled_rejections(&mut self) {
-        if self.browser_rejection_events {
-            // The Window receives an actual UA task with the original Promise/reason values.
-            // Preserve the reason until a later checkpoint reports that same Promise handled.
-            for promise in self.engine.take_late_handled_rejections() {
-                let Some(identity) = self.engine.ctx().object_addr(&promise) else {
-                    continue;
-                };
-                if let Some((promise, reason)) = self.browser_rejection_reasons.remove(&identity) {
-                    self.pending_browser_rejections
-                        .push(BrowserRejectionEvent::Handled { promise, reason });
-                }
-            }
-            for (promise, reason) in self.engine.take_unhandled_rejections_full() {
-                let Some(identity) = self.engine.ctx().object_addr(&promise) else {
-                    continue;
-                };
-                if self
-                    .browser_rejection_reasons
-                    .insert(identity, (promise.clone(), reason.clone()))
-                    .is_none()
-                {
-                    self.pending_browser_rejections
-                        .push(BrowserRejectionEvent::Unhandled { promise, reason });
-                }
+        if self.browser_rejections.is_enabled() {
+            for error in self.browser_rejections.checkpoint(&mut self.engine) {
+                self.report_uncaught(&error);
             }
             return;
         }

@@ -1,5 +1,34 @@
 //! Bounded byte/UTF-16 scans shared by parsers and string adapters.
 
+/// Whether text is empty or consists only of WHATWG ASCII whitespace.
+/// Non-ASCII spaces and vertical tab are not included. This borrows the input
+/// and shares the exact byte classifier used by forgiving decoding and URLs.
+pub fn is_ascii_whitespace_only(text: &str) -> bool {
+    text.bytes().all(crate::codec::is_ascii_whitespace)
+}
+
+/// Strip and collapse WHATWG ASCII whitespace across borrowed text chunks.
+/// Adjacent chunks remain adjacent unless the input contained whitespace.
+/// Non-ASCII spaces and vertical tab are preserved. Only the result is stored.
+pub fn strip_and_collapse_ascii_whitespace<'a>(parts: impl IntoIterator<Item = &'a str>) -> String {
+    let mut result = String::new();
+    let mut pending_space = false;
+    for part in parts {
+        for character in part.chars() {
+            if matches!(character, '\t' | '\n' | '\u{000c}' | '\r' | ' ') {
+                pending_space = !result.is_empty();
+            } else {
+                if pending_space {
+                    result.push(' ');
+                    pending_space = false;
+                }
+                result.push(character);
+            }
+        }
+    }
+    result
+}
+
 /// Append the leading BMP scalars as UTF-16; return the consumed UTF-8 bytes.
 /// Supplementary scalars are left to the caller's string representation policy.
 pub fn utf8_bmp_prefix(text: &str, out: &mut Vec<u16>) -> usize {
@@ -721,6 +750,15 @@ pub fn utf16_is_ascii(units: &[u16]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn whitespace_only_preserves_non_html_spaces_and_url_text() {
+        for text in ["", " ", "\t", "\n", "\u{000c}", "\r", " \t\n\u{000c}\r "] {
+            assert!(is_ascii_whitespace_only(text));
+        }
+        for text in ["\u{000b}", "\u{00a0}", "\u{2003}", "\u{0000}", " a.js "] {
+            assert!(!is_ascii_whitespace_only(text));
+        }
+    }
     #[test]
     fn scans_match_scalar_at_every_length_alignment_and_stop() {
         for offset in 0..16 {

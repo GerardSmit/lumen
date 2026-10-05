@@ -186,8 +186,8 @@ fn key_hash(key: &Value) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_hash, CollectionData};
-    use crate::fasthash::tests::{old_colliding_keys, OldFx};
+    use super::{CollectionData, key_hash};
+    use crate::fasthash::tests::{OldFx, old_colliding_keys};
     use crate::value::{Object, Value};
     use std::hash::{Hash, Hasher};
     use std::time::{Duration, Instant};
@@ -221,9 +221,11 @@ mod tests {
             s.as_str().hash(&mut h);
             h.finish()
         };
-        assert!(hostile
-            .iter()
-            .all(|k| old_digest(k) == old_digest(&hostile[0])));
+        assert!(
+            hostile
+                .iter()
+                .all(|k| old_digest(k) == old_digest(&hostile[0]))
+        );
         let benign: Vec<Value> = (0..hostile.len())
             .map(|i| Value::str(format!("benign-key-{i:05}").as_str()))
             .collect();

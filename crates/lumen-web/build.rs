@@ -105,21 +105,23 @@ const UNITS: &[Unit] = &[
 ];
 
 /// The globals a lazy unit publishes: its column-0 `globalThis.X = …` statements, then `defined`.
+fn assigned_export(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("globalThis.")?;
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+        .unwrap_or(rest.len());
+    let assigned = rest[end..].trim_start().strip_prefix('=')
+        .is_some_and(|tail| !tail.starts_with('='));
+    (end > 0 && assigned).then_some(&rest[..end])
+}
+
 fn published(body: &str, defined: &[(&str, bool)]) -> Vec<(String, bool)> {
     let mut names: Vec<(String, bool)> = Vec::new();
     for line in body.lines() {
-        let Some(rest) = line.strip_prefix("globalThis.") else {
+        let Some(name) = assigned_export(line) else {
             continue;
         };
-        let end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-            .unwrap_or(rest.len());
-        let is_assign = rest[end..]
-            .trim_start()
-            .strip_prefix('=')
-            .is_some_and(|r| !r.starts_with('='));
-        if end > 0 && is_assign && !names.iter().any(|(n, _)| n == &rest[..end]) {
-            names.push((rest[..end].to_string(), true));
+        if !names.iter().any(|(n, _)| n == name) {
+            names.push((name.to_string(), true));
         }
     }
     for (name, enumerable) in defined {
@@ -132,6 +134,25 @@ fn published(body: &str, defined: &[(&str, bool)]) -> Vec<(String, bool)> {
         "a lazy web glue unit must publish a global"
     );
     names
+}
+
+/// Route publications through the unit's private receiver. Reads and closures
+/// still use the real global. The same scanner discovers and redirects exports,
+/// so a unit cannot overwrite a later native provider or author replacement.
+fn guarded_publications(body: &str) -> String {
+    let mut guarded = String::with_capacity(body.len());
+    for line in body.lines() {
+        if assigned_export(line).is_some() {
+            guarded.push_str("__webExports.");
+            guarded.push_str(line.strip_prefix("globalThis.").unwrap());
+        } else {
+            guarded.push_str(line);
+        }
+        guarded.push('\n');
+    }
+    // This also covers the URL unit's dynamic names and internal helper
+    // descriptors. The publisher preserves non-export helper semantics.
+    guarded.replace("Object.defineProperty(globalThis,", "__webDefine(")
 }
 
 fn main() {
@@ -152,12 +173,13 @@ fn main() {
         }
         if unit.lazy {
             let names = published(&body, unit.defined);
+            let body = guarded_publications(&body);
             let list: Vec<String> = names
                 .iter()
                 .map(|(n, e)| format!("{n}{}", if *e { "" } else { "!" }))
                 .collect();
             glue.push_str(&format!(
-                "__lazyWeb({:?}, () => {{\n\"lumen:run-once\";\n{body}}});\n",
+                "__lazyWeb({:?}, (__webExports, __webDefine) => {{\n\"lumen:run-once\";\n{body}}});\n",
                 list.join(" ")
             ));
         } else {

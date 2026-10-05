@@ -23,6 +23,14 @@ pub fn now_ms() -> f64 {
     ms_since_origin(Instant::now())
 }
 
+/// The shared web clock uses 100-microsecond buckets. Integer quantization
+/// keeps exposed event and performance timestamps monotonic and on the same
+/// grid, without changing the internal clock used for deadlines and timings.
+pub fn web_now_ms() -> f64 {
+    let elapsed = Instant::now().saturating_duration_since(origin().0);
+    (elapsed.as_micros() / 100) as f64 / 10.0
+}
+
 pub fn ms_since_origin(at: Instant) -> f64 {
     at.saturating_duration_since(origin().0).as_secs_f64() * 1000.0
 }

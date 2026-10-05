@@ -82,6 +82,7 @@ impl Hub {
     ) {
         match &mutation.kind {
             ObservedKind::ChildList { .. } | ObservedKind::ChildListMany { .. } => (),
+            ObservedKind::SlotAssignment => (),
             ObservedKind::Attribute {
                 name,
                 namespace_uri,
@@ -152,9 +153,13 @@ impl Hub {
         document: &lumen_html::Document,
         mutation: &ObservedMutation,
     ) {
-        self.observers
-            .borrow_mut()
-            .retain(|observer| observer.strong_count() > 0);
+        {
+            let mut observers = self.observers.borrow_mut();
+            observers.retain(|observer| observer.strong_count() > 0);
+            if observers.is_empty() {
+                return;
+            }
+        }
         let observers = self
             .observers
             .borrow()
@@ -322,6 +327,9 @@ fn records(ctx: &mut Ctx, observer: &ObserverData) -> OpResult<Vec<Value>> {
                 ),
                 ObservedKind::ChildListMany { added, removed } => {
                     ("childList", None, None, None, added, removed, None, None)
+                }
+                ObservedKind::SlotAssignment => {
+                    ("childList", None, None, None, Vec::new(), Vec::new(), None, None)
                 }
             };
         property(ctx, &object, "type", Value::str(kind))?;

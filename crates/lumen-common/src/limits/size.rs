@@ -6,11 +6,7 @@
 pub struct TooLarge;
 
 pub fn check(n: usize, max: usize) -> Result<usize, TooLarge> {
-    if n > max {
-        Err(TooLarge)
-    } else {
-        Ok(n)
-    }
+    if n > max { Err(TooLarge) } else { Ok(n) }
 }
 
 /// `a + b`, within `max`.
@@ -39,6 +35,19 @@ pub fn string_with_capacity(n: usize, max: usize) -> Result<String, TooLarge> {
     Ok(s)
 }
 
+/// Append within a byte limit, with fallible, capped geometric growth.
+/// A rejected append leaves the string's contents unchanged.
+pub fn append_string(out: &mut String, text: &str, max: usize) -> Result<(), TooLarge> {
+    let needed = sum(out.len(), text.len(), max)?;
+    if needed > out.capacity() {
+        let capacity = out.capacity().saturating_mul(2).min(max).max(needed);
+        out.try_reserve_exact(capacity - out.len())
+            .map_err(|_| TooLarge)?;
+    }
+    out.push_str(text);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +70,17 @@ mod tests {
             string_with_capacity(16, 16).map(|s| s.capacity() >= 16),
             Ok(true)
         );
+    }
+
+    #[test]
+    fn bounded_string_append_rejects_without_changing_contents() {
+        let mut output = string_with_capacity(1, 2).unwrap();
+        append_string(&mut output, "a", 2).unwrap();
+        append_string(&mut output, "b", 2).unwrap();
+        assert_eq!(output, "ab");
+        let capacity = output.capacity();
+        assert_eq!(append_string(&mut output, "c", 2), Err(TooLarge));
+        assert_eq!(output, "ab");
+        assert_eq!(output.capacity(), capacity);
     }
 }

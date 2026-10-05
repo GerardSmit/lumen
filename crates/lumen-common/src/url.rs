@@ -10,38 +10,103 @@ mod idna;
 
 pub use idna::to_unicode as domain_to_unicode_raw;
 
+pub const MAX_DATA_URL_METADATA_BYTES: usize = 8192;
+
+/// Borrow the MIME essence of a data URL, defaulting invalid or omitted types
+/// to `text/plain` as required by the Fetch data URL processor.
+/// Parameters stay in the URL; consumers needing only an essence do not allocate.
+pub fn data_url_mime_essence(source: &str) -> Option<&str> {
+    if !source.get(..5)?.eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    let (metadata, _) = source[5..].split('#').next()?.split_once(',')?;
+    if metadata.len() > MAX_DATA_URL_METADATA_BYTES {
+        return None;
+    }
+    let essence = metadata.split(';').next()?.trim_matches(|c: char| {
+        c.is_ascii() && crate::codec::is_ascii_whitespace(c as u8)
+    });
+    let token = |s: &str| !s.is_empty() && s.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+    });
+    match essence.split_once('/') {
+        Some((kind, subtype)) if token(kind) && token(subtype) => Some(essence),
+        _ => Some("text/plain"),
+    }
+}
+
 /// Decode a data URL with bounded encoded input and a decoded-body budget.
 /// A base64 marker must be the final metadata parameter.
 pub fn data_url_body(source: &str, limit: usize) -> Option<Vec<u8>> {
-    if !source.get(..5)?.eq_ignore_ascii_case("data:") { return None; }
+    data_url_body_bounded(source, limit).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataUrlError {
+    Malformed,
+    LimitExceeded,
+}
+
+/// Like `data_url_body`, retaining the distinction between malformed input
+/// and a resource budget so hosts can report unsupported workloads honestly.
+pub fn data_url_body_bounded(source: &str, limit: usize) -> Result<Vec<u8>, DataUrlError> {
+    if !source.get(..5).is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:")) {
+        return Err(DataUrlError::Malformed);
+    }
     let source = &source[5..];
-    let source = source.split('#').next()?;
-    let (metadata, payload) = source.split_once(',')?;
-    if metadata.len() > 8192 || payload.len() > limit.checked_mul(3)? {
-        return None;
+    let source = source.split('#').next().ok_or(DataUrlError::Malformed)?;
+    let (metadata, payload) = source.split_once(',').ok_or(DataUrlError::Malformed)?;
+    if metadata.len() > MAX_DATA_URL_METADATA_BYTES || payload.len() > limit.checked_mul(3).ok_or(DataUrlError::LimitExceeded)? {
+        return Err(DataUrlError::LimitExceeded);
     }
     let payload = crate::codec::percent_decode(payload.as_bytes());
-    let bytes = if metadata
-        .trim_end()
-        .to_ascii_lowercase()
-        .ends_with(";base64")
-    {
-        crate::codec::base64_decode_forgiving(&payload)?
+    let base64 = metadata.trim_end_matches(|c: char| {
+        c.is_ascii() && crate::codec::is_ascii_whitespace(c as u8)
+    }).rsplit_once(';')
+        .is_some_and(|(_, marker)| marker.trim_start_matches(' ').eq_ignore_ascii_case("base64"));
+    let bytes = if base64 {
+        crate::codec::base64_decode_forgiving(&payload).ok_or(DataUrlError::Malformed)?
     } else {
         payload
     };
-    (bytes.len() <= limit).then_some(bytes)
+    if bytes.len() > limit {
+        Err(DataUrlError::LimitExceeded)
+    } else {
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn data_url_mime_essence_defaults_invalid_types_without_allocation() {
+    for (source, expected) in [
+        ("DATA:TEXT/CSS;charset=utf-8;BASE64,e30=", "TEXT/CSS"),
+        ("data:;charset=utf-8,hello", "text/plain"),
+        ("data:,hello", "text/plain"),
+        ("data:invalid,hello", "text/plain"),
+        ("data:text/css/extra,hello", "text/plain"),
+        ("data: text/css ;charset=utf-8,hello", "text/css"),
+    ] {
+        assert_eq!(data_url_mime_essence(source), Some(expected));
+    }
+    assert_eq!(data_url_mime_essence("https://example.test/,data"), None);
+    assert_eq!(data_url_mime_essence("data:text/css"), None);
 }
 
 #[cfg(test)]
 #[test]
 fn data_url_body_decodes_final_base64_marker_and_enforces_budget() {
     assert_eq!(data_url_body("DATA:text/plain;base64,SGVsbG8%3D#fragment", 5), Some(b"Hello".to_vec()));
+    assert_eq!(data_url_body("data:text/plain;  BASE64,SGVsbG8=", 5), Some(b"Hello".to_vec()));
+    assert_eq!(data_url_body("data:text/plain;base64\u{2003},SGVsbG8=", 8), Some(b"SGVsbG8=".to_vec()));
+    assert_eq!(data_url_body("data:text/plain;base64\u{000b},SGVsbG8=", 8), Some(b"SGVsbG8=".to_vec()));
     assert_eq!(data_url_body("data:text/plain;base64;other,SGVsbG8=", 8), Some(b"SGVsbG8=".to_vec()));
     assert_eq!(data_url_body("data:,one%20two", 7), Some(b"one two".to_vec()));
     assert_eq!(data_url_body("data:;base64,SGVsbG8=", 4), None);
     assert_eq!(data_url_body("data:,abcd", 3), None);
     assert_eq!(data_url_body("https://example.test/,data", 32), None);
+    assert_eq!(data_url_body_bounded("data:text/css,abcde", 4), Err(DataUrlError::LimitExceeded));
+    assert_eq!(data_url_body_bounded("data:text/css;base64,!", 4), Err(DataUrlError::Malformed));
 }
 
 /// ada's `ada::scheme::type` numbering (the JS side reads it as `scheme_type`).

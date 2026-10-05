@@ -1287,3 +1287,239 @@ fn option_signed_number(value: Option<isize>) -> String {
 fn option_bool(value: Option<bool>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
+
+/// Provider initialization only: debug host timings and ClassAlloc system-boundary
+/// held-byte snapshots (rounded live blocks plus caches), neither JS heap nor RSS.
+#[test]
+fn runtime_provider_initialization_profile() {
+    struct Sample {
+        profile: &'static str,
+        warmup: bool,
+        pair: usize,
+        order: usize,
+        init_us: u128,
+        dom_us: u128,
+        before: Option<usize>,
+        initialized: Option<usize>,
+        dom_installed: Option<usize>,
+        dropped: Option<usize>,
+        parent_before_spawn: Option<usize>,
+        parent_after_join: Option<usize>,
+    }
+    fn sample(profile: &'static str, warmup: bool, pair: usize, order: usize) -> Sample {
+        let parent_before_spawn = lumen::Engine::heap_bytes();
+        let mut result = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let before = lumen::Engine::heap_bytes();
+                let started = Instant::now();
+                let mut runtime = if profile == "browser" {
+                    lumen_runtime::Runtime::new_browser()
+                } else {
+                    lumen_runtime::Runtime::new()
+                };
+                let init_us = started.elapsed().as_micros();
+                let initialized = lumen::Engine::heap_bytes();
+                let started = Instant::now();
+                let realm = lumen_html_js::install(
+                    runtime.engine().ctx(),
+                    "<body><main id='provider-probe'>provider initialization</main></body>",
+                    128,
+                )
+                .unwrap();
+                let dom_us = started.elapsed().as_micros();
+                let dom_installed = lumen::Engine::heap_bytes();
+                // Assert actual profile semantics after the measured snapshots;
+                // no wall-time or allocation threshold is used as correctness.
+                let node_surface = if profile == "browser" {
+                    "typeof process==='undefined' && typeof Buffer==='undefined' && typeof require==='undefined'"
+                } else {
+                    "typeof process==='object' && typeof Buffer==='function' && typeof require==='function'"
+                };
+                let source = format!(
+                    "document.querySelector('#provider-probe').textContent==='provider initialization' && \
+                     ({node_surface}) && \
+                     typeof setTimeout==='function' && typeof fetch==='function' && typeof Worker==='function'"
+                );
+                match runtime.engine().eval(&source, false).unwrap() {
+                    lumen::Completion::Value(value) => assert_eq!(value, "true"),
+                    lumen::Completion::Throw { name, message } => panic!("{name}: {message}"),
+                }
+                drop(realm);
+                drop(runtime);
+                let dropped = lumen::Engine::heap_bytes();
+                Sample {
+                    profile,
+                    warmup,
+                    pair,
+                    order,
+                    init_us,
+                    dom_us,
+                    before,
+                    initialized,
+                    dom_installed,
+                    dropped,
+                    parent_before_spawn,
+                    parent_after_join: None,
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        result.parent_after_join = lumen::Engine::heap_bytes();
+        result
+    }
+    fn delta(after: Option<usize>, before: Option<usize>) -> Option<isize> {
+        after.zip(before).map(|(after, before)| after as isize - before as isize)
+    }
+    fn summary(mut values: Vec<u128>) -> String {
+        values.sort_unstable();
+        format!(
+            "{{\"min\":{},\"median\":{},\"max\":{}}}",
+            values[0],
+            values[values.len() / 2],
+            values[values.len() - 1]
+        )
+    }
+    let mut samples = Vec::with_capacity(16);
+    samples.push(sample("node", true, 0, 0));
+    samples.push(sample("browser", true, 0, 1));
+    for pair in 0..7 {
+        let profiles = if pair % 2 == 0 { ["node", "browser"] } else { ["browser", "node"] };
+        for (order, profile) in profiles.into_iter().enumerate() {
+            samples.push(sample(profile, false, pair, order));
+        }
+    }
+    let rows = samples.iter().map(|sample| format!(
+        "{{\"profile\":\"{}\",\"warmup\":{},\"pair\":{},\"order\":{},\"init_us\":{},\"dom_install_us\":{},\"process_held_bytes_before\":{},\"process_held_bytes_after_init\":{},\"process_held_bytes_after_dom\":{},\"process_held_bytes_after_drop\":{},\"init_held_bytes_delta\":{},\"dom_held_bytes_delta_from_baseline\":{},\"post_drop_held_bytes_delta\":{},\"parent_held_bytes_before_spawn\":{},\"parent_held_bytes_after_join\":{},\"post_thread_join_held_bytes_delta\":{}}}",
+        sample.profile, sample.warmup, sample.pair, sample.order, sample.init_us, sample.dom_us,
+        option_usize(sample.before), option_usize(sample.initialized), option_usize(sample.dom_installed), option_usize(sample.dropped),
+        option_signed_number(delta(sample.initialized,sample.before)), option_signed_number(delta(sample.dom_installed,sample.before)), option_signed_number(delta(sample.dropped,sample.before)), option_usize(sample.parent_before_spawn), option_usize(sample.parent_after_join), option_signed_number(delta(sample.parent_after_join,sample.parent_before_spawn))
+    )).collect::<Vec<_>>().join(",");
+    let summaries = ["node", "browser"].into_iter().map(|profile| {
+        let measured = samples.iter().filter(|sample| sample.profile==profile && !sample.warmup).collect::<Vec<_>>();
+        let init = summary(measured.iter().map(|sample|sample.init_us).collect());
+        let dom = summary(measured.iter().map(|sample|sample.dom_us).collect());
+        let init_payload = measured.iter().filter_map(|sample|delta(sample.initialized,sample.before)).collect::<Vec<_>>();
+        let dom_payload = measured.iter().filter_map(|sample|delta(sample.dom_installed,sample.before)).collect::<Vec<_>>();
+        let residual = measured.iter().filter_map(|sample|delta(sample.dropped,sample.before)).collect::<Vec<_>>();
+        let thread_residual = measured.iter().filter_map(|sample|delta(sample.parent_after_join,sample.parent_before_spawn)).collect::<Vec<_>>();
+        let signed = |mut values: Vec<isize>| {
+            if values.is_empty() { return "null".to_string(); }
+            values.sort_unstable();
+            format!("{{\"min\":{},\"median\":{},\"max\":{}}}",values[0],values[values.len()/2],values[values.len()-1])
+        };
+        format!("\"{profile}\":{{\"init_us\":{init},\"dom_install_us\":{dom},\"init_held_bytes_delta\":{},\"dom_held_bytes_delta_from_baseline\":{},\"post_drop_held_bytes_delta\":{},\"post_thread_join_held_bytes_delta\":{}}}",signed(init_payload),signed(dom_payload),signed(residual),signed(thread_residual))
+    }).collect::<Vec<_>>().join(",");
+    let metrics = format!(
+        "{{\"scope\":\"debug host Runtime provider initialization and identical minimal DOM installation\",\"paired_runs\":7,\"warmup_per_profile\":1,\"thread_stack_bytes\":67108864,\"samples_sequential\":true,\"memory_scope\":\"process-wide ClassAlloc system-boundary held-byte counter: rounded live blocks plus cached free-list blocks, including Rust/native allocations; not requested payload, isolated live JS heap, RSS or native GUI/WPT throughput\",\"post_drop_scope\":\"inside-thread snapshot after genuine Runtime and DOM owner drop, before thread-local teardown; parent snapshot after joined thread is separately recorded. Residual attribution is not established; neither snapshot alone proves or excludes a leak\",\"performance_threshold_asserted\":false,\"samples\":[{rows}],\"summary\":{{{summaries}}}}}"
+    );
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors().nth(4).unwrap()
+        .join("target/html-application-profile/runtime-provider-init.json");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    std::fs::write(&output, &metrics).unwrap();
+    eprintln!("runtime-provider-init {} {metrics}", output.display());
+}
+
+
+/// Isolate provider/DOM held-byte retention without changing allocator behavior.
+#[test]
+fn runtime_provider_retained_memory_isolation() {
+    #[derive(Clone)]
+    struct Sample {
+        mode: &'static str,
+        round: usize,
+        before_held: Option<usize>,
+        after_join_held: Option<usize>,
+        thread_requested_before: isize,
+        thread_requested_after_drop: isize,
+        thread_held_after_drop: Option<usize>,
+        thread_cached_after_drop: usize,
+        thread_cache: lumen::fastalloc::ThreadCacheStats,
+        process_cached_after_drop: Option<usize>,
+        process_cached_before: Option<usize>,
+        process_cached_after_join: Option<usize>,
+        parent_cache_after_join: Option<lumen::fastalloc::ThreadCacheStats>,
+        dom_alive_after_engine_drop: Option<bool>,
+    }
+    let modes = ["no-runtime", "engine-only", "engine-held-function", "engine-released-function", "engine-dom", "browser-only", "node-only", "browser-dom", "node-dom"];
+    let mut samples = Vec::with_capacity(modes.len() * 4);
+    for round in 0..4 {
+        for index in 0..modes.len() {
+            let mode = modes[if round % 2 == 0 {index} else {modes.len()-1-index}];
+            let before_held = lumen::Engine::heap_bytes();
+            let process_cached_before = lumen::memstats::allocator().map(|(_, _, cached, _)| cached);
+            let mut sample = std::thread::Builder::new().stack_size(64*1024*1024).spawn(move || {
+                let requested_before = lumen::fastalloc::thread_live_bytes();
+                let mut engine = None;
+                let mut runtime = None;
+                if mode.starts_with("engine") { engine = Some(lumen::Engine::new()); }
+                if mode.starts_with("browser") { runtime = Some(lumen_runtime::Runtime::new_browser()); }
+                if mode.starts_with("node") { runtime = Some(lumen_runtime::Runtime::new()); }
+                // Mimic Runtime's independently held JS callback fields, without a
+                // Runtime or DOM, and compare releasing the handle before Engine.
+                let mut held_function = if mode.contains("function") {
+                    Some(engine.as_mut().unwrap().eval_value("(() => globalThis)").unwrap())
+                } else { None };
+                if mode == "engine-released-function" { drop(held_function.take()); }
+                let mut weak = None;
+                if mode.ends_with("dom") {
+                    let ctx = match runtime.as_mut() { Some(runtime) => runtime.engine().ctx(), None => engine.as_mut().unwrap().ctx() };
+                    let realm = lumen_html_js::install(ctx, "<body><main id='probe'>retention isolation</main></body>", 128).unwrap();
+                    weak = Some(Rc::downgrade(&realm));
+                    drop(realm);
+                }
+                drop(runtime);
+                drop(engine);
+                drop(held_function);
+                let dom_alive = weak.as_ref().map(|weak| weak.strong_count()!=0);
+                drop(weak);
+                Sample { mode, round, before_held, after_join_held: None,
+                    thread_requested_before: requested_before,
+                    thread_requested_after_drop: lumen::fastalloc::thread_live_bytes(),
+                    thread_held_after_drop: lumen::Engine::heap_bytes(),
+                    thread_cached_after_drop: lumen::fastalloc::cached_bytes_for_test(),
+                    thread_cache: lumen::fastalloc::thread_cache_stats(),
+                    process_cached_after_drop: lumen::memstats::allocator().map(|(_, _, cached, _)| cached),
+                    process_cached_before,
+                    process_cached_after_join: None,
+                    parent_cache_after_join: None,
+                    dom_alive_after_engine_drop: dom_alive }
+            }).unwrap().join().unwrap();
+            sample.after_join_held = lumen::Engine::heap_bytes();
+            sample.process_cached_after_join = lumen::memstats::allocator().map(|(_, _, cached, _)| cached);
+            sample.parent_cache_after_join = Some(lumen::fastalloc::thread_cache_stats());
+            samples.push(sample);
+        }
+    }
+    let rows = samples.iter().map(|sample| {
+        let held_delta = sample.after_join_held.zip(sample.before_held).map(|(after,before)|after as isize-before as isize);
+        let alive = sample.dom_alive_after_engine_drop.map(|alive|alive.to_string()).unwrap_or_else(||"null".to_string());
+        let held_split = |held: Option<usize>, cached: Option<usize>| match (held, cached) {
+            (Some(held), Some(cached)) => format!("{{\"held_bytes\":{held},\"allocator_cached_bytes\":{cached},\"live_block_bytes\":{}}}", held as isize - cached as isize),
+            (Some(held), None) => format!("{{\"held_bytes\":{held},\"allocator_cached_bytes\":null,\"live_block_bytes\":null}}"),
+            _ => "null".to_string(),
+        };
+        let live_delta = match (sample.after_join_held, sample.process_cached_after_join, sample.before_held, sample.process_cached_before) {
+            (Some(held_after), Some(cached_after), Some(held_before), Some(cached_before)) => Some((held_after as isize - cached_after as isize) - (held_before as isize - cached_before as isize)),
+            _ => None,
+        };
+        let cached_delta = sample.process_cached_after_join.zip(sample.process_cached_before).map(|(after, before)| after as isize - before as isize);
+        let classes = |stats: &lumen::fastalloc::ThreadCacheStats| {
+            let mut classes = stats.classes.clone();
+            classes.sort_by_key(|class| std::cmp::Reverse(class.block_bytes * class.blocks));
+            classes.iter().take(8).map(|class| format!("{{\"block_bytes\":{},\"blocks\":{},\"bytes\":{}}}", class.block_bytes, class.blocks, class.block_bytes * class.blocks)).collect::<Vec<_>>().join(",")
+        };
+        let parent_cache = sample.parent_cache_after_join.as_ref().map(|stats| format!("{{\"cached_bytes\":{},\"cached_blocks\":{},\"top_classes\":[{}]}}", stats.cached_bytes, stats.cached_blocks, classes(stats))).unwrap_or_else(|| "null".to_string());
+        let attribution = format!("{{\"before\":{},\"after_join\":{},\"live_block_bytes_delta\":{},\"allocator_cached_bytes_delta\":{},\"thread_cache_at_drop\":{{\"cached_bytes\":{},\"cached_blocks\":{},\"live_requested_bytes\":{},\"top_classes\":[{}]}},\"process_cached_at_drop\":{},\"parent_thread_cache_after_join\":{},\"counter_scope\":\"live_block_bytes is held minus the process-wide free-list total and needs lumen/mem-stats; parent-thread cache lists blocks a surviving thread parked\"}}",
+            held_split(sample.before_held, sample.process_cached_before), held_split(sample.after_join_held, sample.process_cached_after_join), option_signed_number(live_delta), option_signed_number(cached_delta),
+            sample.thread_cache.cached_bytes, sample.thread_cache.cached_blocks, sample.thread_cache.live_requested_bytes, classes(&sample.thread_cache), option_usize(sample.process_cached_after_drop), parent_cache);
+        format!("{{\"mode\":\"{}\",\"round\":{},\"warmup\":{},\"attribution\":{attribution},\"parent_before_held_bytes\":{},\"parent_after_join_held_bytes\":{},\"post_join_held_bytes_delta\":{},\"thread_requested_bytes_before\":{},\"thread_requested_bytes_after_drop\":{},\"thread_requested_bytes_delta\":{},\"thread_held_bytes_after_drop\":{},\"thread_cached_bytes_after_drop\":{},\"dom_weak_alive_after_engine_drop\":{}}}", sample.mode,sample.round,sample.round==0,option_usize(sample.before_held),option_usize(sample.after_join_held),option_signed_number(held_delta),sample.thread_requested_before,sample.thread_requested_after_drop,sample.thread_requested_after_drop-sample.thread_requested_before,option_usize(sample.thread_held_after_drop),sample.thread_cached_after_drop,alive)
+    }).collect::<Vec<_>>().join(",");
+    let output = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(4).unwrap().join("target/html-application-profile/runtime-provider-retention-isolation.json");
+    let metrics = format!("{{\"scope\":\"debug host sequential 64MiB threads, one warmup and three alternating-order samples per mode\",\"counter_scope\":\"held bytes count process-wide rounded live blocks plus free-list caches; requested-live delta counts allocations/frees on owning sample thread before thread teardown, excludes other-thread frees; neither is RSS nor isolated JS heap\",\"no_allocator_behavior_changes\":true,\"samples\":[{rows}]}}");
+    std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+    std::fs::write(&output,&metrics).unwrap();
+    eprintln!("runtime-provider-retention-isolation {} {metrics}",output.display());
+}

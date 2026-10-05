@@ -1016,36 +1016,7 @@ fn tree_connected(document: &lumen_html::Document, id: NodeId) -> bool {
 }
 
 fn valid_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !first.is_ascii_lowercase() || !name.contains('-') {
-        return false;
-    }
-    if !chars.all(|ch| {
-        let cp = ch as u32;
-        ch.is_ascii_lowercase()
-            || ch.is_ascii_digit()
-            || matches!(cp,
-            0x2D | 0x2E | 0x5F | 0xB7 | 0xC0..=0xD6 | 0xD8..=0xF6 | 0xF8..=0x37D |
-            0x37F..=0x1FFF | 0x200C..=0x200D | 0x203F..=0x2040 | 0x2070..=0x218F |
-            0x2C00..=0x2FEF | 0x3001..=0xD7FF | 0xF900..=0xFDCF | 0xFDF0..=0xFFFD |
-            0x10000..=0xEFFFF)
-    }) {
-        return false;
-    }
-    ![
-        "annotation-xml",
-        "color-profile",
-        "font-face",
-        "font-face-src",
-        "font-face-uri",
-        "font-face-format",
-        "font-face-name",
-        "missing-glyph",
-    ]
-    .contains(&name)
+    lumen_html::html::is_valid_custom_element_name(name)
 }
 
 /// Host-specific constructor result used by `HTMLElement`'s native binding. The concrete binding
@@ -1089,6 +1060,8 @@ impl HtmlElementCtor {
             let set_proto = set_prototype_function(ctx)?;
             attach_html_native(ctx, &self.this, &self.realm, self.id, expected_interface)?;
             ctx.invoke(set_proto, Value::Undefined, &[self.this.clone(), proto])?;
+            ctx.set_native_identity_owner::<super::DomNode>(&self.this)
+                .map_err(|error| error.to_value(ctx))?;
             let weak = ctx.weak_value(&self.this).ok_or_else(|| {
                 ctx.make_error("TypeError", "HTMLElement instance is not an object")
             })?;

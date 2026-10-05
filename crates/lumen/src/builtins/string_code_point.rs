@@ -35,14 +35,16 @@ pub(crate) fn nf_code_point_at(
 
 #[cfg(test)]
 mod tests {
-    use crate::{bytecode::Tier, Completion, Engine};
+    use crate::{Completion, Engine, bytecode::Tier};
 
     fn check(source: &str) {
         for tier in [Tier::Interp, Tier::Bytecode] {
             let mut engine = Engine::new();
             engine.set_tier(tier);
             engine.set_tier_threshold(0);
-            let script = format!("function assert(x){{if(!x)throw new Error('code point assertion');}} function point(s,n){{return s.codePointAt(n);}} {source}; 'passed'");
+            let script = format!(
+                "function assert(x){{if(!x)throw new Error('code point assertion');}} function point(s,n){{return s.codePointAt(n);}} {source}; 'passed'"
+            );
             match engine.eval(&script, false).unwrap() {
                 Completion::Value(v) => assert_eq!(v, "passed", "{tier:?}"),
                 Completion::Throw { name, message } => panic!("{tier:?}: {name}: {message}"),

@@ -84,6 +84,7 @@ const kBodyStream = Symbol("bodyStream");
 // never sends — a `new Request(url, { body: new ReadableStream() })` just to probe support.
 const kSourceStream = Symbol("bodySourceStream");
 function browserPolicyAvailable() {
+  if (typeof __http_policy !== "undefined" && __http_policy.policyHandledByHost()) return false;
   if (__http && (__http.policyHandledByHost === true ||
       (typeof __http.policyHandledByHost === "function" && __http.policyHandledByHost()))) return false;
   const nativeOrigin = typeof __http.browserOrigin === "function" ? __http.browserOrigin() : null;
@@ -179,7 +180,7 @@ function initBody(owner, body) {
     owner[kSourceStream] = body;
     owner._bodyBytes = undefined;
   } else if (body instanceof Blob) {
-    owner._bodyBytes = body[kBlobBytes].slice();
+    owner._bodyBytes = body[kBlobBytes];
     if (body.type) contentType = body.type;
   } else if (body instanceof FormData) {
     const encoded = encodeFormData(body);
@@ -439,6 +440,9 @@ class Response {
 }
 bodyMixin(Response.prototype);
 
+// Shared with XHR in this bootstrap; ordinary Fetch callers never install it.
+const kUploadProgress = Symbol("xhrUploadProgress");
+const kForcePreflight = Symbol("xhrForcePreflight");
 async function fetch(input, init = {}) {
   const request = new Request(input, init);
   const signal = request.signal;
@@ -456,18 +460,40 @@ async function fetch(input, init = {}) {
   }
   const hasBody = request._bodyBytes !== undefined || request[kSourceStream] !== undefined;
   let bodyBytes = hasBody ? await request._consume(signal) : undefined;
+  const uploadObserver = init[kUploadProgress];
+  const forcePreflight = init[kForcePreflight] === true;
+  let uploadObserved = false;
+  if (bodyBytes !== undefined && typeof uploadObserver === "function") {
+    uploadObserver(0, bodyBytes.byteLength, false, true);
+  }
   if (signal && signal.aborted) throw abortReason();
   const sendRaw = (method, url, headers, bytes, redirect = "follow") => new Promise((resolve, reject) => {
     let done = false;
     let handle;
-    const onAbort = () => { if (handle) handle.abort(); if (!done) { done = true; reject(abortReason()); } };
+    let uploadTimer;
+    let uploadFinished = false;
+    const observeUpload = bytes !== undefined && !uploadObserved && typeof uploadObserver === "function";
+    if (observeUpload) uploadObserved = true;
+    const sampleUpload = () => {
+      if (!observeUpload || !handle || uploadFinished) return;
+      const complete = handle.uploadComplete === true;
+      const total = handle.uploadTotal;
+      uploadObserver(handle.uploadLoaded, total, complete, false);
+      if (complete) { uploadFinished = true; clearTimeout(uploadTimer); }
+    };
+    const pollUpload = () => {
+      sampleUpload();
+      if (!done && !uploadFinished) uploadTimer = setTimeout(pollUpload, 50);
+    };
+    const onAbort = () => { sampleUpload(); clearTimeout(uploadTimer); if (handle) handle.abort(); if (!done) { done = true; reject(abortReason()); } };
     if (signal) signal.addEventListener("abort", onAbort);
-    const finish = fn => value => { if (done) { if (value && value.bodyReader) value.bodyReader.cancel(); return; } done = true; if (signal) signal.removeEventListener("abort", onAbort); fn(value); };
+    const finish = fn => value => { if (done) { if (value && value.bodyReader) value.bodyReader.cancel(); return; } sampleUpload(); clearTimeout(uploadTimer); done = true; if (signal) signal.removeEventListener("abort", onAbort); fn(value); };
     try {
       handle = __http.request(method, url, headers, bytes, finish(raw => {
         if (raw && !(raw.headers instanceof Headers)) raw.headers = new Headers(raw.headers || []);
         resolve(raw);
-      }), finish(error => reject(error instanceof Error ? error : new TypeError(String(error)))), redirect, {mode: request.mode, credentials: request.credentials, redirect: request.redirect});
+      }), finish(error => reject(error instanceof Error ? error : new TypeError(String(error)))), redirect, {mode: request.mode, credentials: request.credentials, redirect: request.redirect, uploadProgress: observeUpload || forcePreflight, forcePreflight});
+      if (observeUpload) pollUpload();
       if (signal && signal.aborted) onAbort();
     } catch (error) { finish(reject)(error); }
   });
@@ -484,7 +510,7 @@ async function fetch(input, init = {}) {
     if (!browser || mode !== "cors" || (sameOrigin(targetUrl, origin) && corsOrigin === origin)) return;
     const currentHeaders = new Headers(headers);
     const unsafe = corsUnsafeHeaderNames(currentHeaders);
-    if (!corsSafelistedMethods.has(method) || unsafe.length) {
+    if (forcePreflight || !corsSafelistedMethods.has(method) || unsafe.length) {
       const preflightHeaders = [["accept", "*/*"], ["origin", corsOrigin], ["access-control-request-method", method]];
       if (unsafe.length) preflightHeaders.push(["access-control-request-headers", unsafe.join(", ")]);
       const preflight = await sendRaw("OPTIONS", targetUrl, preflightHeaders, undefined, "manual");

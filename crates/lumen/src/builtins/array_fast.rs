@@ -38,11 +38,7 @@ pub(super) fn own_elem(o: &Gc, k: usize) -> Option<Value> {
         return None;
     }
     let p = b.props.get_index(n)?;
-    if p.accessor() {
-        None
-    } else {
-        Some(p.value())
-    }
+    if p.accessor() { None } else { Some(p.value()) }
 }
 
 /// Scan the packed plain elements `from..len` of `o` under one borrow for the first `hit`:
@@ -707,11 +703,7 @@ pub(super) fn array_last_index_of(
             return Ok(Value::Num(-1.0));
         }
         let n = if n.is_nan() { 0 } else { n.trunc() as i64 };
-        if n >= 0 {
-            n.min(len - 1)
-        } else {
-            len + n
-        }
+        if n >= 0 { n.min(len - 1) } else { len + n }
     } else {
         len - 1
     };

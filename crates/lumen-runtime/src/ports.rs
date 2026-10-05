@@ -261,7 +261,14 @@ fn post(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
 /// channel is closed and everything sent before the close has been received.
 fn poll(ctx: &mut Ctx, _: Value, args: &[Value]) -> Result<Value, Value> {
     let port = lookup(ctx, args)?;
-    let message = port.0.queue.lock().unwrap().pop_front();
+    let message = {
+        let mut queue = port.0.queue.lock().unwrap();
+        let message = queue.pop_front();
+        if queue.is_empty() && queue.capacity() > 64 {
+            *queue = VecDeque::new();
+        }
+        message
+    };
     if let Some(message) = message {
         let bytes = clone_transfer::install_message(ctx, message);
         return ctx.make_uint8array(&bytes);

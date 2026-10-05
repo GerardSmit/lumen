@@ -219,16 +219,30 @@ fn browser_timers_are_owned_by_their_realm_and_retained_callbacks_survive_cancel
             .ctx()
             .host_mut::<lumen_timers::Timers>()
             .expect("runtime timer registry");
-        assert_eq!(timers.pending_for_realm(&parent), 1, "parent owns its timer");
-        assert_eq!(timers.pending_for_realm(&child), 2, "child owns both timers");
+        assert_eq!(
+            timers.pending_for_realm(&parent),
+            1,
+            "parent owns its timer"
+        );
+        assert_eq!(
+            timers.pending_for_realm(&child),
+            2,
+            "child owns both timers"
+        );
     }
 
     // Navigation cancellation removes both child-owned timers while preserving the parent's
     // timer. Dropping the queued callbacks does not invalidate a separately retained function
     // from the old document.
     assert_eq!(runtime.cancel_timers_for_realm(&child), 2);
-    runtime.run_until_idle();
-    assert!(stderr.lines().is_empty(), "queued callbacks must not error: {:?}", stderr.lines());
+    // Node's wrapper clamps a zero-delay timer to 1 ms; run_to_completion waits for the
+    // surviving parent timer, whereas run_until_idle may return before its deadline.
+    runtime.run_to_completion();
+    assert!(
+        stderr.lines().is_empty(),
+        "queued callbacks must not error: {:?}",
+        stderr.lines()
+    );
     let child_timeout_state = eval_host_value(
         &mut runtime,
         &child,
@@ -257,6 +271,149 @@ fn browser_timers_are_owned_by_their_realm_and_retained_callbacks_survive_cancel
         "retainedCalls === 1 && intervalCalls === 0",
     );
     assert!(matches!(retained_callback_state, Value::Bool(true)));
+}
+
+#[test]
+fn browser_timer_callback_uses_owner_global_as_this_without_changing_its_lexical_realm() {
+    let (mut runtime, _, stderr) = test_runtime();
+    let child = runtime.engine().ctx().create_host_realm();
+    runtime
+        .install_browser_realm(&child)
+        .expect("browser providers install in the child realm");
+
+    let parent_setup = runtime
+        .engine()
+        .eval_value(
+            "globalThis.parentTimerLexicalGlobal = globalThis; globalThis.makeTimerCallback = expectedOwner => function() { globalThis.timerCallbackLexicalRealm = globalThis === parentTimerLexicalGlobal; globalThis.timerCallbackOwnerThis = this === expectedOwner; }",
+        )
+        .expect("parent callback factory parses")
+        .unwrap_or_else(|_| panic!("parent callback factory runs"));
+    assert!(matches!(parent_setup, Value::Obj(_)));
+
+    let child_global_this = runtime
+        .engine()
+        .ctx()
+        .with_host_realm(&child, |ctx| ctx.global_this())
+        .expect("child realm remains registered");
+    let callback_factory = runtime
+        .engine()
+        .eval_value("makeTimerCallback")
+        .expect("callback factory lookup parses")
+        .unwrap_or_else(|_| panic!("callback factory exists"));
+    let callback = runtime
+        .engine()
+        .call_function(
+            &callback_factory,
+            Value::Undefined,
+            std::slice::from_ref(&child_global_this),
+        )
+        .unwrap_or_else(|_| panic!("parent-realm callback creation succeeds"));
+    let child_set_timeout = eval_host_value(&mut runtime, &child, "setTimeout");
+    runtime
+        .engine()
+        .call_function(
+            &child_set_timeout,
+            Value::Undefined,
+            &[callback, Value::Num(0.0)],
+        )
+        .unwrap_or_else(|_| panic!("child-realm timer registration succeeds"));
+
+    runtime.run_until_idle();
+    assert!(
+        stderr.lines().is_empty(),
+        "timer callback errors: {:?}",
+        stderr.lines()
+    );
+    let result = runtime
+        .engine()
+        .eval_value("timerCallbackOwnerThis && timerCallbackLexicalRealm")
+        .expect("timer callback assertions parse")
+        .unwrap_or_else(|_| panic!("timer callback assertions run"));
+    assert!(matches!(result, Value::Bool(true)));
+}
+
+fn decode_unit_task(
+    _ctx: &mut lumen_host::Ctx,
+    payload: Box<dyn std::any::Any + Send>,
+) -> Result<Vec<Value>, Value> {
+    payload
+        .downcast::<()>()
+        .map(|_| Vec::new())
+        .map_err(|_| Value::Undefined)
+}
+
+#[test]
+fn browser_realm_cancellation_drops_async_settlements_but_keeps_other_realms() {
+    let (mut runtime, _, stderr) = test_runtime();
+    let parent = runtime.engine().ctx().current_host_realm();
+    let child = runtime.engine().ctx().create_host_realm();
+
+    runtime
+        .engine()
+        .eval_value("globalThis.parentTaskSettled = false")
+        .expect("parent setup parses")
+        .unwrap_or_else(|_| panic!("parent setup runs"));
+    let parent_callback = runtime
+        .engine()
+        .eval_value("() => { parentTaskSettled = true; }")
+        .expect("parent callback parses")
+        .unwrap_or_else(|_| panic!("parent callback is created"));
+    let child_setup = eval_host_value(
+        &mut runtime,
+        &child,
+        "globalThis.childTaskSettled = false; true",
+    );
+    assert!(matches!(child_setup, Value::Bool(true)));
+    let child_callback =
+        eval_host_value(&mut runtime, &child, "() => { childTaskSettled = true; }");
+
+    let parent_task = lumen_host::register_task(
+        runtime.engine().ctx(),
+        parent_callback,
+        None,
+        decode_unit_task,
+    );
+    let child_task = runtime
+        .engine()
+        .ctx()
+        .with_host_realm(&child, |ctx| {
+            lumen_host::register_task(ctx, child_callback, None, decode_unit_task)
+        })
+        .expect("child task registration returns to parent realm");
+    assert!(runtime
+        .engine()
+        .ctx()
+        .current_host_realm()
+        .same_realm(&parent));
+    {
+        let tasks = runtime
+            .engine()
+            .ctx()
+            .host_mut::<TaskRegistry>()
+            .expect("runtime task registry");
+        assert_eq!(tasks.pending_for_realm(&parent), 1);
+        assert_eq!(tasks.pending_for_realm(&child), 1);
+    }
+
+    let completions = runtime.completion_sender();
+    completions.send(child_task, Box::new(()));
+    assert_eq!(runtime.cancel_tasks_for_realm(&child), 1);
+    completions.send(parent_task, Box::new(()));
+    runtime.run_until_idle();
+
+    let parent_settled = runtime
+        .engine()
+        .eval_value("parentTaskSettled")
+        .expect("parent result parses")
+        .unwrap_or_else(|_| panic!("parent result runs"));
+    assert!(matches!(parent_settled, Value::Bool(true)));
+    let child_settled = eval_host_value(&mut runtime, &child, "childTaskSettled");
+    assert!(matches!(child_settled, Value::Bool(false)));
+    assert!(
+        stderr.lines().is_empty(),
+        "settlement errors: {:?}",
+        stderr.lines()
+    );
 }
 
 #[test]
@@ -289,6 +446,31 @@ fn repeated_discarded_realms_release_their_interval_entries() {
         .op_state()
         .get::<lumen_timers::Timers>()
         .is_some_and(lumen_timers::Timers::has_pending));
+}
+
+#[test]
+fn browser_timer_omitted_delays_and_cancel_ids_use_optional_idl_defaults() {
+    let mut runtime = Runtime::new_browser();
+    runtime.set_deadline(std::time::Duration::from_secs(1));
+    let result = runtime.engine().eval_value(r#"
+        if (setTimeout.length !== 1 || setInterval.length !== 1 ||
+            clearTimeout.length !== 0 || clearInterval.length !== 0) {
+            throw new Error('timer optional arguments must be reflected in function length');
+        }
+        clearTimeout(); clearInterval();
+        globalThis.timerDefaultTrace = [];
+        setTimeout(() => timerDefaultTrace.push('timeout'));
+        const interval = setInterval(() => {
+            timerDefaultTrace.push('interval'); clearInterval(interval);
+        });
+        timerDefaultTrace.push('sync');
+        timerDefaultTrace.join(',');
+    "#).expect("timer defaults source parses").unwrap_or_else(|_| panic!("timer defaults source runs"));
+    assert!(matches!(result, Value::Str(value) if value.as_str() == "sync"));
+    runtime.run_until_idle();
+    let result = runtime.engine().eval_value("timerDefaultTrace.join(',')")
+        .expect("timer result parses").unwrap_or_else(|_| panic!("timer result runs"));
+    assert!(matches!(result, Value::Str(value) if value.as_str() == "sync,timeout,interval"));
 }
 
 /// The Phase-2 acceptance test: setTimeout + queueMicrotask + console.log complete in the
@@ -454,8 +636,14 @@ fn browser_rejection_collection_is_opt_in_and_preserves_late_handled_reason() {
     let first = rt.take_browser_rejection_events();
     assert_eq!(first.len(), 1);
     let promise = match first.into_iter().next().unwrap() {
-        BrowserRejectionEvent::Unhandled { promise, reason } => {
+        BrowserRejectionEvent::Unhandled {
+            owner, promise, reason, ..
+        } => {
             assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "browser-reason"));
+            // Collection queues notification; simulate its actual UA delivery now.
+            let delivery = rt.browser_rejection_delivery();
+            assert!(delivery.should_dispatch(rt.engine().ctx(), &owner, true, &promise));
+            delivery.did_dispatch_unhandled(rt.engine().ctx(), &owner, &promise);
             promise
         }
         BrowserRejectionEvent::Handled { .. } => panic!("first browser notification was handled"),
@@ -475,6 +663,7 @@ fn browser_rejection_collection_is_opt_in_and_preserves_late_handled_reason() {
         BrowserRejectionEvent::Handled {
             promise: handled_promise,
             reason,
+            ..
         } => {
             assert!(rt.engine().ctx().object_addr(&promise).is_some());
             assert_eq!(
@@ -485,6 +674,145 @@ fn browser_rejection_collection_is_opt_in_and_preserves_late_handled_reason() {
         }
         BrowserRejectionEvent::Unhandled { .. } => panic!("late notification was unhandled"),
     }
+
+    eval_ok(&mut rt, "globalThis.__caughtBeforeDelivery = Promise.reject('early-reason')");
+    rt.run_until_idle();
+    let mut pending = rt.take_browser_rejection_events();
+    assert_eq!(pending.len(), 1);
+    let (owner, promise) = match pending.pop().unwrap() {
+        BrowserRejectionEvent::Unhandled { owner, promise, reason, .. } => {
+            assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "early-reason"));
+            (owner, promise)
+        }
+        BrowserRejectionEvent::Handled { .. } => panic!("early promise was already handled"),
+    };
+    eval_ok(&mut rt, "__caughtBeforeDelivery.catch(() => {})");
+    rt.run_until_idle();
+    assert!(!rt.browser_rejection_delivery().should_dispatch(
+        rt.engine().ctx(), &owner, true, &promise));
+    assert!(rt.take_browser_rejection_events().is_empty(),
+        "catch before actual delivery must not emit rejectionhandled");
+}
+
+#[test]
+fn browser_rejection_events_keep_realm_owner_and_cancel_retired_realm() {
+    let (mut rt, _, _) = test_runtime();
+    rt.enable_browser_rejection_events();
+    let root = rt.engine().ctx().current_host_realm();
+    let child = rt.engine().ctx().create_host_realm();
+
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(&root, "Promise.reject('root-reason')", false)
+        .expect("root rejection evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(
+            &child,
+            "globalThis.late=Promise.reject('child-reason')",
+            false
+        )
+        .expect("child rejection evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(&root, "Promise.reject('root-second')", false)
+        .expect("second root rejection evaluates")
+        .is_ok());
+    rt.run_until_idle();
+
+    let child_events = rt.take_browser_rejection_events_for_realm(&child);
+    assert_eq!(child_events.len(), 1);
+    match child_events.into_iter().next().unwrap() {
+        BrowserRejectionEvent::Unhandled { owner, promise, reason, .. } => {
+            assert!(owner.same_realm(&child));
+            assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "child-reason"));
+            let delivery = rt.browser_rejection_delivery();
+            assert!(delivery.should_dispatch(rt.engine().ctx(), &owner, true, &promise));
+            delivery.did_dispatch_unhandled(rt.engine().ctx(), &owner, &promise);
+        }
+        BrowserRejectionEvent::Handled { .. } => panic!("child rejection was already handled"),
+    }
+    let root_events = rt.take_browser_rejection_events_for_realm(&root);
+    assert_eq!(root_events.len(), 2);
+    let root_reasons = root_events
+        .into_iter()
+        .map(|event| match event {
+            BrowserRejectionEvent::Unhandled { owner, promise, reason, .. } => {
+                assert!(owner.same_realm(&root));
+                let delivery = rt.browser_rejection_delivery();
+                assert!(delivery.should_dispatch(rt.engine().ctx(), &owner, true, &promise));
+                delivery.did_dispatch_unhandled(rt.engine().ctx(), &owner, &promise);
+                match reason {
+                    Value::Str(value) => value.as_str().to_owned(),
+                    _ => panic!("root rejection reason is a string"),
+                }
+            }
+            BrowserRejectionEvent::Handled { .. } => panic!("root rejection was already handled"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        root_reasons,
+        vec!["root-reason".to_owned(), "root-second".to_owned()]
+    );
+
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(&child, "late.catch(() => {})", false)
+        .expect("late handler evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    let handled = rt.take_browser_rejection_events_for_realm(&child);
+    assert_eq!(handled.len(), 1);
+    match handled.into_iter().next().unwrap() {
+        BrowserRejectionEvent::Handled { owner, reason, .. } => {
+            assert!(owner.same_realm(&child));
+            assert!(matches!(reason, Value::Str(ref value) if value.as_str() == "child-reason"));
+        }
+        BrowserRejectionEvent::Unhandled { .. } => {
+            panic!("late handler produced another unhandled event")
+        }
+    }
+
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(
+            &child,
+            "globalThis.retiring=Promise.reject('retiring')",
+            false
+        )
+        .expect("retiring rejection evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    assert!(rt.cancel_browser_rejection_events_for_realm(&child) > 0);
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(
+            &child,
+            "retiring.catch(() => {}); Promise.reject('after-retirement')",
+            false
+        )
+        .expect("post-retirement settlement evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    assert!(rt
+        .take_browser_rejection_events_for_realm(&child)
+        .is_empty());
+
+    assert!(rt
+        .engine()
+        .eval_value_in_host_realm(&root, "Promise.reject('root-still-live')", false)
+        .expect("root rejection after child retirement evaluates")
+        .is_ok());
+    rt.run_until_idle();
+    let root_after = rt.take_browser_rejection_events_for_realm(&root);
+    assert_eq!(root_after.len(), 1);
+    assert!(
+        matches!(root_after[0], BrowserRejectionEvent::Unhandled { ref owner, .. } if owner.same_realm(&root))
+    );
 }
 
 #[test]
@@ -1200,6 +1528,121 @@ fn web_encoding_and_base64() {
         "#,
     );
     assert_eq!(out.lines(), ["7 hi \u{1F600}", "TWFu Man", "TextDecoder"]);
+}
+
+#[test]
+fn web_legacy_encoding_streams_reset_and_preserve_real_buffer_views() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(&mut rt, r#"
+        const assert = (ok) => { if (!ok) throw new Error('decoder contract'); };
+        const decoder = new TextDecoder('  Shift_JIS\n', {fatal:true});
+        assert(decoder.encoding === 'shift_jis' && decoder.fatal && !decoder.ignoreBOM);
+        assert(decoder.decode(Uint8Array.of(0x82), {stream:true}) === '');
+        assert(decoder.decode(Uint8Array.of(0xa0,0x82), {stream:true}) === 'あ');
+        assert(decoder.decode(Uint8Array.of(0xa2)) === 'い');
+        let fatal = false;
+        try { decoder.decode(Uint8Array.of(0x82)); } catch (e) { fatal = e instanceof TypeError; }
+        assert(fatal && decoder.decode(Uint8Array.of(65)) === 'A');
+        const source = Uint8Array.of(0,0xc4,0xe3,0);
+        assert(new TextDecoder('gb18030').decode(new DataView(source.buffer,1,2)) === '你');
+        assert(new TextDecoder('big5').decode(Uint8Array.of(0xa7,0x41)) === '你');
+        assert(new TextDecoder('euc-kr').decode(Uint8Array.of(0xb0,0xa1)) === '가');
+        assert(new TextDecoder('windows-1251').decode(Uint8Array.of(0xcf,0xf0)) === 'Пр');
+        const iso = new TextDecoder('iso-2022-jp');
+        assert(iso.decode(Uint8Array.of(27,36),{stream:true}) === '');
+        assert(iso.decode(Uint8Array.of(66,36,34),{stream:true}) === 'あ');
+        assert(iso.decode(Uint8Array.of(27,40,66,33)) === '!');
+        assert(iso.decode(Uint8Array.of(65)) === 'A');
+        console.log('legacy-streams-ok');
+    "#);
+    assert_eq!(out.lines(), ["legacy-streams-ok"]);
+}
+
+#[test]
+fn web_encoding_encoder_and_decoder_expose_real_webidl_brands_and_arities() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(&mut rt, r#"
+        const assert = (ok) => { if (!ok) throw new Error('encoding IDL contract'); };
+        const fails = (fn) => { try {fn();return false} catch(e){return e instanceof TypeError} };
+        const encoder = new TextEncoder();
+        assert(TextEncoder.length === 0 && TextDecoder.length === 0);
+        assert(TextDecoder.prototype.decode.length === 0);
+        assert(TextEncoder.prototype.encode.length === 0 && TextEncoder.prototype.encodeInto.length === 2);
+        assert(Object.prototype.toString.call(encoder) === '[object TextEncoder]');
+        assert(Object.getOwnPropertyDescriptor(TextEncoder.prototype,'encoding').enumerable);
+        assert(Object.getOwnPropertyDescriptor(TextEncoder.prototype,'encode').enumerable);
+        assert(fails(()=>TextEncoder.prototype.encode.call({},'a')));
+        assert(fails(()=>Object.getOwnPropertyDescriptor(TextEncoder.prototype,'encoding').get.call({})));
+        assert(fails(()=>encoder.encode(Symbol('input'))));
+        assert(fails(()=>new TextDecoder(Symbol('label'))));
+        const empty = encoder.encodeInto('abc', new Uint8Array(0));
+        assert(empty.read === 0 && empty.written === 0);
+        const detached = new Uint8Array(4);
+        structuredClone(detached.buffer,{transfer:[detached.buffer]});
+        const result = encoder.encodeInto('',detached);
+        assert(result.read === 0 && result.written === 0);
+        const fake = Object.create(Uint8Array.prototype);
+        assert(fails(()=>encoder.encodeInto('a',fake)));
+        console.log('encoding-idl-ok');
+    "#);
+    assert_eq!(out.lines(), ["encoding-idl-ok"]);
+}
+
+#[test]
+fn web_encoding_bom_options_order_and_brand_share_native_stream_state() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(&mut rt, r#"
+        const assert = (ok) => { if (!ok) throw new Error('decoder contract'); };
+        const seen = [];
+        const decoder = new TextDecoder('utf-8', {
+            get fatal(){seen.push('fatal');return false},
+            get ignoreBOM(){seen.push('ignoreBOM');return false}
+        });
+        assert(seen.join(',') === 'fatal,ignoreBOM');
+        assert(decoder.decode(Uint8Array.of(0xef),{stream:true}) === '');
+        assert(decoder.decode(Uint8Array.of(0xbb,0xbf,65)) === 'A');
+        assert(decoder.decode(Uint8Array.of(0xef,0xbb,0xbf,66)) === 'B');
+        assert(new TextDecoder('utf-8',{ignoreBOM:true}).decode(Uint8Array.of(0xef,0xbb,0xbf)) === '\ufeff');
+        const le = new TextDecoder('utf-16le');
+        assert(le.decode(Uint8Array.of(0xff),{stream:true}) === '');
+        assert(le.decode(Uint8Array.of(0xfe,65,0)) === 'A');
+        assert(new TextDecoder('windows-1252',{fatal:true}).decode(Uint8Array.of(0x80,0x81)) === '\u20ac\u0081');
+        let invalid = false;
+        try { new TextDecoder('replacement',{get fatal(){throw new Error('must not read')}}); }
+        catch(e){invalid = e instanceof RangeError;}
+        assert(invalid);
+        let branded = false;
+        try { TextDecoder.prototype.decode.call({},new Uint8Array()); }
+        catch(e){branded=e instanceof TypeError;}
+        assert(branded);
+        assert(new TextDecoder('utf-8').decode(Uint8Array.of(0xff)) === '\ufffd');
+        const input = Uint8Array.of(90,65,66,90).subarray(1,3);
+        for (const name of ['buffer','byteOffset','byteLength']) {
+            Object.defineProperty(input,name,{get(){throw new Error('must use intrinsic view range')}});
+        }
+        assert(decoder.decode(input) === 'AB');
+        const data = new DataView(Uint8Array.of(90,67,90).buffer,1,1);
+        for (const name of ['buffer','byteOffset','byteLength']) {
+            Object.defineProperty(data,name,{get(){throw new Error('must use intrinsic DataView range')}});
+        }
+        assert(decoder.decode(data) === 'C');
+        const detaching = Uint8Array.of(65);
+        assert(decoder.decode(detaching,{get stream(){
+            structuredClone(detaching.buffer,{transfer:[detaching.buffer]});return false;
+        }}) === '');
+        const nativeDecode = __lumenEncoding.Decoder.prototype.decode;
+        const nativeLabel = __lumenEncoding.label;
+        try {
+            __lumenEncoding.Decoder.prototype.decode = () => 'corrupt';
+            __lumenEncoding.label = () => 'corrupt';
+            assert(new TextDecoder('utf-8').decode(Uint8Array.of(65)) === 'A');
+        } finally {
+            __lumenEncoding.Decoder.prototype.decode = nativeDecode;
+            __lumenEncoding.label = nativeLabel;
+        }
+        console.log('bom-and-brand-ok');
+    "#);
+    assert_eq!(out.lines(), ["bom-and-brand-ok"]);
 }
 
 #[test]
@@ -1973,6 +2416,32 @@ fn worker_message_round_trip_and_structured_clone() {
 }
 
 #[test]
+fn browser_worker_installs_shared_css_typed_om_interfaces() {
+    let lines = worker_drive(
+        &[(
+            "typed-om.mjs",
+            r#"
+            const parsed = CSSNumericValue.parse("calc(2 * 3s)");
+            const inverse = new CSSMathInvert(CSS.px(2));
+            postMessage([
+                typeof CSSNumericValue,
+                parsed instanceof CSSMathProduct,
+                parsed.toString(),
+                parsed.type().time,
+                inverse.type().length,
+            ].join("|"));
+            close();
+            "#,
+        )],
+        r#"
+        const worker = new Worker("{DIR}/typed-om.mjs", { type: "module" });
+        worker.onmessage = event => console.log(event.data);
+        "#,
+    );
+    assert_eq!(lines, ["function|true|calc(2 * 3s)|1|-1"]);
+}
+
+#[test]
 fn worker_bidirectional_conversation() {
     // Several messages each way, in order; the worker closes after the third.
     let lines = worker_drive(
@@ -2435,8 +2904,24 @@ fn node_require_resolution() {
     assert_eq!(out.lines(), ["42 widget-ok", "true", "true"]);
 }
 
+/// Runs `body` on a thread with the stack real engine hosts use: `run_main` nests the CommonJS
+/// loader, `require` and the lazy node glue's first evaluation, which overflows a default 2 MiB
+/// debug-build test thread.
+fn on_engine_stack(body: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn node_run_main_dirname_and_module() {
+    on_engine_stack(node_run_main_dirname_and_module_body);
+}
+
+fn node_run_main_dirname_and_module_body() {
     use std::fs;
     let dir = TempDir::new("main");
     let entry = dir.0.join("prog.js");
@@ -2453,7 +2938,7 @@ fn node_run_main_dirname_and_module() {
     .unwrap();
     let (mut rt, out, _err) = test_runtime();
     rt.run_main(&entry.to_string_lossy()).expect("runs");
-    assert_eq!(out.lines(), ["true", "true", "true"]);
+    assert_eq!(out.lines(), ["true", "true", "true"], "stderr: {:?}", _err.lines());
 }
 
 #[test]

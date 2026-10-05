@@ -42,7 +42,7 @@ impl RealmHandle {
         self.key
     }
 
-    fn belongs_to(&self, interp: &Interp) -> bool {
+    pub(crate) fn belongs_to(&self, interp: &Interp) -> bool {
         interp
             .host_state
             .get::<HostRealmOwner>()
@@ -530,6 +530,42 @@ impl Interp {
         RealmHandle { owner, global, key }
     }
 
+    /// Recover a registered realm handle from an internal global-object identity. Hosts use
+    /// this for asynchronous records, such as Promise rejection notifications, whose originating
+    /// realm is no longer the currently active interpreter realm.
+    pub fn host_realm_for_key(&mut self, key: usize) -> Option<RealmHandle> {
+        let active_key = Gc::as_ptr(&self.global) as usize;
+        if active_key == key {
+            return Some(self.current_host_realm());
+        }
+        let global = Value::Obj(self.realms.get(&key)?.global.clone());
+        Some(RealmHandle {
+            owner: owner_token(self),
+            global,
+            key,
+        })
+    }
+
+    /// Resolve a callback's ECMAScript realm using GetFunctionRealm, including
+    /// bound functions and callable proxies. Revoked proxies throw their native
+    /// TypeError. Retired realms remain available while their functions are live.
+    pub fn function_host_realm(
+        &mut self,
+        function: &crate::embed::JsFunction,
+    ) -> Result<RealmHandle, Value> {
+        let object = function.value().as_obj().ok_or_else(|| {
+            self.make_error("TypeError", "callback must be a function object")
+        })?;
+        match self.get_function_realm_global(object)
+            .map_err(crate::interpreter::abrupt_value)?
+        {
+            None => Ok(self.current_host_realm()),
+            Some(key) => self.host_realm_for_key(key).ok_or_else(|| {
+                self.make_error("Error", "callback realm is no longer available")
+            }),
+        }
+    }
+
     /// Create and register a fresh native-host realm in this interpreter.
     ///
     /// This uses the same realm initialization and intrinsic installation path as Lumen's
@@ -634,6 +670,131 @@ impl Interp {
         let result = callback(self);
         drop(restore);
         Ok(result)
+    }
+
+    /// Temporarily run host bootstrap work in the interpreter tier and restore the prior tier on
+    /// return or unwinding. Runtime glue is short-lived setup code; compiling each realm's copy
+    /// would repeat work without helping the long-lived installed functions.
+    #[doc(hidden)]
+    pub fn with_host_bootstrap_tier<R>(&mut self, callback: impl FnOnce(&mut Interp) -> R) -> R {
+        let previous = std::mem::replace(&mut self.tier, crate::bytecode::Tier::Interp);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(self)));
+        self.tier = previous;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Parse and execute a classic host bootstrap Script in a registered realm. Script lexical
+    /// declarations persist in that realm, and this method never runs a microtask checkpoint.
+    pub fn eval_value_in_host_realm(
+        &mut self,
+        realm: &RealmHandle,
+        source: &str,
+        strict: bool,
+    ) -> Result<Result<Value, Value>, HostRealmEvalError> {
+        self.eval_value_in_host_realm_named(realm, source, strict, None)
+    }
+
+    /// Parse and execute a classic Script in a registered host realm, naming it for stack traces.
+    /// Script lexical declarations persist in that realm, and this method never runs a microtask
+    /// checkpoint.
+    pub fn eval_value_in_host_realm_named(
+        &mut self,
+        realm: &RealmHandle,
+        source: &str,
+        strict: bool,
+        source_name: Option<&str>,
+    ) -> Result<Result<Value, Value>, HostRealmEvalError> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(HostRealmEvalError::Parse(crate::ParseError {
+                message: "dynamic code is unavailable in native execution".into(),
+                line: 0,
+                at_eof: false,
+            }));
+        }
+        let body = crate::parser::parse_script(source, strict).map_err(|error| {
+            HostRealmEvalError::Parse(crate::ParseError {
+                message: error.message,
+                line: error.line,
+                at_eof: error.at_eof,
+            })
+        })?;
+        self.run_host_script_body(realm, body, strict, source_name)
+    }
+
+    /// Decode and execute a classic host bootstrap Script snapshot without draining jobs. The
+    /// shared source remains alive for lazily decoded function bodies in every realm using it.
+    pub fn eval_snapshot_shared_source_in_host_realm(
+        &mut self,
+        realm: &RealmHandle,
+        bytes: &[u8],
+        source: Rc<str>,
+        strict: bool,
+    ) -> Result<Result<Value, Value>, HostRealmEvalError> {
+        if crate::native_ops::dynamic_code_disabled() {
+            return Err(HostRealmEvalError::Parse(crate::ParseError {
+                message: "source snapshots are unavailable in the Aot profile".into(),
+                line: 0,
+                at_eof: false,
+            }));
+        }
+        let body = crate::snapshot::decode_shared(bytes, source).map_err(|message| {
+            HostRealmEvalError::Parse(crate::ParseError {
+                message,
+                line: 0,
+                at_eof: false,
+            })
+        })?;
+        self.run_host_script_body(realm, body, strict, None)
+    }
+
+    fn run_host_script_body(
+        &mut self,
+        realm: &RealmHandle,
+        body: Vec<crate::ast::Stmt>,
+        strict: bool,
+        source_name: Option<&str>,
+    ) -> Result<Result<Value, Value>, HostRealmEvalError> {
+        let directive_strict = matches!(
+            body.first(),
+            Some(crate::ast::Stmt::Expr(crate::ast::Expr::Str(value))) if &**value == "use strict"
+        );
+        self.with_host_realm(realm, |ctx| {
+            let checkpoint = HostScriptExecutionCheckpoint::capture(ctx);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut scope = HostScriptStrictScope::enter(ctx, strict || directive_strict);
+                scope
+                    .ctx()
+                    .run_program_named(&body, source_name)
+                    .map(|value| match value {
+                        Value::Empty => Value::Undefined,
+                        value => value,
+                    })
+            }));
+            match result {
+                Ok(result) => result,
+                Err(payload) => {
+                    checkpoint.restore(ctx);
+                    std::panic::resume_unwind(payload)
+                }
+            }
+        })
+        .map_err(HostRealmEvalError::Scope)
+    }
+
+    /// Load statically linked native extension glue in a target host realm.
+    #[cfg(feature = "aot-native")]
+    #[doc(hidden)]
+    pub fn load_native_glue_value_in_host_realm(
+        &mut self,
+        realm: &RealmHandle,
+        bytes: &'static [u8],
+    ) -> Result<Result<Value, String>, HostRealmScopeError> {
+        self.with_host_realm(realm, |ctx| {
+            crate::native_aot::load_static_glue_engine(ctx, bytes)
+        })
     }
 
     /// Create a native stable-identity WindowProxy wrapping `target`.
@@ -853,6 +1014,116 @@ impl Interp {
     }
 }
 
+/// Restores a realm's prior strict-mode state if host-script evaluation returns or unwinds.
+/// Keeping the exclusive interpreter borrow inside this safe guard avoids raw pointers while
+/// ensuring a native panic cannot leak script strictness into later work in the same realm.
+struct HostScriptStrictScope<'a> {
+    ctx: &'a mut Interp,
+    previous: bool,
+}
+
+impl<'a> HostScriptStrictScope<'a> {
+    fn enter(ctx: &'a mut Interp, strict: bool) -> Self {
+        let previous = ctx.strict;
+        ctx.strict = strict;
+        Self { ctx, previous }
+    }
+
+    fn ctx(&mut self) -> &mut Interp {
+        self.ctx
+    }
+}
+
+impl Drop for HostScriptStrictScope<'_> {
+    fn drop(&mut self) {
+        self.ctx.strict = self.previous;
+    }
+}
+
+/// Stack-like interpreter state to roll back if a native callback panics through a host Script.
+/// JavaScript throws remain ordinary completions and are not rolled back.
+struct HostScriptExecutionCheckpoint {
+    depth: u32,
+    native_top: usize,
+    cur_site: u32,
+    constructing: bool,
+    super_call_ok: bool,
+    new_target: Value,
+    pending_new_target: Value,
+    pending_tail: Option<Box<(Value, Value, Vec<Value>)>>,
+    fn_frames: usize,
+    jit_frames: usize,
+    using_scopes: usize,
+    native_super_overrides: usize,
+    ctor_caller_realm: Option<RealmState>,
+    pending_fn_name: Option<String>,
+    short_circuit: bool,
+    yield_raw_result: bool,
+    in_async_gen_body: bool,
+    in_field_init_code: bool,
+    tco_ok: bool,
+    decorator_initializers: usize,
+}
+
+impl HostScriptExecutionCheckpoint {
+    fn capture(ctx: &Interp) -> Self {
+        let pending_tail = ctx
+            .pending_tail
+            .as_ref()
+            .map(|tail| Box::new((tail.0.clone(), tail.1.clone(), tail.2.clone())));
+        Self {
+            depth: ctx.depth,
+            native_top: ctx.native_top,
+            cur_site: ctx.cur_site,
+            constructing: ctx.constructing,
+            super_call_ok: ctx.super_call_ok,
+            new_target: ctx.new_target.clone(),
+            pending_new_target: ctx.pending_new_target.clone(),
+            pending_tail,
+            fn_frames: ctx.fn_frames.len(),
+            jit_frames: ctx.jit_frames,
+            using_scopes: ctx.using_stack.len(),
+            native_super_overrides: ctx.native_super_return_overrides.len(),
+            ctor_caller_realm: ctx
+                .ctor_caller_realm
+                .as_ref()
+                .map(RealmState::snapshot_clone),
+            pending_fn_name: ctx.pending_fn_name.clone(),
+            short_circuit: ctx.short_circuit,
+            yield_raw_result: ctx.yield_raw_result,
+            in_async_gen_body: ctx.in_async_gen_body,
+            in_field_init_code: ctx.in_field_init_code,
+            tco_ok: ctx.tco_ok,
+            decorator_initializers: ctx.decorator_initializers.len(),
+        }
+    }
+
+    fn restore(self, ctx: &mut Interp) {
+        ctx.depth = self.depth;
+        ctx.native_top = self.native_top;
+        ctx.cur_site = self.cur_site;
+        ctx.constructing = self.constructing;
+        ctx.super_call_ok = self.super_call_ok;
+        ctx.new_target = self.new_target;
+        ctx.pending_new_target = self.pending_new_target;
+        ctx.pending_tail = self.pending_tail;
+        ctx.fn_frames.truncate(self.fn_frames);
+        ctx.jit_frames = self.jit_frames;
+        ctx.using_stack.truncate(self.using_scopes);
+        ctx.native_super_return_overrides
+            .truncate(self.native_super_overrides);
+        ctx.ctor_caller_realm = self.ctor_caller_realm;
+        ctx.pending_fn_name = self.pending_fn_name;
+        ctx.short_circuit = self.short_circuit;
+        ctx.yield_raw_result = self.yield_raw_result;
+        ctx.in_async_gen_body = self.in_async_gen_body;
+        ctx.in_field_init_code = self.in_field_init_code;
+        ctx.tco_ok = self.tco_ok;
+        ctx.decorator_initializers
+            .truncate(self.decorator_initializers);
+    }
+}
+
 impl WindowProxyRegistry {
     pub(crate) fn sweep(&mut self, key: usize) {
         self.entries.remove(&key);
@@ -1006,6 +1277,17 @@ mod tests {
         _args: &[Value],
     ) -> Result<Value, Value> {
         Ok(ctx.invocation_host_realm().global())
+    }
+
+    fn panic_during_host_script(
+        ctx: &mut Interp,
+        _this: Value,
+        _args: &[Value],
+    ) -> Result<Value, Value> {
+        // Simulate a native callback that temporarily changes interpreter execution state and
+        // then unwinds. The host-script scope must restore its caller's strictness.
+        ctx.strict = false;
+        panic!("host script native panic sentinel");
     }
 
     #[lumen_bind::class(
@@ -1743,6 +2025,26 @@ mod tests {
     }
 
     #[test]
+    fn callback_host_realm_uses_get_function_realm_and_keeps_retired_functions_usable() {
+        let mut engine = Engine::new();
+        let child = engine.ctx().create_host_realm();
+        let callback = engine.eval_value_in_host_realm(&child,
+            "new Proxy((() => 42).bind(null), {})", false).unwrap().ok().expect("callback test script threw");
+        let callback = crate::embed::JsFunction::from_value(callback).unwrap();
+        assert!(engine.ctx().function_host_realm(&callback).ok().expect("callback realm unavailable").same_realm(&child));
+        engine.ctx().dispose_host_realm(&child).unwrap();
+        engine.ctx().collect_garbage();
+        let owner = engine.ctx().function_host_realm(&callback).ok().expect("callback realm unavailable");
+        assert!(owner.same_realm(&child));
+        assert!(matches!(callback.call(engine.ctx(), Value::Undefined, &[]).unwrap(), Value::Num(42.0)));
+        let revoked = engine.eval_value_in_host_realm(&child,
+            "(() => {const pair=Proxy.revocable(()=>0,{});pair.revoke();return pair.proxy})()",
+            false).unwrap().ok().expect("callback test script threw");
+        let revoked = crate::embed::JsFunction::from_value(revoked).unwrap();
+        assert!(engine.ctx().function_host_realm(&revoked).is_err());
+    }
+
+    #[test]
     fn public_invocation_host_realm_survives_native_function_realm_entry() {
         let mut engine = Engine::new();
         let ctx = engine.ctx();
@@ -1845,6 +2147,68 @@ mod tests {
             .with_host_realm(&child, |ctx| ctx.run_program_parsed(&second))
             .expect("enter child realm for second host script");
         assert!(matches!(second_result, Ok(Value::Bool(true))));
+    }
+
+    #[test]
+    fn host_script_panic_restores_strictness_and_active_realm() {
+        let mut engine = Engine::new();
+        let ctx = engine.ctx();
+        let parent_global = ctx.global_object();
+        let parent_id = object_id(ctx, &parent_global);
+        ctx.strict = true;
+
+        let child = ctx.create_host_realm();
+        ctx.with_host_realm(&child, |ctx| {
+            let Value::Obj(global) = ctx.global_object() else {
+                panic!("child realm global is an object");
+            };
+            ctx.def_method(&global, "panicHostScript", 0, panic_during_host_script);
+        })
+        .expect("enter child realm to install test native");
+        assert!(ctx.strict, "direct host setup preserves caller strictness");
+        let depth_before = ctx.depth;
+        let native_top_before = ctx.native_top;
+        let site_before = ctx.cur_site;
+        let fn_frames_before = ctx.fn_frames.len();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = ctx.eval_value_in_host_realm(&child, "'use strict'; panicHostScript()", false);
+        }));
+        assert!(
+            panic.is_err(),
+            "native callback should unwind through script eval"
+        );
+        assert!(ctx.strict, "parent strictness should survive child unwind");
+        assert_eq!(object_id(ctx, &ctx.global_object()), parent_id);
+        assert_eq!(ctx.depth, depth_before, "call depth should be restored");
+        assert_eq!(
+            ctx.native_top, native_top_before,
+            "native frame should be restored"
+        );
+        assert_eq!(ctx.cur_site, site_before, "call site should be restored");
+        assert_eq!(
+            ctx.fn_frames.len(),
+            fn_frames_before,
+            "script frames should be restored"
+        );
+        let _trace_probe = ctx.make_error("Error", "stack after host panic");
+
+        let child_eval = match ctx.eval_value_in_host_realm(
+            &child,
+            "var afterHostPanic = 23; this === globalThis && afterHostPanic === 23",
+            false,
+        ) {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => panic!("child script executes after panic"),
+            Err(error) => panic!("child script parses after panic: {error}"),
+        };
+        assert!(matches!(child_eval, Value::Bool(true)));
+        assert!(ctx.strict, "child execution must restore parent strictness");
+        assert_eq!(object_id(ctx, &ctx.global_object()), parent_id);
+        let parent_isolated = ctx
+            .eval_in_realm(&parent_global, "typeof afterHostPanic === 'undefined'")
+            .unwrap_or_else(|_| panic!("parent global check executes"));
+        assert!(matches!(parent_isolated, Value::Bool(true)));
     }
 
     #[test]

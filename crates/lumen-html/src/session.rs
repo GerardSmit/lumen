@@ -1,9 +1,9 @@
 //! Retained document paint state. Scale-only changes replay the same CSS display list.
 use crate::{
-    Document, MutationKind, NodeId, NodeKind,
     css::{self, Style, StyleIndex},
     layout::{self, ImageResolver, LayoutError},
-    paint::{Affine, DisplayList, ImageData, Rect, TextShaper},
+    paint::{Affine, DisplayList, ImageData, Rect, Rgba, TextShaper},
+    Document, MutationKind, NodeId, NodeKind,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::cell::RefCell;
@@ -119,57 +119,45 @@ fn slot_assignment_host(document: &Document, target: NodeId, attribute: &str) ->
     }
 }
 
-fn transformed_bounds(rect: Rect, transforms: impl Iterator<Item = Affine>) -> Option<Rect> {
-    if !rect.is_valid() {
-        return None;
-    }
-    let mut corners = [
-        (rect.x, rect.y),
-        (rect.x + rect.width, rect.y),
-        (rect.x, rect.y + rect.height),
-        (rect.x + rect.width, rect.y + rect.height),
-    ];
-    for transform in transforms {
-        for point in &mut corners {
-            *point = transform.apply(point.0, point.1);
-        }
-    }
-    let left = corners
-        .iter()
-        .map(|point| point.0)
-        .fold(f32::INFINITY, f32::min);
-    let top = corners
-        .iter()
-        .map(|point| point.1)
-        .fold(f32::INFINITY, f32::min);
-    let right = corners
-        .iter()
-        .map(|point| point.0)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let bottom = corners
-        .iter()
-        .map(|point| point.1)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let bounds = Rect {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
+fn changed_declarations_paint_only(
+    previous: &[(String, String)],
+    next: &[(String, String)],
+) -> bool {
+    let differs = |from: &[(String, String)], to: &[(String, String)]| {
+        from.iter()
+            .filter(|(name, value)| !to.iter().any(|(n, v)| n == name && v == value))
+            .all(|(name, _)| css::paint_only_property(name))
     };
-    bounds.is_valid().then_some(bounds)
+    differs(previous, next) && differs(next, previous)
+}
+
+pub type AnimationStyleInput = (NodeId, Option<NodeId>, [Option<Arc<str>>; 9]);
+
+/// Immutable CSS animation inputs, shared across rendering opportunities.
+pub struct AnimationSnapshot {
+    pub generation: u64,
+    pub nodes: Vec<AnimationStyleInput>,
+    pub keyframes: Vec<css::KeyframesRuleText>,
+    document_version: u64,
+    environment: css::MediaEnvironment,
 }
 
 pub struct RenderSession {
     document: Document,
     rules: Option<StyleIndex>,
     font_face_rules: Vec<css::FontFaceRule>,
+    font_face_generation: u64,
     font_face_descriptor_overrides: Vec<(css::FontFaceIdentity, css::FontFaceDescriptors)>,
     rules_version: u64,
     cached: Option<CachedFrame>,
     frame_id: u64,
     font_generation: u64,
+    validity_generation: u64,
+    interaction_generation: u64,
+    auto_directionality_scan: Option<(u64, bool)>,
     node_bitmaps: Vec<(NodeId, Arc<ImageData>)>,
     paint_revision: u64,
+    canvas_background: Option<Rgba>,
     scrolls: Vec<layout::ScrollOffset>,
     adopted_stylesheets: Vec<(Option<NodeId>, Vec<String>)>,
     linked_stylesheets: Vec<(NodeId, String, String)>,
@@ -181,6 +169,26 @@ pub struct RenderSession {
     style_version: u64,
     style_environment: Option<css::MediaEnvironment>,
     presentation_root: Option<NodeId>,
+    animation_snapshot: Option<Arc<AnimationSnapshot>>,
+    animation_generation: u64,
+    animation_epoch: u64,
+    pending_animation_nodes: Vec<NodeId>,
+    pending_animation_full: bool,
+    rules_generation: u64,
+    read_style_cache: css::StyleCache,
+    read_style_key: Option<ReadStyleKey>,
+}
+
+/// Inputs that validate cached live computed-style reads; any difference
+/// discards the read cache.
+#[derive(Clone, Copy, PartialEq)]
+struct ReadStyleKey {
+    document_version: u64,
+    rules_generation: u64,
+    validity_generation: u64,
+    interaction_generation: u64,
+    animation_epoch: u64,
+    environment: css::MediaEnvironment,
 }
 
 /// One retained overflow clip that applies to a node. `transforms` maps the
@@ -196,17 +204,23 @@ pub struct RetainedOverflowClip {
 
 impl RenderSession {
     pub fn new(document: Document) -> Self {
+        let interaction_generation = document.interaction_generation();
         Self {
             document,
             rules: None,
             font_face_rules: Vec::new(),
+            font_face_generation: 0,
             font_face_descriptor_overrides: Vec::new(),
             rules_version: 0,
             cached: None,
             frame_id: 0,
             font_generation: 0,
+            validity_generation: 0,
+            interaction_generation,
+            auto_directionality_scan: None,
             node_bitmaps: Vec::new(),
             paint_revision: 0,
+            canvas_background: Some(layout::DEFAULT_CANVAS_BACKGROUND),
             scrolls: Vec::new(),
             adopted_stylesheets: Vec::new(),
             linked_stylesheets: Vec::new(),
@@ -218,6 +232,14 @@ impl RenderSession {
             style_version: 0,
             style_environment: None,
             presentation_root: None,
+            animation_snapshot: None,
+            animation_generation: 0,
+            animation_epoch: 0,
+            pending_animation_nodes: Vec::new(),
+            pending_animation_full: false,
+            rules_generation: 0,
+            read_style_cache: css::StyleCache::default(),
+            read_style_key: None,
         }
     }
     /// Changes whenever the cached display list is rebuilt or invalidated.
@@ -227,6 +249,14 @@ impl RenderSession {
     /// Host invalidation includes paint changes that do not mutate the DOM.
     pub fn paint_revision(&self) -> u64 {
         self.paint_revision
+    }
+
+    /// Choose the backing canvas color; image documents use `None` for transparency.
+    pub fn set_canvas_background(&mut self, background: Option<Rgba>) {
+        if self.canvas_background != background {
+            self.canvas_background = background;
+            self.invalidate_paint();
+        }
     }
 
     pub fn set_node_bitmap(
@@ -267,6 +297,45 @@ impl RenderSession {
         self.layout_cache.clear();
         self.paint_revision = self.paint_revision.wrapping_add(1);
     }
+
+    fn has_auto_directionality_controls(&mut self) -> bool {
+        let document_version = self.document.version();
+        if let Some((version, has_controls)) = self.auto_directionality_scan {
+            if version == document_version {
+                return has_controls;
+            }
+        }
+        let has_controls = crate::directionality::has_auto_directionality_controls(&self.document);
+        self.auto_directionality_scan = Some((document_version, has_controls));
+        has_controls
+    }
+
+    /// Refresh retained style and paint when sparse host form or interaction
+    /// state changes. Generation checks are constant-time and store no values.
+    pub fn synchronize_form_state(&mut self) {
+        let validity_generation = self.document.validity_generation();
+        let interaction_generation = self.document.interaction_generation();
+        let validity_changed = validity_generation != self.validity_generation;
+        let interaction_changed = interaction_generation != self.interaction_generation;
+        if !validity_changed && !interaction_changed {
+            return;
+        }
+        self.validity_generation = validity_generation;
+        self.interaction_generation = interaction_generation;
+        let has_selector_dependencies = self
+            .rules
+            .as_ref()
+            .is_some_and(StyleIndex::has_validity_data);
+        if !has_selector_dependencies
+            && !(validity_changed && self.has_auto_directionality_controls())
+        {
+            return;
+        }
+        self.style_cache.borrow_mut().clear();
+        self.animation_snapshot = None;
+        self.invalidate_paint();
+        self.frame_id = self.frame_id.wrapping_add(1);
+    }
     pub fn style_cache_stats(&self) -> css::StyleCacheStats {
         self.style_cache.borrow().stats()
     }
@@ -289,6 +358,14 @@ impl RenderSession {
     pub fn font_faces(&mut self) -> Result<Vec<css::FontFaceRule>, LayoutError> {
         self.refresh_rules()?;
         Ok(self.font_face_rules.clone())
+    }
+
+    /// Counter that changes whenever the effective font-face rule list or any
+    /// face descriptor changes; an unchanged value means `font_faces` would
+    /// return an identical list for the same media environment.
+    pub fn font_face_generation(&mut self) -> Result<u64, LayoutError> {
+        self.refresh_rules()?;
+        Ok(self.font_face_generation)
     }
 
     /// Renderer capability gaps in the live SVG tree and effective stylesheet
@@ -348,6 +425,7 @@ impl RenderSession {
                 .push((identity.clone(), descriptors.clone()));
         }
         self.font_face_rules[face_index].descriptors = descriptors;
+        self.font_face_generation = self.font_face_generation.wrapping_add(1);
         self.invalidate_fonts();
         Ok(true)
     }
@@ -432,6 +510,94 @@ impl RenderSession {
                 layout::StylesheetIdentity::Inline(_) => true,
             })
             .map(|source| &source.source)
+    }
+
+    /// Loaded child sheet for one `@import` URL, if that import succeeded.
+    pub fn imported_stylesheet_source(&self, node: NodeId, href: &str) -> Option<String> {
+        let source = self.stylesheet_source(node)?;
+        source
+            .imports
+            .iter()
+            .find(|import| import.rule.url.as_ref() == href)
+            .and_then(|import| import.source.as_deref())
+            .map(|source| String::from(source.text.as_ref()))
+    }
+
+    pub fn imported_child_stylesheet(
+        &self,
+        node: NodeId,
+        path: &[usize],
+        href: &str,
+    ) -> Option<(usize, String, String)> {
+        let mut source = self.stylesheet_source(node)?;
+        for &index in path {
+            source = source.imports.get(index)?.source.as_deref()?;
+        }
+        source
+            .imports
+            .iter()
+            .enumerate()
+            .find(|(_, import)| import.rule.url.as_ref() == href)
+            .and_then(|(index, import)| {
+                import.source.as_deref().map(|source| {
+                    (
+                        index,
+                        String::from(source.text.as_ref()),
+                        String::from(source.url.as_ref()),
+                    )
+                })
+            })
+    }
+
+    pub fn imported_stylesheet_text(&self, node: NodeId, path: &[usize]) -> Option<String> {
+        let mut source = self.stylesheet_source(node)?;
+        for &index in path {
+            source = source.imports.get(index)?.source.as_deref()?;
+        }
+        Some(String::from(source.text.as_ref()))
+    }
+
+    pub fn replace_imported_stylesheet_text(
+        &mut self,
+        node: NodeId,
+        path: &[usize],
+        text: &str,
+    ) -> Result<(), LayoutError> {
+        let previous = self.stylesheet_sources.clone();
+        let loaded = self
+            .stylesheet_sources
+            .iter_mut()
+            .find(|source| source.owner == node)
+            .ok_or(LayoutError::InvalidTree)?;
+        let mut child = &mut loaded.source;
+        for &index in path {
+            child = child
+                .imports
+                .get_mut(index)
+                .and_then(|import| import.source.as_deref_mut())
+                .ok_or(LayoutError::InvalidTree)?;
+        }
+        child.text = Arc::from(text);
+        if let Some(loaded) = self
+            .stylesheet_sources
+            .iter()
+            .find(|source| source.owner == node)
+        {
+            if let Err(error) = css::parse_graph(&loaded.source, self.media_environment()) {
+                self.stylesheet_sources = previous;
+                return Err(LayoutError::Css(error));
+            }
+        }
+        self.rules = None;
+        if let Err(error) = self.refresh_rules() {
+            self.stylesheet_sources = previous;
+            self.rules = None;
+            let _ = self.refresh_rules();
+            return Err(error);
+        }
+        self.invalidate_paint();
+        self.frame_id = self.frame_id.wrapping_add(1);
+        Ok(())
     }
 
     /// Selects a connected element to render in the viewport's presentation
@@ -628,49 +794,105 @@ impl RenderSession {
         if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
             return Err(LayoutError::InvalidTree);
         }
-        self.refresh_rules()?;
-        let Some(position) = self
+        self.refresh_rules_only()?;
+        let position = self
             .animated_styles
             .iter()
-            .position(|(target, _)| *target == node)
-        else {
-            if declarations.is_empty() {
+            .position(|(target, _)| *target == node);
+        let paint_only = {
+            let previous: &[(String, String)] =
+                position.map_or(&[][..], |index| self.animated_styles[index].1.as_slice());
+            if previous == declarations.as_slice() {
                 return Ok(());
             }
-            self.animated_styles.push((node, declarations.clone()));
-            self.rules
-                .as_mut()
-                .expect("stylesheets initialized")
-                .set_animation_declarations(node, &declarations)
-                .map_err(LayoutError::Css)?;
-            self.style_cache.borrow_mut().clear();
-            self.invalidate_paint();
-            self.frame_id += 1;
-            return Ok(());
+            changed_declarations_paint_only(previous, &declarations)
         };
-        if self.animated_styles[position].1 == declarations {
-            return Ok(());
+        match position {
+            Some(index) => self.animated_styles[index].1 = declarations.clone(),
+            None => self.animated_styles.push((node, declarations.clone())),
         }
-        self.animated_styles[position].1 = declarations.clone();
         self.rules
             .as_mut()
             .expect("stylesheets initialized")
             .set_animation_declarations(node, &declarations)
             .map_err(LayoutError::Css)?;
-        self.style_cache.borrow_mut().clear();
-        self.invalidate_paint();
+        self.animation_epoch = self.animation_epoch.wrapping_add(1);
+        if paint_only {
+            if !self.pending_animation_full && self.pending_animation_nodes.last() != Some(&node) {
+                self.pending_animation_nodes.push(node);
+            }
+        } else {
+            self.pending_animation_full = true;
+            self.pending_animation_nodes.clear();
+        }
+        self.cached = None;
         self.frame_id += 1;
         Ok(())
     }
 
+    /// Apply animation declaration changes accumulated since the last
+    /// rendering opportunity as one invalidation of the widest class seen.
+    fn flush_animation_changes(&mut self) {
+        if self.pending_animation_full {
+            self.pending_animation_full = false;
+            self.style_cache.borrow_mut().clear();
+            self.invalidate_paint();
+            return;
+        }
+        if self.pending_animation_nodes.is_empty() {
+            return;
+        }
+        let mut nodes = core::mem::take(&mut self.pending_animation_nodes);
+        nodes.sort_by_key(|node| node.index());
+        nodes.dedup();
+        if nodes
+            .iter()
+            .any(|node| self.document.kind(*node).is_err())
+        {
+            self.style_cache.borrow_mut().clear();
+            self.invalidate_paint();
+            return;
+        }
+        {
+            let mut cache = self.style_cache.borrow_mut();
+            for node in &nodes {
+                cache.invalidate_node(*node);
+            }
+        }
+        self.cached = None;
+        self.layout_cache
+            .invalidate_subtree_targets(&self.document, &nodes);
+        self.paint_revision = self.paint_revision.wrapping_add(1);
+    }
+
     pub fn computed_style(&mut self, node: NodeId) -> Result<Style, LayoutError> {
+        self.synchronize_form_state();
         if !matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
             return Err(LayoutError::InvalidTree);
         }
         self.refresh_rules()?;
+        let rules = self.rules.as_ref().expect("stylesheets initialized");
+        let key = ReadStyleKey {
+            document_version: self.document.version(),
+            rules_generation: self.rules_generation,
+            validity_generation: self.validity_generation,
+            interaction_generation: self.interaction_generation,
+            animation_epoch: self.animation_epoch,
+            environment: rules.environment,
+        };
+        if self.read_style_key != Some(key) {
+            self.read_style_cache = css::StyleCache::default();
+            self.read_style_key = Some(key);
+        }
+        let cache = &mut self.read_style_cache;
         let mut ancestors = Vec::new();
         let mut current = Some(node);
+        let mut parent_style = None;
         while let Some(id) = current {
+            if let Some(style) = cache.node_style(id) {
+                parent_style = Some(style);
+                break;
+            }
             if ancestors.len() >= 512 {
                 return Err(LayoutError::DepthLimit);
             }
@@ -685,20 +907,140 @@ impl RenderSession {
                 .composed_parent(id)
                 .map_err(|_| LayoutError::InvalidTree)?;
         }
-        let mut style = Style::initial();
         for id in ancestors.into_iter().rev() {
-            style = css::compute_node(
+            let style = css::compute_node_cached(
                 &self.document,
                 id,
-                Some(&style),
-                self.rules.as_ref().expect("stylesheets initialized"),
+                parent_style.as_deref(),
+                rules,
+                cache,
             )
             .map_err(LayoutError::Css)?;
+            parent_style = Some(cache.remember_snapshot_style(&self.document, id, style));
         }
-        Ok(style)
+        parent_style
+            .map(|style| (*style).clone())
+            .ok_or(LayoutError::InvalidTree)
+    }
+
+    /// Snapshot the computed CSS animation inputs and retained keyframes for
+    /// the host animation adapter. Traversal covers document and shadow trees.
+    pub fn animation_snapshot(&mut self) -> Result<Arc<AnimationSnapshot>, LayoutError> {
+        self.synchronize_form_state();
+        self.refresh_rules()?;
+        let version = self.document.version();
+        let rules = self.rules.as_ref().expect("stylesheets initialized");
+        if let Some(snapshot) = self.animation_snapshot.as_ref().filter(|snapshot| {
+            snapshot.document_version == version && snapshot.environment == rules.environment
+        }) {
+            return Ok(snapshot.clone());
+        }
+        // This cache belongs to this immutable snapshot build. Reuse ancestor
+        // styles while walking both light and shadow trees; each node cascades
+        // at most once, using its actual composed parent for inheritance.
+        let mut cache = css::StyleCache::default();
+        let mut roots = alloc::vec![self.document.root()];
+        roots.extend(
+            self.document
+                .shadow_roots()
+                .into_iter()
+                .map(|(_, root, _)| root),
+        );
+        let mut nodes = Vec::new();
+        while let Some(node) = roots.pop() {
+            if matches!(self.document.kind(node), Ok(NodeKind::Element { .. })) {
+                let mut ancestors = Vec::new();
+                let mut current = Some(node);
+                let mut parent_style = None;
+                while let Some(id) = current {
+                    if let Some(style) = cache.node_style(id) {
+                        parent_style = Some(style);
+                        break;
+                    }
+                    if ancestors.len() >= 512 {
+                        return Err(LayoutError::DepthLimit);
+                    }
+                    ancestors.push(id);
+                    current = self
+                        .document
+                        .composed_parent(id)
+                        .map_err(|_| LayoutError::InvalidTree)?;
+                }
+                for id in ancestors.into_iter().rev() {
+                    if matches!(self.document.kind(id), Ok(NodeKind::Element { .. })) {
+                        let style = css::compute_node_cached(
+                            &self.document,
+                            id,
+                            parent_style.as_deref(),
+                            rules,
+                            &mut cache,
+                        )
+                        .map_err(LayoutError::Css)?;
+                        parent_style =
+                            Some(cache.remember_snapshot_style(&self.document, id, style));
+                    }
+                }
+                let style = parent_style.ok_or(LayoutError::InvalidTree)?;
+                let mut rendered = !matches!(style.display, css::Display::None);
+                if rendered && style.animation.iter().any(Option::is_some) {
+                    let mut ancestor = self
+                        .document
+                        .composed_parent(node)
+                        .map_err(|_| LayoutError::InvalidTree)?;
+                    while let Some(id) = ancestor {
+                        if cache
+                            .node_style(id)
+                            .is_some_and(|style| matches!(style.display, css::Display::None))
+                        {
+                            rendered = false;
+                            break;
+                        }
+                        ancestor = self
+                            .document
+                            .composed_parent(id)
+                            .map_err(|_| LayoutError::InvalidTree)?;
+                    }
+                }
+                if rendered && style.animation.iter().any(Option::is_some) {
+                    let root = self
+                        .document
+                        .root_node(node, false)
+                        .map_err(|_| LayoutError::InvalidTree)?;
+                    let scope = (root != self.document.root()).then_some(root);
+                    nodes.push((node, scope, style.animation.clone()));
+                }
+            }
+            let mut child = self
+                .document
+                .first_child(node)
+                .map_err(|_| LayoutError::InvalidTree)?;
+            while let Some(id) = child {
+                roots.push(id);
+                child = self
+                    .document
+                    .next_sibling(id)
+                    .map_err(|_| LayoutError::InvalidTree)?;
+            }
+        }
+        self.animation_generation = self.animation_generation.wrapping_add(1);
+        let snapshot = Arc::new(AnimationSnapshot {
+            generation: self.animation_generation,
+            nodes,
+            keyframes: rules.keyframes.clone(),
+            document_version: version,
+            environment: rules.environment,
+        });
+        self.animation_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
     }
 
     fn refresh_rules(&mut self) -> Result<(), LayoutError> {
+        self.refresh_rules_only()?;
+        self.flush_animation_changes();
+        Ok(())
+    }
+
+    fn refresh_rules_only(&mut self) -> Result<(), LayoutError> {
         let version = self.document.version();
         self.animated_styles
             .retain(|(node, _)| self.document.kind(*node).is_ok());
@@ -729,6 +1071,7 @@ impl RenderSession {
                         MutationKind::Attribute(_) => in_style(&self.document, mutation.target),
                     });
             if rules_changed {
+                self.animation_snapshot = None;
                 let environment = self
                     .rules
                     .as_ref()
@@ -768,7 +1111,9 @@ impl RenderSession {
                     }
                 }
                 self.rules = Some(rules);
+                self.rules_generation = self.rules_generation.wrapping_add(1);
                 self.font_face_rules = font_faces;
+                self.font_face_generation = self.font_face_generation.wrapping_add(1);
                 self.style_cache.borrow_mut().clear();
             }
             self.rules_version = version;
@@ -776,7 +1121,10 @@ impl RenderSession {
         Ok(())
     }
     pub fn invalidate_fonts(&mut self) {
-        self.invalidate_paint();
+        self.cached = None;
+        self.style_cache.borrow_mut().clear();
+        self.layout_cache.invalidate_fonts();
+        self.paint_revision = self.paint_revision.wrapping_add(1);
         self.frame_id += 1;
     }
 
@@ -788,7 +1136,28 @@ impl RenderSession {
 
     /// Hit-test the last completed layout in CSS pixels. Mutated documents need a new frame.
     pub fn hit_test(&self, x_css: f32, y_css: f32) -> Option<NodeId> {
-        let frame = self.cached.as_ref()?;
+        let mut result = None;
+        self.for_each_hit_test(x_css, y_css, |node| {
+            result = Some(node);
+            false
+        });
+        result
+    }
+
+    /// Visit hit regions from topmost to bottommost without allocating a list.
+    /// Returning false from the visitor stops the walk. The return value says
+    /// whether the point belongs to a current completed viewport, including a
+    /// valid point with no hit regions. Fragmented elements may occur more than
+    /// once; consumers exposing element sequences resolve those identities.
+    pub fn for_each_hit_test(
+        &self,
+        x_css: f32,
+        y_css: f32,
+        mut visit: impl FnMut(NodeId) -> bool,
+    ) -> bool {
+        let Some(frame) = self.cached.as_ref() else {
+            return false;
+        };
         if frame.document_version != self.document.version()
             || !x_css.is_finite()
             || !y_css.is_finite()
@@ -797,16 +1166,14 @@ impl RenderSession {
             || x_css >= frame.width as f32
             || y_css >= frame.height as f32
         {
-            return None;
+            return false;
         }
-        frame
-            .geometry
-            .hits
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(index, _)| frame.geometry.contains_hit(*index, x_css, y_css))
-            .map(|(_, hit)| hit.node)
+        for (index, hit) in frame.geometry.hits.iter().enumerate().rev() {
+            if frame.geometry.contains_hit(index, x_css, y_css) && !visit(hit.node) {
+                break;
+            }
+        }
+        true
     }
 
     /// Return the visible border-box bounds for a node in the last completed
@@ -830,7 +1197,7 @@ impl RenderSession {
                 .iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix);
-            let Some(mut bounds) = transformed_bounds(hit.rect, transforms) else {
+            let Some(mut bounds) = layout::transformed_bounds(hit.rect, transforms) else {
                 continue;
             };
             for clip in frame
@@ -843,7 +1210,7 @@ impl RenderSession {
                     .iter()
                     .filter(|transform| transform.hits.contains(&index))
                     .map(|transform| transform.matrix);
-                let Some(clip_bounds) = transformed_bounds(clip.rect, transforms) else {
+                let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = false;
                     break;
                 };
@@ -909,7 +1276,7 @@ impl RenderSession {
                 .iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix);
-            let Some(visible_bounds) = transformed_bounds(hit.rect, transforms) else {
+            let Some(visible_bounds) = layout::transformed_bounds(hit.rect, transforms) else {
                 continue;
             };
             if visible_bounds.intersection(viewport).is_none() {
@@ -926,7 +1293,7 @@ impl RenderSession {
                     .iter()
                     .filter(|transform| transform.hits.contains(&index))
                     .map(|transform| transform.matrix);
-                let Some(clip_bounds) = transformed_bounds(clip.rect, transforms) else {
+                let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = false;
                     break;
                 };
@@ -961,27 +1328,74 @@ impl RenderSession {
     /// pixels. The values come from the last completed layout and become
     /// unavailable as soon as the document changes.
     pub fn client_rects(&self, node: NodeId) -> Vec<Rect> {
-        let Some(frame) = self.cached.as_ref().filter(|frame| {
-            frame.document_version == self.document.version() && self.document.kind(node).is_ok()
-        }) else {
-            return Vec::new();
-        };
-        let mut rects = Vec::new();
-        for (index, hit) in frame.geometry.hits.iter().enumerate() {
-            if hit.node != node || hit.virtual_generated || !hit.rect.is_valid() {
+        self.client_rect_iter(node).collect()
+    }
+
+    fn client_rect_iter(&self, node: NodeId) -> impl Iterator<Item = Rect> + '_ {
+        self.cached
+            .as_ref()
+            .filter(|frame| {
+                frame.document_version == self.document.version()
+                    && self.document.kind(node).is_ok()
+            })
+            .into_iter()
+            .flat_map(move |frame| {
+                frame
+                    .geometry
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(index, hit)| {
+                        if hit.node != node || hit.virtual_generated || !hit.rect.is_valid() {
+                            return None;
+                        }
+                        let transforms = frame
+                            .geometry
+                            .transforms
+                            .iter()
+                            .filter(|transform| transform.hits.contains(&index))
+                            .map(|transform| transform.matrix);
+                        layout::transformed_bounds(hit.rect, transforms)
+                    })
+            })
+    }
+
+    /// Union transformed rendered fragments without allocating a fragment list.
+    /// Return the first fragment when every fragment has a zero dimension;
+    /// otherwise include each fragment with at least one nonzero dimension.
+    pub fn bounding_client_rect(&self, node: NodeId) -> Option<Rect> {
+        Self::client_rect_bounds(self.client_rect_iter(node))
+    }
+
+    fn client_rect_bounds(mut rects: impl Iterator<Item = Rect>) -> Option<Rect> {
+        let first = rects.next()?;
+        let mut bounds = None;
+        let mut has_full_box = false;
+        for rect in core::iter::once(first).chain(rects) {
+            has_full_box |= rect.width != 0.0 && rect.height != 0.0;
+            if rect.width == 0.0 && rect.height == 0.0 {
                 continue;
             }
-            let transforms = frame
-                .geometry
-                .transforms
-                .iter()
-                .filter(|transform| transform.hits.contains(&index))
-                .map(|transform| transform.matrix);
-            if let Some(rect) = transformed_bounds(hit.rect, transforms) {
-                rects.push(rect);
-            }
+            bounds = Some(match bounds {
+                None => rect,
+                Some(current) => {
+                    let current: Rect = current;
+                    let x = current.x.min(rect.x);
+                    let y = current.y.min(rect.y);
+                    Rect {
+                        x,
+                        y,
+                        width: (current.x + current.width).max(rect.x + rect.width) - x,
+                        height: (current.y + current.height).max(rect.y + rect.height) - y,
+                    }
+                }
+            });
         }
-        rects
+        Some(if has_full_box {
+            bounds.unwrap_or(first)
+        } else {
+            first
+        })
     }
 
     /// Untransformed border-box bounds from the current frame. This is useful
@@ -1082,7 +1496,7 @@ impl RenderSession {
                 .iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix);
-            let Some(mut visible) = transformed_bounds(hit.rect, transforms) else {
+            let Some(mut visible) = layout::transformed_bounds(hit.rect, transforms) else {
                 continue;
             };
             for clip in frame
@@ -1095,7 +1509,7 @@ impl RenderSession {
                     .iter()
                     .filter(|transform| transform.hits.contains(&index))
                     .map(|transform| transform.matrix);
-                let Some(clip_bounds) = transformed_bounds(clip.rect, transforms) else {
+                let Some(clip_bounds) = layout::transformed_bounds(clip.rect, transforms) else {
                     visible = Rect {
                         x: visible.x,
                         y: visible.y,
@@ -1155,6 +1569,42 @@ impl RenderSession {
             .map(|extent| (extent.x, extent.y))
     }
 
+    /// The padding-box scrollport in viewport CSS pixels from the last fresh
+    /// layout. The root viewport has no owner hit; element scrollports use the
+    /// owner's retained transform chain without allocating a hit-list copy.
+    pub fn scrollport(&self, node: NodeId) -> Option<Rect> {
+        let frame = self.cached.as_ref().filter(|frame| {
+            frame.document_version == self.document.version() && self.document.kind(node).is_ok()
+        })?;
+        let port = frame
+            .geometry
+            .scroll_ports
+            .iter()
+            .find(|port| port.node == node)?;
+        let Some(owner_hit) = port.owner_hit else {
+            return port.rect.is_valid().then_some(port.rect);
+        };
+        frame.geometry.hits.get(owner_hit)?;
+        let transforms = frame
+            .geometry
+            .transforms
+            .iter()
+            .filter(|transform| transform.hits.contains(&owner_hit))
+            .map(|transform| transform.matrix);
+        layout::transformed_bounds(port.rect, transforms)
+    }
+
+    /// Whether this element is positioned against the viewport in the most
+    /// recent fresh layout. Callers walking composed ancestors can stop before
+    /// scrolling the viewport when they encounter such a fixed root.
+    pub fn is_viewport_fixed(&self, node: NodeId) -> bool {
+        self.cached.as_ref().is_some_and(|frame| {
+            frame.document_version == self.document.version()
+                && self.document.kind(node).is_ok()
+                && frame.geometry.viewport_fixed_nodes.contains(&node)
+        })
+    }
+
     /// CSS-pixel viewport of the last successful layout, when still fresh.
     pub fn viewport_size(&self) -> Option<(u32, u32)> {
         let frame = self
@@ -1203,16 +1653,22 @@ impl RenderSession {
         if !x_css.is_finite() || !y_css.is_finite() {
             return Err(LayoutError::InvalidTree);
         }
-        let Some(extent) = self.cached.as_ref().and_then(|frame| {
+        let extent = self.cached.as_ref().and_then(|frame| {
             frame
                 .geometry
                 .scroll_extents
                 .iter()
                 .find(|extent| extent.node == node)
+                .map(|extent| (extent.x, extent.y))
+        });
+        // The viewport records no extent when its content fits, but a stale offset
+        // from earlier, larger content must still be clamped back to zero.
+        let Some((max_x, max_y)) = extent.or_else(|| {
+            (node == self.document.root() && self.cached.is_some()).then_some((0.0, 0.0))
         }) else {
             return Ok(false);
         };
-        let (x, y) = (x_css.clamp(0.0, extent.x), y_css.clamp(0.0, extent.y));
+        let (x, y) = (x_css.clamp(0.0, max_x), y_css.clamp(0.0, max_y));
         let from = self.scroll_offset(node);
         if from == (x, y) {
             return Ok(false);
@@ -1274,8 +1730,10 @@ impl RenderSession {
         text: &dyn TextShaper,
         images: Option<&dyn ImageResolver>,
     ) -> Result<&DisplayList, LayoutError> {
+        self.synchronize_form_state();
         let _html_allocations =
             lumen_common::memcat::enter(lumen_common::memcat::CategoryTag::HTML);
+        self.flush_animation_changes();
         let font_generation = text.generation();
         if self.font_generation != font_generation {
             self.invalidate_fonts();
@@ -1333,8 +1791,17 @@ impl RenderSession {
                             MutationKind::FullRebuild => false,
                         }
                 });
-            let can_retain =
-                self.style_version == version || (only_local_mutations && rules.siblings_share);
+            // Counter and quote output depends on preceding siblings, not just
+            // the changed subtree. Keep reuse on unchanged frames, but recapture
+            // fragments after mutations in documents with that shared context.
+            let generated_context_changed = self.style_version != version
+                && (rules.has_counter_data()
+                    || rules.has_quote_content()
+                    || rules.has_list_item_data()
+                    || layout::contains_list_item_candidate(&self.document, self.document.root())?);
+            let can_retain = !generated_context_changed
+                && (self.style_version == version
+                    || (only_local_mutations && rules.siblings_share));
             let environment_changed = self.style_environment != Some(rules.environment);
             if !can_retain || environment_changed {
                 self.style_cache.borrow_mut().clear();
@@ -1408,6 +1875,7 @@ impl RenderSession {
                 &self.style_cache,
                 Some(&mut self.layout_cache),
                 self.presentation_root,
+                self.canvas_background,
             )?;
             self.frame_id += 1;
             self.cached = Some(CachedFrame {
@@ -1428,15 +1896,51 @@ impl RenderSession {
 mod tests {
     use super::*;
     use crate::{
-        NodeKind,
         layout::ImageState,
         paint::{ImageData, ShapedRun},
+        NodeKind,
     };
     use alloc::sync::Arc;
     use alloc::vec;
     use core::cell::Cell;
 
     struct NoText;
+
+    #[test]
+    fn client_rect_bounds_preserve_degenerate_fragments_and_all_empty_fallback() {
+        let point = Rect {
+            x: -50.0,
+            y: -50.0,
+            width: 0.0,
+            height: 0.0,
+        };
+        let line = Rect {
+            x: 40.0,
+            y: 30.0,
+            width: 0.0,
+            height: 60.0,
+        };
+        let box_rect = Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 20.0,
+            height: 10.0,
+        };
+        assert_eq!(
+            RenderSession::client_rect_bounds([point, line, box_rect].into_iter()),
+            Some(Rect {
+                x: 10.0,
+                y: 20.0,
+                width: 30.0,
+                height: 70.0
+            }),
+        );
+        assert_eq!(
+            RenderSession::client_rect_bounds([line, point].into_iter()),
+            Some(line),
+        );
+        assert_eq!(RenderSession::client_rect_bounds(core::iter::empty()), None);
+    }
 
     #[test]
     fn canvas_dimensions_follow_html_integer_prefix_rules() {
@@ -1568,6 +2072,38 @@ mod tests {
         assert_eq!(session.computed_style(p).unwrap().height, Some(20.0));
         session.display_list(200, 100, &NoText).unwrap();
         assert!(session.style_cache_stats().computed_styles > 0);
+    }
+
+    #[test]
+    fn retained_layout_preserves_shared_float_context_after_sibling_mutation() {
+        let fixture = "<style>body{margin:0}main{width:60px}.f{float:left;width:30px;height:20px;background:red}</style><main><div><i class=f></i><i class=f></i></div><div><i class=f></i></div><div id=tail style='clear:both;height:10px;background:green'></div></main>";
+        let document = crate::html::parse(fixture, 64).unwrap();
+        let tail = crate::selector::get_element_by_id(&document, document.root(), "tail")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(100, 100, &NoText).unwrap();
+        session
+            .document_mut()
+            .set_attribute(tail, "style", "clear:both;height:12px;background:green")
+            .unwrap();
+        let updated = session.display_list(100, 100, &NoText).unwrap().clone();
+        let reference = crate::html::parse(
+            &fixture.replace(
+                "height:10px;background:green",
+                "height:12px;background:green",
+            ),
+            64,
+        )
+        .unwrap();
+        let reference = RenderSession::new(reference)
+            .display_list(100, 100, &NoText)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            updated, reference,
+            "cached sibling paints must not discard shared float exclusions"
+        );
     }
 
     #[test]
@@ -1840,11 +2376,9 @@ mod tests {
             "@media screen{".repeat(33),
             "}".repeat(33)
         );
-        assert!(
-            session
-                .set_adopted_stylesheets(None, vec![excessive_nesting])
-                .is_err()
-        );
+        assert!(session
+            .set_adopted_stylesheets(None, vec![excessive_nesting])
+            .is_err());
         assert_eq!(session.computed_style(div).unwrap().width, Some(4.0));
         session.set_adopted_stylesheets(None, Vec::new()).unwrap();
         assert_eq!(session.computed_style(div).unwrap().width, None);
@@ -1870,11 +2404,9 @@ mod tests {
         let faces = session.font_faces().unwrap();
         assert_eq!(faces.len(), 2);
         assert!(faces[0].layer_path < faces[1].layer_path);
-        assert!(
-            faces.iter().all(
-                |face| face.source_url.as_deref() == Some("https://example.test/css/page.html")
-            )
-        );
+        assert!(faces
+            .iter()
+            .all(|face| face.source_url.as_deref() == Some("https://example.test/css/page.html")));
         session.set_adopted_stylesheets(None, Vec::new()).unwrap();
         assert_eq!(session.font_faces().unwrap().len(), 1);
         assert_eq!(session.computed_style(div).unwrap().width, Some(4.0));
@@ -1902,11 +2434,9 @@ mod tests {
         let frame = session.frame_id();
         let paint_revision = session.paint_revision();
 
-        assert!(
-            session
-                .set_font_face_descriptors(&identity, descriptors.clone())
-                .unwrap()
-        );
+        assert!(session
+            .set_font_face_descriptors(&identity, descriptors.clone())
+            .unwrap());
         assert!(session.frame_id() > frame);
         assert!(session.paint_revision() > paint_revision);
 
@@ -1941,11 +2471,9 @@ mod tests {
         let identity = original.identity.clone().unwrap();
         let mut descriptors = original.descriptors.clone();
         descriptors.set_family_argument("Temporary").unwrap();
-        assert!(
-            session
-                .set_font_face_descriptors(&identity, descriptors.clone())
-                .unwrap()
-        );
+        assert!(session
+            .set_font_face_descriptors(&identity, descriptors.clone())
+            .unwrap());
         assert_eq!(
             session.font_faces().unwrap()[0].family.as_ref(),
             "Temporary"
@@ -1960,25 +2488,16 @@ mod tests {
         let replacement = session.font_faces().unwrap().remove(0);
         assert_ne!(replacement.identity.as_ref(), Some(&identity));
         assert_eq!(replacement.family.as_ref(), "Replacement");
-        assert!(
-            !session
-                .font_face_descriptor_overrides
-                .iter()
-                .any(|(current, _)| current == &identity)
-        );
-        assert!(
-            !session
-                .set_font_face_descriptors(&identity, descriptors)
-                .unwrap()
-        );
-        assert!(
-            !session
-                .set_font_face_descriptors(
-                    &css::FontFaceIdentity::Manual(99),
-                    replacement.descriptors,
-                )
-                .unwrap()
-        );
+        assert!(!session
+            .font_face_descriptor_overrides
+            .iter()
+            .any(|(current, _)| current == &identity));
+        assert!(!session
+            .set_font_face_descriptors(&identity, descriptors)
+            .unwrap());
+        assert!(!session
+            .set_font_face_descriptors(&css::FontFaceIdentity::Manual(99), replacement.descriptors,)
+            .unwrap());
     }
 
     #[test]
@@ -2039,11 +2558,9 @@ mod tests {
             "@media screen{".repeat(33),
             "}".repeat(33)
         );
-        assert!(
-            session
-                .set_linked_stylesheet(last, Some(excessive_nesting))
-                .is_err()
-        );
+        assert!(session
+            .set_linked_stylesheet(last, Some(excessive_nesting))
+            .is_err());
         assert_eq!(session.computed_style(div).unwrap().width, Some(1.0));
         session.document_mut().remove(last).unwrap();
         assert_eq!(session.computed_style(div).unwrap().width, Some(8.0));
@@ -2195,14 +2712,12 @@ mod tests {
         assert!(environment.print);
         assert_eq!(environment.resolution, 2.0);
         assert_eq!(environment.width, 30.0);
-        assert!(
-            session
-                .set_media_environment(css::MediaEnvironment {
-                    resolution: f32::NAN,
-                    ..Default::default()
-                })
-                .is_err()
-        );
+        assert!(session
+            .set_media_environment(css::MediaEnvironment {
+                resolution: f32::NAN,
+                ..Default::default()
+            })
+            .is_err());
     }
 
     #[test]
@@ -2232,6 +2747,429 @@ mod tests {
         assert_eq!(style.background.r, 255);
         let list = session.display_list(10, 10, &NoText).unwrap();
         assert!(list.0.iter().any(|command| matches!(command, crate::paint::Command::FillRect { rect, color } if rect.width == 3.0 && rect.height == 2.0 && color.r == 255)));
+    }
+
+    #[test]
+    fn live_form_validity_generations_refresh_retained_styles_without_dom_mutation() {
+        use alloc::rc::Rc;
+
+        struct LiveState {
+            invalid: Cell<bool>,
+            generation: Cell<u64>,
+        }
+
+        let mut document = crate::html::parse(
+            "<style>body{margin:0}input{display:block;width:3px;height:2px;padding:0;border:0;background:red}input:invalid{background:blue}</style><body><input pattern='a' value='a'><input pattern='a' value='a'></body>",
+            24,
+        ).unwrap();
+        let nodes =
+            crate::selector::query_selector_all(&document, document.root(), "input").unwrap();
+        let second = nodes[1];
+        let state = Rc::new(LiveState {
+            invalid: Cell::new(false),
+            generation: Cell::new(1),
+        });
+        let weak_read = Rc::downgrade(&state);
+        let weak_generation = Rc::downgrade(&state);
+        document.set_validity_resolver(
+            Rc::new(move |_, node| {
+                weak_read
+                    .upgrade()
+                    .map(|state| crate::forms::ValidityState {
+                        pattern_mismatch: node == second && state.invalid.get(),
+                        ..Default::default()
+                    })
+            }),
+            Rc::new(move || {
+                weak_generation
+                    .upgrade()
+                    .map_or(0, |state| state.generation.get())
+            }),
+        );
+        let mut session = RenderSession::new(document);
+        session.display_list(20, 20, &NoText).unwrap();
+        let frame = session.frame_id();
+        let revision = session.paint_revision();
+        let document_version = session.document().version();
+        session.display_list(20, 20, &NoText).unwrap();
+        assert_eq!(session.frame_id(), frame);
+        assert_eq!(session.paint_revision(), revision);
+
+        state.invalid.set(true);
+        state.generation.set(2);
+        let list = session.display_list(20, 20, &NoText).unwrap();
+        let has_fill =
+            |red, blue| {
+                list.0.iter().any(|command| matches!(command,
+            crate::paint::Command::FillRect { rect, color }
+            if rect.width == 3.0 && rect.height == 2.0 && color.r == red && color.b == blue
+        ))
+            };
+        assert!(has_fill(255, 0), "valid sibling keeps its own style");
+        assert!(has_fill(0, 255), "dirty invalid sibling gets a fresh style");
+        assert_eq!(session.document().version(), document_version);
+        assert_ne!(session.paint_revision(), revision);
+        assert_eq!(session.computed_style(second).unwrap().background.b, 255);
+
+        drop(state);
+        session.display_list(20, 20, &NoText).unwrap();
+        assert_eq!(session.computed_style(second).unwrap().background.r, 255);
+    }
+
+    #[test]
+    fn live_interaction_generation_refreshes_only_observable_styles() {
+        let document = crate::html::parse(
+            "<style>body{margin:0}button{display:block;width:4px;height:3px;padding:0;border:0;background:red}button:focus-visible{background:blue}</style><body><button id='target'></button></body>",
+            24,
+        )
+        .unwrap();
+        let target = crate::selector::get_element_by_id(&document, document.root(), "target")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(12, 8, &NoText).unwrap();
+        let frame = session.frame_id();
+        let paint_revision = session.paint_revision();
+        let document_version = session.document().version();
+
+        session
+            .document_mut()
+            .set_interaction_state(crate::interaction::InteractionState {
+                focused: Some(target),
+                focus_visible: Some(target),
+                ..Default::default()
+            });
+        let style = session.computed_style(target).unwrap();
+
+        assert_eq!(style.background.b, 255);
+        assert!(session.frame_id() > frame);
+        assert!(session.paint_revision() > paint_revision);
+        assert_eq!(session.document().version(), document_version);
+    }
+
+    #[test]
+    fn live_checkedness_generations_refresh_selector_styles_without_dom_mutation() {
+        use alloc::rc::Rc;
+
+        struct LiveState {
+            checked: Cell<bool>,
+            generation: Cell<u64>,
+        }
+
+        let mut document = crate::html::parse(
+            "<style>body{margin:0}input{display:block;width:3px;height:2px;padding:0;border:0;background:red}input:checked{background:blue}</style><body><input type='checkbox'><input id='target' type='checkbox'></body>",
+            24,
+        )
+        .unwrap();
+        let target = crate::selector::query_selector(&document, document.root(), "#target")
+            .unwrap()
+            .unwrap();
+        let state = Rc::new(LiveState {
+            checked: Cell::new(false),
+            generation: Cell::new(1),
+        });
+        let weak_validity = Rc::downgrade(&state);
+        let weak_generation = Rc::downgrade(&state);
+        document.set_validity_resolver(
+            Rc::new(|_, _| None),
+            Rc::new(move || {
+                weak_generation
+                    .upgrade()
+                    .map_or(0, |state| state.generation.get())
+            }),
+        );
+        document.set_form_selector_state_resolver(Rc::new(move |_, node| {
+            let state = weak_validity.upgrade()?;
+            Some(crate::forms::FormSelectorState {
+                checkedness: (node == target).then(|| state.checked.get()),
+                selectedness: None,
+                single_select_option: None,
+                user_validity_interacted: None,
+                placeholder_shown: None,
+                auto_value_directionality: None,
+            })
+        }));
+
+        let mut session = RenderSession::new(document);
+        let before_version = session.document().version();
+        let has_fill =
+            |list: &DisplayList, red: u8, blue: u8| {
+                list.0.iter().any(|command| matches!(command,
+                crate::paint::Command::FillRect { rect, color }
+                if rect.width == 3.0 && rect.height == 2.0 && color.r == red && color.b == blue
+            ))
+            };
+        let (before_has_red, before_has_blue) = {
+            let before = session.display_list(20, 20, &NoText).unwrap();
+            (has_fill(before, 255, 0), has_fill(before, 0, 255))
+        };
+        let revision = session.paint_revision();
+        assert!(before_has_red);
+        assert!(!before_has_blue);
+
+        state.checked.set(true);
+        state.generation.set(2);
+        let after = session.display_list(20, 20, &NoText).unwrap();
+        assert!(has_fill(&after, 255, 0), "the unchecked sibling stays red");
+        assert!(
+            has_fill(&after, 0, 255),
+            "the live checked control turns blue"
+        );
+        assert_eq!(session.document().version(), before_version);
+        assert_ne!(session.paint_revision(), revision);
+        assert_eq!(session.computed_style(target).unwrap().background.b, 255);
+    }
+
+    #[test]
+    fn live_auto_directionality_generations_refresh_selector_styles() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+
+        struct LiveDirection {
+            rtl: Cell<bool>,
+            generation: Cell<u64>,
+        }
+
+        let mut document = crate::html::parse(
+            "<style>body{margin:0}input{display:block;width:3px;height:2px;padding:0;border:0;background:red}input:dir(rtl){background:blue}</style><body><input id='target' dir='auto' value='English'></body>",
+            64,
+        )
+        .unwrap();
+        let target = crate::selector::get_element_by_id(&document, document.root(), "target")
+            .unwrap()
+            .unwrap();
+        let state = Rc::new(LiveDirection {
+            rtl: Cell::new(false),
+            generation: Cell::new(1),
+        });
+        let weak_value = Rc::downgrade(&state);
+        let weak_generation = Rc::downgrade(&state);
+        document.set_validity_resolver(
+            Rc::new(|_, _| None),
+            Rc::new(move || {
+                weak_generation
+                    .upgrade()
+                    .map_or(0, |state| state.generation.get())
+            }),
+        );
+        document.set_form_selector_state_resolver(Rc::new(move |_, node| {
+            let state = weak_value.upgrade()?;
+            Some(crate::forms::FormSelectorState {
+                checkedness: None,
+                selectedness: None,
+                single_select_option: None,
+                user_validity_interacted: None,
+                placeholder_shown: None,
+                auto_value_directionality: (node == target).then(|| {
+                    if state.rtl.get() {
+                        crate::directionality::Direction::Rtl
+                    } else {
+                        crate::directionality::Direction::Ltr
+                    }
+                }),
+            })
+        }));
+
+        let mut session = RenderSession::new(document);
+        let before_version = session.document().version();
+        let has_fill =
+            |list: &DisplayList, red, blue| {
+                list.0.iter().any(|command| matches!(command,
+                crate::paint::Command::FillRect { rect, color }
+                if rect.width == 3.0 && rect.height == 2.0 && color.r == red && color.b == blue
+            ))
+            };
+        {
+            let before = session.display_list(20, 20, &NoText).unwrap();
+            assert!(has_fill(before, 255, 0));
+        }
+        let revision = session.paint_revision();
+
+        state.rtl.set(true);
+        state.generation.set(2);
+        let after = session.display_list(20, 20, &NoText).unwrap();
+        assert!(has_fill(&after, 0, 255));
+        assert_eq!(session.document().version(), before_version);
+        assert_ne!(session.paint_revision(), revision);
+        assert_eq!(session.computed_style(target).unwrap().background.b, 255);
+    }
+
+    #[test]
+    fn live_auto_directionality_ua_styles_refresh_without_selector_rules() {
+        use alloc::rc::Rc;
+        use core::cell::Cell;
+
+        struct LiveDirection {
+            rtl: Cell<bool>,
+            generation: Cell<u64>,
+        }
+
+        let mut document = crate::html::parse(
+            "<body><input id='target' dir='auto' type='text' value='English'></body>",
+            32,
+        )
+        .unwrap();
+        let target = crate::selector::get_element_by_id(&document, document.root(), "target")
+            .unwrap()
+            .unwrap();
+        let state = Rc::new(LiveDirection {
+            rtl: Cell::new(false),
+            generation: Cell::new(1),
+        });
+        let weak_value = Rc::downgrade(&state);
+        let weak_generation = Rc::downgrade(&state);
+        document.set_validity_resolver(
+            Rc::new(|_, _| None),
+            Rc::new(move || {
+                weak_generation
+                    .upgrade()
+                    .map_or(0, |state| state.generation.get())
+            }),
+        );
+        document.set_form_selector_state_resolver(Rc::new(move |_, node| {
+            let state = weak_value.upgrade()?;
+            Some(crate::forms::FormSelectorState {
+                checkedness: None,
+                selectedness: None,
+                single_select_option: None,
+                user_validity_interacted: None,
+                placeholder_shown: None,
+                auto_value_directionality: (node == target).then(|| {
+                    if state.rtl.get() {
+                        crate::directionality::Direction::Rtl
+                    } else {
+                        crate::directionality::Direction::Ltr
+                    }
+                }),
+            })
+        }));
+
+        let mut session = RenderSession::new(document);
+        let before_version = session.document().version();
+        let before = session.computed_style(target).unwrap();
+        assert_eq!(before.direction(), css::Direction::Ltr);
+        let before_revision = session.paint_revision();
+
+        state.rtl.set(true);
+        state.generation.set(2);
+        let after = session.computed_style(target).unwrap();
+        assert_eq!(after.direction(), css::Direction::Rtl);
+        assert_ne!(session.paint_revision(), before_revision);
+        assert_eq!(session.document().version(), before_version);
+    }
+
+    #[test]
+    fn unused_form_validity_generations_preserve_retained_caches() {
+        use alloc::rc::Rc;
+
+        let mut document = crate::html::parse(
+            "<style>div{width:3px;height:2px;background:red}</style><div></div>",
+            16,
+        )
+        .unwrap();
+        let generation = Rc::new(Cell::new(1));
+        let source = generation.clone();
+        document.set_validity_resolver(Rc::new(|_, _| None), Rc::new(move || source.get()));
+        let mut session = RenderSession::new(document);
+        session.display_list(20, 20, &NoText).unwrap();
+        let frame = session.frame_id();
+        let revision = session.paint_revision();
+        let stats = session.style_cache_stats();
+        generation.set(2);
+        session.display_list(20, 20, &NoText).unwrap();
+        assert_eq!(session.frame_id(), frame);
+        assert_eq!(session.paint_revision(), revision);
+        assert_eq!(session.style_cache_stats(), stats);
+    }
+
+    #[test]
+    fn hit_test_pointer_events_inherit_and_override_without_removing_geometry() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div id='outer' style='pointer-events:none;width:20px;height:20px'><div id='inner' style='width:5px;height:5px'></div><div id='override' style='pointer-events:auto;width:5px;height:5px'></div></div>",
+            24,
+        ).unwrap();
+        let find = |id| {
+            crate::selector::get_element_by_id(&document, document.root(), id)
+                .unwrap()
+                .unwrap()
+        };
+        let outer = find("outer");
+        let inner = find("inner");
+        let explicit = find("override");
+        let mut session = RenderSession::new(document);
+        session.display_list(30, 30, &NoText).unwrap();
+        assert!(!session.computed_style(outer).unwrap().pointer_events_auto);
+        assert!(!session.computed_style(inner).unwrap().pointer_events_auto);
+        assert!(
+            session
+                .computed_style(explicit)
+                .unwrap()
+                .pointer_events_auto
+        );
+        assert!(session.client_rects(inner).first().is_some());
+        let mut hits = Vec::new();
+        session.for_each_hit_test(2.0, 2.0, |node| {
+            hits.push(node);
+            true
+        });
+        assert!(!hits.contains(&inner));
+        assert!(!hits.contains(&outer));
+        assert_eq!(session.hit_test(2.0, 7.0), Some(explicit));
+        session
+            .document_mut()
+            .set_attribute(outer, "style", "pointer-events:auto;width:20px;height:20px")
+            .unwrap();
+        session.display_list(30, 30, &NoText).unwrap();
+        assert_eq!(session.hit_test(2.0, 2.0), Some(inner));
+        session
+            .document_mut()
+            .set_attribute(inner, "style", "visibility:hidden;width:5px;height:5px")
+            .unwrap();
+        session.display_list(30, 30, &NoText).unwrap();
+        assert_ne!(session.hit_test(2.0, 2.0), Some(inner));
+        assert!(!session.client_rects(inner).is_empty());
+    }
+
+    #[test]
+    fn hit_test_stack_visits_front_to_back_and_stops_at_the_requested_hit() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div id='outer' style='width:20px;height:20px;padding:2px'><div id='inner' style='width:5px;height:5px'></div></div>",
+            16,
+        )
+        .unwrap();
+        let outer = crate::selector::get_element_by_id(&document, document.root(), "outer")
+            .unwrap()
+            .unwrap();
+        let inner = crate::selector::get_element_by_id(&document, document.root(), "inner")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        assert!(!session.for_each_hit_test(3.0, 3.0, |_| panic!("no completed frame")));
+        session.display_list(30, 30, &NoText).unwrap();
+        let mut hits = Vec::new();
+        assert!(session.for_each_hit_test(3.0, 3.0, |node| {
+            hits.push(node);
+            true
+        }));
+        assert_eq!(hits.first(), Some(&inner));
+        assert!(
+            hits.iter().position(|node| *node == inner).unwrap()
+                < hits.iter().position(|node| *node == outer).unwrap()
+        );
+        let mut visited = 0;
+        assert!(session.for_each_hit_test(3.0, 3.0, |node| {
+            visited += 1;
+            assert_eq!(node, inner);
+            false
+        }));
+        assert_eq!(visited, 1);
+        assert!(!session.for_each_hit_test(f32::NAN, 3.0, |_| panic!("invalid point")));
+        assert!(!session.for_each_hit_test(30.0, 3.0, |_| panic!("outside viewport")));
+        session
+            .document_mut()
+            .set_attribute(inner, "hidden", "")
+            .unwrap();
+        assert!(!session.for_each_hit_test(3.0, 3.0, |_| panic!("stale frame")));
     }
 
     #[test]
@@ -2292,6 +3230,16 @@ mod tests {
         let second = find("#second");
         let mut session = RenderSession::new(document);
         session.display_list(30, 30, &NoText).unwrap();
+        let port = session.scrollport(container).unwrap();
+        assert_eq!(
+            (port.x, port.y, port.width, port.height),
+            (0.0, 0.0, 10.0, 10.0)
+        );
+        let root_port = session.scrollport(session.document().root()).unwrap();
+        assert_eq!(
+            (root_port.x, root_port.y, root_port.width, root_port.height),
+            (0.0, 0.0, 30.0, 30.0)
+        );
         assert_eq!(session.hit_test(5.0, 5.0), Some(first));
         assert_ne!(session.hit_test(5.0, 15.0), Some(second));
         assert!(session.set_scroll_offset(container, 100.0, 100.0).unwrap());
@@ -2301,6 +3249,122 @@ mod tests {
         assert!(!session.set_scroll_offset(container, 0.0, 10.0).unwrap());
         assert!(session.set_scroll_offset(container, -1.0, -1.0).unwrap());
         assert_eq!(session.scroll_offset(container), (0.0, 0.0));
+    }
+
+    #[test]
+    fn scrollport_uses_padding_box_and_owner_transform_chain() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div id='scroll' style='overflow:auto;width:10px;height:10px;padding:2px 3px;transform:translate(20px,10px)'><div style='height:30px'></div></div></body>",
+            16,
+        )
+        .unwrap();
+        let scroll = crate::selector::query_selector(&document, document.root(), "#scroll")
+            .unwrap()
+            .unwrap();
+        let mut session = RenderSession::new(document);
+        session.display_list(60, 60, &NoText).unwrap();
+        let port = session.scrollport(scroll).unwrap();
+        assert_eq!(
+            (port.x, port.y, port.width, port.height),
+            (20.0, 10.0, 16.0, 14.0)
+        );
+
+        session.set_scroll_offset(scroll, 0.0, 5.0).unwrap();
+        session.display_list(60, 60, &NoText).unwrap();
+        assert_eq!(session.scrollport(scroll), Some(port));
+    }
+
+    #[test]
+    fn nested_scrollport_moves_on_fast_outer_scroll_and_matches_relayout() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div id='outer' style='overflow:auto;width:20px;height:20px'><div style='height:40px'></div><div id='inner' style='overflow:auto;width:10px;height:10px;transform:translateX(2px)'><div style='height:20px'></div></div></div></body>",
+            16,
+        )
+        .unwrap();
+        let find = |selector| {
+            crate::selector::query_selector(&document, document.root(), selector)
+                .unwrap()
+                .unwrap()
+        };
+        let outer = find("#outer");
+        let inner = find("#inner");
+        let mut session = RenderSession::new(document);
+        session.display_list(60, 60, &NoText).unwrap();
+        assert!(session
+            .cached
+            .as_ref()
+            .unwrap()
+            .geometry
+            .scroll_regions
+            .iter()
+            .any(|region| region.node == outer));
+        let outer_port = session.scrollport(outer).unwrap();
+        let initial_inner = session.scrollport(inner).unwrap();
+        assert_eq!((initial_inner.x, initial_inner.y), (2.0, 40.0));
+
+        session.set_scroll_offset(outer, 0.0, 10.0).unwrap();
+        let fast_inner = session.scrollport(inner).unwrap();
+        assert_eq!((fast_inner.x, fast_inner.y), (2.0, 30.0));
+        assert_eq!(session.scrollport(outer), Some(outer_port));
+
+        // Force the same scroll state through a full layout and compare the
+        // retained geometry against the translation-only fast path.
+        session.cached = None;
+        session.display_list(60, 60, &NoText).unwrap();
+        assert_eq!(session.scrollport(inner), Some(fast_inner));
+        assert_eq!(session.scrollport(outer), Some(outer_port));
+    }
+
+    #[test]
+    fn root_scroll_extent_includes_visible_and_absolute_overflow_but_not_clipped_or_fixed() {
+        let document = crate::html::parse(
+            "<body style='margin:0'><div id='flow' style='width:60px;height:80px'></div><div id='clipped' style='width:10px;height:10px;overflow:hidden'><div style='width:200px;height:200px'></div></div><div id='absolute' style='position:absolute;left:80px;top:0;width:10px;height:10px'></div><div id='fixed' style='position:fixed;left:2px;top:3px;width:5px;height:5px'></div><div style='position:fixed;left:300px;top:300px;width:10px;height:10px'></div></body>",
+            16,
+        )
+        .unwrap();
+        let find = |selector| {
+            crate::selector::query_selector(&document, document.root(), selector)
+                .unwrap()
+                .unwrap()
+        };
+        let flow = find("#flow");
+        let fixed = find("#fixed");
+        let absolute = find("#absolute");
+        let mut session = RenderSession::new(document);
+        session.display_list(40, 30, &NoText).unwrap();
+        assert_eq!(
+            session.scroll_extent(session.document().root()),
+            Some((50.0, 60.0))
+        );
+        let fixed_before = session.hit_bounds(fixed).unwrap();
+        assert_eq!((fixed_before.x, fixed_before.y), (2.0, 3.0));
+        assert!(session.is_viewport_fixed(fixed));
+        assert!(!session.is_viewport_fixed(flow));
+
+        session
+            .document_mut()
+            .set_attribute(absolute, "style", "display:none")
+            .unwrap();
+        session.display_list(40, 30, &NoText).unwrap();
+        assert_eq!(
+            session.scroll_extent(session.document().root()),
+            Some((20.0, 60.0))
+        );
+
+        session
+            .set_scroll_offset(session.document().root(), 0.0, 20.0)
+            .unwrap();
+        session.display_list(40, 30, &NoText).unwrap();
+        assert_eq!(session.hit_bounds(flow).unwrap().y, -20.0);
+        let fixed_after = session.hit_bounds(fixed).unwrap();
+        assert_eq!((fixed_after.x, fixed_after.y), (2.0, 3.0));
+        assert_eq!(
+            session
+                .scrollport(session.document().root())
+                .unwrap()
+                .height,
+            30.0
+        );
     }
 
     #[test]
@@ -2344,6 +3408,7 @@ mod tests {
         let mut session = RenderSession::new(document);
         let list = session.display_list(40, 40, &NoText).unwrap();
         assert!(list.0.iter().any(|command|matches!(command,crate::paint::Command::FillRect{color,..} if color.r==255 && color.g==0)));
+        assert!(!session.is_viewport_fixed(fixed));
         assert_eq!(session.hit_test(12.0, 2.0), Some(fixed));
         assert_ne!(session.hit_test(2.0, 2.0), Some(fixed));
     }

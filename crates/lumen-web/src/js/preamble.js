@@ -18,19 +18,49 @@ delete globalThis.__wasm;
 delete globalThis.__ws;
 delete globalThis.__sse;
 
-// A unit of web glue that runs on first use. `names` are the globals it publishes (a trailing
-// `!` marks a non-enumerable one): each is an accessor in the slot the unit's own assignment
-// would fill, so the key order is unchanged, and the first read (or write) runs `init`, whose
-// assignments replace the accessors with plain data properties.
+// Capture descriptor intrinsics before author code can replace them. Lazy unit
+// publication inspects properties without invoking a host/author getter or setter.
+const __lazyGlobal = globalThis;
+const __lazyGetDescriptor = Object.getOwnPropertyDescriptor;
+const __lazyDefineProperty = Object.defineProperty;
+const __lazyCreate = Object.create;
+const __lazyOwnKeys = Reflect.ownKeys;
+
+// Each unit owns only the lazy accessor slots it installed. The build redirects
+// export writes to a private receiver; reads and exported closures keep the real
+// globalThis. A host replacement, deletion, or reentrant override is never restored
+// or overwritten when another export causes the rest of the unit to initialize.
 function __lazyWeb(names, init) {
   let state = 0;
+  const slots = __lazyCreate(null);
+  const exports = __lazyCreate(null);
+  const owns = (name) => {
+    const slot = slots[name];
+    const now = __lazyGetDescriptor(__lazyGlobal, name);
+    return slot !== undefined && now !== undefined && now.get === slot.get && now.set === slot.set &&
+      now.enumerable === slot.enumerable && now.configurable === slot.configurable;
+  };
+  const define = (name, descriptor) => {
+    // Object.defineProperty performs ToPropertyKey exactly once. Most bootstrap
+    // exports already use strings; symbols and non-string keys retain semantics.
+    let key = name;
+    if (typeof key !== "string" && typeof key !== "symbol") {
+      const holder = __lazyCreate(null);
+      __lazyDefineProperty(holder, key, { value: true });
+      key = __lazyOwnKeys(holder)[0];
+    }
+    if (slots[key] === undefined || owns(key)) {
+      __lazyDefineProperty(__lazyGlobal, key, descriptor);
+    }
+    return __lazyGlobal;
+  };
   const run = () => {
     if (state !== 0) return;
     state = 1;
     const body = init;
     init = null;
     try {
-      body();
+      body(exports, define);
     } finally {
       state = 2;
     }
@@ -40,20 +70,27 @@ function __lazyWeb(names, init) {
     if (!enumerable) name = name.slice(0, -1);
     const get = () => {
       run();
-      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const now = __lazyGetDescriptor(__lazyGlobal, name);
       if (now !== undefined && now.get === get) {
         if (state !== 2) return undefined;
-        delete globalThis[name];
+        if (owns(name)) delete __lazyGlobal[name];
         return undefined;
       }
-      return globalThis[name];
+      return __lazyGlobal[name];
     };
-    // The slot keeps the enumerability it has when filled (an embedder may have changed it).
+    // An explicit author assignment retains its existing lazy-setter behavior.
     const set = (value) => {
-      const now = Object.getOwnPropertyDescriptor(globalThis, name);
+      const now = __lazyGetDescriptor(__lazyGlobal, name);
       const e = now !== undefined && now.get === get ? now.enumerable : enumerable;
-      Object.defineProperty(globalThis, name, { value, writable: true, enumerable: e, configurable: true });
+      __lazyDefineProperty(__lazyGlobal, name, { value, writable: true, enumerable: e, configurable: true });
     };
-    Object.defineProperty(globalThis, name, { get, set, enumerable, configurable: true });
+    slots[name] = { get, set, enumerable, configurable: true };
+    __lazyDefineProperty(exports, name, {
+      set(value) { if (owns(name)) set(value); }, configurable: true
+    });
+    // Providers installed before this lazy family are canonical too.
+    if (__lazyGetDescriptor(__lazyGlobal, name) === undefined) {
+      __lazyDefineProperty(__lazyGlobal, name, { get, set, enumerable, configurable: true });
+    }
   }
 }

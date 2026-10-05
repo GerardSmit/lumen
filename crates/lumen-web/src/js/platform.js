@@ -3,7 +3,14 @@
 
 globalThis.self = globalThis;
 
-class Performance {
+const performanceConstructionToken = {};
+class Performance extends EventTarget {
+  constructor(...args) {
+    if (args[0] !== performanceConstructionToken) {
+      throw new TypeError("Illegal constructor");
+    }
+    super();
+  }
   now() {
     return __perf.now();
   }
@@ -14,5 +21,13 @@ class Performance {
     return { timeOrigin: this.timeOrigin };
   }
 }
-globalThis.Performance = Performance;
-globalThis.performance = new Performance();
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, {
+  value: "Performance", configurable: true,
+});
+for (const name of ["now", "timeOrigin", "toJSON"]) {
+  Object.defineProperty(Performance.prototype, name, { enumerable: true });
+}
+Object.defineProperty(globalThis, "Performance", {
+  value: Performance, writable: true, configurable: true, enumerable: false,
+});
+globalThis.performance = new Performance(performanceConstructionToken);

@@ -81,6 +81,7 @@ pub struct FetchPolicy {
     redirected: bool,
     cors_tainted: bool,
     redirect_count: usize,
+    force_preflight: bool,
 }
 
 impl FetchPolicy {
@@ -175,6 +176,7 @@ impl FetchPolicy {
             redirected: false,
             cors_tainted,
             redirect_count: 0,
+            force_preflight: false,
         })
     }
 
@@ -190,8 +192,12 @@ impl FetchPolicy {
     pub fn needs_preflight(&self) -> bool {
         self.mode == Mode::Cors
             && (self.current_url_origin != self.origin || self.cors_tainted)
-            && (!is_safelisted_method(&self.method)
+            && (self.force_preflight || !is_safelisted_method(&self.method)
                 || !cors_unsafe_header_names(&self.headers).is_empty())
+    }
+    /// XHR upload listeners require a preflight even for a safelisted request.
+    pub fn set_force_preflight(&mut self, enabled: bool) {
+        self.force_preflight = enabled;
     }
     pub fn preflight_request(&self) -> Option<RequestHead> {
         if !self.needs_preflight() {
@@ -260,7 +266,16 @@ impl FetchPolicy {
         }
         Ok(())
     }
+    pub fn actual_body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
+    }
     pub fn actual_request(&self) -> RequestHead {
+        let mut head = self.actual_request_head();
+        head.body = self.body.clone();
+        head
+    }
+    /// The next request without its body, for callers that only borrow the body from the policy.
+    pub fn actual_request_head(&self) -> RequestHead {
         let mut headers = self.headers.clone();
         if self.mode == Mode::Cors && (self.current_url_origin != self.origin || self.cors_tainted)
         {
@@ -270,7 +285,7 @@ impl FetchPolicy {
             method: self.method.clone(),
             url: self.url.clone(),
             headers,
-            body: self.body.clone(),
+            body: None,
         }
     }
     /// Validate a response head and, when it is a followed redirect, update the next hop.
@@ -598,3 +613,23 @@ fn set_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 }
 
 extern crate alloc;
+
+#[cfg(test)]
+#[test]
+fn upload_listeners_force_preflight_only_across_origins() {
+    let mut cross = FetchPolicy::new("https://page.test", "POST", "https://upload.test/",
+        "https://upload.test", Vec::new(), Some(alloc::vec![65]), Mode::Cors,
+        Credentials::SameOrigin, Redirect::Follow).unwrap();
+    assert!(!cross.needs_preflight());
+    cross.set_force_preflight(true);
+    assert!(cross.needs_preflight());
+    let head = cross.preflight_request().unwrap();
+    assert_eq!(head.method, "OPTIONS");
+    assert!(head.body.is_none());
+    assert!(!head.headers.iter().any(|(name, _)| name == "access-control-request-headers"));
+    let mut same = FetchPolicy::new("https://page.test", "POST", "https://page.test/",
+        "https://page.test", Vec::new(), Some(alloc::vec![65]), Mode::Cors,
+        Credentials::SameOrigin, Redirect::Follow).unwrap();
+    same.set_force_preflight(true);
+    assert!(!same.needs_preflight());
+}

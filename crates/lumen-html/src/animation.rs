@@ -90,13 +90,13 @@ pub struct Sample {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EffectPhase {
+pub enum EffectPhase {
     Before,
     Active,
     After,
 }
 
-fn effect_phase(timing: Timing, current_time_ms: f64, playback_rate: f64) -> Option<EffectPhase> {
+pub fn effect_phase(timing: Timing, current_time_ms: f64, playback_rate: f64) -> Option<EffectPhase> {
     if !current_time_ms.is_finite() || !playback_rate.is_finite() {
         return None;
     }
@@ -195,6 +195,57 @@ pub fn sample_current_time(
         before: (phase == Some(EffectPhase::Before) && !reverse)
             || (phase == Some(EffectPhase::After) && reverse),
         current_iteration,
+    }
+}
+
+/// Frame-to-frame CSS event timing, independent of DOM or language bindings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CssEventSample {
+    pub phase: Option<EffectPhase>,
+    pub iteration: Option<f64>,
+}
+
+impl CssEventSample {
+    pub const IDLE: Self = Self { phase: None, iteration: None };
+}
+
+pub fn css_event_sample(timing: Timing, time_ms: f64, rate: f64) -> CssEventSample {
+    let sample = sample_current_time(Timing { fill: FillMode::Both, ..timing }, time_ms, rate, false);
+    CssEventSample { phase: effect_phase(timing, time_ms, rate), iteration: sample.current_iteration }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CssEvent {
+    pub kind: &'static str,
+    pub elapsed_ms: f64,
+}
+
+/// CSS Animations 2 event dispatch. A skipped frame emits a single iteration
+/// event at the newly sampled boundary, never an unbounded historical loop.
+pub fn css_events(
+    timing: Timing,
+    previous: CssEventSample,
+    current: CssEventSample,
+    cancellation_elapsed_ms: f64,
+) -> [Option<CssEvent>; 2] {
+    use EffectPhase::{Active, After, Before};
+    let start = (-timing.delay_ms).min(timing.active_duration()).max(0.0);
+    let end = (timing.end_time() - timing.delay_ms).min(timing.active_duration()).max(0.0);
+    let event = |kind, elapsed_ms| Some(CssEvent { kind, elapsed_ms });
+    match (previous.phase, current.phase) {
+        (None | Some(Before), Some(Active)) => [event("animationstart", start), None],
+        (None | Some(Before), Some(After)) => [event("animationstart", start), event("animationend", end)],
+        (Some(Active), Some(Before)) => [event("animationend", start), None],
+        (Some(Active), Some(Active)) if previous.iteration != current.iteration => {
+            let boundary = current.iteration.unwrap_or(0.0)
+                + if previous.iteration > current.iteration { 1.0 } else { 0.0 };
+            [event("animationiteration", (boundary - timing.iteration_start) * timing.duration_ms), None]
+        }
+        (Some(Active), Some(After)) => [event("animationend", end), None],
+        (Some(After), Some(Active)) => [event("animationstart", end), None],
+        (Some(After), Some(Before)) => [event("animationstart", end), event("animationend", start)],
+        (Some(Before | Active), None) => [event("animationcancel", cancellation_elapsed_ms), None],
+        _ => [None, None],
     }
 }
 
@@ -618,17 +669,31 @@ pub fn sample_keyframes_composed_with_property(
     keyframes: &[Keyframe],
     progress: f64,
     before: bool,
+    compose: impl FnMut(&str, &Keyframe, &str) -> Option<String>,
+    interpolate: impl FnMut(&str, &str, &str, f64) -> Option<String>,
+) -> Vec<(String, String)> {
+    sample_keyframes_composed_with_property_filter(keyframes, progress, before, |_| true, compose, interpolate)
+}
+
+/// Samples selected properties directly from the original immutable keyframes.
+/// Filtering precedes interval selection and composition, so excluded properties
+/// allocate no tracks and never reach the property callbacks.
+pub fn sample_keyframes_composed_with_property_filter(
+    keyframes: &[Keyframe],
+    progress: f64,
+    before: bool,
+    mut include: impl FnMut(&str) -> bool,
     mut compose: impl FnMut(&str, &Keyframe, &str) -> Option<String>,
     mut interpolate: impl FnMut(&str, &str, &str, f64) -> Option<String>,
 ) -> Vec<(String, String)> {
     if keyframes.is_empty() || !progress.is_finite() {
         return Vec::new();
     }
-    let mut properties = Vec::<String>::new();
+    let mut properties = Vec::<&str>::new();
     for frame in keyframes {
         for (name, _) in &frame.declarations {
-            if !properties.iter().any(|property| property == name) {
-                properties.push(name.clone());
+            if include(name) && !properties.iter().any(|property| *property == name) {
+                properties.push(name.as_str());
             }
         }
     }
@@ -642,7 +707,7 @@ pub fn sample_keyframes_composed_with_property(
                     frame
                         .declarations
                         .iter()
-                        .any(|(name, _)| name == &property)
+                        .any(|(name, _)| name == property)
                         .then_some(index)
                 })
                 .collect::<Vec<_>>();
@@ -669,13 +734,13 @@ pub fn sample_keyframes_composed_with_property(
                 keyframes[index]
                     .declarations
                     .iter()
-                    .find(|(name, _)| name == &property)
+                    .find(|(name, _)| name == property)
                     .map(|(_, value)| value)
             };
-            let left_value = compose(&property, &keyframes[left_index], value_at(left_index)?)?;
-            let right_value = compose(&property, &keyframes[right_index], value_at(right_index)?)?;
+            let left_value = compose(property, &keyframes[left_index], value_at(left_index)?)?;
+            let right_value = compose(property, &keyframes[right_index], value_at(right_index)?)?;
             if left_index == right_index {
-                return Some((property, right_value.clone()));
+                return Some((property.to_owned(), right_value));
             }
             let left = &keyframes[left_index];
             let right = &keyframes[right_index];
@@ -691,7 +756,7 @@ pub fn sample_keyframes_composed_with_property(
                 .and_then(|easing| ease_with_before(easing, local, before))
                 .unwrap_or(local);
             let value =
-                interpolate(&property, &left_value, &right_value, local).unwrap_or_else(|| {
+                interpolate(property, &left_value, &right_value, local).unwrap_or_else(|| {
                     if property == "display" && local > 0.0 && local < 1.0 {
                         if left_value.eq_ignore_ascii_case("none") {
                             return right_value.clone();
@@ -714,7 +779,7 @@ pub fn sample_keyframes_composed_with_property(
                         right_value.clone()
                     }
                 });
-            Some((property, value))
+            Some((property.to_owned(), value))
         })
         .collect()
 }
@@ -723,6 +788,71 @@ pub fn sample_keyframes_composed_with_property(
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn filtered_keyframes_preserve_intervals_metadata_and_original_frames() {
+        let frames = [0.0, 0.5, 0.5, 1.0].into_iter().enumerate().map(|(index, offset)| Keyframe {
+            offset,
+            declarations: vec![("width".into(), format!("{}px",index * 10)),
+                ("transform".into(), "unsupported additive transform".into())],
+            easing: Some("steps(2, start)".into()),
+            composite: Some(CompositeMode::Add),
+        }).collect::<Vec<_>>();
+        for before in [false, true] {
+            for progress in [-0.5, 0.0, 0.25, 0.5, 0.75, 1.0, 1.5] {
+                let compose = |property: &str, frame: &Keyframe, value: &str| {
+                    assert!(frames.iter().any(|original| core::ptr::eq(original, frame)));
+                    assert_eq!(frame.composite, Some(CompositeMode::Add));
+                    if property == "width" { add_numeric_values("10px", value, None) } else { None }
+                };
+                let all = sample_keyframes_composed_with_property(&frames,progress,before,
+                    compose,|_,from,to,at| interpolate_numeric(from,to,at));
+                let selected = sample_keyframes_composed_with_property_filter(&frames,progress,before,
+                    |property| property == "width",
+                    |property,frame,value| {
+                        assert_eq!(property,"width");
+                        compose(property,frame,value)
+                    },|property,from,to,at| {
+                        assert_eq!(property,"width");
+                        interpolate_numeric(from,to,at)
+                    });
+                assert_eq!(selected,all);
+                assert_eq!(selected.len(),1);
+            }
+        }
+    }
+
+    #[test]
+    fn css_animation_event_transitions_follow_shared_phases_and_skipped_frames() {
+        let timing = Timing { delay_ms: -4000.0, duration_ms: 1000.0, iterations: 7.0, ..Timing::default() };
+        let initial = css_event_sample(timing, 0.0, 1.0);
+        assert_eq!(css_events(timing, CssEventSample::IDLE, initial, 0.0),
+            [Some(CssEvent { kind: "animationstart", elapsed_ms: 4000.0 }), None]);
+        let skipped = css_event_sample(timing, 2200.0, 1.0);
+        assert_eq!(css_events(timing, initial, skipped, 0.0),
+            [Some(CssEvent { kind: "animationiteration", elapsed_ms: 6000.0 }), None]);
+        let ended = css_event_sample(timing, 3000.0, 1.0);
+        assert_eq!(css_events(timing, skipped, ended, 0.0),
+            [Some(CssEvent { kind: "animationend", elapsed_ms: 7000.0 }), None]);
+        assert_eq!(css_events(timing, ended, ended, 0.0), [None, None]);
+        assert_eq!(css_events(timing, skipped, initial, 0.0),
+            [Some(CssEvent { kind: "animationiteration", elapsed_ms: 5000.0 }), None]);
+        assert_eq!(css_events(timing, skipped, CssEventSample::IDLE, 6234.0),
+            [Some(CssEvent { kind: "animationcancel", elapsed_ms: 6234.0 }), None]);
+        assert_eq!(css_events(timing, ended, CssEventSample::IDLE, 7000.0), [None, None]);
+        let empty = Timing::default();
+        assert_eq!(css_events(empty, CssEventSample::IDLE, css_event_sample(empty, 0.0, 1.0), 0.0),
+            [Some(CssEvent { kind: "animationstart", elapsed_ms: 0.0 }), Some(CssEvent { kind: "animationend", elapsed_ms: 0.0 })]);
+        let delayed = Timing { delay_ms: 100.0, duration_ms: 200.0, iterations: 2.0, ..Timing::default() };
+        let before = css_event_sample(delayed, 50.0, 1.0);
+        let after = css_event_sample(delayed, 600.0, 1.0);
+        assert_eq!(css_events(delayed, before, after, 0.0),
+            [Some(CssEvent { kind: "animationstart", elapsed_ms: 0.0 }), Some(CssEvent { kind: "animationend", elapsed_ms: 400.0 })]);
+        assert_eq!(css_events(delayed, after, before, 0.0),
+            [Some(CssEvent { kind: "animationstart", elapsed_ms: 400.0 }), Some(CssEvent { kind: "animationend", elapsed_ms: 0.0 })]);
+        // Reverse playback equality uses the shared phase calculation.
+        assert_eq!(effect_phase(delayed,100.0,-1.0),Some(EffectPhase::Before));
+    }
 
     #[test]
     fn timing_honors_fill_direction_and_pausing() {

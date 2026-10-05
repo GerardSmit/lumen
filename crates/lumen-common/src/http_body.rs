@@ -3,6 +3,355 @@
 extern crate alloc;
 use alloc::{string::String, vec::Vec};
 use core::fmt;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Thread-safe progress for the request body bytes accepted by the transport.
+/// The total is fixed when the request starts; a missing total is represented as zero.
+#[derive(Debug)]
+pub struct UploadProgress {
+    loaded: AtomicU64,
+    total: AtomicU64,
+    complete: AtomicBool,
+}
+
+impl UploadProgress {
+    pub fn new(total: Option<u64>) -> Self {
+        Self {
+            loaded: AtomicU64::new(0),
+            total: AtomicU64::new(total.unwrap_or(0)),
+            complete: AtomicBool::new(false),
+        }
+    }
+
+    pub fn loaded(&self) -> u64 {
+        self.loaded.load(Ordering::Acquire)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::Acquire)
+    }
+
+    pub fn complete(&self) -> bool {
+        self.complete.load(Ordering::Acquire)
+    }
+
+    /// Add successfully accepted body bytes. Redirect retransmissions after the
+    /// first completed upload are ignored; the exposed count is capped at total.
+    pub fn record_written(&self, count: usize) {
+        if self.complete() || count == 0 {
+            return;
+        }
+        let total = self.total();
+        let mut loaded = self.loaded.load(Ordering::Relaxed);
+        loop {
+            if self.complete() {
+                return;
+            }
+            let next = loaded.saturating_add(count as u64).min(total);
+            match self.loaded.compare_exchange_weak(
+                loaded,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => loaded = actual,
+            }
+        }
+    }
+
+    /// Freeze progress after the first request body's write and flush finish.
+    pub fn mark_complete(&self) {
+        if self.complete() {
+            return;
+        }
+        self.complete.store(true, Ordering::Release);
+    }
+}
+
+/// Bounded binary request used by synchronous host bridges. A length-prefixed
+/// format keeps request and response bodies binary-safe across the wasm bridge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncHttpRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+    pub mode: String,
+    pub credentials: String,
+    pub redirect: String,
+    pub force_preflight: bool,
+    /// XHR timeout in milliseconds; zero means no per-request timeout.
+    pub timeout_ms: u32,
+    pub origin: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyncHttpResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+const SYNC_REQUEST_MAGIC: &[u8; 4] = b"XHR1";
+const SYNC_RESPONSE_MAGIC: &[u8; 4] = b"XHS1";
+const SYNC_FIELD_LIMIT: usize = 1 << 20;
+const SYNC_HEADER_LIMIT: usize = 8192;
+const SYNC_HEADER_BYTES: usize = 64 << 10;
+const SYNC_BODY_LIMIT: usize = 32 << 20;
+
+impl SyncHttpRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_REQUEST_MAGIC);
+        put_string16(&mut out, &self.method)?;
+        put_string32(&mut out, &self.url)?;
+        put_headers(&mut out, &self.headers)?;
+        put_string16(&mut out, &self.mode)?;
+        put_string16(&mut out, &self.credentials)?;
+        put_string16(&mut out, &self.redirect)?;
+        out.push(u8::from(self.force_preflight));
+        out.extend_from_slice(&self.timeout_ms.to_le_bytes());
+        match &self.origin {
+            None => out.push(0),
+            Some(origin) => {
+                out.push(1);
+                put_string32(&mut out, origin)?;
+            }
+        }
+        match &self.body {
+            None => out.push(0),
+            Some(body) => {
+                if body.len() > SYNC_BODY_LIMIT {
+                    return Err(Error("synchronous HTTP request body is too large"));
+                }
+                out.push(1);
+                put_u32(&mut out, body.len())?;
+                out.extend_from_slice(body);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, Error> {
+        let mut reader = SyncReader::new(input, SYNC_REQUEST_MAGIC)?;
+        let method = reader.string16()?;
+        let url = reader.string32()?;
+        let headers = reader.headers()?;
+        let mode = reader.string16()?;
+        let credentials = reader.string16()?;
+        let redirect = reader.string16()?;
+        let force_preflight = match reader.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error("invalid synchronous HTTP preflight marker")),
+        };
+        let timeout_ms = u32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+        let origin = match reader.byte()? {
+            0 => None,
+            1 => Some(reader.string32()?),
+            _ => return Err(Error("invalid synchronous HTTP origin marker")),
+        };
+        let body = match reader.byte()? {
+            0 => None,
+            1 => Some(reader.bytes32(SYNC_BODY_LIMIT)?.to_vec()),
+            _ => return Err(Error("invalid synchronous HTTP request body marker")),
+        };
+        reader.finish()?;
+        Ok(Self {
+            method,
+            url,
+            headers,
+            body,
+            mode,
+            credentials,
+            redirect,
+            force_preflight,
+            timeout_ms,
+            origin,
+        })
+    }
+}
+
+impl SyncHttpResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        if self.body.len() > SYNC_BODY_LIMIT {
+            return Err(Error("synchronous HTTP response body is too large"));
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(SYNC_RESPONSE_MAGIC);
+        out.extend_from_slice(&self.status.to_le_bytes());
+        put_string16(&mut out, &self.status_text)?;
+        put_string32(&mut out, &self.url)?;
+        put_headers(&mut out, &self.headers)?;
+        put_u32(&mut out, self.body.len())?;
+        out.extend_from_slice(&self.body);
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, Error> {
+        let mut reader = SyncReader::new(input, SYNC_RESPONSE_MAGIC)?;
+        let status = u16::from_le_bytes(reader.take(2)?.try_into().unwrap());
+        let status_text = reader.string16()?;
+        let url = reader.string32()?;
+        let headers = reader.headers()?;
+        let body = reader.bytes32(SYNC_BODY_LIMIT)?.to_vec();
+        reader.finish()?;
+        Ok(Self {
+            status,
+            status_text,
+            url,
+            headers,
+            body,
+        })
+    }
+}
+
+fn put_string16(out: &mut Vec<u8>, value: &str) -> Result<(), Error> {
+    let length =
+        u16::try_from(value.len()).map_err(|_| Error("synchronous HTTP field is too large"))?;
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_string32(out: &mut Vec<u8>, value: &str) -> Result<(), Error> {
+    if value.len() > SYNC_FIELD_LIMIT {
+        return Err(Error("synchronous HTTP field is too large"));
+    }
+    put_u32(out, value.len())?;
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_u32(out: &mut Vec<u8>, length: usize) -> Result<(), Error> {
+    let length = u32::try_from(length).map_err(|_| Error("synchronous HTTP field is too large"))?;
+    out.extend_from_slice(&length.to_le_bytes());
+    Ok(())
+}
+
+fn put_headers(out: &mut Vec<u8>, headers: &[(String, String)]) -> Result<(), Error> {
+    if headers.len() > SYNC_HEADER_LIMIT {
+        return Err(Error("too many synchronous HTTP headers"));
+    }
+    let size = headers
+        .iter()
+        .try_fold(0usize, |size, (name, value)| {
+            size.checked_add(name.len())?.checked_add(value.len())
+        })
+        .ok_or(Error("synchronous HTTP header size overflow"))?;
+    if size > SYNC_HEADER_BYTES {
+        return Err(Error("synchronous HTTP headers exceed the 64 KiB limit"));
+    }
+    out.extend_from_slice(&(headers.len() as u16).to_le_bytes());
+    for (name, value) in headers {
+        put_string16(out, name)?;
+        put_string32(out, value)?;
+    }
+    Ok(())
+}
+
+struct SyncReader<'a> {
+    input: &'a [u8],
+    at: usize,
+}
+
+impl<'a> SyncReader<'a> {
+    fn new(input: &'a [u8], magic: &[u8; 4]) -> Result<Self, Error> {
+        if input.get(..4) != Some(magic) {
+            return Err(Error("invalid synchronous HTTP message"));
+        }
+        Ok(Self { input, at: 4 })
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], Error> {
+        let end = self
+            .at
+            .checked_add(length)
+            .ok_or(Error("synchronous HTTP length overflow"))?;
+        let bytes = self
+            .input
+            .get(self.at..end)
+            .ok_or(Error("truncated synchronous HTTP message"))?;
+        self.at = end;
+        Ok(bytes)
+    }
+
+    fn byte(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn string16(&mut self) -> Result<String, Error> {
+        let length = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
+        self.string(length)
+    }
+
+    fn string32(&mut self) -> Result<String, Error> {
+        let length = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
+        if length > SYNC_FIELD_LIMIT {
+            return Err(Error("synchronous HTTP field is too large"));
+        }
+        self.string(length)
+    }
+
+    fn string(&mut self, length: usize) -> Result<String, Error> {
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| Error("invalid UTF-8 in synchronous HTTP message"))
+    }
+
+    fn bytes32(&mut self, limit: usize) -> Result<&'a [u8], Error> {
+        let length = u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize;
+        if length > limit {
+            return Err(Error("synchronous HTTP body is too large"));
+        }
+        self.take(length)
+    }
+
+    fn headers(&mut self) -> Result<Vec<(String, String)>, Error> {
+        let count = u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as usize;
+        if count > SYNC_HEADER_LIMIT {
+            return Err(Error("too many synchronous HTTP headers"));
+        }
+        let mut headers = Vec::with_capacity(count);
+        let mut size = 0usize;
+        for _ in 0..count {
+            let name = self.string16()?;
+            let value = self.string32()?;
+            size = size.saturating_add(name.len()).saturating_add(value.len());
+            if size > SYNC_HEADER_BYTES {
+                return Err(Error("synchronous HTTP headers exceed the 64 KiB limit"));
+            }
+            headers.push((name, value));
+        }
+        Ok(headers)
+    }
+
+    fn finish(&self) -> Result<(), Error> {
+        if self.at == self.input.len() {
+            Ok(())
+        } else {
+            Err(Error("trailing synchronous HTTP data"))
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn upload_progress_never_fabricates_writes_and_freezes_after_completion() {
+    let progress = UploadProgress::new(Some(10));
+    progress.record_written(3);
+    assert_eq!(progress.loaded(), 3);
+    progress.mark_complete();
+    assert_eq!(progress.loaded(), 3);
+    progress.record_written(20);
+    assert_eq!(progress.loaded(), 3);
+    assert!(progress.complete());
+    let progress = UploadProgress::new(Some(10));
+    progress.record_written(usize::MAX);
+    assert_eq!(progress.loaded(), 10);
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Framing {
@@ -385,6 +734,39 @@ pub fn response_head(bytes: &[u8]) -> Result<ResponseHead, Error> {
 mod tests {
     use super::*;
     #[test]
+    fn synchronous_http_messages_roundtrip_binary_bodies_and_validate_lengths() {
+        let request = SyncHttpRequest {
+            method: "POST".into(),
+            url: "https://example.test/path".into(),
+            headers: vec![("content-type".into(), "application/octet-stream".into())],
+            body: Some(vec![0, 0xff, b'a']),
+            mode: "cors".into(),
+            credentials: "include".into(),
+            redirect: "follow".into(),
+            force_preflight: true,
+            timeout_ms: 2000,
+            origin: Some("https://caller.test".into()),
+        };
+        assert_eq!(
+            SyncHttpRequest::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
+
+        let response = SyncHttpResponse {
+            status: 201,
+            status_text: "Created".into(),
+            url: "https://example.test/path".into(),
+            headers: vec![("x-result".into(), "ok".into())],
+            body: vec![0, 0xfe, b'z'],
+        };
+        assert_eq!(
+            SyncHttpResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
+        assert!(SyncHttpRequest::decode(b"XHR1\xff").is_err());
+    }
+
+    #[test]
     fn shared_http_heads_validate_wire_boundaries_and_owned_framing_headers() {
         let url = crate::url::parse("http://example.test:8080/a?q=1", None).unwrap();
         let head = request_head(
@@ -402,14 +784,16 @@ mod tests {
         assert!(head.contains("Content-Length: 3\r\n"));
         assert!(!head.contains("999") && !head.contains("other.test"));
         assert!(request_head("GET\r\n", &url, &[], None, "Lumen").is_err());
-        assert!(request_head(
-            "GET",
-            &url,
-            &[("X-Test".into(), "ok\r\ninjected: yes".into())],
-            None,
-            "Lumen"
-        )
-        .is_err());
+        assert!(
+            request_head(
+                "GET",
+                &url,
+                &[("X-Test".into(), "ok\r\ninjected: yes".into())],
+                None,
+                "Lumen"
+            )
+            .is_err()
+        );
         assert_eq!(
             response_head(b"HTTP/1.1 100 Continue\r\n\r\n")
                 .unwrap()

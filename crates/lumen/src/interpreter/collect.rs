@@ -241,6 +241,12 @@ impl Interp {
             }
         }
         #[cfg(feature = "embed")]
+        crate::embed_convert::trace_host_identity_owner(self, p as usize, &mut |value| {
+            if let Value::Obj(object) = value {
+                tr.mark_obj(object);
+            }
+        });
+        #[cfg(feature = "embed")]
         if let Some(target) = self.window_proxy_target(p as usize) {
             if let Value::Obj(target) = target {
                 tr.mark_obj(&target);
@@ -325,6 +331,12 @@ impl Interp {
         for o in self.gc_pins.values() {
             o.gc_add_ref();
         }
+        #[cfg(feature = "embed")]
+        crate::embed_convert::count_host_identity_owner_pins(self, &mut |value| {
+            if let Value::Obj(object) = value {
+                object.gc_add_ref();
+            }
+        });
         // A proxy's target and handler are edges of the proxy object (traced when it is marked),
         // so a cycle through them (a `vm` context's global proxy) is collectable.
         for (t, h) in self.proxies.values() {
@@ -558,6 +570,8 @@ impl Interp {
         let garbage_count = garbage.len();
         for o in &garbage {
             let ptr = Gc::as_ptr(o) as usize;
+            #[cfg(feature = "embed")]
+            crate::embed_convert::sweep_host_identity_owner_pin(self, ptr);
             // Most tables are empty in most programs: skip them without hashing.
             macro_rules! evict {
                 ($($t:ident),*) => {$(

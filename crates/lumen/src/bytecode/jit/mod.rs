@@ -492,6 +492,15 @@ pub(super) fn track_chunk(chunk: std::rc::Rc<Chunk>) -> std::rc::Rc<Chunk> {
     chunk
 }
 
+/// Drop the registry's dead entries: a dead `Weak` still pins its chunk's whole allocation.
+pub(crate) fn prune_dead_chunks() {
+    CODE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|chunk| chunk.strong_count() != 0);
+        cache.shrink_to_fit();
+    });
+}
+
 /// Release this driver's native code at an embedder-controlled idle boundary.
 ///
 /// # Safety

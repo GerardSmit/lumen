@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::parse::{FuncType, Module, ValType, MAX_MEMORY_PAGES, MAX_TABLE_SIZE};
+use lumen::embed::SharedBufferHandle;
+
+use super::parse::{FuncType, MAX_MEMORY_PAGES, MAX_TABLE_SIZE, Module, ValType};
 
 pub const PAGE_SIZE: usize = 65536;
 
@@ -130,6 +132,10 @@ pub struct TableEntity {
 pub struct MemEntity {
     pub bytes: LinearMem,
     pub max: Option<u32>,
+    pub shared: bool,
+    /// Incremented for every successful `memory.grow`, including a zero-page grow, so JS buffer
+    /// objects are refreshed even when their captured byte length does not change.
+    pub generation: u64,
 }
 
 impl MemEntity {
@@ -146,6 +152,7 @@ impl MemEntity {
         if !self.bytes.resize(new_pages as usize * PAGE_SIZE, 0) {
             return -1;
         }
+        self.generation = self.generation.wrapping_add(1);
         old_pages as i32
     }
 }
@@ -155,14 +162,20 @@ impl MemEntity {
 /// full guarded reservation and the fault handler is installed, native code needs no bounds
 /// checks ([`LinearMem::guarded`]).
 pub struct LinearMem {
-    region: std::rc::Rc<lumen_codegen::guard::Region>,
+    backing: LinearBacking,
+    base: *mut u8,
     len: usize,
     guarded: bool,
 }
 
+enum LinearBacking {
+    Region(Rc<lumen_codegen::guard::Region>),
+    Shared(SharedBufferHandle),
+}
+
 impl LinearMem {
     pub fn new(len: usize, max_pages: Option<u32>) -> Result<LinearMem, String> {
-        use lumen_codegen::guard::{install, Region, FULL_RESERVATION};
+        use lumen_codegen::guard::{FULL_RESERVATION, Region, install};
         let full = cfg!(target_arch = "x86_64") && install();
         let region = full
             .then(|| Region::reserve(FULL_RESERVATION))
@@ -179,14 +192,32 @@ impl LinearMem {
             return Err("wasm: cannot commit linear memory".into());
         }
         Ok(LinearMem {
-            region: std::rc::Rc::new(region),
+            base: region.base(),
+            backing: LinearBacking::Region(Rc::new(region)),
             len,
             guarded,
         })
     }
 
+    /// A bounded shared linear memory over a genuine engine SharedArrayBuffer backing. The
+    /// handle must already have reserved the declared maximum so its base never moves.
+    pub fn new_shared(handle: SharedBufferHandle) -> Result<LinearMem, String> {
+        let len = handle.byte_len();
+        if handle.max_len() < len || handle.current_len() != len {
+            return Err("wasm: invalid shared memory backing".into());
+        }
+        // SAFETY: the constructor reserved the maximum before handing the handle to Wasm.
+        let base = unsafe { handle.as_mut_ptr() };
+        Ok(LinearMem {
+            base,
+            backing: LinearBacking::Shared(handle),
+            len,
+            guarded: false,
+        })
+    }
+
     pub fn base(&self) -> *mut u8 {
-        self.region.base()
+        self.base
     }
 
     /// Out-of-bounds accesses fault in the reserved tail (no explicit checks needed).
@@ -196,14 +227,37 @@ impl LinearMem {
 
     /// Keeps the bytes alive (an `ArrayBuffer` viewing them holds one).
     pub fn owner(&self) -> std::rc::Rc<dyn std::any::Any> {
-        self.region.clone()
+        match &self.backing {
+            LinearBacking::Region(region) => region.clone(),
+            LinearBacking::Shared(handle) => Rc::new(handle.clone()),
+        }
+    }
+
+    pub fn shared_handle(&self) -> Option<SharedBufferHandle> {
+        match &self.backing {
+            LinearBacking::Shared(handle) => Some(handle.clone()),
+            LinearBacking::Region(_) => None,
+        }
+    }
+
+    pub fn is_shared(&self) -> bool {
+        matches!(&self.backing, LinearBacking::Shared(_))
     }
 
     /// Grow to `len` bytes (zero-filled); false when the reservation can't hold it.
     pub fn resize(&mut self, len: usize, _fill: u8) -> bool {
         if len > self.len {
-            if !self.region.commit(len) {
-                return false;
+            match &mut self.backing {
+                LinearBacking::Region(region) => {
+                    if !region.commit(len) {
+                        return false;
+                    }
+                }
+                LinearBacking::Shared(handle) => {
+                    if handle.grow_to(len).is_err() {
+                        return false;
+                    }
+                }
             }
             self.len = len;
         }
@@ -303,6 +357,13 @@ pub trait Host {
         results: &[ValType],
         mems: &mut [MemEntity],
     ) -> Result<Vec<Val>, String>;
+
+    /// Release shared-memory synchronization around a grow operation, which acquires the same
+    /// backing lock while extending the linear memory.
+    fn before_memory_grow(&mut self) {}
+
+    /// Reacquire shared-memory synchronization after a grow operation.
+    fn after_memory_grow(&mut self) {}
 }
 
 // ---- label pre-scan ---------------------------------------------------------------------------
@@ -769,7 +830,9 @@ impl Store {
                     ip += 1;
                     let ma = mem_addr.ok_or("wasm: no memory")?;
                     let delta = pop(&mut stack)?.i32();
+                    host.before_memory_grow();
                     stack.push(Val::I32(self.mem_grow(ma, delta)));
+                    host.after_memory_grow();
                 }
                 0x41 => stack.push(Val::I32(read_sleb(code, &mut ip)? as i32)),
                 0x42 => stack.push(Val::I64(read_sleb(code, &mut ip)?)),
@@ -812,7 +875,38 @@ impl Store {
             return Err("wasm: invalid memory size".into());
         }
         let bytes = LinearMem::new(min_pages * PAGE_SIZE, max)?;
-        self.memories.push(MemEntity { bytes, max });
+        self.memories.push(MemEntity {
+            bytes,
+            max,
+            shared: false,
+            generation: 0,
+        });
+        Ok(self.memories.len() - 1)
+    }
+
+    /// Allocate a shared memory over a SharedArrayBuffer that has already reserved its maximum.
+    pub fn alloc_shared_memory(
+        &mut self,
+        min_pages: usize,
+        max: u32,
+        handle: SharedBufferHandle,
+    ) -> Result<usize, String> {
+        let limit = MAX_MEMORY_PAGES as usize;
+        if min_pages > limit || max as usize > limit || (max as usize) < min_pages {
+            return Err("wasm: invalid shared memory size".into());
+        }
+        if handle.byte_len() != min_pages.saturating_mul(PAGE_SIZE)
+            || handle.max_len() != (max as usize).saturating_mul(PAGE_SIZE)
+        {
+            return Err("wasm: shared memory backing does not match its limits".into());
+        }
+        let bytes = LinearMem::new_shared(handle)?;
+        self.memories.push(MemEntity {
+            bytes,
+            max: Some(max),
+            shared: true,
+            generation: 0,
+        });
         Ok(self.memories.len() - 1)
     }
     /// Allocate a table of `min` null elements; `Err` when the limits are invalid or too large.
@@ -860,10 +954,18 @@ impl Store {
                     }
                     table_addrs.push(a);
                 }
-                crate::wasm::ImportKind::Memory(_) => {
+                crate::wasm::ImportKind::Memory(expected) => {
                     let a = imports.mem_addr.ok_or("wasm: missing memory import")?;
-                    if a >= self.memories.len() {
-                        return Err("wasm: bad memory import".into());
+                    let memory = self.memories.get(a).ok_or("wasm: bad memory import")?;
+                    let actual_pages = (memory.bytes.len() / PAGE_SIZE) as u32;
+                    let maximum_mismatch = expected
+                        .max
+                        .is_some_and(|max| memory.max.is_none_or(|actual_max| actual_max > max));
+                    if memory.shared != expected.shared
+                        || actual_pages < expected.min
+                        || maximum_mismatch
+                    {
+                        return Err("wasm: memory import type mismatch".into());
                     }
                     mem_addrs.push(a);
                 }
@@ -970,7 +1072,15 @@ impl Store {
                 mem[offset..end].copy_from_slice(&seg.bytes);
             }
         }
-        let native = super::native::build(self, inst_idx);
+        let shared = self.instances[inst_idx]
+            .mem_addrs
+            .iter()
+            .any(|&addr| self.memories.get(addr).is_some_and(|memory| memory.shared));
+        let native = if shared {
+            None
+        } else {
+            super::native::build(self, inst_idx)
+        };
         self.native.resize_with(inst_idx + 1, || None);
         self.native[inst_idx] = native;
         Ok(inst_idx)
@@ -1492,11 +1602,7 @@ macro_rules! wasm_minmax {
             if a.is_nan() || b.is_nan() {
                 <$t>::NAN
             } else if a == b {
-                if $min == a.is_sign_negative() {
-                    a
-                } else {
-                    b
-                }
+                if $min == a.is_sign_negative() { a } else { b }
             } else if (a < b) == $min {
                 a
             } else {

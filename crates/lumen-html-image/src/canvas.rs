@@ -1,13 +1,13 @@
 //! Shared bitmap drawing core for DOM and offscreen canvases.
 //! Paths, coverage, clipping and compositing use tiny-skia's rasterizer.
-use super::{ImageError, Rgba8Image, MAX_IMAGE_BYTES};
+use super::{ImageError, Rgba8Image, MAX_IMAGE_BYTES, MAX_LAYER_BYTES};
 use lumen_html::paint::{FontSpec, ShapedRun};
 use lumen_html_text::{CanvasTextOptions, FontProvider, GlyphOutlineCommand};
 use std::{cell::RefCell, rc::Rc};
 use tiny_skia::{
-    BlendMode, Color, FillRule, FilterQuality, GradientStop, LinearGradient, Mask, Paint, Path,
-    PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient, Rect, Shader, SpreadMode,
-    Stroke, Transform,
+    BlendMode, Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient,
+    Mask, MaskType, Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient,
+    Rect, Shader, SpreadMode, Stroke, Transform,
 };
 
 const MAX_SVG_PATH_BYTES: usize = 1024 * 1024;
@@ -818,6 +818,11 @@ pub struct DrawingState {
     pub alpha: f32,
     pub blend: BlendMode,
     pub line: Stroke,
+    pub miter_limit: f64,
+    pub shadow_color: [u8; 4],
+    pub shadow_blur: f64,
+    pub shadow_offset_x: f64,
+    pub shadow_offset_y: f64,
     pub fill_gradient: Option<CanvasGradient>,
     pub stroke_gradient: Option<CanvasGradient>,
     pub fill_pattern: Option<CanvasPattern>,
@@ -835,8 +840,14 @@ impl Default for DrawingState {
             blend: BlendMode::SourceOver,
             line: Stroke {
                 width: 1.0,
+                miter_limit: 10.0,
                 ..Stroke::default()
             },
+            miter_limit: 10.0,
+            shadow_color: [0, 0, 0, 0],
+            shadow_blur: 0.0,
+            shadow_offset_x: 0.0,
+            shadow_offset_y: 0.0,
             fill_gradient: None,
             stroke_gradient: None,
             fill_pattern: None,
@@ -844,6 +855,487 @@ impl Default for DrawingState {
             clip: None,
         }
     }
+}
+
+const MAX_CANVAS_SHADOW_BLUR: f64 = 128.0;
+
+fn draw_canvas_shadow<F>(
+    bitmap: &mut Option<Pixmap>,
+    canvas_width: u32,
+    canvas_height: u32,
+    state: &DrawingState,
+    source_transform: Transform,
+    bounds: Rect,
+    additional_reserved_bytes: usize,
+    draw_source: F,
+) -> Result<(), ImageError>
+where
+    F: FnOnce(&mut Pixmap, Transform),
+{
+    let shadow = state.shadow_color;
+    if shadow[3] == 0
+        || (state.shadow_blur == 0.0
+            && state.shadow_offset_x == 0.0
+            && state.shadow_offset_y == 0.0)
+        || matches!(state.blend, BlendMode::Clear | BlendMode::Source)
+    {
+        return Ok(());
+    }
+
+    let blur = state.shadow_blur.min(MAX_CANVAS_SHADOW_BLUR) as f32;
+    let padding = super::shadow::blur_padding(blur)? as f64;
+    let (offset_x, offset_y) = (state.shadow_offset_x, state.shadow_offset_y);
+    if !offset_x.is_finite()
+        || !offset_y.is_finite()
+        || offset_x.abs() > f64::from(f32::MAX)
+        || offset_y.abs() > f64::from(f32::MAX)
+    {
+        return Ok(());
+    }
+    let left = (f64::from(bounds.x()) + offset_x - padding).floor();
+    let top = (f64::from(bounds.y()) + offset_y - padding).floor();
+    let right = (f64::from(bounds.x() + bounds.width()) + offset_x + padding).ceil();
+    let bottom = (f64::from(bounds.y() + bounds.height()) + offset_y + padding).ceil();
+    if ![left, top, right, bottom]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Ok(());
+    }
+    let x0 = left.max(0.0).min(f64::from(canvas_width)) as u32;
+    let y0 = top.max(0.0).min(f64::from(canvas_height)) as u32;
+    let x1 = right.max(0.0).min(f64::from(canvas_width)) as u32;
+    let y1 = bottom.max(0.0).min(f64::from(canvas_height)) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(());
+    }
+    let width = x1 - x0;
+    let height = y1 - y0;
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(ImageError::TooLarge)?;
+    // Preflight the complete temporary layer (source pixmap, alpha mask, blur
+    // scratch, and any caller-owned cropped source) before allocating pixels.
+    super::shadow::validate_blur_budget(
+        width as usize,
+        height as usize,
+        blur,
+        1.0,
+        pixels
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(additional_reserved_bytes))
+            .ok_or(ImageError::TooLarge)?,
+    )?;
+    let mut source = Pixmap::new(width, height).ok_or(ImageError::TooLarge)?;
+    let transform =
+        Transform::from_translate(offset_x as f32 - x0 as f32, offset_y as f32 - y0 as f32)
+            .pre_concat(source_transform);
+    draw_source(&mut source, transform);
+
+    let mut mask = Mask::from_pixmap(source.as_ref(), MaskType::Alpha);
+    super::shadow::blur_alpha_mask(
+        mask.data_mut(),
+        width as usize,
+        height as usize,
+        blur,
+        1.0,
+        pixels
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(additional_reserved_bytes))
+            .ok_or(ImageError::TooLarge)?,
+    )?;
+    if let Some(clip) = state.clip.as_ref() {
+        if clip.width() != canvas_width || clip.height() != canvas_height {
+            return Err(ImageError::InvalidViewport);
+        }
+        for (index, alpha) in mask.data_mut().iter_mut().enumerate() {
+            let x = x0 as usize + index % width as usize;
+            let y = y0 as usize + index / width as usize;
+            let clip_alpha = clip.data()[y * canvas_width as usize + x];
+            *alpha = ((*alpha as u16 * clip_alpha as u16 + 127) / 255) as u8;
+        }
+    }
+
+    // The blurred mask is local to this bounded layer, while `fill_rect` on
+    // the canvas bitmap interprets masks in device coordinates. Tint and
+    // composite the local layer first, then place that pixmap at its canvas
+    // origin. Reuse the source allocation now that its alpha has been copied
+    // into `mask`, so shadow rendering does not need a second full-size layer.
+    source.fill(Color::TRANSPARENT);
+    if let Some(rect) = Rect::from_xywh(0.0, 0.0, width as f32, height as f32) {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(shadow[0], shadow[1], shadow[2], shadow[3]);
+        source.fill_rect(rect, &paint, Transform::identity(), Some(&mask));
+    }
+    if let Some(bitmap) = bitmap.as_mut() {
+        let paint = PixmapPaint {
+            blend_mode: state.blend,
+            quality: FilterQuality::Nearest,
+            ..PixmapPaint::default()
+        };
+        bitmap.draw_pixmap(
+            0,
+            0,
+            source.as_ref(),
+            &paint,
+            Transform::from_translate(x0 as f32, y0 as f32),
+            None,
+        );
+    }
+    Ok(())
+}
+
+fn draw_canvas_shadow_from_pixmap(
+    bitmap: &mut Option<Pixmap>,
+    canvas_width: u32,
+    canvas_height: u32,
+    state: &DrawingState,
+    source: &Pixmap,
+    origin_x: u32,
+    origin_y: u32,
+    opacity: f32,
+    additional_reserved_bytes: usize,
+) -> Result<(), ImageError> {
+    let mut left = source.width();
+    let mut top = source.height();
+    let mut right = 0;
+    let mut bottom = 0;
+    let mut found = false;
+    for (index, pixel) in source.pixels().iter().enumerate() {
+        if pixel.alpha() == 0 {
+            continue;
+        }
+        let x = index as u32 % source.width();
+        let y = index as u32 / source.width();
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x + 1);
+        bottom = bottom.max(y + 1);
+        found = true;
+    }
+    if !found {
+        return Ok(());
+    }
+    let Some(bounds) = Rect::from_xywh(
+        (origin_x + left) as f32,
+        (origin_y + top) as f32,
+        (right - left) as f32,
+        (bottom - top) as f32,
+    ) else {
+        return Ok(());
+    };
+    draw_canvas_shadow(
+        bitmap,
+        canvas_width,
+        canvas_height,
+        state,
+        Transform::from_translate(origin_x as f32, origin_y as f32),
+        bounds,
+        additional_reserved_bytes,
+        |target, transform| {
+            let paint = PixmapPaint {
+                blend_mode: BlendMode::SourceOver,
+                opacity,
+                ..PixmapPaint::default()
+            };
+            target.draw_pixmap(0, 0, source.as_ref(), &paint, transform, None);
+        },
+    )
+}
+
+fn cropped_alpha_mask(
+    source: &Pixmap,
+    style_clip: Option<&Mask>,
+    source_origin_x: u32,
+    source_origin_y: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Result<Option<(u32, u32, u32, u32, Mask)>, ImageError> {
+    if style_clip
+        .is_some_and(|clip| clip.width() != viewport_width || clip.height() != viewport_height)
+        || source_origin_x.saturating_add(source.width()) > viewport_width
+        || source_origin_y.saturating_add(source.height()) > viewport_height
+    {
+        return Err(ImageError::InvalidViewport);
+    }
+    let mut left = source.width();
+    let mut top = source.height();
+    let mut right = 0;
+    let mut bottom = 0;
+    for (index, pixel) in source.pixels().iter().enumerate() {
+        let x = index as u32 % source.width();
+        let y = index as u32 / source.width();
+        let alpha = pixel.alpha();
+        let alpha = style_clip.map_or(alpha, |clip| {
+            let clip_index = (source_origin_y as usize + y as usize) * viewport_width as usize
+                + source_origin_x as usize
+                + x as usize;
+            ((u16::from(alpha) * u16::from(clip.data()[clip_index]) + 127) / 255) as u8
+        });
+        if alpha != 0 {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    if right <= left || bottom <= top {
+        return Ok(None);
+    }
+    let width = right - left;
+    let height = bottom - top;
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(ImageError::TooLarge)?;
+    if pixels
+        .checked_mul(5)
+        .map_or(true, |bytes| bytes > MAX_LAYER_BYTES)
+    {
+        return Err(ImageError::TooLarge);
+    }
+    let mut alpha = Vec::new();
+    alpha
+        .try_reserve_exact(pixels)
+        .map_err(|_| ImageError::TooLarge)?;
+    for y in top..bottom {
+        for x in left..right {
+            let index = y as usize * source.width() as usize + x as usize;
+            let value = source.pixels()[index].alpha();
+            alpha.push(style_clip.map_or(value, |clip| {
+                let clip_index = (source_origin_y as usize + y as usize) * viewport_width as usize
+                    + source_origin_x as usize
+                    + x as usize;
+                ((u16::from(value) * u16::from(clip.data()[clip_index]) + 127) / 255) as u8
+            }));
+        }
+    }
+    let size = tiny_skia::IntSize::from_wh(width, height).ok_or(ImageError::TooLarge)?;
+    let mask = Mask::from_vec(alpha, size).ok_or(ImageError::TooLarge)?;
+    Ok(Some((left, top, width, height, mask)))
+}
+
+fn include_text_point(
+    bounds: &mut Option<(f32, f32, f32, f32)>,
+    transform: Transform,
+    x: f32,
+    y: f32,
+) -> bool {
+    if !x.is_finite() || !y.is_finite() {
+        return false;
+    }
+    let mut point = Point::from_xy(x, y);
+    transform.map_point(&mut point);
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return false;
+    }
+    match bounds {
+        Some((left, top, right, bottom)) => {
+            *left = left.min(point.x);
+            *top = top.min(point.y);
+            *right = right.max(point.x);
+            *bottom = bottom.max(point.y);
+        }
+        None => *bounds = Some((point.x, point.y, point.x, point.y)),
+    }
+    true
+}
+
+fn include_text_rect(bounds: &mut Option<(f32, f32, f32, f32)>, rect: Rect) {
+    let rect = (
+        rect.x(),
+        rect.y(),
+        rect.x() + rect.width(),
+        rect.y() + rect.height(),
+    );
+    match bounds {
+        Some((left, top, right, bottom)) => {
+            *left = left.min(rect.0);
+            *top = top.min(rect.1);
+            *right = right.max(rect.2);
+            *bottom = bottom.max(rect.3);
+        }
+        None => *bounds = Some(rect),
+    }
+}
+
+fn text_ink_bounds(
+    font: &dyn FontProvider,
+    run: &ShapedRun,
+    size: f32,
+    x: f32,
+    baseline_y: f32,
+    transform: Transform,
+) -> Result<Option<(f32, f32, f32, f32)>, ImageError> {
+    let mut bounds = None;
+    let mut outlines_available = true;
+    for glyph in run.glyphs.iter() {
+        let outline = match font.outline_glyph(glyph.face, glyph.id, size * glyph.size_scale) {
+            Ok(outline) if !outline.commands.is_empty() => outline,
+            _ => {
+                outlines_available = false;
+                break;
+            }
+        };
+        let mut include = |glyph_x: f32, glyph_y: f32| {
+            include_text_point(
+                &mut bounds,
+                transform,
+                x + glyph.x + glyph_x,
+                baseline_y - glyph.y - glyph_y,
+            )
+        };
+        for command in outline.commands {
+            let valid = match command {
+                GlyphOutlineCommand::MoveTo(x, y) | GlyphOutlineCommand::LineTo(x, y) => {
+                    include(x, y)
+                }
+                GlyphOutlineCommand::QuadTo(x1, y1, x, y) => include(x1, y1) && include(x, y),
+                GlyphOutlineCommand::CurveTo(x1, y1, x2, y2, x, y) => {
+                    include(x1, y1) && include(x2, y2) && include(x, y)
+                }
+                GlyphOutlineCommand::Close => true,
+            };
+            if !valid {
+                outlines_available = false;
+                break;
+            }
+        }
+        if !outlines_available {
+            break;
+        }
+    }
+    if outlines_available {
+        if bounds.is_some() {
+            return Ok(bounds);
+        }
+        // Spaces normally have no outline, but a provider may expose bitmap
+        // glyphs only. Let the raster metrics decide whether any ink exists.
+    }
+
+    let mut bounds = None;
+    for glyph in run.glyphs.iter() {
+        let coverage = font
+            .rasterize_glyph(glyph.face, glyph.id, size * glyph.size_scale)
+            .map_err(ImageError::Font)?;
+        if coverage.width == 0 || coverage.height == 0 {
+            continue;
+        }
+        let expected_len = coverage
+            .width
+            .checked_mul(coverage.height)
+            .ok_or(ImageError::TooLarge)?;
+        if expected_len != coverage.alpha.len() {
+            return Err(ImageError::InvalidViewport);
+        }
+        let width = i32::try_from(coverage.width).map_err(|_| ImageError::TooLarge)?;
+        let height = i32::try_from(coverage.height).map_err(|_| ImageError::TooLarge)?;
+        let left = ((x + glyph.x).round() as i32).saturating_add(coverage.x_min);
+        let top = ((baseline_y - glyph.y).round() as i32)
+            .saturating_sub(coverage.y_min)
+            .saturating_sub(height);
+        if let Some(rect) = Rect::from_xywh(left as f32, top as f32, width as f32, height as f32)
+            .and_then(|rect| rect.transform(transform))
+        {
+            include_text_rect(&mut bounds, rect);
+        }
+    }
+    Ok(bounds)
+}
+
+fn text_ink_region(
+    bounds: Option<(f32, f32, f32, f32)>,
+    transform: Transform,
+    width: u32,
+    height: u32,
+) -> Result<Option<(u32, u32, u32, u32)>, ImageError> {
+    let Some((left, top, right, bottom)) = bounds else {
+        return Ok(None);
+    };
+    // Font rasterization can extend by a glyph pixel beyond vector bounds;
+    // map that uncertainty through the affine transform, then allow one more
+    // device pixel for bilinear glyph sampling.
+    let margin_x = (transform.sx.abs() + transform.kx.abs()).max(1.0) + 1.0;
+    let margin_y = (transform.ky.abs() + transform.sy.abs()).max(1.0) + 1.0;
+    let left = (left - margin_x).floor().max(0.0).min(width as f32);
+    let top = (top - margin_y).floor().max(0.0).min(height as f32);
+    let right = (right + margin_x).ceil().max(0.0).min(width as f32);
+    let bottom = (bottom + margin_y).ceil().max(0.0).min(height as f32);
+    if ![left, top, right, bottom]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Ok(None);
+    }
+    let x0 = left as u32;
+    let y0 = top as u32;
+    let x1 = right as u32;
+    let y1 = bottom as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return Ok(None);
+    }
+    let region_width = x1 - x0;
+    let region_height = y1 - y0;
+    let scratch_pixels = usize::try_from(region_width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(region_height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or(ImageError::TooLarge)?;
+    if scratch_pixels
+        .checked_mul(5)
+        .map_or(true, |bytes| bytes > MAX_LAYER_BYTES)
+    {
+        return Err(ImageError::TooLarge);
+    }
+    Ok(Some((x0, y0, region_width, region_height)))
+}
+
+fn localized_text_transform(
+    canvas_transform: Transform,
+    width_transform: Transform,
+    text_transform: Transform,
+    origin_x: u32,
+    origin_y: u32,
+) -> Option<Transform> {
+    // Subtract the integral ink-region origin before converting the composed
+    // translation back to f32. Composing a large canvas translation first and
+    // then canceling it can lose subpixel precision, making the same text
+    // rasterize differently when moved to a larger canvas.
+    let tx = f64::from(canvas_transform.sx) * f64::from(width_transform.tx)
+        + f64::from(canvas_transform.kx) * f64::from(width_transform.ty)
+        + f64::from(canvas_transform.tx)
+        - f64::from(origin_x);
+    let ty = f64::from(canvas_transform.ky) * f64::from(width_transform.tx)
+        + f64::from(canvas_transform.sy) * f64::from(width_transform.ty)
+        + f64::from(canvas_transform.ty)
+        - f64::from(origin_y);
+    if !tx.is_finite()
+        || !ty.is_finite()
+        || tx.abs() > f64::from(f32::MAX)
+        || ty.abs() > f64::from(f32::MAX)
+    {
+        return None;
+    }
+    Some(Transform::from_row(
+        text_transform.sx,
+        text_transform.ky,
+        text_transform.kx,
+        text_transform.sy,
+        tx as f32,
+        ty as f32,
+    ))
 }
 
 pub struct CanvasSurface {
@@ -902,11 +1394,11 @@ impl CanvasSurface {
         }
     }
 
-    pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
-        self.rect(x, y, width, height, false);
+    pub fn fill_rect(&mut self, x: f32, y: f32, width: f32, height: f32) -> Result<(), ImageError> {
+        self.rect(x, y, width, height, false)
     }
     pub fn clear_rect(&mut self, x: f32, y: f32, width: f32, height: f32) {
-        self.rect(x, y, width, height, true);
+        let _ = self.rect(x, y, width, height, true);
     }
 
     /// Draw an RGBA image into the destination rectangle using the current
@@ -1061,14 +1553,44 @@ impl CanvasSurface {
         let sx = width / image.width as f32;
         let sy = height / image.height as f32;
         let transform = self.state.transform;
-        let destination = Transform::from_row(
-            transform.sx * sx,
-            transform.kx * sx,
-            transform.ky * sy,
-            transform.sy * sy,
-            transform.sx * x + transform.ky * y + transform.tx,
-            transform.kx * x + transform.sy * y + transform.ty,
-        );
+        let destination_transform = |transform: Transform| {
+            Transform::from_row(
+                transform.sx * sx,
+                transform.kx * sx,
+                transform.ky * sy,
+                transform.sy * sy,
+                transform.sx * x + transform.ky * y + transform.tx,
+                transform.kx * x + transform.sy * y + transform.ty,
+            )
+        };
+        if let Some(bounds) =
+            Rect::from_xywh(x, y, width, height).and_then(|rect| rect.transform(transform))
+        {
+            let shadow_paint = PixmapPaint {
+                opacity: self.state.alpha,
+                blend_mode: BlendMode::SourceOver,
+                quality: FilterQuality::Bilinear,
+            };
+            draw_canvas_shadow(
+                &mut self.bitmap,
+                self.width,
+                self.height,
+                &self.state,
+                transform,
+                bounds,
+                0,
+                |target, shadow_transform| {
+                    target.draw_pixmap(
+                        0,
+                        0,
+                        source.as_ref(),
+                        &shadow_paint,
+                        destination_transform(shadow_transform),
+                        None,
+                    );
+                },
+            )?;
+        }
         let paint = PixmapPaint {
             opacity: self.state.alpha,
             blend_mode: self.state.blend,
@@ -1080,7 +1602,7 @@ impl CanvasSurface {
                 0,
                 source.as_ref(),
                 &paint,
-                destination,
+                destination_transform(transform),
                 self.state.clip.as_ref(),
             );
             self.changed();
@@ -1186,9 +1708,6 @@ impl CanvasSurface {
         if horizontal_scale <= 0.0 {
             return Ok(run.width);
         }
-        let Some(mut glyphs) = Pixmap::new(self.width, self.height) else {
-            return Err(ImageError::TooLarge);
-        };
         let width_transform = Transform::from_row(
             horizontal_scale,
             0.0,
@@ -1198,6 +1717,25 @@ impl CanvasSurface {
             0.0,
         );
         let text_transform = self.state.transform.pre_concat(width_transform);
+        let Some((origin_x, origin_y, region_width, region_height)) = text_ink_region(
+            text_ink_bounds(font, &run, size, x, baseline_y, text_transform)?,
+            text_transform,
+            self.width,
+            self.height,
+        )?
+        else {
+            return Ok(run.width);
+        };
+        let mut glyphs = Pixmap::new(region_width, region_height).ok_or(ImageError::TooLarge)?;
+        let Some(glyph_transform) = localized_text_transform(
+            self.state.transform,
+            width_transform,
+            text_transform,
+            origin_x,
+            origin_y,
+        ) else {
+            return Ok(run.width);
+        };
         let pixmap_paint = PixmapPaint {
             blend_mode: BlendMode::SourceOver,
             quality: FilterQuality::Bilinear,
@@ -1210,27 +1748,32 @@ impl CanvasSurface {
             if coverage.width == 0 || coverage.height == 0 {
                 continue;
             }
-            let mut pixels = Vec::with_capacity(coverage.alpha.len().saturating_mul(4));
-            for alpha in coverage.alpha {
-                pixels.extend_from_slice(&[alpha, alpha, alpha, alpha]);
+            let width = u32::try_from(coverage.width).map_err(|_| ImageError::TooLarge)?;
+            let height = u32::try_from(coverage.height).map_err(|_| ImageError::TooLarge)?;
+            let mut source = Pixmap::new(width, height).ok_or(ImageError::TooLarge)?;
+            if source.data().len() / 4 != coverage.alpha.len() {
+                return Err(ImageError::InvalidViewport);
             }
-            let glyph_size =
-                tiny_skia::IntSize::from_wh(coverage.width as u32, coverage.height as u32)
-                    .ok_or(ImageError::TooLarge)?;
-            let source = Pixmap::from_vec(pixels, glyph_size).ok_or(ImageError::TooLarge)?;
-            let left = ((x + glyph.x) as f32).round() as i32 + coverage.x_min;
-            let top =
-                (baseline_y - glyph.y).round() as i32 - coverage.y_min - coverage.height as i32;
+            for (pixel, alpha) in source
+                .data_mut()
+                .chunks_exact_mut(4)
+                .zip(coverage.alpha.into_iter())
+            {
+                pixel.copy_from_slice(&[alpha, alpha, alpha, alpha]);
+            }
+            let left = ((x + glyph.x).round() as i32).saturating_add(coverage.x_min);
+            let top = ((baseline_y - glyph.y).round() as i32)
+                .saturating_sub(coverage.y_min)
+                .saturating_sub(i32::try_from(coverage.height).map_err(|_| ImageError::TooLarge)?);
             glyphs.draw_pixmap(
                 left,
                 top,
                 source.as_ref(),
                 &pixmap_paint,
-                text_transform,
+                glyph_transform,
                 None,
             );
         }
-        let mut mask = Mask::from_pixmap(glyphs.as_ref(), tiny_skia::MaskType::Alpha);
         let gradient_image = self
             .state
             .fill_gradient
@@ -1246,6 +1789,87 @@ impl CanvasSurface {
             gradient_image.as_ref(),
         );
         let pattern_clip = self.pattern_clip(self.state.fill_pattern.as_ref());
+        if self.state.shadow_color[3] != 0
+            && (self.state.shadow_blur != 0.0
+                || self.state.shadow_offset_x != 0.0
+                || self.state.shadow_offset_y != 0.0)
+            && !matches!(self.state.blend, BlendMode::Clear | BlendMode::Source)
+        {
+            if let Some((left, top, width, height, shadow_mask)) = cropped_alpha_mask(
+                &glyphs,
+                pattern_clip.as_ref(),
+                origin_x,
+                origin_y,
+                self.width,
+                self.height,
+            )? {
+                let source_origin_x = origin_x.checked_add(left).ok_or(ImageError::TooLarge)?;
+                let source_origin_y = origin_y.checked_add(top).ok_or(ImageError::TooLarge)?;
+                let shadow_paint = Self::paint(
+                    BlendMode::SourceOver,
+                    self.state.alpha,
+                    self.state.fill,
+                    self.state.fill_gradient.as_ref(),
+                    self.state.fill_pattern.as_ref(),
+                    self.state.transform,
+                    gradient_image.as_ref(),
+                );
+                let Some(mut source) = Pixmap::new(width, height) else {
+                    return Err(ImageError::TooLarge);
+                };
+                let Some(source_rect) = Rect::from_xywh(
+                    source_origin_x as f32,
+                    source_origin_y as f32,
+                    width as f32,
+                    height as f32,
+                ) else {
+                    return Ok(run.width);
+                };
+                source.fill_rect(
+                    source_rect,
+                    &shadow_paint,
+                    Transform::from_translate(-(source_origin_x as f32), -(source_origin_y as f32)),
+                    Some(&shadow_mask),
+                );
+                let reserved_bytes = shadow_mask
+                    .data()
+                    .len()
+                    .checked_add(source.data().len())
+                    .and_then(|bytes| bytes.checked_add(glyphs.data().len()))
+                    .and_then(|bytes| {
+                        pattern_clip
+                            .as_ref()
+                            .map_or(Some(bytes), |clip| bytes.checked_add(clip.data().len()))
+                    })
+                    .and_then(|bytes| {
+                        gradient_image.as_ref().map_or(Some(bytes), |gradient| {
+                            bytes.checked_add(gradient.data().len())
+                        })
+                    })
+                    .ok_or(ImageError::TooLarge)?;
+                draw_canvas_shadow_from_pixmap(
+                    &mut self.bitmap,
+                    self.width,
+                    self.height,
+                    &self.state,
+                    &source,
+                    source_origin_x,
+                    source_origin_y,
+                    1.0,
+                    reserved_bytes,
+                )?;
+            }
+        }
+
+        let mut mask = Mask::new(self.width, self.height).ok_or(ImageError::TooLarge)?;
+        for (local_index, pixel) in glyphs.pixels().iter().enumerate() {
+            let local_x = local_index as u32 % region_width;
+            let local_y = local_index as u32 / region_width;
+            let canvas_index = (origin_y as usize + local_y as usize) * self.width as usize
+                + origin_x as usize
+                + local_x as usize;
+            mask.data_mut()[canvas_index] = pixel.alpha();
+        }
         if let Some(clip) = pattern_clip.as_ref().or(self.state.clip.as_ref()) {
             for (coverage, clip_coverage) in mask.data_mut().iter_mut().zip(clip.data()) {
                 *coverage = ((*coverage as u16 * *clip_coverage as u16 + 127) / 255) as u8;
@@ -1351,6 +1975,47 @@ impl CanvasSurface {
             gradient_image.as_ref(),
         );
         let pattern_clip = self.pattern_clip(self.state.stroke_pattern.as_ref());
+        if let Some(mut bounds) = path.bounds().transform(transform) {
+            let scale_x = transform.sx.hypot(transform.ky);
+            let scale_y = transform.kx.hypot(transform.sy);
+            let outset = f64::from(self.state.line.width)
+                * f64::from(scale_x.max(scale_y))
+                * self.state.miter_limit.max(1.0)
+                * 0.5;
+            if outset.is_finite() && outset <= f64::from(f32::MAX) {
+                let outset = outset as f32;
+                if let Some(expanded) = Rect::from_xywh(
+                    bounds.x() - outset,
+                    bounds.y() - outset,
+                    bounds.width() + outset * 2.0,
+                    bounds.height() + outset * 2.0,
+                ) {
+                    bounds = expanded;
+                }
+            }
+            let shadow_paint = Self::paint(
+                BlendMode::SourceOver,
+                self.state.alpha,
+                self.state.stroke,
+                self.state.stroke_gradient.as_ref(),
+                self.state.stroke_pattern.as_ref(),
+                transform,
+                gradient_image.as_ref(),
+            );
+            let line = &self.state.line;
+            draw_canvas_shadow(
+                &mut self.bitmap,
+                self.width,
+                self.height,
+                &self.state,
+                transform,
+                bounds,
+                0,
+                |source, shadow_transform| {
+                    source.stroke_path(&path, &shadow_paint, line, shadow_transform, None)
+                },
+            )?;
+        }
         if let Some(bitmap) = &mut self.bitmap {
             bitmap.stroke_path(
                 &path,
@@ -1376,9 +2041,16 @@ impl CanvasSurface {
         font.shape_canvas_text(text, size, rtl, font_spec, options)
             .map_err(|_| ImageError::Font("text shaping failed"))
     }
-    fn rect(&mut self, x: f32, y: f32, width: f32, height: f32, clear: bool) {
+    fn rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        clear: bool,
+    ) -> Result<(), ImageError> {
         let Some(rect) = rectangle(x, y, width, height) else {
-            return;
+            return Ok(());
         };
         let gradient_image = if clear {
             None
@@ -1388,6 +2060,29 @@ impl CanvasSurface {
                 .as_ref()
                 .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height))
         };
+        if !clear {
+            if let Some(bounds) = rect.transform(self.state.transform) {
+                let source_paint = Self::paint(
+                    BlendMode::SourceOver,
+                    self.state.alpha,
+                    self.state.fill,
+                    self.state.fill_gradient.as_ref(),
+                    self.state.fill_pattern.as_ref(),
+                    self.state.transform,
+                    gradient_image.as_ref(),
+                );
+                draw_canvas_shadow(
+                    &mut self.bitmap,
+                    self.width,
+                    self.height,
+                    &self.state,
+                    self.state.transform,
+                    bounds,
+                    0,
+                    |source, transform| source.fill_rect(rect, &source_paint, transform, None),
+                )?;
+            }
+        }
         let paint = if clear {
             // DestinationOut with an opaque source applies the clip coverage
             // to destination alpha, including partially covered edge pixels.
@@ -1420,14 +2115,36 @@ impl CanvasSurface {
             );
             self.changed();
         }
+        Ok(())
     }
 
-    pub fn fill_path(&mut self, path: &Path, rule: FillRule) {
+    pub fn fill_path(&mut self, path: &Path, rule: FillRule) -> Result<(), ImageError> {
         let gradient_image = self
             .state
             .fill_gradient
             .as_ref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
+        if let Some(bounds) = path.bounds().transform(self.state.transform) {
+            let source_paint = Self::paint(
+                BlendMode::SourceOver,
+                self.state.alpha,
+                self.state.fill,
+                self.state.fill_gradient.as_ref(),
+                self.state.fill_pattern.as_ref(),
+                self.state.transform,
+                gradient_image.as_ref(),
+            );
+            draw_canvas_shadow(
+                &mut self.bitmap,
+                self.width,
+                self.height,
+                &self.state,
+                self.state.transform,
+                bounds,
+                0,
+                |source, transform| source.fill_path(path, &source_paint, rule, transform, None),
+            )?;
+        }
         let paint = Self::paint(
             self.state.blend,
             self.state.alpha,
@@ -1448,13 +2165,54 @@ impl CanvasSurface {
             );
             self.changed();
         }
+        Ok(())
     }
-    pub fn stroke_path(&mut self, path: &Path) {
+    pub fn stroke_path(&mut self, path: &Path) -> Result<(), ImageError> {
         let gradient_image = self
             .state
             .stroke_gradient
             .as_ref()
             .and_then(|gradient| gradient.equal_radial_bitmap(self.width, self.height));
+        if let Some(mut bounds) = path.bounds().transform(self.state.transform) {
+            let transform = self.state.transform;
+            let scale_x = transform.sx.hypot(transform.ky);
+            let scale_y = transform.kx.hypot(transform.sy);
+            let outset = f64::from(self.state.line.width)
+                * f64::from(scale_x.max(scale_y))
+                * self.state.miter_limit.max(1.0)
+                * 0.5;
+            if outset.is_finite() && outset <= f64::from(f32::MAX) {
+                let outset = outset as f32;
+                if let Some(expanded) = Rect::from_xywh(
+                    bounds.x() - outset,
+                    bounds.y() - outset,
+                    bounds.width() + outset * 2.0,
+                    bounds.height() + outset * 2.0,
+                ) {
+                    bounds = expanded;
+                }
+            }
+            let source_paint = Self::paint(
+                BlendMode::SourceOver,
+                self.state.alpha,
+                self.state.stroke,
+                self.state.stroke_gradient.as_ref(),
+                self.state.stroke_pattern.as_ref(),
+                self.state.transform,
+                gradient_image.as_ref(),
+            );
+            let line = &self.state.line;
+            draw_canvas_shadow(
+                &mut self.bitmap,
+                self.width,
+                self.height,
+                &self.state,
+                self.state.transform,
+                bounds,
+                0,
+                |source, transform| source.stroke_path(path, &source_paint, line, transform, None),
+            )?;
+        }
         let paint = Self::paint(
             self.state.blend,
             self.state.alpha,
@@ -1475,6 +2233,7 @@ impl CanvasSurface {
             );
             self.changed();
         }
+        Ok(())
     }
     pub fn clip_path(&mut self, path: &Path, rule: FillRule) {
         if let Some(clip) = &mut self.state.clip {
@@ -1549,22 +2308,27 @@ impl CanvasSurface {
     /// are transparent black, as required by ImageData readback.
     pub fn read_pixels(
         &self,
-        x: i32,
-        y: i32,
+        x: i64,
+        y: i64,
         width: u32,
         height: u32,
     ) -> Result<Rgba8Image, ImageError> {
         let bytes = pixel_bytes(width, height)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(bytes)
+            .map_err(|_| ImageError::TooLarge)?;
+        pixels.resize(bytes, 0);
         let mut output = Rgba8Image {
             width,
             height,
-            pixels: vec![0; bytes],
+            pixels,
         };
         if let Some(bitmap) = &self.bitmap {
             for row in 0..height {
                 for col in 0..width {
-                    let sx = i64::from(x) + i64::from(col);
-                    let sy = i64::from(y) + i64::from(row);
+                    let sx = x.saturating_add(i64::from(col));
+                    let sy = y.saturating_add(i64::from(row));
                     if sx < 0
                         || sy < 0
                         || sx >= i64::from(self.width)
@@ -1589,27 +2353,79 @@ impl CanvasSurface {
 
     /// Direct pixel replacement bypasses alpha, compositing, transform and clip.
     pub fn write_pixels(&mut self, image: &Rgba8Image, x: i32, y: i32) -> Result<(), ImageError> {
+        self.write_pixels_region(
+            image,
+            i64::from(x),
+            i64::from(y),
+            0,
+            0,
+            image.width,
+            image.height,
+        )
+    }
+
+    /// Copy a source rectangle directly, without compositing, transform, or clip.
+    /// The source and destination are clipped without allocating intermediate pixels.
+    pub fn write_pixels_region(
+        &mut self,
+        image: &Rgba8Image,
+        destination_x: i64,
+        destination_y: i64,
+        source_x: u32,
+        source_y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), ImageError> {
         if image.pixels.len() != pixel_bytes(image.width, image.height)? {
             return Err(ImageError::InvalidViewport);
         }
+        let source_right = source_x
+            .checked_add(width)
+            .ok_or(ImageError::InvalidViewport)?;
+        let source_bottom = source_y
+            .checked_add(height)
+            .ok_or(ImageError::InvalidViewport)?;
+        if source_right > image.width || source_bottom > image.height {
+            return Err(ImageError::InvalidViewport);
+        }
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        let first_col = if destination_x < 0 {
+            u32::try_from(destination_x.saturating_neg()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        let first_row = if destination_y < 0 {
+            u32::try_from(destination_y.saturating_neg()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        let end_col = i64::from(width).min(i64::from(self.width) - destination_x);
+        let end_row = i64::from(height).min(i64::from(self.height) - destination_y);
+        if i64::from(first_col) >= end_col || i64::from(first_row) >= end_row {
+            return Ok(());
+        }
+        let end_col = u32::try_from(end_col).map_err(|_| ImageError::InvalidViewport)?;
+        let end_row = u32::try_from(end_row).map_err(|_| ImageError::InvalidViewport)?;
+        let mut changed = false;
         if let Some(bitmap) = &mut self.bitmap {
-            for row in 0..image.height {
-                for col in 0..image.width {
-                    let dx = i64::from(x) + i64::from(col);
-                    let dy = i64::from(y) + i64::from(row);
-                    if dx < 0
-                        || dy < 0
-                        || dx >= i64::from(self.width)
-                        || dy >= i64::from(self.height)
-                    {
-                        continue;
-                    }
-                    let offset = (row as usize * image.width as usize + col as usize) * 4;
+            for row in first_row..end_row {
+                for col in first_col..end_col {
+                    let dx = destination_x + i64::from(col);
+                    let dy = destination_y + i64::from(row);
+                    let source_col = source_x + col;
+                    let source_row = source_y + row;
+                    let offset =
+                        (source_row as usize * image.width as usize + source_col as usize) * 4;
                     let c = &image.pixels[offset..offset + 4];
                     bitmap.pixels_mut()[dy as usize * self.width as usize + dx as usize] =
                         tiny_skia::ColorU8::from_rgba(c[0], c[1], c[2], c[3]).premultiply();
+                    changed = true;
                 }
             }
+        }
+        if changed {
             self.changed();
         }
         Ok(())
@@ -1791,7 +2607,7 @@ mod tests {
     fn state_clip_transform_clear_and_resize_affect_real_pixels() {
         let mut canvas = CanvasSurface::new(4, 2).unwrap();
         canvas.state_mut().fill = [255, 0, 0, 255];
-        canvas.fill_rect(0.0, 0.0, 4.0, 2.0);
+        canvas.fill_rect(0.0, 0.0, 4.0, 2.0).unwrap();
         canvas.save();
         let path = PathBuilder::from_rect(Rect::from_xywh(1.0, 0.0, 1.0, 2.0).unwrap());
         canvas.clip_path(&path, FillRule::Winding);
@@ -1800,7 +2616,7 @@ mod tests {
         assert_eq!(&canvas.snapshot().pixels[4..8], &[0, 0, 0, 0]);
         assert_eq!(&canvas.snapshot().pixels[8..12], &[255, 0, 0, 255]);
         canvas.restore();
-        canvas.fill_rect(2.0, 1.0, -1.0, -1.0);
+        canvas.fill_rect(2.0, 1.0, -1.0, -1.0).unwrap();
         assert_eq!(&canvas.snapshot().pixels[4..8], &[255, 0, 0, 255]);
         canvas.resize(4, 2).unwrap();
         assert!(canvas.snapshot().pixels.iter().all(|byte| *byte == 0));
@@ -1833,10 +2649,10 @@ mod tests {
     fn source_over_uses_premultiplied_alpha_and_exports_straight_pixels() {
         let mut canvas = CanvasSurface::new(1, 1).unwrap();
         canvas.state_mut().fill = [255, 0, 0, 128];
-        canvas.fill_rect(0.0, 0.0, 1.0, 1.0);
+        canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
         assert_eq!(canvas.snapshot().pixels, [255, 0, 0, 128]);
         canvas.state_mut().fill = [0, 0, 255, 128];
-        canvas.fill_rect(0.0, 0.0, 1.0, 1.0);
+        canvas.fill_rect(0.0, 0.0, 1.0, 1.0).unwrap();
         let pixel = canvas.snapshot().pixels;
         assert!((i32::from(pixel[0]) - 85).abs() <= 1);
         assert!((i32::from(pixel[2]) - 170).abs() <= 1);
@@ -1889,7 +2705,7 @@ mod tests {
         gradient.add_color_stop(0.0, [255, 0, 0, 255]).unwrap();
         let mut canvas = CanvasSurface::new(4, 1).unwrap();
         canvas.state_mut().fill_gradient = Some(gradient);
-        canvas.fill_rect(0.0, 0.0, 4.0, 1.0);
+        canvas.fill_rect(0.0, 0.0, 4.0, 1.0).unwrap();
         let pixels = canvas.snapshot().pixels;
         assert!(pixels[0] > pixels[2]);
         assert!(pixels[12] < pixels[14]);
@@ -1898,6 +2714,219 @@ mod tests {
         canvas.state_mut().fill = [0, 255, 0, 255];
         canvas.restore();
         assert!(canvas.state().fill_gradient.is_some());
+    }
+
+    #[test]
+    fn canvas_state_properties_save_restore_and_resize_with_the_bitmap() {
+        let mut canvas = CanvasSurface::new(4, 3).unwrap();
+        assert_eq!(canvas.state().line.line_cap, LineCap::Butt);
+        assert_eq!(canvas.state().line.line_join, LineJoin::Miter);
+        assert_eq!(canvas.state().miter_limit, 10.0);
+        assert_eq!(canvas.state().shadow_color, [0, 0, 0, 0]);
+        assert_eq!(canvas.state().shadow_blur, 0.0);
+        assert_eq!(canvas.state().shadow_offset_x, 0.0);
+        assert_eq!(canvas.state().shadow_offset_y, 0.0);
+        assert_eq!(canvas.state().shadow_offset_x, 0.0);
+        assert_eq!(canvas.state().shadow_offset_y, 0.0);
+
+        canvas.save();
+        let state = canvas.state_mut();
+        state.line.line_cap = LineCap::Square;
+        state.line.line_join = LineJoin::Bevel;
+        state.miter_limit = 3.5;
+        state.line.miter_limit = 3.5;
+        state.shadow_color = [7, 11, 13, 127];
+        state.shadow_blur = 4.0;
+        state.shadow_offset_x = -2.0;
+        state.shadow_offset_y = 5.0;
+        canvas.restore();
+        assert_eq!(canvas.state().line.line_cap, LineCap::Butt);
+        assert_eq!(canvas.state().line.line_join, LineJoin::Miter);
+        assert_eq!(canvas.state().miter_limit, 10.0);
+        assert_eq!(canvas.state().shadow_color, [0, 0, 0, 0]);
+        assert_eq!(canvas.state().shadow_blur, 0.0);
+
+        let state = canvas.state_mut();
+        state.line.line_cap = LineCap::Round;
+        state.line.line_join = LineJoin::Round;
+        state.miter_limit = 2.0;
+        state.shadow_color = [255, 0, 0, 255];
+        state.shadow_offset_x = 1.0;
+        canvas.resize(4, 3).unwrap();
+        assert_eq!(canvas.state().line.line_cap, LineCap::Butt);
+        assert_eq!(canvas.state().line.line_join, LineJoin::Miter);
+        assert_eq!(canvas.state().miter_limit, 10.0);
+        assert_eq!(canvas.state().shadow_color, [0, 0, 0, 0]);
+        assert_eq!(canvas.state().shadow_blur, 0.0);
+        assert_eq!(canvas.state().shadow_offset_x, 0.0);
+        assert_eq!(canvas.state().shadow_offset_y, 0.0);
+    }
+
+    #[test]
+    fn canvas_text_scratch_region_tracks_transforms_and_enforces_budget() {
+        assert_eq!(
+            text_ink_region(
+                Some((10.25, 20.75, 30.5, 42.25)),
+                Transform::identity(),
+                100,
+                100,
+            )
+            .unwrap(),
+            Some((8, 18, 25, 27))
+        );
+        assert_eq!(
+            text_ink_region(
+                Some((10.25, 20.75, 30.5, 42.25)),
+                Transform::from_scale(3.0, 3.0),
+                100,
+                100,
+            )
+            .unwrap(),
+            Some((6, 16, 29, 31))
+        );
+        assert_eq!(
+            text_ink_region(
+                Some((-8.25, 5.5, 2.25, 10.5)),
+                Transform::identity(),
+                100,
+                100,
+            )
+            .unwrap(),
+            Some((0, 3, 5, 10))
+        );
+        assert_eq!(
+            text_ink_region(
+                Some((50.2, 50.2, 51.2, 51.2)),
+                Transform::from_skew(5.0, 0.0),
+                100,
+                100,
+            )
+            .unwrap(),
+            Some((43, 48, 16, 6))
+        );
+        let width_transform = Transform::from_row(0.8, 0.0, 0.0, 1.0, 3.125, 0.0);
+        let small_transform = Transform::from_row(1.0, 0.25, 0.5, 1.0, 16.0, 8.0);
+        let large_transform = Transform::from_row(1.0, 0.25, 0.5, 1.0, 1016.0, 1008.0);
+        let small_local = localized_text_transform(
+            small_transform,
+            width_transform,
+            small_transform.pre_concat(width_transform),
+            20,
+            12,
+        )
+        .unwrap();
+        let large_local = localized_text_transform(
+            large_transform,
+            width_transform,
+            large_transform.pre_concat(width_transform),
+            1020,
+            1012,
+        )
+        .unwrap();
+        assert_eq!(small_local, large_local);
+        assert!(matches!(
+            text_ink_region(
+                Some((10.0, 10.0, 1010.0, 1010.0)),
+                Transform::identity(),
+                2000,
+                2000,
+            ),
+            Err(ImageError::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn canvas_shadows_render_for_rects_and_images_with_alpha_and_clearrect_ignores_them() {
+        let mut canvas = CanvasSurface::new(10, 4).unwrap();
+        {
+            let state = canvas.state_mut();
+            state.fill = [255, 0, 0, 255];
+            state.shadow_color = [0, 0, 255, 255];
+            state.shadow_offset_x = 3.0;
+        }
+        canvas.fill_rect(1.0, 1.0, 2.0, 2.0).unwrap();
+        let pixel = |image: &Rgba8Image, x: usize, y: usize| {
+            let offset = (y * image.width as usize + x) * 4;
+            [
+                image.pixels[offset],
+                image.pixels[offset + 1],
+                image.pixels[offset + 2],
+                image.pixels[offset + 3],
+            ]
+        };
+        let image = canvas.snapshot();
+        assert_eq!(pixel(&image, 1, 1), [255, 0, 0, 255]);
+        assert_eq!(pixel(&image, 4, 1), [0, 0, 255, 255]);
+
+        let mut image_canvas = CanvasSurface::new(8, 3).unwrap();
+        {
+            let state = image_canvas.state_mut();
+            state.shadow_color = [0, 0, 255, 255];
+            state.shadow_offset_x = 3.0;
+        }
+        image_canvas
+            .draw_image(
+                &Rgba8Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![255, 0, 0, 128],
+                },
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+            )
+            .unwrap();
+        let image = image_canvas.snapshot();
+        assert_eq!(pixel(&image, 4, 1), [0, 0, 255, 128]);
+
+        let mut cleared = CanvasSurface::new(8, 3).unwrap();
+        {
+            let state = cleared.state_mut();
+            state.shadow_color = [0, 0, 255, 255];
+            state.shadow_offset_x = 3.0;
+        }
+        cleared.clear_rect(1.0, 1.0, 1.0, 1.0);
+        assert!(cleared
+            .snapshot()
+            .pixels
+            .iter()
+            .all(|channel| *channel == 0));
+    }
+
+    #[test]
+    fn canvas_shadow_blur_spreads_alpha_and_uses_shadow_color() {
+        let mut canvas = CanvasSurface::new(16, 8).unwrap();
+        {
+            let state = canvas.state_mut();
+            state.fill = [255, 0, 0, 128];
+            state.shadow_color = [0, 255, 0, 255];
+            state.shadow_blur = 4.0;
+            state.shadow_offset_x = 4.0;
+        }
+        canvas.fill_rect(5.0, 3.0, 1.0, 1.0).unwrap();
+        let image = canvas.snapshot();
+        let pixel = |x: usize, y: usize| {
+            let offset = (y * 16 + x) * 4;
+            [
+                image.pixels[offset],
+                image.pixels[offset + 1],
+                image.pixels[offset + 2],
+                image.pixels[offset + 3],
+            ]
+        };
+        let source_pixel = pixel(5, 3);
+        // The translucent source is drawn over the blurred shadow tail at its
+        // own position, so source-over slightly raises alpha and lets some
+        // shadow color contribute beneath the red fill.
+        assert!(source_pixel[0] > source_pixel[1]);
+        assert!(source_pixel[1] > 0);
+        assert!(source_pixel[2] == 0);
+        assert!(source_pixel[3] > 128 && source_pixel[3] < 255);
+        assert!(pixel(9, 3)[1] > 0);
+        assert!(pixel(9, 3)[3] > 0);
+        assert!(pixel(9, 3)[0] == 0);
+        assert!(pixel(8, 3)[3] >= pixel(11, 3)[3]);
     }
 
     #[test]

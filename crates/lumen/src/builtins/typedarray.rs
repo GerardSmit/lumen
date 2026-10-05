@@ -70,10 +70,28 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         if !new_len.is_finite() || new_len < cur as f64 || new_len as usize > max {
             return Err(i.make_error("RangeError", "SharedArrayBuffer grow out of range"));
         }
-        if let Some(buf) = i.array_buffers.get(&ptr) {
-            buf.resize(new_len as usize)
-                .map_err(|e| buffer_error(i, e))?;
+        let new_len = new_len as usize;
+        let id = match i.get_member(&this, "\u{0}sab_id") {
+            Ok(Value::Num(id)) => id as u64,
+            _ => return Err(i.make_error("TypeError", "not a SharedArrayBuffer")),
+        };
+        let memory = crate::interpreter::shared_mem_get(id)
+            .ok_or_else(|| i.make_error("TypeError", "SharedArrayBuffer backing store is gone"))?;
+        let mut bytes = memory.lock().unwrap();
+        let len = bytes.len();
+        if new_len > len {
+            bytes
+                .try_reserve_exact(new_len - len)
+                .map_err(|_| i.make_error("RangeError", "SharedArrayBuffer allocation too large"))?;
         }
+        let store = i
+            .array_buffers
+            .get(&ptr)
+            .ok_or_else(|| i.make_error("TypeError", "SharedArrayBuffer backing is detached"))?;
+        store
+            .grow_metadata_to(new_len)
+            .map_err(|e| buffer_error(i, e))?;
+        bytes.resize(new_len, 0);
         Ok(Value::Undefined)
     });
     if let Some(key) = well_known_key(it, "toStringTag") {
@@ -188,8 +206,11 @@ pub(super) fn install_shared_array_buffer(it: &mut Interp) {
         }
         let bp = Gc::as_ptr(&obj) as usize;
         i.gc_pin(&obj);
-        i.array_buffers
-            .insert(bp, new_store(len, max.map(|m| m as usize)).into());
+        let store = match max {
+            Some(max) => ByteStore::metadata_only(len).with_max_len(max as usize),
+            None => ByteStore::metadata_only(len),
+        };
+        i.array_buffers.insert(bp, store.into());
         set_internal(
             &obj,
             "\u{0}ab_max_byte_length",
@@ -844,11 +865,7 @@ fn rel_index(n: f64, len: usize) -> usize {
         return 0;
     }
     let n = if n.is_infinite() {
-        if n > 0.0 {
-            len as f64
-        } else {
-            0.0
-        }
+        if n > 0.0 { len as f64 } else { 0.0 }
     } else {
         n.trunc()
     };
@@ -1028,11 +1045,7 @@ fn ta_native(
             // coerces to 0); the default when absent is 0 (indexOf) / len-1 (lastIndexOf).
             let from = if args.len() >= 2 {
                 let n = ab(i.to_number(&arg(args, 1)))?;
-                if n.is_nan() {
-                    0.0
-                } else {
-                    n.trunc()
-                }
+                if n.is_nan() { 0.0 } else { n.trunc() }
             } else if last {
                 (len - 1) as f64
             } else {
@@ -1110,11 +1123,7 @@ fn ta_native(
             let from = match args.get(1) {
                 Some(v) if !matches!(v, Value::Undefined) => {
                     let n = ab(i.to_number(v))?;
-                    if n.is_nan() {
-                        0.0
-                    } else {
-                        n.trunc()
-                    }
+                    if n.is_nan() { 0.0 } else { n.trunc() }
                 }
                 _ => 0.0,
             };
@@ -1724,11 +1733,7 @@ fn ta_set(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
         Value::Undefined => 0.0,
         v => {
             let n = ab(i.to_number(&v))?;
-            if n.is_nan() {
-                0.0
-            } else {
-                n.trunc()
-            }
+            if n.is_nan() { 0.0 } else { n.trunc() }
         }
     };
     if offset_n < 0.0 {
@@ -2049,11 +2054,18 @@ fn u8_bytes(i: &mut Interp, this: &Value) -> Result<Vec<u8>, Value> {
     if !matches!(info.kind, TaKind::U8) {
         return Err(i.make_error("TypeError", "method requires a Uint8Array"));
     }
-    let buf = i
-        .array_buffers
-        .get(&info.buffer)
+    let len = i
+        .ta_len(&info)
         .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
-    Ok(buf.bytes()[info.offset..info.offset + info.len].to_vec())
+    let end = info
+        .offset
+        .checked_add(len)
+        .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
+    i.with_buffer_bytes(info.buffer, |bytes| {
+        bytes.get(info.offset..end).map(<[u8]>::to_vec)
+    })
+    .flatten()
+    .ok_or_else(|| i.make_error("TypeError", "detached buffer"))
 }
 fn make_u8array(i: &mut Interp, bytes: Vec<u8>) -> Result<Value, Value> {
     let ctor = ab(i.get_member(&Value::Obj(i.global.clone()), "Uint8Array"))?;
@@ -2234,8 +2246,22 @@ fn u8_set_bytes(i: &mut Interp, info: &TaInfo, read: usize, bytes: &[u8]) -> Res
             "cannot write into a view over an immutable ArrayBuffer",
         ));
     }
-    if let Some(buf) = i.array_buffers.get(&info.buffer) {
-        buf.bytes_mut()[info.offset..info.offset + bytes.len()].copy_from_slice(bytes);
+    let len = i
+        .ta_len(info)
+        .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
+    if bytes.len() > len {
+        return Err(i.make_error("TypeError", "detached buffer"));
+    }
+    let end = info
+        .offset
+        .checked_add(bytes.len())
+        .ok_or_else(|| i.make_error("TypeError", "detached buffer"))?;
+    let wrote = i.with_buffer_bytes_mut(info.buffer, |buf| {
+        buf.get_mut(info.offset..end)
+            .map(|dst| dst.copy_from_slice(bytes))
+    });
+    if !matches!(wrote, Some(Some(()))) {
+        return Err(i.make_error("TypeError", "detached buffer"));
     }
     let result = i.new_object();
     set_data(&result, "read", Value::Num(read as f64));

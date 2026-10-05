@@ -6,6 +6,23 @@ pub(crate) struct DomShadowRoot {
 }
 #[lumen_bind::methods]
 impl DomShadowRoot {
+    #[method(name = "elementFromPoint", coerce)]
+    fn element_from_point(&self, ctx: &mut Ctx, x: f64, y: f64) -> OpResult<Value> {
+        let node = &self.base.base;
+        let found = geometry::element_from_point_in_tree(&node.realm, Some(node.id), x, y)?;
+        Ok(node.realm.wrap_option(ctx, found))
+    }
+
+    #[method(name = "elementsFromPoint", coerce)]
+    fn elements_from_point(&self, ctx: &mut Ctx, x: f64, y: f64) -> OpResult<Vec<Value>> {
+        let node = &self.base.base;
+        let nodes = geometry::elements_from_point_in_tree(&node.realm, Some(node.id), x, y)?;
+        Ok(nodes
+            .into_iter()
+            .map(|id| node.realm.wrap(ctx, id))
+            .collect())
+    }
+
     fn get_animations(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let node = &self.base.base;
         animations::for_tree_root(ctx, &node.realm, node.id)
@@ -50,6 +67,23 @@ impl DomShadowRoot {
         .into())
     }
     #[getter]
+    fn slot_assignment(&self) -> OpResult<String> {
+        let node = &self.base.base;
+        Ok(match node
+            .realm
+            .session
+            .borrow()
+            .document()
+            .shadow_options(node.id)
+            .map_err(dom_error)?
+            .map(|options| options.slot_assignment)
+        {
+            Some(lumen_html::SlotAssignmentMode::Manual) => "manual",
+            _ => "named",
+        }
+        .into())
+    }
+    #[getter]
     fn active_element(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let node = &self.base.base;
         let Some(focused) = node.realm.focused_node() else {
@@ -72,12 +106,6 @@ impl DomShadowRoot {
         Ok(node
             .realm
             .wrap_option(ctx, (root == node.id).then_some(target)))
-    }
-    fn get_element_by_id(&self, ctx: &mut Ctx, id: &str) -> OpResult<Value> {
-        let node = &self.base.base;
-        let found = element_by_id_in(node.realm.session.borrow().document(), node.id, id)
-            .map_err(dom_error)?;
-        Ok(node.realm.wrap_option(ctx, found))
     }
 }
 
@@ -105,6 +133,38 @@ impl DomSlotElement {
     }
     fn assigned_elements(&self, ctx: &mut Ctx, options: Option<Value>) -> OpResult<Value> {
         self.assigned(ctx, options, true)
+    }
+
+    fn assign(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
+        let slot = &self.base.base.base;
+        let mut ids = Vec::with_capacity(nodes.len());
+        for value in nodes {
+            let (realm, id) =
+                ctx.with_instance::<DomNode, _>(&value, |node| (node.realm.clone(), node.id))?;
+            if !Rc::ptr_eq(&realm, &slot.realm) {
+                return Err(OpError::new(
+                    "WrongDocumentError",
+                    "assigned node belongs to another document",
+                ));
+            }
+            if !matches!(
+                slot.realm.session.borrow().document().kind(id),
+                Ok(lumen_html::NodeKind::Element { .. } | lumen_html::NodeKind::Text(_))
+            ) {
+                return Err(OpError::new(
+                    "TypeError",
+                    "assigned nodes must be Elements or Text nodes",
+                ));
+            }
+            ids.push(id);
+        }
+        slot.realm
+            .session
+            .borrow_mut()
+            .document_mut()
+            .assign_slot(slot.id, &ids)
+            .map(|_| ())
+            .map_err(dom_error)
     }
 }
 
@@ -256,6 +316,61 @@ mod tests {
         engine.collect_garbage();
         engine.ctx().drain_microtasks_for_host();
         check(&mut engine, "calls===3 && slot.assignedNodes().length===0");
+    }
+
+    #[test]
+    fn manual_slot_assignment_is_reflected_composed_and_signals_changes() {
+        let mut engine = Engine::new();
+        let _realm = install(
+            engine.ctx(),
+            "<div id=host><b id=a slot=ignored>A</b><i id=b>B</i></div>",
+            128,
+        )
+        .unwrap();
+        check(
+            &mut engine,
+            "var host=document.getElementById('host'),a=document.getElementById('a'),b=document.getElementById('b');var root=host.attachShadow({mode:'open',slotAssignment:'manual'});root.innerHTML='<slot id=one></slot><slot id=two><em>fallback</em></slot>';var one=root.getElementById('one'),two=root.getElementById('two'),events=0,twoEvents=0;one.addEventListener('slotchange',()=>events++);two.addEventListener('slotchange',()=>twoEvents++);root.slotAssignment==='manual'&&one.assignedNodes().length===0",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(
+            &mut engine,
+            "one.assign(b,a,b);one.assignedNodes().length===2&&one.assignedNodes()[0]===b&&one.assignedNodes()[1]===a&&a.assignedSlot===one&&b.assignedSlot===one",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(
+            &mut engine,
+            "events===1&&one.assign(b,a)===undefined&&events===1",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(
+            &mut engine,
+            "one.assign();one.assignedNodes().length===0&&a.assignedSlot===null&&two.assignedNodes().length===0",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(
+            &mut engine,
+            "events===2&&two.assignedNodes({flatten:true})[0].localName==='em'",
+        );
+        check(
+            &mut engine,
+            "var detached=document.createTextNode('outside');one.assign(detached);one.assignedNodes().length===0&&detached.assignedSlot===null;host.appendChild(detached);one.assignedNodes()[0]===detached&&detached.assignedSlot===one",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(&mut engine, "events===3");
+        check(
+            &mut engine,
+            "one.assign(detached,a);two.assign(a);one.assignedNodes().length===1&&one.assignedNodes()[0]===detached&&two.assignedNodes()[0]===a&&a.assignedSlot===two",
+        );
+        engine.ctx().drain_microtasks_for_host();
+        check(&mut engine, "events===4&&twoEvents===1");
+        check(
+            &mut engine,
+            "var rejected=false;try{one.assign(document.createComment('bad'))}catch(e){rejected=e.name==='TypeError'}rejected",
+        );
+        check(
+            &mut engine,
+            "var automatic=host.attachShadow;var other=document.createElement('div'),auto=other.attachShadow({mode:'open'});auto.innerHTML='<slot></slot>';auto.firstChild.assign(a);a.assignedSlot===null&&auto.slotAssignment==='named'",
+        );
     }
 }
 impl DomSlotElement {

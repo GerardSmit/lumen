@@ -12,6 +12,100 @@ fn assert_script(runtime: &mut Runtime, expression: &str) {
     evaluate(runtime, &format!("if (!({expression})) throw new Error('browser contract failed: {}')", expression.replace('\'', "\\'")));
 }
 
+#[test]
+fn browser_rejection_caught_before_delivery_has_no_handled_notification() {
+    let mut runtime = Runtime::new();
+    runtime.enable_browser_rejection_events();
+    evaluate(&mut runtime, "globalThis.deliveryPromise = Promise.reject({marker: 1});");
+    let pending = runtime.take_browser_rejection_events();
+    assert_eq!(pending.len(), 1, "checkpoint collects the rejected promise");
+    evaluate(&mut runtime, "deliveryPromise.catch(() => {});");
+    assert!(runtime.take_browser_rejection_events().is_empty(),
+        "a promise that has never delivered unhandledrejection cannot emit rejectionhandled");
+    drop(pending);
+}
+
+fn pending_browser_rejection(runtime: &mut Runtime) -> (lumen::embed::RealmHandle, lumen::embed::Value, lumen::embed::Value) {
+    let mut pending = runtime.take_browser_rejection_events();
+    assert_eq!(pending.len(), 1);
+    match pending.pop().unwrap() {
+        lumen_runtime::BrowserRejectionEvent::Unhandled { owner, promise, reason, .. } => (owner, promise, reason),
+        _ => panic!("expected pending unhandled notification"),
+    }
+}
+
+#[test]
+fn browser_rejection_later_catch_reports_delivered_identity_and_reason_once() {
+    let mut runtime = Runtime::new();
+    runtime.enable_browser_rejection_events();
+    evaluate(&mut runtime, "globalThis.deliveryReason = {marker: 2}; globalThis.deliveryPromise = Promise.reject(deliveryReason);");
+    let (owner, promise, reason) = pending_browser_rejection(&mut runtime);
+    let delivery = runtime.browser_rejection_delivery();
+    assert!(delivery.should_dispatch(runtime.engine().ctx(), &owner, true, &promise));
+    delivery.did_dispatch_unhandled(runtime.engine().ctx(), &owner, &promise);
+    evaluate(&mut runtime, "deliveryPromise.catch(() => {});");
+    let mut notifications = runtime.take_browser_rejection_events();
+    assert_eq!(notifications.len(), 1);
+    match notifications.pop().unwrap() {
+        lumen_runtime::BrowserRejectionEvent::Handled { owner: handled_owner, promise: handled, reason: actual } => {
+            assert!(handled_owner.same_realm(&owner));
+            assert_eq!(handled.object_identity(), promise.object_identity());
+            assert_eq!(actual.object_identity(), reason.object_identity());
+        }
+        _ => panic!("expected genuine handled notification"),
+    }
+    evaluate(&mut runtime, "deliveryPromise.catch(() => {});");
+    assert!(runtime.take_browser_rejection_events().is_empty());
+}
+
+#[test]
+fn browser_rejection_catch_during_delivery_does_not_publish_outstanding() {
+    let mut runtime = Runtime::new();
+    runtime.enable_browser_rejection_events();
+    evaluate(&mut runtime, "globalThis.deliveryPromise = Promise.reject({marker: 3});");
+    let (owner, promise, _) = pending_browser_rejection(&mut runtime);
+    let delivery = runtime.browser_rejection_delivery();
+    assert!(delivery.should_dispatch(runtime.engine().ctx(), &owner, true, &promise));
+    evaluate(&mut runtime, "deliveryPromise.catch(() => {});");
+    delivery.did_dispatch_unhandled(runtime.engine().ctx(), &owner, &promise);
+    evaluate(&mut runtime, "0;");
+    assert!(runtime.take_browser_rejection_events().is_empty());
+}
+
+#[test]
+fn browser_rejection_delivered_weak_tracking_releases_reason_back_reference() {
+    let mut runtime = Runtime::new();
+    runtime.enable_browser_rejection_events();
+    evaluate(&mut runtime, "globalThis.deliveryReason = {}; globalThis.deliveryPromise = Promise.reject(deliveryReason); deliveryReason.promise = deliveryPromise;");
+    let (owner, promise, reason) = pending_browser_rejection(&mut runtime);
+    let weak_promise = runtime.engine().ctx().weak_value(&promise).unwrap();
+    let weak_reason = runtime.engine().ctx().weak_value(&reason).unwrap();
+    let delivery = runtime.browser_rejection_delivery();
+    assert!(delivery.should_dispatch(runtime.engine().ctx(), &owner, true, &promise));
+    delivery.did_dispatch_unhandled(runtime.engine().ctx(), &owner, &promise);
+    drop(promise);
+    drop(reason);
+    evaluate(&mut runtime, "deliveryPromise = null; deliveryReason = null;");
+    runtime.engine().collect_garbage();
+    runtime.engine().collect_garbage();
+    assert!(weak_promise.upgrade().is_none(), "outstanding tracking must be genuinely weak");
+    assert!(weak_reason.upgrade().is_none(), "a reason back-reference must not retain the promise graph");
+}
+
+#[test]
+fn browser_rejection_retirement_invalidates_already_taken_delivery() {
+    let mut runtime = Runtime::new();
+    runtime.enable_browser_rejection_events();
+    evaluate(&mut runtime, "globalThis.deliveryPromise = Promise.reject({marker: 4});");
+    let (owner, promise, _) = pending_browser_rejection(&mut runtime);
+    let delivery = runtime.browser_rejection_delivery();
+    runtime.cancel_browser_rejection_events_for_realm(&owner);
+    assert!(!delivery.should_dispatch(runtime.engine().ctx(), &owner, true, &promise));
+    delivery.did_dispatch_unhandled(runtime.engine().ctx(), &owner, &promise);
+    evaluate(&mut runtime, "deliveryPromise.catch(() => {});");
+    assert!(runtime.take_browser_rejection_events().is_empty());
+}
+
 fn server(delay: Duration) -> (String, thread::JoinHandle<String>) {
     payload_server(delay, "application/json", b"{\"answer\":42}".to_vec())
 }
@@ -44,6 +138,53 @@ fn payload_server(delay: Duration, mime: &str, body: Vec<u8>) -> (String, thread
         String::from_utf8(received).unwrap()
     });
     (url, task)
+}
+
+#[test]
+fn xhr_upload_events_follow_written_bytes_and_finish_before_response_headers() {
+    let (url, task) = server(Duration::from_millis(150));
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var uploadXhr=new XMLHttpRequest(),uploadEvents=[];
+        uploadXhr.open('POST','{url}');
+        for(const type of ['loadstart','progress','load','loadend'])
+          uploadXhr.upload.addEventListener(type,e=>uploadEvents.push(type+':'+e.loaded+':'+e.total+':'+e.lengthComputable));
+        uploadXhr.onreadystatechange=()=>{{if(uploadXhr.readyState===2)uploadEvents.push('headers')}};
+        uploadXhr.send('héllo');
+    "#));
+    assert_script(&mut runtime, "uploadEvents.join(',')==='loadstart:0:6:true,progress:6:6:true,load:6:6:true,loadend:6:6:true,headers' && uploadXhr.status===200");
+    assert!(task.join().unwrap().ends_with("héllo"));
+}
+
+#[test]
+fn xhr_completed_upload_does_not_emit_upload_timeout_for_a_slow_response() {
+    let (url, task) = server(Duration::from_millis(350));
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var slowUpload=new XMLHttpRequest(),slowEvents=[];
+        slowUpload.open('POST','{url}');slowUpload.timeout=200;
+        for(const type of ['load','timeout','error','loadend'])
+          slowUpload.upload.addEventListener(type,()=>slowEvents.push('upload:'+type));
+        slowUpload.ontimeout=()=>slowEvents.push('request:timeout');slowUpload.send('bytes');
+    "#));
+    assert_script(&mut runtime, "slowEvents.join(',')==='upload:load,upload:loadend,request:timeout' && slowUpload.status===0");
+    assert!(task.join().unwrap().ends_with("bytes"));
+}
+
+#[test]
+fn xhr_abort_from_upload_loadstart_cancels_before_transport_admission() {
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, r#"
+        var cancelledUpload=new XMLHttpRequest(),cancelledEvents=[];
+        cancelledUpload.open('POST','http://127.0.0.1:9/unreachable');
+        cancelledUpload.upload.onloadstart=()=>{cancelledEvents.push('start');cancelledUpload.abort()};
+        cancelledUpload.upload.onabort=()=>cancelledEvents.push('upload:abort');
+        cancelledUpload.upload.onloadend=()=>cancelledEvents.push('upload:end');
+        cancelledUpload.onabort=()=>cancelledEvents.push('request:abort');
+        cancelledUpload.onloadend=()=>cancelledEvents.push('request:end');
+        cancelledUpload.send('bytes');
+    "#);
+    assert_script(&mut runtime, "cancelledEvents.join(',')==='start,upload:abort,upload:end,request:abort,request:end' && cancelledUpload.readyState===0 && cancelledUpload.status===0");
 }
 
 #[test]
@@ -118,14 +259,45 @@ fn xhr_validation_and_progress_interfaces() {
     let mut runtime = Runtime::new();
     evaluate(&mut runtime, r#"
         var xhr=new XMLHttpRequest();var errors=[];
-        for(const fn of [()=>xhr.send(),()=>xhr.open('TRACE','http://localhost'),()=>xhr.open('GET','http://localhost',false)]) {
+        for(const fn of [()=>xhr.send(),()=>xhr.open('TRACE','http://localhost')]) {
           try{fn()}catch(e){errors.push(e.name)}
         }
         xhr.open('GET','http://localhost');xhr.responseType='arraybuffer';
         try{void xhr.responseText}catch(e){errors.push(e.name)}
         var p=new ProgressEvent('progress',{loaded:12,total:20,lengthComputable:true});
     "#);
-    assert_script(&mut runtime, "errors.join(',')==='InvalidStateError,SecurityError,NotSupportedError,InvalidStateError' && p instanceof Event && p.loaded===12 && p.total===20 && p.lengthComputable && xhr.upload instanceof XMLHttpRequestUpload && xhr.DONE===XMLHttpRequest.DONE");
+    assert_script(&mut runtime, "errors.join(',')==='InvalidStateError,SecurityError,InvalidStateError' && p instanceof Event && p.loaded===12 && p.total===20 && p.lengthComputable && xhr.upload instanceof XMLHttpRequestUpload && xhr.DONE===XMLHttpRequest.DONE");
+}
+
+#[test]
+fn synchronous_xhr_returns_binary_body_before_send_returns() {
+    let (url, task) = payload_server(Duration::ZERO, "application/octet-stream", vec![0, 255, 65]);
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var syncXhr=new XMLHttpRequest(),syncEvents=[];
+        syncXhr.open('POST','{url}',false);syncXhr.responseType='arraybuffer';
+        syncXhr.onload=e=>syncEvents.push('load:'+e.loaded+':'+e.total+':'+e.lengthComputable);
+        syncXhr.onloadend=()=>syncEvents.push('end');
+        syncXhr.upload.onload=()=>syncEvents.push('upload');
+        syncXhr.send(new Blob(['héllo']));
+        var syncReturned=syncXhr.readyState===4 && syncXhr.status===200;
+    "#));
+    assert_script(&mut runtime, "syncReturned && Array.from(new Uint8Array(syncXhr.response)).join(',')==='0,255,65' && syncEvents.join(',')==='load:3:3:true,end'");
+    assert!(task.join().unwrap().ends_with("héllo"));
+}
+
+#[test]
+fn synchronous_xhr_timeout_throws_without_dispatching_completion_events() {
+    let (url, task) = server(Duration::from_millis(150));
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var syncTimed=new XMLHttpRequest(),syncFailure='',syncFailureEvents=[];
+        syncTimed.open('GET','{url}',false);syncTimed.timeout=50;
+        for(const type of ['load','error','timeout','loadend'])syncTimed.addEventListener(type,()=>syncFailureEvents.push(type));
+        try{{syncTimed.send()}}catch(e){{syncFailure=e.name}}
+    "#));
+    assert_script(&mut runtime, "syncFailure==='TimeoutError' && syncTimed.readyState===4 && syncTimed.status===0 && syncFailureEvents.length===0");
+    task.join().unwrap();
 }
 
 #[test]
@@ -178,6 +350,39 @@ fn fetch_headers_arrive_before_body_and_stream_clones_preserve_bytes() {
         var empty=new Response(),emptyTexts;Promise.all([empty.text(),empty.text()]).then(values=>emptyTexts=values.join('|'));
     "#);
     assert_script(&mut runtime, "cloneFailure==='TypeError' && direct.bodyUsed && directChunk==='abc' && !empty.bodyUsed && emptyTexts==='|'");
+}
+
+#[test]
+fn browser_host_upload_uses_native_progress_and_preserves_binary_response() {
+    let mut runtime = Runtime::new();
+    let source = include_str!("../../lumen-wasm/js/host.js")
+        .replace("export async function createRuntime", "async function createRuntime");
+    evaluate(&mut runtime, &format!("{source}\nglobalThis.createUploadHost = createRuntime;"));
+    evaluate(&mut runtime, r#"
+        var uploadHost,nativeUpload,uploadHostEvents=[],completeSnapshot;
+        class UploadSession {
+          constructor(host){uploadHost=host}
+          pushEvent(id,kind,args){completeSnapshot=uploadHost.fetchUploadProgress(id);uploadHostEvents.push([id,kind,args]);return {status:{idle:true,halted:false,nextTimerMs:null,pendingTasks:false}}}
+        }
+        class NativeUpload {
+          constructor(){nativeUpload=this;this.upload={};this.response=new Uint8Array([0,255]).buffer}
+          open(method,url){this.method=method;this.url=url}
+          setRequestHeader(name,value){}
+          getAllResponseHeaders(){return 'content-type: application/octet-stream\r\nx-result: yes\r\n'}
+          send(body){this.sent=body}
+          abort(){this.aborted=true}
+        }
+        createUploadHost({RuntimeSession:UploadSession,XMLHttpRequestImpl:NativeUpload,
+          fetchImpl:()=>{throw new Error('Fetch cannot report upload progress')}});
+        uploadHost.fetch(17,'POST','https://example.test/upload',[],new Uint8Array([65,66,67]),
+          {mode:'cors',credentials:'include',redirect:'follow',uploadProgress:true});
+        nativeUpload.upload.onprogress({loaded:2,total:3,lengthComputable:true});
+    "#);
+    assert_script(&mut runtime, "uploadHost.fetchUploadProgress(17).join(',')==='2,3,false' && nativeUpload.responseType==='arraybuffer' && nativeUpload.withCredentials && nativeUpload.sent[2]===67 && uploadHostEvents.length===0");
+    evaluate(&mut runtime, "nativeUpload.upload.onload({loaded:3,total:3,lengthComputable:true});nativeUpload.status=200;nativeUpload.statusText='OK';nativeUpload.responseURL='https://example.test/upload';nativeUpload.onload()");
+    assert_script(&mut runtime, "completeSnapshot.join(',')==='3,3,true' && uploadHostEvents[0][1]==='ok' && uploadHostEvents[0][2][3][0]===0 && uploadHostEvents[0][2][3][1]===255");
+    evaluate(&mut runtime, "uploadHost.fetch(18,'POST','https://example.test/upload',[],new Uint8Array([65]),{mode:'cors',redirect:'follow',uploadProgress:true});uploadHost.fetchAbort(18)");
+    assert_script(&mut runtime, "nativeUpload.aborted && uploadHostEvents.length===1");
 }
 
 #[test]

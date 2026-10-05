@@ -1,33 +1,53 @@
 //! Canvas DOM bindings backed by lumen-html-image's shared raster surface.
 use super::*;
-use lumen::embed::{Deferred, JsFunction};
-use lumen_html::paint::{FontSpec, FontStyle, TextShaper};
+use lumen::embed::{Deferred, JsFunction, TaKind};
+use lumen_html::paint::{FontSpec, FontStyle, Rgba, TextShaper};
 use lumen_html_image::{
-    Rgba8Image,
     canvas::{
         CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSurface,
         ParsedSvgPath,
     },
+    Rgba8Image,
 };
 use lumen_html_text::{
-    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering,
-    DEFAULT_FONT_BYTES, FontFace, FontProvider, FontSet, RegisteredFont, TEST_FONT_BOLD_BYTES,
+    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering, FontFace,
+    FontProvider, FontSet, RegisteredFont, DEFAULT_FONT_BYTES, TEST_FONT_BOLD_BYTES,
     TEST_FONT_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     cell::RefCell,
     collections::HashMap,
+    ops::Deref,
     rc::Rc,
     sync::{Arc, OnceLock},
 };
-use tiny_skia::{BlendMode, FillRule, Path, PathBuilder, Rect, Transform};
+use tiny_skia::{BlendMode, FillRule, LineCap, LineJoin, Path, PathBuilder, Rect, Transform};
 
 const DEFAULT_WIDTH: u32 = 300;
 const DEFAULT_HEIGHT: u32 = 150;
-const MAX_CANVAS_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_DATA_BYTES: usize = 64 * 1024 * 1024;
+const WEBIDL_UINT32_MODULUS: f64 = 4_294_967_296.0;
+const WEBIDL_UINT64_LIMIT: f64 = 18_446_744_073_709_551_616.0;
+const OFFSCREEN_CANVAS_OWNER_SLOT: &str = "#lumen_offscreen_canvas_owner\u{1}canvas";
 static NEXT_GRADIENT_ID: AtomicU64 = AtomicU64::new(1);
 static CANVAS_FONTS: OnceLock<FontSet> = OnceLock::new();
+
+enum CanvasFontSource {
+    Static(&'static FontSet),
+    Realm(Rc<FontSet>),
+}
+
+impl Deref for CanvasFontSource {
+    type Target = FontSet;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Static(fonts) => fonts,
+            Self::Realm(fonts) => fonts,
+        }
+    }
+}
 
 #[derive(Clone)]
 struct CanvasTextState {
@@ -110,6 +130,21 @@ thread_local! {
     static PATTERNS: RefCell<HashMap<u64, std::rc::Weak<PatternHandle>>> = RefCell::new(HashMap::new());
 }
 
+/// Drop this thread's dead gradient and pattern entries: a dead `Weak` still pins the handle's
+/// allocation until the entry is removed.
+pub fn prune_dead_thread_handles() {
+    let _ = GRADIENTS.try_with(|gradients| {
+        let mut gradients = gradients.borrow_mut();
+        gradients.retain(|_, weak| weak.strong_count() > 0);
+        gradients.shrink_to_fit();
+    });
+    let _ = PATTERNS.try_with(|patterns| {
+        let mut patterns = patterns.borrow_mut();
+        patterns.retain(|_, weak| weak.strong_count() > 0);
+        patterns.shrink_to_fit();
+    });
+}
+
 #[derive(Default)]
 pub struct CanvasRegistry {
     surfaces: RefCell<HashMap<NodeId, Rc<RefCell<CanvasData>>>>,
@@ -119,12 +154,19 @@ pub struct CanvasRegistry {
 
 pub struct CanvasData {
     surface: CanvasSurface,
+    logical_width: u64,
+    logical_height: u64,
+    bitmap_available: bool,
     context_mode: Option<&'static str>,
     bitmap_output: Option<Rgba8Image>,
     gpu_generation: u64,
     gpu_snapshot_revision: u64,
     snapshot_synchronizer: Option<Rc<dyn Fn() -> Result<(), String>>>,
     bitmap_alpha: bool,
+    alpha: bool,
+    color_space: CanvasColorSpace,
+    desynchronized: bool,
+    will_read_frequently: bool,
     current_path: CanvasPath,
     context_wrapper: Option<WeakValue>,
     suppress_dimension_mutation: bool,
@@ -140,6 +182,176 @@ pub struct CanvasData {
     origin_clean: bool,
     text: CanvasTextState,
     saved_text: Vec<CanvasTextState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CanvasColorSpace {
+    #[default]
+    Srgb,
+    DisplayP3,
+}
+
+impl CanvasColorSpace {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Srgb => "srgb",
+            Self::DisplayP3 => "display-p3",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Canvas2dSettings {
+    alpha: bool,
+    color_space: CanvasColorSpace,
+    desynchronized: bool,
+    will_read_frequently: bool,
+}
+
+impl Default for Canvas2dSettings {
+    fn default() -> Self {
+        Self {
+            alpha: true,
+            color_space: CanvasColorSpace::Srgb,
+            desynchronized: false,
+            will_read_frequently: false,
+        }
+    }
+}
+
+fn parse_canvas_2d_settings(ctx: &mut Ctx, options: Option<&Value>) -> OpResult<Canvas2dSettings> {
+    let Some(options) = options.filter(|value| !matches!(value, Value::Null | Value::Undefined))
+    else {
+        return Ok(Canvas2dSettings::default());
+    };
+    let mut settings = Canvas2dSettings::default();
+    let alpha = ctx.member_get(options, "alpha").map_err(OpError::thrown)?;
+    if !matches!(alpha, Value::Undefined) {
+        settings.alpha = ctx.to_boolean(&alpha);
+    }
+    let color_space = ctx
+        .member_get(options, "colorSpace")
+        .map_err(OpError::thrown)?;
+    if !matches!(color_space, Value::Undefined) {
+        let color_space = ctx.coerce_string(&color_space).map_err(OpError::thrown)?;
+        settings.color_space = match color_space.as_ref() {
+            "srgb" => CanvasColorSpace::Srgb,
+            "display-p3" => CanvasColorSpace::DisplayP3,
+            _ => {
+                return Err(OpError::new(
+                    "TypeError",
+                    "CanvasRenderingContext2D colorSpace is invalid",
+                ));
+            }
+        };
+    }
+    let desynchronized = ctx
+        .member_get(options, "desynchronized")
+        .map_err(OpError::thrown)?;
+    if !matches!(desynchronized, Value::Undefined) {
+        settings.desynchronized = ctx.to_boolean(&desynchronized);
+    }
+    let will_read_frequently = ctx
+        .member_get(options, "willReadFrequently")
+        .map_err(OpError::thrown)?;
+    if !matches!(will_read_frequently, Value::Undefined) {
+        settings.will_read_frequently = ctx.to_boolean(&will_read_frequently);
+    }
+    Ok(settings)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ImageDataPixelFormat {
+    #[default]
+    RgbaUnorm8,
+    RgbaFloat16,
+}
+
+impl ImageDataPixelFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RgbaUnorm8 => "rgba-unorm8",
+            Self::RgbaFloat16 => "rgba-float16",
+        }
+    }
+
+    fn typed_array_kind(self) -> TaKind {
+        match self {
+            Self::RgbaUnorm8 => TaKind::U8Clamped,
+            Self::RgbaFloat16 => TaKind::F16,
+        }
+    }
+
+    fn bytes_per_component(self) -> usize {
+        match self {
+            Self::RgbaUnorm8 => 1,
+            Self::RgbaFloat16 => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ImageDataSettings {
+    color_space: CanvasColorSpace,
+    pixel_format: ImageDataPixelFormat,
+}
+
+fn parse_image_data_settings(
+    ctx: &mut Ctx,
+    options: Option<&Value>,
+) -> OpResult<ImageDataSettings> {
+    parse_image_data_settings_with_default(ctx, options, CanvasColorSpace::Srgb)
+}
+
+fn parse_image_data_settings_with_default(
+    ctx: &mut Ctx,
+    options: Option<&Value>,
+    default_color_space: CanvasColorSpace,
+) -> OpResult<ImageDataSettings> {
+    let mut settings = ImageDataSettings {
+        color_space: default_color_space,
+        pixel_format: ImageDataPixelFormat::RgbaUnorm8,
+    };
+    let Some(options) = options.filter(|value| !matches!(value, Value::Null | Value::Undefined))
+    else {
+        return Ok(settings);
+    };
+    if !matches!(options, Value::Obj(_)) {
+        return Err(OpError::new(
+            "TypeError",
+            "ImageData settings must be an object",
+        ));
+    }
+    let color_space = ctx
+        .member_get(options, "colorSpace")
+        .map_err(OpError::thrown)?;
+    if !matches!(color_space, Value::Undefined) {
+        let color_space = ctx.coerce_string(&color_space).map_err(OpError::thrown)?;
+        settings.color_space = match color_space.as_ref() {
+            "srgb" => CanvasColorSpace::Srgb,
+            "display-p3" => CanvasColorSpace::DisplayP3,
+            _ => {
+                return Err(OpError::new("TypeError", "ImageData colorSpace is invalid"));
+            }
+        };
+    }
+    let pixel_format = ctx
+        .member_get(options, "pixelFormat")
+        .map_err(OpError::thrown)?;
+    if !matches!(pixel_format, Value::Undefined) {
+        let pixel_format = ctx.coerce_string(&pixel_format).map_err(OpError::thrown)?;
+        settings.pixel_format = match pixel_format.as_ref() {
+            "rgba-unorm8" => ImageDataPixelFormat::RgbaUnorm8,
+            "rgba-float16" => ImageDataPixelFormat::RgbaFloat16,
+            _ => {
+                return Err(OpError::new(
+                    "TypeError",
+                    "ImageData pixelFormat is invalid",
+                ));
+            }
+        };
+    }
+    Ok(settings)
 }
 
 /// Opaque backing supplied to the embedder when a canvas requests WebGPU.
@@ -211,6 +423,7 @@ fn create_webgl_canvas_context(
 impl CanvasData {
     /// Read the current drawing buffer without holding a borrow across backend work.
     pub fn snapshot_for_read(data: &Rc<RefCell<Self>>) -> OpResult<Rgba8Image> {
+        data.borrow().ensure_bitmap_available()?;
         let synchronize = data.borrow().snapshot_synchronizer.clone();
         if let Some(synchronize) = synchronize {
             synchronize().map_err(|message| OpError::new("OperationError", message))?;
@@ -225,12 +438,19 @@ impl CanvasData {
         })?;
         Ok(Self {
             surface,
+            logical_width: u64::from(width),
+            logical_height: u64::from(height),
+            bitmap_available: true,
             context_mode: None,
             bitmap_output: None,
             gpu_generation: 0,
             gpu_snapshot_revision: 0,
             snapshot_synchronizer: None,
             bitmap_alpha: true,
+            alpha: true,
+            color_space: CanvasColorSpace::Srgb,
+            desynchronized: false,
+            will_read_frequently: false,
             current_path: CanvasPath::default(),
             context_wrapper: None,
             suppress_dimension_mutation: false,
@@ -249,11 +469,39 @@ impl CanvasData {
         })
     }
 
+    fn new_offscreen(width: u64, height: u64) -> OpResult<Self> {
+        let (surface, bitmap_available) = offscreen_surface(width, height)?;
+        let mut data = Self::new(0, 0)?;
+        data.surface = surface;
+        data.logical_width = width;
+        data.logical_height = height;
+        data.bitmap_available = bitmap_available;
+        Ok(data)
+    }
+
     fn resize(&mut self, width: u32, height: u32) -> OpResult<()> {
         check_dimensions(width, height)?;
         self.surface.resize(width, height).map_err(|_| {
             OpError::new("IndexSizeError", "canvas bitmap dimensions are too large")
         })?;
+        self.logical_width = u64::from(width);
+        self.logical_height = u64::from(height);
+        self.bitmap_available = true;
+        self.reset_after_resize();
+        Ok(())
+    }
+
+    fn resize_offscreen(&mut self, width: u64, height: u64) -> OpResult<()> {
+        let (surface, bitmap_available) = offscreen_surface(width, height)?;
+        self.surface = surface;
+        self.logical_width = width;
+        self.logical_height = height;
+        self.bitmap_available = bitmap_available;
+        self.reset_after_resize();
+        Ok(())
+    }
+
+    fn reset_after_resize(&mut self) {
         if matches!(self.context_mode, Some("webgpu" | "webgl" | "webgl2")) {
             self.bitmap_output = None;
         }
@@ -272,7 +520,17 @@ impl CanvasData {
         self.saved_stroke_styles.clear();
         self.text = CanvasTextState::default();
         self.saved_text.clear();
-        Ok(())
+    }
+
+    fn ensure_bitmap_available(&self) -> OpResult<()> {
+        if self.bitmap_available {
+            Ok(())
+        } else {
+            Err(OpError::new(
+                "InvalidStateError",
+                "canvas bitmap is unavailable because its dimensions exceed the host resource limit",
+            ))
+        }
     }
 
     fn snapshot(&self) -> Rgba8Image {
@@ -281,13 +539,10 @@ impl CanvasData {
             .clone()
             .unwrap_or_else(|| self.surface.snapshot());
         if self.context_mode == Some("bitmaprenderer") && !self.bitmap_alpha {
-            for pixel in image.pixels.chunks_exact_mut(4) {
-                for channel in 0..3 {
-                    pixel[channel] =
-                        ((u16::from(pixel[channel]) * u16::from(pixel[3]) + 127) / 255) as u8;
-                }
-                pixel[3] = 255;
-            }
+            make_image_opaque(&mut image.pixels);
+        }
+        if self.context_mode == Some("2d") && !self.alpha {
+            make_image_opaque(&mut image.pixels);
         }
         image
     }
@@ -352,8 +607,10 @@ impl CanvasRegistry {
         Ok(state)
     }
 
-    pub fn data_for_offscreen(&self, width: u32, height: u32) -> OpResult<Rc<RefCell<CanvasData>>> {
-        Ok(Rc::new(RefCell::new(CanvasData::new(width, height)?)))
+    pub fn data_for_offscreen(&self, width: u64, height: u64) -> OpResult<Rc<RefCell<CanvasData>>> {
+        Ok(Rc::new(RefCell::new(CanvasData::new_offscreen(
+            width, height,
+        )?)))
     }
 
     /// Called from the permanent DOM mutation router. This updates the surface
@@ -389,7 +646,8 @@ impl CanvasRegistry {
                 }
             }
             lumen_html::observe::ObservedKind::Attribute { .. }
-            | lumen_html::observe::ObservedKind::CharacterData { .. } => {}
+            | lumen_html::observe::ObservedKind::CharacterData { .. }
+            | lumen_html::observe::ObservedKind::SlotAssignment => {}
         }
     }
 
@@ -559,13 +817,154 @@ fn collect_subtree(document: &lumen_html::Document, root: NodeId, output: &mut V
 }
 
 fn check_dimensions(width: u32, height: u32) -> OpResult<()> {
-    if width > MAX_CANVAS_DIMENSION || height > MAX_CANVAS_DIMENSION {
+    // Empty bitmaps carry dimensions but allocate no pixels. For non-empty
+    // surfaces, bound the actual pixel storage rather than imposing an
+    // independent per-axis limit.
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| OpError::new("IndexSizeError", "canvas bitmap dimensions are too large"))?;
+    if bytes > MAX_IMAGE_DATA_BYTES as u64 {
         return Err(OpError::new(
             "IndexSizeError",
             "canvas bitmap dimensions are too large",
         ));
     }
     Ok(())
+}
+
+fn offscreen_surface(width: u64, height: u64) -> OpResult<(CanvasSurface, bool)> {
+    let empty_surface = || {
+        CanvasSurface::new(0, 0)
+            .map_err(|_| OpError::new("IndexSizeError", "canvas bitmap dimensions are too large"))
+    };
+    let (Ok(width), Ok(height)) = (u32::try_from(width), u32::try_from(height)) else {
+        return Ok((empty_surface()?, false));
+    };
+    if check_dimensions(width, height).is_err() {
+        return Ok((empty_surface()?, false));
+    }
+    match CanvasSurface::new(width, height) {
+        Ok(surface) => Ok((surface, true)),
+        Err(_) => Ok((empty_surface()?, false)),
+    }
+}
+
+fn make_image_opaque(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
+        for channel in 0..3 {
+            pixel[channel] = ((u16::from(pixel[channel]) * u16::from(pixel[3]) + 127) / 255) as u8;
+        }
+        pixel[3] = 255;
+    }
+}
+
+fn webidl_unsigned_long(ctx: &mut Ctx, value: &Value) -> OpResult<u32> {
+    let number = ctx.coerce_number(value).map_err(OpError::thrown)?;
+    if !number.is_finite() || number == 0.0 {
+        return Ok(0);
+    }
+    Ok(number.trunc().rem_euclid(WEBIDL_UINT32_MODULUS) as u32)
+}
+
+fn webidl_enforce_range_unsigned_long_long(ctx: &mut Ctx, value: &Value) -> OpResult<u64> {
+    let number = ctx.coerce_number(value).map_err(OpError::thrown)?;
+    let integer = number.trunc();
+    if !integer.is_finite() || integer < 0.0 || integer >= WEBIDL_UINT64_LIMIT {
+        return Err(OpError::new(
+            "TypeError",
+            "canvas dimension is outside the unsigned 64-bit range",
+        ));
+    }
+    Ok(integer as u64)
+}
+
+fn canvas_long(ctx: &mut Ctx, value: &Value) -> OpResult<i32> {
+    let number = ctx.coerce_number(value).map_err(OpError::thrown)?;
+    let integer = number.trunc();
+    if !integer.is_finite() || integer < i32::MIN as f64 || integer > i32::MAX as f64 {
+        return Err(OpError::new(
+            "TypeError",
+            "canvas image-data dimension is outside the signed 32-bit range",
+        ));
+    }
+    Ok(integer as i32)
+}
+
+fn normalized_dirty_rect(
+    image_width: u32,
+    image_height: u32,
+    dirty_x: i32,
+    dirty_y: i32,
+    dirty_width: i32,
+    dirty_height: i32,
+) -> Option<(u32, u32, u32, u32)> {
+    let (mut x, mut y, mut width, mut height) = (
+        i64::from(dirty_x),
+        i64::from(dirty_y),
+        i64::from(dirty_width),
+        i64::from(dirty_height),
+    );
+    if width < 0 {
+        x += width;
+        width = -width;
+    }
+    if height < 0 {
+        y += height;
+        height = -height;
+    }
+    if x < 0 {
+        width += x;
+        x = 0;
+    }
+    if y < 0 {
+        height += y;
+        y = 0;
+    }
+    if x + width > i64::from(image_width) {
+        width = i64::from(image_width) - x;
+    }
+    if y + height > i64::from(image_height) {
+        height = i64::from(image_height) - y;
+    }
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    Some((
+        u32::try_from(x).ok()?,
+        u32::try_from(y).ok()?,
+        u32::try_from(width).ok()?,
+        u32::try_from(height).ok()?,
+    ))
+}
+
+fn zeroed_bytes(length: usize, message: &'static str) -> OpResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| OpError::new("IndexSizeError", message))?;
+    bytes.resize(length, 0);
+    Ok(bytes)
+}
+
+fn copy_bytes(source: &[u8], message: &'static str) -> OpResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(source.len())
+        .map_err(|_| OpError::new("IndexSizeError", message))?;
+    bytes.extend_from_slice(source);
+    Ok(bytes)
+}
+
+fn clone_rgba_image(image: &Rgba8Image) -> OpResult<Rgba8Image> {
+    Ok(Rgba8Image {
+        width: image.width,
+        height: image.height,
+        pixels: copy_bytes(&image.pixels, "ImageData bitmap allocation failed")?,
+    })
 }
 
 fn image_data(image: Rgba8Image) -> Option<Arc<lumen_html::paint::ImageData>> {
@@ -1006,7 +1405,8 @@ impl DomCanvasElement {
     }
 
     #[setter]
-    fn set_width(&self, ctx: &mut Ctx, value: u32) -> OpResult<()> {
+    fn set_width(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
+        let value = webidl_unsigned_long(ctx, &value)?;
         set_dom_dimension(ctx, &self.base.base.base, &self.data()?, "width", value)
     }
 
@@ -1042,7 +1442,8 @@ impl DomCanvasElement {
     }
 
     #[setter]
-    fn set_height(&self, ctx: &mut Ctx, value: u32) -> OpResult<()> {
+    fn set_height(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
+        let value = webidl_unsigned_long(ctx, &value)?;
         set_dom_dimension(ctx, &self.base.base.base, &self.data()?, "height", value)
     }
 
@@ -1236,27 +1637,33 @@ pub struct DomOffscreenCanvas {
 #[lumen_bind::methods]
 impl DomOffscreenCanvas {
     #[constructor]
-    fn new(width: u32, height: u32) -> OpResult<Self> {
+    fn new(ctx: &mut Ctx, width: Value, height: Value) -> OpResult<Self> {
+        let width = webidl_enforce_range_unsigned_long_long(ctx, &width)?;
+        let height = webidl_enforce_range_unsigned_long_long(ctx, &height)?;
         Ok(Self {
-            data: Rc::new(RefCell::new(CanvasData::new(width, height)?)),
+            data: Rc::new(RefCell::new(CanvasData::new_offscreen(width, height)?)),
         })
     }
 
     #[getter]
-    fn width(&self) -> u32 {
-        self.data.borrow().surface.dimensions().0
+    fn width(&self) -> f64 {
+        self.data.borrow().logical_width as f64
     }
     #[setter]
-    fn set_width(&self, width: u32) -> OpResult<()> {
-        resize_offscreen(&self.data, width, self.height())
+    fn set_width(&self, ctx: &mut Ctx, width: Value) -> OpResult<()> {
+        let width = webidl_enforce_range_unsigned_long_long(ctx, &width)?;
+        let height = self.data.borrow().logical_height;
+        resize_offscreen(&self.data, width, height)
     }
     #[getter]
-    fn height(&self) -> u32 {
-        self.data.borrow().surface.dimensions().1
+    fn height(&self) -> f64 {
+        self.data.borrow().logical_height as f64
     }
     #[setter]
-    fn set_height(&self, height: u32) -> OpResult<()> {
-        resize_offscreen(&self.data, self.width(), height)
+    fn set_height(&self, ctx: &mut Ctx, height: Value) -> OpResult<()> {
+        let height = webidl_enforce_range_unsigned_long_long(ctx, &height)?;
+        let width = self.data.borrow().logical_width;
+        resize_offscreen(&self.data, width, height)
     }
 
     fn get_context(
@@ -1272,7 +1679,10 @@ impl DomOffscreenCanvas {
             && context_id != "webgl"
             && context_id != "webgl2"
         {
-            return Ok(Value::Null);
+            return Err(OpError::new(
+                "TypeError",
+                "OffscreenCanvas context identifier is unsupported",
+            ));
         }
         let wrapper = this.0;
         context_value(
@@ -1342,8 +1752,8 @@ impl DomOffscreenCanvas {
     }
 }
 
-fn resize_offscreen(data: &Rc<RefCell<CanvasData>>, width: u32, height: u32) -> OpResult<()> {
-    data.borrow_mut().resize(width, height)
+fn resize_offscreen(data: &Rc<RefCell<CanvasData>>, width: u64, height: u64) -> OpResult<()> {
+    data.borrow_mut().resize_offscreen(width, height)
 }
 
 fn context_value(
@@ -1362,6 +1772,12 @@ fn context_value(
     {
         return Ok(Value::Null);
     }
+    if !data.borrow().bitmap_available && context_id != "2d" {
+        return Err(OpError::new(
+            "NotSupportedError",
+            "canvas bitmap exceeds the available backend resource limit",
+        ));
+    }
     if let Some(value) = data
         .borrow()
         .context_wrapper
@@ -1370,6 +1786,12 @@ fn context_value(
     {
         return Ok(value);
     }
+    let options = options.filter(|value| matches!(value, Value::Obj(_)));
+    let context_settings = if context_id == "2d" {
+        Some(parse_canvas_2d_settings(ctx, options.as_ref())?)
+    } else {
+        None
+    };
     if context_id == "webgpu" {
         let target = gpu_canvas_target(
             data.clone(),
@@ -1401,6 +1823,7 @@ fn context_value(
         data.borrow_mut().context_wrapper = ctx.weak_value(&value);
         return Ok(value);
     }
+    let is_offscreen = realm.is_none() && node.is_none();
     let value = if context_id == "bitmaprenderer" {
         if data.borrow().context_mode.is_none() {
             let alpha =
@@ -1413,24 +1836,77 @@ fn context_value(
                 };
             data.borrow_mut().bitmap_alpha = alpha;
         }
+        let value = ctx.new_instance(DomImageBitmapRenderingContext {
+            data: data.clone(),
+            realm,
+            node,
+            canvas_in_private_slot: is_offscreen,
+        });
+        if is_offscreen {
+            install_offscreen_canvas_owner(ctx, &value, canvas_wrapper)?;
+        }
         data.borrow_mut().context_mode = Some("bitmaprenderer");
-        ctx.new_instance(DomImageBitmapRenderingContext {
-            data: data.clone(),
-            realm,
-            node,
-            canvas_wrapper,
-        })
+        value
     } else {
+        let value = if is_offscreen {
+            let value = ctx.new_instance(DomOffscreenCanvasRenderingContext2D {
+                data: data.clone(),
+                realm,
+                node,
+                canvas_in_private_slot: true,
+            });
+            install_offscreen_canvas_owner(ctx, &value, canvas_wrapper)?;
+            value
+        } else {
+            ctx.new_instance(DomCanvasRenderingContext2D {
+                data: data.clone(),
+                realm,
+                node,
+                canvas_in_private_slot: false,
+            })
+        };
+        if let Some(settings) = context_settings {
+            let mut data = data.borrow_mut();
+            data.alpha = settings.alpha;
+            data.color_space = settings.color_space;
+            data.desynchronized = settings.desynchronized;
+            data.will_read_frequently = settings.will_read_frequently;
+        }
         data.borrow_mut().context_mode = Some("2d");
-        ctx.new_instance(DomCanvasRenderingContext2D {
-            data: data.clone(),
-            realm,
-            node,
-            canvas_wrapper,
-        })
+        value
     };
     data.borrow_mut().context_wrapper = ctx.weak_value(&value);
     Ok(value)
+}
+
+fn install_offscreen_canvas_owner(
+    ctx: &mut Ctx,
+    context: &Value,
+    canvas: Option<Value>,
+) -> OpResult<()> {
+    let Some(canvas) = canvas else {
+        return Ok(());
+    };
+    ctx.define_native_private_value_slot(context, OFFSCREEN_CANVAS_OWNER_SLOT, canvas)
+        .map_err(OpError::thrown)
+}
+
+fn canvas_owner_value(
+    ctx: &mut Ctx,
+    realm: &Option<Rc<DomRealm>>,
+    node: Option<NodeId>,
+    canvas_in_private_slot: bool,
+    this: &Value,
+) -> Value {
+    if canvas_in_private_slot {
+        return ctx
+            .native_private_value_slot(this, OFFSCREEN_CANVAS_OWNER_SLOT)
+            .unwrap_or(Value::Null);
+    }
+    match (realm, node) {
+        (Some(realm), Some(node)) => realm.wrap(ctx, node),
+        _ => Value::Null,
+    }
 }
 
 fn gpu_canvas_target(
@@ -1534,7 +2010,7 @@ pub struct DomImageBitmapRenderingContext {
     data: Rc<RefCell<CanvasData>>,
     realm: Option<Rc<DomRealm>>,
     node: Option<NodeId>,
-    canvas_wrapper: Option<Value>,
+    canvas_in_private_slot: bool,
 }
 
 #[lumen_bind::methods]
@@ -1548,16 +2024,18 @@ impl DomImageBitmapRenderingContext {
     }
 
     #[getter]
-    fn canvas(&self, ctx: &mut Ctx) -> Value {
-        self.canvas_wrapper
-            .clone()
-            .unwrap_or_else(|| match (&self.realm, self.node) {
-                (Some(realm), Some(node)) => realm.wrap(ctx, node),
-                _ => Value::Null,
-            })
+    fn canvas(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
+        canvas_owner_value(
+            ctx,
+            &self.realm,
+            self.node,
+            self.canvas_in_private_slot,
+            &this.0,
+        )
     }
 
     fn transfer_from_image_bitmap(&self, ctx: &mut Ctx, bitmap: Value) -> OpResult<()> {
+        self.data.borrow().ensure_bitmap_available()?;
         let (image, clean) = if matches!(bitmap, Value::Null) {
             (None, true)
         } else {
@@ -1587,938 +2065,1228 @@ pub struct DomCanvasRenderingContext2D {
     data: Rc<RefCell<CanvasData>>,
     realm: Option<Rc<DomRealm>>,
     node: Option<NodeId>,
-    canvas_wrapper: Option<Value>,
+    canvas_in_private_slot: bool,
 }
 
-#[lumen_bind::methods]
-impl DomCanvasRenderingContext2D {
-    #[getter]
-    fn canvas(&self, ctx: &mut Ctx) -> OpResult<Value> {
-        if let Some(value) = self.canvas_wrapper.clone() {
-            return Ok(value);
-        }
-        match (&self.realm, self.node) {
-            (Some(realm), Some(node)) => Ok(realm.wrap(ctx, node)),
-            _ => Ok(Value::Null),
-        }
-    }
-
-    #[getter]
-    fn global_alpha(&self) -> f32 {
-        self.data.borrow().surface.state().alpha
-    }
-    #[setter]
-    fn set_global_alpha(&self, value: f32) {
-        if value.is_finite() && (0.0..=1.0).contains(&value) {
-            self.data.borrow_mut().surface.state_mut().alpha = value;
-        }
-    }
-    #[getter]
-    fn fill_style(&self) -> Value {
-        let data = self.data.borrow();
-        data.fill_gradient_value
-            .clone()
-            .or_else(|| data.fill_pattern_value.clone())
-            .unwrap_or_else(|| Value::Str(color_string(data.surface.state().fill).into()))
-    }
-    #[setter]
-    fn set_fill_style(&self, ctx: &mut Ctx, value: Value) {
-        if let Some(color) = parse_style_color(&value) {
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().fill = color;
-            data.surface.state_mut().fill_gradient = None;
-            data.surface.state_mut().fill_pattern = None;
-            data.fill_gradient_value = None;
-            data.fill_pattern_value = None;
-            data.fill_pattern_origin_clean = true;
-        } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().fill_gradient = Some(gradient);
-            data.surface.state_mut().fill_pattern = None;
-            data.fill_gradient_value = Some(value);
-            data.fill_pattern_value = None;
-            data.fill_pattern_origin_clean = true;
-        } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
-            let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().fill_gradient = None;
-            data.surface.state_mut().fill_pattern = Some(pattern);
-            data.fill_gradient_value = None;
-            data.fill_pattern_value = Some(value);
-            data.fill_pattern_origin_clean = clean;
-        }
-    }
-    #[getter]
-    fn stroke_style(&self) -> Value {
-        let data = self.data.borrow();
-        data.stroke_gradient_value
-            .clone()
-            .or_else(|| data.stroke_pattern_value.clone())
-            .unwrap_or_else(|| Value::Str(color_string(data.surface.state().stroke).into()))
-    }
-    #[setter]
-    fn set_stroke_style(&self, ctx: &mut Ctx, value: Value) {
-        if let Some(color) = parse_style_color(&value) {
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().stroke = color;
-            data.surface.state_mut().stroke_gradient = None;
-            data.surface.state_mut().stroke_pattern = None;
-            data.stroke_gradient_value = None;
-            data.stroke_pattern_value = None;
-            data.stroke_pattern_origin_clean = true;
-        } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().stroke_gradient = Some(gradient);
-            data.surface.state_mut().stroke_pattern = None;
-            data.stroke_gradient_value = Some(value);
-            data.stroke_pattern_value = None;
-            data.stroke_pattern_origin_clean = true;
-        } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
-            let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
-            let mut data = self.data.borrow_mut();
-            data.surface.state_mut().stroke_gradient = None;
-            data.surface.state_mut().stroke_pattern = Some(pattern);
-            data.stroke_gradient_value = None;
-            data.stroke_pattern_value = Some(value);
-            data.stroke_pattern_origin_clean = clean;
-        }
-    }
-    #[getter]
-    fn line_width(&self) -> f32 {
-        self.data.borrow().surface.state().line.width
-    }
-    #[setter]
-    fn set_line_width(&self, width: f32) {
-        if width.is_finite() && width > 0.0 {
-            self.data.borrow_mut().surface.state_mut().line.width = width;
-        }
-    }
-    #[getter]
-    fn global_composite_operation(&self) -> String {
-        composite_name(self.data.borrow().surface.state().blend).into()
-    }
-    #[setter]
-    fn set_global_composite_operation(&self, value: &str) {
-        if let Some(mode) = composite_mode(value) {
-            self.data.borrow_mut().surface.state_mut().blend = mode;
-        }
-    }
-
-    #[getter]
-    fn font(&self) -> String {
-        self.data.borrow().text.font.clone()
-    }
-    #[setter]
-    fn set_font(&self, value: &str) {
-        if let Some((font, size, spec)) = parse_canvas_font(value) {
-            let mut data = self.data.borrow_mut();
-            data.text.font = font;
-            data.text.size = size;
-            data.text.spec = spec;
-        }
-    }
-    #[getter]
-    fn font_stretch(&self) -> String {
-        stretch_value(self.data.borrow().text.spec.stretch)
-    }
-    #[setter]
-    fn set_font_stretch(&self, value: &str) {
-        if let Some(stretch) = parse_stretch(value) {
-            self.data.borrow_mut().text.spec.stretch = stretch;
-        }
-    }
-    #[getter]
-    fn font_kerning(&self) -> &'static str {
-        match self.data.borrow().text.font_kerning {
-            CanvasFontKerning::Auto => "auto",
-            CanvasFontKerning::Normal => "normal",
-            CanvasFontKerning::None => "none",
-        }
-    }
-    #[setter]
-    fn set_font_kerning(&self, value: &str) {
-        let value = match value {
-            "auto" => CanvasFontKerning::Auto,
-            "normal" => CanvasFontKerning::Normal,
-            "none" => CanvasFontKerning::None,
-            _ => return,
-        };
-        self.data.borrow_mut().text.font_kerning = value;
-    }
-    #[getter]
-    fn font_variant_caps(&self) -> &'static str {
-        match self.data.borrow().text.font_variant_caps {
-            CanvasFontVariantCaps::Normal => "normal",
-            CanvasFontVariantCaps::SmallCaps => "small-caps",
-            CanvasFontVariantCaps::AllSmallCaps => "all-small-caps",
-            CanvasFontVariantCaps::PetiteCaps => "petite-caps",
-            CanvasFontVariantCaps::AllPetiteCaps => "all-petite-caps",
-            CanvasFontVariantCaps::Unicase => "unicase",
-            CanvasFontVariantCaps::TitlingCaps => "titling-caps",
-        }
-    }
-    #[setter]
-    fn set_font_variant_caps(&self, value: &str) {
-        let value = match value {
-            "normal" => CanvasFontVariantCaps::Normal,
-            "small-caps" => CanvasFontVariantCaps::SmallCaps,
-            "all-small-caps" => CanvasFontVariantCaps::AllSmallCaps,
-            "petite-caps" => CanvasFontVariantCaps::PetiteCaps,
-            "all-petite-caps" => CanvasFontVariantCaps::AllPetiteCaps,
-            "unicase" => CanvasFontVariantCaps::Unicase,
-            "titling-caps" => CanvasFontVariantCaps::TitlingCaps,
-            _ => return,
-        };
-        self.data.borrow_mut().text.font_variant_caps = value;
-    }
-    #[getter]
-    fn text_rendering(&self) -> &'static str {
-        match self.data.borrow().text.text_rendering {
-            CanvasTextRendering::Auto => "auto",
-            CanvasTextRendering::OptimizeSpeed => "optimizeSpeed",
-            CanvasTextRendering::OptimizeLegibility => "optimizeLegibility",
-            CanvasTextRendering::GeometricPrecision => "geometricPrecision",
-        }
-    }
-    #[setter]
-    fn set_text_rendering(&self, value: &str) {
-        let value = match value {
-            "auto" => CanvasTextRendering::Auto,
-            "optimizeSpeed" => CanvasTextRendering::OptimizeSpeed,
-            "optimizeLegibility" => CanvasTextRendering::OptimizeLegibility,
-            "geometricPrecision" => CanvasTextRendering::GeometricPrecision,
-            _ => return,
-        };
-        self.data.borrow_mut().text.text_rendering = value;
-    }
-    #[getter]
-    fn letter_spacing(&self) -> String {
-        css_spacing_string(self.data.borrow().text.letter_spacing)
-    }
-    #[setter]
-    fn set_letter_spacing(&self, value: &str) {
-        let text = self.data.borrow().text.clone();
-        if let Some(value) = parse_css_spacing(
-            value,
-            text.size,
-            &text.spec,
-            canvas_root_font_size(self.realm.as_ref()),
-        ) {
-            self.data.borrow_mut().text.letter_spacing = value;
-        }
-    }
-    #[getter]
-    fn word_spacing(&self) -> String {
-        css_spacing_string(self.data.borrow().text.word_spacing)
-    }
-    #[setter]
-    fn set_word_spacing(&self, value: &str) {
-        let text = self.data.borrow().text.clone();
-        if let Some(value) = parse_css_spacing(
-            value,
-            text.size,
-            &text.spec,
-            canvas_root_font_size(self.realm.as_ref()),
-        ) {
-            self.data.borrow_mut().text.word_spacing = value;
-        }
-    }
-    #[getter]
-    fn text_align(&self) -> String {
-        self.data.borrow().text.align.clone()
-    }
-    #[setter]
-    fn set_text_align(&self, value: &str) {
-        if matches!(value, "start" | "end" | "left" | "right" | "center") {
-            self.data.borrow_mut().text.align = value.into();
-        }
-    }
-    #[getter]
-    fn text_baseline(&self) -> String {
-        self.data.borrow().text.baseline.clone()
-    }
-    #[setter]
-    fn set_text_baseline(&self, value: &str) {
-        if matches!(
-            value,
-            "top" | "hanging" | "middle" | "alphabetic" | "ideographic" | "bottom"
-        ) {
-            self.data.borrow_mut().text.baseline = value.into();
-        }
-    }
-    #[getter]
-    fn direction(&self) -> String {
-        self.data.borrow().text.direction.clone()
-    }
-    #[setter]
-    fn set_direction(&self, value: &str) {
-        if matches!(value, "inherit" | "ltr" | "rtl") {
-            self.data.borrow_mut().text.direction = value.into();
-        }
-    }
-    #[method(name = "measureText")]
-    fn measure_text(&self, ctx: &mut Ctx, text: &str) -> OpResult<Value> {
-        let (font_size, spec, rtl, options) = {
-            let data = self.data.borrow();
-            (
-                data.text.size,
-                data.text.spec.clone(),
-                data.text.direction == "rtl",
-                data.text.shaping_options(),
-            )
-        };
-        let fonts = canvas_fonts();
-        let run = self
-            .data
-            .borrow()
-            .surface
-            .measure_text(fonts, text, font_size, &spec, rtl, &options)
-            .map_err(|error| {
-                OpError::new(
-                    "InvalidStateError",
-                    format!("text shaping failed: {error:?}"),
-                )
-            })?;
-        let metrics = text_metrics(fonts, &run, font_size, &spec)?;
-        let value = ctx.new_instance(DomTextMetrics { metrics });
-        Ok(value)
-    }
-    #[method(name = "fillText")]
-    fn fill_text(&self, text: &str, x: f64, y: f64, max_width: Option<f64>) -> OpResult<()> {
-        if !x.is_finite() || !y.is_finite() {
-            return Ok(());
-        }
-        let fonts = canvas_fonts();
-        let mut data = self.data.borrow_mut();
-        if !data.fill_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        let text_state = data.text.clone();
-        let options = text_state.shaping_options();
-        let (width, ascent, descent) = {
-            let run = data
-                .surface
-                .measure_text(
-                    fonts,
-                    text,
-                    text_state.size,
-                    &text_state.spec,
-                    text_state.direction == "rtl",
-                    &options,
-                )
-                .map_err(|error| {
-                    OpError::new(
-                        "InvalidStateError",
-                        format!("text shaping failed: {error:?}"),
-                    )
-                })?;
-            (
-                run.width,
-                fonts.ascent_styled(text_state.size, &text_state.spec),
-                (fonts.line_height_styled(text_state.size, &text_state.spec)
-                    - fonts.ascent_styled(text_state.size, &text_state.spec))
-                .max(0.0),
-            )
-        };
-        let origin_x = x as f32 - width * text_anchor(&text_state);
-        let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
-        data.surface
-            .fill_text(
-                fonts,
-                text,
-                text_state.size,
-                &text_state.spec,
-                text_state.direction == "rtl",
-                origin_x,
-                x as f32,
-                baseline_y,
-                max_width.map(|value| value as f32),
-                &options,
-            )
-            .map_err(|error| {
-                OpError::new(
-                    "InvalidStateError",
-                    format!("text drawing failed: {error:?}"),
-                )
-            })?;
-        self.publish_data(&data)
-    }
-    #[method(name = "strokeText")]
-    fn stroke_text(&self, text: &str, x: f64, y: f64, max_width: Option<f64>) -> OpResult<()> {
-        if !x.is_finite()
-            || !y.is_finite()
-            || max_width.is_some_and(|value| !value.is_finite() || value < 0.0)
-        {
-            return Ok(());
-        }
-        let fonts = canvas_fonts();
-        let mut data = self.data.borrow_mut();
-        if !data.stroke_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        let text_state = data.text.clone();
-        let options = text_state.shaping_options();
-        let (width, ascent, descent) = {
-            let run = data
-                .surface
-                .measure_text(
-                    fonts,
-                    text,
-                    text_state.size,
-                    &text_state.spec,
-                    text_state.direction == "rtl",
-                    &options,
-                )
-                .map_err(|error| {
-                    OpError::new(
-                        "InvalidStateError",
-                        format!("text shaping failed: {error:?}"),
-                    )
-                })?;
-            (
-                run.width,
-                fonts.ascent_styled(text_state.size, &text_state.spec),
-                (fonts.line_height_styled(text_state.size, &text_state.spec)
-                    - fonts.ascent_styled(text_state.size, &text_state.spec))
-                .max(0.0),
-            )
-        };
-        let anchor = text_anchor(&text_state);
-        let origin_x = x as f32 - width * anchor;
-        let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
-        data.surface
-            .stroke_text(
-                fonts,
-                text,
-                text_state.size,
-                &text_state.spec,
-                text_state.direction == "rtl",
-                origin_x,
-                x as f32,
-                baseline_y,
-                max_width.map(|value| value as f32),
-                &options,
-            )
-            .map_err(|error| {
-                OpError::new(
-                    "InvalidStateError",
-                    format!("text drawing failed: {error:?}"),
-                )
-            })?;
-        self.publish_data(&data)
-    }
-
-    #[method(name = "createLinearGradient")]
-    fn create_linear_gradient(
-        &self,
-        ctx: &mut Ctx,
-        x0: f64,
-        y0: f64,
-        x1: f64,
-        y1: f64,
-    ) -> OpResult<Value> {
-        if ![x0, y0, x1, y1]
-            .iter()
-            .all(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX))
-            || (x0 == x1 && y0 == y1)
-        {
-            return Err(OpError::new(
-                "IndexSizeError",
-                "linear gradient endpoints must be finite and distinct",
-            ));
-        }
-        let transform = self.data.borrow().surface.state().transform;
-        new_gradient(
-            ctx,
-            CanvasGradient::new(CanvasGradientKind::Linear {
-                start: [x0 as f32, y0 as f32],
-                end: [x1 as f32, y1 as f32],
-                transform,
-            }),
-        )
-    }
-
-    #[method(name = "createRadialGradient")]
-    fn create_radial_gradient(
-        &self,
-        ctx: &mut Ctx,
-        x0: f64,
-        y0: f64,
-        r0: f64,
-        x1: f64,
-        y1: f64,
-        r1: f64,
-    ) -> OpResult<Value> {
-        if ![x0, y0, r0, x1, y1, r1]
-            .iter()
-            .all(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX))
-            || r0 < 0.0
-            || r1 < 0.0
-        {
-            return Err(OpError::new(
-                "IndexSizeError",
-                "radial gradient circles are invalid",
-            ));
-        }
-        let transform = self.data.borrow().surface.state().transform;
-        new_gradient(
-            ctx,
-            CanvasGradient::new(CanvasGradientKind::Radial {
-                start: [x0 as f32, y0 as f32],
-                end: [x1 as f32, y1 as f32],
-                start_radius: r0 as f32,
-                end_radius: r1 as f32,
-                transform,
-            }),
-        )
-    }
-
-    #[method(name = "createPattern")]
-    fn create_pattern(
-        &self,
-        ctx: &mut Ctx,
-        source: Value,
-        repetition: Option<&str>,
-    ) -> OpResult<Value> {
-        let source_clean = canvas_source_origin_clean(ctx, &source);
-        let image = match canvas_source_image(ctx, source)? {
-            Some(image) => image,
-            None => return Ok(Value::Null),
-        };
-        let repetition = match repetition.unwrap_or("repeat") {
-            "repeat" => CanvasPatternRepetition::Repeat,
-            "repeat-x" => CanvasPatternRepetition::RepeatX,
-            "repeat-y" => CanvasPatternRepetition::RepeatY,
-            "no-repeat" => CanvasPatternRepetition::NoRepeat,
-            _ => {
-                return Err(OpError::new(
-                    "SyntaxError",
-                    "invalid CanvasPattern repetition",
-                ));
-            }
-        };
-        if image.width == 0 || image.height == 0 {
-            return Ok(Value::Null);
-        }
-        let pattern = CanvasPattern::new(&image, repetition).map_err(|_| {
-            OpError::new(
-                "InvalidStateError",
-                "pattern source could not be rasterized",
-            )
-        })?;
-        new_pattern(ctx, pattern, source_clean)
-    }
-
-    fn save(&self) {
-        let mut data = self.data.borrow_mut();
-        data.surface.save();
-        let fill = (
-            data.fill_gradient_value.clone(),
-            data.fill_pattern_value.clone(),
-            data.fill_pattern_origin_clean,
-        );
-        let stroke = (
-            data.stroke_gradient_value.clone(),
-            data.stroke_pattern_value.clone(),
-            data.stroke_pattern_origin_clean,
-        );
-        data.saved_fill_styles.push(fill);
-        data.saved_stroke_styles.push(stroke);
-        let text = data.text.clone();
-        data.saved_text.push(text);
-    }
-    fn restore(&self) {
-        let mut data = self.data.borrow_mut();
-        data.surface.restore();
-        if let Some((gradient, pattern, pattern_clean)) = data.saved_fill_styles.pop() {
-            data.fill_gradient_value = gradient;
-            data.fill_pattern_value = pattern;
-            data.fill_pattern_origin_clean = pattern_clean;
-        }
-        if let Some((gradient, pattern, pattern_clean)) = data.saved_stroke_styles.pop() {
-            data.stroke_gradient_value = gradient;
-            data.stroke_pattern_value = pattern;
-            data.stroke_pattern_origin_clean = pattern_clean;
-        }
-        if let Some(text) = data.saved_text.pop() {
-            data.text = text;
-        }
-    }
-    fn fill_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        if !data.fill_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        data.surface
-            .fill_rect(x as f32, y as f32, width as f32, height as f32);
-        self.publish_data(&data)
-    }
-    fn clear_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        data.surface
-            .clear_rect(x as f32, y as f32, width as f32, height as f32);
-        self.publish_data(&data)
-    }
-    fn stroke_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        if !data.stroke_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        data.current_path = CanvasPath {
-            commands: vec![PathCommand::Rect(
-                x as f32,
-                y as f32,
-                width as f32,
-                height as f32,
-            )],
-        };
-        if let Some(path) = data.current_path.build(Transform::identity()) {
-            data.surface.stroke_path(&path);
-        }
-        self.publish_data(&data)
-    }
-    fn begin_path(&self) {
-        self.data.borrow_mut().current_path = CanvasPath::default();
-    }
-    fn close_path(&self) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Close);
-    }
-    fn move_to(&self, x: f64, y: f64) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Move(x as f32, y as f32));
-    }
-    fn line_to(&self, x: f64, y: f64) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Line(x as f32, y as f32));
-    }
-    fn quadratic_curve_to(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Quad(
-                cpx as f32, cpy as f32, x as f32, y as f32,
-            ));
-    }
-    fn bezier_curve_to(&self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Cubic(
-                cp1x as f32,
-                cp1y as f32,
-                cp2x as f32,
-                cp2y as f32,
-                x as f32,
-                y as f32,
-            ));
-    }
-    #[method(name = "arc")]
-    fn arc(
-        &self,
-        x: f64,
-        y: f64,
-        radius: f64,
-        start_angle: f64,
-        end_angle: f64,
-        counterclockwise: Option<bool>,
-    ) -> OpResult<()> {
-        if radius < 0.0 {
-            return Err(OpError::new(
-                "IndexSizeError",
-                "arc radius must be non-negative",
-            ));
-        }
-        let values = [x, y, radius, start_angle, end_angle];
-        if !values.iter().all(|value| value.is_finite())
-            || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
-        {
-            return Ok(());
-        }
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Arc {
-                cx: x as f32,
-                cy: y as f32,
-                rx: radius as f32,
-                ry: radius as f32,
-                rotation: 0.0,
-                start: start_angle as f32,
-                end: end_angle as f32,
-                counterclockwise: counterclockwise.unwrap_or(false),
-            });
-        Ok(())
-    }
-    #[method(name = "ellipse")]
-    fn ellipse(
-        &self,
-        x: f64,
-        y: f64,
-        radius_x: f64,
-        radius_y: f64,
-        rotation: f64,
-        start_angle: f64,
-        end_angle: f64,
-        counterclockwise: Option<bool>,
-    ) -> OpResult<()> {
-        if radius_x < 0.0 || radius_y < 0.0 {
-            return Err(OpError::new(
-                "IndexSizeError",
-                "ellipse radii must be non-negative",
-            ));
-        }
-        let values = [x, y, radius_x, radius_y, rotation, start_angle, end_angle];
-        if !values.iter().all(|value| value.is_finite())
-            || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
-        {
-            return Ok(());
-        }
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Arc {
-                cx: x as f32,
-                cy: y as f32,
-                rx: radius_x as f32,
-                ry: radius_y as f32,
-                rotation: rotation as f32,
-                start: start_angle as f32,
-                end: end_angle as f32,
-                counterclockwise: counterclockwise.unwrap_or(false),
-            });
-        Ok(())
-    }
-    fn rect(&self, x: f64, y: f64, width: f64, height: f64) {
-        self.data
-            .borrow_mut()
-            .current_path
-            .commands
-            .push(PathCommand::Rect(
-                x as f32,
-                y as f32,
-                width as f32,
-                height as f32,
-            ));
-    }
-    fn fill(
-        &self,
-        ctx: &mut Ctx,
-        path_or_rule: Option<Value>,
-        fill_rule: Option<&str>,
-    ) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        if !data.fill_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        let (path_data, rule_text) = match path_or_rule {
-            Some(Value::Str(rule)) => (None, Some(rule.as_str().to_owned())),
-            Some(path_value) => (
-                Some(clone_path2d(ctx, &path_value)?),
-                fill_rule.map(str::to_owned),
-            ),
-            None => (None, fill_rule.map(str::to_owned)),
-        };
-        let rule = parse_fill_rule(rule_text.as_deref())?;
-        let path = path_data
-            .as_ref()
-            .unwrap_or(&data.current_path)
-            .build(Transform::identity());
-        if let Some(path) = path {
-            data.surface.fill_path(&path, rule);
-        }
-        self.publish_data(&data)
-    }
-    fn stroke(&self, ctx: &mut Ctx, path_data: Option<Value>) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        if !data.stroke_pattern_origin_clean {
-            data.origin_clean = false;
-        }
-        let path_data = path_data
-            .map(|value| clone_path2d(ctx, &value))
-            .transpose()?;
-        let path = path_data
-            .as_ref()
-            .unwrap_or(&data.current_path)
-            .build(Transform::identity());
-        if let Some(path) = path {
-            data.surface.stroke_path(&path);
-        }
-        self.publish_data(&data)
-    }
-    fn clip(
-        &self,
-        ctx: &mut Ctx,
-        path_or_rule: Option<Value>,
-        fill_rule: Option<&str>,
-    ) -> OpResult<()> {
-        let mut data = self.data.borrow_mut();
-        let (path_data, rule_text) = match path_or_rule {
-            Some(Value::Str(rule)) => (None, Some(rule.as_str().to_owned())),
-            Some(path_value) => (
-                Some(clone_path2d(ctx, &path_value)?),
-                fill_rule.map(str::to_owned),
-            ),
-            None => (None, fill_rule.map(str::to_owned)),
-        };
-        let rule = parse_fill_rule(rule_text.as_deref())?;
-        let path = path_data
-            .as_ref()
-            .unwrap_or(&data.current_path)
-            .build(Transform::identity());
-        if let Some(path) = path {
-            data.surface.clip_path(&path, rule);
-        }
-        Ok(())
-    }
-
-    fn translate(&self, x: f64, y: f64) {
-        self.transform(Transform::from_translate(x as f32, y as f32));
-    }
-    fn scale(&self, x: f64, y: f64) {
-        self.transform(Transform::from_scale(x as f32, y as f32));
-    }
-    fn rotate(&self, angle: f64) {
-        if angle.is_finite() {
-            let (s, c) = (angle.sin() as f32, angle.cos() as f32);
-            self.transform(Transform::from_row(c, s, -s, c, 0.0, 0.0));
-        }
-    }
-    fn set_transform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
-        if [a, b, c, d, e, f].iter().all(|n| n.is_finite()) {
-            self.data.borrow_mut().surface.state_mut().transform =
-                Transform::from_row(a as f32, b as f32, c as f32, d as f32, e as f32, f as f32);
-        }
-    }
-    fn reset_transform(&self) {
-        self.data.borrow_mut().surface.state_mut().transform = Transform::identity();
-    }
-
-    fn get_image_data(&self, ctx: &mut Ctx, sx: i32, sy: i32, sw: i32, sh: i32) -> OpResult<Value> {
-        ensure_origin_clean(&self.data.borrow())?;
-        if sw == 0 || sh == 0 {
-            return Err(OpError::new(
-                "IndexSizeError",
-                "image data dimensions cannot be zero",
-            ));
-        }
-        let width = sw.unsigned_abs();
-        let height = sh.unsigned_abs();
-        let image = self
-            .data
-            .borrow()
-            .surface
-            .read_pixels(
-                if sw < 0 { sx + sw } else { sx },
-                if sh < 0 { sy + sh } else { sy },
-                width,
-                height,
-            )
-            .map_err(|_| OpError::new("IndexSizeError", "image data is too large"))?;
-        Ok(ctx.new_instance(DomImageData::from_image(image)))
-    }
-    fn put_image_data(
-        &self,
-        ctx: &mut Ctx,
-        image: &DomImageData,
-        dx: i32,
-        dy: i32,
-    ) -> OpResult<()> {
-        let pixels = image.read_pixels(ctx)?;
-        let mut data = self.data.borrow_mut();
-        data.surface
-            .write_pixels(&pixels, dx, dy)
-            .map_err(|_| OpError::new("IndexSizeError", "invalid image data"))?;
-        self.publish_data(&data)
-    }
-
-    #[method(name = "drawImage")]
-    fn draw_image(
-        &self,
-        ctx: &mut Ctx,
-        source: Value,
-        a: f64,
-        b: f64,
-        c: Option<f64>,
-        d: Option<f64>,
-        e: Option<f64>,
-        f: Option<f64>,
-        g: Option<f64>,
-        h: Option<f64>,
-    ) -> OpResult<()> {
-        let source_origin_clean = canvas_source_origin_clean(ctx, &source);
-        let premultiply_alpha = ctx
-            .instance_data::<DomImageBitmap>(&source)
-            .map_or(true, |bitmap| bitmap.as_ref().borrow().premultiply_alpha);
-        let Some(image) = canvas_source_image(ctx, source)? else {
-            return Ok(());
-        };
-        let mut data = self.data.borrow_mut();
-        if !source_origin_clean {
-            data.origin_clean = false;
-        }
-        match (c, d, e, f, g, h) {
-            (None, None, None, None, None, None) => data.surface.draw_image_with_alpha_behavior(
-                &image,
-                a as f32,
-                b as f32,
-                image.width as f32,
-                image.height as f32,
-                premultiply_alpha,
-            ),
-            (Some(width), Some(height), None, None, None, None) => {
-                data.surface.draw_image_with_alpha_behavior(
-                    &image,
-                    a as f32,
-                    b as f32,
-                    width as f32,
-                    height as f32,
-                    premultiply_alpha,
-                )
-            }
-            (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => {
-                data.surface.draw_image_crop_with_alpha_behavior(
-                    &image,
-                    a as f32,
-                    b as f32,
-                    sw as f32,
-                    sh as f32,
-                    dx as f32,
-                    dy as f32,
-                    dw as f32,
-                    dh as f32,
-                    premultiply_alpha,
-                )
-            }
-            _ => {
-                return Err(OpError::new(
-                    "TypeError",
-                    "drawImage expects 3, 5, or 9 arguments",
-                ));
-            }
-        }
-        .map_err(|_| {
-            OpError::new(
-                "InvalidStateError",
-                "drawImage could not rasterize the source",
-            )
-        })?;
-        self.publish_data(&data)
-    }
+#[lumen_bind::class(name = "OffscreenCanvasRenderingContext2D", hint(js(webidl)))]
+pub struct DomOffscreenCanvasRenderingContext2D {
+    data: Rc<RefCell<CanvasData>>,
+    realm: Option<Rc<DomRealm>>,
+    node: Option<NodeId>,
+    canvas_in_private_slot: bool,
 }
+
+macro_rules! impl_canvas_2d_methods {
+    ($context:ident) => {
+        #[lumen_bind::methods]
+        impl $context {
+            #[getter]
+            fn canvas(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> OpResult<Value> {
+                Ok(canvas_owner_value(
+                    ctx,
+                    &self.realm,
+                    self.node,
+                    self.canvas_in_private_slot,
+                    &this.0,
+                ))
+            }
+
+            #[getter]
+            fn global_alpha(&self) -> f32 {
+                self.data.borrow().surface.state().alpha
+            }
+            #[setter]
+            fn set_global_alpha(&self, value: f32) {
+                if value.is_finite() && (0.0..=1.0).contains(&value) {
+                    self.data.borrow_mut().surface.state_mut().alpha = value;
+                }
+            }
+            #[getter]
+            fn fill_style(&self) -> Value {
+                let data = self.data.borrow();
+                data.fill_gradient_value
+                    .clone()
+                    .or_else(|| data.fill_pattern_value.clone())
+                    .unwrap_or_else(|| Value::Str(color_string(data.surface.state().fill).into()))
+            }
+            #[setter]
+            fn set_fill_style(&self, ctx: &mut Ctx, value: Value) {
+                if let Some(color) =
+                    parse_style_color(&value, current_canvas_color(&self.realm, self.node))
+                {
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().fill = color;
+                    data.surface.state_mut().fill_gradient = None;
+                    data.surface.state_mut().fill_pattern = None;
+                    data.fill_gradient_value = None;
+                    data.fill_pattern_value = None;
+                    data.fill_pattern_origin_clean = true;
+                } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().fill_gradient = Some(gradient);
+                    data.surface.state_mut().fill_pattern = None;
+                    data.fill_gradient_value = Some(value);
+                    data.fill_pattern_value = None;
+                    data.fill_pattern_origin_clean = true;
+                } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
+                    let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().fill_gradient = None;
+                    data.surface.state_mut().fill_pattern = Some(pattern);
+                    data.fill_gradient_value = None;
+                    data.fill_pattern_value = Some(value);
+                    data.fill_pattern_origin_clean = clean;
+                }
+            }
+            #[getter]
+            fn stroke_style(&self) -> Value {
+                let data = self.data.borrow();
+                data.stroke_gradient_value
+                    .clone()
+                    .or_else(|| data.stroke_pattern_value.clone())
+                    .unwrap_or_else(|| Value::Str(color_string(data.surface.state().stroke).into()))
+            }
+            #[setter]
+            fn set_stroke_style(&self, ctx: &mut Ctx, value: Value) {
+                if let Some(color) =
+                    parse_style_color(&value, current_canvas_color(&self.realm, self.node))
+                {
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().stroke = color;
+                    data.surface.state_mut().stroke_gradient = None;
+                    data.surface.state_mut().stroke_pattern = None;
+                    data.stroke_gradient_value = None;
+                    data.stroke_pattern_value = None;
+                    data.stroke_pattern_origin_clean = true;
+                } else if let Some((gradient, value)) = resolve_gradient(ctx, &value) {
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().stroke_gradient = Some(gradient);
+                    data.surface.state_mut().stroke_pattern = None;
+                    data.stroke_gradient_value = Some(value);
+                    data.stroke_pattern_value = None;
+                    data.stroke_pattern_origin_clean = true;
+                } else if let Some((pattern, value)) = resolve_pattern(ctx, &value) {
+                    let clean = pattern_origin_clean(ctx, &value).unwrap_or(true);
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().stroke_gradient = None;
+                    data.surface.state_mut().stroke_pattern = Some(pattern);
+                    data.stroke_gradient_value = None;
+                    data.stroke_pattern_value = Some(value);
+                    data.stroke_pattern_origin_clean = clean;
+                }
+            }
+            #[getter]
+            fn line_width(&self) -> f32 {
+                self.data.borrow().surface.state().line.width
+            }
+            #[setter]
+            fn set_line_width(&self, width: f32) {
+                if width.is_finite() && width > 0.0 {
+                    self.data.borrow_mut().surface.state_mut().line.width = width;
+                }
+            }
+            #[getter]
+            fn line_cap(&self) -> &'static str {
+                match self.data.borrow().surface.state().line.line_cap {
+                    LineCap::Butt => "butt",
+                    LineCap::Round => "round",
+                    LineCap::Square => "square",
+                }
+            }
+            #[setter]
+            fn set_line_cap(&self, value: &str) {
+                let line_cap = match value {
+                    "butt" => LineCap::Butt,
+                    "round" => LineCap::Round,
+                    "square" => LineCap::Square,
+                    _ => return,
+                };
+                self.data.borrow_mut().surface.state_mut().line.line_cap = line_cap;
+            }
+            #[getter]
+            fn line_join(&self) -> &'static str {
+                match self.data.borrow().surface.state().line.line_join {
+                    LineJoin::Miter | LineJoin::MiterClip => "miter",
+                    LineJoin::Round => "round",
+                    LineJoin::Bevel => "bevel",
+                }
+            }
+            #[setter]
+            fn set_line_join(&self, value: &str) {
+                let line_join = match value {
+                    "miter" => LineJoin::Miter,
+                    "round" => LineJoin::Round,
+                    "bevel" => LineJoin::Bevel,
+                    _ => return,
+                };
+                self.data.borrow_mut().surface.state_mut().line.line_join = line_join;
+            }
+            #[getter]
+            fn miter_limit(&self) -> f64 {
+                self.data.borrow().surface.state().miter_limit
+            }
+            #[setter]
+            fn set_miter_limit(&self, value: f64) {
+                if value.is_finite() && value > 0.0 {
+                    let mut data = self.data.borrow_mut();
+                    data.surface.state_mut().miter_limit = value;
+                    data.surface.state_mut().line.miter_limit =
+                        value.min(f64::from(f32::MAX)) as f32;
+                }
+            }
+            #[getter]
+            fn shadow_color(&self) -> String {
+                color_string(self.data.borrow().surface.state().shadow_color)
+            }
+            #[setter]
+            fn set_shadow_color(&self, value: &str) {
+                if let Some(color) = lumen_html::css::parse_animation_color(
+                    value,
+                    current_canvas_color(&self.realm, self.node),
+                ) {
+                    self.data.borrow_mut().surface.state_mut().shadow_color =
+                        [color.r, color.g, color.b, color.a];
+                }
+            }
+            #[getter]
+            fn shadow_blur(&self) -> f64 {
+                self.data.borrow().surface.state().shadow_blur
+            }
+            #[setter]
+            fn set_shadow_blur(&self, value: f64) {
+                if value.is_finite() && value >= 0.0 {
+                    self.data.borrow_mut().surface.state_mut().shadow_blur = value;
+                }
+            }
+            #[getter]
+            fn shadow_offset_x(&self) -> f64 {
+                self.data.borrow().surface.state().shadow_offset_x
+            }
+            #[setter]
+            fn set_shadow_offset_x(&self, value: f64) {
+                if value.is_finite() {
+                    self.data.borrow_mut().surface.state_mut().shadow_offset_x = value;
+                }
+            }
+            #[getter]
+            fn shadow_offset_y(&self) -> f64 {
+                self.data.borrow().surface.state().shadow_offset_y
+            }
+            #[setter]
+            fn set_shadow_offset_y(&self, value: f64) {
+                if value.is_finite() {
+                    self.data.borrow_mut().surface.state_mut().shadow_offset_y = value;
+                }
+            }
+            #[getter]
+            fn global_composite_operation(&self) -> String {
+                composite_name(self.data.borrow().surface.state().blend).into()
+            }
+            #[setter]
+            fn set_global_composite_operation(&self, value: &str) {
+                if let Some(mode) = composite_mode(value) {
+                    self.data.borrow_mut().surface.state_mut().blend = mode;
+                }
+            }
+
+            #[getter]
+            fn font(&self) -> String {
+                self.data.borrow().text.font.clone()
+            }
+            #[setter]
+            fn set_font(&self, value: &str) {
+                if let Some((font, size, spec)) = parse_canvas_font(value) {
+                    let mut data = self.data.borrow_mut();
+                    data.text.font = font;
+                    data.text.size = size;
+                    data.text.spec = spec;
+                }
+            }
+            #[getter]
+            fn font_stretch(&self) -> String {
+                stretch_value(self.data.borrow().text.spec.stretch)
+            }
+            #[setter]
+            fn set_font_stretch(&self, value: &str) {
+                if let Some(stretch) = parse_stretch(value) {
+                    self.data.borrow_mut().text.spec.stretch = stretch;
+                }
+            }
+            #[getter]
+            fn font_kerning(&self) -> &'static str {
+                match self.data.borrow().text.font_kerning {
+                    CanvasFontKerning::Auto => "auto",
+                    CanvasFontKerning::Normal => "normal",
+                    CanvasFontKerning::None => "none",
+                }
+            }
+            #[setter]
+            fn set_font_kerning(&self, value: &str) {
+                let value = match value {
+                    "auto" => CanvasFontKerning::Auto,
+                    "normal" => CanvasFontKerning::Normal,
+                    "none" => CanvasFontKerning::None,
+                    _ => return,
+                };
+                self.data.borrow_mut().text.font_kerning = value;
+            }
+            #[getter]
+            fn font_variant_caps(&self) -> &'static str {
+                match self.data.borrow().text.font_variant_caps {
+                    CanvasFontVariantCaps::Normal => "normal",
+                    CanvasFontVariantCaps::SmallCaps => "small-caps",
+                    CanvasFontVariantCaps::AllSmallCaps => "all-small-caps",
+                    CanvasFontVariantCaps::PetiteCaps => "petite-caps",
+                    CanvasFontVariantCaps::AllPetiteCaps => "all-petite-caps",
+                    CanvasFontVariantCaps::Unicase => "unicase",
+                    CanvasFontVariantCaps::TitlingCaps => "titling-caps",
+                }
+            }
+            #[setter]
+            fn set_font_variant_caps(&self, value: &str) {
+                let value = match value {
+                    "normal" => CanvasFontVariantCaps::Normal,
+                    "small-caps" => CanvasFontVariantCaps::SmallCaps,
+                    "all-small-caps" => CanvasFontVariantCaps::AllSmallCaps,
+                    "petite-caps" => CanvasFontVariantCaps::PetiteCaps,
+                    "all-petite-caps" => CanvasFontVariantCaps::AllPetiteCaps,
+                    "unicase" => CanvasFontVariantCaps::Unicase,
+                    "titling-caps" => CanvasFontVariantCaps::TitlingCaps,
+                    _ => return,
+                };
+                self.data.borrow_mut().text.font_variant_caps = value;
+            }
+            #[getter]
+            fn text_rendering(&self) -> &'static str {
+                match self.data.borrow().text.text_rendering {
+                    CanvasTextRendering::Auto => "auto",
+                    CanvasTextRendering::OptimizeSpeed => "optimizeSpeed",
+                    CanvasTextRendering::OptimizeLegibility => "optimizeLegibility",
+                    CanvasTextRendering::GeometricPrecision => "geometricPrecision",
+                }
+            }
+            #[setter]
+            fn set_text_rendering(&self, value: &str) {
+                let value = match value {
+                    "auto" => CanvasTextRendering::Auto,
+                    "optimizeSpeed" => CanvasTextRendering::OptimizeSpeed,
+                    "optimizeLegibility" => CanvasTextRendering::OptimizeLegibility,
+                    "geometricPrecision" => CanvasTextRendering::GeometricPrecision,
+                    _ => return,
+                };
+                self.data.borrow_mut().text.text_rendering = value;
+            }
+            #[getter]
+            fn letter_spacing(&self) -> String {
+                css_spacing_string(self.data.borrow().text.letter_spacing)
+            }
+            #[setter]
+            fn set_letter_spacing(&self, value: &str) {
+                let text = self.data.borrow().text.clone();
+                if let Some(value) = parse_css_spacing(
+                    value,
+                    text.size,
+                    &text.spec,
+                    canvas_root_font_size(self.realm.as_ref()),
+                ) {
+                    self.data.borrow_mut().text.letter_spacing = value;
+                }
+            }
+            #[getter]
+            fn word_spacing(&self) -> String {
+                css_spacing_string(self.data.borrow().text.word_spacing)
+            }
+            #[setter]
+            fn set_word_spacing(&self, value: &str) {
+                let text = self.data.borrow().text.clone();
+                if let Some(value) = parse_css_spacing(
+                    value,
+                    text.size,
+                    &text.spec,
+                    canvas_root_font_size(self.realm.as_ref()),
+                ) {
+                    self.data.borrow_mut().text.word_spacing = value;
+                }
+            }
+            #[getter]
+            fn text_align(&self) -> String {
+                self.data.borrow().text.align.clone()
+            }
+            #[setter]
+            fn set_text_align(&self, value: &str) {
+                if matches!(value, "start" | "end" | "left" | "right" | "center") {
+                    self.data.borrow_mut().text.align = value.into();
+                }
+            }
+            #[getter]
+            fn text_baseline(&self) -> String {
+                self.data.borrow().text.baseline.clone()
+            }
+            #[setter]
+            fn set_text_baseline(&self, value: &str) {
+                if matches!(
+                    value,
+                    "top" | "hanging" | "middle" | "alphabetic" | "ideographic" | "bottom"
+                ) {
+                    self.data.borrow_mut().text.baseline = value.into();
+                }
+            }
+            #[getter]
+            fn direction(&self) -> String {
+                self.data.borrow().text.direction.clone()
+            }
+            #[setter]
+            fn set_direction(&self, value: &str) {
+                if matches!(value, "inherit" | "ltr" | "rtl") {
+                    self.data.borrow_mut().text.direction = value.into();
+                }
+            }
+            #[method(name = "measureText")]
+            fn measure_text(&self, ctx: &mut Ctx, text: &str) -> OpResult<Value> {
+                let (font_size, spec, rtl, options) = {
+                    let data = self.data.borrow();
+                    (
+                        data.text.size,
+                        data.text.spec.clone(),
+                        data.text.direction == "rtl",
+                        data.text.shaping_options(),
+                    )
+                };
+                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let run = self
+                    .data
+                    .borrow()
+                    .surface
+                    .measure_text(&*fonts, text, font_size, &spec, rtl, &options)
+                    .map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("text shaping failed: {error:?}"),
+                        )
+                    })?;
+                let metrics = text_metrics(&*fonts, &run, font_size, &spec)?;
+                let value = ctx.new_instance(DomTextMetrics { metrics });
+                Ok(value)
+            }
+            #[method(name = "fillText")]
+            fn fill_text(
+                &self,
+                text: &str,
+                x: f64,
+                y: f64,
+                max_width: Option<f64>,
+            ) -> OpResult<()> {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || max_width.is_some_and(|value| value.is_nan() || value <= 0.0)
+                {
+                    return Ok(());
+                }
+                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let mut data = self.data.borrow_mut();
+                if !data.fill_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                let text_state = data.text.clone();
+                let options = text_state.shaping_options();
+                let (width, ascent, descent) = {
+                    let run = data
+                        .surface
+                        .measure_text(
+                            &*fonts,
+                            text,
+                            text_state.size,
+                            &text_state.spec,
+                            text_state.direction == "rtl",
+                            &options,
+                        )
+                        .map_err(|error| {
+                            OpError::new(
+                                "InvalidStateError",
+                                format!("text shaping failed: {error:?}"),
+                            )
+                        })?;
+                    (
+                        run.width,
+                        fonts.ascent_styled(text_state.size, &text_state.spec),
+                        (fonts.line_height_styled(text_state.size, &text_state.spec)
+                            - fonts.ascent_styled(text_state.size, &text_state.spec))
+                        .max(0.0),
+                    )
+                };
+                let origin_x = x as f32 - width * text_anchor(&text_state);
+                let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
+                data.surface
+                    .fill_text(
+                        &*fonts,
+                        text,
+                        text_state.size,
+                        &text_state.spec,
+                        text_state.direction == "rtl",
+                        origin_x,
+                        x as f32,
+                        baseline_y,
+                        max_width.map(|value| value as f32),
+                        &options,
+                    )
+                    .map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("text drawing failed: {error:?}"),
+                        )
+                    })?;
+                self.publish_data(&data)
+            }
+            #[method(name = "strokeText")]
+            fn stroke_text(
+                &self,
+                text: &str,
+                x: f64,
+                y: f64,
+                max_width: Option<f64>,
+            ) -> OpResult<()> {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || max_width.is_some_and(|value| value.is_nan() || value <= 0.0)
+                {
+                    return Ok(());
+                }
+                let fonts = canvas_font_source(self.realm.as_ref())?;
+                let mut data = self.data.borrow_mut();
+                if !data.stroke_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                let text_state = data.text.clone();
+                let options = text_state.shaping_options();
+                let (width, ascent, descent) = {
+                    let run = data
+                        .surface
+                        .measure_text(
+                            &*fonts,
+                            text,
+                            text_state.size,
+                            &text_state.spec,
+                            text_state.direction == "rtl",
+                            &options,
+                        )
+                        .map_err(|error| {
+                            OpError::new(
+                                "InvalidStateError",
+                                format!("text shaping failed: {error:?}"),
+                            )
+                        })?;
+                    (
+                        run.width,
+                        fonts.ascent_styled(text_state.size, &text_state.spec),
+                        (fonts.line_height_styled(text_state.size, &text_state.spec)
+                            - fonts.ascent_styled(text_state.size, &text_state.spec))
+                        .max(0.0),
+                    )
+                };
+                let anchor = text_anchor(&text_state);
+                let origin_x = x as f32 - width * anchor;
+                let baseline_y = text_baseline(&text_state, y as f32, ascent, descent);
+                data.surface
+                    .stroke_text(
+                        &*fonts,
+                        text,
+                        text_state.size,
+                        &text_state.spec,
+                        text_state.direction == "rtl",
+                        origin_x,
+                        x as f32,
+                        baseline_y,
+                        max_width.map(|value| value as f32),
+                        &options,
+                    )
+                    .map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("text drawing failed: {error:?}"),
+                        )
+                    })?;
+                self.publish_data(&data)
+            }
+
+            #[method(name = "createLinearGradient")]
+            fn create_linear_gradient(
+                &self,
+                ctx: &mut Ctx,
+                x0: f64,
+                y0: f64,
+                x1: f64,
+                y1: f64,
+            ) -> OpResult<Value> {
+                if ![x0, y0, x1, y1]
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX))
+                    || (x0 == x1 && y0 == y1)
+                {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "linear gradient endpoints must be finite and distinct",
+                    ));
+                }
+                let transform = self.data.borrow().surface.state().transform;
+                new_gradient(
+                    ctx,
+                    CanvasGradient::new(CanvasGradientKind::Linear {
+                        start: [x0 as f32, y0 as f32],
+                        end: [x1 as f32, y1 as f32],
+                        transform,
+                    }),
+                )
+            }
+
+            #[method(name = "createRadialGradient")]
+            fn create_radial_gradient(
+                &self,
+                ctx: &mut Ctx,
+                x0: f64,
+                y0: f64,
+                r0: f64,
+                x1: f64,
+                y1: f64,
+                r1: f64,
+            ) -> OpResult<Value> {
+                if ![x0, y0, r0, x1, y1, r1]
+                    .iter()
+                    .all(|v| v.is_finite() && v.abs() <= f64::from(f32::MAX))
+                    || r0 < 0.0
+                    || r1 < 0.0
+                {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "radial gradient circles are invalid",
+                    ));
+                }
+                let transform = self.data.borrow().surface.state().transform;
+                new_gradient(
+                    ctx,
+                    CanvasGradient::new(CanvasGradientKind::Radial {
+                        start: [x0 as f32, y0 as f32],
+                        end: [x1 as f32, y1 as f32],
+                        start_radius: r0 as f32,
+                        end_radius: r1 as f32,
+                        transform,
+                    }),
+                )
+            }
+
+            #[method(name = "createPattern")]
+            fn create_pattern(
+                &self,
+                ctx: &mut Ctx,
+                source: Value,
+                repetition: Option<&str>,
+            ) -> OpResult<Value> {
+                let source_clean = canvas_source_origin_clean(ctx, &source);
+                let image = match canvas_source_image(ctx, source)? {
+                    Some(image) => image,
+                    None => return Ok(Value::Null),
+                };
+                let repetition = match repetition.unwrap_or("repeat") {
+                    "repeat" => CanvasPatternRepetition::Repeat,
+                    "repeat-x" => CanvasPatternRepetition::RepeatX,
+                    "repeat-y" => CanvasPatternRepetition::RepeatY,
+                    "no-repeat" => CanvasPatternRepetition::NoRepeat,
+                    _ => {
+                        return Err(OpError::new(
+                            "SyntaxError",
+                            "invalid CanvasPattern repetition",
+                        ));
+                    }
+                };
+                if image.width == 0 || image.height == 0 {
+                    return Ok(Value::Null);
+                }
+                let pattern = CanvasPattern::new(&image, repetition).map_err(|_| {
+                    OpError::new(
+                        "InvalidStateError",
+                        "pattern source could not be rasterized",
+                    )
+                })?;
+                new_pattern(ctx, pattern, source_clean)
+            }
+
+            fn save(&self) {
+                let mut data = self.data.borrow_mut();
+                data.surface.save();
+                let fill = (
+                    data.fill_gradient_value.clone(),
+                    data.fill_pattern_value.clone(),
+                    data.fill_pattern_origin_clean,
+                );
+                let stroke = (
+                    data.stroke_gradient_value.clone(),
+                    data.stroke_pattern_value.clone(),
+                    data.stroke_pattern_origin_clean,
+                );
+                data.saved_fill_styles.push(fill);
+                data.saved_stroke_styles.push(stroke);
+                let text = data.text.clone();
+                data.saved_text.push(text);
+            }
+            fn restore(&self) {
+                let mut data = self.data.borrow_mut();
+                data.surface.restore();
+                if let Some((gradient, pattern, pattern_clean)) = data.saved_fill_styles.pop() {
+                    data.fill_gradient_value = gradient;
+                    data.fill_pattern_value = pattern;
+                    data.fill_pattern_origin_clean = pattern_clean;
+                }
+                if let Some((gradient, pattern, pattern_clean)) = data.saved_stroke_styles.pop() {
+                    data.stroke_gradient_value = gradient;
+                    data.stroke_pattern_value = pattern;
+                    data.stroke_pattern_origin_clean = pattern_clean;
+                }
+                if let Some(text) = data.saved_text.pop() {
+                    data.text = text;
+                }
+            }
+            fn fill_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                if !data.fill_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                data.surface
+                    .fill_rect(x as f32, y as f32, width as f32, height as f32)
+                    .map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("canvas shadow rendering failed: {error:?}"),
+                        )
+                    })?;
+                self.publish_data(&data)
+            }
+            fn clear_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                data.surface
+                    .clear_rect(x as f32, y as f32, width as f32, height as f32);
+                self.publish_data(&data)
+            }
+            fn stroke_rect(&self, x: f64, y: f64, width: f64, height: f64) -> OpResult<()> {
+                if ![x, y, width, height].iter().all(|value| value.is_finite())
+                    || width == 0.0 && height == 0.0
+                {
+                    return Ok(());
+                }
+                let mut data = self.data.borrow_mut();
+                if !data.stroke_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                let rectangle = CanvasPath {
+                    commands: vec![PathCommand::Rect(
+                        x as f32,
+                        y as f32,
+                        width as f32,
+                        height as f32,
+                    )],
+                };
+                if let Some(path) = rectangle.build(Transform::identity()) {
+                    data.surface.stroke_path(&path).map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("canvas shadow rendering failed: {error:?}"),
+                        )
+                    })?;
+                }
+                self.publish_data(&data)
+            }
+            fn begin_path(&self) {
+                self.data.borrow_mut().current_path = CanvasPath::default();
+            }
+            fn close_path(&self) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Close);
+            }
+            fn move_to(&self, x: f64, y: f64) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Move(x as f32, y as f32));
+            }
+            fn line_to(&self, x: f64, y: f64) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Line(x as f32, y as f32));
+            }
+            fn quadratic_curve_to(&self, cpx: f64, cpy: f64, x: f64, y: f64) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Quad(
+                        cpx as f32, cpy as f32, x as f32, y as f32,
+                    ));
+            }
+            fn bezier_curve_to(&self, cp1x: f64, cp1y: f64, cp2x: f64, cp2y: f64, x: f64, y: f64) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Cubic(
+                        cp1x as f32,
+                        cp1y as f32,
+                        cp2x as f32,
+                        cp2y as f32,
+                        x as f32,
+                        y as f32,
+                    ));
+            }
+            #[method(name = "arc")]
+            fn arc(
+                &self,
+                x: f64,
+                y: f64,
+                radius: f64,
+                start_angle: f64,
+                end_angle: f64,
+                counterclockwise: Option<bool>,
+            ) -> OpResult<()> {
+                if radius < 0.0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "arc radius must be non-negative",
+                    ));
+                }
+                let values = [x, y, radius, start_angle, end_angle];
+                if !values.iter().all(|value| value.is_finite())
+                    || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
+                {
+                    return Ok(());
+                }
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Arc {
+                        cx: x as f32,
+                        cy: y as f32,
+                        rx: radius as f32,
+                        ry: radius as f32,
+                        rotation: 0.0,
+                        start: start_angle as f32,
+                        end: end_angle as f32,
+                        counterclockwise: counterclockwise.unwrap_or(false),
+                    });
+                Ok(())
+            }
+            #[method(name = "ellipse")]
+            fn ellipse(
+                &self,
+                x: f64,
+                y: f64,
+                radius_x: f64,
+                radius_y: f64,
+                rotation: f64,
+                start_angle: f64,
+                end_angle: f64,
+                counterclockwise: Option<bool>,
+            ) -> OpResult<()> {
+                if radius_x < 0.0 || radius_y < 0.0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "ellipse radii must be non-negative",
+                    ));
+                }
+                let values = [x, y, radius_x, radius_y, rotation, start_angle, end_angle];
+                if !values.iter().all(|value| value.is_finite())
+                    || values.iter().any(|value| value.abs() > f64::from(f32::MAX))
+                {
+                    return Ok(());
+                }
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Arc {
+                        cx: x as f32,
+                        cy: y as f32,
+                        rx: radius_x as f32,
+                        ry: radius_y as f32,
+                        rotation: rotation as f32,
+                        start: start_angle as f32,
+                        end: end_angle as f32,
+                        counterclockwise: counterclockwise.unwrap_or(false),
+                    });
+                Ok(())
+            }
+            fn rect(&self, x: f64, y: f64, width: f64, height: f64) {
+                self.data
+                    .borrow_mut()
+                    .current_path
+                    .commands
+                    .push(PathCommand::Rect(
+                        x as f32,
+                        y as f32,
+                        width as f32,
+                        height as f32,
+                    ));
+            }
+            fn fill(
+                &self,
+                ctx: &mut Ctx,
+                path_or_rule: Option<Value>,
+                fill_rule: Option<&str>,
+            ) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                if !data.fill_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                let (path_data, rule_text) = match path_or_rule {
+                    Some(Value::Str(rule)) => (None, Some(rule.as_str().to_owned())),
+                    Some(path_value) => (
+                        Some(clone_path2d(ctx, &path_value)?),
+                        fill_rule.map(str::to_owned),
+                    ),
+                    None => (None, fill_rule.map(str::to_owned)),
+                };
+                let rule = parse_fill_rule(rule_text.as_deref())?;
+                let path = path_data
+                    .as_ref()
+                    .unwrap_or(&data.current_path)
+                    .build(Transform::identity());
+                if let Some(path) = path {
+                    data.surface.fill_path(&path, rule).map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("canvas shadow rendering failed: {error:?}"),
+                        )
+                    })?;
+                }
+                self.publish_data(&data)
+            }
+            fn stroke(&self, ctx: &mut Ctx, path_data: Option<Value>) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                if !data.stroke_pattern_origin_clean {
+                    data.origin_clean = false;
+                }
+                let path_data = path_data
+                    .map(|value| clone_path2d(ctx, &value))
+                    .transpose()?;
+                let path = path_data
+                    .as_ref()
+                    .unwrap_or(&data.current_path)
+                    .build(Transform::identity());
+                if let Some(path) = path {
+                    data.surface.stroke_path(&path).map_err(|error| {
+                        OpError::new(
+                            "InvalidStateError",
+                            format!("canvas shadow rendering failed: {error:?}"),
+                        )
+                    })?;
+                }
+                self.publish_data(&data)
+            }
+            fn clip(
+                &self,
+                ctx: &mut Ctx,
+                path_or_rule: Option<Value>,
+                fill_rule: Option<&str>,
+            ) -> OpResult<()> {
+                let mut data = self.data.borrow_mut();
+                let (path_data, rule_text) = match path_or_rule {
+                    Some(Value::Str(rule)) => (None, Some(rule.as_str().to_owned())),
+                    Some(path_value) => (
+                        Some(clone_path2d(ctx, &path_value)?),
+                        fill_rule.map(str::to_owned),
+                    ),
+                    None => (None, fill_rule.map(str::to_owned)),
+                };
+                let rule = parse_fill_rule(rule_text.as_deref())?;
+                let path = path_data
+                    .as_ref()
+                    .unwrap_or(&data.current_path)
+                    .build(Transform::identity());
+                if let Some(path) = path {
+                    data.surface.clip_path(&path, rule);
+                }
+                Ok(())
+            }
+
+            fn translate(&self, x: f64, y: f64) {
+                self.transform(Transform::from_translate(x as f32, y as f32));
+            }
+            fn scale(&self, x: f64, y: f64) {
+                self.transform(Transform::from_scale(x as f32, y as f32));
+            }
+            fn rotate(&self, angle: f64) {
+                if angle.is_finite() {
+                    let (s, c) = (angle.sin() as f32, angle.cos() as f32);
+                    self.transform(Transform::from_row(c, s, -s, c, 0.0, 0.0));
+                }
+            }
+            fn set_transform(&self, a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) {
+                if [a, b, c, d, e, f].iter().all(|n| n.is_finite()) {
+                    self.data.borrow_mut().surface.state_mut().transform = Transform::from_row(
+                        a as f32, b as f32, c as f32, d as f32, e as f32, f as f32,
+                    );
+                }
+            }
+            fn reset_transform(&self) {
+                self.data.borrow_mut().surface.state_mut().transform = Transform::identity();
+            }
+
+            fn get_image_data(
+                &self,
+                ctx: &mut Ctx,
+                sx: Value,
+                sy: Value,
+                sw: Value,
+                sh: Value,
+                settings: Option<Value>,
+            ) -> OpResult<Value> {
+                let sx = canvas_long(ctx, &sx)?;
+                let sy = canvas_long(ctx, &sy)?;
+                let sw = canvas_long(ctx, &sw)?;
+                let sh = canvas_long(ctx, &sh)?;
+                let default_color_space = self.data.borrow().color_space;
+                let settings = parse_image_data_settings_with_default(
+                    ctx,
+                    settings.as_ref(),
+                    default_color_space,
+                )?;
+                ensure_origin_clean(&self.data.borrow())?;
+                self.data.borrow().ensure_bitmap_available()?;
+                if sw == 0 || sh == 0 {
+                    return Err(OpError::new(
+                        "IndexSizeError",
+                        "image data dimensions cannot be zero",
+                    ));
+                }
+                let width = sw.unsigned_abs();
+                let height = sh.unsigned_abs();
+                image_data_storage(width, height, settings.pixel_format)?;
+                let mut image = self
+                    .data
+                    .borrow()
+                    .surface
+                    .read_pixels(
+                        if sw < 0 {
+                            i64::from(sx) + i64::from(sw)
+                        } else {
+                            i64::from(sx)
+                        },
+                        if sh < 0 {
+                            i64::from(sy) + i64::from(sh)
+                        } else {
+                            i64::from(sy)
+                        },
+                        width,
+                        height,
+                    )
+                    .map_err(|_| OpError::new("IndexSizeError", "image data is too large"))?;
+                if !self.data.borrow().alpha {
+                    make_image_opaque(&mut image.pixels);
+                }
+                Ok(ctx.new_instance(DomImageData::from_image_settings(image, settings)))
+            }
+
+            fn create_image_data(
+                &self,
+                ctx: &mut Ctx,
+                source_or_width: Value,
+                height: Option<Value>,
+                settings: Option<Value>,
+            ) -> OpResult<Value> {
+                if let Some(source) = ctx.instance_data::<DomImageData>(&source_or_width) {
+                    let source = source.borrow();
+                    let settings = ImageDataSettings {
+                        color_space: source.color_space,
+                        pixel_format: source.pixel_format,
+                    };
+                    let image = match source.pixel_format {
+                        ImageDataPixelFormat::RgbaUnorm8 => Some(Rgba8Image {
+                            width: source.width,
+                            height: source.height,
+                            pixels: zeroed_bytes(
+                                image_data_bytes(source.width, source.height)?,
+                                "ImageData allocation failed",
+                            )?,
+                        }),
+                        ImageDataPixelFormat::RgbaFloat16 => None,
+                    };
+                    let copy = DomImageData {
+                        image,
+                        width: source.width,
+                        height: source.height,
+                        color_space: settings.color_space,
+                        pixel_format: settings.pixel_format,
+                        pixels: RefCell::new(None),
+                    };
+                    return Ok(ctx.new_instance(copy));
+                }
+                if matches!(source_or_width, Value::Obj(_)) {
+                    return Err(OpError::new(
+                        "TypeError",
+                        "createImageData expects an ImageData object or numeric dimensions",
+                    ));
+                }
+                let height = height.ok_or_else(|| {
+                    OpError::new("TypeError", "createImageData requires two dimensions")
+                })?;
+                let sw = canvas_long(ctx, &source_or_width)?;
+                let sh = canvas_long(ctx, &height)?;
+                let default_color_space = self.data.borrow().color_space;
+                let settings = parse_image_data_settings_with_default(
+                    ctx,
+                    settings.as_ref(),
+                    default_color_space,
+                )?;
+                let width = sw.unsigned_abs();
+                let height = sh.unsigned_abs();
+                let (_, byte_len) = image_data_storage(width, height, settings.pixel_format)?;
+                let image = match settings.pixel_format {
+                    ImageDataPixelFormat::RgbaUnorm8 => Some(Rgba8Image {
+                        width,
+                        height,
+                        pixels: zeroed_bytes(byte_len, "ImageData allocation failed")?,
+                    }),
+                    ImageDataPixelFormat::RgbaFloat16 => None,
+                };
+                Ok(ctx.new_instance(DomImageData {
+                    image,
+                    width,
+                    height,
+                    color_space: settings.color_space,
+                    pixel_format: settings.pixel_format,
+                    pixels: RefCell::new(None),
+                }))
+            }
+            fn put_image_data(
+                &self,
+                ctx: &mut Ctx,
+                image: &DomImageData,
+                dx: Value,
+                dy: Value,
+                dirty_x: lumen_bind::Passed<Value>,
+                dirty_y: lumen_bind::Passed<Value>,
+                dirty_width: lumen_bind::Passed<Value>,
+                dirty_height: lumen_bind::Passed<Value>,
+            ) -> OpResult<()> {
+                let dx = canvas_long(ctx, &dx)?;
+                let dy = canvas_long(ctx, &dy)?;
+                let dirty = match (dirty_x.0, dirty_y.0, dirty_width.0, dirty_height.0) {
+                    (Some(x), Some(y), Some(width), Some(height)) => {
+                        let x = canvas_long(ctx, &x)?;
+                        let y = canvas_long(ctx, &y)?;
+                        let width = canvas_long(ctx, &width)?;
+                        let height = canvas_long(ctx, &height)?;
+                        normalized_dirty_rect(image.width, image.height, x, y, width, height)
+                    }
+                    // The overload set has three- and seven-argument forms.
+                    // Arguments beyond the shorter overload are ignored when
+                    // the seven-argument overload is not selected.
+                    _ => Some((0, 0, image.width, image.height)),
+                };
+                let Some((source_x, source_y, width, height)) = dirty else {
+                    return Ok(());
+                };
+                self.data.borrow().ensure_bitmap_available()?;
+                let pixels = image.read_pixels(ctx)?;
+                let mut data = self.data.borrow_mut();
+                data.surface
+                    .write_pixels_region(
+                        &pixels,
+                        i64::from(dx) + i64::from(source_x),
+                        i64::from(dy) + i64::from(source_y),
+                        source_x,
+                        source_y,
+                        width,
+                        height,
+                    )
+                    .map_err(|_| OpError::new("IndexSizeError", "invalid image data"))?;
+                self.publish_data(&data)
+            }
+
+            #[method(name = "drawImage")]
+            fn draw_image(
+                &self,
+                ctx: &mut Ctx,
+                source: Value,
+                a: f64,
+                b: f64,
+                c: Option<f64>,
+                d: Option<f64>,
+                e: Option<f64>,
+                f: Option<f64>,
+                g: Option<f64>,
+                h: Option<f64>,
+            ) -> OpResult<()> {
+                let source_origin_clean = canvas_source_origin_clean(ctx, &source);
+                let premultiply_alpha = ctx
+                    .instance_data::<DomImageBitmap>(&source)
+                    .map_or(true, |bitmap| bitmap.as_ref().borrow().premultiply_alpha);
+                let Some(image) = canvas_source_image(ctx, source)? else {
+                    return Ok(());
+                };
+                let mut data = self.data.borrow_mut();
+                if !source_origin_clean {
+                    data.origin_clean = false;
+                }
+                match (c, d, e, f, g, h) {
+                    (None, None, None, None, None, None) => {
+                        data.surface.draw_image_with_alpha_behavior(
+                            &image,
+                            a as f32,
+                            b as f32,
+                            image.width as f32,
+                            image.height as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    (Some(width), Some(height), None, None, None, None) => {
+                        data.surface.draw_image_with_alpha_behavior(
+                            &image,
+                            a as f32,
+                            b as f32,
+                            width as f32,
+                            height as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    (Some(sw), Some(sh), Some(dx), Some(dy), Some(dw), Some(dh)) => {
+                        data.surface.draw_image_crop_with_alpha_behavior(
+                            &image,
+                            a as f32,
+                            b as f32,
+                            sw as f32,
+                            sh as f32,
+                            dx as f32,
+                            dy as f32,
+                            dw as f32,
+                            dh as f32,
+                            premultiply_alpha,
+                        )
+                    }
+                    _ => {
+                        return Err(OpError::new(
+                            "TypeError",
+                            "drawImage expects 3, 5, or 9 arguments",
+                        ));
+                    }
+                }
+                .map_err(|_| {
+                    OpError::new(
+                        "InvalidStateError",
+                        "drawImage could not rasterize the source",
+                    )
+                })?;
+                self.publish_data(&data)
+            }
+        }
+    };
+}
+
+impl_canvas_2d_methods!(DomCanvasRenderingContext2D);
+impl_canvas_2d_methods!(DomOffscreenCanvasRenderingContext2D);
 
 fn new_gradient(ctx: &mut Ctx, gradient: CanvasGradient) -> OpResult<Value> {
     let id = NEXT_GRADIENT_ID.fetch_add(1, Ordering::Relaxed);
@@ -2600,8 +3368,17 @@ impl DomCanvasGradient {
     #[method(name = "addColorStop")]
     fn add_color_stop(&self, offset: f64, color: &str) -> OpResult<()> {
         let value = Value::Str(color.into());
-        let color = parse_style_color(&value)
-            .ok_or_else(|| OpError::new("SyntaxError", "invalid gradient color"))?;
+        // Gradients are canvas-neutral, so there is no element color to inherit.
+        let color = parse_style_color(
+            &value,
+            Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+        )
+        .ok_or_else(|| OpError::new("SyntaxError", "invalid gradient color"))?;
         self.handle
             .gradient
             .add_color_stop(offset as f32, color)
@@ -2723,6 +3500,9 @@ fn create_image_bitmap(
         let decode = ctx
             .get_member(&job, "decode")
             .map_err(|_| OpError::new("Error", "ImageBitmap decoder is unavailable"))?;
+        let decode = ctx
+            .bind_function_this(decode, job)
+            .map_err(OpError::thrown)?;
         return then.call(ctx, bytes_promise, &[decode]);
     }
 
@@ -3062,17 +3842,14 @@ fn decode_image_bitmap_inner(
     array_buffer: Value,
     options: BitmapOptions,
 ) -> OpResult<Value> {
-    let constructor = ctx
-        .get_member(&ctx.global_object(), "Uint8Array")
-        .map_err(|_| OpError::new("Error", "Uint8Array is unavailable"))?;
-    let typed_array = ctx.construct_value(constructor, &[array_buffer])?;
     let bytes = ctx
-        .typed_array_bytes(&typed_array)
+        .buffer_source_bytes(&array_buffer)
         .ok_or_else(|| OpError::new("TypeError", "Blob data is not an ArrayBuffer"))?;
     let icc_profile = if options.convert_color_space {
         lumen_html_image::raster_image_icc_profile(&bytes).map_err(|_| {
-            OpError::new(
-                "NotSupportedError",
+            error_reporting::dom_exception(
+                ctx,
+                "InvalidStateError",
                 "createImageBitmap could not read the raster color profile",
             )
         })?
@@ -3084,8 +3861,9 @@ fn decode_image_bitmap_inner(
         options.from_image_orientation,
     )
     .map_err(|_| {
-        OpError::new(
-            "NotSupportedError",
+        error_reporting::dom_exception(
+            ctx,
+            "InvalidStateError",
             "createImageBitmap could not decode the raster image",
         )
     })?;
@@ -3121,7 +3899,19 @@ impl DomBitmapDecodeJob {
 
     #[method(name = "decode")]
     fn decode(&self, ctx: &mut Ctx, array_buffer: Value) -> OpResult<Value> {
-        decode_image_bitmap_inner(ctx, array_buffer, self.options)
+        let deferred = Deferred::new(ctx);
+        let promise = deferred.promise();
+        let options = self.options;
+        // Blob reading completes through Promise jobs, but bitmap creation and
+        // rejection settle in a genuine host task, retaining its owner realm.
+        scheduling::queue_task(ctx, move |ctx| {
+            match decode_image_bitmap_inner(ctx, array_buffer, options) {
+                Ok(bitmap) => deferred.resolve(ctx, bitmap),
+                Err(error) => deferred.reject(ctx, error),
+            }
+            Ok(())
+        })?;
+        Ok(promise)
     }
 }
 
@@ -3342,16 +4132,25 @@ fn pattern_origin_clean(ctx: &mut Ctx, pattern: &Value) -> Option<bool> {
         .map(|pattern| pattern.borrow().handle.origin_clean)
 }
 
-impl DomCanvasRenderingContext2D {
-    fn publish_data(&self, data: &CanvasData) -> OpResult<()> {
-        publish(self.realm.as_ref(), self.node, data)
-    }
-    fn transform(&self, transform: Transform) {
-        let mut data = self.data.borrow_mut();
-        let current = data.surface.state().transform;
-        data.surface.state_mut().transform = current.pre_concat(transform);
-    }
+macro_rules! impl_canvas_2d_helpers {
+    ($context:ident) => {
+        impl $context {
+            fn publish_data(&self, data: &CanvasData) -> OpResult<()> {
+                data.ensure_bitmap_available()?;
+                publish(self.realm.as_ref(), self.node, data)
+            }
+
+            fn transform(&self, transform: Transform) {
+                let mut data = self.data.borrow_mut();
+                let current = data.surface.state().transform;
+                data.surface.state_mut().transform = current.pre_concat(transform);
+            }
+        }
+    };
 }
+
+impl_canvas_2d_helpers!(DomCanvasRenderingContext2D);
+impl_canvas_2d_helpers!(DomOffscreenCanvasRenderingContext2D);
 
 #[derive(Clone, Copy, Default)]
 struct CanvasTextMetricsData {
@@ -3415,7 +4214,46 @@ impl DomTextMetrics {
     }
 }
 
-fn canvas_fonts() -> &'static FontSet {
+fn canvas_font_source(realm: Option<&Rc<DomRealm>>) -> OpResult<CanvasFontSource> {
+    let Some(realm) = realm else {
+        return Ok(CanvasFontSource::Static(canvas_fallback_fonts()));
+    };
+    if !realm
+        .font_loading
+        .has_canvas_font_source()
+        .map_err(|error| OpError::new("InvalidStateError", error))?
+    {
+        return Ok(CanvasFontSource::Static(canvas_fallback_fonts()));
+    }
+    let key = {
+        let mut session = realm.session.borrow_mut();
+        let generation = session.font_face_generation().map_err(|error| {
+            OpError::new("InvalidStateError", format!("font stylesheet: {error:?}"))
+        })?;
+        (generation, session.media_environment())
+    };
+    if realm.font_loading.canvas_css_key.get() != Some(key) {
+        let css_faces = {
+            let mut session = realm.session.borrow_mut();
+            let environment = session.media_environment();
+            let mut faces = session.font_faces().map_err(|error| {
+                OpError::new("InvalidStateError", format!("font stylesheet: {error:?}"))
+            })?;
+            faces.retain(|face| face.applies(environment));
+            faces
+        };
+        realm.font_loading.replace_document_css_faces(&css_faces)?;
+        realm.font_loading.canvas_css_key.set(Some(key));
+    }
+    let document_base = realm.base_url();
+    let fonts = realm
+        .font_loading
+        .canvas_font_set(canvas_fallback_fonts(), &document_base)
+        .map_err(|error| OpError::new("InvalidStateError", error))?;
+    Ok(CanvasFontSource::Realm(fonts))
+}
+
+fn canvas_fallback_fonts() -> &'static FontSet {
     CANVAS_FONTS.get_or_init(|| {
         let mono = Arc::new(
             FontFace::new(Arc::from(DEFAULT_FONT_BYTES))
@@ -3457,6 +4295,10 @@ fn canvas_fonts() -> &'static FontSet {
         }
         FontSet::new(faces).expect("bundled canvas fonts form a valid font set")
     })
+}
+
+fn canvas_fonts() -> &'static FontSet {
+    canvas_fallback_fonts()
 }
 
 fn parse_canvas_font(value: &str) -> Option<(String, f32, FontSpec)> {
@@ -3666,95 +4508,30 @@ fn text_metrics(
     Ok(metrics)
 }
 
-fn parse_style_color(value: &Value) -> Option<[u8; 4]> {
+fn current_canvas_color(realm: &Option<Rc<DomRealm>>, node: Option<NodeId>) -> Rgba {
+    const BLACK: Rgba = Rgba {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
+    };
+    let (Some(realm), Some(node)) = (realm, node) else {
+        return BLACK;
+    };
+    realm.with_session(|session| {
+        session
+            .computed_style(node)
+            .ok()
+            .map_or(BLACK, |style| style.color)
+    })
+}
+
+fn parse_style_color(value: &Value, current: Rgba) -> Option<[u8; 4]> {
     let Value::Str(value) = value else {
         return None;
     };
-    let value = value.as_str().trim().to_ascii_lowercase();
-    let named = match value.as_str() {
-        "black" => Some([0, 0, 0, 255]),
-        "white" => Some([255, 255, 255, 255]),
-        "red" => Some([255, 0, 0, 255]),
-        "green" => Some([0, 128, 0, 255]),
-        "blue" => Some([0, 0, 255, 255]),
-        "yellow" => Some([255, 255, 0, 255]),
-        "magenta" | "fuchsia" => Some([255, 0, 255, 255]),
-        "cyan" | "aqua" => Some([0, 255, 255, 255]),
-        "transparent" => Some([0, 0, 0, 0]),
-        _ => None,
-    };
-    if named.is_some() {
-        return named;
-    }
-    if let Some(body) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        return parse_rgb(body, false);
-    }
-    if let Some(body) = value
-        .strip_prefix("rgba(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        return parse_rgb(body, true);
-    }
-    let digits = value.strip_prefix('#')?;
-    let expand = |c: char| c.to_digit(16).map(|n| (n * 17) as u8);
-    match digits.len() {
-        3 | 4 => {
-            let mut out = [0, 0, 0, 255];
-            for (i, c) in digits.chars().enumerate() {
-                out[i] = expand(c)?;
-            }
-            Some(out)
-        }
-        6 | 8 => {
-            let mut out = [0, 0, 0, 255];
-            for i in 0..digits.len() / 2 {
-                out[i] = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).ok()?;
-            }
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-fn parse_rgb(body: &str, has_alpha: bool) -> Option<[u8; 4]> {
-    let parts = body.split(',').map(str::trim).collect::<Vec<_>>();
-    if parts.len() != if has_alpha { 4 } else { 3 } {
-        return None;
-    }
-    let channel = |value: &str| {
-        if let Some(percent) = value.strip_suffix('%') {
-            let percent: f32 = percent.trim().parse().ok()?;
-            (percent.is_finite() && (0.0..=100.0).contains(&percent))
-                .then(|| (percent * 2.55).round() as u8)
-        } else {
-            let channel: f32 = value.parse().ok()?;
-            (channel.is_finite() && (0.0..=255.0).contains(&channel)).then(|| channel.round() as u8)
-        }
-    };
-    let alpha = if has_alpha {
-        let value = parts[3];
-        if let Some(percent) = value.strip_suffix('%') {
-            let percent: f32 = percent.trim().parse().ok()?;
-            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
-                return None;
-            }
-            (percent * 2.55).round() as u8
-        } else {
-            let alpha: f32 = value.parse().ok()?;
-            if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
-                return None;
-            }
-            (alpha * 255.0).round() as u8
-        }
-    } else {
-        255
-    };
-    Some([
-        channel(parts[0])?,
-        channel(parts[1])?,
-        channel(parts[2])?,
-        alpha,
-    ])
+    let color = lumen_html::css::parse_animation_color(value.as_str(), current)?;
+    Some([color.r, color.g, color.b, color.a])
 }
 
 fn color_string(color: [u8; 4]) -> String {
@@ -3849,28 +4626,83 @@ fn parse_fill_rule(rule: Option<&str>) -> OpResult<FillRule> {
 
 #[lumen_bind::class(name = "ImageData", hint(js(webidl)))]
 pub struct DomImageData {
-    image: Rgba8Image,
+    image: Option<Rgba8Image>,
+    width: u32,
+    height: u32,
+    color_space: CanvasColorSpace,
+    pixel_format: ImageDataPixelFormat,
     pixels: RefCell<Option<Value>>,
 }
 
 impl DomImageData {
-    fn from_image(image: Rgba8Image) -> Self {
+    fn from_image_settings(image: Rgba8Image, settings: ImageDataSettings) -> Self {
         Self {
-            image,
+            width: image.width,
+            height: image.height,
+            image: Some(image),
+            color_space: settings.color_space,
+            pixel_format: settings.pixel_format,
             pixels: RefCell::new(None),
         }
     }
+
     fn read_pixels(&self, ctx: &mut Ctx) -> OpResult<Rgba8Image> {
-        let mut image = self.image.clone();
-        if let Some(data) = self.pixels.borrow().as_ref() {
-            let bytes = ctx
-                .typed_array_bytes(data)
-                .ok_or_else(|| OpError::new("TypeError", "ImageData data is detached"))?;
-            if bytes.len() == image.pixels.len() {
-                image.pixels = bytes;
+        let Some(data) = self.pixels.borrow().clone() else {
+            if let Some(image) = self.image.as_ref() {
+                return clone_rgba_image(image);
+            }
+            let length = image_data_bytes(self.width, self.height)?;
+            return Ok(Rgba8Image {
+                width: self.width,
+                height: self.height,
+                pixels: zeroed_bytes(length, "ImageData bitmap allocation failed")?,
+            });
+        };
+        let expected = image_data_storage(self.width, self.height, self.pixel_format)?.1;
+        let actual = ctx
+            .typed_array_byte_len(&data)
+            .ok_or_else(|| OpError::new("TypeError", "ImageData data is detached"))?;
+        if actual != expected {
+            return Err(OpError::new(
+                "InvalidStateError",
+                "ImageData data no longer matches its dimensions",
+            ));
+        }
+        let bytes = ctx
+            .typed_array_bytes(&data)
+            .ok_or_else(|| OpError::new("TypeError", "ImageData data is detached"))?;
+        match self.pixel_format {
+            ImageDataPixelFormat::RgbaUnorm8 => Ok(Rgba8Image {
+                width: self.width,
+                height: self.height,
+                pixels: bytes,
+            }),
+            ImageDataPixelFormat::RgbaFloat16 => {
+                let output_len = image_data_bytes(self.width, self.height)?;
+                let mut pixels = Vec::new();
+                pixels.try_reserve_exact(output_len).map_err(|_| {
+                    OpError::new("IndexSizeError", "ImageData bitmap allocation failed")
+                })?;
+                for rgba in bytes.chunks_exact(8) {
+                    for component in 0..4 {
+                        let bits =
+                            u16::from_ne_bytes([rgba[component * 2], rgba[component * 2 + 1]]);
+                        let number = lumen_common::float16::f16_bits_to_f64(bits);
+                        let channel = if number.is_nan() {
+                            0
+                        } else {
+                            (number.clamp(0.0, 1.0) * 255.0).round() as u8
+                        };
+                        pixels.push(channel);
+                    }
+                }
+                Ok(Rgba8Image {
+                    width: self.width,
+                    height: self.height,
+                    pixels,
+                })
             }
         }
-        Ok(image)
     }
 }
 
@@ -3880,79 +4712,140 @@ impl DomImageData {
     fn new(
         ctx: &mut Ctx,
         data_or_width: Value,
-        height: Option<u32>,
-        data_height: Option<u32>,
+        height: Option<Value>,
+        data_height_or_settings: Option<Value>,
+        settings: Option<Value>,
     ) -> OpResult<Self> {
-        let (width, height, pixels, data_value) = match (data_or_width, height, data_height) {
-            (Value::Num(width), Some(height), None)
-                if width.is_finite()
-                    && width >= 0.0
-                    && width.fract() == 0.0
-                    && width <= u32::MAX as f64 =>
-            {
-                let width = width as u32;
-                let bytes = image_data_bytes(width, height)?;
-                (width, height, vec![0; bytes], None)
-            }
-            (data, Some(width), Some(height)) => {
-                let constructor = ctx.get_member(&data, "constructor").map_err(|_| {
-                    OpError::new("TypeError", "ImageData requires a Uint8ClampedArray")
+        match ctx.typed_array_kind(&data_or_width) {
+            Some(TaKind::U8Clamped | TaKind::F16) => {
+                let width = height.as_ref().ok_or_else(|| {
+                    OpError::new("TypeError", "ImageData requires width and height")
                 })?;
-                if !matches!(ctx.get_member(&constructor, "name"), Ok(Value::Str(name)) if name.as_str() == "Uint8ClampedArray")
-                {
+                let height = data_height_or_settings.as_ref().ok_or_else(|| {
+                    OpError::new("TypeError", "ImageData requires width and height")
+                })?;
+                let width = webidl_unsigned_long(ctx, width)?;
+                let height = webidl_unsigned_long(ctx, height)?;
+                let parsed = parse_image_data_settings(ctx, settings.as_ref())?;
+                let (_, byte_len) = image_data_storage(width, height, parsed.pixel_format)?;
+                let actual_kind = ctx.typed_array_kind(&data_or_width);
+                if actual_kind != Some(parsed.pixel_format.typed_array_kind()) {
+                    return Err(OpError::new(
+                        "InvalidStateError",
+                        "ImageData pixelFormat does not match its pixel array",
+                    ));
+                }
+                if ctx.typed_array_byte_len(&data_or_width) != Some(byte_len) {
+                    return Err(OpError::new(
+                        "InvalidStateError",
+                        "ImageData array is detached or its length does not match its dimensions",
+                    ));
+                }
+                Ok(Self {
+                    image: None,
+                    width,
+                    height,
+                    color_space: parsed.color_space,
+                    pixel_format: parsed.pixel_format,
+                    pixels: RefCell::new(Some(data_or_width)),
+                })
+            }
+            Some(_) => Err(OpError::new(
+                "TypeError",
+                "ImageData requires a Uint8ClampedArray or Float16Array",
+            )),
+            None => {
+                if matches!(data_or_width, Value::Obj(_)) {
                     return Err(OpError::new(
                         "TypeError",
-                        "ImageData requires a Uint8ClampedArray",
+                        "ImageData expects an image-data array or numeric dimensions",
                     ));
                 }
-                let bytes = ctx.typed_array_bytes(&data).ok_or_else(|| {
-                    OpError::new("TypeError", "ImageData requires a Uint8ClampedArray")
+                let height = height.ok_or_else(|| {
+                    OpError::new("TypeError", "ImageData expects width and height")
                 })?;
-                let expected = image_data_bytes(width, height)?;
-                if bytes.len() != expected {
-                    return Err(OpError::new(
-                        "IndexSizeError",
-                        "ImageData array length does not match its dimensions",
-                    ));
-                }
-                (width, height, bytes, Some(data))
+                let width = webidl_unsigned_long(ctx, &data_or_width)?;
+                let height = webidl_unsigned_long(ctx, &height)?;
+                let parsed = parse_image_data_settings(ctx, data_height_or_settings.as_ref())?;
+                let (_, byte_len) = image_data_storage(width, height, parsed.pixel_format)?;
+                let image = match parsed.pixel_format {
+                    ImageDataPixelFormat::RgbaUnorm8 => Some(Rgba8Image {
+                        width,
+                        height,
+                        pixels: zeroed_bytes(byte_len, "ImageData allocation failed")?,
+                    }),
+                    ImageDataPixelFormat::RgbaFloat16 => None,
+                };
+                Ok(Self {
+                    image,
+                    width,
+                    height,
+                    color_space: parsed.color_space,
+                    pixel_format: parsed.pixel_format,
+                    pixels: RefCell::new(None),
+                })
             }
-            _ => {
-                return Err(OpError::new(
-                    "TypeError",
-                    "ImageData expects dimensions or pixel data and dimensions",
-                ));
-            }
-        };
-        Ok(Self {
-            image: Rgba8Image {
-                width,
-                height,
-                pixels,
-            },
-            pixels: RefCell::new(data_value),
-        })
+        }
     }
     #[getter]
     fn width(&self) -> u32 {
-        self.image.width
+        self.width
     }
     #[getter]
     fn height(&self) -> u32 {
-        self.image.height
+        self.height
+    }
+    #[getter]
+    fn color_space(&self) -> &'static str {
+        self.color_space.as_str()
+    }
+    #[getter]
+    fn pixel_format(&self) -> &'static str {
+        self.pixel_format.as_str()
     }
     #[getter]
     fn data(&self, ctx: &mut Ctx) -> OpResult<Value> {
         if let Some(value) = self.pixels.borrow().clone() {
             return Ok(value);
         }
+        let element_count = image_data_storage(self.width, self.height, self.pixel_format)?.0;
+        let constructor_name = match self.pixel_format {
+            ImageDataPixelFormat::RgbaUnorm8 => "Uint8ClampedArray",
+            ImageDataPixelFormat::RgbaFloat16 => "Float16Array",
+        };
         let constructor = ctx
-            .get_member(&ctx.global_object(), "Uint8ClampedArray")
-            .map_err(|_| OpError::new("Error", "Uint8ClampedArray is unavailable"))?;
-        let array =
-            ctx.construct_value(constructor, &[Value::Num(self.image.pixels.len() as f64)])?;
-        if !ctx.typed_array_set_bytes(&array, &self.image.pixels) {
-            return Err(OpError::new("TypeError", "could not initialize image data"));
+            .get_member(&ctx.global_object(), constructor_name)
+            .map_err(|_| OpError::new("Error", "ImageData typed array is unavailable"))?;
+        let array = ctx
+            .construct_value(constructor, &[Value::Num(element_count as f64)])
+            .map_err(OpError::thrown)?;
+        if let Some(image) = self.image.as_ref() {
+            match self.pixel_format {
+                ImageDataPixelFormat::RgbaUnorm8 => {
+                    if !ctx.typed_array_set_bytes(&array, &image.pixels) {
+                        return Err(OpError::new("TypeError", "could not initialize image data"));
+                    }
+                }
+                ImageDataPixelFormat::RgbaFloat16 => {
+                    let mut bytes = Vec::new();
+                    let (_, byte_len) = image_data_storage(
+                        self.width,
+                        self.height,
+                        ImageDataPixelFormat::RgbaFloat16,
+                    )?;
+                    bytes.try_reserve_exact(byte_len).map_err(|_| {
+                        OpError::new("IndexSizeError", "ImageData data allocation failed")
+                    })?;
+                    for component in &image.pixels {
+                        let number = f64::from(*component) / 255.0;
+                        let bits = lumen_common::float16::f64_to_f16_bits(number).unwrap_or(0);
+                        bytes.extend_from_slice(&bits.to_ne_bytes());
+                    }
+                    if !ctx.typed_array_set_bytes(&array, &bytes) {
+                        return Err(OpError::new("TypeError", "could not initialize image data"));
+                    }
+                }
+            }
         }
         *self.pixels.borrow_mut() = Some(array.clone());
         Ok(array)
@@ -3960,13 +4853,32 @@ impl DomImageData {
 }
 
 fn image_data_bytes(width: u32, height: u32) -> OpResult<usize> {
-    check_dimensions(width, height)?;
-    let bytes = usize::try_from(u64::from(width) * u64::from(height) * 4)
-        .map_err(|_| OpError::new("IndexSizeError", "image data is too large"))?;
-    if bytes > 64 * 1024 * 1024 {
+    image_data_storage(width, height, ImageDataPixelFormat::RgbaUnorm8).map(|(_, bytes)| bytes)
+}
+
+fn image_data_storage(
+    width: u32,
+    height: u32,
+    pixel_format: ImageDataPixelFormat,
+) -> OpResult<(usize, usize)> {
+    if width == 0 || height == 0 {
+        return Err(OpError::new(
+            "IndexSizeError",
+            "image data dimensions cannot be zero",
+        ));
+    }
+    let elements = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .and_then(|elements| usize::try_from(elements).ok())
+        .ok_or_else(|| OpError::new("IndexSizeError", "image data is too large"))?;
+    let bytes = elements
+        .checked_mul(pixel_format.bytes_per_component())
+        .ok_or_else(|| OpError::new("IndexSizeError", "image data is too large"))?;
+    if bytes > MAX_IMAGE_DATA_BYTES {
         return Err(OpError::new("IndexSizeError", "image data is too large"));
     }
-    Ok(bytes)
+    Ok((elements, bytes))
 }
 
 fn clone_path2d(ctx: &mut Ctx, value: &Value) -> OpResult<CanvasPath> {
@@ -4009,7 +4921,7 @@ fn parse_dom_matrix(ctx: &mut Ctx, value: &Value) -> OpResult<Transform> {
     ))
 }
 
-pub(crate) fn install(ctx: &mut Ctx) -> OpResult<()> {
+fn install_canvas_apis(ctx: &mut Ctx, include_window_context: bool) -> OpResult<()> {
     let global = ctx.global_object();
     let _bitmap_decode_job_constructor = ctx.class_constructor::<DomBitmapDecodeJob>();
     for (name, constructor) in [
@@ -4018,8 +4930,8 @@ pub(crate) fn install(ctx: &mut Ctx) -> OpResult<()> {
             ctx.class_constructor::<DomOffscreenCanvas>(),
         ),
         (
-            "CanvasRenderingContext2D",
-            ctx.class_constructor::<DomCanvasRenderingContext2D>(),
+            "OffscreenCanvasRenderingContext2D",
+            ctx.class_constructor::<DomOffscreenCanvasRenderingContext2D>(),
         ),
         (
             "ImageBitmapRenderingContext",
@@ -4038,17 +4950,34 @@ pub(crate) fn install(ctx: &mut Ctx) -> OpResult<()> {
         crate::install_interface(ctx, &global, name, constructor)
             .map_err(|_| OpError::new("Error", "canvas constructor installation failed"))?;
     }
+    if include_window_context {
+        let constructor = ctx.class_constructor::<DomCanvasRenderingContext2D>();
+        crate::install_interface(ctx, &global, "CanvasRenderingContext2D", constructor)
+            .map_err(|_| OpError::new("Error", "canvas constructor installation failed"))?;
+    }
     let create_bitmap = ctx.bound_function(&lumen_bind::FnItem::of::<create_image_bitmap::Op>());
     ctx.set_member(&global, "createImageBitmap", create_bitmap)
         .map_err(|_| OpError::new("Error", "createImageBitmap installation failed"))?;
     Ok(())
 }
 
-pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 9] {
+pub(crate) fn install(ctx: &mut Ctx) -> OpResult<()> {
+    install_canvas_apis(ctx, true)
+}
+
+pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
+    install_canvas_apis(ctx, false)
+}
+
+pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 10] {
     [
         (
             "OffscreenCanvas",
             ctx.class_constructor::<DomOffscreenCanvas>(),
+        ),
+        (
+            "OffscreenCanvasRenderingContext2D",
+            ctx.class_constructor::<DomOffscreenCanvasRenderingContext2D>(),
         ),
         (
             "CanvasRenderingContext2D",
@@ -4073,6 +5002,7 @@ pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lumen::embed::WeakValue;
     use lumen::Engine;
 
     fn eval_bool(engine: &mut Engine, source: &str) -> bool {
@@ -4086,6 +5016,443 @@ mod tests {
             Err(_) => panic!("JavaScript evaluation could not start"),
             Ok(Ok(_)) => panic!("JavaScript assertion did not return a boolean"),
         }
+    }
+
+    #[test]
+    fn offscreen_context_uses_its_own_brand_and_shared_2d_operations() {
+        let mut engine = Engine::new();
+        super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas(2, 1);
+                const context = canvas.getContext('2d');
+                const domCanvas = document.createElement('canvas');
+                const domContext = domCanvas.getContext('2d');
+                context.fillStyle = 'red';
+                context.fillRect(0, 0, 1, 1);
+                const pixel = context.getImageData(0, 0, 1, 1).data;
+                const ctor = OffscreenCanvasRenderingContext2D;
+                return canvas instanceof OffscreenCanvas &&
+                    context instanceof ctor &&
+                    Object.getPrototypeOf(context) === ctor.prototype &&
+                    Object.getPrototypeOf(ctor.prototype) === Object.prototype &&
+                    !(context instanceof CanvasRenderingContext2D) &&
+                    domContext instanceof CanvasRenderingContext2D &&
+                    !(domContext instanceof ctor) &&
+                    canvas.getContext('2d') === context && context.canvas === canvas &&
+                    pixel[0] === 255 && pixel[1] === 0 && pixel[3] === 255;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn stroke_rect_zero_area_is_a_noop_and_rectangles_preserve_the_current_path() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(() => {
+            const canvas=new OffscreenCanvas(20,20);
+            const context=canvas.getContext('2d');
+            context.beginPath();context.moveTo(2,2);context.lineTo(2,10);
+            context.strokeStyle='red';context.lineWidth=250;
+            context.lineCap='round';context.lineJoin='round';
+            context.strokeRect(15,15,0,0);
+            if(context.getImageData(15,15,1,1).data[3]!==0)return false;
+            context.strokeRect(NaN,0,5,5);
+            context.strokeStyle='#00ff00';context.lineWidth=2;context.lineCap='butt';
+            context.strokeRect(12,12,5,5);
+            context.stroke();
+            const pixel=context.getImageData(2,5,1,1).data;
+            return pixel[0]===0&&pixel[1]===255&&pixel[2]===0&&pixel[3]===255;
+        })()"#
+        ));
+    }
+
+    #[test]
+    fn canvas_line_and_shadow_state_roundtrips_saves_renders_and_resets() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas(9, 4);
+                const context = canvas.getContext('2d');
+                const defaults = context.lineCap === 'butt' && context.lineJoin === 'miter' &&
+                    context.miterLimit === 10 && context.shadowColor === 'rgba(0, 0, 0, 0)' &&
+                    context.shadowBlur === 0 && context.shadowOffsetX === 0 &&
+                    context.shadowOffsetY === 0;
+                context.lineCap = 'round';
+                context.lineCap = 'not-a-cap';
+                context.lineJoin = 'bevel';
+                context.miterLimit = 3.5;
+                context.shadowColor = 'blue';
+                context.shadowBlur = 2;
+                context.shadowOffsetX = 3;
+                context.shadowOffsetY = -1;
+                context.save();
+                context.lineCap = 'square';
+                context.lineJoin = 'round';
+                context.miterLimit = 7;
+                context.shadowColor = 'red';
+                context.shadowBlur = 8;
+                context.shadowOffsetX = -5;
+                context.shadowOffsetY = 6;
+                context.restore();
+                const restored = context.lineCap === 'round' && context.lineJoin === 'bevel' &&
+                    context.miterLimit === 3.5 && context.shadowColor === 'rgb(0, 0, 255)' &&
+                    context.shadowBlur === 2 && context.shadowOffsetX === 3 &&
+                    context.shadowOffsetY === -1;
+                context.shadowBlur = 0;
+                context.shadowOffsetY = 0;
+                context.fillStyle = 'red';
+                context.fillRect(1, 2, 1, 1);
+                const source = context.getImageData(1, 2, 1, 1).data;
+                const shadow = context.getImageData(4, 2, 1, 1).data;
+                canvas.width = 9;
+                const reset = context.lineCap === 'butt' && context.lineJoin === 'miter' &&
+                    context.miterLimit === 10 && context.shadowColor === 'rgba(0, 0, 0, 0)' &&
+                    context.shadowBlur === 0 && context.shadowOffsetX === 0 &&
+                    context.shadowOffsetY === 0;
+                return defaults && restored && source[0] === 255 && source[3] === 255 &&
+                    shadow[2] === 255 && shadow[3] === 255 && reset;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn worker_canvas_installer_exposes_only_worker_context_brand() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas(2, 1);
+                const context = canvas.getContext('2d');
+                context.fillStyle = 'blue';
+                context.fillRect(1, 0, 1, 1);
+                const pixel = context.getImageData(1, 0, 1, 1).data;
+                const ctor = OffscreenCanvasRenderingContext2D;
+                return typeof OffscreenCanvas === 'function' &&
+                    typeof TextMetrics === 'function' && typeof ImageData === 'function' &&
+                    typeof createImageBitmap === 'function' &&
+                    typeof CanvasRenderingContext2D === 'undefined' &&
+                    typeof document === 'undefined' && context instanceof ctor &&
+                    Object.getPrototypeOf(context) === ctor.prototype &&
+                    Object.getPrototypeOf(ctor.prototype) === Object.prototype &&
+                    canvas.getContext('2d') === context && context.canvas === canvas &&
+                    pixel[0] === 0 && pixel[2] === 255 && pixel[3] === 255;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn offscreen_dimensions_enforce_webidl_unsigned_long_long_and_allow_large_empty_axes() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas('2.9', 3.9);
+                let conversions = 0;
+                canvas.width = { valueOf() { conversions++; return '5.9'; } };
+                const coercedOnce = canvas.width === 5 && conversions === 1;
+                canvas.height = '0';
+                canvas.width = 4294967297;
+                const beyondU32 = canvas.width === 4294967297;
+                const hugeEmpty = new OffscreenCanvas(2 ** 53, 0);
+                const invalid = (fn) => {
+                    try { fn(); } catch (error) { return error instanceof TypeError; }
+                    return false;
+                };
+                const unavailable = (fn) => {
+                    try { fn(); } catch (error) { return error.name === 'InvalidStateError'; }
+                    return false;
+                };
+                const preserved = new OffscreenCanvas(17, 0);
+                const rejectInfinity = invalid(() => new OffscreenCanvas(Infinity, 0));
+                const rejectNegative = invalid(() => new OffscreenCanvas(-1, 0));
+                const rejectU64Limit = invalid(() => new OffscreenCanvas(2 ** 64, 0));
+                const rejectSetter = invalid(() => { preserved.width = 2 ** 64; });
+                const setterAtomic = preserved.width === 17;
+                const oversized = new OffscreenCanvas(16385, 1025);
+                const context = oversized.getContext('2d');
+                const readFails = unavailable(() => context.getImageData(0, 0, 1, 1));
+                const drawFails = unavailable(() => context.fillRect(0, 0, 1, 1));
+                return canvas.height === 0 && beyondU32 && hugeEmpty.width === 2 ** 53 &&
+                    hugeEmpty.height === 0 && coercedOnce && conversions === 1 &&
+                    rejectInfinity && rejectNegative && rejectU64Limit && rejectSetter &&
+                    setterAtomic && oversized.width === 16385 && oversized.height === 1025 &&
+                    readFails && drawFails;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn image_data_overloads_use_internal_typed_array_brands_and_bounded_storage() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas(2, 2);
+                const context = canvas.getContext('2d');
+                const bytes = new Uint8ClampedArray([1, 2, 3, 4]);
+                const image = new ImageData(bytes, 1, 1);
+                const blank = context.createImageData(image);
+                const dimensions = context.createImageData(-2.9, 1.9);
+                const halves = new Float16Array([1, 0.5, 0, 1]);
+                const floatImage = new ImageData(halves, 1, 1, {
+                    pixelFormat: 'rgba-float16'
+                });
+                const floatBlank = context.createImageData(1, 1, {
+                    pixelFormat: 'rgba-float16'
+                });
+                const typeError = (fn) => {
+                    try { fn(); } catch (error) { return error instanceof TypeError; }
+                    return false;
+                };
+                const indexSize = (fn) => {
+                    try { fn(); } catch (error) { return error.name === 'IndexSizeError'; }
+                    return false;
+                };
+                const spoof = {
+                    0: 0, 1: 0, 2: 0, 3: 0, length: 4,
+                    [Symbol.toStringTag]: 'Uint8ClampedArray'
+                };
+                return image.data === bytes && image.width === 1 && image.height === 1 &&
+                    blank !== image && blank.data !== bytes && Array.from(blank.data).every(v => v === 0) &&
+                    dimensions.width === 2 && dimensions.height === 1 &&
+                    floatImage.data === halves && floatImage.pixelFormat === 'rgba-float16' &&
+                    floatBlank.data instanceof Float16Array && floatBlank.pixelFormat === 'rgba-float16' &&
+                    typeError(() => new ImageData(new Uint8Array(4), 1, 1)) &&
+                    typeError(() => new ImageData(spoof, 1, 1)) &&
+                    typeError(() => new ImageData(Object.create(ImageData.prototype))) &&
+                    typeError(() => context.createImageData(null)) &&
+                    typeError(() => context.createImageData(NaN, 1)) &&
+                    typeError(() => context.createImageData(2147483648, 1)) &&
+                    typeError(() => new ImageData(1, 1, true)) &&
+                    indexSize(() => context.createImageData(0, 1)) &&
+                    indexSize(() => new ImageData(1, 0)) &&
+                    indexSize(() => context.createImageData(2147483647, 0));
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn put_image_data_clips_dirty_rectangles_and_enforces_signed_long_arguments() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const source = new Uint8ClampedArray(3 * 2 * 4);
+                for (let y = 0; y < 2; y++) for (let x = 0; x < 3; x++) {
+                    source.set([x * 50, y * 60, x + y, 255], (y * 3 + x) * 4);
+                }
+                const image = new ImageData(source, 3, 2);
+                const canvas = new OffscreenCanvas(5, 4);
+                const context = canvas.getContext('2d');
+                const pixel = (x, y) => Array.from(context.getImageData(x, y, 1, 1).data);
+                const empty = pixel(0, 0)[3] === 0;
+                context.putImageData(image, 0, 0, 1, 0, 2, 2);
+                const initialDirty = pixel(1, 0).join(',') === '50,0,1,255' &&
+                    pixel(2, 1).join(',') === '100,60,3,255' && pixel(0, 0)[3] === 0;
+                context.putImageData(image, 3, 2, 3, 2, -2, -2);
+                const negativeExtent = pixel(4, 2).join(',') === '50,0,1,255';
+                context.putImageData(image, 0, 0, -1, 0, 3, 1);
+                const clippedNegativeOrigin = pixel(0, 0).join(',') === '0,0,0,255' &&
+                    pixel(1, 0).join(',') === '50,0,1,255';
+                context.putImageData(image, 0, 0, 30, 30, 2, 1);
+                const outsideNoop = pixel(0, 0).join(',') === '0,0,0,255';
+                // With four to six arguments the short Web IDL overload is selected;
+                // the extra arguments do not restrict the source rectangle.
+                context.putImageData(image, 0, 3, 30);
+                const shortOverload = pixel(2, 3).join(',') === '100,0,2,255';
+                const typeError = (fn) => {
+                    try { fn(); } catch (error) { return error instanceof TypeError; }
+                    return false;
+                };
+                return empty && initialDirty && negativeExtent && clippedNegativeOrigin &&
+                    outsideNoop && shortOverload &&
+                    typeError(() => context.getImageData(NaN, 0, 1, 1)) &&
+                    typeError(() => context.getImageData(0, 0, Infinity, 1)) &&
+                    typeError(() => context.getImageData(0, 0, 2147483648, 1)) &&
+                    typeError(() => context.putImageData(image, Infinity, 0)) &&
+                    typeError(() => context.putImageData(image, 2147483648, 0)) &&
+                    typeError(() => context.putImageData(image, 0, 0, 0, 0, -2147483649, 1));
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn canvas_colors_reuse_css_color_grammar_and_clamp_rgb_channels() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const context = new OffscreenCanvas(2, 1).getContext('2d');
+                context.fillStyle = 'rgb(300 -10 12)';
+                context.fillRect(0, 0, 1, 1);
+                const pixel = context.getImageData(0, 0, 1, 1).data;
+                return pixel[0] === 255 && pixel[1] === 0 && pixel[2] === 12 && pixel[3] === 255;
+            })()"#
+        ));
+
+        let mut engine = Engine::new();
+        super::super::install(
+            engine.ctx(),
+            "<style>canvas{color:rgb(20,40,60)}</style><canvas width='1' height='1'></canvas>",
+            64,
+        )
+        .unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const context = document.querySelector('canvas').getContext('2d');
+                context.fillStyle = 'currentColor';
+                context.fillRect(0, 0, 1, 1);
+                const pixel = context.getImageData(0, 0, 1, 1).data;
+                return pixel[0] === 20 && pixel[1] === 40 && pixel[2] === 60 && pixel[3] === 255;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn canvas_and_image_data_settings_read_dictionary_members_in_order() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const contextOrder = [];
+                const contextOptions = {
+                    get alpha() { contextOrder.push('alpha'); return true; },
+                    get colorSpace() {
+                        contextOrder.push('colorSpace');
+                        return { toString() { contextOrder.push('colorSpace toString'); return 'srgb'; } };
+                    },
+                    get desynchronized() { contextOrder.push('desynchronized'); return false; },
+                    get willReadFrequently() { contextOrder.push('willReadFrequently'); return false; }
+                };
+                const canvas = new OffscreenCanvas(1, 1);
+                const context = canvas.getContext('2d', contextOptions);
+                const creationOrder = contextOrder.join('|');
+                contextOrder.length = 0;
+                const cached = canvas.getContext('2d', contextOptions) === context;
+                const cachedUntouched = contextOrder.length === 0;
+
+                const imageOrder = [];
+                const image = new ImageData(1, 1, {
+                    get colorSpace() {
+                        imageOrder.push('colorSpace');
+                        return { toString() { imageOrder.push('colorSpace toString'); return 'srgb'; } };
+                    },
+                    get pixelFormat() { imageOrder.push('pixelFormat'); return 'rgba-unorm8'; }
+                });
+                const imageCreationOrder = imageOrder.join('|');
+                const invalidContext = (name) => {
+                    try { canvas.getContext(name); } catch (error) { return error instanceof TypeError; }
+                    return false;
+                };
+                const primitiveOptions = ['ignored', 42, false, true, null, undefined].every(options =>
+                    new OffscreenCanvas(1, 1).getContext('2d', options) instanceof OffscreenCanvasRenderingContext2D
+                );
+                return creationOrder === 'alpha|colorSpace|colorSpace toString|desynchronized|willReadFrequently' &&
+                    cached && cachedUntouched && imageCreationOrder === 'colorSpace|colorSpace toString|pixelFormat' &&
+                    image.colorSpace === 'srgb' && image.pixelFormat === 'rgba-unorm8' &&
+                    new OffscreenCanvas(1, 1).getContext('2d', true) instanceof OffscreenCanvasRenderingContext2D &&
+                    new OffscreenCanvas(1, 1).getContext('2d', 'primitive', 'ignored') instanceof OffscreenCanvasRenderingContext2D &&
+                    primitiveOptions &&
+                    invalidContext('') && invalidContext('2D') && invalidContext('3d') &&
+                    invalidContext(undefined);
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn offscreen_context_owner_edge_is_traced_and_collectible() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(()=>{
+                const canvas = new OffscreenCanvas(1, 1);
+                canvas.ownerMarker = { value: 73 };
+                const context = canvas.getContext('2d');
+                globalThis.keptOffscreenContext = context;
+                return context.canvas === canvas;
+            })()"#
+        ));
+
+        let (canvas_weak, context_weak): (WeakValue, WeakValue) = {
+            let ctx = engine.ctx();
+            let global = ctx.global_object();
+            let context_value = ctx
+                .member_get(&global, "keptOffscreenContext")
+                .ok()
+                .expect("global context root exists");
+            let canvas_value = ctx
+                .member_get(&context_value, "canvas")
+                .ok()
+                .expect("context canvas getter succeeds");
+            let canvas_weak = ctx
+                .weak_value(&canvas_value)
+                .expect("offscreen canvas wrapper is an object");
+            let context_weak = ctx
+                .weak_value(&context_value)
+                .expect("offscreen context wrapper is an object");
+            (canvas_weak, context_weak)
+        };
+        engine.collect_garbage();
+
+        let (canvas, context) = {
+            let ctx = engine.ctx();
+            let context = context_weak
+                .upgrade()
+                .expect("the JavaScript global keeps the context alive");
+            let canvas = canvas_weak
+                .upgrade()
+                .expect("the rooted context traces its original canvas");
+            let current_canvas = ctx
+                .member_get(&context, "canvas")
+                .ok()
+                .expect("context canvas getter still succeeds after collection");
+            assert!(ctx.values_strict_equal(&canvas, &current_canvas));
+            let marker = ctx
+                .member_get(&canvas, "ownerMarker")
+                .ok()
+                .expect("canvas expando survives through the context owner edge");
+            assert!(matches!(
+                ctx.member_get(&marker, "value"),
+                Ok(Value::Num(value)) if value == 73.0
+            ));
+            (canvas, context)
+        };
+
+        {
+            let ctx = engine.ctx();
+            assert!(ctx
+                .set_member(&canvas, "contextCycle", context.clone())
+                .is_ok());
+            let global = ctx.global_object();
+            assert!(ctx
+                .delete_member(&global, "keptOffscreenContext")
+                .unwrap_or(false));
+        }
+        drop(context);
+        drop(canvas);
+        engine.collect_garbage();
+        assert!(
+            context_weak.upgrade().is_none(),
+            "unrooted context/canvas cycle is collectible"
+        );
+        assert!(
+            canvas_weak.upgrade().is_none(),
+            "unrooted canvas/context cycle is collectible"
+        );
     }
 
     #[test]
@@ -4332,10 +5699,17 @@ mod tests {
             data: data.clone(),
             realm: None,
             node: None,
-            canvas_wrapper: None,
+            canvas_in_private_slot: false,
         };
         let error = context
-            .get_image_data(engine.ctx(), 0, 0, 1, 1)
+            .get_image_data(
+                engine.ctx(),
+                Value::Num(0.0),
+                Value::Num(0.0),
+                Value::Num(1.0),
+                Value::Num(1.0),
+                None,
+            )
             .err()
             .expect("tainted canvas must reject readback");
         assert_eq!(error.class(), "SecurityError");
@@ -4415,6 +5789,82 @@ mod tests {
         assert!(eval_bool(
             &mut engine,
             "(()=>{const c=new OffscreenCanvas(120,40),x=c.getContext('2d');x.font='20px sans-serif';x.fillStyle='white';const m=x.measureText('Canvas');x.fillText('Canvas',2,28);const pixels=x.getImageData(0,0,120,40).data;let ink=0;for(let i=3;i<pixels.length;i+=4)if(pixels[i])ink++;return m instanceof TextMetrics&&m.width>20&&m.actualBoundingBoxAscent>0&&ink>20&&x.font==='20px sans-serif'})()"
+        ));
+    }
+
+    #[test]
+    fn canvas_text_invalid_geometry_is_a_noop_and_infinite_width_is_unconstrained() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(() => {
+                const canvas = new OffscreenCanvas(80, 40);
+                const context = canvas.getContext('2d');
+                context.font = '20px sans-serif';
+                for (const method of ['fillText', 'strokeText']) {
+                    for (const width of [0, -1, NaN, -Infinity]) {
+                        context[method]('Canvas', 2, 28, width);
+                    }
+                    context[method]('Canvas', NaN, 28);
+                    context[method]('Canvas', 2, Infinity);
+                }
+                if (context.getImageData(0, 0, 80, 40).data.some(value => value !== 0)) return false;
+                for (const method of ['fillText', 'strokeText']) {
+                    context.clearRect(0, 0, 80, 40);
+                    context[method]('Canvas', 2, 28);
+                    const expected = context.getImageData(0, 0, 80, 40).data;
+                    if (!expected.some(value => value !== 0)) return false;
+                    context.clearRect(0, 0, 80, 40);
+                    context[method]('Canvas', 2, 28, Infinity);
+                    const actual = context.getImageData(0, 0, 80, 40).data;
+                    if (!actual.every((value, index) => value === expected[index])) return false;
+                }
+                return true;
+            })()"#
+        ));
+    }
+
+    #[test]
+    fn canvas_text_region_raster_preserves_transformed_pixels_on_large_canvases() {
+        let mut engine = Engine::new();
+        install_worker(engine.ctx()).unwrap();
+        assert!(eval_bool(
+            &mut engine,
+            r#"(() => {
+            const small = new OffscreenCanvas(160, 96).getContext('2d');
+            const large = new OffscreenCanvas(2048, 2048).getContext('2d');
+            for (const [context, offset] of [[small, 0], [large, 1000]]) {
+                context.font = '20px sans-serif';
+                context.fillStyle = '#336699';
+                context.shadowColor = '#ff0000';
+                context.shadowBlur = 2;
+                context.shadowOffsetX = 3;
+                context.setTransform(1, 0.25, 0.5, 1, 16 + offset, 8 + offset);
+                context.fillText('Text', 2, 28, 36);
+            }
+            const expected = small.getImageData(0, 0, 160, 96).data;
+            const actual = large.getImageData(1000, 1000, 160, 96).data;
+            const bounds = data => {
+                let left = 160, top = 96, right = -1, bottom = -1;
+                for (let pixel = 0; pixel < data.length / 4; pixel++) {
+                    if (data[pixel * 4 + 3] === 0) continue;
+                    const x = pixel % 160, y = Math.floor(pixel / 160);
+                    left = Math.min(left, x); top = Math.min(top, y);
+                    right = Math.max(right, x); bottom = Math.max(bottom, y);
+                }
+                return [left, top, right, bottom];
+            };
+            for (let index = 0; index < actual.length; index++) {
+                if (actual[index] !== expected[index]) {
+                    throw new Error(JSON.stringify({index,
+                        expected: expected[index], actual: actual[index],
+                        expectedBounds: bounds(expected), actualBounds: bounds(actual)}));
+                }
+            }
+            return expected.some(value => value !== 0) &&
+                actual.every((value, index) => value === expected[index]);
+        })()"#
         ));
     }
 

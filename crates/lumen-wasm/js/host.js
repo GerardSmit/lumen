@@ -15,6 +15,7 @@ export async function createRuntime({
   onOutput = () => {},
   fetchImpl = globalThis.fetch && globalThis.fetch.bind(globalThis),
   WebSocketImpl = globalThis.WebSocket,
+  XMLHttpRequestImpl = globalThis.XMLHttpRequest,
 }) {
   let session = null;
   let timer = null;
@@ -56,8 +57,52 @@ export async function createRuntime({
   const host = {
     fetch(id, method, url, headers, body, options = {}) {
       const controller = new AbortController();
-      const state = { controller, reader: null };
+      const state = { controller, reader: null, upload: [0, body === null ? null : body.byteLength, false] };
       requests.set(id, state);
+      if (options.uploadProgress) {
+        // Fetch provides no browser transmission callbacks. Use the embedding
+        // browser's XHR for requests requiring genuine upload notifications.
+        if (!XMLHttpRequestImpl || options.mode === 'no-cors' || options.redirect !== 'follow') {
+          push(id, 'error', ['Browser upload transport requires CORS and redirect mode follow']);
+          requests.delete(id);
+          return;
+        }
+        try {
+          const xhr = new XMLHttpRequestImpl();
+          controller.signal.addEventListener('abort', () => xhr.abort(), {once: true});
+          xhr.open(method, url);
+          xhr.responseType = 'arraybuffer';
+          xhr.withCredentials = options.credentials === 'include';
+          for (const [name, value] of headers) xhr.setRequestHeader(name, value);
+          xhr.upload.onprogress = event => {
+            state.upload = [event.loaded, event.lengthComputable ? event.total : null, false];
+          };
+          xhr.upload.onload = event => {
+            state.upload = [event.loaded, event.lengthComputable ? event.total : state.upload[1], true];
+          };
+          xhr.onload = () => {
+            if (controller.signal.aborted) return;
+            const pairs = [];
+            for (const line of xhr.getAllResponseHeaders().split('\r\n')) {
+              const colon = line.indexOf(':');
+              if (colon > 0) pairs.push(line.slice(0, colon), line.slice(colon + 1).trim());
+            }
+            const bytes = new Uint8Array(xhr.response || new ArrayBuffer(0));
+            push(id, 'ok', [xhr.status, xhr.statusText, xhr.responseURL || url, bytes,
+              xhr.responseURL !== url, 'basic', ...pairs]);
+            requests.delete(id);
+          };
+          xhr.onerror = () => {
+            if (!controller.signal.aborted) push(id, 'error', ['Browser upload request failed']);
+            requests.delete(id);
+          };
+          xhr.send(body);
+        } catch (error) {
+          push(id, 'error', [String(error && error.message || error)]);
+          requests.delete(id);
+        }
+        return;
+      }
       (async () => {
         try {
           const init = { method, headers: new Headers(headers), signal: controller.signal };
@@ -89,6 +134,10 @@ export async function createRuntime({
           push(id, 'error', [String((e && e.message) || e)]);
         }
       })();
+    },
+    fetchUploadProgress(id) {
+      const state = requests.get(id);
+      return state ? state.upload : [0, null, false];
     },
     fetchRead(id, taskId) {
       const state = requests.get(id);
@@ -150,7 +199,8 @@ export async function createRuntime({
     },
     syncCall(kind, payload) {
       if (!bridge) throw new Error('no synchronous host bridge was provided');
-      return bridge.call(kind, payload);
+      // HTTP owns its request deadline, including timeout=0 (no XHR timer).
+      return bridge.call(kind, payload, kind === 'http.request' ? {timeoutMs: Infinity} : {});
     },
   };
 

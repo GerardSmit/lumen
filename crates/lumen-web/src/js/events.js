@@ -766,6 +766,23 @@ const eventTargetInternals = {
   kMaxEventTargetListenersWarned, defineEventHandler: defineNodeEventHandler, initEventTarget, isEventTarget, isNodeEventTarget,
   isAbortSignal, isEvent, kTarget, kDispatching, kStop, createAbortSignal: () => new AbortSignal(kSignalCreate),
   abortSignal,
+  hasListeners(target) {
+    if (!target[kEvents] && typeof __dom_event_targets !== 'undefined') {
+      const inactive = [];
+      if (target[kHandlers]) for (const handler of target[kHandlers].values())
+        if (typeof handler.handler !== 'function') inactive.push(handler);
+      return __dom_event_targets.hasListeners(target, inactive);
+    }
+    for (const [type, entries] of target[kEvents]) {
+      const handler = target[kHandlers]?.get(type);
+      for (const entry of entries) {
+        if (entry.removed) continue;
+        const callback = entryCallback(entry);
+        if (callback && (callback !== handler || typeof handler.handler === "function")) return true;
+      }
+    }
+    return false;
+  },
 };
 Object.defineProperties(eventTargetInternals, {
   codedError: { value: codedError },

@@ -866,6 +866,10 @@ pub(crate) mod store {
 
     static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
+    /// Decompressed blocks of static blobs kept for the process's life so every later realm
+    /// skips decompression; past this budget, blocks go through the small recent cache.
+    const SHARED_BLOCK_BUDGET: usize = 48 << 20;
+
     /// `(decompressed blocks, their bytes, joined cross-block slices, their bytes)` held by the
     /// process-wide cache (for the `LUMEN_MEM_STATS` report).
     pub(crate) fn cached_bytes() -> (usize, usize, usize, usize) {
@@ -1036,6 +1040,21 @@ pub(crate) mod store {
         let mut out = Vec::with_capacity(len);
         let mut recent = RECENT_BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
         for b in first..=last {
+            let lo = if b == first {
+                off - first * idx.block_size
+            } else {
+                0
+            };
+            let cached = CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|c| c.blocks.get(&(key, b)).copied());
+            if let Some(block) = cached {
+                let hi = (lo + (len - out.len())).min(block.len());
+                out.extend_from_slice(&block[lo..hi]);
+                continue;
+            }
             let at = match recent.iter().position(|(k, n, _)| *k == key && *n == b) {
                 Some(at) => at,
                 None => {
@@ -1045,6 +1064,18 @@ pub(crate) mod store {
                     )?;
                     if d.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                         return Err("precompiled: bad store block".into());
+                    }
+                    {
+                        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+                        let cache = guard.get_or_insert_with(Cache::default);
+                        let held: usize = cache.blocks.values().map(|d| d.len()).sum();
+                        if held + d.len() <= SHARED_BLOCK_BUDGET {
+                            let block: &'static [u8] = Box::leak(d.into_boxed_slice());
+                            cache.blocks.insert((key, b), block);
+                            let hi = (lo + (len - out.len())).min(block.len());
+                            out.extend_from_slice(&block[lo..hi]);
+                            continue;
+                        }
                     }
                     if recent.len() == RECENT {
                         recent.remove(0);

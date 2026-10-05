@@ -2,48 +2,42 @@ use super::editing_history::{Composition, EditSnapshot, MAX_CONTROL_BYTES};
 use super::*;
 use lumen_common::ucd::{next_grapheme_boundary, previous_grapheme_boundary};
 
+fn null_attribute<'a>(
+    document: &'a lumen_html::Document,
+    node: NodeId,
+    name: &str,
+) -> Option<&'a str> {
+    document
+        .get_attribute_ns_ref(node, None, name)
+        .ok()
+        .flatten()
+}
+
 fn disabled_form_control(document: &lumen_html::Document, node: NodeId) -> OpResult<bool> {
-    let NodeKind::Element {
-        namespace: Namespace::Html,
-        name,
-        attributes,
-    } = document.kind(node).map_err(dom_error)?
-    else {
+    let Some(name) = lumen_html::forms::html_element_local_name(document, node) else {
         return Ok(false);
     };
     let disableable = matches!(
-        name.as_str(),
+        name,
         "button" | "fieldset" | "input" | "optgroup" | "option" | "select" | "textarea"
     );
     if !disableable {
         return Ok(false);
     }
-    if attributes.iter().any(|(name, _)| name == "disabled") {
+    if null_attribute(document, node, "disabled").is_some() {
         return Ok(true);
     }
 
     let mut ancestor = document.parent(node).map_err(dom_error)?;
     while let Some(fieldset) = ancestor {
-        let disabled = matches!(
-            document.kind(fieldset).map_err(dom_error)?,
-            NodeKind::Element {
-                namespace: Namespace::Html,
-                name,
-                attributes,
-            } if name.as_str() == "fieldset" && attributes.iter().any(|(name, _)| name == "disabled")
-        );
+        let disabled = lumen_html::forms::html_element_local_name(document, fieldset)
+            == Some("fieldset")
+            && null_attribute(document, fieldset, "disabled").is_some();
         if disabled {
             let mut first_legend = None;
             let mut child = document.first_child(fieldset).map_err(dom_error)?;
             while let Some(id) = child {
-                if matches!(
-                    document.kind(id).map_err(dom_error)?,
-                    NodeKind::Element {
-                        namespace: Namespace::Html,
-                        name,
-                        ..
-                    } if name.as_str() == "legend"
-                ) {
+                if lumen_html::forms::html_element_local_name(document, id) == Some("legend") {
                     first_legend = Some(id);
                     break;
                 }
@@ -73,10 +67,15 @@ fn disabled_form_control(document: &lumen_html::Document, node: NodeId) -> OpRes
 fn byte_offset(text: &str, offset: usize) -> usize {
     let mut units = 0;
     for (byte, ch) in text.char_indices() {
-        if units + ch.len_utf16() > offset {
+        let width = if lumen_common::smuggle::smuggled(ch).is_some() {
+            1
+        } else {
+            ch.len_utf16()
+        };
+        if units + width > offset {
             return byte;
         }
-        units += ch.len_utf16();
+        units += width;
     }
     text.len()
 }
@@ -87,7 +86,11 @@ fn byte_offset_ceil(text: &str, offset: usize) -> usize {
         if units >= offset {
             return byte;
         }
-        units += ch.len_utf16();
+        units += if lumen_common::smuggle::smuggled(ch).is_some() {
+            1
+        } else {
+            ch.len_utf16()
+        };
         if units >= offset {
             return byte + ch.len_utf8();
         }
@@ -95,7 +98,64 @@ fn byte_offset_ceil(text: &str, offset: usize) -> usize {
     text.len()
 }
 
+fn normalize_textarea_value(value: &str) -> OpResult<String> {
+    if value.len() > MAX_CONTROL_BYTES {
+        return Err(OpError::new(
+            "RangeError",
+            "text control exceeds the editing limit",
+        ));
+    }
+    let mut normalized = String::new();
+    normalized
+        .try_reserve_exact(value.len())
+        .map_err(|_| OpError::new("RangeError", "text control allocation failed"))?;
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    Ok(normalized)
+}
+
 impl DomRealm {
+    pub fn supports_text_selection(&self, node: NodeId) -> bool {
+        lumen_html::forms::supports_text_selection(&self.session.borrow().document(), node)
+    }
+
+    /// Apply the IDL value setter and update the text-control caret only when
+    /// the resulting API value actually changes. Textarea values are exposed
+    /// with normalized line endings, so compare and store that form.
+    pub fn set_control_value_and_selection(
+        self: &Rc<Self>,
+        node: NodeId,
+        value: &str,
+        is_textarea: bool,
+    ) -> OpResult<()> {
+        let normalized;
+        let value = if is_textarea {
+            normalized = normalize_textarea_value(value)?;
+            normalized.as_str()
+        } else {
+            value
+        };
+        let previous = self.control_value(node)?;
+        forms::set_control_value(self, &mut self.forms.borrow_mut(), node, value)?;
+        if self.supports_text_selection(node) {
+            let current = self.control_value(node)?;
+            if current != previous {
+                let end = lumen_common::smuggle::utf16_unit_len(&current);
+                self.set_selection(node, end, end, "none")?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn composition_range(&self, node: NodeId) -> Option<(usize, usize)> {
         self.editing
             .borrow()
@@ -126,24 +186,39 @@ impl DomRealm {
         &self,
         node: NodeId,
     ) -> Option<(String, usize, usize, bool, Option<(usize, usize)>)> {
-        let value = {
+        let live = {
+            let state = self.forms.borrow();
+            match super::forms::live_value(&state, node) {
+                Some(value) if value.len() > MAX_CONTROL_BYTES => return None,
+                Some(value) => Some(value.to_owned()),
+                None => None,
+            }
+        };
+        let value = if let Some(value) = live {
+            value
+        } else {
             let session = self.session.borrow();
             let document = session.document();
-            let NodeKind::Element {
-                name, attributes, ..
-            } = document.kind(node).ok()?
-            else {
+            let tag = lumen_html::forms::html_element_local_name(document, node)?;
+            let NodeKind::Element { .. } = document.kind(node).ok()? else {
                 return None;
             };
-            if !matches!(name.as_str(), "input" | "textarea") {
+            if !matches!(tag, "input" | "textarea") {
                 return None;
             }
-            if let Some((_, value)) = attributes.iter().find(|(key, _)| key == "value") {
+            if tag == "input" {
+                let raw = null_attribute(document, node, "value").unwrap_or("");
+                if raw.len() > MAX_CONTROL_BYTES {
+                    return None;
+                }
+                let value = lumen_html::forms::default_value(document, node)?;
                 if value.len() > MAX_CONTROL_BYTES {
                     return None;
                 }
-                value.clone()
-            } else if name == "textarea" {
+                value
+            } else {
+                // Textarea's value is its live sidecar, or its current text
+                // children. A `value` attribute is unrelated DOM content.
                 let mut value = String::new();
                 let mut pending = Vec::new();
                 if let Some(child) = document.first_child(node).ok().flatten() {
@@ -152,7 +227,7 @@ impl DomRealm {
                 }
                 while let Some(current) = pending.pop() {
                     match document.kind(current).ok()? {
-                        NodeKind::Text(text) => {
+                        NodeKind::Text(text) | NodeKind::CData(text) => {
                             if value.len().saturating_add(text.len()) > MAX_CONTROL_BYTES {
                                 return None;
                             }
@@ -178,17 +253,18 @@ impl DomRealm {
                     }
                 }
                 value
-            } else {
-                String::new()
             }
         };
-        let length = value.encode_utf16().count();
+        let length = lumen_common::smuggle::utf16_unit_len(&value);
         let (start, end, direction) =
             self.selections
                 .borrow()
                 .get(&node)
                 .cloned()
-                .unwrap_or((length, length, "none".into()));
+                .unwrap_or_else(|| {
+                    let initial = self.initial_caret(node, length);
+                    (initial, initial, "none".into())
+                });
         let start = start.min(length);
         let end = end.min(length).max(start);
         Some((
@@ -205,30 +281,27 @@ impl DomRealm {
             return Ok(None);
         }
         let session = self.session.borrow();
-        let NodeKind::Element {
-            name, attributes, ..
-        } = session.document().kind(node).map_err(dom_error)?
-        else {
+        let tag = lumen_html::forms::html_element_local_name(session.document(), node);
+        let document = session.document();
+        let NodeKind::Element { .. } = document.kind(node).map_err(dom_error)? else {
             return Ok(None);
         };
-        let attr = |key: &str| {
-            attributes
-                .iter()
-                .find(|(name, _)| name == key)
-                .map(|(_, value)| value.as_str())
+        let Some(tag) = tag else {
+            return Ok(None);
         };
-        if !matches!(name.as_str(), "input" | "textarea")
-            || (name == "input"
+        let attr = |key: &str| null_attribute(document, node, key);
+        if !matches!(tag, "input" | "textarea")
+            || (tag == "input"
                 && !matches!(
-                    attr("type").unwrap_or("text"),
-                    "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+                    attr("type").unwrap_or("text").to_ascii_lowercase().as_str(),
+                    "text" | "search" | "email" | "url" | "tel" | "password"
                 ))
         {
             return Ok(None);
         }
         Ok(Some((
-            name == "textarea",
-            attr("maxlength").and_then(|value| value.parse::<usize>().ok()),
+            tag == "textarea",
+            attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer),
             attr("readonly").is_some(),
         )))
     }
@@ -243,22 +316,24 @@ impl DomRealm {
         if inserted.len() > MAX_CONTROL_BYTES {
             return None;
         }
-        let length = before.value.encode_utf16().count();
+        let length = lumen_common::smuggle::utf16_unit_len(&before.value);
         let start = range.0.min(length);
         let end = range.1.min(length).max(start);
         let left = byte_offset(&before.value, start);
         let right = byte_offset_ceil(&before.value, end);
-        let normalized_start = before.value[..left].encode_utf16().count();
+        let normalized_start = lumen_common::smuggle::utf16_unit_len(&before.value[..left]);
         let mut replacement = String::new();
         replacement
             .try_reserve(before.value.len().saturating_add(inserted.len()))
             .ok()?;
         replacement.push_str(&before.value[..left]);
         replacement.push_str(inserted);
-        let caret = replacement.encode_utf16().count();
+        let caret = lumen_common::smuggle::utf16_unit_len(&replacement);
         replacement.push_str(&before.value[right..]);
         if replacement.len() > MAX_CONTROL_BYTES
-            || maximum.is_some_and(|maximum| replacement.encode_utf16().count() > maximum)
+            || maximum.is_some_and(|maximum| {
+                lumen_common::smuggle::utf16_unit_len(&replacement) > maximum
+            })
         {
             return None;
         }
@@ -273,16 +348,7 @@ impl DomRealm {
         end: usize,
         direction: &str,
     ) -> OpResult<()> {
-        forms::capture_defaults(
-            &mut self.forms.borrow_mut(),
-            self.session.borrow().document(),
-            node,
-        );
-        self.session
-            .borrow_mut()
-            .document_mut()
-            .set_attribute(node, "value", value)
-            .map_err(dom_error)?;
+        forms::set_control_value_from_user(self, &mut self.forms.borrow_mut(), node, value)?;
         self.set_selection(node, start, end, direction)
     }
 
@@ -298,6 +364,37 @@ impl DomRealm {
         cancelable: bool,
         composing: bool,
         record_history: bool,
+    ) -> OpResult<bool> {
+        self.apply_text_edit_with_keypress(
+            ctx,
+            node,
+            before,
+            range,
+            inserted,
+            input_type,
+            data,
+            cancelable,
+            composing,
+            record_history,
+            false,
+            None,
+        )
+    }
+
+    fn apply_text_edit_with_keypress(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: NodeId,
+        before: EditSnapshot,
+        range: (usize, usize),
+        inserted: &str,
+        input_type: &str,
+        data: Option<&str>,
+        cancelable: bool,
+        composing: bool,
+        record_history: bool,
+        trusted_input: bool,
+        keypress: Option<&[(&str, Value)]>,
     ) -> OpResult<bool> {
         let Some((_, maximum, readonly)) = self.edit_control_info(node)? else {
             return Ok(false);
@@ -317,7 +414,12 @@ impl DomRealm {
             ("isComposing", Value::Bool(composing)),
         ];
         let epoch = self.value_epoch();
-        if !self.dispatch(ctx, node, "beforeinput", true, cancelable, &properties)? {
+        let beforeinput_allowed = if trusted_input {
+            self.dispatch_user_agent(ctx, node, "beforeinput", true, cancelable, &properties)?
+        } else {
+            self.dispatch(ctx, node, "beforeinput", true, cancelable, &properties)?
+        };
+        if !beforeinput_allowed {
             return Ok(false);
         }
         let after_beforeinput = self.edit_snapshot(node)?;
@@ -331,14 +433,38 @@ impl DomRealm {
         if !matches!(self.edit_control_info(node)?, Some((_, _, false))) {
             return Ok(false);
         }
+        if let Some(properties) = keypress {
+            if self.focused_node() != Some(node)
+                || !self.dispatch_user_agent_keyboard_event(ctx, node, "keypress", properties)?
+            {
+                return Ok(false);
+            }
+            let after_keypress = self.edit_snapshot(node)?;
+            if self.value_changed_since(node, epoch) || after_keypress.value != before.value {
+                self.invalidate_editing_for_value_change(node);
+                return Ok(false);
+            }
+            if after_keypress != after_beforeinput
+                || !matches!(self.edit_control_info(node)?, Some((_, _, false)))
+            {
+                return Ok(false);
+            }
+        }
         self.write_control_value(node, &replacement, caret, caret, "none")?;
+        // Record host provenance before dispatching `input`; a reentrant
+        // script value setter clears it again through set_control_value.
+        forms::mark_user_edited(&mut self.forms.borrow_mut(), node);
         let expected = EditSnapshot {
             value: replacement,
             start: caret,
             end: caret,
             direction: "none".into(),
         };
-        self.dispatch(ctx, node, "input", true, false, &properties)?;
+        if trusted_input {
+            self.dispatch_user_agent(ctx, node, "input", true, false, &properties)?;
+        } else {
+            self.dispatch(ctx, node, "input", true, false, &properties)?;
+        }
         let after = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after.value != expected.value {
             self.invalidate_editing_for_value_change(node);
@@ -349,7 +475,7 @@ impl DomRealm {
         } else {
             let has_composition = self.editing.borrow().composition(node).is_some();
             if has_composition {
-                let mark_end = mark_start + inserted.encode_utf16().count();
+                let mark_end = mark_start + lumen_common::smuggle::utf16_unit_len(inserted);
                 self.editing.borrow_mut().update_composition(
                     node,
                     mark_start,
@@ -478,6 +604,7 @@ impl DomRealm {
             target.end,
             &target.direction,
         )?;
+        forms::mark_user_edited(&mut self.forms.borrow_mut(), node);
         self.dispatch(ctx, node, "input", true, false, &properties)?;
         let after = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after.value != target.value {
@@ -585,13 +712,14 @@ impl DomRealm {
         if after_beforeinput != before {
             return Ok(false);
         }
-        let mark_end = mark_start + text.encode_utf16().count();
+        let mark_end = mark_start + lumen_common::smuggle::utf16_unit_len(text);
         let (selection_start, selection_end) =
             selected_range.map_or((mark_end, mark_end), |(start, end)| {
-                let length = text.encode_utf16().count();
+                let length = lumen_common::smuggle::utf16_unit_len(text);
                 (mark_start + start.min(length), mark_start + end.min(length))
             });
         self.write_control_value(node, &replacement, selection_start, selection_end, "none")?;
+        forms::mark_user_edited(&mut self.forms.borrow_mut(), node);
         self.dispatch(ctx, node, "input", true, false, &properties)?;
         let after = self.edit_snapshot(node)?;
         if self.value_changed_since(node, epoch) || after.value != replacement {
@@ -644,16 +772,16 @@ impl DomRealm {
             }
             let (element, inert, hidden_input) =
                 match session.document().kind(current).map_err(dom_error)? {
-                    NodeKind::Element {
-                        name, attributes, ..
-                    } => (
+                    NodeKind::Element { attributes, .. } => (
                         true,
                         attributes.iter().any(|(name, _)| name == "inert"),
                         current == node
-                            && name == "input"
-                            && attributes.iter().any(|(key, value)| {
-                                key == "type" && value.eq_ignore_ascii_case("hidden")
-                            }),
+                            && lumen_html::forms::html_element_local_name(
+                                session.document(),
+                                current,
+                            ) == Some("input")
+                            && null_attribute(session.document(), current, "type")
+                                .is_some_and(|value| value.eq_ignore_ascii_case("hidden")),
                     ),
                     _ => (false, false, false),
                 };
@@ -697,43 +825,46 @@ impl DomRealm {
             current = parent;
         }
     }
-    pub fn control_value(&self, node: NodeId) -> OpResult<String> {
+    /// A textarea that was never written through the value setter or a selection API
+    /// starts with its caret at the start; other text controls start at the end.
+    fn initial_caret(&self, node: NodeId, length: usize) -> usize {
         let session = self.session.borrow();
-        let document = session.document();
-        let NodeKind::Element {
-            name, attributes, ..
-        } = document.kind(node).map_err(dom_error)?
-        else {
+        if lumen_html::forms::html_element_local_name(session.document(), node)
+            == Some("textarea")
+        {
+            0
+        } else {
+            length
+        }
+    }
+
+    pub fn control_value(&self, node: NodeId) -> OpResult<String> {
+        let is_text_control = matches!(
+            lumen_html::forms::html_element_local_name(&self.session.borrow().document(), node,),
+            Some("input" | "textarea")
+        );
+        if !is_text_control {
             return Err(OpError::new(
                 "InvalidStateError",
                 "selection requires a text control",
             ));
-        };
-        if !matches!(name.as_str(), "input" | "textarea") {
-            return Err(OpError::new(
-                "InvalidStateError",
-                "selection requires a text control",
-            ));
         }
-        if let Some((_, value)) = attributes.iter().find(|(key, _)| key == "value") {
-            return Ok(value.clone());
-        }
-        let mut value = String::new();
-        if name == "textarea" {
-            document.append_descendant_text(node, &mut value).map_err(dom_error)?;
-        }
-        Ok(value)
+        super::forms::control_value(self, node)
     }
 
     /// Selection offsets use UTF-16 code units, as in the DOM.
     pub fn selection(&self, node: NodeId) -> OpResult<(usize, usize, String)> {
-        let length = self.control_value(node)?.encode_utf16().count();
+        let value = self.control_value(node)?;
+        let length = lumen_common::smuggle::utf16_unit_len(&value);
         let (start, end, direction) =
             self.selections
                 .borrow()
                 .get(&node)
                 .cloned()
-                .unwrap_or((length, length, "none".into()));
+                .unwrap_or_else(|| {
+                    let initial = self.initial_caret(node, length);
+                    (initial, initial, "none".into())
+                });
         Ok((start.min(length), end.min(length), direction))
     }
 
@@ -744,7 +875,8 @@ impl DomRealm {
         end: usize,
         direction: &str,
     ) -> OpResult<()> {
-        let length = self.control_value(node)?.encode_utf16().count();
+        let value = self.control_value(node)?;
+        let length = lumen_common::smuggle::utf16_unit_len(&value);
         let end = end.min(length);
         self.selections.borrow_mut().insert(
             node,
@@ -759,6 +891,182 @@ impl DomRealm {
                 .into(),
             ),
         );
+        Ok(())
+    }
+
+    pub fn set_selection_and_queue_event(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: NodeId,
+        start: usize,
+        end: usize,
+        direction: &str,
+    ) -> OpResult<()> {
+        if !self.supports_text_selection(node) {
+            return Err(error_reporting::dom_exception(
+                ctx,
+                "InvalidStateError",
+                "text selection does not apply to this input type",
+            ));
+        }
+        let before = self.selection(node)?;
+        self.set_selection(node, start, end, direction)?;
+        if self.selection(node)? != before {
+            self.queue_select_event(ctx, node)?;
+        }
+        Ok(())
+    }
+
+    pub fn set_range_text(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: NodeId,
+        replacement: &str,
+        start: Option<usize>,
+        end: Option<usize>,
+        use_current_selection: bool,
+        selection_mode: &str,
+    ) -> OpResult<()> {
+        if !self.supports_text_selection(node) {
+            return Err(error_reporting::dom_exception(
+                ctx,
+                "InvalidStateError",
+                "setRangeText does not apply to this input type",
+            ));
+        }
+        if !matches!(selection_mode, "select" | "start" | "end" | "preserve") {
+            return Err(OpError::new(
+                "TypeError",
+                "invalid setRangeText selection mode",
+            ));
+        }
+
+        let before = self.edit_snapshot(node)?;
+        let old_units = lumen_common::smuggle::utf16_units(&before.value);
+        let length = old_units.len();
+        let current_selection = (before.start, before.end);
+        let (requested_start, requested_end) = if use_current_selection {
+            current_selection
+        } else {
+            (start.unwrap_or(0), end.unwrap_or(0))
+        };
+        forms::mark_value_dirty(self, &mut self.forms.borrow_mut(), node)?;
+        if requested_start > requested_end {
+            return Err(error_reporting::dom_exception(
+                ctx,
+                "IndexSizeError",
+                "setRangeText start is greater than end",
+            ));
+        }
+        let range = (requested_start.min(length), requested_end.min(length));
+        let is_textarea = {
+            let session = self.session.borrow();
+            lumen_html::forms::html_element_local_name(session.document(), node) == Some("textarea")
+        };
+        if replacement.len() > MAX_CONTROL_BYTES {
+            return Err(OpError::new(
+                "RangeError",
+                "setRangeText result exceeds the text-control editing limit",
+            ));
+        }
+        let replacement_units = lumen_common::smuggle::utf16_units(replacement);
+        let new_unit_len = old_units
+            .len()
+            .checked_sub(range.1 - range.0)
+            .and_then(|remaining| remaining.checked_add(replacement_units.len()))
+            .ok_or_else(|| {
+                OpError::new(
+                    "RangeError",
+                    "setRangeText result exceeds the text-control editing limit",
+                )
+            })?;
+        // The UTF-16 scratch list may be larger than its source strings, but
+        // keep it bounded independently of the final byte-size check.
+        if new_unit_len > MAX_CONTROL_BYTES.saturating_mul(2) {
+            return Err(OpError::new(
+                "RangeError",
+                "setRangeText result exceeds the text-control editing limit",
+            ));
+        }
+        let mut new_units = old_units;
+        new_units
+            .try_reserve(replacement_units.len())
+            .map_err(|_| OpError::new("RangeError", "setRangeText allocation failed"))?;
+        new_units.splice(range.0..range.1, replacement_units.iter().copied());
+        let raw_value = lumen_common::smuggle::utf16_from_units(&new_units);
+        if raw_value.len() > MAX_CONTROL_BYTES {
+            return Err(OpError::new(
+                "RangeError",
+                "setRangeText result exceeds the text-control editing limit",
+            ));
+        }
+        // Textarea selection operates on its API value. Normalize after the
+        // code-unit splice so offsets are never calculated against a different
+        // line-ending representation than the pre-edit value.
+        let new_value = if is_textarea {
+            normalize_textarea_value(&raw_value)?
+        } else {
+            raw_value
+        };
+        let inserted_end = range.0.saturating_add(replacement_units.len());
+
+        forms::set_control_value(self, &mut self.forms.borrow_mut(), node, &new_value)?;
+
+        let (selection_start, selection_end) = match selection_mode {
+            "select" => (range.0, inserted_end),
+            "start" => (range.0, range.0),
+            "end" => (inserted_end, inserted_end),
+            "preserve" => {
+                let old_length = range.1 - range.0;
+                let delta = replacement_units.len() as isize - old_length as isize;
+                let mut selection_start = current_selection.0;
+                let mut selection_end = current_selection.1;
+                if use_current_selection {
+                    if selection_start > range.1 {
+                        selection_start = selection_start.saturating_add_signed(delta);
+                    } else if selection_start > range.0 {
+                        selection_start = range.0;
+                    }
+                    if selection_end > range.1 {
+                        selection_end = selection_end.saturating_add_signed(delta);
+                    } else if selection_end > range.0 {
+                        selection_end = inserted_end;
+                    }
+                } else {
+                    if selection_start > range.0 {
+                        selection_start = range.0;
+                    }
+                    if selection_end > range.0 {
+                        selection_end = inserted_end;
+                    }
+                }
+                (selection_start, selection_end)
+            }
+            _ => unreachable!("selection mode was checked above"),
+        };
+        self.set_selection_and_queue_event(ctx, node, selection_start, selection_end, "none")
+    }
+
+    fn queue_select_event(self: &Rc<Self>, ctx: &mut Ctx, node: NodeId) -> OpResult<()> {
+        let should_queue = self
+            .editing
+            .borrow_mut()
+            .begin_select_event(node)
+            .map_err(|_| OpError::new("QuotaExceededError", "selection event queue is full"))?;
+        if !should_queue {
+            return Ok(());
+        }
+        let target = self.wrap(ctx, node);
+        let realm = self.clone();
+        if let Err(error) = scheduling::queue_task(ctx, move |ctx| {
+            let _target = target;
+            realm.editing.borrow_mut().finish_select_event(node);
+            realm.dispatch_user_agent(ctx, node, "select", true, false, &[])?;
+            Ok(())
+        }) {
+            self.editing.borrow_mut().finish_select_event(node);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -830,6 +1138,17 @@ impl DomRealm {
         node: NodeId,
         properties: &[(&str, Value)],
     ) -> OpResult<()> {
+        self.edit_control_key_with_keypress(ctx, node, properties, false, None)
+    }
+
+    pub(super) fn edit_control_key_with_keypress(
+        self: &Rc<Self>,
+        ctx: &mut Ctx,
+        node: NodeId,
+        properties: &[(&str, Value)],
+        trusted_input: bool,
+        keypress_properties: Option<&[(&str, Value)]>,
+    ) -> OpResult<()> {
         let get = |name: &str| {
             properties
                 .iter()
@@ -865,22 +1184,19 @@ impl DomRealm {
         }
         let (multiline, maximum, readonly) = {
             let session = self.session.borrow();
-            let NodeKind::Element {
-                name, attributes, ..
-            } = session.document().kind(node).map_err(dom_error)?
-            else {
+            let document = session.document();
+            let tag = lumen_html::forms::html_element_local_name(document, node);
+            let NodeKind::Element { .. } = document.kind(node).map_err(dom_error)? else {
                 return Ok(());
             };
-            let attr = |key: &str| {
-                attributes
-                    .iter()
-                    .find(|(name, _)| name == key)
-                    .map(|(_, value)| value.as_str())
+            let Some(tag) = tag else {
+                return Ok(());
             };
-            if !matches!(name.as_str(), "input" | "textarea") || attr("disabled").is_some() {
+            let attr = |key: &str| null_attribute(document, node, key);
+            if !matches!(tag, "input" | "textarea") || attr("disabled").is_some() {
                 return Ok(());
             }
-            if name == "input"
+            if tag == "input"
                 && !matches!(
                     attr("type").unwrap_or("text"),
                     "text" | "search" | "email" | "url" | "tel" | "password" | "number"
@@ -889,8 +1205,8 @@ impl DomRealm {
                 return Ok(());
             }
             (
-                name == "textarea",
-                attr("maxlength").and_then(|value| value.parse::<usize>().ok()),
+                tag == "textarea",
+                attr("maxlength").and_then(lumen_html::forms::parse_nonnegative_integer),
                 attr("readonly").is_some(),
             )
         };
@@ -911,7 +1227,7 @@ impl DomRealm {
                 "ArrowLeft" => previous_grapheme_boundary(&value, caret),
                 _ => next_grapheme_boundary(&value, caret),
             };
-            let offset = value[..next].encode_utf16().count();
+            let offset = lumen_common::smuggle::utf16_unit_len(&value[..next]);
             let anchor = if direction == "backward" { end } else { start };
             return if shift {
                 self.set_selection(
@@ -953,8 +1269,8 @@ impl DomRealm {
         if left == right && inserted.is_empty() {
             return Ok(());
         }
-        let left_utf16 = value[..left].encode_utf16().count();
-        let right_utf16 = value[..right].encode_utf16().count();
+        let left_utf16 = lumen_common::smuggle::utf16_unit_len(&value[..left]);
+        let right_utf16 = lumen_common::smuggle::utf16_unit_len(&value[..right]);
         let data = (!inserted.is_empty()).then_some(inserted);
         let before = EditSnapshot {
             value,
@@ -963,18 +1279,39 @@ impl DomRealm {
             direction,
         };
         let _ = maximum;
-        self.apply_text_edit(
-            ctx,
-            node,
-            before,
-            (left_utf16, right_utf16),
-            inserted,
-            kind,
-            data,
-            true,
-            false,
-            true,
-        )?;
+        if trusted_input {
+            self.apply_text_edit_with_keypress(
+                ctx,
+                node,
+                before,
+                (left_utf16, right_utf16),
+                inserted,
+                kind,
+                data,
+                true,
+                false,
+                true,
+                true,
+                if kind == "insertText" {
+                    keypress_properties
+                } else {
+                    None
+                },
+            )?;
+        } else {
+            self.apply_text_edit(
+                ctx,
+                node,
+                before,
+                (left_utf16, right_utf16),
+                inserted,
+                kind,
+                data,
+                true,
+                false,
+                true,
+            )?;
+        }
         Ok(())
     }
 }
@@ -983,6 +1320,20 @@ impl DomRealm {
 mod tests {
     use super::*;
     use lumen::Engine;
+
+    fn eval_value_or_panic(engine: &mut Engine, source: &str) -> Value {
+        match engine.eval_value(source).expect("JavaScript should parse") {
+            Ok(value) => value,
+            Err(thrown) => {
+                let message = engine
+                    .ctx()
+                    .coerce_string(&thrown)
+                    .map(|message| message.to_string())
+                    .unwrap_or_else(|_| "unknown JavaScript exception".into());
+                panic!("JavaScript threw while evaluating `{source}`: {message}");
+            }
+        }
+    }
 
     #[test]
     fn selection_replaces_utf16_ranges_and_deletes_graphemes() {
@@ -1149,7 +1500,169 @@ mod tests {
             .host_insert_text_at(engine.ctx(), node, "X", Some((2, 2)))
             .unwrap());
         assert_eq!(realm.control_value(node).unwrap(), "aXz");
+        assert!(matches!(
+            engine
+                .eval_value("field.value === 'aXz' && field.defaultValue === 'a😀z' && field.getAttribute('value') === 'a😀z'")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
         assert_eq!(realm.selection(node).unwrap().0, 2);
+    }
+
+    #[test]
+    fn idl_value_changes_and_set_range_text_keep_utf16_selection_semantics() {
+        let mut engine = Engine::new();
+        let realm = install(
+            engine.ctx(),
+            "<input id=field value=default><textarea id=area>default</textarea>",
+            64,
+        )
+        .unwrap();
+
+        let value_changes = eval_value_or_panic(
+            &mut engine,
+            r#"
+                (() => {
+                const field = document.getElementById('field');
+                const area = document.getElementById('area');
+                field.value = 'abcdef';
+                field.setSelectionRange(2, 4);
+                field.value = 'abcdef';
+                const sameValueKeepsSelection = field.selectionStart === 2 && field.selectionEnd === 4;
+                field.value = 'xy';
+                const changedValueMovesCaret = field.selectionStart === 2 && field.selectionEnd === 2;
+                field.type = 'button';
+                const valueModeToDefaultMode = field.value === 'xy' && field.getAttribute('value') === 'xy';
+                field.value = 'discarded';
+                const defaultModeWritesContentAttribute = field.value === 'discarded' &&
+                    field.getAttribute('value') === 'discarded';
+                field.type = 'text';
+                const defaultModeToValueMode = field.value === 'discarded';
+                field.value = 'abc';
+                field.setSelectionRange(1, 1);
+                field.value = 'a\r\nbc';
+                const sameSanitizedValueKeepsSelection = field.value === 'abc' &&
+                    field.selectionStart === 1 && field.selectionEnd === 1;
+                field.value = null;
+                const nullInputIsEmpty = field.value === '';
+                area.value = null;
+                const nullTextareaIsEmpty = area.value === '';
+                return [
+                    ['same-value selection', sameValueKeepsSelection],
+                    ['changed-value caret', changedValueMovesCaret],
+                    ['value to default mode', valueModeToDefaultMode],
+                    ['default-mode setter', defaultModeWritesContentAttribute],
+                    ['default to value mode', defaultModeToValueMode],
+                    ['sanitized equal value selection', sameSanitizedValueKeepsSelection],
+                    ['null input', nullInputIsEmpty],
+                    ['null textarea', nullTextareaIsEmpty]
+                ].map(([name, passed]) => name + '=' + passed).join('|');
+                })()
+                "#,
+        );
+        assert!(
+            matches!(&value_changes, Value::Str(value) if value.as_str() == "same-value selection=true|changed-value caret=true|value to default mode=true|default-mode setter=true|default to value mode=true|sanitized equal value selection=true|null input=true|null textarea=true"),
+            "value/selection/type transition contract returned {}",
+            match &value_changes {
+                Value::Str(value) => value.as_str(),
+                _ => "non-string result",
+            }
+        );
+
+        let range_modes = eval_value_or_panic(
+            &mut engine,
+            r#"
+                (() => {
+                const field = document.getElementById('field');
+                field.value = 'abcdef';
+                field.setSelectionRange(2, 4);
+                field.setRangeText('X');
+                const oneArgumentPreserves = field.value === 'abXef' &&
+                    field.selectionStart === 2 && field.selectionEnd === 3;
+                field.setRangeText('Y', 1, 2, 'start');
+                const startMode = field.value === 'aYXef' &&
+                    field.selectionStart === 1 && field.selectionEnd === 1;
+                field.setRangeText('Z', 1, 2, 'end');
+                const endMode = field.value === 'aZXef' &&
+                    field.selectionStart === 2 && field.selectionEnd === 2;
+                field.setRangeText('Q', 1, 2, 'select');
+                const selectMode = field.value === 'aQXef' &&
+                    field.selectionStart === 1 && field.selectionEnd === 2;
+                field.setSelectionRange(5, 6);
+                field.setRangeText('P', 1, 2, 'preserve');
+                const explicitPreserveMode = field.value === 'aPXef' &&
+                    field.selectionStart === 1 && field.selectionEnd === 2;
+                return [
+                    ['one-argument preserve', oneArgumentPreserves],
+                    ['start mode', startMode],
+                    ['end mode', endMode],
+                    ['select mode', selectMode],
+                    ['explicit preserve mode', explicitPreserveMode]
+                ].map(([name, passed]) => name + '=' + passed).join('|');
+                })()
+                "#,
+        );
+        assert!(
+            matches!(&range_modes, Value::Str(value) if value.as_str() == "one-argument preserve=true|start mode=true|end mode=true|select mode=true|explicit preserve mode=true"),
+            "setRangeText mode contract returned {}",
+            match &range_modes {
+                Value::Str(value) => value.as_str(),
+                _ => "non-string result",
+            }
+        );
+
+        let split_surrogate = eval_value_or_panic(
+            &mut engine,
+            r#"
+                (() => {
+                const field = document.getElementById('field');
+                field.value = 'A😀Z';
+                field.setRangeText('x', 2, 3, 'select');
+                return [field.value.length, field.value.charCodeAt(1), field.value.charCodeAt(2),
+                    field.selectionStart, field.selectionEnd].join(',');
+                })()
+                "#,
+        );
+        assert!(
+            matches!(&split_surrogate, Value::Str(value) if value.as_str() == "4,55357,120,2,3"),
+            "setRangeText UTF-16 code-unit result was {}",
+            match &split_surrogate {
+                Value::Str(value) => value.as_str(),
+                _ => "non-string result",
+            }
+        );
+    }
+
+    #[test]
+    fn set_range_text_queues_one_trusted_select_event_for_selection_changes() {
+        let mut engine = Engine::new();
+        let _realm = install(engine.ctx(), "<input id=field value=abcd>", 64).unwrap();
+        engine
+            .eval_value(
+                "const field=document.getElementById('field');const events=[];field.addEventListener('select',e=>events.push([e.isTrusted,e.bubbles,e.cancelable,e.target===field]));field.setRangeText('X',1,2,'select');",
+            )
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(matches!(
+            engine
+                .eval_value("events.length===0")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(super::scheduling::run_tasks(&mut engine, 8).is_empty());
+        assert!(matches!(
+            engine
+                .eval_value("events.length===1&&events[0].join(',')==='true,true,false,true'")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
     }
 
     #[test]
@@ -1172,6 +1685,114 @@ mod tests {
         assert!(!realm.host_insert_text(engine.ctx(), node, "a").unwrap());
         assert!(!realm.host_composition_start(engine.ctx(), node).unwrap());
         assert_eq!(realm.control_value(node).unwrap(), "ab");
+    }
+
+    #[test]
+    fn length_constraints_use_utf16_and_require_a_host_edit() {
+        let mut engine = Engine::new();
+        let realm = install(
+            engine.ctx(),
+            "<input id=field minlength=2><input id=number type=number minlength=2><input id=long maxlength=4><textarea id=area minlength=2></textarea><textarea id=typed type=number minlength=2></textarea>",
+            64,
+        ).unwrap();
+        engine
+            .eval_value("field.value='x';area.value='x';number.value='x';typed.value='x'")
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(matches!(engine.eval_value("!field.validity.tooShort && !area.validity.tooShort && !number.validity.tooShort && !typed.validity.tooShort").unwrap().ok().unwrap(), Value::Bool(true)));
+        let field = {
+            let session = realm.session.borrow();
+            lumen_html::selector::query_selector(
+                session.document(),
+                session.document().root(),
+                "#field",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let area = {
+            let session = realm.session.borrow();
+            lumen_html::selector::query_selector(
+                session.document(),
+                session.document().root(),
+                "#area",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let long = {
+            let session = realm.session.borrow();
+            lumen_html::selector::query_selector(
+                session.document(),
+                session.document().root(),
+                "#long",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // A single supplementary character occupies two UTF-16 code units.
+        engine
+            .eval_value("field.value='';area.value=''")
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(realm.host_insert_text(engine.ctx(), field, "😀").unwrap());
+        assert!(realm.host_insert_text(engine.ctx(), area, "😀").unwrap());
+        assert!(matches!(
+            engine
+                .eval_value("!field.validity.tooShort && !area.validity.tooShort")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        engine
+            .eval_value("field.value='x';area.value='x'")
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(matches!(
+            engine
+                .eval_value("!field.validity.tooShort && !area.validity.tooShort")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        engine.eval_value("field.value=''").unwrap().ok().unwrap();
+        assert!(realm.host_insert_text(engine.ctx(), field, "x").unwrap());
+        assert!(matches!(engine.eval_value("field.validity.tooShort && !field.checkValidity() && field.validationMessage.length>0").unwrap().ok().unwrap(), Value::Bool(true)));
+        engine
+            .eval_value("field.value='';field.oninput=()=>{field.value='x'}")
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(realm.host_insert_text(engine.ctx(), field, "😀").unwrap());
+        assert!(matches!(
+            engine
+                .eval_value("field.value==='x' && !field.validity.tooShort")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
+        assert!(realm.host_insert_text(engine.ctx(), long, "😀").unwrap());
+        engine
+            .eval_value("long.setAttribute('maxlength','1')")
+            .unwrap()
+            .ok()
+            .unwrap();
+        assert!(matches!(engine.eval_value("long.validity.tooLong && !long.checkValidity() && long.validationMessage.length>0").unwrap().ok().unwrap(), Value::Bool(true)));
+        engine.eval_value("long.value='😀'").unwrap().ok().unwrap();
+        assert!(matches!(
+            engine
+                .eval_value("!long.validity.tooLong")
+                .unwrap()
+                .ok()
+                .unwrap(),
+            Value::Bool(true)
+        ));
     }
 
     #[test]

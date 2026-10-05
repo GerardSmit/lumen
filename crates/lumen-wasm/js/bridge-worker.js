@@ -171,11 +171,186 @@ async function handle(kind, payload) {
     const res = await fetch(decoder.decode(payload));
     return new Uint8Array(await res.arrayBuffer());
   }
+  if (kind === 'http.request') {
+    const request = decodeSyncRequest(payload);
+    if (request.mode === 'same-origin' && request.origin !== null &&
+        new URL(request.url).origin !== request.origin) {
+      throw new Error('synchronous request blocked by same-origin mode');
+    }
+    let response;
+    const xhrAvailable = typeof XMLHttpRequest === 'function' && request.mode === 'cors' && request.redirect === 'follow';
+    if (request.forcePreflight && !xhrAvailable) {
+      throw new Error('NotSupportedError: this host cannot force the required CORS preflight');
+    }
+    if (xhrAvailable) {
+      response = await xhrRequest(request);
+    } else {
+      const controller = new AbortController();
+      let timedOut = false;
+      const timer = request.timeoutMs
+        ? setTimeout(() => { timedOut = true; controller.abort(); }, request.timeoutMs)
+        : null;
+      const init = {
+        method: request.method,
+        headers: request.headers,
+        mode: request.mode,
+        credentials: request.credentials,
+        redirect: request.redirect,
+        signal: controller.signal,
+      };
+      if (request.body !== null && request.method !== 'GET' && request.method !== 'HEAD') {
+        init.body = request.body;
+      }
+      try {
+        const result = await fetch(request.url, init);
+        response = {
+          status: result.status,
+          statusText: result.statusText,
+          url: result.url || request.url,
+          headers: [...result.headers],
+          body: new Uint8Array(await result.arrayBuffer()),
+        };
+      } catch (error) {
+        if (timedOut) throw new Error('TimeoutError: synchronous HTTP request timed out');
+        throw error;
+      } finally {
+        if (timer !== null) clearTimeout(timer);
+      }
+    }
+    return encodeSyncResponse({
+      status: response.status,
+      statusText: response.statusText,
+      url: response.url,
+      headers: response.headers,
+      body: response.body,
+    });
+  }
   if (kind === 'sleep') {
     await new Promise((r) => setTimeout(r, Number(decoder.decode(payload))));
     return new Uint8Array(0);
   }
   throw new Error(`unknown host call '${kind}'`);
+}
+
+const HTTP_FIELD_LIMIT = 1 << 20;
+const HTTP_HEADER_LIMIT = 8192;
+const HTTP_HEADER_BYTES = 64 << 10;
+const HTTP_BODY_LIMIT = 32 << 20;
+
+function decodeSyncRequest(input) {
+  let at = 0;
+  const take = n => {
+    if (!Number.isSafeInteger(n) || n < 0 || at + n > input.length) throw new Error('truncated synchronous HTTP request');
+    const value = input.subarray(at, at + n);
+    at += n;
+    return value;
+  };
+  const u8 = () => take(1)[0];
+  const u16 = () => new DataView(take(2).buffer, input.byteOffset + at - 2, 2).getUint16(0, true);
+  const u32 = limit => {
+    const value = new DataView(take(4).buffer, input.byteOffset + at - 4, 4).getUint32(0, true);
+    if (value > limit) throw new Error('synchronous HTTP field is too large');
+    return value;
+  };
+  const text16 = () => decoder.decode(take(u16()));
+  const text32 = () => decoder.decode(take(u32(HTTP_FIELD_LIMIT)));
+  const headers = () => {
+    const count = u16();
+    if (count > HTTP_HEADER_LIMIT) throw new Error('too many synchronous HTTP headers');
+    const out = [];
+    let size = 0;
+    for (let i = 0; i < count; i++) {
+      const name = text16(), value = text32();
+      size += encoder.encode(name).length + encoder.encode(value).length;
+      if (size > HTTP_HEADER_BYTES) throw new Error('synchronous HTTP headers exceed 64 KiB');
+      out.push([name, value]);
+    }
+    return out;
+  };
+  if (decoder.decode(take(4)) !== 'XHR1') throw new Error('invalid synchronous HTTP request');
+  const method = text16();
+  const url = text32();
+  const requestHeaders = headers();
+  const mode = text16();
+  const credentials = text16();
+  const redirect = text16();
+  const forcePreflight = u8();
+  if (forcePreflight > 1) throw new Error('invalid synchronous HTTP preflight marker');
+  const timeoutMs = u32(0xffffffff);
+  const hasOrigin = u8();
+  if (hasOrigin > 1) throw new Error('invalid synchronous HTTP origin marker');
+  const origin = hasOrigin ? text32() : null;
+  const hasBody = u8();
+  if (hasBody > 1) throw new Error('invalid synchronous HTTP body marker');
+  const body = hasBody ? take(u32(HTTP_BODY_LIMIT)) : null;
+  if (at !== input.length) throw new Error('trailing synchronous HTTP request data');
+  return {method, url, headers: requestHeaders, mode, credentials, redirect, forcePreflight: !!forcePreflight, timeoutMs, origin, body};
+}
+
+function xhrRequest(request) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(request.method, request.url, true);
+    xhr.withCredentials = request.credentials === 'include';
+    xhr.timeout = request.timeoutMs;
+    xhr.responseType = 'arraybuffer';
+    for (const [name, value] of request.headers) xhr.setRequestHeader(name, value);
+    if (request.forcePreflight) xhr.upload.addEventListener('progress', () => {});
+    xhr.onload = () => {
+      const headers = [];
+      for (const line of xhr.getAllResponseHeaders().split('\r\n')) {
+        const colon = line.indexOf(':');
+        if (colon > 0) headers.push([line.slice(0, colon).trim(), line.slice(colon + 1).trim()]);
+      }
+      resolve({
+        status: xhr.status,
+        statusText: xhr.statusText,
+        url: xhr.responseURL || request.url,
+        headers,
+        body: new Uint8Array(xhr.response || new ArrayBuffer(0)),
+      });
+    };
+    xhr.onerror = () => reject(new Error('synchronous host HTTP request failed'));
+    xhr.ontimeout = () => reject(new Error('TimeoutError: synchronous HTTP request timed out'));
+    xhr.onabort = () => reject(new Error('synchronous host HTTP request was aborted'));
+    try { xhr.send(request.body); } catch (error) { reject(error); }
+  });
+}
+
+function encodeSyncResponse(response) {
+  const parts = [];
+  const u16 = n => parts.push(Uint8Array.of(n & 255, (n >>> 8) & 255));
+  const u32 = n => parts.push(Uint8Array.of(n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255));
+  const text16 = value => {
+    const bytes = encoder.encode(value);
+    if (bytes.length > 65535) throw new Error('synchronous HTTP field is too large');
+    u16(bytes.length); parts.push(bytes);
+  };
+  const text32 = value => {
+    const bytes = encoder.encode(value);
+    if (bytes.length > HTTP_FIELD_LIMIT) throw new Error('synchronous HTTP field is too large');
+    u32(bytes.length); parts.push(bytes);
+  };
+  const body = response.body;
+  if (body.length > HTTP_BODY_LIMIT) throw new Error('synchronous HTTP response body is too large');
+  parts.push(encoder.encode('XHS1'));
+  u16(response.status);
+  text16(response.statusText);
+  text32(response.url);
+  if (response.headers.length > HTTP_HEADER_LIMIT) throw new Error('too many synchronous HTTP headers');
+  u16(response.headers.length);
+  let headerBytes = 0;
+  for (const [name, value] of response.headers) {
+    headerBytes += encoder.encode(name).length + encoder.encode(value).length;
+    if (headerBytes > HTTP_HEADER_BYTES) throw new Error('synchronous HTTP headers exceed 64 KiB');
+    text16(name); text32(value);
+  }
+  u32(body.length); parts.push(body);
+  const length = parts.reduce((n, part) => n + part.length, 0);
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) { output.set(part, offset); offset += part.length; }
+  return output;
 }
 
 port.listen(async (msg) => {

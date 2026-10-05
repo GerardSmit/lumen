@@ -738,7 +738,10 @@ fn shared_worker_http_redirect_loads_module_dependencies_from_final_url() {
 
 #[test]
 fn shared_worker_http_classic_has_shared_scope_and_real_connect_ports() {
-    fn accept_request(listener: &TcpListener, deadline: std::time::Instant) -> (std::net::TcpStream, String) {
+    fn accept_request(
+        listener: &TcpListener,
+        deadline: std::time::Instant,
+    ) -> (std::net::TcpStream, String) {
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
@@ -749,6 +752,7 @@ fn shared_worker_http_classic_has_shared_scope_and_real_connect_ports() {
                 Err(error) => panic!("accept shared-worker HTTP request: {error}"),
             }
         };
+        stream.set_nonblocking(false).expect("set shared-worker request blocking mode");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("set shared-worker request timeout");
@@ -914,6 +918,7 @@ fn shared_worker_http_redirect_never_requests_a_foreign_origin() {
                 Err(error) => panic!("accept shared-worker redirect request: {error}"),
             }
         };
+        stream.set_nonblocking(false).expect("set shared-worker redirect blocking mode");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("set shared-worker redirect timeout");
@@ -1007,17 +1012,28 @@ fn shared_worker_http_redirect_never_requests_a_foreign_origin() {
 
 #[test]
 fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
-    fn accept_request(listener: &TcpListener, deadline: std::time::Instant) -> (std::net::TcpStream, String) {
+    fn accept_request(
+        listener: &TcpListener,
+        deadline: std::time::Instant,
+        expected_path: &str,
+    ) -> (std::net::TcpStream, String) {
         let (mut stream, _) = loop {
             match listener.accept() {
                 Ok(connection) => break connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(std::time::Instant::now() < deadline, "timed out waiting for worker HTTP request");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "timed out waiting for worker HTTP request {expected_path}"
+                    );
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("accept worker HTTP request: {error}"),
             }
         };
+        // A stream accepted from the polling listener can inherit its
+        // nonblocking mode on macOS; the existing read deadline requires a
+        // blocking accepted stream, independently of listener polling.
+        stream.set_nonblocking(false).expect("set worker request blocking mode");
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("set worker request timeout");
@@ -1066,17 +1082,49 @@ fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
 
     let worker_server = thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let (mut redirect, path) = accept_request(&worker_listener, deadline);
+        let (mut redirect, path) =
+            accept_request(&worker_listener, deadline, "/redirect.js?case=1");
         assert_eq!(path, "/redirect.js?case=1");
         redirect
             .write_all(b"HTTP/1.1 302 Found\r\nLocation: /dir/entry.js?case=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("write worker redirect");
 
-        let (mut entry, path) = accept_request(&worker_listener, deadline);
+        let (mut entry, path) =
+            accept_request(&worker_listener, deadline, "/dir/entry.js?case=1");
         assert_eq!(path, "/dir/entry.js?case=1");
         let body = format!(
             r#"
-            importScripts("http://alt.test:{import_port}/lib.js?lib=1");
+            importScripts(
+              "http://alt.test:{import_port}/lib.js?lib=1",
+              "http://alt.test:{import_port}/state.js?state=1"
+            );
+            const importedLexicalsPersist = importedConst === 41 && importedLet === 43 &&
+              importedLater === "initialized" && importedFunction() === 84;
+            const importedLexicalsStayOffGlobal =
+              !Object.prototype.hasOwnProperty.call(globalThis, "importedConst") &&
+              !Object.prototype.hasOwnProperty.call(globalThis, "importedLet");
+            const importedVarAndFunctionAreGlobal = globalThis.importedVar === 43 &&
+              globalThis.importedFunction === importedFunction;
+            let duplicateLexicalRejected = false;
+            try {{ importScripts("http://alt.test:{import_port}/duplicate.js?case=1"); }}
+            catch (error) {{ duplicateLexicalRejected = error instanceof SyntaxError; }}
+            let syntaxErrorHasSourceUrl = false;
+            try {{ importScripts("http://alt.test:{import_port}/invalid.js?case=1"); }}
+            catch (error) {{
+              syntaxErrorHasSourceUrl = error instanceof SyntaxError &&
+                String(error.message).includes("http://alt.test:{import_port}/invalid.js?case=1");
+            }}
+            let thrownImportPreserved = false;
+            let thrownImportHasSourceUrl = false;
+            try {{ importScripts("http://alt.test:{import_port}/throw.js?case=1"); }}
+            catch (error) {{
+              thrownImportPreserved = error === globalThis.importThrownError &&
+                error instanceof Error &&
+                error.message === "classic-worker-import-failure";
+              thrownImportHasSourceUrl = String(error.stack).includes(
+                "http://alt.test:{import_port}/throw.js?case=1"
+              );
+            }}
             const originalSelf = self;
             self = 1;
             const selfAssignmentPreserved = self === originalSelf;
@@ -1124,6 +1172,19 @@ fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
                 dispatchAfterRemove,
                 invalidReceiverRejected,
                 messageReceiver: this === self && event.currentTarget === self,
+                messageInterface: event instanceof MessageEvent,
+                nodeGlobalsAbsent: typeof process === "undefined" &&
+                  typeof Buffer === "undefined" && typeof require === "undefined",
+                importedLexicalsPersist,
+                importedLexicalsStayOffGlobal,
+                importedVarAndFunctionAreGlobal,
+                importedTdzObserved,
+                importedState: globalThis.importScriptState,
+                duplicateLexicalRejected,
+                duplicateScriptBodyDidNotRun: globalThis.duplicateScriptBodyRan === undefined,
+                syntaxErrorHasSourceUrl,
+                thrownImportPreserved,
+                thrownImportHasSourceUrl,
               }});
             }};
             addEventListener("message", receiveAck);
@@ -1133,16 +1194,37 @@ fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
         send_script(&mut entry, "text/javascript; charset=utf-8", &body);
     });
     let import_server = thread::spawn(move || {
-        let (mut stream, path) = accept_request(
-            &import_listener,
-            std::time::Instant::now() + Duration::from_secs(15),
-        );
-        assert_eq!(path, "/lib.js?lib=1");
-        send_script(
-            &mut stream,
-            "application/javascript",
-            "globalThis.crossOriginImport = 'loaded';",
-        );
+        let scripts = [
+            (
+                "/lib.js?lib=1",
+                "const importedConst = 41;\nlet importedLet = 42;\nvar importedVar = 43;\nfunction importedFunction() { return importedConst + importedLet; }\nlet importedTdzObserved = false;\ntry { importedLater; } catch (error) { importedTdzObserved = error instanceof ReferenceError; }\nlet importedLater = 'initialized';\nglobalThis.crossOriginImport = 'loaded';",
+            ),
+            (
+                "/state.js?state=1",
+                "importedLet++;\nglobalThis.importScriptState = { constValue: importedConst, letValue: importedLet, varValue: importedVar, functionValue: importedFunction(), tdzObserved: importedTdzObserved, laterValue: importedLater };",
+            ),
+            (
+                "/duplicate.js?case=1",
+                "globalThis.duplicateScriptBodyRan = true; const importedConst = 99;",
+            ),
+            (
+                "/invalid.js?case=1",
+                "const = ;",
+            ),
+            (
+                "/throw.js?case=1",
+                "globalThis.importThrownError = new Error('classic-worker-import-failure'); throw globalThis.importThrownError;",
+            ),
+        ];
+        for (expected_path, body) in scripts {
+            let (mut stream, path) = accept_request(
+                &import_listener,
+                std::time::Instant::now() + Duration::from_secs(15),
+                expected_path,
+            );
+            assert_eq!(path, expected_path);
+            send_script(&mut stream, "application/javascript", body);
+        }
     });
 
     let mut runtime = Runtime::new();
@@ -1162,7 +1244,7 @@ fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
     runtime.engine().ctx().op_state().put(fetch);
 
     let expected = format!(
-        r#"{{"phase":"report","scope":true,"dedicated":true,"eventTarget":true,"workerLocation":true,"href":"http://wpt.test:{worker_port}/dir/entry.js?case=1","type":"classic","name":"native-wpt","imported":"loaded","selfAssignmentPreserved":true,"selfPropertyIsReadOnlyAccessor":true,"eventCount":1,"eventReceiver":true,"eventCurrentTarget":true,"dispatchResult":true,"dispatchAfterRemove":true,"invalidReceiverRejected":true,"messageReceiver":true}}"#
+        r#"{{"phase":"report","scope":true,"dedicated":true,"eventTarget":true,"workerLocation":true,"href":"http://wpt.test:{worker_port}/dir/entry.js?case=1","type":"classic","name":"native-wpt","imported":"loaded","selfAssignmentPreserved":true,"selfPropertyIsReadOnlyAccessor":true,"eventCount":1,"eventReceiver":true,"eventCurrentTarget":true,"dispatchResult":true,"dispatchAfterRemove":true,"invalidReceiverRejected":true,"messageReceiver":true,"messageInterface":true,"nodeGlobalsAbsent":true,"importedLexicalsPersist":true,"importedLexicalsStayOffGlobal":true,"importedVarAndFunctionAreGlobal":true,"importedTdzObserved":true,"importedState":{{"constValue":41,"letValue":43,"varValue":43,"functionValue":84,"tdzObserved":true,"laterValue":"initialized"}},"duplicateLexicalRejected":true,"duplicateScriptBodyDidNotRun":true,"syntaxErrorHasSourceUrl":true,"thrownImportPreserved":true,"thrownImportHasSourceUrl":true}}"#
     );
     let source = format!(
         r#"
@@ -1189,6 +1271,10 @@ fn dedicated_http_worker_uses_final_location_and_cross_origin_import_scripts() {
         Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
     }
     worker_server.join().expect("worker fixture exits");
-    import_server.join().expect("import fixture exits");
+    assert!(
+        import_server.join().is_ok(),
+        "import fixture thread panicked; worker console: {:?}",
+        out.lines()
+    );
     assert_eq!(out.lines(), ["origin SecurityError", expected.as_str()]);
 }

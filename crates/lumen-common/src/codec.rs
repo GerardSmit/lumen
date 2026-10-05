@@ -668,7 +668,7 @@ pub fn hex_decode_partial(src: &[u8], max_len: usize) -> PartialDecode {
 }
 
 #[inline]
-fn is_ascii_whitespace(c: u8) -> bool {
+pub(crate) fn is_ascii_whitespace(c: u8) -> bool {
     matches!(c, b'\t' | b'\n' | b'\x0c' | b'\r' | b' ')
 }
 

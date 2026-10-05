@@ -1241,6 +1241,8 @@ pub enum Exotic {
     /// every `Exotic::Array` fast path misses it; any mutation or direct-props consumer first
     /// materializes it in place into an ordinary `Exotic::Array`.
     SplitView,
+    /// A Date object. Its [[DateValue]] is stored in the common hidden exotic payload slot.
+    Date,
 }
 
 impl Exotic {
@@ -1318,6 +1320,26 @@ impl Object {
             Exotic::None | Exotic::Array | Exotic::Arguments | Exotic::SplitView => None,
             _ => self.props.get(EXOTIC_SLOT).map(|p| p.value()),
         }
+    }
+
+    /// [[DateValue]] of a genuine Date object. A same-named public property is never a brand.
+    pub(crate) fn date_value(&self) -> Option<f64> {
+        if self.exotic != Exotic::Date {
+            return None;
+        }
+        match self.exotic_payload() {
+            Some(Value::Num(milliseconds)) => Some(milliseconds),
+            _ => None,
+        }
+    }
+
+    /// Update [[DateValue]] without changing the object's brand or prototype.
+    pub(crate) fn set_date_value(&mut self, milliseconds: f64) {
+        debug_assert_eq!(self.exotic, Exotic::Date);
+        self.props.insert(
+            EXOTIC_SLOT,
+            Property::data(Value::Num(milliseconds), false, false, false),
+        );
     }
 
     /// [[StringData]] of a String wrapper.

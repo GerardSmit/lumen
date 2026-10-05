@@ -5,7 +5,7 @@
 use crate::builtins::collection_data::CollectionKind;
 use crate::builtins::{ab, arg, can_be_held_weakly, map_ptr, set_to_string_tag};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, NativeFn, Object, Property, Value};
+use crate::value::{NativeFn, Object, Property, Value, set_builtin};
 
 /// Require the exact weak collection slot; ordinary properties cannot supply it.
 fn weak_brand_ptr(i: &Interp, this: &Value, want: CollectionKind) -> Result<usize, Value> {

@@ -10,6 +10,7 @@ use lumen_html::animation::{
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 /// Preserve the actual JS identity alongside the native record when a native class
 /// is passed as an argument. Native constructors return a host-wrapped instance after
@@ -22,6 +23,32 @@ struct NativeClassArgument<T> {
 
 type EffectArgument = NativeClassArgument<DomKeyframeEffect>;
 type TimelineArgument = NativeClassArgument<DomDocumentTimeline>;
+
+/// The Animation constructor tells an omitted timeline (the default document
+/// timeline) apart from an explicit null (no timeline).
+enum TimelineChoice {
+    Default,
+    Null,
+    Timeline(TimelineArgument),
+}
+
+impl<'a> FromArg<'a, lumen::embed::JsHost> for TimelineChoice {
+    fn from_arg(
+        cx: &'a lumen::embed::ArgCx<'_>,
+        value: &'a Value,
+        at: Slot,
+    ) -> Result<Self, Value> {
+        match value {
+            Value::Undefined => Ok(Self::Default),
+            Value::Null => Ok(Self::Null),
+            _ => TimelineArgument::from_arg(cx, value, at).map(Self::Timeline),
+        }
+    }
+
+    fn from_missing(_: &'a lumen::embed::ArgCx<'_>, _: Slot) -> Result<Self, Value> {
+        Ok(Self::Default)
+    }
+}
 
 impl<'a, T: Class + Clone> FromArg<'a, lumen::embed::JsHost> for NativeClassArgument<T> {
     fn from_arg(
@@ -42,25 +69,44 @@ struct Record {
     id: u32,
     public_id: String,
     effect_id: Option<u32>,
+    css_name: Option<String>,
+    css_order: Option<usize>,
     realm: Weak<DomRealm>,
     timeline_realm: Weak<DomRealm>,
     timeline_id: u32,
     timeline_origin_ms: f64,
     timeline_value: Value,
     node: Option<NodeId>,
-    keyframes: Vec<Keyframe>,
-    underlying: HashMap<String, String>,
+    keyframes: Rc<[Keyframe]>,
+    underlying: Rc<HashMap<String, String>>,
     timing: Timing,
-    easing: String,
+    easing: Rc<str>,
     composite: CompositeMode,
     start_ms: f64,
     start_time_ms: f64,
     hold_time_ms: Option<f64>,
     playback_rate: f64,
     paused_at_ms: Option<f64>,
+    pending_task: Option<PlaybackState>,
+    pending_task_revision: u64,
+    start_resolved: bool,
     cancelled: bool,
     finish_event_fired: bool,
+    retired: bool,
     event_target: DomEventTarget,
+}
+
+// Immutable payloads remain alive across the layout flush between paint passes.
+// The short registry borrow ends before layout or any reentrant host callback.
+struct PaintSnapshot {
+    id: u32,
+    css_order: Option<usize>,
+    node: Option<NodeId>,
+    keyframes: Rc<[Keyframe]>,
+    underlying: Rc<HashMap<String, String>>,
+    easing: Rc<str>,
+    composite: CompositeMode,
+    sample: animation::Sample,
 }
 
 #[derive(Clone)]
@@ -68,14 +114,25 @@ struct EffectRecord {
     id: u32,
     realm: Weak<DomRealm>,
     node: Option<NodeId>,
-    keyframes: Vec<Keyframe>,
-    underlying: HashMap<String, String>,
+    keyframes: Rc<[Keyframe]>,
+    underlying: Rc<HashMap<String, String>>,
     timing: Timing,
-    easing: String,
+    easing: Rc<str>,
     duration_auto: bool,
     fill_auto: bool,
     composite: CompositeMode,
     animation_id: Option<u32>,
+}
+
+struct CssEventState {
+    owner: Weak<DomRealm>,
+    node: NodeId,
+    order: usize,
+    _retention: NodeRetention,
+    previous: animation::CssEventSample,
+    sampled: bool,
+    associated: bool,
+    css_paused: bool,
 }
 
 struct AnimationHub {
@@ -93,6 +150,12 @@ struct AnimationHub {
     default_timeline_ids: HashMap<usize, u32>,
     timeline_values: HashMap<u32, WeakValue>,
     overlaid_nodes: HashMap<usize, HashSet<NodeId>>,
+    css_records: HashMap<(usize, NodeId, usize), (String, String, u32)>,
+    css_generations: HashMap<usize, (Weak<DomRealm>, u64)>,
+    css_events: HashMap<u32, CssEventState>,
+    rendered_revisions: HashMap<usize, (Weak<DomRealm>, u64, u64)>,
+    dispatching_css: HashMap<u32, usize>,
+    css_cancellations: Vec<Weak<CssCancellation>>,
 }
 
 impl Default for AnimationHub {
@@ -111,40 +174,45 @@ impl Default for AnimationHub {
             default_timeline_ids: HashMap::new(),
             timeline_values: HashMap::new(),
             overlaid_nodes: HashMap::new(),
+            css_records: HashMap::new(),
+            css_generations: HashMap::new(),
+            css_events: HashMap::new(),
+            rendered_revisions: HashMap::new(),
+            dispatching_css: HashMap::new(),
+            css_cancellations: Vec::new(),
             default_realm: Weak::new(),
         }
     }
 }
 
 struct FinishedPromise {
-    promise: Value,
+    promise: WeakValue,
     deferred: Option<Deferred>,
 }
 
 struct ReadyPromise {
-    promise: Value,
+    promise: WeakValue,
     deferred: Option<Deferred>,
 }
 
-fn new_finished_promise(ctx: &mut Ctx) -> FinishedPromise {
-    let deferred = Deferred::new(ctx);
-    FinishedPromise {
-        promise: deferred.promise(),
-        deferred: Some(deferred),
-    }
+fn replace_finished_promise(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> (Value, Option<FinishedPromise>) {
+    Deferred::new_registered(ctx, |ctx, deferred| {
+        let value = deferred.promise();
+        let promise = ctx.weak_value(&value).expect("Promise is a GC object");
+        let previous = hub.borrow_mut().finished.insert(id, FinishedPromise { promise, deferred: Some(deferred) });
+        (value, previous)
+    })
 }
 
-fn new_ready_promise(ctx: &mut Ctx) -> ReadyPromise {
-    let deferred = Deferred::new(ctx);
-    ReadyPromise {
-        promise: deferred.promise(),
-        deferred: Some(deferred),
-    }
-}
-
-fn resolved_promise(ctx: &mut Ctx, value: Value) -> Value {
-    let deferred = Deferred::new(ctx);
-    let promise = deferred.promise();
+fn replace_resolved_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, value: Value) -> Value {
+    let (deferred, promise) = Deferred::new_registered(ctx, |ctx, deferred| {
+        let promise = deferred.promise();
+        hub.borrow_mut().ready.insert(id, ReadyPromise {
+            promise: ctx.weak_value(&promise).expect("Promise is a GC object"),
+            deferred: None,
+        });
+        (deferred, promise)
+    });
     deferred.resolve(ctx, value);
     promise
 }
@@ -159,8 +227,13 @@ pub fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) {
     hub.default_realm = Rc::downgrade(realm);
     RealmServices::replace_current(ctx, RefCell::new(hub));
     ctx.class_constructor::<DomAnimation>();
+    ctx.class_constructor::<DomCssAnimation>();
     ctx.class_constructor::<DomKeyframeEffect>();
     ctx.class_constructor::<DomDocumentTimeline>();
+    let constructor = ctx.class_constructor::<DomAnimationEvent>();
+    let global = ctx.global_object();
+    assert!(crate::install_interface(ctx, &global, "AnimationEvent", constructor).is_ok(),
+        "AnimationEvent interface install");
 }
 
 fn normalize_effect_options(ctx: &mut Ctx, options: Option<Value>) -> OpResult<Option<Value>> {
@@ -568,6 +641,9 @@ fn normalize_offsets(frames: &mut [Keyframe]) -> OpResult<()> {
 }
 
 fn parse_keyframes(ctx: &mut Ctx, value: &Value) -> OpResult<Vec<Keyframe>> {
+    if matches!(value, Value::Null | Value::Undefined) {
+        return Ok(Vec::new());
+    }
     if ctx.is_array_value(value).map_err(OpError::thrown)? {
         let sequence = values(ctx, value)?;
         let mut frames = Vec::with_capacity(sequence.len());
@@ -840,10 +916,10 @@ fn create_effect(
                 animation_id: None,
                 realm: Rc::downgrade(realm),
                 node,
-                keyframes: frames,
-                underlying,
+                keyframes: frames.into(),
+                underlying: Rc::new(underlying),
                 timing,
-                easing,
+                easing: easing.into(),
                 duration_auto,
                 fill_auto,
                 composite,
@@ -864,7 +940,7 @@ fn attach_effect(
     timeline_value: Value,
 ) -> OpResult<(u32, DomEventTarget)> {
     let hub = hub(ctx)?;
-    let now = lumen_host::perf::now_ms();
+    let now = document_time(timeline_realm).unwrap_or(0.0);
     let (id, event_target, realms) = {
         let mut state = hub.borrow_mut();
         let effect = state
@@ -898,6 +974,8 @@ fn attach_effect(
                 id,
                 public_id: String::new(),
                 effect_id: Some(effect_id),
+                css_name: None,
+                css_order: None,
                 realm: effect.realm.clone(),
                 timeline_realm: Rc::downgrade(timeline_realm),
                 timeline_id,
@@ -911,11 +989,15 @@ fn attach_effect(
                 composite: effect.composite,
                 start_ms: now,
                 start_time_ms: 0.0,
-                hold_time_ms: None,
+                hold_time_ms: start_playing.then_some(0.0),
                 playback_rate: 1.0,
                 paused_at_ms: None,
+                pending_task: start_playing.then_some(PlaybackState::Running),
+                pending_task_revision: 0,
+                start_resolved: false,
                 cancelled: !start_playing,
                 finish_event_fired: false,
+                retired: false,
                 event_target: event_target.clone(),
             },
         );
@@ -929,10 +1011,8 @@ fn attach_effect(
         }
         (id, event_target, realms)
     };
-    hub.borrow_mut()
-        .finished
-        .insert(id, new_finished_promise(ctx));
-    hub.borrow_mut().ready.insert(id, new_ready_promise(ctx));
+    mark_ready_pending(ctx, &hub, id);
+    ensure_pending_finished(ctx, &hub, id);
     let _ = start_playing;
     for realm in realms {
         apply_realm(&hub, &realm, now)?;
@@ -983,7 +1063,7 @@ pub fn animate(
     }
     let effect = create_effect(ctx, realm, Some(node), keyframes, options)?;
     let effect_id = effect.id;
-    let now = lumen_host::perf::now_ms();
+    let now = document_time(realm).unwrap_or(0.0);
     let timeline_value = document_timeline(ctx, realm)?;
     let timeline_id = hub(ctx)?
         .borrow()
@@ -1017,16 +1097,43 @@ pub fn animate(
     Ok(wrapper)
 }
 
-pub fn for_element(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId) -> OpResult<Value> {
+pub fn for_element(ctx: &mut Ctx, realm: &Rc<DomRealm>, node: NodeId, subtree: bool) -> OpResult<Value> {
+    let tree_order = if subtree {
+        let session = realm.session.borrow();
+        let document = session.document();
+        let mut order = HashMap::new();
+        order.insert(node, 0usize);
+        let mut cursor = super::next_descendant(document, node, node).map_err(dom_error)?;
+        while let Some(id) = cursor {
+            order.insert(id, order.len());
+            cursor = super::next_descendant(document, node, id).map_err(dom_error)?;
+        }
+        order
+    } else {
+        HashMap::from([(node, 0usize)])
+    };
     let hub = hub(ctx)?;
-    let now = lumen_host::perf::now_ms();
-    let ids = hub
+    let now = document_time(realm).unwrap_or(0.0);
+    refresh_css_animations(ctx, &hub, realm, now)?;
+    apply_realm(&hub, realm, now)?;
+    collect_retired_css_animations(ctx, &hub);
+    let mut matched = hub
         .borrow()
         .records
         .values()
-        .filter(|record| record.node == Some(node) && record_is_relevant(record, realm, now))
-        .map(|record| record.id)
+        .filter(|record| {
+            record.node.is_some_and(|target| tree_order.contains_key(&target))
+                && record_is_relevant(record, realm, now)
+        })
+        .map(|record| (
+            record.node.and_then(|target| tree_order.get(&target).copied()).unwrap_or(0),
+            record.css_name.is_none(),
+            record.css_order.unwrap_or(0),
+            record.id,
+        ))
         .collect::<Vec<_>>();
+    matched.sort_unstable();
+    let ids = matched.into_iter().map(|(_, _, _, id)| id).collect::<Vec<_>>();
     animation_array(ctx, &hub, &ids)
 }
 
@@ -1046,7 +1153,10 @@ pub fn for_tree_root(ctx: &mut Ctx, realm: &Rc<DomRealm>, root: NodeId) -> OpRes
         targets
     };
     let hub = hub(ctx)?;
-    let now = lumen_host::perf::now_ms();
+    let now = document_time(realm).unwrap_or(0.0);
+    refresh_css_animations(ctx, &hub, realm, now)?;
+    apply_realm(&hub, realm, now)?;
+    collect_retired_css_animations(ctx, &hub);
     // Animation IDs follow creation order in the hub. Iterating its BTreeMap
     // preserves the effect stack's order for native WAAPI animations.
     let ids = hub
@@ -1076,6 +1186,318 @@ fn record_is_relevant(record: &Record, realm: &Rc<DomRealm>, now: f64) -> bool {
         )
 }
 
+fn css_list_value(style: &[Option<Arc<str>>; 9], property: usize, index: usize, default: &str) -> String {
+    let values = style[property]
+        .as_deref()
+        .map(lumen_html::css::css_list_items)
+        .unwrap_or_default();
+    values.get(index % values.len().max(1)).cloned().unwrap_or_else(|| default.to_owned())
+}
+
+fn css_time_value(input: &str) -> Option<f64> {
+    let input = input.trim();
+    let (number, scale) = if let Some(number) = input.strip_suffix("ms") { (number, 1.0) }
+    else if let Some(number) = input.strip_suffix('s') { (number, 1000.0) }
+    else { return None; };
+    let value = number.trim().parse::<f64>().ok()? * scale;
+    value.is_finite().then_some(value)
+}
+
+fn css_keyframe_effect(
+    keyframes: &lumen_html::css::KeyframesRuleText,
+    direction: animation::Direction,
+    composite: CompositeMode,
+) -> Option<Vec<Keyframe>> {
+    let mut frames = Vec::new();
+    for rule in &keyframes.rules {
+        let offsets = lumen_html::css::keyframe_offsets(&rule.key_text)?;
+        let mut declarations = lumen_html::css::parse_keyframe_declarations(&rule.style).ok()?;
+        let easing = declarations
+            .iter()
+            .position(|(name, _)| name == "animation-timing-function")
+            .map(|index| declarations.remove(index).1);
+        for offset in offsets {
+            frames.push(Keyframe {
+                offset,
+                declarations: declarations.clone(),
+                easing: easing.clone(),
+                composite: Some(composite),
+            });
+        }
+    }
+    // A valid empty CSS rule is a timed effect with no property tracks,
+    // just like Element.animate([]). It still participates in cancellation
+    // and finished/ready promises through the shared timeline sampler.
+    // CSS keyframe selectors are normalized by the shared parser; preserve
+    // source order among duplicate offsets for the shared sampler.
+    frames.sort_by(|left, right| left.offset.total_cmp(&right.offset));
+    let _ = direction;
+    Some(frames)
+}
+
+/// An animation-name list edit keeps each surviving name's Animation and moves
+/// it to its new list position; only names that left the list are cancelled.
+fn reposition_css_records(
+    hub: &Rc<RefCell<AnimationHub>>,
+    realm_key: usize,
+    node: NodeId,
+    names: &[String],
+    snapshot: &lumen_html::session::AnimationSnapshot,
+    scope: Option<NodeId>,
+    environment: lumen_html::css::MediaEnvironment,
+) {
+    let wanted = names.iter().map(|authored| {
+        lumen_html::css::normalize_animation_name(authored).filter(|name| name != "none"
+            && snapshot.keyframes.iter().any(|rule| rule.name == *name && rule.scope == scope
+                && rule.media.iter().all(|query| lumen_html::css::media_query_matches(query, environment))))
+    }).collect::<Vec<_>>();
+    let mut state = hub.borrow_mut();
+    let displaced = wanted.iter().enumerate().any(|(index, name)| name.as_ref().is_some_and(|name|
+        state.css_records.get(&(realm_key, node, index)).is_some_and(|(old, _, _)| old != name)));
+    if !displaced { return; }
+    let mut old = state.css_records.iter()
+        .filter(|(key, _)| key.0 == realm_key && key.1 == node)
+        .map(|(key, entry)| (key.2, entry.clone()))
+        .collect::<Vec<_>>();
+    old.sort_by_key(|(index, _)| *index);
+    let mut claimed = vec![false; old.len()];
+    let mut moves = Vec::new();
+    for (index, name) in wanted.iter().enumerate() {
+        let Some(name) = name else { continue };
+        if old.iter().any(|(old_index, (old_name, _, _))| *old_index == index && old_name == name) {
+            if let Some(slot) = old.iter().position(|(old_index, _)| *old_index == index) { claimed[slot] = true; }
+        }
+    }
+    for (index, name) in wanted.iter().enumerate() {
+        let Some(name) = name else { continue };
+        if old.iter().any(|(old_index, (old_name, _, _))| *old_index == index && old_name == name) { continue; }
+        if let Some(slot) = old.iter().enumerate().position(|(slot, (_, (old_name, _, _)))| !claimed[slot] && old_name == name) {
+            claimed[slot] = true;
+            moves.push((old[slot].0, index, old[slot].1.clone()));
+        }
+    }
+    for (from, _, _) in &moves { state.css_records.remove(&(realm_key, node, *from)); }
+    for (_, to, entry) in moves {
+        let id = entry.2;
+        state.css_records.insert((realm_key, node, to), entry);
+        if let Some(record) = state.records.get_mut(&id) { record.css_order = Some(to); }
+        if let Some(event) = state.css_events.get_mut(&id) { event.order = to; }
+    }
+}
+
+fn refresh_css_animations(
+    ctx: &mut Ctx,
+    hub: &Rc<RefCell<AnimationHub>>,
+    realm: &Rc<DomRealm>,
+    now: f64,
+) -> OpResult<()> {
+    let snapshot = realm
+        .session
+        .borrow_mut()
+        .animation_snapshot()
+        .map_err(|_| OpError::new("SyntaxError", "CSS animation style resolution failed"))?;
+    let environment = realm.session.borrow().media_environment();
+    let realm_key = Rc::as_ptr(realm) as usize;
+    if hub.borrow().css_generations.get(&realm_key).is_some_and(|(owner, generation)| {
+        *generation == snapshot.generation && owner.upgrade().is_some_and(|owner| Rc::ptr_eq(&owner, realm))
+    }) {
+        return Ok(());
+    }
+    let mut active = HashSet::new();
+    let mut created = Vec::new();
+    let mut cancelled = Vec::new();
+    let mut playback_changes = Vec::new();
+    for (node, scope, style) in &snapshot.nodes {
+        let (node, scope) = (*node, *scope);
+        let names = style[0].as_deref().map(lumen_html::css::css_list_items).unwrap_or_default();
+        reposition_css_records(hub, realm_key, node, &names, &snapshot, scope, environment);
+        for (index, authored_name) in names.iter().enumerate() {
+            let Some(name) = lumen_html::css::normalize_animation_name(authored_name) else { continue; };
+            if name == "none" { continue; }
+            let selected = snapshot.keyframes.iter().filter(|rule| {
+                rule.name == name && rule.scope == scope
+                    && rule.media.iter().all(|query| lumen_html::css::media_query_matches(query, environment))
+            }).last();
+            let Some(selected) = selected else { continue };
+            let key = (realm_key, node, index);
+            active.insert(key);
+            let signature = format!("{:?}|{}", style, selected.css_text);
+            let old_entry = hub.borrow().css_records.get(&key).cloned();
+            if old_entry.as_ref().is_some_and(|(old_name, old_signature, _)| old_name == &name && old_signature == &signature) {
+                continue;
+            }
+            let duration = css_time_value(&css_list_value(&style, 1, index, "0s")).unwrap_or(0.0).max(0.0);
+            let delay = css_time_value(&css_list_value(&style, 2, index, "0s")).unwrap_or(0.0);
+            let easing = css_list_value(&style, 3, index, "ease");
+            let iterations = match css_list_value(&style, 4, index, "1").as_str() {
+                "infinite" => f64::INFINITY,
+                value => value.parse::<f64>().unwrap_or(1.0).max(0.0),
+            };
+            let direction = match css_list_value(&style, 5, index, "normal").as_str() {
+                "reverse" => Direction::Reverse,
+                "alternate" => Direction::Alternate,
+                "alternate-reverse" => Direction::AlternateReverse,
+                _ => Direction::Normal,
+            };
+            let fill = match css_list_value(&style, 6, index, "none").as_str() {
+                "forwards" => FillMode::Forwards,
+                "backwards" => FillMode::Backwards,
+                "both" => FillMode::Both,
+                _ => FillMode::None,
+            };
+            let play_state = css_list_value(&style, 7, index, "running");
+            let composite = match css_list_value(&style, 8, index, "replace").as_str() {
+                "add" => CompositeMode::Add,
+                "accumulate" => CompositeMode::Accumulate,
+                _ => CompositeMode::Replace,
+            };
+            let mut frames = css_keyframe_effect(selected, direction, composite)
+                .ok_or_else(|| OpError::new("SyntaxError", "invalid CSS keyframe block"))?;
+            resolve_underlying(realm, node, &mut frames)?;
+            let underlying = capture_underlying(realm, Some(node), &frames)?;
+            let timing = Timing {
+                delay_ms: delay,
+                end_delay_ms: 0.0,
+                duration_ms: duration,
+                iteration_start: 0.0,
+                iterations,
+                fill,
+                direction,
+            };
+            let frames: Rc<[Keyframe]> = frames.into();
+            let underlying = Rc::new(underlying);
+            let easing: Rc<str> = easing.into();
+            if let Some((old_name, _old_signature, old_id)) = old_entry {
+                if old_name == name {
+                    let mut state = hub.borrow_mut();
+                    let Some(record_snapshot) = state.records.get(&old_id).cloned() else { continue; };
+                    let desired_pause=play_state=="paused";
+                    let play_state_changed=state.css_events.get(&old_id).is_some_and(|event|event.css_paused!=desired_pause);
+                    if let Some(event)=state.css_events.get_mut(&old_id){event.css_paused=desired_pause;}
+                    if let Some(record) = state.records.get_mut(&old_id) {
+                        record.timing = timing;
+                        record.keyframes = frames.clone();
+                        record.underlying = underlying.clone();
+                        record.easing = easing.clone();
+                        record.composite = composite;
+                    }
+                    if let Some(effect_id) = record_snapshot.effect_id {
+                        if let Some(effect) = state.effect_records.get_mut(&effect_id) {
+                            effect.timing = timing;
+                            effect.keyframes = frames;
+                            effect.underlying = underlying;
+                            effect.easing = easing;
+                            effect.composite = composite;
+                        }
+                    }
+                    state.css_records.insert(key, (name, signature, old_id));
+                    drop(state);
+                    if play_state_changed {
+                        playback_changes.push((old_id, if desired_pause {PlaybackState::Paused}else{PlaybackState::Running}));
+                    }
+                    continue;
+                }
+            }
+            let old_entry = { hub.borrow_mut().css_records.remove(&key) };
+            if let Some((_, _, old_id)) = old_entry {
+                retire_css_snapshot_record(ctx, hub, old_id, now)?;
+                cancelled.push(old_id);
+            }
+            let timeline_value=document_timeline(ctx,realm)?;
+            let timeline_id=hub.borrow().default_timeline_ids[&realm_key];
+            let mut state = hub.borrow_mut();
+            state.next_effect_id = state.next_effect_id.wrapping_add(1).max(1);
+            let effect_id = state.next_effect_id;
+            state.next_id = state.next_id.wrapping_add(1).max(1);
+            let id = state.next_id;
+            let event_target = DomEventTarget::independent(realm);
+            state.effect_records.insert(effect_id, EffectRecord {
+                id: effect_id,
+                realm: Rc::downgrade(realm),
+                node: Some(node),
+                keyframes: frames.clone(),
+                underlying: underlying.clone(),
+                timing,
+                easing: easing.clone(),
+                duration_auto: false,
+                fill_auto: false,
+                composite,
+                animation_id: Some(id),
+            });
+            state.records.insert(id, Record {
+                id,
+                public_id: String::new(),
+                effect_id: Some(effect_id),
+                css_name: Some(name.clone()),
+                css_order: Some(index),
+                realm: Rc::downgrade(realm),
+                timeline_realm: Rc::downgrade(realm),
+                timeline_id,
+                timeline_origin_ms: 0.0,
+                timeline_value,
+                node: Some(node),
+                keyframes: frames,
+                underlying,
+                timing,
+                easing,
+                composite,
+                start_ms: now,
+                start_time_ms: 0.0,
+                hold_time_ms: Some(0.0),
+                playback_rate: 1.0,
+                paused_at_ms: None,
+                pending_task: Some(if play_state=="paused" { PlaybackState::Paused } else { PlaybackState::Running }),
+                pending_task_revision: 0,
+                start_resolved: false,
+                cancelled: false,
+                finish_event_fired: false,
+                retired: false,
+                event_target,
+            });
+            state.css_events.insert(id, CssEventState {
+                owner: Rc::downgrade(realm), node, order: index,
+                _retention: NodeRetention::new(realm, node),
+                previous: animation::CssEventSample::IDLE, sampled: false,
+                associated: true, css_paused: play_state=="paused",
+            });
+            state.css_records.insert(key, (name, signature, id));
+            created.push(id);
+        }
+    }
+    let stale = hub.borrow().css_records.keys()
+        .filter(|key| key.0 == realm_key && !active.contains(*key))
+        .copied().collect::<Vec<_>>();
+    for key in stale {
+        let old_entry = { hub.borrow_mut().css_records.remove(&key) };
+        if let Some((_, _, id)) = old_entry {
+            retire_css_snapshot_record(ctx, hub, id, now)?;
+            cancelled.push(id);
+        }
+    }
+    hub.borrow_mut().css_generations.insert(realm_key, (Rc::downgrade(realm), snapshot.generation));
+    // Commit the complete CSS snapshot before publishing Promise hooks. A hook
+    // may enumerate animations, mutate styles, or replace a pending task.
+    let mut publication = DispatchRetention { hub: hub.clone(), ids: Vec::new() };
+    for id in cancelled.iter().chain(created.iter()).chain(playback_changes.iter().map(|(id, _)| id)) {
+        publication.retain(*id);
+    }
+    for id in cancelled { reset_pending_task(ctx, hub, id)?; }
+    for (id, playback) in playback_changes {
+        if hub.borrow().css_generations.get(&realm_key).is_some_and(|(_, generation)| *generation == snapshot.generation) {
+            request_pending_task(ctx, hub, id, playback, false)?;
+        }
+    }
+    for id in created {
+        let needs_ready = {
+            let state = hub.borrow();
+            state.records.get(&id).is_some_and(|record| !record.cancelled)
+                && !state.ready.contains_key(&id)
+        };
+        if needs_ready { mark_ready_pending(ctx, hub, id); }
+    }
+    Ok(())
+}
+
 fn animation_array(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, ids: &[u32]) -> OpResult<Value> {
     let global = ctx.global_object();
     let array_ctor = ctx
@@ -1096,16 +1518,21 @@ fn existing_wrapper(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> 
     if let Some(value) = hub.borrow().wrappers.get(&id).and_then(WeakValue::upgrade) {
         return Ok(value);
     }
-    let event_target = hub
+    let (event_target, css_name) = hub
         .borrow()
         .records
         .get(&id)
-        .map(|record| record.event_target.clone())
+        .map(|record| (record.event_target.clone(), record.css_name.clone()))
         .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
-    let value = ctx.new_instance(DomAnimation {
+    let animation = DomAnimation {
         id,
         base: event_target,
-    });
+    };
+    let value = if css_name.is_some() {
+        ctx.new_instance(DomCssAnimation { base: animation })
+    } else {
+        ctx.new_instance(animation)
+    };
     if let Some(weak) = ctx.weak_value(&value) {
         hub.borrow_mut().wrappers.insert(id, weak);
     }
@@ -1290,66 +1717,145 @@ fn timeline_wrapper(
 
 fn refresh_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> OpResult<()> {
     let animation = existing_wrapper(ctx, hub, id)?;
-    let promise = resolved_promise(ctx, animation);
-    hub.borrow_mut().ready.insert(
-        id,
-        ReadyPromise {
-            promise,
-            deferred: None,
-        },
-    );
+    replace_resolved_ready(ctx, hub, id, animation);
     Ok(())
 }
 
-fn mark_ready_pending(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) {
-    hub.borrow_mut().ready.insert(id, new_ready_promise(ctx));
+fn mark_ready_pending(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> Value {
+    Deferred::new_registered(ctx, |ctx, deferred| {
+        let value = deferred.promise();
+        let promise = ctx.weak_value(&value).expect("Promise is a GC object");
+        hub.borrow_mut().ready.insert(id, ReadyPromise { promise, deferred: Some(deferred) });
+        value
+    })
 }
 
-fn settle_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>) -> OpResult<()> {
-    let pending = {
-        let state = hub.borrow();
-        state
-            .ready
-            .iter()
-            .filter_map(|(id, promise)| {
-                let record = state.records.get(id)?;
-                (!record.cancelled
-                    && promise.deferred.is_some()
-                    && sample_record(record, lumen_host::perf::now_ms()).state
-                        != PlaybackState::Idle)
-                    .then_some(*id)
-            })
-            .collect::<Vec<_>>()
-    };
-    for id in pending {
-        let animation = existing_wrapper(ctx, hub, id)?;
-        let deferred = hub
-            .borrow_mut()
-            .ready
-            .get_mut(&id)
-            .and_then(|ready| ready.deferred.take());
-        if let Some(deferred) = deferred {
-            deferred.resolve(ctx, animation);
+fn resolve_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> OpResult<()> {
+    let animation=existing_wrapper(ctx,hub,id)?;
+    let deferred=hub.borrow_mut().ready.get_mut(&id).and_then(|ready|ready.deferred.take());
+    if let Some(deferred)=deferred {deferred.resolve(ctx,animation);}
+    Ok(())
+}
+
+fn reset_pending_task(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> OpResult<()> {
+    let pending=hub.borrow_mut().records.get_mut(&id).and_then(|record|record.pending_task.take());
+    if pending.is_some() {
+        let deferred=hub.borrow_mut().ready.get_mut(&id).and_then(|ready|ready.deferred.take());
+        if let Some(deferred)=deferred {
+            let reason=OpError::new("AbortError","animation playback was canceled").to_value(ctx);
+            deferred.reject_handled(ctx,reason);
         }
+        refresh_ready(ctx,hub,id)?;
+    }
+    Ok(())
+}
+
+fn request_pending_task(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32,
+    kind: PlaybackState, auto_rewind: bool) -> OpResult<()> {
+    let now=hub_time(hub);
+    let had_pending={
+        let mut state=hub.borrow_mut();
+        let record=state.records.get_mut(&id).ok_or_else(||OpError::new("InvalidStateError","animation is no longer available"))?;
+        if kind==PlaybackState::Paused && (record.pending_task==Some(kind)
+            || (record.pending_task.is_none() && record.paused_at_ms.is_some())) {return Ok(());}
+        let current=(!record.cancelled).then(||sample_record(record,now).current_time_ms);
+        let rewind=auto_rewind && current.is_none_or(|time| if record.playback_rate>=0.0 {
+            time<0.0 || time>=record.timing.end_time()
+        } else {time<=0.0 || time>record.timing.end_time()});
+        if kind==PlaybackState::Running && record.pending_task.is_none()
+            && record.start_resolved && record.paused_at_ms.is_none() && !rewind {return Ok(());}
+        let had_pending=record.pending_task.is_some();
+        let revision = if record.pending_task == Some(kind) {
+            record.pending_task_revision
+        } else {
+            record.pending_task_revision.checked_add(1)
+                .ok_or_else(|| OpError::new("QuotaExceededError", "animation task revision exhausted"))?
+        };
+        if current.is_none() || rewind {
+            let seek=if record.playback_rate<0.0 {record.timing.end_time()}else{0.0};
+            if !seek.is_finite(){return Err(OpError::new("InvalidStateError","cannot rewind an infinite reverse animation"));}
+            record.hold_time_ms=Some(seek);
+        } else if kind==PlaybackState::Running && record.paused_at_ms.is_some() {
+            record.hold_time_ms=current;
+        }
+        if record.hold_time_ms.is_some(){record.start_resolved=false;}
+        record.pending_task=Some(kind);
+        record.pending_task_revision = revision;
+        record.cancelled=false;
+        record.retired=false;
+        record.finish_event_fired=false;
+        had_pending
+    };
+    if !had_pending {mark_ready_pending(ctx,hub,id);}
+    Ok(())
+}
+
+fn refresh_css_animation_for_accessor(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> OpResult<()> {
+    let owner={let state=hub.borrow();state.records.get(&id).filter(|record|record.css_name.is_some()).and_then(|record|record.realm.upgrade())};
+    if let Some(owner)=owner {refresh_css_animations(ctx,hub,&owner,owner.timeline_sample.get())?;}
+    Ok(())
+}
+
+fn settle_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, timestamp_ms: f64) -> OpResult<()> {
+    let pending=hub.borrow().records.iter().filter_map(|(id,record)|
+        (record.pending_task.is_some() && !record.cancelled && record_time(record).is_some())
+            .then_some((*id, record.pending_task_revision))).collect::<Vec<_>>();
+    let mut publication = DispatchRetention { hub: hub.clone(), ids: Vec::new() };
+    for (id, _) in &pending { publication.retain(*id); }
+    for (id, revision) in pending {
+        {
+            let mut state=hub.borrow_mut();
+            let Some(record)=state.records.get_mut(&id) else { continue; };
+            if record.pending_task_revision != revision || record.cancelled
+                || record.pending_task.is_none() || record_time(record).is_none() {
+                continue;
+            }
+            match record.pending_task.take() {
+                Some(PlaybackState::Running)=>{
+                    if let Some(hold)=record.hold_time_ms {
+                        record.start_time_ms=hold;record.start_ms=record_time(record).unwrap();
+                        if record.playback_rate!=0.0 {record.hold_time_ms=None;}
+                    }
+                    record.start_resolved=true;record.paused_at_ms=None;
+                }
+                Some(PlaybackState::Paused)=>{
+                    record.hold_time_ms=Some(sample_record(record,timestamp_ms).current_time_ms);
+                    record.start_resolved=false;record.paused_at_ms=record_time(record);
+                }
+                _=>{}
+            }
+        }
+        resolve_ready(ctx,hub,id)?;
     }
     Ok(())
 }
 
 fn apply_realm(hub: &Rc<RefCell<AnimationHub>>, realm: &Rc<DomRealm>, now: f64) -> OpResult<()> {
     let key = Rc::as_ptr(realm) as usize;
-    let snapshot = hub
+    let mut snapshot = hub
         .borrow()
         .records
         .values()
         .filter(|record| {
-            record.effect_id.is_some()
+            !record.cancelled && record.effect_id.is_some()
                 && record
                     .realm
                     .upgrade()
                     .is_some_and(|candidate| Rc::ptr_eq(&candidate, realm))
         })
-        .cloned()
+        .map(|record| PaintSnapshot {
+            id: record.id, css_order: record.css_order, node: record.node,
+            keyframes: record.keyframes.clone(), underlying: record.underlying.clone(),
+            easing: record.easing.clone(), composite: record.composite,
+            sample: sample_record(record, now),
+        })
         .collect::<Vec<_>>();
+    // CSS animations precede script-created Web Animations in the effect
+    // stack; later CSS list entries win among CSS animations.
+    snapshot.sort_by_key(|record| match record.css_order {
+        Some(order) => (0u8, order as u64),
+        None => (1u8, record.id as u64),
+    });
     let mut declarations = HashMap::<NodeId, BTreeMap<String, String>>::new();
     let has_transforms = snapshot.iter().any(|record| {
         record.keyframes.iter().any(|frame| {
@@ -1363,24 +1869,11 @@ fn apply_realm(hub: &Rc<RefCell<AnimationHub>>, realm: &Rc<DomRealm>, now: f64) 
     // percentage translation must use the same frame's animated reference box.
     for transform_pass in [false, true] {
         for record in &snapshot {
-            if record.cancelled {
+            if !record.keyframes.iter().any(|frame| frame.declarations.iter()
+                .any(|(name, _)| (name == "transform") == transform_pass)) {
                 continue;
             }
-            let keyframes = record
-                .keyframes
-                .iter()
-                .cloned()
-                .map(|mut frame| {
-                    frame
-                        .declarations
-                        .retain(|(name, _)| (name == "transform") == transform_pass);
-                    frame
-                })
-                .collect::<Vec<_>>();
-            if !keyframes.iter().any(|frame| !frame.declarations.is_empty()) {
-                continue;
-            }
-            let sample = sample_record(record, now);
+            let sample = record.sample;
             if let Some(progress) = sample.progress {
                 let eased = animation::ease_with_before(&record.easing, progress, sample.before)
                     .unwrap_or(progress);
@@ -1405,10 +1898,11 @@ fn apply_realm(hub: &Rc<RefCell<AnimationHub>>, realm: &Rc<DomRealm>, now: f64) 
                     };
                     let properties = declarations.entry(node).or_default();
                     let mut composition_failed = false;
-                    let sampled = animation::sample_keyframes_composed_with_property(
-                        &keyframes,
+                    let sampled = animation::sample_keyframes_composed_with_property_filter(
+                        &record.keyframes,
                         eased,
                         sample.before,
+                        |property| (property == "transform") == transform_pass,
                         |property, frame, value| {
                             let mode = frame.composite.unwrap_or(record.composite);
                             if mode == CompositeMode::Replace {
@@ -1543,8 +2037,27 @@ fn snapshot_active_nodes(
         .collect()
 }
 
-fn sample_record(record: &Record, now: f64) -> animation::Sample {
-    if record.timeline_realm.upgrade().is_none() {
+// Document timelines remain fixed between real rendering opportunities. An
+// adopted target does not change the document that owns its animation timeline.
+fn document_time(realm: &DomRealm) -> Option<f64> {
+    (realm.has_browsing_context && realm.browsing_context()
+        .is_some_and(|context| browsing_context::is_active_document(&context, realm)))
+        .then(|| realm.timeline_sample.get())
+}
+
+fn record_time(record: &Record) -> Option<f64> {
+    record.timeline_realm.upgrade().and_then(|realm| document_time(&realm))
+}
+
+fn hub_time(hub: &Rc<RefCell<AnimationHub>>) -> f64 {
+    hub.borrow().default_realm.upgrade().and_then(|realm| document_time(&realm)).unwrap_or(0.0)
+}
+
+fn sample_record(record: &Record, _now: f64) -> animation::Sample {
+    let timeline_time = record_time(record);
+
+    if record.cancelled || (record.hold_time_ms.is_none()
+        && (!record.start_resolved || timeline_time.is_none())) {
         return animation::Sample {
             current_time_ms: record.hold_time_ms.unwrap_or(0.0),
             progress: None,
@@ -1555,7 +2068,7 @@ fn sample_record(record: &Record, now: f64) -> animation::Sample {
     }
     let mut current_time = record
         .hold_time_ms
-        .unwrap_or(record.start_time_ms + (now - record.start_ms) * record.playback_rate);
+        .unwrap_or(record.start_time_ms + (timeline_time.unwrap_or(record.start_ms) - record.start_ms) * record.playback_rate);
     if record.hold_time_ms.is_none() && record.paused_at_ms.is_none() {
         let end_time = record.timing.end_time();
         if record.playback_rate > 0.0
@@ -1575,25 +2088,86 @@ fn sample_record(record: &Record, now: f64) -> animation::Sample {
     )
 }
 
+// Retired CSS animations have no effect on the cascade. Keep them only while
+// script retains an Animation or KeyframeEffect wrapper. Promise caches must
+// not themselves keep a resolved Animation alive forever.
+fn collect_retired_css_animations(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>) {
+    let retired = {
+        let mut state = hub.borrow_mut();
+        state.css_generations.retain(|_, (realm, _)| realm.strong_count() != 0);
+        let mut retired = state.records.values()
+            .filter(|record| record.cancelled && record.css_name.is_some())
+            .map(|record| record.id).collect::<Vec<_>>();
+        // Frames without cancelled CSS records allocate neither a set nor a list.
+        if !retired.is_empty() {
+            let active = state.css_records.values().map(|(_, _, id)| *id).collect::<HashSet<_>>();
+            retired.retain(|id| !active.contains(id));
+        }
+        retired
+    };
+    for id in retired {
+        let first_retirement = hub.borrow_mut().records.get_mut(&id).is_some_and(|record| {
+            let first = !record.retired;
+            record.retired = true;
+            first
+        });
+        if first_retirement { reject_finished(ctx, hub, id); }
+        let mut state = hub.borrow_mut();
+        let effect_id = state.records.get(&id).and_then(|record| record.effect_id);
+        let animation_live = state.wrappers.get(&id).and_then(WeakValue::upgrade).is_some();
+        let effect_live = effect_id.and_then(|effect| state.effects.get(&effect))
+            .and_then(WeakValue::upgrade).is_some();
+        if animation_live || effect_live || state.dispatching_css.contains_key(&id) {
+            continue;
+        }
+        state.records.remove(&id);
+        state.wrappers.remove(&id);
+        state.finished.remove(&id);
+        state.ready.remove(&id);
+        state.css_events.remove(&id);
+        if let Some(effect) = effect_id {
+            state.effect_records.remove(&effect);
+            state.effects.remove(&effect);
+        }
+    }
+}
+
 pub fn advance(ctx: &mut Ctx, timestamp_ms: f64) -> OpResult<()> {
     let Some(hub) = RealmServices::<RefCell<AnimationHub>>::current(ctx) else {
         return Ok(());
     };
-    let realms = hub
+    let owner = hub.borrow().default_realm.upgrade();
+    let Some(owner) = owner.filter(|owner| document_time(owner).is_some()) else {
+        return Ok(());
+    };
+    owner.timeline_sample.set(timestamp_ms);
+    let mut realms = hub
         .borrow()
         .records
         .values()
         .filter_map(|record| record.realm.upgrade())
         .collect::<Vec<_>>();
+    realms.extend(hub.borrow().css_events.values().filter_map(|event| event.owner.upgrade()));
+    if let Some(default_realm) = hub.borrow().default_realm.upgrade() {
+        realms.push(default_realm);
+    }
     let mut seen = HashSet::new();
     for realm in realms {
         let key = Rc::as_ptr(&realm) as usize;
         if seen.insert(key) {
+            refresh_css_animations(ctx, &hub, &realm, realm.timeline_sample.get())?;
             apply_realm(&hub, &realm, timestamp_ms)?;
         }
     }
+    settle_ready(ctx, &hub, timestamp_ms)?;
+    // Style refresh admits genuine old-animation cancellations. Publish that
+    // already admitted event batch before sampling the replacement starts;
+    // never run unrelated author tasks here. The batch is snapshotted before
+    // callbacks, so listener-created cancellations retain their later turn.
+    dispatch_css_cancellations(ctx, &hub)?;
+    dispatch_css_events(ctx, &hub, timestamp_ms)?;
+    collect_retired_css_animations(ctx, &hub);
     settle_finished(ctx, &hub, timestamp_ms)?;
-    settle_ready(ctx, &hub)?;
     Ok(())
 }
 
@@ -1611,6 +2185,12 @@ pub fn adopt_nodes(
     };
     {
         let mut state = hub.borrow_mut();
+        // The source document no longer owns adopted nodes. Its next style
+        // publication must not clear overlays through obsolete source NodeIds;
+        // the migrated records below publish into the destination normally.
+        if let Some(overlaid) = state.overlaid_nodes.get_mut(&(Rc::as_ptr(source) as usize)) {
+            for (old_node, _) in mapping { overlaid.remove(old_node); }
+        }
         for record in state.records.values_mut() {
             if !record
                 .realm
@@ -1625,6 +2205,15 @@ pub fn adopt_nodes(
             {
                 record.node = Some(*new_node);
                 record.realm = Rc::downgrade(target);
+            }
+        }
+        for event in state.css_events.values_mut() {
+            if event.owner.upgrade().is_some_and(|realm| Rc::ptr_eq(&realm, source)) {
+                if let Some((_, node)) = mapping.iter().find(|(old, _)| *old == event.node) {
+                    event.owner = Rc::downgrade(target);
+                    event.node = *node;
+                    event._retention.adopt_nodes(source, target, mapping);
+                }
             }
         }
         let AnimationHub {
@@ -1655,7 +2244,7 @@ pub fn adopt_nodes(
             }
         }
     }
-    let now = lumen_host::perf::now_ms();
+    let now = hub_time(&hub);
     apply_realm(&hub, source, now)?;
     apply_realm(&hub, target, now)
 }
@@ -1667,6 +2256,7 @@ fn settle_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, now: f64) -> 
         .values()
         .filter(|record| {
             !record.cancelled
+                && record.pending_task.is_none()
                 && record.paused_at_ms.is_none()
                 && sample_record(record, now).state == PlaybackState::Finished
         })
@@ -1686,6 +2276,7 @@ fn settle_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, now: f64) -> 
         };
         let still_finished = hub.borrow().records.get(&id).is_some_and(|record| {
             !record.cancelled
+                && record.pending_task.is_none()
                 && record.paused_at_ms.is_none()
                 && sample_record(record, now).state == PlaybackState::Finished
         });
@@ -1711,13 +2302,13 @@ fn settle_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, now: f64) -> 
 }
 
 fn reject_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) {
-    let deferred = hub
-        .borrow_mut()
-        .finished
-        .get_mut(&id)
-        .and_then(|finished| finished.deferred.take());
-    if let Some(deferred) = deferred {
-        deferred.reject(ctx, OpError::new("AbortError", "animation was canceled"));
+    // Cancellation starts a new finished-promise lifecycle even when the old
+    // promise already settled. Publish the replacement before rejection jobs
+    // or cancel listeners can observe the animation again.
+    let (_, previous) = replace_finished_promise(ctx, hub, id);
+    if let Some(deferred) = previous.and_then(|finished| finished.deferred) {
+        let reason = OpError::new("AbortError", "animation was canceled").to_value(ctx);
+        deferred.reject_handled(ctx, reason);
     }
 }
 
@@ -1744,17 +2335,363 @@ fn ensure_pending_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u
         .get(&id)
         .is_none_or(|finished| finished.deferred.is_none());
     if should_replace {
-        hub.borrow_mut()
-            .finished
-            .insert(id, new_finished_promise(ctx));
+        replace_finished_promise(ctx, hub, id);
     }
+}
+
+struct DispatchRetention {
+    hub: Rc<RefCell<AnimationHub>>,
+    ids: Vec<u32>,
+}
+
+impl DispatchRetention {
+    fn retain(&mut self, id: u32) {
+        *self.hub.borrow_mut().dispatching_css.entry(id).or_default() += 1;
+        self.ids.push(id);
+    }
+}
+
+impl Drop for DispatchRetention {
+    fn drop(&mut self) {
+        let mut state = self.hub.borrow_mut();
+        for id in &self.ids {
+            if let Some(count) = state.dispatching_css.get_mut(id) {
+                *count -= 1;
+                if *count == 0 { state.dispatching_css.remove(id); }
+            }
+        }
+    }
+}
+
+struct CssCancellation {
+    id: u32,
+    owner: Rc<DomRealm>,
+    node: NodeId,
+    order: usize,
+    name: String,
+    elapsed_ms: f64,
+    dispatched: Cell<bool>,
+    _retention: DispatchRetention,
+}
+
+fn queue_css_cancellation(
+    ctx: &mut Ctx,
+    hub: &Rc<RefCell<AnimationHub>>,
+    id: u32,
+    now: f64,
+    detach: bool,
+) -> OpResult<()> {
+    // Only copy event metadata: cancellation does not copy keyframes or style.
+    let snapshot = {
+        let state = hub.borrow();
+        let record = state.records.get(&id);
+        let event = state.css_events.get(&id);
+        match (record, event) {
+            (Some(record), Some(event)) if !record.cancelled => {
+                let phase = if record.pending_task.is_some() && event.previous.phase.is_none() {None}else{css_sample(record, now).phase};
+                if matches!(phase, Some(animation::EffectPhase::Before | animation::EffectPhase::Active)) {
+                    event.owner.upgrade().map(|owner| (owner, event.node, event.order,
+                        record.css_name.clone().unwrap_or_default(),
+                        (sample_record(record, now).current_time_ms - record.timing.delay_ms)
+                            .max(0.0).min(record.timing.active_duration())))
+                } else { None }
+            }
+            _ => None,
+        }
+    };
+    if let Some((owner, node, order, name, elapsed_ms)) = snapshot {
+        let mut retention = DispatchRetention { hub: hub.clone(), ids: Vec::new() };
+        retention.retain(id);
+        let snapshot = Rc::new(CssCancellation { id, owner: owner.clone(), node, order, name,
+            elapsed_ms, dispatched: Cell::new(false), _retention: retention });
+        let callback_snapshot = snapshot.clone();
+        let callback_hub = hub.clone();
+        let enqueue = move |ctx: &mut Ctx| crate::scheduling::queue_task(ctx, move |ctx| {
+            // Earlier admitted cancellation tasks may have already dispatched
+            // this snapshot in their sorted batch. Newly queued listener work
+            // remains for its own later task, not these old placeholders.
+            if !callback_snapshot.dispatched.get() {
+                dispatch_css_cancellations(ctx, &callback_hub)?;
+            }
+            Ok(())
+        });
+        // The shared queue owns admission, microtask checkpoints, and teardown.
+        // On failure, the retained snapshot drops and author state is unchanged.
+        match owner.child_realm_handle() {
+            Ok(Some(realm)) => ctx.with_host_realm(&realm, enqueue)
+                .map_err(|error| OpError::new("Error", error.to_string()))??,
+            Ok(None) => enqueue(ctx)?,
+            Err(_) => { snapshot.dispatched.set(true); }
+        }
+        if !snapshot.dispatched.get() {
+            let mut state = hub.borrow_mut();
+            // Live snapshots are bounded by the shared task queue. Prune dead
+            // weak metadata at that admission bound, not on every cancellation.
+            if state.css_cancellations.len() >= crate::scheduling::MAX_PENDING_HTML_TASKS {
+                state.css_cancellations.retain(|entry| entry.strong_count() != 0);
+            }
+            state.css_cancellations.push(Rc::downgrade(&snapshot));
+        }
+    }
+    if let Some(event) = hub.borrow_mut().css_events.get_mut(&id) {
+        // Cancel is a real idle transition even if play() runs before rendering.
+        event.previous = animation::CssEventSample::IDLE;
+        if detach { event.associated = false; }
+    }
+    Ok(())
+}
+
+fn cancel_css_record(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, now: f64, detach: bool) -> OpResult<()> {
+    queue_css_cancellation(ctx, hub, id, now, detach)?;
+    reset_pending_task(ctx,hub,id)?;
+    retire_css_record_state(hub, id);
+    Ok(())
+}
+
+// Snapshot reconciliation must retire old CSS identities before publishing any
+// Promise hook. Ready-promise settlement follows after the full snapshot commit.
+fn retire_css_snapshot_record(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, now: f64) -> OpResult<()> {
+    queue_css_cancellation(ctx, hub, id, now, true)?;
+    retire_css_record_state(hub, id);
+    Ok(())
+}
+
+fn retire_css_record_state(hub: &Rc<RefCell<AnimationHub>>, id: u32) {
+    if let Some(record) = hub.borrow_mut().records.get_mut(&id) {
+        record.start_resolved = false;
+        record.hold_time_ms = None;
+        record.paused_at_ms = None;
+        record.retired = record.cancelled;
+        record.cancelled = true;
+    }
+}
+
+fn css_tree_order<'a>(owners: impl Iterator<Item = &'a Rc<DomRealm>>) -> OpResult<HashMap<usize, HashMap<NodeId, usize>>> {
+    let mut result = HashMap::new();
+    for owner in owners {
+        let key = Rc::as_ptr(owner) as usize;
+        if result.contains_key(&key) { continue; }
+        let session = owner.session.borrow();
+        let document = session.document();
+        let root = document.root();
+        let mut order = HashMap::new();
+        order.insert(root, 0usize);
+        let mut node = super::next_descendant(document, root, root).map_err(dom_error)?;
+        while let Some(id) = node {
+            order.insert(id, order.len());
+            node = super::next_descendant(document, root, id).map_err(dom_error)?;
+        }
+        result.insert(key, order);
+    }
+    Ok(result)
+}
+
+fn dispatch_css_cancellations(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>) -> OpResult<()> {
+    let mut snapshots = std::mem::take(&mut hub.borrow_mut().css_cancellations)
+        .into_iter().filter_map(|entry| entry.upgrade()).collect::<Vec<_>>();
+    let tree_order = css_tree_order(snapshots.iter().map(|entry| &entry.owner))?;
+    snapshots.sort_by_key(|entry| {
+        let realm = Rc::as_ptr(&entry.owner) as usize;
+        (realm, tree_order[&realm].get(&entry.node).copied().unwrap_or(usize::MAX), entry.order)
+    });
+    for snapshot in &snapshots { snapshot.dispatched.set(true); }
+    let mut first_error = None;
+    for snapshot in snapshots {
+        if let Err(error) = dispatch_css_event(ctx, hub, snapshot.id,
+            animation::CssEvent { kind: "animationcancel", elapsed_ms: snapshot.elapsed_ms },
+            &snapshot.owner, snapshot.node, &snapshot.name) {
+            if first_error.is_none() { first_error = Some(error); }
+            else {
+                let error = error.to_value(ctx);
+                DomRealm::report_exception(ctx, error);
+            }
+        }
+    }
+    match first_error { Some(error) => Err(error), None => Ok(()) }
+}
+
+fn dispatch_css_event(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32,
+    sample: animation::CssEvent, owner: &Rc<DomRealm>, node: NodeId, name: &str) -> OpResult<()> {
+    let (owner, node) = owner.resolve_adopted_node(node);
+    let dispatch = |ctx: &mut Ctx| -> OpResult<()> {
+        let animation = existing_wrapper(ctx, hub, id)?;
+        let init = ctx.new_object_with_proto(&Value::Null);
+        ctx.member_set(&init, "bubbles", Value::Bool(true)).map_err(OpError::thrown)?;
+        let event = DomAnimationEvent { base: DomEvent::new(ctx, sample.kind, Some(init))?,
+            animation_name: name.to_owned(), elapsed_time: sample.elapsed_ms / 1000.0,
+            pseudo_element: String::new(), animation };
+        let value = ctx.new_instance(event);
+        let event = JsObject::from_value(value).ok_or_else(|| OpError::type_error("invalid AnimationEvent"))?;
+        let target = owner.wrap(ctx, node);
+        crate::events::dispatch_user_agent_event(ctx, This(target), event)?;
+        Ok(())
+    };
+    match owner.child_realm_handle() {
+        Ok(Some(realm)) => ctx.with_host_realm(&realm, dispatch)
+            .map_err(|error| OpError::new("Error", error.to_string()))??,
+        Ok(None) => dispatch(ctx)?,
+        // Retired browsing-context generations no longer receive user-agent events.
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+fn css_sample(record: &Record, now: f64) -> animation::CssEventSample {
+    if record.cancelled { return animation::CssEventSample::IDLE; }
+    let sampled=sample_record(record,now);
+    if sampled.state==PlaybackState::Idle {return animation::CssEventSample::IDLE;}
+    let time=sampled.current_time_ms;
+    if record.effect_id.is_none() {
+        return animation::CssEventSample {
+            phase: Some(if time < 0.0 { animation::EffectPhase::Before } else { animation::EffectPhase::After }),
+            iteration: None,
+        };
+    }
+    animation::css_event_sample(record.timing, time, record.playback_rate)
+}
+
+fn render_revision(realm: &DomRealm) -> (u64, u64) {
+    let session = realm.session.borrow();
+    (session.document().version(), session.paint_revision())
+}
+
+fn dispatch_css_events(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, now: f64) -> OpResult<()> {
+    struct Queued {
+        id: u32, event: animation::CssEvent, owner: Rc<DomRealm>, node: NodeId,
+        order: usize, cancelled: bool, scheduled: f64, sequence: usize,
+    }
+    let mut queue = Vec::new();
+    let mut retention = DispatchRetention { hub: hub.clone(), ids: Vec::new() };
+    {
+        let mut state = hub.borrow_mut();
+        let AnimationHub { records, css_events, .. } = &mut *state;
+        for record in records.values().filter(|record| record.css_name.is_some()) {
+            if record.pending_task.is_some() {continue;}
+            let Some(event) = css_events.get_mut(&record.id) else { continue; };
+            let current = css_sample(record, now);
+            let owner = event.owner.upgrade();
+            if event.associated {
+                // Backward seeks with a positive playback rate cannot project
+                // both boundaries independently: that would reverse the
+                // specified start/end transition batch. Keep its anchor and
+                // sequence together while other events retain actual times.
+                let backwards_pair = event.previous.phase == Some(animation::EffectPhase::After)
+                    && current.phase == Some(animation::EffectPhase::Before);
+                let mut batch_time = None;
+                for (sequence, sample) in animation::css_events(record.timing, event.previous, current,
+                    0.0).into_iter().enumerate() {
+                    if let (Some(sample), Some(owner)) = (sample, owner.as_ref()) {
+                        let scheduled = if record.paused_at_ms.is_some() || record.playback_rate == 0.0
+                            || sample.kind == "animationcancel" { now } else {
+                            record.start_ms + (record.timing.delay_ms + sample.elapsed_ms - record.start_time_ms)
+                                / record.playback_rate
+                        };
+                        let scheduled = if backwards_pair {
+                            *batch_time.get_or_insert(scheduled)
+                        } else { scheduled };
+                        queue.push(Queued { id: record.id, event: sample, owner: owner.clone(), node: event.node,
+                            order: event.order, cancelled: sample.kind == "animationcancel",
+                            scheduled, sequence });
+                    }
+                }
+            }
+            event.previous = current;
+            event.sampled = true;
+        }
+        for queued in &queue {
+            if retention.ids.last() != Some(&queued.id) {
+                *state.dispatching_css.entry(queued.id).or_default() += 1;
+                retention.ids.push(queued.id);
+            }
+        }
+        state.rendered_revisions.retain(|_, (realm, _, _)| realm.strong_count() != 0);
+        let mut owners = state.records.values().filter_map(|record| record.realm.upgrade()).collect::<Vec<_>>();
+        owners.extend(state.css_events.values().filter_map(|event| event.owner.upgrade()));
+        owners.extend(state.default_realm.upgrade());
+        for owner in owners {
+            let (version, paint) = render_revision(&owner);
+            state.rendered_revisions.insert(Rc::as_ptr(&owner) as usize, (Rc::downgrade(&owner), version, paint));
+        }
+    }
+    let tree_order = css_tree_order(queue.iter().map(|queued| &queued.owner))?;
+    queue.sort_by(|a, b| {
+        a.scheduled.total_cmp(&b.scheduled)
+            .then_with(|| {
+                let ak = Rc::as_ptr(&a.owner) as usize;
+                let bk = Rc::as_ptr(&b.owner) as usize;
+                ak.cmp(&bk).then_with(|| tree_order[&ak].get(&a.node).unwrap_or(&usize::MAX)
+                    .cmp(tree_order[&bk].get(&b.node).unwrap_or(&usize::MAX)))
+            })
+            .then_with(|| (!a.cancelled).cmp(&(!b.cancelled)))
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.id.cmp(&b.id)).then_with(|| a.sequence.cmp(&b.sequence))
+    });
+    for queued in queue {
+        let name = hub.borrow().records.get(&queued.id).and_then(|record| record.css_name.clone())
+            .unwrap_or_default();
+        dispatch_css_event(ctx, hub, queued.id, queued.event, &queued.owner, queued.node, &name)?;
+    }
+    Ok(())
+}
+
+#[lumen_bind::class(name = "AnimationEvent", extends = DomEvent, hint(js(webidl)))]
+pub struct DomAnimationEvent {
+    base: DomEvent,
+    animation_name: String,
+    elapsed_time: f64,
+    pseudo_element: String,
+    animation: Value,
+}
+
+#[lumen_bind::methods]
+impl DomAnimationEvent {
+    #[constructor(coerce)]
+    fn new(ctx: &mut Ctx, kind: &str, init: Option<Value>) -> OpResult<Self> {
+        let base = DomEvent::new(ctx, kind, init.clone())?;
+        let animation_name = crate::ui_events::dictionary_string(ctx, &init, "animationName", "", false)?;
+        let elapsed_time = match crate::ui_events::dictionary_member(ctx, &init, "elapsedTime")? {
+            Some(value) => ctx.coerce_number(&value).map_err(OpError::thrown)?, None => 0.0,
+        };
+        if !elapsed_time.is_finite() {
+            return Err(OpError::type_error("AnimationEvent.elapsedTime must be finite"));
+        }
+        let pseudo_element = crate::ui_events::dictionary_string(ctx, &init, "pseudoElement", "", false)?;
+        let animation = crate::ui_events::dictionary_member(ctx, &init, "animation")?.unwrap_or(Value::Null);
+        if !matches!(animation, Value::Null) {
+            ctx.with_instance::<DomCssAnimation, _>(&animation, |_| ())
+                .map_err(|_| OpError::type_error("animation must be a CSSAnimation"))?;
+        }
+        Ok(Self { base, animation_name, elapsed_time, pseudo_element, animation })
+    }
+    #[getter(name = "animationName")]
+    fn animation_name(&self) -> String { self.animation_name.clone() }
+    #[getter(name = "elapsedTime")]
+    fn elapsed_time(&self) -> f64 { self.elapsed_time }
+    #[getter(name = "pseudoElement")]
+    fn pseudo_element(&self) -> String { self.pseudo_element.clone() }
+    #[getter]
+    fn animation(&self) -> Value { self.animation.clone() }
 }
 
 pub fn pending(ctx: &mut Ctx) -> bool {
     RealmServices::<RefCell<AnimationHub>>::current(ctx).is_some_and(|hub| {
-        let now = lumen_host::perf::now_ms();
+        let now = hub_time(&hub);
         let state = hub.borrow();
+        let dirty = |realm: &Rc<DomRealm>| {
+            let (version, paint) = render_revision(realm);
+            state.rendered_revisions.get(&(Rc::as_ptr(realm) as usize))
+                .is_none_or(|(_, previous_version, previous_paint)| *previous_version != version || *previous_paint != paint)
+        };
+        if state.default_realm.upgrade().is_some_and(|realm| dirty(&realm))
+            || state.records.values().filter_map(|record| record.realm.upgrade()).any(|realm| dirty(&realm)) {
+            return true;
+        }
         state.records.values().any(|record| {
+            if record.pending_task.is_some() {return record_time(record).is_some();}
+            if state.css_events.get(&record.id).is_some_and(|event| {
+                event.associated && (!event.sampled
+                    || event.previous != css_sample(record, now))
+            }) { return true; }
             if record.cancelled || record.paused_at_ms.is_some() || record.playback_rate == 0.0 {
                 return false;
             }
@@ -1777,6 +2714,20 @@ pub fn pending(ctx: &mut Ctx) -> bool {
 pub struct DomAnimation {
     id: u32,
     base: DomEventTarget,
+}
+
+#[lumen_bind::class(name = "CSSAnimation", extends = DomAnimation, hint(js(webidl)))]
+pub struct DomCssAnimation {
+    base: DomAnimation,
+}
+
+#[lumen_bind::methods]
+impl DomCssAnimation {
+    #[getter]
+    fn animation_name(&self, ctx: &mut Ctx) -> OpResult<Value> {
+        let (_, record) = record_state(ctx, self.base.id)?;
+        Ok(record.css_name.map(|name| Value::Str(name.into())).unwrap_or(Value::Null))
+    }
 }
 
 fn record_state(ctx: &mut Ctx, id: u32) -> OpResult<(Rc<RefCell<AnimationHub>>, Record)> {
@@ -1827,9 +2778,14 @@ impl DomAnimation {
         ctx: &mut Ctx,
         this: This<Value>,
         effect: Option<EffectArgument>,
-        timeline: Option<TimelineArgument>,
+        #[default(TimelineChoice::Default)] timeline: TimelineChoice,
     ) -> OpResult<Self> {
         let hub = hub(ctx)?;
+        let null_timeline = matches!(timeline, TimelineChoice::Null);
+        let timeline = match timeline {
+            TimelineChoice::Timeline(timeline) => Some(timeline),
+            _ => None,
+        };
         let (id, event_target) = if let Some(effect) = effect {
             if let Some(weak) = ctx.weak_value(&effect.value) {
                 hub.borrow_mut().effects.insert(effect.native.id, weak);
@@ -1927,21 +2883,23 @@ impl DomAnimation {
                 let mut state = hub.borrow_mut();
                 state.next_id = state.next_id.wrapping_add(1).max(1);
                 let id = state.next_id;
-                let now = lumen_host::perf::now_ms();
+                let now = document_time(&realm).unwrap_or(0.0);
                 state.records.insert(
                     id,
                     Record {
                         id,
                         public_id: String::new(),
                         effect_id: None,
+                        css_name: None,
+                        css_order: None,
                         realm: Rc::downgrade(&realm),
                         timeline_realm: Rc::downgrade(&realm),
                         timeline_id,
                         timeline_origin_ms: timeline_origin,
                         timeline_value,
                         node: None,
-                        keyframes: Vec::new(),
-                        underlying: HashMap::new(),
+                        keyframes: Vec::new().into(),
+                        underlying: Rc::new(HashMap::new()),
                         timing: Timing::default(),
                         easing: "linear".into(),
                         composite: CompositeMode::Replace,
@@ -1950,22 +2908,32 @@ impl DomAnimation {
                         hold_time_ms: None,
                         playback_rate: 1.0,
                         paused_at_ms: None,
+                        pending_task: None,
+                        pending_task_revision: 0,
+                        start_resolved: false,
                         cancelled: true,
                         finish_event_fired: false,
+                        retired: false,
                         event_target: DomEventTarget::independent(&realm),
                     },
                 );
                 id
             };
             let base = hub.borrow().records[&id].event_target.clone();
-            hub.borrow_mut()
-                .finished
-                .insert(id, new_finished_promise(ctx));
-            hub.borrow_mut().ready.insert(id, new_ready_promise(ctx));
+            mark_ready_pending(ctx, &hub, id);
+            ensure_pending_finished(ctx, &hub, id);
             (id, base)
         };
         if let Some(weak) = ctx.weak_value(&this.0) {
             hub.borrow_mut().wrappers.insert(id, weak);
+        }
+        if null_timeline {
+            if let Some(record) = hub.borrow_mut().records.get_mut(&id) {
+                record.timeline_realm = Weak::new();
+                record.timeline_id = 0;
+                record.timeline_origin_ms = 0.0;
+                record.timeline_value = Value::Null;
+            }
         }
         hub.borrow_mut().ready.remove(&id);
         Ok(Self {
@@ -2004,7 +2972,7 @@ impl DomAnimation {
     fn set_effect(&self, ctx: &mut Ctx, effect: Option<EffectArgument>) -> OpResult<()> {
         let hub = hub(ctx)?;
         let previous = record_state(ctx, self.id)?.1;
-        let now = lumen_host::perf::now_ms();
+        let now = record_time(&previous).unwrap_or(0.0);
         let old_realm = previous.realm.upgrade();
         let new_effect = if let Some(effect) = &effect {
             if let Some(weak) = ctx.weak_value(&effect.value) {
@@ -2096,8 +3064,8 @@ impl DomAnimation {
                 ));
             }
         }
-        let now = lumen_host::perf::now_ms();
-        let current = sample_record(&record, now).current_time_ms;
+        let current = sample_record(&record, record_time(&record).unwrap_or(0.0)).current_time_ms;
+        let now = timeline_realm.as_ref().and_then(|realm| document_time(realm)).unwrap_or(0.0);
         let timeline_value =
             if let (Some(timeline), Some(realm)) = (timeline.as_ref(), timeline_realm.as_ref()) {
                 if let Some(weak) = ctx.weak_value(&timeline.value) {
@@ -2122,6 +3090,11 @@ impl DomAnimation {
                 .map_or(timeline_value, |timeline| timeline.value.clone());
             record.start_time_ms = current;
             record.start_ms = now;
+            if timeline.is_none() && !record.cancelled
+                && record.hold_time_ms.is_none() && record.start_resolved {
+                record.hold_time_ms = Some(current);
+                record.start_resolved = false;
+            }
         }
         if let Some(realm) = target_realm {
             apply_realm(&hub, &realm, now)?;
@@ -2131,6 +3104,7 @@ impl DomAnimation {
     #[getter(name = "ready")]
     fn ready(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<Value> {
         let hub = hub(ctx)?;
+        refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         if !hub.borrow().records.contains_key(&self.id) {
             return Err(OpError::new(
                 "InvalidStateError",
@@ -2140,17 +3114,14 @@ impl DomAnimation {
         if let Some(weak) = ctx.weak_value(&this.0) {
             hub.borrow_mut().wrappers.insert(self.id, weak);
         }
-        if !hub.borrow().ready.contains_key(&self.id) {
-            let promise = resolved_promise(ctx, this.0.clone());
-            hub.borrow_mut().ready.insert(
-                self.id,
-                ReadyPromise {
-                    promise,
-                    deferred: None,
-                },
-            );
+        if hub.borrow().ready.get(&self.id).and_then(|promise| promise.promise.upgrade()).is_none() {
+            if hub.borrow().records[&self.id].pending_task.is_some() {
+                return Ok(mark_ready_pending(ctx,&hub,self.id));
+            }
+            let promise = replace_resolved_ready(ctx, &hub, self.id, this.0.clone());
+            return Ok(promise);
         }
-        let promise = hub.borrow().ready[&self.id].promise.clone();
+        let promise = hub.borrow().ready[&self.id].promise.upgrade().expect("new or live ready promise");
         Ok(promise)
     }
     #[getter(name = "finished")]
@@ -2162,41 +3133,95 @@ impl DomAnimation {
                 "animation is no longer available",
             ));
         }
-        if !hub.borrow().finished.contains_key(&self.id) {
-            hub.borrow_mut()
-                .finished
-                .insert(self.id, new_finished_promise(ctx));
+        if hub.borrow().finished.get(&self.id).and_then(|promise| promise.promise.upgrade()).is_none() {
+            return Ok(replace_finished_promise(ctx, &hub, self.id).0);
         }
-        let promise = hub.borrow().finished[&self.id].promise.clone();
+        let promise = hub.borrow().finished[&self.id].promise.upgrade().expect("new or live finished promise");
         Ok(promise)
+    }
+    #[getter(name = "pending")]
+    fn is_pending(&self, ctx: &mut Ctx) -> OpResult<bool> {
+        let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
+        let pending=hub.borrow().records.get(&self.id).is_some_and(|record|record.pending_task.is_some());
+        Ok(pending)
+    }
+    #[getter(name = "startTime")]
+    fn start_time(&self, ctx: &mut Ctx) -> OpResult<Option<f64>> {
+        let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
+        let state=hub.borrow();
+        let record=state.records.get(&self.id)
+            .ok_or_else(||OpError::new("InvalidStateError","animation is no longer available"))?;
+        Ok(record.start_resolved.then(||record.start_ms-record.timeline_origin_ms
+            -if record.playback_rate==0.0 {0.0}else{record.start_time_ms/record.playback_rate}))
+    }
+    #[setter(name = "startTime")]
+    fn set_start_time(&self, ctx: &mut Ctx, value: Option<f64>) -> OpResult<()> {
+        if value.is_some_and(|value|!value.is_finite()){return Err(OpError::type_error("startTime must be finite"));}
+        let hub=hub(ctx)?;
+        let now=hub.borrow().records.get(&self.id)
+            .and_then(record_time).unwrap_or(0.0);
+        {
+            let mut state=hub.borrow_mut();let record=state.records.get_mut(&self.id).ok_or_else(||OpError::new("InvalidStateError","animation is no longer available"))?;
+            let current=(!record.cancelled).then(||sample_record(record,now).current_time_ms);
+            record.start_resolved=value.is_some();
+            if let Some(value)=value {
+                record.start_ms=value+record.timeline_origin_ms;record.start_time_ms=0.0;
+                if record.playback_rate!=0.0{record.hold_time_ms=None;}
+                record.cancelled=false;record.paused_at_ms=None;
+            } else {
+                record.hold_time_ms=current;record.paused_at_ms=current.map(|_|now);
+            }
+            record.pending_task=None;
+        }
+        resolve_ready(ctx,&hub,self.id)?;
+        let realm=hub.borrow().records.get(&self.id).and_then(|record|record.realm.upgrade());
+        if let Some(realm)=realm {apply_realm(&hub,&realm,now)?;}
+        settle_finished(ctx,&hub,now)
     }
     #[getter(name = "currentTime")]
     fn current_time(&self, ctx: &mut Ctx) -> OpResult<Option<f64>> {
-        let (_, record) = record_state(ctx, self.id)?;
+        let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
+        let state = hub.borrow();
+        let record = state.records.get(&self.id)
+            .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
         if record.cancelled {
             return Ok(None);
         }
-        let sample = sample_record(&record, lumen_host::perf::now_ms());
+        let now = record_time(&record);
+        if now.is_none() && record.hold_time_ms.is_none() {
+            return Ok(None);
+        }
+        let sample = sample_record(record, now.unwrap_or(0.0));
         Ok((sample.state != PlaybackState::Idle).then_some(sample.current_time_ms))
     }
     #[setter(name = "currentTime")]
     fn set_current_time(&self, ctx: &mut Ctx, value: Option<f64>) -> OpResult<()> {
         let hub = hub(ctx)?;
-        let now = lumen_host::perf::now_ms();
-        let realm = {
+        let now = record_time(&record_state(ctx, self.id)?.1).unwrap_or(0.0);
+        let (realm, was_cancelled, completed_pause) = {
             let mut hub_mut = hub.borrow_mut();
             let record = hub_mut.records.get_mut(&self.id).ok_or_else(|| {
                 OpError::new("InvalidStateError", "animation is no longer available")
             })?;
+            let was_cancelled = record.cancelled;
+            if value.is_none() {
+                if !was_cancelled && (record.hold_time_ms.is_some() || (record.start_resolved && record_time(record).is_some())) {
+                    return Err(OpError::type_error("resolved currentTime cannot become null"));
+                }
+                return Ok(());
+            }
+            let completed_pause=record.pending_task==Some(PlaybackState::Paused);
             if let Some(value) = value {
                 if !value.is_finite() {
                     return Err(OpError::new("TypeError", "currentTime must be finite"));
                 }
                 record.start_time_ms = value;
                 record.start_ms = now;
-                if record.paused_at_ms.is_some() || record.timeline_realm.upgrade().is_none() {
+                if completed_pause || !record.start_resolved || record.playback_rate==0.0
+                    || record.paused_at_ms.is_some() || record_time(record).is_none() {
                     record.hold_time_ms = Some(value);
                 }
+                if completed_pause {record.pending_task=None;record.paused_at_ms=Some(now);record.start_resolved=false;}
                 record.cancelled = false;
                 record.finish_event_fired = false;
             } else {
@@ -2204,16 +3229,16 @@ impl DomAnimation {
                 record.hold_time_ms = None;
                 record.paused_at_ms = None;
             }
-            record.realm.upgrade()
+            (record.realm.upgrade(), was_cancelled, completed_pause)
         };
         if let Some(realm) = realm {
             apply_realm(&hub, &realm, now)?;
         }
-        refresh_ready(ctx, &hub, self.id)?;
+        if completed_pause {resolve_ready(ctx,&hub,self.id)?;}
         if value.is_some() {
             ensure_pending_finished(ctx, &hub, self.id);
             settle_finished(ctx, &hub, now)?;
-        } else {
+        } else if !was_cancelled {
             reject_finished(ctx, &hub, self.id);
         }
         Ok(())
@@ -2228,7 +3253,7 @@ impl DomAnimation {
             return Err(OpError::new("TypeError", "playbackRate must be finite"));
         }
         let hub = hub(ctx)?;
-        let now = lumen_host::perf::now_ms();
+        let now = record_time(&record_state(ctx, self.id)?.1).unwrap_or(0.0);
         let realm = {
             let mut state = hub.borrow_mut();
             let record = state.records.get_mut(&self.id).ok_or_else(|| {
@@ -2238,25 +3263,33 @@ impl DomAnimation {
             record.playback_rate = value;
             record.start_time_ms = current;
             record.start_ms = now;
-            if record.paused_at_ms.is_some() {
+            if record.paused_at_ms.is_some() || !record.start_resolved || value==0.0 {
                 record.hold_time_ms = Some(current);
+            } else {
+                record.hold_time_ms = None;
             }
             record.realm.upgrade()
         };
         if let Some(realm) = realm {
             apply_realm(&hub, &realm, now)?;
         }
-        refresh_ready(ctx, &hub, self.id)?;
         settle_finished(ctx, &hub, now)
     }
     #[getter(name = "playState")]
     fn play_state(&self, ctx: &mut Ctx) -> OpResult<String> {
+        let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         let (_, record) = record_state(ctx, self.id)?;
         if record.cancelled {
             return Ok("idle".into());
         }
+        // A resolved start time remains running when its document timeline
+        // becomes inactive; an unresolved current time alone is not idle.
+        if record.pending_task.is_none() && record.start_resolved
+            && record.hold_time_ms.is_none() && record_time(&record).is_none() {
+            return Ok("running".into());
+        }
         Ok(
-            match sample_record(&record, lumen_host::perf::now_ms()).state {
+            match record.pending_task.unwrap_or_else(||sample_record(&record, 0.0).state) {
                 PlaybackState::Idle => "idle",
                 PlaybackState::Running => "running",
                 PlaybackState::Paused => "paused",
@@ -2266,59 +3299,33 @@ impl DomAnimation {
         )
     }
     fn play(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<()> {
-        let hub = hub(ctx)?;
-        if let Some(weak) = ctx.weak_value(&this.0) {
-            hub.borrow_mut().wrappers.insert(self.id, weak);
+        let hub=hub(ctx)?;
+        if let Some(weak)=ctx.weak_value(&this.0){hub.borrow_mut().wrappers.insert(self.id,weak);}
+        let (_,record)=record_state(ctx,self.id)?;
+        if record.cancelled || sample_record(&record,0.0).state==PlaybackState::Finished {
+            ensure_pending_finished(ctx,&hub,self.id);
         }
-        let (_, record) = record_state(ctx, self.id)?;
-        let restart = record.cancelled
-            || sample_record(&record, lumen_host::perf::now_ms()).state == PlaybackState::Finished;
-        if restart {
-            ensure_pending_finished(ctx, &hub, self.id);
-        }
-        mutate(self.id, ctx, |record, now| {
-            if let Some(paused) = record.paused_at_ms.take() {
-                record.start_time_ms = record.hold_time_ms.take().unwrap_or_else(|| {
-                    (paused - record.start_ms) * record.playback_rate + record.start_time_ms
-                });
-                record.start_ms = now;
-                record.paused_at_ms = None;
-            } else if record.cancelled
-                || sample_record(record, now).state == PlaybackState::Finished
-            {
-                record.start_time_ms = if record.playback_rate < 0.0 {
-                    record.timing.end_time()
-                } else {
-                    0.0
-                };
-                record.start_ms = now;
-            }
-            record.hold_time_ms = None;
-            record.cancelled = false;
-            record.finish_event_fired = false;
-        })?;
-        mark_ready_pending(ctx, &hub, self.id);
-        Ok(())
+        request_pending_task(ctx,&hub,self.id,PlaybackState::Running,true)
     }
     fn pause(&self, ctx: &mut Ctx) -> OpResult<()> {
-        mutate(self.id, ctx, |record, now| {
-            if record.paused_at_ms.is_none() {
-                record.hold_time_ms = Some(sample_record(record, now).current_time_ms);
-                record.paused_at_ms = Some(now);
-            }
-        })
+        let hub=hub(ctx)?;
+        request_pending_task(ctx,&hub,self.id,PlaybackState::Paused,false)
     }
     fn cancel(&self, ctx: &mut Ctx, this: This<Value>) -> OpResult<()> {
         let (_, prior) = record_state(ctx, self.id)?;
         let should_fire = !prior.cancelled;
+        let state = hub(ctx)?;
+        queue_css_cancellation(ctx, &state, self.id, record_time(&prior).unwrap_or(0.0), false)?;
+        reset_pending_task(ctx,&state,self.id)?;
         mutate(self.id, ctx, |record, _| {
             record.cancelled = true;
+            record.start_resolved = false;
             record.paused_at_ms = None;
             record.hold_time_ms = None;
         })?;
         let hub = hub(ctx)?;
-        reject_finished(ctx, &hub, self.id);
         if should_fire {
+            reject_finished(ctx, &hub, self.id);
             let event = DomEvent::new(ctx, "cancel", None)?;
             let event = ctx.new_instance(event);
             let event = JsObject::from_value(event)
@@ -2340,6 +3347,9 @@ impl DomAnimation {
             let hub = hub(ctx)?;
             ensure_pending_finished(ctx, &hub, self.id);
         }
+        let hub=hub(ctx)?;
+        if let Some(record)=hub.borrow_mut().records.get_mut(&self.id){record.pending_task=None;record.start_resolved=true;}
+        resolve_ready(ctx,&hub,self.id)?;
         mutate(self.id, ctx, |record, now| {
             record.start_time_ms = if record.playback_rate < 0.0 {
                 0.0
@@ -2353,31 +3363,19 @@ impl DomAnimation {
         })
     }
     fn reverse(&self, ctx: &mut Ctx) -> OpResult<()> {
-        let (_, record) = record_state(ctx, self.id)?;
-        let restart = record.cancelled
-            || sample_record(&record, lumen_host::perf::now_ms()).state == PlaybackState::Finished;
-        if restart {
-            let hub = hub(ctx)?;
-            ensure_pending_finished(ctx, &hub, self.id);
+        let hub=hub(ctx)?;let (_,record)=record_state(ctx,self.id)?;
+        if record_time(&record).is_none(){return Err(OpError::new("InvalidStateError","animation timeline is inactive"));}
+        if record.cancelled || sample_record(&record,0.0).state==PlaybackState::Finished {
+            ensure_pending_finished(ctx,&hub,self.id);
         }
-        mutate(self.id, ctx, |record, now| {
-            let current_time = if record.cancelled {
-                if record.playback_rate > 0.0 {
-                    record.timing.end_time()
-                } else {
-                    0.0
-                }
-            } else {
-                sample_record(record, now).current_time_ms
-            };
-            record.playback_rate = -record.playback_rate;
-            record.start_time_ms = record.hold_time_ms.take().unwrap_or(current_time);
-            record.start_ms = now;
-            record.paused_at_ms = None;
-            record.cancelled = false;
-            record.finish_event_fired = false;
-        })
+        {
+            let mut state=hub.borrow_mut();let record=state.records.get_mut(&self.id).unwrap();
+            let current=(!record.cancelled).then(||sample_record(record,0.0).current_time_ms);
+            record.playback_rate=-record.playback_rate;record.hold_time_ms=current;record.start_resolved=false;
+        }
+        request_pending_task(ctx,&hub,self.id,PlaybackState::Running,true)
     }
+
 }
 
 #[lumen_bind::class(name = "KeyframeEffect", hint(js(webidl)))]
@@ -2455,7 +3453,7 @@ impl DomKeyframeEffect {
                 ));
             }
         }
-        let now = lumen_host::perf::now_ms();
+        let now = hub_time(&hub);
         let updated = {
             let mut state = hub.borrow_mut();
             let effect = state.effect_records.get_mut(&self.id).ok_or_else(|| {
@@ -2464,9 +3462,11 @@ impl DomKeyframeEffect {
             effect.realm = Rc::downgrade(&realm);
             effect.node = node;
             if let Some(node) = node {
-                resolve_underlying(&realm, node, &mut effect.keyframes)?;
+                let mut frames = effect.keyframes.to_vec();
+                resolve_underlying(&realm, node, &mut frames)?;
+                effect.keyframes = frames.into();
             }
-            effect.underlying = capture_underlying(&realm, node, &effect.keyframes)?;
+            effect.underlying = Rc::new(capture_underlying(&realm, node, &effect.keyframes)?);
             effect.clone()
         };
         sync_effect_animation(&hub, &updated);
@@ -2507,7 +3507,7 @@ impl DomKeyframeEffect {
             .upgrade()
             .ok_or_else(|| OpError::new("InvalidStateError", "effect document was destroyed"))?;
         sync_effect_animation(&hub, &effect);
-        apply_realm(&hub, &realm, lumen_host::perf::now_ms())
+        apply_realm(&hub, &realm, hub_time(&hub))
     }
     #[getter]
     fn pseudo_element(&self) -> Option<String> {
@@ -2535,7 +3535,7 @@ impl DomKeyframeEffect {
             .records
             .values()
             .find(|record| record.effect_id == Some(self.id) && !record.cancelled)
-            .map(|record| sample_record(record, lumen_host::perf::now_ms()));
+            .map(|record| sample_record(record,0.0));
         let local_time = sampled
             .filter(|sample| sample.state != PlaybackState::Idle)
             .map(|sample| sample.current_time_ms);
@@ -2570,14 +3570,14 @@ impl DomKeyframeEffect {
             resolve_underlying(&realm, node, &mut frames)?;
         }
         let underlying = capture_underlying(&realm, effect.node, &frames)?;
-        let now = lumen_host::perf::now_ms();
+        let now = hub_time(&hub);
         let updated = {
             let mut state = hub.borrow_mut();
             let effect = state.effect_records.get_mut(&self.id).ok_or_else(|| {
                 OpError::new("InvalidStateError", "animation is no longer available")
             })?;
-            effect.keyframes = frames;
-            effect.underlying = underlying;
+            effect.keyframes = frames.into();
+            effect.underlying = Rc::new(underlying);
             effect.clone()
         };
         let attached = sync_effect_animation(&hub, &updated);
@@ -2625,14 +3625,14 @@ impl DomKeyframeEffect {
             }
         }
         let (timing, easing, duration_auto, fill_auto) = parse_options(ctx, Some(&merged))?;
-        let now = lumen_host::perf::now_ms();
+        let now = hub_time(&hub);
         let updated = {
             let mut state = hub.borrow_mut();
             let effect = state.effect_records.get_mut(&self.id).ok_or_else(|| {
                 OpError::new("InvalidStateError", "animation is no longer available")
             })?;
             effect.timing = timing;
-            effect.easing = easing;
+            effect.easing = easing.into();
             effect.duration_auto = duration_auto;
             effect.fill_auto = fill_auto;
             effect.clone()
@@ -2698,7 +3698,8 @@ impl DomDocumentTimeline {
     fn current_time(&self) -> Option<f64> {
         self.realm
             .upgrade()
-            .map(|_| lumen_host::perf::now_ms() - self.origin_time_ms)
+            .and_then(|realm| document_time(&realm))
+            .map(|time| time - self.origin_time_ms)
     }
     #[getter(name = "duration")]
     fn duration(&self) -> Option<f64> {
@@ -2712,14 +3713,14 @@ impl DomDocumentTimeline {
 
 fn mutate(id: u32, ctx: &mut Ctx, change: impl FnOnce(&mut Record, f64)) -> OpResult<()> {
     let hub = hub(ctx)?;
-    let now = lumen_host::perf::now_ms();
+    let now = hub_time(&hub);
     let realm = {
         let mut state = hub.borrow_mut();
         let record = state
             .records
             .get_mut(&id)
             .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
-        change(record, now);
+        change(record, record_time(record).unwrap_or(0.0));
         record.realm.upgrade()
     };
     if let Some(realm) = realm {
@@ -2732,6 +3733,107 @@ fn mutate(id: u32, ctx: &mut Ctx, change: impl FnOnce(&mut Record, f64)) -> OpRe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paint_snapshot_retains_immutable_payload_across_reentrant_layout_flush() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(),"<body style='margin:0'><div id='target' style='width:100px;height:20px;transform-origin:0 0'></div></body>",64).unwrap();
+        let font = Rc::new(lumen_html_text::FontFace::new(std::sync::Arc::from(
+            lumen_html_text::DEFAULT_FONT_BYTES)).unwrap());
+        let setup_font = font.clone();
+        realm.set_layout_flusher(Rc::new(move |session| session.display_list(300,100,setup_font.as_ref())
+            .map(|_| ()).map_err(|error| format!("{error:?}"))));
+        eval_ok(&mut engine,"var sampled=document.getElementById('target').animate([{width:'100px',transform:'translateX(100%)'},{width:'200px',transform:'matrix(1,0,0,1,0,0)'}],{duration:100,fill:'both'});sampled.pause();sampled.currentTime=50;");
+        let state = hub(engine.ctx()).unwrap();
+        let id = *state.borrow().records.keys().next().unwrap();
+        let old_frames = state.borrow().records[&id].keyframes.clone();
+        let callback_state = state.clone();
+        let replaced = Rc::new(Cell::new(false));
+        let callback_replaced = replaced.clone();
+        let layout_font = font.clone();
+        realm.set_layout_flusher(Rc::new(move |session| {
+            if !callback_replaced.replace(true) {
+                let mut state = callback_state.borrow_mut();
+                let record = state.records.get_mut(&id).unwrap();
+                assert!(Rc::strong_count(&record.keyframes) >= 3);
+                let mut frames = record.keyframes.to_vec();
+                for frame in &mut frames {
+                    for (property,value) in &mut frame.declarations {
+                        if property == "width" { *value = "300px".into(); }
+                        if property == "transform" && value.contains("100%") {
+                            *value = "translateX(200%)".into();
+                        }
+                    }
+                }
+                record.keyframes = frames.into();
+                let payload = record.keyframes.clone();
+                let effect_id = record.effect_id.unwrap();
+                state.effect_records.get_mut(&effect_id).unwrap().keyframes = payload;
+            }
+            session.display_list(300,100,layout_font.as_ref()).map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        let geometry = |width: f32, translation: f32| realm.with_session(|session| {
+            session.display_list(300,100,font.as_ref()).unwrap();
+            let node = selector::query_selector(session.document(),session.document().root(),"#target").unwrap().unwrap();
+            let rect = session.layout_rect(node).unwrap();
+            let matrix = session.computed_style(node).unwrap().transform_matrix(rect).unwrap();
+            assert!((rect.width-width).abs() < 0.001);
+            assert!((matrix.e-translation).abs() < 0.001);
+        });
+        let now = realm.timeline_sample.get();
+        apply_realm(&state,&realm,now).unwrap();
+        assert!(replaced.get());
+        geometry(150.0,75.0);
+        assert_eq!(old_frames[0].declarations[0].1,"100px");
+        assert!(!Rc::ptr_eq(&old_frames,&state.borrow().records[&id].keyframes));
+        engine.ctx().collect_garbage();
+        assert!(matches!(eval_ok(&mut engine,
+            "sampled.effect.getKeyframes().every(frame=>frame.width==='300px')"),Value::Bool(true)));
+        apply_realm(&state,&realm,now).unwrap();
+        geometry(300.0,300.0);
+    }
+
+    #[test]
+    fn paint_snapshot_steady_sampling_measurement() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(), "<body></body>", 64).unwrap();
+        let font = Rc::new(lumen_html_text::FontFace::new(
+            Arc::from(lumen_html_text::DEFAULT_FONT_BYTES)).unwrap());
+        realm.set_layout_flusher(Rc::new(move |session| {
+            session.display_list(300,150,font.as_ref()).map(|_| ())
+                .map_err(|error| format!("{error:?}"))
+        }));
+        eval_ok(&mut engine, r#"
+            globalThis.sampledAnimations = [];
+            for (let index = 0; index < 4; index++) {
+                const target = document.createElement('div');
+                target.id = 'sample-' + index;
+                target.style.height = '20px';
+                document.body.appendChild(target);
+                const frames = [];
+                for (let frame = 0; frame < 128; frame++) {
+                    frames.push({offset:frame/127, width:frame+'px',
+                        opacity:frame/127, transform:'translateX('+frame+'%)'});
+                }
+                const animation = target.animate(frames,{duration:1000,fill:'both'});
+                animation.pause();
+                animation.currentTime = 500;
+                sampledAnimations.push(animation);
+            }
+        "#);
+        let state = hub(engine.ctx()).unwrap();
+        let now = realm.timeline_sample.get();
+        apply_realm(&state,&realm,now).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..64 { apply_realm(&state,&realm,now).unwrap(); }
+        let elapsed = started.elapsed();
+        eprintln!("paint steady sampling: 4 effects x128 mixed keyframes x64 samples: {} us",elapsed.as_micros());
+        assert!(matches!(eval_ok(&mut engine,r#"
+            sampledAnimations.every(animation => animation.currentTime === 500 &&
+                animation.effect.getKeyframes().length === 128 &&
+                getComputedStyle(animation.effect.target).width === '63.5px')
+        "#),Value::Bool(true)));
+    }
     use super::*;
     use lumen::Engine;
     use lumen_html::selector;
@@ -2745,9 +3847,165 @@ mod tests {
                     .coerce_string(&error)
                     .map(|message| message.to_string())
                     .unwrap_or_else(|_| "unknown JavaScript exception".into());
-                panic!("JavaScript threw: {message}");
+                panic!("JavaScript threw while evaluating `{source}`: {message}");
             }
         }
+    }
+
+    #[test]
+    fn nullable_keyframes_create_empty_effects_without_accepting_primitives() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        let result = eval_ok(&mut engine, r#"
+            const target = document.getElementById('target');
+            for (const frames of [null, undefined]) {
+                const effect = new KeyframeEffect(target, frames, 1000);
+                if (effect.getKeyframes().length !== 0) throw Error('constructor frames');
+                effect.setKeyframes([{opacity: 0}, {opacity: 1}]);
+                effect.setKeyframes(frames);
+                if (effect.getKeyframes().length !== 0) throw Error('replacement frames');
+                const animation = target.animate(frames, 1000);
+                if (animation.effect.getKeyframes().length !== 0 || !animation.pending)
+                    throw Error('empty effect must retain timing and pending play');
+                animation.cancel();
+            }
+            for (const frames of [true, 1, 'opacity']) {
+                let rejected = false;
+                try { new KeyframeEffect(target, frames, 1000); }
+                catch (error) { rejected = error instanceof TypeError; }
+                if (!rejected) throw Error('primitive accepted');
+            }
+            true
+        "#);
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn animation_promise_init_hook_can_inspect_animation_list() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(),
+            "<style>@keyframes a{}</style><div id='target'></div>", 64).unwrap();
+        let init = eval_ok(&mut engine,
+            "globalThis.hookRuns = 0; (() => { hookRuns++; document.getAnimations(); })");
+        engine.ctx().set_promise_hooks(Some([
+            init, Value::Undefined, Value::Undefined, Value::Undefined,
+        ]));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            eval_ok(&mut engine,
+                "document.getElementById('target').style.animation = 'a 100s'; document.getAnimations();");
+        }));
+        engine.ctx().set_promise_hooks(None);
+        assert!(outcome.is_ok(), "Promise init hook must not reenter a borrowed animation hub");
+    }
+
+    #[test]
+    fn animation_promise_hooks_observe_committed_identity_and_style_replacement() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(),
+            "<style>@keyframes a{} @keyframes b{}</style><div id='target'></div>", 64).unwrap();
+        let init = eval_ok(&mut engine, r#"
+            globalThis.observed = null;
+            globalThis.replaceStyle = false;
+            (() => {
+                const animations = document.getAnimations();
+                if (animations.length) {
+                    const animation = animations[0];
+                    observed = {animation, ready: animation.ready, finished: animation.finished};
+                    if (replaceStyle) {
+                        replaceStyle = false;
+                        document.getElementById('target').style.animation = 'b 100s';
+                        document.getAnimations();
+                    }
+                }
+            })
+        "#);
+        engine.ctx().set_promise_hooks(Some([
+            init, Value::Undefined, Value::Undefined, Value::Undefined,
+        ]));
+        eval_ok(&mut engine, r#"
+            document.getElementById('target').style.animation = 'a 100s';
+            let animation = document.getAnimations()[0];
+            if (observed.animation !== animation || observed.ready !== animation.ready ||
+                observed.finished !== animation.finished) throw Error('hook identity overwritten');
+            animation.cancel();
+            document.getElementById('target').style.animation = 'none';
+            document.getAnimations();
+            replaceStyle = true;
+            document.getElementById('target').style.animation = 'a 99s';
+            document.getAnimations();
+            const current = document.getAnimations();
+            if (current.length !== 1 || current[0].animationName !== 'b')
+                throw Error('outer snapshot overwrote hook style replacement');
+        "#);
+        engine.ctx().set_promise_hooks(None);
+    }
+
+    #[test]
+    fn animation_promise_init_hook_retains_unsampled_cancelled_siblings() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(),
+            "<style>@keyframes a{} @keyframes b{}</style><div id='target' style='animation:a 100s,b 100s'></div>", 64).unwrap();
+        let global = engine.ctx().global_object();
+        assert!(engine.ctx().install_module::<event_test_gc::Module>(&global).is_ok());
+        eval_ok(&mut engine, "document.getAnimations();");
+        engine.ctx().collect_garbage();
+        let init = eval_ok(&mut engine, "(() => { forceEventGC(); document.getAnimations(); })");
+        engine.ctx().set_promise_hooks(Some([init, Value::Undefined, Value::Undefined, Value::Undefined]));
+        eval_ok(&mut engine,
+            "document.getElementById('target').style.animation='none'; document.getAnimations();");
+        engine.ctx().set_promise_hooks(None);
+        let state = hub(engine.ctx()).unwrap();
+        assert!(state.borrow().dispatching_css.is_empty(), "publication leases release after hooks");
+        engine.ctx().collect_garbage();
+        collect_retired_css_animations(engine.ctx(), &state);
+        assert!(state.borrow().records.is_empty(), "unobserved retired siblings remain collectible");
+    }
+
+    #[test]
+    fn animation_finished_getter_keeps_promise_alive_when_init_hook_settles_it() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        eval_ok(&mut engine,
+            "globalThis.animation=document.getElementById('target').animate([],1); animation.finish();");
+        engine.ctx().collect_garbage();
+        let init = eval_ok(&mut engine, "(() => animation.finish())");
+        engine.ctx().set_promise_hooks(Some([init, Value::Undefined, Value::Undefined, Value::Undefined]));
+        let promise = eval_ok(&mut engine, "animation.finished");
+        engine.ctx().set_promise_hooks(None);
+        assert!(matches!(promise, Value::Obj(_)), "getter returns its actual promise after reentrant settlement");
+    }
+
+    #[test]
+    fn animation_ready_resolve_hook_defers_restarted_sibling_to_next_frame() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        eval_ok(&mut engine, r#"
+            const target = document.getElementById('target');
+            globalThis.first = target.animate([],1000);
+            globalThis.second = target.animate([],1000);
+            globalThis.firstReady = first.ready;
+            globalThis.armed = true;
+        "#);
+        let resolve = eval_ok(&mut engine, r#"
+            (promise => {
+                if (armed) {
+                    armed = false;
+                    globalThis.restarted = promise === firstReady ? second : first;
+                    restarted.cancel();
+                    restarted.play();
+                }
+            })
+        "#);
+        engine.ctx().set_promise_hooks(Some([Value::Undefined,Value::Undefined,Value::Undefined,resolve]));
+        let state = hub(engine.ctx()).unwrap();
+        let start = state.borrow().records.values().map(|record|record.start_ms).fold(0.0,f64::max);
+        advance(engine.ctx(), start).unwrap();
+        engine.ctx().set_promise_hooks(None);
+        assert!(matches!(eval_ok(&mut engine,"restarted.pending"),Value::Bool(true)),
+            "hook-created task must not consume a previous task's frame opportunity");
+        advance(engine.ctx(), start+20.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"restarted.pending"),Value::Bool(false)));
+        assert!(state.borrow().dispatching_css.is_empty());
     }
 
     #[test]
@@ -2849,6 +4107,8 @@ mod tests {
         );
         assert!(matches!(result, Value::Bool(true)));
 
+        // Resolve actual first-frame readiness before manipulating the test clock.
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
         let hub = hub(engine.ctx()).unwrap();
         let now = lumen_host::perf::now_ms();
         for record in hub.borrow_mut().records.values_mut() {
@@ -3167,7 +4427,7 @@ mod tests {
             try { target.animate([], {timeline:{}}); }
             catch (error) { rejected = error.name === 'TypeError'; }
             valid && selected.id === 'renamed' && detached.timeline === null &&
-                detached.currentTime === null && idle.id === '' && rejected
+                detached.currentTime === 0 && detached.pending && idle.id === '' && rejected
         "#,
         );
         assert!(matches!(result, Value::Bool(true)));
@@ -3317,6 +4577,692 @@ mod tests {
     }
 
     #[test]
+    fn retired_css_animation_records_are_bounded_and_observed_wrappers_survive() {
+        let mut engine = Engine::new();
+        let realm = crate::install(engine.ctx(),
+            "<style>@keyframes fade{from{opacity:0}to{opacity:1}}</style><div id='target'></div>",64).unwrap();
+        let state = hub(engine.ctx()).unwrap();
+        for _ in 0..128 {
+            eval_ok(&mut engine,"document.getElementById('target').style.animation='100s fade'");
+            advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+            assert_eq!(state.borrow().records.len(),1);
+            eval_ok(&mut engine,"document.getElementById('target').style.animation='none';document.getElementById('target').getAnimations();");
+            assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+            engine.ctx().collect_garbage();
+            advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+            assert!(state.borrow().records.is_empty());
+            assert!(state.borrow().effect_records.is_empty());
+        }
+        eval_ok(&mut engine,"document.getElementById('target').style.animation='100s fade'; window.saved=document.getElementById('target').getAnimations()[0]; window.ready=saved.ready; window.finished=saved.finished; finished.catch(()=>{});");
+        eval_ok(&mut engine,"document.getElementById('target').style.animation='none'");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert_eq!(state.borrow().records.len(),1);
+        assert!(matches!(eval_ok(&mut engine,"saved.playState==='idle' && saved.effect!==null"),Value::Bool(true)));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        eval_ok(&mut engine,"window.saved=null;window.ready=null;window.finished=null;");
+        while engine.run_one_job() {}
+        engine.ctx().collect_garbage();
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(state.borrow().records.is_empty());
+        assert!(state.borrow().effect_records.is_empty());
+        // The realm remains usable after record collection.
+        assert!(realm.with_session(|session| session.animation_snapshot().unwrap().nodes.len()) > 0);
+    }
+
+    #[test]
+    fn empty_css_keyframes_preserve_timing_cancellation_and_sibling_settlement() {
+        let mut engine = Engine::new();
+        let _realm = crate::install(engine.ctx(),
+            "<style>@keyframes full{to{opacity:0.5}}@keyframes empty{}</style><div id='target' style='animation:full 100s'></div><div id='sibling'></div>",
+            64).unwrap();
+        eval_ok(&mut engine, r#"
+            globalThis.target=document.getElementById('target');
+            globalThis.original=target.getAnimations()[0];
+            globalThis.rejected=0; globalThis.completed=0;
+            original.finished.catch(error=>{if(error.name==='AbortError')rejected++;});
+            globalThis.sibling=document.getElementById('sibling').animate([], {duration:20,fill:'both'});
+            sibling.finished.then(()=>completed++);
+            target.style.animation='empty 100s';
+            globalThis.emptyAnimation=target.getAnimations()[0];
+            globalThis.emptyCompleted=0;
+            emptyAnimation.finished.then(()=>emptyCompleted++);
+        "#);
+        // Publish the first actual frame before measuring elapsed playback.
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine, r#"
+            rejected===1 && original.playState==='idle' && emptyAnimation instanceof CSSAnimation
+            && emptyAnimation.animationName==='empty' && emptyAnimation.effect.getKeyframes().length===0
+            && emptyAnimation.effect.getTiming().duration===100000
+        "#),Value::Bool(true)));
+        let state = hub(engine.ctx()).unwrap();
+        let start = state.borrow().records.values().map(|record|record.start_ms)
+            .fold(0.0, f64::max);
+        for offset in [25.0, 50.0, 75.0] {
+            advance(engine.ctx(), start + offset).unwrap();
+            while engine.run_one_job() {}
+        }
+        assert!(matches!(eval_ok(&mut engine,"completed===1 && emptyCompleted===0 && rejected===1"),Value::Bool(true)));
+        advance(engine.ctx(),start+100001.0).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"emptyCompleted===1 && completed===1 && rejected===1"),Value::Bool(true)));
+        for _ in 0..3 {
+            assert!(crate::scheduling::run_animation_frame(&mut engine).is_empty(),
+                "valid empty keyframes must not repeatedly report frame errors");
+        }
+    }
+
+    #[test]
+    fn cancellation_replaces_finished_promise_once_and_replay_settles_replacement() {
+        let mut engine = Engine::new();
+        let _realm = crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        eval_ok(&mut engine, r#"
+            globalThis.animation=document.getElementById('target').animate([],100000);
+            globalThis.old=animation.finished;
+            globalThis.aborted=0; globalThis.resolved=0; globalThis.cancelCount=0;
+            old.catch(e=>{if(e.name==='AbortError')aborted++;});
+            // Listener observes the new promise synchronously during dispatch.
+            animation.addEventListener('cancel',()=>{cancelCount++; globalThis.listenerPromise=animation.finished;});
+            animation.cancel();
+            globalThis.replacement=animation.finished;
+            replacement.then(()=>resolved++);
+            globalThis.identity=old!==replacement && replacement===listenerPromise;
+            animation.cancel(); animation.currentTime=null;
+            identity=identity && replacement===animation.finished;
+        "#);
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"identity && aborted===1 && resolved===0 && cancelCount===1"),Value::Bool(true)));
+        eval_ok(&mut engine,"animation.play(); animation.finish();");
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"animation.finished===replacement && resolved===1 && aborted===1"),Value::Bool(true)));
+        eval_ok(&mut engine,r#"
+            animation.cancel();
+            globalThis.idlePromise=animation.finished;
+            globalThis.idleSettled=0;
+            idlePromise.then(()=>idleSettled++,()=>idleSettled++);
+            animation.cancel();
+        "#);
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"idlePromise!==replacement && idlePromise===animation.finished && idleSettled===0 && resolved===1"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn automatic_css_cancellation_replaces_finished_promise_without_settling_siblings() {
+        let mut engine = Engine::new();
+        let _realm = crate::install(engine.ctx(),
+            "<style>@keyframes full{to{opacity:0.5}}@keyframes empty{}</style><div id='target' style='animation:full 100s'></div><div id='sibling'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');
+            globalThis.animation=target.getAnimations()[0];
+            globalThis.old=animation.finished;
+            globalThis.aborted=0; globalThis.replacementSettled=0; globalThis.siblingDone=0;
+            old.catch(e=>{if(e.name==='AbortError')aborted++;});
+            globalThis.sibling=document.getElementById('sibling').animate([],20);
+            sibling.finished.then(()=>siblingDone++);
+            target.style.animation='empty 100s'; target.getAnimations();
+            globalThis.replacement=animation.finished;
+            replacement.then(()=>replacementSettled++,()=>replacementSettled++);
+        "#);
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"old!==replacement && replacement===animation.finished && aborted===1 && replacementSettled===0 && animation.playState==='idle'"),Value::Bool(true)));
+        let state=hub(engine.ctx()).unwrap();
+        let start=state.borrow().records.values().map(|record|record.start_ms).fold(0.0,f64::max);
+        for offset in [25.0,50.0,75.0] {
+            advance(engine.ctx(),start+offset).unwrap();
+            while engine.run_one_job() {}
+        }
+        assert!(matches!(eval_ok(&mut engine,"replacement===animation.finished && replacementSettled===0 && aborted===1 && siblingDone===1"),Value::Bool(true)));
+        eval_ok(&mut engine, r#"
+            globalThis.explicit=target.getAnimations()[0];
+            explicit.finished.catch(()=>{}); explicit.cancel();
+            globalThis.explicitPending=explicit.finished;
+            target.style.animation='none'; target.getAnimations();
+        "#);
+        advance(engine.ctx(),start+100.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"explicit.finished===explicitPending"),Value::Bool(true)));
+    }
+
+    #[lumen_bind::module(name = "animation_event_test_gc")]
+    mod event_test_gc {
+        use super::*;
+        #[op(rename(js = "forceEventGC"))]
+        fn force_event_gc(ctx: &mut Ctx) { ctx.collect_garbage(); }
+    }
+
+    #[test]
+    fn running_animation_seek_uses_committed_document_frame_clock() {
+        let mut engine = Engine::new();
+        let _realm = crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        eval_ok(&mut engine, r#"
+            globalThis.animation = document.getElementById('target').animate(
+                [{opacity: 0}, {opacity: 1}], {duration: 1000, fill: 'both'});
+        "#);
+        advance(engine.ctx(), lumen_host::perf::web_now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,
+            "!animation.pending && animation.startTime !== null && animation.playState === 'running'"),
+            Value::Bool(true)));
+        // Wall-clock passage without another rendering opportunity must not change
+        // the committed document timeline used by a synchronous seek and read.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        eval_ok(&mut engine, r#"
+            globalThis.frameTime = document.timeline.currentTime;
+            animation.currentTime = 500;
+            globalThis.seekResult = animation.currentTime;
+        "#);
+        let checks = eval_ok(&mut engine,
+            "document.timeline.currentTime === frameTime && seekResult === 500 && animation.currentTime === 500");
+        if !matches!(checks, Value::Bool(true)) {
+            let diagnostics = eval_ok(&mut engine,
+                "JSON.stringify({frameTime, timeline: document.timeline.currentTime, seekResult, currentTime: animation.currentTime})");
+            let diagnostics = engine.ctx().coerce_string(&diagnostics).ok().expect("diagnostics string");
+            panic!("running currentTime seek regression: {diagnostics}");
+        }
+        eval_ok(&mut engine, "animation.playbackRate=2;");
+        assert!(matches!(eval_ok(&mut engine,
+            "animation.currentTime===500 && animation.effect.getComputedTiming().localTime===500 && getComputedStyle(document.getElementById('target')).opacity==='0.5'"), Value::Bool(true)));
+        let frame = _realm.timeline_sample.get();
+        advance(engine.ctx(), frame + 25.0).unwrap();
+        let time = eval_ok(&mut engine, "animation.currentTime");
+        // Subtracting fractional document timestamps may round the elapsed
+        // result by a few ulps; retain a tolerance far below the clock quantum.
+        assert!(matches!(time, Value::Num(value) if (value - 550.0).abs() < 1e-7), "advanced animation time: {}", engine.ctx().coerce_string(&time).ok().expect("time diagnostic"));
+        eval_ok(&mut engine, "animation.playbackRate=-1;");
+        advance(engine.ctx(), frame + 75.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine, "Math.abs(animation.currentTime-500)<1e-7"), Value::Bool(true)));
+        eval_ok(&mut engine, "animation.playbackRate=0;");
+        advance(engine.ctx(), frame + 125.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine, "Math.abs(animation.currentTime-500)<1e-7 && Math.abs(animation.effect.getComputedTiming().localTime-500)<1e-7"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn adopted_animation_preserves_timeline_clock_and_inactive_owner_is_unresolved() {
+        let mut engine = Engine::new();
+        let source = crate::install(engine.ctx(), "<div id='target'></div>", 64).unwrap();
+        eval_ok(&mut engine, r#"
+            globalThis.target=document.getElementById('target');
+            globalThis.animation=target.animate([{opacity:0},{opacity:1}],{duration:1000,fill:'both'});
+            globalThis.otherDocument=document.implementation.createHTMLDocument('destination');
+        "#);
+        let frame = source.timeline_sample.get();
+        advance(engine.ctx(), frame).unwrap();
+        while engine.run_one_job() {}
+        eval_ok(&mut engine, "otherDocument.adoptNode(target);");
+        let state = hub(engine.ctx()).unwrap();
+        let destination = state.borrow().records.values().next().unwrap().realm.upgrade().unwrap();
+        let destination_time = destination.timeline_sample.get();
+        advance(engine.ctx(), frame + 250.0).unwrap();
+        assert_eq!(destination.timeline_sample.get(), destination_time,
+            "applying an adopted target must not manufacture its document frame");
+        let checks = eval_ok(&mut engine,
+            "Math.abs(animation.currentTime-250)<1e-7 && Math.abs(animation.effect.getComputedTiming().localTime-250)<1e-7 && getComputedStyle(target).opacity==='0.25' && target.ownerDocument===otherDocument");
+        assert!(matches!(checks, Value::Bool(true)), "adopted animation diagnostic: {}", {
+            let value = eval_ok(&mut engine, "JSON.stringify({time:animation.currentTime,local:animation.effect.getComputedTiming().localTime,opacity:getComputedStyle(target).opacity,owner:target.ownerDocument===otherDocument})");
+            engine.ctx().coerce_string(&value).ok().expect("adoption diagnostic")
+        });
+
+        // Use the same active-document replacement primitive as navigation,
+        // keeping the old document and animation alive through author roots.
+        let context = source.browsing_context().unwrap();
+        browsing_context::bind_context_document(&context, &destination);
+        assert!(matches!(eval_ok(&mut engine,
+            "document.timeline.currentTime===null && animation.currentTime===null && animation.playState==='running' && animation.effect.getComputedTiming().localTime===null"), Value::Bool(true)));
+        advance(engine.ctx(), frame + 500.0).unwrap();
+        assert_eq!(source.timeline_sample.get(), frame + 250.0,
+            "inactive document must not commit a new timeline sample");
+        eval_ok(&mut engine, "animation.currentTime=125;animation.pause();");
+        advance(engine.ctx(), frame + 750.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,
+            "animation.currentTime===125 && animation.pending && animation.startTime===null"), Value::Bool(true)));
+    }
+
+    #[test]
+    fn pending_animation_start_time_seek_completes_ready_and_updates_actual_style() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),"<style>@keyframes a{from{opacity:0}to{opacity:1}}</style><div id='target' style='animation:a 100s linear'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.animation=target.getAnimations()[0];
+            globalThis.originalReady=animation.ready;globalThis.readyCount=0;originalReady.then(()=>readyCount++);
+            animation.startTime=document.timeline.currentTime-50000;
+        "#);
+        while engine.run_one_job() {}
+        let checks = eval_ok(&mut engine,"!animation.pending && originalReady===animation.ready && readyCount===1 && Math.abs(animation.currentTime-50000)<20 && Math.abs(parseFloat(getComputedStyle(target).opacity)-0.5)<0.01");
+        if !matches!(checks,Value::Bool(true)) {
+            let diagnostics = eval_ok(&mut engine,"JSON.stringify({pending:animation.pending,sameReady:originalReady===animation.ready,readyCount,time:animation.currentTime,opacity:getComputedStyle(target).opacity})");
+            let diagnostics = engine.ctx().coerce_string(&diagnostics).ok().expect("diagnostics string");
+            panic!("startTime seek regression: {diagnostics}");
+        }
+        eval_ok(&mut engine,"animation.startTime=null;globalThis.held=animation.currentTime;");
+        assert!(matches!(eval_ok(&mut engine,"!animation.pending && animation.playState==='paused' && animation.startTime===null && animation.currentTime===held && originalReady===animation.ready"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn pending_animation_inactive_timeline_and_signed_rate_readiness_are_truthful() {
+        let mut engine=Engine::new();
+        let realm=crate::install(engine.ctx(),"<div id='target'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.animation=target.animate([],1000);
+            globalThis.originalReady=animation.ready;globalThis.resolved=0;originalReady.then(()=>resolved++);
+            animation.timeline=null;
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"animation.pending && animation.currentTime===0 && animation.startTime===null && animation.ready===originalReady && resolved===0"),Value::Bool(true)));
+        eval_ok(&mut engine,"animation.timeline=document.timeline;");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"!animation.pending && resolved===1 && originalReady===animation.ready"),Value::Bool(true)));
+        eval_ok(&mut engine,"animation.cancel();animation.playbackRate=-1;animation.pause();globalThis.pauseReady=animation.ready;animation.pause();");
+        assert!(matches!(eval_ok(&mut engine,"animation.pending && animation.currentTime===1000 && animation.ready===pauseReady"),Value::Bool(true)));
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"!animation.pending && animation.playState==='paused' && animation.currentTime===1000 && animation.startTime===null"),Value::Bool(true)));
+        eval_ok(&mut engine,r#"
+            globalThis.infinite=target.animate([],{duration:Infinity});infinite.cancel();infinite.playbackRate=-1;
+            globalThis.infiniteReady=infinite.ready;globalThis.invalidPause=false;
+            try{infinite.pause();}catch(e){invalidPause=e.name==='InvalidStateError';}
+            globalThis.zero=target.animate([{opacity:0},{opacity:1}],{duration:100,fill:'both'});zero.playbackRate=0;globalThis.zeroReady=zero.ready;
+        "#);
+        assert!(matches!(eval_ok(&mut engine,"invalidPause && !infinite.pending && infinite.playState==='idle' && infiniteReady===infinite.ready && zero.pending && zero.currentTime===0"),Value::Bool(true)));
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        advance(engine.ctx(),lumen_host::perf::now_ms()+1000.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"!zero.pending && zero.currentTime===0 && zero.startTime!==null && zeroReady===zero.ready"),Value::Bool(true)));
+        eval_ok(&mut engine,"zero.playbackRate=1;zero.id='resumed-zero-rate';");
+        let state=hub(engine.ctx()).unwrap();
+        let resumed=state.borrow().records.values().find(|record|record.public_id=="resumed-zero-rate").unwrap().start_ms;
+        advance(engine.ctx(),resumed+50.0).unwrap();
+        realm.with_session(|session|{
+            let document=session.document();
+            let target=selector::query_selector(document,document.root(),"#target").unwrap().unwrap();
+            assert!((session.computed_style(target).unwrap().opacity-0.5).abs()<0.001);
+        });
+    }
+
+    #[test]
+    fn pending_animation_initial_css_time_and_ready_settle_at_real_frame() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),"<style>@keyframes a{}</style><div id='target' style='animation:a 100s'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.animation=document.getElementById('target').getAnimations()[0];globalThis.initialReady=animation.ready;globalThis.readyCount=0;initialReady.then(()=>readyCount++);");
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===true && animation.currentTime===0 && animation.startTime===null && animation.timeline===document.timeline && initialReady===animation.ready && readyCount===0"),Value::Bool(true)));
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===false && animation.startTime!==null && initialReady===animation.ready && readyCount===1"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn pending_animation_play_pause_switch_reuses_ready_and_seek_completes_pause() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),"<div id='target'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.animation=document.getElementById('target').animate([],100000);globalThis.originalReady=animation.ready;animation.pause();globalThis.pauseReady=animation.ready;animation.pause();animation.play();");
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===true && originalReady===pauseReady && pauseReady===animation.ready && animation.playState==='running' && animation.currentTime===0"),Value::Bool(true)));
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"animation.pause();globalThis.nextReady=animation.ready;animation.pause();");
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===true && nextReady!==originalReady && nextReady===animation.ready && animation.playState==='paused'"),Value::Bool(true)));
+        eval_ok(&mut engine,"animation.currentTime=400;");
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===false && animation.currentTime===400 && animation.startTime===null && nextReady===animation.ready && animation.playState==='paused'"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn pending_animation_cancel_unsampled_replay_rejects_ready_without_extra_css_cancel() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),"<style>@keyframes a{}</style><div id='target' style='animation:a 100s'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.target=document.getElementById('target');globalThis.animation=target.getAnimations()[0];globalThis.cancels=0;target.addEventListener('animationcancel',()=>cancels++);");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"animation.cancel();animation.play();globalThis.pendingReady=animation.ready;globalThis.rejected=0;pendingReady.catch(e=>{if(e.name==='AbortError')rejected++;});animation.cancel();globalThis.replacementReady=animation.ready;");
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,"animation.pending===false && animation.playState==='idle' && animation.currentTime===null && pendingReady!==replacementReady && rejected===1"),Value::Bool(true)));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"cancels===1 && animation.ready===replacementReady"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_automatic_replacement_cancels_before_new_start_without_author_task_drain() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes a{}@keyframes b{}@keyframes c{}</style><div id='target' style='animation:a 100s paused,b 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.events=[];globalThis.authorTasks=0;
+            target.getAnimations();
+            for(const kind of ['animationstart','animationcancel'])target.addEventListener(kind,e=>events.push([e.type,e.animationName]));
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"events.length=0;target.style.animation='c 100s paused,b 100s paused';");
+        crate::scheduling::queue_task(engine.ctx(),|ctx| {
+            let global=ctx.global_object();
+            ctx.member_set(&global,"authorTasks",Value::Num(1.0)).map_err(OpError::thrown)?;Ok(())
+        }).unwrap();
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(events)==='[["animationcancel","a"],["animationstart","c"]]' && authorTasks===0"#),Value::Bool(true)));
+        assert!(crate::scheduling::task_pending(engine.ctx()));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(matches!(eval_ok(&mut engine,"events.length===2 && authorTasks===1"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_frame_flush_keeps_listener_cancellation_for_next_task() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes a{}@keyframes b{}</style><div id='first' style='animation:a 100s paused'></div><div id='second' style='animation:b 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.first=document.getElementById('first');globalThis.second=document.getElementById('second');
+            first.getAnimations();globalThis.otherAnimation=second.getAnimations()[0];globalThis.cancels=[];
+            first.addEventListener('animationcancel',e=>{cancels.push(e.animationName);otherAnimation.cancel();});
+            second.addEventListener('animationcancel',e=>cancels.push(e.animationName));
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"first.style.animation='none';");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(cancels)==='["a"]'"#),Value::Bool(true)));
+        assert!(crate::scheduling::task_pending(engine.ctx()));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(cancels)==='["a","b"]'"#),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_backward_seek_preserves_start_end_pair_order() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.animation=target.getAnimations()[0];
+            globalThis.events=[];
+            for(const kind of ['animationstart','animationend'])target.addEventListener(kind,e=>events.push([e.type,e.elapsedTime]));
+            animation.finish();
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"events=[];animation.currentTime=0;");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(events)==='[["animationstart",100],["animationend",0]]'"#),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_rapid_cancellations_preserve_each_real_transition() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.animation=target.getAnimations()[0];
+            globalThis.events=[];globalThis.aborted=0;
+            for(const kind of ['animationstart','animationcancel'])target.addEventListener(kind,e=>events.push(e.type));
+            animation.finished.catch(e=>{if(e.name==='AbortError')aborted++;});
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,r#"
+            animation.cancel();globalThis.firstPending=animation.finished;
+            firstPending.catch(e=>{if(e.name==='AbortError')aborted++;});
+            animation.play();
+        "#);
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        // A second genuine cancellation follows a sampled replay, not an
+        // aborted pending-play task that never reaches an active CSS phase.
+        eval_ok(&mut engine,"animation.cancel();globalThis.lastPending=animation.finished;animation.cancel();animation.play();");
+        assert!(matches!(eval_ok(&mut engine,"firstPending!==lastPending && lastPending===animation.finished"),Value::Bool(true)));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        while engine.run_one_job() {}
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(events)==='["animationstart","animationcancel","animationstart","animationcancel","animationstart"]' && aborted===2 && animation.finished===lastPending"#),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_queued_sibling_resolves_identity_after_listener_adoption() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes a{}@keyframes b{}</style><div id='first' style='animation:a 100s paused'></div><div id='second' style='animation:b 100s paused'></div>",64).unwrap();
+        let global=engine.ctx().global_object();
+        assert!(engine.ctx().install_module::<event_test_gc::Module>(&global).is_ok());
+        eval_ok(&mut engine,r#"
+            globalThis.first=document.getElementById('first');globalThis.second=document.getElementById('second');
+            first.getAnimations();second.getAnimations();globalThis.received=[];
+            globalThis.otherDocument=document.implementation.createHTMLDocument('destination');
+            first.addEventListener('animationstart',()=>{
+                otherDocument.adoptNode(second);document.getAnimations();forceEventGC();
+            });
+            second.addEventListener('animationstart',e=>received.push([e.animationName,e.target===second,e.target.ownerDocument===otherDocument]));
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"received.length===1 && received[0][0]==='b' && received[0][1] && received[0][2]"),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_listener_cancellation_waits_for_its_own_task_turn() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div><div id='sibling' style='animation:empty 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');globalThis.animation=target.getAnimations()[0];
+            globalThis.sibling=document.getElementById('sibling');globalThis.other=sibling.getAnimations()[0];
+            globalThis.cancels=0;
+            target.addEventListener('animationcancel',()=>{
+                cancels++;other.cancel();
+            });
+            sibling.addEventListener('animationcancel',()=>cancels++);
+        "#);
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        eval_ok(&mut engine,"animation.cancel();");
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(matches!(eval_ok(&mut engine,"cancels===1"),Value::Bool(true)));
+        assert!(crate::scheduling::task_pending(engine.ctx()));
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(matches!(eval_ok(&mut engine,"cancels===2"),Value::Bool(true)));
+        assert!(!crate::scheduling::task_pending(engine.ctx()));
+    }
+
+    #[test]
+    fn css_animation_event_task_admission_failure_preserves_author_state() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.animation=document.getElementById('target').getAnimations()[0];globalThis.promise=animation.finished;");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        for _ in 0..crate::scheduling::MAX_PENDING_HTML_TASKS {
+            crate::scheduling::queue_task(engine.ctx(),|_|Ok(())).unwrap();
+        }
+        assert!(matches!(eval_ok(&mut engine,r#"
+            (()=>{try{animation.cancel();return false;}catch(e){return e.name==='QuotaExceededError';}})()
+                && animation.playState==='paused' && animation.finished===promise
+        "#),Value::Bool(true)));
+        let state=hub(engine.ctx()).unwrap();
+        assert!(state.borrow().dispatching_css.is_empty());
+        assert!(state.borrow().css_cancellations.is_empty());
+        while crate::scheduling::task_pending(engine.ctx()) {
+            assert!(crate::scheduling::run_tasks(&mut engine,256).is_empty());
+        }
+    }
+
+    #[test]
+    fn css_animation_event_retired_child_tasks_release_snapshots_and_keep_parent_work() {
+        let mut engine=Engine::new();
+        let _parent=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.animation=document.getElementById('target').getAnimations()[0];globalThis.cancels=0;document.getElementById('target').addEventListener('animationcancel',()=>cancels++);");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        let child=engine.ctx().create_host_realm();
+        let _child_realm=engine.ctx().with_host_realm(&child,|ctx| crate::install(ctx,
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div>",64).unwrap()).unwrap();
+        assert!(engine.eval_value_in_host_realm(&child,
+            "globalThis.animation=document.getElementById('target').getAnimations()[0];globalThis.cancels=0;document.getElementById('target').addEventListener('animationcancel',()=>cancels++);",false).unwrap().is_ok());
+        engine.ctx().with_host_realm(&child,|ctx|advance(ctx,lumen_host::perf::now_ms()).unwrap()).unwrap();
+        assert!(engine.eval_value_in_host_realm(&child,"animation.cancel();",false).unwrap().is_ok());
+        let child_hub=engine.ctx().with_host_realm(&child,|ctx|hub(ctx).unwrap()).unwrap();
+        assert_eq!(child_hub.borrow().dispatching_css.len(),1);
+        eval_ok(&mut engine,"animation.cancel();");
+        assert_eq!(crate::scheduling::cancel_tasks_for_realm(engine.ctx(),&child),1);
+        assert!(child_hub.borrow().dispatching_css.is_empty());
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(matches!(eval_ok(&mut engine,"cancels===1"),Value::Bool(true)));
+        let child_count=engine.eval_value_in_host_realm(&child,"cancels===0",false).unwrap().ok().unwrap();
+        assert!(matches!(child_count,Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_sampling_keeps_parent_and_child_realms_independent() {
+        let mut engine=Engine::new();
+        let _parent=crate::install(engine.ctx(),
+            "<style>@keyframes parent{}</style><div id='target' style='animation:parent 100s paused'></div>",64).unwrap();
+        eval_ok(&mut engine,"globalThis.count=0;document.getElementById('target').addEventListener('animationstart',e=>{if(e instanceof AnimationEvent && e.animationName==='parent')count++;});");
+        let child=engine.ctx().create_host_realm();
+        let _child_realm=engine.ctx().with_host_realm(&child,|ctx| crate::install(ctx,
+            "<style>@keyframes child{}</style><div id='target' style='animation:child 100s paused'></div>",64).unwrap()).unwrap();
+        assert!(engine.eval_value_in_host_realm(&child,
+            "globalThis.count=0;document.getElementById('target').addEventListener('animationstart',e=>{if(e instanceof AnimationEvent && e.animationName==='child' && e.target.ownerDocument===document)count++;});",false).unwrap().is_ok());
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"count===1"),Value::Bool(true)));
+        let child_count=engine.eval_value_in_host_realm(&child,"count===0",false).unwrap().ok().unwrap();
+        assert!(matches!(child_count,Value::Bool(true)));
+        engine.ctx().with_host_realm(&child,|ctx| advance(ctx,lumen_host::perf::now_ms()).unwrap()).unwrap();
+        let child_count=engine.eval_value_in_host_realm(&child,"count===1",false).unwrap().ok().unwrap();
+        assert!(matches!(child_count,Value::Bool(true)));
+        assert!(matches!(eval_ok(&mut engine,"count===1"),Value::Bool(true)));
+        assert!(!pending(engine.ctx()));
+    }
+
+    #[test]
+    fn css_animation_event_init_rejects_nonfinite_and_preserves_conversion_errors() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),"<div></div>",32).unwrap();
+        assert!(matches!(eval_ok(&mut engine,r#"
+            (()=>{
+                let rejected=0;
+                for(const value of [NaN,Infinity,-Infinity]) {
+                    try { new AnimationEvent('test',{elapsedTime:value}); }
+                    catch(e) { if(e instanceof TypeError)rejected++; }
+                }
+                const sentinel={};let preserved=false;
+                try { new AnimationEvent('test',{elapsedTime:{valueOf(){throw sentinel;}}}); }
+                catch(e) { preserved=e===sentinel; }
+                return rejected===3 && preserved;
+            })()
+        "#),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_queue_retains_cancelled_sibling_during_listener_gc() {
+        let mut engine=Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes a{}@keyframes b{}</style><div id='first' style='animation:a 100s paused'></div><div id='second' style='animation:b 100s paused'></div>",64).unwrap();
+        let global=engine.ctx().global_object();
+        assert!(engine.ctx().install_module::<event_test_gc::Module>(&global).is_ok());
+        eval_ok(&mut engine,r#"
+            globalThis.first=document.getElementById('first'); globalThis.second=document.getElementById('second');
+            first.getAnimations();second.getAnimations();globalThis.received=[];
+            first.addEventListener('animationstart',()=>{
+                second.style.animation='none'; second.getAnimations(); document.getAnimations();
+                forceEventGC();
+            });
+            second.addEventListener('animationstart',e=>received.push([e.animationName,e.animation.animationName,e.target===second]));
+        "#);
+        let state=hub(engine.ctx()).unwrap();
+        let start=state.borrow().records.values().map(|record|record.start_ms).fold(0.0,f64::max);
+        advance(engine.ctx(),start).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"received.length===1 && received[0][0]==='b' && received[0][1]==='b' && received[0][2]"),Value::Bool(true)));
+        assert!(crate::scheduling::task_pending(engine.ctx()), "listener cancellation remains admitted for a later task turn");
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        assert!(state.borrow().dispatching_css.is_empty());
+        advance(engine.ctx(),start+20.0).unwrap();
+    }
+
+    #[test]
+    fn css_animation_event_class_and_real_negative_delay_lifecycle() {
+        let mut engine = Engine::new();
+        let _realm = crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='parent'><div id='target' style='animation:empty 1s -4s 7 paused'></div></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target');
+            globalThis.parent=document.getElementById('parent');
+            globalThis.animation=target.getAnimations()[0];
+            globalThis.events=[]; globalThis.bubbled=0;
+            for(const name of ['animationstart','animationiteration','animationend','animationcancel'])
+                target.addEventListener(name,e=>events.push([e.type,e.elapsedTime,e.animationName,
+                    e.animation===animation,e instanceof AnimationEvent,e instanceof Event,e.isTrusted,e.bubbles,e.cancelable]));
+            parent.addEventListener('animationstart',()=>bubbled++);
+            const init=new AnimationEvent('sample',{animationName:null,elapsedTime:'1.5',pseudoElement:'::before',bubbles:true});
+            globalThis.constructorOK=init.animationName==='null' && init.elapsedTime===1.5
+                && init.pseudoElement==='::before' && !init.isTrusted && init.animation===null;
+        "#);
+        assert!(pending(engine.ctx()));
+        let state=hub(engine.ctx()).unwrap();
+        let start=state.borrow().records.values().next().unwrap().start_ms;
+        advance(engine.ctx(),start).unwrap();
+        assert!(!pending(engine.ctx()),"paused sampled effects must not continuously render");
+        assert!(matches!(eval_ok(&mut engine,r#"constructorOK && bubbled===1 && JSON.stringify(events)==='[["animationstart",4,"empty",true,true,true,true,true,false]]'"#),Value::Bool(true)));
+        eval_ok(&mut engine,"target.style.animationPlayState='running';target.getAnimations();");
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
+        let resume=state.borrow().records.values().next().unwrap().start_ms;
+        advance(engine.ctx(),resume+1100.0).unwrap();
+        advance(engine.ctx(),resume+2100.0).unwrap();
+        advance(engine.ctx(),resume+3100.0).unwrap();
+        advance(engine.ctx(),resume+4100.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,r#"JSON.stringify(events.map(e=>[e[0],e[1]]))==='[["animationstart",4],["animationiteration",5],["animationiteration",6],["animationend",7]]'"#),Value::Bool(true)));
+    }
+
+    #[test]
+    fn css_animation_event_cancel_is_queued_and_owner_survives_effect_retargeting() {
+        let mut engine = Engine::new();
+        let _realm=crate::install(engine.ctx(),
+            "<style>@keyframes empty{}</style><div id='target' style='animation:empty 100s paused'></div><div id='other'></div>",64).unwrap();
+        eval_ok(&mut engine,r#"
+            globalThis.target=document.getElementById('target'); globalThis.other=document.getElementById('other');
+            globalThis.animation=target.getAnimations()[0]; globalThis.events=[];globalThis.wrong=0;
+            for(const kind of ['animationstart','animationcancel']) {
+                target.addEventListener(kind,e=>events.push([e.type,e.elapsedTime,e.target===target,e.animation===animation]));
+                other.addEventListener(kind,()=>wrong++);
+            }
+            animation.finished.catch(()=>{});
+            animation.effect.target=other;
+        "#);
+        let state=hub(engine.ctx()).unwrap();
+        let start=state.borrow().records.values().next().unwrap().start_ms;
+        advance(engine.ctx(),start).unwrap();
+        eval_ok(&mut engine,"animation.currentTime=1234;animation.cancel();globalThis.newFinished=animation.finished;");
+        assert!(matches!(eval_ok(&mut engine,"events.length===1"),Value::Bool(true)),"CSS cancel must not synchronously dispatch");
+        assert!(crate::scheduling::run_tasks(&mut engine,32).is_empty());
+        advance(engine.ctx(),start+2000.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"wrong===0 && events.length===2 && events[1][0]==='animationcancel' && events[1][1]===1.234 && events[1][2] && events[1][3]"),Value::Bool(true)));
+        eval_ok(&mut engine,"animation.cancel();target.style.animation='none';target.getAnimations();animation.play();");
+        advance(engine.ctx(),start+3000.0).unwrap();
+        assert!(matches!(eval_ok(&mut engine,"events.length===2 && wrong===0 && animation.finished===newFinished"),Value::Bool(true)),"orphan replay and idle retirement cannot restart CSS events");
+    }
+
+    #[test]
+    fn empty_css_keyframes_do_not_accept_invalid_keyframe_syntax() {
+        let mut rule = lumen_html::css::parse_keyframes_rule("@keyframes example{to{opacity:1}}")
+            .unwrap().unwrap();
+        rule.rules[0].key_text="not-a-keyframe-offset".into();
+        assert!(css_keyframe_effect(&rule, Direction::Normal, CompositeMode::Replace).is_none());
+        let empty = lumen_html::css::parse_keyframes_rule("@keyframes empty{}")
+            .unwrap().unwrap();
+        assert!(css_keyframe_effect(&empty, Direction::Normal, CompositeMode::Replace)
+            .is_some_and(|frames| frames.is_empty()));
+    }
+
+    #[test]
+    fn css_animation_uses_shared_timeline_sampler_and_get_animations() {
+        let mut engine = Engine::new();
+        let realm = crate::install(
+            engine.ctx(),
+            "<style>@keyframes fade { from { opacity: 0 } to { opacity: 1 } }</style><div id='target' style='animation: 100ms linear both fade'></div>",
+            64,
+        ).unwrap();
+        let start = lumen_host::perf::now_ms();
+        advance(engine.ctx(), start).unwrap();
+        let record_start = hub(engine.ctx()).unwrap().borrow().records.values()
+            .find(|record| record.css_name.as_deref() == Some("fade"))
+            .expect("CSS animation record").start_ms;
+        advance(engine.ctx(), record_start + 50.0).unwrap();
+        realm.with_session(|session| {
+            let document = session.document();
+            let node = selector::query_selector(document, document.root(), "#target").unwrap().unwrap();
+            assert!((session.computed_style(node).unwrap().opacity - 0.5).abs() < 0.02);
+        });
+        let animation = eval_ok(&mut engine, "document.getElementById('target').getAnimations()[0]");
+        assert!(matches!(animation, Value::Obj(_)));
+        assert!(matches!(eval_ok(&mut engine, "document.getElementById('target').getAnimations()[0] instanceof CSSAnimation"), Value::Bool(true)));
+        assert!(matches!(eval_ok(&mut engine, "document.getElementById('target').getAnimations()[0].animationName"), Value::Str(ref value) if value.as_ref() == "fade"));
+    }
+
+    #[test]
     fn public_animation_samples_style_and_resolves_finished_promise() {
         let mut engine = Engine::new();
         let realm = crate::install(
@@ -3337,6 +5283,8 @@ mod tests {
         );
         assert!(matches!(result, Value::Bool(true)));
 
+        // Resolve actual first-frame readiness before manipulating the test clock.
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
         let hub = hub(engine.ctx()).unwrap();
         let started = {
             let hub = hub.borrow();
@@ -3462,6 +5410,8 @@ mod tests {
             "association diagnostic: {diagnostic}"
         );
 
+        // Resolve actual first-frame readiness before manipulating the test clock.
+        advance(engine.ctx(),lumen_host::perf::now_ms()).unwrap();
         let hub = hub(engine.ctx()).unwrap();
         let animation_id = hub
             .borrow()

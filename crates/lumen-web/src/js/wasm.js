@@ -3,8 +3,9 @@
 // a Memory/Table/Global can be created standalone and imported by any module (cross-module
 // linking). Functions are called by their store address.
 //
-// A Memory's buffer views the store's bytes in place (no copies); growing the memory replaces
-// the buffer and detaches the old one. No SIMD/threads/GC.
+// A Memory's buffer views the store's bytes in place (no copies). Growing an unshared memory
+// detaches its old ArrayBuffer; a shared memory keeps old fixed-length SharedArrayBuffers alive
+// and returns a new wrapper over the same backing at the next length.
 
 class CompileError extends Error {
   constructor(m) { super(m); this.name = "CompileError"; }
@@ -31,6 +32,19 @@ function toBytes(source) {
   throw new TypeError("WebAssembly: expected a BufferSource");
 }
 
+function pageCount(value) {
+  // WebAssembly's JS-facing page count is an enforced unsigned 32-bit integer. Unary plus uses
+  // ToNumber (and therefore rejects BigInt), unlike Number(), which accepts it.
+  const number = +value;
+  const integer = Math.trunc(number);
+  if (!Number.isFinite(number) || integer < 0 || integer > 0xffffffff) {
+    throw new TypeError("WebAssembly.Memory page count is outside the unsigned 32-bit range");
+  }
+  return integer;
+}
+
+const memoryAddresses = new WeakMap();
+
 __wasm.setErrors(RuntimeError);
 
 // A store function address as a callable (a native function: no JS frame per call).
@@ -52,16 +66,50 @@ class Module {
 
 class Memory {
   constructor(descriptor) {
+    let address;
     if (descriptor && descriptor.__addr !== undefined) {
-      this._addr = descriptor.__addr; // bound to an existing store memory (an export)
+      address = descriptor.__addr; // bound to an existing store memory (an export)
     } else {
-      const initial = (descriptor && descriptor.initial) || 0;
-      this._addr = __wasm.allocMemory(initial, descriptor && descriptor.maximum);
+      if (descriptor === null || (typeof descriptor !== "object" && typeof descriptor !== "function")) {
+        throw new TypeError("WebAssembly.Memory expects a descriptor object");
+      }
+      const initial = pageCount(descriptor.initial);
+      const maximumValue = descriptor.maximum;
+      const maximum = maximumValue === undefined ? undefined : pageCount(maximumValue);
+      const shared = Boolean(descriptor.shared);
+      if (shared && maximum === undefined) {
+        throw new TypeError("WebAssembly shared memory requires maximum");
+      }
+      if (maximum !== undefined && maximum < initial) {
+        throw new RangeError("WebAssembly.Memory maximum is below initial");
+      }
+      if (initial > 65536 || (maximum !== undefined && maximum > 65536)) {
+        throw new RangeError("WebAssembly.Memory page count exceeds the 4 GiB limit");
+      }
+      let sharedBuffer;
+      if (shared) {
+        if (maximum * 65536 > 256 * 1024 * 1024) {
+          throw new RangeError("WebAssembly shared memory exceeds the shared buffer limit");
+        }
+        sharedBuffer = new SharedArrayBuffer(initial * 65536);
+      }
+      address = __wasm.allocMemory(initial, maximum, sharedBuffer);
     }
+    this._addr = address;
+    memoryAddresses.set(this, address);
   }
-  get buffer() { return __wasm.memBuffer(this._addr); }
+  get buffer() {
+    if (!memoryAddresses.has(this)) throw new TypeError("WebAssembly.Memory.buffer called on incompatible receiver");
+    return __wasm.memBuffer(memoryAddresses.get(this));
+  }
   grow(delta) {
-    const prev = __wasm.memGrow(this._addr, delta);
+    if (!memoryAddresses.has(this)) throw new TypeError("WebAssembly.Memory.grow called on incompatible receiver");
+    const number = +delta;
+    const pages = Math.trunc(number);
+    if (!Number.isFinite(number) || pages < 0 || pages > 0xffffffff) {
+      throw new TypeError("WebAssembly.Memory.grow page count is outside the unsigned 32-bit range");
+    }
+    const prev = __wasm.memGrow(memoryAddresses.get(this), pages);
     if (prev < 0) throw new RangeError("WebAssembly.Memory.grow() failed");
     return prev;
   }

@@ -16,9 +16,9 @@ use super::parse::FuncType;
 use super::translate::{self, *};
 use lumen_codegen::guard;
 use lumen_codegen::jitmem::ExecMemory;
-use lumen_codegen::{opt, x64, Signature};
+use lumen_codegen::{Signature, opt, x64};
 use std::collections::HashMap;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 #[repr(C)]
 pub struct VmCtx {

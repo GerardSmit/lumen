@@ -1,7 +1,27 @@
 use super::*;
-use lumen::embed::{JsFunction, JsObject, OpError, OpResult};
-use lumen_bind::This;
+use lumen::embed::{JsFunction, JsHost, JsObject, OpError, OpResult};
+use lumen_bind::{CtorRet, Host, This};
 use std::rc::Weak;
+
+#[lumen_bind::module(name = "__dom_event_targets")]
+pub(crate) mod target_bindings {
+    use super::*;
+    #[op(rename(js = "hasListeners"))]
+    pub fn has_listeners(ctx: &mut Ctx, target: Value, inactive: Vec<Value>) -> OpResult<bool> {
+        let target = ctx
+            .with_instance::<DomEventTarget, _>(&target, |target| target.clone())
+            .map_err(|_| OpError::new("TypeError", "Illegal EventTarget receiver"))?;
+        let found = target.data.listeners.borrow().iter().any(|listener| {
+            !listener.removed.get()
+                && listener
+                    .callback
+                    .borrow()
+                    .identity_value()
+                    .is_some_and(|callback| !inactive.iter().any(|value| same(value, callback)))
+        });
+        Ok(found)
+    }
+}
 
 #[derive(Clone)]
 struct Listener {
@@ -72,6 +92,7 @@ impl ListenerCallback {
 pub(crate) struct TargetData {
     realm: RefCell<Weak<DomRealm>>,
     node: Cell<Option<NodeId>>,
+    click_in_progress: Cell<bool>,
     listeners: RefCell<Vec<Listener>>,
 }
 
@@ -82,6 +103,50 @@ pub struct DomEventTarget {
 }
 
 impl DomEventTarget {
+    /// Enumerate the exact values held by native listener storage. The engine
+    /// discounts these bookkeeping edges and traces them from a reachable DOM
+    /// wrapper, so detached handler/owner cycles do not become blanket roots.
+    pub(crate) fn trace_callback_values(&self, visit: &mut dyn FnMut(&Value)) {
+        for listener in self.data.listeners.borrow().iter() {
+            match &*listener.callback.borrow() {
+                ListenerCallback::Function(callback)
+                | ListenerCallback::ContentHandler { compiled: Some(callback), .. } => {
+                    visit(callback.value());
+                }
+                ListenerCallback::Object(callback) => visit(callback),
+                ListenerCallback::Empty
+                | ListenerCallback::ContentHandler { compiled: None, .. } => {}
+            }
+        }
+    }
+
+    pub(crate) fn associated_realm(&self) -> Option<Rc<DomRealm>> {
+        self.data.realm.borrow().upgrade()
+    }
+
+    pub(crate) fn erase_listeners(&self, ctx: &mut Ctx, owner: Option<&Value>) {
+        let mut listeners = self.data.listeners.borrow_mut();
+        if listeners.is_empty() {
+            return;
+        }
+        for listener in listeners.iter() {
+            listener.removed.set(true);
+        }
+        listeners.clear();
+        drop(listeners);
+        if let Some(owner) = owner {
+            ctx.retain_instance(owner, false);
+        }
+    }
+
+    pub(crate) fn try_begin_click(&self) -> bool {
+        !self.data.click_in_progress.replace(true)
+    }
+
+    pub(crate) fn end_click(&self) {
+        self.data.click_in_progress.set(false);
+    }
+
     pub(crate) fn handler(&self, kind: &str) -> Option<JsFunction> {
         self.data
             .listeners
@@ -271,6 +336,7 @@ impl DomEventTarget {
             data: Rc::new(TargetData {
                 realm: RefCell::new(Rc::downgrade(realm)),
                 node: Cell::new(None),
+                click_in_progress: Cell::new(false),
                 listeners: RefCell::new(Vec::new()),
             }),
         }
@@ -282,6 +348,7 @@ impl DomEventTarget {
         let data = Rc::new(TargetData {
             realm: RefCell::new(Rc::downgrade(realm)),
             node: Cell::new(Some(id)),
+            click_in_progress: Cell::new(false),
             listeners: RefCell::new(Vec::new()),
         });
         realm.targets.borrow_mut().insert(id, Rc::downgrade(&data));
@@ -295,6 +362,7 @@ impl DomEventTarget {
             data: Rc::new(TargetData {
                 realm: RefCell::new(Rc::downgrade(realm)),
                 node: Cell::new(None),
+                click_in_progress: Cell::new(false),
                 listeners: RefCell::new(Vec::new()),
             }),
         }
@@ -309,6 +377,29 @@ impl DomEventTarget {
             .with_instance::<Self, _>(&receiver, |target| target.clone())
             .map_err(|_| OpError::new("TypeError", "Illegal invocation"))?;
         Ok((target, receiver))
+    }
+}
+
+/// Erase a node's event listeners, including content-attribute and IDL handler
+/// callbacks, only when it has a live sparse-registry entry. The owner is the
+/// existing JS wrapper, when one is still live, so callback retention is
+/// released without creating wrappers for untouched DOM nodes.
+pub(crate) fn erase_node_listeners(
+    ctx: &mut Ctx,
+    realm: &DomRealm,
+    node: NodeId,
+    owner: Option<&Value>,
+) {
+    let target = realm.targets.borrow().get(&node).and_then(Weak::upgrade);
+    if let Some(target) = target {
+        DomEventTarget::from_data(target).erase_listeners(ctx, owner);
+    }
+}
+
+pub(crate) fn erase_window_listeners(ctx: &mut Ctx, realm: &DomRealm, owner: Option<&Value>) {
+    let target = realm.window_target.borrow().clone();
+    if let Some(target) = target {
+        DomEventTarget::from_data(target).erase_listeners(ctx, owner);
     }
 }
 
@@ -338,6 +429,7 @@ impl DomEventTarget {
             data: Rc::new(TargetData {
                 realm: RefCell::new(Weak::new()),
                 node: Cell::new(None),
+                click_in_progress: Cell::new(false),
                 listeners: RefCell::new(Vec::new()),
             }),
         }
@@ -453,6 +545,9 @@ fn dispatch_event_core(
         .with_instance::<DomEvent, _>(event.value(), Clone::clone)
         .map_err(|_| OpError::new("TypeError", "dispatchEvent requires an Event"))?;
     let event_value = event.into_value();
+    // Native dispatch state owns observable target Values after dispatch. Make
+    // them edges of this event wrapper rather than opaque external GC roots.
+    ctx.set_native_identity_owner::<DomEvent>(&event_value)?;
     let event = event_handle;
     if event.dispatching.get() || !event.initialized.get() {
         return Err(super::error_reporting::dom_exception(
@@ -698,14 +793,28 @@ fn invoke(
     capture: bool,
     phase: u8,
 ) -> OpResult<()> {
+    let listeners: Vec<Listener> = {
+        let all = target.listeners.borrow();
+        if all.is_empty() {
+            return Ok(());
+        }
+        let kind = event.kind.borrow();
+        all.iter()
+            .filter(|listener| {
+                listener.capture == capture
+                    && !listener.removed.get()
+                    && listener.kind.as_str() == kind.as_str()
+            })
+            .cloned()
+            .collect()
+    };
+    if listeners.is_empty() {
+        return Ok(());
+    }
     event.phase.set(phase);
     *event.current.borrow_mut() = value.clone();
-    let listeners = target.listeners.borrow().clone();
     for listener in listeners {
-        if listener.kind.as_str() != event.kind.borrow().as_str()
-            || listener.capture != capture
-            || listener.removed.get()
-        {
+        if listener.removed.get() {
             continue;
         }
         if listener.once {
@@ -819,11 +928,28 @@ pub struct DomEvent {
     state: Rc<DomEventState>,
 }
 
+impl lumen::embed::NativeIdentityOwner for DomEvent {
+    const TRACES_NATIVE_VALUES: bool = true;
+
+    fn trace_native_identities(&self, _: u64, _: &mut dyn FnMut(&Value)) {}
+
+    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
+        visit(&self.target.borrow());
+        visit(&self.current.borrow());
+        visit(&self.related_original.borrow());
+        visit(&self.related.borrow());
+        for (target, _) in self.path.borrow().iter() {
+            visit(target);
+        }
+    }
+}
+
 // A cloned handle keeps the same dispatch state after the native base projection
 // is released, allowing callbacks to read and update the original event.
 #[doc(hidden)]
 pub struct DomEventState {
     kind: RefCell<String>,
+    time_stamp: f64,
     bubbles: Cell<bool>,
     cancelable: Cell<bool>,
     composed: Cell<bool>,
@@ -845,6 +971,13 @@ pub struct DomEventState {
     movement_y: Cell<f64>,
 }
 
+#[derive(Clone, Copy)]
+struct EventInit {
+    bubbles: bool,
+    cancelable: bool,
+    composed: bool,
+}
+
 impl std::ops::Deref for DomEvent {
     type Target = DomEventState;
 
@@ -853,10 +986,8 @@ impl std::ops::Deref for DomEvent {
     }
 }
 
-#[lumen_bind::methods]
 impl DomEvent {
-    #[constructor(coerce)]
-    pub(crate) fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
+    fn read_init(ctx: &mut Ctx, options: &Option<Value>) -> OpResult<EventInit> {
         if options
             .as_ref()
             .is_some_and(|value| !matches!(value, Value::Obj(_) | Value::Null | Value::Undefined))
@@ -865,12 +996,27 @@ impl DomEvent {
                 "EventInit must be an object, null, or undefined",
             ));
         }
-        Ok(Self {
+        Ok(EventInit {
+            bubbles: flag(ctx, options, "bubbles")?,
+            cancelable: flag(ctx, options, "cancelable")?,
+            composed: flag(ctx, options, "composed")?,
+        })
+    }
+
+    fn from_init(kind: &str, init: EventInit) -> Self {
+        let EventInit {
+            bubbles,
+            cancelable,
+            composed,
+        } = init;
+        let time_stamp = lumen_host::perf::web_now_ms();
+        Self {
             state: Rc::new(DomEventState {
                 kind: RefCell::new(kind.into()),
-                bubbles: Cell::new(flag(ctx, &options, "bubbles")?),
-                cancelable: Cell::new(flag(ctx, &options, "cancelable")?),
-                composed: Cell::new(flag(ctx, &options, "composed")?),
+                time_stamp,
+                bubbles: Cell::new(bubbles),
+                cancelable: Cell::new(cancelable),
+                composed: Cell::new(composed),
                 initialized: Cell::new(true),
                 trusted: Cell::new(false),
                 path: RefCell::new(Vec::new()),
@@ -888,11 +1034,23 @@ impl DomEvent {
                 movement_x: Cell::new(0.0),
                 movement_y: Cell::new(0.0),
             }),
-        })
+        }
+    }
+}
+
+#[lumen_bind::methods]
+impl DomEvent {
+    #[constructor(coerce)]
+    pub(crate) fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
+        Ok(Self::from_init(kind, Self::read_init(ctx, &options)?))
     }
     #[getter(name = "type")]
     fn kind(&self) -> String {
         self.kind.borrow().clone()
+    }
+    #[getter]
+    fn time_stamp(&self) -> f64 {
+        self.time_stamp
     }
     #[getter]
     fn bubbles(&self) -> bool {
@@ -929,21 +1087,9 @@ impl DomEvent {
     fn current_target(&self) -> Value {
         self.current.borrow().clone()
     }
-    #[getter]
-    fn related_target(&self) -> Value {
-        self.related.borrow().clone()
-    }
     #[getter(name = "srcElement")]
     fn src_element(&self) -> Value {
         self.target.borrow().clone()
-    }
-    #[getter(name = "movementX")]
-    fn movement_x(&self) -> f64 {
-        self.movement_x.get()
-    }
-    #[getter(name = "movementY")]
-    fn movement_y(&self) -> f64 {
-        self.movement_y.get()
     }
     #[getter]
     fn event_phase(&self) -> u8 {
@@ -996,6 +1142,201 @@ impl DomEvent {
     }
 }
 
+#[lumen_bind::class(name = "SubmitEvent", extends = DomEvent, hint(js(webidl)))]
+pub(crate) struct DomSubmitEvent {
+    base: DomEvent,
+    submitter_slot: Option<String>,
+}
+
+struct SubmitEventConstructor {
+    event: DomSubmitEvent,
+    submitter: Option<Value>,
+}
+
+impl SubmitEventConstructor {
+    fn into_instance(self, ctx: &mut Ctx) -> Result<Value, Value> {
+        let slot = self.event.submitter_slot.clone();
+        let Self { event, submitter } = self;
+        let instance = ctx.new_instance(event);
+        if let (Some(slot), Some(submitter)) = (slot, submitter) {
+            ctx.define_native_private_value_slot(&instance, &slot, submitter)?;
+        }
+        Ok(instance)
+    }
+}
+
+impl CtorRet<JsHost, DomSubmitEvent> for SubmitEventConstructor {
+    fn into_ctor(self, cx: &<JsHost as Host>::Cx<'_>) -> Result<Value, Value> {
+        let slot = self.event.submitter_slot.clone();
+        let Self { event, submitter } = self;
+        let instance = <JsHost as Host>::construct(cx, event)?;
+        <JsHost as Host>::with_ctx(cx, |ctx: &mut Ctx| {
+            if let (Some(slot), Some(submitter)) = (slot, submitter) {
+                ctx.define_native_private_value_slot(&instance, &slot, submitter)?;
+            }
+            Ok(())
+        })?;
+        Ok(instance)
+    }
+}
+
+#[lumen_bind::methods]
+impl DomSubmitEvent {
+    #[constructor(coerce)]
+    fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<SubmitEventConstructor> {
+        let dictionary = options.clone();
+        let init = DomEvent::read_init(ctx, &options)?;
+        let submitter = match super::ui_events::dictionary_member(ctx, &dictionary, "submitter")? {
+            None | Some(Value::Null | Value::Undefined) => None,
+            Some(value) => {
+                ctx.with_instance::<super::DomHtmlElement, _>(&value, |_| ())
+                    .map_err(|_| {
+                        OpError::type_error("SubmitEvent submitter must be an HTMLElement")
+                    })?;
+                Some(value)
+            }
+        };
+        let submitter_slot = submitter
+            .as_ref()
+            .map(|_| ctx.allocate_native_private_slot_name());
+        Ok(SubmitEventConstructor {
+            event: Self {
+                base: DomEvent::from_init(kind, init),
+                submitter_slot,
+            },
+            submitter,
+        })
+    }
+
+    #[getter]
+    fn submitter(&self, ctx: &mut Ctx, this: This<Value>) -> Value {
+        self.submitter_slot
+            .as_deref()
+            .and_then(|slot| ctx.native_private_value_slot(&this.0, slot))
+            .unwrap_or(Value::Null)
+    }
+}
+
+impl DomSubmitEvent {
+    pub(crate) fn for_user_agent(
+        ctx: &mut Ctx,
+        kind: &str,
+        submitter: Option<Value>,
+    ) -> OpResult<Value> {
+        let options = ctx.new_object_with_proto(&Value::Null);
+        for (name, value) in [
+            ("bubbles", Value::Bool(true)),
+            ("cancelable", Value::Bool(true)),
+            ("composed", Value::Bool(false)),
+        ] {
+            ctx.member_set(&options, name, value)
+                .map_err(OpError::thrown)?;
+        }
+        let slot = submitter
+            .as_ref()
+            .map(|_| ctx.allocate_native_private_slot_name());
+        let base = DomEvent::new(ctx, kind, Some(options))?;
+        let instance = ctx.new_instance(Self {
+            base,
+            submitter_slot: slot.clone(),
+        });
+        if let (Some(slot), Some(submitter)) = (slot, submitter) {
+            ctx.define_native_private_value_slot(&instance, &slot, submitter)
+                .map_err(OpError::thrown)?;
+        }
+        Ok(instance)
+    }
+}
+
+#[lumen_bind::class(name = "FormDataEvent", extends = DomEvent, hint(js(webidl)))]
+pub(crate) struct DomFormDataEvent {
+    base: DomEvent,
+    form_data_slot: String,
+}
+
+struct FormDataEventConstructor {
+    event: DomFormDataEvent,
+    form_data: Value,
+}
+
+impl FormDataEventConstructor {
+    fn into_instance(self, ctx: &mut Ctx) -> Result<Value, Value> {
+        let slot = self.event.form_data_slot.clone();
+        let Self { event, form_data } = self;
+        let instance = ctx.new_instance(event);
+        ctx.define_native_private_value_slot(&instance, &slot, form_data)?;
+        Ok(instance)
+    }
+}
+
+impl CtorRet<JsHost, DomFormDataEvent> for FormDataEventConstructor {
+    fn into_ctor(self, cx: &<JsHost as Host>::Cx<'_>) -> Result<Value, Value> {
+        let slot = self.event.form_data_slot.clone();
+        let Self { event, form_data } = self;
+        let instance = <JsHost as Host>::construct(cx, event)?;
+        <JsHost as Host>::with_ctx(cx, |ctx: &mut Ctx| {
+            ctx.define_native_private_value_slot(&instance, &slot, form_data)?;
+            Ok(())
+        })?;
+        Ok(instance)
+    }
+}
+
+#[lumen_bind::methods]
+impl DomFormDataEvent {
+    #[constructor(coerce)]
+    fn new(
+        ctx: &mut Ctx,
+        kind: &str,
+        options: Option<Value>,
+    ) -> OpResult<FormDataEventConstructor> {
+        let dictionary = options.clone();
+        let init = DomEvent::read_init(ctx, &options)?;
+        let form_data = super::ui_events::dictionary_member(ctx, &dictionary, "formData")?
+            .filter(|value| !matches!(value, Value::Null | Value::Undefined))
+            .ok_or_else(|| OpError::type_error("FormDataEvent requires a FormData object"))?;
+        if !form_data_bridge::is_form_data(ctx, &form_data)? {
+            return Err(OpError::type_error(
+                "FormDataEvent requires a FormData object",
+            ));
+        }
+        Ok(FormDataEventConstructor {
+            event: Self {
+                base: DomEvent::from_init(kind, init),
+                form_data_slot: ctx.allocate_native_private_slot_name(),
+            },
+            form_data,
+        })
+    }
+
+    #[getter]
+    fn form_data(&self, ctx: &mut Ctx, this: This<Value>) -> Value {
+        ctx.native_private_value_slot(&this.0, &self.form_data_slot)
+            .unwrap_or(Value::Null)
+    }
+}
+
+impl DomFormDataEvent {
+    pub(crate) fn for_user_agent(ctx: &mut Ctx, kind: &str, form_data: Value) -> OpResult<Value> {
+        let options = ctx.new_object_with_proto(&Value::Null);
+        ctx.member_set(&options, "bubbles", Value::Bool(true))
+            .map_err(OpError::thrown)?;
+        ctx.member_set(&options, "cancelable", Value::Bool(false))
+            .map_err(OpError::thrown)?;
+        ctx.member_set(&options, "composed", Value::Bool(false))
+            .map_err(OpError::thrown)?;
+        let slot = ctx.allocate_native_private_slot_name();
+        let base = DomEvent::new(ctx, kind, Some(options))?;
+        let instance = ctx.new_instance(Self {
+            base,
+            form_data_slot: slot.clone(),
+        });
+        ctx.define_native_private_value_slot(&instance, &slot, form_data)
+            .map_err(OpError::thrown)?;
+        Ok(instance)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::install;
@@ -1031,6 +1372,69 @@ mod tests {
             }
         }
         value
+    }
+
+    #[test]
+    fn event_timestamps_share_the_performance_clock_and_survive_initialization_and_dispatch() {
+        let value = eval(
+            r#"(() => {
+                for (const constructor of [Event, CustomEvent, MouseEvent, KeyboardEvent, WheelEvent, FocusEvent]) {
+                    const before = performance.now();
+                    const event = new constructor('initial');
+                    const after = performance.now();
+                    const timestamp = event.timeStamp;
+                    if (!Number.isFinite(timestamp) || timestamp < before || timestamp > after)
+                        throw new Error('event clock differs from performance clock');
+                    if (Math.abs(timestamp * 10 - Math.round(timestamp * 10)) > 1e-6)
+                        throw new Error('event timestamp is not on the shared 100us clock grid');
+                    event.initEvent('changed', false, false);
+                    const target = new EventTarget();
+                    target.dispatchEvent(event);
+                    target.dispatchEvent(event);
+                    if (event.timeStamp !== timestamp)
+                        throw new Error('initialization or dispatch changed creation time');
+                }
+                const legacy = document.createEvent('Event');
+                const timestamp = legacy.timeStamp;
+                legacy.initEvent('legacy', false, false);
+                return legacy.timeStamp === timestamp &&
+                    Object.hasOwn(Event.prototype, 'timeStamp');
+            })()"#,
+        );
+        assert!(matches!(value, Value::Bool(true)));
+    }
+
+    #[test]
+    fn submit_and_formdata_events_retain_singleton_values_without_changing_identity() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const button = document.createElement('button');
+                const data = new FormData();
+                const submit = new SubmitEvent('submit', {submitter: button});
+                const formdata = new FormDataEvent('formdata', {formData: data});
+                class CustomSubmit extends SubmitEvent {}
+                const custom = new CustomSubmit('submit', {submitter: button});
+                formdata.formData.append('x', 'y');
+                let badSubmitterRejected = false;
+                try { new SubmitEvent('submit', {submitter: {}}); }
+                catch (error) { badSubmitterRejected = error instanceof TypeError; }
+                check(submit.submitter === button, 'submitter-identity');
+                check(custom instanceof CustomSubmit && custom.submitter === button,
+                    'subclass-construction-and-retention');
+                check(new SubmitEvent('submit', {submitter: null}).submitter === null,
+                    'null-submitter');
+                check(formdata.formData === data, 'formdata-identity');
+                check(data.get('x') === 'y', 'formdata-live-mutation');
+                check(badSubmitterRejected, 'invalid-submitter-brand');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("event singleton contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "event singleton failures: {failures}");
     }
 
     #[test]
@@ -1407,6 +1811,23 @@ impl DomPromiseRejectionEvent {
 }
 
 impl DomEvent {
+    pub(crate) fn active_dispatch_target(&self) -> Option<Value> {
+        self.dispatching.get().then(|| self.target.borrow().clone())
+    }
+
+    /// The last retargeted event target remains on the Event after dispatch.
+    /// Derived event attributes whose values are themselves nodes can use it
+    /// to apply the same shadow-boundary adjustment as Event.target.
+    pub(crate) fn target_for_retarget(&self) -> Value {
+        self.target.borrow().clone()
+    }
+
+    pub(crate) fn active_current_target(&self) -> Option<Value> {
+        self.dispatching
+            .get()
+            .then(|| self.current.borrow().clone())
+    }
+
     /// Apply the common legacy Event initialization steps. Derived event
     /// initializers call this before updating their own interface fields.
     pub(crate) fn initialize_legacy(&self, kind: &str, bubbles: bool, cancelable: bool) -> bool {
@@ -1434,6 +1855,10 @@ impl DomEvent {
     pub(crate) fn set_movement(&self, x: f64, y: f64) {
         self.movement_x.set(x);
         self.movement_y.set(y);
+    }
+
+    pub(crate) fn movement(&self) -> (f64, f64) {
+        (self.movement_x.get(), self.movement_y.get())
     }
 
     pub(crate) fn set_related_target(&self, value: Value) {

@@ -915,7 +915,14 @@ mod tests {
     fn eval_bool(engine: &mut Engine, source: &str) -> bool {
         match engine.eval_value(source) {
             Ok(Ok(Value::Bool(value))) => value,
-            Ok(Err(error)) => panic!("JavaScript evaluation ended abruptly: {}", engine.ctx().to_string(&error).map(|text| text.to_string()).unwrap_or_else(|_| "<unprintable>".into())),
+            Ok(Err(error)) => panic!(
+                "JavaScript evaluation ended abruptly: {}",
+                engine
+                    .ctx()
+                    .to_string(&error)
+                    .map(|text| text.to_string())
+                    .unwrap_or_else(|_| "<unprintable>".into())
+            ),
             Err(_) => panic!("JavaScript evaluation could not start"),
             Ok(Ok(_)) => panic!("JavaScript assertion did not return a boolean"),
         }

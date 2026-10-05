@@ -3,7 +3,7 @@
 use crate::builtins::collection_data::CollectionKind;
 use crate::builtins::{arg, coll_ptr, coll_ptr_kind, iter_result, map_ptr, set_internal};
 use crate::interpreter::Interp;
-use crate::value::{set_builtin, Gc, Object, Value};
+use crate::value::{Gc, Object, Value, set_builtin};
 
 /// Build a live iterator over a Map/Set. `kind`: 0 = values, 1 = keys, 2 = [key,value].
 /// Like [`collection_iter`] but brand-checks the exact collection kind ("Set" / "Map").

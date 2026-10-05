@@ -21,11 +21,7 @@ pub(super) fn install_number(it: &mut Interp) {
             Value::Undefined => 10.0,
             v => {
                 let r = ab(i.to_number(&v))?;
-                if r.is_nan() {
-                    0.0
-                } else {
-                    r.trunc()
-                }
+                if r.is_nan() { 0.0 } else { r.trunc() }
             }
         };
         if !(2.0..=36.0).contains(&radix) {
@@ -188,11 +184,7 @@ fn to_precision(n: f64, p: usize) -> String {
     } else {
         format!("0.{}{}", "0".repeat((-e - 1) as usize), digits)
     };
-    if n < 0.0 {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if n < 0.0 { format!("-{body}") } else { body }
 }
 
 /// `Number.prototype.toExponential`: `f` fraction digits, or (fractionDigits undefined,

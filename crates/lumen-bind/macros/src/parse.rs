@@ -183,7 +183,20 @@ const HINT: &str = "hint";
 
 pub fn parse_opts(ts: TokenStream) -> Res<Opts> {
     let mut o = Opts::default();
-    let toks: Vec<TokenTree> = ts.into_iter().collect();
+    // macro_rules! forwards literal fragments through invisible groups.
+    // These groups carry hygiene, but are transparent in attribute options.
+    fn append_options(ts: TokenStream, tokens: &mut Vec<TokenTree>) {
+        for token in ts {
+            match token {
+                TokenTree::Group(group) if group.delimiter() == Delimiter::None => {
+                    append_options(group.stream(), tokens);
+                }
+                token => tokens.push(token),
+            }
+        }
+    }
+    let mut toks = Vec::new();
+    append_options(ts, &mut toks);
     for part in split_commas(&toks) {
         match part.as_slice() {
             [] => {}

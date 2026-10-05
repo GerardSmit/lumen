@@ -291,6 +291,7 @@ pub struct LoaderCache {
 
 const SOURCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const SOURCE_CACHE_ENTRIES: usize = 512;
+const KEY_CACHE_ENTRIES: usize = 4096;
 type SourceKey = (String, Option<String>);
 
 /// Dynamic imports can keep a loader alive for an entire account lifetime. Cache only
@@ -502,12 +503,17 @@ impl LoaderCache {
         *self.memo.borrow_mut() = memo;
         let (resolved, src) = result?;
         if let Some(base) = base {
-            self.keys
-                .borrow_mut()
-                .insert((specifier.to_owned(), base, attr.clone()), resolved.clone());
-            self.sources
-                .borrow_mut()
-                .insert((resolved.clone(), attr), &src);
+            let mut sources = self.sources.borrow_mut();
+            sources.insert((resolved.clone(), attr.clone()), &src);
+            let mut keys = self.keys.borrow_mut();
+            if keys.len() >= KEY_CACHE_ENTRIES {
+                // A key whose source was evicted can no longer short-circuit a resolution.
+                keys.retain(|(_, _, a), r| sources.entries.contains_key(&(r.clone(), a.clone())));
+                if keys.len() >= KEY_CACHE_ENTRIES {
+                    keys.clear();
+                }
+            }
+            keys.insert((specifier.to_owned(), base, attr), resolved.clone());
         }
         Some((resolved, src))
     }

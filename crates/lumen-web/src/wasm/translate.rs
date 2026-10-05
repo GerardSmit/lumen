@@ -120,7 +120,7 @@ fn ir_type(t: ValType) -> Result<Type, String> {
         ValType::F32 => Type::F32,
         ValType::F64 => Type::F64,
         ValType::FuncRef | ValType::ExternRef => {
-            return Err("wasm jit: reference types are not supported".into())
+            return Err("wasm jit: reference types are not supported".into());
         }
     })
 }

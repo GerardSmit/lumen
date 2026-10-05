@@ -74,9 +74,37 @@ pub struct Timers {
     next_id: u64,
     heap: BinaryHeap<Reverse<(Instant, u64)>>,
     entries: HashMap<u64, Entry>,
+    unref_count: usize,
 }
 
 impl Timers {
+    fn remove_entry(&mut self, id: u64) {
+        if let Some(entry) = self.entries.remove(&id) {
+            if !entry.refed {
+                self.unref_count -= 1;
+            }
+        }
+    }
+
+    fn release_idle_capacity(&mut self) {
+        if self.entries.is_empty() {
+            self.heap.clear();
+            if self.heap.capacity() > 64 {
+                self.heap = BinaryHeap::new();
+            }
+            if self.entries.capacity() > 64 {
+                self.entries = HashMap::new();
+            }
+        } else {
+            if self.heap.capacity() > 256 && self.heap.len() * 4 < self.heap.capacity() {
+                self.heap.shrink_to(self.heap.len().max(64) * 2);
+            }
+            if self.entries.capacity() > 256 && self.entries.len() * 4 < self.entries.capacity() {
+                self.entries.shrink_to(self.entries.len().max(64) * 2);
+            }
+        }
+    }
+
     fn schedule(
         &mut self,
         callback: Value,
@@ -110,9 +138,12 @@ impl Timers {
             .get(&id)
             .is_some_and(|entry| entry.owner.same_realm(owner))
         {
-            self.entries.remove(&id);
+            self.remove_entry(id);
         }
         self.compact_stale_heap();
+        if self.entries.is_empty() {
+            self.release_idle_capacity();
+        }
     }
 
     /// Drop every pending timer and interval owned by `realm`, returning the number cancelled.
@@ -120,11 +151,19 @@ impl Timers {
     /// values immediately. Other realms' timers remain in the shared heap.
     pub fn cancel_realm(&mut self, realm: &RealmHandle) -> usize {
         let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| !entry.owner.same_realm(realm));
+        let mut unref_removed = 0;
+        self.entries.retain(|_, entry| {
+            let keep = !entry.owner.same_realm(realm);
+            if !keep && !entry.refed {
+                unref_removed += 1;
+            }
+            keep
+        });
+        self.unref_count -= unref_removed;
         let cancelled = before - self.entries.len();
         if cancelled != 0 {
             self.compact_stale_heap();
+            self.release_idle_capacity();
         }
         cancelled
     }
@@ -147,6 +186,7 @@ impl Timers {
                     .get(id)
                     .is_some_and(|entry| entry.deadline == *deadline)
             });
+            self.release_idle_capacity();
         }
     }
 
@@ -154,6 +194,9 @@ impl Timers {
     pub fn set_ref(&mut self, id: u64, owner: &RealmHandle, refed: bool) -> bool {
         match self.entries.get_mut(&id) {
             Some(e) if e.owner.same_realm(owner) => {
+                if e.refed != refed {
+                    if refed { self.unref_count -= 1; } else { self.unref_count += 1; }
+                }
                 e.refed = refed;
                 true
             }
@@ -178,7 +221,7 @@ impl Timers {
 
     /// Whether any live ref'd timer remains (the loop stays alive while true).
     pub fn has_pending(&self) -> bool {
-        self.entries.values().any(|e| e.refed)
+        self.entries.len() > self.unref_count
     }
 
     fn is_live(&self, id: u64, deadline: Instant) -> bool {
@@ -206,8 +249,8 @@ impl Timers {
     /// does not stop it firing. The event loop uses [`Timers::take_next_due`] instead.
     pub fn take_due(&mut self, now: Instant) -> Vec<(Value, Vec<Value>)> {
         let mut due = Vec::new();
-        while let Some(next) = self.take_next_due(now) {
-            due.push(next);
+        while let Some((callback, args, _owner)) = self.take_next_due(now) {
+            due.push((callback, args));
         }
         due
     }
@@ -215,7 +258,7 @@ impl Timers {
     /// The earliest callback due at `now`, if any, taken the same way as [`Timers::take_due`].
     /// Taking one at a time and running it before taking the next is what lets a timer callback
     /// cancel or refresh another timer that is due in the same turn, as in Node.
-    pub fn take_next_due(&mut self, now: Instant) -> Option<(Value, Vec<Value>)> {
+    pub fn take_next_due(&mut self, now: Instant) -> Option<(Value, Vec<Value>, RealmHandle)> {
         while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
             if deadline > now {
                 return None;
@@ -225,7 +268,11 @@ impl Timers {
                 continue; // cancelled, or superseded by a refresh
             }
             let entry = self.entries.get_mut(&id).expect("live entry");
-            let due = (entry.callback.clone(), entry.args.clone());
+            let due = (
+                entry.callback.clone(),
+                entry.args.clone(),
+                entry.owner.clone(),
+            );
             match entry.repeat {
                 Some(period) => {
                     // Keep the cadence, catching up on a short lag (the OS timer granularity makes
@@ -245,7 +292,10 @@ impl Timers {
                     self.heap.push(Reverse((entry.deadline, id)));
                 }
                 None => {
-                    self.entries.remove(&id);
+                    self.remove_entry(id);
+                    if self.entries.is_empty() {
+                        self.release_idle_capacity();
+                    }
                 }
             }
             return Some(due);
@@ -273,18 +323,46 @@ fn schedule(
     } else {
         0
     });
+    schedule_delay(ctx, callback, args, delay, repeat).map(|id| id as f64)
+}
+
+/// Schedule a host-owned one-shot callback in the current realm using the same bounded timer
+/// heap and cancellation/lifetime rules as the JavaScript timer globals. Browser subsystems use
+/// this for asynchronous operations whose completion must be ordered by real elapsed time, rather
+/// than introducing a second callback queue or blocking the event loop.
+pub fn schedule_host_callback(
+    ctx: &mut Ctx,
+    callback: Value,
+    args: &[Value],
+    delay: Duration,
+) -> Result<u64, OpError> {
+    if !callback.is_callable() {
+        return Err(NativeError::type_error("host timer callback must be callable").into());
+    }
+    schedule_delay(ctx, callback, args, delay, false)
+}
+
+fn schedule_delay(
+    ctx: &mut Ctx,
+    callback: Value,
+    args: &[Value],
+    delay: Duration,
+    repeat: bool,
+) -> Result<u64, OpError> {
     let deadline = Instant::now()
         .checked_add(delay)
         .ok_or_else(|| NativeError::overflow("timer delay exceeds the clock range"))?;
     let owner = ctx.current_host_realm();
-    let timers = ctx.host_mut::<Timers>().expect("timers state installed");
+    let timers = ctx
+        .host_mut::<Timers>()
+        .ok_or_else(|| NativeError::type_error("timer host state is not installed"))?;
     if timers
         .limit
         .is_some_and(|limit| timers.entries.len() >= limit)
     {
         return Err(NativeError::overflow("timer capacity exhausted").into());
     }
-    Ok(timers.schedule(callback, args.to_vec(), owner, delay, repeat, deadline) as f64)
+    Ok(timers.schedule(callback, args.to_vec(), owner, delay, repeat, deadline))
 }
 
 /// A timer id argument; `None` for ids that name no timer (non-numeric, negative, NaN).
@@ -318,7 +396,7 @@ mod globals {
     fn set_timeout(
         ctx: &mut Ctx,
         callback: Value,
-        delay: Value,
+        #[default(Value::Num(0.0))] delay: Value,
         #[varargs] args: &[Value],
     ) -> Result<f64, OpError> {
         schedule(ctx, callback, delay, args, false)
@@ -328,19 +406,19 @@ mod globals {
     fn set_interval(
         ctx: &mut Ctx,
         callback: Value,
-        delay: Value,
+        #[default(Value::Num(0.0))] delay: Value,
         #[varargs] args: &[Value],
     ) -> Result<f64, OpError> {
         schedule(ctx, callback, delay, args, true)
     }
 
     #[op(name = "clearTimeout")]
-    fn clear_timeout(ctx: &mut Ctx, id: Value) -> Result<(), Value> {
+    fn clear_timeout(ctx: &mut Ctx, #[default(Value::Num(0.0))] id: Value) -> Result<(), Value> {
         clear_timer(ctx, &id)
     }
 
     #[op(name = "clearInterval")]
-    fn clear_interval(ctx: &mut Ctx, id: Value) -> Result<(), Value> {
+    fn clear_interval(ctx: &mut Ctx, #[default(Value::Num(0.0))] id: Value) -> Result<(), Value> {
         clear_timer(ctx, &id)
     }
 

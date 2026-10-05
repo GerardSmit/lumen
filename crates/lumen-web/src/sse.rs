@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lumen_host::{Ctx, SpawnHandle, Value};
@@ -93,7 +93,7 @@ pub(crate) fn op_sse_connect(ctx: &mut Ctx, _this: Value, args: &[Value]) -> Res
             return Err(ctx.make_error(
                 "SyntaxError",
                 format!("EventSource: unsupported scheme '{other}'"),
-            ))
+            ));
         }
     }
 
@@ -230,12 +230,12 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
             204 | 205 => {
                 return Err(ConnectError::Fatal(format!(
                     "server returned {status} (stop)"
-                )))
+                )));
             }
             _ => {
                 return Err(ConnectError::Fatal(format!(
                     "server returned HTTP {status}"
-                )))
+                )));
             }
         }
     }
@@ -255,7 +255,7 @@ fn decode_connect(
                     return Ok(vec![
                         Value::from_string("fatal".into()),
                         Value::from_string("closed".into()),
-                    ])
+                    ]);
                 }
             };
             arm_read(ctx, id, StreamReader { stream, closed });

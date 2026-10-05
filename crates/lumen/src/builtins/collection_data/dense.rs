@@ -172,9 +172,11 @@ mod tests {
         }
         assert!(index.candidate(&Value::Num(LIMIT as f64), 0).is_none());
         assert_eq!(index.candidate(&Value::Num(0.0), EMPTY as usize), Some(0));
-        assert!(DenseIndex::default()
-            .candidate(&Value::Num(0.0), EMPTY as usize)
-            .is_none());
+        assert!(
+            DenseIndex::default()
+                .candidate(&Value::Num(0.0), EMPTY as usize)
+                .is_none()
+        );
         assert_eq!(index.0.as_ref().unwrap().len(), LIMIT);
         assert!(index.0.as_ref().unwrap().capacity() <= LIMIT);
         assert_eq!(index.lookup(&Value::Num(-0.0)), Some(0));

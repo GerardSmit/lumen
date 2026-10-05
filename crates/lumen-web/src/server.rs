@@ -30,8 +30,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use lumen_host::{Ctx, SpawnHandle, Value};
@@ -380,7 +380,7 @@ fn accept_one(listener: &TcpListener, closed: &AtomicBool, fallback_host: &str) 
                     url,
                     headers,
                     body,
-                })
+                });
             }
             Err(msg) => {
                 let (code, text) = if msg.contains("headers too large") {
