@@ -582,28 +582,6 @@ fn load_impl(
     Ok(image)
 }
 
-/// Release-policy entry point: a detached signature must match an allowed key.
-#[cfg(feature = "native-signing")]
-pub fn load_signed(
-    bytes: &[u8],
-    target: &TargetSpec,
-    signature: &[u8; lumen_common::aot::signature::SIGNATURE_LEN],
-    allowed_keys: &[[u8; lumen_common::aot::signature::PUBLIC_KEY_LEN]],
-    resolve_import: impl FnMut(&str, &str, u64) -> Option<usize>,
-    resolve: impl FnMut(got::Kind, u32, *const u8, &[u8]) -> Option<usize>,
-) -> Result<LoadedNative, String> {
-    load(
-        bytes,
-        target,
-        |blob| {
-            lumen_common::aot::signature::verify(blob, signature, allowed_keys)
-                .map_err(str::to_owned)
-        },
-        resolve_import,
-        resolve,
-    )
-}
-
 fn host_arch() -> Option<Arch> {
     #[cfg(target_arch = "aarch64")]
     {

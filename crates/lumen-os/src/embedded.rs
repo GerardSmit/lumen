@@ -244,11 +244,7 @@ pub fn package(
         .map(|path| std::fs::read(path).map_err(|e| format!("{}: {e}", path.display())))
         .transpose()?;
     if pe {
-        let header = executable::pe_header(&bytes)?;
-        if bytes[header + 24 + 144..header + 24 + 152]
-            .iter()
-            .any(|byte| *byte != 0)
-        {
+        if executable::pe_is_signed(&bytes)? {
             return Err(
                 "signed PE stubs must be supplied unsigned and signed after app embedding".into(),
             );

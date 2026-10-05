@@ -40,6 +40,7 @@ pub use lumen_common::hash::Algo;
 mod apple;
 #[cfg(crypto_cng)]
 mod cng;
+pub mod ed25519;
 mod error;
 #[cfg(any(crypto_apple, crypto_cng))]
 mod der;
@@ -48,6 +49,7 @@ mod openssl;
 #[cfg(any(crypto_rustcrypto, crypto_apple, crypto_cng))]
 #[allow(dead_code)] // which items a build uses depends on the backends it contains
 mod pss;
+pub mod native_signature;
 mod rng;
 #[allow(dead_code)] // which items a build uses depends on the backends it contains
 mod rsa_util;

@@ -757,7 +757,7 @@ fn load_program_impl(
     }
     let verify = |blob: &[u8]| match signed {
         Some(signature) => {
-            aot::signature::verify(blob, &signature, allowed_keys).map_err(str::to_owned)
+            lumen_crypto::native_signature::verify(blob, &signature, allowed_keys).map_err(str::to_owned)
         }
         None if allow_unsigned => Ok(()),
         None => Err("unsigned native image is not allowed".into()),

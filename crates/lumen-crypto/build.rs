@@ -19,7 +19,7 @@ fn main() {
             println!("cargo::rustc-cfg=crypto_{name}");
         }
     }
-    if !(apple || cng || openssl || rustcrypto) {
+    if !(apple || cng || openssl || rustcrypto || feature("SIGNATURES_ONLY")) {
         println!(
             "cargo::error=lumen-crypto: no backend can be built for {}: enable `rustcrypto`, or the system backend of the target \
              (`apple` on Apple, `cng` on Windows, `openssl` on other unix)",

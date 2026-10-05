@@ -15,8 +15,9 @@ aac = ["video", "dep:rusty_aac"]
 cookies = ["dep:psl"]
 # Exact allocation counters in `fastalloc` (see the engine's `memstats`); they sit on the allocation fast path.
 mem-stats = []
-native-signing = ["dep:ed25519-dalek"]
 native-sidecar = ["dep:sha2"]
+# `executable`: ELF / Mach-O / PE structure of standalone stubs, read through the `object` crate.
+executable = ["dep:object"]
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt", "dep:subtle"]
 # `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
@@ -36,7 +37,8 @@ unicode-segmentation = { version = "=1.12.0", default-features = false }
 unicode-bidi = { version = "=0.3.18", default-features = false, features = ["hardcoded-data"] }
 unicode-script = "=0.5.8"
 psl = { version = "=2.1.238", optional = true }
-ed25519-dalek = { version = "2", default-features = false, optional = true }
+# Same version as lumen-codegen's object writer; `read` brings the ELF, Mach-O and PE readers (no_std + alloc).
+object = { version = "=0.36.7", default-features = false, features = ["read"], optional = true }
 digest = { version = "0.10", optional = true }
 md-5 = { version = "0.10", optional = true }
 sha1 = { version = "0.10", optional = true }

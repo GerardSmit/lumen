@@ -149,7 +149,7 @@ pub(crate) mod bindings {
             OID_ED25519 => {
                 let mut inner = key.value;
                 let secret: [u8; 32] = expect(&mut inner, OCTET_STRING)?.value.try_into().ok()?;
-                ed25519_dalek::SigningKey::from_bytes(&secret)
+                lumen_crypto::ed25519::SigningKey::from_bytes(&secret)
                     .verifying_key()
                     .to_bytes()
                     .to_vec()
@@ -378,11 +378,11 @@ pub(crate) mod bindings {
                 }
                 let (Ok(key), Ok(sig)) = (
                     <[u8; 32]>::try_from(spki.key),
-                    ed25519_dalek::Signature::from_slice(signature),
+                    lumen_crypto::ed25519::Signature::from_slice(signature),
                 ) else {
                     return false;
                 };
-                ed25519_dalek::VerifyingKey::from_bytes(&key)
+                lumen_crypto::ed25519::VerifyingKey::from_bytes(&key)
                     .is_ok_and(|vk| vk.verify_strict(data, &sig).is_ok())
             }
         }

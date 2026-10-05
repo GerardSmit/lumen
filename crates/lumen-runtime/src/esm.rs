@@ -680,18 +680,9 @@ fn strip_url_fragment(value: &str) -> String {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn url_origin(value: &str) -> Option<String> {
     let url = lumen_common::url::parse(value, None).ok()?;
-    if !matches!(url.scheme.as_str(), "http" | "https") {
-        return None;
-    }
-    let host = url.host?;
-    let default_port = if url.scheme == "https" { 443 } else { 80 };
-    Some(match url.port {
-        Some(port) if port != default_port => format!("{}://{}:{port}", url.scheme, host),
-        _ => format!("{}://{}", url.scheme, host),
-    })
+    matches!(url.scheme.as_str(), "http" | "https").then(|| url.origin())
 }
 
 /// The source of a `data:text/javascript,...` (or `application/javascript`) module URL, whose
