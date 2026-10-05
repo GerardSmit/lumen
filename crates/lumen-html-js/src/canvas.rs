@@ -3,15 +3,15 @@ use super::*;
 use lumen::embed::{Deferred, JsFunction};
 use lumen_html::paint::{FontSpec, FontStyle, TextShaper};
 use lumen_html_image::{
-    Rgba8Image,
     canvas::{
         CanvasGradient, CanvasGradientKind, CanvasPattern, CanvasPatternRepetition, CanvasSurface,
         ParsedSvgPath,
     },
+    Rgba8Image,
 };
 use lumen_html_text::{
-    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering,
-    DEFAULT_FONT_BYTES, FontFace, FontProvider, FontSet, RegisteredFont, TEST_FONT_BOLD_BYTES,
+    CanvasFontKerning, CanvasFontVariantCaps, CanvasTextOptions, CanvasTextRendering, FontFace,
+    FontProvider, FontSet, RegisteredFont, DEFAULT_FONT_BYTES, TEST_FONT_BOLD_BYTES,
     TEST_FONT_BYTES,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -3671,91 +3671,14 @@ fn parse_style_color(value: &Value) -> Option<[u8; 4]> {
     let Value::Str(value) = value else {
         return None;
     };
-    let value = value.as_str().trim().to_ascii_lowercase();
-    let named = match value.as_str() {
-        "black" => Some([0, 0, 0, 255]),
-        "white" => Some([255, 255, 255, 255]),
-        "red" => Some([255, 0, 0, 255]),
-        "green" => Some([0, 128, 0, 255]),
-        "blue" => Some([0, 0, 255, 255]),
-        "yellow" => Some([255, 255, 0, 255]),
-        "magenta" | "fuchsia" => Some([255, 0, 255, 255]),
-        "cyan" | "aqua" => Some([0, 255, 255, 255]),
-        "transparent" => Some([0, 0, 0, 0]),
-        _ => None,
+    let black = lumen_html::paint::Rgba {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: 255,
     };
-    if named.is_some() {
-        return named;
-    }
-    if let Some(body) = value.strip_prefix("rgb(").and_then(|s| s.strip_suffix(')')) {
-        return parse_rgb(body, false);
-    }
-    if let Some(body) = value
-        .strip_prefix("rgba(")
-        .and_then(|s| s.strip_suffix(')'))
-    {
-        return parse_rgb(body, true);
-    }
-    let digits = value.strip_prefix('#')?;
-    let expand = |c: char| c.to_digit(16).map(|n| (n * 17) as u8);
-    match digits.len() {
-        3 | 4 => {
-            let mut out = [0, 0, 0, 255];
-            for (i, c) in digits.chars().enumerate() {
-                out[i] = expand(c)?;
-            }
-            Some(out)
-        }
-        6 | 8 => {
-            let mut out = [0, 0, 0, 255];
-            for i in 0..digits.len() / 2 {
-                out[i] = u8::from_str_radix(&digits[i * 2..i * 2 + 2], 16).ok()?;
-            }
-            Some(out)
-        }
-        _ => None,
-    }
-}
-
-fn parse_rgb(body: &str, has_alpha: bool) -> Option<[u8; 4]> {
-    let parts = body.split(',').map(str::trim).collect::<Vec<_>>();
-    if parts.len() != if has_alpha { 4 } else { 3 } {
-        return None;
-    }
-    let channel = |value: &str| {
-        if let Some(percent) = value.strip_suffix('%') {
-            let percent: f32 = percent.trim().parse().ok()?;
-            (percent.is_finite() && (0.0..=100.0).contains(&percent))
-                .then(|| (percent * 2.55).round() as u8)
-        } else {
-            let channel: f32 = value.parse().ok()?;
-            (channel.is_finite() && (0.0..=255.0).contains(&channel)).then(|| channel.round() as u8)
-        }
-    };
-    let alpha = if has_alpha {
-        let value = parts[3];
-        if let Some(percent) = value.strip_suffix('%') {
-            let percent: f32 = percent.trim().parse().ok()?;
-            if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
-                return None;
-            }
-            (percent * 2.55).round() as u8
-        } else {
-            let alpha: f32 = value.parse().ok()?;
-            if !alpha.is_finite() || !(0.0..=1.0).contains(&alpha) {
-                return None;
-            }
-            (alpha * 255.0).round() as u8
-        }
-    } else {
-        255
-    };
-    Some([
-        channel(parts[0])?,
-        channel(parts[1])?,
-        channel(parts[2])?,
-        alpha,
-    ])
+    let color = lumen_html::css::parse_animation_color(value.as_str(), black)?;
+    Some([color.r, color.g, color.b, color.a])
 }
 
 fn color_string(color: [u8; 4]) -> String {
