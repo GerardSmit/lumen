@@ -11,7 +11,7 @@ license.workspace = true
 
 [dependencies]
 lumen-codegen = { path = "../lumen-codegen", optional = true }
-lumen-common = { path = "../lumen-common" }
+lumen-common = { path = "../lumen-common", features = ["deflate"] }
 lumen-os = { path = "../lumen-os" }
 # Ed25519 verification of signed native images (`aot-native`); no asymmetric backends needed.
 lumen-crypto = { path = "../lumen-crypto", default-features = false, features = ["signatures-only"], optional = true }

@@ -104,6 +104,17 @@ pub fn decompress_woff1_with_custom_z(
         // Pad output to 4 bytes
         out.resize(Round4!(out.len()), 0);
 
+        // Reject a table whose contents do not match its directory checksum (the `head` table's
+        // checksum is taken with its checkSumAdjustment field zeroed).
+        let table_bytes = &out[table_offset..table_end];
+        let mut table_sum = compute_checksum(table_bytes);
+        if table.tag == crate::HEAD {
+            bail_if!(table_bytes.len() < 12);
+            let adjustment = u32::from_be_bytes(table_bytes[8..12].try_into().unwrap());
+            table_sum = table_sum.wrapping_sub(adjustment);
+        }
+        bail_if!(table_sum != table.orig_checksum);
+
         // Update checksum
         checksum = checksum.wrapping_add(compute_checksum(&out[dir_entry_start..dir_entry_end]));
         checksum = checksum.wrapping_add(compute_checksum(&out[table_offset..table_end]));

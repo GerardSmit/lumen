@@ -461,12 +461,5 @@ fn validate_shape(kind: Kind, payload: &[u8], signed: bool) -> Result<(), &'stat
 }
 
 fn crc32(header: &[u8], body: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &byte in header.iter().chain(body) {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    crate::crc32::crc32_from(crate::crc32::crc32_from(0, header), body)
 }

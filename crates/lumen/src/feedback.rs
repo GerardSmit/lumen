@@ -26,11 +26,8 @@ pub fn record<R>(body: impl FnOnce() -> R) -> (R, Profile) {
     (result, profile)
 }
 
-pub(crate) fn hash(bytes: &[u8], mut hash: u64) -> u64 {
-    for &byte in bytes {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-    }
-    hash
+pub(crate) fn hash(bytes: &[u8], seed: u64) -> u64 {
+    lumen_common::fasthash::fnv1a64(seed, bytes)
 }
 
 pub(crate) fn observe(key: impl FnOnce() -> u64, pc: usize, left: &Value, right: &Value) {

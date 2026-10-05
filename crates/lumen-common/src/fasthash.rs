@@ -18,6 +18,21 @@ fn folded_multiply(x: u64, y: u64) -> u64 {
     (full as u64) ^ ((full >> 64) as u64)
 }
 
+/// The FNV-1a 64-bit offset basis: the `seed` of a fresh [`fnv1a64`] hash.
+pub const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64 of `bytes`, continued from `seed` ([`FNV1A64_OFFSET`] to start; a previous result
+/// to chain). Unseeded and stable across processes, for fingerprints and cache keys that are
+/// stored or compared across runs; not a defence against hash flooding.
+pub const fn fnv1a64(mut seed: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        seed = (seed ^ bytes[i] as u64).wrapping_mul(0x0100_0000_01b3);
+        i += 1;
+    }
+    seed
+}
+
 static SEED: AtomicU64 = AtomicU64::new(0);
 static FOLD: AtomicU64 = AtomicU64::new(0);
 

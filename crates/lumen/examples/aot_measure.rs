@@ -2,7 +2,7 @@
 //! Run with LUMEN_JIT_EAGER=1; counts are generated regions, not complete AOT functions.
 use lumen::precompiled::{CompiledUnit, PrecompileBundle, SEC_MANIFEST};
 use lumen::{Completion, Engine, SourceKind};
-use lumen_common::{aot, lzh};
+use lumen_common::{aot, compress};
 #[cfg(feature = "bench")]
 use std::io::Write;
 use std::time::Instant;
@@ -20,7 +20,7 @@ fn main() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     }
-    println!("program,source_bytes,functions,chunks,refused,blob_bytes,raw_blob_bytes,bytecode_store_bytes,bytecode_lzh_bytes,lzh_decode_mbps,jit_units,jit_bytes,native_entries,eval_ms");
+    println!("program,source_bytes,functions,chunks,refused,blob_bytes,raw_blob_bytes,bytecode_store_bytes,bytecode_deflate_bytes,deflate_decode_mbps,jit_units,jit_bytes,native_entries,eval_ms");
     for path in std::env::args().skip(1) {
         let src = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
         let unit = CompiledUnit::compile(&src, SourceKind::Script)?;
@@ -47,11 +47,11 @@ fn main() -> Result<(), String> {
         } else {
             container.sections[bc_index].data
         };
-        let compressed = lzh::compress(store);
+        let compressed = compress::deflate_best(store);
         let start = Instant::now();
         let mut iterations = 0;
         while start.elapsed().as_millis() < 100 {
-            assert_eq!(lzh::decompress_bounded(&compressed, store.len())?, store);
+            assert_eq!(compress::inflate_limited(&compressed, store.len())?, store);
             iterations += 1;
         }
         let mbps =

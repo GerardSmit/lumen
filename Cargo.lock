@@ -1204,6 +1204,7 @@ dependencies = [
  "blake2",
  "brotli",
  "bzip2",
+ "crc32fast",
  "digest 0.10.7",
  "hkdf",
  "hmac",

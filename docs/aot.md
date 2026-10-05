@@ -187,7 +187,7 @@ also rechecks the signature policy. Inventory reports the highest accepted gener
 for each app as current or stale against the running target; it does not launch
 an app. An otherwise compatible blob is stale if its code/GOT mapping exceeds
 the device's current AOT reservation or violates page placement.
-The optional `native-sidecar` codec stores sorted function/code-offset line
+The sidecar codec (`lumen-common`'s `hash` feature) stores sorted function/code-offset line
 entries and source names under the SHA-256 hash of the exact blob.
 `symbolize-native` verifies that hash, validates function offsets against the
 blob, then resolves a function index and code offset. Generating sidecars and

@@ -12,7 +12,7 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen" }
 lumen-aot = { path = "../lumen-aot", features = ["native"] }
-lumen-common = { path = "../lumen-common", features = ["native-sidecar", "executable"] }
+lumen-common = { path = "../lumen-common", features = ["hash", "executable"] }
 lumen-codegen = { path = "../lumen-codegen", features = ["standalone-object"] }
 lumen-host = { path = "../lumen-host" }
 lumen-os = { path = "../lumen-os" }

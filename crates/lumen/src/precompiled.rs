@@ -45,7 +45,7 @@
 //! *store* section. A unit refers to its slices by offset. The bytecode store is *raw*: chunks
 //! decode straight from the blob's static bytes (a load registers every chunk of a unit, so a
 //! compressed store would have to be decompressed whole and held). The others are compressed
-//! ([`crate::lzh`]) in independent blocks of [`STORE_BLOCK`] bytes: kept text (read only by
+//! (raw deflate) in independent blocks of [`STORE_BLOCK`] bytes: kept text (read only by
 //! `toString`) decompresses a block the first time a slice in it is needed and keeps it for the
 //! life of the process; a function body is decoded through a small cache of recently
 //! decompressed blocks and copied out, so a program's decoded bodies never pin whole blocks.
@@ -74,8 +74,8 @@
 //! tables for stack traces.
 //!
 //! A store: `block_size`, `raw_len`, `block_count` (LEB128), `block_count` compressed block
-//! lengths (LEB128), then the blocks, each a [`crate::lzh`] frame of `block_size` bytes (the
-//! last one shorter).
+//! lengths (LEB128), then the blocks, each a frame of `block_size` bytes (the last one
+//! shorter): `method` (u8: 0 stored, 2 raw deflate), the block's raw length (LEB128), the payload.
 //!
 //! The manifest: the section indices of the body, bytecode and kept-text stores (LEB128, 0 =
 //! none), `unit_count` (LEB128), then per unit `kind` (u8: 0 script, 1 module, 2 CommonJS),
@@ -759,17 +759,56 @@ impl PrecompileBundle {
     }
 }
 
+const BLOCK_STORED: u8 = 0;
+const BLOCK_DEFLATE: u8 = 2;
+
+/// One store block as a frame: deflated when that is smaller (and `compress` is set), else stored.
+fn pack_block(block: &[u8], compress: bool) -> Vec<u8> {
+    let packed = if compress && block.len() >= 64 {
+        lumen_common::compress::deflate_best(block)
+    } else {
+        Vec::new()
+    };
+    let (method, payload) = if !packed.is_empty() && packed.len() < block.len() {
+        (BLOCK_DEFLATE, packed.as_slice())
+    } else {
+        (BLOCK_STORED, block)
+    };
+    let mut frame = vec![method];
+    uv(&mut frame, block.len() as u64);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// The block a [`pack_block`] frame holds, refusing one that decodes to more than `max_len`.
+fn unpack_block(frame: &[u8], max_len: usize) -> Result<Vec<u8>, String> {
+    let bad = || "precompiled: corrupt store block".to_string();
+    let method = *frame.first().ok_or_else(bad)?;
+    let mut pos = 1;
+    let len = usize::try_from(lumen_common::aot::read_varint(frame, &mut pos).map_err(|_| bad())?)
+        .map_err(|_| bad())?;
+    if len > max_len {
+        return Err(bad());
+    }
+    let payload = frame.get(pos..).ok_or_else(bad)?;
+    let block = match method {
+        BLOCK_STORED => payload.to_vec(),
+        BLOCK_DEFLATE => {
+            lumen_common::compress::inflate_limited(payload, len).map_err(|_| bad())?
+        }
+        _ => return Err("precompiled: unsupported store block method (rebuild the blob)".into()),
+    };
+    if block.len() != len {
+        return Err(bad());
+    }
+    Ok(block)
+}
+
 /// A store section over `data`: blocks of [`STORE_BLOCK`] bytes, each compressed (or stored).
 fn store_section(data: &[u8], compress: bool) -> Vec<u8> {
     let frames: Vec<Vec<u8>> = data
         .chunks(STORE_BLOCK)
-        .map(|block| {
-            if compress {
-                crate::lzh::compress(block)
-            } else {
-                crate::lzh::stored(block)
-            }
-        })
+        .map(|block| pack_block(block, compress))
         .collect();
     let mut out = Vec::new();
     uv(&mut out, STORE_BLOCK as u64);
@@ -968,8 +1007,7 @@ pub(crate) mod store {
         let last = (end - 1) / idx.block_size;
         let mut out = Vec::with_capacity(len);
         for b in first..=last {
-            let data =
-                crate::lzh::decompress_bounded(&section[idx.frames[b].clone()], idx.block_size)?;
+            let data = super::unpack_block(&section[idx.frames[b].clone()], idx.block_size)?;
             if data.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                 return Err("precompiled: bad store block".into());
             }
@@ -1039,10 +1077,7 @@ pub(crate) mod store {
             let at = match recent.iter().position(|(k, n, _)| *k == key && *n == b) {
                 Some(at) => at,
                 None => {
-                    let d = crate::lzh::decompress_bounded(
-                        &section[idx.frames[b].clone()],
-                        idx.block_size,
-                    )?;
+                    let d = super::unpack_block(&section[idx.frames[b].clone()], idx.block_size)?;
                     if d.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                         return Err("precompiled: bad store block".into());
                     }
@@ -1110,8 +1145,7 @@ pub(crate) mod store {
             .ok_or("precompiled: store slice out of bounds")?;
         let (first, last) = (off / idx.block_size, (end - 1) / idx.block_size);
         let decode = |b: usize| -> Result<Vec<u8>, String> {
-            let d =
-                crate::lzh::decompress_bounded(&section[idx.frames[b].clone()], idx.block_size)?;
+            let d = super::unpack_block(&section[idx.frames[b].clone()], idx.block_size)?;
             if d.len() != idx.block_size.min(idx.raw_len - b * idx.block_size) {
                 return Err("precompiled: bad store block".into());
             }
