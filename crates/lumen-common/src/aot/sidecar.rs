@@ -1,6 +1,6 @@
 //! Host-side line maps for stripped native blobs.
 
-use sha2::{Digest, Sha256};
+use crate::hash::{Algo, Hasher};
 
 pub const MAGIC: &[u8; 8] = b"LUMMAP01";
 pub const VERSION: u32 = 1;
@@ -193,9 +193,14 @@ impl Sidecar {
 }
 
 pub fn hash(blob: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(blob);
+    let mut digest = Hasher::new(Algo::Sha256);
+    digest.update(blob);
+    finish_sha256(digest)
+}
+
+fn finish_sha256(digest: Hasher) -> [u8; 32] {
     let mut out = [0; 32];
-    out.copy_from_slice(&digest);
+    out.copy_from_slice(&digest.finish());
     out
 }
 
@@ -213,16 +218,14 @@ pub fn hash_sources(sources: &[(&str, &[u8])]) -> Result<[u8; 32], &'static str>
     if sorted.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err("duplicate source name");
     }
-    let mut digest = Sha256::new();
+    let mut digest = Hasher::new(Algo::Sha256);
     digest.update(b"LUMEN-AOT-SOURCE-SET-1");
-    digest.update((sorted.len() as u64).to_le_bytes());
+    digest.update(&(sorted.len() as u64).to_le_bytes());
     for (name, bytes) in sorted {
-        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(&(name.len() as u64).to_le_bytes());
         digest.update(name.as_bytes());
-        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(&(bytes.len() as u64).to_le_bytes());
         digest.update(bytes);
     }
-    let mut out = [0; 32];
-    out.copy_from_slice(&digest.finalize());
-    Ok(out)
+    Ok(finish_sha256(digest))
 }

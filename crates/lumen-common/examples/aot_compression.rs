@@ -5,12 +5,12 @@ use std::{
 };
 
 fn measure(program: &str, region: &str, raw: &[u8]) -> Result<(), String> {
-    let frame = lumen_common::lzh::compress(raw);
-    if lumen_common::lzh::compress(raw) != frame {
-        return Err("non-deterministic LZH frame".into());
+    let frame = lumen_common::compress::deflate_best(raw);
+    if lumen_common::compress::deflate_best(raw) != frame {
+        return Err("non-deterministic deflate stream".into());
     }
-    if lumen_common::lzh::decompress_bounded(&frame, raw.len())? != raw {
-        return Err("LZH round trip mismatch".into());
+    if lumen_common::compress::inflate_limited(&frame, raw.len())? != raw {
+        return Err("deflate round trip mismatch".into());
     }
     // Include decoder allocation/free cost, but exclude disk IO and compression.
     let mut samples = Vec::new();
@@ -18,7 +18,7 @@ fn measure(program: &str, region: &str, raw: &[u8]) -> Result<(), String> {
         let start = Instant::now();
         let mut iterations = 0u64;
         loop {
-            black_box(lumen_common::lzh::decompress_bounded(
+            black_box(lumen_common::compress::inflate_limited(
                 black_box(&frame),
                 raw.len(),
             )?);
@@ -45,7 +45,7 @@ fn measure(program: &str, region: &str, raw: &[u8]) -> Result<(), String> {
 }
 
 fn main() -> Result<(), String> {
-    println!("program,region,raw_bytes,lzh_frame_bytes,median_decode_us,decode_mib_per_second,min_decode_us,max_decode_us");
+    println!("program,region,raw_bytes,deflate_bytes,median_decode_us,decode_mib_per_second,min_decode_us,max_decode_us");
     let paths: Vec<_> = std::env::args_os().skip(1).collect();
     if paths.is_empty() {
         return Err("usage: aot_compression NATIVE_BLOB...".into());

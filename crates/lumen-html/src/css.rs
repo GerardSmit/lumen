@@ -13108,12 +13108,7 @@ fn font_descriptor_error() -> CssError {
 }
 
 fn css_source_revision(input: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in input.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    lumen_common::fasthash::fnv1a64(lumen_common::fasthash::FNV1A64_OFFSET, input.as_bytes())
 }
 
 fn normalize_font_descriptor_name(name: &str) -> Option<String> {
@@ -14398,10 +14393,10 @@ fn parse_rules(
 }
 
 fn bloom_bits(kind: u8, name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ u64::from(kind);
-    for byte in name.bytes() {
-        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-    }
+    let hash = lumen_common::fasthash::fnv1a64(
+        lumen_common::fasthash::FNV1A64_OFFSET ^ u64::from(kind),
+        name.as_bytes(),
+    );
     (1u64 << (hash & 63)) | (1u64 << ((hash >> 20) & 63))
 }
 

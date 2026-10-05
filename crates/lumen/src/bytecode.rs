@@ -1030,7 +1030,7 @@ impl Chunk {
     #[cfg(feature = "compiler")]
     pub(crate) fn feedback_key(&self) -> u64 {
         *self.feedback_key.get_or_init(|| {
-            let mut key = crate::feedback::hash(self.debug_name.as_bytes(), 0xcbf29ce484222325);
+            let mut key = crate::feedback::hash(self.debug_name.as_bytes(), lumen_common::fasthash::FNV1A64_OFFSET);
             key = crate::feedback::hash(format!("{:?}", self.ops).as_bytes(), key);
             for name in &self.names {
                 key = crate::feedback::hash(name.as_bytes(), key);

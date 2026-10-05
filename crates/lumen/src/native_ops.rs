@@ -212,12 +212,8 @@ pub(crate) fn shape_hash(value: &Value) -> u64 {
     if !object.ic_plain.get() {
         return 0;
     }
-    let mut hash = 0xcbf29ce484222325u64;
-    let mut feed = |bytes: &[u8]| {
-        for &byte in bytes {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-        }
-    };
+    let mut hash = lumen_common::fasthash::FNV1A64_OFFSET;
+    let mut feed = |bytes: &[u8]| hash = lumen_common::fasthash::fnv1a64(hash, bytes);
     for (name, property) in object.props.iter_named() {
         if Interp::is_sym_key(name) || Interp::is_private_key(name) {
             return 0;

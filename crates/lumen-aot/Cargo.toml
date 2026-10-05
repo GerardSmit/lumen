@@ -17,7 +17,7 @@ lumen-aot-macros = { path = "macros" }
 lumen-codegen = { path = "../lumen-codegen", optional = true }
 
 [features]
-native = ["lumen/jit", "lumen/aot-native", "lumen-common/native-sidecar", "dep:lumen-codegen", "lumen-codegen/standalone-object"]
+native = ["lumen/jit", "lumen/aot-native", "lumen-common/hash", "dep:lumen-codegen", "lumen-codegen/standalone-object"]
 
 [dev-dependencies]
 # examples/aot_node.rs runs a node_modules bundle on the Node runtime.

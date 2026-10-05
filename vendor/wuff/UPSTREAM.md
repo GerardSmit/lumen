@@ -35,12 +35,15 @@ changes are deliberately limited to resource bounds and the integration seam:
   as allocation bounds. The format's decoded table stream and actual
   reconstruction lengths are checked separately.
 
-The patched upstream files are `src/lib.rs`, `src/decompress_woff2.rs`,
+- `decompress_woff1_with_custom_z` verifies each table's directory checksum
+  (`head` with its checkSumAdjustment zeroed) and fails on a mismatch.
+
+The patched upstream files are `src/lib.rs`, `src/decompress_woff1.rs`, `src/decompress_woff2.rs`,
 `src/woff/headers.rs`, `src/woff/glyf_decoder.rs`, `src/woff/hmtx_decoder.rs`,
 and the `pub(crate)` test callback visibility in `src/brotli.rs`. The tests add
 only `src/decompress_woff2.rs` unit cases and the listed WPT fixtures.
 
 Lumen consumes this as an optional local path dependency from
-`lumen-common`'s `compress` feature. It supplies the Brotli callback from the
-existing bounded shared decoder; no generated decoder copy or resolver
+`lumen-common`'s `compress` feature. It supplies the zlib (WOFF1) and Brotli (WOFF2)
+callbacks from the existing bounded shared decoders; no generated decoder copy or resolver
 override is used.

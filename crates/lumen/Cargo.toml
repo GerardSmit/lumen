@@ -11,7 +11,7 @@ license.workspace = true
 
 [dependencies]
 lumen-codegen = { path = "../lumen-codegen", optional = true }
-lumen-common = { path = "../lumen-common" }
+lumen-common = { path = "../lumen-common", features = ["deflate"] }
 lumen-os = { path = "../lumen-os" }
 # The language-neutral binding framework (`#[lumen_bind::op]`, `#[class]`, `#[module]`); the
 # JS host lives in `embed_convert`. Only pulled in by the `embed` feature.

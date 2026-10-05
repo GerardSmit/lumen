@@ -16,11 +16,12 @@ cookies = ["dep:psl"]
 # Exact allocation counters in `fastalloc` (see the engine's `memstats`); they sit on the allocation fast path.
 mem-stats = []
 native-signing = ["dep:ed25519-dalek"]
-native-sidecar = ["dep:sha2"]
 # `hash`: message digests, HMAC, PBKDF2, HKDF, scrypt over the RustCrypto crates.
 hash = ["dep:digest", "dep:md-5", "dep:sha1", "dep:sha2", "dep:sha3", "dep:ripemd", "dep:blake2", "dep:sm3", "dep:hmac", "dep:hkdf", "dep:pbkdf2", "dep:scrypt", "dep:subtle"]
-# `compress`: zlib / gzip / raw deflate, Brotli, Zstandard and bzip2 over maintained crates.
-compress = ["dep:libz-rs-sys", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2", "dep:wuff"]
+# `deflate`: zlib / gzip / raw deflate and Adler-32 over the pure-Rust zlib-rs.
+deflate = ["dep:libz-rs-sys"]
+# `compress`: `deflate` plus Brotli, Zstandard and bzip2 over maintained crates.
+compress = ["deflate", "dep:brotli", "dep:zstd", "dep:ruzstd", "dep:bzip2", "dep:wuff"]
 # `lzma`: xz / lzma (LZMA1, LZMA2, raw / alone / xz containers, BCJ and delta filters) in pure Rust:
 # the decoder is written in `compress::xz`, the encoders come from `lzma-rust2`.
 lzma = ["compress", "dep:lzma-rust2", "dep:sha2"]
@@ -30,6 +31,7 @@ crypt = ["dep:bcrypt"]
 [dependencies]
 # Vectorized byte and substring search (`search`); no_std, no dependencies of its own.
 memchr = { version = "2", default-features = false }
+crc32fast = { version = "1.5", default-features = false }
 bcrypt = { version = "0.17", default-features = false, optional = true }
 unicode-linebreak = { version = "=0.1.5", default-features = false }
 unicode-segmentation = { version = "=1.12.0", default-features = false }
@@ -74,6 +76,10 @@ ruzstd = { version = "0.8", optional = true }
 rusty_h264 = { version = "=0.16.0", default-features = false, features = ["std"] }
 # The xz container writer, as an independent encoder for the decoder tests.
 lzma-rust2 = { version = "0.15", default-features = false, features = ["std", "encoder", "xz"] }
+
+[[example]]
+name = "aot_compression"
+required-features = ["deflate"]
 
 [lints]
 workspace = true
