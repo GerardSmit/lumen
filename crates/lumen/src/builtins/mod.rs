@@ -3893,6 +3893,7 @@ fn install_object(it: &mut Interp) {
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptor")?;
         let key = ab(i.to_property_key(&arg(args, 1)))?;
         ab(i.defer_trigger(&o, Some(&key)))?;
+        i.materialize_lazy_globals(&o, Some(&key))?;
         if Interp::is_private_key(&key) {
             return Ok(Value::Undefined); // private-name slot is not an own property
         }
@@ -3938,6 +3939,7 @@ fn install_object(it: &mut Interp) {
         // ToObject coerces primitives (and throws for null/undefined).
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyDescriptors")?;
         let ov = Value::Obj(o.clone());
+        i.materialize_lazy_globals(&o, None)?;
         let result = i.new_object();
         // A proxy goes through its [[OwnPropertyKeys]]/[[GetOwnProperty]] traps, in order.
         if let Some((target, handler)) = proxy_pair(i, &ov) {

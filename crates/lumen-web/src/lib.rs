@@ -6,14 +6,15 @@
 //! - [x] `console`, timers, `queueMicrotask` (lumen-runtime/lumen-timers)
 //! - [x] `DOMException`, `Event`, `CustomEvent`, `EventTarget`, `AbortController`,
 //!   `AbortSignal` (incl. `abort()`/`timeout()` statics) — flat target, no capture phase
-//! - [x] `TextEncoder` / `TextDecoder` (UTF-8 and Windows-1252 labels; `fatal` supported)
-//! - [x] `atob` / `btoa`
+//! - [x] `TextEncoder` / `TextDecoder` (every WHATWG label; `fatal`, `ignoreBOM`, `stream`) and
+//!   `atob` / `btoa`: native classes and ops in `lumen_host::encoding`, published lazily
 //! - [x] `structuredClone` (objects/arrays/cycles, Date, RegExp, Map, Set, Error,
 //!   ArrayBuffer, typed arrays; no transfer list)
 //! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
-//!   `lumen_os::proc::entropy`, no crates), `crypto.subtle.digest` (SHA-256 only)
+//!   `lumen_os::proc::entropy`), `crypto.subtle.digest` (SHA-1/256/384/512): native classes in
+//!   `lumen_host::webcrypto`, published lazily
 //! - [x] `fetch` / `Headers` / `Request` / `Response` — HTTP and certificate-verified HTTPS
 //!   through lumen-tls (system OpenSSL on Unix, rustls on Windows)
 //! - [~] `Lumen.serve` — an HTTP/1.1 *server* (not a WinterTC API; follows the cross-runtime
@@ -722,11 +723,10 @@ pub fn extension() -> Extension {
         name: "web",
         modules: &[
             lumen_host::namespace::<http_policy::Module>,
-            lumen_host::namespace::<lumen_host::encoding::bindings::Module>,
             lumen_host::namespace::<perf::Module>,
-            encoding_namespace,
             url_namespace,
-            lumen_host::namespace::<crypto::Module>,
+            lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,
             lumen_host::namespace::<websocket::Module>,
@@ -779,11 +779,6 @@ mod perf {
     }
 }
 
-fn encoding_namespace(ctx: &mut Ctx) -> Result<(), Value> {
-    let ns = ctx.namespace_object("__encoding");
-    ctx.install_module::<lumen_host::encoding::bindings::Module>(&ns)
-}
-
 fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
     let ns = ctx.namespace_object("__url");
     ctx.install_module::<lumen_host::url::bindings::Module>(&ns)
@@ -791,58 +786,11 @@ fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
 
 // ---- crypto ----
 
-fn entropy(buf: &mut [u8]) -> Result<(), OpError> {
-    lumen_os::proc::entropy(buf).map_err(|e| OpError::error(format!("no randomness source: {e}")))
-}
-
 /// `n` cryptographically-random bytes (the WebSocket handshake key needs these, same source as
 /// `crypto.getRandomValues`).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn web_random_bytes(n: usize) -> Result<Vec<u8>, OpError> {
-    let mut buf = vec![0u8; n];
-    entropy(&mut buf)?;
-    Ok(buf)
-}
-
-#[lumen_bind::module(name = "__crypto")]
-mod crypto {
-    use super::*;
-
-    /// Fill the given typed array in place (the glue enforces the 65536-byte quota + returns it).
-    #[op]
-    pub fn fill(buf: &mut [u8]) -> Result<(), OpError> {
-        entropy(buf)
-    }
-
-    #[op]
-    pub fn uuid() -> Result<String, OpError> {
-        let mut b = [0u8; 16];
-        entropy(&mut b)?;
-        b[6] = (b[6] & 0x0f) | 0x40; // version 4
-        b[8] = (b[8] & 0x3f) | 0x80; // variant 10
-        let s: String = b.iter().map(|x| format!("{x:02x}")).collect();
-        Ok(format!(
-            "{}-{}-{}-{}-{}",
-            &s[0..8],
-            &s[8..12],
-            &s[12..16],
-            &s[16..20],
-            &s[20..32]
-        ))
-    }
-
-    #[op(coerce)]
-    pub fn digest(name: String, data: &[u8]) -> Result<Vec<u8>, OpError> {
-        use lumen_common::hash::{digest, Algo};
-        let algo = match name.as_str() {
-            "SHA-1" => Algo::Sha1,
-            "SHA-256" => Algo::Sha256,
-            "SHA-384" => Algo::Sha384,
-            "SHA-512" => Algo::Sha512,
-            _ => return Err(OpError::type_error(format!("unsupported digest {name}"))),
-        };
-        Ok(digest(algo, data).to_vec())
-    }
+    lumen_host::webcrypto::random_bytes(n)
 }
 
 // ---- fetch ----

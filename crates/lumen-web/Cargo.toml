@@ -14,7 +14,7 @@ publish = false
 [dependencies]
 lumen = { path = "../lumen", default-features = false }
 lumen-bind = { path = "../lumen-bind" }
-lumen-host = { path = "../lumen-host", default-features = false }
+lumen-host = { path = "../lumen-host", default-features = false, features = ["webcrypto"] }
 lumen-os = { path = "../lumen-os" }
 lumen-common = { path = "../lumen-common", features = ["hash"] }
 lumen-codegen = { path = "../lumen-codegen" }

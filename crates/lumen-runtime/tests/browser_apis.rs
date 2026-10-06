@@ -522,3 +522,60 @@ fn browser_host_forwards_fetch_policy_and_preserves_opaque_metadata() {
     "#);
     assert_script(&mut runtime,"policyInit.mode==='no-cors' && policyInit.credentials==='omit' && policyInit.redirect==='manual' && policyEvents.length===1 && policyEvents[0][2][0]===0 && policyEvents[0][2][2]==='' && policyEvents[0][2][4]===false && policyEvents[0][2][5]==='opaque'");
 }
+
+#[test]
+fn text_codec_globals_keep_web_idl_shape() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "Object.getOwnPropertyDescriptor(globalThis, 'TextEncoder').writable && !Object.getOwnPropertyDescriptor(globalThis, 'TextEncoder').enumerable",
+        "TextEncoder.length === 0 && TextDecoder.length === 0",
+        "new TextEncoder().encoding === 'utf-8'",
+        "Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encoding').enumerable",
+        "Object.getOwnPropertyDescriptor(TextEncoder.prototype, 'encode').enumerable",
+        "new TextEncoder().encode().length === 0 && new TextEncoder().encode(undefined).length === 0",
+        "new TextEncoder().encode('h\\u00e9').join() === '104,195,169'",
+        "(() => { const out = new Uint8Array(5); const r = new TextEncoder().encodeInto('a\\u{1F600}b', out); const short = new Uint8Array(4); const s = new TextEncoder().encodeInto('a\\u{1F600}b', short); return r.read === 3 && r.written === 5 && out[0] === 97 && s.read === 1 && s.written === 1; })()",
+        "(() => { try { new TextEncoder().encodeInto('a', new Uint16Array(1)); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "new TextDecoder().decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x68])) === 'h'",
+        "new TextDecoder('utf-8', { ignoreBOM: true }).decode(new Uint8Array([0xEF, 0xBB, 0xBF, 0x68])) === '\\uFEFFh'",
+        "new TextDecoder('utf-8', { ignoreBOM: true }).ignoreBOM === true && new TextDecoder().fatal === false",
+        "(() => { const d = new TextDecoder(); const a = d.decode(new Uint8Array([0xE2, 0x82]), { stream: true }); return a === '' && d.decode(new Uint8Array([0xAC])) === '\\u20AC'; })()",
+        "(() => { try { new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xFF])); } catch (e) { return e instanceof TypeError && e.code === 'ERR_ENCODING_INVALID_ENCODED_DATA'; } return false; })()",
+        "(() => { try { new TextDecoder('nope'); } catch (e) { return e instanceof RangeError && e.code === 'ERR_ENCODING_NOT_SUPPORTED'; } return false; })()",
+        "(() => { try { Object.getOwnPropertyDescriptor(TextDecoder.prototype, 'encoding').get.call({}); } catch (e) { return e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "btoa('abc') === 'YWJj' && atob('YWJj') === 'abc' && btoa.length === 1 && atob.length === 1",
+        "(() => { try { btoa('\\u0100'); } catch (e) { return e.name === 'InvalidCharacterError'; } return false; })()",
+        "(() => { try { atob('*'); } catch (e) { return e.name === 'InvalidCharacterError'; } return false; })()",
+        "typeof new TextDecoder()[Symbol.for('nodejs.util.inspect.custom')] === 'function'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn web_crypto_globals_keep_web_idl_shape() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "crypto instanceof Crypto && Object.getOwnPropertyDescriptor(globalThis, 'crypto').enumerable",
+        "crypto.subtle === crypto.subtle && crypto.subtle instanceof SubtleCrypto",
+        "/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID())",
+        "(() => { const a = new Uint8Array(32); return crypto.getRandomValues(a) === a && a.some((b) => b !== 0); })()",
+        "(() => { try { crypto.getRandomValues(new Float32Array(1)); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { return e.name === 'QuotaExceededError'; } return false; })()",
+        "crypto.getRandomValues(new Uint8Array(65536)).length === 65536",
+        "(() => { try { new Crypto(); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { try { new SubtleCrypto(); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { try { new CryptoKey(); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "crypto.subtle.digest('SHA-256', new Uint8Array(0)) instanceof Promise",
+        "(() => { globalThis.digestResult = null; crypto.subtle.digest({ name: 'sha-256' }, new Uint8Array([97, 98, 99])).then((buffer) => { globalThis.digestResult = [...new Uint8Array(buffer)].map((b) => b.toString(16).padStart(2, '0')).join(''); }); return true; })()",
+        "(() => { globalThis.digestError = null; crypto.subtle.digest('MD5', new Uint8Array(1)).catch((e) => { globalThis.digestError = e.name; }); return true; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+    runtime.run_until_idle();
+    assert_script(
+        &mut runtime,
+        "digestResult === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'",
+    );
+    assert_script(&mut runtime, "digestError === 'NotSupportedError'");
+}

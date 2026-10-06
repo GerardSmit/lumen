@@ -1,124 +1,355 @@
-//! Typed encoding primitives shared by network and native HTML embedders.
-#[lumen_bind::module(name = "__lumenEncoding")]
+//! The WHATWG Encoding interfaces (`TextEncoder`, `TextDecoder`) and the base64 globals
+//! (`atob`, `btoa`) as typed natives, shared by network and native HTML embedders.
+//!
+//! Install with `lazy_globals::<bindings::Module>`: the classes are only built when a program
+//! first touches one of the names.
+#[lumen_bind::module(name = "webEncoding")]
 pub mod bindings {
-    use lumen::embed::{Ctx, OpError, OpResult, Value};
+    use lumen::embed::{Ctx, OpError, OpResult, TaKind, This, Value};
+    use std::{cell::RefCell, rc::Rc};
 
-    #[op]
-    pub fn label(label: &str) -> Option<String> {
-        lumen_common::encoding::canonical_label(label)
-            .ok()
-            .map(str::to_ascii_lowercase)
+    fn coded(error: OpError, code: &'static str) -> OpError {
+        error.with_code(code)
     }
 
-    #[class(name = "Decoder")]
-    pub struct Decoder {
-        decoder: lumen_common::encoding::TextDecoder,
+    /// Node's `Received ...` tail for argument type errors.
+    fn received_suffix(ctx: &mut Ctx, value: &Value) -> String {
+        match value {
+            Value::Null => return " Received null".into(),
+            Value::Undefined => return " Received undefined".into(),
+            _ => {}
+        }
+        if value.is_callable() {
+            let name = ctx
+                .member_get(value, "name")
+                .ok()
+                .and_then(|name| ctx.coerce_string(&name).ok())
+                .unwrap_or_default();
+            return format!(" Received function {name}");
+        }
+        if matches!(value, Value::Obj(_)) {
+            let name = ctx
+                .member_get(value, "constructor")
+                .ok()
+                .filter(|constructor| matches!(constructor, Value::Obj(_)))
+                .and_then(|constructor| ctx.member_get(&constructor, "name").ok())
+                .and_then(|name| ctx.coerce_string(&name).ok())
+                .filter(|name| !name.is_empty());
+            return match name {
+                Some(name) => format!(" Received an instance of {name}"),
+                None => " Received [Object: null prototype] {}".into(),
+            };
+        }
+        let kind = value.type_of();
+        let text = if kind == "symbol" {
+            let global = ctx.global_object();
+            let string = ctx.member_get(&global, "String").unwrap_or(Value::Undefined);
+            ctx.invoke(string, Value::Undefined, &[value.clone()])
+                .ok()
+                .and_then(|text| ctx.coerce_string(&text).ok())
+                .unwrap_or_default()
+        } else {
+            ctx.coerce_string(value).unwrap_or_default()
+        };
+        let mut shown = if kind == "string" {
+            let units = lumen_common::smuggle::utf16_units(&text);
+            if units.len() > 28 {
+                format!(
+                    "'{}...'",
+                    lumen_common::smuggle::utf16_from_units(&units[..25])
+                )
+            } else {
+                format!("'{text}'")
+            }
+        } else {
+            text.to_string()
+        };
+        if kind == "bigint" {
+            shown.push('n');
+        }
+        format!(" Received type {kind} ({shown})")
     }
 
-    fn decode_error(error: lumen_common::encoding::DecodeError) -> OpError {
+    /// An `options` argument: absent, `null` or an object. Anything else is Node's
+    /// `ERR_INVALID_ARG_TYPE`.
+    fn require_options(ctx: &mut Ctx, options: &Value) -> OpResult<()> {
+        match options {
+            Value::Undefined | Value::Null | Value::Obj(_) => Ok(()),
+            _ => Err(coded(
+                OpError::type_error(format!(
+                    "The \"options\" argument must be of type object.{}",
+                    received_suffix(ctx, options)
+                )),
+                "ERR_INVALID_ARG_TYPE",
+            )),
+        }
+    }
+
+    fn option_flag(ctx: &mut Ctx, options: &Value, name: &str) -> OpResult<bool> {
+        if !matches!(options, Value::Obj(_)) {
+            return Ok(false);
+        }
+        let value = ctx.member_get(options, name).map_err(OpError::thrown)?;
+        Ok(ctx.to_boolean(&value))
+    }
+
+    fn decode_error(error: lumen_common::encoding::DecodeError, encoding: &str) -> OpError {
         use lumen_common::encoding::DecodeError;
         match error {
-            DecodeError::UnsupportedLabel => {
-                OpError::new("RangeError", "encoding label is unsupported")
-            }
-            DecodeError::Malformed => OpError::new("TypeError", "encoded data is malformed"),
+            DecodeError::UnsupportedLabel => OpError::range_error("encoding label is unsupported"),
+            DecodeError::Malformed => coded(
+                OpError::type_error(format!(
+                    "The encoded data was not valid for encoding {encoding}"
+                )),
+                "ERR_ENCODING_INVALID_ENCODED_DATA",
+            ),
             DecodeError::ResourceLimit => {
-                OpError::new("RangeError", "decoded text exceeds the host resource limit")
+                OpError::range_error("decoded text exceeds the host resource limit")
             }
         }
     }
 
+    #[class(name = "TextEncoder", hint(js(webidl)))]
+    pub struct TextEncoder;
+
     #[methods]
-    impl Decoder {
+    impl TextEncoder {
         #[constructor]
-        fn new(label: &str, fatal: bool, ignore_bom: bool) -> OpResult<Self> {
-            Ok(Self {
-                decoder: lumen_common::encoding::TextDecoder::new(label, fatal, ignore_bom)
-                    .map_err(decode_error)?,
-            })
+        fn new() -> Self {
+            TextEncoder
         }
 
         #[getter]
         fn encoding(&self) -> String {
-            self.decoder.encoding().to_ascii_lowercase()
+            "utf-8".into()
         }
 
-        fn decode(&mut self, ctx: &mut Ctx, input: Value, stream: bool) -> OpResult<Value> {
-            let length = match ctx.typed_array_byte_len(&input) {
-                Some(length) => length,
-                // Option conversion can detach a view after Web IDL conversion.
-                // Such an input contributes no bytes; preserve the decoder's flush semantics.
-                None if ctx.typed_array_kind(&input).is_some() => 0,
-                None => return Err(OpError::type_error("decoder input must be a BufferSource")),
-            };
-            if length > lumen_common::encoding::MAX_DECODED_BYTES {
-                return Err(decode_error(
-                    lumen_common::encoding::DecodeError::ResourceLimit,
+        /// A lone surrogate encodes as U+FFFD.
+        #[method(coerce)]
+        fn encode(&self, #[default("")] input: &str) -> Vec<u8> {
+            lumen::well_formed_utf8(input).into_owned().into_bytes()
+        }
+
+        /// Encoding §8.1.2: as much of `source` as fits, whole UTF-8 sequences only; `read`
+        /// counts UTF-16 code units.
+        #[method(coerce)]
+        fn encode_into(
+            &self,
+            ctx: &mut Ctx,
+            source: &str,
+            destination: Value,
+        ) -> OpResult<Value> {
+            if ctx.typed_array_kind(&destination) != Some(TaKind::U8) {
+                return Err(OpError::type_error(
+                    "TextEncoder.encodeInto: destination must be a Uint8Array",
                 ));
             }
-            let text = if length == 0 {
-                self.decoder.decode(&[], stream)
-            } else {
-                ctx.with_typed_array_bytes(&input, |bytes| self.decoder.decode(bytes, stream))
-                    .ok_or_else(|| OpError::type_error("decoder input must be a BufferSource"))?
-            }
-            .map_err(decode_error)?;
-            Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(
-                text,
-            )))
+            let text = lumen::well_formed_utf8(source);
+            let (read, written) = ctx
+                .with_typed_array_bytes_mut(&destination, |destination| {
+                    if text.len() <= destination.len() {
+                        destination[..text.len()].copy_from_slice(text.as_bytes());
+                        return (lumen_common::smuggle::utf16_unit_len(source), text.len());
+                    }
+                    let (mut read, mut written) = (0, 0);
+                    for character in text.chars() {
+                        let width = character.len_utf8();
+                        if written + width > destination.len() {
+                            break;
+                        }
+                        character.encode_utf8(&mut destination[written..]);
+                        written += width;
+                        read += character.len_utf16();
+                    }
+                    (read, written)
+                })
+                .unwrap_or((0, 0));
+            Ok(ctx.plain_object(&[
+                ("read", Value::Num(read as f64)),
+                ("written", Value::Num(written as f64)),
+            ]))
         }
     }
 
-    #[op]
-    pub fn encode(ctx: &mut Ctx, input: Value) -> OpResult<Value> {
-        let input = ctx.coerce_string(&input).map_err(OpError::thrown)?;
-        let bytes = crate::well_formed_utf8(&input);
-        ctx.make_uint8array(bytes.as_bytes())
-            .map_err(OpError::thrown)
+    #[class(name = "TextDecoder", hint(js(webidl)))]
+    pub struct TextDecoder {
+        decoder: lumen_common::encoding::TextDecoder,
+        encoding: String,
+        fatal: bool,
+        ignore_bom: bool,
     }
 
-    #[op]
-    pub fn decode(ctx: &mut Ctx, input: Value, #[default(false)] fatal: bool) -> OpResult<Value> {
-        let bytes = ctx.typed_array_bytes(&input).ok_or_else(|| {
-            OpError::new("TypeError", "TextDecoder.decode expects a BufferSource")
-        })?;
-        let text = if fatal {
-            String::from_utf8(bytes)
-                .map_err(|_| OpError::new("TypeError", "TextDecoder: invalid utf-8 (fatal)"))?
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
-        Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(
-            text,
-        )))
+    fn decoder_of(ctx: &Ctx, receiver: &Value) -> OpResult<Rc<RefCell<TextDecoder>>> {
+        ctx.instance_data::<TextDecoder>(receiver).ok_or_else(|| {
+            coded(
+                OpError::type_error("Value of \"this\" must be of type TextDecoder"),
+                "ERR_INVALID_THIS",
+            )
+        })
     }
 
-    #[op]
-    pub fn btoa(ctx: &mut Ctx, input: Value) -> OpResult<Value> {
-        let input = ctx.coerce_string(&input).map_err(OpError::thrown)?;
-        let mut bytes = Vec::with_capacity(input.len());
-        for character in input.chars() {
+    #[methods]
+    impl TextDecoder {
+        #[constructor]
+        fn new(
+            ctx: &mut Ctx,
+            #[default(Value::Undefined)] label: Value,
+            #[default(Value::Undefined)] options: Value,
+        ) -> OpResult<Self> {
+            let label = match label {
+                Value::Undefined => "utf-8".into(),
+                label => ctx.coerce_string(&label).map_err(OpError::thrown)?,
+            };
+            let unsupported = || {
+                coded(
+                    OpError::range_error(format!("The \"{label}\" encoding is not supported")),
+                    "ERR_ENCODING_NOT_SUPPORTED",
+                )
+            };
+            let encoding = lumen_common::encoding::canonical_label(&label)
+                .map_err(|_| unsupported())?
+                .to_ascii_lowercase();
+            require_options(ctx, &options)?;
+            let fatal = option_flag(ctx, &options, "fatal")?;
+            let ignore_bom = option_flag(ctx, &options, "ignoreBOM")?;
+            let decoder = lumen_common::encoding::TextDecoder::new(&encoding, fatal, ignore_bom)
+                .map_err(|_| unsupported())?;
+            Ok(Self {
+                decoder,
+                encoding,
+                fatal,
+                ignore_bom,
+            })
+        }
+
+        #[getter]
+        fn encoding(this: This<Value>, ctx: &mut Ctx) -> OpResult<String> {
+            Ok(decoder_of(ctx, &this)?.borrow().encoding.clone())
+        }
+
+        #[getter]
+        fn fatal(this: This<Value>, ctx: &mut Ctx) -> OpResult<bool> {
+            Ok(decoder_of(ctx, &this)?.borrow().fatal)
+        }
+
+        #[getter(rename(js = "ignoreBOM"))]
+        fn ignore_bom(this: This<Value>, ctx: &mut Ctx) -> OpResult<bool> {
+            Ok(decoder_of(ctx, &this)?.borrow().ignore_bom)
+        }
+
+        /// `input` is read after `options`, so a `stream` getter that detaches the buffer
+        /// leaves nothing to decode.
+        fn decode(
+            this: This<Value>,
+            ctx: &mut Ctx,
+            #[default(Value::Undefined)] input: Value,
+            #[default(Value::Undefined)] options: Value,
+        ) -> OpResult<Value> {
+            let state = decoder_of(ctx, &this)?;
+            let has_input = !matches!(input, Value::Undefined);
+            if has_input && ctx.with_buffer_source_bytes(&input, |_| ()).is_none() {
+                return Err(OpError::type_error(
+                    "TextDecoder input must be a BufferSource",
+                ));
+            }
+            require_options(ctx, &options)?;
+            let stream = option_flag(ctx, &options, "stream")?;
+            let mut state = state.try_borrow_mut().map_err(|_| {
+                OpError::type_error("TextDecoder.decode: decoder is already in use")
+            })?;
+            let encoding = state.encoding.clone();
+            let decoded = if has_input {
+                ctx.with_buffer_source_bytes(&input, |bytes| {
+                    if bytes.len() > lumen_common::encoding::MAX_DECODED_BYTES {
+                        return Err(lumen_common::encoding::DecodeError::ResourceLimit);
+                    }
+                    state.decoder.decode(bytes, stream)
+                })
+                .unwrap_or_else(|| state.decoder.decode(&[], stream))
+            } else {
+                state.decoder.decode(&[], stream)
+            }
+            .map_err(|error| decode_error(error, &encoding))?;
+            Ok(Value::from_string(lumen_common::smuggle::utf16_text_owned(
+                decoded,
+            )))
+        }
+
+        /// `util.inspect` output, keyed by the `nodejs.util.inspect.custom` registry symbol.
+        #[method(hint(js(symbol_for = "nodejs.util.inspect.custom")))]
+        fn inspect_custom(
+            this: This<Value>,
+            ctx: &mut Ctx,
+            #[default(Value::Undefined)] depth: Value,
+            #[default(Value::Undefined)] options: Value,
+            #[default(Value::Undefined)] inspect: Value,
+        ) -> OpResult<Value> {
+            let (encoding, fatal, ignore_bom) = {
+                let state = decoder_of(ctx, &this)?;
+                let state = state.borrow();
+                (state.encoding.clone(), state.fatal, state.ignore_bom)
+            };
+            if matches!(depth, Value::Num(depth) if depth < 0.0) {
+                return Ok(this.0.clone());
+            }
+            let shown = ctx.plain_object(&[
+                ("encoding", Value::from_string(encoding)),
+                ("fatal", Value::Bool(fatal)),
+                ("ignoreBOM", Value::Bool(ignore_bom)),
+            ]);
+            let constructor = ctx.member_get(&this, "constructor").map_err(OpError::thrown)?;
+            let name = ctx.member_get(&constructor, "name").map_err(OpError::thrown)?;
+            let name = ctx.coerce_string(&name).map_err(OpError::thrown)?;
+            let text = if inspect.is_callable() {
+                ctx.invoke(inspect, Value::Undefined, &[shown, options])
+                    .map_err(OpError::thrown)?
+            } else {
+                let global = ctx.global_object();
+                let json = ctx.member_get(&global, "JSON").map_err(OpError::thrown)?;
+                let stringify = ctx.member_get(&json, "stringify").map_err(OpError::thrown)?;
+                ctx.invoke(stringify, json, &[shown]).map_err(OpError::thrown)?
+            };
+            let text = ctx.coerce_string(&text).map_err(OpError::thrown)?;
+            Ok(Value::from_string(format!("{name} {text}")))
+        }
+    }
+
+    /// `btoa(data)`: Latin-1 text to base64.
+    #[op(
+        coerce,
+        hint(js(
+            webidl,
+            missing_code = "ERR_MISSING_ARGS",
+            missing_message = "The \"input\" argument must be specified"
+        ))
+    )]
+    pub fn btoa(data: &str) -> OpResult<String> {
+        let mut bytes = Vec::with_capacity(data.len());
+        for character in data.chars() {
             let Ok(byte) = u8::try_from(u32::from(character)) else {
-                return Ok(Value::Null);
+                return Err(OpError::new(
+                    "InvalidCharacterError",
+                    "btoa: character beyond latin1 range",
+                ));
             };
             bytes.push(byte);
         }
-        Ok(Value::from_string(lumen_common::codec::base64_encode(
-            &bytes, false, true,
-        )))
+        Ok(lumen_common::codec::base64_encode(&bytes, false, true))
     }
 
-    #[op]
-    pub fn atob(ctx: &mut Ctx, input: Value) -> OpResult<Value> {
-        let input = ctx.coerce_string(&input).map_err(OpError::thrown)?;
-        Ok(
-            match lumen_common::codec::base64_decode_forgiving(input.as_bytes()) {
-                Some(bytes) => {
-                    Value::from_string(bytes.into_iter().map(char::from).collect::<String>())
-                }
-                None => Value::Null,
-            },
-        )
+    /// `atob(data)`: forgiving-base64 to Latin-1 text.
+    #[op(
+        coerce,
+        hint(js(
+            webidl,
+            missing_code = "ERR_MISSING_ARGS",
+            missing_message = "The \"input\" argument must be specified"
+        ))
+    )]
+    pub fn atob(data: &str) -> OpResult<String> {
+        lumen_common::codec::base64_decode_forgiving(data.as_bytes())
+            .map(|bytes| bytes.into_iter().map(char::from).collect())
+            .ok_or_else(|| OpError::new("InvalidCharacterError", "atob: invalid base64"))
     }
 }
 
@@ -127,39 +358,42 @@ mod tests {
     use super::*;
     use lumen::embed::Value;
 
-    #[test]
-    fn typed_streaming_decoder_preserves_state_brands_and_buffer_ranges() {
+    fn eval(source: &str) -> Value {
         let mut engine = lumen::Engine::new();
-        crate::namespace::<bindings::Module>(engine.ctx())
+        crate::globals::<bindings::Module>(engine.ctx())
             .ok()
-            .expect("encoding namespace");
-        let result = engine
-            .eval_value(
-                r#"(() => {
-            const decoder = new __lumenEncoding.Decoder('shift_jis', true, false);
+            .expect("encoding globals");
+        engine
+            .eval_value(source)
+            .expect("script parses")
+            .ok()
+            .expect("script runs")
+    }
+
+    #[test]
+    fn streaming_decoder_preserves_state_brands_and_buffer_ranges() {
+        let result = eval(
+            r#"(() => {
+            const decoder = new TextDecoder('shift_jis', { fatal: true });
             const source = Uint8Array.of(0,0xa0,0);
-            if (__lumenEncoding.label(' ASCII ') !== 'windows-1252') return false;
-            if (decoder.encoding !== 'shift_jis') return false;
-            if (decoder.decode(Uint8Array.of(0x82),true) !== '') return false;
-            if (decoder.decode(source.subarray(1,2),false) !== 'あ') return false;
+            if (decoder.encoding !== 'shift_jis' || !decoder.fatal || decoder.ignoreBOM) return false;
+            if (decoder.decode(Uint8Array.of(0x82), { stream: true }) !== '') return false;
+            if (decoder.decode(source.subarray(1,2)) !== 'あ') return false;
             let invalid = false;
-            try { decoder.decode.call({},source,false); }
-            catch (e) { invalid = e instanceof TypeError; }
+            try { decoder.decode.call({}, source); }
+            catch (e) { invalid = e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; }
             if (!invalid) return false;
             let fatal = false;
-            try { decoder.decode(Uint8Array.of(0x82),false); }
-            catch (e) { fatal = e instanceof TypeError; }
-            if (!fatal || decoder.decode(Uint8Array.of(65),false) !== 'A') return false;
-            const utf8 = new __lumenEncoding.Decoder('utf-8',false,false);
-            if (utf8.decode(Uint8Array.of(0xef),true) !== '') return false;
-            if (utf8.decode(Uint8Array.of(0xbb,0xbf,65),false) !== 'A') return false;
-            if (utf8.decode(Uint8Array.of(0xef,0xbb,0xbf,66),false) !== 'B') return false;
+            try { decoder.decode(Uint8Array.of(0x82)); }
+            catch (e) { fatal = e instanceof TypeError && e.code === 'ERR_ENCODING_INVALID_ENCODED_DATA'; }
+            if (!fatal || decoder.decode(Uint8Array.of(65)) !== 'A') return false;
+            const utf8 = new TextDecoder();
+            if (utf8.decode(Uint8Array.of(0xef), { stream: true }) !== '') return false;
+            if (utf8.decode(Uint8Array.of(0xbb,0xbf,65)) !== 'A') return false;
+            if (utf8.decode(Uint8Array.of(0xef,0xbb,0xbf,66)) !== 'B') return false;
             return true;
         })()"#,
-            )
-            .expect("guard parses")
-            .ok()
-            .expect("guard executes");
+        );
         assert!(matches!(result, Value::Bool(true)));
     }
 }

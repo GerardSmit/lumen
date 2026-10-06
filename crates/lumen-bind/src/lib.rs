@@ -51,9 +51,15 @@
 //!   class as `This<_>`), `#[skip]`. A member without a receiver (`&self`, `&mut self`,
 //!   `This<_>`) is static.
 //! - `#[module(options)]` on an inline `mod`: every `#[op]`, `#[class]`, `#[constant(name = ..)]`
-//!   (a `const`) and `#[init]` (`fn(&mut Ctx, &Value)`, runs once on the new module object, for
+//!   (a `const`; `enumerable` makes the property enumerable, as a Web IDL attribute of the global
+//!   object is) and `#[init]` (`fn(&mut Ctx, &Value)`, runs once on the new module object, for
 //!   host-specific extras such as exception types) inside is registered by one declaration
-//!   (`<mod>::Module`).
+//!   (`<mod>::Module`). A constant's value may be an instance of a class of the same module
+//!   (`const CRYPTO: Crypto = Crypto;`); hosts register the module's classes first.
+//! - `#[constant(name = ..)]` on an associated `const` inside a `#[methods]` impl: a class
+//!   constant (a Web IDL `const`). The JS host defines it on the constructor and on the
+//!   prototype, enumerable, non-writable and non-configurable. The Python host does not read
+//!   class constants ([`Methods::constants`] is empty for it unless it implements it).
 //!
 //! Options: `name = ".."` (verbatim for every host), `rename(js = "..", py = "..")`,
 //! `only(js, ..)` / `skip(py, ..)` (rare), `coerce` (the host's lenient conversions), `async`
@@ -79,7 +85,24 @@
 //! class) and `shared` (members installed into several core types). See `lumen_py::bind::args` and `lumen_py::bind::class`.
 //! The JS host recognizes `hint(js(webidl))` on a class to make named operations
 //! and attributes enumerable as required by Web IDL; ordinary native classes
-//! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable.
+//! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable. On an `#[op]`
+//! the same hint makes the installed property enumerable (a Web IDL operation of the global
+//! object such as `atob`). Further JS hints:
+//! - `hint(js(symbol_for = "key"))` on an instance method installs it (non-enumerable) under the
+//!   registry symbol `Symbol.for("key")` instead of a string name
+//!   (`nodejs.util.inspect.custom`);
+//! - `hint(js(missing_message = "..", missing_code = ".."))` on an op or member replaces the
+//!   `TypeError` a missing required argument throws with that message and `err.code`.
+//!
+//! # Lazy globals (JS host)
+//! `ctx.install_module_lazy::<M>()` (`Engine::define_lazy_globals`, `lumen_host::lazy_globals`)
+//! publishes everything a module declares as globals that are built on first access: each name
+//! is an accessor on the global object (enumerable only for a `webidl` op or an `enumerable`
+//! constant, configurable) whose getter creates the class, function or constant, replaces the
+//! accessor with the data property (writable, configurable, same enumerability, so an interface
+//! object has the descriptor of an eager one) and returns it; a setter replaces it with the
+//! assigned value. A name the realm already defines is left alone, `#[init]` runs immediately,
+//! and a script that redefines or deletes the accessor first is never overwritten.
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.

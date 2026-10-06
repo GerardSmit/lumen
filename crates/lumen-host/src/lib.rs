@@ -40,6 +40,8 @@ pub mod sysfs;
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 pub mod url;
+#[cfg(feature = "webcrypto")]
+pub mod webcrypto;
 
 /// Browser-embedding hooks: the suspending synchronous host call (Worker + `Atomics.wait`, or
 /// JSPI) and the completion queue the embedder pushes settled Promises into.
@@ -61,6 +63,14 @@ pub type ModuleInit = fn(&mut Ctx) -> Result<(), Value>;
 pub fn globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
     let g = ctx.global_object();
     ctx.install_module::<M>(&g)
+}
+
+/// [`ModuleInit`]: everything `M` declares as lazy globals: each name is an accessor on the
+/// global object that builds the real class or function on first access and replaces itself
+/// with a data property (see `Ctx::install_module_lazy`). A realm that already defines a name
+/// keeps it.
+pub fn lazy_globals<M: lumen_bind::Module<JsHost>>(ctx: &mut Ctx) -> Result<(), Value> {
+    ctx.install_module_lazy::<M>()
 }
 
 /// [`ModuleInit`]: `globalThis.<module name>` holding everything `M` declares.

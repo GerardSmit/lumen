@@ -3176,6 +3176,30 @@ impl Interp {
         .flatten()
     }
 
+    /// Write a live TypedArray's exact byte range in place (a shared buffer stays locked while
+    /// `fill` runs). `None` when `v` is not a live TypedArray over a writable buffer.
+    /// The callback must not execute JavaScript.
+    pub fn with_typed_array_bytes_mut<R>(
+        &self,
+        v: &Value,
+        fill: impl FnOnce(&mut [u8]) -> R,
+    ) -> Option<R> {
+        let obj = v.as_obj()?;
+        let info = self
+            .typed_arrays
+            .get(&(Gc::as_ptr(obj) as usize))
+            .copied()?;
+        let bytes = self.ta_len(&info)?.checked_mul(info.kind.elsize())?;
+        let end = info.offset.checked_add(bytes)?;
+        if self.buffer_immutable(info.buffer) {
+            return None;
+        }
+        self.with_buffer_bytes_mut(info.buffer, |buffer| {
+            buffer.get_mut(info.offset..end).map(fill)
+        })
+        .flatten()
+    }
+
     /// Overwrite a TypedArray's covered bytes from the start (a write past the view's end is
     /// a bounds-checked no-op, matching the engine's internal write semantics). `false` when
     /// `v` isn't a typed array.
@@ -4808,6 +4832,55 @@ impl Interp {
             return None;
         }
         self.proxies.get(&ptr).cloned()
+    }
+
+    /// Register a materializer for a lazily published global (`global` + `name`). Reflection on
+    /// the global object runs it first, so the lazy accessor is never observable.
+    pub(crate) fn register_lazy_global(
+        &mut self,
+        global: &Gc,
+        name: &str,
+        materialize: Rc<dyn Fn(&mut Interp) -> Result<(), Value>>,
+    ) {
+        if !self.host_state.has::<LazyGlobalHooks>() {
+            self.host_state.put(LazyGlobalHooks::default());
+        }
+        self.host_state
+            .get_mut::<LazyGlobalHooks>()
+            .expect("lazy global hooks")
+            .0
+            .insert((Gc::as_ptr(global) as usize, name.to_string()), materialize);
+    }
+
+    /// Materialize `key` of `o` if it is a lazy global that has not been touched yet (`None`:
+    /// every lazy global of `o`).
+    pub(crate) fn materialize_lazy_globals(
+        &mut self,
+        o: &Gc,
+        key: Option<&str>,
+    ) -> Result<(), Value> {
+        let Some(hooks) = self.host_state.get_mut::<LazyGlobalHooks>() else {
+            return Ok(());
+        };
+        if hooks.0.is_empty() {
+            return Ok(());
+        }
+        let ptr = Gc::as_ptr(o) as usize;
+        let due: Vec<_> = match key {
+            Some(k) => hooks
+                .0
+                .remove(&(ptr, k.to_string()))
+                .into_iter()
+                .collect(),
+            None => {
+                let names: Vec<_> = hooks.0.keys().filter(|(p, _)| *p == ptr).cloned().collect();
+                names.iter().filter_map(|n| hooks.0.remove(n)).collect()
+            }
+        };
+        for materialize in due {
+            materialize(self)?;
+        }
+        Ok(())
     }
 
     #[inline(always)]
@@ -9221,3 +9294,9 @@ thread_local! {
     static STR_KEY_IC: std::cell::RefCell<[Option<(u32, crate::lstr::LStr, u32)>; STR_KEY_IC_LEN]> =
         const { std::cell::RefCell::new([const { None }; STR_KEY_IC_LEN]) };
 }
+
+/// Materializers of lazily published globals, keyed by global object and name.
+#[derive(Default)]
+pub(crate) struct LazyGlobalHooks(
+    std::collections::HashMap<(usize, String), Rc<dyn Fn(&mut Interp) -> Result<(), Value>>>,
+);

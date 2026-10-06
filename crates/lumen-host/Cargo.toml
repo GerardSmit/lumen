@@ -19,7 +19,9 @@ lumen-os = { path = "../lumen-os" }
 web-time = "1"
 
 [features]
-default = ["compiler", "jit", "aot-native", "intl", "typed"]
+default = ["compiler", "jit", "aot-native", "intl", "typed", "webcrypto"]
+# `webcrypto`: the Web Crypto globals (`lumen_host::webcrypto`), which need the digest crates.
+webcrypto = ["lumen-common/hash"]
 compiler = ["lumen/compiler"]
 jit = ["compiler", "lumen/jit"]
 aot-native = ["lumen/aot-native"]

@@ -42,7 +42,7 @@ use crate::value::{
 };
 pub use lumen_bind::Slot;
 use lumen_bind::{
-    BigInt, Class, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet, Methods,
+    BigInt, Class, Elem, FnDesc, FnItem, FromArg, Host, IntKind, IntoError, IntoRet, Make, Methods,
     Module, ModuleItems, Native, NextRet, Owner, Role, ScalarEntry, SpawnHost, State, StateHost,
     flags,
 };
@@ -674,6 +674,24 @@ impl<'s> ArgCx<'s> {
         self.interp().make_error("TypeError", msg)
     }
 
+    /// The error for a required argument that was not passed: `TypeError: <op>: argument N
+    /// (<name>) is required`, or the op's own `hint(js(missing_message = "..", missing_code =
+    /// ".."))` wording and `err.code`.
+    #[cold]
+    fn missing_argument(&self, at: Slot) -> Value {
+        let Some(message) = self.desc.hint("js", "missing_message") else {
+            return self.type_error(at, "is required");
+        };
+        let error = self.interp().make_error("TypeError", message.to_string());
+        if let (Value::Obj(object), Some(code)) = (&error, self.desc.hint("js", "missing_code")) {
+            object
+                .borrow_mut()
+                .props
+                .insert("code", Property::plain(Value::str(code)));
+        }
+        error
+    }
+
     /// A `RangeError: <op>: argument N (<name>) <what>` value.
     #[cold]
     pub fn range_error(&self, at: Slot, what: &str) -> Value {
@@ -1014,6 +1032,35 @@ impl Interp {
         self.with_buffer_bytes(buffer, |bytes| bytes.get(offset..end).map(<[u8]>::to_vec))?
     }
 
+    /// Read the bytes of any BufferSource (ArrayBuffer, SharedArrayBuffer, typed array or
+    /// DataView) through internal brands and ranges, without copying and without reading author
+    /// properties. A detached or out-of-bounds source reads as empty; `None` when `value` is not
+    /// a BufferSource. The callback must not run JavaScript.
+    pub fn with_buffer_source_bytes<R>(
+        &self,
+        value: &Value,
+        read: impl FnOnce(&[u8]) -> R,
+    ) -> Option<R> {
+        let (buffer, offset, length) = match resolve_view(self, value) {
+            Ok(range) => range,
+            Err(ViewErr::NotView) => return None,
+            Err(ViewErr::Detached) => return Some(read(&[])),
+        };
+        let mut read = Some(read);
+        let found = offset.checked_add(length).and_then(|end| {
+            self.with_buffer_bytes(buffer, |bytes| {
+                bytes
+                    .get(offset..end)
+                    .map(|bytes| (read.take().expect("read once"))(bytes))
+            })
+            .flatten()
+        });
+        Some(match found {
+            Some(result) => result,
+            None => (read.take().expect("read once"))(&[]),
+        })
+    }
+
     /// Allocate a unique engine-private name for a native object's traced slot.
     ///
     /// The returned name is intentionally held only by the native payload. The slot is hidden
@@ -1232,7 +1279,7 @@ impl Host for JsHost {
         let max = cx.desc.max_pos as usize;
         let min = cx.desc.min_pos as usize;
         if args.len() < min {
-            return Err(cx.type_error(Slot::arg(args.len() as u32), "is required"));
+            return Err(cx.missing_argument(Slot::arg(args.len() as u32)));
         }
         // Keyword-only parameters after `*args` cannot be passed positionally.
         let positional = if N > max && cx.desc.has_varargs() {
@@ -1526,10 +1573,10 @@ impl SpawnHost for JsHost {
 fn install_items(ctx: &mut Interp, target: &Gc, items: ModuleItems<JsHost>) -> Result<(), Value> {
     for f in items.functions.iter().filter(|f| f.desc.exposed_to("js")) {
         let v = ctx.bound_function(f);
-        target
-            .borrow_mut()
-            .props
-            .insert(&*js_name(f.desc), Property::builtin(v));
+        target.borrow_mut().props.insert(
+            &*js_name(f.desc),
+            Property::data(v, true, f.desc.hint("js", "webidl").is_some(), true),
+        );
     }
     for c in items.classes.iter().filter(|c| c.desc.exposed_to("js")) {
         let v = (c.object)(ctx)?;
@@ -1543,7 +1590,7 @@ fn install_items(ctx: &mut Interp, target: &Gc, items: ModuleItems<JsHost>) -> R
         target
             .borrow_mut()
             .props
-            .insert(k.name, Property::builtin(v));
+            .insert(k.name, Property::data(v, true, k.enumerable, true));
     }
     if let Some(init) = items.init {
         init(ctx, &Value::Obj(target.clone()))?;
@@ -3502,6 +3549,15 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         }
         register_op(i, m);
         match d.role {
+            Role::Method if d.hint("js", "symbol_for").is_some() => {
+                let description = d.hint("js", "symbol_for").unwrap_or_default();
+                let key = symbol_for_key(i, description);
+                let f = i.make_native(&format!("[{description}]"), d.min_pos as usize, m.entry);
+                proto
+                    .borrow_mut()
+                    .props
+                    .insert(key, Property::builtin(Value::Obj(f)));
+            }
             Role::Method | Role::Proto("next" | "str") => {
                 i.def_method(&proto, &js, d.min_pos as usize, m.entry);
                 if webidl {
@@ -3550,6 +3606,18 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
             .props
             .insert(&*name, Property::accessor_prop(get, set, webidl, true));
     }
+    let mut constants = Vec::new();
+    T::constants(&mut constants);
+    for constant in constants {
+        let value = (constant.value)(i)
+            .unwrap_or_else(|_| panic!("class constant {} does not convert", constant.name));
+        for target in [&ctor, &proto] {
+            target
+                .borrow_mut()
+                .props
+                .insert(constant.name, Property::data(value.clone(), false, true, false));
+        }
+    }
     let entry = (Value::Obj(ctor), proto);
     if !i.host_state.has::<ClassRegistry>() {
         i.host_state.put(ClassRegistry::default());
@@ -3560,6 +3628,176 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         .map
         .insert((realm_key, TypeId::of::<T>()), entry.clone());
     entry
+}
+
+/// The property key of the registry symbol `Symbol.for(description)`.
+fn symbol_for_key(i: &mut Interp, description: &str) -> String {
+    let data = match crate::interpreter::sym_for_get(description) {
+        Some(data) => data,
+        None => {
+            let symbol = i.new_symbol(Some(Rc::from(description)));
+            let Value::Sym(data) = symbol else {
+                unreachable!("new_symbol must return a symbol")
+            };
+            crate::interpreter::sym_for_insert(description.to_string(), data.clone());
+            data
+        }
+    };
+    Interp::sym_key(&data)
+}
+
+// ---- lazy globals ----------------------------------------------------------------------------
+
+/// What a lazily published global becomes on first access.
+enum LazyItem {
+    Function(FnItem<JsHost>),
+    Class(Make<JsHost>),
+    /// A module constant; it may instantiate the module's classes, so they are registered first.
+    Constant(Make<JsHost>, Rc<[Make<JsHost>]>),
+}
+
+/// One lazily published global: an accessor on its realm's global object that replaces itself
+/// with the final data property the first time it is read (or written, which stores the assigned
+/// value instead).
+struct LazyGlobal {
+    /// The global object it was published on. Weak: the object owns the accessor.
+    global: WeakGc,
+    name: String,
+    item: LazyItem,
+    enumerable: bool,
+    /// The accessor's getter, so the slot can tell whether the property is still its own.
+    getter: RefCell<Option<std::rc::Weak<crate::value::NativeClosure>>>,
+}
+
+impl LazyGlobal {
+    fn owns(&self, global: &Gc) -> bool {
+        let Some(mine) = self.getter.borrow().as_ref().and_then(std::rc::Weak::upgrade) else {
+            return false;
+        };
+        global.borrow().props.get(&self.name).is_some_and(|p| {
+            p.accessor()
+                && p.getter()
+                    .and_then(Value::as_obj)
+                    .is_some_and(|getter| match &getter.borrow().call {
+                        Callable::NativeData(data) => Rc::ptr_eq(&data.func, &mine),
+                        _ => false,
+                    })
+        })
+    }
+
+    /// Replace the accessor with a writable data property that keeps the accessor's current
+    /// enumerable and configurable attributes (a script may have changed them meanwhile).
+    fn publish(&self, global: &Gc, value: Value) {
+        let mut global = global.borrow_mut();
+        let (enumerable, configurable) = global
+            .props
+            .get(&self.name)
+            .map_or((self.enumerable, true), |p| (p.enumerable(), p.configurable()));
+        global.props.remove(&self.name);
+        global.props.insert(
+            self.name.as_str(),
+            Property::data(value, true, enumerable, configurable),
+        );
+    }
+
+    fn get(&self, i: &mut Interp) -> Result<Value, Value> {
+        let Some(global) = self.global.upgrade() else {
+            return Ok(Value::Undefined);
+        };
+        if !self.owns(&global) {
+            return i
+                .get_member(&Value::Obj(global), &self.name)
+                .map_err(abrupt_value);
+        }
+        let value = match &self.item {
+            LazyItem::Function(f) => i.bound_function(f),
+            LazyItem::Class(make) => make(i)?,
+            LazyItem::Constant(make, classes) => {
+                for class in classes.iter() {
+                    class(i)?;
+                }
+                make(i)?
+            }
+        };
+        self.publish(&global, value.clone());
+        Ok(value)
+    }
+
+    fn set(&self, i: &mut Interp, value: Value) -> Result<Value, Value> {
+        let Some(global) = self.global.upgrade() else {
+            return Ok(Value::Undefined);
+        };
+        if self.owns(&global) {
+            self.publish(&global, value);
+        } else {
+            i.set_member(&Value::Obj(global), &self.name, value)
+                .map_err(abrupt_value)?;
+        }
+        Ok(Value::Undefined)
+    }
+}
+
+/// Publish everything `items` declares as lazy accessors on the global object. A global the
+/// realm already has is left alone: earlier providers stay canonical.
+fn install_items_lazy(ctx: &mut Interp, items: ModuleItems<JsHost>) -> Result<(), Value> {
+    let global = ctx.global.clone();
+    let mut published: Vec<(String, LazyItem, bool)> = Vec::new();
+    for f in items.functions.iter().filter(|f| f.desc.exposed_to("js")) {
+        let enumerable = f.desc.hint("js", "webidl").is_some();
+        published.push((js_name(f.desc).into_owned(), LazyItem::Function(*f), enumerable));
+    }
+    for c in items.classes.iter().filter(|c| c.desc.exposed_to("js")) {
+        published.push((c.desc.name_for("js").to_string(), LazyItem::Class(c.object), false));
+    }
+    let classes: Rc<[Make<JsHost>]> = items
+        .classes
+        .iter()
+        .filter(|c| c.desc.exposed_to("js"))
+        .map(|c| c.object)
+        .collect();
+    for k in &items.constants {
+        let item = LazyItem::Constant(k.value, classes.clone());
+        published.push((k.name.to_string(), item, k.enumerable));
+    }
+    for (name, item, enumerable) in published {
+        if global.borrow().props.contains(&name) {
+            continue;
+        }
+        let slot = Rc::new(LazyGlobal {
+            global: Gc::downgrade(&global),
+            name,
+            item,
+            enumerable,
+            getter: RefCell::new(None),
+        });
+        let get: Rc<crate::value::NativeClosure> = {
+            let slot = slot.clone();
+            Rc::new(move |i: &mut Interp, _: Value, _: &[Value]| slot.get(i))
+        };
+        *slot.getter.borrow_mut() = Some(Rc::downgrade(&get));
+        let set: Rc<crate::value::NativeClosure> = {
+            let slot = slot.clone();
+            Rc::new(move |i: &mut Interp, _: Value, args: &[Value]| {
+                slot.set(i, args.first().cloned().unwrap_or(Value::Undefined))
+            })
+        };
+        let materialize = slot.clone();
+        ctx.register_lazy_global(
+            &global,
+            &slot.name,
+            Rc::new(move |i: &mut Interp| materialize.get(i).map(|_| ())),
+        );
+        let getter = Value::Obj(ctx.make_native_closure(&format!("get {}", slot.name), 0, get));
+        let setter = Value::Obj(ctx.make_native_closure(&format!("set {}", slot.name), 1, set));
+        global.borrow_mut().props.insert(
+            slot.name.as_str(),
+            Property::accessor_prop(Some(getter), Some(setter), enumerable, true),
+        );
+    }
+    if let Some(init) = items.init {
+        init(ctx, &Value::Obj(global))?;
+    }
+    Ok(())
 }
 
 fn register_op(i: &mut Interp, f: &FnItem<JsHost>) {
@@ -3612,6 +3850,16 @@ impl Interp {
             return Err(self.make_error("TypeError", "install_module: target must be an object"));
         };
         install_items(self, o, ModuleItems::of::<M>())
+    }
+
+    /// Publish everything `#[module]` `M` declares as lazy globals: each function, class and
+    /// constant is an accessor on the global object that builds the real value on first access
+    /// and replaces itself with a data property (writable and configurable; enumerable only for
+    /// an `#[op]` with `hint(js(webidl))`). Assigning to the accessor first stores the assigned
+    /// value instead. A name the realm already defines is skipped; `#[init]` runs immediately,
+    /// with the global object.
+    pub fn install_module_lazy<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
+        install_items_lazy(self, ModuleItems::of::<M>())
     }
 
     /// The registration record of the bound fn behind `callee`, if it is one (`op_function`,
@@ -3865,6 +4113,19 @@ impl Interp {
         self.invoke(parse, json, &[Value::str(text)])
     }
 
+    /// A new plain object whose own data properties are `entries` (enumerable, writable,
+    /// configurable), defined directly so no setter on `Object.prototype` can observe them.
+    pub fn plain_object(&mut self, entries: &[(&str, Value)]) -> Value {
+        let object = self.new_object();
+        {
+            let mut object = object.borrow_mut();
+            for (name, value) in entries {
+                object.props.insert(*name, Property::plain(value.clone()));
+            }
+        }
+        Value::Obj(object)
+    }
+
     /// `globalThis[name]` when it is an object, else a new plain object installed there.
     pub fn namespace_object(&mut self, name: &str) -> Value {
         Value::Obj(self.global_namespace(name))
@@ -3907,6 +4168,12 @@ impl crate::Engine {
     pub fn define_globals<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
         let g = self.interp.global.clone();
         install_items(&mut self.interp, &g, ModuleItems::of::<M>())
+    }
+
+    /// Define everything `#[module]` `M` declares as lazy globals (see
+    /// [`Interp::install_module_lazy`]).
+    pub fn define_lazy_globals<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
+        self.interp.install_module_lazy::<M>()
     }
 
     /// Define `globalThis.<class name>` as class `T`'s constructor.
@@ -4648,6 +4915,136 @@ mod tests {
             !Object.getOwnPropertyDescriptor(globalThis, 'WebIdlDescriptor').enumerable &&
             object.operation() === 9 && WebIdlDescriptor.staticOperation() === 42
         "#).ok().expect("descriptor checks execute");
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[lumen_bind::module(name = "lazyFixtures")]
+    mod lazy_fixtures {
+        use super::*;
+
+        #[class(name = "LazyThing", hint(js(webidl)))]
+        pub struct LazyThing;
+
+        #[methods]
+        impl LazyThing {
+            #[constant]
+            const FIRST: u16 = 1;
+            #[constant(name = "SECOND")]
+            const SECOND_VALUE: u16 = 2;
+
+            #[constructor]
+            fn new() -> Self {
+                Self
+            }
+        }
+
+        #[op(hint(js(webidl)))]
+        #[allow(non_snake_case)]
+        pub fn lazyDouble(x: i32) -> i32 {
+            x * 2
+        }
+
+        #[op(hint(js(webidl)))]
+        #[allow(non_snake_case)]
+        pub fn lazyAssigned(x: i32) -> i32 {
+            x
+        }
+
+        #[op(hint(js(webidl)))]
+        #[allow(non_snake_case)]
+        pub fn lazyDeleted(x: i32) -> i32 {
+            x
+        }
+
+        #[op(hint(js(webidl)))]
+        #[allow(non_snake_case)]
+        pub fn lazyPresent(x: i32) -> i32 {
+            x
+        }
+
+        #[constant(name = "LAZY_LIMIT", enumerable)]
+        const LIMIT: u32 = 7;
+    }
+
+    #[test]
+    fn lazy_module_globals_become_the_eager_descriptors_on_first_access() {
+        let mut engine = crate::Engine::new();
+        native_eval(&mut engine, "globalThis.lazyPresent = 'canonical'")
+            .ok()
+            .expect("preexisting global");
+        engine
+            .define_lazy_globals::<lazy_fixtures::Module>()
+            .ok()
+            .expect("lazy install");
+        let global = engine.ctx().global_object();
+        let global = global.as_obj().expect("global object").clone();
+        for (name, enumerable) in [("LazyThing", false), ("lazyDouble", true), ("LAZY_LIMIT", true)] {
+            let borrowed = global.borrow();
+            let property = borrowed.props.get(name).expect("lazy global is published");
+            assert!(property.accessor() && property.configurable(), "{name}");
+            assert_eq!(property.enumerable(), enumerable, "{name}");
+        }
+        let result = native_eval(
+            &mut engine,
+            r#"
+            const own = (name) => Object.getOwnPropertyDescriptor(globalThis, name);
+            const untouched = own('lazyPresent').value === 'canonical' && !('get' in own('lazyPresent'));
+
+            const Thing = LazyThing;
+            const classAfter = own('LazyThing');
+            const stable = classAfter.value === Thing && LazyThing === Thing &&
+                classAfter.writable && !classAfter.enumerable && classAfter.configurable;
+            const opAfter = own('lazyDouble');
+            const opReady = lazyDouble(4) === 8 && typeof opAfter.value === 'function' &&
+                opAfter.writable && opAfter.enumerable && opAfter.configurable &&
+                opAfter.value.name === 'lazyDouble';
+            const constantAfter = own('LAZY_LIMIT');
+            const constantReady = LAZY_LIMIT === 7 && constantAfter.writable &&
+                constantAfter.enumerable && constantAfter.configurable;
+
+            globalThis.lazyAssigned = 'mine';
+            const assigned = own('lazyAssigned');
+            const assignReplaces = assigned.value === 'mine' && assigned.writable &&
+                assigned.enumerable && assigned.configurable;
+            delete globalThis.lazyDeleted;
+            const deleteWins = own('lazyDeleted') === undefined && typeof lazyDeleted === 'undefined';
+
+            const redefined = (() => {
+                Object.defineProperty(globalThis, 'LazyThing', { value: 1, configurable: true });
+                return LazyThing === 1;
+            })();
+            untouched && stable && opReady && constantReady &&
+                assignReplaces && deleteWins && redefined
+            "#,
+        )
+        .ok()
+        .expect("lazy descriptor checks execute");
+        assert!(matches!(result, Value::Bool(true)));
+    }
+
+    #[test]
+    fn class_constants_live_on_constructor_and_prototype_as_web_idl_constants() {
+        let mut engine = crate::Engine::new();
+        engine.define_class::<lazy_fixtures::LazyThing>();
+        let result = native_eval(
+            &mut engine,
+            r#"
+            const check = (target) => {
+                const first = Object.getOwnPropertyDescriptor(target, 'FIRST');
+                const second = Object.getOwnPropertyDescriptor(target, 'SECOND');
+                return first.value === 1 && second.value === 2 &&
+                    first.enumerable && second.enumerable &&
+                    !first.writable && !second.writable &&
+                    !first.configurable && !second.configurable;
+            };
+            LazyThing.FIRST = 9;
+            check(LazyThing) && check(LazyThing.prototype) &&
+                new LazyThing().FIRST === 1 && LazyThing.FIRST === 1 &&
+                !Object.hasOwn(LazyThing, 'SECOND_VALUE')
+            "#,
+        )
+        .ok()
+        .expect("class constant checks execute");
         assert!(matches!(result, Value::Bool(true)));
     }
 

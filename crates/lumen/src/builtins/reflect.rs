@@ -171,6 +171,7 @@ pub(crate) fn reflect_gopd(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Val
         }
     };
     let key = ab(i.to_property_key(&arg(a, 1)))?;
+    i.materialize_lazy_globals(&o, Some(&key))?;
     if Interp::is_private_key(&key) {
         return Ok(Value::Undefined); // private-name slot is not an own property
     }

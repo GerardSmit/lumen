@@ -285,6 +285,7 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let modname = format!("__lumen_bind_{self_ty}");
     let mut gen_items = String::new();
     let mut members = Vec::new();
+    let mut constants: Vec<(String, String, String)> = Vec::new();
     let mut new_body: Vec<TokenTree> = Vec::new();
     for (n, it) in split_items(&body_toks).into_iter().enumerate() {
         let is_fn = {
@@ -292,7 +293,33 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
             it[s..].iter().take(6).any(|t| is_ident(t, "fn"))
         };
         if !is_fn {
-            new_body.extend(it);
+            let (attrs, after) = take_attrs(&it, 0);
+            let Some(bind) = attrs.iter().find(|a| a.is("constant")) else {
+                new_body.extend(it);
+                continue;
+            };
+            let rest = &it[after..];
+            let k = rest
+                .iter()
+                .position(|t| is_ident(t, "const"))
+                .ok_or((bind.span, "#[constant] goes on a `const`".to_string()))?;
+            let Some(TokenTree::Ident(name)) = rest.get(k + 1) else {
+                return Err((bind.span, "expected `const X: T = ..;`".into()));
+            };
+            let eq = rest
+                .iter()
+                .position(|t| is_punct(t, '='))
+                .ok_or((bind.span, "expected `const X: T = ..;`".to_string()))?;
+            let ty = render(&rest[k + 3..eq], None, Lt::Infer);
+            let o = parse_opts(bind.args_ts())?;
+            o.check(&["name"])?;
+            let name = name.to_string();
+            let shown = o.get("name").unwrap_or(&name).to_string();
+            constants.push((shown, name, ty));
+            for a in attrs.iter().filter(|a| !std::ptr::eq(*a, bind)) {
+                new_body.extend(a.tokens.iter().cloned());
+            }
+            new_body.extend(rest.iter().cloned());
             continue;
         }
         let (attrs, _) = take_attrs(&it, 0);
@@ -364,11 +391,25 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
     let bounds = members
         .iter()
         .map(|m| format!("{modname}::{m}: {B}::Native<H>"))
+        .chain(
+            constants
+                .iter()
+                .map(|(_, _, ty)| format!("{ty}: {B}::IntoRet<H>")),
+        )
         .collect::<Vec<_>>()
         .join(", ");
     let pushes = members
         .iter()
         .map(|m| format!("out.push({B}::FnItem::of::<{modname}::{m}>());"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let const_pushes = constants
+        .iter()
+        .map(|(shown, name, ty)| {
+            format!(
+                "out.push({B}::ConstItem {{ name: {shown:?}, value: |ctx| {B}::__private::constant::<H, {ty}>(ctx, <{self_ty}>::{name}), enumerable: false }});"
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let code = format!(
@@ -378,6 +419,7 @@ fn expand_methods(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
          impl<H: {B}::Host> {B}::Methods<H> for {self_ty} where {self_ty}: {B}::Inheritance<H>, {bounds} {{\n\
            fn base_class(ctx: &mut H::Ctx) -> Result<Option<H::Value>, H::Error> {{ <Self as {B}::Inheritance<H>>::base_class(ctx) }}\n\
            fn members(out: &mut ::std::vec::Vec<{B}::FnItem<H>>) {{\n{pushes}\n}}\n\
+           fn constants(out: &mut ::std::vec::Vec<{B}::ConstItem<H>>) {{\n{const_pushes}\n}}\n\
          }}\n"
     );
     let mut ts: TokenStream = out.into_iter().collect();
@@ -560,11 +602,12 @@ fn expand_module(attr: TokenStream, item: TokenStream) -> Res<TokenStream> {
                     .ok_or((bind.span, "expected `const X: T = ..;`".to_string()))?;
                 let ty = render(&rest[k + 3..eq], None, Lt::Infer);
                 let o = parse_opts(bind.args_ts())?;
-                o.check(&["name"])?;
+                o.check(&["name", "enumerable"])?;
                 let shown = o.get("name").unwrap_or(&name).to_string();
+                let enumerable = o.has("enumerable");
                 ibounds.push(format!("{ty}: {B}::IntoRet<H>"));
                 ipushes.push(format!(
-                    "out.constants.push({B}::ConstItem {{ name: {shown:?}, value: |ctx| {B}::__private::constant::<H, {ty}>(ctx, {name}) }});"
+                    "out.constants.push({B}::ConstItem {{ name: {shown:?}, value: |ctx| {B}::__private::constant::<H, {ty}>(ctx, {name}), enumerable: {enumerable} }});"
                 ));
             }
             "init" => {

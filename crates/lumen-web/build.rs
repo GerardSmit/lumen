@@ -88,7 +88,7 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["crypto.js"],
+        files: &["navigator.js"],
         lazy: false,
         defined: &[],
     },

@@ -359,6 +359,14 @@ globalThis.Blob = Blob;
 globalThis.File = File;
 globalThis.FormData = FormData;
 
+// structuredClone lives in another unit and must refuse file-backed blobs.
+Object.defineProperty(globalThis, "__lumenIsFileBackedBlob", {
+  configurable: false,
+  enumerable: false,
+  writable: false,
+  value: (blob) => Boolean(blob[kBlobFile]),
+});
+
 // Private native bridge used by the browser's HTML form-navigation service.
 // It snapshots the actual post-`formdata` entry list, including File bytes,
 // without exposing or replacing FormData's private entry storage.

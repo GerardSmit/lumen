@@ -1630,16 +1630,6 @@ fn web_encoding_bom_options_order_and_brand_share_native_stream_state() {
         assert(decoder.decode(detaching,{get stream(){
             structuredClone(detaching.buffer,{transfer:[detaching.buffer]});return false;
         }}) === '');
-        const nativeDecode = __lumenEncoding.Decoder.prototype.decode;
-        const nativeLabel = __lumenEncoding.label;
-        try {
-            __lumenEncoding.Decoder.prototype.decode = () => 'corrupt';
-            __lumenEncoding.label = () => 'corrupt';
-            assert(new TextDecoder('utf-8').decode(Uint8Array.of(65)) === 'A');
-        } finally {
-            __lumenEncoding.Decoder.prototype.decode = nativeDecode;
-            __lumenEncoding.label = nativeLabel;
-        }
         console.log('bom-and-brand-ok');
     "#);
     assert_eq!(out.lines(), ["bom-and-brand-ok"]);
