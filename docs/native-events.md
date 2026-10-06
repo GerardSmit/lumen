@@ -163,7 +163,8 @@ object. The native core:
   native `NodeEventTarget` with `kNewListener` / `kRemoveListener` hooks and `emit`;
   `perf_hooks.js` no longer calls `initEventTarget` (any object becomes a target by having the
   native data).
-- `lumen-runtime` worker scopes read `kTrustEvent` from the internals as before.
+- `lumen-runtime` worker scopes are native (`lumen_host::workers`); `worker_scope.js` and its
+  `kTrustEvent` reads are gone.
 - The Bitnest kernel installs `lumen_host::events::bindings` with `define_lazy_globals` before
   its byte-type glue, instead of concatenating `events.js` and `error-events.js`.
 - `fetch.js` is gone: `Headers`, `Request`, `Response` and `fetch` are native ([native-network.md](native-network.md)).
@@ -182,5 +183,6 @@ object. The native core:
   published lazily): `userAgent` is a prototype getter, no longer an own data property. The DOM
   realm's `Navigator` (`DomNavigator`, `lumen-html-js`) `extends` it. The extension drops the raw
   `__http` namespace after registering the transport and no longer creates `__url`.
-- Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
-  [native-messaging.md](native-messaging.md).
+- Worker and SharedWorker page classes and the worker global scopes are native
+  (`lumen_host::workers`, [plans/native-workers.md](plans/native-workers.md)); `messaging.js` and
+  `platform.js` moved to [native-messaging.md](native-messaging.md). Service-worker classes remain.

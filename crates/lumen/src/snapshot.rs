@@ -2462,7 +2462,7 @@ mod tests {
     fn roundtrip_real_web_glue() {
         // The actual runtime glue — the thing the build-time snapshot will encode.
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../lumen-runtime/src/js/");
-        for file in ["worker.js", "worker_scope.js"] {
+        for file in ["error_shim.js", "env_proxy.js"] {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();
             assert_roundtrips(&src);
         }

@@ -749,21 +749,8 @@ impl Runtime {
 
     fn run_worker_rejection_task(&mut self, task: lumen_html_js::BrowserRejectionTask) {
         let delivery = self.browser_rejections.delivery();
-        let global = self.engine.global_this();
-        let dispatch = self
-            .engine
-            .ctx()
-            .get_member(&global, "__workerDispatchRejection")
-            .ok()
-            .and_then(lumen::embed::JsFunction::from_value);
-        let Some(dispatch) = dispatch else {
-            return;
-        };
         let result: Result<(), lumen::embed::OpError> = lumen_html_js::run_rejection_task(self.engine.ctx(), &delivery, task, |ctx, kind, promise, reason| {
-            match dispatch.call(ctx, Value::Undefined, &[Value::str(kind), promise, reason])? {
-                Value::Bool(not_prevented) => Ok(not_prevented),
-                _ => Ok(true),
-            }
+            lumen_host::workers::dispatch_rejection(ctx, kind, promise, reason)
         });
         if let Err(error) = result {
             let error = error.to_value(self.engine.ctx());

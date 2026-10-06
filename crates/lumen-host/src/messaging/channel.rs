@@ -237,7 +237,8 @@ fn close_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) 
     let Some(id) = link.id.get() else {
         return;
     };
-    ports::close(ctx, id);
+    ports::set_pin(ctx, id, None);
+    ports::close_and_detach(ctx, id);
     finish(ctx, receiver, link, kind, false);
 }
 
@@ -246,6 +247,7 @@ fn close_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) 
 /// value for as long as it wants delivery: dropping it releases the endpoint through the realm's
 /// reaper. Messages are deserialized straight from the wire bytes (no script buffer in between)
 /// and each is its own loop task.
+#[derive(Clone)]
 pub struct NativeReceiver {
     link: Rc<Link>,
     kind: Receiver,
@@ -269,6 +271,36 @@ impl NativeReceiver {
     /// Close the channel for both sides; `target` is the object events were dispatched on.
     pub fn close(&self, ctx: &mut Ctx, target: &Value) {
         close_link(ctx, target, &self.link, self.kind);
+    }
+
+    /// Whether the loop task of the endpoint keeps the event loop alive (it starts unref'd).
+    pub fn set_ref(&self, ctx: &mut Ctx, keep: bool) {
+        if let Some(id) = self.link.id.get() {
+            ports::set_ref(ctx, id, keep);
+        }
+    }
+
+    /// Deliver every message already queued as events on `target` now, so an event that was
+    /// sent on another channel after them (an error, an exit) cannot overtake them. The close
+    /// is reported only once the queue is drained.
+    pub fn flush(&self, ctx: &mut Ctx, target: &Value) {
+        loop {
+            let Some(id) = self.link.id.get() else {
+                return;
+            };
+            match ports::poll_raw(ctx, id) {
+                Ok(RawPolled::Message(bytes)) => deliver(ctx, target, bytes, self.kind),
+                Ok(RawPolled::Empty) => return,
+                Ok(RawPolled::Closed) => {
+                    finish(ctx, target, &self.link, self.kind, true);
+                    return;
+                }
+                Err(_) => {
+                    finish(ctx, target, &self.link, self.kind, false);
+                    return;
+                }
+            }
+        }
     }
 
     /// Keep `target` alive (or stop doing so) while the peer can still send.

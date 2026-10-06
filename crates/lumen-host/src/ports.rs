@@ -100,6 +100,39 @@ impl<T> Mailbox<T> {
     pub fn is_bound(&self) -> bool {
         self.slot.waker.lock().unwrap().is_some()
     }
+
+    /// Bind the calling realm: `callback` runs as a loop task whenever the mailbox is woken. The
+    /// task keeps the loop alive until [`unlisten`](Self::unlisten); a wake is coalesced until the
+    /// callback's turn begins, so the callback pops what it wants and calls [`rewake`](Self::rewake)
+    /// when more remains.
+    pub fn listen(&self, ctx: &mut Ctx, callback: Value) -> Result<TaskId, OpError> {
+        let sender = ctx
+            .op_state()
+            .get::<CompletionSender>()
+            .cloned()
+            .ok_or_else(|| NativeError::runtime("workers require an event loop"))?;
+        let reg = ctx
+            .host_mut::<TaskRegistry>()
+            .ok_or_else(|| NativeError::runtime("workers require an event loop"))?;
+        let task = reg.register_stream(callback, decode_wake);
+        self.bind(sender, task);
+        Ok(task)
+    }
+
+    /// Stop waking the realm and drop its loop task.
+    pub fn unlisten(&self, ctx: &mut Ctx, task: TaskId) {
+        self.unbind();
+        if let Some(reg) = ctx.host_mut::<TaskRegistry>() {
+            reg.cancel(task);
+        }
+    }
+
+    /// [`wake`](Self::wake), but only when something is left to look at.
+    pub fn rewake(&self) {
+        if !self.queue.is_empty() || self.queue.is_closed() {
+            self.wake();
+        }
+    }
 }
 
 struct Endpoint {
@@ -580,6 +613,14 @@ pub fn detach(ctx: &mut Ctx, id: u64) {
 /// by the peer; messages queued for the closing side are dropped. Each side then sees the close.
 pub fn close(ctx: &mut Ctx, id: u64) {
     if let Ok(port) = lookup(ctx, id as f64) {
+        port.0.close_both();
+    }
+}
+
+/// [`close`] for an owner that finishes the close itself: the handle is released first, so the
+/// closing side's own loop task is cancelled and the close wakes only the peer.
+pub fn close_and_detach(ctx: &mut Ctx, id: u64) {
+    if let Some(port) = release(ctx, id) {
         port.0.close_both();
     }
 }

@@ -27,6 +27,7 @@ pub use channel::bindings::{BroadcastChannel, MessageChannel, MessagePort};
 pub use channel::shared;
 pub use channel::install_port_clone;
 pub use channel::{listen_native, NativeReceiver, Receiver};
+pub(crate) use channel::new_port;
 pub use events::bindings as event_bindings;
 pub use events::bindings::{CloseEvent, MessageEvent, PromiseRejectionEvent};
 

@@ -603,4 +603,105 @@ mod owner_loop_tests {
         pump_all(&mut engine);
         assert_eq!(eval_str(&mut engine, "log.join()"), "hook,far close");
     }
+
+    struct MockBackend {
+        spawned: Arc<AtomicUsize>,
+        terminated: Arc<AtomicUsize>,
+    }
+
+    impl workers::WorkerBackend for MockBackend {
+        fn spawn_dedicated(
+            &self,
+            _ctx: &mut Ctx,
+            _spec: workers::DedicatedSpec,
+        ) -> lumen_bind::NativeResult<u64> {
+            Ok(self.spawned.fetch_add(1, Ordering::SeqCst) as u64)
+        }
+
+        fn terminate(&self, _ctx: &mut Ctx, _id: u64) {
+            self.terminated.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn worker_engine() -> (Engine, Arc<AtomicUsize>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (mut engine, notifies) = owner_engine();
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let terminated = Arc::new(AtomicUsize::new(0));
+        workers::set_backend(
+            engine.ctx(),
+            Rc::new(MockBackend {
+                spawned: Arc::clone(&spawned),
+                terminated: Arc::clone(&terminated),
+            }),
+        );
+        assert!(workers::install_page_classes(engine.ctx()).is_ok());
+        (engine, notifies, spawned, terminated)
+    }
+
+    #[test]
+    fn worker_class_has_web_idl_shape() {
+        let (mut engine, _, spawned, _) = worker_engine();
+        assert_eq!(eval_str(&mut engine, "Worker.length"), "1");
+        assert_eq!(
+            eval_str(
+                &mut engine,
+                "const d = Object.getOwnPropertyDescriptor(Worker.prototype, 'onmessage'); typeof d.get + typeof d.set"
+            ),
+            "functionfunction"
+        );
+        assert_eq!(
+            eval_str(&mut engine, "Object.getPrototypeOf(Worker.prototype) === EventTarget.prototype"),
+            "true"
+        );
+        assert_eq!(
+            eval_str(
+                &mut engine,
+                "try { Worker.prototype.postMessage.call({}, 1); 'no' } catch (e) { e.constructor.name }"
+            ),
+            "TypeError"
+        );
+        assert_eq!(
+            eval_str(&mut engine, "try { Worker('x.js'); 'no' } catch (e) { e.constructor.name }"),
+            "TypeError"
+        );
+        assert_eq!(spawned.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn worker_without_backend_support_is_not_supported() {
+        let (mut engine, _) = owner_engine();
+        assert!(workers::install_page_classes(engine.ctx()).is_ok());
+        assert_eq!(
+            eval_str(
+                &mut engine,
+                "try { new Worker('x.js'); 'no' } catch (e) { e.name }"
+            ),
+            "NotSupportedError"
+        );
+    }
+
+    #[test]
+    fn terminate_notifies_the_backend_once_and_idle_worker_is_not_notified() {
+        let (mut engine, notifies, spawned, terminated) = worker_engine();
+        eval_str(
+            &mut engine,
+            "globalThis.w = new Worker('x.js'); w.onmessage = () => {}; w.terminate(); w.terminate(); 0",
+        );
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        assert_eq!(terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(notifies.load(Ordering::SeqCst), 0);
+        assert!(!owner_loop::has_ready(engine.ctx()));
+    }
+
+    #[test]
+    fn worker_post_message_after_terminate_throws_nothing_and_listenerless_worker_collects() {
+        let (mut engine, _, _, terminated) = worker_engine();
+        eval_str(
+            &mut engine,
+            "globalThis.w = new Worker('x.js'); w.terminate(); w.postMessage(1); 0",
+        );
+        eval_str(&mut engine, "new Worker('y.js'); 0");
+        engine.collect_garbage();
+        assert_eq!(terminated.load(Ordering::SeqCst), 1);
+    }
 }

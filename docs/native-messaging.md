@@ -3,7 +3,8 @@
 `MessageEvent`, `CloseEvent`, `PromiseRejectionEvent`, `MessagePort`, `MessageChannel`,
 `BroadcastChannel` and `Performance` (with the `performance` and `self` globals) are native
 `lumen_bind` classes in `lumen_host`. They replace `lumen-web`'s `messaging.js` and `platform.js`.
-The kernel keeps its own transport for shared workers and installs only the event classes and
+`Worker`, `SharedWorker` and the worker global scopes are native too (`lumen_host::workers`).
+The kernel keeps its own transport for shared workers until step 6 of the worker plan and installs only the event classes and
 `Performance`.
 
 ## Ownership
@@ -77,7 +78,9 @@ replaces. Nothing mutates a global any more.
   nothing is detached. The queue is checked by the sender.
 - `messaging::listen_native(ctx, id, target, Receiver, on_close)` delivers an endpoint's messages
   to a native class (a `Worker`, a worker global) instead of a `MessagePort`, with the same
-  per-message tasks and no script buffer in between. The returned `NativeReceiver` posts, closes and
+  per-message tasks and no script buffer in between. `lumen_host::workers` uses it for `Worker`
+  (page side) and for the dedicated and shared worker global scopes (the dedicated pair is the
+  implicit port pair, so transfer lists work). The returned `NativeReceiver` posts, closes and
   pins.
 - `owner_loop` drives all of this in a host without an event loop; see
   [plans/native-workers.md](plans/native-workers.md).

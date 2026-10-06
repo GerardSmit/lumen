@@ -1,7 +1,7 @@
 # Plan: native workers
 
-Status: steps 1 and 2 implemented (owner loop, port limits, messaging extension, native receivers);
-steps 3-8 are design. Goal: delete the last JavaScript worker glue and run one
+Status: steps 1-4 implemented (owner loop, port limits, messaging extension, native receivers,
+native `Worker`/`SharedWorker` and worker global scopes in `lumen-runtime`); steps 5-8 are design. Goal: delete the last JavaScript worker glue and run one
 native implementation of `Worker`, `SharedWorker`, the service-worker classes and the worker
 global scopes in both `lumen-runtime` and the Bitnest kernel.
 
@@ -238,7 +238,7 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
    (`install` and `extension()`), `lumen-web/src/lib.rs` (uses it). Tests: full queue →
    `QuotaExceededError`, oversized → `DataCloneError`, native receiver gets `data` + `ports`,
    close fires on the receiver. Behaviour: none without limits.
-3. **Native `Worker` and `SharedWorker` page classes** (lumen). Files: new
+3. **Native `Worker` and `SharedWorker` page classes** (lumen) — done. Files: new
    `lumen-host/src/workers/{mod,control,backend,page}.rs`; `lumen-runtime/src/worker.rs`
    (backend impl; `WorkerEntry.dispatch` becomes a `Control`, the per-inbox relay thread for web
    workers is replaced by the backend pushing into `Control` from `route`), `worker_browser.rs`,
@@ -248,7 +248,7 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
    new: `Worker.length`, `onmessage` accessors on the prototype, brand checks, `SharedWorker.port`
    is a native `MessagePort`, `error`/`close` events trusted. Behaviour: classes are Web IDL
    shaped; events trusted.
-4. **Native worker global scopes + implicit port** (lumen). Files:
+4. **Native worker global scopes + implicit port** (lumen) — done. Files:
    `lumen-host/src/workers/scope.rs`; `lumen-runtime/src/worker.rs` (`run_worker` calls
    `install_scope`; dedicated messages move to the implicit pair: `ToWorker::Data`,
    `ToMain::Message` and the inbox `Message` arms go for web workers; inside port ref'd for web
@@ -380,3 +380,74 @@ What differs from the sketch above, and why (checked against the source while im
 - **Remaining costs.** A cross-thread send takes the mailbox's waker mutex and the channel's
   mutex; each message is still its own loop task (one `Weak::upgrade` pair and a native call), which
   is what gives microtask checkpoints between messages.
+
+## Implementation notes for steps 3 and 4
+
+Steps 3 and 4 landed together: the dedicated transport could not stay on `ToWorker`/`ToMain` once
+the scopes were native, so the implicit port pair replaced it directly. Not compiled-and-run here:
+only compile checks were done (`lumen`, `lumen-host`, `lumen-web`, `lumen-runtime`, `lumen-node`,
+`lumen-html-js` tests, `lumen-web` and `lumen-runtime` on wasm32); the new tests have not been run.
+
+What differs from the sketch above:
+
+- **Files.** `lumen-host/src/workers/{mod,control,backend,page,scope}.rs`. `lumen-runtime/src/worker.rs`
+  is rewritten; `worker_browser.rs` keeps only the unsupported `__lumenWorkerOps` stub plus the lazy
+  page classes (constructing throws `NotSupportedError` through the default backend). Deleted:
+  `worker.js`, `worker_scope.js`, `shared_worker_scope.js`, `node_worker_scope.js`; `build.rs` no
+  longer lists `worker`; the `roundtrip_real_web_glue` snapshot test reads `error_shim.js` and
+  `env_proxy.js` instead.
+- **`WorkerBackend`** differs from the sketch: `terminate`, `exited` and `disconnect_shared` take
+  `ctx`; `connect_shared` takes a `SharedSpec { key, entry, remote, page_side, worker_side, control }`
+  (the backend, not the page class, owns the registry key and client accounting); there is no
+  `set_ref` (the page class pins itself) and no `service_workers` yet. The backend is stored in
+  `OpState` with `workers::set_backend`. `WorkerScopeHost` supplies `kind`, `location`, `name`,
+  `module`, `close`, `load_classic_script` (the runtime's HTTP loader, so `importScripts` stays
+  outside `lumen-host`) and `report_error`.
+- **`Control`** is an `Arc<Mailbox<WorkerEvent>>` (`Online`, `Error`, `Exit`, `Close`, `Connect`).
+  The page object listens with a stream task; the worker thread pushes straight into it, so the
+  per-worker relay thread is gone. Dedicated terminate closes the page receiver, which wakes the
+  worker through the peer-endpoint wake; shared workers wake through their scope `Control`.
+- **Event order.** Before an `error` or `exit` is dispatched the page flushes the port's queued
+  messages, so a message posted before an error is not overtaken. The shared page side drains
+  every control event in one turn so the worker's `error` then `close` beat the port-close hook.
+- **Node `worker_threads` is unchanged in shape** but its bootstrap moved into Rust
+  (`boot_node_worker` calls `__lumenInitWorkerThread` with `__wself`, the thread id, the init bytes
+  and the `[public, internal]` ports); `__worker` was renamed `__lumenWorkerOps` and its `spawn`
+  is node-only. `__wself` keeps only `exit`; `post`, `close`, `setRef`, `report` and
+  `loadClassicScript` and the `ToWorker`/`ToMain::Message` channels are gone. Node still has its
+  two blocking inbox threads (main-side `arm_main_inbox`, worker-side terminate wake): follow-up.
+
+Behaviour changes:
+
+- `SharedWorker` with an invalid URL throws a `DOMException` `SyntaxError` (was `TypeError`).
+- Constructor options are validated strictly (`TypeError`, including enum errors for `type` and
+  `credentials`).
+- `SharedWorker` has no `onclose` property; the `close` event still fires through
+  `addEventListener`.
+- Page-side `error` events are trusted, cancelable `ErrorEvent`s; `onmessage`/`onerror` handlers
+  are ordinary listeners in registration order (the handler used to run first).
+- A `SharedWorker` with no document location resolves against the realm cwd, else `file:///`.
+- Transfer lists are honoured by `Worker.postMessage` and the worker's `postMessage`.
+- A message posted before `terminate()` is dropped by the closed port.
+- A page `Worker` with a `message`/`messageerror`/`error` listener is pinned until it exits or is
+  terminated; one without listeners is collectable, and collecting never terminates the thread.
+- The worker global is an instance of `DedicatedWorkerGlobalScope`/`SharedWorkerGlobalScope`
+  (`attach_instance`), so `self instanceof EventTarget` holds with no `hasInstance` override;
+  `self` is an own accessor and `location` a `WorkerLocation`.
+
+### Performance and startup
+
+- No blocking inbox thread per web worker and no shared-worker router thread; both directions are
+  wire bytes to a native receiver to an event, with no JS glue and no `Uint8Array` copy.
+- Idle is free: nothing is armed beyond ref'd stream tasks that hold the loop only while the worker
+  can still receive. Wakes are coalesced (one per burst); terminate wakes the worker immediately.
+  The 50 ms stop poll in `worker_loop` stays only as a fallback.
+- Startup: web workers no longer parse or run `worker_scope.js`/`shared_worker_scope.js` or the AOT
+  blob, and the page realm no longer evaluates `worker.js`; the classes are lazy globals, so a realm
+  that never touches `Worker` pays nothing. Node workers still run the `worker_threads` glue as
+  before; startup is unchanged there.
+
+Tests: `lumen-host/src/tests.rs` (mock backend: WebIDL shape, brand checks, `SharedWorker.port`,
+trusted events, GC of an idle `Worker`) and `lumen-runtime/src/tests.rs` (dedicated transfer of an
+`ArrayBuffer` and a `MessagePort` both ways, scope prototype chain and globals, posting before
+`terminate()`). Existing worker tests were not changed.

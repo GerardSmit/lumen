@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-const SCRIPTS: &[&str] = &["process", "env_proxy", "error_shim", "worker"];
+const SCRIPTS: &[&str] = &["process", "env_proxy", "error_shim"];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

@@ -4700,3 +4700,58 @@ fn native_event_target_follows_node_event_target_semantics() {
     rt.run_to_completion();
     assert_eq!(out.lines(), ["ok"]);
 }
+
+#[test]
+fn worker_scope_shape_and_dedicated_transfer() {
+    let lines = worker_drive(
+        &[(
+            "scope.mjs",
+            r#"
+            onmessage = (e) => {
+                const [buffer] = e.data.buffers;
+                const port = e.ports[0];
+                port.postMessage({ len: buffer.byteLength });
+                const back = new ArrayBuffer(8);
+                postMessage({
+                    shape: [
+                        self instanceof EventTarget,
+                        Object.getPrototypeOf(self) === DedicatedWorkerGlobalScope.prototype,
+                        self === globalThis,
+                        location.constructor.name,
+                    ].join(),
+                    detached: buffer.byteLength,
+                }, [back]);
+                port.close();
+                close();
+            };
+            "#,
+        )],
+        r#"
+        const w = new Worker("{DIR}/scope.mjs", { type: "module" });
+        const channel = new MessageChannel();
+        channel.port1.onmessage = (e) => console.log("port", e.data.len);
+        w.onmessage = (e) => console.log("main", e.data.shape, e.data.detached);
+        const buffer = new ArrayBuffer(16);
+        w.postMessage({ buffers: [buffer] }, [buffer, channel.port2]);
+        console.log("sent", buffer.byteLength);
+        "#,
+    );
+    assert_eq!(lines[0], "sent 0");
+    assert!(lines.contains(&"port 16".to_string()));
+    assert!(lines.contains(&"main true,true,true,WorkerLocation 16".to_string()));
+}
+
+#[test]
+fn worker_message_posted_before_terminate_is_dropped() {
+    let lines = worker_drive(
+        &[("quiet.mjs", "onmessage = () => postMessage('late');")],
+        r#"
+        const w = new Worker("{DIR}/quiet.mjs", { type: "module" });
+        w.onmessage = () => console.log("unexpected");
+        w.postMessage(1);
+        w.terminate();
+        console.log("terminated");
+        "#,
+    );
+    assert_eq!(lines, ["terminated"]);
+}
