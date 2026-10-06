@@ -1,44 +1,44 @@
 //! WebSocket (RFC 6455) over plain TCP or verified TLS: a *client* (the upgrade sibling of the fetch
 //! client in `http.rs`, driving the native `WebSocket` class in `websocket_class.rs`) plus a *server-side
 //! adopt* (`adopt_connection`), which takes a connection accepted by the HTTP server in `server.rs`,
-//! answers the 101 handshake, and runs it through the same registry/read-loop with unmasked
+//! answers the 101 handshake, and runs it through the same registry/frame machinery with unmasked
 //! outgoing frames — backing `Lumen.upgradeWebSocket` and Bun.serve's `websocket` option.
 //!
 //! ## How it runs on the loop
-//! Same re-arm pattern as the HTTP server: `connect` runs the TCP/TLS dial + HTTP upgrade handshake
-//! on a pool thread and comes back as a completion; the completion decoder stores the shared stream,
-//! fires the socket's JS dispatch (`"open"`), and arms a reader task. Each reader task blocks
-//! until ONE complete message (transparently answering pings and swallowing pongs), returns it as
-//! a completion — which re-arms the next read — and carries the fragmentation-capable reader back
-//! and forth by value. Sends/closes write on the loop thread under a per-socket write mutex (a
-//! write timeout bounds a stalled peer; real backpressure handling is future work, matching the
-//! server's v1 notes).
+//! `connect` runs the TCP/TLS dial + HTTP upgrade handshake on a pool thread (one short, bounded
+//! job that ends with the socket switched to nonblocking mode) and comes back as a completion; its
+//! decoder fires the socket's JS dispatch (`"open"`) and registers the socket with the loop's
+//! readiness reactor (`nbio`). An adopted server connection is registered at once. From then on a
+//! connection has no thread and no timer while it is idle: the reactor wakes the loop thread, which
+//! reads what the socket has until it would block, answers pings, swallows pongs and delivers at
+//! most one message per loop completion (a message left in the buffer schedules another pass), so
+//! every message keeps its own microtask checkpoint. Sends and closes write straight to the
+//! socket on the loop thread; what the socket does not take is queued and goes out when the
+//! reactor reports it writable again, and a peer that takes nothing for 30 s is dropped.
 //!
 //! ## What's intentionally missing (v1)
 //! - **permessage-deflate** and other extensions (`extensions` is always `""`).
-//! - **Backpressure**: `send` writes synchronously; `bufferedAmount` is 0 once `send` returns.
+//! - **bufferedAmount**: `send` always reports 0 buffered; the queue behind a slow peer is capped
+//!   at `MAX_QUEUED`, beyond which `send` throws.
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use lumen_bind::NativeError;
 use lumen_host::{Ctx, SpawnHandle, Value};
+use lumen_os::reactor::Interest;
 
+use crate::nbio::{self, Conn, Fill, HeadError, Link, NbStream};
 use crate::url;
 use crate::websocket_class::Outgoing;
 use lumen_common::hash::{digest, Algo};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-/// Bound reads/writes so a dead peer can't pin a pool worker (reads) or the loop (writes).
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a read holds the stream lock before releasing it for a send; the read then retries.
-const READ_POLL: Duration = Duration::from_millis(100);
 /// Message size cap (mirrors the HTTP body cap); exceeding it fails the connection with 1009.
 const MAX_MESSAGE: usize = 32 << 20;
+/// Output queued behind a peer that is not reading; `send` throws beyond it.
+const MAX_QUEUED: usize = 64 << 20;
 
 pub(crate) fn base64(data: &[u8]) -> String {
     lumen_common::codec::base64_encode(data, false, true)
@@ -123,34 +123,45 @@ struct RawFrame {
     payload: Vec<u8>,
 }
 
-fn read_exact_buf(r: &mut impl Read, n: usize) -> Result<Vec<u8>, WsError> {
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)
-        .map_err(|e| WsError::Io(e.to_string()))?;
-    Ok(buf)
+enum Parsed {
+    /// A whole frame and the number of bytes it took.
+    Frame(RawFrame, usize),
+    /// At least this many more bytes are needed to make progress.
+    Need(usize),
 }
 
-fn read_raw_frame(r: &mut impl Read, max: usize) -> Result<RawFrame, WsError> {
-    let head = read_exact_buf(r, 2)?;
-    let fin = head[0] & 0x80 != 0;
-    if head[0] & 0x70 != 0 {
+/// Decode the frame at the start of `buf`, if it is all there. The size limits are checked as soon
+/// as the length is known, before any payload is waited for.
+fn parse_frame(buf: &[u8], max: usize) -> Result<Parsed, WsError> {
+    if buf.len() < 2 {
+        return Ok(Parsed::Need(2 - buf.len()));
+    }
+    let fin = buf[0] & 0x80 != 0;
+    if buf[0] & 0x70 != 0 {
         return Err(WsError::Protocol(
             1002,
             "reserved bits set (no extension negotiated)",
         ));
     }
-    let opcode = head[0] & 0x0f;
-    let masked = head[1] & 0x80 != 0;
-    let mut len = (head[1] & 0x7f) as usize;
+    let opcode = buf[0] & 0x0f;
+    let masked = buf[1] & 0x80 != 0;
+    let mut len = (buf[1] & 0x7f) as usize;
     if opcode >= 0x8 && (!fin || len > 125) {
         return Err(WsError::Protocol(1002, "malformed control frame"));
     }
+    let mut head = 2;
     if len == 126 {
-        let ext = read_exact_buf(r, 2)?;
-        len = u16::from_be_bytes([ext[0], ext[1]]) as usize;
+        head = 4;
+        if buf.len() < head {
+            return Ok(Parsed::Need(head - buf.len()));
+        }
+        len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
     } else if len == 127 {
-        let ext = read_exact_buf(r, 8)?;
-        let n = u64::from_be_bytes(ext.try_into().unwrap());
+        head = 10;
+        if buf.len() < head {
+            return Ok(Parsed::Need(head - buf.len()));
+        }
+        let n = u64::from_be_bytes(buf[2..10].try_into().unwrap());
         if n > max as u64 {
             return Err(WsError::Protocol(1009, "message too big"));
         }
@@ -160,143 +171,53 @@ fn read_raw_frame(r: &mut impl Read, max: usize) -> Result<RawFrame, WsError> {
         return Err(WsError::Protocol(1009, "message too big"));
     }
     // A server MUST NOT mask (§5.1); tolerate it by unmasking rather than failing.
-    let mask: Option<[u8; 4]> = if masked {
-        Some(read_exact_buf(r, 4)?.try_into().unwrap())
-    } else {
-        None
-    };
-    let mut payload = read_exact_buf(r, len)?;
-    if let Some(m) = mask {
+    if masked {
+        head += 4;
+    }
+    let total = head + len;
+    if buf.len() < total {
+        return Ok(Parsed::Need(total - buf.len()));
+    }
+    let mut payload = buf[head..total].to_vec();
+    if masked {
+        let mask: [u8; 4] = buf[head - 4..head].try_into().unwrap();
         for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= m[i % 4];
+            *b ^= mask[i % 4];
         }
     }
-    Ok(RawFrame {
-        fin,
-        opcode,
-        payload,
-    })
+    Ok(Parsed::Frame(
+        RawFrame {
+            fin,
+            opcode,
+            payload,
+        },
+        total,
+    ))
 }
 
-/// The reader half: owns the read stream plus cross-message fragmentation state, and a write
-/// handle for transparent ping→pong replies. Moves into each pool read task and back out
-/// through its completion.
-trait WsStream: Read + Write + Send {}
-impl<T: Read + Write + Send> WsStream for T {}
-
-#[derive(Clone)]
-struct SharedStream(Arc<Mutex<Box<dyn WsStream>>>);
-impl Read for SharedStream {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let result = self.0.lock().unwrap().read(buffer);
-        match result {
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                ) =>
-            {
-                std::thread::yield_now();
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "WebSocket read should retry",
-                ))
-            }
-            other => other,
-        }
-    }
-}
-impl Write for SharedStream {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(buffer)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
-    }
-}
-
-pub(crate) struct WsReader {
-    stream: BufReader<SharedStream>,
-    writer: SharedStream,
-    mask_seed: u64,
-    /// true = we are the CLIENT end (mask outgoing pongs); false = server end (never mask).
-    masked: bool,
-}
-
-impl WsReader {
-    fn next_mask(&mut self) -> [u8; 4] {
-        // Mask keys need unpredictability only against proxies (RFC 6455 §10.3); a cheap LCG
-        // seeded from the handshake's CSPRNG key is fine and keeps the reader self-contained.
-        self.mask_seed = self
-            .mask_seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.mask_seed >> 24).to_be_bytes()[4..8]
-            .try_into()
-            .unwrap()
-    }
-
-    /// Block until one complete MESSAGE (or close), answering pings and skipping pongs inline.
-    pub(crate) fn read_message(&mut self) -> Result<WsEvent, WsError> {
-        let mut partial: Option<(u8, Vec<u8>)> = None;
-        loop {
-            let frame = read_raw_frame(&mut self.stream, MAX_MESSAGE)?;
-            match frame.opcode {
-                0x9 => {
-                    // Ping → pong with the same payload (§5.5.3); masked only from the client end.
-                    let pong = if self.masked {
-                        let mask = self.next_mask();
-                        encode_frame(0xA, &frame.payload, mask)
-                    } else {
-                        encode_frame_unmasked(0xA, &frame.payload)
-                    };
-                    self.writer
-                        .write_all(&pong)
-                        .map_err(|e| WsError::Io(e.to_string()))?;
-                }
-                0xA => {} // unsolicited pong: ignore (§5.5.3)
-                0x8 => {
-                    let (code, reason) = if frame.payload.len() >= 2 {
-                        let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
-                        let reason = String::from_utf8(frame.payload[2..].to_vec())
-                            .map_err(|_| WsError::Protocol(1007, "close reason is not UTF-8"))?;
-                        (code, reason)
-                    } else {
-                        (1005, String::new())
-                    };
-                    return Ok(WsEvent::Close(code, reason));
-                }
-                0x1 | 0x2 => {
-                    if partial.is_some() {
-                        return Err(WsError::Protocol(
-                            1002,
-                            "new data frame during fragmented message",
-                        ));
-                    }
-                    if frame.fin {
-                        return finish_message(frame.opcode, frame.payload);
-                    }
-                    partial = Some((frame.opcode, frame.payload));
-                }
-                0x0 => {
-                    let Some((op, mut buf)) = partial.take() else {
-                        return Err(WsError::Protocol(1002, "continuation without a message"));
-                    };
-                    if buf.len() + frame.payload.len() > MAX_MESSAGE {
-                        return Err(WsError::Protocol(1009, "message too big"));
-                    }
-                    buf.extend_from_slice(&frame.payload);
-                    if frame.fin {
-                        return finish_message(op, buf);
-                    }
-                    partial = Some((op, buf));
-                }
-                _ => return Err(WsError::Protocol(1002, "unknown opcode")),
+/// Read one frame from a blocking reader, taking exactly the bytes it needs.
+fn read_raw_frame(r: &mut impl Read, max: usize) -> Result<RawFrame, WsError> {
+    let mut buf = Vec::new();
+    loop {
+        match parse_frame(&buf, max)? {
+            Parsed::Frame(frame, _) => return Ok(frame),
+            Parsed::Need(count) => {
+                let at = buf.len();
+                buf.resize(at + count, 0);
+                r.read_exact(&mut buf[at..])
+                    .map_err(|e| WsError::Io(e.to_string()))?;
             }
         }
     }
+}
+
+/// Mask keys need unpredictability only against proxies (RFC 6455 §10.3); a cheap LCG seeded from
+/// the handshake's CSPRNG key is fine.
+fn next_mask(seed: &mut u64) -> [u8; 4] {
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    (*seed >> 24).to_be_bytes()[4..8].try_into().unwrap()
 }
 
 fn finish_message(opcode: u8, payload: Vec<u8>) -> Result<WsEvent, WsError> {
@@ -317,12 +238,36 @@ pub(crate) struct WsRegistry {
     socks: HashMap<u64, WsEntry>,
 }
 
+/// An open socket on the reactor.
+struct Live {
+    conn: Conn<Box<dyn NbStream>>,
+    /// The message being assembled from fragments: its opcode and the bytes so far.
+    partial: Option<(u8, Vec<u8>)>,
+    /// The peer closed its end; buffered frames are still delivered.
+    eof: bool,
+    /// A read or rearm error to report once the buffered frames are delivered.
+    failure: Option<String>,
+}
+
+impl Live {
+    fn wants_read(&self) -> bool {
+        !self.eof && self.failure.is_none()
+    }
+
+    /// Waits for writability when the socket did not take everything.
+    fn watch_writable(&self) {
+        if self.conn.pending() {
+            let _ = self.conn.rearm(self.wants_read());
+        }
+    }
+}
+
 struct WsEntry {
-    /// Write half; `None` until the handshake completes.
-    writer: Option<SharedStream>,
+    /// `None` until the handshake completes.
+    live: Option<Live>,
     /// One close frame ever goes out (ours or the echo of theirs).
-    close_sent: Arc<AtomicBool>,
-    /// Stops the read re-arm after close/error delivery.
+    close_sent: bool,
+    /// Nobody listens to the socket any more: it lives on until the peer answers our close.
     dead: bool,
     dispatch: Value,
     mask_seed: u64,
@@ -337,16 +282,9 @@ struct ConnectResult {
 }
 
 struct ConnectedSocket {
-    stream: Box<dyn WsStream>,
+    /// Nonblocking, positioned right after the handshake response.
+    stream: Box<dyn NbStream>,
     protocol: String,
-}
-
-/// What one read task sends back to the loop.
-struct ReadResult {
-    id: u64,
-    outcome: Result<WsEvent, WsError>,
-    /// Handed back for the next read task (None when the loop should stop).
-    reader: Option<WsReader>,
 }
 
 fn ws_registry(ctx: &mut Ctx) -> &mut WsRegistry {
@@ -356,7 +294,7 @@ fn ws_registry(ctx: &mut Ctx) -> &mut WsRegistry {
 
 /// Adopts a connection accepted by `Lumen.serve` (see server.rs: the parsed request's `TcpStream`
 /// sits in the resource table under `conn_id`) as a SERVER-side WebSocket: writes the RFC 6455 101
-/// handshake response, then joins the same registry/read-loop machinery the client uses - with
+/// handshake response, then joins the same registry/frame machinery the client uses - with
 /// `masked: false`, since a server must not mask (§5.1). `dispatch(kind, ...)` receives
 /// `("text", string)`, `("binary", u8array)`, `("close", code, reason, wasClean)`,
 /// `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died). There is no
@@ -383,15 +321,8 @@ pub(crate) fn adopt_connection(
     let Some(stream) = stream else {
         return Err(NativeError::type_error("upgrade: unknown or already-answered connection"));
     };
-
-    // `SharedStream` holds its lock across each read, so reads must time out regularly (as on the
-    // client end) or a blocked read task would starve every send and close from the loop thread.
-    stream.set_read_timeout(Some(READ_POLL)).ok();
-    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
     stream.set_nodelay(true).ok();
 
-    // The 101 response is small; writing it on the loop thread matches how sends and closes are
-    // written.
     let mut resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Accept: {}\r\n",
@@ -411,37 +342,46 @@ pub(crate) fn adopt_connection(
         resp.push_str(&format!("{name}: {value}\r\n"));
     }
     resp.push_str("\r\n");
-    (&stream)
-        .write_all(resp.as_bytes())
-        .map_err(|e| NativeError::runtime(format!("WebSocket upgrade: handshake write: {e}")))?;
-
-    let writer = SharedStream(Arc::new(Mutex::new(Box::new(stream))));
 
     let id = {
         let reg = ws_registry(ctx);
         let id = reg.next;
         reg.next += 1;
-        reg.socks.insert(
-            id,
-            WsEntry {
-                writer: Some(writer.clone()),
-                close_sent: Arc::new(AtomicBool::new(false)),
-                dead: false,
-                dispatch,
-                mask_seed: 0,
-                masked: false,
-            },
-        );
         id
     };
-
-    let reader = WsReader {
-        stream: BufReader::new(writer.clone()),
-        writer,
-        mask_seed: 0,
-        masked: false,
+    let mut conn = Conn::open(
+        ctx,
+        Box::new(stream) as Box<dyn NbStream>,
+        Interest::READ,
+        id,
+        dispatch.clone(),
+        decode_ws,
+    )
+    .map_err(|e| NativeError::runtime(format!("WebSocket upgrade: {e}")))?;
+    if let Err(e) = conn.write(resp.as_bytes()) {
+        conn.link().cancel(ctx);
+        return Err(NativeError::runtime(format!(
+            "WebSocket upgrade: handshake write: {e}"
+        )));
+    }
+    let live = Live {
+        conn,
+        partial: None,
+        eof: false,
+        failure: None,
     };
-    arm_read(ctx, id, reader);
+    live.watch_writable();
+    ws_registry(ctx).socks.insert(
+        id,
+        WsEntry {
+            live: Some(live),
+            close_sent: false,
+            dead: false,
+            dispatch,
+            mask_seed: 0,
+            masked: false,
+        },
+    );
     Ok(id)
 }
 
@@ -482,8 +422,8 @@ pub(crate) fn connect_socket(
         reg.socks.insert(
             id,
             WsEntry {
-                writer: None,
-                close_sent: Arc::new(AtomicBool::new(false)),
+                live: None,
+                close_sent: false,
                 dead: false,
                 dispatch: dispatch.clone(),
                 mask_seed,
@@ -509,89 +449,113 @@ pub(crate) fn connect_socket(
     Ok(id)
 }
 
-/// Encode and write one data frame. `false` when the socket is gone or already closing.
+/// Encode and send one data frame. `false` when the socket is gone or already closing.
 pub(crate) fn send_frame(ctx: &mut Ctx, id: u64, payload: Outgoing<'_>) -> Result<bool, NativeError> {
     let (opcode, bytes) = match payload {
         Outgoing::Binary(bytes) => (0x2u8, bytes),
         Outgoing::Text(text) => (0x1u8, text.as_bytes()),
     };
-    let (writer, mask) = {
-        let reg = ws_registry(ctx);
-        let Some(e) = reg.socks.get_mut(&id) else {
-            return Ok(false);
-        };
-        if e.close_sent.load(Ordering::SeqCst) {
-            return Ok(false);
-        }
-        e.mask_seed = e
-            .mask_seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        // Server-adopted sockets never mask (RFC 6455 §5.1).
-        let mask: Option<[u8; 4]> = e
-            .masked
-            .then(|| (e.mask_seed >> 24).to_be_bytes()[4..8].try_into().unwrap());
-        match &e.writer {
-            Some(w) => (w.clone(), mask),
-            None => return Err(NativeError::runtime("send before open")),
-        }
+    let reg = ws_registry(ctx);
+    let Some(e) = reg.socks.get_mut(&id) else {
+        return Ok(false);
+    };
+    if e.close_sent {
+        return Ok(false);
+    }
+    // Server-adopted sockets never mask (RFC 6455 §5.1).
+    let mask = e.masked.then(|| next_mask(&mut e.mask_seed));
+    let Some(live) = e.live.as_mut() else {
+        return Err(NativeError::runtime("send before open"));
     };
     let frame = match mask {
         Some(m) => encode_frame(opcode, bytes, m),
         None => encode_frame_unmasked(opcode, bytes),
     };
-    let mut writer = writer;
-    writer
-        .write_all(&frame)
+    if live.conn.queued() + frame.len() > MAX_QUEUED {
+        return Err(NativeError::runtime("WebSocket send: write buffer is full"));
+    }
+    live.conn
+        .write(&frame)
         .map_err(|e| NativeError::runtime(format!("WebSocket send: {e}")))?;
+    live.watch_writable();
     Ok(true)
+}
+
+/// Sends the one close frame a socket may send. The peer's echo then arrives as the close event.
+fn send_close(entry: &mut WsEntry, payload: &[u8], mask: [u8; 4]) {
+    if std::mem::replace(&mut entry.close_sent, true) {
+        return;
+    }
+    let Some(live) = entry.live.as_mut() else {
+        return;
+    };
+    let frame = if entry.masked {
+        encode_frame(0x8, payload, mask)
+    } else {
+        encode_frame_unmasked(0x8, payload)
+    };
+    let _ = live.conn.write(&frame);
+    live.watch_writable();
 }
 
 /// Send the close frame (once); the read loop then surfaces the peer's echo as the close event.
 pub(crate) fn close_socket(ctx: &mut Ctx, id: u64, code: u16, reason: &str) {
-    let (writer, masked) = {
-        let reg = ws_registry(ctx);
-        let Some(e) = reg.socks.get_mut(&id) else {
-            return;
-        };
-        if e.close_sent.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        (e.writer.clone(), e.masked)
-    };
-    if let Some(mut w) = writer {
-        let payload = close_payload(code, reason);
-        let frame = if masked {
-            encode_frame(0x8, &payload, [0x1f, 0x2e, 0x3d, 0x4c])
-        } else {
-            encode_frame_unmasked(0x8, &payload)
-        };
-        let _ = w.write_all(&frame);
+    if let Some(entry) = ws_registry(ctx).socks.get_mut(&id) {
+        send_close(entry, &close_payload(code, reason), [0x1f, 0x2e, 0x3d, 0x4c]);
     }
 }
 
-/// Close a socket nobody listens to any more and forget it: the read in flight ends with the
-/// peer's echo and is not re-armed.
+/// Close a socket nobody listens to any more: it ends with the peer's echo, silently.
 pub(crate) fn abandon_socket(ctx: &mut Ctx, id: u64) {
     close_socket(ctx, id, 1001, "");
-    ws_registry(ctx).socks.remove(&id);
+    let reg = ws_registry(ctx);
+    match reg.socks.get_mut(&id) {
+        Some(entry) if entry.live.is_some() => entry.dead = true,
+        _ => {
+            reg.socks.remove(&id);
+        }
+    }
 }
 
-/// Dial + HTTP/1.1 upgrade (RFC 6455 §4.1/§4.2). Returns the open stream and the negotiated
+/// Dial + HTTP/1.1 upgrade (RFC 6455 §4.1/§4.2) on a blocking socket, which is switched to
+/// nonblocking mode once the response head is read. Returns the open stream and the negotiated
 /// subprotocol ("" when none).
 fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket, String> {
     let port = u.port.unwrap_or(if u.scheme == "wss" { 443 } else { 80 });
     let host = u.hostname().trim_matches(['[', ']']);
     let tcp = TcpStream::connect((host, port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_nodelay(true).ok();
-    tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-    tcp.set_read_timeout(Some(READ_POLL)).ok();
-    let mut stream: Box<dyn WsStream> = if u.scheme == "wss" {
-        Box::new(lumen_tls::TlsStream::connect(tcp, host)?)
+    tcp.set_write_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
+    tcp.set_read_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
+    if u.scheme == "wss" {
+        let mut tls = lumen_tls::TlsStream::connect(tcp, host)?;
+        let protocol = upgrade(&mut tls, u, key, protocols)?;
+        tls.set_nonblocking(true)
+            .map_err(|e| format!("handshake: {e}"))?;
+        Ok(ConnectedSocket {
+            stream: Box::new(tls),
+            protocol,
+        })
     } else {
-        Box::new(tcp)
-    };
+        let mut tcp = tcp;
+        let protocol = upgrade(&mut tcp, u, key, protocols)?;
+        tcp.set_nonblocking(true)
+            .map_err(|e| format!("handshake: {e}"))?;
+        Ok(ConnectedSocket {
+            stream: Box::new(tcp),
+            protocol,
+        })
+    }
+}
 
+/// The upgrade request and the check of its response; returns the negotiated subprotocol.
+fn upgrade(
+    stream: &mut (impl Read + Write),
+    u: &url::Url,
+    key: &str,
+    protocols: &str,
+) -> Result<String, String> {
+    let port = u.port.unwrap_or(if u.scheme == "wss" { 443 } else { 80 });
     let host_header = if u.port.is_some() && u.port != Some(80) {
         format!("{}:{}", u.hostname(), port)
     } else {
@@ -610,19 +574,10 @@ fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket
         .write_all(req.as_bytes())
         .map_err(|e| format!("handshake write: {e}"))?;
 
-    // Read the 101 response head. BufReader over a clone would over-read into the frame stream,
-    // so read byte-wise until CRLFCRLF (the head is tiny).
-    let mut head = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() > 64 << 10 {
-            return Err("handshake response too large".into());
-        }
-        stream
-            .read_exact(&mut byte)
-            .map_err(|e| format!("handshake read: {e}"))?;
-        head.push(byte[0]);
-    }
+    let head = nbio::read_head(stream, 64 << 10).map_err(|e| match e {
+        HeadError::TooLarge => "handshake response too large".to_string(),
+        HeadError::Io(e) => format!("handshake read: {e}"),
+    })?;
     let head = String::from_utf8_lossy(&head);
     let mut lines = head.split("\r\n");
     let status = lines.next().unwrap_or("");
@@ -662,7 +617,7 @@ fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket
             "server selected unrequested subprotocol '{protocol}'"
         ));
     }
-    Ok(ConnectedSocket { stream, protocol })
+    Ok(protocol)
 }
 
 fn decode_connect(
@@ -670,137 +625,242 @@ fn decode_connect(
     payload: Box<dyn std::any::Any + Send>,
 ) -> Result<Vec<Value>, Value> {
     let ConnectResult { id, outcome } = *payload.downcast::<ConnectResult>().expect("ws payload");
-    match outcome {
-        Err(msg) => {
-            if let Some(e) = ws_registry(ctx).socks.get_mut(&id) {
-                e.dead = true;
-            }
-            ws_registry(ctx).socks.remove(&id);
-            Ok(vec![
-                Value::from_string("error".into()),
-                Value::from_string(msg),
-            ])
-        }
-        Ok(ConnectedSocket { stream, protocol }) => {
-            let writer = SharedStream(Arc::new(Mutex::new(stream)));
-            let mask_seed = {
-                let reg = ws_registry(ctx);
-                let Some(entry) = reg.socks.get_mut(&id) else {
-                    return Ok(vec![Value::from_string("close".into()), Value::Num(1006.0)]);
+    let error = |ctx: &mut Ctx, msg: String| {
+        ws_registry(ctx).socks.remove(&id);
+        Ok(vec![
+            Value::from_string("error".into()),
+            Value::from_string(msg),
+        ])
+    };
+    let ConnectedSocket { stream, protocol } = match outcome {
+        Ok(socket) => socket,
+        Err(msg) => return error(ctx, msg),
+    };
+    let Some(dispatch) = ws_registry(ctx).socks.get(&id).map(|e| e.dispatch.clone()) else {
+        return Ok(vec![Value::from_string("close".into()), Value::Num(1006.0)]);
+    };
+    let conn = match Conn::open(ctx, stream, Interest::READ, id, dispatch, decode_ws) {
+        Ok(conn) => conn,
+        Err(msg) => return error(ctx, msg),
+    };
+    // A TLS session may already hold decrypted bytes the socket will never signal again.
+    conn.link().remote().raise(nbio::IO);
+    if let Some(entry) = ws_registry(ctx).socks.get_mut(&id) {
+        entry.live = Some(Live {
+            conn,
+            partial: None,
+            eof: false,
+            failure: None,
+        });
+    }
+    Ok(vec![
+        Value::from_string("open".into()),
+        Value::from_string(protocol),
+    ])
+}
+
+/// What one pass over a socket found.
+enum Step {
+    /// Nothing for JS: a partial frame, a pong, a write that made progress.
+    Idle,
+    /// A message for JS; the socket stays open.
+    Event(Event),
+    /// The last report for this socket, which is closed.
+    End(Event),
+}
+
+enum Event {
+    Text(String),
+    Binary(Vec<u8>),
+    Close(u16, String),
+    Fail(u16, &'static str),
+    Io(String),
+}
+
+/// The next complete message in the receive buffer, answering pings and skipping pongs on the way.
+fn next_message(entry: &mut WsEntry) -> Result<Option<WsEvent>, WsError> {
+    let WsEntry {
+        live,
+        mask_seed,
+        masked,
+        ..
+    } = entry;
+    let live = live.as_mut().expect("an open socket");
+    loop {
+        let (frame, used) = match parse_frame(live.conn.rx.bytes(), MAX_MESSAGE)? {
+            Parsed::Need(_) => return Ok(None),
+            Parsed::Frame(frame, used) => (frame, used),
+        };
+        live.conn.rx.consume(used);
+        match frame.opcode {
+            0x9 => {
+                // Ping → pong with the same payload (§5.5.3); masked only from the client end.
+                let pong = if *masked {
+                    encode_frame(0xA, &frame.payload, next_mask(mask_seed))
+                } else {
+                    encode_frame_unmasked(0xA, &frame.payload)
                 };
-                entry.writer = Some(writer.clone());
-                entry.mask_seed
-            };
-            let reader = WsReader {
-                stream: BufReader::new(writer.clone()),
-                writer,
-                mask_seed,
-                masked: true,
-            };
-            arm_read(ctx, id, reader);
-            Ok(vec![
-                Value::from_string("open".into()),
-                Value::from_string(protocol),
-            ])
+                live.conn
+                    .write(&pong)
+                    .map_err(|e| WsError::Io(e.to_string()))?;
+                live.watch_writable();
+            }
+            0xA => {} // unsolicited pong: ignore (§5.5.3)
+            0x8 => {
+                let (code, reason) = if frame.payload.len() >= 2 {
+                    let code = u16::from_be_bytes([frame.payload[0], frame.payload[1]]);
+                    let reason = String::from_utf8(frame.payload[2..].to_vec())
+                        .map_err(|_| WsError::Protocol(1007, "close reason is not UTF-8"))?;
+                    (code, reason)
+                } else {
+                    (1005, String::new())
+                };
+                return Ok(Some(WsEvent::Close(code, reason)));
+            }
+            0x1 | 0x2 => {
+                if live.partial.is_some() {
+                    return Err(WsError::Protocol(
+                        1002,
+                        "new data frame during fragmented message",
+                    ));
+                }
+                if frame.fin {
+                    return finish_message(frame.opcode, frame.payload).map(Some);
+                }
+                live.partial = Some((frame.opcode, frame.payload));
+            }
+            0x0 => {
+                let Some((op, mut buf)) = live.partial.take() else {
+                    return Err(WsError::Protocol(1002, "continuation without a message"));
+                };
+                if buf.len() + frame.payload.len() > MAX_MESSAGE {
+                    return Err(WsError::Protocol(1009, "message too big"));
+                }
+                buf.extend_from_slice(&frame.payload);
+                if frame.fin {
+                    return finish_message(op, buf).map(Some);
+                }
+                live.partial = Some((op, buf));
+            }
+            _ => return Err(WsError::Protocol(1002, "unknown opcode")),
         }
     }
 }
 
-fn arm_read(ctx: &mut Ctx, id: u64, mut reader: WsReader) {
-    let dispatch = match ws_registry(ctx).socks.get(&id) {
-        Some(e) if !e.dead => e.dispatch.clone(),
-        _ => return,
+/// One pass over a socket the reactor woke: stalls, queued output, input, then at most one message.
+fn advance(entry: &mut WsEntry, link: &Link, flags: u8) -> Step {
+    let Some(live) = entry.live.as_mut() else {
+        return Step::Idle;
     };
-    let task = lumen_host::register_task(ctx, dispatch, None, decode_read);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(task, move || {
-        let outcome = reader.read_message();
-        let keep = outcome.is_ok() && !matches!(outcome, Ok(WsEvent::Close(..)));
-        Box::new(ReadResult {
-            id,
-            outcome,
-            reader: keep.then_some(reader),
-        })
-    });
-}
-
-fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
-    let ReadResult {
-        id,
-        outcome,
-        reader,
-    } = *payload.downcast::<ReadResult>().expect("ws payload");
-    match outcome {
-        Ok(WsEvent::Text(s)) => {
-            if let Some(r) = reader {
-                arm_read(ctx, id, r);
-            }
-            Ok(vec![
-                Value::from_string("text".into()),
-                Value::from_string(s),
-            ])
+    if flags & (nbio::READ_STALL | nbio::WRITE_STALL) != 0 {
+        if let Some(stalled) = live.conn.on_stall(flags) {
+            return Step::End(Event::Io(stalled.error().to_string()));
         }
-        Ok(WsEvent::Binary(b)) => {
-            let arr = ctx.make_uint8array(&b)?;
-            if let Some(r) = reader {
-                arm_read(ctx, id, r);
-            }
-            Ok(vec![Value::from_string("binary".into()), arr])
+    }
+    if live.conn.pending() {
+        if let Err(e) = live.conn.flush() {
+            return Step::End(Event::Io(e.to_string()));
         }
-        Ok(WsEvent::Close(code, reason)) => {
-            // Echo the close (once) so the TCP close handshake completes cleanly (§5.5.1),
-            // then tear down.
-            let entry = ws_registry(ctx).socks.remove(&id);
-            if let Some(e) = entry {
-                if let (Some(w), false) = (&e.writer, e.close_sent.swap(true, Ordering::SeqCst)) {
-                    let payload = close_payload(if code == 1005 { 1000 } else { code }, "");
-                    let frame = if e.masked {
-                        encode_frame(0x8, &payload, [0x37, 0x11, 0x9a, 0x42])
-                    } else {
-                        encode_frame_unmasked(0x8, &payload)
-                    };
-                    let mut writer = w.clone();
-                    let _ = writer.write_all(&frame);
-                }
-            }
-            Ok(vec![
-                Value::from_string("close".into()),
-                Value::Num(code as f64),
-                Value::from_string(reason),
-                Value::Bool(true),
-            ])
+    }
+    let mut more = false;
+    if live.wants_read() {
+        match live.conn.fill() {
+            Ok(Fill::Eof) => live.eof = true,
+            Ok(Fill::More) => more = true,
+            Ok(Fill::Drained) => {}
+            Err(e) => live.failure = Some(e.to_string()),
+        }
+    }
+    let step = match next_message(entry) {
+        Ok(Some(WsEvent::Text(s))) => Step::Event(Event::Text(s)),
+        Ok(Some(WsEvent::Binary(b))) => Step::Event(Event::Binary(b)),
+        Ok(Some(WsEvent::Close(code, reason))) => {
+            // Echo the close (once) so the TCP close handshake completes cleanly (§5.5.1).
+            let echo = close_payload(if code == 1005 { 1000 } else { code }, "");
+            send_close(entry, &echo, [0x37, 0x11, 0x9a, 0x42]);
+            Step::End(Event::Close(code, reason))
         }
         Err(WsError::Protocol(code, msg)) => {
-            let entry = ws_registry(ctx).socks.remove(&id);
-            if let Some(e) = entry {
-                if let (Some(w), false) = (&e.writer, e.close_sent.swap(true, Ordering::SeqCst)) {
-                    let payload = close_payload(code, msg);
-                    let frame = if e.masked {
-                        encode_frame(0x8, &payload, [0x37, 0x11, 0x9a, 0x42])
-                    } else {
-                        encode_frame_unmasked(0x8, &payload)
-                    };
-                    let mut writer = w.clone();
-                    let _ = writer.write_all(&frame);
-                }
+            send_close(entry, &close_payload(code, msg), [0x37, 0x11, 0x9a, 0x42]);
+            Step::End(Event::Fail(code, msg))
+        }
+        Err(WsError::Io(msg)) => Step::End(Event::Io(msg)),
+        Ok(None) => {
+            let live = entry.live.as_ref().expect("an open socket");
+            if live.eof {
+                Step::End(Event::Io("failed to fill whole buffer".into()))
+            } else if let Some(msg) = &live.failure {
+                Step::End(Event::Io(msg.clone()))
+            } else {
+                Step::Idle
             }
-            Ok(vec![
-                Value::from_string("fail".into()),
-                Value::Num(code as f64),
-                Value::from_string(msg.to_string()),
-            ])
         }
-        Err(WsError::Io(msg)) => {
-            ws_registry(ctx).socks.remove(&id);
-            Ok(vec![
-                Value::from_string("io".into()),
-                Value::from_string(msg),
-            ])
-        }
+    };
+    let live = entry.live.as_ref().expect("an open socket");
+    let again = match step {
+        Step::Event(_) => more || !live.conn.rx.is_empty() || live.eof || live.failure.is_some(),
+        Step::Idle => more,
+        Step::End(_) => false,
+    };
+    if again {
+        link.mark(nbio::RESUME);
+    }
+    step
+}
+
+fn event_args(ctx: &mut Ctx, event: Event) -> Result<Vec<Value>, Value> {
+    let kind = |name: &str| Value::from_string(name.to_string());
+    Ok(match event {
+        Event::Text(text) => vec![kind("text"), Value::from_string(text)],
+        Event::Binary(bytes) => vec![kind("binary"), ctx.make_uint8array(&bytes)?],
+        Event::Close(code, reason) => vec![
+            kind("close"),
+            Value::Num(code as f64),
+            Value::from_string(reason),
+            Value::Bool(true),
+        ],
+        Event::Fail(code, msg) => vec![
+            kind("fail"),
+            Value::Num(code as f64),
+            Value::from_string(msg.to_string()),
+        ],
+        Event::Io(msg) => vec![kind("io"), Value::from_string(msg)],
+    })
+}
+
+/// Settles one reactor wake of a socket. A wake with nothing to report returns no arguments, which
+/// both transports' dispatch functions ignore.
+fn decode_ws(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
+    let id = *payload.downcast::<u64>().expect("ws payload");
+    let Some(link) = ws_registry(ctx)
+        .socks
+        .get(&id)
+        .and_then(|e| e.live.as_ref())
+        .map(|live| live.conn.link())
+    else {
+        return Ok(Vec::new());
+    };
+    let flags = link.take();
+    let step = match ws_registry(ctx).socks.get_mut(&id) {
+        Some(entry) => advance(entry, &link, flags),
+        None => return Ok(Vec::new()),
+    };
+    if let Step::End(event) = step {
+        // Dropping the entry deregisters the socket and closes it.
+        let dead = ws_registry(ctx).socks.remove(&id).is_some_and(|e| e.dead);
+        link.cancel(ctx);
+        return if dead { Ok(Vec::new()) } else { event_args(ctx, event) };
+    }
+    link.next_task(ctx);
+    let entry = ws_registry(ctx).socks.get_mut(&id).expect("socket is still open");
+    let live = entry.live.as_mut().expect("an open socket");
+    if let Err(e) = live.conn.rearm(live.wants_read()) {
+        live.failure = Some(e.to_string());
+        link.remote().raise(nbio::RESUME);
+    }
+    match step {
+        Step::Event(event) if !entry.dead => event_args(ctx, event),
+        _ => Ok(Vec::new()),
     }
 }
 

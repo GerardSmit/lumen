@@ -154,6 +154,7 @@ pub struct TlsStream {
     context: *mut SslCtx,
     ssl: *mut Ssl,
     _alpn_config: Option<Box<AlpnConfig>>,
+    nonblocking: bool,
 }
 
 struct AlpnConfig(Vec<Vec<u8>>);
@@ -315,6 +316,7 @@ impl TlsStream {
             context,
             ssl,
             _alpn_config: None,
+            nonblocking: false,
         })
     }
 
@@ -424,11 +426,34 @@ impl TlsStream {
             context,
             ssl,
             _alpn_config: alpn_config,
+            nonblocking: false,
         })
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    /// The TCP socket under the TLS session, for registering it with a readiness reactor.
+    pub fn socket(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    /// Switches the socket to nonblocking mode. A read or write that needs the peer then fails
+    /// with `WouldBlock` (wait for the socket, then repeat the call) instead of `Interrupted`,
+    /// and a write may accept fewer bytes than offered. Call it after the handshake, which
+    /// always runs blocking.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        const SSL_CTRL_MODE: c_int = 33;
+        const SSL_CTRL_CLEAR_MODE: c_int = 78;
+        // ENABLE_PARTIAL_WRITE | ACCEPT_MOVING_WRITE_BUFFER: a retried write may be longer and
+        // live elsewhere than the one that would have blocked.
+        const WRITE_MODES: c_long = 0x3;
+        self.stream.set_nonblocking(nonblocking)?;
+        let command = if nonblocking { SSL_CTRL_MODE } else { SSL_CTRL_CLEAR_MODE };
+        unsafe { (self.api.ssl_ctrl)(self.ssl, command, WRITE_MODES, std::ptr::null_mut()) };
+        self.nonblocking = nonblocking;
+        Ok(())
     }
 
     pub fn protocol(&self) -> String {
@@ -470,7 +495,10 @@ impl TlsStream {
 
     fn io_error(&self, result: c_int) -> std::io::Error {
         let code = unsafe { (self.api.ssl_get_error)(self.ssl, result) };
-        if matches!(code, 2 | 3 | 5) {
+        if self.nonblocking && matches!(code, 2 | 3) {
+            return std::io::ErrorKind::WouldBlock.into();
+        }
+        if !self.nonblocking && matches!(code, 2 | 3 | 5) {
             return std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "TLS operation should retry",

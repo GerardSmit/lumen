@@ -4933,3 +4933,57 @@ fn worker_message_posted_before_terminate_is_dropped() {
     );
     assert_eq!(lines, ["terminated"]);
 }
+
+fn pump_until(rt: &mut Runtime, condition: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        rt.run_until_idle();
+        let done = rt
+            .engine()
+            .eval_value(condition)
+            .expect("condition parses")
+            .unwrap_or_else(|_| panic!("condition runs"));
+        if matches!(done, Value::Bool(true)) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {condition}");
+        rt.wait_for_completion(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_idle_server_websocket_holds_no_thread_and_wakes_nothing() {
+    let (mut rt, _out, _err) = test_runtime();
+    rt.engine()
+        .eval(
+            r#"
+            globalThis.state = { open: false, echoed: false, upgraded: false };
+            globalThis.server = Lumen.serve((req) => {
+                const peer = Lumen.upgradeWebSocket(req);
+                state.upgraded = peer !== null;
+                peer.onmessage = (data) => peer.send("echo:" + data);
+                return new Response("");
+            }, { hostname: "127.0.0.1", port: 0 });
+            globalThis.ws = new WebSocket(`ws://127.0.0.1:${server.port}/`);
+            ws.onopen = () => { state.open = true; ws.send("hi"); };
+            ws.onmessage = (event) => { state.echoed = event.data === "echo:hi"; };
+            "#,
+            false,
+        )
+        .expect("setup parses");
+    pump_until(&mut rt, "state.open && state.echoed && state.upgraded");
+
+    // Let the last completions drain, then watch an idle connection.
+    rt.run_until_idle();
+    let turns = rt.loop_turns.load(Ordering::Relaxed);
+    let wakeups = rt.loop_wakeups.load(Ordering::Relaxed);
+    assert!(!rt.wait_for_completion(Duration::from_millis(300)));
+    assert_eq!(rt.pool.pending(), 0, "a connection holds a pool thread");
+    assert!(rt.loop_turns.load(Ordering::Relaxed) - turns <= 1);
+    assert_eq!(rt.loop_wakeups.load(Ordering::Relaxed), wakeups);
+
+    rt.engine()
+        .eval("ws.close(); server.shutdown()", false)
+        .expect("teardown parses");
+    pump_until(&mut rt, "ws.readyState === 3");
+}

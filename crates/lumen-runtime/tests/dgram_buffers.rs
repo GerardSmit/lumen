@@ -18,6 +18,15 @@ impl Write for Captured {
 
 #[test]
 fn udp_socket_buffer_sizes_are_native_and_validated() {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(udp_socket_buffer_sizes_body)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+fn udp_socket_buffer_sizes_body() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
     runtime.engine().ctx().op_state().put(ConsoleOut {

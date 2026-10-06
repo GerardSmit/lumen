@@ -2,7 +2,13 @@
 //! GET whose `text/event-stream` body is delivered chunk-by-chunk to the native `EventSource` class
 //! (`eventsource_class.rs`), which runs the line parser and reconnection logic. The fetch client fully buffers responses, so an
 //! endless event stream can't ride on it; this is a dedicated streaming reader (the same
-//! connect→read re-arm shape as the WebSocket client).
+//! connect then reactor shape as the WebSocket client).
+//!
+//! ## How it runs on the loop
+//! The dial, TLS handshake and response head run on one pool job that ends with the socket in
+//! nonblocking mode. The body is then read on the loop thread whenever the readiness reactor
+//! reports the socket readable: no thread and no timer wake while the stream is idle except one
+//! inactivity timer (`READ_TIMEOUT`) that drops a stream which sends nothing at all.
 //!
 //! ## What's intentionally missing (v1)
 //! - **CORS / credentials** — server runtime, no origin model (matches fetch here).
@@ -10,18 +16,18 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use lumen_bind::NativeError;
 use lumen_host::{Ctx, SpawnHandle, Value};
+use lumen_os::reactor::Interest;
 
+use crate::nbio::{self, Conn, Fill, HeadError, NbStream};
 use crate::url;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_HEADER_BYTES: usize = 64 << 10;
-/// One streamed body read; the SSE parser reassembles across chunks, so this is just a buffer.
+/// One delivered body chunk; the SSE parser reassembles across chunks.
 const CHUNK: usize = 16 << 10;
 const MAX_REDIRECTS: u8 = 5;
 
@@ -32,40 +38,26 @@ pub(crate) struct SseRegistry {
 }
 
 struct SseEntry {
-    closed: Arc<AtomicBool>,
+    /// `None` until the connect job has returned.
+    conn: Option<Conn<Box<dyn NbStream>>>,
     dispatch: Value,
+    /// `close()` ran before the connect job returned.
     dead: bool,
 }
 
-/// The connect task result: the open stream + the response status, or an error.
+/// The connect task result: the open stream, or an error.
 struct ConnectResult {
     id: u64,
-    outcome: Result<Box<dyn SseStream>, ConnectError>,
+    outcome: Result<Box<dyn NbStream>, ConnectError>,
 }
 
 enum ConnectError {
     /// A non-network failure that must NOT reconnect (bad scheme, wrong content-type, 204,
-    /// a 4xx/5xx that isn't retriable): `(message, reconnect=false)`.
+    /// a 4xx/5xx that isn't retriable).
     Fatal(String),
     /// A network-level failure the client may retry after its reconnection delay.
     Retriable(String),
 }
-
-/// A streamed body read: `Some(bytes)` (possibly empty on a spurious wakeup) or end-of-stream.
-struct ReadResult {
-    id: u64,
-    outcome: std::io::Result<Vec<u8>>,
-    /// Handed back to re-arm the next read (None on EOF/error).
-    reader: Option<StreamReader>,
-}
-
-struct StreamReader {
-    stream: Box<dyn SseStream>,
-    closed: Arc<AtomicBool>,
-}
-
-trait SseStream: Read + Write + Send {}
-impl<T: Read + Write + Send> SseStream for T {}
 
 fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
     ctx.host_mut::<SseRegistry>()
@@ -73,8 +65,8 @@ fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
 }
 
 /// Open the stream for `target` on the pool and return its id. `dispatch(kind, ...)` then
-/// receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), `("drop",
-/// message)` (reconnect per the retry interval) or `("closed")`.
+/// receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect) or `("drop",
+/// message)` (reconnect per the retry interval).
 pub(crate) fn connect_stream(
     ctx: &mut Ctx,
     target: &str,
@@ -103,7 +95,7 @@ pub(crate) fn connect_stream(
         reg.conns.insert(
             id,
             SseEntry {
-                closed: Arc::new(AtomicBool::new(false)),
+                conn: None,
                 dispatch: dispatch.clone(),
                 dead: false,
             },
@@ -128,17 +120,25 @@ pub(crate) fn connect_stream(
     Ok(id)
 }
 
-/// Flip the closed flag; the reader loop tears down and reports `closed`.
+/// Ends the stream at once: the socket is deregistered and closed, nothing more is dispatched.
 pub(crate) fn close_stream(ctx: &mut Ctx, id: u64) {
-    if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {
-        e.dead = true;
-        e.closed.store(true, Ordering::SeqCst);
+    let reg = sse_registry(ctx);
+    let Some(entry) = reg.conns.get_mut(&id) else {
+        return;
+    };
+    match entry.conn.take() {
+        Some(conn) => {
+            let link = conn.link();
+            reg.conns.remove(&id);
+            link.cancel(ctx);
+        }
+        None => entry.dead = true,
     }
 }
 
 /// GET `target` with the SSE request headers, following redirects, and validate the response is
 /// a `text/event-stream` 200 — returning the still-open stream positioned at the body start.
-fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, ConnectError> {
+fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn NbStream>, ConnectError> {
     let mut target = target.to_string();
     for _ in 0..=MAX_REDIRECTS {
         let u = url::parse(&target, None).map_err(ConnectError::Fatal)?;
@@ -153,102 +153,139 @@ fn open_stream(target: &str, last_event_id: &str) -> Result<Box<dyn SseStream>, 
         let tcp = TcpStream::connect((host, port))
             .map_err(|e| ConnectError::Retriable(format!("connect: {e}")))?;
         tcp.set_nodelay(true).ok();
-        tcp.set_read_timeout(Some(READ_TIMEOUT)).ok();
-        let mut stream: Box<dyn SseStream> = if u.scheme == "https" {
-            Box::new(lumen_tls::TlsStream::connect(tcp, host).map_err(ConnectError::Retriable)?)
+        tcp.set_read_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
+        tcp.set_write_timeout(Some(nbio::HANDSHAKE_TIMEOUT)).ok();
+
+        let mut stream = if u.scheme == "https" {
+            Stream::Tls(lumen_tls::TlsStream::connect(tcp, host).map_err(ConnectError::Retriable)?)
         } else {
-            Box::new(tcp)
+            Stream::Plain(tcp)
         };
-
-        let host_header = if u.port.is_some() && u.port != Some(80) {
-            format!("{}:{}", u.hostname(), port)
-        } else {
-            u.hostname().to_string()
+        let outcome = match &mut stream {
+            Stream::Plain(s) => exchange(s, &u, last_event_id)?,
+            Stream::Tls(s) => exchange(s, &u, last_event_id)?,
         };
-        let path = u.request_target();
-        let mut req = format!(
-            "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: text/event-stream\r\n\
-             Cache-Control: no-cache\r\nConnection: keep-alive\r\n"
-        );
-        if !last_event_id.is_empty() {
-            req.push_str(&format!("Last-Event-ID: {last_event_id}\r\n"));
-        }
-        req.push_str("\r\n");
-        stream
-            .write_all(req.as_bytes())
-            .map_err(|e| ConnectError::Retriable(format!("request write: {e}")))?;
-
-        // Read the response head byte-wise (a BufReader would swallow body bytes).
-        let mut head = Vec::with_capacity(256);
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            if head.len() > MAX_HEADER_BYTES {
-                return Err(ConnectError::Fatal("response head too large".into()));
+        match outcome {
+            Exchange::Open => {
+                return stream
+                    .into_nonblocking()
+                    .map_err(|e| ConnectError::Retriable(format!("socket: {e}")))
             }
-            match stream.read_exact(&mut byte) {
-                Ok(()) => head.push(byte[0]),
-                Err(e) => return Err(ConnectError::Retriable(format!("head read: {e}"))),
-            }
-        }
-        let head = String::from_utf8_lossy(&head);
-        let mut lines = head.split("\r\n");
-        let status_line = lines.next().unwrap_or("");
-        let status: u16 = status_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let mut location = None;
-        let mut content_type = String::new();
-        for line in lines {
-            let Some((k, v)) = line.split_once(':') else {
-                continue;
-            };
-            let (k, v) = (k.trim(), v.trim());
-            if k.eq_ignore_ascii_case("location") {
-                location = Some(v.to_string());
-            } else if k.eq_ignore_ascii_case("content-type") {
-                content_type = v.to_ascii_lowercase();
-            }
-        }
-
-        match status {
-            200 => {
-                if !content_type
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("text/event-stream")
-                {
-                    return Err(ConnectError::Fatal(format!(
-                        "EventSource response Content-Type is '{content_type}', not text/event-stream"
-                    )));
-                }
-                return Ok(stream);
-            }
-            301 | 302 | 303 | 307 | 308 => {
-                let Some(loc) = location else {
-                    return Err(ConnectError::Fatal("redirect without Location".into()));
-                };
-                target = url::parse(&loc, Some(&u.href()))
-                    .map_err(ConnectError::Fatal)?
-                    .href();
-            }
-            // 204 No Content and 205 tell the client to STOP (no reconnect).
-            204 | 205 => {
-                return Err(ConnectError::Fatal(format!(
-                    "server returned {status} (stop)"
-                )))
-            }
-            _ => {
-                return Err(ConnectError::Fatal(format!(
-                    "server returned HTTP {status}"
-                )))
-            }
+            Exchange::Redirect(next) => target = next,
         }
     }
     Err(ConnectError::Fatal("too many redirects".into()))
+}
+
+enum Stream {
+    Plain(TcpStream),
+    Tls(lumen_tls::TlsStream),
+}
+
+impl Stream {
+    fn into_nonblocking(self) -> std::io::Result<Box<dyn NbStream>> {
+        match self {
+            Stream::Plain(s) => {
+                s.set_nonblocking(true)?;
+                Ok(Box::new(s))
+            }
+            Stream::Tls(mut s) => {
+                s.set_nonblocking(true)?;
+                Ok(Box::new(s))
+            }
+        }
+    }
+}
+
+enum Exchange {
+    Open,
+    Redirect(String),
+}
+
+/// Sends the request and judges the response head.
+fn exchange(
+    stream: &mut (impl Read + Write),
+    u: &url::Url,
+    last_event_id: &str,
+) -> Result<Exchange, ConnectError> {
+    let port = u.port.unwrap_or(if u.scheme == "https" { 443 } else { 80 });
+    let host_header = if u.port.is_some() && u.port != Some(80) {
+        format!("{}:{}", u.hostname(), port)
+    } else {
+        u.hostname().to_string()
+    };
+    let path = u.request_target();
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host_header}\r\nAccept: text/event-stream\r\n\
+         Cache-Control: no-cache\r\nConnection: keep-alive\r\n"
+    );
+    if !last_event_id.is_empty() {
+        req.push_str(&format!("Last-Event-ID: {last_event_id}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| ConnectError::Retriable(format!("request write: {e}")))?;
+
+    let head = nbio::read_head(stream, MAX_HEADER_BYTES).map_err(|e| match e {
+        HeadError::TooLarge => ConnectError::Fatal("response head too large".into()),
+        HeadError::Io(e) => ConnectError::Retriable(format!("head read: {e}")),
+    })?;
+    let head = String::from_utf8_lossy(&head);
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut location = None;
+    let mut content_type = String::new();
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k.eq_ignore_ascii_case("location") {
+            location = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("content-type") {
+            content_type = v.to_ascii_lowercase();
+        }
+    }
+
+    match status {
+        200 => {
+            if !content_type
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+            {
+                return Err(ConnectError::Fatal(format!(
+                    "EventSource response Content-Type is '{content_type}', not text/event-stream"
+                )));
+            }
+            Ok(Exchange::Open)
+        }
+        301 | 302 | 303 | 307 | 308 => {
+            let Some(loc) = location else {
+                return Err(ConnectError::Fatal("redirect without Location".into()));
+            };
+            Ok(Exchange::Redirect(
+                url::parse(&loc, Some(&u.href()))
+                    .map_err(ConnectError::Fatal)?
+                    .href(),
+            ))
+        }
+        // 204 No Content and 205 tell the client to STOP (no reconnect).
+        204 | 205 => Err(ConnectError::Fatal(format!(
+            "server returned {status} (stop)"
+        ))),
+        _ => Err(ConnectError::Fatal(format!(
+            "server returned HTTP {status}"
+        ))),
+    }
 }
 
 fn decode_connect(
@@ -256,113 +293,127 @@ fn decode_connect(
     payload: Box<dyn std::any::Any + Send>,
 ) -> Result<Vec<Value>, Value> {
     let ConnectResult { id, outcome } = *payload.downcast::<ConnectResult>().expect("sse payload");
+    let kind = |name: &str, msg: String| {
+        Ok(vec![
+            Value::from_string(name.into()),
+            Value::from_string(msg),
+        ])
+    };
     match outcome {
         Ok(stream) => {
-            let closed = match sse_registry(ctx).conns.get(&id) {
-                Some(e) if !e.dead => Arc::clone(&e.closed),
+            let dispatch = match sse_registry(ctx).conns.get(&id) {
+                Some(e) if !e.dead => e.dispatch.clone(),
                 _ => {
                     sse_registry(ctx).conns.remove(&id);
-                    return Ok(vec![
-                        Value::from_string("fatal".into()),
-                        Value::from_string("closed".into()),
-                    ])
+                    return kind("fatal", "closed".into());
                 }
             };
-            arm_read(ctx, id, StreamReader { stream, closed });
+            let mut conn = match Conn::open(ctx, stream, Interest::READ, id, dispatch, decode_read)
+            {
+                Ok(conn) => conn,
+                Err(msg) => {
+                    sse_registry(ctx).conns.remove(&id);
+                    return kind("fatal", msg);
+                }
+            };
+            conn.watch_reads(READ_TIMEOUT);
+            // Body bytes may already sit in a TLS session or behind the head.
+            conn.link().remote().raise(nbio::IO);
+            if let Some(entry) = sse_registry(ctx).conns.get_mut(&id) {
+                entry.conn = Some(conn);
+            }
             Ok(vec![Value::from_string("open".into())])
         }
         Err(ConnectError::Fatal(msg)) => {
             sse_registry(ctx).conns.remove(&id);
-            Ok(vec![
-                Value::from_string("fatal".into()),
-                Value::from_string(msg),
-            ])
+            kind("fatal", msg)
         }
         Err(ConnectError::Retriable(msg)) => {
             sse_registry(ctx).conns.remove(&id);
-            Ok(vec![
-                Value::from_string("drop".into()),
-                Value::from_string(msg),
-            ])
+            kind("drop", msg)
         }
     }
 }
 
-fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
-    let dispatch = match sse_registry(ctx).conns.get(&id) {
-        Some(e) if !e.dead => e.dispatch.clone(),
-        _ => return,
-    };
-    let task = lumen_host::register_task(ctx, dispatch, None, decode_read);
-    let spawn = ctx
-        .op_state()
-        .get::<SpawnHandle>()
-        .expect("runtime installs the spawn handle")
-        .clone();
-    spawn.spawn_blocking(task, move || {
-        let mut reader = reader;
-        let mut buf = vec![0u8; CHUNK];
-        let outcome = if reader.closed.load(Ordering::SeqCst) {
-            Ok(Vec::new()) // treated as EOF below
-        } else {
-            reader.stream.read(&mut buf).map(|n| buf[..n].to_vec())
-        };
-        // EOF (0 bytes) or a closed flag ends the loop → the class reconnects.
-        let keep =
-            matches!(&outcome, Ok(b) if !b.is_empty()) && !reader.closed.load(Ordering::SeqCst);
-        Box::new(ReadResult {
-            id,
-            outcome,
-            reader: keep.then_some(reader),
-        })
-    });
-}
-
+/// Settles one reactor wake: delivers up to one chunk, or ends the connection.
 fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<Vec<Value>, Value> {
-    let ReadResult {
-        id,
-        outcome,
-        reader,
-    } = *payload.downcast::<ReadResult>().expect("sse payload");
-    // A close() while this read was in flight: swallow and stop.
-    let closed_now = sse_registry(ctx)
-        .conns
-        .get(&id)
-        .map(|e| e.dead || e.closed.load(Ordering::SeqCst))
-        .unwrap_or(true);
-    match outcome {
-        Ok(bytes) if !bytes.is_empty() && !closed_now => {
-            let arr = ctx.make_uint8array(&bytes)?;
-            if let Some(r) = reader {
-                arm_read(ctx, id, r);
-            }
-            Ok(vec![Value::from_string("chunk".into()), arr])
+    let id = *payload.downcast::<u64>().expect("sse payload");
+    let reg = sse_registry(ctx);
+    let Some(conn) = reg.conns.get_mut(&id).and_then(|e| e.conn.as_mut()) else {
+        return Ok(Vec::new());
+    };
+    let link = conn.link();
+    let flags = link.take();
+
+    let mut end: Option<String> = None;
+    let mut more = false;
+    if flags & nbio::READ_STALL != 0 {
+        if let Some(stalled) = conn.on_stall(flags) {
+            end = Some(stalled.error().to_string());
         }
-        Ok(_) => {
-            // EOF or closed: end this connection. A user close() is final; a server-side EOF
-            // reconnects (the class decides based on its readyState).
-            sse_registry(ctx).conns.remove(&id);
-            if closed_now {
-                Ok(vec![Value::from_string("closed".into())])
-            } else {
-                Ok(vec![
-                    Value::from_string("drop".into()),
-                    Value::from_string("stream ended".into()),
-                ])
+    }
+    if end.is_none() {
+        match conn.fill() {
+            Ok(Fill::More) => more = true,
+            Ok(Fill::Drained) => {}
+            Ok(Fill::Eof) => {
+                if conn.rx.is_empty() {
+                    end = Some("stream ended".into());
+                } else {
+                    more = true;
+                }
             }
-        }
-        Err(e) => {
-            sse_registry(ctx).conns.remove(&id);
-            if closed_now {
-                Ok(vec![Value::from_string("closed".into())])
-            } else {
-                Ok(vec![
-                    Value::from_string("drop".into()),
-                    Value::from_string(e.to_string()),
-                ])
+            Err(e) => {
+                if conn.rx.is_empty() {
+                    end = Some(e.to_string());
+                } else {
+                    more = true;
+                }
             }
         }
     }
+    let chunk: Vec<u8> = {
+        let bytes = conn.rx.bytes();
+        let take = bytes.len().min(CHUNK);
+        let chunk = bytes[..take].to_vec();
+        conn.rx.consume(take);
+        chunk
+    };
+    if let Some(msg) = end.filter(|_| chunk.is_empty()) {
+        reg.conns.remove(&id);
+        link.cancel(ctx);
+        return Ok(vec![
+            Value::from_string("drop".into()),
+            Value::from_string(msg),
+        ]);
+    }
+    if more || !conn.rx.is_empty() {
+        link.mark(nbio::RESUME);
+    }
+    link.next_task(ctx);
+    let conn = sse_registry(ctx)
+        .conns
+        .get_mut(&id)
+        .and_then(|e| e.conn.as_mut())
+        .expect("stream is still open");
+    if let Err(e) = conn.rearm(true) {
+        link.remote().raise(nbio::RESUME);
+        if chunk.is_empty() {
+            sse_registry(ctx).conns.remove(&id);
+            link.cancel(ctx);
+            return Ok(vec![
+                Value::from_string("drop".into()),
+                Value::from_string(e.to_string()),
+            ]);
+        }
+    }
+    if chunk.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![
+        Value::from_string("chunk".into()),
+        ctx.make_uint8array(&chunk)?,
+    ])
 }
 
 // ---- test support -------------------------------------------------------------------------------

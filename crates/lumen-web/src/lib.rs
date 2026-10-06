@@ -195,6 +195,8 @@ mod http_body;
 mod http_body;
 mod request_control;
 #[cfg(not(target_arch = "wasm32"))]
+mod nbio;
+#[cfg(not(target_arch = "wasm32"))]
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod sse;
@@ -708,7 +710,7 @@ mod browser;
 #[cfg(target_arch = "wasm32")]
 use browser::{server, sse, websocket};
 
-/// Close every HTTP listener the realm still holds, waking the accepts blocked on them.
+/// Close every HTTP listener the realm still holds, and drop the connections in flight.
 pub fn close_servers(ctx: &mut Ctx) {
     #[cfg(not(target_arch = "wasm32"))]
     server::close_all(ctx);

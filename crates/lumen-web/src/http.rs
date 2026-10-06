@@ -3,12 +3,12 @@
 //! redirects followed up to 5 hops. HTTPS goes through lumen-tls (the dynamically loaded system
 //! OpenSSL on Unix, rustls on Windows) with CA and hostname verification.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::time::Duration;
 
 use crate::url;
 pub(crate) use lumen_os::http_body::read_capped_line;
-use lumen_os::http_body::{BodyReader, Framing};
+use lumen_os::http_body::BodyReader;
 
 pub struct HttpResponse {
     pub status: u16,
@@ -79,22 +79,10 @@ impl Drop for OpenHttpBody {
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 /// Response-body cap so a hostile server can't balloon the worker (32 MiB).
-const MAX_BODY: u64 = 32 << 20;
+pub(crate) const MAX_BODY: u64 = 32 << 20;
 /// Cap on the status/request line plus headers (and on chunked trailers).
 pub(crate) const MAX_HEADER_BYTES: usize = 64 << 10;
-const INITIAL_BODY_CAPACITY: u64 = 64 << 10;
-
-/// Read `len` bytes (capped at `MAX_BODY`), growing the buffer as data arrives rather than
-/// trusting the declared length for the allocation.
-pub(crate) fn read_body_exact(reader: &mut impl BufRead, len: u64) -> std::io::Result<Vec<u8>> {
-    let want = len.min(MAX_BODY);
-    let mut body = Vec::with_capacity(want.min(INITIAL_BODY_CAPACITY) as usize);
-    reader.by_ref().take(want).read_to_end(&mut body)?;
-    if (body.len() as u64) < want {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
-    }
-    Ok(body)
-}
+pub(crate) const INITIAL_BODY_CAPACITY: u64 = 64 << 10;
 
 pub(crate) fn request(
     method: &str,
@@ -188,6 +176,28 @@ pub(crate) fn request_sync_with_timeout(
     config: &crate::FetchConfig,
     timeout_ms: u32,
 ) -> Result<HttpResponse, SyncRequestError> {
+    request_sync_with_timeout_on(
+        lumen_os::sched::current(),
+        method,
+        target,
+        headers,
+        body,
+        config,
+        timeout_ms,
+    )
+}
+
+/// The deadline is a timer of `scheduler`, armed for the length of the request and cancelled when
+/// it finishes first; no thread waits for it.
+fn request_sync_with_timeout_on(
+    scheduler: &dyn lumen_os::sched::Scheduler,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    config: &crate::FetchConfig,
+    timeout_ms: u32,
+) -> Result<HttpResponse, SyncRequestError> {
     let cancellation = lumen_os::net::TcpCancellation::default();
     let state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let timer = if timeout_ms == 0 {
@@ -195,27 +205,25 @@ pub(crate) fn request_sync_with_timeout(
     } else {
         let timer_state = state.clone();
         let timer_cancellation = cancellation.clone();
-        let (finished, wait) = std::sync::mpsc::channel();
-        let timer = std::thread::Builder::new()
-            .name("lumen-xhr-timeout".into())
-            .spawn(move || {
-                if matches!(
-                    wait.recv_timeout(Duration::from_millis(timeout_ms as u64)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) && timer_state
-                    .compare_exchange(
-                        0,
-                        2,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    timer_cancellation.cancel();
-                }
-            })
+        let timer = scheduler
+            .after(
+                Duration::from_millis(timeout_ms as u64),
+                Box::new(move || {
+                    if timer_state
+                        .compare_exchange(
+                            0,
+                            2,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        timer_cancellation.cancel();
+                    }
+                }),
+            )
             .map_err(|error| SyncRequestError::Transport(format!("XHR timeout timer: {error}")))?;
-        Some((finished, timer))
+        Some(timer)
     };
     let result =
         request_cancellable_with_config(method, target, headers, body, &cancellation, config);
@@ -225,10 +233,7 @@ pub(crate) fn request_sync_with_timeout(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Acquire,
     );
-    if let Some((finished, timer)) = timer {
-        let _ = finished.send(());
-        let _ = timer.join();
-    }
+    drop(timer);
     if state.load(std::sync::atomic::Ordering::Acquire) == 2 {
         return Err(SyncRequestError::Timeout);
     }
@@ -622,18 +627,10 @@ fn http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
-pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
-    let mut reader = BodyReader::new(reader, Framing::Chunked, MAX_BODY)?;
-    let mut body = Vec::new();
-    while let Some(chunk) = reader.read_chunk(64 << 10)? {
-        body.extend(chunk);
-    }
-    Ok(body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
     use std::net::TcpListener;
 
     fn serve_http_once(
@@ -664,13 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn chunked_decoding() {
-        let raw = b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
-        let mut r = std::io::BufReader::new(&raw[..]);
-        assert_eq!(read_chunked(&mut r).unwrap(), b"Wikipedia");
-    }
-
-    #[test]
     fn endless_header_line_is_rejected_at_the_cap() {
         struct Endless(usize);
         impl Read for Endless {
@@ -693,32 +683,6 @@ mod tests {
         let mut budget = 10;
         assert_eq!(read_capped_line(&mut r, &mut budget).unwrap(), "aaaa\r\n");
         assert!(read_capped_line(&mut r, &mut budget).is_err());
-    }
-
-    #[test]
-    fn oversized_chunk_size_line_is_rejected() {
-        let mut raw = vec![b'1'; 100_000];
-        raw.extend_from_slice(b"\r\n");
-        let mut r = std::io::Cursor::new(raw);
-        assert!(read_chunked(&mut r).is_err());
-    }
-
-    #[test]
-    fn huge_content_length_with_small_body_does_not_preallocate() {
-        struct Probe<'a>(std::io::Cursor<&'a [u8]>);
-        impl Read for Probe<'_> {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                self.0.read(buf)
-            }
-        }
-        let mut reader = BufReader::new(Probe(std::io::Cursor::new(b"tiny")));
-        let err = read_body_exact(&mut reader, u64::MAX).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
-
-        let mut cursor = std::io::Cursor::new(b"hello world".to_vec());
-        let body = read_body_exact(&mut cursor, 5).unwrap();
-        assert_eq!(body, b"hello");
-        assert!(body.capacity() <= INITIAL_BODY_CAPACITY as usize);
     }
 
     #[test]
@@ -1012,6 +976,168 @@ mod tests {
         let result =
             request_sync_with_timeout("GET", "http://timeout.test/slow", &[], None, &config, 20);
         assert!(matches!(result, Err(SyncRequestError::Timeout)));
+        server.join().unwrap();
+    }
+
+    /// A scheduler that forwards to an OS scheduler and counts the timers it hands out.
+    struct CountingScheduler {
+        inner: lumen_os::sched::OsScheduler,
+        armed: std::sync::atomic::AtomicUsize,
+        cancelled: std::sync::atomic::AtomicUsize,
+    }
+
+    struct CountedTimer {
+        timer: lumen_os::sched::Timer,
+        scheduler: &'static CountingScheduler,
+    }
+
+    impl lumen_os::sched::TimerCancel for CountedTimer {
+        fn cancel(&self) -> bool {
+            self.scheduler
+                .cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.timer.cancel()
+        }
+    }
+
+    impl lumen_os::sched::Scheduler for CountingScheduler {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn available_parallelism(&self) -> std::num::NonZeroUsize {
+            self.inner.available_parallelism()
+        }
+        fn spawn_thread(
+            &self,
+            spec: lumen_os::sched::ThreadSpec,
+            main: lumen_os::sched::ThreadMain,
+        ) -> Result<lumen_os::sched::ThreadHandle, lumen_os::sched::SchedError> {
+            self.inner.spawn_thread(spec, main)
+        }
+        fn spawn_blocking(
+            &self,
+            job: lumen_os::sched::Job,
+        ) -> Result<(), lumen_os::sched::Job> {
+            self.inner.spawn_blocking(job)
+        }
+        fn parker(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lumen_os::sched::Park>, lumen_os::sched::SchedError> {
+            self.inner.parker()
+        }
+        fn after(
+            &self,
+            delay: Duration,
+            fire: lumen_os::sched::Job,
+        ) -> Result<lumen_os::sched::Timer, lumen_os::sched::SchedError> {
+            self.armed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let timer = self.inner.after(delay, fire)?;
+            let scheduler: &'static CountingScheduler = counting();
+            Ok(lumen_os::sched::Timer::new(std::sync::Arc::new(CountedTimer {
+                timer,
+                scheduler,
+            })))
+        }
+    }
+
+    fn counting() -> &'static CountingScheduler {
+        static SCHEDULER: CountingScheduler = CountingScheduler {
+            inner: lumen_os::sched::OsScheduler::new(),
+            armed: std::sync::atomic::AtomicUsize::new(0),
+            cancelled: std::sync::atomic::AtomicUsize::new(0),
+        };
+        &SCHEDULER
+    }
+
+    #[test]
+    fn synchronous_timeout_is_a_scheduler_timer_that_completion_cancels() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let scheduler = counting();
+        let route = |listener: &TcpListener, config: &mut crate::FetchConfig| {
+            config.set_require_routes(true);
+            config
+                .set_route("timer.test", 80, listener.local_addr().unwrap())
+                .unwrap();
+        };
+        let serve = |listener: TcpListener, delay: Duration| {
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                std::thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            })
+        };
+
+        // The request outlives its deadline: the timer fires and cancels the socket.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::from_millis(300));
+        let armed = scheduler.armed.load(SeqCst);
+        let started = std::time::Instant::now();
+        let result = request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/slow",
+            &[],
+            None,
+            &config,
+            50,
+        );
+        assert!(matches!(result, Err(SyncRequestError::Timeout)));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(scheduler.armed.load(SeqCst), armed + 1);
+        server.join().unwrap();
+
+        // The request finishes first: the timer is cancelled before it could fire.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::ZERO);
+        let (armed, cancelled) = (scheduler.armed.load(SeqCst), scheduler.cancelled.load(SeqCst));
+        let response = request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/fast",
+            &[],
+            None,
+            &config,
+            60_000,
+        )
+        .unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(scheduler.armed.load(SeqCst), armed + 1);
+        assert_eq!(scheduler.cancelled.load(SeqCst), cancelled + 1);
+        server.join().unwrap();
+
+        // No deadline, no timer.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = crate::FetchConfig::default();
+        route(&listener, &mut config);
+        let server = serve(listener, Duration::ZERO);
+        let armed = scheduler.armed.load(SeqCst);
+        request_sync_with_timeout_on(
+            scheduler,
+            "GET",
+            "http://timer.test/none",
+            &[],
+            None,
+            &config,
+            0,
+        )
+        .unwrap();
+        assert_eq!(scheduler.armed.load(SeqCst), armed);
         server.join().unwrap();
     }
 

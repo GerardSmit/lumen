@@ -20,8 +20,24 @@ impl Write for Captured {
     }
 }
 
+/// Runs `body` on the stack real engine hosts use: the lazily evaluated node glue nests deeply
+/// enough in a debug build to overflow a default 2 MiB test thread (the overflow surfaces as a
+/// swallowed RangeError inside a callback, leaving the peer waiting forever).
+fn on_engine_stack(body: fn()) {
+    std::thread::Builder::new()
+        .stack_size(lumen::THREAD_STACK_SIZE)
+        .spawn(body)
+        .unwrap()
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
 #[test]
 fn server_handles_multiplexed_node_requests() {
+    on_engine_stack(server_handles_multiplexed_node_requests_body);
+}
+
+fn server_handles_multiplexed_node_requests_body() {
     if Command::new("node").arg("--version").output().is_err() {
         return;
     }
@@ -110,6 +126,10 @@ fn server_handles_multiplexed_node_requests() {
 
 #[test]
 fn secure_server_negotiates_h2_with_node_client() {
+    on_engine_stack(secure_server_negotiates_h2_with_node_client_body);
+}
+
+fn secure_server_negotiates_h2_with_node_client_body() {
     if Command::new("node").arg("--version").output().is_err()
         || Command::new("openssl").arg("version").output().is_err()
     {

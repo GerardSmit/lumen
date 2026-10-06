@@ -296,6 +296,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 pub struct TlsStream {
     connection: Connection,
     stream: TcpStream,
+    nonblocking: bool,
 }
 
 impl TlsStream {
@@ -358,6 +359,7 @@ impl TlsStream {
         let mut tls = Self {
             connection: connection.into(),
             stream,
+            nonblocking: false,
         };
         tls.handshake()
             .map_err(|error| format!("TLS handshake failed: {error}"))?;
@@ -401,6 +403,7 @@ impl TlsStream {
         let mut tls = Self {
             connection: connection.into(),
             stream,
+            nonblocking: false,
         };
         tls.handshake()
             .map_err(|error| format!("TLS server handshake failed: {error}"))?;
@@ -409,6 +412,22 @@ impl TlsStream {
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)
+    }
+
+    /// The TCP socket under the TLS session, for registering it with a readiness reactor.
+    pub fn socket(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    /// Switches the socket to nonblocking mode. A read that needs the peer then fails with
+    /// `WouldBlock` (wait for the socket, then repeat the call) instead of `Interrupted`. A write
+    /// always accepts what it is given; records the socket would not take stay queued, and
+    /// [`Write::flush`] fails with `WouldBlock` until they are out. Call it after the handshake,
+    /// which always runs blocking.
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        self.stream.set_nonblocking(nonblocking)?;
+        self.nonblocking = nonblocking;
+        Ok(())
     }
 
     /// The negotiated version in OpenSSL's `SSL_get_version` spelling ("TLSv1.3").
@@ -541,10 +560,16 @@ impl Read for TlsStream {
                 Err(error) => return Err(error),
             }
             // Post-handshake messages (key updates, alerts) may have queued a reply.
-            self.flush_tls()?;
+            match self.flush_tls() {
+                Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {}
+                other => other?,
+            }
             match self.connection.read_tls(&mut self.stream) {
                 // EOF is recorded by rustls; the next reader() call reports it.
                 Ok(_) => self.process_packets()?,
+                Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {
+                    return Err(ErrorKind::WouldBlock.into())
+                }
                 Err(error) if is_retry(&error) => {
                     return Err(std::io::Error::new(
                         ErrorKind::Interrupted,
@@ -562,7 +587,11 @@ impl Write for TlsStream {
         // Drain earlier records first so the plaintext buffer has room for this one.
         self.flush_tls()?;
         let length = self.connection.writer().write(buffer)?;
-        self.flush_tls()?;
+        match self.flush_tls() {
+            // The plaintext is accepted and its records are queued; `flush` sends them.
+            Err(error) if self.nonblocking && error.kind() == ErrorKind::WouldBlock => {}
+            other => other?,
+        }
         Ok(length)
     }
 

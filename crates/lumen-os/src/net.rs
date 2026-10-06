@@ -410,6 +410,36 @@ mod imp {
             .map(drop)
     }
 
+    /// Starts a TCP connect to `addr` without blocking, optionally from the bound local address
+    /// `local` (which must be of `addr`'s family). The socket is returned non-blocking; the flag is
+    /// `true` while the connection is still in progress, in which case the caller waits for the
+    /// socket to become writable and then reads [`std::net::TcpStream::take_error`] and
+    /// [`std::net::TcpStream::peer_addr`]. Errors that `connect` reports at once are returned.
+    pub fn connect_start(
+        addr: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+    ) -> std::io::Result<(std::net::TcpStream, bool)> {
+        use std::os::fd::FromRawFd;
+        let domain = if addr.is_ipv6() { libc::AF_INET6 } else { libc::AF_INET };
+        let fd = socket(domain, libc::SOCK_STREAM, 0).map_err(|e| std::io::Error::from_raw_os_error(e.errno()))?;
+        // SAFETY: `socket` just allocated this descriptor; the stream is its only owner, so every
+        // early return below closes it.
+        let stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        stream.set_nonblocking(true)?;
+        if let Some(local) = local {
+            bind(fd, &SockAddr::from(local)).map_err(|e| std::io::Error::from_raw_os_error(e.errno()))?;
+        }
+        loop {
+            match connect(fd, &SockAddr::from(addr)) {
+                Ok(()) => return Ok((stream, false)),
+                Err(e) if e.errno() == libc::EINTR => {}
+                Err(e) if e.errno() == libc::EISCONN => return Ok((stream, false)),
+                Err(e) if in_progress(e.errno()) || e.errno() == libc::EALREADY => return Ok((stream, true)),
+                Err(e) => return Err(std::io::Error::from_raw_os_error(e.errno())),
+            }
+        }
+    }
+
     /// Dissolve a datagram socket's peer (`connect` to an `AF_UNSPEC` address).
     pub fn disconnect(fd: i32) -> R<()> {
         // SAFETY: an all-zero sockaddr_storage with family AF_UNSPEC is the documented way to
