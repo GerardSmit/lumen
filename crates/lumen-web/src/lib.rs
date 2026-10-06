@@ -745,6 +745,7 @@ pub fn extension() -> Extension {
             lumen_host::namespace::<http_ops::Module>,
             install_transport,
             lumen_host::lazy_globals::<lumen_host::net::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::net::fetch_bindings::Module>,
             lumen_host::namespace::<server::Module>,
             lumen_host::namespace::<websocket::Module>,
             lumen_host::lazy_globals::<websocket_class::bindings::Module>,

@@ -15,6 +15,8 @@ pub(crate) enum AbortStep {
     },
     /// Abort a signal created by `cloneTransferableSignal` on a later turn.
     Native(Rc<dyn Fn(&mut Ctx, &Value)>),
+    /// A native algorithm its owner keeps alive; dropped with the owner.
+    Owned(Weak<dyn Fn(&mut Ctx, &Value)>),
 }
 
 /// The native state of one `AbortSignal`.
@@ -96,6 +98,41 @@ pub(crate) fn add_native_step(signal: &SignalState, step: Rc<dyn Fn(&mut Ctx, &V
     signal.steps.borrow_mut().push(AbortStep::Native(step));
 }
 
+/// Register `step` on `signal` without keeping it alive: it runs only while its owner holds the
+/// `Rc`. Steps whose owner is gone are dropped from the signal on every registration, so a
+/// long-lived signal does not accumulate the algorithms of finished operations.
+pub fn add_owned_step(signal: &SignalState, step: &Rc<dyn Fn(&mut Ctx, &Value)>) {
+    let mut steps = signal.steps.borrow_mut();
+    steps.retain(|known| !matches!(known, AbortStep::Owned(weak) if weak.strong_count() == 0));
+    steps.push(AbortStep::Owned(Rc::downgrade(step)));
+}
+
+/// Make `follower` abort when `source` does, with the same reason (the "follow" algorithm of the
+/// DOM standard). The returned step is the registration: the caller keeps it for as long as
+/// `follower` should follow. `None` when `source` had already aborted (and so `follower` now has).
+pub fn follow_signal(
+    ctx: &mut Ctx,
+    source: &Value,
+    follower: &Value,
+) -> OpResult<Option<Rc<dyn Fn(&mut Ctx, &Value)>>> {
+    let Some(state) = signal_state(ctx, source) else {
+        return Err(invalid_arg_type(ctx, "signal", "an instance of AbortSignal", source));
+    };
+    if state.aborted.get() {
+        let reason = state.reason.borrow().clone();
+        abort_signal(ctx, follower, reason)?;
+        return Ok(None);
+    }
+    let target = ctx.weak_value(follower).expect("signals are objects");
+    let step: Rc<dyn Fn(&mut Ctx, &Value)> = Rc::new(move |ctx: &mut Ctx, reason: &Value| {
+        if let Some(follower) = target.upgrade() {
+            let _ = abort_signal(ctx, &follower, reason.clone());
+        }
+    });
+    add_owned_step(&state, &step);
+    Ok(Some(step))
+}
+
 /// Signal abort: set the reason, run the abort algorithms, fire a trusted `abort` event, then
 /// abort the dependent signals.
 pub fn abort_signal(ctx: &mut Ctx, signal: &Value, reason: Value) -> OpResult<()> {
@@ -121,6 +158,11 @@ pub fn abort_signal(ctx: &mut Ctx, signal: &Value, reason: Value) -> OpResult<()
                 }
             }
             AbortStep::Native(step) => step(ctx, &reason),
+            AbortStep::Owned(step) => {
+                if let Some(step) = step.upgrade() {
+                    step(ctx, &reason);
+                }
+            }
         }
     }
     let event = ctx.new_instance(Event::trusted("abort"));

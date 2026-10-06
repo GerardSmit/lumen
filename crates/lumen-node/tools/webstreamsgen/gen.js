@@ -39,7 +39,7 @@ const patches = {
       readableStreamDefaultControllerCallPullIfNeeded(controller);`],
     [`function setupReadableStreamBYOBReader(reader, stream) {`,
      `// lumen: one read that completes synchronously or not at all, for lumen-web's buffered
-// Request/Response bodies (fetch.js). Returns \`{ pending: true }\` when the source cannot produce
+// Request/Response bodies (now native in `lumen_host::net`). Returns \`{ pending: true }\` when the source cannot produce
 // a chunk without awaiting; the read request is then withdrawn, leaving the stream as it was.
 function readableStreamDefaultReaderReadSync(reader) {
   if (!isReadableStreamDefaultReader(reader))
@@ -75,6 +75,10 @@ function setupReadableStreamBYOBReader(reader, stream) {`],
   ],
 };
 const browserPatches = {
+  'internal/webstreams/readablestream': [
+    // The browser realm has no `process`; a microtask is the nearest host-independent tick.
+    [`        process.nextTick(() => {`, `        queueMicrotask(() => {`],
+  ],
   'stream/web': [
     [`const {
   CompressionStream,

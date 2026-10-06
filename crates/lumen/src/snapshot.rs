@@ -2463,9 +2463,8 @@ mod tests {
         // The actual runtime glue — the thing the build-time snapshot will encode.
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../lumen-web/src/js/");
         for file in [
-            "events.js",
+            "preamble.js",
             "encoding.js",
-            "fetch.js",
             "server.js",
         ] {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();

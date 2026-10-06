@@ -2,7 +2,7 @@
 use lumen::embed::{Ctx, JsHost, OpResult, Promise, SendError, Value};
 use std::sync::{Arc, Mutex};
 
-/// A body read: the next chunk's bytes, or `null` at the end of the body (what fetch.js tests).
+/// A body read: the next chunk's bytes, or `null` at the end of the body (what the transport body tests read).
 pub(crate) enum Chunk {
     Bytes(Vec<u8>),
     End,

@@ -42,11 +42,6 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["fetch.js"],
-        lazy: true,
-        defined: &[],
-    },
-    Unit {
         files: &["server.js"],
         lazy: false,
         defined: &[],

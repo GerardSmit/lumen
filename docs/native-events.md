@@ -165,5 +165,9 @@ object. The native core:
 - `lumen-runtime` worker scopes read `kTrustEvent` from the internals as before.
 - The Bitnest kernel installs `lumen_host::events::bindings` with `define_lazy_globals` before
   its byte-type glue, instead of concatenating `events.js` and `error-events.js`.
+- `fetch.js` is gone: `Headers`, `Request`, `Response` and `fetch` are native ([native-network.md](native-network.md)).
+  `fetch` registers an owned abort step on the signal it was given (`add_owned_step`, a weak
+  `AbortStep::Owned`, pruned on each registration), and `Request.signal` is a signal that
+  `follow_signal`s the one passed in.
 - Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
   [native-messaging.md](native-messaging.md).

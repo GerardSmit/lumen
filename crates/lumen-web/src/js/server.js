@@ -74,7 +74,7 @@ async function __dispatch(serverId, connId, method, url, headerPairs, bodyBytes,
   } catch {
     bodyOut = new Uint8Array(0); // body already consumed, etc.
   }
-  const headerPairsOut = response.headers._pairs();
+  const headerPairsOut = [...response.headers];
   // Resolve/reject settle when the socket write finishes; a write failure means the client hung
   // up, which is not actionable here.
   await new Promise((resolve, reject) => {
@@ -106,7 +106,7 @@ function upgradeWebSocket(request, options = {}) {
   const pairs = [];
   const extra = options.headers;
   if (extra) {
-    if (typeof extra._pairs === "function") pairs.push(...extra._pairs());
+    if (extra instanceof Headers) pairs.push(...extra);
     else if (Array.isArray(extra)) for (const [n, v] of extra) pairs.push([String(n), String(v)]);
     else for (const n of Object.keys(extra)) pairs.push([n, String(extra[n])]);
   }

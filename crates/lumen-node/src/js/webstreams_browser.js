@@ -2451,7 +2451,7 @@ function readableStreamDefaultTee(stream, cloneForBranch2) {
         // The `process.nextTick()` is not part of the spec.
         // This approach was needed to avoid a race condition working with esm
         // Further information, see: https://github.com/nodejs/node/issues/39758
-        process.nextTick(() => {
+        queueMicrotask(() => {
           reading = false;
           if (!canceled1)
             readableStreamDefaultControllerClose(branch1[kState].controller);
@@ -3086,7 +3086,7 @@ function readableStreamDefaultReaderRead(reader, readRequest) {
 }
 
 // lumen: one read that completes synchronously or not at all, for lumen-web's buffered
-// Request/Response bodies (fetch.js). Returns `{ pending: true }` when the source cannot produce
+// Request/Response bodies (now native in `lumen_host::net`). Returns `{ pending: true }` when the source cannot produce
 // a chunk without awaiting; the read request is then withdrawn, leaving the stream as it was.
 function readableStreamDefaultReaderReadSync(reader) {
   if (!isReadableStreamDefaultReader(reader))

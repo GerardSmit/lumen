@@ -49,9 +49,7 @@ pub fn extract_body(ctx: &mut Ctx, value: &Value) -> OpResult<ExtractedBody> {
 }
 
 fn to_text(ctx: &mut Ctx, value: &Value) -> OpResult<String> {
-    ctx.coerce_string(value)
-        .map(|text| text.to_string())
-        .map_err(OpError::thrown)
+    crate::webidl::usv_string(ctx, value).map_err(OpError::thrown)
 }
 
 /// The value of the `charset` parameter of a media type, unquoted.

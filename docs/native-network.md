@@ -1,9 +1,8 @@
 # Native network classes
 
 `XMLHttpRequest`, `XMLHttpRequestEventTarget`, `XMLHttpRequestUpload`, `ProgressEvent`,
-`WebSocket` and `EventSource` are native `lumen_bind` classes. They replace `lumen-web`'s
-`xhr.js`, `websocket.js` and `eventsource.js`. `fetch` is still JavaScript (`fetch.js`); its
-request preparation moves onto the same Rust pipeline when it is ported.
+`WebSocket`, `EventSource`, `Headers`, `Request`, `Response` and `fetch` are native `lumen_bind`
+classes. They replace `lumen-web`'s `xhr.js`, `websocket.js`, `eventsource.js` and `fetch.js`.
 
 ## Ownership
 
@@ -12,6 +11,9 @@ request preparation moves onto the same Rust pipeline when it is ported.
 | `lumen_host::net::transport` | `Transport`: the realm's HTTP transport objects as Rust sees them; `Failure`, `ResponseBody`, `read_chunk`, `SyncRequest` |
 | `lumen_host::net::flow` | `start`, `RequestSpec`, `Response`, `RequestControl`: one request through the CORS policy |
 | `lumen_host::net::body` | `extract_body` (`BodyInit` to bytes and default `Content-Type`), charset and media type helpers |
+| `lumen_host::net::headers` | `HeadersData` (header list, guards, forbidden names, HeadersInit parsing) |
+| `lumen_host::net::fetch_body` | `Body`, `Source`, `NetBody`, `Drain`: body mixin state, clone/tee, reading a body to the end |
+| `lumen_host::net::fetch` | `Headers`, `HeadersIterator`, `Request`, `Response`, `fetch` (`net::fetch_bindings::Module`) |
 | `lumen_host::net::xhr` | `ProgressEvent`, `XMLHttpRequestEventTarget`, `XMLHttpRequestUpload`, `XMLHttpRequest` (`net::bindings::Module`) |
 | `lumen_host::timers` | `set_timeout`: a native callback scheduled through the realm's `setTimeout` |
 | `lumen-web` `websocket_class`, `eventsource_class`, `net_class` | `WebSocket`, `EventSource` and what they share (constructor that starts the connection, pins, event helpers) |
@@ -45,8 +47,7 @@ no script callback is held.
   or the global has a `document` or `location`) and the transport does not apply policy itself
   (`policyHandledByHost`). A `lumen_common::cors::FetchPolicy` is driven over the transport:
   preflight when `needs_preflight`, redirect hops requested with `redirect = "manual"`,
-  `response_head` checks, then `filter_response`. This is the loop `fetch.js` still has in
-  JavaScript.
+  `response_head` checks, then `filter_response`. `fetch` and XHR share this loop.
 - **Direct.** One transport request that carries `mode`, `credentials` and `redirect`. The kernel takes
   this plan: its transport applies the policy (`policyHandledByHost`).
 
@@ -116,7 +117,51 @@ split across chunks. `WebSocket` follows the HTML Standard's state machine, incl
 - An opaque or status-0 response is a network error (`error`, not `load`).
 - `fetch.js` no longer has the XHR-only upload and forced-preflight hooks.
 
+## fetch
+
+`Headers`, `Request` and `Response` follow the WebIDL shape (enumerable members, `@@toStringTag`,
+lengths, `Headers` iterator).
+
+- **Header list.** Names are stored lowercase; iteration is sorted and combined with `, `, except
+  `set-cookie`, which stays one entry per value (`getSetCookie`). Guards: none, `request`,
+  `request-no-cors`, `response`, `immutable`. Request guards apply only when the transport reports
+  a `browserOrigin` (a context whose policy Lumen applies); forbidden names are dropped
+  silently. The `response` guard drops `set-cookie`. `immutable` throws `TypeError`.
+- **Bodies.** `Source` is `Null`, shared `Bytes`, a transport `Net` body or a `Stream`. Strings,
+  buffers, `Blob`, `FormData` and `URLSearchParams` go through `extract_body`. A `ReadableStream`
+  is created lazily (`new ReadableStream({type: 'bytes'})` from the global) so `new Response('x')`
+  never loads the streams glue. `json/text/arrayBuffer/blob/formData/bytes` share one `consume`
+  path: used and locked checks, then a cancellable `Drain`. `clone()` shares bytes or tees the
+  stream through the `Symbol.for('lumen.cloneBody')` hook.
+- **fetch.** `run_fetch` builds the `RequestSpec` and calls `flow::start`. A `FetchState`
+  (deferred, request control, drain, weak body, abort step) lives while the fetch is in flight
+  and while the response body is open; the response body is a `NetBody` that holds it. Abort
+  rejects the promise, cancels the transport and errors open bodies (`AbortError` or the signal
+  reason). A native owned abort step is registered on the signal given to `fetch` (no signal, no
+  step).
+- **Signal.** `Request.signal` is created on first access and follows the signal passed in
+  (`follow_signal`).
+- **GC.** The `Request`/`Response` objects are native identity owners that trace their headers,
+  body stream and signal; in-flight state is released at every terminal path and holds the
+  controller weakly.
+
+### fetch behavior changes
+
+- Methods are normalised only for `DELETE GET HEAD OPTIONS POST PUT`; `patch` stays lowercase.
+- Forbidden request headers are dropped at `Headers`/`Request` construction in a browsing
+  context, not at send time. The `response` guard drops `set-cookie`.
+- `Headers.getSetCookie()` exists; `new Headers(null)` and non-object inits throw `TypeError`.
+- `request.signal` is not the object passed as `init.signal`.
+- Added attributes: `cache`, `referrer`, `referrerPolicy`, `integrity`, `keepalive`,
+  `destination`, `duplex` and the navigation flags.
+- `new Request(request)` transfers the body (the input becomes used) instead of piping it.
+- Constructed responses have type `default`; status outside 200..599 throws `RangeError`;
+  `Response.error`, `redirect` and `json` exist; `GET`/`HEAD` with a body is a `TypeError`.
+- `fetch()` without arguments throws synchronously. Transport failures reject with `TypeError`;
+  abort and timeout reject with `DOMException`.
+- `body::to_text` converts to USVString, which also affects XHR string bodies.
+
 ## Still JavaScript
 
-`fetch.js` (including its own copy of the policy loop and body extraction), `server.js` (it
+`server.js` (it
 uses `__ws.upgrade/send/close`), `service_worker.js` and `shared_worker.js`.

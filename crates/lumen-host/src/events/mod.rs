@@ -22,7 +22,9 @@ pub use node::internals;
 pub use node::{node_handler_get, node_handler_set};
 pub use web::bindings;
 
-pub use abort::{abort_signal, dom_exception, new_signal};
+pub use abort::{abort_signal, add_owned_step, dom_exception, follow_signal, new_signal};
+pub(crate) use abort::signal_state;
+pub use abort::SignalState;
 pub use bindings::{
     AbortController, AbortSignal, CustomEvent, DomException, ErrorEvent, Event, EventTarget,
 };

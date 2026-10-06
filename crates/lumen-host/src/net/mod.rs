@@ -1,5 +1,6 @@
 //! Network requests for native web classes: one request pipeline over the realm's HTTP
-//! transport, and the classes built on it (`XMLHttpRequest`, `ProgressEvent`). Design:
+//! transport, and the classes built on it (`fetch` and its classes, `XMLHttpRequest`,
+//! `ProgressEvent`). Design:
 //! `docs/native-network.md`.
 //!
 //! - [`Transport`] adapts the host's `__http`-shaped operations (the desktop runtime's
@@ -11,11 +12,14 @@
 //! - [`extract_body`] turns a `BodyInit` into bytes and a default content type; [`ResponseBody`]
 //!   and [`read_chunk`] stream a response; [`bindings`] publishes the classes.
 //!
-//! `fetch` is still JavaScript; its request preparation and policy loop move onto this module
-//! when it is ported.
+//! - [`fetch_bindings`] publishes `Headers`, `Request`, `Response` and `fetch` over the same
+//!   pipeline; its body handling is in `fetch_body`, its header list in `headers`.
 
 mod body;
+mod fetch;
+mod fetch_body;
 mod flow;
+mod headers;
 mod transport;
 mod xhr;
 
@@ -28,11 +32,20 @@ pub use lumen_common::cors::{Credentials, Mode, Redirect};
 pub use transport::{
     cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, SyncResponse, Transport,
 };
+pub use fetch::bindings as fetch_bindings;
 pub use xhr::bindings;
 
 /// A `DOMException` of the given name as an error to throw.
 pub fn dom_error(ctx: &mut Ctx, name: &str, message: impl AsRef<str>) -> OpError {
     OpError::thrown(ctx.new_instance(DomException::with_name(message.as_ref(), name)))
+}
+
+/// Whether `text` is an HTTP token (a method or a header name).
+pub(crate) fn is_token(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 pub(crate) fn has_global_object(ctx: &mut Ctx, name: &str) -> bool {

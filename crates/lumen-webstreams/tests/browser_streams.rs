@@ -109,14 +109,8 @@ fn browser_fetch_response_clone_tees_native_byte_reader_chunks() {
     eval(
         &mut engine,
         r#"
-        globalThis.URL = class { constructor(value) { this.href = String(value); } };
-        globalThis.Blob = class {};
-        globalThis.FormData = class {};
-        globalThis.URLSearchParams = class {};
         let nativeRead = 0;
-        globalThis.__bitnestHttp = {
-          now: () => 0,
-          timeOrigin: 0,
+        globalThis.stubHttp = {
           request(_method, url, _headers, _body, resolve) {
             resolve({
               status: 200,
@@ -136,11 +130,10 @@ fn browser_fetch_response_clone_tees_native_byte_reader_chunks() {
         };
         "#,
     );
-    let fetch_source = include_str!("../../lumen-web/src/js/fetch.js");
-    eval(
-        &mut engine,
-        &format!("(() => {{ const __http=globalThis.__bitnestHttp; {fetch_source} }})()"),
-    );
+    let ctx = engine.engine().ctx();
+    let global = ctx.global_object();
+    let Ok(stub) = ctx.member_get(&global, "stubHttp") else { panic!("stub transport") };
+    lumen_host::net::Transport::install(ctx, stub, lumen::embed::Value::Undefined, lumen::embed::Value::Undefined);
     eval(
         &mut engine,
         r#"

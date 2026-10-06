@@ -1242,3 +1242,549 @@ fn xhr_open_validation_and_forbidden_headers() {
     "#);
     assert_script(&mut runtime, "errors.join() === 'SyntaxError,SyntaxError,InvalidStateError,SyntaxError,0'");
 }
+
+fn install_stub_transport(runtime: &mut Runtime, origin: Option<&str>) {
+    let origin_member = origin
+        .map(|origin| format!("browserOrigin() {{ return '{origin}'; }},"))
+        .unwrap_or_default();
+    evaluate(
+        runtime,
+        &format!(
+            r#"
+        globalThis.__stub = {{
+          calls: [],
+          handler: null,
+          {origin_member}
+          request(method, url, headers, body, resolve, reject, redirect, options) {{
+            const call = {{ method, url, headers, body, redirect, options, resolve, reject, aborted: false }};
+            __stub.calls.push(call);
+            if (__stub.handler) __stub.handler(call);
+            return {{ abort() {{ call.aborted = true; }} }};
+          }},
+        }};
+        globalThis.bodyReader = (chunks) => {{
+          let index = 0;
+          return {{
+            cancelled: 0,
+            read() {{ return Promise.resolve(index < chunks.length ? new Uint8Array(chunks[index++]) : null); }},
+            cancel() {{ this.cancelled++; }},
+          }};
+        }};
+        globalThis.respond = (call, chunks, headers = [], status = 200) => call.resolve({{
+          status, statusText: 'OK', url: call.url, headers, bodyReader: bodyReader(chunks),
+        }});
+        globalThis.out = {{}};
+        "#
+        ),
+    );
+    let ctx = runtime.engine().ctx();
+    let global = ctx.global_object();
+    let Ok(stub) = ctx.member_get(&global, "__stub") else {
+        panic!("stub transport")
+    };
+    lumen_host::net::Transport::install(ctx, stub.clone(), stub.clone(), stub);
+}
+
+#[test]
+fn fetch_classes_publish_the_webidl_shape() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    evaluate(
+        &mut runtime,
+        "var own = (object, key) => Object.getOwnPropertyDescriptor(object, key); var tags = [new Headers(), new Request('http://a.test/'), new Response(), new Headers().entries()].map((value) => Object.prototype.toString.call(value)).join();",
+    );
+    for expression in [
+        "[Headers.length, Request.length, Response.length, fetch.length].join() === '0,1,0,1'",
+        "[Headers.prototype.append, Headers.prototype.delete, Headers.prototype.get, Headers.prototype.getSetCookie, Headers.prototype.has, Headers.prototype.set, Headers.prototype.forEach].map((method) => method.length).join() === '2,1,1,0,1,2,1'",
+        "[Response.json.length, Response.redirect.length, Response.error.length, Request.prototype.clone.length, Response.prototype.clone.length].join() === '1,1,0,0,0'",
+        "tags === '[object Headers],[object Request],[object Response],[object Headers Iterator]'",
+        "Headers.prototype[Symbol.iterator] === Headers.prototype.entries",
+        "['append', 'delete', 'get', 'getSetCookie', 'has', 'set', 'entries', 'keys', 'values', 'forEach'].every((key) => own(Headers.prototype, key).enumerable)",
+        "['method', 'url', 'headers', 'destination', 'referrer', 'referrerPolicy', 'mode', 'credentials', 'cache', 'redirect', 'integrity', 'keepalive', 'isReloadNavigation', 'isHistoryNavigation', 'signal', 'duplex', 'body', 'bodyUsed'].every((key) => { const d = own(Request.prototype, key); return d.enumerable && typeof d.get === 'function' && d.set === undefined; })",
+        "['type', 'url', 'redirected', 'status', 'ok', 'statusText', 'headers', 'body', 'bodyUsed'].every((key) => { const d = own(Response.prototype, key); return d.enumerable && typeof d.get === 'function' && d.set === undefined; })",
+        "['clone', 'arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text'].every((key) => own(Request.prototype, key).enumerable && own(Response.prototype, key).enumerable)",
+        "['json', 'redirect', 'error'].every((key) => typeof Response[key] === 'function') && Response.json !== Response.prototype.json",
+        "(() => { const d = own(globalThis, 'fetch'); return d.enumerable && d.writable && d.configurable && typeof d.value === 'function'; })()",
+        "(() => { try { own(Request.prototype, 'method').get.call({}); } catch (e) { return e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { try { Headers(); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { const proto = Object.getPrototypeOf(new Headers().keys()); return own(proto, 'next').enumerable && !proto.hasOwnProperty('constructor') && proto[Symbol.toStringTag] === 'Headers Iterator'; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn request_and_response_constructors_validate_and_default() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    let throws = |class: &str, body: &str| {
+        format!("(() => {{ try {{ {body} }} catch (e) {{ return e instanceof {class}; }} return false; }})()")
+    };
+    for expression in [
+        "(() => { const r = new Request('http://a.test/x'); return [r.method, r.url, r.mode, r.credentials, r.cache, r.redirect, r.referrer, r.referrerPolicy, r.integrity, r.keepalive, r.destination, r.duplex, r.body, r.bodyUsed, r.isReloadNavigation, r.isHistoryNavigation].join('|') === 'GET|http://a.test/x|cors|same-origin|default|follow|about:client|||false||half||false|false|false'; })()",
+        "(() => { const r = new Request('http://a.test/x'); return r.headers === r.headers && r.signal === r.signal && r.signal instanceof AbortSignal && !r.signal.aborted; })()",
+        "new Request('http://a.test/', { method: 'patch' }).method === 'patch' && new Request('http://a.test/', { method: 'post' }).method === 'POST'",
+        "(() => { const r = new Request('http://a.test/', { method: 'POST', body: 'q', headers: { 'x-a': '1' }, cache: 'no-store', credentials: 'include', redirect: 'manual', mode: 'same-origin', integrity: 'sha256-x', keepalive: true, referrerPolicy: 'origin' }); const c = new Request(r, { method: 'PUT' }); return [c.method, c.headers.get('x-a'), c.headers.get('content-type'), c.cache, c.credentials, c.redirect, c.mode, c.integrity, c.keepalive, c.referrerPolicy, r.bodyUsed].join() === 'PUT,1,text/plain;charset=UTF-8,no-store,include,manual,same-origin,sha256-x,true,origin,true'; })()",
+        "(() => { const r = new Request('http://a.test/', { method: 'POST', body: 'q' }); return r.headers.get('content-type') === 'text/plain;charset=UTF-8' && new Request('http://a.test/', { method: 'POST', body: new URLSearchParams({ a: '1' }) }).headers.get('content-type') === 'application/x-www-form-urlencoded;charset=UTF-8' && new Request('http://a.test/', { method: 'POST', body: new Blob(['x'], { type: 'a/b' }) }).headers.get('content-type') === 'a/b' && new Request('http://a.test/', { method: 'POST', body: 'q', headers: { 'content-type': 'x/y' } }).headers.get('content-type') === 'x/y'; })()",
+        &throws("TypeError", "new Request('http://a.test/', { mode: 'navigate' });"),
+        &throws("TypeError", "new Request('http://a.test/', { mode: 'other' });"),
+        &throws("TypeError", "new Request('http://a.test/', { method: 'CONNECT' });"),
+        &throws("TypeError", "new Request('http://a.test/', { method: 'trace' });"),
+        &throws("TypeError", "new Request('http://a.test/', { method: 'bad method' });"),
+        &throws("TypeError", "new Request('http://user:pw@a.test/');"),
+        &throws("TypeError", "new Request('http://a.test/', { window: 1 });"),
+        &throws("TypeError", "new Request('http://a.test/', { body: 'x' });"),
+        &throws("TypeError", "new Request('http://a.test/', { method: 'HEAD', body: 'x' });"),
+        &throws("TypeError", "new Request('http://a.test/', { signal: {} });"),
+        &throws("TypeError", "new Request('http://a.test/', { cache: 'bad' });"),
+        &throws("TypeError", "new Request('http://a.test/', 5);"),
+        &throws("TypeError", "new Request();"),
+        &throws("TypeError", "new Request('http://a.test/', { method: 'POST', body: new ReadableStream() });"),
+        "(() => { const r = new Request('http://a.test/', { method: 'POST', body: new ReadableStream(), duplex: 'half' }); return r.body instanceof ReadableStream && !r.bodyUsed; })()",
+        "(() => { const r = new Request('http://a.test/', { method: 'POST', body: 'x' }); const moved = new Request(r); return r.bodyUsed && !moved.bodyUsed; })()",
+        &throws("TypeError", "const r = new Request('http://a.test/', { method: 'POST', body: 'x' }); new Request(r); new Request(r);"),
+        "(() => { const r = new Response(); return [r.status, r.statusText, r.type, r.url, r.redirected, r.ok, r.body, r.headers instanceof Headers].join('|') === '200||default||false|true||true'; })()",
+        &throws("RangeError", "new Response(null, { status: 199 });"),
+        &throws("RangeError", "new Response(null, { status: 600 });"),
+        &throws("TypeError", "new Response('x', { status: 204 });"),
+        &throws("TypeError", "new Response(null, { statusText: 'a\\nb' });"),
+        &throws("TypeError", "new Response(null, 5);"),
+        "new Response(null, { status: 204 }).status === 204 && new Response(null, { status: undefined }).status === 200",
+        "(() => { const r = Response.error(); return r.type === 'error' && r.status === 0 && r.ok === false && r.body === null; })()",
+        "(() => { const r = Response.redirect('http://a.test/b', 301); return r.status === 301 && r.headers.get('location') === 'http://a.test/b' && r.type === 'default'; })()",
+        &throws("RangeError", "Response.redirect('http://a.test/', 200);"),
+        &throws("TypeError", "Response.redirect('http://');"),
+        &throws("TypeError", "Response.json(undefined);"),
+        "(() => { const r = Response.json({ a: 1 }, { status: 201 }); return r.status === 201 && r.headers.get('content-type') === 'application/json'; })()",
+        "new Response('x', { headers: { 'set-cookie': 'a=1', 'x-a': '1' } }).headers.has('set-cookie') === false",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn request_signal_follows_the_signal_it_was_given() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    for expression in [
+        "(() => { const ac = new AbortController(); const r = new Request('http://a.test/', { signal: ac.signal }); const before = r.signal !== ac.signal && !r.signal.aborted; ac.abort('why'); return before && r.signal.aborted && r.signal.reason === 'why'; })()",
+        "new Request('http://a.test/', { signal: AbortSignal.abort() }).signal.aborted === true",
+        "(() => { const ac = new AbortController(); const r = new Request('http://a.test/', { signal: ac.signal }); const c = r.clone(); ac.abort(); return c.signal.aborted && c.signal !== r.signal; })()",
+        "(() => { const ac = new AbortController(); const r = new Request('http://a.test/', { signal: ac.signal }); const c = new Request(r, { signal: null }); ac.abort(); return !c.signal.aborted; })()",
+        "(() => { const ac = new AbortController(); const r = new Request('http://a.test/', { signal: ac.signal }); const c = new Request(r); ac.abort(); return c.signal.aborted; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn headers_guards_iteration_and_forbidden_names() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    let throws = |body: &str| {
+        format!("(() => {{ try {{ {body} }} catch (e) {{ return e instanceof TypeError; }} return false; }})()")
+    };
+    for expression in [
+        "(() => { const h = new Headers([['B', '2'], ['a', '1'], ['b', '3']]); return [...h].map((pair) => pair.join(':')).join('|') === 'a:1|b:2, 3' && h.get('B') === '2, 3' && h.has('A') && h.get('zz') === null; })()",
+        "(() => { const h = new Headers({ X: '1' }); h.set('x', ' v '); h.append('y', 'a'); h.append('y', 'b'); h.delete('nope'); return h.get('x') === 'v' && h.get('y') === 'a, b' && [...h.keys()].join() === 'x,y' && [...h.values()].join('|') === 'v|a, b'; })()",
+        "(() => { const h = new Headers(new Headers([['a', '1']])); return h.get('a') === '1' && new Headers(new Map([['m', 'n']])).get('m') === 'n'; })()",
+        "(() => { const h = new Headers(); h.append('Set-Cookie', 'a=1'); h.append('set-cookie', 'b=2'); h.append('x', '1'); return h.getSetCookie().join('|') === 'a=1|b=2' && [...h].map((pair) => pair.join(':')).join('|') === 'set-cookie:a=1|set-cookie:b=2|x:1' && h.get('set-cookie') === 'a=1, b=2'; })()",
+        "(() => { const h = new Headers([['a', '1']]); const it = h.keys(); const first = it.next(); h.append('b', '2'); const second = it.next(); return first.value === 'a' && second.value === 'b' && it.next().done === true; })()",
+        "(() => { const h = new Headers([['a', '1'], ['b', '2']]); const seen = []; const self = {}; h.forEach(function (value, name, headers) { seen.push(name + value + (this === self) + (headers === h)); }, self); return seen.join() === 'a1truetrue,b2truetrue'; })()",
+        "(() => { const h = new Headers(); h.append('x', '\\u00ff'); return h.get('x') === '\\u00ff'; })()",
+        &throws("new Headers([['a']]);"),
+        &throws("new Headers([['a', 'b', 'c']]);"),
+        &throws("new Headers(null);"),
+        &throws("new Headers(5);"),
+        &throws("new Headers().append('bad name', 'x');"),
+        &throws("new Headers().append('', 'x');"),
+        &throws("new Headers().append('a', 'x\\ny');"),
+        &throws("new Headers().append('a', 'x\\u0100');"),
+        &throws("new Headers().get('b@d');"),
+        &throws("new Headers().append('a');"),
+        "(() => { const r = new Request('http://a.test/x', { headers: { Cookie: 'a', 'X-Ok': '1', 'Sec-Fetch-Mode': 'x', Host: 'h', 'Proxy-Authorization': 'p' } }); return !r.headers.has('cookie') && !r.headers.has('sec-fetch-mode') && !r.headers.has('host') && !r.headers.has('proxy-authorization') && r.headers.get('x-ok') === '1'; })()",
+        "(() => { const r = new Request('http://other.test/', { mode: 'no-cors', headers: { 'X-Custom': '1', Accept: 'text/html', 'Content-Type': 'application/json' } }); return !r.headers.has('x-custom') && r.headers.get('accept') === 'text/html' && !r.headers.has('content-type'); })()",
+        &throws("new Request('http://other.test/', { mode: 'no-cors', method: 'PUT' });"),
+        "(() => { const r = new Response('', { headers: { 'Set-Cookie': 'a=1', 'Set-Cookie2': 'b', 'X-A': '1' } }); return !r.headers.has('set-cookie') && !r.headers.has('set-cookie2') && r.headers.get('x-a') === '1'; })()",
+        "(() => { const h = Response.error().headers; try { h.append('a', 'b'); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { const h = Response.redirect('http://a.test/', 302).headers; try { h.delete('location'); } catch (e) { return e instanceof TypeError && h.has('location'); } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn body_mixin_consumption_locking_and_cloning() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    evaluate(
+        &mut runtime,
+        r#"
+        (async () => {
+          const attempt = async (promise) => { try { await promise; return 'resolved'; } catch (e) { return e.constructor.name; } };
+          const response = new Response('{"a":1}', { headers: { 'content-type': 'application/json' } });
+          out.before = response.bodyUsed;
+          out.json = (await response.json()).a;
+          out.after = response.bodyUsed;
+          out.reuse = await attempt(response.text());
+          out.text = await new Response('héllo \u{1f600}').text();
+          out.bom = await new Response(new Uint8Array([0xef, 0xbb, 0xbf, 0x41])).text();
+          out.buffer = (await new Response(new Uint8Array([1, 2, 3])).arrayBuffer()).byteLength;
+          const bytes = await new Response('ab').bytes();
+          out.bytes = bytes instanceof Uint8Array && bytes.join();
+          const blob = await new Response('abc', { headers: { 'content-type': 'text/x' } }).blob();
+          out.blob = blob.size + blob.type;
+          const urlencoded = await new Response(new URLSearchParams({ a: '1', b: '2' })).formData();
+          out.urlencoded = urlencoded.get('a') + urlencoded.get('b');
+          const sent = new FormData(); sent.append('k', 'v'); sent.append('f', new Blob(['file'], { type: 'text/plain' }), 'n.txt');
+          const multipart = await new Response(sent).formData();
+          out.multipart = multipart.get('k') + multipart.get('f').name;
+          out.unsupported = await attempt(new Response('x', { headers: { 'content-type': 'text/plain' } }).formData());
+          out.badJson = await attempt(new Response('{').json());
+          const empty = new Response(null);
+          out.empty = empty.body === null && (await empty.text()) === '' && !empty.bodyUsed && (await empty.text()) === '';
+
+          const streamed = new Response('xy');
+          const stream = streamed.body;
+          out.streamIdentity = stream instanceof ReadableStream && stream === streamed.body && !streamed.bodyUsed;
+          const reader = stream.getReader();
+          out.locked = streamed.body.locked;
+          out.lockedRead = await attempt(streamed.text());
+          out.lockedClone = (() => { try { streamed.clone(); return 'cloned'; } catch (e) { return e.constructor.name; } })();
+          const chunk = await reader.read();
+          out.chunk = chunk.value.join();
+          out.usedAfterRead = streamed.bodyUsed;
+          out.usedRead = await attempt(streamed.text());
+
+          const original = new Response('same');
+          const copy = original.clone();
+          out.clones = (await original.text()) + (await copy.text());
+          out.usedClone = (() => { try { original.clone(); return 'cloned'; } catch (e) { return e.constructor.name; } })();
+
+          const piped = new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('he')); c.enqueue(new TextEncoder().encode('llo')); c.close(); } }));
+          const twin = piped.clone();
+          out.teed = (await piped.text()) + (await twin.text());
+          out.badChunk = await attempt(new Response(new ReadableStream({ start(c) { c.enqueue('text'); c.close(); } })).text());
+          out.failing = await (async () => { try { await new Response(new ReadableStream({ start(c) { c.error(new RangeError('boom')); } })).text(); } catch (e) { return e.message; } })();
+
+          const request = new Request('http://a.test/', { method: 'POST', body: 'q' });
+          const moved = new Request(request);
+          out.moved = request.bodyUsed + ':' + (await moved.text()) + ':' + (await attempt(request.text()));
+          const post = new Request('http://a.test/', { method: 'POST', body: 'again' });
+          const postClone = post.clone();
+          out.requestClone = (await post.text()) + (await postClone.text());
+          out.userStream = await (async () => {
+            const body = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('ab')); c.close(); } });
+            const r = new Request('http://a.test/', { method: 'POST', body, duplex: 'half' });
+            return (await r.text()) + r.bodyUsed;
+          })();
+        })().catch((error) => { out.error = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.error === undefined",
+        "out.before === false && out.json === 1 && out.after === true && out.reuse === 'TypeError'",
+        "out.text === 'h\\u00e9llo \\u{1f600}' && out.bom === 'A' && out.buffer === 3 && out.bytes === '97,98'",
+        "out.blob === '3text/x' && out.urlencoded === '12' && out.multipart === 'vn.txt'",
+        "out.unsupported === 'TypeError' && out.badJson === 'SyntaxError' && out.empty === true",
+        "out.streamIdentity === true && out.locked === true && out.lockedRead === 'TypeError' && out.lockedClone === 'TypeError'",
+        "out.chunk === '120,121' && out.usedAfterRead === true && out.usedRead === 'TypeError'",
+        "out.clones === 'samesame' && out.usedClone === 'TypeError' && out.teed === 'hellohello'",
+        "out.badChunk === 'TypeError' && out.failing === 'boom'",
+        "out.moved === 'true:q:TypeError' && out.requestClone === 'againagain' && out.userStream === 'abtrue'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn bytes_bodies_do_not_load_the_streams_glue_until_body_is_read() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    evaluate(
+        &mut runtime,
+        r#"
+        var glueRuns = 0;
+        const nativeDefine = Object.defineProperty;
+        Object.defineProperty = function (target, key, descriptor) {
+          if (key === Symbol.for('lumen.cloneBody')) glueRuns++;
+          return nativeDefine.call(this, target, key, descriptor);
+        };
+        var done = [];
+        (async () => {
+          const response = new Response('abc');
+          const copy = response.clone();
+          done.push(await response.text(), await copy.text(), await new Request('http://a.test/', { method: 'POST', body: 'x' }).clone().text());
+          done.push(glueRuns);
+        })().catch((error) => done.push(error.message));
+        "#,
+    );
+    runtime.run_until_idle();
+    assert_script(&mut runtime, "done.join() === 'abc,abc,x,0'");
+    assert_script(&mut runtime, "(() => { const r = new Response('abc'); return r.body instanceof ReadableStream && glueRuns === 1; })()");
+}
+
+#[test]
+fn fetch_runs_over_the_transport_and_exposes_the_response() {
+    let mut runtime = Runtime::new();
+    install_stub_transport(&mut runtime, None);
+    evaluate(
+        &mut runtime,
+        r#"
+        __stub.handler = (call) => respond(call, [[104, 105], [33]], [['content-type', 'text/plain'], ['x-a', '1'], ['x-a', '2']]);
+        fetch('http://api.test/x?q=1#frag', { method: 'POST', body: 'data', headers: { 'X-Req': '1' } }).then(async (response) => {
+          out.status = response.status + response.statusText;
+          out.type = response.type;
+          out.url = response.url;
+          out.ok = response.ok;
+          out.redirected = response.redirected;
+          out.header = response.headers.get('x-a');
+          out.immutable = (() => { try { response.headers.set('a', 'b'); } catch (e) { return e instanceof TypeError; } return false; })();
+          out.text = await response.text();
+          out.bodyUsed = response.bodyUsed;
+        }).catch((error) => { out.error = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.error === undefined",
+        "out.status === '200OK' && out.type === 'basic' && out.url === 'http://api.test/x?q=1' && out.ok && out.redirected === false",
+        "out.header === '1, 2' && out.immutable === true && out.text === 'hi!' && out.bodyUsed === true",
+        "__stub.calls.length === 1 && __stub.calls[0].method === 'POST' && __stub.calls[0].redirect === 'follow'",
+        "new TextDecoder().decode(__stub.calls[0].body) === 'data'",
+        "__stub.calls[0].headers.map((pair) => pair.join(':')).join() === 'content-type:text/plain;charset=UTF-8,x-req:1'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn fetch_reads_request_bodies_of_every_kind_and_fails_with_the_source_error() {
+    let mut runtime = Runtime::new();
+    install_stub_transport(&mut runtime, None);
+    evaluate(
+        &mut runtime,
+        r#"
+        __stub.handler = (call) => respond(call, []);
+        (async () => {
+          const stream = new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('ab')); c.enqueue(new TextEncoder().encode('cd')); c.close(); } });
+          await fetch('http://api.test/stream', { method: 'POST', body: stream, duplex: 'half' });
+          const form = new FormData(); form.append('k', 'v');
+          await fetch('http://api.test/form', { method: 'POST', body: form });
+          await fetch('http://api.test/params', { method: 'PUT', body: new URLSearchParams({ a: '1' }) });
+          await fetch(new Request('http://api.test/request', { method: 'POST', body: new Uint8Array([1, 2]) }));
+          out.failure = await fetch('http://api.test/fail', { method: 'POST', body: new ReadableStream({ start(c) { c.error(new RangeError('source failed')); } }), duplex: 'half' }).then(() => 'resolved', (e) => e.message);
+          out.rejected = await fetch('relative-without-base').then(() => 'resolved', (e) => e.constructor.name);
+          out.noArgs = (() => { try { fetch(); } catch (e) { return e.constructor.name; } return 'no throw'; })();
+        })().catch((error) => { out.error = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.error === undefined && out.failure === 'source failed' && out.rejected === 'TypeError'",
+        "new TextDecoder().decode(__stub.calls[0].body) === 'abcd'",
+        "__stub.calls[1].headers.some(([name, value]) => name === 'content-type' && value.startsWith('multipart/form-data; boundary=')) && __stub.calls[1].body.length > 0",
+        "new TextDecoder().decode(__stub.calls[2].body) === 'a=1' && __stub.calls[2].method === 'PUT'",
+        "__stub.calls[3].url === 'http://api.test/request' && __stub.calls[3].body.join() === '1,2'",
+        "__stub.calls.length === 4",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn fetch_abort_rejects_cancels_the_transport_and_errors_open_bodies() {
+    let mut runtime = Runtime::new();
+    install_stub_transport(&mut runtime, None);
+    evaluate(
+        &mut runtime,
+        r#"
+        globalThis.stalled = { cancelled: 0, read() { return new Promise(() => {}); }, cancel() { this.cancelled++; } };
+        (async () => {
+          const attempt = (promise) => promise.then(() => 'resolved', (e) => (e && e.name) || String(e));
+
+          const early = new AbortController();
+          const pending = fetch('http://api.test/pending', { signal: early.signal });
+          early.abort();
+          out.pending = await attempt(pending);
+          out.pendingAborted = __stub.calls[0].aborted;
+
+          const reason = new AbortController();
+          const withReason = fetch('http://api.test/reason', { signal: reason.signal });
+          reason.abort('custom');
+          out.reason = await attempt(withReason);
+
+          out.preAborted = await attempt(fetch('http://api.test/never', { signal: AbortSignal.abort() }));
+          out.callsAfterPre = __stub.calls.length;
+
+          __stub.handler = (call) => call.resolve({ status: 200, statusText: 'OK', url: call.url, headers: [], bodyReader: stalled });
+          const reading = new AbortController();
+          const response = await fetch('http://api.test/body', { signal: reading.signal });
+          const text = attempt(response.text());
+          reading.abort();
+          out.bodyRead = await text;
+          out.cancelled = stalled.cancelled;
+
+          const streamed = new AbortController();
+          const second = await fetch('http://api.test/stream', { signal: streamed.signal });
+          const streamReader = second.body.getReader();
+          const streamRead = attempt(streamReader.read());
+          streamed.abort();
+          out.streamRead = await streamRead;
+
+          __stub.handler = (call) => respond(call, [[111, 107]]);
+          const finished = new AbortController();
+          const done = await fetch('http://api.test/done', { signal: finished.signal });
+          const doneText = await done.text();
+          finished.abort();
+          out.afterBody = doneText;
+
+          const shared = new AbortController();
+          const first = await fetch('http://api.test/shared-1', { signal: shared.signal });
+          await first.text();
+          const sharedSecond = await fetch('http://api.test/shared-2', { signal: shared.signal });
+          shared.abort();
+          out.sharedSecond = await attempt(sharedSecond.text());
+          out.sharedFirst = first.bodyUsed;
+        })().catch((error) => { out.error = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.error === undefined",
+        "out.pending === 'AbortError' && out.pendingAborted === true && out.reason === 'custom'",
+        "out.preAborted === 'AbortError' && out.callsAfterPre === 2",
+        "out.bodyRead === 'AbortError' && out.cancelled >= 1",
+        "out.streamRead === 'AbortError'",
+        "out.afterBody === 'ok'",
+        "out.sharedSecond === 'AbortError' && out.sharedFirst === true",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn fetch_redirect_modes_in_direct_mode() {
+    let mut runtime = Runtime::new();
+    install_stub_transport(&mut runtime, None);
+    evaluate(
+        &mut runtime,
+        r#"
+        __stub.handler = (call) => call.resolve({ status: 302, statusText: 'Found', url: call.url, headers: [['location', '/next']] });
+        (async () => {
+          const attempt = (promise) => promise.then((r) => r, (e) => e);
+          const manual = await fetch('http://api.test/a', { redirect: 'manual' });
+          out.manual = [manual.type, manual.status, manual.url, manual.body, manual.headers.has('location')].join();
+          const error = await attempt(fetch('http://api.test/a', { redirect: 'error' }));
+          out.error = error instanceof TypeError;
+          const follow = await fetch('http://api.test/a');
+          out.follow = follow.status + ':' + follow.headers.get('location');
+          out.modes = __stub.calls.map((call) => call.redirect).join();
+        })().catch((error) => { out.failure = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.failure === undefined",
+        "out.manual === 'opaqueredirect,0,,,false'",
+        "out.error === true",
+        "out.follow === '302:/next'",
+        "out.modes === 'manual,manual,follow'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn fetch_applies_cors_policy_and_follows_redirects_in_a_browsing_context() {
+    let mut runtime = Runtime::new_browser();
+    install_stub_transport(&mut runtime, Some("http://page.test"));
+    evaluate(
+        &mut runtime,
+        r#"
+        (async () => {
+          const attempt = (promise) => promise.then((r) => r, (e) => e);
+          __stub.handler = (call) => {
+            if (call.url === 'http://page.test/a') call.resolve({ status: 302, statusText: 'Found', url: call.url, headers: [['location', '/b']] });
+            else respond(call, [[111]], [['content-type', 'text/plain']]);
+          };
+          const followed = await fetch('http://page.test/a');
+          out.followed = [followed.url, followed.redirected, followed.type, await followed.text(), __stub.calls.length].join();
+          const refused = await attempt(fetch('http://page.test/a', { redirect: 'error' }));
+          out.refused = refused instanceof TypeError;
+          const manual = await fetch('http://page.test/a', { redirect: 'manual' });
+          out.manual = manual.type + manual.status;
+
+          __stub.calls.length = 0;
+          __stub.handler = (call) => respond(call, [[1]], [['content-type', 'text/plain'], ['x-secret', '1']]);
+          out.blocked = (await attempt(fetch('http://other.test/data'))) instanceof TypeError;
+          __stub.handler = (call) => respond(call, [[1]], [['access-control-allow-origin', '*'], ['content-type', 'text/plain'], ['x-secret', '1']]);
+          const cors = await fetch('http://other.test/data');
+          out.cors = [cors.type, cors.headers.has('x-secret'), cors.headers.has('content-type')].join();
+          const noCors = await fetch('http://other.test/data', { mode: 'no-cors' });
+          out.noCors = [noCors.type, noCors.status, noCors.url, noCors.body, [...noCors.headers].length].join();
+          out.sameOriginMode = (await attempt(fetch('http://other.test/data', { mode: 'same-origin' }))) instanceof TypeError;
+          out.origin = __stub.calls.filter((call) => call.url.startsWith('http://other.test') && call.options.mode === 'cors').every((call) => call.headers.some(([name, value]) => name === 'origin' && value === 'http://page.test'));
+        })().catch((error) => { out.failure = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.failure === undefined",
+        "out.followed === 'http://page.test/b,true,basic,o,2' && out.refused === true && out.manual === 'opaqueredirect0'",
+        "out.blocked === true && out.cors === 'cors,false,true'",
+        "out.noCors === 'opaque,0,,,0' && out.sameOriginMode === true && out.origin === true",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn fetch_responses_and_in_flight_fetches_are_collectable() {
+    let mut runtime = Runtime::new();
+    install_stub_transport(&mut runtime, None);
+    evaluate(
+        &mut runtime,
+        r#"
+        __stub.handler = (call) => respond(call, [[1, 2], [3]]);
+        globalThis.weak = {};
+        // Defined outside the async function: a closure created inside it may keep the
+        // function's whole scope (and every local below) alive while the fetch is pending.
+        const ignore = () => {};
+        (async () => {
+          const controller = new AbortController();
+          const response = await fetch('http://api.test/gc', { signal: controller.signal });
+          const stream = response.body;
+          weak.response = new WeakRef(response);
+          weak.stream = new WeakRef(stream);
+          weak.headers = new WeakRef(response.headers);
+          weak.signal = new WeakRef(controller.signal);
+          await response.clone().bytes();
+          const fresh = new Response('x');
+          weak.fresh = new WeakRef(fresh);
+          weak.freshHeaders = new WeakRef(fresh.headers);
+          const request = new Request('http://api.test/', { signal: controller.signal });
+          weak.request = new WeakRef(request);
+          weak.followed = new WeakRef(request.signal);
+          __stub.handler = null;
+          fetch('http://api.test/never', { signal: controller.signal }).catch(ignore);
+          out.settled = true;
+        })().catch((error) => { out.error = error.name + ': ' + error.message; });
+        "#,
+    );
+    runtime.run_until_idle();
+    assert_script(&mut runtime, "out.error === undefined && out.settled === true");
+    runtime.engine().collect_garbage();
+    runtime.engine().collect_garbage();
+    for expression in [
+        "weak.response.deref() === undefined",
+        "weak.stream.deref() === undefined",
+        "weak.headers.deref() === undefined",
+        "weak.fresh.deref() === undefined && weak.freshHeaders.deref() === undefined",
+        "weak.request.deref() === undefined && weak.followed.deref() === undefined",
+        "weak.signal.deref() === undefined",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}

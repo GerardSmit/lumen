@@ -8,7 +8,7 @@
 use super::body::{charset_of, decode_text, essence_of, extract_body, ExtractedBody};
 use super::flow::{header, start, RequestControl, RequestSpec, Response, ResponseKind};
 use super::transport::{cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, Transport};
-use super::{dom_error, has_global_object};
+use super::{dom_error, has_global_object, is_token};
 use crate::blob::new_blob;
 use crate::events::{Event, EventTarget};
 use crate::timers::{set_timeout, Timer};
@@ -220,13 +220,6 @@ fn invalid_state(ctx: &mut Ctx, message: &str) -> OpError {
     dom_error(ctx, "InvalidStateError", message)
 }
 
-fn is_token(text: &str) -> bool {
-    !text.is_empty()
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
-}
-
 fn combine_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
     let mut combined: Vec<(String, String)> = Vec::new();
     for (name, value) in headers {
@@ -255,7 +248,7 @@ fn content_length(headers: &[(String, String)]) -> (f64, bool) {
     }
 }
 
-fn without_fragment(url: &str) -> String {
+pub(super) fn without_fragment(url: &str) -> String {
     match lumen_common::url::parse_url(url, None) {
         Some(mut parsed) => {
             parsed.set_hash("");
@@ -265,7 +258,7 @@ fn without_fragment(url: &str) -> String {
     }
 }
 
-fn document_base(ctx: &mut Ctx) -> Option<String> {
+pub(super) fn document_base(ctx: &mut Ctx) -> Option<String> {
     let global = ctx.global_object();
     for (object, key) in [("document", "baseURI"), ("location", "href")] {
         let Ok(holder @ Value::Obj(_)) = ctx.member_get(&global, object) else {
