@@ -10,11 +10,16 @@
 //! 2. run queued **callbacks** (`process.nextTick`, `setImmediate`),
 //! 3. fire due **timers**,
 //! 4. dispatch ready **completions** from the threadpool,
-//! then block on the completion channel until the next timer deadline (or indefinitely if
-//! only completions remain). The loop exits when nothing is pending anywhere. A hand-rolled
-//! readiness reactor on raw syscalls (epoll, kqueue, poll; no crate, no mio) now exists in
-//! `lumen_os::reactor`; this loop does not use it yet, and threadpool + completions (libuv's own fs
-//! strategy) still covers everything hosted here today.
+//! then block until the next timer deadline (or indefinitely if only completions remain). The
+//! loop exits when nothing is pending anywhere.
+//!
+//! Blocking happens in the loop's own `lumen_os::reactor::Poller` (a hand-rolled readiness
+//! reactor on raw syscalls: epoll, kqueue, poll; no crate, no mio). Every completion sender wakes
+//! it through a coalesced waker, so a burst of completions costs the loop one wake-up, and sources
+//! registered through [`Runtime::reactor`] run their wakes on the loop thread inside the same
+//! turn. The poller is created when the loop first blocks or a source is first registered;
+//! nothing is armed while the loop is idle. Where there is no reactor backend (wasm32, Windows
+//! for now) the loop blocks on the completion channel instead.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -27,6 +32,7 @@ use std::time::Duration;
 
 use lumen_host::time::Instant;
 
+use lumen_host::loop_reactor::LoopReactor;
 use lumen_host::{
     install, owner_loop, CallbackQueue, CompletionSender, CompletionTx, Engine, Extension, HostRealmInstaller,
     TaskCompletion, TaskDecoder, TaskId, TaskRegistry, ThreadPool, Value,
@@ -299,6 +305,13 @@ pub struct Runtime {
     tick_recovery: bool,
     /// Wakes the loop when it is blocked on completions.
     wake: CompletionTx,
+    /// The loop's readiness reactor, created on first use.
+    reactor: LoopReactor,
+    /// The first block has drained the completions sent before the poller's waker existed.
+    poller_primed: bool,
+    /// Blocking waits entered (a poller turn or a channel wait).
+    #[cfg(test)]
+    pub(crate) loop_turns: Arc<AtomicU64>,
     #[cfg(not(target_arch = "wasm32"))]
     deadline: Option<lumen_os::sched::Deadline>,
 }
@@ -509,6 +522,8 @@ impl Runtime {
             .op_state()
             .put(CompletionSender::new(tx.clone()));
         engine.ctx().op_state().put(TaskRegistry::default());
+        let reactor = LoopReactor::new(tx.clone());
+        engine.ctx().op_state().put(reactor.clone());
         // `#[op(async)]` / `Ctx::spawn_blocking` / `Ctx::completer` settle through the loop.
         engine.ctx().set_async_host(lumen_host::LoopAsyncHost {
             spawn: pool.handle(),
@@ -675,6 +690,10 @@ impl Runtime {
             signal_exit: None,
             tick_recovery: false,
             wake: tx,
+            reactor,
+            poller_primed: false,
+            #[cfg(test)]
+            loop_turns: Arc::default(),
             completions: rx,
             fire_error,
             fire_rejection,
@@ -1321,26 +1340,18 @@ impl Runtime {
             if self.ticks_pending() {
                 continue;
             }
-            let deadline = self.wait_deadline();
-            let blocked = Instant::now();
-            let received = match deadline {
+            let timeout = match self.wait_deadline() {
                 Some(deadline) => {
                     let now = Instant::now();
                     if deadline <= now {
                         continue;
                     }
-                    self.completions.recv_timeout(deadline - now)
+                    Some(deadline - now)
                 }
-                None => self
-                    .completions
-                    .recv()
-                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+                None => None,
             };
-            lumen_host::perf::add_idle(blocked.elapsed());
-            match received {
-                Ok(done) => self.dispatch(done),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            if self.block(timeout).is_none() {
+                return;
             }
             #[cfg(test)]
             self.loop_wakeups.fetch_add(1, Ordering::Relaxed);
@@ -1425,15 +1436,20 @@ impl Runtime {
         if cfg!(target_arch = "wasm32") || self.halted() || timeout.is_zero() {
             return false;
         }
-        let blocked = Instant::now();
-        let received = self.completions.recv_timeout(timeout);
-        lumen_host::perf::add_idle(blocked.elapsed());
-        match received {
-            Ok(done) => {
-                self.dispatch(done);
-                true
+        let end = Instant::now().checked_add(timeout);
+        loop {
+            let left = match end {
+                Some(end) => end.saturating_duration_since(Instant::now()),
+                None => timeout,
+            };
+            if left.is_zero() || self.halted() {
+                return false;
             }
-            Err(_) => false,
+            match self.block(Some(left)) {
+                Some(0) => {}
+                Some(_) => return true,
+                None => return false,
+            }
         }
     }
 
@@ -1461,13 +1477,8 @@ impl Runtime {
                 progressed = true;
                 self.fire_timer(&cb, &args, &owner);
             }
-            while !self.halted() {
-                let Ok(done) = self.completions.try_recv() else {
-                    break;
-                };
-                progressed = true;
-                self.dispatch(done);
-            }
+            self.reactor.poll();
+            progressed |= self.drain_completions() > 0;
             if self.halted() || !(progressed || self.ticks_pending()) {
                 break;
             }
@@ -1545,13 +1556,7 @@ impl Runtime {
                     progressed = true;
                     self.fire_timer(&cb, &args, &owner);
                 }
-                while !self.halted() {
-                    let Ok(done) = self.completions.try_recv() else {
-                        break;
-                    };
-                    progressed = true;
-                    self.dispatch(done);
-                }
+                progressed |= self.drain_completions() > 0;
                 if !progressed || self.halted() {
                     break;
                 }
@@ -1574,33 +1579,98 @@ impl Runtime {
             // A pending idle pass must not wait forever behind an otherwise silent task.
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let deadline = self.wait_deadline_with(maintenance);
-                match deadline {
+                let timeout = match self.wait_deadline_with(maintenance) {
                     Some(deadline) => {
                         let now = Instant::now();
-                        if deadline > now {
-                            let blocked = Instant::now();
-                            let received = self.completions.recv_timeout(deadline - now);
-                            lumen_host::perf::add_idle(blocked.elapsed());
-                            if let Ok(done) = received {
-                                self.dispatch(done);
-                            }
+                        if deadline <= now {
+                            continue;
                         }
+                        Some(deadline - now)
                     }
-                    None => match {
-                        let blocked = Instant::now();
-                        let received = self.completions.recv();
-                        lumen_host::perf::add_idle(blocked.elapsed());
-                        received
-                    } {
-                        Ok(done) => self.dispatch(done),
-                        // The pool is gone (unreachable while `self.pool` lives); nothing can
-                        // ever complete, so pending tasks are abandoned rather than spun on.
-                        Err(_) => return,
-                    },
+                    None => None,
+                };
+                // The pool is gone (unreachable while `self.pool` lives); nothing can ever
+                // complete, so pending tasks are abandoned rather than spun on.
+                if self.block(timeout).is_none() {
+                    return;
                 }
             }
         }
+    }
+
+    /// Dispatch every completion that is queued now; returns how many.
+    fn drain_completions(&mut self) -> usize {
+        let mut dispatched = 0;
+        while !self.halted() {
+            let Ok(done) = self.completions.try_recv() else {
+                break;
+            };
+            dispatched += 1;
+            self.dispatch(done);
+        }
+        dispatched
+    }
+
+    /// Block until a completion arrives, a registered source is ready or `timeout` passes (`None`
+    /// waits without a limit), then dispatch the completions that are queued. Returns how many
+    /// were dispatched, or `None` when the channel is gone and nothing can ever arrive. Returns
+    /// early now and then without having dispatched anything.
+    fn block(&mut self, timeout: Option<Duration>) -> Option<usize> {
+        let blocked = Instant::now();
+        let dispatched = self.block_inner(timeout);
+        lumen_host::perf::add_idle(blocked.elapsed());
+        dispatched
+    }
+
+    fn block_inner(&mut self, timeout: Option<Duration>) -> Option<usize> {
+        let Some(poller) = self.reactor.poller().cloned() else {
+            return self.block_on_channel(timeout);
+        };
+        if !self.poller_primed {
+            // Completions sent before the poller's waker was installed were not announced to it.
+            self.poller_primed = true;
+            let dispatched = self.drain_completions();
+            if dispatched > 0 {
+                return Some(dispatched);
+            }
+        }
+        #[cfg(test)]
+        self.loop_turns.fetch_add(1, Ordering::Relaxed);
+        if poller.turn(timeout).is_err() {
+            return self.block_on_channel(timeout);
+        }
+        Some(self.drain_completions())
+    }
+
+    fn block_on_channel(&mut self, timeout: Option<Duration>) -> Option<usize> {
+        #[cfg(test)]
+        self.loop_turns.fetch_add(1, Ordering::Relaxed);
+        let received = match timeout {
+            Some(timeout) => self.completions.recv_timeout(timeout),
+            None => self
+                .completions
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match received {
+            Ok(done) => {
+                self.dispatch(done);
+                Some(1 + self.drain_completions())
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Some(0),
+            Err(mpsc::RecvTimeoutError::Disconnected) => None,
+        }
+    }
+
+    /// The loop's readiness reactor: registrations made on it run their wakes on this runtime's
+    /// loop thread, inside the loop's own turn. `None` on a platform without a reactor backend.
+    pub fn reactor(&self) -> Option<Arc<dyn lumen_os::reactor::Reactor>> {
+        self.reactor.reactor()
+    }
+
+    /// The same reactor as a handle that native ops also find in their realm's `OpState`.
+    pub fn loop_reactor(&self) -> &LoopReactor {
+        &self.reactor
     }
 
     /// When a blocking wait must end by itself: the next timer or the idle maintenance pass,

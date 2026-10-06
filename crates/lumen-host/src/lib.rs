@@ -45,6 +45,8 @@ pub mod navigator;
 /// Event delivery for hosts without their own event loop (the Bitnest kernel): `install`,
 /// `has_ready`, `pump` and `settle`.
 pub mod owner_loop;
+/// The readiness reactor of a loop that blocks in a poller, reachable from a `Ctx`.
+pub mod loop_reactor;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
 /// The native `Performance` interface and the `performance` and `self` globals.
@@ -659,11 +661,19 @@ impl CallbackQueue {
 
 /// The sending end of a loop's completion channel. A loop whose thread parks on a scheduler
 /// [`Park`](lumen_os::sched::Park) instead of blocking on the channel registers it with
-/// [`CompletionTx::set_notify`]; every send then unparks that thread.
+/// [`CompletionTx::set_notify`]; a loop blocked in a [`lumen_os::reactor::Poller`] registers the
+/// poller's waker with [`CompletionTx::set_loop_waker`]. Every send then wakes both, and a burst of
+/// sends costs the poller one syscall.
 #[derive(Clone)]
 pub struct CompletionTx {
     tx: mpsc::Sender<TaskCompletion>,
-    notify: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn lumen_os::sched::Unpark>>>,
+    notify: std::sync::Arc<Notify>,
+}
+
+#[derive(Default)]
+struct Notify {
+    unpark: std::sync::OnceLock<std::sync::Arc<dyn lumen_os::sched::Unpark>>,
+    waker: std::sync::OnceLock<lumen_os::reactor::LoopWaker>,
 }
 
 impl CompletionTx {
@@ -677,12 +687,22 @@ impl CompletionTx {
     /// Unpark `notify` after every completion sent from now on, through any clone. Set once; a
     /// second call is ignored.
     pub fn set_notify(&self, notify: std::sync::Arc<dyn lumen_os::sched::Unpark>) {
-        let _ = self.notify.set(notify);
+        let _ = self.notify.unpark.set(notify);
+    }
+
+    /// Wake `waker`'s poller after every completion sent from now on, through any clone. Set
+    /// once; a second call is ignored. A completion sent before this call is in the channel and
+    /// is not announced, so the loop drains the channel once after setting it.
+    pub fn set_loop_waker(&self, waker: lumen_os::reactor::LoopWaker) {
+        let _ = self.notify.waker.set(waker);
     }
 
     pub fn send(&self, done: TaskCompletion) -> Result<(), mpsc::SendError<TaskCompletion>> {
         self.tx.send(done)?;
-        if let Some(notify) = self.notify.get() {
+        if let Some(waker) = self.notify.waker.get() {
+            waker.wake();
+        }
+        if let Some(notify) = self.notify.unpark.get() {
             notify.unpark();
         }
         Ok(())

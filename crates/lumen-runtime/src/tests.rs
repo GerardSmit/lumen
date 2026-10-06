@@ -1036,6 +1036,7 @@ fn idle_worker_loop_reclaims_before_silent_task_completion() {
 struct IdleWorker {
     waker: RuntimeWaker,
     wakeups: Arc<AtomicU64>,
+    turns: Arc<AtomicU64>,
     exited: mpsc::Receiver<Instant>,
 }
 
@@ -1061,16 +1062,21 @@ fn start_idle_worker(parent: Option<WorkerEmbedding>, stop: Arc<AtomicBool>) -> 
                 .unwrap_or_else(|_| panic!("callback exists"));
             lumen_host::register_task(rt.engine().ctx(), callback, None, |_, _| Ok(Vec::new()));
             ready_tx
-                .send((rt.waker(), Arc::clone(&rt.loop_wakeups)))
+                .send((
+                    rt.waker(),
+                    Arc::clone(&rt.loop_wakeups),
+                    Arc::clone(&rt.loop_turns),
+                ))
                 .unwrap();
             rt.run_worker_loop(&stop);
             exited_tx.send(Instant::now()).unwrap();
         })
         .unwrap();
-    let (waker, wakeups) = ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    let (waker, wakeups, turns) = ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     IdleWorker {
         waker,
         wakeups,
+        turns,
         exited,
     }
 }
@@ -1104,6 +1110,74 @@ fn an_idle_worker_loop_does_not_wake() {
     stop.store(true, Ordering::SeqCst);
     worker.waker.wake();
     worker.exited.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn an_idle_worker_loop_blocks_in_one_turn() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(worker.turns.load(Ordering::Relaxed), 1);
+    stop.store(true, Ordering::SeqCst);
+    worker.waker.wake();
+    worker.exited.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn a_burst_of_completions_is_one_loop_wake() {
+    const BURST: usize = 1000;
+    let mut rt = Runtime::new();
+    // The first wait creates the poller and finds nothing.
+    assert!(!rt.wait_for_completion(Duration::from_millis(1)));
+    let turns = rt.loop_turns.load(Ordering::Relaxed);
+    let waker = rt.waker();
+    std::thread::spawn(move || {
+        for _ in 0..BURST {
+            waker.wake();
+        }
+    })
+    .join()
+    .unwrap();
+    assert!(rt.wait_for_completion(Duration::from_secs(5)));
+    assert!(rt.completions.try_recv().is_err(), "the burst was not drained");
+    assert!(rt.loop_turns.load(Ordering::Relaxed) - turns <= 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_registered_descriptor_wakes_the_loop_on_its_own_thread() {
+    use lumen_os::reactor::{Interest, Ready, Source};
+    let mut rt = Runtime::new();
+    let reactor = rt.reactor().expect("a reactor on this platform");
+    let (read, write) = lumen_os::fs::pipe().unwrap();
+    let woke_on = Arc::new(Mutex::new(None));
+    let waker = rt.waker();
+    let registration = {
+        let woke_on = Arc::clone(&woke_on);
+        reactor
+            .register(
+                Source::Fd(read),
+                Interest::READ,
+                Arc::new(move || {
+                    *woke_on.lock().unwrap() = Some(std::thread::current().id());
+                    waker.wake();
+                }),
+            )
+            .unwrap()
+    };
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        lumen_os::fs::write(write, b"x", None).unwrap();
+    });
+    let started = Instant::now();
+    assert!(rt.wait_for_completion(Duration::from_secs(10)));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    writer.join().unwrap();
+    assert_eq!(*woke_on.lock().unwrap(), Some(std::thread::current().id()));
+    assert!(registration.take_ready().contains(Ready::READ));
+    drop(registration);
+    lumen_os::fs::close(read).unwrap();
+    lumen_os::fs::close(write).unwrap();
 }
 
 #[test]
