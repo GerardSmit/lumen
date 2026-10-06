@@ -275,7 +275,6 @@ mod sys {
     extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
         fn pthread_jit_write_protect_np(enabled: i32);
         fn sys_icache_invalidate(start: *mut u8, len: usize);
     }
@@ -327,9 +326,10 @@ mod sys {
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), tail, tail_len);
         sys_icache_invalidate(base, code_len);
-        let sealed = mprotect(base, code_len, 0x1 | 0x4) == 0;
+        // XNU refuses mprotect on MAP_JIT pages (EACCES); W^X for them is the
+        // per-thread write-protect switch, which every new thread starts with on.
         pthread_jit_write_protect_np(1);
-        sealed
+        true
     }
 
     pub unsafe fn free_native_image(mem: *mut u8, len: usize) {
