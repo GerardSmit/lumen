@@ -374,16 +374,24 @@ fn start_thread(
     kill: Arc<AtomicBool>,
     wake: WakeSlot,
 ) -> std::io::Result<()> {
-    std::thread::Builder::new()
-        .name(name)
-        // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug
-        // build's frames overflow the 2 MiB default long before the depth guard trips.
-        .stack_size(lumen::THREAD_STACK_SIZE)
-        .spawn(move || {
-            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
-            run_worker(spec, stop, kill, wake);
-        })
+    // Same reasoning as the CLI's main thread: the engine recurses natively, and a debug build's
+    // frames overflow the 2 MiB default long before the depth guard trips.
+    let mut thread = lumen_os::sched::ThreadSpec::new(name, lumen_os::sched::Purpose::Engine);
+    thread.stack_bytes = lumen::THREAD_STACK_SIZE;
+    lumen_os::sched::current()
+        .spawn_thread(
+            thread,
+            Box::new(move |start| {
+                let stack = match start.stack_bytes {
+                    0 => lumen::THREAD_STACK_SIZE,
+                    bytes => bytes,
+                };
+                lumen::set_thread_stack_size(stack);
+                run_worker(spec, stop, kill, wake);
+            }),
+        )
         .map(|_| ())
+        .map_err(std::io::Error::other)
 }
 
 /// The backend `lumen_host::workers` runs over in this runtime: one OS thread and one `Runtime`

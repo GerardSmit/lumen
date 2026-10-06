@@ -176,7 +176,7 @@ fn resource_table_roundtrip() {
 #[test]
 fn threadpool_completions_arrive() {
     let (tx, rx) = std::sync::mpsc::channel();
-    let pool = ThreadPool::new(4, tx);
+    let pool = ThreadPool::new(tx);
     for id in 0..16u64 {
         pool.spawn_blocking(id, move || {
             Box::new(id * 2) as Box<dyn std::any::Any + Send>
@@ -189,7 +189,44 @@ fn threadpool_completions_arrive() {
     }
     assert_eq!(seen.len(), 16);
     assert!((0..16).all(|id| seen[&id] == id * 2));
-    drop(pool); // joins workers; must not deadlock
+    drop(pool); // waits for pending tasks; must not deadlock
+}
+
+#[test]
+fn threadpool_drop_waits_for_pending_without_polling() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let pool = ThreadPool::new(tx);
+    let started = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    {
+        let (started, finished) = (started.clone(), finished.clone());
+        pool.spawn_blocking(1, move || {
+            started.store(true, Ordering::SeqCst);
+            go_rx.recv().unwrap();
+            finished.store(true, Ordering::SeqCst);
+            Box::new(()) as Box<dyn std::any::Any + Send>
+        });
+    }
+    while !started.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    assert_eq!(pool.pending(), 1);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        go_tx.send(()).unwrap();
+    });
+    let begin = Instant::now();
+    drop(pool);
+    let waited = begin.elapsed();
+    assert!(finished.load(Ordering::SeqCst), "drop returned before the task finished");
+    assert!(waited >= Duration::from_millis(40), "drop did not wait: {waited:?}");
+    assert!(waited < Duration::from_millis(400), "drop overshot the task: {waited:?}");
+    release.join().unwrap();
 }
 
 mod owner_loop_tests {

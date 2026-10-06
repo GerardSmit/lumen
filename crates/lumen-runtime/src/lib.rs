@@ -233,9 +233,6 @@ pub(crate) struct WorkerEmbedding {
     tree: Arc<child_realm::RealmTree>,
 }
 
-/// Workers for blocking work. libuv's default; revisit when async fs lands and has numbers.
-const POOL_SIZE: usize = 4;
-
 /// Bring source text read from disk into the engine's string encoding. The engine stores a lone
 /// surrogate as a plane-16 private-use scalar (U+10F800..=U+10FFFF) and a *real* character in that
 /// range as the corresponding smuggled surrogate pair; text decoded from UTF-8 can hold such a real
@@ -494,7 +491,7 @@ impl Runtime {
         lumen_host::perf::start_clock();
         lumen_host::perf::mark(lumen_host::perf::Milestone::NodeStart);
         let (tx, rx) = mpsc::channel();
-        let pool = ThreadPool::new(POOL_SIZE, tx.clone());
+        let pool = ThreadPool::new(tx.clone());
         lumen::set_tail_calls(false);
         let mut engine = Engine::new();
         engine.set_jsx_options_loader(|filename, defaults| {
@@ -886,7 +883,7 @@ impl Runtime {
         result
     }
 
-    /// Schedule blocking resource work on this runtime's existing bounded host pool. The job
+    /// Schedule blocking resource work on the process scheduler's shared blocking pool. The job
     /// must return its result through a channel owned by the embedder; it never touches the
     /// runtime's JavaScript engine from the worker thread.
     pub fn spawn_blocking_detached(&self, job: impl FnOnce() + Send + 'static) {

@@ -3717,7 +3717,7 @@ fn perf_boot_breakdown() {
     let mut totals = vec![Vec::new(); names.len()];
     for _ in 0..30 {
         let (tx, _rx) = std::sync::mpsc::channel();
-        let pool = ThreadPool::new(4, tx);
+        let pool = ThreadPool::new(tx);
         let mut engine = lumen_host::Engine::new();
         engine.ctx().op_state().put(pool.handle());
         engine.ctx().op_state().put(TaskRegistry::default());

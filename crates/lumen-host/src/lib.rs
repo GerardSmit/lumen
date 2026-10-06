@@ -657,69 +657,80 @@ impl CallbackQueue {
     }
 }
 
-enum Task {
-    /// Work whose result goes back to the loop as a [`TaskCompletion`] tagged `id`.
-    Tracked {
-        id: TaskId,
-        work: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
-    },
-    /// Work that reports back by itself (an async op's job holds a `Completer`).
-    Detached(Box<dyn FnOnce() + Send>),
-}
-
-/// A fixed pool of std worker threads running blocking work (`std::fs`, blocking
-/// `std::net`); completions come back over the `mpsc` channel given at construction. This is
-/// the whole async-I/O story until (if ever) a hand-rolled readiness reactor on raw platform
-/// syscalls is explicitly authorized — never via a crate.
+/// Runs blocking work on the process scheduler's shared pool (`std::fs`, blocking `std::net`);
+/// completions come back over the `mpsc` channel given at construction. The pool owns no
+/// threads: this adapter keeps the runtime's own accounting (what it has in flight, so dropping
+/// it can wait for exactly its tasks) and the [`TaskCompletion`] wrapping. Work that blocks for an
+/// unbounded time belongs on a dedicated thread ([`CompletionSender::run_blocking`]), never here.
 pub struct ThreadPool {
     shared: std::sync::Arc<PoolShared>,
 }
 
-/// State shared by the pool and its spawn handles. Worker threads are created by the first
-/// submission, so a runtime that never runs blocking work never starts any.
 struct PoolShared {
-    size: usize,
     completions: mpsc::Sender<TaskCompletion>,
     /// Tasks submitted and not yet finished (queued or running).
-    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    state: std::sync::Mutex<PoolState>,
+    pending: std::sync::atomic::AtomicUsize,
+    closed: std::sync::atomic::AtomicBool,
+    /// Set by a dropping pool that is waiting for `pending` to reach zero.
+    drain: std::sync::Mutex<Option<std::sync::Arc<dyn lumen_os::sched::Unpark>>>,
 }
 
-enum PoolState {
-    Idle,
-    Running {
-        work_tx: mpsc::Sender<Task>,
-        workers: Vec<std::thread::JoinHandle<()>>,
-    },
-    Closed,
+/// Counts one task against its pool for as long as it is queued or running, including when the
+/// work panics.
+struct PendingTask(std::sync::Arc<PoolShared>);
+
+impl Drop for PendingTask {
+    fn drop(&mut self) {
+        let before = self
+            .0
+            .pending
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if before == 1 {
+            let drain = self.0.drain.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(drain) = drain {
+                drain.unpark();
+            }
+        }
+    }
 }
 
-/// Spawn a host thread with the engine's thread stack size: work run here may call back into an
-/// engine (or run one), whose recursion is sized for it.
+/// Spawn a host thread through the process scheduler with the engine's thread stack size: work
+/// run here may call back into an engine (or run one), whose recursion is sized for it. Detached
+/// when the handle is dropped.
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_thread<F: FnOnce() + Send + 'static>(f: F) -> std::thread::JoinHandle<()> {
-    std::thread::Builder::new()
-        .stack_size(lumen::THREAD_STACK_SIZE)
-        .spawn(move || {
-            lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
+pub fn spawn_thread<F: FnOnce() + Send + 'static>(
+    name: &'static str,
+    purpose: lumen_os::sched::Purpose,
+    f: F,
+) -> Result<lumen_os::sched::ThreadHandle, lumen_os::sched::SchedError> {
+    let mut spec = lumen_os::sched::ThreadSpec::new(name, purpose);
+    spec.stack_bytes = lumen::THREAD_STACK_SIZE;
+    lumen_os::sched::current().spawn_thread(
+        spec,
+        Box::new(move |start| {
+            let stack = if start.stack_bytes > 0 {
+                start.stack_bytes
+            } else {
+                lumen::THREAD_STACK_SIZE
+            };
+            lumen::set_thread_stack_size(stack);
             f()
-        })
-        .expect("spawn host thread")
+        }),
+    )
 }
 
 impl ThreadPool {
-    /// Up to `size` worker threads, started on the first submitted job, sending
-    /// [`TaskCompletion`]s to `completions` (the loop thread holds the receiving end).
+    /// Sends [`TaskCompletion`]s to `completions` (the loop thread holds the receiving end).
     ///
-    /// On `wasm32` there are no threads: the pool has no workers and runs each job inline on the
-    /// calling (loop) thread, delivering its completion on the same channel.
-    pub fn new(size: usize, completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
+    /// Where the scheduler has no pool (`wasm32`), each job runs inline on the calling (loop)
+    /// thread, delivering its completion on the same channel.
+    pub fn new(completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
         ThreadPool {
             shared: std::sync::Arc::new(PoolShared {
-                size,
                 completions,
                 pending: Default::default(),
-                state: std::sync::Mutex::new(PoolState::Idle),
+                closed: Default::default(),
+                drain: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -742,70 +753,28 @@ impl ThreadPool {
         }
     }
 
-    /// Whether any worker thread has been started.
-    pub fn started(&self) -> bool {
-        matches!(
-            *self.shared.state.lock().expect("pool state poisoned"),
-            PoolState::Running { .. }
-        )
+    /// Tasks submitted and not yet finished.
+    pub fn pending(&self) -> usize {
+        self.shared.pending.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
 impl PoolShared {
-    #[cfg(not(target_arch = "wasm32"))]
-    fn start(&self) -> (mpsc::Sender<Task>, Vec<std::thread::JoinHandle<()>>) {
-        let (work_tx, work_rx) = mpsc::channel::<Task>();
-        // std's mpsc receiver is single-consumer: share it across workers behind a mutex.
-        let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
-        let workers = (0..self.size.max(1))
-            .map(|_| {
-                let work_rx = std::sync::Arc::clone(&work_rx);
-                let completions = self.completions.clone();
-                let pending = std::sync::Arc::clone(&self.pending);
-                spawn_thread(move || loop {
-                    let task = match work_rx.lock().expect("worker queue poisoned").recv() {
-                        Ok(t) => t,
-                        Err(_) => return, // pool dropped: no more work
-                    };
-                    match task {
-                        Task::Tracked { id, work } => {
-                            let result = work();
-                            // The loop shutting down first is fine; the result just has nowhere
-                            // to go.
-                            let _ = completions.send(TaskCompletion { task: id, result });
-                        }
-                        Task::Detached(job) => job(),
-                    }
-                    pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-            .collect();
-        (work_tx, workers)
-    }
-
-    /// Queue `task`, starting the workers if this is the first submission. `Err` hands the task
-    /// back when the pool is closed or has no threads (`wasm32`).
-    fn submit(&self, task: Task) -> Result<(), Task> {
-        #[cfg(target_arch = "wasm32")]
-        {
-            return Err(task);
+    /// Run `work` on the scheduler's pool, or inline when it has none. Dropped when the pool has
+    /// been closed.
+    fn submit(self: &std::sync::Arc<Self>, work: Box<dyn FnOnce() + Send>) {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let mut state = self.state.lock().expect("pool state poisoned");
-            if matches!(*state, PoolState::Idle) {
-                let (work_tx, workers) = self.start();
-                *state = PoolState::Running { work_tx, workers };
-            }
-            match &*state {
-                PoolState::Running { work_tx, .. } => {
-                    self.pending
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    work_tx.send(task).expect("worker threads gone");
-                    Ok(())
-                }
-                _ => Err(task),
-            }
+        self.pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let task = PendingTask(std::sync::Arc::clone(self));
+        let job: lumen_os::sched::Job = Box::new(move || {
+            let _task = task;
+            work();
+        });
+        if let Err(job) = lumen_os::sched::current().spawn_blocking(job) {
+            job();
         }
     }
 }
@@ -823,29 +792,18 @@ impl SpawnHandle {
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
-        let task = Task::Tracked {
-            id,
-            work: Box::new(work),
-        };
-        if let Err(Task::Tracked { id, work }) = self.shared.submit(task) {
-            if cfg!(target_arch = "wasm32") {
-                let result = work();
-                let _ = self
-                    .shared
-                    .completions
-                    .send(TaskCompletion { task: id, result });
-            }
-        }
+        let completions = self.shared.completions.clone();
+        self.shared.submit(Box::new(move || {
+            let result = work();
+            // The loop shutting down first is fine; the result just has nowhere to go.
+            let _ = completions.send(TaskCompletion { task: id, result });
+        }));
     }
 
     /// Run `job` on a pool thread; it reports back by itself (e.g. through a
     /// [`lumen::embed::Completer`]), so no completion is sent for it.
     pub fn spawn_detached(&self, job: Box<dyn FnOnce() + Send>) {
-        if let Err(Task::Detached(job)) = self.shared.submit(Task::Detached(job)) {
-            if cfg!(target_arch = "wasm32") {
-                job();
-            }
-        }
+        self.shared.submit(job);
     }
 }
 
@@ -903,7 +861,8 @@ impl CompletionSender {
         #[cfg(target_arch = "wasm32")]
         run();
         #[cfg(not(target_arch = "wasm32"))]
-        spawn_thread(run);
+        spawn_thread("lumen-blocking-io", lumen_os::sched::Purpose::Blocking, run)
+            .expect("spawn host thread");
     }
 
     /// Deliver a completion from any thread (an I/O callback, a readiness thread).
@@ -945,7 +904,8 @@ impl lumen::embed::AsyncHost for LoopAsyncHost {
     fn spawn(&self, job: Box<dyn FnOnce() + Send>, dedicated: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         if dedicated {
-            spawn_thread(job);
+            spawn_thread("lumen-blocking-io", lumen_os::sched::Purpose::Blocking, job)
+                .expect("spawn host thread");
             return;
         }
         #[cfg(target_arch = "wasm32")]
@@ -1146,31 +1106,26 @@ const POOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(5
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Closing the work channel ends each worker's recv loop. Normally the workers are joined
-        // so none outlives the runtime that owns the completion receiver; a task stuck in a
+        // No task may outlive the runtime that owns the completion receiver. A task stuck in a
         // blocking call (a read that never returns) must not hold the drop hostage, so after a
-        // grace period the workers are detached and exit when that call does.
-        let state = std::mem::replace(
-            &mut *self.shared.state.lock().expect("pool state poisoned"),
-            PoolState::Closed,
-        );
-        let PoolState::Running { work_tx, workers } = state else {
+        // grace period it is left to finish on its own; its completion then has nowhere to go.
+        use std::sync::atomic::Ordering::SeqCst;
+        let shared = &self.shared;
+        shared.closed.store(true, SeqCst);
+        if shared.pending.load(SeqCst) == 0 {
+            return;
+        }
+        let Ok(parker) = lumen_os::sched::current().parker() else {
             return;
         };
-        drop(work_tx);
-        let pending = &self.shared.pending;
+        *shared.drain.lock().unwrap_or_else(|e| e.into_inner()) = Some(parker.clone().unparker());
         let give_up = std::time::Instant::now() + POOL_DRAIN_GRACE;
-        while pending.load(std::sync::atomic::Ordering::SeqCst) > 0
-            && std::time::Instant::now() < give_up
-        {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        let stuck = pending.load(std::sync::atomic::Ordering::SeqCst) > 0;
-        for w in workers {
-            if !stuck || w.is_finished() {
-                let _ = w.join();
+        while shared.pending.load(SeqCst) > 0 {
+            if parker.park(Some(give_up)) == lumen_os::sched::Woke::TimedOut {
+                break;
             }
         }
+        *shared.drain.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
