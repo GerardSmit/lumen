@@ -315,7 +315,7 @@ fn thrown(value: Value) -> OpError {
     OpError::thrown(value)
 }
 
-fn define_data(
+pub(crate) fn define_data(
     ctx: &mut Ctx,
     target: &Value,
     key: &str,

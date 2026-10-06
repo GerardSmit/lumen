@@ -179,8 +179,6 @@ pub(crate) mod websocket {
     #[derive(Default)]
     pub(crate) struct WsRegistry;
 
-    pub(crate) use bindings::Module;
-
     /// Open a browser `WebSocket`; the host pushes `open` / `text` / `binary` / `close` / `error`
     /// events for the returned id into `dispatch`.
     pub(crate) fn connect_socket(
@@ -250,33 +248,6 @@ pub(crate) mod websocket {
             r.cancel(id);
         }
     }
-
-    #[lumen_bind::module(name = "__ws")]
-    pub(crate) mod bindings {
-        use super::*;
-
-        /// `__ws.send(id, stringOrBytes)` -> whether the host accepted it.
-        #[op]
-        fn send(ctx: &mut Ctx, id: f64, data: Value) -> Result<bool, OpError> {
-            let id = id as u64;
-            if let Some(bytes) = ctx.typed_array_bytes(&data) {
-                return Ok(send_frame(ctx, id, Outgoing::Binary(&bytes))?);
-            }
-            let text = ctx.coerce_string(&data)?;
-            Ok(send_frame(ctx, id, Outgoing::Text(&text))?)
-        }
-
-        /// `__ws.close(id, code, reason)`.
-        #[op(coerce)]
-        fn close(ctx: &mut Ctx, id: f64, code: Option<f64>, reason: String) {
-            close_socket(ctx, id as u64, code.map_or(1000, |n| n as u16), &reason);
-        }
-
-        #[op]
-        fn upgrade(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
-            Err(unsupported("Accepting WebSocket connections"))
-        }
-    }
 }
 
 pub(crate) mod server {
@@ -287,26 +258,31 @@ pub(crate) mod server {
 
     pub(crate) use bindings::Module;
 
-    #[lumen_bind::module(name = "__http_server")]
+    #[lumen_bind::module(name = "Lumen")]
     pub(crate) mod bindings {
         use super::*;
 
-        #[op]
-        fn listen(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
+        #[op(hint(js(webidl)))]
+        fn serve(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
             Err(unsupported("Lumen.serve"))
         }
 
-        #[op]
-        fn respond(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
-            Err(unsupported("Lumen.serve"))
+        #[op(name = "upgradeWebSocket", hint(js(webidl)))]
+        fn upgrade_websocket(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
+            Err(unsupported("Lumen.upgradeWebSocket"))
         }
 
-        #[op]
-        fn close(#[varargs] _args: &[Value]) {}
-
-        #[op]
-        fn version() -> String {
-            env!("CARGO_PKG_VERSION").to_string()
+        #[init]
+        fn init(ctx: &mut Ctx, target: &Value) -> Result<(), Value> {
+            crate::wasm_ops::define_data(
+                ctx,
+                target,
+                "version",
+                Value::str(env!("CARGO_PKG_VERSION")),
+                false,
+                true,
+                true,
+            )
         }
     }
 }

@@ -190,6 +190,11 @@ impl Body {
         }
     }
 
+    /// Whether the body is in memory and has no bytes.
+    pub(crate) fn is_empty_bytes(&self) -> bool {
+        matches!(&self.source, Source::Bytes(bytes) if bytes.is_empty())
+    }
+
     pub(crate) fn bytes(bytes: Vec<u8>) -> Body {
         Body {
             source: Source::Bytes(Rc::new(bytes)),

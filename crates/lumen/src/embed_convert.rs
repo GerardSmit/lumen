@@ -4047,6 +4047,15 @@ fn register_op(i: &mut Interp, f: &FnItem<JsHost>) {
 
 /// Binding-layer methods on the native-function context.
 impl Interp {
+    /// Run `on_ok(value)` or `on_err(reason)` once `value` (any value, a thenable is adopted) has
+    /// settled, like `await value`, through the engine's own promise machinery. The reaction runs
+    /// in a microtask even for a plain value.
+    pub fn then_value(&mut self, value: Value, on_ok: Value, on_err: Value) {
+        let promise = self.new_promise();
+        self.resolve_promise(&promise, value);
+        self.promise_then(&promise, on_ok, on_err);
+    }
+
     pub fn weak_value(&self, value: &Value) -> Option<WeakValue> {
         match value {
             Value::Obj(object) => Some(WeakValue(Gc::downgrade(object))),

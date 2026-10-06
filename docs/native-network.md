@@ -126,7 +126,7 @@ lengths, `Headers` iterator).
   `set-cookie`, which stays one entry per value (`getSetCookie`). Guards: none, `request`,
   `request-no-cors`, `response`, `immutable`. Request guards apply only when the transport reports
   a `browserOrigin` (a context whose policy Lumen applies); forbidden names are dropped
-  silently. The `response` guard drops `set-cookie`. `immutable` throws `TypeError`.
+  silently. The `response` guard (browsing context only; otherwise constructed responses are unguarded) drops `set-cookie`. `immutable` throws `TypeError`.
 - **Bodies.** `Source` is `Null`, shared `Bytes`, a transport `Net` body or a `Stream`. Strings,
   buffers, `Blob`, `FormData` and `URLSearchParams` go through `extract_body`. A `ReadableStream`
   is created lazily (`new ReadableStream({type: 'bytes'})` from the global) so `new Response('x')`
@@ -149,7 +149,7 @@ lengths, `Headers` iterator).
 
 - Methods are normalised only for `DELETE GET HEAD OPTIONS POST PUT`; `patch` stays lowercase.
 - Forbidden request headers are dropped at `Headers`/`Request` construction in a browsing
-  context, not at send time. The `response` guard drops `set-cookie`.
+  context, not at send time. The `response` guard drops `set-cookie` in a browsing context only.
 - `Headers.getSetCookie()` exists; `new Headers(null)` and non-object inits throw `TypeError`.
 - `request.signal` is not the object passed as `init.signal`.
 - Added attributes: `cache`, `referrer`, `referrerPolicy`, `integrity`, `keepalive`,
@@ -161,7 +161,61 @@ lengths, `Headers` iterator).
   abort and timeout reject with `DOMException`.
 - `body::to_text` converts to USVString, which also affects XHR string bodies.
 
+## Lumen.serve
+
+`Lumen.serve`, `Lumen.upgradeWebSocket` and `Lumen.version` are one `lumen_bind` module named
+`Lumen` (`lumen-web/src/server.rs`; `js/server.js` and the raw `__http_server` and `__ws`
+namespaces are gone). The extension installs it eagerly on the realm's `Lumen` object (created
+when absent, so the parallel glue still finds it); `serve` and `upgradeWebSocket` are enumerable
+operations and `version` is a read-only, enumerable, configurable data property. On `wasm32` the
+same module exists and the operations throw `unsupported`.
+
+- **Requests.** The accept decoder builds the `Request` natively (`net::server_request`: method
+  checks of the `Request` constructor, URL without credentials, the wire's headers under no guard,
+  a bytes body for non-`GET`/`HEAD` requests with a body) and calls the handler directly with
+  `(request, info)`. The connection id lives in a native private slot of the `Request`, not in a
+  script-visible symbol property.
+- **Responses.** The handler's result is awaited with `Ctx::then_value`, then read natively:
+  `net::served_response` (status, status text, headers as iteration yields them) and
+  `net::read_served_body` (the body drain of `fetch_body`; a missing, used, locked or failing body
+  reads as empty). A value that is not a `Response`, or a status outside 100..=599, is a handler
+  error. `onError` (also awaited) produces the response, else the error is logged with
+  `console.error` and the answer is a 500 with `Internal Server Error` (`text/plain;charset=UTF-8`);
+  if `onError` throws or returns a non-`Response`, the answer is that 500.
+- **WebSocket upgrade.** `upgradeWebSocket` adopts the socket with `websocket::adopt_connection`
+  (the same registry and read loop as the `WebSocket` client, unmasked frames) and returns the
+  handle `{remoteAddress, onmessage, onclose, send(data) -> bool, close(code?, reason?)}`. The
+  transport reports to a native dispatch function that reads `onmessage` / `onclose` from the
+  handle when an event arrives; `onclose` fires once for a close frame, a protocol failure
+  (`1006`-style) or a dead socket. The handle is held by that dispatch function for as long as the
+  socket is registered.
+- **GC.** A server entry holds the handler and `onError` until the listener stops (`shutdown`,
+  `AbortSignal` or realm teardown). Requests and responses are ordinary native identity owners and
+  are collectable once the answer has been written; no per-request state outlives the write.
+
+### Server behavior changes
+
+- Constructed `Response` headers follow the `response` guard only in a browsing context; outside
+  one (Node, Bun, `Lumen.serve` handlers) they are unguarded, so a `Set-Cookie` header on a
+  `Response` returned from a handler is kept and written as one header line per value. Responses
+  filtered from the network (`basic`/`cors`) still hide it.
+- `new Response("", { status: 204 })` (an empty body with a null body status) is accepted outside a
+  browsing context and has no body, as in Bun; a non-empty body still throws `TypeError`, and a
+  browsing context throws for any body.
+- Answers to `HEAD` keep the headers (and `Content-Length`, when computed) of the `GET` answer and
+  write no body. `1xx`, `204` and `304` answers write no `Content-Length` and no body.
+- Upgraded server sockets poll their reads (100 ms timeout, like the client end) so that
+  `send`/`close` from the loop thread never wait on a blocked read.
+- The handler receives a request whose header list is the wire's (invalid pairs are skipped
+  instead of failing the request); a request that is rejected by the `Request` rules (a forbidden
+  method such as `TRACE`, a URL with credentials) goes through `onError`, as before.
+- `await`ing a handler result uses the engine's promise machinery, so a patched
+  `Promise.prototype.then` no longer sees it.
+- A request object used after its connection was answered or upgraded throws a `TypeError`
+  (`upgrade: unknown or already-answered connection`); it used to report an already-upgraded
+  connection as such.
+- `Lumen.serve` throws `RangeError` for a `port` outside 0..65535.
+
 ## Still JavaScript
 
-`server.js` (it
-uses `__ws.upgrade/send/close`), `service_worker.js` and `shared_worker.js`.
+`service_worker.js` and `shared_worker.js`.

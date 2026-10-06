@@ -32,7 +32,10 @@ pub use lumen_common::cors::{Credentials, Mode, Redirect};
 pub use transport::{
     cancel_reader, read_chunk, Failure, ResponseBody, SyncRequest, SyncResponse, Transport,
 };
-pub use fetch::bindings as fetch_bindings;
+pub use fetch::{
+    bindings as fetch_bindings, headers_entries, read_served_body, request_header, server_request,
+    served_response, ServedResponse,
+};
 pub use xhr::bindings;
 
 /// A `DOMException` of the given name as an error to throw.

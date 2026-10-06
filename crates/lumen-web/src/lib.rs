@@ -746,8 +746,7 @@ pub fn extension() -> Extension {
             install_transport,
             lumen_host::lazy_globals::<lumen_host::net::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::net::fetch_bindings::Module>,
-            lumen_host::namespace::<server::Module>,
-            lumen_host::namespace::<websocket::Module>,
+            install_lumen,
             lumen_host::lazy_globals::<websocket_class::bindings::Module>,
             lumen_host::lazy_globals::<eventsource_class::bindings::Module>,
             wasm_ops::install,
@@ -792,6 +791,18 @@ fn install_transport(ctx: &mut Ctx) -> Result<(), Value> {
     let policy = ctx.member_get(&global, "__http_policy")?;
     lumen_host::net::Transport::install(ctx, http, policy.clone(), policy);
     Ok(())
+}
+
+/// Publish `Lumen.serve`, `Lumen.upgradeWebSocket` and `Lumen.version` on the realm's `Lumen`
+/// object, creating it when no earlier provider did.
+fn install_lumen(ctx: &mut Ctx) -> Result<(), Value> {
+    let global = ctx.global_object();
+    let mut lumen = ctx.member_get(&global, "Lumen")?;
+    if !matches!(lumen, Value::Obj(_)) {
+        lumen = Value::Obj(ctx.new_object());
+        ctx.member_set(&global, "Lumen", lumen.clone())?;
+    }
+    ctx.install_module::<server::Module>(&lumen)
 }
 
 fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {

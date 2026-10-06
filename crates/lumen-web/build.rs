@@ -42,11 +42,6 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["server.js"],
-        lazy: false,
-        defined: &[],
-    },
-    Unit {
         files: &["navigator.js"],
         lazy: false,
         defined: &[],

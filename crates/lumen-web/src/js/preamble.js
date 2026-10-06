@@ -3,10 +3,8 @@
 "use strict";
 const __url = globalThis.__url;
 const __http = globalThis.__http;
-const __ws = globalThis.__ws;
 delete globalThis.__url;
 delete globalThis.__http;
-delete globalThis.__ws;
 
 // Capture descriptor intrinsics before author code can replace them. Lazy unit
 // publication inspects properties without invoking a host/author getter or setter.

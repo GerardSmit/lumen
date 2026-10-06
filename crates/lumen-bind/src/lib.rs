@@ -129,6 +129,9 @@
 //! - `Ctx::allocate_native_private_slot_name` / `define_native_private_value_slot` /
 //!   `native_private_value_slot` hold a JS value on an instance, traced from the wrapper and
 //!   invisible to script (`CustomEvent.detail`, `AbortController.signal`).
+//! - `Ctx::then_value(value, on_ok, on_err)` reacts to any value the way `await value` does (a
+//!   thenable is adopted) through the engine's own promise machinery, with native closures from
+//!   `Ctx::new_native_fn` as the reactions (`Lumen.serve` awaits its handler this way).
 //! - `Ctx::freeze_native_object(value)` freezes an object without consulting globals (the frozen,
 //!   null-prototype `WebAssembly.Instance.exports`).
 //!

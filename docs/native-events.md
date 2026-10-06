@@ -170,5 +170,8 @@ object. The native core:
   `AbortStep::Owned`, pruned on each registration), and `Request.signal` is a signal that
   `follow_signal`s the one passed in.
 - `wasm.js` is gone: the `WebAssembly` namespace is native ([native-wasm.md](native-wasm.md)).
+- `server.js` is gone: `Lumen.serve`, `Lumen.upgradeWebSocket` and `Lumen.version` are native
+  ([native-network.md](native-network.md)), with the raw `__http_server` and `__ws` namespaces
+  removed; `lumen-web`'s `build.rs` drops the unit.
 - Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
   [native-messaging.md](native-messaging.md).

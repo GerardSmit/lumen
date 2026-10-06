@@ -497,8 +497,23 @@ fn build_response(
             text
         }
     };
-    let headers = HeadersData::shared(Guard::Response);
+    // Forbidden response header names only apply to responses a browsing context's script sees;
+    // a server builds `Set-Cookie` itself.
+    let guard = if browsing_context(ctx) { Guard::Response } else { Guard::None };
+    let headers = HeadersData::shared(guard);
     fill(ctx, &headers, &init_headers, existing_headers)?;
+    let supplied = match supplied {
+        // Servers outside a browsing context (Bun, Lumen.serve handlers) write
+        // `new Response("", { status: 204 })`; an empty body of a null body status is no body.
+        Some((body, _))
+            if NULL_BODY_STATUSES.contains(&status)
+                && body.is_empty_bytes()
+                && !browsing_context(ctx) =>
+        {
+            None
+        }
+        other => other,
+    };
     let body = match supplied {
         Some((body, content_type)) => {
             if NULL_BODY_STATUSES.contains(&status) {
@@ -809,6 +824,108 @@ fn headers_object(
     let object = ctx.new_instance(bindings::Headers { data });
     store(ctx, object.clone())?;
     Ok(object)
+}
+
+/// A `Request` as an HTTP server receives it: the headers are the wire's, whatever the realm's
+/// guard rules, and the body is the bytes read from the socket (`GET` and `HEAD` have none).
+pub fn server_request(
+    ctx: &mut Ctx,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> OpResult<Value> {
+    if !super::is_token(method) {
+        return Err(OpError::type_error(format!("'{method}' is not a valid HTTP method.")));
+    }
+    if FORBIDDEN_METHODS.contains(&method.to_ascii_uppercase().as_str()) {
+        return Err(OpError::type_error(format!("'{method}' HTTP method is unsupported.")));
+    }
+    let method = normalize_method(method);
+    let parsed = lumen_common::url::parse(url, None)
+        .map_err(|_| OpError::type_error(format!("Failed to parse URL from {url}")))?;
+    if !parsed.username.is_empty() || !parsed.password.is_empty() {
+        return Err(OpError::type_error(
+            "Request cannot be constructed from a URL that includes credentials",
+        ));
+    }
+    let body = if body.is_empty() || matches!(method.as_str(), "GET" | "HEAD") {
+        Body::null()
+    } else {
+        Body::bytes(body)
+    };
+    new_request(
+        ctx,
+        bindings::Request {
+            method,
+            url: parsed.href(),
+            headers: Rc::new(RefCell::new(HeadersData::from_pairs(headers, Guard::None))),
+            headers_value: RefCell::new(None),
+            signal_source: None,
+            signal: RefCell::new(None),
+            follow: RefCell::new(None),
+            body: body.cell(),
+            mode: Mode::Cors,
+            credentials: Credentials::SameOrigin,
+            redirect: Redirect::Follow,
+            extra: Extra::default(),
+        },
+    )
+}
+
+/// The combined value of header `name` of a `Request`, `None` for another value or no header.
+pub fn request_header(ctx: &mut Ctx, request: &Value, name: &str) -> Option<String> {
+    ctx.with_instance::<bindings::Request, _>(request, |request| {
+        request.headers.borrow().value_of(&name.to_ascii_lowercase())
+    })
+    .ok()
+    .flatten()
+}
+
+/// The entries of a `Headers` object as iteration yields them, `None` for another value.
+pub fn headers_entries(ctx: &mut Ctx, headers: &Value) -> Option<Vec<(String, String)>> {
+    ctx.with_instance::<bindings::Headers, _>(headers, |headers| {
+        headers.data.borrow().sorted_combined()
+    })
+    .ok()
+}
+
+/// The status line and headers of a `Response`, as a server writes them.
+pub struct ServedResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub headers: Vec<(String, String)>,
+}
+
+/// The head of `response`, `None` when it is not a `Response`.
+pub fn served_response(ctx: &mut Ctx, response: &Value) -> Option<ServedResponse> {
+    ctx.with_instance::<bindings::Response, _>(response, |response| ServedResponse {
+        status: response.status,
+        status_text: response.status_text.clone(),
+        headers: response.headers.borrow().sorted_combined(),
+    })
+    .ok()
+}
+
+/// Read the body of a `Response` to its end for a server to write. A body that is missing, was
+/// already used or is locked, or whose stream fails, reads as empty. `done` may run before this
+/// returns when the bytes are in memory.
+pub fn read_served_body(
+    ctx: &mut Ctx,
+    response: &Value,
+    done: Box<dyn FnOnce(&mut Ctx, Vec<u8>)>,
+) {
+    let body = ctx
+        .with_instance::<bindings::Response, _>(response, |response| response.body.clone())
+        .ok();
+    let Some(body) = body.filter(|body| !is_null(body) && !unusable(ctx, body)) else {
+        return done(ctx, Vec::new());
+    };
+    read_all(
+        ctx,
+        &body,
+        Box::new(move |ctx, result| done(ctx, result.unwrap_or_default())),
+    );
 }
 
 fn rejected(ctx: &mut Ctx, error: OpError) -> Value {

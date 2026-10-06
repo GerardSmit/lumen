@@ -1,6 +1,6 @@
 //! WebSocket (RFC 6455) over plain TCP or verified TLS: a *client* (the upgrade sibling of the fetch
 //! client in `http.rs`, driving the native `WebSocket` class in `websocket_class.rs`) plus a *server-side
-//! adopt* (`op_ws_upgrade`), which takes a connection accepted by the HTTP server in `server.rs`,
+//! adopt* (`adopt_connection`), which takes a connection accepted by the HTTP server in `server.rs`,
 //! answers the 101 handshake, and runs it through the same registry/read-loop with unmasked
 //! outgoing frames — backing `Lumen.upgradeWebSocket` and Bun.serve's `websocket` option.
 //!
@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use lumen_bind::NativeError;
-use lumen_host::{Ctx, OpError, SpawnHandle, Value};
+use lumen_host::{Ctx, SpawnHandle, Value};
 
 use crate::url;
 use crate::websocket_class::Outgoing;
@@ -35,6 +35,8 @@ use lumen_common::hash::{digest, Algo};
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Bound reads/writes so a dead peer can't pin a pool worker (reads) or the loop (writes).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a read holds the stream lock before releasing it for a send; the read then retries.
+const READ_POLL: Duration = Duration::from_millis(100);
 /// Message size cap (mirrors the HTTP body cap); exceeding it fails the connection with 1009.
 const MAX_MESSAGE: usize = 32 << 20;
 
@@ -90,7 +92,7 @@ pub(crate) fn encode_frame(opcode: u8, payload: &[u8], mask: [u8; 4]) -> Vec<u8>
 }
 
 /// Encode one UNMASKED frame — the server side of the wire (a server MUST NOT mask, RFC 6455
-/// §5.1). Used by connections adopted via `op_ws_upgrade` (`Lumen.serve` → WebSocket handoff).
+/// §5.1). Used by connections adopted via `adopt_connection` (`Lumen.serve` → WebSocket handoff).
 pub(crate) fn encode_frame_unmasked(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 10);
     out.push(0x80 | (opcode & 0x0f)); // FIN + opcode
@@ -352,124 +354,95 @@ fn ws_registry(ctx: &mut Ctx) -> &mut WsRegistry {
         .expect("web installs WsRegistry")
 }
 
-pub(crate) use bindings::Module;
-
-#[lumen_bind::module(name = "__ws")]
-mod bindings {
-    use super::*;
-
-    /// `__ws.send(id, stringOrBytes)` - encodes and writes one data frame on the loop thread.
-    #[op]
-    fn send(ctx: &mut Ctx, id: f64, data: Value) -> Result<bool, OpError> {
-        let id = id as u64;
-        if let Some(bytes) = ctx.typed_array_bytes(&data) {
-            return Ok(send_frame(ctx, id, Outgoing::Binary(&bytes))?);
-        }
-        let text = ctx.coerce_string(&data)?;
-        Ok(send_frame(ctx, id, Outgoing::Text(&text))?)
+/// Adopts a connection accepted by `Lumen.serve` (see server.rs: the parsed request's `TcpStream`
+/// sits in the resource table under `conn_id`) as a SERVER-side WebSocket: writes the RFC 6455 101
+/// handshake response, then joins the same registry/read-loop machinery the client uses - with
+/// `masked: false`, since a server must not mask (§5.1). `dispatch(kind, ...)` receives
+/// `("text", string)`, `("binary", u8array)`, `("close", code, reason, wasClean)`,
+/// `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died). There is no
+/// "open" event: the connection is open the moment this returns. Returns the socket's id.
+pub(crate) fn adopt_connection(
+    ctx: &mut Ctx,
+    conn_id: u32,
+    key: &str,
+    protocol: &str,
+    extra_headers: &[(String, String)],
+    dispatch: Value,
+) -> Result<u64, NativeError> {
+    if !dispatch.is_callable() {
+        return Err(NativeError::type_error("upgrade: dispatch must be a function"));
     }
 
-    /// `__ws.close(id, code, reason)` - sends the close frame (once); the read loop then surfaces
-    /// the peer's echo as the close event.
-    #[op(coerce)]
-    fn close(ctx: &mut Ctx, id: f64, code: Option<f64>, reason: String) {
-        close_socket(ctx, id as u64, code.map_or(1000, |n| n as u16), &reason);
+    // Take the socket out of the resource table (the same handoff the response write makes, so a
+    // later response on this connection correctly fails as "already answered").
+    let stream = ctx
+        .resource_table()
+        .close(conn_id)
+        .and_then(|rc| rc.downcast::<TcpStream>().ok())
+        .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
+    let Some(stream) = stream else {
+        return Err(NativeError::type_error("upgrade: unknown or already-answered connection"));
+    };
+
+    // `SharedStream` holds its lock across each read, so reads must time out regularly (as on the
+    // client end) or a blocked read task would starve every send and close from the loop thread.
+    stream.set_read_timeout(Some(READ_POLL)).ok();
+    stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+    stream.set_nodelay(true).ok();
+
+    // The 101 response is small; writing it on the loop thread matches how sends and closes are
+    // written.
+    let mut resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {}\r\n",
+        websocket_accept(key)
+    );
+    if !protocol.is_empty() {
+        resp.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
     }
-
-    /// `__ws.upgrade(connId, secWebSocketKey, protocol, extraHeaderPairs, dispatch)` -> id.
-    ///
-    /// Adopts a connection accepted by `Lumen.serve` (see server.rs: the parsed request's
-    /// `TcpStream` sits in the resource table under `connId`) as a SERVER-side WebSocket: writes
-    /// the RFC 6455 101 handshake response, then joins the same registry/read-loop machinery the
-    /// client uses - with `masked: false`, since a server must not mask (§5.1). `dispatch(kind,
-    /// ...)` receives `("text", string)`, `("binary", u8array)`, `("close", code, reason,
-    /// wasClean)`, `("fail", code, msg)` (protocol violation), and `("io", msg)` (socket died).
-    /// There is no "open" event: the connection is open the moment this op returns.
-    #[op(coerce)]
-    fn upgrade(
-        ctx: &mut Ctx,
-        conn_id: u32,
-        key: String,
-        protocol: String,
-        extra_headers: Value,
-        dispatch: Value,
-    ) -> Result<f64, OpError> {
-        let extra_headers = crate::read_header_pairs(ctx, &extra_headers)?;
-        if !dispatch.is_callable() {
-            return Err(NativeError::type_error("upgrade: dispatch must be a function").into());
+    for (name, value) in extra_headers {
+        // The handshake-critical headers above must not be overridden by user extras.
+        if name.eq_ignore_ascii_case("upgrade")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("sec-websocket-accept")
+        {
+            continue;
         }
+        resp.push_str(&format!("{name}: {value}\r\n"));
+    }
+    resp.push_str("\r\n");
+    (&stream)
+        .write_all(resp.as_bytes())
+        .map_err(|e| NativeError::runtime(format!("WebSocket upgrade: handshake write: {e}")))?;
 
-        // Take the socket out of the resource table (same handoff as respond(); a later respond
-        // on this connection now correctly fails as "already answered").
-        let stream = ctx
-            .resource_table()
-            .close(conn_id)
-            .and_then(|rc| rc.downcast::<TcpStream>().ok())
-            .and_then(|rc| std::rc::Rc::try_unwrap(rc).ok());
-        let Some(stream) = stream else {
-            return Err(NativeError::type_error("upgrade: unknown or already-answered connection").into());
-        };
+    let writer = SharedStream(Arc::new(Mutex::new(Box::new(stream))));
 
-        // The accept loop set a read timeout to bound header parsing; a WebSocket idles
-        // legitimately.
-        stream.set_read_timeout(None).ok();
-        stream.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-        stream.set_nodelay(true).ok();
-
-        // Write the 101 upgrade response. It is small; writing on the loop thread matches how
-        // sends and closes are written.
-        let mut resp = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {}\r\n",
-            websocket_accept(&key)
+    let id = {
+        let reg = ws_registry(ctx);
+        let id = reg.next;
+        reg.next += 1;
+        reg.socks.insert(
+            id,
+            WsEntry {
+                writer: Some(writer.clone()),
+                close_sent: Arc::new(AtomicBool::new(false)),
+                dead: false,
+                dispatch,
+                mask_seed: 0,
+                masked: false,
+            },
         );
-        if !protocol.is_empty() {
-            resp.push_str(&format!("Sec-WebSocket-Protocol: {protocol}\r\n"));
-        }
-        for (name, value) in &extra_headers {
-            // The handshake-critical headers above must not be overridden by user extras.
-            if name.eq_ignore_ascii_case("upgrade")
-                || name.eq_ignore_ascii_case("connection")
-                || name.eq_ignore_ascii_case("sec-websocket-accept")
-            {
-                continue;
-            }
-            resp.push_str(&format!("{name}: {value}\r\n"));
-        }
-        resp.push_str("\r\n");
-        (&stream)
-            .write_all(resp.as_bytes())
-            .map_err(|e| NativeError::runtime(format!("WebSocket upgrade: handshake write: {e}")))?;
+        id
+    };
 
-        let writer = SharedStream(Arc::new(Mutex::new(Box::new(stream))));
-
-        let id = {
-            let reg = ws_registry(ctx);
-            let id = reg.next;
-            reg.next += 1;
-            reg.socks.insert(
-                id,
-                WsEntry {
-                    writer: Some(writer.clone()),
-                    close_sent: Arc::new(AtomicBool::new(false)),
-                    dead: false,
-                    dispatch,
-                    mask_seed: 0,
-                    masked: false,
-                },
-            );
-            id
-        };
-
-        let reader = WsReader {
-            stream: BufReader::new(writer.clone()),
-            writer,
-            mask_seed: 0,
-            masked: false,
-        };
-        arm_read(ctx, id, reader);
-        Ok(id as f64)
-    }
+    let reader = WsReader {
+        stream: BufReader::new(writer.clone()),
+        writer,
+        mask_seed: 0,
+        masked: false,
+    };
+    arm_read(ctx, id, reader);
+    Ok(id)
 }
 
 /// Open a client socket to `target` offering `protocols`. The handshake runs on the pool; the
@@ -612,7 +585,7 @@ fn handshake(u: &url::Url, key: &str, protocols: &str) -> Result<ConnectedSocket
     let tcp = TcpStream::connect((host, port)).map_err(|e| format!("connect: {e}"))?;
     tcp.set_nodelay(true).ok();
     tcp.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
-    tcp.set_read_timeout(Some(Duration::from_millis(100))).ok();
+    tcp.set_read_timeout(Some(READ_POLL)).ok();
     let mut stream: Box<dyn WsStream> = if u.scheme == "wss" {
         Box::new(lumen_tls::TlsStream::connect(tcp, host)?)
     } else {

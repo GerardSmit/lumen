@@ -3232,6 +3232,348 @@ fn web_serve_roundtrip_over_loopback() {
     );
 }
 
+#[test]
+fn web_serve_has_the_lumen_namespace_shape() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const names = Object.keys(Lumen).filter((name) => ["serve", "upgradeWebSocket", "version"].includes(name));
+        console.log(names.sort().join());
+        console.log(typeof Lumen.serve, typeof Lumen.upgradeWebSocket, typeof Lumen.version);
+        const version = Object.getOwnPropertyDescriptor(Lumen, "version");
+        console.log(version.writable, version.enumerable, version.configurable);
+        try { Lumen.serve(42); } catch (error) { console.log(error.name); }
+        try { Lumen.serve({}); } catch (error) { console.log(error.name); }
+        try { Lumen.upgradeWebSocket({}); } catch (error) { console.log(error.name); }
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "serve,upgradeWebSocket,version",
+            "function function string",
+            "false true true",
+            "TypeError",
+            "TypeError",
+            "TypeError"
+        ]
+    );
+}
+
+#[test]
+fn web_serve_accepts_every_handler_form_and_reports_errors() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const listening = [];
+            const optionsFirst = Lumen.serve(
+                { hostname: "127.0.0.1", port: 0, onListen: (info) => listening.push(info.hostname) },
+                (req, info) => new Response(info.remoteAddr.transport + ":" + info.remoteAddr.hostname),
+            );
+            const r1 = await fetch(`http://127.0.0.1:${optionsFirst.port}/`);
+            console.log("options-first", r1.status, await r1.text(), listening.join());
+            await optionsFirst.shutdown();
+
+            const app = {
+                greeting: "hello",
+                onError() { return new Response("must not be used", { status: 418 }); },
+                fetch(req) { return new Response(this.greeting + " " + new URL(req.url).pathname); },
+                hostname: "127.0.0.1",
+                port: 0,
+            };
+            const fromObject = Lumen.serve(app);
+            const r2 = await fetch(`http://127.0.0.1:${fromObject.port}/object`);
+            console.log("object", r2.status, await r2.text());
+            await fromObject.shutdown();
+
+            const thrown = Lumen.serve(() => { throw new Error("boom"); }, { hostname: "127.0.0.1", port: 0 });
+            const r3 = await fetch(`http://127.0.0.1:${thrown.port}/`);
+            console.log("default-500", r3.status, r3.statusText, r3.headers.get("content-type"), await r3.text());
+            await thrown.shutdown();
+
+            const hooked = Lumen.serve(
+                async (req) => { if (req.method === "GET") return "not a response"; throw new RangeError("later"); },
+                {
+                    hostname: "127.0.0.1",
+                    port: 0,
+                    onError: async (error) => new Response(error.name + ":" + error.message, { status: 502 }),
+                },
+            );
+            const r4 = await fetch(`http://127.0.0.1:${hooked.port}/`);
+            console.log("hook-type", r4.status, await r4.text());
+            const r5 = await fetch(`http://127.0.0.1:${hooked.port}/`, { method: "POST", body: "x" });
+            console.log("hook-throw", r5.status, await r5.text());
+            await hooked.shutdown();
+
+            const failingHook = Lumen.serve(
+                () => { throw new Error("first"); },
+                { hostname: "127.0.0.1", port: 0, onError: () => { throw new Error("second"); } },
+            );
+            const r6 = await fetch(`http://127.0.0.1:${failingHook.port}/`);
+            console.log("hook-fails", r6.status, await r6.text());
+            await failingHook.shutdown();
+
+            const controller = new AbortController();
+            const aborted = Lumen.serve(() => new Response("x"), {
+                hostname: "127.0.0.1",
+                port: 0,
+                signal: controller.signal,
+            });
+            controller.abort();
+            await aborted.finished;
+            console.log("aborted");
+            const early = new AbortController();
+            early.abort();
+            const never = Lumen.serve(() => new Response("x"), { hostname: "127.0.0.1", port: 0, signal: early.signal });
+            await never.finished;
+            console.log("pre-aborted");
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "options-first 200 tcp:127.0.0.1 127.0.0.1",
+            "object 200 hello /object",
+            "default-500 500 Internal Server Error text/plain;charset=UTF-8 Internal Server Error",
+            "hook-type 502 TypeError:serve handler did not return a Response",
+            "hook-throw 502 RangeError:later",
+            "hook-fails 500 Internal Server Error",
+            "aborted",
+            "pre-aborted",
+        ]
+    );
+    assert!(err.lines().iter().any(|line| line.contains("boom")), "{:?}", err.lines());
+}
+
+#[test]
+fn web_serve_gives_the_handler_native_requests_and_writes_native_responses() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve(async (req) => {
+                const url = new URL(req.url);
+                if (url.pathname === "/inspect") {
+                    return new Response(JSON.stringify({
+                        isRequest: req instanceof Request,
+                        method: req.method,
+                        query: url.searchParams.get("q"),
+                        header: req.headers.get("x-probe"),
+                        body: req.body === null,
+                    }));
+                }
+                if (url.pathname === "/stream") {
+                    return new Response(new ReadableStream({
+                        start(controller) {
+                            controller.enqueue(new TextEncoder().encode("one,"));
+                            controller.enqueue(new TextEncoder().encode("two"));
+                            controller.close();
+                        },
+                    }), { status: 201, statusText: "Made", headers: { "x-extra": "yes" } });
+                }
+                if (url.pathname === "/used") {
+                    const response = new Response("consumed");
+                    await response.text();
+                    return response;
+                }
+                if (url.pathname === "/cookies") {
+                    const headers = new Headers();
+                    headers.append("x-multi", "a=1");
+                    headers.append("x-multi", "b=2");
+                    return new Response(null, { status: 204, headers });
+                }
+                if (url.pathname === "/echo") {
+                    return new Response(await req.arrayBuffer(), { headers: { "content-type": req.headers.get("content-type") } });
+                }
+                return new Response("missing", { status: 404 });
+            }, { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            const inspect = await fetch(`${base}/inspect?q=7`, { headers: { "x-probe": "p" } });
+            console.log(JSON.stringify(await inspect.json()));
+            const stream = await fetch(`${base}/stream`);
+            console.log(stream.status, stream.statusText, stream.headers.get("x-extra"), await stream.text());
+            const used = await fetch(`${base}/used`);
+            console.log(used.status, JSON.stringify(await used.text()));
+            const cookies = await fetch(`${base}/cookies`);
+            console.log(cookies.status, cookies.headers.get("x-multi"));
+            const echo = await fetch(`${base}/echo`, { method: "PUT", body: new Uint8Array([1, 2, 3, 250]) });
+            console.log(echo.status, [...new Uint8Array(await echo.arrayBuffer())].join());
+            const missing = await fetch(`${base}/nope`);
+            console.log(missing.status, await missing.text());
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            r#"{"isRequest":true,"method":"GET","query":"7","header":"p","body":true}"#,
+            "201 Made yes one,two",
+            r#"200 """#,
+            "204 a=1, b=2",
+            "200 1,2,3,250",
+            "404 missing",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_writes_each_set_cookie_and_no_body_for_null_body_statuses() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve((req) => {
+                const path = new URL(req.url).pathname;
+                if (path === "/init") {
+                    return new Response("ok", { headers: { "set-cookie": "a=1", "x-a": "1" } });
+                }
+                if (path === "/append") {
+                    const headers = new Headers();
+                    headers.append("set-cookie", "a=1");
+                    headers.append("set-cookie", "b=2; Path=/");
+                    return new Response("ok", { headers });
+                }
+                if (path === "/empty204") return new Response("", { status: 204 });
+                return new Response("payload", { headers: { "x-kind": "get" } });
+            }, { hostname: "127.0.0.1", port: 0 });
+            const base = `http://127.0.0.1:${server.port}`;
+            const init = await fetch(`${base}/init`);
+            console.log("init", init.headers.getSetCookie().join("|"), init.headers.get("x-a"));
+            const appended = await fetch(`${base}/append`);
+            console.log("append", appended.headers.getSetCookie().join("|"));
+            const empty = await fetch(`${base}/empty204`, { method: "DELETE", body: new Uint8Array(0) });
+            console.log("204", empty.status, JSON.stringify(await empty.text()));
+            const head = await fetch(`${base}/get`, { method: "HEAD" });
+            console.log("head", head.status, head.headers.get("x-kind"), head.headers.get("content-length"), JSON.stringify(await head.text()));
+            console.log("browser guard", new Response("", { headers: { "set-cookie": "z=1" } }).headers.has("set-cookie"));
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "init a=1 1",
+            "append a=1|b=2; Path=/",
+            r#"204 204 """#,
+            r#"head 200 get 7 """#,
+            "browser guard true",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_upgrades_a_connection_to_a_websocket() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const serverEvents = [];
+            let handleSeen = null;
+            let secondUpgrade = "";
+            const server = Lumen.serve((req) => {
+                const handle = Lumen.upgradeWebSocket(req, { protocol: "chat", headers: { "x-served": "lumen" } });
+                if (!handle) return new Response("plain");
+                handleSeen = handle;
+                try { Lumen.upgradeWebSocket(req); } catch (error) { secondUpgrade = error.message; }
+                handle.onmessage = (data, isBinary) => {
+                    serverEvents.push(isBinary ? "binary:" + data.length : "text:" + data);
+                    handle.send(isBinary ? data : data.toUpperCase());
+                };
+                handle.onclose = (code, reason, clean) => serverEvents.push(`close:${code}:${clean}`);
+                return new Response("ignored after upgrade");
+            }, { hostname: "127.0.0.1", port: 0 });
+
+            const plain = await fetch(`http://127.0.0.1:${server.port}/`);
+            console.log("plain", await plain.text());
+
+            const ws = new WebSocket(`ws://127.0.0.1:${server.port}/`, "chat");
+            ws.binaryType = "arraybuffer";
+            const received = [];
+            const closed = new Promise((resolve) => { ws.onclose = (event) => resolve(event.code); });
+            await new Promise((resolve, reject) => { ws.onopen = resolve; ws.onerror = reject; });
+            console.log("protocol", ws.protocol, typeof handleSeen.send, typeof handleSeen.close, handleSeen.remoteAddress);
+            const next = () => new Promise((resolve) => { ws.onmessage = (event) => resolve(event.data); });
+            let pending = next();
+            ws.send("hello");
+            received.push(await pending);
+            pending = next();
+            ws.send(new Uint8Array([9, 8, 7]));
+            received.push([...new Uint8Array(await pending)].join(""));
+            console.log("received", received.join("|"));
+            console.log("second upgrade", secondUpgrade);
+
+            ws.close(1000);
+            console.log("client close", await closed);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            console.log("server events", serverEvents.join(","));
+            console.log("send after close", handleSeen.send("late"));
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "plain plain",
+            "protocol chat function function 127.0.0.1",
+            "received HELLO|987",
+            "second upgrade upgradeWebSocket: connection already upgraded",
+            "client close 1000",
+            "server events text:hello,binary:3,close:1000:true",
+            "send after close false",
+        ]
+    );
+}
+
+#[test]
+fn web_serve_handler_requests_and_responses_are_collectable() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.expose_gc();
+    eval_ok(
+        &mut rt,
+        r#"
+        globalThis.weak = {};
+        const done = (error) => console.log("failed", error && error.stack);
+        const run = async () => {
+            const server = Lumen.serve((req) => {
+                const response = new Response("gc");
+                weak.request = new WeakRef(req);
+                weak.headers = new WeakRef(req.headers);
+                weak.response = new WeakRef(response);
+                return response;
+            }, { hostname: "127.0.0.1", port: 0 });
+            await (await fetch(`http://127.0.0.1:${server.port}/`)).text();
+            await server.shutdown();
+        };
+        run().catch(done);
+        "#,
+    );
+    rt.engine().collect_garbage();
+    rt.engine().collect_garbage();
+    eval_ok(
+        &mut rt,
+        "console.log(weak.request.deref() === undefined, weak.headers.deref() === undefined, weak.response.deref() === undefined);",
+    );
+    assert_eq!(out.lines(), ["true true true"]);
+}
+
 // ---- lumen-node (node: compat; the runtime assembles it) ----
 
 #[test]

@@ -2465,7 +2465,7 @@ mod tests {
         for file in [
             "preamble.js",
             "encoding.js",
-            "server.js",
+            "serialize.js",
         ] {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();
             assert_roundtrips(&src);
