@@ -28,6 +28,16 @@ pub enum CpuHint {
     Performance,
 }
 
+impl CpuHint {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Efficiency => "efficiency",
+            Self::Performance => "performance",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Purpose {
     /// Runs an engine: needs the engine stack size; the thread calls `set_thread_stack_size`

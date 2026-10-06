@@ -657,6 +657,44 @@ impl CallbackQueue {
     }
 }
 
+/// The sending end of a loop's completion channel. A loop whose thread parks on a scheduler
+/// [`Park`](lumen_os::sched::Park) instead of blocking on the channel registers it with
+/// [`CompletionTx::set_notify`]; every send then unparks that thread.
+#[derive(Clone)]
+pub struct CompletionTx {
+    tx: mpsc::Sender<TaskCompletion>,
+    notify: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn lumen_os::sched::Unpark>>>,
+}
+
+impl CompletionTx {
+    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionTx {
+        CompletionTx {
+            tx,
+            notify: Default::default(),
+        }
+    }
+
+    /// Unpark `notify` after every completion sent from now on, through any clone. Set once; a
+    /// second call is ignored.
+    pub fn set_notify(&self, notify: std::sync::Arc<dyn lumen_os::sched::Unpark>) {
+        let _ = self.notify.set(notify);
+    }
+
+    pub fn send(&self, done: TaskCompletion) -> Result<(), mpsc::SendError<TaskCompletion>> {
+        self.tx.send(done)?;
+        if let Some(notify) = self.notify.get() {
+            notify.unpark();
+        }
+        Ok(())
+    }
+}
+
+impl From<mpsc::Sender<TaskCompletion>> for CompletionTx {
+    fn from(tx: mpsc::Sender<TaskCompletion>) -> CompletionTx {
+        CompletionTx::new(tx)
+    }
+}
+
 /// Runs blocking work on the process scheduler's shared pool (`std::fs`, blocking `std::net`);
 /// completions come back over the `mpsc` channel given at construction. The pool owns no
 /// threads: this adapter keeps the runtime's own accounting (what it has in flight, so dropping
@@ -667,7 +705,7 @@ pub struct ThreadPool {
 }
 
 struct PoolShared {
-    completions: mpsc::Sender<TaskCompletion>,
+    completions: CompletionTx,
     /// Tasks submitted and not yet finished (queued or running).
     pending: std::sync::atomic::AtomicUsize,
     closed: std::sync::atomic::AtomicBool,
@@ -724,10 +762,10 @@ impl ThreadPool {
     ///
     /// Where the scheduler has no pool (`wasm32`), each job runs inline on the calling (loop)
     /// thread, delivering its completion on the same channel.
-    pub fn new(completions: mpsc::Sender<TaskCompletion>) -> ThreadPool {
+    pub fn new(completions: impl Into<CompletionTx>) -> ThreadPool {
         ThreadPool {
             shared: std::sync::Arc::new(PoolShared {
-                completions,
+                completions: completions.into(),
                 pending: Default::default(),
                 closed: Default::default(),
                 drain: std::sync::Mutex::new(None),
@@ -814,24 +852,27 @@ impl SpawnHandle {
 /// call; blocked threads cost only memory, not a pool slot.
 #[derive(Clone)]
 pub struct CompletionSender {
-    tx: mpsc::Sender<TaskCompletion>,
+    tx: CompletionTx,
     wake: Option<std::sync::Arc<owner_loop::Wake>>,
 }
 
 impl CompletionSender {
-    pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionSender {
-        CompletionSender { tx, wake: None }
+    pub fn new(tx: impl Into<CompletionTx>) -> CompletionSender {
+        CompletionSender {
+            tx: tx.into(),
+            wake: None,
+        }
     }
 
     /// A sender for a loop that is driven by its host's turns ([`owner_loop`]): every completion
     /// is counted, and `notify` runs on the transition from nothing ready to something ready, so a
     /// burst of sends wakes the host once. `notify` runs on the sending thread and must not block.
     pub fn with_notify(
-        tx: mpsc::Sender<TaskCompletion>,
+        tx: impl Into<CompletionTx>,
         notify: std::sync::Arc<dyn Fn() + Send + Sync>,
     ) -> CompletionSender {
         CompletionSender {
-            tx,
+            tx: tx.into(),
             wake: Some(std::sync::Arc::new(owner_loop::Wake::new(notify))),
         }
     }

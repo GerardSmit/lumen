@@ -6,24 +6,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
+use lumen_os::sched::{Park, Unpark};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CpuHint {
-    Any,
-    Efficiency,
-    Performance,
-}
-impl CpuHint {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Any => "any",
-            Self::Efficiency => "efficiency",
-            Self::Performance => "performance",
-        }
-    }
-}
+pub use lumen_os::sched::CpuHint;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub core: u32,
@@ -99,6 +86,8 @@ pub(crate) struct Link {
     pub interrupt: Arc<AtomicBool>,
     pub finished: AtomicBool,
     pub parent_alive: AtomicBool,
+    /// The scheduler timer that will hard-stop the task; cancelled when the task finishes.
+    pub hard_stop_timer: Mutex<Option<lumen_os::sched::Timer>>,
     #[cfg(feature = "aot-native")]
     pub native_glue: Mutex<Option<&'static [u8]>>,
 }
@@ -115,6 +104,7 @@ impl Link {
             interrupt: Arc::new(AtomicBool::new(false)),
             finished: AtomicBool::new(false),
             parent_alive: AtomicBool::new(true),
+            hard_stop_timer: Mutex::new(None),
         })
     }
     pub(crate) fn wake(&self) {
@@ -502,6 +492,13 @@ impl Worker {
             Turn::Idle
         }
     }
+    #[cfg(not(target_os = "none"))]
+    fn fail(&mut self, message: &str) {
+        let link = self.link.clone();
+        let error = self.engine().interp.make_error("EvalError", message);
+        super::api::complete(&mut self.engine().interp, &link, error, true);
+        self.finish();
+    }
     fn finish(&mut self) {
         if let Some(engine) = self.engine.take() {
             self.link.queues.lock().unwrap().jit_stats += engine.jit_stats();
@@ -517,6 +514,7 @@ impl Worker {
             queues.pending_result.take()
         };
         self.link.finished.store(true, Ordering::Release);
+        self.link.hard_stop_timer.lock().unwrap().take();
         if let Some((parcel, failed)) = result {
             self.link.push(Event::Result(parcel, failed));
         } else {
@@ -533,17 +531,28 @@ impl Drop for Worker {
 }
 
 #[cfg(not(target_os = "none"))]
+type Configure = Arc<dyn Fn(&mut Engine, Arc<dyn Unpark>) + Send + Sync>;
+#[cfg(not(target_os = "none"))]
+type TurnFn = Arc<dyn Fn(&mut Engine) -> Result<Option<Instant>, String> + Send + Sync>;
+
+#[cfg(not(target_os = "none"))]
+const THREAD_HOST_STACK: usize = 8 << 20;
+
+/// Runs each task on a scheduler thread. The thread parks on the scheduler between turns and is
+/// woken by messages, cancellation and (through the unparker `configure` receives) the realm's
+/// own completions; nothing is armed while it is idle.
+#[cfg(not(target_os = "none"))]
 pub struct ThreadHost {
-    configure: Arc<dyn Fn(&mut Engine) + Send + Sync>,
-    turn: Arc<dyn Fn(&mut Engine) -> Result<(), String> + Send + Sync>,
+    configure: Configure,
+    turn: TurnFn,
     can_migrate: bool,
 }
 #[cfg(not(target_os = "none"))]
 impl Default for ThreadHost {
     fn default() -> Self {
         Self {
-            configure: Arc::new(|_| {}),
-            turn: Arc::new(|_| Ok(())),
+            configure: Arc::new(|_, _| {}),
+            turn: Arc::new(|_| Ok(None)),
             can_migrate: true,
         }
     }
@@ -552,15 +561,19 @@ impl Default for ThreadHost {
 impl ThreadHost {
     pub fn with_configure(configure: impl Fn(&mut Engine) + Send + Sync + 'static) -> Self {
         Self {
-            configure: Arc::new(configure),
-            turn: Arc::new(|_| Ok(())),
+            configure: Arc::new(move |engine, _| configure(engine)),
+            turn: Arc::new(|_| Ok(None)),
             can_migrate: true,
         }
     }
 
+    /// A host with its own event loop in the realm. `configure` receives an unparker to call
+    /// whenever the loop gets work from another thread. `turn` runs everything that is ready and
+    /// returns when it next needs to run on its own (the earliest timer), or `None` to wait for
+    /// an unpark.
     pub fn with_turn(
-        configure: impl Fn(&mut Engine) + Send + Sync + 'static,
-        turn: impl Fn(&mut Engine) -> Result<(), String> + Send + Sync + 'static,
+        configure: impl Fn(&mut Engine, Arc<dyn Unpark>) + Send + Sync + 'static,
+        turn: impl Fn(&mut Engine) -> Result<Option<Instant>, String> + Send + Sync + 'static,
     ) -> Self {
         Self {
             configure: Arc::new(configure),
@@ -587,58 +600,94 @@ impl ParallelHost for ThreadHost {
         };
         handle.set_placement(placement);
         let host = job.link.host.clone();
-        std::thread::Builder::new()
-            .name(format!("lumen-parallel-{core}"))
-            .stack_size(8 << 20)
-            .spawn(move || {
-                crate::set_thread_stack_size(8 << 20);
-                let owner = std::thread::current();
-                let mut worker = Worker::new(job, |engine| configure(engine));
-                worker.set_waker(Arc::new(move || owner.unpark()));
-                loop {
-                    if worker.engine.is_none() {
-                        break;
-                    }
-                    if let Err(message) = turn(worker.engine()) {
-                        let link = worker.link.clone();
-                        let error = worker.engine().interp.make_error("EvalError", &message);
-                        super::api::complete(&mut worker.engine().interp, &link, error, true);
-                        worker.finish();
-                        break;
-                    }
-                    if worker.turn() == Turn::Done {
-                        break;
-                    }
-                    if let Some((cpu, job)) = worker.take_migration(placement.core) {
-                        if host.spawn(cpu, job).is_err() {
-                            TaskHandle(worker.link.clone()).migration_failed();
-                        }
-                        break;
-                    }
-                    std::thread::park_timeout(Duration::from_millis(1));
-                }
-            })
-            .map_err(|error| SpawnError(error.to_string()))?;
+        let mut spec = lumen_os::sched::ThreadSpec::new(
+            format!("lumen-parallel-{core}"),
+            lumen_os::sched::Purpose::Engine,
+        );
+        spec.stack_bytes = THREAD_HOST_STACK;
+        spec.cpu = cpu;
+        lumen_os::sched::current()
+            .spawn_thread(
+                spec,
+                Box::new(move |start| {
+                    crate::set_thread_stack_size(if start.stack_bytes > 0 {
+                        start.stack_bytes
+                    } else {
+                        THREAD_HOST_STACK
+                    });
+                    run_worker(job, host, configure, turn, placement.core);
+                }),
+            )
+            .map_err(|error| SpawnError(format!("{error:?}")))?;
         Ok((placement, handle))
     }
     fn interrupt_after(&self, task: TaskHandle, grace: Duration) {
-        let fallback = task.clone();
-        if std::thread::Builder::new()
-            .name("lumen-cancel".into())
-            .spawn(move || {
-                let started = std::time::Instant::now();
-                while !task.is_finished() {
-                    let remaining = grace.saturating_sub(started.elapsed());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        let fired = task.clone();
+        match lumen_os::sched::current().after(grace, Box::new(move || fired.hard_stop())) {
+            Ok(timer) => {
+                *task.0.hard_stop_timer.lock().unwrap() = Some(timer);
+                if task.is_finished() {
+                    task.0.hard_stop_timer.lock().unwrap().take();
                 }
-                task.hard_stop();
-            })
-            .is_err()
-        {
-            fallback.hard_stop();
+            }
+            Err(_) => task.hard_stop(),
         }
+    }
+}
+
+#[cfg(not(target_os = "none"))]
+fn run_worker(
+    job: Job,
+    host: Arc<dyn ParallelHost>,
+    configure: Configure,
+    turn: TurnFn,
+    core: u32,
+) {
+    let park: Arc<dyn Park> = lumen_os::sched::current()
+        .parker()
+        .unwrap_or_else(|_| Arc::new(lumen_os::sched::OsPark::new()));
+    let unpark = park.clone().unparker();
+    let mut worker = Worker::new(job, |engine| configure(engine, unpark.clone()));
+    {
+        let wake = unpark.clone();
+        worker.set_waker(Arc::new(move || wake.unpark()));
+        let wake = unpark.clone();
+        if let Some(engine) = worker.engine.as_mut() {
+            engine
+                .ctx()
+                .set_async_waker(Arc::new(move || wake.unpark()));
+        }
+    }
+    loop {
+        if worker.engine.is_none() {
+            break;
+        }
+        if let Err(message) = turn(worker.engine()) {
+            worker.fail(&message);
+            break;
+        }
+        if worker.turn() == Turn::Done {
+            break;
+        }
+        if let Some((cpu, job)) = worker.take_migration(core) {
+            if host.spawn(cpu, job).is_err() {
+                TaskHandle(worker.link.clone()).migration_failed();
+            }
+            break;
+        }
+        // The message handlers above may have queued work for the realm's own loop.
+        let next = match turn(worker.engine()) {
+            Ok(next) => next,
+            Err(message) => {
+                worker.fail(&message);
+                break;
+            }
+        };
+        let deadline = if worker.engine().has_pending_jobs() {
+            Some(Instant::now())
+        } else {
+            next
+        };
+        park.park(deadline);
     }
 }

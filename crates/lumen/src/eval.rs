@@ -3824,7 +3824,8 @@ impl Interp {
     /// async wait as its waiter thread reports, running the scheduled reactions in between.
     pub(crate) fn run_agent_event_loop(&mut self) {
         self.drain_microtasks();
-        let mut spins = 0u32;
+        let park = self.agent_park();
+        let mut idle_since = std::time::Instant::now();
         while !self.pending_async_waits.is_empty() || !self.pending_timers.is_empty() {
             let mut resolved_any = false;
             let mut i = 0;
@@ -3854,14 +3855,28 @@ impl Interp {
             }
             if resolved_any {
                 self.drain_microtasks();
-                spins = 0;
+                idle_since = std::time::Instant::now();
             } else {
-                spins += 1;
-                // A safety bound (~30s at 1ms) so a never-completing wait can't hang the process.
-                if spins > 4_000 {
+                // A safety bound so a never-completing wait can't hang the process.
+                let limit = idle_since + std::time::Duration::from_secs(30);
+                let now = std::time::Instant::now();
+                if now >= limit {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                let wake = self
+                    .pending_timers
+                    .iter()
+                    .map(|(_, deadline)| *deadline)
+                    .fold(limit, std::time::Instant::min);
+                match &park {
+                    Some(park) => {
+                        park.park(Some(wake));
+                    }
+                    None => std::thread::sleep(
+                        wake.saturating_duration_since(now)
+                            .min(std::time::Duration::from_millis(1)),
+                    ),
+                }
             }
         }
     }

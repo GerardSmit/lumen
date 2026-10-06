@@ -27,7 +27,7 @@ use std::time::Duration;
 use lumen_host::time::Instant;
 
 use lumen_host::{
-    install, owner_loop, CallbackQueue, CompletionSender, Engine, Extension, HostRealmInstaller,
+    install, owner_loop, CallbackQueue, CompletionSender, CompletionTx, Engine, Extension, HostRealmInstaller,
     TaskCompletion, TaskDecoder, TaskId, TaskRegistry, ThreadPool, Value,
 };
 
@@ -177,7 +177,7 @@ const WAKE_TASK: TaskId = TaskId::MAX - 2;
 /// result travels over a channel the embedder owns.
 #[derive(Clone)]
 pub struct RuntimeWaker {
-    wake: mpsc::Sender<TaskCompletion>,
+    wake: CompletionTx,
 }
 
 impl RuntimeWaker {
@@ -194,7 +194,7 @@ impl RuntimeWaker {
 #[derive(Clone)]
 pub struct Terminator {
     handle: InterruptHandle,
-    wake: mpsc::Sender<TaskCompletion>,
+    wake: CompletionTx,
 }
 
 impl Terminator {
@@ -297,7 +297,7 @@ pub struct Runtime {
     /// A tick threw and its error was handled: the queue behind it drains before the next callback.
     tick_recovery: bool,
     /// Wakes the loop when it is blocked on completions.
-    wake: mpsc::Sender<TaskCompletion>,
+    wake: CompletionTx,
     #[cfg(not(target_arch = "wasm32"))]
     deadline: Option<lumen_os::sched::Deadline>,
 }
@@ -399,7 +399,7 @@ impl Default for Runtime {
 
 /// A wake for a loop blocked on completions, which no task id matches, so the loop finds nothing
 /// to settle and sees the interrupt flag.
-fn loop_wake(tx: &mpsc::Sender<TaskCompletion>) -> Arc<dyn Fn() + Send + Sync> {
+fn loop_wake(tx: &CompletionTx) -> Arc<dyn Fn() + Send + Sync> {
     let tx = tx.clone();
     Arc::new(move || {
         let _ = tx.send(TaskCompletion {
@@ -491,6 +491,7 @@ impl Runtime {
         lumen_host::perf::start_clock();
         lumen_host::perf::mark(lumen_host::perf::Milestone::NodeStart);
         let (tx, rx) = mpsc::channel();
+        let tx = CompletionTx::new(tx);
         let pool = ThreadPool::new(tx.clone());
         lumen::set_tail_calls(false);
         let mut engine = Engine::new();
@@ -1399,6 +1400,13 @@ impl Runtime {
     /// [`lumen_host::register_task`] this way, then calls [`Self::run_until_idle`].
     pub fn completion_sender(&self) -> CompletionSender {
         CompletionSender::new(self.wake.clone())
+    }
+
+    /// Unpark `notify` whenever a completion, a wake or an interrupt arrives, for a host that
+    /// parks this loop's thread itself between [`Self::run_until_idle`] turns instead of blocking
+    /// in [`Self::wait_for_completion`].
+    pub fn set_completion_notify(&self, notify: Arc<dyn lumen_os::sched::Unpark>) {
+        self.wake.set_notify(notify);
     }
 
     /// A handle that ends [`Self::wait_for_completion`] when an embedder-owned channel has

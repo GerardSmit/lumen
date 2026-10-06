@@ -1123,6 +1123,8 @@ pub struct Interp {
     pub(crate) pending_async_waits: Vec<(Value, std::sync::mpsc::Receiver<&'static str>)>,
     /// Host timers from `$262.agent.setTimeout`: (callback, deadline).
     pub(crate) pending_timers: Vec<(Value, std::time::Instant)>,
+    /// Parks the agent event loop between completions; waiter threads unpark it.
+    pub(crate) agent_park: Option<std::sync::Arc<dyn lumen_os::sched::Park>>,
     /// Agent-harness wiring (present only in spawned agents / a main with agents).
     pub(crate) agent: Option<Box<AgentChannels>>,
     /// TypedArray view state, keyed by the typed-array object's pointer.
@@ -2056,6 +2058,7 @@ impl Interp {
             atomics_wait_hook: None,
             pending_async_waits: Vec::new(),
             pending_timers: Vec::new(),
+            agent_park: None,
             agent: None,
             typed_arrays: Default::default(),
             async_gens: std::collections::HashSet::new(),
@@ -9300,3 +9303,14 @@ thread_local! {
 pub(crate) struct LazyGlobalHooks(
     std::collections::HashMap<(usize, String), Rc<dyn Fn(&mut Interp) -> Result<(), Value>>>,
 );
+
+impl Interp {
+    /// The park slot for the agent event loop, created on first use. `None` where the scheduler
+    /// cannot park (the loop then sleeps in short steps).
+    pub(crate) fn agent_park(&mut self) -> Option<std::sync::Arc<dyn lumen_os::sched::Park>> {
+        if self.agent_park.is_none() {
+            self.agent_park = lumen_os::sched::current().parker().ok();
+        }
+        self.agent_park.clone()
+    }
+}

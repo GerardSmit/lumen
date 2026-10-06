@@ -275,6 +275,26 @@ pub use parser::{JsxOptions, JsxRuntime};
 pub use stack::{set_thread_stack_bounds, set_thread_stack_size, THREAD_STACK_SIZE};
 pub use value::HeapStats;
 
+/// Starts a thread through the process scheduler with `stack_bytes` of stack (0 for the engine's
+/// `THREAD_STACK_SIZE`) and records the stack the scheduler actually granted for the engine's
+/// recursion limit. Dropping the handle detaches the thread.
+pub(crate) fn spawn_engine_thread(
+    name: &'static str,
+    stack_bytes: usize,
+    f: impl FnOnce() + Send + 'static,
+) -> Result<lumen_os::sched::ThreadHandle, lumen_os::sched::SchedError> {
+    let requested = if stack_bytes == 0 { THREAD_STACK_SIZE } else { stack_bytes };
+    let mut spec = lumen_os::sched::ThreadSpec::new(name, lumen_os::sched::Purpose::Engine);
+    spec.stack_bytes = requested;
+    lumen_os::sched::current().spawn_thread(
+        spec,
+        Box::new(move |start| {
+            set_thread_stack_size(if start.stack_bytes > 0 { start.stack_bytes } else { requested });
+            f()
+        }),
+    )
+}
+
 /// Parse `src` without running it: as an ES module when `module`, otherwise as a CommonJS
 /// module body (where a top-level `return` is legal). Node's `--check`.
 pub fn check_syntax(src: &str, module: bool) -> Result<(), ParseError> {

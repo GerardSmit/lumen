@@ -1121,3 +1121,96 @@ fn buffer_flags_and_all_typed_array_kinds_are_preserved() {
         assert_eq!(evaluate(&mut receiver, "root.track.length===16 && root.track[0]===42"), "true");
     }).join().unwrap();
 }
+
+#[test]
+fn idle_thread_host_worker_does_not_spin() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let turns = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = turns.clone();
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::with_turn(
+            |_, _| {},
+            move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            },
+        )),
+    );
+    evaluate(
+        &mut engine,
+        "var ready;var task=Lumen.parallel.spawn(port=>{port.postMessage('ready');return new Promise(()=>{});});task.receive().then(x=>ready=x);task.result.catch(()=>{});",
+    );
+    assert_eq!(await_global(&mut engine, "ready"), "ready");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let before = turns.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let idle_turns = turns.load(Ordering::Relaxed) - before;
+    assert!(idle_turns <= 2, "idle worker ran {idle_turns} turns in 200 ms");
+    evaluate(&mut engine, "task.terminate();");
+}
+
+#[test]
+fn thread_host_worker_turns_on_the_deadline_the_turn_returns() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let turns = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = turns.clone();
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::with_turn(
+            |_, _| {},
+            move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(20),
+                ))
+            },
+        )),
+    );
+    evaluate(
+        &mut engine,
+        "var ready;var task=Lumen.parallel.spawn(port=>{port.postMessage('ready');return new Promise(()=>{});});task.receive().then(x=>ready=x);task.result.catch(()=>{});",
+    );
+    assert_eq!(await_global(&mut engine, "ready"), "ready");
+    let before = turns.load(Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let ticks = turns.load(Ordering::Relaxed) - before;
+    assert!((4..=40).contains(&ticks), "{ticks} turns in 250 ms at a 20 ms deadline");
+    evaluate(&mut engine, "task.terminate();");
+}
+
+#[test]
+fn interrupt_after_fires_from_the_scheduler_timer() {
+    let mut engine = Engine::new();
+    super::install(
+        &mut engine,
+        std::sync::Arc::new(super::ThreadHost::default()),
+    );
+    evaluate(
+        &mut engine,
+        "var entered;var cancelled;var task=Lumen.parallel.spawn(port=>{port.postMessage('entered');while(true){}},[],{grace:40});task.receive().then(x=>entered=x);task.result.catch(e=>cancelled=String(e));",
+    );
+    assert_eq!(await_global(&mut engine, "entered"), "entered");
+    let started = std::time::Instant::now();
+    evaluate(&mut engine, "task.terminate('stop');");
+    await_global(&mut engine, "cancelled");
+    // The result rejects at once; the spinning worker only stops when the grace timer hard-stops it.
+    while engine
+        .interp
+        .host_mut::<super::api::Realm>()
+        .unwrap()
+        .task_count()
+        != 0
+    {
+        engine.ctx().poll_async();
+        while engine.run_one_job() {}
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "worker failed to stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(started.elapsed() >= std::time::Duration::from_millis(30));
+}

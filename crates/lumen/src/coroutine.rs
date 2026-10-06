@@ -441,13 +441,9 @@ fn get_worker() -> std::io::Result<Sender<Job>> {
     }
     let (job_tx, job_rx) = channel::<Job>();
     let self_tx = job_tx.clone();
-    std::thread::Builder::new()
-        // Generous stack: execution recurses up to MAX_EVAL_DEPTH units (see its sizing).
-        .stack_size(crate::THREAD_STACK_SIZE)
-        .spawn(move || {
-            crate::set_thread_stack_size(crate::THREAD_STACK_SIZE);
-            worker_loop(job_rx, self_tx)
-        })?;
+    // Generous stack: execution recurses up to MAX_EVAL_DEPTH units (see its sizing).
+    crate::spawn_engine_thread("lumen-coroutine", 0, move || worker_loop(job_rx, self_tx))
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
     Ok(job_tx)
 }
 
