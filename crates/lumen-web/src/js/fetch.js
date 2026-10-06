@@ -316,8 +316,9 @@ function makeBodyStream(owner) {
     type: "bytes",
     pull(controller) {
       const bytes = owner._bodyBytes;
-      // Byte controllers transfer buffers. Keep BodyInit's original bytes intact.
-      if (bytes && bytes.length) controller.enqueue(bytes.slice());
+      // Byte controllers transfer buffers. Copy into a fresh ArrayBuffer: `slice()` of a Buffer
+      // is a view, and transferring it would detach Buffer's shared pool.
+      if (bytes && bytes.length) controller.enqueue(new Uint8Array(bytes));
       controller.close();
     },
   });
@@ -418,7 +419,11 @@ class Response {
     }
     this.statusText = init.statusText !== undefined ? String(init.statusText) : "";
     if (/[^\x09\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError("invalid response status text");
-    if (body !== null && body !== undefined && [204, 205, 304].includes(this.status)) throw new TypeError("response status cannot have a body");
+    if (body !== null && body !== undefined && [204, 205, 304].includes(this.status)) {
+      // Bun accepts an empty string body here (servers commonly return `new Response("", { status: 204 })`).
+      if (body === "" && globalThis.Bun !== undefined) body = null;
+      else throw new TypeError("response status cannot have a body");
+    }
     this.headers = new Headers(init.headers);
     this.url = "";
     this.redirected = false;

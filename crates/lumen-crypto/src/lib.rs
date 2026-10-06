@@ -50,6 +50,7 @@ mod openssl;
 #[allow(dead_code)] // which items a build uses depends on the backends it contains
 mod pss;
 pub mod native_signature;
+mod prime_args;
 mod rng;
 #[allow(dead_code)] // which items a build uses depends on the backends it contains
 mod rsa_util;
