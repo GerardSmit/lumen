@@ -1,4 +1,5 @@
 use super::park::OsPark;
+use crate::reactor::{Interest, Reactor, Registration, Source, Wake};
 use super::timer::Driver;
 use super::{
     host_parallelism, Job, JoinThread, Park, SchedError, Scheduler, ThreadHandle, ThreadMain,
@@ -195,5 +196,20 @@ impl Scheduler for OsScheduler {
 
     fn after(&self, delay: Duration, fire: Job) -> Result<Timer, SchedError> {
         Ok(Timer::new(self.driver()?.after(delay, fire)?))
+    }
+
+    fn reactor(&self) -> Option<&dyn Reactor> {
+        cfg!(unix).then_some(self as &dyn Reactor)
+    }
+}
+
+/// Registrations live on the driver's poller, so wakes run on the `lumen-driver` thread next to
+/// the timers; they must be short and must not block. The driver starts with the first one.
+impl Reactor for OsScheduler {
+    fn register(&self, src: Source, interest: Interest, wake: Arc<dyn Wake>) -> Result<Registration, SchedError> {
+        self.driver()?
+            .poller()
+            .ok_or(SchedError::Unsupported("readiness reactor"))?
+            .register(src, interest, wake)
     }
 }

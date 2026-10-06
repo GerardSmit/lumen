@@ -700,6 +700,9 @@ impl From<mpsc::Sender<TaskCompletion>> for CompletionTx {
 /// threads: this adapter keeps the runtime's own accounting (what it has in flight, so dropping
 /// it can wait for exactly its tasks) and the [`TaskCompletion`] wrapping. Work that blocks for an
 /// unbounded time belongs on a dedicated thread ([`CompletionSender::run_blocking`]), never here.
+///
+/// Readiness-driven I/O does not belong here either: `lumen_os::reactor` is the hand-rolled
+/// raw-syscall readiness reactor (no crate, no mio) for sources that can be waited on.
 pub struct ThreadPool {
     shared: std::sync::Arc<PoolShared>,
 }

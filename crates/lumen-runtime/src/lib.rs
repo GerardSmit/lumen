@@ -11,9 +11,10 @@
 //! 3. fire due **timers**,
 //! 4. dispatch ready **completions** from the threadpool,
 //! then block on the completion channel until the next timer deadline (or indefinitely if
-//! only completions remain). The loop exits when nothing is pending anywhere. A readiness
-//! reactor (epoll/kqueue) would need raw syscalls and stays out unless explicitly authorized;
-//! threadpool + completions is libuv's own fs strategy and covers everything we host today.
+//! only completions remain). The loop exits when nothing is pending anywhere. A hand-rolled
+//! readiness reactor on raw syscalls (epoll, kqueue, poll; no crate, no mio) now exists in
+//! `lumen_os::reactor`; this loop does not use it yet, and threadpool + completions (libuv's own fs
+//! strategy) still covers everything hosted here today.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;

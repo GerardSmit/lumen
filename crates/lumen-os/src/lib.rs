@@ -23,6 +23,7 @@ pub mod net;
 pub mod poll;
 pub mod posix;
 pub mod proc;
+pub mod reactor;
 pub mod rlimit;
 pub mod sched;
 pub mod signal;

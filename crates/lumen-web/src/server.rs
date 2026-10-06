@@ -21,9 +21,9 @@
 //!
 //! ## What's intentionally missing (v1 — cold-start / low-concurrency focus)
 //! - **Concurrency**: exactly one `accept()` is in flight at a time, and it holds one of the
-//!   pool's worker threads while blocked. Fine for cold-start latency and light load; a real
-//!   readiness reactor (epoll/kqueue) or a dedicated listener thread is future work and would
-//!   need raw syscalls (out of scope under the zero-dep policy) or a new host primitive.
+//!   pool's worker threads while blocked. Fine for cold-start latency and light load. A
+//!   hand-rolled raw-syscall readiness reactor now exists in `lumen_os::reactor` (no crate, no
+//!   mio); the server keeps its blocking `accept` until it moves onto listener registrations.
 //! - **Keep-alive**: every response is `Connection: close`; one request per connection.
 //! - **Streaming**: request and response bodies are fully buffered (no chunked *response*
 //!   output, no backpressure) — same limitation the fetch client / body streams have today.

@@ -3,6 +3,7 @@
 //! (Bitnest does, from its runtime services); otherwise [`current`] returns the platform default:
 //! [`OsScheduler`] on operating systems, [`NoThreads`] on wasm32 and [`Unavailable`] on bare metal.
 
+use crate::reactor::Reactor;
 use std::borrow::Cow;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, OnceLock};
@@ -167,6 +168,10 @@ pub trait Scheduler: Send + Sync + 'static {
     /// call. `fire` runs on the scheduler's timer driver, so it must be short and must not block;
     /// hand longer work to `spawn_blocking` or `spawn_thread`.
     fn after(&self, delay: Duration, fire: Job) -> Result<Timer, SchedError>;
+    /// The process-wide readiness reactor, when the platform has one.
+    fn reactor(&self) -> Option<&dyn Reactor> {
+        None
+    }
 }
 
 /// The standard library's view of the CPU count, 1 when it cannot tell. The single source for

@@ -2,10 +2,12 @@
 //! thread owns a [`DeadlineQueue`] and fires due jobs. The thread is created by the first `after`;
 //! until then, and while the queue is empty, nothing is armed. The driver blocks in
 //! [`Idle::wait`] with the next deadline as its timeout, or with no timeout when the queue is
-//! empty. `Idle` is the one place that decides how the driver sleeps and is woken, so the process
-//! reactor can replace its condition variable without touching the queue logic.
+//! empty. `Idle` is the one place that decides how the driver sleeps and is woken: a reactor
+//! [`Poller`] turn where one exists, so I/O registrations run on this same thread, else a condition
+//! variable.
 
 use super::{Job, SchedError, TimerCancel};
+use crate::reactor::{LoopWaker, Poller};
 use lumen_common::deadline::DeadlineQueue;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -14,13 +16,22 @@ use std::time::{Duration, Instant};
 /// The driver's sleep: blocks until `notify` was called since the last wait returned, or until the
 /// deadline. A notify with no waiter is remembered, so a wake that races the driver going to sleep
 /// is never lost.
+///
+/// Where the platform has a reactor the sleep is a [`Poller`] turn, so timers and I/O
+/// registrations share the one driver thread and a notify is a coalesced [`LoopWaker`] wake.
+/// Elsewhere (Windows until its backend lands) it is a condition variable.
+enum Idle {
+    Poll { poller: Poller, waker: LoopWaker },
+    Cond(CondIdle),
+}
+
 #[derive(Default)]
-struct Idle {
+struct CondIdle {
     notified: Mutex<bool>,
     wake: Condvar,
 }
 
-impl Idle {
+impl CondIdle {
     fn notify(&self) {
         let mut notified = self.notified.lock().unwrap_or_else(|e| e.into_inner());
         if !*notified {
@@ -50,26 +61,64 @@ impl Idle {
     }
 }
 
+impl Idle {
+    fn new() -> Idle {
+        match Poller::new() {
+            Ok(poller) => {
+                let waker = poller.waker();
+                Idle::Poll { poller, waker }
+            }
+            Err(_) => Idle::Cond(CondIdle::default()),
+        }
+    }
+
+    fn notify(&self) {
+        match self {
+            Idle::Poll { waker, .. } => waker.wake(),
+            Idle::Cond(idle) => idle.notify(),
+        }
+    }
+
+    fn wait(&self, until: Option<Instant>) {
+        match self {
+            Idle::Poll { poller, .. } => {
+                let timeout = until.map(|u| u.saturating_duration_since(Instant::now()));
+                if poller.turn(timeout).is_err() {
+                    std::thread::sleep(timeout.unwrap_or(Duration::from_millis(10)).min(Duration::from_millis(10)));
+                }
+            }
+            Idle::Cond(idle) => idle.wait(until),
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     queue: DeadlineQueue<Instant, Job>,
     shutdown: bool,
 }
 
-#[derive(Default)]
 pub(super) struct Driver {
     state: Mutex<State>,
     idle: Idle,
 }
 
 impl Driver {
+    /// The reactor that shares this driver's thread, when the platform has one.
+    pub(super) fn poller(&self) -> Option<&Poller> {
+        match &self.idle {
+            Idle::Poll { poller, .. } => Some(poller),
+            Idle::Cond(_) => None,
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Spawns the driver thread. It exits when [`Driver::shutdown`] is called.
     pub(super) fn start() -> Result<Arc<Self>, SchedError> {
-        let driver = Arc::new(Self::default());
+        let driver = Arc::new(Self { state: Mutex::default(), idle: Idle::new() });
         let thread = driver.clone();
         std::thread::Builder::new()
             .name("lumen-driver".into())
