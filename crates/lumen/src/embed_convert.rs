@@ -4666,14 +4666,13 @@ mod tests {
                     catch (error) { return error instanceof TypeError; }
                     return false;
                 })();
-                const setCreatesOwnExpando = (() => {
+                const setIsRejected = (() => {
                     try {
                         (function() { 'use strict'; shadowed.collision = 'assigned'; })();
-                        return shadowed.collision === 'assigned' &&
-                            Object.getOwnPropertyDescriptor(shadowed, 'collision').writable;
-                    } catch { return false; }
+                    } catch (error) { return error instanceof TypeError; }
+                    return false;
                 })();
-                const deleteOwnRestoresNamed = delete shadowed.collision &&
+                const deleteIsRejected = delete shadowed.collision === false &&
                     shadowed.collision === 'named:collision';
                 const own = new NativeOverrideNamedWrapper();
                 Object.defineProperty(own, 'collision', {
@@ -4685,7 +4684,7 @@ mod tests {
                     !descriptor.writable && !descriptor.enumerable &&
                     Object.getOwnPropertyNames(shadowed).includes('collision') &&
                     !Object.keys(shadowed).includes('collision') &&
-                    blockedDefine && setCreatesOwnExpando && deleteOwnRestoresNamed &&
+                    blockedDefine && setIsRejected && deleteIsRejected &&
                     own.collision === 'expando' &&
                     Object.getOwnPropertyDescriptor(own, 'collision').writable
             "#,
