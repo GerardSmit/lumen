@@ -1,4 +1,5 @@
-//! Native structured-clone attachments (`__cloneTransfer`). Wire bytes carry only message-local indexes;
+//! Native structured-clone attachments (`__cloneTransfer`), used by [`crate::structured_clone`]
+//! directly and, for tests, through the namespace. Wire bytes carry only message-local indexes;
 //! JavaScript cannot look up a process-global shared-memory or MessagePort identity.
 //! Each realm stages at most 1024 capabilities per message and 32 nested serialization frames.
 //! A getter may post another message without overwriting the outer frame. Delivery replaces the incoming
@@ -26,9 +27,69 @@ struct CloneTransfers {
     incoming: Vec<Option<CloneAttachment>>,
 }
 
+/// The realm's frames; a realm that did not install the extension (the kernel's) gets empty ones
+/// on first use, so a local `structuredClone` can still share memory.
 fn state(ctx: &mut Ctx) -> &mut CloneTransfers {
+    if !ctx.op_state().has::<CloneTransfers>() {
+        ctx.op_state().put(CloneTransfers::default());
+    }
     ctx.host_mut::<CloneTransfers>()
         .expect("clone transfer state installed")
+}
+
+/// Open the frame that collects the attachments of the message being serialized.
+pub(crate) fn begin_frame(ctx: &mut Ctx) -> Result<(), OpError> {
+    if state(ctx).outgoing.len() >= MAX_NESTED_FRAMES {
+        return Err(NativeError::named(
+            "DataCloneError",
+            "Structured-clone nesting limit exceeded",
+        )
+        .into());
+    }
+    state(ctx).outgoing.push(Vec::new());
+    Ok(())
+}
+
+/// Drop the frame of a serialization that failed.
+pub(crate) fn abort_frame(ctx: &mut Ctx) {
+    state(ctx).outgoing.pop();
+}
+
+/// Release the attachments of the message that was just deserialized.
+pub(crate) fn finish_frame(ctx: &mut Ctx) {
+    state(ctx).incoming.clear();
+}
+
+/// Stage a `SharedArrayBuffer` in the open frame; the wire carries the returned index.
+pub(crate) fn stage_shared(ctx: &mut Ctx, buffer: &Value) -> Result<usize, OpError> {
+    let handle = ctx.export_shared_array_buffer(buffer)?.ok_or_else(|| {
+        NativeError::named("DataCloneError", "Expected a genuine SharedArrayBuffer")
+    })?;
+    stage(ctx, CloneAttachment::Shared(handle))
+}
+
+/// The `SharedArrayBuffer` of the incoming attachment `index`.
+pub(crate) fn import_shared(ctx: &mut Ctx, index: f64) -> Result<Value, OpError> {
+    if !(index.is_finite()
+        && index >= 0.0
+        && index.fract() == 0.0
+        && index < MAX_ATTACHMENTS as f64)
+    {
+        return Err(
+            NativeError::named("DataCloneError", "Invalid shared-memory attachment index").into(),
+        );
+    }
+    let handle = match state(ctx).incoming.get(index as usize) {
+        Some(Some(CloneAttachment::Shared(handle))) => handle.clone(),
+        _ => {
+            return Err(NativeError::named(
+                "DataCloneError",
+                "Shared-memory attachment is not admitted to this message",
+            )
+            .into());
+        }
+    };
+    Ok(ctx.import_shared_array_buffer(&handle))
 }
 
 fn stage(ctx: &mut Ctx, attachment: CloneAttachment) -> Result<usize, OpError> {
@@ -86,39 +147,10 @@ pub fn install_message(ctx: &mut Ctx, message: CloneMessage) -> Vec<u8> {
     message.bytes
 }
 
+/// What the capability tests drive from script: the attachment checks of `postMessage`.
 #[lumen_bind::module(name = "__cloneTransfer")]
 mod bindings {
     use super::*;
-
-    #[op(name = "begin")]
-    fn op_begin(ctx: &mut Ctx) -> Result<(), OpError> {
-        if state(ctx).outgoing.len() >= MAX_NESTED_FRAMES {
-            return Err(NativeError::named(
-                "DataCloneError",
-                "Structured-clone nesting limit exceeded",
-            )
-            .into());
-        }
-        state(ctx).outgoing.push(Vec::new());
-        Ok(())
-    }
-
-    #[op(name = "abort")]
-    fn op_abort(ctx: &mut Ctx) {
-        state(ctx).outgoing.pop();
-    }
-
-    #[op(name = "finish")]
-    fn op_finish(ctx: &mut Ctx) {
-        state(ctx).incoming.clear();
-    }
-
-    #[op(name = "local")]
-    fn op_local(ctx: &mut Ctx, bytes: &[u8]) -> Result<Value, OpError> {
-        let message = take_message(ctx, bytes.to_vec());
-        let bytes = install_message(ctx, message);
-        Ok(ctx.make_uint8array(&bytes)?)
-    }
 
     #[op(name = "isTransferableBuffer")]
     fn op_is_transferable_buffer(ctx: &mut Ctx, buffer: &Value) -> bool {
@@ -138,46 +170,9 @@ mod bindings {
         Ok(())
     }
 
-    #[op(name = "cloneShared")]
-    fn op_clone_shared(ctx: &mut Ctx, buffer: &Value) -> Result<Value, OpError> {
-        match ctx.export_shared_array_buffer(buffer)? {
-            Some(handle) => Ok(ctx.import_shared_array_buffer(&handle)),
-            None => Ok(Value::Undefined),
-        }
-    }
-
-    #[op(name = "exportShared")]
-    fn op_export_shared(ctx: &mut Ctx, buffer: &Value) -> Result<f64, OpError> {
-        let handle = ctx.export_shared_array_buffer(buffer)?.ok_or_else(|| {
-            NativeError::named("DataCloneError", "Expected a genuine SharedArrayBuffer")
-        })?;
-        Ok(stage(ctx, CloneAttachment::Shared(handle))? as f64)
-    }
-
     #[op(name = "importShared", coerce)]
     fn op_import_shared(ctx: &mut Ctx, index: f64) -> Result<Value, OpError> {
-        if !(index.is_finite()
-            && index >= 0.0
-            && index.fract() == 0.0
-            && index < MAX_ATTACHMENTS as f64)
-        {
-            return Err(NativeError::named(
-                "DataCloneError",
-                "Invalid shared-memory attachment index",
-            )
-            .into());
-        }
-        let handle = match state(ctx).incoming.get(index as usize) {
-            Some(Some(CloneAttachment::Shared(handle))) => handle.clone(),
-            _ => {
-                return Err(NativeError::named(
-                    "DataCloneError",
-                    "Shared-memory attachment is not admitted to this message",
-                )
-                .into());
-            }
-        };
-        Ok(ctx.import_shared_array_buffer(&handle))
+        import_shared(ctx, index)
     }
 }
 

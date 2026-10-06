@@ -2576,6 +2576,282 @@ fn structured_clone_wire_round_trips() {
     );
 }
 
+#[test]
+fn structured_clone_arrays_objects_and_property_order() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const holey = [1, , 3];
+        holey.extra = 'x';
+        const copy = structuredClone(holey);
+        check(copy.length === 3 && !(1 in copy) && copy[0] === 1 && copy[2] === 3, 'holes survive');
+        check(copy.extra === 'x', 'extra array property survives');
+        const sparse = [];
+        sparse[5] = 'tail';
+        const sparseCopy = structuredClone(sparse);
+        check(sparseCopy.length === 6 && Object.keys(sparseCopy).join() === '5', 'sparse length');
+        const proto = structuredClone(JSON.parse('{"__proto__":{"polluted":1}}'));
+        check(Object.getPrototypeOf(proto) === Object.prototype, '__proto__ key stays data');
+        check(Object.prototype.hasOwnProperty.call(proto, '__proto__') && proto.polluted === undefined, '__proto__ own');
+        const symbolKeyed = { [Symbol('k')]: 1, visible: 2 };
+        check(Object.getOwnPropertySymbols(structuredClone(symbolKeyed)).length === 0, 'symbol keys dropped');
+        const hidden = Object.defineProperty({ shown: 1 }, 'hidden', { value: 2, enumerable: false });
+        check(!('hidden' in structuredClone(hidden)), 'non-enumerable dropped');
+        const order = [];
+        const source = {
+            get first() { order.push('first'); delete this.second; return 1; },
+            second: 2,
+            third: 3,
+        };
+        const ordered = structuredClone(source);
+        check(order.join() === 'first', 'getters run once');
+        check(JSON.stringify(ordered) === '{"first":1,"third":3}', 'deleted key is skipped');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_errors_boxed_primitives_and_strings() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = new RangeError('bad', { cause: new TypeError('inner') });
+        const copy = structuredClone(failure);
+        check(copy instanceof RangeError && copy !== failure, 'error type');
+        check(copy.message === 'bad' && copy.stack === failure.stack, 'message and stack');
+        check(copy.cause instanceof TypeError && copy.cause.message === 'inner', 'cause');
+        check(!Object.prototype.propertyIsEnumerable.call(copy, 'cause'), 'cause hidden');
+        class Custom extends Error {
+            constructor(message) { super(message); this.name = 'Custom'; this.extra = 1; }
+        }
+        const custom = structuredClone(new Custom('x'));
+        check(Object.getPrototypeOf(custom) === Error.prototype && custom.message === 'x', 'custom error name');
+        check(!('extra' in custom), 'error own properties dropped');
+        const noMessage = structuredClone(new Error());
+        check(!Object.prototype.hasOwnProperty.call(noMessage, 'message'), 'no message stays absent');
+        const big = structuredClone(Object(90071992547409910n));
+        check(typeof big === 'object' && big.valueOf() === 90071992547409910n, 'boxed bigint');
+        check(structuredClone(new Boolean(false)).valueOf() === false, 'boxed boolean');
+        check(structuredClone(Object(-0)).valueOf() === 0 && Object.is(structuredClone(Object(-0)).valueOf(), -0), 'boxed -0');
+        const lone = structuredClone('a\ud800b');
+        check(lone.length === 3 && lone.charCodeAt(1) === 0xd800, 'lone surrogate string');
+        const boxedLone = structuredClone(new String('\udc00'));
+        check(boxedLone.valueOf().charCodeAt(0) === 0xdc00, 'lone surrogate in String object');
+        const key = structuredClone({ ['\ud800']: 1 });
+        check(Object.keys(key)[0].charCodeAt(0) === 0xd800, 'lone surrogate key');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_collections_dates_and_regexps_keep_identity() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const map = new Map();
+        map.set('self', map);
+        map.set(map, 1);
+        const mapCopy = structuredClone(map);
+        check(mapCopy !== map && mapCopy.get('self') === mapCopy && mapCopy.get(mapCopy) === 1, 'map cycle');
+        const set = new Set();
+        set.add(set);
+        set.add(1);
+        const setCopy = structuredClone(set);
+        check(setCopy.has(setCopy) && setCopy.has(1) && setCopy.size === 2, 'set cycle');
+        const date = new Date(5);
+        const shared = structuredClone({ a: date, b: date, s: new Set([date]) });
+        check(shared.a === shared.b && shared.s.has(shared.a) && shared.a.getTime() === 5, 'date identity');
+        const re = /x(y)/gi;
+        re.lastIndex = 3;
+        const regexps = structuredClone({ a: re, b: re });
+        check(regexps.a === regexps.b && regexps.a.lastIndex === 0, 'regexp identity and lastIndex');
+        check(regexps.a.source === 'x(y)' && regexps.a.flags === 'gi', 'regexp parts');
+        check(structuredClone(new Date(NaN)).getTime() !== structuredClone(new Date(NaN)).getTime(), 'invalid date');
+        const buffer = new ArrayBuffer(8);
+        const views = structuredClone({ whole: new Uint8Array(buffer), part: new Int16Array(buffer, 2, 2), dv: new DataView(buffer, 1, 3) });
+        check(views.whole.buffer === views.part.buffer && views.part.buffer === views.dv.buffer, 'views share the buffer');
+        check(views.part.byteOffset === 2 && views.part.length === 2 && views.dv.byteOffset === 1 && views.dv.byteLength === 3, 'view windows');
+        check(views.whole.buffer !== buffer, 'buffer copied');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_rejects_uncloneable_values_and_bad_options() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name + ':' + (e.code ?? ''); } };
+        for (const [label, make] of [
+            ['proxy', () => new Proxy({}, {})],
+            ['function proxy', () => new Proxy(function () {}, {})],
+            ['weakmap', () => new WeakMap()],
+            ['weakset', () => new WeakSet()],
+            ['weakref', () => new WeakRef({})],
+            ['promise', () => Promise.resolve(1)],
+            ['symbol object', () => Object(Symbol('s'))],
+            ['symbol', () => Symbol('s')],
+            ['function', () => () => {}],
+            ['nested function', () => ({ deep: [{ f() {} }] })],
+            ['native instance', () => new Event('x')],
+        ]) {
+            check(failure(() => structuredClone(make())) === 'DataCloneError:25', label);
+        }
+        check(failure(() => structuredClone()) === 'TypeError:ERR_MISSING_ARGS', 'missing value');
+        check(structuredClone(undefined) === undefined, 'explicit undefined');
+        check(failure(() => structuredClone(1, 5)) === 'TypeError:ERR_INVALID_ARG_TYPE', 'options type');
+        check(failure(() => structuredClone(1, { transfer: 5 })) === 'TypeError:ERR_INVALID_ARG_TYPE', 'transfer type');
+        check(structuredClone(1, null) === 1 && structuredClone(1, { transfer: null }) === 1, 'null options');
+        const iterable = { *[Symbol.iterator]() { yield new ArrayBuffer(1); } };
+        check(structuredClone(2, { transfer: iterable }) === 2, 'iterable transfer');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_transfer_detaches_only_after_success() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const buffer = new ArrayBuffer(8);
+        const view = new Uint8Array(buffer, 2, 4);
+        view.set([1, 2, 3, 4]);
+        const moved = structuredClone({ buffer, view }, { transfer: [buffer] });
+        check(buffer.byteLength === 0 && buffer.detached, 'source detached');
+        check(moved.buffer.byteLength === 8 && moved.view.buffer === moved.buffer, 'clone keeps the buffer');
+        check(moved.view.byteOffset === 2 && moved.view.join() === '1,2,3,4', 'clone keeps the view');
+        check(failure(() => structuredClone(1, { transfer: [buffer] })) === 'DataCloneError', 'detached transfer');
+        const twice = new ArrayBuffer(4);
+        check(failure(() => structuredClone(1, { transfer: [twice, twice] })) === 'DataCloneError', 'duplicate transfer');
+        check(failure(() => structuredClone(1, { transfer: [{}] })) === 'DataCloneError', 'object transfer');
+        check(failure(() => structuredClone(1, { transfer: [new SharedArrayBuffer(1)] })) === 'DataCloneError', 'shared transfer');
+        check(twice.byteLength === 4, 'refused transfer leaves the buffer');
+        const kept = new ArrayBuffer(4);
+        check(failure(() => structuredClone({ f() {} }, { transfer: [kept] })) === 'DataCloneError', 'failed clone');
+        check(kept.byteLength === 4, 'failed clone leaves the buffer');
+        const mutated = new ArrayBuffer(4);
+        const sneaky = { get detach() { structuredClone(0, { transfer: [mutated] }); return 1; } };
+        check(failure(() => structuredClone(sneaky, { transfer: [mutated] })) === 'DataCloneError', 'detached by a getter');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_ports_and_shared_memory() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const failure = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const channel = new MessageChannel();
+        check(failure(() => structuredClone({ port: channel.port1 })) === 'DataCloneError', 'unlisted port');
+        const moved = structuredClone({ port: channel.port1, again: channel.port1 }, { transfer: [channel.port1] });
+        check(moved.port instanceof MessagePort && moved.port !== channel.port1 && moved.port === moved.again, 'transferred port');
+        check(failure(() => structuredClone(1, { transfer: [channel.port1] })) === 'DataCloneError', 'transferred port is detached');
+        const shared = new SharedArrayBuffer(8);
+        const copy = structuredClone({ a: shared, b: shared, view: new Int32Array(shared) });
+        check(copy.a instanceof SharedArrayBuffer && copy.a !== shared && copy.a === copy.b, 'shared copy');
+        copy.view[1] = 42;
+        check(new Int32Array(shared)[1] === 42, 'shared memory stays shared');
+        moved.port.close();
+        channel.port2.close();
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_host_object_protocol_and_blobs() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const kClone = Symbol.for('lumen.transferable.clone');
+        const kDeserialize = Symbol.for('lumen.transferable.deserialize');
+        class Box {
+            constructor(value) { this.value = value; }
+            [kClone]() { return { data: { value: this.value }, deserializeInfo: 'test:box' }; }
+            [kDeserialize](data) { this.value = data.value; }
+        }
+        const factory = (data) => ({ factory: data.n });
+        globalThis.__lumenCloneResolve = (info) => ({ 'test:box': Box, 'test:factory': factory })[info];
+        const box = new Box(7);
+        const pair = structuredClone({ one: box, two: box });
+        check(pair.one instanceof Box && pair.one !== box && pair.one.value === 7 && pair.one === pair.two, 'host object');
+        class Made { [kClone]() { return { data: { n: 3 }, deserializeInfo: 'test:factory' }; } }
+        check(structuredClone(new Made()).factory === 3, 'factory host object');
+        class Unknown { [kClone]() { return { data: 1, deserializeInfo: 'test:missing' }; } }
+        try { structuredClone(new Unknown()); check(false, 'unknown host object'); } catch (e) { check(e.name === 'DataCloneError', 'unknown host error'); }
+        const file = new File(['abc'], 'n.txt', { type: 'Text/Plain', lastModified: 9 });
+        const blob = new Blob(['xy'], { type: 'a/b' });
+        const copy = structuredClone({ file, blob, again: blob });
+        check(copy.file instanceof File && copy.file !== file && copy.file.name === 'n.txt', 'file clone');
+        check(copy.file.lastModified === 9 && copy.file.type === 'text/plain' && copy.file.size === 3, 'file parts');
+        check(copy.blob instanceof Blob && !(copy.blob instanceof File) && copy.blob === copy.again && copy.blob.size === 2, 'blob clone');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
+#[test]
+fn structured_clone_wire_extended_round_trips() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const check = (ok, label) => { if (!ok) throw new Error(label); };
+        const name = (fn) => { try { fn(); return 'none'; } catch (e) { return e.name; } };
+        const rt = (v, transfer) => __deserializeClone(__serializeForClone(v, transfer));
+        const date = new Date(7);
+        const graph = rt({ a: date, b: date, list: Object.assign([1, , 3], { tag: 't' }), e: new Error('x', { cause: 4 }) });
+        check(graph.a === graph.b, 'date identity on the wire');
+        check(graph.list.length === 3 && !(1 in graph.list) && graph.list.tag === 't', 'array entries on the wire');
+        check(graph.e.cause === 4 && graph.e.message === 'x', 'error cause on the wire');
+        const buffer = new ArrayBuffer(16);
+        const out = rt({ view: new Float32Array(buffer, 4, 2), dv: new DataView(buffer, 8, 8) });
+        check(out.view.buffer === out.dv.buffer && out.view.byteOffset === 4 && out.dv.byteOffset === 8, 'views on the wire');
+        if (typeof Float16Array === 'function') {
+            check(rt(new Float16Array([1.5, 2])).join() === '1.5,2', 'Float16Array on the wire');
+        }
+        check(name(() => __serializeForClone(new SharedArrayBuffer(1))) === 'DataCloneError', 'shared memory needs transport');
+        check(name(() => __serializeForClone(1, [new ArrayBuffer(1)])) === 'DataCloneError', 'buffer transfer needs transport');
+        check(name(() => __deserializeClone(new Uint8Array(0))) === 'DataCloneError', 'empty message');
+        check(name(() => __deserializeClone(Uint8Array.of(250))) === 'DataCloneError', 'unknown tag');
+        const truncated = __serializeForClone('hello');
+        check(name(() => __deserializeClone(truncated.subarray(0, truncated.length - 2))) === 'DataCloneError', 'truncated message');
+        const file = rt(new File(['abc'], 'n.txt', { type: 'text/plain', lastModified: 9 }));
+        check(file instanceof File && file.name === 'n.txt' && file.lastModified === 9 && file.size === 3, 'file on the wire');
+        console.log('ok');
+        "#,
+    );
+    assert_eq!(out.lines(), ["ok"]);
+}
+
 // ---- Web Workers (realm-per-thread + structured messaging) ----
 
 /// Write worker scripts into a temp dir and drive `main_src` against them; returns stdout lines.

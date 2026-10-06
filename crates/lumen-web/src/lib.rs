@@ -8,8 +8,9 @@
 //!   `AbortSignal` (incl. `abort()`/`timeout()` statics) — flat target, no capture phase
 //! - [x] `TextEncoder` / `TextDecoder` (every WHATWG label; `fatal`, `ignoreBOM`, `stream`) and
 //!   `atob` / `btoa`: native classes and ops in `lumen_host::encoding`, published lazily
-//! - [x] `structuredClone` (objects/arrays/cycles, Date, RegExp, Map, Set, Error,
-//!   ArrayBuffer, typed arrays; no transfer list)
+//! - [x] `structuredClone` (objects/arrays/cycles, Date, RegExp, Map, Set, Error, Blob/File,
+//!   ArrayBuffer and views, `SharedArrayBuffer`, transferable buffers, ports and signals): native
+//!   in `lumen_host::structured_clone`, published lazily
 //! - [x] `URL` / `URLSearchParams`: native classes in `lumen_host::url` over the WHATWG parser in
 //!   `lumen_common::url`, published lazily
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
@@ -741,6 +742,8 @@ pub fn extension() -> Extension {
             lumen_host::lazy_globals::<lumen_host::messaging::channel_bindings::Module>,
             lumen_host::namespace::<lumen_host::messaging::shared::Module>,
             lumen_host::messaging::install_port_clone,
+            lumen_host::lazy_globals::<lumen_host::structured_clone::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::structured_clone::internals::Module>,
             lumen_host::performance::install_globals,
             lumen_host::namespace::<http_ops::Module>,
             install_transport,

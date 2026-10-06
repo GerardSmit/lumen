@@ -6,7 +6,7 @@
 //! A `Worker` is a dedicated OS thread running its OWN [`Runtime`] (a fresh realm: its own global,
 //! intrinsics, event loop, and thread pool). Because engine `Value`s are `!Send`, messages cross
 //! the thread boundary as bytes: the sender serializes with the JS structured-clone wire format
-//! (`__serializeForClone`, see `lumen-web/src/js/serialize.js`) and the receiver deserializes in
+//! (`__serializeForClone`, native in `lumen_host::structured_clone`) and the receiver deserializes in
 //! its own realm. Two `mpsc` channels carry those bytes; each side arms a blocking "inbox" task
 //! (the WebSocket-reader re-arm pattern) that delivers each message to JS and re-arms the next.
 //!

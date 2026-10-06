@@ -182,6 +182,18 @@
 //! 9. Run the corpus (`cargo test --release -p lumen-py --test corpus`) and compare error
 //!    messages with `python3`.
 //!
+//! # Classifying and building objects from a JS native
+//! A native that walks or rebuilds script values (structured clone, serializers) must not
+//! read properties the script can replace. `Ctx::clone_brand` classifies an object by its
+//! internal slots (`CloneBrand`: Date, RegExp, boxed primitives, Error, Array, Map, Set,
+//! buffers and views with their windows, uncloneable kinds); `Ctx::collection_entries`,
+//! `enumerable_own_string_keys` and `object_identity` read without running author code. The
+//! matching builders (`new_date_value`, `new_regexp_value`, `new_boxed_primitive`,
+//! `new_collection_value` with `collection_insert`, `new_typed_array_view`,
+//! `new_data_view_value`, `make_array_buffer_from`, `create_data_property`) construct from the
+//! realm's own intrinsics. Recursive walkers call `check_native_stack_for_host` per level.
+//! `lumen_host::structured_clone` is the reference user.
+//!
 //! # Implementing a host
 //! Implement [`Host`]: value / error / context types, the argument primitives (`to_f64`,
 //! `to_str`, `to_bytes`, ...), the result primitives (`from_f64`, `from_list`, ...), `bind`

@@ -1,6 +1,6 @@
 // node:worker_threads — REAL workers: one OS thread + one fresh engine realm per Worker, over the
 // runtime's __worker/__wself ops (lumen-runtime/src/worker.rs). Messages cross thread boundaries
-// as structured-clone wire bytes (__serializeForClone, lumen-web/src/js/serialize.js) through the
+// as structured-clone wire bytes (__serializeForClone, native in lumen_host::structured_clone) through the
 // native MessagePort endpoints (lumen-runtime/src/ports.rs), which also carry transferred ports.
 //
 // Each Worker is wired like Node's: a public channel (worker 'message' <-> parentPort) and an
@@ -333,7 +333,7 @@
     throw new Error("worker_threads moveMessagePortToContext is not supported in lumen");
   }
 
-  // The serializer's view of ports (lumen-web serialize.js).
+  // The serializer's view of ports (lumen_host::structured_clone).
   Object.defineProperty(globalThis, "__lumenPortClone", {
     value: {
       isPort: isMessagePort,

@@ -4203,6 +4203,12 @@ impl Interp {
         host_data(self, v)?.downcast::<RefCell<T>>().ok()
     }
 
+    /// Whether `v` is an instance of any native (`lumen_bind`) class, a subclass created by
+    /// script included.
+    pub fn is_native_instance(&self, v: &Value) -> bool {
+        host_entry_key(self, v).is_some()
+    }
+
     /// Read a native instance or one of its embedded base classes.
     pub fn with_instance<T: Class, R>(
         &mut self,

@@ -1,4 +1,4 @@
-//! Sender build, receiver adoption, structuredClone and real task latency.
+//! Sender build, receiver adoption and real task latency.
 use lumen::{
     embed::Value,
     parallel::{install, Limits, Parcel, ThreadHost},
@@ -22,29 +22,13 @@ fn root(engine: &mut Engine) -> Value {
         .expect("root parses")
         .unwrap_or_else(|_| panic!("root"))
 }
-fn install_clone_baseline(engine: &mut Engine) {
-    // Reuse the web crate's actual in-realm copier. These workloads require no
-    // encoding, network or file ops; their namespaces are never called.
-    eval(
-        engine,
-        concat!(
-            "(function(){\n",
-            include_str!("../../lumen-web/src/js/preamble.js"),
-            "\n",
-            include_str!("../../lumen-web/src/js/events.js"),
-            "\n",
-            include_str!("../../lumen-web/src/js/encoding.js"),
-            "\n})();"
-        ),
-    );
-}
 fn main() {
     let samples = std::env::var("LUMEN_BENCH_SAMPLES")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(5)
         .max(1);
-    println!("graph,build_us,adopt_us,run_us,structured_clone_us,parcel_bytes,objects");
+    println!("graph,build_us,adopt_us,run_us,parcel_bytes,objects");
     for (name, source, transfer) in [
         ("small", "var root={a:1,b:'text',c:[2,3]};", false),
         (
@@ -70,7 +54,7 @@ fn main() {
             true,
         ),
     ] {
-        let mut totals = [Duration::ZERO; 4];
+        let mut totals = [Duration::ZERO; 3];
         let mut bytes = 0;
         let mut objects = 0;
         for _ in 0..samples {
@@ -125,24 +109,11 @@ fn main() {
             totals[2] += start.elapsed();
             drop(sender);
 
-            let mut sender = Engine::new();
-            install_clone_baseline(&mut sender);
-            eval(&mut sender, source);
-            let start = Instant::now();
-            eval(
-                &mut sender,
-                if transfer {
-                    "structuredClone(root,{transfer:[root]});undefined;"
-                } else {
-                    "structuredClone(root);undefined;"
-                },
-            );
-            totals[3] += start.elapsed();
         }
         let us = totals.map(|v| v.as_secs_f64() * 1e6 / samples as f64);
         println!(
-            "{name},{:.2},{:.2},{:.2},{:.2},{bytes},{objects}",
-            us[0], us[1], us[2], us[3]
+            "{name},{:.2},{:.2},{:.2},{bytes},{objects}",
+            us[0], us[1], us[2]
         );
     }
 }

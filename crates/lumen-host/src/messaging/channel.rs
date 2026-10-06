@@ -1,9 +1,9 @@
 //! `MessagePort`, `MessageChannel` and `BroadcastChannel` over the endpoints of [`crate::ports`].
 //!
 //! A web port is an `EventTarget` that owns one endpoint handle (`Link`). Messages cross the
-//! channel as structured-clone wire bytes: `postMessage` serializes synchronously through the
-//! shared serializer (`__serializeForClone`), the receiving realm wakes a loop task, and each
-//! message is deserialized (`__deserializeClone`) and dispatched as its own task.
+//! channel as structured-clone wire bytes: `postMessage` serializes synchronously through
+//! [`crate::structured_clone`], the receiving realm wakes a loop task, and each message is
+//! deserialized there and dispatched as its own task.
 //!
 //! Lifetime. The loop task holds its port weakly. A port that has started, has a `message`
 //! listener and can still receive is pinned by its handle, so it survives without a script
@@ -15,6 +15,7 @@ use crate::events::{
 };
 use crate::messaging::{MessageEvent, Slotted};
 use crate::ports::{self, DeadPorts, Polled, Posted};
+use crate::{clone_transfer, structured_clone};
 use lumen::embed::{Ctx, NativeIdentityOwner, OpError, OpResult, Value};
 use lumen_bind::NativeError;
 use std::cell::{Cell, RefCell};
@@ -89,15 +90,6 @@ pub(crate) fn new_port(ctx: &mut Ctx, id: u64, on_close: Option<Value>) -> OpRes
     Ok(port)
 }
 
-fn call_global(ctx: &mut Ctx, name: &str, args: &[Value]) -> OpResult<Value> {
-    let global = ctx.global_object();
-    let function = ctx.member_get(&global, name).map_err(OpError::thrown)?;
-    if !function.is_callable() {
-        return Err(OpError::type_error(format!("{name} is unavailable")));
-    }
-    ctx.invoke(function, Value::Undefined, args).map_err(OpError::thrown)
-}
-
 // ---- lifetime and delivery ---------------------------------------------------------------------
 
 fn has_message_listener(ctx: &mut Ctx, receiver: &Value) -> bool {
@@ -170,8 +162,11 @@ fn on_wake(ctx: &mut Ctx, receiver: &Value) {
 fn deliver(ctx: &mut Ctx, receiver: &Value, bytes: Value) {
     let event = (|| -> OpResult<Value> {
         let bridge = web_bridge(ctx)?;
+        let bytes = ctx
+            .buffer_source_bytes(&bytes)
+            .ok_or_else(|| OpError::type_error("received message is not a buffer"))?;
         ports::begin_received(ctx);
-        let data = call_global(ctx, "__deserializeClone", &[bytes, bridge]);
+        let data = structured_clone::deserialize(ctx, &bytes, &bridge);
         let received = ports::end_received(ctx);
         match data {
             Ok(data) => MessageEvent::create(ctx, "message", data, "", Value::Null, received),
@@ -254,18 +249,13 @@ fn post_link(
     transfer: Value,
 ) -> OpResult<()> {
     let list = transfer_list(ctx, transfer)?;
+    let list = structured_clone::array_items(ctx, &list)?;
     let bridge = web_bridge(ctx)?;
-    let bytes = call_global(
-        ctx,
-        "__serializeForClone",
-        &[message, list, Value::Bool(true), bridge],
-    )?;
+    let bytes = structured_clone::serialize(ctx, &message, &list, true, &bridge)?;
     let Some(id) = link.id.get() else {
+        clone_transfer::abort_frame(ctx);
         return Ok(());
     };
-    let bytes = ctx
-        .buffer_source_bytes(&bytes)
-        .ok_or_else(|| OpError::type_error("serialized message is not a buffer"))?;
     match ports::post(ctx, id, &bytes)? {
         Posted::Queued | Posted::Dropped | Posted::Lost => Ok(()),
     }

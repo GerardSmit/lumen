@@ -46,6 +46,8 @@ pub mod perf;
 pub mod performance;
 /// Transferable `MessagePort` endpoints.
 pub mod ports;
+/// `structuredClone` and the wire format behind `postMessage` (`docs/native-clone.md`).
+pub mod structured_clone;
 /// Typed host services scoped to one realm.
 pub mod random;
 pub mod realm_services;

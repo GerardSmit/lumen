@@ -159,3 +159,48 @@ fn local_shared_clone_preserves_backing_and_rejects_unlisted_ports() {
     "#,
     );
 }
+
+#[test]
+fn node_ports_carry_the_native_clone_graph_semantics() {
+    check(
+        r#"
+        const assert=require('node:assert/strict');
+        const {MessageChannel,receiveMessageOnPort}=require('node:worker_threads');
+        const {port1,port2}=new MessageChannel();
+        const date=new Date(3);
+        const map=new Map();
+        map.set('map',map);
+        const list=Object.assign([1,,3],{tag:'t'});
+        port2.postMessage({a:date,b:date,map,list,error:new Error('x',{cause:'why'})});
+        const got=receiveMessageOnPort(port1).message;
+        assert.equal(got.a,got.b);
+        assert.equal(got.map.get('map'),got.map);
+        assert.equal(got.list.length,3);
+        assert.equal(1 in got.list,false);
+        assert.equal(got.list.tag,'t');
+        assert.equal(got.error.cause,'why');
+        assert.throws(()=>port2.postMessage({proxy:new Proxy({},{})}),error=>error.name==='DataCloneError');
+        port1.close(); port2.close();
+        'passed'
+    "#,
+    );
+}
+
+#[test]
+fn unlisted_and_uncloneable_values_leave_no_outgoing_frame() {
+    check(
+        r#"
+        const assert=require('node:assert/strict');
+        const {MessageChannel,receiveMessageOnPort}=require('node:worker_threads');
+        const {port1,port2}=new MessageChannel();
+        const shared=new SharedArrayBuffer(4);
+        for (let attempt=0;attempt<100;attempt++) {
+            assert.throws(()=>port2.postMessage({shared,weak:new WeakMap()}),error=>error.name==='DataCloneError');
+        }
+        port2.postMessage(shared);
+        assert(receiveMessageOnPort(port1).message instanceof SharedArrayBuffer);
+        port1.close(); port2.close();
+        'passed'
+    "#,
+    );
+}

@@ -76,6 +76,12 @@ pub(crate) struct WeakState {
 }
 
 impl Interp {
+    /// Whether `pointer` is a WeakRef or FinalizationRegistry.
+    #[cfg(feature = "embed")]
+    pub(crate) fn is_weak_ref_or_registry(&self, pointer: usize) -> bool {
+        self.weak.refs.contains_key(&pointer) || self.weak.registries.contains_key(&pointer)
+    }
+
     #[cfg(feature = "parallel")]
     pub(crate) fn is_weak_object(&self, pointer: usize) -> bool {
         self.weak.refs.contains_key(&pointer) || self.weak.registries.contains_key(&pointer)

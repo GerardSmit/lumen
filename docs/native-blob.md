@@ -58,5 +58,5 @@ registered source; `object_url_resource` gives browser resource loaders the byte
 ## `__lumenBlobInternals`
 
 A hidden, non-enumerable global for the remaining JavaScript glue: `isBlob`, `isFileBacked`,
-`isFormData`, `bytes`, `clone`, `snapshot`/`restore` (wire format of `postMessage`), `fileBlob`,
+`isFormData`, `bytes`, `fileBlob`,
 `encodeFormData`, `decodeMultipart`, `resolveObjectURL`.

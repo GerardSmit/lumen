@@ -14,6 +14,7 @@ The kernel keeps its own transport for shared workers and installs only the even
 | `messaging::channel` | `MessagePort`, `MessageChannel`, `BroadcastChannel`, the structured-clone bridge, the `__lumenSharedPorts` namespace |
 | `ports` | endpoint handles (moved from `lumen-runtime`): `new_pair`, `adopt`, `poll`, `post`, `listen`, `broadcast`, reaper |
 | `clone_transfer` | `__cloneTransfer`: shared-memory and port attachments of a message (moved from `lumen-runtime`) |
+| `structured_clone` | `structuredClone` and the wire format of every message ([native-clone.md](native-clone.md)) |
 | `performance` | `Performance`, `install_globals` |
 
 Install `messaging::event_bindings::Module` and `messaging::channel_bindings::Module` with
@@ -37,17 +38,20 @@ A web port is an `EventTarget` owning a `Link` (the endpoint handle id, the star
 close hook). Messages are structured-clone wire bytes:
 
 - `postMessage(message, transfer | options)` parses the transfer list, then calls
-  `__serializeForClone(message, list, true, bridge)` synchronously and queues the bytes on the
-  endpoint (`ports::post`). Posting on a closed port does nothing.
+  `structured_clone::serialize(message, list, true, bridge)` synchronously and queues the bytes on
+  the endpoint (`ports::post`). Posting on a closed port does nothing.
 - The receiving realm runs a loop task (`ports::listen`) that polls one message per wake,
-  calls `__deserializeClone(bytes, bridge)` and dispatches a trusted `MessageEvent` (or
+  calls `structured_clone::deserialize(bytes, bridge)` and dispatches a trusted `MessageEvent` (or
   `messageerror` carrying the error). Ports created by the deserialization are collected by
   `ports::begin_received` / `end_received` and become `event.ports`.
 - The peer closing is reported as a `close` event after the queued messages.
 - Assigning `onmessage` (a function) starts the port; `addEventListener("message")` does not.
 
-`bridge` is the explicit port parameter of the serializer: `serializeForClone(value, transfer,
-transport, ports)` and `deserializeClone(bytes, ports)` default to `globalThis.__lumenPortClone`.
+`bridge` is the explicit port parameter of the serializer: `serialize(ctx, value, transfer,
+transport, bridge)` and `deserialize(ctx, bytes, bridge)` (and the script-level
+`__serializeForClone(value, transfer, transport, bridge)` / `__deserializeClone(bytes, bridge)`)
+default to `globalThis.__lumenPortClone` when `bridge` is not an object. The serializer itself is
+described in [native-clone.md](native-clone.md).
 The web bridge (built natively, kept in a native slot of the realm's global) answers for web
 ports and hands every other port to the installed global bridge, which Node's `worker_threads`
 replaces. Nothing mutates a global any more.

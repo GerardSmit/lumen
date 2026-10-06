@@ -13,7 +13,7 @@ pub(crate) enum AbortStep {
         receiver: WeakValue,
         removed: Rc<Cell<bool>>,
     },
-    /// Abort a signal created by `cloneTransferableSignal` on a later turn.
+    /// Abort a signal created by `clone_transferable` on a later turn.
     Native(Rc<dyn Fn(&mut Ctx, &Value)>),
     /// A native algorithm its owner keeps alive; dropped with the owner.
     Owned(Weak<dyn Fn(&mut Ctx, &Value)>),
@@ -302,6 +302,15 @@ pub(crate) fn any_signal(ctx: &mut Ctx, signals: Value) -> OpResult<Value> {
         }
     }
     Ok(result)
+}
+
+/// Whether `value` is an `AbortSignal` marked transferable (`nodejs.abortsignal.transferable`).
+pub(crate) fn is_transferable_signal(ctx: &mut Ctx, value: &Value) -> bool {
+    if signal_state(ctx, value).is_none() {
+        return false;
+    }
+    let key = ctx.symbol_for(TRANSFERABLE_SIGNAL);
+    matches!(ctx.reflect_get(value, &key, value), Ok(Value::Bool(true)))
 }
 
 /// The copy of a transferable signal that arrives through a `MessagePort`: aborted already if

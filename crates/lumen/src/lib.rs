@@ -32,6 +32,9 @@ mod coroutine;
 /// Typed Rust <-> JS conversions and the runtime of the binding macros (see [`embed`]).
 #[cfg(feature = "embed")]
 mod embed_convert;
+/// Brand and slot access for structured clone (see [`embed::CloneBrand`]).
+#[cfg(feature = "embed")]
+mod embed_clone;
 #[cfg(feature = "embed")]
 mod embed_realms;
 mod eval;
@@ -1152,6 +1155,7 @@ impl Engine {
 /// published crate; it stabilizes together with the `lumen-host`/`lumen-runtime` crates.
 #[cfg(feature = "embed")]
 pub mod embed {
+    pub use crate::embed_clone::{object_identity, CloneBrand};
     pub use crate::embed_realms::{
         HostGlobalThisError, HostRealmDisposeError, HostRealmEvalError, HostRealmScopeError,
         RealmHandle, WindowProxyDisposition, WindowProxyError, WindowProxyOperation,

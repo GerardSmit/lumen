@@ -15,9 +15,9 @@ every op crate and does not depend on `lumen-html`, so the core knows nothing ab
 | --- | --- |
 | `events::target` | `TargetData` (the listener list), listener registration, the dispatch loop, listener invocation, `Callback`, the `TargetHooks` trait |
 | `events::event` | `EventState` and the operations host subclasses share (`EventInit`, legacy initialization) |
-| `events::abort` | `SignalState`, abort algorithms, `AbortSignal.timeout` / `any`, `cloneTransferableSignal` |
+| `events::abort` | `SignalState`, abort algorithms, `AbortSignal.timeout` / `any`, `clone_transferable` / `is_transferable_signal` (used by `structuredClone`) |
 | `events::web` (re-exported as `events::bindings`) | the `lumen_bind` module published as lazy globals: `Event`, `EventTarget`, `CustomEvent`, `ErrorEvent`, `AbortSignal`, `AbortController`, `DOMException` |
-| `events::node` (re-exported as `events::internals`) | the `__eventTargetInternals` constant: `NodeEventTarget`, the Node symbols, `defineEventHandler`, `hasListeners`, `listeners`, `cloneTransferableSignal`, brand predicates |
+| `events::node` (re-exported as `events::internals`) | the `__eventTargetInternals` constant: `NodeEventTarget`, the Node symbols, `defineEventHandler`, `hasListeners`, `listeners`, brand predicates |
 | `events::RealmPolicy` | the per-realm exception reporter and error style (see below) |
 | `lumen_host::realm_services` | `RealmServices<T>`, the per-realm typed service store (moved here from `lumen-html-js`) |
 
@@ -154,7 +154,8 @@ object. The native core:
 - `events.js`, `custom-event.js` and `error-events.js` are deleted; `lumen-web`'s `build.rs` drops
   their units and its extension publishes `lumen_host::events` as lazy globals.
 - `xhr.js` is gone: `XMLHttpRequest` is native ([native-network.md](native-network.md));
-  `encoding.js` uses `__eventTargetInternals.cloneTransferableSignal`. `MessageEvent`,
+  `encoding.js` and `serialize.js` are native too: `structuredClone` copies a transferable
+  `AbortSignal` with `events::clone_transferable` ([native-clone.md](native-clone.md)). `MessageEvent`,
   `MessagePort` and the other channel classes are native subclasses
   ([native-messaging.md](native-messaging.md)).
 - `lumen-node`: `internal/event_target` maps to the native internals; `events.js` reads listeners

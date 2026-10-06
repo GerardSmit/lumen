@@ -25,6 +25,7 @@ pub use web::bindings;
 pub use abort::{abort_signal, add_owned_step, dom_exception, follow_signal, new_signal};
 pub(crate) use abort::signal_state;
 pub use abort::SignalState;
+pub(crate) use abort::{clone_transferable, is_transferable_signal};
 pub use bindings::{
     AbortController, AbortSignal, CustomEvent, DomException, ErrorEvent, Event, EventTarget,
 };

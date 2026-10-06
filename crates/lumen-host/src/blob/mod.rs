@@ -230,6 +230,58 @@ pub fn new_file(
     ))
 }
 
+/// What structured clone keeps of a `Blob` or `File`.
+pub(crate) struct BlobSnapshot {
+    pub file: bool,
+    pub content_type: String,
+    pub name: String,
+    pub last_modified: f64,
+    pub bytes: Bytes,
+}
+
+/// A genuine `Blob` or `File`'s content for structured clone: `None` for any other value, an
+/// error for a file-backed blob.
+pub(crate) fn snapshot_blob(ctx: &mut Ctx, value: &Value) -> Option<OpResult<BlobSnapshot>> {
+    let view = blob_of(ctx, value)?;
+    if view.source.is_file_backed() {
+        return Some(Err(invalid_state("File-backed Blobs are not cloneable")));
+    }
+    let parts = ctx
+        .with_instance::<File, _>(value, |file| (file.name.clone(), file.last_modified))
+        .ok();
+    let bytes = match view.source.bytes(ctx) {
+        Ok(bytes) => bytes,
+        Err(error) => return Some(Err(error)),
+    };
+    let (file, name, last_modified) = match parts {
+        Some((name, last_modified)) => (true, name, last_modified),
+        None => (false, String::new(), 0.0),
+    };
+    Some(Ok(BlobSnapshot {
+        file,
+        content_type: view.content_type,
+        name,
+        last_modified,
+        bytes,
+    }))
+}
+
+/// The `Blob` or `File` a [`BlobSnapshot`] describes.
+pub(crate) fn restore_blob(ctx: &mut Ctx, snapshot: BlobSnapshot) -> Value {
+    let source = Source::Memory(snapshot.bytes);
+    let content_type = normalize_type(&snapshot.content_type);
+    if snapshot.file {
+        ctx.new_instance(File::new_native(
+            source,
+            content_type,
+            snapshot.name,
+            snapshot.last_modified,
+        ))
+    } else {
+        ctx.new_instance(Blob::from_source(source, content_type))
+    }
+}
+
 /// A `Uint8Array` over `buffer`, constructed through the realm's `Uint8Array`.
 pub(crate) fn uint8_array(ctx: &mut Ctx, buffer: Value) -> OpResult<Value> {
     let global = ctx.global_object();

@@ -399,15 +399,6 @@ pub mod internals {
             ctx.make_array(callbacks)
         }
 
-        #[method(name = "cloneTransferableSignal")]
-        fn clone_transferable_signal(
-            ctx: &mut Ctx,
-            _this: This<Value>,
-            signal: Value,
-        ) -> OpResult<Value> {
-            super::super::abort::clone_transferable(ctx, &signal)
-        }
-
         /// `target.emit`-style dispatch: node-style listeners get `arg`; DOM-style ones get the
         /// event `factory()` returns, created when the first of them runs.
         #[method(name = "emitLazy")]
