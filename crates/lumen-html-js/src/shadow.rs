@@ -122,6 +122,7 @@ impl DomSlotElement {
             .base
             .base
             .get_attribute("name")?
+            .0
             .unwrap_or_default())
     }
     #[setter]

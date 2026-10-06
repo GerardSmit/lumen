@@ -583,7 +583,7 @@ impl DomHtmlVideoElement {
 
     #[getter]
     fn src(&self) -> OpResult<String> {
-        let Some(source) = self.node().get_attribute("src")? else {
+        let Some(source) = self.node().get_attribute("src")?.0 else {
             return Ok(String::new());
         };
         let base = self.node().realm.base_url();
@@ -608,6 +608,7 @@ impl DomHtmlVideoElement {
         if self
             .node()
             .get_attribute("src")?
+            .0
             .as_deref()
             .unwrap_or("")
             .is_empty()
@@ -771,7 +772,7 @@ impl DomHtmlAudioElement {
     #[getter]
     fn src(&self) -> OpResult<String> {
         let node = self.node();
-        let Some(source) = node.get_attribute("src")? else {
+        let Some(source) = node.get_attribute("src")?.0 else {
             return Ok(String::new());
         };
         let base = node.realm.base_url();
@@ -800,6 +801,7 @@ impl DomHtmlAudioElement {
         if self
             .node()
             .get_attribute("src")?
+            .0
             .as_deref()
             .unwrap_or("")
             .is_empty()

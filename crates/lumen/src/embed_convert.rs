@@ -1704,6 +1704,23 @@ impl IntoRet<JsHost> for Null {
     }
 }
 
+/// A nullable result (WebIDL `T?`): `None` is JS `null`, where a bare `Option<T>` is `undefined`.
+#[derive(Clone, Debug, Default)]
+pub struct Nullable<T>(pub Option<T>);
+
+impl<T: IntoRet<JsHost>> IntoRet<JsHost> for Nullable<T> {
+    const MAY_RUN: bool = T::MAY_RUN;
+    #[inline]
+    fn into_ret(self, ctx: &mut Interp) -> Result<Value, Value> {
+        match self.0 {
+            Some(value) => value.into_ret(ctx),
+            None => Ok(Value::Null),
+        }
+    }
+}
+
+impl<T: Elem> Elem for Nullable<T> {}
+
 /// Any JS object (functions included).
 #[derive(Clone)]
 pub struct JsObject(Value);

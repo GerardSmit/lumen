@@ -1196,7 +1196,7 @@ pub mod embed {
     // The JS host of `lumen-bind`, errors, promises and async work (see `embed_convert`).
     pub use crate::embed_convert::{
         class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
-        JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
+        JsFunction, JsHost, JsObject, Nullable, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
         LazyGroupInit, NativeIdentityOwner, WeakValue,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).

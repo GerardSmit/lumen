@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::window_globals::DomWindow;
-use lumen::embed::{Ctx, JsHost, OpError, OpResult, Value};
+use lumen::embed::{Ctx, JsHost, Nullable, OpError, OpResult, Value};
 use lumen_bind::{CtorRet, Host};
 
 pub(crate) fn dictionary_member(
@@ -1513,8 +1513,8 @@ impl DomInputEvent {
     }
 
     #[getter]
-    fn data(&self) -> Option<String> {
-        self.data.borrow().clone()
+    fn data(&self) -> Nullable<String> {
+        Nullable(self.data.borrow().clone())
     }
     #[getter]
     fn is_composing(&self) -> bool {

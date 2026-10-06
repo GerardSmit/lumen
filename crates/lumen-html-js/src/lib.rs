@@ -1,5 +1,5 @@
 //! DOM objects for one Lumen realm, backed by the shared Rust render session.
-use lumen::embed::{Ctx, JsObject, OpError, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, JsObject, Nullable, OpError, OpResult, Value, WeakValue};
 use lumen_html::selector::next_descendant;
 use lumen_html::{html, selector, session::RenderSession, Error, Namespace, NodeId, NodeKind};
 use std::{
@@ -4361,7 +4361,7 @@ impl DomElement {
                 "attribute name is not a valid attribute local name",
             ));
         }
-        let present = self.base.get_attribute(name.as_ref())?.is_some();
+        let present = self.base.get_attribute(name.as_ref())?.0.is_some();
         let add = force.unwrap_or(!present);
         if add == present {
             return Ok(present);
@@ -4884,6 +4884,7 @@ impl DomHtmlDivElement {
             .base
             .base
             .get_attribute("align")?
+            .0
             .unwrap_or_default())
     }
     #[setter(coerce)]
@@ -4904,6 +4905,7 @@ impl DomHtmlBrElement {
             .base
             .base
             .get_attribute("clear")?
+            .0
             .unwrap_or_default())
     }
     #[setter(coerce)]
@@ -7632,7 +7634,7 @@ impl DomHtmlElement {
             return Ok(value);
         }
         if self.base.base.local_name()?.as_deref() == Some("textarea") {
-            return Ok(self.base.base.text_content()?.unwrap_or_default());
+            return Ok(self.base.base.text_content()?.0.unwrap_or_default());
         }
         Ok(String::new())
     }
@@ -7806,7 +7808,7 @@ pub struct DomCharacterData {
 impl DomCharacterData {
     #[getter]
     fn data(&self) -> OpResult<String> {
-        Ok(self.base.node_value()?.unwrap_or_default())
+        Ok(self.base.node_value()?.0.unwrap_or_default())
     }
     #[setter(coerce)]
     fn set_data(&self, ctx: &mut Ctx, value: Value) -> OpResult<()> {
@@ -9481,9 +9483,9 @@ impl DomNode {
         Ok(())
     }
     #[getter(name = "namespaceURI")]
-    fn namespace_uri(&self) -> OpResult<Option<String>> {
+    fn namespace_uri(&self) -> OpResult<Nullable<String>> {
         let session = self.realm.session.borrow();
-        Ok(match session.document().kind(self.id).map_err(dom_error)? {
+        Ok(Nullable(match session.document().kind(self.id).map_err(dom_error)? {
             NodeKind::Element {
                 namespace: Namespace::Other(value),
                 ..
@@ -9498,7 +9500,7 @@ impl DomNode {
                 .into(),
             ),
             _ => None,
-        })
+        }))
     }
     #[getter]
     fn local_name(&self) -> OpResult<Option<String>> {
@@ -9521,8 +9523,8 @@ impl DomNode {
         )
     }
     #[getter]
-    fn prefix(&self) -> OpResult<Option<String>> {
-        Ok(
+    fn prefix(&self) -> OpResult<Nullable<String>> {
+        Ok(Nullable(
             match self
                 .realm
                 .session
@@ -9537,7 +9539,7 @@ impl DomNode {
                     .map(|(prefix, _)| prefix.to_owned()),
                 _ => None,
             },
-        )
+        ))
     }
     #[getter]
     fn tag_name(&self) -> OpResult<String> {
@@ -9575,7 +9577,7 @@ impl DomNode {
     }
     #[method(coerce)]
     fn has_attribute(&self, name: &str) -> OpResult<bool> {
-        Ok(self.get_attribute(name)?.is_some())
+        Ok(self.get_attribute(name)?.0.is_some())
     }
     #[getter]
     fn style(&self, ctx: &mut Ctx, this: lumen_bind::This<Value>) -> Value {
@@ -9698,14 +9700,14 @@ impl DomNode {
     }
 
     #[getter]
-    fn node_value(&self) -> OpResult<Option<String>> {
+    fn node_value(&self) -> OpResult<Nullable<String>> {
         let session = self.realm.session.borrow();
-        Ok(match session.document().kind(self.id).map_err(dom_error)? {
+        Ok(Nullable(match session.document().kind(self.id).map_err(dom_error)? {
             NodeKind::Text(value) | NodeKind::Comment(value) => Some(value.clone()),
             NodeKind::CData(value) => Some(value.clone()),
             NodeKind::ProcessingInstruction { data, .. } => Some(data.clone()),
             _ => None,
-        })
+        }))
     }
 
     #[setter(coerce)]
@@ -10294,7 +10296,7 @@ impl DomNode {
     }
 
     #[method(coerce)]
-    fn get_attribute(&self, name: &str) -> OpResult<Option<String>> {
+    fn get_attribute(&self, name: &str) -> OpResult<Nullable<String>> {
         let name = self.normalized_attribute_name(name);
         let session = self.realm.session.borrow();
         let NodeKind::Element { attributes, .. } =
@@ -10302,10 +10304,12 @@ impl DomNode {
         else {
             return Err(OpError::new("TypeError", "attributes require an element"));
         };
-        Ok(attributes
-            .iter()
-            .find(|(key, _)| key.as_str() == name.as_ref())
-            .map(|(_, value)| value.clone()))
+        Ok(Nullable(
+            attributes
+                .iter()
+                .find(|(key, _)| key.as_str() == name.as_ref())
+                .map(|(_, value)| value.clone()),
+        ))
     }
 
     #[method(name = "getAttributeNS", coerce)]
@@ -10313,19 +10317,20 @@ impl DomNode {
         &self,
         namespace_uri: Option<&str>,
         local_name: &str,
-    ) -> OpResult<Option<String>> {
+    ) -> OpResult<Nullable<String>> {
         let namespace_uri = namespace_uri.filter(|uri| !uri.is_empty());
         self.realm
             .session
             .borrow()
             .document()
             .get_attribute_ns(self.id, namespace_uri, local_name)
+            .map(Nullable)
             .map_err(dom_error)
     }
 
     #[method(name = "hasAttributeNS", coerce)]
     fn has_attribute_ns(&self, namespace_uri: Option<&str>, local_name: &str) -> OpResult<bool> {
-        Ok(self.get_attribute_ns(namespace_uri, local_name)?.is_some())
+        Ok(self.get_attribute_ns(namespace_uri, local_name)?.0.is_some())
     }
 
     #[method(name = "setAttributeNS", coerce)]
@@ -10437,7 +10442,7 @@ impl DomNode {
     #[method(coerce)]
     fn remove_attribute(&self, ctx: &mut Ctx, name: &str) -> OpResult<()> {
         let name = self.normalized_attribute_name(name);
-        let existed = self.get_attribute(name.as_ref())?.is_some();
+        let existed = self.get_attribute(name.as_ref())?.0.is_some();
         let namespace_uri = self
             .realm
             .session
@@ -10529,14 +10534,16 @@ impl DomNode {
     }
 
     #[getter(name = "textContent")]
-    fn text_content(&self) -> OpResult<Option<String>> {
+    fn text_content(&self) -> OpResult<Nullable<String>> {
         let session = self.realm.session.borrow();
         match session.document().kind(self.id).map_err(dom_error)? {
             NodeKind::Text(text) | NodeKind::CData(text) | NodeKind::Comment(text) => {
-                return Ok(Some(text.clone()));
+                return Ok(Nullable(Some(text.clone())));
             }
-            NodeKind::ProcessingInstruction { data, .. } => return Ok(Some(data.clone())),
-            NodeKind::Document | NodeKind::DocumentType(_) => return Ok(None),
+            NodeKind::ProcessingInstruction { data, .. } => {
+                return Ok(Nullable(Some(data.clone())))
+            }
+            NodeKind::Document | NodeKind::DocumentType(_) => return Ok(Nullable(None)),
             _ => {}
         }
         let mut out = String::new();
@@ -10544,7 +10551,7 @@ impl DomNode {
             .document()
             .append_descendant_text(self.id, &mut out)
             .map_err(dom_error)?;
-        Ok(Some(out))
+        Ok(Nullable(Some(out)))
     }
 
     #[setter(name = "textContent", coerce)]

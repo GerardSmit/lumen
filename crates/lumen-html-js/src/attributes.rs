@@ -6,7 +6,7 @@
 //! directly from the live Element each time.
 
 use super::{dom_error, error_reporting, event_content_handlers, forms, DomNode, DomRealm};
-use lumen::embed::{Ctx, OpError, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, Nullable, OpError, OpResult, Value, WeakValue};
 use lumen_html::{Error, Namespace, NodeId, NodeKind};
 use std::rc::Rc;
 
@@ -35,14 +35,14 @@ impl DomAttr {
     }
 
     #[getter(name = "namespaceURI")]
-    fn namespace_uri(&self) -> OpResult<Option<String>> {
-        Ok(self.attribute()?.0)
+    fn namespace_uri(&self) -> OpResult<Nullable<String>> {
+        Ok(Nullable(self.attribute()?.0))
     }
 
     #[getter]
-    fn prefix(&self) -> OpResult<Option<String>> {
+    fn prefix(&self) -> OpResult<Nullable<String>> {
         let (namespace, name, _) = self.attribute()?;
-        Ok(namespace.and_then(|_| name.split_once(':').map(|(prefix, _)| prefix.to_owned())))
+        Ok(Nullable(namespace.and_then(|_| name.split_once(':').map(|(prefix, _)| prefix.to_owned()))))
     }
 
     #[getter]
