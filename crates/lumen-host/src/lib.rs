@@ -62,6 +62,7 @@ pub mod timers;
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 pub mod url;
+pub mod url_pattern;
 pub mod webidl;
 #[cfg(feature = "webcrypto")]
 pub mod webcrypto;

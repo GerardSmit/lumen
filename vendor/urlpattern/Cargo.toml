@@ -1,0 +1,16 @@
+[package]
+name = "urlpattern"
+version = "0.6.0"
+edition = "2024"
+authors = ["the Deno authors", "crowlKats <crowlkats@toaxl.com>"]
+description = "rust-urlpattern is a Rust implementation of the URLPattern standard"
+license = "MIT"
+repository = "https://github.com/denoland/rust-urlpattern"
+publish = false
+
+[lib]
+name = "urlpattern"
+path = "src/lib.rs"
+
+[dependencies]
+lumen-common = { path = "../../crates/lumen-common" }

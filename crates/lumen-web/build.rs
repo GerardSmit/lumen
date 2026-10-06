@@ -32,11 +32,6 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["urlpattern.js"],
-        lazy: true,
-        defined: &[],
-    },
-    Unit {
         files: &["navigator.js"],
         lazy: false,
         defined: &[],

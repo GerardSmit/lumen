@@ -29,7 +29,9 @@
 //!   accept asynchronous streams. Request uploads are prepared before transport delivery.
 //! - [x] `WebSocket` and `EventSource`: native classes (`websocket_class.rs`, `eventsource_class.rs`)
 //!   over the transports in `websocket.rs` and `sse.rs`, published lazily
-//! - [ ] `URLPattern`, `crypto.subtle` beyond digest
+//! - [x] `URLPattern`: native class in `lumen_host::url_pattern` over the vendored `urlpattern` crate,
+//!   whose component expressions run on `lumen_common::regex`; published lazily
+//! - [ ] `crypto.subtle` beyond digest
 
 use lumen_bind::NativeError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -733,6 +735,7 @@ pub fn extension() -> Extension {
             url_namespace,
             lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::url::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::url_pattern::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::events::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::events::internals::Module>,
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,

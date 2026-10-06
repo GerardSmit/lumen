@@ -15,6 +15,7 @@ lumen = { path = "../lumen", default-features = false, features = ["embed"] }
 lumen-bind = { path = "../lumen-bind" }
 lumen-common = { path = "../lumen-common", features = ["compress", "web-encoding"] }
 lumen-os = { path = "../lumen-os" }
+urlpattern = { path = "../../vendor/urlpattern" }
 
 web-time = "1"
 

@@ -1729,6 +1729,116 @@ fn web_url_reads_the_native_record() {
 }
 
 #[test]
+fn web_url_pattern_matches_and_reports_groups() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const books = new URLPattern({ pathname: "/books/:id" });
+        console.log(books.pathname, books.protocol, books.hasRegExpGroups);
+        console.log(books.test("https://ex.com/books/123"), books.test("https://ex.com/books/"));
+        const hit = books.exec("https://ex.com/books/123?x=1#h");
+        console.log(JSON.stringify(hit.pathname), JSON.stringify(hit.search), hit.inputs.length, hit.inputs[0]);
+        console.log(JSON.stringify(Object.keys(hit)));
+        console.log(JSON.stringify(new URLPattern({ pathname: "/:b/:a" }).exec({ pathname: "/1/2" }).pathname.groups));
+
+        const based = new URLPattern("/a/:b", "https://example.com");
+        console.log(based.protocol, based.hostname, based.port, based.pathname, based.search);
+        console.log(based.test("https://example.com/a/z"), based.test("http://example.com/a/z"));
+
+        const digits = new URLPattern({ pathname: "/files/(\\d+)" });
+        console.log(digits.hasRegExpGroups, digits.test({ pathname: "/files/12" }), digits.test({ pathname: "/files/ab" }));
+        console.log(JSON.stringify(digits.exec({ pathname: "/files/12" }).pathname.groups));
+
+        const optional = new URLPattern({ pathname: "/a/:b?" }).exec("http://x/a");
+        console.log("b" in optional.pathname.groups, optional.pathname.groups.b);
+
+        console.log(new URLPattern({ pathname: "/Foo" }, { ignoreCase: true }).test({ pathname: "/foo" }));
+        console.log(new URLPattern({ pathname: "/Foo" }).test({ pathname: "/foo" }));
+        console.log(new URLPattern({ hostname: "*.example.com" }).test("https://a.example.com/"));
+
+        const rel = new URLPattern({ pathname: "/b" });
+        console.log(rel.test("/b", "https://x.org"), rel.exec("not a url"), JSON.stringify(rel.exec("/b", "https://x.org").inputs));
+        console.log(rel.exec(undefined) === null, new URLPattern().test("https://any.example/p?q#h"));
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "/books/:id * false",
+            "true false",
+            r#"{"input":"/books/123","groups":{"id":"123"}} {"input":"x=1","groups":{"0":"x=1"}} 1 https://ex.com/books/123?x=1#h"#,
+            r#"["inputs","protocol","username","password","hostname","port","pathname","search","hash"]"#,
+            r#"{"b":"1","a":"2"}"#,
+            "https example.com  /a/:b *",
+            "true false",
+            "true true false",
+            r#"{"0":"12"}"#,
+            "true undefined",
+            "true",
+            "false",
+            "true",
+            "true null [\"/b\",\"https://x.org\"]",
+            "true true",
+        ]
+    );
+}
+
+#[test]
+fn web_url_pattern_errors_and_interface_shape() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const name = (fn) => { try { fn(); return "no error"; } catch (e) { return e.name; } };
+        console.log(name(() => new URLPattern("/relative")));
+        console.log(name(() => new URLPattern({ pathname: "/a(" })));
+        console.log(name(() => new URLPattern({ pathname: "/(?<n>x)" })));
+        console.log(name(() => new URLPattern({ pathname: "/:a/:a" })));
+        console.log(name(() => new URLPattern({}, "https://x.org")));
+        console.log(name(() => new URLPattern("/a", "not a url")));
+        console.log(name(() => new URLPattern("https://x.org/", 5)));
+        console.log(name(() => new URLPattern({ protocol: "ht tp" })));
+        console.log(name(() => new URLPattern({ port: "99999" })));
+        console.log(name(() => new URLPattern({ pathname: "/x" }).test({ pathname: "/x" }, "https://x.org")));
+        console.log(name(() => URLPattern.prototype.exec.call({})));
+        console.log(name(() => URLPattern()));
+
+        console.log(URLPattern.length, URLPattern.prototype.test.length, URLPattern.prototype.exec.length);
+        console.log(Object.prototype.toString.call(new URLPattern()));
+        const d = Object.getOwnPropertyDescriptor(URLPattern.prototype, "pathname");
+        console.log(typeof d.get, d.set, d.enumerable, d.configurable);
+        console.log(Object.getOwnPropertyDescriptor(URLPattern.prototype, "exec").enumerable);
+        console.log(Object.getOwnPropertyNames(URLPattern.prototype).sort().join(","));
+        console.log(Object.getOwnPropertyDescriptor(globalThis, "URLPattern").enumerable);
+        "#,
+    );
+    assert_eq!(
+        out.lines(),
+        [
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "TypeError",
+            "0 0 0",
+            "[object URLPattern]",
+            "function undefined true true",
+            "true",
+            "constructor,exec,hasRegExpGroups,hash,hostname,password,pathname,port,protocol,search,test,username",
+            "false",
+        ]
+    );
+}
+
+#[test]
 fn web_response_status_defaults() {
     // An explicit `undefined` status/statusText counts as absent (WebIDL) and takes the default,
     // rather than coercing to `Number(undefined)` → NaN / `String(undefined)` → "undefined". This
