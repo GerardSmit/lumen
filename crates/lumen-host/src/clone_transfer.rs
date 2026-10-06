@@ -1,22 +1,21 @@
-//! Native structured-clone attachments. Wire bytes carry only message-local indexes;
+//! Native structured-clone attachments (`__cloneTransfer`). Wire bytes carry only message-local indexes;
 //! JavaScript cannot look up a process-global shared-memory or MessagePort identity.
 //! Each realm stages at most 1024 capabilities per message and 32 nested serialization frames.
 //! A getter may post another message without overwriting the outer frame. Delivery replaces the incoming
 //! frame; deserialization's `finish` releases it, and realm teardown drops both frames.
 use lumen::embed::SharedBufferHandle;
 use lumen_bind::NativeError;
-use lumen_host::OpError;
-use lumen_host::{Ctx, Extension, Value};
+use crate::{Ctx, Extension, OpError, Value};
 
 const MAX_ATTACHMENTS: usize = 1024;
 const MAX_NESTED_FRAMES: usize = 32;
 
-pub(crate) enum CloneAttachment {
+pub enum CloneAttachment {
     Shared(SharedBufferHandle),
     Port(crate::ports::PortTransfer),
 }
 
-pub(crate) struct CloneMessage {
+pub struct CloneMessage {
     pub bytes: Vec<u8>,
     pub attachments: Vec<CloneAttachment>,
 }
@@ -48,14 +47,14 @@ fn stage(ctx: &mut Ctx, attachment: CloneAttachment) -> Result<usize, OpError> {
     Ok(index)
 }
 
-pub(crate) fn stage_port(
+pub fn stage_port(
     ctx: &mut Ctx,
     port: crate::ports::PortTransfer,
 ) -> Result<usize, OpError> {
     stage(ctx, CloneAttachment::Port(port))
 }
 
-pub(crate) fn take_port(
+pub fn take_port(
     ctx: &mut Ctx,
     index: usize,
 ) -> Result<crate::ports::PortTransfer, OpError> {
@@ -75,14 +74,14 @@ pub(crate) fn take_port(
     }
 }
 
-pub(crate) fn take_message(ctx: &mut Ctx, bytes: Vec<u8>) -> CloneMessage {
+pub fn take_message(ctx: &mut Ctx, bytes: Vec<u8>) -> CloneMessage {
     CloneMessage {
         bytes,
         attachments: state(ctx).outgoing.pop().unwrap_or_default(),
     }
 }
 
-pub(crate) fn install_message(ctx: &mut Ctx, message: CloneMessage) -> Vec<u8> {
+pub fn install_message(ctx: &mut Ctx, message: CloneMessage) -> Vec<u8> {
     state(ctx).incoming = message.attachments.into_iter().map(Some).collect();
     message.bytes
 }
@@ -182,10 +181,10 @@ mod bindings {
     }
 }
 
-pub(crate) fn extension() -> Extension {
+pub fn extension() -> Extension {
     Extension {
         name: "clone-transfer",
-        modules: &[lumen_host::namespace::<bindings::Module>],
+        modules: &[crate::namespace::<bindings::Module>],
         state_init: Some(|state| state.put(CloneTransfers::default())),
         js_init: None,
         js_init_snapshot: None,

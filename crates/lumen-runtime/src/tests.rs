@@ -39,6 +39,19 @@ fn test_runtime() -> (Runtime, Captured, Captured) {
     (rt, out, err)
 }
 
+/// Like [`test_runtime`], with the browser globals: `MessagePort` and friends are the web
+/// classes, not Node's `worker_threads` ones.
+fn browser_test_runtime() -> (Runtime, Captured, Captured) {
+    let mut rt = Runtime::new_browser();
+    let out = Captured::default();
+    let err = Captured::default();
+    rt.engine().ctx().op_state().put(console::ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(err.clone()),
+    });
+    (rt, out, err)
+}
+
 fn eval_ok(rt: &mut Runtime, src: &str) {
     match rt.eval(src).expect("parses") {
         Completion::Value(_) => {}
@@ -2115,6 +2128,208 @@ fn message_channel_semantics() {
     )
     .unwrap();
     assert_eq!(out.lines(), ["1 true true message"]);
+}
+
+#[test]
+fn native_messaging_classes_have_the_web_idl_shape() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const descriptor = Object.getOwnPropertyDescriptor(globalThis, "MessagePort");
+        console.log(descriptor.enumerable, descriptor.writable, descriptor.configurable);
+        const channel = new MessageChannel();
+        console.log(channel.port1 === channel.port1, channel.port1 !== channel.port2);
+        console.log(Object.prototype.toString.call(channel), Object.prototype.toString.call(channel.port1));
+        console.log(MessagePort.length, MessageChannel.length, BroadcastChannel.length,
+            MessageEvent.length, CloseEvent.length, PromiseRejectionEvent.length);
+        console.log(Object.getPrototypeOf(MessagePort) === EventTarget,
+            Object.getPrototypeOf(BroadcastChannel) === EventTarget,
+            Object.getPrototypeOf(MessageEvent) === Event,
+            Object.getPrototypeOf(CloseEvent) === Event,
+            Object.getPrototypeOf(PromiseRejectionEvent) === Event);
+        const post = Object.getOwnPropertyDescriptor(MessagePort.prototype, "postMessage");
+        console.log(post.enumerable, MessagePort.prototype.postMessage.length, BroadcastChannel.prototype.postMessage.length);
+        try { new MessagePort(); } catch (e) { console.log("ctor", e.constructor.name); }
+        try { MessagePort.prototype.start.call({}); } catch (e) { console.log("brand", e.constructor.name); }
+        channel.port1.close();
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "false true true",
+            "true true",
+            "[object MessageChannel] [object MessagePort]",
+            "0 0 1 1 1 2",
+            "true true true true true",
+            "true 1 1",
+            "ctor TypeError",
+            "brand TypeError",
+        ]
+    );
+}
+
+#[test]
+fn message_channel_transfers_buffers_and_ports() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        const inner = new MessageChannel();
+        const buffer = new ArrayBuffer(8);
+        new Uint8Array(buffer)[0] = 7;
+        port1.onmessage = (e) => {
+            console.log("buffer", e.data.buffer.byteLength, new Uint8Array(e.data.buffer)[0], buffer.byteLength);
+            console.log("ports", e.ports.length, Object.isFrozen(e.ports), e.ports[0] instanceof MessagePort, e.ports === e.ports);
+            const received = e.ports[0];
+            received.onmessage = (m) => {
+                console.log("inner", m.data);
+                port1.close();
+                received.close();
+            };
+            inner.port1.postMessage("via-transferred");
+        };
+        port2.postMessage({ buffer }, [buffer, inner.port2]);
+        console.log("detached", buffer.byteLength);
+        inner.port2.postMessage("ignored: transferred away");
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "detached 0",
+            "buffer 8 7 0",
+            "ports 1 true true true",
+            "inner via-transferred",
+        ]
+    );
+}
+
+#[test]
+fn message_port_listeners_do_not_start_a_port_and_close_reaches_the_peer() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        port1.addEventListener("message", (e) => console.log("message", e.data));
+        port1.addEventListener("close", () => console.log("close event"));
+        port2.postMessage("queued");
+        setTimeout(() => {
+            console.log("before start");
+            port1.start();
+            port2.postMessage("last");
+            port2.close();
+            port2.postMessage("dropped");
+        }, 5);
+        setTimeout(() => console.log("done"), 40);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        ["before start", "message queued", "message last", "close event", "done"]
+    );
+}
+
+#[test]
+fn broadcast_channel_delivers_to_same_name_channels_and_close_stops_it() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const a = new BroadcastChannel("t");
+        const b = new BroadcastChannel("t");
+        const c = new BroadcastChannel("other");
+        console.log(a.name);
+        b.onmessage = (e) => console.log("b", e.data.n, e instanceof MessageEvent, e.origin === "", e.target === b);
+        c.onmessage = () => console.log("c: wrong channel");
+        a.onmessage = () => console.log("a: wrong, the sender");
+        const message = { n: 1 };
+        a.postMessage(message);
+        message.n = 2;
+        setTimeout(() => {
+            b.close();
+            try { b.postMessage(1); } catch (e) { console.log(e.name); }
+            a.postMessage(3);
+            a.close();
+            a.close();
+            c.close();
+        }, 20);
+        setTimeout(() => console.log("done"), 50);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["t", "b 1 true true true", "InvalidStateError", "done"]);
+}
+
+#[test]
+fn message_close_and_promise_rejection_events_read_their_init() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const m = new MessageEvent("message", { data: { x: 1 }, origin: "https://a.test", lastEventId: "7", ports: [] });
+        console.log(m.data.x, m.origin, m.lastEventId, m.source, Object.isFrozen(m.ports), m.ports.length, m.isTrusted, m instanceof Event);
+        const d = new MessageEvent("message");
+        console.log(d.data, d.origin === "", d.lastEventId === "", d.source);
+        try { new MessageEvent("m", { source: {} }); } catch (e) { console.log("source", e.constructor.name); }
+        try { new MessageEvent("m", { ports: [{}] }); } catch (e) { console.log("ports", e.constructor.name); }
+        m.initMessageEvent("again", true, true, "d", "o", "i", null, []);
+        console.log(m.type, m.bubbles, m.data, m.origin, m.lastEventId);
+        const c = new CloseEvent("close", { code: 1006, reason: "gone", wasClean: false });
+        console.log(c.code, c.reason, c.wasClean, c.type);
+        const p = Promise.reject(1);
+        p.catch(() => {});
+        const r = new PromiseRejectionEvent("unhandledrejection", { promise: p, reason: "why", cancelable: true });
+        console.log(r.promise === p, r.reason, r.cancelable, r instanceof Event);
+        try { new PromiseRejectionEvent("x"); } catch (e) { console.log("missing", e.constructor.name); }
+        try { new PromiseRejectionEvent("x", {}); } catch (e) { console.log("promise", e.constructor.name); }
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "1 https://a.test 7 null true 0 false true",
+            "null true true null",
+            "source TypeError",
+            "ports TypeError",
+            "again true d o i",
+            "1006 gone false close",
+            "true why true true",
+            "missing TypeError",
+            "promise TypeError",
+        ]
+    );
+}
+
+#[test]
+fn performance_is_a_native_event_target_over_the_process_clock() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const a = performance.now();
+        const b = performance.now();
+        console.log(a >= 0, b >= a, Number.isFinite(performance.timeOrigin), performance.timeOrigin > 1e12);
+        console.log(performance.toJSON().timeOrigin === performance.timeOrigin);
+        console.log(Object.prototype.toString.call(performance), performance instanceof EventTarget, performance instanceof Performance);
+        try { new Performance(); } catch (e) { console.log(e.constructor.name); }
+        console.log(self === globalThis, Object.getOwnPropertyDescriptor(globalThis, "performance").enumerable);
+        console.log(Object.getOwnPropertyDescriptor(Performance.prototype, "now").enumerable);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "true true true true",
+            "true",
+            "[object Performance] true true",
+            "TypeError",
+            "true true",
+            "true",
+        ]
+    );
 }
 
 #[test]

@@ -32,12 +32,10 @@ use lumen_host::{
 };
 
 mod child_realm;
-mod clone_transfer;
 mod console;
 mod esm;
 #[cfg(all(feature = "parallel", not(target_os = "none")))]
 mod parallel;
-mod ports;
 mod process;
 mod process_env;
 pub mod tsconfig;
@@ -258,8 +256,8 @@ fn browser_extensions() -> Vec<Extension> {
         console::extension(),
         lumen_web::extension(),
         lumen_webstreams::extension(),
-        clone_transfer::extension(),
-        ports::extension(),
+        lumen_host::clone_transfer::extension(),
+        lumen_host::ports::extension(),
     ]
 }
 
@@ -560,8 +558,8 @@ impl Runtime {
                     lumen_web::extension(),
                     // Last: Buffer uses TextEncoder (web), and require() calls process.cwd().
                     lumen_node::extension(),
-                    clone_transfer::extension(),
-                    ports::extension(),
+                    lumen_host::clone_transfer::extension(),
+                    lumen_host::ports::extension(),
                     worker::extension(),
                 ],
             );

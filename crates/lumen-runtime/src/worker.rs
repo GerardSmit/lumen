@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use lumen::embed::JsFunction;
 use lumen_host::{CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
 
-use crate::clone_transfer::{self, CloneMessage};
+use lumen_host::clone_transfer::{self, CloneMessage};
 use crate::Runtime;
 
 #[lumen_bind::module(name = "__lumenSharedWorker")]
@@ -119,7 +119,7 @@ static NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
 enum ToWorker {
     Data(CloneMessage),
-    Connect(crate::ports::PortTransfer),
+    Connect(lumen_host::ports::PortTransfer),
 }
 
 enum ToMain {
@@ -156,13 +156,13 @@ struct WorkerEntry {
 struct SharedClientLocal {
     dispatch: Value,
     inbox_task: Option<TaskId>,
-    port: crate::ports::PortTransfer,
+    port: lumen_host::ports::PortTransfer,
 }
 
 type SharedWorkerKey = lumen_common::worker::SharedWorkerKey;
 
 struct SharedClient {
-    worker_port: crate::ports::PortTransfer,
+    worker_port: lumen_host::ports::PortTransfer,
     events: Sender<SharedEvent>,
 }
 
@@ -266,7 +266,7 @@ struct WorkerSpec {
     shared_host: Option<Weak<SharedWorkerHost>>,
     shared_env: Option<crate::process_env::RealmEnvironment>,
     /// Node mode: the worker's ends of the public (`parentPort`) and internal channels.
-    ports: Option<(crate::ports::PortTransfer, crate::ports::PortTransfer)>,
+    ports: Option<(lumen_host::ports::PortTransfer, lumen_host::ports::PortTransfer)>,
     limits: WorkerLimits,
 }
 
@@ -347,7 +347,7 @@ fn op_shared_worker_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
         resolve_shared_worker(ctx, &raw_url, &requested_origin, is_module, name)?;
     let host = get_or_start_shared_worker(ctx, key.clone(), entry, is_module, is_remote)?;
 
-    let (client_port, worker_port) = crate::ports::new_pair();
+    let (client_port, worker_port) = lumen_host::ports::new_pair();
     let client_id = NEXT_SHARED_CLIENT.fetch_add(1, Ordering::SeqCst);
     let (events_tx, events_rx) = channel();
     {
@@ -370,7 +370,7 @@ fn op_shared_worker_connect(ctx: &mut Ctx, _t: Value, args: &[Value]) -> Result<
     }
 
     let local_port = client_port.clone();
-    let port_id = crate::ports::adopt(ctx, client_port);
+    let port_id = lumen_host::ports::adopt(ctx, client_port);
     let local_id = {
         let registry = registry(ctx);
         let id = registry.next;
@@ -1002,8 +1002,8 @@ fn run_worker(
             Value::Num(spec.thread_id as f64),
         );
         if let Some((public, internal)) = spec.ports.take() {
-            let public = crate::ports::adopt(ctx, public);
-            let internal = crate::ports::adopt(ctx, internal);
+            let public = lumen_host::ports::adopt(ctx, public);
+            let internal = lumen_host::ports::adopt(ctx, internal);
             let ids = ctx.make_array(vec![Value::Num(public as f64), Value::Num(internal as f64)]);
             let _ = ctx.set_member(&global, "__lumenWorkerPorts", ids);
         }
@@ -1230,7 +1230,7 @@ struct WorkerInbox {
 
 enum WorkerInboxEvent {
     Message(CloneMessage),
-    Connect(crate::ports::PortTransfer),
+    Connect(lumen_host::ports::PortTransfer),
 }
 
 struct WorkerInboxResult {
@@ -1304,7 +1304,7 @@ fn decode_worker_inbox(
             Ok(vec![arr])
         }
         Some(WorkerInboxEvent::Connect(port)) => {
-            let id = crate::ports::adopt(ctx, port);
+            let id = lumen_host::ports::adopt(ctx, port);
             Ok(vec![
                 Value::from_string("connect".into()),
                 Value::Num(id as f64),
@@ -1577,11 +1577,11 @@ mod worker_ops {
             .unwrap_or_default();
         let mut parent_ports = None;
         let ports = is_node.then(|| {
-            let (public_main, public_worker) = crate::ports::new_pair();
-            let (internal_main, internal_worker) = crate::ports::new_pair();
+            let (public_main, public_worker) = lumen_host::ports::new_pair();
+            let (internal_main, internal_worker) = lumen_host::ports::new_pair();
             parent_ports = Some((
-                crate::ports::adopt(ctx, public_main),
-                crate::ports::adopt(ctx, internal_main),
+                lumen_host::ports::adopt(ctx, public_main),
+                lumen_host::ports::adopt(ctx, internal_main),
             ));
             (public_worker, internal_worker)
         });

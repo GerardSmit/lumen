@@ -2711,8 +2711,10 @@ impl DomRealm {
             .as_ref()
             .and_then(WeakValue::upgrade)
             .ok_or_else(|| OpError::new("InvalidStateError", "Window is unavailable"))?;
-        let event = events::DomPromiseRejectionEvent::for_user_agent(ctx, kind, promise, reason)?;
-        let event = lumen::embed::JsObject::from_value(ctx.new_instance(event))
+        let event = lumen_host::messaging::PromiseRejectionEvent::for_user_agent(
+            ctx, kind, promise, reason,
+        )?;
+        let event = lumen::embed::JsObject::from_value(event)
             .expect("native PromiseRejectionEvent object");
         events::dispatch_user_agent_event(ctx, lumen_bind::This(window), event)
     }
@@ -11345,7 +11347,7 @@ fn install_document_with_context_metadata(
         ),
         (
             "PromiseRejectionEvent",
-            ctx.class_constructor::<events::DomPromiseRejectionEvent>(),
+            ctx.class_constructor::<lumen_host::messaging::PromiseRejectionEvent>(),
         ),
         (
             "FontFace",
@@ -14858,7 +14860,9 @@ mod tests {
                 r#"
             rejectionEvent instanceof PromiseRejectionEvent && rejectionEvent instanceof Event &&
             rejectionEvent.target === window && rejectionEvent.isTrusted && rejectionEvent.cancelable &&
-            rejectionEvent.defaultPrevented && rejectionEvent.promise === rejected && rejectionEvent.reason === reason
+            rejectionEvent.defaultPrevented && rejectionEvent.promise === rejected && rejectionEvent.reason === reason &&
+            rejectionEvent.constructor === PromiseRejectionEvent && PromiseRejectionEvent.length === 2 &&
+            Object.prototype.toString.call(rejectionEvent) === '[object PromiseRejectionEvent]'
         "#
             ),
             Value::Bool(true)

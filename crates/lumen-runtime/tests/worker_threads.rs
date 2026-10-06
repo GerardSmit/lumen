@@ -137,6 +137,34 @@ fn same_realm_node_ports_queue_poll_emit_and_ref_genuinely() {
 }
 
 #[test]
+fn node_message_ports_deliver_native_message_events_and_transferred_ports() {
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(Captured::default()),
+    });
+    let source = r#"
+        const { MessageChannel: NodeChannel, MessagePort: NodePort } = require('node:worker_threads');
+        const { port1, port2 } = new NodeChannel();
+        const inner = new NodeChannel();
+        port1.addEventListener('message', (event) => {
+            console.log(event instanceof MessageEvent, event.data.value, Object.isFrozen(event.ports),
+                event.ports.length, event.ports[0] instanceof NodePort);
+            port1.close();
+            event.ports[0].close();
+        });
+        port1.start();
+        port2.postMessage({ value: 3 }, [inner.port2]);
+    "#;
+    match runtime.eval(source).expect("source parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    assert_eq!(out.lines(), ["true 3 true 1 true"]);
+}
+
+#[test]
 fn node_and_web_message_ports_keep_their_event_target_after_dom_install() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
@@ -146,9 +174,10 @@ fn node_and_web_message_ports_keep_their_event_target_after_dom_install() {
         err: Box::new(err.clone()),
     });
 
-    // Load Node's MessageChannel before the DOM adapter replaces the global EventTarget.
+    // Capture the web MessageChannel before Node's worker_threads replaces the global, then
+    // load Node's before the DOM adapter is installed.
     match runtime
-        .eval("globalThis.__nodeMessageChannelForDomTest = require('node:worker_threads').MessageChannel;")
+        .eval("globalThis.__webMessageChannelForDomTest = MessageChannel; globalThis.__nodeMessageChannelForDomTest = require('node:worker_threads').MessageChannel;")
         .expect("Node channel setup parses")
     {
         Completion::Value(_) => {}
@@ -183,12 +212,10 @@ fn node_and_web_message_ports_keep_their_event_target_after_dom_install() {
         nodeTarget.start();
         nodeSource.postMessage('node');
 
-        // This hidden lazy trigger installs browser MessageChannel without replacing the DOM
-        // EventTarget that the native document adapter just exposed.
         const portBridge = globalThis.__lumenSharedPorts;
         assert.equal(EventTarget, domEventTarget);
         assert.equal(typeof portBridge.create, 'function');
-        const webChannel = new MessageChannel();
+        const webChannel = new globalThis.__webMessageChannelForDomTest();
         const webSource = webChannel.port1;
         const webTarget = webChannel.port2;
         webTarget.addEventListener('message', event => {

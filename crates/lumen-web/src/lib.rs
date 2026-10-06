@@ -724,7 +724,6 @@ pub fn extension() -> Extension {
         name: "web",
         modules: &[
             lumen_host::namespace::<http_policy::Module>,
-            lumen_host::namespace::<perf::Module>,
             url_namespace,
             lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::url::bindings::Module>,
@@ -733,6 +732,11 @@ pub fn extension() -> Extension {
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::blob::internals::Module>,
+            lumen_host::lazy_globals::<lumen_host::messaging::event_bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::messaging::channel_bindings::Module>,
+            lumen_host::namespace::<lumen_host::messaging::shared::Module>,
+            lumen_host::messaging::install_port_clone,
+            lumen_host::performance::install_globals,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,
             lumen_host::namespace::<websocket::Module>,
@@ -771,20 +775,6 @@ pub fn extension() -> Extension {
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 #[cfg(feature = "compiler")]
 const JS_GLUE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
-
-#[lumen_bind::module(name = "__perf")]
-mod perf {
-    #[op]
-    pub fn now() -> f64 {
-        lumen_host::perf::web_now_ms()
-    }
-
-    /// `performance.timeOrigin`: Unix-epoch milliseconds at the monotonic clock's zero point.
-    #[op(name = "timeOrigin")]
-    pub fn time_origin() -> f64 {
-        lumen_host::perf::time_origin_ms()
-    }
-}
 
 fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
     let ns = ctx.namespace_object("__url");

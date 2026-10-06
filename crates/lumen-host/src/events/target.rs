@@ -179,14 +179,26 @@ pub trait TargetHooks: Any {
 pub struct TargetData {
     pub(crate) listeners: RefCell<Vec<Listener>>,
     hooks: Option<Rc<dyn TargetHooks>>,
+    on_change: Cell<Option<ChangeObserver>>,
 }
+
+/// Called with the receiver after its listener list changed (see [`TargetData::observe_changes`]).
+pub type ChangeObserver = fn(&mut Ctx, &Value, &TargetData);
 
 impl TargetData {
     pub fn new(hooks: Option<Rc<dyn TargetHooks>>) -> Rc<Self> {
         Rc::new(Self {
             listeners: RefCell::new(Vec::new()),
             hooks,
+            on_change: Cell::new(None),
         })
+    }
+
+    /// Have `observer` run after every change of the listener list (a listener or handler added
+    /// or removed). A host class whose lifetime depends on its listeners (`MessagePort`) uses
+    /// it to update its own retention.
+    pub fn observe_changes(&self, observer: ChangeObserver) {
+        self.on_change.set(Some(observer));
     }
 
     pub fn hooks(&self) -> Option<&Rc<dyn TargetHooks>> {
@@ -451,6 +463,9 @@ impl EventTarget {
             let _ = ctx.ensure_native_identity_owner::<EventTarget>(receiver);
         }
         ctx.retain_instance(receiver, listening);
+        if let Some(observer) = data.on_change.get() {
+            observer(ctx, receiver, data);
+        }
     }
 
     /// `addEventListener` after argument conversion.

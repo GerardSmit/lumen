@@ -862,10 +862,6 @@ __builtins.set("perf_hooks", __lazyValue(() => {
   for (const name of Object.keys(perf)) {
     if (Object.getOwnPropertyDescriptor(perf, name).get) delete perf[name];
   }
-  if (!(Performance.prototype instanceof EventTarget)) {
-    Object.setPrototypeOf(Performance.prototype, EventTarget.prototype);
-    __eventTargetInternals.initEventTarget(perf);
-  }
 
   const method = (fn, name = fn.name) => Object.defineProperty(fn, "name", { value: name, configurable: true });
   const define = (target, table) => {

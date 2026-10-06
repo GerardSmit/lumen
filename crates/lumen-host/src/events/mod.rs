@@ -19,6 +19,7 @@ mod target;
 mod web;
 
 pub use node::internals;
+pub(crate) use node::{node_handler_get, node_handler_set};
 pub use web::bindings;
 
 pub use abort::{abort_signal, new_signal};
@@ -28,7 +29,7 @@ pub use bindings::{
 pub use event::{EventInit, EventState};
 pub use internals::NodeEventTarget;
 pub use target::{
-    report_exception, Callback, DeferredCompile, EventPath, HandlerKind, ListenerOptions,
+    report_exception, Callback, ChangeObserver, DeferredCompile, EventPath, HandlerKind, ListenerOptions,
     PathEntry, TargetData, TargetHooks,
 };
 

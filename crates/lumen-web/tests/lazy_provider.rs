@@ -109,31 +109,24 @@ fn lazy_provider_preserves_modified_lazy_accessor_descriptors() {
 }
 
 #[test]
-fn lazy_provider_generated_glue_keeps_replacement_and_delivers_real_channel_message() {
+fn lazy_provider_generated_glue_keeps_replacement_and_publishes_native_messaging() {
     std::thread::Builder::new()
         .stack_size(16 * 1024 * 1024)
         .spawn(|| {
             let mut engine = lumen::Engine::new();
             lumen_host::install(&mut engine, &[lumen_web::extension()]);
-            // The standalone web extension has no timer provider. Supply a test host
-            // task queue; execute genuine MessagePort callbacks without replacing
-            // any messaging constructor or delivery method.
             let source = r#"
-                globalThis.tasks=[];
-                globalThis.setTimeout=callback=>tasks.push(callback);
                 globalThis.hostRejection=function HostRejection(){};
                 Object.defineProperty(globalThis,'PromiseRejectionEvent',{
                     value:hostRejection,writable:false,enumerable:false,configurable:false
                 });
-                globalThis.channel=new MessageChannel();
-                globalThis.received=[];
-                channel.port1.onmessage=event=>received.push(event);
-                channel.port2.postMessage({value:'generated-glue'});
-                while(tasks.length)tasks.shift()();
+                let withoutPorts='none';
+                try { new MessageChannel(); } catch (error) { withoutPorts=error.constructor.name; }
                 PromiseRejectionEvent===hostRejection &&
-                    typeof MessagePort==='function' && channel.port1 instanceof MessagePort &&
-                    received.length===1 && received[0] instanceof MessageEvent &&
-                    received[0].data.value==='generated-glue' &&
+                    typeof MessagePort==='function' && typeof BroadcastChannel==='function' &&
+                    Object.getPrototypeOf(MessageEvent)===Event &&
+                    new MessageEvent('message',{data:1}).data===1 &&
+                    withoutPorts==='TypeError' &&
                     !Object.getOwnPropertyDescriptor(globalThis,'PromiseRejectionEvent').configurable;
             "#;
             match engine.eval(source, false).expect("parse generated glue contract") {

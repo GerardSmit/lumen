@@ -32,14 +32,6 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["messaging.js"],
-        lazy: true,
-        // This helper is installed with Object.defineProperty rather than an assignment, so
-        // publish it explicitly as a lazy trigger for realms whose MessagePort global is already
-        // occupied by Node's implementation.
-        defined: &[("__lumenSharedPorts", false)],
-    },
-    Unit {
         files: &["encoding.js", "serialize.js"],
         lazy: true,
         defined: &[],
@@ -66,11 +58,6 @@ const UNITS: &[Unit] = &[
     },
     Unit {
         files: &["navigator.js"],
-        lazy: false,
-        defined: &[],
-    },
-    Unit {
-        files: &["platform.js"],
         lazy: false,
         defined: &[],
     },

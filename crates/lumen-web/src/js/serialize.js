@@ -35,6 +35,9 @@ const T_SHARED = 21;
 const T_PORT = 22;
 const T_HOST = 23;
 const T_BLOB = 24;
+// Leading header: every transferred port, in transfer-list order, so a port that the value does
+// not reference still reaches the receiver (`MessageEvent.ports`).
+const T_PORTS = 25;
 
 // Platform objects (KeyObject, CryptoKey, X509Certificate, ...) clone through `[kTransferClone]()`,
 // which returns `{ data, deserializeInfo: "module:name" }`, and are rebuilt on the receiving side by
@@ -58,10 +61,9 @@ const kUntransferable = Symbol.for("nodejs.untransferable");
 // A pooled buffer's ArrayBuffer (see Buffer's pool) stays with the sender: it is cloned instead.
 const isUntransferableBuffer = (item) => item !== null && typeof item === "object" && item[kUntransferable] === true;
 
-function serializeForClone(value, transfer = [], transport = false) {
+function serializeForClone(value, transfer = [], transport = false, ports = globalThis.__lumenPortClone) {
   let list = Array.isArray(transfer) ? transfer : transfer?.transfer ?? [];
   if (!Array.isArray(list)) throw new TypeError("transferList must be an array");
-  const ports = globalThis.__lumenPortClone;
   const isPooledBuffer = (item) => isUntransferableBuffer(item) && !ports?.isPort(item);
   if (list.some(isPooledBuffer)) list = list.filter((item) => !isPooledBuffer(item));
   const listed = new Set();
@@ -226,6 +228,11 @@ function serializeForClone(value, transfer = [], transport = false) {
     for (let i = 0; i < keys.length; i++) { const k = keys[i]; str(k); write(v[k]); }
   };
 
+  if (portIndices.size > 0) {
+    u8(T_PORTS);
+    u32(portIndices.size);
+    for (const index of portIndices.values()) u32(index);
+  }
   write(value);
   // Getters may have transferred an outer buffer/port in a nested message. Revalidate
   // the complete list before detaching any sender-owned resources.
@@ -259,7 +266,7 @@ function reviveHostObject(info) {
   return Ctor;
 }
 
-function deserializeClone(buf) {
+function deserializeClone(buf, ports = globalThis.__lumenPortClone) {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const utf8 = new TextDecoder();
   const memory = []; // ref index -> value
@@ -283,6 +290,15 @@ function deserializeClone(buf) {
     return s;
   };
 
+  const transferred = new Map(); // export index -> imported port
+  if (buf.length > 0 && buf[0] === T_PORTS) {
+    pos = 1;
+    for (let n = u32(); n > 0; n--) {
+      const index = u32();
+      transferred.set(index, ports.import(index));
+    }
+  }
+
   const read = () => {
     const tag = u8();
     switch (tag) {
@@ -297,7 +313,7 @@ function deserializeClone(buf) {
       case T_DATE: return new Date(f64());
       case T_REGEXP: { const source = str(); return new RegExp(source, str()); }
       case T_SHARED: {const value=globalThis.__cloneTransfer.importShared(u32());memory.push(value);return value;}
-      case T_PORT: {const value=globalThis.__lumenPortClone.import(u32());memory.push(value);return value;}
+      case T_PORT: {const index=u32();const value=transferred.has(index)?transferred.get(index):ports.import(index);memory.push(value);return value;}
       case T_BLOB: {
         const kind = str();
         const type = str();

@@ -116,9 +116,6 @@
         const origin = location?.origin ?? url.origin;
         if (location && url.origin !== location.origin) throw new DOMException("SharedWorker script must be same-origin", "SecurityError");
         const name = options.name === undefined ? "" : String(options.name);
-        // Touching MessagePort runs lumen-web's lazy message-port bridge before adopting the
-        // native endpoint returned by the runtime.
-        void globalThis.MessagePort;
         const connected = __sharedWorker.connect(url.href, origin, type === "module", name,
           (kind, ...args) => this.#onEvent(kind, args));
         this.#id = connected.id;

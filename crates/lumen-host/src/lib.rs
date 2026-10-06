@@ -35,8 +35,17 @@ pub use lumen_common::compress as codec;
 pub mod encoding;
 /// The native `Event` / `EventTarget` / `AbortSignal` / `DOMException` core (`docs/native-events.md`).
 pub mod events;
+/// Native structured-clone attachments (`__cloneTransfer`).
+pub mod clone_transfer;
+/// `MessageEvent`, `CloseEvent`, `PromiseRejectionEvent`, `MessagePort`, `MessageChannel` and
+/// `BroadcastChannel` (`docs/native-messaging.md`).
+pub mod messaging;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
+/// The native `Performance` interface and the `performance` and `self` globals.
+pub mod performance;
+/// Transferable `MessagePort` endpoints.
+pub mod ports;
 /// Typed host services scoped to one realm.
 pub mod random;
 pub mod realm_services;

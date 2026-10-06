@@ -671,68 +671,10 @@ fn install_named_properties(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()>
     Ok(())
 }
 
-fn install_performance_event_target(ctx: &mut Ctx, global: &Value) -> OpResult<()> {
-    // Keep the runtime's Performance implementation and clock. Replacing the
-    // DOM EventTarget interface must also give this existing singleton a native
-    // receiver; changing its prototype alone leaves native methods unbranded.
-    let performance = ctx
-        .member_get(global, "performance")
-        .map_err(OpError::thrown)?;
-    if !matches!(performance, Value::Obj(_)) {
-        return Ok(());
-    }
-    if ctx.instance_data::<DomEventTarget>(&performance).is_some() {
-        return Ok(());
-    }
-    let prototype = ctx.prototype_of(&performance);
-    if !matches!(prototype, Value::Obj(_)) {
-        return Ok(());
-    }
-    let performance_constructor = ctx
-        .member_get(global, "Performance")
-        .map_err(OpError::thrown)?;
-    if !performance_constructor.is_callable() {
-        return Ok(());
-    }
-    let declared_prototype = ctx
-        .member_get(&performance_constructor, "prototype")
-        .map_err(OpError::thrown)?;
-    if !matches!((&prototype, &declared_prototype),
-        (Value::Obj(actual), Value::Obj(declared)) if std::ptr::eq(&**actual, &**declared))
-    {
-        return Ok(());
-    }
-    let constructor = ctx.class_constructor::<DomEventTarget>();
-    let event_target_prototype = ctx
-        .member_get(&constructor, "prototype")
-        .map_err(OpError::thrown)?;
-    let object = ctx.member_get(global, "Object").map_err(OpError::thrown)?;
-    let set_prototype = ctx
-        .member_get(&object, "setPrototypeOf")
-        .map_err(OpError::thrown)?;
-    ctx.invoke(
-        set_prototype.clone(),
-        object.clone(),
-        &[prototype.clone(), event_target_prototype],
-    )
-    .map_err(OpError::thrown)?;
-    ctx.invoke(
-        set_prototype.clone(),
-        object.clone(),
-        &[performance_constructor, constructor],
-    )
-    .map_err(OpError::thrown)?;
-    ctx.attach_instance(&performance, DomEventTarget::new())?;
-    ctx.invoke(set_prototype, object, &[performance, prototype])
-        .map_err(OpError::thrown)?;
-    Ok(())
-}
-
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     RealmServices::replace_current(ctx, WindowRealm(Rc::downgrade(realm)));
     let function = ctx.bound_function(&lumen_bind::FnItem::of::<get_selection::Op>());
     let global = ctx.global_object();
-    install_performance_event_target(ctx, &global)?;
     // The general runtime exposes data properties for its Node-style error shim.
     // Transfer existing callbacks to the native Window handler slots so those
     // properties cannot shadow the browser's event-handler accessors.
@@ -785,67 +727,16 @@ mod tests {
     }
 
     #[test]
-    fn performance_singleton_keeps_its_clock_and_uses_native_event_target() {
+    fn native_performance_is_an_event_target_of_the_window_realm() {
         let mut engine = Engine::new();
-        script(
+        lumen_host::install(
             &mut engine,
-            r#"
-            class ExistingEventTarget {}
-            class Performance extends ExistingEventTarget {
-              now() { return 23.5; }
-              get timeOrigin() { return 1000; }
-              toJSON() { return {timeOrigin:this.timeOrigin}; }
-            }
-            globalThis.Performance = Performance;
-            globalThis.performance = new Performance();
-            globalThis.originalPerformance = performance;
-            globalThis.originalPerformancePrototype = Performance.prototype;
-            globalThis.originalNow = performance.now;
-            performance.extra = {value:73};
-        "#,
+            &[lumen_host::Extension {
+                modules: &[lumen_host::performance::install_globals],
+                ..lumen_host::Extension::new("performance")
+            }],
         );
-        crate::install(engine.ctx(), "<main></main>", 96).unwrap();
-        let result = script(
-            &mut engine,
-            r#"
-            let calls = 0;
-            let sameReceiver = false;
-            const listener = function(event) {
-              ++calls;
-              sameReceiver = this === performance && event.target === performance &&
-                event.currentTarget === performance;
-              event.preventDefault();
-            };
-            performance.addEventListener('clock-event', listener, {once:true});
-            const first = performance.dispatchEvent(new Event('clock-event', {cancelable:true}));
-            const second = performance.dispatchEvent(new Event('clock-event', {cancelable:true}));
-            let rejectsUnbranded = false;
-            try { EventTarget.prototype.addEventListener.call({}, 'x', listener); }
-            catch(error) { rejectsUnbranded = error instanceof TypeError; }
-            performance === originalPerformance &&
-              Object.getPrototypeOf(performance) === originalPerformancePrototype &&
-              performance instanceof Performance && performance instanceof EventTarget &&
-              performance.now === originalNow && performance.now() === 23.5 &&
-              performance.toJSON().timeOrigin === 1000 && performance.extra.value === 73 &&
-              calls === 1 && sameReceiver && first === false && second === true && rejectsUnbranded
-        "#,
-        );
-        assert!(matches!(result, Value::Bool(true)));
-    }
-
-    #[test]
-    fn performance_web_glue_inherits_native_event_target_and_rejects_construction() {
-        let mut engine = Engine::new();
         crate::install(engine.ctx(), "<main></main>", 64).unwrap();
-        script(
-            &mut engine,
-            "const __perf = {now:()=>23.5,timeOrigin:()=>1000};",
-        );
-        let platform = format!(
-            "(() => {{ {} }})()",
-            include_str!("../../lumen-web/src/js/platform.js")
-        );
-        script(&mut engine, &platform);
         let result = script(
             &mut engine,
             r#"
@@ -862,7 +753,7 @@ mod tests {
               Object.getOwnPropertyDescriptor(globalThis,'Performance').enumerable === false &&
               Object.prototype.toString.call(performance) === '[object Performance]' &&
               Object.getOwnPropertyDescriptor(Performance.prototype,'now').enumerable === true &&
-              performance.now() === 23.5 && performance.toJSON().timeOrigin === 1000
+              typeof performance.now() === 'number' && performance.toJSON().timeOrigin > 0
         "#,
         );
         assert!(matches!(result, Value::Bool(true)));

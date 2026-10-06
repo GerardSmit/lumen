@@ -154,8 +154,9 @@ object. The native core:
 - `events.js`, `custom-event.js` and `error-events.js` are deleted; `lumen-web`'s `build.rs` drops
   their units and its extension publishes `lumen_host::events` as lazy globals.
 - `xhr.js` uses `__eventTargetInternals.defineEventHandler` / `hasListeners`, now native;
-  `encoding.js` uses `__eventTargetInternals.cloneTransferableSignal`; `messaging.js` keeps its
-  own `MessageEvent` / `MessagePort` classes over the native `Event` / `EventTarget`.
+  `encoding.js` uses `__eventTargetInternals.cloneTransferableSignal`. `MessageEvent`,
+  `MessagePort` and the other channel classes are native subclasses
+  ([native-messaging.md](native-messaging.md)).
 - `lumen-node`: `internal/event_target` maps to the native internals; `events.js` reads listeners
   through `__eventTargetInternals.listeners`; `worker_threads.js` builds `MessagePort` on the
   native `NodeEventTarget` with `kNewListener` / `kRemoveListener` hooks and `emit`;
@@ -164,6 +165,5 @@ object. The native core:
 - `lumen-runtime` worker scopes read `kTrustEvent` from the internals as before.
 - The Bitnest kernel installs `lumen_host::events::bindings` with `define_lazy_globals` before
   its byte-type glue, instead of concatenating `events.js` and `error-events.js`.
-- Left in JS: `messaging.js` (`MessageEvent`, `MessagePort`, `BroadcastChannel`), the worker
-  scope classes and `platform.js` (`Performance`). They are separate interfaces built on the
-  native classes and move in later steps.
+- Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
+  [native-messaging.md](native-messaging.md).
