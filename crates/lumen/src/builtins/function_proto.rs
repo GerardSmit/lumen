@@ -325,7 +325,7 @@ fn create_dynamic_function(i: &mut Interp, args: &[Value], prefix: &str) -> Resu
 // Object
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod intrinsic_bind_tests {
     #[test]
     fn host_binding_reuses_intrinsic_after_public_bind_is_replaced() {

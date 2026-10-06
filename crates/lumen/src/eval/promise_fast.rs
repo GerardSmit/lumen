@@ -927,7 +927,7 @@ impl Interp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embed"))]
 mod native_rejection_handled_tests {
     use super::*;
     use std::cell::Cell;

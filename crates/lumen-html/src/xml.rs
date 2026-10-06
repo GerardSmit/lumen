@@ -104,7 +104,10 @@ pub fn parse_fragment_in(
     let mut wrapped = String::with_capacity(input.len() + 64);
     wrapped.push('<');
     wrapped.push_str(FRAGMENT_ROOT);
-    for (prefix, uri) in namespaces.iter().skip(2) {
+    for (index, (prefix, uri)) in namespaces.iter().enumerate().skip(2) {
+        if namespaces[index + 1..].iter().any(|(later, _)| later == prefix) {
+            continue;
+        }
         wrapped.push_str(if prefix.is_empty() {
             " xmlns"
         } else {
