@@ -1398,10 +1398,15 @@ impl Host for JsHost {
         Value::Undefined
     }
 
-    /// `Option::None` is `undefined`; return [`Null`] for a JS `null`.
+    /// `Option::None` is `undefined` (`null` once [`Interp::set_none_is_null`] is on); return
+    /// [`Null`] for a JS `null` regardless.
     #[inline(always)]
-    fn none(_: &mut Interp) -> Value {
-        Value::Undefined
+    fn none(ctx: &mut Interp) -> Value {
+        if ctx.none_is_null {
+            Value::Null
+        } else {
+            Value::Undefined
+        }
     }
 
     #[inline(always)]
