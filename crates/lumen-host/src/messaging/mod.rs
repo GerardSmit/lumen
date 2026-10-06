@@ -8,10 +8,14 @@
 //! - [`shared`]: the hidden `__lumenSharedPorts` object the worker glue uses to wrap an adopted
 //!   endpoint, and [`install_port_clone`], the default structured-clone port bridge.
 //!
-//! Install the class modules with [`crate::lazy_globals`]. A host with its own message port
-//! transport (the Bitnest kernel's shared workers) installs only the event classes.
+//! [`extension`] installs all of it (the event and channel classes as lazy globals, the
+//! `__lumenSharedPorts` namespace and the port bridge); a realm also needs
+//! [`crate::ports::extension`], [`crate::clone_transfer::extension`] and an event loop (a runtime's,
+//! or [`crate::owner_loop`]). [`listen_native`] delivers an endpoint's messages to a native class
+//! instead of a `MessagePort`.
 
 use crate::events::same;
+use crate::{lazy_globals, namespace, Extension};
 use lumen::embed::{Ctx, JsHost, NativeIdentityOwner, OpError, OpResult, Value};
 use lumen_bind::{Class, CtorRet, Host};
 
@@ -22,8 +26,32 @@ pub use channel::bindings as channel_bindings;
 pub use channel::bindings::{BroadcastChannel, MessageChannel, MessagePort};
 pub use channel::shared;
 pub use channel::install_port_clone;
+pub use channel::{listen_native, NativeReceiver, Receiver};
 pub use events::bindings as event_bindings;
 pub use events::bindings::{CloseEvent, MessageEvent, PromiseRejectionEvent};
+
+/// Install the messaging classes into a realm: `MessageEvent`, `CloseEvent`,
+/// `PromiseRejectionEvent`, `MessagePort`, `MessageChannel` and `BroadcastChannel` (lazy
+/// globals), the hidden `__lumenSharedPorts` namespace and the default structured-clone port
+/// bridge. The one list `lumen-web` and the Bitnest kernel both use.
+pub fn install(ctx: &mut Ctx) -> Result<(), Value> {
+    lazy_globals::<event_bindings::Module>(ctx)?;
+    lazy_globals::<channel_bindings::Module>(ctx)?;
+    namespace::<shared::Module>(ctx)?;
+    install_port_clone(ctx)
+}
+
+/// [`install`] as an extension, for a host that lists extensions (the kernel).
+pub fn extension() -> Extension {
+    Extension {
+        name: "messaging",
+        modules: &[install],
+        state_init: None,
+        js_init: None,
+        js_init_snapshot: None,
+        lazy_globals: &[],
+    }
+}
 
 /// A constructor result for a class that is a native identity owner: the instance becomes the
 /// owner, so the values it holds are traced from the wrapper.

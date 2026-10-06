@@ -27,7 +27,7 @@ use std::time::Duration;
 use lumen_host::time::Instant;
 
 use lumen_host::{
-    install, CallbackQueue, CompletionSender, Engine, Extension, HostRealmInstaller,
+    install, owner_loop, CallbackQueue, CompletionSender, Engine, Extension, HostRealmInstaller,
     TaskCompletion, TaskDecoder, TaskId, TaskRegistry, ThreadPool, Value,
 };
 
@@ -1845,25 +1845,16 @@ impl Runtime {
         if done.task == WAKE_TASK {
             return;
         }
-        let entry = self
-            .engine
-            .ctx()
-            .host_mut::<TaskRegistry>()
-            .and_then(|r| r.take(done.task));
-        let Some(entry) = entry else {
-            return; // cancelled while in flight
-        };
         // Native resources retain their admitting scope even for raw callbacks (sockets,
         // subprocesses, workers). Promise reactions additionally keep their own scope.
-        let outer = self.engine.ctx().set_async_context(entry.context);
-        match (entry.decode)(self.engine.ctx(), done.result) {
-            Ok(args) => self.fire(&entry.on_ok, &args),
-            Err(e) => match &entry.on_err {
-                Some(reject) => self.fire(reject, std::slice::from_ref(&e)),
-                None => self.report_uncaught(&e),
-            },
+        let Some(settled) = owner_loop::settle(self.engine.ctx(), done) else {
+            return; // cancelled while in flight
+        };
+        match &settled.outcome {
+            owner_loop::Outcome::Call { callback, args } => self.fire(callback, args),
+            owner_loop::Outcome::Uncaught(error) => self.report_uncaught(error),
         }
-        self.engine.ctx().set_async_context(outer);
+        settled.finish(self.engine.ctx());
         self.checkpoint();
         self.report_unhandled_rejections();
     }

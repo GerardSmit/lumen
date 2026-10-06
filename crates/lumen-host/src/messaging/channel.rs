@@ -14,12 +14,12 @@ use crate::events::{
     node_handler_get, node_handler_set, EventTarget, TargetData,
 };
 use crate::messaging::{MessageEvent, Slotted};
-use crate::ports::{self, DeadPorts, Polled, Posted};
+use crate::ports::{self, DeadPorts, Posted, RawPolled};
 use crate::{clone_transfer, structured_clone};
-use lumen::embed::{Ctx, NativeIdentityOwner, OpError, OpResult, Value};
+use lumen::embed::{Ctx, NativeIdentityOwner, OpError, OpResult, Value, WeakValue};
 use lumen_bind::NativeError;
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 /// One realm-side endpoint of a port or broadcast channel.
 pub(crate) struct Link {
@@ -108,7 +108,55 @@ fn refresh_pin(ctx: &mut Ctx, receiver: &Value, link: &Link) {
     ports::set_pin(ctx, id, keep.then(|| receiver.clone()));
 }
 
-/// Start receiving: register the loop task that drains the endpoint.
+/// Which event a native receiver dispatches for each message, and what the peer's close does.
+#[derive(Clone, Copy)]
+pub enum Receiver {
+    /// A `MessageEvent` on a `MessagePort`; the peer's close fires `close` on it.
+    Port,
+    /// A `MessageEvent` on a `Worker` (the page end of a dedicated worker's implicit port).
+    Worker,
+    /// A `MessageEvent` on a worker global scope.
+    WorkerGlobal,
+    /// An event the host builds from the message's `data` and `ports` (a service worker's
+    /// `ExtendableMessageEvent`).
+    Custom(fn(&mut Ctx, Value, Vec<Value>) -> OpResult<Value>),
+}
+
+impl Receiver {
+    fn message_event(self, ctx: &mut Ctx, data: Value, ports: Vec<Value>) -> OpResult<Value> {
+        match self {
+            Receiver::Custom(build) => build(ctx, data, ports),
+            _ => MessageEvent::create(ctx, "message", data, "", Value::Null, ports),
+        }
+    }
+
+    fn fires_close(self) -> bool {
+        matches!(self, Receiver::Port)
+    }
+}
+
+/// Start receiving: register the loop task that drains the endpoint. The task holds the target
+/// and the link weakly: whoever owns them decides how long delivery lasts.
+fn register_listener(
+    ctx: &mut Ctx,
+    id: u64,
+    target: WeakValue,
+    link: Weak<Link>,
+    kind: Receiver,
+) -> OpResult<()> {
+    let callback = ctx.new_native_fn(
+        "",
+        0,
+        Rc::new(move |ctx: &mut Ctx, _this: Value, _: &[Value]| {
+            if let (Some(target), Some(link)) = (target.upgrade(), link.upgrade()) {
+                on_wake(ctx, &target, &link, kind);
+            }
+            Ok(Value::Undefined)
+        }),
+    );
+    ports::listen(ctx, id, callback)
+}
+
 fn start_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>) -> OpResult<()> {
     let Some(id) = link.id.get() else {
         return Ok(());
@@ -117,59 +165,45 @@ fn start_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>) -> OpResult<()> 
         return Ok(());
     }
     let weak = ctx.weak_value(receiver).expect("ports are objects");
-    let callback = ctx.new_native_fn(
-        "",
-        0,
-        Rc::new(move |ctx: &mut Ctx, _this: Value, _: &[Value]| {
-            if let Some(port) = weak.upgrade() {
-                on_wake(ctx, &port);
-            }
-            Ok(Value::Undefined)
-        }),
-    );
-    ports::listen(ctx, id, callback)?;
+    register_listener(ctx, id, weak, Rc::downgrade(link), Receiver::Port)?;
     link.started.set(true);
     refresh_pin(ctx, receiver, link);
     Ok(())
 }
 
-fn on_wake(ctx: &mut Ctx, receiver: &Value) {
-    let Some(link) = link_of(ctx, receiver) else {
-        return;
-    };
+fn on_wake(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) {
     let Some(id) = link.id.get() else {
         return;
     };
     ports::reap(ctx);
-    match ports::poll(ctx, id) {
+    match ports::poll_raw(ctx, id) {
         Err(_) => {
-            finish(ctx, receiver, &link, false);
+            finish(ctx, receiver, link, kind, false);
             return;
         }
-        Ok(Polled::Closed) => {
-            finish(ctx, receiver, &link, true);
+        Ok(RawPolled::Closed) => {
+            finish(ctx, receiver, link, kind, true);
             return;
         }
-        Ok(Polled::Empty) => {}
-        Ok(Polled::Message(bytes)) => {
-            ports::wake(ctx, id);
-            deliver(ctx, receiver, bytes);
+        Ok(RawPolled::Empty) => {}
+        Ok(RawPolled::Message(bytes)) => {
+            ports::rewake(ctx, id);
+            deliver(ctx, receiver, bytes, kind);
         }
     }
-    refresh_pin(ctx, receiver, &link);
+    if matches!(kind, Receiver::Port) {
+        refresh_pin(ctx, receiver, link);
+    }
 }
 
-fn deliver(ctx: &mut Ctx, receiver: &Value, bytes: Value) {
+fn deliver(ctx: &mut Ctx, receiver: &Value, bytes: Vec<u8>, kind: Receiver) {
     let event = (|| -> OpResult<Value> {
         let bridge = web_bridge(ctx)?;
-        let bytes = ctx
-            .buffer_source_bytes(&bytes)
-            .ok_or_else(|| OpError::type_error("received message is not a buffer"))?;
         ports::begin_received(ctx);
         let data = structured_clone::deserialize(ctx, &bytes, &bridge);
         let received = ports::end_received(ctx);
         match data {
-            Ok(data) => MessageEvent::create(ctx, "message", data, "", Value::Null, received),
+            Ok(data) => kind.message_event(ctx, data, received),
             Err(error) => {
                 let error = error.to_value(ctx);
                 MessageEvent::create(ctx, "messageerror", error, "", Value::Null, Vec::new())
@@ -183,7 +217,7 @@ fn deliver(ctx: &mut Ctx, receiver: &Value, bytes: Value) {
 
 /// The endpoint is gone (the peer closed, or a transfer detached it): release the handle, run the
 /// close hook and, for the peer's close, fire `close` on a port.
-fn finish(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, fire: bool) {
+fn finish(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver, fire: bool) {
     let Some(id) = link.id.take() else {
         return;
     };
@@ -193,18 +227,79 @@ fn finish(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, fire: bool) {
     if let Some(hook) = hook {
         let _ = ctx.invoke(hook, Value::Undefined, &[]);
     }
-    if fire {
+    if fire && kind.fires_close() {
         let event = ctx.new_instance(crate::events::Event::trusted("close"));
         let _ = EventTarget::dispatch_trusted(ctx, receiver, &event);
     }
 }
 
-fn close_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>) {
+fn close_link(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) {
     let Some(id) = link.id.get() else {
         return;
     };
     ports::close(ctx, id);
-    finish(ctx, receiver, link, false);
+    finish(ctx, receiver, link, kind, false);
+}
+
+/// The receiving end of an endpoint whose messages a native class (a `Worker`, a worker global)
+/// dispatches itself, instead of a `MessagePort` wrapping the endpoint. The owner keeps this
+/// value for as long as it wants delivery: dropping it releases the endpoint through the realm's
+/// reaper. Messages are deserialized straight from the wire bytes (no script buffer in between)
+/// and each is its own loop task.
+pub struct NativeReceiver {
+    link: Rc<Link>,
+    kind: Receiver,
+}
+
+impl NativeReceiver {
+    /// Whether the endpoint is still attached (not closed locally or by the peer, not detached).
+    pub fn is_open(&self) -> bool {
+        self.link.id.get().is_some()
+    }
+
+    /// `postMessage(message, transfer)` on the endpoint, with the same transfer-list handling,
+    /// limits and errors as a `MessagePort`. A closed endpoint drops the message.
+    pub fn post(&self, ctx: &mut Ctx, message: Value, transfer: Value) -> OpResult<()> {
+        if !self.is_open() {
+            return Ok(());
+        }
+        post_link(ctx, &self.link, message, transfer)
+    }
+
+    /// Close the channel for both sides; `target` is the object events were dispatched on.
+    pub fn close(&self, ctx: &mut Ctx, target: &Value) {
+        close_link(ctx, target, &self.link, self.kind);
+    }
+
+    /// Keep `target` alive (or stop doing so) while the peer can still send.
+    pub fn pin(&self, ctx: &mut Ctx, target: Option<Value>) {
+        if let Some(id) = self.link.id.get() {
+            ports::set_pin(ctx, id, target);
+        }
+    }
+
+    /// Report the values the receiver holds to the collector.
+    pub fn trace(&self, visit: &mut dyn FnMut(&Value)) {
+        if let Some(hook) = &*self.link.on_close.borrow() {
+            visit(hook);
+        }
+    }
+}
+
+/// Deliver the messages of the adopted endpoint `id` as events on `target`. Receiving starts at
+/// once. `on_close` runs when the endpoint closes from either side.
+pub fn listen_native(
+    ctx: &mut Ctx,
+    id: u64,
+    target: WeakValue,
+    kind: Receiver,
+    on_close: Option<Value>,
+) -> OpResult<NativeReceiver> {
+    require_ports(ctx)?;
+    let link = Link::new(ctx, id, on_close);
+    register_listener(ctx, id, target, Rc::downgrade(&link), kind)?;
+    link.started.set(true);
+    Ok(NativeReceiver { link, kind })
 }
 
 // ---- posting -----------------------------------------------------------------------------------
@@ -250,14 +345,18 @@ fn post_link(
 ) -> OpResult<()> {
     let list = transfer_list(ctx, transfer)?;
     let list = structured_clone::array_items(ctx, &list)?;
+    if link.id.get().is_some_and(|id| ports::is_full(ctx, id)) {
+        return Err(ports::queue_full());
+    }
     let bridge = web_bridge(ctx)?;
     let bytes = structured_clone::serialize(ctx, &message, &list, true, &bridge)?;
     let Some(id) = link.id.get() else {
         clone_transfer::abort_frame(ctx);
         return Ok(());
     };
-    match ports::post(ctx, id, &bytes)? {
+    match ports::post_owned(ctx, id, bytes)? {
         Posted::Queued | Posted::Dropped | Posted::Lost => Ok(()),
+        Posted::Full => Err(ports::queue_full()),
     }
 }
 
@@ -485,7 +584,7 @@ pub mod bindings {
             let Some(link) = link_of(ctx, &this.0) else {
                 return Err(crate::webidl::invalid_this("MessagePort"));
             };
-            close_link(ctx, &this.0, &link);
+            close_link(ctx, &this.0, &link, Receiver::Port);
             Ok(())
         }
 
@@ -639,7 +738,7 @@ pub mod bindings {
             let Some(link) = link_of(ctx, &this.0) else {
                 return Err(crate::webidl::invalid_this("BroadcastChannel"));
             };
-            close_link(ctx, &this.0, &link);
+            close_link(ctx, &this.0, &link, Receiver::Port);
             Ok(())
         }
 

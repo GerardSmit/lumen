@@ -2241,6 +2241,68 @@ fn message_channel_semantics() {
 }
 
 #[test]
+fn message_channel_has_no_queue_or_size_limit_by_default() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        let received = 0;
+        let big = 0;
+        for (let i = 0; i < 2000; i++) port2.postMessage(i);
+        port2.postMessage(new Uint8Array(8 * 1024 * 1024));
+        port1.onmessage = (e) => {
+            received++;
+            if (e.data instanceof Uint8Array) big = e.data.length;
+            if (received === 2001) {
+                console.log(received, big);
+                port1.close();
+            }
+        };
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["2001 8388608"]);
+}
+
+#[test]
+fn message_channel_delivers_each_message_as_its_own_task_with_microtasks_between() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        const order = [];
+        port1.onmessage = (e) => {
+            order.push("m" + e.data);
+            Promise.resolve().then(() => order.push("t" + e.data));
+            if (e.data === 3) {
+                port1.close();
+                setTimeout(() => console.log(order.join()), 0);
+            }
+        };
+        for (let i = 1; i <= 3; i++) port2.postMessage(i);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["m1,t1,m2,t2,m3,t3"]);
+}
+
+#[test]
+fn completions_for_cancelled_tasks_are_ignored_by_the_loop() {
+    let (mut rt, out, _err) = test_runtime();
+    rt.eval(
+        r#"
+        const { port1, port2 } = new MessageChannel();
+        port1.onmessage = () => console.log("never");
+        port2.postMessage(1);
+        port1.close();
+        setTimeout(() => console.log("done"), 5);
+        "#,
+    )
+    .unwrap();
+    assert_eq!(out.lines(), ["done"]);
+}
+
+#[test]
 fn native_messaging_classes_have_the_web_idl_shape() {
     let (mut rt, out, _err) = browser_test_runtime();
     rt.eval(

@@ -84,9 +84,10 @@ impl<'a> Writer<'a> {
         transport: bool,
         locals: &'a [Value],
         local: bool,
+        limit: usize,
     ) -> Self {
         Self {
-            sink: Sink::default(),
+            sink: Sink::with_limit(limit),
             memory: HashMap::new(),
             keep: Vec::new(),
             bridge,
@@ -96,6 +97,11 @@ impl<'a> Writer<'a> {
             local,
             transfer_clone: ctx.symbol_for(TRANSFER_CLONE),
         }
+    }
+
+    /// The error of a message that passed the ceiling.
+    pub fn too_large(&self) -> OpError {
+        crate::ports::too_large(self.sink.limit())
     }
 
     pub fn add_port(&mut self, port: Value, index: u32) {
@@ -120,6 +126,9 @@ impl<'a> Writer<'a> {
     }
 
     pub fn write(&mut self, ctx: &mut Ctx, value: &Value) -> OpResult<()> {
+        if self.sink.overflow {
+            return Err(self.too_large());
+        }
         match value {
             Value::Undefined | Value::Empty => self.sink.u8(T_UNDEFINED),
             Value::Null => self.sink.u8(T_NULL),

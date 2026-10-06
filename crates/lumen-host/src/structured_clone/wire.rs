@@ -63,35 +63,77 @@ pub(super) fn malformed() -> OpError {
     clone_error("malformed clone data")
 }
 
-#[derive(Default)]
+/// The wire being written. A ceiling makes an oversized message fail while it is written: once a
+/// write would pass it, nothing more is appended and `overflow` is set, which the writer checks
+/// before every value.
 pub(super) struct Sink {
     pub bytes: Vec<u8>,
+    limit: usize,
+    pub overflow: bool,
+}
+
+impl Default for Sink {
+    fn default() -> Self {
+        Self::with_limit(usize::MAX)
+    }
 }
 
 impl Sink {
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            overflow: false,
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    #[inline]
+    fn room(&mut self, extra: usize) -> bool {
+        if self.bytes.len().saturating_add(extra) > self.limit {
+            self.overflow = true;
+        }
+        !self.overflow
+    }
+
     pub fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
+        if self.room(1) {
+            self.bytes.push(value);
+        }
     }
 
     pub fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        if self.room(4) {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
     }
 
     pub fn f64(&mut self, value: f64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
+        if self.room(8) {
+            self.bytes.extend_from_slice(&value.to_le_bytes());
+        }
     }
 
     pub fn str(&mut self, value: &str) {
-        self.u32(value.len() as u32);
-        self.bytes.extend_from_slice(value.as_bytes());
+        if self.room(4 + value.len()) {
+            self.bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            self.bytes.extend_from_slice(value.as_bytes());
+        }
     }
 
     pub fn raw(&mut self, value: &[u8]) {
-        self.bytes.extend_from_slice(value);
+        if self.room(value.len()) {
+            self.bytes.extend_from_slice(value);
+        }
     }
 
     pub fn patch_u32(&mut self, at: usize, value: u32) {
-        self.bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        if let Some(slot) = self.bytes.get_mut(at..at + 4) {
+            slot.copy_from_slice(&value.to_le_bytes());
+        }
     }
 }
 

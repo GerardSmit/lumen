@@ -15,18 +15,98 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+/// What a mailbox's owning realm is woken through.
 struct Waker {
     sender: CompletionSender,
     task: TaskId,
+    /// The payload of the last wake, kept so the next one allocates nothing.
+    spare: Option<Box<WakeToken>>,
+}
+
+/// The payload of a wake: which mailbox to mark consumed when the realm decodes it.
+struct WakeToken(Weak<WakeSlot>);
+
+struct WakeSlot {
+    pending: AtomicBool,
+    waker: Mutex<Option<Waker>>,
+}
+
+/// A thread-safe queue whose owning realm is woken through its [`CompletionSender`]: the one
+/// waker behind every port endpoint (and, in the worker classes, every control mailbox). Wakes
+/// coalesce: after one is sent, further sends are free until the realm has decoded it, so a burst
+/// of messages costs one completion, and a steady state allocates nothing (the payload is
+/// recycled).
+pub struct Mailbox<T> {
+    pub queue: Queue<T>,
+    slot: Arc<WakeSlot>,
+}
+
+impl<T> Default for Mailbox<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Mailbox<T> {
+    pub fn new() -> Self {
+        Self {
+            queue: Queue::new(),
+            slot: Arc::new(WakeSlot {
+                pending: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Ask the owning realm to look at this mailbox (coalesced until the wake is consumed).
+    pub fn wake(&self) {
+        if self.slot.pending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut waker = self.slot.waker.lock().unwrap();
+        match waker.as_mut() {
+            Some(waker) => {
+                let token = waker
+                    .spare
+                    .take()
+                    .unwrap_or_else(|| Box::new(WakeToken(Arc::downgrade(&self.slot))));
+                waker.sender.send(waker.task, token);
+            }
+            None => self.slot.pending.store(false, Ordering::SeqCst),
+        }
+    }
+
+    /// Wake `task` of the realm behind `sender` whenever something arrives; wakes at once when
+    /// the mailbox already holds a message or is closed.
+    pub fn bind(&self, sender: CompletionSender, task: TaskId) {
+        *self.slot.waker.lock().unwrap() = Some(Waker {
+            sender,
+            task,
+            spare: None,
+        });
+        self.slot.pending.store(false, Ordering::SeqCst);
+        if self.queue.is_closed() || !self.queue.is_empty() {
+            self.wake();
+        }
+    }
+
+    /// Stop waking any realm.
+    pub fn unbind(&self) {
+        *self.slot.waker.lock().unwrap() = None;
+        self.slot.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a realm is bound.
+    pub fn is_bound(&self) -> bool {
+        self.slot.waker.lock().unwrap().is_some()
+    }
 }
 
 struct Endpoint {
     /// Closed on both endpoints by either side's `close()` (or its realm going away): no message
     /// is accepted any more, and the receiver reports the close once its queue is drained.
-    queue: Queue<CloneMessage>,
+    mail: Mailbox<CloneMessage>,
     peer: Mutex<Weak<Endpoint>>,
-    waker: Mutex<Option<Waker>>,
-    wake_pending: AtomicBool,
     close_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     close_notified: AtomicBool,
     /// A BroadcastChannel endpoint: posts fan out to every other endpoint of this name.
@@ -39,10 +119,8 @@ impl Endpoint {
     fn new(group: Option<String>) -> Arc<Endpoint> {
         Arc::new(Endpoint {
             group,
-            queue: Queue::new(),
+            mail: Mailbox::new(),
             peer: Mutex::new(Weak::new()),
-            waker: Mutex::new(None),
-            wake_pending: AtomicBool::new(false),
             close_hook: Mutex::new(None),
             close_notified: AtomicBool::new(false),
         })
@@ -52,24 +130,14 @@ impl Endpoint {
         self.peer.lock().unwrap().upgrade()
     }
 
-    /// Ask the owning realm to look at this endpoint (coalesced until the wake is consumed).
-    fn wake(self: &Arc<Self>) {
-        if self.wake_pending.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        let waker = self.waker.lock().unwrap();
-        match waker.as_ref() {
-            Some(w) => w
-                .sender
-                .send(w.task, Box::new(PortTransfer(Arc::clone(self)))),
-            None => self.wake_pending.store(false, Ordering::SeqCst),
-        }
+    fn wake(&self) {
+        self.mail.wake();
     }
 
     fn close_both(self: &Arc<Self>) {
         if let Some(name) = &self.group {
-            self.queue.close();
-            self.queue.clear();
+            self.mail.queue.close();
+            self.mail.queue.clear();
             if let Some(members) = GROUPS
                 .lock()
                 .unwrap()
@@ -84,11 +152,12 @@ impl Endpoint {
             self.notify_close();
             return;
         }
-        self.queue.close();
+        self.mail.queue.close();
+        self.mail.queue.clear();
         self.wake();
         self.notify_close();
         if let Some(peer) = self.peer() {
-            peer.queue.close();
+            peer.mail.queue.close();
             peer.wake();
             peer.notify_close();
         }
@@ -113,7 +182,7 @@ pub struct PortTransfer(Arc<Endpoint>);
 impl PortTransfer {
     pub fn on_close(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.0.close_hook.lock().unwrap() = Some(hook);
-        if self.0.queue.is_closed() {
+        if self.0.mail.queue.is_closed() {
             self.0.notify_close();
         }
     }
@@ -134,6 +203,8 @@ struct Handle {
 pub struct DeadPorts {
     ids: std::cell::RefCell<Vec<u64>>,
     wake: Option<(CompletionSender, TaskId)>,
+    /// A reap is already scheduled: further drops only append their id.
+    armed: std::cell::Cell<bool>,
 }
 
 impl DeadPorts {
@@ -141,7 +212,9 @@ impl DeadPorts {
     pub fn push(&self, id: u64) {
         self.ids.borrow_mut().push(id);
         if let Some((sender, task)) = &self.wake {
-            sender.send(*task, Box::new(()));
+            if !self.armed.replace(true) {
+                sender.send(*task, Box::new(()));
+            }
         }
     }
 }
@@ -153,12 +226,13 @@ struct Ports {
     dead: Option<Rc<DeadPorts>>,
     /// The ports deserialization created, innermost message last.
     received: Vec<Vec<Value>>,
+    limits: PortLimits,
 }
 
 impl Drop for Ports {
     fn drop(&mut self) {
         for handle in self.handles.values() {
-            *handle.port.0.waker.lock().unwrap() = None;
+            handle.port.0.mail.unbind();
             handle.port.0.close_both();
         }
     }
@@ -207,8 +281,7 @@ fn lookup(ctx: &mut Ctx, id: f64) -> Result<PortTransfer, NativeError> {
 /// Drop this realm's handle: its wake task stops and the endpoint no longer wakes this realm.
 fn release(ctx: &mut Ctx, id: u64) -> Option<PortTransfer> {
     let handle = ctx.host_mut::<Ports>().unwrap().handles.remove(&id)?;
-    *handle.port.0.waker.lock().unwrap() = None;
-    handle.port.0.wake_pending.store(false, Ordering::SeqCst);
+    handle.port.0.mail.unbind();
     if let (Some(task), Some(reg)) = (handle.task, ctx.host_mut::<TaskRegistry>()) {
         reg.cancel(task);
     }
@@ -219,8 +292,13 @@ fn decode_wake(
     _ctx: &mut Ctx,
     payload: Box<dyn std::any::Any + Send>,
 ) -> Result<Vec<Value>, Value> {
-    if let Ok(port) = payload.downcast::<PortTransfer>() {
-        port.0.wake_pending.store(false, Ordering::SeqCst);
+    if let Ok(token) = payload.downcast::<WakeToken>() {
+        if let Some(slot) = token.0.upgrade() {
+            if let Some(waker) = slot.waker.lock().unwrap().as_mut() {
+                waker.spare = Some(token);
+            }
+            slot.pending.store(false, Ordering::SeqCst);
+        }
     }
     Ok(Vec::new())
 }
@@ -234,6 +312,13 @@ pub enum Polled {
     Closed,
 }
 
+/// What one [`poll_raw`] found: the wire bytes themselves, with no script value built.
+pub enum RawPolled {
+    Message(Vec<u8>),
+    Empty,
+    Closed,
+}
+
 /// What one `post` did with its message.
 pub enum Posted {
     Queued,
@@ -241,25 +326,106 @@ pub enum Posted {
     Dropped,
     /// The message transferred the receiving endpoint itself, so both sides closed.
     Lost,
+    /// The receiving queue holds [`PortLimits::max_queued`] messages: the message is dropped.
+    Full,
+}
+
+/// Bounds a realm applies to the messages it sends. The default is no bound, which is what
+/// `lumen-runtime` uses; the kernel opts in with [`set_limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortLimits {
+    /// Largest wire message; a larger one is a `DataCloneError`, raised while it is serialized.
+    pub max_message_bytes: usize,
+    /// Messages a receiving queue may hold; a post beyond it is a `QuotaExceededError`.
+    pub max_queued: usize,
+}
+
+impl Default for PortLimits {
+    fn default() -> Self {
+        Self {
+            max_message_bytes: usize::MAX,
+            max_queued: usize::MAX,
+        }
+    }
+}
+
+/// Bound the messages this realm sends. A queue is checked by the sender, so a port transferred to
+/// another realm keeps the limits of whichever realm posts on it.
+pub fn set_limits(ctx: &mut Ctx, limits: PortLimits) {
+    if let Some(ports) = ctx.host_mut::<Ports>() {
+        ports.limits = limits;
+    }
+}
+
+/// The realm's limits ([`PortLimits::default`] without the ports extension).
+pub fn limits(ctx: &mut Ctx) -> PortLimits {
+    ctx.host_mut::<Ports>()
+        .map(|ports| ports.limits)
+        .unwrap_or_default()
+}
+
+pub(crate) fn too_large(limit: usize) -> OpError {
+    NativeError::named(
+        "DataCloneError",
+        format!("Message exceeds the maximum size of {limit} bytes"),
+    )
+    .into()
+}
+
+pub(crate) fn queue_full() -> OpError {
+    NativeError::named("QuotaExceededError", "The message queue of the port is full").into()
+}
+
+/// Whether the other end of `id` already holds the limit of messages. Checked before a message
+/// is serialized, so a refused post detaches nothing.
+pub fn is_full(ctx: &mut Ctx, id: u64) -> bool {
+    let max = limits(ctx).max_queued;
+    if max == usize::MAX {
+        return false;
+    }
+    let Ok(port) = lookup(ctx, id as f64) else {
+        return false;
+    };
+    port.0.group.is_none()
+        && port
+            .0
+            .peer()
+            .is_some_and(|peer| peer.mail.queue.len() >= max)
+}
+
+/// The next message as wire bytes, its attachments installed for the deserialization that
+/// follows. No `Uint8Array` is built: native receivers read the bytes directly.
+pub fn poll_raw(ctx: &mut Ctx, id: u64) -> Result<RawPolled, OpError> {
+    let port = lookup(ctx, id as f64)?;
+    Ok(match port.0.mail.queue.pop() {
+        Pop::Message(message) => RawPolled::Message(clone_transfer::install_message(ctx, message)),
+        Pop::Closed => RawPolled::Closed,
+        Pop::Empty => RawPolled::Empty,
+    })
 }
 
 pub fn poll(ctx: &mut Ctx, id: u64) -> Result<Polled, OpError> {
-    let port = lookup(ctx, id as f64)?;
-    Ok(match port.0.queue.pop() {
-        Pop::Message(message) => {
-            let bytes = clone_transfer::install_message(ctx, message);
-            Polled::Message(ctx.make_uint8array(&bytes)?)
-        }
-        Pop::Closed => Polled::Closed,
-        Pop::Empty => Polled::Empty,
+    Ok(match poll_raw(ctx, id)? {
+        RawPolled::Message(bytes) => Polled::Message(ctx.make_uint8array(&bytes)?),
+        RawPolled::Closed => Polled::Closed,
+        RawPolled::Empty => Polled::Empty,
     })
 }
 
 pub fn post(ctx: &mut Ctx, id: u64, bytes: &[u8]) -> Result<Posted, OpError> {
+    post_owned(ctx, id, bytes.to_vec())
+}
+
+/// [`post`] for bytes the caller owns: the vector becomes the queued message, uncopied.
+pub fn post_owned(ctx: &mut Ctx, id: u64, bytes: Vec<u8>) -> Result<Posted, OpError> {
     let port = lookup(ctx, id as f64)?;
-    let message = clone_transfer::take_message(ctx, bytes.to_vec());
+    let limits = limits(ctx);
+    let message = clone_transfer::take_message(ctx, bytes);
+    if message.bytes.len() > limits.max_message_bytes {
+        return Err(too_large(limits.max_message_bytes));
+    }
     if let Some(name) = &port.0.group {
-        if port.0.queue.is_closed() {
+        if port.0.mail.queue.is_closed() {
             return Ok(Posted::Dropped);
         }
         let members: Vec<Arc<Endpoint>> = GROUPS
@@ -273,7 +439,11 @@ pub fn post(ctx: &mut Ctx, id: u64, bytes: &[u8]) -> Result<Posted, OpError> {
             })
             .unwrap_or_default();
         for member in members {
-            if Arc::ptr_eq(&member, &port.0) || member.queue.is_closed() {
+            if Arc::ptr_eq(&member, &port.0)
+                || member.mail.queue.is_closed()
+                || (limits.max_queued != usize::MAX
+                    && member.mail.queue.len() >= limits.max_queued)
+            {
                 continue;
             }
             let attachments = message
@@ -284,7 +454,7 @@ pub fn post(ctx: &mut Ctx, id: u64, bytes: &[u8]) -> Result<Posted, OpError> {
                     CloneAttachment::Port(_) => None,
                 })
                 .collect();
-            let _ = member.queue.push(CloneMessage {
+            let _ = member.mail.queue.push(CloneMessage {
                 bytes: message.bytes.clone(),
                 attachments,
             });
@@ -295,7 +465,7 @@ pub fn post(ctx: &mut Ctx, id: u64, bytes: &[u8]) -> Result<Posted, OpError> {
     let Some(peer) = port.0.peer() else {
         return Ok(Posted::Dropped);
     };
-    if port.0.queue.is_closed() || peer.queue.is_closed() {
+    if port.0.mail.queue.is_closed() || peer.mail.queue.is_closed() {
         return Ok(Posted::Dropped);
     }
     let carries_target = message.attachments.iter().any(|a| match a {
@@ -307,7 +477,10 @@ pub fn post(ctx: &mut Ctx, id: u64, bytes: &[u8]) -> Result<Posted, OpError> {
         port.0.close_both();
         return Ok(Posted::Lost);
     }
-    if peer.queue.push(message).is_err() {
+    if limits.max_queued != usize::MAX && peer.mail.queue.len() >= limits.max_queued {
+        return Ok(Posted::Full);
+    }
+    if peer.mail.queue.push(message).is_err() {
         return Ok(Posted::Dropped);
     }
     peer.wake();
@@ -342,11 +515,7 @@ pub fn listen(ctx: &mut Ctx, id: u64, callback: Value) -> Result<(), OpError> {
     if let Some(h) = ctx.host_mut::<Ports>().unwrap().handles.get_mut(&id) {
         h.task = Some(task);
     }
-    *port.0.waker.lock().unwrap() = Some(Waker { sender, task });
-    port.0.wake_pending.store(false, Ordering::SeqCst);
-    if port.0.queue.is_closed() || !port.0.queue.is_empty() {
-        port.0.wake();
-    }
+    port.0.mail.bind(sender, task);
     Ok(())
 }
 
@@ -373,6 +542,16 @@ pub fn wake(ctx: &mut Ctx, id: u64) {
     }
 }
 
+/// [`wake`], but only when something is left to deliver (a queued message or the close): the last
+/// message of a burst costs no extra turn.
+pub fn rewake(ctx: &mut Ctx, id: u64) {
+    if let Ok(port) = lookup(ctx, id as f64) {
+        if !port.0.mail.queue.is_empty() || port.0.mail.queue.is_closed() {
+            port.0.wake();
+        }
+    }
+}
+
 pub fn export(ctx: &mut Ctx, id: u64) -> Result<usize, OpError> {
     let port = lookup(ctx, id as f64)?;
     clone_transfer::stage_port(ctx, port)
@@ -389,7 +568,7 @@ pub fn import(ctx: &mut Ctx, index: f64) -> Result<u64, OpError> {
 }
 
 pub fn is_closed(ctx: &mut Ctx, id: u64) -> Result<bool, OpError> {
-    Ok(lookup(ctx, id as f64)?.0.queue.is_closed())
+    Ok(lookup(ctx, id as f64)?.0.mail.queue.is_closed())
 }
 
 /// Drop this realm's handle on `id`.
@@ -397,8 +576,8 @@ pub fn detach(ctx: &mut Ctx, id: u64) {
     release(ctx, id);
 }
 
-/// End the channel for both sides. Messages already queued are still received; each side then
-/// sees the close.
+/// End the channel for both sides. Messages the closing side had already sent are still received
+/// by the peer; messages queued for the closing side are dropped. Each side then sees the close.
 pub fn close(ctx: &mut Ctx, id: u64) {
     if let Ok(port) = lookup(ctx, id as f64) {
         port.0.close_both();
@@ -424,7 +603,7 @@ pub fn can_receive(ctx: &mut Ctx, id: u64) -> bool {
     let Ok(port) = lookup(ctx, id as f64) else {
         return false;
     };
-    if port.0.queue.is_closed() {
+    if port.0.mail.queue.is_closed() {
         return false;
     }
     port.0.group.is_some() || port.0.peer().is_some()
@@ -461,6 +640,7 @@ pub fn dead_ports(ctx: &mut Ctx) -> Rc<DeadPorts> {
     let dead = Rc::new(DeadPorts {
         ids: Default::default(),
         wake,
+        armed: Default::default(),
     });
     ctx.host_mut::<Ports>().unwrap().dead = Some(dead.clone());
     dead
@@ -479,6 +659,7 @@ pub fn reap(ctx: &mut Ctx) {
     let Some(dead) = ctx.host_mut::<Ports>().and_then(|ports| ports.dead.clone()) else {
         return;
     };
+    dead.armed.set(false);
     let ids = std::mem::take(&mut *dead.ids.borrow_mut());
     for id in ids {
         if let Some(port) = release(ctx, id) {
@@ -532,6 +713,7 @@ mod bindings {
             Posted::Queued => Value::Bool(true),
             Posted::Dropped => Value::Bool(false),
             Posted::Lost => Value::from_string("lost".into()),
+            Posted::Full => return Err(queue_full()),
         })
     }
 
@@ -557,10 +739,10 @@ mod bindings {
     #[op(name = "peek", coerce)]
     fn op_peek(ctx: &mut Ctx, id: f64) -> Result<f64, OpError> {
         let port = lookup(ctx, id)?;
-        let queued = !port.0.queue.is_empty();
+        let queued = !port.0.mail.queue.is_empty();
         Ok(if queued {
             1.0
-        } else if port.0.queue.is_closed() {
+        } else if port.0.mail.queue.is_closed() {
             -1.0
         } else {
             0.0

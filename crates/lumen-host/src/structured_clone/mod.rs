@@ -147,8 +147,16 @@ fn write_message(
     transport: bool,
     bridge: &Bridge,
     locals: Option<&[Value]>,
+    limit: usize,
 ) -> OpResult<Vec<u8>> {
-    let mut writer = Writer::new(ctx, bridge, transport, locals.unwrap_or(&[]), locals.is_some());
+    let mut writer = Writer::new(
+        ctx,
+        bridge,
+        transport,
+        locals.unwrap_or(&[]),
+        locals.is_some(),
+        limit,
+    );
     for item in list {
         if !bridge.flag(ctx, "isPort", item)? {
             continue;
@@ -164,6 +172,9 @@ fn write_message(
     }
     writer.write_ports_header();
     writer.write(ctx, value)?;
+    if writer.sink.overflow {
+        return Err(writer.too_large());
+    }
     // Getters may have transferred an outer buffer or port in a nested message: revalidate the
     // whole list before detaching any sender-owned resource.
     for item in list {
@@ -190,12 +201,13 @@ fn serialize_with(
     transport: bool,
     bridge: &Bridge,
     locals: Option<&[Value]>,
+    limit: usize,
 ) -> OpResult<Vec<u8>> {
     let list = settle_transfer_list(ctx, transfer, transport, bridge)?;
     if transport {
         clone_transfer::begin_frame(ctx)?;
     }
-    let result = write_message(ctx, value, &list, transport, bridge, locals);
+    let result = write_message(ctx, value, &list, transport, bridge, locals, limit);
     if result.is_err() && transport {
         clone_transfer::abort_frame(ctx);
     }
@@ -217,7 +229,8 @@ fn deserialize_with(
 /// `ArrayBuffer`s transferred. With `transport` the attachments wait in a frame that the caller
 /// must take with [`clone_transfer::take_message`] (it is dropped when serialization fails);
 /// without it, memory sharing and port transfer are refused. `bridge` is the port bridge, or
-/// `undefined` for the realm's `__lumenPortClone`.
+/// `undefined` for the realm's `__lumenPortClone`. A transported message larger than the realm's
+/// [`crate::ports::PortLimits::max_message_bytes`] fails with a `DataCloneError` while it is written.
 pub fn serialize(
     ctx: &mut Ctx,
     value: &Value,
@@ -226,7 +239,12 @@ pub fn serialize(
     bridge: &Value,
 ) -> OpResult<Vec<u8>> {
     let bridge = Bridge::resolve(ctx, bridge);
-    serialize_with(ctx, value, transfer, transport, &bridge, None)
+    let limit = if transport {
+        crate::ports::limits(ctx).max_message_bytes
+    } else {
+        usize::MAX
+    };
+    serialize_with(ctx, value, transfer, transport, &bridge, None, limit)
 }
 
 /// StructuredDeserialize of bytes made by [`serialize`] in any realm of this process, after the
@@ -253,7 +271,7 @@ pub fn structured_clone(ctx: &mut Ctx, value: &Value, transfer: Vec<Value>) -> O
             list.push(item);
         }
     }
-    let bytes = serialize_with(ctx, value, &list, true, &bridge, Some(&originals))?;
+    let bytes = serialize_with(ctx, value, &list, true, &bridge, Some(&originals), usize::MAX)?;
     let message = clone_transfer::take_message(ctx, bytes);
     let bytes = clone_transfer::install_message(ctx, message);
     deserialize_with(ctx, &bytes, &bridge, &copies)

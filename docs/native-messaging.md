@@ -20,7 +20,7 @@ The kernel keeps its own transport for shared workers and installs only the even
 Install `messaging::event_bindings::Module` and `messaging::channel_bindings::Module` with
 `lazy_globals`, `messaging::shared::Module` with `namespace`, and call
 `messaging::install_port_clone` and `performance::install_globals` as module initializers.
-`lumen-web`'s extension does all of this; ports additionally need `lumen_host::ports::extension()`
+`lumen-web`'s extension does all of this through `messaging::install` (also `messaging::extension()`, which the kernel will use); ports additionally need `lumen_host::ports::extension()`
 and `clone_transfer::extension()` (the runtime lists them) and an event loop. `new MessageChannel()`
 without the ports extension throws a `TypeError`.
 
@@ -68,6 +68,19 @@ replaces. Nothing mutates a global any more.
 - A collected wrapper reports its id to `DeadPorts` from `Drop`; the realm's reaper task
   releases the handle on the realm thread.
 - The loop task is unref'd: an open port never keeps the loop alive.
+
+### Limits and native receivers
+
+- `ports::set_limits(ctx, PortLimits { max_message_bytes, max_queued })` is opt-in per realm (the
+  default is unbounded). An oversized message is a `DataCloneError`, raised while it is serialized;
+  a full receiving queue is a `QuotaExceededError`, raised before the message is serialized so
+  nothing is detached. The queue is checked by the sender.
+- `messaging::listen_native(ctx, id, target, Receiver, on_close)` delivers an endpoint's messages
+  to a native class (a `Worker`, a worker global) instead of a `MessagePort`, with the same
+  per-message tasks and no script buffer in between. The returned `NativeReceiver` posts, closes and
+  pins.
+- `owner_loop` drives all of this in a host without an event loop; see
+  [plans/native-workers.md](plans/native-workers.md).
 
 ## BroadcastChannel
 

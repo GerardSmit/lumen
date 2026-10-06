@@ -42,6 +42,9 @@ pub mod clone_transfer;
 pub mod messaging;
 /// The native `Navigator` interface and the `navigator` global.
 pub mod navigator;
+/// Event delivery for hosts without their own event loop (the Bitnest kernel): `install`,
+/// `has_ready`, `pump` and `settle`.
+pub mod owner_loop;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
 /// The native `Performance` interface and the `performance` and `self` globals.
@@ -852,19 +855,44 @@ impl SpawnHandle {
 #[derive(Clone)]
 pub struct CompletionSender {
     tx: mpsc::Sender<TaskCompletion>,
+    wake: Option<std::sync::Arc<owner_loop::Wake>>,
 }
 
 impl CompletionSender {
     pub fn new(tx: mpsc::Sender<TaskCompletion>) -> CompletionSender {
-        CompletionSender { tx }
+        CompletionSender { tx, wake: None }
     }
+
+    /// A sender for a loop that is driven by its host's turns ([`owner_loop`]): every completion
+    /// is counted, and `notify` runs on the transition from nothing ready to something ready, so a
+    /// burst of sends wakes the host once. `notify` runs on the sending thread and must not block.
+    pub fn with_notify(
+        tx: mpsc::Sender<TaskCompletion>,
+        notify: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> CompletionSender {
+        CompletionSender {
+            tx,
+            wake: Some(std::sync::Arc::new(owner_loop::Wake::new(notify))),
+        }
+    }
+
+    pub(crate) fn wake_handle(&self) -> Option<std::sync::Arc<owner_loop::Wake>> {
+        self.wake.clone()
+    }
+
     /// Run `work` on a new dedicated thread; its result comes back to the loop as a
     /// [`TaskCompletion`] tagged with `id` (settled through the [`TaskRegistry`], like pool work).
+    ///
+    /// Not available on an [`owner_loop`] sender: the owner loop never spawns threads.
     pub fn run_blocking(
         &self,
         id: TaskId,
         work: impl FnOnce() -> Box<dyn Any + Send> + Send + 'static,
     ) {
+        debug_assert!(
+            self.wake.is_none(),
+            "run_blocking is not supported on an owner-loop sender"
+        );
         let tx = self.tx.clone();
         let run = move || {
             let result = work();
@@ -875,9 +903,22 @@ impl CompletionSender {
         #[cfg(not(target_arch = "wasm32"))]
         spawn_thread(run);
     }
+
     /// Deliver a completion from any thread (an I/O callback, a readiness thread).
     pub fn send(&self, id: TaskId, result: Box<dyn Any + Send>) {
-        let _ = self.tx.send(TaskCompletion { task: id, result });
+        match &self.wake {
+            None => {
+                let _ = self.tx.send(TaskCompletion { task: id, result });
+            }
+            Some(wake) => {
+                // Count before queueing so the receiver never sees a message the counter does not
+                // cover; notify after queueing so the woken host finds it.
+                let first = wake.arrive();
+                if self.tx.send(TaskCompletion { task: id, result }).is_ok() && first {
+                    wake.notify();
+                }
+            }
+        }
     }
 }
 
