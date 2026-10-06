@@ -153,7 +153,7 @@ object. The native core:
 
 - `events.js`, `custom-event.js` and `error-events.js` are deleted; `lumen-web`'s `build.rs` drops
   their units and its extension publishes `lumen_host::events` as lazy globals.
-- `xhr.js` uses `__eventTargetInternals.defineEventHandler` / `hasListeners`, now native;
+- `xhr.js` is gone: `XMLHttpRequest` is native ([native-network.md](native-network.md));
   `encoding.js` uses `__eventTargetInternals.cloneTransferableSignal`. `MessageEvent`,
   `MessagePort` and the other channel classes are native subclasses
   ([native-messaging.md](native-messaging.md)).

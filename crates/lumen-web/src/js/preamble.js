@@ -5,12 +5,10 @@ const __url = globalThis.__url;
 const __http = globalThis.__http;
 const __wasm = globalThis.__wasm;
 const __ws = globalThis.__ws;
-const __sse = globalThis.__sse;
 delete globalThis.__url;
 delete globalThis.__http;
 delete globalThis.__wasm;
 delete globalThis.__ws;
-delete globalThis.__sse;
 
 // Capture descriptor intrinsics before author code can replace them. Lazy unit
 // publication inspects properties without invoking a host/author getter or setter.

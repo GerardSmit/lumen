@@ -456,9 +456,6 @@ class Response {
 }
 bodyMixin(Response.prototype);
 
-// Shared with XHR in this bootstrap; ordinary Fetch callers never install it.
-const kUploadProgress = Symbol("xhrUploadProgress");
-const kForcePreflight = Symbol("xhrForcePreflight");
 async function fetch(input, init = {}) {
   const request = new Request(input, init);
   const signal = request.signal;
@@ -476,40 +473,18 @@ async function fetch(input, init = {}) {
   }
   const hasBody = request._bodyBytes !== undefined || request[kSourceStream] !== undefined;
   let bodyBytes = hasBody ? await request._consume(signal) : undefined;
-  const uploadObserver = init[kUploadProgress];
-  const forcePreflight = init[kForcePreflight] === true;
-  let uploadObserved = false;
-  if (bodyBytes !== undefined && typeof uploadObserver === "function") {
-    uploadObserver(0, bodyBytes.byteLength, false, true);
-  }
   if (signal && signal.aborted) throw abortReason();
   const sendRaw = (method, url, headers, bytes, redirect = "follow") => new Promise((resolve, reject) => {
     let done = false;
     let handle;
-    let uploadTimer;
-    let uploadFinished = false;
-    const observeUpload = bytes !== undefined && !uploadObserved && typeof uploadObserver === "function";
-    if (observeUpload) uploadObserved = true;
-    const sampleUpload = () => {
-      if (!observeUpload || !handle || uploadFinished) return;
-      const complete = handle.uploadComplete === true;
-      const total = handle.uploadTotal;
-      uploadObserver(handle.uploadLoaded, total, complete, false);
-      if (complete) { uploadFinished = true; clearTimeout(uploadTimer); }
-    };
-    const pollUpload = () => {
-      sampleUpload();
-      if (!done && !uploadFinished) uploadTimer = setTimeout(pollUpload, 50);
-    };
-    const onAbort = () => { sampleUpload(); clearTimeout(uploadTimer); if (handle) handle.abort(); if (!done) { done = true; reject(abortReason()); } };
+    const onAbort = () => { if (handle) handle.abort(); if (!done) { done = true; reject(abortReason()); } };
     if (signal) signal.addEventListener("abort", onAbort);
-    const finish = fn => value => { if (done) { if (value && value.bodyReader) value.bodyReader.cancel(); return; } sampleUpload(); clearTimeout(uploadTimer); done = true; if (signal) signal.removeEventListener("abort", onAbort); fn(value); };
+    const finish = fn => value => { if (done) { if (value && value.bodyReader) value.bodyReader.cancel(); return; } done = true; if (signal) signal.removeEventListener("abort", onAbort); fn(value); };
     try {
       handle = __http.request(method, url, headers, bytes, finish(raw => {
         if (raw && !(raw.headers instanceof Headers)) raw.headers = new Headers(raw.headers || []);
         resolve(raw);
-      }), finish(error => reject(error instanceof Error ? error : new TypeError(String(error)))), redirect, {mode: request.mode, credentials: request.credentials, redirect: request.redirect, uploadProgress: observeUpload || forcePreflight, forcePreflight});
-      if (observeUpload) pollUpload();
+      }), finish(error => reject(error instanceof Error ? error : new TypeError(String(error)))), redirect, {mode: request.mode, credentials: request.credentials, redirect: request.redirect});
       if (signal && signal.aborted) onAbort();
     } catch (error) { finish(reject)(error); }
   });
@@ -526,7 +501,7 @@ async function fetch(input, init = {}) {
     if (!browser || mode !== "cors" || (sameOrigin(targetUrl, origin) && corsOrigin === origin)) return;
     const currentHeaders = new Headers(headers);
     const unsafe = corsUnsafeHeaderNames(currentHeaders);
-    if (forcePreflight || !corsSafelistedMethods.has(method) || unsafe.length) {
+    if (!corsSafelistedMethods.has(method) || unsafe.length) {
       const preflightHeaders = [["accept", "*/*"], ["origin", corsOrigin], ["access-control-request-method", method]];
       if (unsafe.length) preflightHeaders.push(["access-control-request-headers", unsafe.join(", ")]);
       const preflight = await sendRaw("OPTIONS", targetUrl, preflightHeaders, undefined, "manual");

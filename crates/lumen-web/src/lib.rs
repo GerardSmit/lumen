@@ -26,7 +26,9 @@
 //!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
 //!   Fetch reads native response bodies incrementally; body consumption and cloning also
 //!   accept asynchronous streams. Request uploads are prepared before transport delivery.
-//! - [ ] `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
+//! - [x] `WebSocket` and `EventSource`: native classes (`websocket_class.rs`, `eventsource_class.rs`)
+//!   over the transports in `websocket.rs` and `sse.rs`, published lazily
+//! - [ ] `URLPattern`, `crypto.subtle` beyond digest
 
 use lumen_bind::NativeError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -193,6 +195,9 @@ mod sse;
 mod url;
 #[cfg(not(target_arch = "wasm32"))]
 mod websocket;
+mod eventsource_class;
+mod net_class;
+mod websocket_class;
 
 #[cfg(not(target_arch = "wasm32"))]
 fn sync_http_desktop(
@@ -738,9 +743,12 @@ pub fn extension() -> Extension {
             lumen_host::messaging::install_port_clone,
             lumen_host::performance::install_globals,
             lumen_host::namespace::<http_ops::Module>,
+            install_transport,
+            lumen_host::lazy_globals::<lumen_host::net::bindings::Module>,
             lumen_host::namespace::<server::Module>,
             lumen_host::namespace::<websocket::Module>,
-            lumen_host::namespace::<sse::Module>,
+            lumen_host::lazy_globals::<websocket_class::bindings::Module>,
+            lumen_host::lazy_globals::<eventsource_class::bindings::Module>,
             lumen_host::namespace::<wasm_ops::WasmModule>,
         ],
         state_init: Some(|state: &mut OpState| {
@@ -775,6 +783,15 @@ pub fn extension() -> Extension {
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
 #[cfg(feature = "compiler")]
 const JS_GLUE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
+
+/// Register the `__http` and `__http_policy` operations as the realm's native request transport.
+fn install_transport(ctx: &mut Ctx) -> Result<(), Value> {
+    let global = ctx.global_object();
+    let http = ctx.member_get(&global, "__http")?;
+    let policy = ctx.member_get(&global, "__http_policy")?;
+    lumen_host::net::Transport::install(ctx, http, policy.clone(), policy);
+    Ok(())
+}
 
 fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
     let ns = ctx.namespace_object("__url");

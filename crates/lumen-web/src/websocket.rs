@@ -1,5 +1,5 @@
 //! WebSocket (RFC 6455) over plain TCP or verified TLS: a *client* (the upgrade sibling of the fetch
-//! client in `http.rs`, driving the `WebSocket` global in `js/websocket.js`) plus a *server-side
+//! client in `http.rs`, driving the native `WebSocket` class in `websocket_class.rs`) plus a *server-side
 //! adopt* (`op_ws_upgrade`), which takes a connection accepted by the HTTP server in `server.rs`,
 //! answers the 101 handshake, and runs it through the same registry/read-loop with unmasked
 //! outgoing frames — backing `Lumen.upgradeWebSocket` and Bun.serve's `websocket` option.
@@ -29,6 +29,7 @@ use lumen_bind::NativeError;
 use lumen_host::{Ctx, OpError, SpawnHandle, Value};
 
 use crate::url;
+use crate::websocket_class::Outgoing;
 use lumen_common::hash::{digest, Algo};
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -357,127 +358,22 @@ pub(crate) use bindings::Module;
 mod bindings {
     use super::*;
 
-    /// `__ws.connect(url, protocolsJoined, dispatch)` -> id. The handshake runs on the pool; the
-    /// socket's lifecycle then flows entirely through `dispatch(kind, ...)`:
-    /// `("open", protocol)`, `("text", string)`, `("binary", u8array)`,
-    /// `("close", code, reason, wasClean)`, `("error", message)`.
-    #[op(coerce)]
-    fn connect(ctx: &mut Ctx, target: String, protocols: String, dispatch: Value) -> Result<f64, OpError> {
-        if !dispatch.is_callable() {
-            return Err(NativeError::type_error("connect: dispatch must be a function").into());
-        }
-
-        let u = url::parse(&target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
-        match u.scheme.as_str() {
-            "ws" | "wss" => {}
-            other => {
-                return Err(NativeError::named("SyntaxError", format!("WebSocket: unsupported scheme '{other}'")).into())
-            }
-        }
-
-        // 16 random bytes for the handshake key (CSPRNG); also seeds the per-socket mask LCG.
-        let key_bytes = crate::web_random_bytes(16)?;
-        let key = base64(&key_bytes);
-        let mask_seed = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap()) | 1;
-
-        let id = {
-            let reg = ws_registry(ctx);
-            let id = reg.next;
-            reg.next += 1;
-            reg.socks.insert(
-                id,
-                WsEntry {
-                    writer: None,
-                    close_sent: Arc::new(AtomicBool::new(false)),
-                    dead: false,
-                    dispatch: dispatch.clone(),
-                    mask_seed,
-                    masked: true,
-                },
-            );
-            id
-        };
-
-        let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
-        let spawn = ctx
-            .op_state()
-            .get::<SpawnHandle>()
-            .expect("runtime installs the spawn handle")
-            .clone();
-        spawn.spawn_blocking(task, move || {
-            Box::new(ConnectResult {
-                id,
-                outcome: handshake(&u, &key, &protocols),
-            })
-        });
-        Ok(id as f64)
-    }
-
-    /// `__ws.send(id, stringOrBytes)` - encodes and writes one masked data frame on the loop thread.
+    /// `__ws.send(id, stringOrBytes)` - encodes and writes one data frame on the loop thread.
     #[op]
     fn send(ctx: &mut Ctx, id: f64, data: Value) -> Result<bool, OpError> {
         let id = id as u64;
-        let (opcode, bytes) = match ctx.typed_array_bytes(&data) {
-            Some(b) => (0x2u8, b),
-            None => (0x1u8, ctx.coerce_string(&data)?.to_string().into_bytes()),
-        };
-        let (writer, mask) = {
-            let reg = ws_registry(ctx);
-            let Some(e) = reg.socks.get_mut(&id) else {
-                return Ok(false); // already closed: spec drops silently
-            };
-            if e.close_sent.load(Ordering::SeqCst) {
-                return Ok(false);
-            }
-            e.mask_seed = e
-                .mask_seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            // Server-adopted sockets never mask (RFC 6455 §5.1).
-            let mask: Option<[u8; 4]> = e
-                .masked
-                .then(|| (e.mask_seed >> 24).to_be_bytes()[4..8].try_into().unwrap());
-            match &e.writer {
-                Some(w) => (w.clone(), mask),
-                None => return Err(NativeError::runtime("send before open").into()),
-            }
-        };
-        let frame = match mask {
-            Some(m) => encode_frame(opcode, &bytes, m),
-            None => encode_frame_unmasked(opcode, &bytes),
-        };
-        let mut writer = writer;
-        writer
-            .write_all(&frame)
-            .map_err(|e| NativeError::runtime(format!("WebSocket send: {e}")))?;
-        Ok(true)
+        if let Some(bytes) = ctx.typed_array_bytes(&data) {
+            return Ok(send_frame(ctx, id, Outgoing::Binary(&bytes))?);
+        }
+        let text = ctx.coerce_string(&data)?;
+        Ok(send_frame(ctx, id, Outgoing::Text(&text))?)
     }
 
     /// `__ws.close(id, code, reason)` - sends the close frame (once); the read loop then surfaces
     /// the peer's echo as the close event.
     #[op(coerce)]
     fn close(ctx: &mut Ctx, id: f64, code: Option<f64>, reason: String) {
-        let id = id as u64;
-        let code = code.map_or(1000, |n| n as u16);
-        let (writer, masked) = {
-            let reg = ws_registry(ctx);
-            let Some(e) = reg.socks.get_mut(&id) else {
-                return;
-            };
-            if e.close_sent.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            (e.writer.clone(), e.masked)
-        };
-        if let Some(mut w) = writer {
-            let payload = close_payload(code, &reason);
-            let frame = if masked {
-                encode_frame(0x8, &payload, [0x1f, 0x2e, 0x3d, 0x4c])
-            } else {
-                encode_frame_unmasked(0x8, &payload)
-            };
-            let _ = w.write_all(&frame);
-        }
+        close_socket(ctx, id as u64, code.map_or(1000, |n| n as u16), &reason);
     }
 
     /// `__ws.upgrade(connId, secWebSocketKey, protocol, extraHeaderPairs, dispatch)` -> id.
@@ -574,6 +470,138 @@ mod bindings {
         arm_read(ctx, id, reader);
         Ok(id as f64)
     }
+}
+
+/// Open a client socket to `target` offering `protocols`. The handshake runs on the pool; the
+/// socket's lifecycle then flows through `dispatch(kind, ...)`: `("open", protocol)`,
+/// `("text", string)`, `("binary", u8array)`, `("close", code, reason, wasClean)`,
+/// `("fail", code, message)` and `("error", message)`. Returns the socket's id.
+pub(crate) fn connect_socket(
+    ctx: &mut Ctx,
+    target: &str,
+    protocols: &[String],
+    dispatch: Value,
+) -> Result<u64, NativeError> {
+    if !dispatch.is_callable() {
+        return Err(NativeError::type_error("connect: dispatch must be a function"));
+    }
+
+    let u = url::parse(target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
+    match u.scheme.as_str() {
+        "ws" | "wss" => {}
+        other => {
+            return Err(NativeError::named(
+                "SyntaxError",
+                format!("WebSocket: unsupported scheme '{other}'"),
+            ))
+        }
+    }
+
+    // 16 random bytes for the handshake key (CSPRNG); also seeds the per-socket mask LCG.
+    let key_bytes = crate::web_random_bytes(16).map_err(|e| NativeError::runtime(e.message().to_string()))?;
+    let key = base64(&key_bytes);
+    let mask_seed = u64::from_be_bytes(key_bytes[0..8].try_into().unwrap()) | 1;
+
+    let id = {
+        let reg = ws_registry(ctx);
+        let id = reg.next;
+        reg.next += 1;
+        reg.socks.insert(
+            id,
+            WsEntry {
+                writer: None,
+                close_sent: Arc::new(AtomicBool::new(false)),
+                dead: false,
+                dispatch: dispatch.clone(),
+                mask_seed,
+                masked: true,
+            },
+        );
+        id
+    };
+
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
+    let spawn = ctx
+        .op_state()
+        .get::<SpawnHandle>()
+        .expect("runtime installs the spawn handle")
+        .clone();
+    let protocols = protocols.join(", ");
+    spawn.spawn_blocking(task, move || {
+        Box::new(ConnectResult {
+            id,
+            outcome: handshake(&u, &key, &protocols),
+        })
+    });
+    Ok(id)
+}
+
+/// Encode and write one data frame. `false` when the socket is gone or already closing.
+pub(crate) fn send_frame(ctx: &mut Ctx, id: u64, payload: Outgoing<'_>) -> Result<bool, NativeError> {
+    let (opcode, bytes) = match payload {
+        Outgoing::Binary(bytes) => (0x2u8, bytes),
+        Outgoing::Text(text) => (0x1u8, text.as_bytes()),
+    };
+    let (writer, mask) = {
+        let reg = ws_registry(ctx);
+        let Some(e) = reg.socks.get_mut(&id) else {
+            return Ok(false);
+        };
+        if e.close_sent.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        e.mask_seed = e
+            .mask_seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // Server-adopted sockets never mask (RFC 6455 §5.1).
+        let mask: Option<[u8; 4]> = e
+            .masked
+            .then(|| (e.mask_seed >> 24).to_be_bytes()[4..8].try_into().unwrap());
+        match &e.writer {
+            Some(w) => (w.clone(), mask),
+            None => return Err(NativeError::runtime("send before open")),
+        }
+    };
+    let frame = match mask {
+        Some(m) => encode_frame(opcode, bytes, m),
+        None => encode_frame_unmasked(opcode, bytes),
+    };
+    let mut writer = writer;
+    writer
+        .write_all(&frame)
+        .map_err(|e| NativeError::runtime(format!("WebSocket send: {e}")))?;
+    Ok(true)
+}
+
+/// Send the close frame (once); the read loop then surfaces the peer's echo as the close event.
+pub(crate) fn close_socket(ctx: &mut Ctx, id: u64, code: u16, reason: &str) {
+    let (writer, masked) = {
+        let reg = ws_registry(ctx);
+        let Some(e) = reg.socks.get_mut(&id) else {
+            return;
+        };
+        if e.close_sent.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        (e.writer.clone(), e.masked)
+    };
+    if let Some(mut w) = writer {
+        let payload = close_payload(code, reason);
+        let frame = if masked {
+            encode_frame(0x8, &payload, [0x1f, 0x2e, 0x3d, 0x4c])
+        } else {
+            encode_frame_unmasked(0x8, &payload)
+        };
+        let _ = w.write_all(&frame);
+    }
+}
+
+/// Close a socket nobody listens to any more and forget it: the read in flight ends with the
+/// peer's echo and is not re-armed.
+pub(crate) fn abandon_socket(ctx: &mut Ctx, id: u64) {
+    close_socket(ctx, id, 1001, "");
+    ws_registry(ctx).socks.remove(&id);
 }
 
 /// Dial + HTTP/1.1 upgrade (RFC 6455 §4.1/§4.2). Returns the open stream and the negotiated

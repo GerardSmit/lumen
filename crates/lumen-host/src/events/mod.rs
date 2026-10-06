@@ -19,10 +19,10 @@ mod target;
 mod web;
 
 pub use node::internals;
-pub(crate) use node::{node_handler_get, node_handler_set};
+pub use node::{node_handler_get, node_handler_set};
 pub use web::bindings;
 
-pub use abort::{abort_signal, new_signal};
+pub use abort::{abort_signal, dom_exception, new_signal};
 pub use bindings::{
     AbortController, AbortSignal, CustomEvent, DomException, ErrorEvent, Event, EventTarget,
 };

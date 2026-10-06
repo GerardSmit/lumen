@@ -6,7 +6,7 @@ use super::target::{self, Callback, HandlerKind};
 use super::*;
 
 /// The `on<type>` getter of a Node-style event handler (`defineEventHandler`, `AbortSignal`).
-pub(crate) fn node_handler_get(ctx: &mut Ctx, receiver: &Value, kind: &str) -> OpResult<Value> {
+pub fn node_handler_get(ctx: &mut Ctx, receiver: &Value, kind: &str) -> OpResult<Value> {
     let (data, _) = EventTarget::of_receiver(ctx, receiver)?;
     Ok(data
         .handler_cell(kind)
@@ -16,7 +16,7 @@ pub(crate) fn node_handler_get(ctx: &mut Ctx, receiver: &Value, kind: &str) -> O
 
 /// The `on<type>` setter: a function becomes the handler, anything else empties it. The handler
 /// keeps the position of its first registration, also across `null`.
-pub(crate) fn node_handler_set(
+pub fn node_handler_set(
     ctx: &mut Ctx,
     receiver: &Value,
     kind: &str,

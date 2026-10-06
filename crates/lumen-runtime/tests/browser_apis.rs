@@ -1063,3 +1063,182 @@ fn native_dom_exception_behaves_like_an_error() {
         assert_script(&mut runtime, expression);
     }
 }
+
+#[test]
+fn xhr_classes_have_the_web_idl_shape() {
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, r#"
+        var own = (target, name) => Object.getOwnPropertyDescriptor(target, name);
+        var interfaces = [XMLHttpRequest, XMLHttpRequestEventTarget, XMLHttpRequestUpload, ProgressEvent];
+        var globalsOk = interfaces.every(c => { const d = own(globalThis, c.name); return d.writable && !d.enumerable && d.configurable; });
+        var chainOk = Object.getPrototypeOf(XMLHttpRequest) === XMLHttpRequestEventTarget
+          && Object.getPrototypeOf(XMLHttpRequestUpload) === XMLHttpRequestEventTarget
+          && Object.getPrototypeOf(XMLHttpRequestEventTarget) === EventTarget
+          && Object.getPrototypeOf(ProgressEvent) === Event;
+        var constantsOk = Object.entries({UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4}).every(([name, value]) =>
+          [XMLHttpRequest, XMLHttpRequest.prototype].every(target => {
+            const d = own(target, name);
+            return d.value === value && d.enumerable && !d.writable && !d.configurable;
+          }));
+        var lengthsOk = XMLHttpRequest.length === 0 && ProgressEvent.length === 1 && XMLHttpRequest.prototype.open.length === 2
+          && XMLHttpRequest.prototype.setRequestHeader.length === 2 && XMLHttpRequest.prototype.send.length === 0;
+        var tags = [new XMLHttpRequest(), new XMLHttpRequest().upload, new ProgressEvent('x')].map(o => Object.prototype.toString.call(o)).join();
+        var illegal = [XMLHttpRequestEventTarget, XMLHttpRequestUpload].map(c => { try { new c(); return 'constructed'; } catch (e) { return e.constructor.name; } }).join();
+        var handlers = ['loadstart', 'progress', 'abort', 'error', 'load', 'timeout', 'loadend'].every(type => {
+          const d = own(XMLHttpRequestEventTarget.prototype, 'on' + type);
+          return d && typeof d.get === 'function' && typeof d.set === 'function' && d.enumerable && d.configurable;
+        }) && own(XMLHttpRequest.prototype, 'onreadystatechange') !== undefined
+          && own(XMLHttpRequestUpload.prototype, 'onload') === undefined;
+        var xhr = new XMLHttpRequest(), handler = () => {};
+        xhr.onload = handler;
+        var roundTrip = xhr.onload === handler && (xhr.onload = 5, xhr.onload === null) && xhr.onreadystatechange === null;
+        var brand = (() => { try { own(XMLHttpRequest.prototype, 'readyState').get.call({}); return 'no throw'; } catch (e) { return e.constructor.name; } })();
+        var progress = new ProgressEvent('progress', {loaded: 3.7, lengthComputable: 1});
+        var progressOk = progress.loaded === 3 && progress.total === 0 && progress.lengthComputable === true && progress.isTrusted === false;
+        var initial = [xhr.readyState, xhr.status, xhr.statusText, xhr.responseURL, xhr.responseText, xhr.response, xhr.responseType, xhr.timeout, xhr.withCredentials].join('|');
+    "#);
+    assert_script(&mut runtime, "globalsOk && chainOk && constantsOk && lengthsOk && handlers && roundTrip && progressOk");
+    assert_script(&mut runtime, "tags === '[object XMLHttpRequest],[object XMLHttpRequestUpload],[object ProgressEvent]'");
+    assert_script(&mut runtime, "illegal === 'TypeError,TypeError' && brand === 'TypeError' && initial === '0|0||||||0|false'");
+    assert_script(&mut runtime, "xhr.upload === xhr.upload && xhr instanceof EventTarget && xhr.upload instanceof XMLHttpRequestEventTarget");
+}
+
+#[test]
+fn xhr_download_sequence_orders_ready_state_and_progress_events() {
+    let (url, task) = server(Duration::ZERO);
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var xhr = new XMLHttpRequest(), order = [];
+        xhr.onreadystatechange = () => order.push('rsc' + xhr.readyState);
+        for (const type of ['loadstart', 'progress', 'load', 'loadend', 'error', 'abort', 'timeout'])
+          xhr.addEventListener(type, e => order.push(type + ':' + e.loaded + '/' + e.total + (e.lengthComputable ? '!' : '') + (e.isTrusted ? 't' : '')));
+        xhr.open('GET', '{url}');
+        xhr.send();
+        order.push('sent');
+    "#));
+    assert_script(&mut runtime, "order.join(',') === 'rsc1,loadstart:0/0t,sent,rsc2,rsc3,progress:13/13!t,rsc4,load:13/13!t,loadend:13/13!t'");
+    assert_script(&mut runtime, "xhr.readyState === 4 && xhr.status === 200 && xhr.statusText === 'OK' && xhr.responseURL.startsWith('http://127.0.0.1:')");
+    task.join().unwrap();
+}
+
+#[test]
+fn xhr_network_failure_dispatches_error_then_loadend_with_done_state() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/refused", listener.local_addr().unwrap());
+    drop(listener);
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var xhr = new XMLHttpRequest(), order = [];
+        xhr.onreadystatechange = () => order.push('rsc' + xhr.readyState);
+        for (const type of ['loadstart', 'error', 'load', 'loadend', 'abort', 'timeout'])
+          xhr.addEventListener(type, () => order.push(type));
+        xhr.upload.addEventListener('error', () => order.push('upload:error'));
+        xhr.open('POST', '{url}');
+        xhr.send('payload');
+    "#));
+    assert_script(&mut runtime, "order.join(',') === 'rsc1,loadstart,rsc4,upload:error,error,loadend' && xhr.readyState === 4 && xhr.status === 0 && xhr.responseText === ''");
+}
+
+#[test]
+fn xhr_response_types_decode_the_same_bytes() {
+    let mut runtime = Runtime::new();
+    let cases: [(&str, &str, Vec<u8>, &str); 5] = [
+        ("", "text/plain;charset=windows-1252", b"caf\xe9".to_vec(), "xhr.response === 'café' && xhr.responseText === 'café'"),
+        ("text", "text/plain", "héllo".as_bytes().to_vec(), "xhr.response === 'héllo'"),
+        ("json", "application/json", b"{\"a\":[1,2]}".to_vec(), "xhr.response.a[1] === 2 && xhr.response === xhr.response"),
+        ("arraybuffer", "application/octet-stream", vec![9, 8, 7], "xhr.response instanceof ArrayBuffer && new Uint8Array(xhr.response).join() === '9,8,7'"),
+        ("blob", "image/png", vec![1, 2, 3, 4], "xhr.response instanceof Blob && xhr.response.type === 'image/png' && xhr.response.size === 4"),
+    ];
+    for (kind, mime, body, expectation) in cases {
+        let (url, task) = payload_server(Duration::ZERO, mime, body);
+        evaluate(&mut runtime, &format!("var xhr = new XMLHttpRequest(); xhr.open('GET', '{url}'); xhr.responseType = '{kind}'; xhr.send();"));
+        assert_script(&mut runtime, &format!("xhr.readyState === 4 && xhr.status === 200 && {expectation}"));
+        task.join().unwrap();
+    }
+    assert_script(&mut runtime, "(() => { try { void xhr.responseText; return false; } catch (e) { return e.name === 'InvalidStateError'; } })()");
+    let (url, task) = payload_server(Duration::ZERO, "application/json", b"not json".to_vec());
+    evaluate(&mut runtime, &format!("var bad = new XMLHttpRequest(); bad.open('GET', '{url}'); bad.responseType = 'json'; bad.send();"));
+    assert_script(&mut runtime, "bad.status === 200 && bad.response === null");
+    task.join().unwrap();
+}
+
+#[test]
+fn xhr_request_bodies_carry_their_default_content_type() {
+    let mut runtime = Runtime::new();
+    let cases: [(&str, &str); 5] = [
+        ("'text'", "content-type: text/plain;charset=utf-8\r\n"),
+        ("new URLSearchParams({a: '1 2'})", "content-type: application/x-www-form-urlencoded;charset=utf-8\r\n"),
+        ("new Blob(['x'], {type: 'text/csv'})", "content-type: text/csv\r\n"),
+        ("(() => { const f = new FormData(); f.append('k', 'v'); return f; })()", "content-type: multipart/form-data; boundary="),
+        ("new Uint8Array([1, 2])", ""),
+    ];
+    for (body, expected) in cases {
+        let (url, task) = payload_server(Duration::ZERO, "text/plain", Vec::new());
+        evaluate(&mut runtime, &format!("var xhr = new XMLHttpRequest(); xhr.open('POST', '{url}'); xhr.send({body});"));
+        let request = task.join().unwrap().to_lowercase();
+        if expected.is_empty() {
+            assert!(!request.contains("content-type:"), "{request}");
+        } else {
+            assert!(request.contains(expected), "{expected}: {request}");
+        }
+    }
+    let (url, task) = payload_server(Duration::ZERO, "text/plain", Vec::new());
+    evaluate(&mut runtime, &format!("var xhr = new XMLHttpRequest(); xhr.open('POST', '{url}'); xhr.setRequestHeader('Content-Type', 'application/x-custom'); xhr.send('body');"));
+    let request = task.join().unwrap().to_lowercase();
+    assert!(request.contains("content-type: application/x-custom\r\n") && !request.contains("text/plain"), "{request}");
+}
+
+#[test]
+fn xhr_in_flight_request_survives_collection_and_idle_objects_collect() {
+    let (url, task) = server(Duration::from_millis(40));
+    let mut runtime = Runtime::new();
+    runtime.expose_gc();
+    evaluate(&mut runtime, &format!(r#"
+        globalThis.log = []; globalThis.refs = [];
+        (() => {{
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '{url}');
+            xhr.onload = () => log.push('load:' + xhr.responseText);
+            refs.push(new WeakRef(xhr));
+            xhr.send();
+            const idle = new XMLHttpRequest();
+            idle.onload = () => {{}};
+            idle.open('GET', 'http://127.0.0.1:9/never');
+            refs.push(new WeakRef(idle));
+        }})();
+        let rounds = 0;
+        const timer = setInterval(() => {{ gc(); if (++rounds === 30) clearInterval(timer); }}, 2);
+    "#));
+    assert_script(&mut runtime, "log.join() === 'load:{\"answer\":42}'");
+    evaluate(&mut runtime, "gc(); gc();");
+    assert_script(&mut runtime, "refs.map(ref => ref.deref() === undefined).join() === 'true,true'");
+    task.join().unwrap();
+}
+
+#[test]
+fn synchronous_xhr_network_failure_throws_a_dom_exception() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/refused", listener.local_addr().unwrap());
+    drop(listener);
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!(r#"
+        var sync = new XMLHttpRequest(), thrown = '', events = [];
+        sync.open('GET', '{url}', false);
+        for (const type of ['error', 'load', 'loadend']) sync.addEventListener(type, () => events.push(type));
+        try {{ sync.send(); }} catch (e) {{ thrown = e.name + ':' + (e instanceof DOMException); }}
+    "#));
+    assert_script(&mut runtime, "thrown === 'NetworkError:true' && sync.readyState === 4 && sync.status === 0 && events.length === 0");
+}
+
+#[test]
+fn xhr_open_validation_and_forbidden_headers() {
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, r#"
+        var errors = [], xhr = new XMLHttpRequest();
+        for (const run of [() => xhr.open('bad method', 'http://localhost/'), () => xhr.open('GET', 'http://'), () => xhr.setRequestHeader('X', '1'),
+            () => { xhr.open('GET', 'http://localhost/'); xhr.setRequestHeader('X-Bad', 'a\nb'); }, () => { xhr.withCredentials = true; xhr.timeout = 'abc'; return xhr.timeout; }]) {
+          try { errors.push(String(run())); } catch (e) { errors.push(e.name); }
+        }
+    "#);
+    assert_script(&mut runtime, "errors.join() === 'SyntaxError,SyntaxError,InvalidStateError,SyntaxError,0'");
+}

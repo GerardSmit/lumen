@@ -65,7 +65,7 @@ pub fn new_signal(ctx: &mut Ctx) -> OpResult<Value> {
 }
 
 /// `new DOMException(message, name)`.
-pub(crate) fn dom_exception(ctx: &mut Ctx, message: &str, name: &str) -> Value {
+pub fn dom_exception(ctx: &mut Ctx, message: &str, name: &str) -> Value {
     let exception = DomException::with_name(message, name);
     ctx.new_instance(exception)
 }

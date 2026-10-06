@@ -174,79 +174,102 @@ pub(crate) mod http_ops {
 
 pub(crate) mod websocket {
     use super::*;
+    use crate::websocket_class::Outgoing;
 
     #[derive(Default)]
     pub(crate) struct WsRegistry;
 
     pub(crate) use bindings::Module;
 
+    /// Open a browser `WebSocket`; the host pushes `open` / `text` / `binary` / `close` / `error`
+    /// events for the returned id into `dispatch`.
+    pub(crate) fn connect_socket(
+        ctx: &mut Ctx,
+        target: &str,
+        protocols: &[String],
+        dispatch: Value,
+    ) -> Result<u64, NativeError> {
+        if !dispatch.is_callable() {
+            return Err(NativeError::type_error(
+                "connect: dispatch must be a function",
+            ));
+        }
+        let id = {
+            let registry = ctx
+                .host_mut::<lumen_host::TaskRegistry>()
+                .expect("runtime task registry");
+            registry.register_stream(dispatch, decode_event)
+        };
+        if let Err(message) = call_host(
+            "wsOpen",
+            &[
+                JsValue::from_f64(id as f64),
+                target.into(),
+                protocols.join(", ").into(),
+            ],
+        ) {
+            if let Some(r) = ctx.host_mut::<lumen_host::TaskRegistry>() {
+                r.cancel(id);
+            }
+            return Err(NativeError::runtime(format!("WebSocket: {message}")));
+        }
+        Ok(id)
+    }
+
+    /// Whether the host accepted the message.
+    pub(crate) fn send_frame(
+        _ctx: &mut Ctx,
+        id: u64,
+        payload: Outgoing<'_>,
+    ) -> Result<bool, NativeError> {
+        let data: JsValue = match payload {
+            Outgoing::Binary(bytes) => Uint8Array::from(bytes).into(),
+            Outgoing::Text(text) => text.into(),
+        };
+        match call_host("wsSend", &[JsValue::from_f64(id as f64), data]) {
+            Ok(v) => Ok(v.as_bool().unwrap_or(true)),
+            Err(message) => Err(NativeError::runtime(format!("WebSocket send: {message}"))),
+        }
+    }
+
+    pub(crate) fn close_socket(_ctx: &mut Ctx, id: u64, code: u16, reason: &str) {
+        let _ = call_host(
+            "wsClose",
+            &[
+                JsValue::from_f64(id as f64),
+                JsValue::from_f64(code as f64),
+                reason.into(),
+            ],
+        );
+    }
+
+    /// Close a socket nobody listens to any more and stop delivering its events.
+    pub(crate) fn abandon_socket(ctx: &mut Ctx, id: u64) {
+        close_socket(ctx, id, 1001, "");
+        if let Some(r) = ctx.host_mut::<lumen_host::TaskRegistry>() {
+            r.cancel(id);
+        }
+    }
+
     #[lumen_bind::module(name = "__ws")]
     pub(crate) mod bindings {
         use super::*;
 
-        /// `__ws.connect(url, protocols, dispatch)` -> id. The host opens a browser `WebSocket`
-        /// and pushes `open` / `text` / `binary` / `close` / `error` events for the returned id.
-        #[op(coerce)]
-        fn connect(
-            ctx: &mut Ctx,
-            target: String,
-            protocols: String,
-            dispatch: Value,
-        ) -> Result<f64, NativeError> {
-            if !dispatch.is_callable() {
-                return Err(NativeError::type_error(
-                    "connect: dispatch must be a function",
-                ));
-            }
-            let id = {
-                let registry = ctx
-                    .host_mut::<lumen_host::TaskRegistry>()
-                    .expect("runtime task registry");
-                registry.register_stream(dispatch, decode_event)
-            };
-            if let Err(message) = call_host(
-                "wsOpen",
-                &[
-                    JsValue::from_f64(id as f64),
-                    target.into(),
-                    protocols.into(),
-                ],
-            ) {
-                if let Some(r) = ctx.host_mut::<lumen_host::TaskRegistry>() {
-                    r.cancel(id);
-                }
-                return Err(NativeError::runtime(format!("WebSocket: {message}")));
-            }
-            Ok(id as f64)
-        }
-
         /// `__ws.send(id, stringOrBytes)` -> whether the host accepted it.
         #[op]
         fn send(ctx: &mut Ctx, id: f64, data: Value) -> Result<bool, OpError> {
-            let data: JsValue = match ctx.typed_array_bytes(&data) {
-                Some(b) => Uint8Array::from(b.as_slice()).into(),
-                None => ctx.coerce_string(&data)?.to_string().into(),
-            };
-            match call_host("wsSend", &[JsValue::from_f64(id), data]) {
-                Ok(v) => Ok(v.as_bool().unwrap_or(true)),
-                Err(message) => {
-                    Err(NativeError::runtime(format!("WebSocket send: {message}")).into())
-                }
+            let id = id as u64;
+            if let Some(bytes) = ctx.typed_array_bytes(&data) {
+                return Ok(send_frame(ctx, id, Outgoing::Binary(&bytes))?);
             }
+            let text = ctx.coerce_string(&data)?;
+            Ok(send_frame(ctx, id, Outgoing::Text(&text))?)
         }
 
         /// `__ws.close(id, code, reason)`.
         #[op(coerce)]
-        fn close(id: f64, code: Option<f64>, reason: String) {
-            let code = code.unwrap_or(1000.0);
-            let _ = call_host(
-                "wsClose",
-                &[
-                    JsValue::from_f64(id),
-                    JsValue::from_f64(code),
-                    reason.into(),
-                ],
-            );
+        fn close(ctx: &mut Ctx, id: f64, code: Option<f64>, reason: String) {
+            close_socket(ctx, id as u64, code.map_or(1000, |n| n as u16), &reason);
         }
 
         #[op]
@@ -291,21 +314,14 @@ pub(crate) mod server {
 pub(crate) mod sse {
     use super::*;
 
-    #[derive(Default)]
-    pub(crate) struct SseRegistry;
-
-    pub(crate) use bindings::Module;
-
-    #[lumen_bind::module(name = "__sse")]
-    pub(crate) mod bindings {
-        use super::*;
-
-        #[op]
-        fn connect(#[varargs] _args: &[Value]) -> Result<(), NativeError> {
-            Err(unsupported("EventSource"))
-        }
-
-        #[op]
-        fn close(#[varargs] _args: &[Value]) {}
+    pub(crate) fn connect_stream(
+        _ctx: &mut Ctx,
+        _target: &str,
+        _last_event_id: &str,
+        _dispatch: Value,
+    ) -> Result<u64, NativeError> {
+        Err(unsupported("EventSource"))
     }
+
+    pub(crate) fn close_stream(_ctx: &mut Ctx, _id: u64) {}
 }

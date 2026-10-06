@@ -51,6 +51,11 @@ pub mod random;
 pub mod realm_services;
 pub mod blob;
 pub mod sysfs;
+/// Network requests for native web classes: the shared request pipeline and `XMLHttpRequest`
+/// (`docs/native-network.md`).
+pub mod net;
+/// Native callbacks scheduled through the realm's `setTimeout`.
+pub mod timers;
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;

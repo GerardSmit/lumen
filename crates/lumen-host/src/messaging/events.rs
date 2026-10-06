@@ -198,12 +198,35 @@ pub mod bindings {
             source: Value,
             ports: Vec<Value>,
         ) -> OpResult<Value> {
+            Self::build(ctx, kind, data, origin, "", source, ports)
+        }
+
+        /// A trusted `MessageEvent` carrying a `lastEventId` (server-sent events).
+        pub fn create_with_id(
+            ctx: &mut Ctx,
+            kind: &str,
+            data: Value,
+            origin: &str,
+            last_event_id: &str,
+        ) -> OpResult<Value> {
+            Self::build(ctx, kind, data, origin, last_event_id, Value::Null, Vec::new())
+        }
+
+        fn build(
+            ctx: &mut Ctx,
+            kind: &str,
+            data: Value,
+            origin: &str,
+            last_event_id: &str,
+            source: Value,
+            ports: Vec<Value>,
+        ) -> OpResult<Value> {
             let ports = frozen_array(ctx, ports)?;
             let instance = ctx.new_instance(Self {
                 base: Event::trusted(kind),
                 data: RefCell::new(data),
                 origin: RefCell::new(origin.into()),
-                last_event_id: RefCell::new(String::new()),
+                last_event_id: RefCell::new(last_event_id.into()),
                 source: RefCell::new(source),
                 ports: RefCell::new(ports),
             });
@@ -262,6 +285,18 @@ pub mod bindings {
         #[getter]
         fn reason(&self) -> String {
             self.reason.clone()
+        }
+    }
+
+    impl CloseEvent {
+        /// A trusted `CloseEvent` the user agent fires.
+        pub fn create(ctx: &mut Ctx, kind: &str, code: u16, reason: &str, was_clean: bool) -> Value {
+            ctx.new_instance(Self {
+                base: Event::trusted(kind),
+                was_clean,
+                code,
+                reason: reason.into(),
+            })
         }
     }
 

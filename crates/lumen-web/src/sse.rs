@@ -1,6 +1,6 @@
 //! Server-Sent Events transport (WHATWG HTML §9.2) over HTTP or verified HTTPS — a streaming HTTP
-//! GET whose `text/event-stream` body is delivered chunk-by-chunk to `js/eventsource.js`, which
-//! runs the line parser and reconnection logic. The fetch client fully buffers responses, so an
+//! GET whose `text/event-stream` body is delivered chunk-by-chunk to the native `EventSource` class
+//! (`eventsource_class.rs`), which runs the line parser and reconnection logic. The fetch client fully buffers responses, so an
 //! endless event stream can't ride on it; this is a dedicated streaming reader (the same
 //! connect→read re-arm shape as the WebSocket client).
 //!
@@ -72,66 +72,67 @@ fn sse_registry(ctx: &mut Ctx) -> &mut SseRegistry {
         .expect("web installs SseRegistry")
 }
 
-pub(crate) use bindings::Module;
-
-#[lumen_bind::module(name = "__sse")]
-mod bindings {
-    use super::*;
-
-    /// `__sse.connect(url, lastEventId, dispatch)` -> id. Opens the stream on the pool; the JS side
-    /// then receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), or
-    /// `("drop", message)` (reconnect per the retry interval).
-    #[op(coerce)]
-    fn connect(ctx: &mut Ctx, target: String, last_event_id: String, dispatch: Value) -> Result<f64, NativeError> {
-        if !dispatch.is_callable() {
-            return Err(NativeError::type_error("connect: dispatch must be a function"));
-        }
-
-        let u = url::parse(&target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
-        match u.scheme.as_str() {
-            "http" | "https" => {}
-            other => {
-                return Err(NativeError::named("SyntaxError", format!("EventSource: unsupported scheme '{other}'")))
-            }
-        }
-
-        let id = {
-            let reg = sse_registry(ctx);
-            let id = reg.next;
-            reg.next += 1;
-            reg.conns.insert(
-                id,
-                SseEntry {
-                    closed: Arc::new(AtomicBool::new(false)),
-                    dispatch: dispatch.clone(),
-                    dead: false,
-                },
-            );
-            id
-        };
-
-        let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
-        let spawn = ctx
-            .op_state()
-            .get::<SpawnHandle>()
-            .expect("runtime installs the spawn handle")
-            .clone();
-        spawn.spawn_blocking(task, move || {
-            Box::new(ConnectResult {
-                id,
-                outcome: open_stream(&target, &last_event_id),
-            })
-        });
-        Ok(id as f64)
+/// Open the stream for `target` on the pool and return its id. `dispatch(kind, ...)` then
+/// receives `("open")`, `("chunk", u8array)`, `("fatal", message)` (no reconnect), `("drop",
+/// message)` (reconnect per the retry interval) or `("closed")`.
+pub(crate) fn connect_stream(
+    ctx: &mut Ctx,
+    target: &str,
+    last_event_id: &str,
+    dispatch: Value,
+) -> Result<u64, NativeError> {
+    if !dispatch.is_callable() {
+        return Err(NativeError::type_error("connect: dispatch must be a function"));
     }
 
-    /// `__sse.close(id)` - flip the closed flag; the reader loop tears down and reports `closed`.
-    #[op]
-    fn close(ctx: &mut Ctx, id: f64) {
-        if let Some(e) = sse_registry(ctx).conns.get_mut(&(id as u64)) {
-            e.dead = true;
-            e.closed.store(true, Ordering::SeqCst);
+    let u = url::parse(target, None).map_err(|e| NativeError::named("SyntaxError", e))?;
+    match u.scheme.as_str() {
+        "http" | "https" => {}
+        other => {
+            return Err(NativeError::named(
+                "SyntaxError",
+                format!("EventSource: unsupported scheme '{other}'"),
+            ))
         }
+    }
+
+    let id = {
+        let reg = sse_registry(ctx);
+        let id = reg.next;
+        reg.next += 1;
+        reg.conns.insert(
+            id,
+            SseEntry {
+                closed: Arc::new(AtomicBool::new(false)),
+                dispatch: dispatch.clone(),
+                dead: false,
+            },
+        );
+        id
+    };
+
+    let task = lumen_host::register_task(ctx, dispatch, None, decode_connect);
+    let spawn = ctx
+        .op_state()
+        .get::<SpawnHandle>()
+        .expect("runtime installs the spawn handle")
+        .clone();
+    let target = target.to_string();
+    let last_event_id = last_event_id.to_string();
+    spawn.spawn_blocking(task, move || {
+        Box::new(ConnectResult {
+            id,
+            outcome: open_stream(&target, &last_event_id),
+        })
+    });
+    Ok(id)
+}
+
+/// Flip the closed flag; the reader loop tears down and reports `closed`.
+pub(crate) fn close_stream(ctx: &mut Ctx, id: u64) {
+    if let Some(e) = sse_registry(ctx).conns.get_mut(&id) {
+        e.dead = true;
+        e.closed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -260,6 +261,7 @@ fn decode_connect(
             let closed = match sse_registry(ctx).conns.get(&id) {
                 Some(e) if !e.dead => Arc::clone(&e.closed),
                 _ => {
+                    sse_registry(ctx).conns.remove(&id);
                     return Ok(vec![
                         Value::from_string("fatal".into()),
                         Value::from_string("closed".into()),
@@ -305,7 +307,7 @@ fn arm_read(ctx: &mut Ctx, id: u64, reader: StreamReader) {
         } else {
             reader.stream.read(&mut buf).map(|n| buf[..n].to_vec())
         };
-        // EOF (0 bytes) or a closed flag ends the loop → the JS side reconnects.
+        // EOF (0 bytes) or a closed flag ends the loop → the class reconnects.
         let keep =
             matches!(&outcome, Ok(b) if !b.is_empty()) && !reader.closed.load(Ordering::SeqCst);
         Box::new(ReadResult {
@@ -338,7 +340,7 @@ fn decode_read(ctx: &mut Ctx, payload: Box<dyn std::any::Any + Send>) -> Result<
         }
         Ok(_) => {
             // EOF or closed: end this connection. A user close() is final; a server-side EOF
-            // reconnects (the JS side decides based on its readyState).
+            // reconnects (the class decides based on its readyState).
             sse_registry(ctx).conns.remove(&id);
             if closed_now {
                 Ok(vec![Value::from_string("closed".into())])

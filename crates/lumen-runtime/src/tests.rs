@@ -2886,6 +2886,234 @@ fn websocket_constructor_validation() {
     );
 }
 
+/// Run `script` against a fresh browser runtime that exposes `gc()`.
+fn gc_runtime(script: &str) -> (Runtime, Captured) {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.expose_gc();
+    rt.eval(script).expect("script parses and runs to quiescence");
+    (rt, out)
+}
+
+#[test]
+fn websocket_and_eventsource_have_the_web_idl_shape() {
+    let (mut rt, out, _err) = browser_test_runtime();
+    rt.eval(
+        r#"
+        const d = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+        console.log(d.enumerable, d.writable, d.configurable, WebSocket.length, EventSource.length);
+        console.log(Object.getPrototypeOf(WebSocket) === EventTarget, Object.getPrototypeOf(EventSource) === EventTarget);
+        for (const [ctor, names] of [[WebSocket, ["CONNECTING", "OPEN", "CLOSING", "CLOSED"]], [EventSource, ["CONNECTING", "OPEN", "CLOSED"]]]) {
+            console.log(names.map((name) => {
+                const own = Object.getOwnPropertyDescriptor(ctor, name);
+                const inherited = Object.getOwnPropertyDescriptor(ctor.prototype, name);
+                return `${name}=${own.value}/${inherited.value}/${own.writable}/${own.enumerable}/${own.configurable}`;
+            }).join(" "));
+        }
+        const accessors = (proto, names) => names.map((name) => {
+            const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+            return `${name}:${typeof descriptor.get}:${typeof descriptor.set}`;
+        }).join(" ");
+        console.log(accessors(WebSocket.prototype, ["url", "readyState", "bufferedAmount", "extensions", "protocol", "binaryType", "onopen", "onmessage", "onerror", "onclose"]));
+        console.log(accessors(EventSource.prototype, ["url", "withCredentials", "readyState", "onopen", "onmessage", "onerror"]));
+        const ws = new WebSocket("ws://127.0.0.1:1/");
+        const es = new EventSource("http://127.0.0.1:1/", { withCredentials: true });
+        console.log(Object.prototype.toString.call(ws), Object.prototype.toString.call(es));
+        console.log(ws instanceof EventTarget, es instanceof EventTarget, ws.url, es.url, es.withCredentials);
+        console.log(ws.readyState, ws.protocol === "", ws.extensions === "", ws.bufferedAmount, ws.binaryType, es.readyState);
+        const handler = () => {};
+        console.log(ws.onopen === null, (ws.onopen = handler, ws.onopen === handler), (ws.onopen = null, ws.onopen === null), (es.onmessage = 5, es.onmessage === null));
+        console.log(WebSocket.prototype.send.length, WebSocket.prototype.close.length, EventSource.prototype.close.length);
+        try { WebSocket.prototype.send.call({}, "x"); } catch (e) { console.log("brand", e.constructor.name, e.code); }
+        try { new WebSocket(); } catch (e) { console.log("missing", e.constructor.name); }
+        es.close();
+        ws.close();
+        "#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.lines(),
+        [
+            "false true true 1 1",
+            "true true",
+            "CONNECTING=0/0/false/true/false OPEN=1/1/false/true/false CLOSING=2/2/false/true/false CLOSED=3/3/false/true/false",
+            "CONNECTING=0/0/false/true/false OPEN=1/1/false/true/false CLOSED=2/2/false/true/false",
+            "url:function:undefined readyState:function:undefined bufferedAmount:function:undefined extensions:function:undefined protocol:function:undefined binaryType:function:function onopen:function:function onmessage:function:function onerror:function:function onclose:function:function",
+            "url:function:undefined withCredentials:function:undefined readyState:function:undefined onopen:function:function onmessage:function:function onerror:function:function",
+            "[object WebSocket] [object EventSource]",
+            "true true ws://127.0.0.1:1/ http://127.0.0.1:1/ true",
+            "0 true true 0 blob 0",
+            "true true true true",
+            "1 0 0",
+            "brand TypeError ERR_INVALID_THIS",
+            "missing TypeError",
+        ]
+    );
+}
+
+#[test]
+fn websocket_event_sequence_and_ready_states() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        const sizeOf = (data) => data instanceof Blob ? "blob:" + data.size : data instanceof ArrayBuffer ? "arraybuffer:" + data.byteLength : typeof data;
+        ws.addEventListener("open", (e) => {
+            console.log("open", ws.readyState, e.constructor.name, e.isTrusted, e.target === ws);
+            ws.send("hello");
+        });
+        ws.addEventListener("message", (e) => {
+            console.log("message", sizeOf(e.data), e.constructor.name, e.isTrusted, e.lastEventId === "", e.source);
+            if (typeof e.data === "string") {
+                ws.send(new Uint8Array([1, 2, 3]));
+            } else if (e.data instanceof Blob) {
+                ws.binaryType = "arraybuffer";
+                ws.send(new Blob([new Uint8Array([9, 8, 7, 6])]));
+            } else {
+                ws.close(4000, "bye");
+                console.log("closing", ws.readyState);
+            }
+        });
+        ws.onclose = (e) => console.log("close", ws.readyState, e.constructor.name, e.isTrusted, e.code, e.reason, e.wasClean);
+        const bad = (fn) => { try { fn(); return "none"; } catch (e) { return e.name; } };
+        console.log(bad(() => { ws.binaryType = "text"; }), bad(() => ws.close(1)), bad(() => ws.close(1000, "x".repeat(124))));
+        "#,
+    );
+    assert_eq!(
+        lines,
+        [
+            "SyntaxError InvalidAccessError SyntaxError",
+            "open 1 Event true true",
+            "message string MessageEvent true true null",
+            "message blob:3 MessageEvent true true null",
+            "message arraybuffer:4 MessageEvent true true null",
+            "closing 2",
+            "close 3 CloseEvent true 4000 bye true",
+        ]
+    );
+}
+
+#[test]
+fn websocket_send_before_open_throws_and_close_while_connecting_fails() {
+    let lines = ws_drive(
+        WsMode::Echo,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:{PORT}/");
+        try { ws.send("early"); } catch (e) { console.log(e.name, e instanceof DOMException); }
+        ws.onopen = () => console.log("open (wrong!)");
+        ws.onerror = () => console.log("error", ws.readyState);
+        ws.onclose = (e) => console.log("close", e.code, e.wasClean);
+        ws.close();
+        console.log("state", ws.readyState);
+        ws.send("after close request");
+        "#,
+    );
+    assert_eq!(
+        lines,
+        ["InvalidStateError true", "state 2", "error 3", "close 1006 false"]
+    );
+}
+
+#[test]
+fn websocket_refused_connection_is_error_then_close() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const ws = new WebSocket("ws://127.0.0.1:1/");
+        ws.onopen = () => console.log("open (wrong!)");
+        ws.addEventListener("error", (e) => console.log("error", ws.readyState, e.constructor.name, e.isTrusted));
+        ws.addEventListener("close", (e) => console.log("close", ws.readyState, e.code, e.reason === "", e.wasClean));
+        "#,
+    );
+    assert_eq!(out.lines(), ["error 3 Event true", "close 3 1006 true false"]);
+}
+
+#[test]
+fn websocket_with_listeners_survives_collection_and_closed_sockets_collect() {
+    let port = spawn_echo(WsMode::Echo, 1);
+    let (mut rt, out) = gc_runtime(&format!(
+        r#"
+        globalThis.refs = [];
+        (() => {{
+            const ws = new WebSocket("ws://127.0.0.1:{port}/");
+            ws.onopen = () => ws.send("ping");
+            ws.onmessage = (e) => {{ console.log("echo", e.data); ws.close(); }};
+            ws.onclose = (e) => console.log("close", e.code, e.wasClean);
+            refs.push(new WeakRef(ws));
+            const refused = new WebSocket("ws://127.0.0.1:1/");
+            refused.onerror = () => {{}};
+            refs.push(new WeakRef(refused));
+        }})();
+        let rounds = 0;
+        const timer = setInterval(() => {{ gc(); if (++rounds === 20) clearInterval(timer); }}, 2);
+        "#
+    ));
+    assert_eq!(out.lines(), ["echo ping", "close 1000 true"]);
+    rt.eval("gc(); gc(); console.log(refs.map((ref) => ref.deref() === undefined).join());")
+        .unwrap();
+    assert_eq!(out.lines()[2], "true,true");
+}
+
+#[test]
+fn eventsource_custom_events_and_last_event_id() {
+    let lines = sse_drive(
+        SseMode::Events,
+        1,
+        r#"
+        const es = new EventSource("http://127.0.0.1:{PORT}/stream");
+        es.addEventListener("tick", (e) => console.log("tick", e.data, e.type, e.constructor.name, e.isTrusted, e.origin === new URL(es.url).origin, JSON.stringify(e.lastEventId)));
+        es.onmessage = (e) => console.log("message", JSON.stringify(e.data), JSON.stringify(e.lastEventId));
+        es.onerror = () => { console.log("error", es.readyState); es.close(); console.log("closed", es.readyState); };
+        "#,
+    );
+    assert_eq!(
+        lines,
+        [
+            r#"message "hello" """#,
+            r#"tick 42 tick MessageEvent true true """#,
+            r#"message "line one\nline two" "9""#,
+            "error 0",
+            "closed 2",
+        ]
+    );
+}
+
+#[test]
+fn eventsource_reconnects_while_unreferenced_with_listeners() {
+    let port = spawn_sse(SseMode::Reconnect, 2);
+    let (_rt, out) = gc_runtime(&format!(
+        r#"
+        (() => {{
+            const es = new EventSource("http://127.0.0.1:{port}/stream");
+            let seen = 0;
+            es.onmessage = (e) => {{
+                console.log("msg", e.data, e.lastEventId);
+                if (++seen === 2) e.target.close();
+            }};
+        }})();
+        let rounds = 0;
+        const timer = setInterval(() => {{ gc(); if (++rounds === 20) clearInterval(timer); }}, 2);
+        "#
+    ));
+    assert_eq!(out.lines(), ["msg first 5", "msg resumed-from-5 5"]);
+}
+
+#[test]
+fn closed_eventsource_is_collectable_and_close_during_error_stops_reconnects() {
+    let (mut rt, out) = gc_runtime(
+        r#"
+        globalThis.weak = (() => {
+            const es = new EventSource("http://127.0.0.1:1/");
+            es.onerror = () => { es.close(); console.log("error", es.readyState); };
+            return new WeakRef(es);
+        })();
+        "#,
+    );
+    assert_eq!(out.lines(), ["error 2"]);
+    rt.eval("gc(); gc(); console.log(weak.deref() === undefined);").unwrap();
+    assert_eq!(out.lines()[1], "true");
+}
+
 #[test]
 fn wintertc_functional_smoke() {
     // Presence is not correctness: exercise the core interfaces end-to-end.
