@@ -386,6 +386,14 @@ fn opaque(kind: ResponseKind) -> Response {
     }
 }
 
+fn opaque_kind(raw: &Raw) -> ResponseType {
+    if raw.kind.as_deref() == Some("opaqueredirect") {
+        ResponseType::OpaqueRedirect
+    } else {
+        ResponseType::Opaque
+    }
+}
+
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -405,7 +413,7 @@ fn on_preflight(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
 fn on_actual(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
     if raw.status == 0 || matches!(raw.kind.as_deref(), Some("opaque" | "opaqueredirect")) {
         raw.body.cancel(ctx);
-        return finish(ctx, flow, Ok(opaque(ResponseType::Opaque)));
+        return finish(ctx, flow, Ok(opaque(opaque_kind(&raw))));
     }
     let location = header(&raw.headers, "location").map(str::to_owned);
     let next = {
@@ -481,7 +489,7 @@ fn on_actual(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
 fn on_direct(ctx: &mut Ctx, flow: &Shared, raw: Raw) {
     if raw.status == 0 || matches!(raw.kind.as_deref(), Some("opaque" | "opaqueredirect")) {
         raw.body.cancel(ctx);
-        return finish(ctx, flow, Ok(opaque(ResponseType::Opaque)));
+        return finish(ctx, flow, Ok(opaque(opaque_kind(&raw))));
     }
     let redirect = flow.borrow().redirect;
     if redirect != Redirect::Follow

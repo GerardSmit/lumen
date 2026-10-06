@@ -1,8 +1,8 @@
 # Plan: native workers
 
-Status: steps 1-5 implemented (owner loop, port limits, messaging extension, native receivers,
+Status: steps 1-6 implemented (owner loop, port limits, messaging extension, native receivers,
 native `Worker`/`SharedWorker` and worker global scopes in `lumen-runtime`, native service-worker
-classes in `lumen-host`); steps 6-8 are design. Goal: delete the last JavaScript worker glue and run one
+classes in `lumen-host`, Bitnest kernel on native ports and `SharedWorker`); steps 7-8 are design. Goal: delete the last JavaScript worker glue and run one
 native implementation of `Worker`, `SharedWorker`, the service-worker classes and the worker
 global scopes in both `lumen-runtime` and the Bitnest kernel.
 
@@ -269,12 +269,12 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
    `ServiceWorker` identity per worker, `FetchEvent.respondWith` produces status/headers/body,
    `waitUntil` extends, `navigator.serviceWorker === navigator.serviceWorker`, `undefined` without
    a registry. `lumen-web/src/js/*.js` stay (Bitnest still reads them).
-6. **Kernel: owner loop, ports, SharedWorker** (Bitnest, bumps `external/lumen`). Files:
+6. **Kernel: owner loop, ports, SharedWorker** (Bitnest, done; see the step 6 notes). Files:
    `runtime-services/src/lib.rs` (install owner loop, `ports`/`clone_transfer`/`messaging`
    extensions, `workers` page + scope install, pump calls, `next_timer_delay_ms`),
    `runtime-services/src/shared_worker.rs` (registry keeps identity; backend impl over
    `PortTransfer`; port code deleted), `runtime-services/build.rs` (drop `shared_worker.js`),
-   `kernel/runtime/src/services/shared_worker.rs` (`accept_shared_connections`). Tests: the
+   `kernel/runtime/src/services/shared_worker.rs` (wake-flag pump; there is no `accept_shared_connections`). Tests: the
    SharedWorker tests in `runtime-services` (rewritten against native ports): connect, two clients
    share one worker, `MessageChannel` port transfer page → worker → page, last client close stops
    the worker, queue full → `QuotaExceededError`, idle realm gets no notify. Behaviour:
@@ -500,3 +500,74 @@ Step 7 kernel checklist:
   `owner_loop::pump` / `has_ready`; call `workers::install_service_workers` after the DOM navigator
   exists, for secure contexts only (`is_secure_context`).
 - Drop `__bitnestInstallFetch` and the byte-types glue.
+
+## Implementation notes for step 6
+
+Bitnest files: `runtime-services/src/{lib,shared_worker,fetch_policy_tests}.rs`,
+`runtime-services/build.rs`, `kernel/runtime/src/services/{shared_worker,native_shell}.rs`.
+Lumen is unchanged. Built with `cargo xtask build --board virt`; the host tests compile but were
+not run.
+
+- **Install.** `JsRuntime::install_messaging` (called from `install_html_byte_types`, so page,
+  service-worker and shared-worker realms all get it) installs `owner_loop` with the realm waker
+  as notify (a no-op until `set_waker` runs; set the waker first), then the `ports`,
+  `clone_transfer` and `messaging` extensions, then the opt-in limits (1 MiB per message, 128
+  queued). `MessageChannel`, `BroadcastChannel` and trusted message events are now in every
+  kernel realm.
+- **Pump.** `pump_timers` runs `owner_loop::pump(.., 32)` after the engine timers and
+  `next_timer_delay_ms` returns `Some(0)` while `has_ready`. The pump is not in
+  `pump_html_browser_services`: every shell turn that pumps services also calls `pump_timers`, and
+  one place avoids a second `has_ready` check. A callback that posts during the pump does not
+  re-notify, which is why the delay check after the pump matters.
+- **`SharedWorkerHost`** is now an `Arc<Mutex<Registry>>` of workers by key, clients by id and
+  script requests. It keeps identity (origin, URL, module, credentials, name), queues one script
+  request per worker, and holds each client's `Control` and the not-yet-delivered worker-side
+  `PortTransfer`. `Connect` is sent when the worker is running (`mark_running` for clients that
+  waited, at once for later ones), so module workers never see `connect` before their graph
+  evaluated. Actions that touch other realms (control sends, port closes, the shell notify) run
+  after the lock is released because `PortTransfer::on_close` runs synchronously. The page end's
+  `on_close` calls `disconnect`; the last client takes the worker with it and notifies the shell.
+- **Backend.** `KernelWorkerBackend: WorkerBackend` does the HTTP(S), same-origin and
+  no-credentials checks, then `connect`. `KernelScopeHost: WorkerScopeHost` maps `close` to
+  `mark_stopped` and `report_error` to `broadcast_error`. The `Worker` global is deleted after
+  `install_page_classes` (the kernel never had dedicated workers); `importScripts` throws
+  `NotSupportedError` (it was not implemented before either).
+- **Deleted.** `shared_worker.js`, the JS `MessagePort` / `SharedWorkerPort` / reviver / port
+  registry, the `Parcel` messaging for shared workers, `dispatch_shared_worker_connect/messages`,
+  `take_connections`, the lazy-global event bindings and the `__sharedWorker*` prologue.
+  `service_worker.js` stays on its own path (it reads nothing from the removed code).
+- **Deviation: no `accept_shared_connections`.** The registry delivers `Connect` itself, so the
+  per-turn manager has nothing to accept.
+
+### Kernel wake and CPU behaviour
+
+- The shared-worker manager no longer enters every worker realm every shell turn (it used to
+  call `pump_timers(32)` on each, a fiber switch per worker per turn). Each worker gets its own
+  wake closure that sets an `AtomicBool` and then notifies the shell. `pump` enters a realm only
+  when the flag was set or its cached deadline is due, and afterwards stores
+  `next_timer_delay_ms()` as the next absolute deadline. An idle worker costs one atomic load and
+  one registry lookup per turn and allocates nothing.
+- Worker timers now feed the shell wait through `SharedWorkerManager::next_delay_ms`, clamped to
+  the idle cap. Before, a worker's `setTimeout` only fired when the shell woke for another
+  reason.
+- A page that never touches ports is never woken by them: the owner loop notifies only on the 0 to
+  1 pending transition, bursts coalesce into one wake, and nothing arms a timer.
+- A worker ending outside a shell turn (last client closed, or `self.close()`) notifies the shell
+  through `SharedWorkerHost::set_notify`, so its realm is dropped promptly instead of at the next
+  unrelated wake.
+- Message bodies are structured-clone bytes moved between realms (one address space), with no
+  JSON and no `Parcel`. The old `Parcel` bounds (65536 objects) are replaced by the byte limit.
+
+Tests (`runtime-services/src/fetch_policy_tests.rs` and `shared_worker.rs`, not run):
+`MessageChannel` round trip and port transfer, `DataCloneError`, idle realm (no wake, no
+`Some(0)`, `has_ready` false after draining), two clients and identity by name and credentials,
+port transfer page to worker to page, queue full gives `QuotaExceededError` at 128, module worker
+startup, registry unit tests (identity, startup state, last-client stop, failure closes controls).
+
+### Left for step 7
+
+- `service_worker.js`, its `__bitnestInstallFetch` glue in `html-byte-types.aot`, the
+  `Parcel`-based service-worker messaging and `kernel/runtime/src/services/service_worker.rs`
+  (which still pumps every service worker each turn and could use the same wake-flag scheme).
+- Service-worker realms already get the owner loop and ports; step 7 only has to implement
+  `ServiceWorkerRegistry` / `ServiceScopeHost` and call `install_scope(Service)`.

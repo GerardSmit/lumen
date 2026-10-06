@@ -404,6 +404,12 @@ fn post_link(
 ) -> OpResult<()> {
     let list = transfer_list(ctx, transfer)?;
     let list = structured_clone::array_items(ctx, &list)?;
+    if list
+        .iter()
+        .any(|item| native_port(ctx, item).is_some_and(|port| Rc::ptr_eq(&port, link)))
+    {
+        return Err(NativeError::named("DataCloneError", "Transfer list contains source port").into());
+    }
     if link.id.get().is_some_and(|id| ports::is_full(ctx, id)) {
         return Err(ports::queue_full());
     }

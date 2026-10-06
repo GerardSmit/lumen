@@ -4,8 +4,8 @@
 `BroadcastChannel` and `Performance` (with the `performance` and `self` globals) are native
 `lumen_bind` classes in `lumen_host`. They replace `lumen-web`'s `messaging.js` and `platform.js`.
 `Worker`, `SharedWorker` and the worker global scopes are native too (`lumen_host::workers`).
-The kernel keeps its own transport for shared workers until step 6 of the worker plan and installs only the event classes and
-`Performance`.
+The kernel installs the same extensions (owner loop, ports, `clone_transfer`, `messaging`) and has no transport of its own for
+shared workers; service workers still use a kernel `Parcel` path until step 7 of the worker plan.
 
 ## Ownership
 
