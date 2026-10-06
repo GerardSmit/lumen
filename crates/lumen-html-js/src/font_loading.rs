@@ -1963,8 +1963,8 @@ impl DomFontFaceSet {
     }
 
     #[getter]
-    fn onloading(&self) -> Option<JsFunction> {
-        self.base.handler("loading")
+    fn onloading(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("loading"))
     }
 
     #[setter]
@@ -1978,8 +1978,8 @@ impl DomFontFaceSet {
     }
 
     #[getter]
-    fn onloadingdone(&self) -> Option<JsFunction> {
-        self.base.handler("loadingdone")
+    fn onloadingdone(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("loadingdone"))
     }
 
     #[setter]
@@ -1993,8 +1993,8 @@ impl DomFontFaceSet {
     }
 
     #[getter]
-    fn onloadingerror(&self) -> Option<JsFunction> {
-        self.base.handler("loadingerror")
+    fn onloadingerror(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("loadingerror"))
     }
 
     #[setter]

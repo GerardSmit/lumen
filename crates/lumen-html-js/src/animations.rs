@@ -2045,11 +2045,6 @@ fn document_time(realm: &DomRealm) -> Option<f64> {
         .then(|| realm.timeline_sample.get())
 }
 
-/// A CSSNumberish-or-null result: unresolved times are JS `null`, not `undefined`.
-fn time_or_null(time: Option<f64>) -> Value {
-    time.map_or(Value::Null, Value::Num)
-}
-
 fn record_time(record: &Record) -> Option<f64> {
     record.timeline_realm.upgrade().and_then(|realm| document_time(&realm))
 }
@@ -3151,12 +3146,12 @@ impl DomAnimation {
         Ok(pending)
     }
     #[getter(name = "startTime")]
-    fn start_time(&self, ctx: &mut Ctx) -> OpResult<Value> {
+    fn start_time(&self, ctx: &mut Ctx) -> OpResult<Nullable<f64>> {
         let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         let state=hub.borrow();
         let record=state.records.get(&self.id)
             .ok_or_else(||OpError::new("InvalidStateError","animation is no longer available"))?;
-        Ok(time_or_null(record.start_resolved.then(||record.start_ms-record.timeline_origin_ms
+        Ok(Nullable(record.start_resolved.then(||record.start_ms-record.timeline_origin_ms
             -if record.playback_rate==0.0 {0.0}else{record.start_time_ms/record.playback_rate})))
     }
     #[setter(name = "startTime")]
@@ -3184,20 +3179,20 @@ impl DomAnimation {
         settle_finished(ctx,&hub,now)
     }
     #[getter(name = "currentTime")]
-    fn current_time(&self, ctx: &mut Ctx) -> OpResult<Value> {
+    fn current_time(&self, ctx: &mut Ctx) -> OpResult<Nullable<f64>> {
         let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         let state = hub.borrow();
         let record = state.records.get(&self.id)
             .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
         if record.cancelled {
-            return Ok(Value::Null);
+            return Ok(Nullable(None));
         }
         let now = record_time(&record);
         if now.is_none() && record.hold_time_ms.is_none() {
-            return Ok(Value::Null);
+            return Ok(Nullable(None));
         }
         let sample = sample_record(record, now.unwrap_or(0.0));
-        Ok(time_or_null((sample.state != PlaybackState::Idle).then_some(sample.current_time_ms)))
+        Ok(Nullable((sample.state != PlaybackState::Idle).then_some(sample.current_time_ms)))
     }
     #[setter(name = "currentTime")]
     fn set_current_time(&self, ctx: &mut Ctx, value: Option<f64>) -> OpResult<()> {
@@ -3515,8 +3510,8 @@ impl DomKeyframeEffect {
         apply_realm(&hub, &realm, hub_time(&hub))
     }
     #[getter]
-    fn pseudo_element(&self) -> Option<String> {
-        None
+    fn pseudo_element(&self) -> Nullable<String> {
+        Nullable(None)
     }
     fn get_keyframes(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let (_, effect) = effect_state(ctx, self.id)?;
@@ -3700,15 +3695,15 @@ impl DomDocumentTimeline {
         })
     }
     #[getter(name = "currentTime")]
-    fn current_time(&self) -> Value {
-        time_or_null(self.realm
+    fn current_time(&self) -> Nullable<f64> {
+        Nullable(self.realm
             .upgrade()
             .and_then(|realm| document_time(&realm))
             .map(|time| time - self.origin_time_ms))
     }
     #[getter(name = "duration")]
-    fn duration(&self) -> Option<f64> {
-        None
+    fn duration(&self) -> Nullable<f64> {
+        Nullable(None)
     }
     #[getter(name = "originTime")]
     fn origin_time(&self) -> f64 {
@@ -5569,6 +5564,41 @@ mod tests {
                 .map(|value| value.to_string())
                 .unwrap_or_else(|_| "<diagnostic was not a string>".into());
             panic!("DocumentOrShadowRoot.getAnimations failed: {diagnostic}");
+        }
+    }
+
+    #[test]
+    fn nullable_webidl_accessors_return_null_not_undefined() {
+        let mut engine = Engine::new();
+        crate::install(engine.ctx(),"<body><img id='img'><input id='num' type='number'><div id='target' class='a'></div></body>",64).unwrap();
+        let result = eval_ok(&mut engine, r#"
+            const failures = [];
+            const check = (name, ok) => { if (!ok) failures.push(name); };
+            const target = document.getElementById('target');
+            const animation = target.animate({opacity: [0, 1]}, {duration: 100});
+            animation.cancel();
+            check('cancelled Animation.currentTime', animation.currentTime === null);
+            check('DocumentTimeline.duration', document.timeline.duration === null);
+            check('KeyframeEffect.pseudoElement', animation.effect.pseudoElement === null);
+            const pending = target.animate({opacity: [0, 1]}, {duration: 100});
+            pending.pause();
+            check('pending Animation.startTime', pending.startTime === null);
+            check('img.crossOrigin', document.getElementById('img').crossOrigin === null);
+            const number = document.getElementById('num');
+            check('number input selectionStart', number.selectionStart === null);
+            check('number input selectionEnd', number.selectionEnd === null);
+            check('number input selectionDirection', number.selectionDirection === null);
+            check('DOMTokenList.item out of range', target.classList.item(5) === null);
+            check('oninput default', number.oninput === null);
+            check('NodeIterator.filter', document.createNodeIterator(target).filter === null);
+            window.nullableFailures = failures;
+            failures.length === 0
+        "#);
+        if !matches!(result, Value::Bool(true)) {
+            let diagnostic = eval_ok(&mut engine, "window.nullableFailures.join(', ')");
+            let diagnostic = engine.ctx().coerce_string(&diagnostic).map(|value| value.to_string())
+                .unwrap_or_else(|_| "<diagnostic was not a string>".into());
+            panic!("nullable accessors returned undefined: {diagnostic}");
         }
     }
 }

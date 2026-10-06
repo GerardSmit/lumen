@@ -5233,15 +5233,15 @@ impl DomHtmlImageElement {
     }
 
     #[getter(rename(js = "crossOrigin"))]
-    fn cross_origin(&self) -> OpResult<Option<String>> {
+    fn cross_origin(&self) -> OpResult<Nullable<String>> {
         let value = self.image_node().get_null_attribute("crossorigin")?;
-        Ok(value.map(|value| {
+        Ok(Nullable(value.map(|value| {
             if value.eq_ignore_ascii_case("use-credentials") {
                 "use-credentials".to_owned()
             } else {
                 "anonymous".to_owned()
             }
-        }))
+        })))
     }
 
     #[setter(rename(js = "crossOrigin"), coerce)]
@@ -7658,12 +7658,12 @@ impl DomHtmlElement {
         }
     }
     #[getter]
-    fn selection_start(&self) -> OpResult<Option<usize>> {
+    fn selection_start(&self) -> OpResult<Nullable<usize>> {
         let node = &self.base.base;
         if !node.realm.supports_text_selection(node.id) {
-            return Ok(None);
+            return Ok(Nullable(None));
         }
-        Ok(Some(node.realm.selection(node.id)?.0))
+        Ok(Nullable(Some(node.realm.selection(node.id)?.0)))
     }
     #[setter]
     fn set_selection_start(&self, ctx: &mut Ctx, start: usize) -> OpResult<()> {
@@ -7673,12 +7673,12 @@ impl DomHtmlElement {
             .set_selection_and_queue_event(ctx, node.id, start, end.max(start), &direction)
     }
     #[getter]
-    fn selection_end(&self) -> OpResult<Option<usize>> {
+    fn selection_end(&self) -> OpResult<Nullable<usize>> {
         let node = &self.base.base;
         if !node.realm.supports_text_selection(node.id) {
-            return Ok(None);
+            return Ok(Nullable(None));
         }
-        Ok(Some(node.realm.selection(node.id)?.1))
+        Ok(Nullable(Some(node.realm.selection(node.id)?.1)))
     }
     #[setter]
     fn set_selection_end(&self, ctx: &mut Ctx, end: usize) -> OpResult<()> {
@@ -7688,12 +7688,12 @@ impl DomHtmlElement {
             .set_selection_and_queue_event(ctx, node.id, start, end, &direction)
     }
     #[getter]
-    fn selection_direction(&self) -> OpResult<Option<String>> {
+    fn selection_direction(&self) -> OpResult<Nullable<String>> {
         let node = &self.base.base;
         if !node.realm.supports_text_selection(node.id) {
-            return Ok(None);
+            return Ok(Nullable(None));
         }
-        Ok(Some(node.realm.selection(node.id)?.2))
+        Ok(Nullable(Some(node.realm.selection(node.id)?.2)))
     }
     #[setter(coerce)]
     fn set_selection_direction(&self, ctx: &mut Ctx, direction: &str) -> OpResult<()> {
@@ -8619,8 +8619,8 @@ impl DomDocument {
     }
 
     #[getter]
-    fn oninput(&self) -> Option<lumen::embed::JsFunction> {
-        self.base.base.handler("input")
+    fn oninput(&self) -> Nullable<lumen::embed::JsFunction> {
+        Nullable(self.base.base.handler("input"))
     }
     #[setter]
     fn set_oninput(

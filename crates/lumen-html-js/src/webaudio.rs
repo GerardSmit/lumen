@@ -5,7 +5,7 @@
 
 use crate::events::HtmlTargetExt;
 use crate::{DomDocument, DomRealm};
-use lumen::embed::{Ctx, Deferred, JsFunction, JsObject, OpError, OpResult, Value, WeakValue};
+use lumen::embed::{Ctx, Deferred, JsFunction, JsObject, Nullable, OpError, OpResult, Value, WeakValue};
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1052,8 +1052,8 @@ pub struct DomAudioBufferSourceNode {
 #[lumen_bind::methods]
 impl DomAudioBufferSourceNode {
     #[getter]
-    fn onended(&self) -> Option<JsFunction> {
-        self.base.handler("ended")
+    fn onended(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("ended"))
     }
 
     #[setter]
@@ -1067,14 +1067,14 @@ impl DomAudioBufferSourceNode {
     }
 
     #[getter]
-    fn buffer(&self) -> Option<DomAudioBuffer> {
-        self.realm
+    fn buffer(&self) -> Nullable<DomAudioBuffer> {
+        Nullable(self.realm
             .web_audio
             .borrow()
             .oscillators
             .get(&self.id)
             .and_then(|source| source.buffer.as_ref())
-            .map(|data| DomAudioBuffer { data: data.clone() })
+            .map(|data| DomAudioBuffer { data: data.clone() }))
     }
 
     #[setter]
@@ -1344,8 +1344,8 @@ pub struct DomOscillatorNode {
 #[lumen_bind::methods]
 impl DomOscillatorNode {
     #[getter]
-    fn onended(&self) -> Option<JsFunction> {
-        self.base.handler("ended")
+    fn onended(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("ended"))
     }
 
     #[setter]

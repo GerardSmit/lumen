@@ -249,8 +249,8 @@ impl DomWindow {
     }
 
     #[getter]
-    fn onunhandledrejection(&self) -> Option<lumen::embed::JsFunction> {
-        self.base.handler("unhandledrejection")
+    fn onunhandledrejection(&self) -> Nullable<lumen::embed::JsFunction> {
+        Nullable(self.base.handler("unhandledrejection"))
     }
 
     #[setter]
@@ -265,8 +265,8 @@ impl DomWindow {
     }
 
     #[getter]
-    fn onrejectionhandled(&self) -> Option<lumen::embed::JsFunction> {
-        self.base.handler("rejectionhandled")
+    fn onrejectionhandled(&self) -> Nullable<lumen::embed::JsFunction> {
+        Nullable(self.base.handler("rejectionhandled"))
     }
 
     #[setter]

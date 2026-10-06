@@ -522,8 +522,8 @@ impl DomNotification {
     }
 
     #[getter]
-    fn onclick(&self) -> Option<JsFunction> {
-        self.base.handler("click")
+    fn onclick(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("click"))
     }
     #[setter]
     fn set_onclick(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
@@ -531,8 +531,8 @@ impl DomNotification {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onshow(&self) -> Option<JsFunction> {
-        self.base.handler("show")
+    fn onshow(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("show"))
     }
     #[setter]
     fn set_onshow(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
@@ -540,8 +540,8 @@ impl DomNotification {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onclose(&self) -> Option<JsFunction> {
-        self.base.handler("close")
+    fn onclose(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("close"))
     }
     #[setter]
     fn set_onclose(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {
@@ -549,8 +549,8 @@ impl DomNotification {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
     }
     #[getter]
-    fn onerror(&self) -> Option<JsFunction> {
-        self.base.handler("error")
+    fn onerror(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("error"))
     }
     #[setter]
     fn set_onerror(&self, ctx: &mut Ctx, this: This<Value>, callback: Option<JsFunction>) {

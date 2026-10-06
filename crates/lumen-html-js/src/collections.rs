@@ -1467,8 +1467,8 @@ impl DomTokenList {
     fn indexed(&self, index: usize) -> OpResult<Option<String>> {
         Ok(self.tokens()?.get(index).cloned())
     }
-    fn item(&self, index: usize) -> OpResult<Option<String>> {
-        self.indexed(index)
+    fn item(&self, index: usize) -> OpResult<Nullable<String>> {
+        self.indexed(index).map(Nullable)
     }
     #[method(coerce)]
     fn contains(&self, token: &str) -> OpResult<bool> {

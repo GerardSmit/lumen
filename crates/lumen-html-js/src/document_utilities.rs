@@ -514,8 +514,8 @@ impl DomTreeWalker {
     }
 
     #[getter]
-    fn filter(&self) -> Option<Value> {
-        self.filter.callback.clone()
+    fn filter(&self) -> Nullable<Value> {
+        Nullable(self.filter.callback.clone())
     }
 
     fn parent_node(&self, ctx: &mut Ctx) -> OpResult<Value> {
@@ -860,8 +860,8 @@ impl DomNodeIterator {
         self.filter.what_to_show
     }
     #[getter]
-    fn filter(&self) -> Option<Value> {
-        self.filter.callback.clone()
+    fn filter(&self) -> Nullable<Value> {
+        Nullable(self.filter.callback.clone())
     }
     fn next_node(&self, ctx: &mut Ctx) -> OpResult<Value> {
         self.traverse(ctx, true)

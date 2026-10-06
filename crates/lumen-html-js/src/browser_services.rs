@@ -460,8 +460,8 @@ impl DomPermissionStatus {
     }
 
     #[getter]
-    fn onchange(&self) -> Option<lumen::embed::JsFunction> {
-        self.base.handler("change")
+    fn onchange(&self) -> Nullable<lumen::embed::JsFunction> {
+        Nullable(self.base.handler("change"))
     }
 
     #[setter]

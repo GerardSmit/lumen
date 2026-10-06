@@ -3248,8 +3248,8 @@ impl DomMediaQueryList {
     }
 
     #[getter]
-    fn onchange(&self) -> Option<JsFunction> {
-        self.base.handler("change")
+    fn onchange(&self) -> Nullable<JsFunction> {
+        Nullable(self.base.handler("change"))
     }
 
     #[setter]
@@ -5305,15 +5305,15 @@ impl DomCssImportRule {
     }
 
     #[getter(name = "layerName")]
-    fn layer_name(&self) -> OpResult<Option<String>> {
-        Ok(
+    fn layer_name(&self) -> OpResult<Nullable<String>> {
+        Ok(Nullable(
             source_import(&self.base.realm, &self.base.source, &self.base.index)?
                 .layer
                 .map(|layer| match layer {
                     css::ImportLayer::Anonymous => String::new(),
                     css::ImportLayer::Named(name) => name.to_string(),
                 }),
-        )
+        ))
     }
 
     #[getter(name = "styleSheet")]
