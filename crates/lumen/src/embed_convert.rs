@@ -1156,6 +1156,12 @@ impl Interp {
         Ok(())
     }
 
+    /// Freeze an object in place: non-extensible, every own property non-writable and
+    /// non-configurable (`Object.freeze` without consulting globals or running author code).
+    pub fn freeze_native_object(&self, value: &Value) {
+        self.freeze_object(value);
+    }
+
     /// Store an immutable, reflection-hidden array on a native wrapper. Both the slot and its
     /// backing array are frozen using engine-owned object storage, without consulting globals or
     /// running author code. The array's elements therefore become ordinary traced GC edges.

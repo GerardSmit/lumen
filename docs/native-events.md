@@ -169,5 +169,6 @@ object. The native core:
   `fetch` registers an owned abort step on the signal it was given (`add_owned_step`, a weak
   `AbortStep::Owned`, pruned on each registration), and `Request.signal` is a signal that
   `follow_signal`s the one passed in.
+- `wasm.js` is gone: the `WebAssembly` namespace is native ([native-wasm.md](native-wasm.md)).
 - Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
   [native-messaging.md](native-messaging.md).

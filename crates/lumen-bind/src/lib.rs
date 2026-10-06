@@ -129,6 +129,8 @@
 //! - `Ctx::allocate_native_private_slot_name` / `define_native_private_value_slot` /
 //!   `native_private_value_slot` hold a JS value on an instance, traced from the wrapper and
 //!   invisible to script (`CustomEvent.detail`, `AbortController.signal`).
+//! - `Ctx::freeze_native_object(value)` freezes an object without consulting globals (the frozen,
+//!   null-prototype `WebAssembly.Instance.exports`).
 //!
 //! # Parameters
 //! Named parameters are positional-only unless marked `#[kw]` (positional or keyword) or

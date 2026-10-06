@@ -1788,3 +1788,173 @@ fn fetch_responses_and_in_flight_fetches_are_collectable() {
         assert_script(&mut runtime, expression);
     }
 }
+
+const WASM_PRELUDE: &str = r#"
+const wasm = (...sections) => new Uint8Array([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sections.flat()]);
+const ADD = wasm(
+  [0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f],
+  [0x03, 0x02, 0x01, 0x00],
+  [0x07, 0x07, 0x01, 0x03, 0x61, 0x64, 0x64, 0x00, 0x00],
+  [0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b]);
+const IMPORTS = wasm(
+  [0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00],
+  [0x02, 0x16, 0x02, 0x03, 0x65, 0x6e, 0x76, 0x03, 0x6c, 0x6f, 0x67, 0x00, 0x00,
+   0x03, 0x65, 0x6e, 0x76, 0x03, 0x6d, 0x65, 0x6d, 0x02, 0x00, 0x01],
+  [0x03, 0x02, 0x01, 0x01],
+  [0x07, 0x07, 0x01, 0x03, 0x72, 0x75, 0x6e, 0x00, 0x01],
+  [0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x07, 0x10, 0x00, 0x0b]);
+const GLOBAL = wasm(
+  [0x06, 0x06, 0x01, 0x7f, 0x01, 0x41, 0x05, 0x0b],
+  [0x07, 0x05, 0x01, 0x01, 0x67, 0x03, 0x00]);
+const MEMORY = wasm(
+  [0x05, 0x03, 0x01, 0x00, 0x01],
+  [0x07, 0x07, 0x01, 0x03, 0x6d, 0x65, 0x6d, 0x02, 0x00]);
+const TRAP_AT_START = wasm(
+  [0x01, 0x04, 0x01, 0x60, 0x00, 0x00],
+  [0x03, 0x02, 0x01, 0x00],
+  [0x08, 0x01, 0x00],
+  [0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b]);
+const caught = (fn) => { try { fn(); } catch (error) { return error; } };
+"#;
+
+fn wasm_runtime() -> Runtime {
+    let mut runtime = Runtime::new();
+    evaluate(&mut runtime, &format!("{WASM_PRELUDE} globalThis.wasm = wasm; globalThis.ADD = ADD; globalThis.IMPORTS = IMPORTS; globalThis.GLOBAL = GLOBAL; globalThis.MEMORY = MEMORY; globalThis.TRAP_AT_START = TRAP_AT_START; globalThis.caught = caught;"));
+    runtime
+}
+
+#[test]
+fn webassembly_namespace_and_classes_keep_their_shape() {
+    let mut runtime = wasm_runtime();
+    for expression in [
+        "typeof WebAssembly === 'object' && Object.getPrototypeOf(WebAssembly) === Object.prototype",
+        "(() => { const d = Object.getOwnPropertyDescriptor(globalThis, 'WebAssembly'); return d.writable && !d.enumerable && d.configurable && d.value === WebAssembly; })()",
+        "['validate', 'compile', 'instantiate'].every((n) => typeof WebAssembly[n] === 'function' && Object.getOwnPropertyDescriptor(WebAssembly, n).enumerable)",
+        "['Module', 'Instance', 'Memory', 'Table', 'Global', 'CompileError', 'LinkError', 'RuntimeError'].every((n) => typeof WebAssembly[n] === 'function' && WebAssembly[n].name === n)",
+        "caught(() => WebAssembly.Module(ADD)) instanceof TypeError",
+        "caught(() => new WebAssembly.Module()) instanceof TypeError",
+        "caught(() => new WebAssembly.Module(5)) instanceof TypeError",
+        "caught(() => new WebAssembly.Instance({})) instanceof TypeError",
+        "caught(() => WebAssembly.validate('x')) instanceof TypeError",
+        "WebAssembly.validate(ADD) === true && WebAssembly.validate(new Uint8Array(4)) === false && WebAssembly.validate(ADD.buffer) === true",
+        "(() => { for (const n of ['CompileError', 'LinkError', 'RuntimeError']) { const C = WebAssembly[n]; const e = new C('boom'); if (!(e instanceof Error && e instanceof C && e.name === n && e.message === 'boom' && Object.prototype.hasOwnProperty.call(e, 'message') && !Object.prototype.propertyIsEnumerable.call(e, 'message') && C.prototype.name === n && Object.getPrototypeOf(C.prototype) === Error.prototype && String(e) === n + ': boom' && new C().message === '')) return false; } return true; })()",
+        "Object.getPrototypeOf(WebAssembly.CompileError) === Error",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn webassembly_module_and_instance_expose_exports_and_call_wasm() {
+    let mut runtime = wasm_runtime();
+    for expression in [
+        "(() => { const m = new WebAssembly.Module(ADD); const i = new WebAssembly.Instance(m); return i instanceof WebAssembly.Instance && i.exports.add(2, 3) === 5 && i.exports.add(-10, 4) === -6; })()",
+        "(() => { const m = new WebAssembly.Module(ADD); const e = WebAssembly.Module.exports(m); return e.length === 1 && e[0].name === 'add' && e[0].kind === 'function' && WebAssembly.Module.imports(m).length === 0 && WebAssembly.Module.customSections(m, 'x').length === 0; })()",
+        "(() => { const m = new WebAssembly.Module(IMPORTS); const i = WebAssembly.Module.imports(m); return i.length === 2 && i[0].module === 'env' && i[0].name === 'log' && i[0].kind === 'function' && i[1].name === 'mem' && i[1].kind === 'memory'; })()",
+        "caught(() => WebAssembly.Module.exports({})) instanceof TypeError",
+        "(() => { const e = new WebAssembly.Instance(new WebAssembly.Module(ADD)).exports; return Object.getPrototypeOf(e) === null && Object.isFrozen(e) && Object.keys(e).join() === 'add' && e.add.length === 2 && e.add === e.add; })()",
+        "(() => { const i = new WebAssembly.Instance(new WebAssembly.Module(ADD)); const d = Object.getOwnPropertyDescriptor(WebAssembly.Instance.prototype, 'exports'); return typeof d.get === 'function' && d.get.call(i) === i.exports && caught(() => d.get.call({})) instanceof TypeError; })()",
+        "(() => { const m = new WebAssembly.Module(ADD); return new WebAssembly.Instance(m).exports.add !== new WebAssembly.Instance(m).exports.add; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn webassembly_imports_link_functions_memories_and_report_errors() {
+    let mut runtime = wasm_runtime();
+    for expression in [
+        "(() => { const seen = []; const mem = new WebAssembly.Memory({ initial: 1 }); const i = new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: { log: (v) => seen.push(v), mem } }); i.exports.run(); return seen.join() === '7'; })()",
+        "caught(() => new WebAssembly.Instance(new WebAssembly.Module(IMPORTS))) instanceof TypeError",
+        "caught(() => new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: 1 })) instanceof TypeError",
+        "caught(() => new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: { log: 1, mem: new WebAssembly.Memory({ initial: 1 }) } })) instanceof WebAssembly.LinkError",
+        "caught(() => new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: { log() {}, mem: {} } })) instanceof WebAssembly.LinkError",
+        "(() => { const e = caught(() => new WebAssembly.Instance(new WebAssembly.Module(TRAP_AT_START))); return e instanceof WebAssembly.RuntimeError && e instanceof Error && e.name === 'RuntimeError'; })()",
+        "(() => { const thrown = new Error('from import'); const i = new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: { log() { throw thrown; }, mem: new WebAssembly.Memory({ initial: 1 }) } }); return caught(() => i.exports.run()) === thrown; })()",
+        "(() => { const e = caught(() => new WebAssembly.Module(new Uint8Array([1, 2, 3, 4]))); return e instanceof WebAssembly.CompileError && e.name === 'CompileError' && e.message.length > 0; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn webassembly_memory_table_and_global_validate_and_share_identity() {
+    let mut runtime = wasm_runtime();
+    for expression in [
+        "(() => { const m = new WebAssembly.Memory({ initial: 1, maximum: 2 }); const b = m.buffer; const previous = m.grow(1); return previous === 1 && b.byteLength === 0 && m.buffer.byteLength === 131072 && m.buffer === m.buffer && caught(() => m.grow(1)) instanceof RangeError; })()",
+        "caught(() => new WebAssembly.Memory()) instanceof TypeError && caught(() => new WebAssembly.Memory({})) instanceof TypeError && caught(() => new WebAssembly.Memory({ initial: -1 })) instanceof TypeError && caught(() => new WebAssembly.Memory({ initial: 2, maximum: 1 })) instanceof RangeError && caught(() => new WebAssembly.Memory({ initial: 1n })) instanceof TypeError",
+        "caught(() => WebAssembly.Memory.prototype.grow.call({}, 1)) instanceof TypeError && caught(() => Object.getOwnPropertyDescriptor(WebAssembly.Memory.prototype, 'buffer').get.call({})) instanceof TypeError",
+        "(() => { const i = new WebAssembly.Instance(new WebAssembly.Module(MEMORY)); return i.exports.mem instanceof WebAssembly.Memory && i.exports.mem.buffer.byteLength === 65536 && i.exports.mem === i.exports.mem; })()",
+        "(() => { const m = new WebAssembly.Memory({ initial: 1 }); const i = new WebAssembly.Instance(new WebAssembly.Module(IMPORTS), { env: { log() {}, mem: m } }); return i.exports.run !== undefined; })()",
+        "(() => { const t = new WebAssembly.Table({ element: 'anyfunc', initial: 2 }); const f = new WebAssembly.Instance(new WebAssembly.Module(ADD)).exports.add; t.set(0, f); return t.length === 2 && t.get(0) === f && t.get(1) === null && caught(() => t.set(1, () => {})) instanceof TypeError && caught(() => t.get(9)) instanceof RangeError && (t.set(0, null), t.get(0) === null); })()",
+        "caught(() => new WebAssembly.Table()) instanceof TypeError && caught(() => new WebAssembly.Table({ element: 'externref', initial: 1 })) instanceof TypeError",
+        "(() => { const g = new WebAssembly.Global({ value: 'i32', mutable: true }, 3); g.value = 9; return g.value === 9 && g.valueOf() === 9 && g instanceof WebAssembly.Global; })()",
+        "(() => { const g = new WebAssembly.Global({ value: 'i64' }, 5n); return g.value === 5n && caught(() => { g.value = 1n; }) instanceof TypeError; })()",
+        "caught(() => new WebAssembly.Global({ value: 'bogus' })) instanceof TypeError && caught(() => new WebAssembly.Global()) instanceof TypeError",
+        "(() => { const i = new WebAssembly.Instance(new WebAssembly.Module(GLOBAL)); const g = i.exports.g; if (g.value !== 5) return false; g.value = 8; return g.value === 8 && g === i.exports.g; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn webassembly_compile_and_instantiate_return_promises() {
+    let mut runtime = wasm_runtime();
+    evaluate(
+        &mut runtime,
+        r#"
+        globalThis.out = {};
+        const record = (name) => (value) => { out[name] = value; };
+        const fail = (name) => (error) => { out[name] = error; };
+        const compiled = WebAssembly.compile(ADD);
+        out.promise = compiled instanceof Promise;
+        compiled.then(record('compiled'), fail('compiledError'));
+        WebAssembly.instantiate(ADD).then(record('pair'), fail('pairError'));
+        WebAssembly.compile(ADD).then((m) => WebAssembly.instantiate(m)).then(record('instance'), fail('instanceError'));
+        WebAssembly.compile(new Uint8Array(4)).then(fail('compileUnexpected'), record('compileRejected'));
+        WebAssembly.compile('text').then(fail('typeUnexpected'), record('typeRejected'));
+        WebAssembly.instantiate(IMPORTS, {}).then(fail('importUnexpected'), record('importRejected'));
+        WebAssembly.instantiate(new WebAssembly.Module(IMPORTS), { env: { log: 1, mem: new WebAssembly.Memory({ initial: 1 }) } })
+          .then(fail('linkUnexpected'), record('linkRejected'));
+        "#,
+    );
+    runtime.run_until_idle();
+    for expression in [
+        "out.promise === true && out.compiled instanceof WebAssembly.Module",
+        "out.pair.module instanceof WebAssembly.Module && out.pair.instance instanceof WebAssembly.Instance && out.pair.instance.exports.add(4, 5) === 9",
+        "out.instance instanceof WebAssembly.Instance && out.instance.exports.add(1, 1) === 2",
+        "out.compileRejected instanceof WebAssembly.CompileError && out.compileUnexpected === undefined",
+        "out.typeRejected instanceof TypeError",
+        "out.importRejected instanceof TypeError",
+        "out.linkRejected instanceof WebAssembly.LinkError",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn webassembly_wrappers_are_collected_and_exports_outlive_their_instance() {
+    let mut runtime = wasm_runtime();
+    evaluate(
+        &mut runtime,
+        r#"
+        globalThis.weak = {};
+        globalThis.kept = (() => {
+          const module = new WebAssembly.Module(ADD);
+          const instance = new WebAssembly.Instance(module);
+          weak.module = new WeakRef(module);
+          weak.instance = new WeakRef(instance);
+          weak.memory = new WeakRef(new WebAssembly.Memory({ initial: 1 }));
+          return instance.exports;
+        })();
+        "#,
+    );
+    runtime.engine().collect_garbage();
+    runtime.engine().collect_garbage();
+    for expression in [
+        "weak.module.deref() === undefined && weak.instance.deref() === undefined && weak.memory.deref() === undefined",
+        "kept.add(20, 22) === 42",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}

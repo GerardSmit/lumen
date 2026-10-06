@@ -51,11 +51,6 @@ const UNITS: &[Unit] = &[
         lazy: false,
         defined: &[],
     },
-    Unit {
-        files: &["wasm.js"],
-        lazy: true,
-        defined: &[],
-    },
 ];
 
 /// The globals a lazy unit publishes: its column-0 `globalThis.X = …` statements, then `defined`.

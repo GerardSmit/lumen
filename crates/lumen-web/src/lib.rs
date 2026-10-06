@@ -750,7 +750,7 @@ pub fn extension() -> Extension {
             lumen_host::namespace::<websocket::Module>,
             lumen_host::lazy_globals::<websocket_class::bindings::Module>,
             lumen_host::lazy_globals::<eventsource_class::bindings::Module>,
-            lumen_host::namespace::<wasm_ops::WasmModule>,
+            wasm_ops::install,
         ],
         state_init: Some(|state: &mut OpState| {
             #[cfg(not(target_arch = "wasm32"))]

@@ -1,5 +1,5 @@
 //! WebAssembly: a from-scratch, std-only engine — binary decoder (`parse`), a bytecode interpreter
-//! (`exec`), and the JS `WebAssembly.*` API assembled over native ops in `lib.rs`/`js/wasm.js`.
+//! (`exec`), and the JS `WebAssembly.*` API bound natively in `wasm_ops.rs`.
 //! Supports the MVP instruction set plus common post-MVP ops (multi-value, sign-extension,
 //! saturating conversions, bulk memory). Not supported: SIMD, threads/atomics, exceptions, GC.
 
