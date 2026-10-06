@@ -40,6 +40,8 @@ pub mod clone_transfer;
 /// `MessageEvent`, `CloseEvent`, `PromiseRejectionEvent`, `MessagePort`, `MessageChannel` and
 /// `BroadcastChannel` (`docs/native-messaging.md`).
 pub mod messaging;
+/// The native `Navigator` interface and the `navigator` global.
+pub mod navigator;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
 /// The native `Performance` interface and the `performance` and `self` globals.

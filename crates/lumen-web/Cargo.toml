@@ -1,8 +1,8 @@
 # WinterTC "Minimum Common Web Platform API" op crate: Event/AbortController, TextEncoder/
 # TextDecoder, atob/btoa, structuredClone, URL/URLSearchParams, performance.now, crypto
 # (getRandomValues/randomUUID/subtle.digest), fetch (HTTP and verified HTTPS through lumen-tls:
-# system OpenSSL on Unix, rustls on Windows). Pure-JS pieces ship as js_init glue;
-# Rust backs the parsing/crypto/network ops. See lib.rs for the conformance checklist.
+# system OpenSSL on Unix, rustls on Windows). Every API is native
+# lumen_bind Rust. See lib.rs for the conformance checklist.
 [package]
 name = "lumen-web"
 version.workspace = true
@@ -25,11 +25,6 @@ lumen-tls = { path = "../lumen-tls" }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "=0.2.127"
 js-sys = "0.3"
-
-# Build-only: used by build.rs to parse the JS glue and emit its AST snapshot (no runtime dep).
-[build-dependencies]
-lumen = { path = "../lumen" }
-lumen-aot = { path = "../lumen-aot", features = ["native"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

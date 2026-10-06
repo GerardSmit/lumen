@@ -5,6 +5,7 @@
 use super::*;
 use lumen::embed::{Deferred, JsObject, Promise};
 use lumen_bind::{IntoError, This};
+use lumen_host::navigator::Navigator;
 use std::{
     cell::Cell,
     rc::Weak,
@@ -207,8 +208,9 @@ impl DomRealm {
     }
 }
 
-#[lumen_bind::class(name = "Navigator", hint(js(webidl)))]
+#[lumen_bind::class(name = "Navigator", extends = Navigator, hint(js(webidl)))]
 pub struct DomNavigator {
+    base: Navigator,
     clipboard: Value,
     permissions: Value,
     user_activation: Value,
@@ -548,6 +550,7 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
         realm: Rc::downgrade(realm),
     });
     let navigator_data = DomNavigator {
+        base: Navigator,
         clipboard,
         permissions,
         user_activation,

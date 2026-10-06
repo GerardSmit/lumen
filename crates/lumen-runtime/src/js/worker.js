@@ -91,7 +91,7 @@
   }
   Object.defineProperty(globalThis, "Worker", { value: Worker, writable: true, enumerable: true, configurable: true });
   };
-  // The class extends EventTarget, so it is built when first used (see lumen-web's `__lazyWeb`).
+  // The class extends EventTarget, so it is built when first used (`EventTarget` itself is a lazy native global).
   Object.defineProperty(globalThis, "Worker", {
     get() { defineWorker(); return globalThis.Worker; },
     set(value) { Object.defineProperty(globalThis, "Worker", { value, writable: true, enumerable: true, configurable: true }); },

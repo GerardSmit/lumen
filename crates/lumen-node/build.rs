@@ -1,6 +1,5 @@
-//! Precompile the `node:` compat JS glue to an AST snapshot at build time (see
-//! `lumen-web/build.rs` for the rationale — parsing the static glue on every boot is the
-//! dominant cold-start cost). Assembles the same IIFE `lib.rs` used to `concat!` and writes the
+//! Precompile the `node:` compat JS glue to an AST snapshot at build time (parsing
+//! the static glue on every boot is the dominant cold-start cost). Assembles the same IIFE `lib.rs` used to `concat!` and writes the
 //! source + snapshot to `OUT_DIR`, the single source of truth.
 //!
 //! The snapshot is an ahead-of-time blob (`lumen::precompiled::precompile_glue`): the glue's

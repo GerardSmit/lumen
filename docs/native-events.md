@@ -176,5 +176,11 @@ object. The native core:
   removed; `lumen-web`'s `build.rs` drops the unit.
 - `urlpattern.js` is gone: `URLPattern` is native ([native-urlpattern.md](native-urlpattern.md)),
   published lazily by `lumen-web`; `build.rs` has no lazy glue units left.
+- `preamble.js` and `navigator.js` are gone: `lumen-web` has no JS glue (`build.rs`, the lazy unit
+  machinery `__lazyWeb` and the glue IIFE are deleted, so no realm decodes or runs a web glue
+  blob at boot). `Navigator` and the `navigator` global are native (`lumen_host::navigator`,
+  published lazily): `userAgent` is a prototype getter, no longer an own data property. The DOM
+  realm's `Navigator` (`DomNavigator`, `lumen-html-js`) `extends` it. The extension drops the raw
+  `__http` namespace after registering the transport and no longer creates `__url`.
 - Left in JS: the worker scope classes. `messaging.js` and `platform.js` moved to
   [native-messaging.md](native-messaging.md).

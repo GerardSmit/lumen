@@ -315,13 +315,27 @@ fn installed_web_abort_globals_keep_their_identity() {
     evaluate(&mut engine, "globalThis.performance={now:()=>Date.now()};");
     evaluate(
         &mut engine,
-        concat!(
-            "(function(){\n",
-            include_str!("../../../lumen-web/src/js/preamble.js"),
-            "\n",
-            include_str!("../../../lumen-web/src/js/events.js"),
-            "\n})();"
-        ),
+        "(function(){
+            class EventTarget {
+                constructor() { this.listeners = []; }
+                addEventListener(type, fn) { this.listeners.push([type, fn]); }
+                removeEventListener(type, fn) { this.listeners = this.listeners.filter(entry => entry[1] !== fn); }
+                dispatchEvent(event) { for (const [type, fn] of this.listeners.slice()) if (type === event.type) fn.call(this, event); }
+            }
+            class AbortSignal extends EventTarget {
+                constructor() { super(); this.aborted = false; this.reason = undefined; }
+            }
+            class AbortController {
+                constructor() { this.signal = new AbortSignal(); }
+                abort(reason) {
+                    if (this.signal.aborted) return;
+                    this.signal.aborted = true;
+                    this.signal.reason = reason;
+                    this.signal.dispatchEvent({ type: 'abort' });
+                }
+            }
+            Object.assign(globalThis, { EventTarget, AbortSignal, AbortController });
+        })();",
     );
     evaluate(
         &mut engine,

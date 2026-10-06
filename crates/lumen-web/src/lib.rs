@@ -1,7 +1,7 @@
 //! lumen-web — the WinterTC "Minimum Common Web Platform API", incrementally.
 //!
-//! Pure-JS pieces ship as `js_init` glue (see `src/js/`); Rust backs parsing, crypto, and the
-//! network. Conformance checklist against the WinterTC minimum common API:
+//! Every API is native `lumen_bind` Rust; the extension has no JS glue. Conformance checklist
+//! against the WinterTC minimum common API:
 //!
 //! - [x] `console`, timers, `queueMicrotask` (lumen-runtime/lumen-timers)
 //! - [x] `DOMException`, `Event`, `CustomEvent`, `EventTarget`, `AbortController`,
@@ -13,7 +13,8 @@
 //!   in `lumen_host::structured_clone`, published lazily
 //! - [x] `URL` / `URLSearchParams`: native classes in `lumen_host::url` over the WHATWG parser in
 //!   `lumen_common::url`, published lazily
-//! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
+//! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`: native `Navigator` in
+//!   `lumen_host::navigator`, published lazily
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
 //!   `lumen_os::proc::entropy`), `crypto.subtle.digest` (SHA-1/256/384/512): native classes in
 //!   `lumen_host::webcrypto`, published lazily
@@ -732,10 +733,10 @@ pub fn extension() -> Extension {
         name: "web",
         modules: &[
             lumen_host::namespace::<http_policy::Module>,
-            url_namespace,
             lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::url::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::url_pattern::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::navigator::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::events::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::events::internals::Module>,
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
@@ -767,28 +768,11 @@ pub fn extension() -> Extension {
             }
             state.put(wasm_ops::WasmStore::default());
         }),
-        js_init: {
-            #[cfg(feature = "compiler")]
-            {
-                Some(JS_GLUE_SOURCE)
-            }
-            #[cfg(not(feature = "compiler"))]
-            {
-                None
-            }
-        },
-        js_init_snapshot: Some(JS_GLUE_AOT),
+        js_init: None,
+        js_init_snapshot: None,
         lazy_globals: &[],
     }
 }
-
-/// One IIFE (preamble captures and deletes the raw `__*` namespaces, the rest defines the
-/// standard classes over them), assembled by `build.rs` from `src/js/*.js` — the single source
-/// of truth — and precompiled there to an ahead-of-time blob (AST, bytecode, compressed function
-/// text), loaded at boot (see `lumen_host::install`).
-const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/web_glue.aot"));
-#[cfg(feature = "compiler")]
-const JS_GLUE_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/web_glue.js"));
 
 /// Register the `__http` and `__http_policy` operations as the realm's native request transport.
 fn install_transport(ctx: &mut Ctx) -> Result<(), Value> {
@@ -796,6 +780,7 @@ fn install_transport(ctx: &mut Ctx) -> Result<(), Value> {
     let http = ctx.member_get(&global, "__http")?;
     let policy = ctx.member_get(&global, "__http_policy")?;
     lumen_host::net::Transport::install(ctx, http, policy.clone(), policy);
+    ctx.delete_member(&global, "__http")?;
     Ok(())
 }
 
@@ -809,11 +794,6 @@ fn install_lumen(ctx: &mut Ctx) -> Result<(), Value> {
         ctx.member_set(&global, "Lumen", lumen.clone())?;
     }
     ctx.install_module::<server::Module>(&lumen)
-}
-
-fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
-    let ns = ctx.namespace_object("__url");
-    ctx.install_module::<lumen_host::url::natives::Module>(&ns)
 }
 
 // ---- crypto ----

@@ -1503,7 +1503,6 @@ version = "0.1.3"
 dependencies = [
  "js-sys",
  "lumen",
- "lumen-aot",
  "lumen-bind",
  "lumen-codegen",
  "lumen-common",
