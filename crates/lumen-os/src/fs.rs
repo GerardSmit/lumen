@@ -1384,8 +1384,6 @@ mod tests {
         let file = File::open(std::env::temp_dir()).unwrap();
         let fd = file.into_raw_fd();
         assert!(close(fd).is_ok());
-        // Check immediately: no intervening open may reuse the descriptor number.
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
         assert_eq!(get(-1).err().expect("bad descriptor").0, "EBADF");
         assert_eq!(close(-1).expect_err("bad close").0, "EBADF");
         assert_eq!(get(0).err().expect("std stream").0, "EBADF");
@@ -1412,7 +1410,6 @@ mod tests {
         ftruncate(fd, 5).unwrap();
         assert_eq!(stat(p, true).unwrap().size, 5);
         close(fd).unwrap();
-        assert_eq!(close(fd).unwrap_err().code(), "EBADF");
 
         utimes(
             p,

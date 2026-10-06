@@ -495,9 +495,17 @@ mod sys {
 #[cfg(all(test, any(windows, unix)))]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static GLOBAL_COUNTERS: Mutex<()> = Mutex::new(());
+
+    fn serialize_counters() -> MutexGuard<'static, ()> {
+        GLOBAL_COUNTERS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn thread_limit_fails_allocation_past_the_budget_and_counts_frees() {
+        let _serial = serialize_counters();
         set_thread_exec_limit(Some(300));
         let trim = exec_trim_generation();
         let a = ExecMemory::new(&[0xc3; 200]).unwrap();
@@ -522,6 +530,7 @@ mod tests {
 
     #[test]
     fn requesting_a_trim_moves_the_generation() {
+        let _serial = serialize_counters();
         let before = exec_trim_generation();
         request_exec_trim();
         assert!(exec_trim_generation() > before);
