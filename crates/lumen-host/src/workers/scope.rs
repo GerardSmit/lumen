@@ -11,6 +11,8 @@
 //! host's values, and a worker that never touches `location` or `importScripts` never builds them.
 
 use super::backend::{ScopeKind, WorkerScopeHost};
+use super::service::Space;
+use super::service_scope::{self, ServiceState};
 use super::control::{Control, WorkerEvent};
 use crate::events::{
     node_handler_get, node_handler_set, report_exception, Event, EventTarget, TargetData,
@@ -24,15 +26,16 @@ use lumen_os::channel::Pop;
 use std::cell::{Cell, OnceCell};
 use std::rc::Rc;
 
-struct ScopeState {
+pub(super) struct ScopeState {
     host: Rc<dyn WorkerScopeHost>,
     module: bool,
     name: String,
     url: Rc<Url>,
     location: OnceCell<Value>,
     receiver: OnceCell<NativeReceiver>,
-    control: Option<Control>,
-    task: Cell<Option<TaskId>>,
+    pub(super) control: Option<Control>,
+    pub(super) task: Cell<Option<TaskId>>,
+    pub(super) service: Option<Rc<ServiceState>>,
 }
 
 /// What a worker realm hands to [`install_scope`].
@@ -44,7 +47,7 @@ pub struct ScopeInstall {
     pub control: Option<Control>,
 }
 
-fn scope_state(ctx: &mut Ctx, this: &Value, interface: &str) -> OpResult<Rc<ScopeState>> {
+pub(super) fn scope_state(ctx: &mut Ctx, this: &Value, interface: &str) -> OpResult<Rc<ScopeState>> {
     let receiver = match this {
         Value::Undefined | Value::Null => ctx.global_object(),
         other => other.clone(),
@@ -119,7 +122,17 @@ pub fn install_scope(ctx: &mut Ctx, install: ScopeInstall) -> OpResult<()> {
     let url = lumen_common::url::parse(&host.location(), Some("file:///"))
         .or_else(|_| lumen_common::url::parse("file:///", None))
         .map_err(|_| OpError::type_error("invalid worker location"))?;
+    let service = match kind {
+        ScopeKind::Service => {
+            let service = host
+                .service()
+                .ok_or_else(|| OpError::type_error("a service worker scope needs its service host"))?;
+            Some(ServiceState::new(service, Space::new(None)))
+        }
+        _ => None,
+    };
     let state = Rc::new(ScopeState {
+        service,
         module: host.module(),
         name: host.name(),
         host: host.clone(),
@@ -143,6 +156,11 @@ pub fn install_scope(ctx: &mut Ctx, install: ScopeInstall) -> OpResult<()> {
         ScopeKind::Shared => {
             lazy_globals::<shared::Module>(ctx).map_err(OpError::thrown)?;
             ctx.attach_instance(&global, shared::SharedWorkerGlobalScope { base })?;
+        }
+        ScopeKind::Service => {
+            lazy_globals::<service_scope::bindings::Module>(ctx).map_err(OpError::thrown)?;
+            lazy_globals::<super::service::bindings::Module>(ctx).map_err(OpError::thrown)?;
+            ctx.attach_instance(&global, service_scope::ServiceWorkerGlobalScope { base })?;
         }
     }
 
@@ -189,28 +207,45 @@ pub fn install_scope(ctx: &mut Ctx, install: ScopeInstall) -> OpResult<()> {
         }
         ScopeKind::Shared => {
             handler_accessor(ctx, &global, "onconnect", "connect")?;
-            let control = state
-                .control
-                .clone()
-                .ok_or_else(|| OpError::type_error("a shared worker scope needs its control"))?;
-            let weak = ctx.weak_value(&global).expect("the global is an object");
-            let callback = {
-                let state = state.clone();
-                ctx.new_native_fn(
-                    "",
-                    0,
-                    Rc::new(move |ctx: &mut Ctx, _this: Value, _: &[Value]| {
-                        if let Some(global) = weak.upgrade() {
-                            scope_wake(ctx, &global, &state);
-                        }
-                        Ok(Value::Undefined)
-                    }),
-                )
-            };
-            let task = control.listen(ctx, callback)?;
-            state.task.set(Some(task));
+            listen_control(ctx, &global, &state, scope_wake)?;
+        }
+        ScopeKind::Service => {
+            for (property, kind) in service_scope::HANDLERS {
+                handler_accessor(ctx, &global, *property, *kind)?;
+            }
+            listen_control(ctx, &global, &state, service_scope::wake)?;
         }
     }
+    Ok(())
+}
+
+/// Run `wake` on the realm's loop whenever the scope's control has something for the worker.
+fn listen_control(
+    ctx: &mut Ctx,
+    global: &Value,
+    state: &Rc<ScopeState>,
+    wake: fn(&mut Ctx, &Value, &Rc<ScopeState>),
+) -> OpResult<()> {
+    let control = state
+        .control
+        .clone()
+        .ok_or_else(|| OpError::type_error("this worker scope needs its control"))?;
+    let weak = ctx.weak_value(global).expect("the global is an object");
+    let callback = {
+        let state = state.clone();
+        ctx.new_native_fn(
+            "",
+            0,
+            Rc::new(move |ctx: &mut Ctx, _this: Value, _: &[Value]| {
+                if let Some(global) = weak.upgrade() {
+                    wake(ctx, &global, &state);
+                }
+                Ok(Value::Undefined)
+            }),
+        )
+    };
+    let task = control.listen(ctx, callback)?;
+    state.task.set(Some(task));
     Ok(())
 }
 

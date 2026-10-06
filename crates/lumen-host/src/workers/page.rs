@@ -117,7 +117,7 @@ fn read_options(ctx: &mut Ctx, interface: &str, options: &Value) -> OpResult<Opt
 }
 
 /// The page's `location.href` and `location.origin`, when it has a location.
-fn page_location(ctx: &mut Ctx) -> Option<(String, String)> {
+pub(super) fn page_location(ctx: &mut Ctx) -> Option<(String, String)> {
     let global = ctx.global_object();
     let location = ctx.member_get(&global, "location").ok()?;
     if !matches!(location, Value::Obj(_)) {

@@ -5,6 +5,10 @@
 //! (the waker behind every port endpoint, [`crate::ports::Mailbox`]). Nothing is armed while the
 //! mailbox is empty, and a burst of events costs one wake.
 
+use super::registry::{
+    ClientRecord, FetchRequest, JobId, LifecycleKind, RegistrationRecord, WorkerRecord, WorkerState,
+};
+use crate::clone_transfer::CloneMessage;
 use crate::ports::{Mailbox, PortTransfer};
 use crate::{Ctx, OpError, TaskId, Value};
 use lumen_os::channel::Pop;
@@ -23,6 +27,41 @@ pub enum WorkerEvent {
     Close,
     /// A client connected to a shared worker: the worker-side end of its port.
     Connect(PortTransfer),
+
+    // Pushed by a `ServiceWorkerRegistry` to a page's `navigator.serviceWorker` (and, for the
+    // registration and state events, to the service worker's own scope).
+    /// A registration's current workers: replaces what its `installing`, `waiting` and `active`
+    /// report and may resolve `ready`. Fires no event itself.
+    Registration(Box<RegistrationRecord>),
+    /// A worker's state changed: fires `statechange` on its `ServiceWorker` when the page has one.
+    StateChange { worker: u64, state: WorkerState },
+    /// A new worker started installing: fires `updatefound` on the registration.
+    UpdateFound { registration: u64 },
+    /// The page's controller changed: fires `controllerchange` on the container.
+    ControllerChange(Option<WorkerRecord>),
+    /// A `register()` or `update()` job finished.
+    JobSettled {
+        job: JobId,
+        /// The registration, or the `DOMException` name and message the promise rejects with.
+        result: Result<Box<RegistrationRecord>, (String, String)>,
+    },
+    /// A message a service worker posted to the page: a `message` event on the container.
+    ServiceMessage {
+        source: WorkerRecord,
+        message: CloneMessage,
+    },
+
+    // Pushed by the host that runs a service worker to its global scope.
+    /// Fire `install` or `activate`; the outcome goes to `ServiceScopeHost::event_settled`.
+    Lifecycle { event: u64, kind: LifecycleKind },
+    /// Fire a `fetch` event.
+    Fetch(Box<FetchRequest>),
+    /// A message a client posted to the worker: an `ExtendableMessageEvent`.
+    ClientMessage {
+        event: u64,
+        source: ClientRecord,
+        message: CloneMessage,
+    },
 }
 
 /// A `Send` handle on one realm-side object's event queue.

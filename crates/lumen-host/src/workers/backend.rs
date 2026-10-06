@@ -2,6 +2,7 @@
 //! call, and where a realm finds its implementation.
 
 use super::control::Control;
+use super::registry::ServiceScopeHost;
 use crate::ports::PortTransfer;
 use crate::Ctx;
 use lumen_bind::{NativeError, NativeResult};
@@ -77,6 +78,8 @@ pub fn unsupported(class: &str) -> NativeError {
 pub enum ScopeKind {
     Dedicated,
     Shared,
+    /// A service worker: [`WorkerScopeHost::service`] must be implemented.
+    Service,
 }
 
 /// The worker side: what a global scope asks its host.
@@ -99,6 +102,11 @@ pub trait WorkerScopeHost: 'static {
 
     /// An uncaught error in the worker, for the page's `error` event.
     fn report_error(&self, message: String);
+
+    /// The service-worker half of the host, for [`ScopeKind::Service`].
+    fn service(&self) -> Option<Rc<dyn ServiceScopeHost>> {
+        None
+    }
 }
 
 struct BackendSlot(Rc<dyn WorkerBackend>);

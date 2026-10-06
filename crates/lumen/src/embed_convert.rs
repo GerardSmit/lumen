@@ -3692,7 +3692,11 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                     .insert(key, Property::builtin(Value::Obj(f)));
             }
             Role::Method | Role::Proto("next" | "str") => {
-                i.def_method(&proto, &js, d.min_pos as usize, m.entry);
+                let length = d
+                    .hint("js", "length")
+                    .and_then(|length| length.parse().ok())
+                    .unwrap_or(d.min_pos as usize);
+                i.def_method(&proto, &js, length, m.entry);
                 if webidl {
                     if let Some(property) = proto.borrow_mut().props.get_mut(&*js) {
                         property.set_enumerable(true);

@@ -1177,6 +1177,9 @@ impl Drop for ThreadPool {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod service_worker_tests;
+
 /// Starts a subprocess for `child_process`. The default is `command.spawn()`; an embedder that runs
 /// realms inside its own process supplies one that puts the child where it belongs (a job object
 /// or cgroup per realm) — the realm has no process of its own for descendants to inherit.

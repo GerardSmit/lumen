@@ -196,6 +196,33 @@ fn on_wake(ctx: &mut Ctx, receiver: &Value, link: &Rc<Link>, kind: Receiver) {
     }
 }
 
+/// Read a message that arrived with its attachments (the service-worker mailboxes carry whole
+/// `CloneMessage`s): the data or the `messageerror` reason, and the ports it brought.
+pub(crate) fn deserialize_message(
+    ctx: &mut Ctx,
+    message: clone_transfer::CloneMessage,
+) -> OpResult<(Result<Value, OpError>, Vec<Value>)> {
+    let bridge = web_bridge(ctx)?;
+    let bytes = clone_transfer::install_message(ctx, message);
+    ports::begin_received(ctx);
+    let data = structured_clone::deserialize(ctx, &bytes, &bridge);
+    Ok((data, ports::end_received(ctx)))
+}
+
+/// `postMessage(message, transfer)` into a [`CloneMessage`] a host queues itself: the same
+/// transfer-list handling and limits as a port.
+pub(crate) fn serialize_message(
+    ctx: &mut Ctx,
+    message: Value,
+    transfer: Value,
+) -> OpResult<clone_transfer::CloneMessage> {
+    let list = transfer_list(ctx, transfer)?;
+    let list = structured_clone::array_items(ctx, &list)?;
+    let bridge = web_bridge(ctx)?;
+    let bytes = structured_clone::serialize(ctx, &message, &list, true, &bridge)?;
+    Ok(clone_transfer::take_message(ctx, bytes))
+}
+
 fn deliver(ctx: &mut Ctx, receiver: &Value, bytes: Vec<u8>, kind: Receiver) {
     let event = (|| -> OpResult<Value> {
         let bridge = web_bridge(ctx)?;

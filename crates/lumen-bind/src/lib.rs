@@ -101,6 +101,9 @@
 //!   with a captured stack (`DOMException`);
 //! - `hint(js(missing_message = "..", missing_code = ".."))` on an op or member replaces the
 //!   `TypeError` a missing required argument throws with that message and `err.code`;
+//! - `hint(js(length = "N"))` on a method overrides the function `length` derived from the
+//!   signature, for a parameter that is required in Web IDL but must reach the body when absent
+//!   (`ServiceWorkerContainer.register` rejects its promise instead of throwing);
 //! - `hint(js(also_iterator))` on an instance method also installs the same function object
 //!   (non-enumerable) as `[Symbol.iterator]` (`URLSearchParams.prototype.entries`);
 //! - `hint(js(iterator))` on a class makes its prototype inherit `%IteratorPrototype%` and

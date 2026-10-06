@@ -835,6 +835,32 @@ pub fn server_request(
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> OpResult<Value> {
+    request_from_parts(
+        ctx,
+        method,
+        url,
+        headers,
+        body,
+        Mode::Cors,
+        Credentials::SameOrigin,
+        Redirect::Follow,
+    )
+}
+
+/// A `Request` built by the user agent from the parts of a request it intercepted (a service
+/// worker's `FetchEvent.request`): [`server_request`] with the request's own `mode`,
+/// `credentials` and `redirect`.
+#[allow(clippy::too_many_arguments)]
+pub fn request_from_parts(
+    ctx: &mut Ctx,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    mode: Mode,
+    credentials: Credentials,
+    redirect: Redirect,
+) -> OpResult<Value> {
     if !super::is_token(method) {
         return Err(OpError::type_error(format!("'{method}' is not a valid HTTP method.")));
     }
@@ -865,9 +891,9 @@ pub fn server_request(
             signal: RefCell::new(None),
             follow: RefCell::new(None),
             body: body.cell(),
-            mode: Mode::Cors,
-            credentials: Credentials::SameOrigin,
-            redirect: Redirect::Follow,
+            mode,
+            credentials,
+            redirect,
             extra: Extra::default(),
         },
     )

@@ -1,7 +1,8 @@
 # Plan: native workers
 
-Status: steps 1-4 implemented (owner loop, port limits, messaging extension, native receivers,
-native `Worker`/`SharedWorker` and worker global scopes in `lumen-runtime`); steps 5-8 are design. Goal: delete the last JavaScript worker glue and run one
+Status: steps 1-5 implemented (owner loop, port limits, messaging extension, native receivers,
+native `Worker`/`SharedWorker` and worker global scopes in `lumen-runtime`, native service-worker
+classes in `lumen-host`); steps 6-8 are design. Goal: delete the last JavaScript worker glue and run one
 native implementation of `Worker`, `SharedWorker`, the service-worker classes and the worker
 global scopes in both `lumen-runtime` and the Bitnest kernel.
 
@@ -186,11 +187,11 @@ pub fn settle(ctx: &mut Ctx, done: TaskCompletion) -> Option<Settled>; // TaskRe
 | Shared worker | `WorkerGlobalScope`, `SharedWorkerGlobalScope`, `WorkerLocation`, `onconnect` | same, `ScopeKind::Shared` |
 | Service worker | `WorkerGlobalScope`, `ServiceWorkerGlobalScope`, `ExtendableEvent`, `ExtendableMessageEvent`, `FetchEvent`, `Clients`, `Client`, `WindowClient`, `registration`, `clients`, `skipWaiting` | same, `ScopeKind::Service` |
 
-- `navigator.serviceWorker`: a getter on the native `Navigator` (`navigator.rs`), so
-  `DomNavigator` inherits it. It returns the realm's `[SameObject]` container (a `RealmServices`
-  entry created on first read) when the realm's backend has `service_workers()`, else
-  `undefined`. Behaviour change: `"serviceWorker" in navigator` is `true` in every realm (the JS
-  defined the property only where the kernel ops existed).
+- `navigator.serviceWorker`: an own accessor on the realm's navigator instance, defined by
+  `workers::install_service_workers(ctx, registry)` and only where the host installs a registry
+  (a secure-context window). It is not on `Navigator.prototype`, so `"serviceWorker" in navigator`
+  is `true` exactly in realms with a registry, as the JS did. The getter creates the realm's
+  `[SameObject]` container on first read (kept in a private slot on the navigator).
 - Container state is native: identity maps (`ServiceWorker` per worker id, registration per
   scope), `ready` deferreds, register/update deferreds keyed by `JobId`. The registry pushes
   events to the subscribed `Control`; there is no `registrations()` JSON diffing.
@@ -261,8 +262,8 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
    DedicatedWorkerGlobalScope.prototype`. Behaviour: transfer lists honoured on `Worker` and
    worker `postMessage`; a message posted before `terminate()` is dropped by the closed port
    (was filtered in JS).
-5. **Service-worker classes** (lumen). Files: `lumen-host/src/workers/{page,service_scope}.rs`,
-   `navigator.rs`, `net/fetch.rs` (`request_from_parts`). Tests in `lumen-host` with an
+5. **Service-worker classes** (lumen, done). Files: `lumen-host/src/workers/{registry,service,service_scope}.rs`,
+   `net/fetch.rs` (`request_from_parts`). Tests in `lumen-host` with an
    in-memory `ServiceWorkerRegistry` and owner loop: `register` settles on `JobSettled`, `ready`
    resolves on push without polling, `statechange`/`updatefound`/`controllerchange` order,
    `ServiceWorker` identity per worker, `FetchEvent.respondWith` produces status/headers/body,
@@ -309,7 +310,8 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
   ports use `Mutex`/`Condvar` through `lumen_os::channel`), but every port wake now crosses them.
 - **Shared-worker lifetime change.** Transferring a client's connection port into the worker no
   longer ends that client; the worker lives until every page end closes or is collected.
-- **`navigator.serviceWorker` exposure** changes feature detection (`in` is always true).
+- **`navigator.serviceWorker` exposure.** Resolved in step 5: the property is an own accessor
+  installed per realm only when a registry exists, so feature detection is unchanged.
 - **Submodule ordering.** Bitnest reads `lumen-web/src/js/*.js` at build time; the files are
   deleted only after Bitnest stops reading them (step 8), never in the same Lumen commit as an
   API Bitnest still needs.
@@ -451,3 +453,50 @@ Tests: `lumen-host/src/tests.rs` (mock backend: WebIDL shape, brand checks, `Sha
 trusted events, GC of an idle `Worker`) and `lumen-runtime/src/tests.rs` (dedicated transfer of an
 `ArrayBuffer` and a `MessagePort` both ways, scope prototype chain and globals, posting before
 `terminate()`). Existing worker tests were not changed.
+
+## Implementation notes for step 5
+
+Code: `lumen-host/src/workers/registry.rs` (data types, `ServiceWorkerRegistry`,
+`ServiceScopeHost`, `is_secure_context`), `service.rs` (page classes and
+`install_service_workers`), `service_scope.rs` (scope classes and event dispatch), wired into
+`scope.rs` for `ScopeKind::Service`. New `WorkerEvent` variants: `Registration`, `StateChange`,
+`UpdateFound`, `ControllerChange`, `JobSettled`, `ServiceMessage`, `Lifecycle`, `Fetch`,
+`ClientMessage`. `messaging::{serialize_message, deserialize_message}` and
+`net::request_from_parts` are new shared helpers. Tests: `lumen-host/src/service_worker_tests.rs`
+(in-memory registry and mock scope host; written, not yet run).
+
+Deviations from the plan text:
+
+- `navigator.serviceWorker` is not a `Navigator` getter (see section 4); `navigator.rs` is
+  unchanged.
+- Service-worker messages do not use `Receiver::Custom`: that hook carries no per-message source,
+  and `ExtendableMessageEvent.source` / the page's `MessageEvent.source` need one. Messages ride
+  the `Control` as `ServiceMessage` / `ClientMessage` events with a `CloneMessage`.
+- The classes live in `service.rs` / `service_scope.rs`, not `page.rs`. The container is a separate
+  module so service-worker realms expose `ServiceWorker` and `ServiceWorkerRegistration` but not
+  `ServiceWorkerContainer`.
+- Registration ids must be stable per scope (the page caches the wrapper by id); worker ids change
+  per version. The kernel today uses the worker id as registration id.
+- A listener that throws is reported through the scope's `report_error` and does not fail the
+  event; only a rejected `waitUntil` / `respondWith` does. The kernel failed the event on a throw.
+
+Performance: nothing is armed while idle (the container subscribes on first read, and its loop task
+is unref'd); pushes coalesce into one wake and drain in batches of 64 (scope: 32); no per-event
+JSON; wrappers are cached per registration, worker and client id in weak maps swept when they
+double; a wrapper with listeners pins itself only while it can still receive events (a redundant
+worker is released); `ready` is cached; state never moves backwards, so stale snapshots are
+harmless; classes are lazy globals.
+
+Step 7 kernel checklist:
+
+- Implement `ServiceWorkerRegistry` over `ServiceWorkerHost`: stable registration id per
+  (origin, scope); push `Registration` before the `UpdateFound` / `StateChange` it explains, plus
+  `ControllerChange`, `JobSettled`, `ServiceMessage`; enforce the 1 MiB / 128 message limits in
+  `post_to_worker` or `ports::set_limits`; keep the client id `"bitnest-window-client"`.
+- Implement `WorkerScopeHost` (`kind` = `Service`, `service()`) and `ServiceScopeHost` per worker
+  realm; push `Lifecycle`, `Fetch`, `ClientMessage` on the scope `Control`; consume `event_settled`
+  and `fetch_response` instead of polling `__bitnestServiceWorkerEventState`.
+- Install the owner loop, `ports`, `clone_transfer` and `messaging` extensions; call
+  `owner_loop::pump` / `has_ready`; call `workers::install_service_workers` after the DOM navigator
+  exists, for secure contexts only (`is_secure_context`).
+- Drop `__bitnestInstallFetch` and the byte-types glue.
