@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 ///
 /// Where the platform has a reactor the sleep is a [`Poller`] turn, so timers and I/O
 /// registrations share the one driver thread and a notify is a coalesced [`LoopWaker`] wake.
-/// Elsewhere (Windows until its backend lands) it is a condition variable.
+/// Where the poller cannot be created (wasm32) it is a condition variable.
 enum Idle {
     Poll { poller: Poller, waker: LoopWaker },
     Cond(CondIdle),

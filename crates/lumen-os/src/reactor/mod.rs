@@ -2,8 +2,8 @@
 //! [`Wake`] callback, driven by a [`Poller`] that one loop thread turns.
 //!
 //! Raw syscalls only, no crate: `epoll` on Linux and Android, `kqueue` on macOS, iOS and FreeBSD,
-//! `poll(2)` on other Unix. Windows and wasm32 have no backend yet; [`Poller::new`] reports
-//! `Unsupported` there. Registrations are one-shot: after a wake the source is disarmed until
+//! `poll(2)` on other Unix, an I/O completion port on Windows. wasm32 has no backend;
+//! [`Poller::new`] reports `Unsupported` there. Registrations are one-shot: after a wake the source is disarmed until
 //! [`Registration::rearm`], which the consumer calls once it has seen `WouldBlock`. A slot index
 //! plus a generation in every kernel token lets a late event for a dropped registration be
 //! recognised and ignored.
@@ -35,6 +35,8 @@ mod epoll;
     target_pointer_width = "64"
 ))]
 mod kqueue;
+#[cfg(windows)]
+mod iocp;
 mod hosted;
 
 pub use hosted::{HostHooks, HostedReactor};
@@ -416,6 +418,7 @@ impl Poller {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn dispatch_for_test(&self, token: u64, ready: Ready) -> bool {
         self.core.dispatch(token, ready)
     }
@@ -465,6 +468,8 @@ fn native_backend() -> Result<Box<dyn Backend>, SchedError> {
         ))
     ))]
     return Ok(Box::new(pollfd::PollBackend::new()?));
+    #[cfg(windows)]
+    return Ok(Box::new(iocp::IocpBackend::new()?));
     Err(SchedError::Unsupported("readiness reactor"))
 }
 

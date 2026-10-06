@@ -199,7 +199,7 @@ impl Scheduler for OsScheduler {
     }
 
     fn reactor(&self) -> Option<&dyn Reactor> {
-        cfg!(unix).then_some(self as &dyn Reactor)
+        cfg!(any(unix, windows)).then_some(self as &dyn Reactor)
     }
 }
 

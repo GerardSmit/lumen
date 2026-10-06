@@ -28,7 +28,7 @@ default:
   reactor `Poller`, and each pass runs `Poller::turn(next_deadline)` and then fires due jobs; with
   nothing queued it blocks with no timeout. Jobs and readiness wakes therefore run on the driver
   thread and must be short and must not block. `sched::Deadline` is the drop-to-cancel wrapper
-  over `after`. Where no `Poller` exists (Windows today) the driver waits on a condition variable
+  over `after`. Where no `Poller` can be created (wasm32) the driver waits on a condition variable
   instead and timers behave the same.
 
 ## `lumen_os::reactor`
@@ -41,9 +41,15 @@ Hand-rolled over raw syscalls: no crate, no mio.
 | `kqueue` | macOS, iOS, FreeBSD (64-bit) | `kevent` into a reused buffer | `EVFILT_USER` + `NOTE_TRIGGER` | `EV_ONESHOT` read and write filters, token in `udata` |
 | `pollfd` | other Unix | `poll(2)` over the armed set, rebuilt only when it changes | self-pipe | level-triggered, one-shot emulated |
 | `hosted` | embedders | none: the host delivers readiness | none | `Source::Host(u64)` through `HostHooks` |
-| Windows | not implemented | | | `Source::Socket` is declared; the IOCP backend is step L7 |
+| `iocp` | Windows | `GetQueuedCompletionStatusEx` on an I/O completion port | `PostQueuedCompletionStatus` with a reserved key | `Source::Socket(usize)`: `ProcessSocketNotifications` one-shot level-triggered registrations (Windows 10 build 20348+, resolved from `ws2_32` with `GetProcAddress` and probed once). Otherwise one `lumen-wsapoll` helper thread blocks in `WSAPoll` over the armed sockets and a loopback UDP wake socket and posts packets to the port. Only documented APIs. |
 
 wasm32 has no backend: `Poller::new()` returns `SchedError::Unsupported`.
+
+Windows notes: the completion key of each registration is a fresh counter value, never reused, so late
+packets of a dropped registration are ignored. Timeouts have the usual ~15.6 ms granularity. The `WSAPoll`
+fallback inherits `WSAPoll`'s old-Windows gap (failed non-blocking connects are not reported), so connect
+should stay a blocking offload there. `poll::poll` is also implemented on Windows with `WSAPoll`; `select`
+is still `ENOSYS` there.
 
 Concepts:
 
@@ -67,6 +73,7 @@ Concepts:
 
 Compile-checked for macOS (`aarch64-apple-darwin`), wasm32, Linux and Windows (`x86_64`). The reactor
 and driver tests are written for the kqueue and `poll` backends (macOS host) and epoll (Linux host);
-they were compiled but not run when this was added, and nothing here has been run on Windows. No other Lumen crate registers with the
+they were compiled but not run when this was added, and the Windows backend (`iocp`, both the `ProcessSocketNotifications` path and the forced `WSAPoll` fallback) and
+its tests are compiled for `x86_64-pc-windows-msvc` but have not been run on Windows. No other Lumen crate registers with the
 reactor yet: sockets, child pipes, the `lumen-runtime` loop and the web server still use their own
 threads and blocking calls.
