@@ -648,6 +648,9 @@ impl Effect {
                             if name == "style" && matches!(value, Value::Obj(_)) {
                                 let element = realm.wrap(ctx, *node);
                                 super::jsx::apply_style(ctx, &element, &value)?;
+                            } else if name == "value"
+                                && write_form_value(ctx, realm, *node, &value)?
+                            {
                             } else if matches!(
                                 value,
                                 Value::Null | Value::Undefined | Value::Bool(false)
@@ -691,6 +694,32 @@ impl Effect {
             }
         }
     }
+}
+
+/// A form control's `value` binding drives the live IDL value: once the user has edited a
+/// control, its content attribute no longer affects what it shows.
+fn write_form_value(
+    ctx: &mut Ctx,
+    realm: &Rc<DomRealm>,
+    node: NodeId,
+    value: &Value,
+) -> OpResult<bool> {
+    let element = realm.wrap(ctx, node);
+    let local_name = ctx
+        .get_member(&element, "localName")
+        .ok()
+        .and_then(|name| ctx.coerce_string(&name).ok());
+    if !matches!(local_name.as_deref(), Some("input" | "textarea" | "select")) {
+        return Ok(false);
+    }
+    let next = if matches!(value, Value::Null | Value::Undefined) {
+        Value::str("")
+    } else {
+        Value::str(ctx.coerce_string(value).map_err(OpError::thrown)?)
+    };
+    ctx.set_member(&element, "value", next)
+        .map_err(|_| OpError::new("TypeError", "form control value write failed"))?;
+    Ok(true)
 }
 
 fn catch_at_boundary(

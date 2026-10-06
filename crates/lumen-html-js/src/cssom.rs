@@ -4601,9 +4601,17 @@ impl DomCssRuleList {
         }
         let mut path = self.rule_path.clone();
         path.push(position.clone());
+        let source = if self.rule_path.is_empty() {
+            SheetSource::Rule {
+                source: Rc::new(self.source.clone()),
+                position: position.clone(),
+            }
+        } else {
+            self.source.clone()
+        };
         let base = DomCssRule {
             realm: self.realm.clone(),
-            source: self.source.clone(),
+            source,
             index: position.clone(),
             path,
             keyframe_index: None,

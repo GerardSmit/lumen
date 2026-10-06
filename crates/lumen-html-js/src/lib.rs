@@ -133,12 +133,14 @@ pub fn pump_webrtc(ctx: &mut Ctx) -> lumen::embed::OpResult<()> {
 /// worker realm. Window installation uses the same implementation through
 /// the full CSSOM installer.
 pub fn install_css_typed_om(ctx: &mut Ctx) -> OpResult<()> {
+    ctx.set_none_is_null(true);
     cssom::install_typed_numeric(ctx)
 }
 
 /// Install the OffscreenCanvas interfaces and worker-safe canvas helpers in a
 /// browser worker realm without exposing Window's CanvasRenderingContext2D.
 pub fn install_worker_canvas(ctx: &mut Ctx) -> OpResult<()> {
+    ctx.set_none_is_null(true);
     canvas::install_worker(ctx)
 }
 
@@ -11057,6 +11059,7 @@ pub fn install(
     max_nodes: usize,
 ) -> Result<Rc<DomRealm>, InstallError> {
     let _html_allocations = enter_html_allocation_category();
+    ctx.set_none_is_null(true);
     let controller = dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?;
     let document = html::parse_with_options_initialized(
         source,
@@ -11190,6 +11193,7 @@ fn install_document_with_context_metadata(
     publish_global_this: bool,
     prepared_details: Option<Rc<dialog_popover::DetailsController>>,
 ) -> Result<Rc<DomRealm>, InstallError> {
+    ctx.set_none_is_null(true);
     let controller = match prepared_details {
         Some(controller) => controller,
         None => dialog_popover::DetailsController::prepare(ctx).map_err(|_| InstallError::Global)?,

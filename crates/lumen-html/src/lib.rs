@@ -1750,6 +1750,11 @@ impl Document {
     }
 
     fn insert_detached_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) {
+        // Parser insertions into a live document do not advance `version`, so the id index
+        // cannot be trusted across them.
+        let index = self.id_index.get_mut();
+        index.built_version = None;
+        index.walked_version = None;
         let previous = before.map_or(self.nodes[parent.index as usize].last_child, |id| {
             self.nodes[id.index()].prev_sibling
         });

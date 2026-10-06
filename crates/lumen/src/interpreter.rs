@@ -955,6 +955,9 @@ pub struct Interp {
     pub(crate) tier: crate::bytecode::Tier,
     /// Calls before an eligible function tier-ups to bytecode (env `LUMEN_TIER_THRESHOLD`).
     pub(crate) tier_threshold: u32,
+    /// Set by DOM embedders: a bound native's `Option::None` result is `null` (WebIDL nullable)
+    /// instead of `undefined`.
+    pub(crate) none_is_null: bool,
     /// Recycled (slots, operand stack) buffers for bytecode-VM activations, so a hot call tree
     /// doesn't allocate two `Vec`s per call (see `bytecode::run`).
     pub(crate) vm_pool: Vec<(Vec<Value>, Vec<Value>)>,
@@ -2032,6 +2035,7 @@ impl Interp {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(if cfg!(target_arch = "wasm32") { 0 } else { 8 }),
+            none_is_null: false,
             vm_pool: Vec::new(),
             vm_frame_pool: Vec::new(),
             vm_frame_one: Vec::new(),
@@ -3141,6 +3145,12 @@ impl Interp {
     /// Conversions can throw: they may run user `valueOf`/`toString`.
     pub fn coerce_number(&mut self, v: &Value) -> Result<f64, Value> {
         self.to_number(v).map_err(abrupt_value)
+    }
+
+    /// Makes a bound native's `Option::None` result `null` rather than `undefined`, as DOM
+    /// attributes and methods with nullable types require.
+    pub fn set_none_is_null(&mut self, on: bool) {
+        self.none_is_null = on;
     }
 
     /// ToString with the abrupt completion lowered to the thrown value (see [`invoke`]).

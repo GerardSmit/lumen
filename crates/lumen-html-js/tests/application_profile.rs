@@ -394,7 +394,7 @@ fn run_profile_inner(
 
     eval(
         &mut runtime,
-        "document.getElementById('toggle-3').setAttribute('checked',''); document.getElementById('toggle-3').dispatchEvent(new Event('click',{bubbles:true})); document.getElementById('toggle-3').dispatchEvent(new Event('change',{bubbles:true}));",
+        "document.getElementById('toggle-3').checked=true; document.getElementById('toggle-3').dispatchEvent(new Event('click',{bubbles:true})); document.getElementById('toggle-3').dispatchEvent(new Event('change',{bubbles:true}));",
     );
     runtime.run_until_idle();
     assert_js_true(
