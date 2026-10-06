@@ -55,7 +55,10 @@ fn checked_input(input: &str) -> Result<&str, ParseError> {
         return Err(error(0, "XML input too large"));
     }
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
-    match input.char_indices().find(|(_, ch)| !shared::is_xml_char(*ch)) {
+    match input
+        .char_indices()
+        .find(|(_, ch)| !shared::is_xml_char(*ch))
+    {
         Some((offset, _)) => Err(error(offset, "invalid XML character")),
         None => Ok(input),
     }
@@ -102,7 +105,11 @@ pub fn parse_fragment_in(
     wrapped.push('<');
     wrapped.push_str(FRAGMENT_ROOT);
     for (prefix, uri) in namespaces.iter().skip(2) {
-        wrapped.push_str(if prefix.is_empty() { " xmlns" } else { " xmlns:" });
+        wrapped.push_str(if prefix.is_empty() {
+            " xmlns"
+        } else {
+            " xmlns:"
+        });
         wrapped.push_str(prefix);
         wrapped.push_str("=\"");
         escape_attribute_value(&mut wrapped, uri);
@@ -174,7 +181,6 @@ fn escape_attribute_value(out: &mut String, value: &str) {
     }
 }
 
-
 fn fragment_context(
     document: &Document,
     context: NodeId,
@@ -241,14 +247,16 @@ fn fragment_context(
                 } else {
                     continue;
                 };
-                bind_namespace(&mut namespaces, prefix, value).map_err(|message| error(0, message))?;
+                bind_namespace(&mut namespaces, prefix, value)
+                    .map_err(|message| error(0, message))?;
             }
             if id == context {
                 let (prefix, _) = split_qname(name.as_str())
                     .ok_or_else(|| error(0, "invalid context qualified name"))?;
                 if namespace_for(&namespaces, prefix).is_none() {
                     let uri = namespace_uri(namespace);
-                    bind_namespace(&mut namespaces, prefix, uri).map_err(|message| error(0, message))?;
+                    bind_namespace(&mut namespaces, prefix, uri)
+                        .map_err(|message| error(0, message))?;
                 }
             }
         }
@@ -282,10 +290,15 @@ fn namespace_uri(namespace: &Namespace) -> &str {
     }
 }
 
+struct Open {
+    content: NodeId,
+    mark: usize,
+}
+
 struct Builder {
     shared: Rc<Shared>,
     document: Document,
-    open: Vec<(NodeId, usize)>,
+    open: Vec<Open>,
     bindings: Vec<(String, String)>,
     text: String,
     doctype_name: Option<String>,
@@ -319,7 +332,7 @@ impl Builder {
     fn parent(&self) -> NodeId {
         self.open
             .last()
-            .map_or(self.document.root(), |(node, _)| *node)
+            .map_or(self.document.root(), |open| open.content)
     }
 
     fn add(&mut self, kind: NodeKind, placement: &'static str) -> Result<NodeId, &'static str> {
@@ -419,13 +432,27 @@ impl Builder {
                 .map(|attr| (Name::new(&attr.name), attr.value.clone()))
                 .collect(),
         };
-        let id = self.add(kind, "invalid element placement")?;
+        let id = self.document.create(kind).map_err(|e| match e {
+            DomError::LimitExceeded => "XML node limit exceeded",
+            _ => "invalid XML node",
+        })?;
         for (qualified_name, uri) in namespace_metadata {
             self.document
                 .set_attribute_namespace_metadata(id, qualified_name, uri.as_deref())
                 .map_err(|_| "invalid attribute namespace metadata")?;
         }
-        self.open.push((id, mark));
+        let parent = self.parent();
+        self.document
+            .append(parent, id)
+            .map_err(|_| "invalid element placement")?;
+        // HTML templates keep their children in a detached content fragment, even
+        // when the qualified name carries a namespace prefix.
+        let content = self
+            .document
+            .template_content(id)
+            .map_err(|_| "invalid template contents")?
+            .unwrap_or(id);
+        self.open.push(Open { content, mark });
         Ok(())
     }
 }
@@ -463,8 +490,8 @@ impl Handler for Builder {
 
     fn end_element(&mut self, _name: &str) -> Flow {
         let result = self.flush_text();
-        if let Some((_, mark)) = self.open.pop() {
-            self.bindings.truncate(mark);
+        if let Some(open) = self.open.pop() {
+            self.bindings.truncate(open.mark);
         }
         self.flow(result)
     }
@@ -638,7 +665,6 @@ enum SerializeEvent {
         scope_start: usize,
     },
 }
-
 
 /// Serialize a node using XML fragment serialization and namespace fixup.
 ///
@@ -1447,12 +1473,29 @@ mod tests {
         let root = root_element(&document);
         let first = document.first_child(root).unwrap().unwrap();
         let second = document.next_sibling(first).unwrap().unwrap();
-        assert!(matches!(document.kind(first).unwrap(), NodeKind::Element { namespace: Namespace::Html, name, .. } if crate::svg::local_name(name) == "details"));
-        assert_eq!(*events.borrow(), vec![
-            crate::details::DetailsTransition { node: first, old_open: false, new_open: true },
-            crate::details::DetailsTransition { node: second, old_open: false, new_open: true },
-            crate::details::DetailsTransition { node: second, old_open: true, new_open: false },
-        ]);
+        assert!(
+            matches!(document.kind(first).unwrap(), NodeKind::Element { namespace: Namespace::Html, name, .. } if crate::svg::local_name(name) == "details")
+        );
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                crate::details::DetailsTransition {
+                    node: first,
+                    old_open: false,
+                    new_open: true
+                },
+                crate::details::DetailsTransition {
+                    node: second,
+                    old_open: false,
+                    new_open: true
+                },
+                crate::details::DetailsTransition {
+                    node: second,
+                    old_open: true,
+                    new_open: false
+                },
+            ]
+        );
         assert_eq!(document.details_open_state(second), Some(false));
     }
 
@@ -1467,7 +1510,9 @@ mod tests {
         }
         for (input, max_nodes) in [("<root><child></root>", 32), ("<root><child/></root>", 1)] {
             let mut calls = 0;
-            let actual = parse_initialized(input, max_nodes, |_| calls += 1).err().unwrap();
+            let actual = parse_initialized(input, max_nodes, |_| calls += 1)
+                .err()
+                .unwrap();
             assert_eq!(calls, 1);
             assert_eq!(actual, parse(input, max_nodes).err().unwrap());
         }
@@ -1481,11 +1526,16 @@ mod tests {
         ).unwrap();
         let root = root_element(&document);
         let template = document.first_child(root).unwrap().unwrap();
-        let content = document.template_content(template).unwrap().expect("prefixed HTML template content");
+        let content = document
+            .template_content(template)
+            .unwrap()
+            .expect("prefixed HTML template content");
         assert_eq!(document.parent(content).unwrap(), None);
         assert_eq!(document.first_child(template).unwrap(), None);
         let g = document.first_child(content).unwrap().unwrap();
-        assert!(matches!(document.kind(g).unwrap(), NodeKind::Element { namespace: Namespace::Other(uri), name, .. } if uri.is_empty() && name == "g"));
+        assert!(
+            matches!(document.kind(g).unwrap(), NodeKind::Element { namespace: Namespace::Other(uri), name, .. } if uri.is_empty() && name == "g")
+        );
         let nested_template = document.next_sibling(g).unwrap().unwrap();
         let nested_content = document.template_content(nested_template).unwrap().unwrap();
         assert_eq!(document.first_child(nested_template).unwrap(), None);
@@ -1493,16 +1543,36 @@ mod tests {
         let text = document.next_sibling(nested_template).unwrap().unwrap();
         assert!(matches!(document.kind(text).unwrap(), NodeKind::Text(value) if value == "text"));
         let comment = document.next_sibling(text).unwrap().unwrap();
-        assert!(matches!(document.kind(comment).unwrap(), NodeKind::Comment(value) if value == "note"));
+        assert!(
+            matches!(document.kind(comment).unwrap(), NodeKind::Comment(value) if value == "note")
+        );
         let cdata = document.next_sibling(comment).unwrap().unwrap();
         assert!(matches!(document.kind(cdata).unwrap(), NodeKind::CData(value) if value == "data"));
         let sibling = document.next_sibling(template).unwrap().unwrap();
-        assert!(matches!(document.kind(sibling).unwrap(), NodeKind::Element { namespace: Namespace::Other(uri), .. } if uri.as_ref() == "urn:default"));
+        assert!(
+            matches!(document.kind(sibling).unwrap(), NodeKind::Element { namespace: Namespace::Other(uri), .. } if uri.as_ref() == "urn:default")
+        );
         let clone = document.clone_subtree(template).unwrap();
-        assert!(document.first_child(document.template_content(clone).unwrap().unwrap()).unwrap().is_some());
-        let fragment = parse_fragment_in(&mut document, root, "<h:template xmlns=''><g/></h:template><sibling/>").unwrap();
+        assert!(document
+            .first_child(document.template_content(clone).unwrap().unwrap())
+            .unwrap()
+            .is_some());
+        let fragment = parse_fragment_in(
+            &mut document,
+            root,
+            "<h:template xmlns=''><g/></h:template><sibling/>",
+        )
+        .unwrap();
         let fragment_template = document.first_child(fragment).unwrap().unwrap();
-        assert!(document.first_child(document.template_content(fragment_template).unwrap().unwrap()).unwrap().is_some());
+        assert!(document
+            .first_child(
+                document
+                    .template_content(fragment_template)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+            .is_some());
         assert_eq!(document.first_child(fragment_template).unwrap(), None);
     }
 
@@ -1511,12 +1581,18 @@ mod tests {
         for (markup, is_template) in [
             ("<h:template xmlns:h='http://www.w3.org/1999/xhtml'/>", true),
             ("<template xmlns='http://www.w3.org/1999/xhtml'/>", true),
-            ("<h:Template xmlns:h='http://www.w3.org/1999/xhtml'/>", false),
+            (
+                "<h:Template xmlns:h='http://www.w3.org/1999/xhtml'/>",
+                false,
+            ),
             ("<h:template xmlns:h='urn:foreign'/>", false),
         ] {
             let document = parse(markup, 3).unwrap();
             let root = root_element(&document);
-            assert_eq!(document.template_content(root).unwrap().is_some(), is_template);
+            assert_eq!(
+                document.template_content(root).unwrap().is_some(),
+                is_template
+            );
             assert_eq!(document.node_count(), if is_template { 3 } else { 2 });
             assert_eq!(parse(markup, 2).is_err(), is_template);
         }
@@ -1826,14 +1902,23 @@ mod tests {
         let trailing = document.next_sibling(bold).unwrap().unwrap();
         assert_eq!(
             document.kind(trailing).unwrap(),
-            &NodeKind::Text("tail<i/><i/>&lt;Z".into())
+            &NodeKind::Text("tail<i/>".into())
         );
+        // A character reference in an entity value is expanded when the entity is declared, so
+        // the replacement text `<i/>` is markup and `&lt;` is a reference to the less-than sign.
+        let numeric = document.next_sibling(trailing).unwrap().unwrap();
+        assert!(matches!(
+            document.kind(numeric),
+            Ok(NodeKind::Element { name, .. }) if name == "i"
+        ));
+        let last = document.next_sibling(numeric).unwrap().unwrap();
+        assert_eq!(document.kind(last).unwrap(), &NodeKind::Text("<Z".into()));
 
         // Entity declarations are parser input only; the DOM doctype writer
         // serializes the identifiers and name without copying the subset.
         assert_eq!(
             serialize_xml(&document, document.root(), false).unwrap(),
-            "<!DOCTYPE foo><foo title=\"hello world\">Ahello world:<b title=\"hello world\">hello world</b>tail&lt;i/&gt;&lt;i/&gt;&amp;lt;Z</foo>"
+            "<!DOCTYPE foo><foo title=\"hello world\">Ahello world:<b title=\"hello world\">hello world</b>tail&lt;i/&gt;<i/>&lt;Z</foo>"
         );
     }
 

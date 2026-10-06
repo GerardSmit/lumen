@@ -1167,7 +1167,7 @@ mod tests {
         super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
         assert!(eval_bool(
             &mut engine,
-            "const parsed=new DOMParser().parseFromString('<root><item></root>','application/xml'); parsed.documentElement.localName==='parsererror' && parsed.documentElement.textContent.includes('mismatched end tag') && parsed.querySelector('root')===null"
+            "const parsed=new DOMParser().parseFromString('<root><item></root>','application/xml'); parsed.documentElement.localName==='parsererror' && parsed.documentElement.textContent.includes('mismatched tag') && parsed.querySelector('root')===null"
         ));
     }
 
