@@ -550,6 +550,9 @@ impl Backend for OpenSsl {
     }
 
     fn prime_generate(&self, bits: u32, safe: bool, add: Option<&[u8]>, rem: Option<&[u8]>) -> Result<Vec<u8>> {
+        if let Some(add) = add {
+            crate::prime_args::validate(safe, add, rem)?;
+        }
         self.clear_errors();
         unsafe {
             let prime = self.handle((self.api.BN_new)(), self.api.BN_free, "BN_new failed")?;
