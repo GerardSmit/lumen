@@ -284,6 +284,8 @@ pub struct Runtime {
     /// Set once an exception or rejection went unhandled: Node's fatal path. The loop stops,
     /// `finish_process` emits `'exit'` with this code (no `'beforeExit'`) and returns it.
     fatal_exit: Option<i32>,
+    /// The first error that made the process fatal, as `(name, message)`; `eval` returns it.
+    fatal_error: Option<(String, String)>,
     #[cfg(feature = "aot-native")]
     native_builtins_installed: bool,
     /// When the loop last collected because it was about to block, and the heap-object count it
@@ -701,6 +703,7 @@ impl Runtime {
             browser_rejections: lumen_html_js::BrowserRejectionPolicy::default(),
             worker_rejection_tasks: Rc::new(RefCell::new(VecDeque::new())),
             fatal_exit: None,
+            fatal_error: None,
             #[cfg(feature = "aot-native")]
             native_builtins_installed: false,
             idle_gc: (Instant::now(), 0),
@@ -1303,7 +1306,7 @@ impl Runtime {
 
     fn worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
         loop {
-            if stop.load(Ordering::SeqCst) || self.interrupted() {
+            if stop.load(Ordering::SeqCst) || self.halted() {
                 return;
             }
             self.checkpoint();
@@ -1391,7 +1394,12 @@ impl Runtime {
         let _mem = lumen::memstats::enter(lumen::memstats::Cat::Runtime);
         let result = self.engine.eval(src, false);
         self.run_to_completion();
-        result
+        match (result, self.fatal_error.take()) {
+            (Ok(Completion::Value(_)), Some((name, message))) => {
+                Ok(Completion::Throw { name, message })
+            }
+            (result, _) => result,
+        }
     }
 
     /// Spawn blocking work on the pool; when it finishes, `decode` turns its payload into
@@ -2132,7 +2140,24 @@ impl Runtime {
         }
         let error = thrown.as_ref().unwrap_or(error);
         self.print_fatal(error, prefix);
+        if self.fatal_exit.is_none() {
+            self.fatal_error = Some(self.error_parts(error));
+        }
         self.fatal_exit.get_or_insert(code);
+    }
+
+    fn error_parts(&mut self, error: &Value) -> (String, String) {
+        let ctx = self.engine.ctx();
+        if error.as_obj().is_some() {
+            let mut member = |key: &str| match ctx.get_member(error, key) {
+                Ok(Value::Undefined) | Err(_) => None,
+                Ok(v) => Some(console::render_value(ctx, &v)),
+            };
+            if let Some(name) = member("name") {
+                return (name, member("message").unwrap_or_default());
+            }
+        }
+        (String::new(), console::render_value(ctx, error))
     }
 
     fn print_fatal(&mut self, error: &Value, prefix: &str) {

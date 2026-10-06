@@ -581,14 +581,19 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
     // Node: an exception nobody catches ends the process with code 1 — later timers never run,
     // 'exit' fires (no 'beforeExit'), and the error is printed.
     let (mut rt, out, err) = test_runtime();
-    eval_ok(
-        &mut rt,
-        r#"
+    let completion = rt
+        .eval(
+            r#"
         process.on("beforeExit", () => console.log("beforeExit must not run"));
         process.on("exit", (code) => console.log("exit", code));
         setTimeout(() => { throw new TypeError("boom") }, 5);
         setTimeout(() => console.log("must not run"), 10);
         "#,
+        )
+        .expect("parses");
+    assert!(
+        matches!(&completion, Completion::Throw { name, message } if name == "TypeError" && message == "boom"),
+        "{}", show(&completion)
     );
     assert_eq!(rt.fatal_exit_code(), Some(1));
     assert_eq!(rt.finish_process(), 1);
@@ -629,6 +634,63 @@ fn uncaught_callback_error_is_fatal_unless_a_listener_owns_it() {
         ]
     );
     assert_eq!(err.lines(), Vec::<String>::new());
+}
+
+fn show(completion: &Completion) -> String {
+    match completion {
+        Completion::Value(_) => "value".into(),
+        Completion::Throw { name, message } => format!("throw {name}: {message}"),
+    }
+}
+
+fn eval_throw(src: &str) -> (Completion, Vec<String>) {
+    let (mut rt, out, _) = test_runtime();
+    let completion = rt.eval(src).expect("parses");
+    (completion, out.lines())
+}
+
+#[test]
+fn uncaught_errors_in_loop_callbacks_surface_from_eval() {
+    for (label, src) in [
+        ("timer", r#"setTimeout(() => { throw new RangeError("late") }, 1)"#),
+        ("immediate", r#"setImmediate(() => { throw new RangeError("late") })"#),
+        ("tick", r#"process.nextTick(() => { throw new RangeError("late") })"#),
+        ("microtask", r#"queueMicrotask(() => { throw new RangeError("late") })"#),
+        (
+            "emitter",
+            r#"const e = new (require("events"))();
+               e.on("x", () => { throw new RangeError("late") });
+               setTimeout(() => e.emit("x"), 1)"#,
+        ),
+        (
+            "completion",
+            r#"require("fs").stat(".", () => { throw new RangeError("late") })"#,
+        ),
+        (
+            "rejection",
+            r#"Promise.reject(new RangeError("late"))"#,
+        ),
+    ] {
+        let (completion, out) = eval_throw(&format!(
+            "{src}; setTimeout(() => console.log('after'), 50);"
+        ));
+        assert!(
+            matches!(&completion, Completion::Throw { name, message } if name == "RangeError" && message == "late"),
+            "{label}: {}", show(&completion)
+        );
+        assert!(!out.contains(&"after".to_string()), "{label}: loop kept running");
+    }
+}
+
+#[test]
+fn uncaught_exception_listener_keeps_eval_value_and_loop_running() {
+    let (completion, out) = eval_throw(
+        r#"process.on("uncaughtException", (e) => console.log("caught", e.message));
+           setTimeout(() => { throw new RangeError("late") }, 1);
+           setTimeout(() => console.log("after"), 20);"#,
+    );
+    assert!(matches!(completion, Completion::Value(_)), "{}", show(&completion));
+    assert_eq!(out, ["caught late", "after"]);
 }
 
 #[test]

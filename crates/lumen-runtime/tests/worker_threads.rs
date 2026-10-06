@@ -1340,3 +1340,77 @@ fn worker_ipc_properties_throw_only_when_the_parent_has_an_ipc_channel() {
     assert!(lines[0].starts_with("ipc ERR_WORKER_UNSUPPORTED_OPERATION,ERR_WORKER_UNSUPPORTED_OPERATION,stub,stub"));
     assert_eq!(lines[1], "plain undefined,undefined,undefined,undefined");
 }
+
+fn run_worker_error_case(worker_source: &str) -> Vec<String> {
+    let mut runtime = Runtime::new();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(Captured::default()),
+    });
+    let source = format!(
+        r#"
+        const {{ Worker }} = require("node:worker_threads");
+        const worker = new Worker({worker_source:?}, {{ eval: true }});
+        worker.on("error", (error) => console.log("error", error.name, error.message));
+        worker.on("exit", (code) => console.log("exit", code));
+        "#
+    );
+    match runtime.eval(&source).expect("source parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    out.lines()
+}
+
+#[test]
+fn node_worker_callback_throw_reaches_the_parent_as_an_error_event() {
+    let lines = run_worker_error_case(
+        r#"setTimeout(() => { throw new RangeError("worker-boom") }, 1); setTimeout(() => {}, 5000);"#,
+    );
+    assert_eq!(lines, ["error RangeError worker-boom", "exit 1"]);
+}
+
+#[test]
+fn node_worker_uncaught_exception_listener_keeps_the_worker_alive() {
+    let lines = run_worker_error_case(
+        r#"process.on("uncaughtException", (e) => console.log("worker caught", e.message));
+           setTimeout(() => { throw new RangeError("worker-boom") }, 1);
+           setTimeout(() => console.log("worker alive"), 20);"#,
+    );
+    assert_eq!(lines, ["worker caught worker-boom", "worker alive", "exit 0"]);
+}
+
+#[test]
+fn web_worker_callback_throw_reaches_the_parent_and_the_worker_keeps_running() {
+    let entry = std::env::temp_dir().join(format!("lumen-web-worker-throw-{}.js", std::process::id()));
+    std::fs::write(
+        &entry,
+        "setTimeout(() => { throw new RangeError('web-boom') }, 1);\n\
+         setTimeout(() => postMessage('still running'), 30);\n",
+    )
+    .expect("write worker entry");
+    let mut runtime = Runtime::new_browser();
+    let out = Captured::default();
+    runtime.engine().ctx().op_state().put(ConsoleOut {
+        out: Box::new(out.clone()),
+        err: Box::new(Captured::default()),
+    });
+    let source = format!(
+        r#"
+        const worker = new Worker({:?});
+        worker.onerror = (event) => {{ event.preventDefault(); console.log("error", event.message); }};
+        worker.onmessage = ({{ data }}) => {{ console.log(data); worker.terminate(); }};
+        "#,
+        entry.to_string_lossy()
+    );
+    match runtime.eval(&source).expect("source parses") {
+        Completion::Value(_) => {}
+        Completion::Throw { name, message } => panic!("uncaught {name}: {message}"),
+    }
+    let _ = std::fs::remove_file(&entry);
+    let lines = out.lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("error ") && lines[0].contains("web-boom"), "{lines:?}");
+    assert_eq!(lines[1], "still running");
+}

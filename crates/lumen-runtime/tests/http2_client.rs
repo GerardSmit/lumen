@@ -24,6 +24,10 @@ impl Write for Captured {
 
 #[test]
 fn client_multiplexes_requests_against_node_server() {
+    support::on_engine_stack(client_multiplexes_requests_against_node_server_body);
+}
+
+fn client_multiplexes_requests_against_node_server_body() {
     if Command::new("node").arg("--version").output().is_err() {
         return;
     }

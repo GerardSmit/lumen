@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 
+mod support;
+
 use lumen_runtime::{ConsoleOut, RealmExit, Runtime};
 
 #[derive(Clone, Default)]
@@ -18,6 +20,10 @@ impl Write for Captured {
 
 #[test]
 fn request_bodies_may_be_streams_that_produce_data_later() {
+    support::on_engine_stack(request_bodies_may_be_streams_that_produce_data_later_body);
+}
+
+fn request_bodies_may_be_streams_that_produce_data_later_body() {
     let mut runtime = Runtime::new();
     let out = Captured::default();
     let err = Captured::default();
