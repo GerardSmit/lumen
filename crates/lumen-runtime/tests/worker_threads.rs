@@ -673,6 +673,8 @@ fn shared_worker_http_redirect_loads_module_dependencies_from_final_url() {
                     Err(error) => panic!("accept HTTP module request: {error}"),
                 }
             };
+            stream.set_nonblocking(false).expect("set module request blocking mode");
+            stream.set_read_timeout(Some(Duration::from_secs(3))).expect("set module request timeout");
             let mut request = Vec::new();
             let mut chunk = [0; 1024];
             loop {

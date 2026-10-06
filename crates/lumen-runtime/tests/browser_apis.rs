@@ -132,7 +132,7 @@ fn payload_server(delay: Duration, mime: &str, body: Vec<u8>) -> (String, thread
         stream.read_exact(&mut request_body).unwrap();
         received.extend(request_body);
         thread::sleep(delay);
-        let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Test: yes\r\nSet-Cookie: secret=1\r\nConnection: close\r\n\r\n", body.len());
+        let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nX-Test: yes\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Test\r\nSet-Cookie: secret=1\r\nConnection: close\r\n\r\n", body.len());
         let _ = stream.write_all(headers.as_bytes());
         let _ = stream.write_all(&body);
         String::from_utf8(received).unwrap()
@@ -417,14 +417,14 @@ fn fetch_prepares_async_request_body_and_cancels_pending_source() {
     evaluate(&mut runtime, &format!(r#"
         var uploadResult='pending';
         var upload=new ReadableStream({{start(c){{c.enqueue(new Uint8Array([65]));setTimeout(()=>{{c.enqueue(new Uint8Array([66]));c.close()}},5)}}}});
-        fetch('{url}',{{method:'POST',body:upload}}).then(r=>r.json()).then(value=>uploadResult=value.answer);
+        fetch('{url}',{{method:'POST',body:upload,duplex:'half'}}).then(r=>r.json()).then(value=>uploadResult=value.answer);
     "#));
     assert_script(&mut runtime, "uploadResult===42 && !upload.locked");
     assert!(task.join().unwrap().ends_with("\r\n\r\nAB"));
     evaluate(&mut runtime, r#"
         var pendingController=new AbortController(),cancelledSource=false,abortResult='pending';
         var pendingSource=new ReadableStream({cancel(reason){cancelledSource=reason.name==='AbortError'}});
-        fetch('http://127.0.0.1:1/',{method:'POST',body:pendingSource,signal:pendingController.signal}).catch(error=>abortResult=error.name);
+        fetch('http://127.0.0.1:1/',{method:'POST',body:pendingSource,duplex:'half',signal:pendingController.signal}).catch(error=>abortResult=error.name);
         setTimeout(()=>pendingController.abort(),5);
     "#);
     assert_script(&mut runtime, "abortResult==='AbortError' && cancelledSource && !pendingSource.locked");
