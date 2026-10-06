@@ -4,11 +4,12 @@
 //! adapter can expose them from the element classes without maintaining a
 //! second control tree.
 use crate::{Document, Error, Name, Namespace, NodeId, NodeKind};
+#[cfg(test)]
+use alloc::vec;
 use alloc::{
     borrow::ToOwned,
     string::{String, ToString},
     sync::Arc,
-    vec,
     vec::Vec,
 };
 
@@ -995,22 +996,6 @@ fn text_content(document: &Document, root: NodeId) -> String {
         let _ = document.append_descendant_text(root, &mut text);
     }
     text
-}
-
-fn descendants(document: &Document, root: NodeId) -> Vec<NodeId> {
-    let mut result = Vec::new();
-    let mut pending = vec![root];
-    while let Some(node) = pending.pop() {
-        result.push(node);
-        let mut children = Vec::new();
-        let mut current = document.first_child(node).ok().flatten();
-        while let Some(child) = current {
-            children.push(child);
-            current = document.next_sibling(child).ok().flatten();
-        }
-        pending.extend(children.into_iter().rev());
-    }
-    result
 }
 
 /// The input states whose `value` IDL property is backed by a separate live
@@ -2224,6 +2209,7 @@ pub fn placeholder_shown(
     value_empty
 }
 
+#[cfg(test)]
 fn selected_option_ids(document: &Document, select: NodeId) -> Vec<NodeId> {
     selected_option_ids_with(document, select, &[])
 }
@@ -2947,7 +2933,6 @@ struct InputStepSettings {
     minimum: Option<f64>,
     maximum: Option<f64>,
     step: Option<f64>,
-    step_is_any: bool,
     base: f64,
 }
 
@@ -3007,7 +2992,6 @@ fn input_step_settings(document: &Document, node: NodeId, kind: &str) -> InputSt
         minimum,
         maximum,
         step,
-        step_is_any,
         base,
     }
 }

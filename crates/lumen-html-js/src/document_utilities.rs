@@ -439,7 +439,7 @@ impl TreeWalkerRegistry {
         walkers.retain(|entry| {
             entry
                 .upgrade()
-                .is_some_and(|state| !migrated.iter().any(|moved| moved.ptr_eq(entry)))
+                .is_some_and(|_| !migrated.iter().any(|moved| moved.ptr_eq(entry)))
         });
         target_registry.walkers.borrow_mut().extend(migrated);
     }
@@ -754,7 +754,7 @@ impl IteratorRegistry {
         iterators.retain(|entry| {
             entry
                 .upgrade()
-                .is_some_and(|state| !migrated.iter().any(|moved| moved.ptr_eq(entry)))
+                .is_some_and(|_| !migrated.iter().any(|moved| moved.ptr_eq(entry)))
         });
         target_registry.iterators.borrow_mut().extend(migrated);
     }

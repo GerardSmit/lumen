@@ -124,7 +124,7 @@ impl<'a> Tokenizer<'a> {
 pub fn tokenize(
   input: &str,
   policy: TokenizePolicy,
-) -> Result<Vec<Token>, Error> {
+) -> Result<Vec<Token<'_>>, Error> {
   let mut tokenizer = Tokenizer {
     input,
     policy,

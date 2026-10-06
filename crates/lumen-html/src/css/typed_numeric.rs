@@ -960,7 +960,7 @@ impl NumericType {
         }
         let hint = self.percent_hint.or(other.percent_hint);
         let mut left = self.apply_percent_hint(hint)?;
-        let mut right = other.apply_percent_hint(hint)?;
+        let right = other.apply_percent_hint(hint)?;
         if left.exponents_equal(right) {
             left.percent_hint = hint;
             return Some(left);

@@ -1689,32 +1689,6 @@ pub fn document_timeline(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<Value>
     Ok(value)
 }
 
-fn timeline_wrapper(
-    ctx: &mut Ctx,
-    hub: &Rc<RefCell<AnimationHub>>,
-    id: u32,
-    realm: &Rc<DomRealm>,
-    origin_time_ms: f64,
-) -> Value {
-    if let Some(value) = hub
-        .borrow()
-        .timeline_values
-        .get(&id)
-        .and_then(WeakValue::upgrade)
-    {
-        return value;
-    }
-    let value = ctx.new_instance(DomDocumentTimeline {
-        id,
-        realm: Rc::downgrade(realm),
-        origin_time_ms,
-    });
-    if let Some(weak) = ctx.weak_value(&value) {
-        hub.borrow_mut().timeline_values.insert(id, weak);
-    }
-    value
-}
-
 fn refresh_ready(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) -> OpResult<()> {
     let animation = existing_wrapper(ctx, hub, id)?;
     replace_resolved_ready(ctx, hub, id, animation);
@@ -2313,12 +2287,9 @@ fn reject_finished(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32) {
 }
 
 fn fire_event(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, kind: &str) -> OpResult<()> {
-    let record = hub
-        .borrow()
-        .records
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
+    if !hub.borrow().records.contains_key(&id) {
+        return Err(OpError::new("InvalidStateError", "animation is no longer available"));
+    }
     let wrapper = existing_wrapper(ctx, hub, id)?;
     let event = DomEvent::new(ctx, kind, None)?;
     let event = ctx.new_instance(event);
@@ -2438,13 +2409,6 @@ fn queue_css_cancellation(
         event.previous = animation::CssEventSample::IDLE;
         if detach { event.associated = false; }
     }
-    Ok(())
-}
-
-fn cancel_css_record(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, now: f64, detach: bool) -> OpResult<()> {
-    queue_css_cancellation(ctx, hub, id, now, detach)?;
-    reset_pending_task(ctx,hub,id)?;
-    retire_css_record_state(hub, id);
     Ok(())
 }
 
@@ -3067,7 +3031,7 @@ impl DomAnimation {
         let current = sample_record(&record, record_time(&record).unwrap_or(0.0)).current_time_ms;
         let now = timeline_realm.as_ref().and_then(|realm| document_time(realm)).unwrap_or(0.0);
         let timeline_value =
-            if let (Some(timeline), Some(realm)) = (timeline.as_ref(), timeline_realm.as_ref()) {
+            if let (Some(timeline), Some(_)) = (timeline.as_ref(), timeline_realm.as_ref()) {
                 if let Some(weak) = ctx.weak_value(&timeline.value) {
                     hub.borrow_mut()
                         .timeline_values
@@ -3637,7 +3601,7 @@ impl DomKeyframeEffect {
             effect.fill_auto = fill_auto;
             effect.clone()
         };
-        let attached = sync_effect_animation(&hub, &updated);
+        sync_effect_animation(&hub, &updated);
         let realm = updated
             .realm
             .upgrade()

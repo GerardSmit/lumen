@@ -156,12 +156,13 @@ pub(crate) fn validate_install(
 }
 
 pub(crate) struct NativeProgram {
+    #[cfg(feature = "parallel")]
     pub(crate) trusted_glue: bool,
     pub(crate) image: Arc<LoadedNative>,
     pub(crate) metadata: metadata::Metadata,
     /// The authenticated, immutable source for another realm's independent GOT.
+    #[cfg(feature = "parallel")]
     pub(crate) bytes: Arc<[u8]>,
-    pub(crate) signature: Option<[u8; 64]>,
 }
 
 /// Module state is owned by each realm; a program never retains the scopes of
@@ -209,12 +210,12 @@ const STATUS_SUSPEND: u32 = 2;
 
 fn helper_address(id: u32) -> Option<usize> {
     match id {
-        crate::native_ops::ENTER => Some(enter as usize),
-        crate::native_ops::SAFEPOINT => Some(safepoint as usize),
-        crate::native_ops::LAND => Some(land as usize),
-        crate::native_ops::RESUME => Some(resume as usize),
-        crate::native_ops::TYPE_GUARD => Some(type_guard as usize),
-        crate::native_ops::NUM_BINARY => Some(num_binary as usize),
+        crate::native_ops::ENTER => Some(enter as *const () as usize),
+        crate::native_ops::SAFEPOINT => Some(safepoint as *const () as usize),
+        crate::native_ops::LAND => Some(land as *const () as usize),
+        crate::native_ops::RESUME => Some(resume as *const () as usize),
+        crate::native_ops::TYPE_GUARD => Some(type_guard as *const () as usize),
+        crate::native_ops::NUM_BINARY => Some(num_binary as *const () as usize),
         _ => ops::address(id),
     }
 }
@@ -796,16 +797,18 @@ fn load_program_impl(
         lumen_os::native::load_shared(&bytes, &target, verify, resolve_import, resolve)?
     };
     Ok(Rc::new(NativeProgram {
+        #[cfg(feature = "parallel")]
         trusted_glue: static_glue,
         image,
         metadata,
+        #[cfg(feature = "parallel")]
         bytes,
-        signature: signed,
     }))
 }
 
 /// Re-map the immutable bytes retained by an already-authenticated native
 /// program when creating another realm. This is not an install entry point.
+#[cfg(feature = "parallel")]
 pub(crate) fn load_authenticated_program(
     interp: &mut Interp,
     bytes: Arc<[u8]>,

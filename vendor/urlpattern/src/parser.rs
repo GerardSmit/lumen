@@ -328,7 +328,7 @@ where
   fn consume_required_token(
     &mut self,
     kind: TokenType,
-  ) -> Result<Token, Error> {
+  ) -> Result<Token<'_>, Error> {
     self.try_consume_token(kind.clone()).ok_or_else(|| {
       Error::Parser(ParserError::ExpectedToken(
         kind,

@@ -54,17 +54,11 @@ const EXTENSIONS: [&str; 9] = [
     ".mjs", ".js", ".jsx", ".tsx", ".json", ".cjs", ".ts", ".mts", ".cts",
 ];
 
-/// Build the loader closure `eval_module` wants. It owns everything (`'static`); the engine
-/// caches results by the canonical key we return, so returning a stable realpath per file is
-/// what dedupes shared dependencies.
-pub fn make_loader(
-    builtins: BuiltinModules,
-) -> impl Fn(&str, &str, Option<&str>) -> Option<(String, String)> {
-    make_cached_loader(builtins).0
-}
-
-/// [`make_loader`], plus a handle on its [`LoaderCache`] so the caller can drop the cached
-/// sources once the module graph they were fetched for has loaded.
+/// Build the loader closure `eval_module` wants, plus a handle on its [`LoaderCache`] so the
+/// caller can drop the cached sources once the module graph they were fetched for has loaded. It
+/// owns everything (`'static`); the engine caches results by the canonical key we return, so
+/// returning a stable realpath per file is what dedupes shared dependencies.
+#[cfg(target_arch = "wasm32")]
 pub fn make_cached_loader(
     builtins: BuiltinModules,
 ) -> (
@@ -77,7 +71,7 @@ pub fn make_cached_loader(
 /// A loader bound to one immutable native fetch-routing and trust snapshot. This keeps network
 /// module requests on the same per-runtime routes as `fetch()` without consulting process-global
 /// DNS or trust configuration after the loader is created.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub fn make_loader_with_fetch_config(
     builtins: BuiltinModules,
     fetch_config: lumen_web::FetchConfig,
@@ -239,17 +233,9 @@ pub fn fetch_network_module_resource(
     })
 }
 
-fn default_network_module_resource(url: &str) -> Option<NetworkModuleResource> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let resource = lumen_web::load_module_resource(url).ok()?;
-        Some((resource.url, resource.content_type, resource.bytes))
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = url;
-        None
-    }
+#[cfg(target_arch = "wasm32")]
+fn default_network_module_resource(_url: &str) -> Option<NetworkModuleResource> {
+    None
 }
 
 fn make_cached_loader_with_resource_loader(

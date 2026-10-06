@@ -6,7 +6,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Output};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lumen_runtime::Runtime;
 

@@ -343,16 +343,6 @@ pub fn set_priority(pid: i32, priority: i32) -> R<()> {
     }
 }
 
-#[cfg(target_os = "macos")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__error()
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__errno_location()
-}
-
 /// The temporary directory as Node's `os.tmpdir()` picks it from the environment `env`: Unix
 /// `TMPDIR`, `TMP`, `TEMP`, else `/tmp`, without a trailing `/`; Windows `TEMP`, `TMP`, else
 /// `%SystemRoot%\temp`, without a trailing `\` (but keeping `C:\`).

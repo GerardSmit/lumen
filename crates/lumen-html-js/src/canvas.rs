@@ -607,12 +607,6 @@ impl CanvasRegistry {
         Ok(state)
     }
 
-    pub fn data_for_offscreen(&self, width: u64, height: u64) -> OpResult<Rc<RefCell<CanvasData>>> {
-        Ok(Rc::new(RefCell::new(CanvasData::new_offscreen(
-            width, height,
-        )?)))
-    }
-
     /// Called from the permanent DOM mutation router. This updates the surface
     /// but only queues publication: the router still holds the session borrow.
     pub fn on_mutation(
@@ -645,8 +639,7 @@ impl CanvasRegistry {
                     self.queue_attached_subtree(document, *node);
                 }
             }
-            lumen_html::observe::ObservedKind::Attribute { .. }
-            | lumen_html::observe::ObservedKind::CharacterData { .. }
+            lumen_html::observe::ObservedKind::CharacterData { .. }
             | lumen_html::observe::ObservedKind::SlotAssignment => {}
         }
     }
@@ -3793,24 +3786,6 @@ fn apply_bitmap_crop(
     })
 }
 
-#[lumen_bind::op(name = "__lumenDecodeImageBitmap")]
-fn decode_image_bitmap(ctx: &mut Ctx, array_buffer: Value) -> OpResult<Value> {
-    decode_image_bitmap_inner(
-        ctx,
-        array_buffer,
-        BitmapOptions {
-            crop: None,
-            resize_width: None,
-            resize_height: None,
-            quality: lumen_html_image::canvas::ImageResizeQuality::Low,
-            flip_y: false,
-            from_image_orientation: true,
-            premultiply_alpha: true,
-            convert_color_space: true,
-        },
-    )
-}
-
 fn decode_image_bitmap_inner(
     ctx: &mut Ctx,
     array_buffer: Value,
@@ -4941,36 +4916,6 @@ pub(crate) fn install(ctx: &mut Ctx) -> OpResult<()> {
 
 pub(crate) fn install_worker(ctx: &mut Ctx) -> OpResult<()> {
     install_canvas_apis(ctx, false)
-}
-
-pub(crate) fn constructors(ctx: &mut Ctx) -> [(&'static str, Value); 10] {
-    [
-        (
-            "OffscreenCanvas",
-            ctx.class_constructor::<DomOffscreenCanvas>(),
-        ),
-        (
-            "OffscreenCanvasRenderingContext2D",
-            ctx.class_constructor::<DomOffscreenCanvasRenderingContext2D>(),
-        ),
-        (
-            "CanvasRenderingContext2D",
-            ctx.class_constructor::<DomCanvasRenderingContext2D>(),
-        ),
-        (
-            "ImageBitmapRenderingContext",
-            ctx.class_constructor::<DomImageBitmapRenderingContext>(),
-        ),
-        ("ImageData", ctx.class_constructor::<DomImageData>()),
-        (
-            "CanvasGradient",
-            ctx.class_constructor::<DomCanvasGradient>(),
-        ),
-        ("CanvasPattern", ctx.class_constructor::<DomCanvasPattern>()),
-        ("TextMetrics", ctx.class_constructor::<DomTextMetrics>()),
-        ("Path2D", ctx.class_constructor::<DomPath2D>()),
-        ("ImageBitmap", ctx.class_constructor::<DomImageBitmap>()),
-    ]
 }
 
 #[cfg(test)]

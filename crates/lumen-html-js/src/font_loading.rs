@@ -14,7 +14,7 @@ use lumen_html::{
 };
 pub use lumen_html_text::{FontFaceStatus, ManualFontFace};
 use lumen_html_text::{
-    FontFace, FontLoadRequest, FontProvider, FontRegistration, FontRegistryContext,
+    FontFace, FontLoadRequest, FontProvider, FontRegistryContext,
     FontRegistrySnapshot, FontSet, ManualFontFaceState, ManualFontRegistry,
     ManualFontSource,
     MAX_MANUAL_FONT_BYTES_PER_FACE,
@@ -589,11 +589,6 @@ impl FontLoading {
             });
         }
         Ok(fonts)
-    }
-
-    pub(crate) fn manual_faces(&self) -> Vec<ManualFontFace> {
-        self.with_font_registry_snapshot(|snapshot| snapshot.manual_faces.to_vec())
-            .unwrap_or_default()
     }
 
     fn sync_manual_faces(&self) {
@@ -1909,7 +1904,7 @@ impl DomFontFaceSet {
         })();
         match result {
             Err(error) => Promise::rejected(error),
-            Ok((realm, faces)) if faces.is_empty() => Promise::resolved(Vec::<Value>::new()),
+            Ok((_, faces)) if faces.is_empty() => Promise::resolved(Vec::<Value>::new()),
             Ok((realm, faces)) => {
                 let deferred = Deferred::new(ctx);
                 let promise = Promise::pending(&deferred);

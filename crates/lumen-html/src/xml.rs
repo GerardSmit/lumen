@@ -1209,12 +1209,12 @@ fn append_fixed_attribute_name(
         return append_xml(output, qname);
     }
     let local = split_qname(qname).map_or(qname, |(_, local)| local);
-    let Some(uri) = uri.filter(|uri| !uri.is_empty()) else {
+    if uri.is_none_or(str::is_empty) {
         if require_well_formed && (!is_xml_name(local) || local.contains(':') || local == "xmlns") {
             return Err(DomError::WrongKind);
         }
         return append_xml(output, local);
-    };
+    }
     if require_well_formed && (!is_xml_name(local) || local.contains(':')) {
         return Err(DomError::WrongKind);
     }

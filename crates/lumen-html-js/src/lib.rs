@@ -2965,7 +2965,7 @@ impl DomRealm {
                 .remove(&old)
                 .and_then(|weak| weak.upgrade());
             if let Some(wrapper) = wrapper {
-                let mut collections = ctx.with_instance_mut::<DomNode, _>(&wrapper, |node| {
+                let collections = ctx.with_instance_mut::<DomNode, _>(&wrapper, |node| {
                     node.base.rebind_node(target, new);
                     node.realm = target.clone();
                     node.id = new;
@@ -9460,7 +9460,7 @@ impl DomNode {
     }
     fn replace_children(&self, ctx: &mut Ctx, #[varargs] nodes: Vec<Value>) -> OpResult<()> {
         let (ids, generated) = converted_dom_nodes(ctx, &self.realm, nodes)?;
-        let mut session = self.realm.session.borrow_mut();
+        let session = self.realm.session.borrow_mut();
         let old = children(session.document(), self.id).map_err(dom_error)?;
         drop(session);
         let select_mutation = capture_select_mutation(&self.realm, self.id, &ids, &old)?;
@@ -11132,31 +11132,6 @@ pub fn install_xml(
         None,
         true,
         Some(controller),
-    )
-}
-
-fn install_document(
-    ctx: &mut Ctx,
-    document: lumen_html::Document,
-    content_type: &str,
-    is_html_document: bool,
-    has_browsing_context: bool,
-    context: Option<Rc<browsing_context::BrowsingContext>>,
-    document_url: Option<String>,
-    about_base_url: Option<String>,
-) -> Result<Rc<DomRealm>, InstallError> {
-    install_document_with_context_metadata(
-        ctx,
-        document,
-        content_type,
-        is_html_document,
-        has_browsing_context,
-        context,
-        document_url,
-        about_base_url,
-        None,
-        true,
-        None,
     )
 }
 

@@ -418,42 +418,6 @@ pub(crate) fn synthetic_click_event(ctx: &mut Ctx, view: Value) -> OpResult<Valu
         .map_err(OpError::thrown)
 }
 
-/// Construct a trusted mouse PointerEvent for the browser's bounded pointer
-/// interaction path. The event is dispatched through `dispatch_user_agent_event`
-/// by the caller; script-created PointerEvents continue to use the constructors
-/// above and remain untrusted.
-pub(crate) fn user_agent_pointer_event(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    pressure: f64,
-    bubbles: bool,
-    cancelable: bool,
-) -> OpResult<Value> {
-    user_agent_pointer_event_with_state(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        pressure,
-        bubbles,
-        cancelable,
-        Value::Null,
-        UserAgentModifiers::default(),
-        0.0,
-        0.0,
-    )
-}
-
 #[derive(Clone, Copy, Default)]
 pub(crate) struct UserAgentModifiers {
     pub ctrl: bool,
@@ -489,44 +453,6 @@ impl Default for UserAgentPointerProperties {
             twist: 0,
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn user_agent_pointer_event_with_state(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    pressure: f64,
-    bubbles: bool,
-    cancelable: bool,
-    related_target: Value,
-    modifiers: UserAgentModifiers,
-    movement_x: f64,
-    movement_y: f64,
-) -> OpResult<Value> {
-    user_agent_pointer_event_with_properties(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        pressure,
-        bubbles,
-        cancelable,
-        related_target,
-        modifiers,
-        movement_x,
-        movement_y,
-        UserAgentPointerProperties::default(),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -609,38 +535,6 @@ pub(crate) fn host_pointer_or_mouse_event(
     } else {
         Ok(None)
     }
-}
-
-/// Construct the compatibility MouseEvent associated with a trusted mouse
-/// pointer sequence. Trust is assigned only by the user-agent dispatch path.
-pub(crate) fn user_agent_mouse_event(
-    ctx: &mut Ctx,
-    kind: &str,
-    view: Value,
-    client_x: f64,
-    client_y: f64,
-    button: i16,
-    buttons: u16,
-    detail: i32,
-    bubbles: bool,
-    cancelable: bool,
-) -> OpResult<Value> {
-    user_agent_mouse_event_with_state(
-        ctx,
-        kind,
-        view,
-        client_x,
-        client_y,
-        button,
-        buttons,
-        detail,
-        bubbles,
-        cancelable,
-        Value::Null,
-        UserAgentModifiers::default(),
-        0.0,
-        0.0,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]

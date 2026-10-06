@@ -274,6 +274,7 @@ impl Interp {
     /// Parse `key` and, transitively, every dependency — registering each module's environment,
     /// namespace object, and export tables. No user code runs and no linking happens yet, so a later
     /// ResolveExport can see the whole graph. Idempotent per key.
+    #[cfg(test)]
     fn parse_and_register(&mut self, key: &str, src: Option<String>) -> Result<(), Abrupt> {
         let mut added = Vec::new();
         let result = self.parse_and_register_graph(key, key, key, src, &mut added);

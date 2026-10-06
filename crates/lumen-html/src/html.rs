@@ -1160,9 +1160,7 @@ impl Tag {
                 | Tag::Dialog
                 | Tag::Dir
                 | Tag::Div
-                | Tag::Dd
                 | Tag::Dl
-                | Tag::Dt
                 | Tag::Dt
                 | Tag::Fieldset
                 | Tag::Frame
@@ -1190,7 +1188,6 @@ impl Tag {
                 | Tag::Listing
                 | Tag::Li
                 | Tag::Link
-                | Tag::Li
                 | Tag::Main
                 | Tag::Marquee
                 | Tag::Menu
@@ -1338,14 +1335,6 @@ impl Tag {
             Tag::Title => "title",
             _ => "textarea",
         }
-    }
-}
-
-fn ascii_lowercase(value: &str) -> Cow<'_, str> {
-    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(value.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(value)
     }
 }
 
@@ -2819,7 +2808,6 @@ enum TemplateMode {
     InColumnGroup,
     InTableBody,
     InRow,
-    InCell,
     InBody,
 }
 
@@ -3514,7 +3502,6 @@ impl<'a> Parser<'a, '_> {
                 Some(TemplateMode::InColumnGroup) => Some(Tag::Colgroup),
                 Some(TemplateMode::InTableBody) => Some(Tag::Tbody),
                 Some(TemplateMode::InRow) => Some(Tag::Tr),
-                Some(TemplateMode::InCell) => Some(Tag::Td),
                 _ => None,
             };
         }
@@ -3524,7 +3511,6 @@ impl<'a> Parser<'a, '_> {
                 Some(TemplateMode::InColumnGroup) => Some(Tag::Colgroup),
                 Some(TemplateMode::InTableBody) => Some(Tag::Tbody),
                 Some(TemplateMode::InRow) => Some(Tag::Tr),
-                Some(TemplateMode::InCell) => Some(Tag::Td),
                 _ => None,
             };
         }
@@ -3689,8 +3675,8 @@ impl<'a> Parser<'a, '_> {
             return Ok(());
         }
         let blank = value.bytes().all(|byte| byte.is_ascii_whitespace());
-        let mut parent = self.parent();
-        let mut tag = self.parent_tag();
+        let parent = self.parent();
+        let tag = self.parent_tag();
         if tag == Tag::Colgroup && !blank {
             let split = value
                 .bytes()
@@ -3781,7 +3767,6 @@ impl<'a> Parser<'a, '_> {
                 TemplateMode::InTable
                     | TemplateMode::InTableBody
                     | TemplateMode::InRow
-                    | TemplateMode::InCell
             );
             if foster_mode && !tag.is_table_part() && tag != Tag::Template {
                 if let Some(content) = self.template_content(self.stack[index].id) {

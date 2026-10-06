@@ -1418,7 +1418,7 @@ unsafe fn unwrap_adaptor(
     }
     let take = |k: usize| std::ptr::replace(args.add(k), Value::Undefined);
     match &b.call {
-        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_call as usize => {
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_call as crate::value::NativeFn as usize => {
             if argc > ARGBUF + 1 || !this.is_callable() {
                 return None;
             }
@@ -1428,7 +1428,7 @@ unsafe fn unwrap_adaptor(
             }
             Some((this.clone(), t))
         }
-        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_apply as usize => {
+        Callable::Native(fp) if *fp as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize => {
             if argc > 2 || !this.is_callable() {
                 return None;
             }
@@ -1620,7 +1620,7 @@ unsafe fn apply_args(
     let intrinsic = match &*st.add(base + 1) {
         Value::Obj(o) => o.try_borrow().is_ok_and(|b| {
             matches!(&b.call, crate::value::Callable::Native(fp)
-                if *fp as usize == crate::builtins::nf_function_apply as usize)
+                if *fp as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize)
         }),
         _ => false,
     };

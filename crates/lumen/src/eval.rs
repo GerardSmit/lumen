@@ -8645,12 +8645,6 @@ fn bigint_arith(
     Some(v)
 }
 
-/// StringToBigInt: trimmed decimal / 0x / 0o / 0b text (empty is 0); None when unparsable (or
-/// too large).
-fn string_to_bigint(s: &str) -> Option<crate::bigint::JsBigInt> {
-    string_to_bigint_checked(s).ok().flatten()
-}
-
 /// StringToBigInt, distinguishing unparsable text (`Ok(None)`) from a value past the size cap.
 fn string_to_bigint_checked(
     s: &str,

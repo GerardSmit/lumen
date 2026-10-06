@@ -55,12 +55,6 @@ impl TestDriverCaseState {
     }
 }
 
-#[derive(Clone, Copy)]
-enum RootKind {
-    Internal,
-    Public,
-}
-
 struct RealmBridge {
     case: Rc<TestDriverCaseState>,
     internal_root: WeakValue,
@@ -2406,7 +2400,6 @@ mod tests {
         assert!(deadline >= started + Duration::from_millis(80));
         assert_eq!(timers.pending_for_realm(&parent), 1);
         assert_eq!(timers.pending_for_realm(&child), 1);
-        drop(timers);
 
         assert_eq!(
             engine

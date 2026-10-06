@@ -5,7 +5,7 @@ use lumen_html::paint::{FontSpec, ShapedRun};
 use lumen_html_text::{CanvasTextOptions, FontProvider, GlyphOutlineCommand};
 use std::{cell::RefCell, rc::Rc};
 use tiny_skia::{
-    BlendMode, Color, FillRule, FilterQuality, GradientStop, LineCap, LineJoin, LinearGradient,
+    BlendMode, Color, FillRule, FilterQuality, GradientStop, LinearGradient,
     Mask, MaskType, Paint, Path, PathBuilder, Pattern, Pixmap, PixmapPaint, Point, RadialGradient,
     Rect, Shader, SpreadMode, Stroke, Transform,
 };
@@ -2601,7 +2601,7 @@ fn rectangle(x: f32, y: f32, width: f32, height: f32) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tiny_skia::PathBuilder;
+    use tiny_skia::{LineCap, LineJoin, PathBuilder};
 
     #[test]
     fn state_clip_transform_clear_and_resize_affect_real_pixels() {

@@ -282,7 +282,6 @@ fn list_style_shorthand(
         none_count -= 1;
     }
     if none_count != 0 && !image_specified {
-        image_specified = true;
         none_count -= 1;
     }
     if none_count != 0 {
@@ -2981,7 +2980,6 @@ enum Value {
     TransformRaw(String),
     TransformOrigin([TransformLength; 2]),
     TransformOriginRaw(String),
-    BorderPattern(BorderPattern),
     BorderCurrentColor,
     BackgroundCurrentColor,
     Shadows(Option<Arc<[BoxShadow]>>),
@@ -3068,7 +3066,6 @@ enum Value {
     BorderRadiusCorner(usize, BorderRadiusCorner),
     BorderWidth(f32),
     BorderColor(Rgba),
-    BorderSolid(bool),
     BorderStyle(BorderStyle),
     OverflowAxis(usize, Overflow),
     BackgroundAttachment(Arc<[BackgroundAttachment]>),
@@ -3173,7 +3170,6 @@ impl Value {
             Self::LogicalBorder(slot, _) => *slot,
             Self::Transforms(_) | Self::TransformRaw(_) => 59,
             Self::TransformOrigin(_) | Self::TransformOriginRaw(_) => 60,
-            Self::BorderPattern(_) => 11,
             Self::BorderStyle(_) => 11,
             Self::BorderCurrentColor => 10,
             Self::BackgroundCurrentColor => 2,
@@ -3254,7 +3250,6 @@ impl Value {
             | Self::BorderRadiusCorner(index, _) => 134 + *index,
             Self::BorderWidth(_) => 9,
             Self::BorderColor(_) => 10,
-            Self::BorderSolid(_) => 11,
             Self::OverflowAxis(slot, _) => *slot,
             Self::BackgroundAttachment(_) => 133,
             Self::LineHeight(_) => 13,
@@ -3295,11 +3290,6 @@ impl Value {
                 }
             }
             Self::TransformRaw(_) | Self::TransformOriginRaw(_) => unreachable!(),
-            Self::BorderPattern(v) => {
-                style.border_style = BorderStyle::from_pattern(*v);
-                style.border_solid = true;
-                style.border_pattern = Some(*v);
-            }
             Self::BorderCurrentColor => style.border_color = style.color,
             Self::BackgroundCurrentColor => style.background = style.color,
             Self::Shadows(v) => {
@@ -3488,17 +3478,6 @@ impl Value {
             }
             Self::BorderWidth(v) => style.border_width = *v,
             Self::BorderColor(v) => style.border_color = *v,
-            Self::BorderSolid(v) => {
-                style.border_solid = *v;
-                style.border_style = if *v {
-                    BorderStyle::Solid
-                } else {
-                    BorderStyle::None
-                };
-                if style.border_pattern.is_some() {
-                    style.border_pattern = None;
-                }
-            }
             Self::BorderStyle(value) => {
                 style.border_style = *value;
                 style.border_solid = value.paints();
@@ -3751,14 +3730,6 @@ struct Declaration {
     important: bool,
 }
 
-impl Rule {
-    /// Tags a parsed rule with the shadow root its `<style>` lives in.
-    pub(crate) fn scoped(mut self, scope: Option<NodeId>) -> Self {
-        self.scope = scope;
-        self
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Rule {
     selector: Selector,
@@ -3770,8 +3741,6 @@ pub struct Rule {
     /// query test only rules that apply to the actual SVG node.
     unsupported_svg_properties: Arc<[String]>,
     pub(crate) media: Arc<[Arc<str>]>,
-    /// Conditions inherited from `@supports` and conditional imports.
-    pub(crate) supports: Arc<[Arc<str>]>,
     /// URL of the stylesheet that declared this rule, when available.
     pub(crate) source_url: Option<Arc<str>>,
     layer: Option<usize>,
@@ -3780,32 +3749,6 @@ pub struct Rule {
 }
 
 impl Rule {
-    /// Whether this rule may apply at all given the node's tree position.
-    fn scope_allows(&self, context: Option<(&Document, NodeId)>, root: NodeId) -> bool {
-        match self.scope {
-            None => match context {
-                None => true,
-                Some((document, node)) => {
-                    // Document rules do not reach into shadow trees, except
-                    // through `::part()` which crosses the boundary.
-                    self.selector.part.is_some() || document.root_node(node, false) == Ok(root)
-                }
-            },
-            Some(scope) => {
-                match context {
-                    None => false,
-                    Some((document, node)) => {
-                        document.root_node(node, false) == Ok(scope)
-                            || (self.selector.host && document.shadow_host(scope) == Ok(Some(node)))
-                            || (self.selector.slotted
-                                && document.assigned_slot(node).ok().flatten().is_some_and(
-                                    |slot| document.root_node(slot, false) == Ok(scope),
-                                ))
-                    }
-                }
-            }
-        }
-    }
     /// Matches a rule against a node with the rule's scope semantics applied.
     pub(crate) fn matches_at(&self, document: &Document, node: NodeId) -> bool {
         self.matches_at_with_validity(document, node, &crate::forms::NoValidityOverrides)
@@ -12136,18 +12079,6 @@ fn border_side_value(value: &Value, side: usize) -> Option<Value> {
         Value::BorderCurrentColor => {
             Value::LogicalBorder(119 + side, LogicalBorderComponent::CurrentColor)
         }
-        Value::BorderSolid(solid) => Value::LogicalBorder(
-            123 + side,
-            LogicalBorderComponent::Style(if *solid {
-                BorderStyle::Solid
-            } else {
-                BorderStyle::None
-            }),
-        ),
-        Value::BorderPattern(pattern) => Value::LogicalBorder(
-            123 + side,
-            LogicalBorderComponent::Style(BorderStyle::from_pattern(*pattern)),
-        ),
         Value::BorderStyle(style) => {
             Value::LogicalBorder(123 + side, LogicalBorderComponent::Style(*style))
         }
@@ -14905,7 +14836,6 @@ pub fn parse_stylesheet(input: &str) -> Result<ParsedStylesheets, CssError> {
             declarations: Arc::from([]),
             unsupported_svg_properties: Arc::from([]),
             media: Arc::from([]),
-            supports: Arc::from([]),
             source_url: None,
             layer: None,
             layers: Arc::from([]),
@@ -16503,7 +16433,6 @@ pub fn parse_graph(
             declarations: Arc::from([]),
             unsupported_svg_properties: Arc::from([]),
             media: Arc::from([]),
-            supports: Arc::from([]),
             source_url: Some(root.url.clone()),
             layer: None,
             layers: Arc::from([]),
@@ -16930,7 +16859,6 @@ fn parse_rules(
                     declarations: declarations.clone(),
                     unsupported_svg_properties: unsupported_properties.clone().into(),
                     media: media.clone(),
-                    supports: supports.clone(),
                     source_url: None,
                     layer,
                     layers: Arc::from([]),
@@ -17317,13 +17245,6 @@ impl Selector {
         Some(true)
     }
 
-    /// Matches inside a scoped (shadow) rule context: `:host` matches the
-    /// host, `::slotted()` matches assigned light children, `::part()` matches
-    /// exposed parts, and plain selectors use the shadow tree structure.
-    pub(crate) fn matches_shadow(&self, document: &Document, node: NodeId, root: NodeId) -> bool {
-        self.matches_in_context(document, node, Some(root), Some(root), 0)
-    }
-
     pub(crate) fn matches_shadow_with_validity(
         &self,
         document: &Document,
@@ -17332,24 +17253,6 @@ impl Selector {
         validity: &dyn crate::forms::ValidityStateView,
     ) -> bool {
         self.matches_in_context_with_validity(document, node, Some(root), Some(root), 0, validity)
-    }
-
-    fn matches_in_context(
-        &self,
-        document: &Document,
-        node: NodeId,
-        shadow_root: Option<NodeId>,
-        scope_root: Option<NodeId>,
-        depth: usize,
-    ) -> bool {
-        self.matches_in_context_with_validity(
-            document,
-            node,
-            shadow_root,
-            scope_root,
-            depth,
-            &crate::forms::NoValidityOverrides,
-        )
     }
 
     fn matches_in_context_with_validity(
@@ -17369,26 +17272,6 @@ impl Selector {
             depth,
             None,
             validity,
-        )
-    }
-
-    fn matches_in_context_with_anchor(
-        &self,
-        document: &Document,
-        node: NodeId,
-        shadow_root: Option<NodeId>,
-        scope_root: Option<NodeId>,
-        depth: usize,
-        relative_anchor: Option<(NodeId, Relation)>,
-    ) -> bool {
-        self.matches_in_context_with_anchor_and_validity(
-            document,
-            node,
-            shadow_root,
-            scope_root,
-            depth,
-            relative_anchor,
-            &crate::forms::NoValidityOverrides,
         )
     }
 
@@ -17488,10 +17371,12 @@ impl Selector {
 
     /// Matching with no selector scope. DOM query APIs use
     /// `matches_node_in_scope` to supply their ParentNode/Element root.
+    #[cfg(test)]
     pub(crate) fn matches_node(&self, document: &Document, node: NodeId) -> bool {
         self.matches_node_in_scope(document, node, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn matches_node_in_scope(
         &self,
         document: &Document,

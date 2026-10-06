@@ -260,6 +260,7 @@ impl TaskSender {
         true
     }
 
+    #[cfg(test)]
     pub(crate) fn queue(
         &self, callback: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static,
     ) -> Result<(), TaskAdmissionFailure> {
@@ -268,6 +269,7 @@ impl TaskSender {
 
     /// Prepared native documents admit work at mutation time, but cannot run
     /// author callbacks before their target arena is installed.
+    #[cfg(test)]
     pub(crate) fn queue_when_ready(
         &self, ready: Rc<Cell<bool>>,
         callback: impl FnOnce(&mut Ctx) -> OpResult<()> + 'static,

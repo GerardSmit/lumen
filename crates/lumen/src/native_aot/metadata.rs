@@ -79,17 +79,12 @@ pub(crate) struct Function {
     pub rest_slot: Option<u32>,
     pub virt_base: Option<u32>,
     pub frame_flags: u32,
-    pub property_caches: u32,
-    pub name_caches: u32,
-    pub object_templates: u32,
     pub var_resets: Vec<u32>,
     pub captures: Vec<Capture>,
     pub children: Vec<u32>,
     pub names: Vec<String>,
     pub slot_names: Vec<String>,
     pub constants: Vec<Value>,
-    pub resumes: Vec<(u32, u32)>,
-    pub positions: Vec<(u32, u32)>,
     pub classes: Vec<Class>,
 }
 
@@ -306,9 +301,9 @@ pub(crate) fn decode(bytes: &[u8], native_functions: usize) -> Result<Metadata, 
         if frame_flags & !0x0f != 0 {
             return Err("unsupported native JS frame flags");
         }
-        let property_caches = reader.word()?;
-        let name_caches = reader.word()?;
-        let object_templates = reader.word()?;
+        for _ in 0..3 {
+            reader.word()?;
+        }
         let reset_count = reader.count(4)?;
         let mut var_resets = Vec::with_capacity(reset_count);
         for _ in 0..reset_count {
@@ -355,7 +350,7 @@ pub(crate) fn decode(bytes: &[u8], native_functions: usize) -> Result<Metadata, 
         }) {
             return Err("native JS captured function out of range");
         }
-        let mut read_names = |reader: &mut Reader<'_>| -> Result<Vec<String>, &'static str> {
+        let read_names = |reader: &mut Reader<'_>| -> Result<Vec<String>, &'static str> {
             let count = reader.count(4)?;
             (0..count).map(|_| reader.string()).collect()
         };
@@ -473,17 +468,12 @@ pub(crate) fn decode(bytes: &[u8], native_functions: usize) -> Result<Metadata, 
             rest_slot,
             virt_base,
             frame_flags,
-            property_caches,
-            name_caches,
-            object_templates,
             var_resets,
             captures,
             children,
             names,
             slot_names,
             constants,
-            resumes,
-            positions,
             classes,
         });
     }

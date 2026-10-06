@@ -42,6 +42,9 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.82"
 
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(lumen_op_stats)'] }
+
 # Lints shared by every crate (each crate opts in with `[lints] workspace = true`). Two lints
 # fight the nature of an engine — deeply nested callback / `dyn Fn` types and pipeline functions
 # that legitimately take many parameters — everything else stays denied in CI

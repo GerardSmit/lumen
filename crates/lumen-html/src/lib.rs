@@ -27,7 +27,7 @@ pub mod xml;
 pub use name::Name;
 pub use shadow::{ShadowMode, ShadowOptions, SlotAssignmentMode};
 
-use alloc::{boxed::Box, rc::Rc, string::String, vec, vec::Vec};
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_DOCUMENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -655,7 +655,7 @@ impl Document {
     fn clear_interaction_subtree(&mut self, root: NodeId) {
         let mut state = self.interaction_state;
         let old_state = self.interaction_state;
-        let mut clear = |node: &mut Option<NodeId>| {
+        let clear = |node: &mut Option<NodeId>| {
             if node.is_some_and(|node| self.is_shadow_including_descendant_of(root, node)) {
                 *node = None;
             }
@@ -665,7 +665,6 @@ impl Document {
         clear(&mut state.hover);
         clear(&mut state.active[0]);
         clear(&mut state.active[1]);
-        drop(clear);
         let mut removed_top_layer = false;
         let mut index = 0;
         while index < self.top_layer_elements.len() {
@@ -1779,11 +1778,6 @@ impl Document {
         }
         self.details_inserted(child)
             .expect("validated detached insertion has a valid ordinary tree");
-    }
-
-    fn prepend_detached(&mut self, parent: NodeId, child: NodeId) {
-        let first = self.link_id(self.nodes[parent.index as usize].first_child);
-        self.insert_detached_before(parent, child, first);
     }
 
     fn node(&self, id: NodeId) -> Result<&Node, Error> {

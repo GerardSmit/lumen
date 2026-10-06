@@ -46,7 +46,6 @@ pub(crate) struct ImageSnapshot {
     pub(crate) current_src: String,
     pub(crate) natural_width: u32,
     pub(crate) natural_height: u32,
-    pub(crate) origin_clean: bool,
 }
 
 /// The image source state exposed to canvas consumers. Pending or absent
@@ -412,7 +411,6 @@ impl ImageLoader {
                 .image
                 .as_ref()
                 .map_or(0, |image| image.height),
-            origin_clean: request.current.origin_clean,
         }
     }
 
@@ -579,10 +577,6 @@ impl ImageLoader {
     fn mark_scan_needed(&self) {
         self.needs_scan.set(true);
         self.loading_remaining.set(true);
-    }
-
-    pub(crate) fn has_pending(&self) -> bool {
-        self.loading_remaining.get()
     }
 
     pub(crate) fn is_loading(&self, node: NodeId) -> bool {

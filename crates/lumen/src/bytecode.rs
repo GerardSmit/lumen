@@ -4048,7 +4048,7 @@ fn step_value(
 /// [`step_value`] pushing its result onto the VM's operand stack.
 /// Where [`step_and_store`] pushes: the run loop's [`VmStack`] or a plain `Vec` (helpers
 /// outside the loop).
-trait PushValue {
+pub(crate) trait PushValue {
     fn push_value(&mut self, v: Value);
 }
 impl PushValue for VmStack {
@@ -5152,7 +5152,7 @@ pub(crate) fn virt_apply(
     let intrinsic = match apply {
         Value::Obj(o) => o.try_borrow().is_ok_and(|b| {
             matches!(&b.call, crate::value::Callable::Native(fp)
-                if *fp as usize == crate::builtins::nf_function_apply as usize)
+                if *fp as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize)
         }),
         _ => false,
     };

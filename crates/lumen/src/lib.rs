@@ -111,6 +111,7 @@ mod cldr_units;
 #[cfg(feature = "intl")]
 mod tznames;
 #[rustfmt::skip]
+#[cfg(feature = "intl")]
 mod units;
 use lumen_common::unicode_norm_impl;
 use lumen_common::unicode_props;

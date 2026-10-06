@@ -111,7 +111,6 @@ openssl_api! {
     ssl SSL_get0_alpn_selected(CPtr, *mut *const u8, *mut c_uint);
     ssl SSL_select_next_proto(*mut *mut u8, *mut u8, *const u8, c_uint, *const u8, c_uint) -> c_int;
     ssl SSL_get1_session(Ptr) -> Ptr;
-    ssl SSL_get_session(CPtr) -> Ptr;
     ssl SSL_set_session(Ptr, Ptr) -> c_int;
     ssl SSL_session_reused(CPtr) -> c_int;
     ssl SSL_SESSION_free(Ptr);
@@ -130,7 +129,6 @@ openssl_api! {
     ssl SSL_pending(CPtr) -> c_int;
     ssl SSL_client_hello_get0_session_id(Ptr, *mut *const u8) -> usize;
     ssl SSL_client_hello_get0_ext(Ptr, c_uint, *mut *const u8, *mut usize) -> c_int;
-    ssl SSL_set_options(Ptr, u64) -> u64;
     ssl SSL_get_shared_sigalgs(Ptr, c_int, *mut c_int, *mut c_int, *mut c_int, *mut u8, *mut u8) -> c_int;
     ssl SSL_get_verify_mode(CPtr) -> c_int;
     ssl SSL_get_shutdown(CPtr) -> c_int;
@@ -197,11 +195,8 @@ openssl_api! {
     crypto PEM_read_bio_PrivateKey(Ptr, *mut Ptr, CPtr, Ptr) -> Ptr;
     crypto PEM_read_bio_X509_CRL(Ptr, *mut Ptr, CPtr, Ptr) -> Ptr;
     crypto PEM_read_bio_DHparams(Ptr, *mut Ptr, CPtr, Ptr) -> Ptr;
-    crypto d2i_X509(*mut Ptr, *mut *const u8, c_long) -> Ptr;
     crypto i2d_X509(CPtr, *mut *mut u8) -> c_int;
     crypto X509_free(Ptr);
-    crypto X509_up_ref(Ptr) -> c_int;
-    crypto X509_dup(CPtr) -> Ptr;
     crypto X509_check_issued(CPtr, CPtr) -> c_int;
     crypto X509_CRL_free(Ptr);
     crypto EVP_PKEY_free(Ptr);
@@ -209,13 +204,11 @@ openssl_api! {
     crypto DH_get0_pqg(CPtr, *mut CPtr, *mut CPtr, *mut CPtr);
     crypto BN_num_bits(CPtr) -> c_int;
     crypto X509_STORE_new() -> Ptr;
-    crypto X509_STORE_free(Ptr);
     crypto X509_STORE_up_ref(Ptr) -> c_int;
     crypto X509_STORE_add_cert(Ptr, Ptr) -> c_int;
     crypto X509_STORE_add_crl(Ptr, Ptr) -> c_int;
     crypto X509_STORE_set_flags(Ptr, c_ulong) -> c_int;
     crypto X509_STORE_set_default_paths(Ptr) -> c_int;
-    crypto X509_STORE_load_file(Ptr, *const c_char) -> c_int;
     crypto X509_STORE_get0_objects(CPtr) -> Ptr;
     crypto X509_OBJECT_get_type(CPtr) -> c_int;
     crypto X509_OBJECT_get0_X509(CPtr) -> Ptr;
@@ -226,13 +219,10 @@ openssl_api! {
     crypto d2i_PKCS12_bio(Ptr, *mut Ptr) -> Ptr;
     crypto PKCS12_parse(Ptr, *const c_char, *mut Ptr, *mut Ptr, *mut Ptr) -> c_int;
     crypto PKCS12_free(Ptr);
-    crypto OPENSSL_sk_new_null() -> Ptr;
     crypto OPENSSL_sk_num(CPtr) -> c_int;
     crypto OPENSSL_sk_value(CPtr, c_int) -> Ptr;
-    crypto OPENSSL_sk_push(Ptr, CPtr) -> c_int;
     crypto OPENSSL_sk_free(Ptr);
     crypto CRYPTO_malloc(usize, *const c_char, c_int) -> Ptr;
-    crypto CRYPTO_free(Ptr, *const c_char, c_int);
     crypto EVP_PKEY_get_bits(CPtr) -> c_int;
     crypto EVP_PKEY_get_base_id(CPtr) -> c_int;
     crypto ERR_get_error() -> c_ulong;

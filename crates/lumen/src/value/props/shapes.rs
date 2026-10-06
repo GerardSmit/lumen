@@ -28,7 +28,7 @@ pub(crate) fn proto_epoch() -> u32 {
 
 /// Invalidate every property-creation inline cache (see [`PROTO_EPOCH`]).
 pub(crate) fn bump_proto_epoch() {
-    let _ = PROTO_EPOCH.fetch_update(
+    let _ = PROTO_EPOCH.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |v| Some(v.saturating_add(1)),

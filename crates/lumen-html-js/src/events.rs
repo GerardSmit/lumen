@@ -492,18 +492,6 @@ struct SubmitEventConstructor {
     submitter: Option<Value>,
 }
 
-impl SubmitEventConstructor {
-    fn into_instance(self, ctx: &mut Ctx) -> Result<Value, Value> {
-        let slot = self.event.submitter_slot.clone();
-        let Self { event, submitter } = self;
-        let instance = ctx.new_instance(event);
-        if let (Some(slot), Some(submitter)) = (slot, submitter) {
-            ctx.define_native_private_value_slot(&instance, &slot, submitter)?;
-        }
-        Ok(instance)
-    }
-}
-
 impl CtorRet<JsHost, DomSubmitEvent> for SubmitEventConstructor {
     fn into_ctor(self, cx: &<JsHost as Host>::Cx<'_>) -> Result<Value, Value> {
         let slot = self.event.submitter_slot.clone();
@@ -596,16 +584,6 @@ pub(crate) struct DomFormDataEvent {
 struct FormDataEventConstructor {
     event: DomFormDataEvent,
     form_data: Value,
-}
-
-impl FormDataEventConstructor {
-    fn into_instance(self, ctx: &mut Ctx) -> Result<Value, Value> {
-        let slot = self.event.form_data_slot.clone();
-        let Self { event, form_data } = self;
-        let instance = ctx.new_instance(event);
-        ctx.define_native_private_value_slot(&instance, &slot, form_data)?;
-        Ok(instance)
-    }
 }
 
 impl CtorRet<JsHost, DomFormDataEvent> for FormDataEventConstructor {

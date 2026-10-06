@@ -14,8 +14,6 @@ pub use lumen_common::ucd::{
     graphemes, line_breaks, next_grapheme_boundary, previous_grapheme_boundary, BreakOpportunity,
 };
 
-#[cfg(test)]
-use alloc::vec;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::cmp::Ordering as CmpOrdering;
@@ -1080,6 +1078,7 @@ impl FontSet {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     fn metric_face(&self, spec: &FontSpec) -> &FontFace {
         &self.faces[self.metric_face_index(spec)].face
     }
@@ -3067,6 +3066,10 @@ mod tests {
         assert_eq!(
             shape(&["Second", "First"], 400, FontStyle::Normal).glyphs[0].face,
             second_id
+        );
+        assert_eq!(
+            shape(&["First"], 400, FontStyle::Normal).glyphs[0].face,
+            regular_id
         );
         assert_eq!(
             shape(&["First"], 450, FontStyle::Normal).glyphs[0].face,

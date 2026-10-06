@@ -895,6 +895,7 @@ pub(crate) fn upgrade_created_element(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn deliver_reactions(ctx: &mut Ctx) -> OpResult<()> {
     if let Some(hub) = hub_from_ctx(ctx) {
         hub.flush(ctx)?;

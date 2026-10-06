@@ -6,8 +6,11 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(not(target_os = "none"))]
+use std::time::Instant;
+#[cfg(not(target_os = "none"))]
 use lumen_os::sched::{Park, Unpark};
 
 pub use lumen_os::sched::CpuHint;

@@ -8,7 +8,7 @@ use super::*;
 use crate::realm_services::RealmServices;
 use lumen::embed::{
     HostRealmScopeError, RealmHandle, WeakValue, WindowProxyDisposition, WindowProxyOperation,
-    WindowProxyPolicy, WindowProxyResult,
+    WindowProxyPolicy,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -893,9 +893,6 @@ fn request_for_frame(context: &BrowsingContext) -> FrameNavigationRequest {
         FrameSource::Blank
     };
     let sandboxed = sandbox.is_some();
-    let sandbox_allows_same_origin = sandbox.as_deref().is_some_and(|value| {
-        super::html_space_tokens(value).any(|token| token.eq_ignore_ascii_case("allow-same-origin"))
-    });
     let unsupported = if sandboxed {
         Some(FrameUnsupportedReason::SandboxPolicy)
     } else if matches!(source, FrameSource::InvalidUrl(_)) {
@@ -1025,10 +1022,6 @@ impl BrowsingContext {
             .unwrap_or_else(|| "about:blank".to_owned())
     }
 
-    pub(crate) fn request_location_navigation(&self, input: &str) -> OpResult<()> {
-        self.request_location_navigation_from(input, &self.current_document_url())
-    }
-
     pub(crate) fn request_location_navigation_from(
         &self,
         input: &str,
@@ -1071,10 +1064,6 @@ impl BrowsingContext {
 
     fn parent_context(&self) -> Option<Rc<BrowsingContext>> {
         self.parent.as_ref()?.upgrade()
-    }
-
-    fn frame_element(&self) -> Option<(Rc<DomRealm>, NodeId)> {
-        Some((self.owner_realm.as_ref()?.upgrade()?, self.owner_node?))
     }
 
     fn top_context(self: &Rc<Self>) -> Rc<Self> {
@@ -1603,7 +1592,7 @@ pub(crate) fn root_context(ctx: &mut Ctx) -> Result<Rc<BrowsingContext>, Value> 
     BrowsingContext::root(ctx)
 }
 
-pub(crate) fn context_service(context: Rc<BrowsingContext>) -> BrowsingContextService {
+fn context_service(context: Rc<BrowsingContext>) -> BrowsingContextService {
     BrowsingContextService {
         context: Rc::downgrade(&context),
         metadata: context.metadata.borrow().clone(),
@@ -1615,18 +1604,6 @@ pub(crate) fn context_service(context: Rc<BrowsingContext>) -> BrowsingContextSe
 
 pub(crate) fn context_proxy(ctx: &mut Ctx, context: &BrowsingContext) -> Option<Value> {
     context.make_window_proxy(ctx).ok()
-}
-
-pub(crate) fn context_proxy_value(context: &BrowsingContext) -> Option<Value> {
-    context.proxy()
-}
-
-pub(crate) fn context_is_top(context: &BrowsingContext) -> bool {
-    context.parent.is_none()
-}
-
-pub(crate) fn context_parent_option(context: &BrowsingContext) -> Option<Rc<BrowsingContext>> {
-    context.parent_context()
 }
 
 pub(crate) fn context_top(context: &Rc<BrowsingContext>) -> Rc<BrowsingContext> {
@@ -1738,11 +1715,6 @@ pub(crate) fn register_context_service_with_metadata(
     );
 }
 
-pub(crate) fn current_context(ctx: &mut Ctx) -> Option<Rc<BrowsingContext>> {
-    RealmServices::<BrowsingContextService>::current(ctx)
-        .and_then(|service| service.context.upgrade())
-}
-
 pub(crate) fn create_context_proxy(ctx: &mut Ctx, context: &BrowsingContext) -> OpResult<Value> {
     context
         .make_window_proxy(ctx)
@@ -1833,17 +1805,6 @@ pub(crate) fn window_frame_element_from_metadata(
     let parent_realm = parent_context.realm_handle();
     ctx.with_host_realm(&parent_realm, |ctx| owner_realm.wrap(ctx, owner_node))
         .map_err(host_realm_error)
-}
-
-pub(crate) fn invocation_context(ctx: &mut Ctx) -> Option<Rc<BrowsingContext>> {
-    let service = RealmServices::<BrowsingContextService>::current(ctx)?;
-    let caller = ctx.invocation_host_realm();
-    service
-        .context
-        .upgrade()?
-        .group
-        .upgrade()?
-        .for_realm(&caller)
 }
 
 pub(crate) fn invocation_origin(ctx: &mut Ctx) -> Option<Origin> {

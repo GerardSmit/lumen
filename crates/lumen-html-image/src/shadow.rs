@@ -18,7 +18,7 @@ pub(super) fn draw(
     else {
         return Ok(());
     };
-    let (sizes, padding) = blur_sizes(shadow.blur, raster.scale)?;
+    let (_, padding) = blur_sizes(shadow.blur, raster.scale)?;
     let left = (visible.x * raster.scale).floor() - padding as f32;
     let top = (visible.y * raster.scale).floor() - padding as f32;
     let width = ((visible.x + visible.width) * raster.scale).ceil() - left + padding as f32;

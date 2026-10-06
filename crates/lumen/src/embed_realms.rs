@@ -2375,6 +2375,7 @@ mod tests {
 
         assert!(matches!(child_checks, Value::Bool(true)));
         assert_ne!(object_id(ctx, &parent_base), object_id(ctx, &child_base));
+        assert_ne!(object_id(ctx, &parent_derived), object_id(ctx, &child_derived));
         assert!(ctx
             .member_set(&parent_global, "HostRealmBase", parent_base.clone())
             .is_ok());

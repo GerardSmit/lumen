@@ -164,7 +164,10 @@ pub fn pagesize() -> i64 {
 
 /// The `resource` module's `RLIMIT_*` and `RUSAGE_*` constants on this platform.
 pub fn constants() -> Vec<(&'static str, i64)> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
     let mut v: Vec<(&'static str, i64)> = Vec::new();
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+    let v: Vec<(&'static str, i64)> = Vec::new();
     #[cfg(any(target_os = "linux", target_os = "android"))]
     v.extend([
         ("RLIMIT_CPU", 0),

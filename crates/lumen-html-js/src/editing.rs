@@ -1514,7 +1514,7 @@ mod tests {
     #[test]
     fn idl_value_changes_and_set_range_text_keep_utf16_selection_semantics() {
         let mut engine = Engine::new();
-        let realm = install(
+        install(
             engine.ctx(),
             "<input id=field value=default><textarea id=area>default</textarea>",
             64,

@@ -2,7 +2,7 @@
 use crate::{
     css::{
         self, AlignItems, BorderStyle, BoxSizing, Clear, Direction, Display, FlexDirection, Float,
-        JustifyContent, LineHeight, Overflow, Position, Style, StyleIndex, TextAlign, WhiteSpace,
+        JustifyContent, LineHeight, Position, Style, StyleIndex, TextAlign, WhiteSpace,
     },
     paint::{
         Affine, BackgroundBox, BackgroundImage, BackgroundLayer, BackgroundPaint, BackgroundRepeat,
@@ -3030,7 +3030,7 @@ impl Layout<'_> {
                 depth,
             );
         };
-        let mut node_style = match computed {
+        let node_style = match computed {
             Some(style) => style,
             None => self
                 .computed_style(node, Some(parent_style))
@@ -3904,7 +3904,7 @@ impl Layout<'_> {
     ) -> Result<f32, LayoutError> {
         let resolved_style = style.resolve_percentages(available, self.parent_height);
         let style = &resolved_style;
-        let [margin_top, margin_right, margin_bottom, margin_left] = style.margin_sides;
+        let [margin_top, _, margin_bottom, margin_left] = style.margin_sides;
         let [padding_top, padding_right, padding_bottom, padding_left] = style.padding_sides;
         let [border_top, border_right, border_bottom, border_left] = border_widths(style);
         let attr_width = style.width.map(|width| content_dimension(style, width));
@@ -4461,11 +4461,9 @@ struct BlockChild {
     first_float: usize,
     border_top: f32,
     margin_top: f32,
-    margin_bottom: f32,
     /// `Some(chain)` when the child collapsed through completely; `chain` is
     /// its single collapsed margin `max(top, bottom)`.
     through: Option<f32>,
-    advance: f32,
     break_before: bool,
 }
 
@@ -7386,7 +7384,7 @@ fn raise_range(range: &mut core::ops::Range<usize>, first: usize, last: usize, e
     // An empty chunk moves no entries. Its former boundary may lie beyond
     // the current stream after an empty transform/opacity wrapper is removed.
     // Empty recorded ranges likewise have no entries to remap.
-    if first == last || range.is_empty() {
+    if first == last || range.start >= range.end {
         return;
     }
     if range.start >= first && range.end <= last {
@@ -10868,7 +10866,6 @@ impl Layout<'_> {
         item_style.flex_basis = basis;
 
         let natural = self.intrinsic_virtual_generated_size(&child, &item_style, false)?;
-        let minimum_intrinsic = self.intrinsic_virtual_generated_size(&child, &item_style, true)?;
         let edges = box_edges(&item_style, row);
         let cross_edges = box_edges(&item_style, !row);
         let content_basis = if item_style.flex_basis_content {
@@ -12668,16 +12665,16 @@ impl Layout<'_> {
             - border_right
             - left
             - right;
-        let (used_left, used_right) = if free >= 0.0 && (left_auto || right_auto) {
+        let used_left = if free >= 0.0 && (left_auto || right_auto) {
             match (left_auto, right_auto) {
-                (true, true) => (free * 0.5, free * 0.5),
-                (true, false) => (free, right),
-                _ => (left, free),
+                (true, true) => free * 0.5,
+                (true, false) => free,
+                _ => left,
             }
         } else if parent_style.direction == Direction::Rtl {
-            (left + free, right)
+            left + free
         } else {
-            (left, right)
+            left
         };
         let outer_x = x + used_left;
         let outer_y = y + margin_top;
@@ -12950,9 +12947,7 @@ impl Layout<'_> {
             first_float: self.floats.len(),
             border_top: child_y + margin_top,
             margin_top,
-            margin_bottom,
             through: None,
-            advance,
             break_before: *non_block_since,
         });
         let horizontal_extent = child
@@ -18581,9 +18576,7 @@ impl Layout<'_> {
                     first_float,
                     border_top: child_y + margin,
                     margin_top: margin,
-                    margin_bottom,
                     through,
-                    advance,
                     break_before: non_block_since,
                 });
                 non_block_since = false;
@@ -18611,7 +18604,6 @@ impl Layout<'_> {
                     &mut paragraph,
                     &mut frame_path,
                 )?;
-                list_marker_inside_pending = false;
             }
             if generated_before_pending {
                 let before = generated_before.as_ref().ok_or(LayoutError::InvalidTree)?;
@@ -18740,7 +18732,6 @@ impl Layout<'_> {
                     &mut trailing_space,
                     depth + 1,
                 )?;
-                non_block_since = true;
                 last_was_block = false;
                 saw_non_block = true;
             }

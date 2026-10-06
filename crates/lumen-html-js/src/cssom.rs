@@ -9,7 +9,9 @@ use crate::realm_services::RealmServices;
 use lumen::embed::Promise;
 use lumen::embed::{JsFunction, JsHost, JsObject};
 use lumen_bind::{CtorRet, FromArg, Host, Passed, This};
-use lumen_html::css::{self, MediaEnvironment};
+use lumen_html::css;
+#[cfg(test)]
+use lumen_html::css::MediaEnvironment;
 use std::{cell::Cell, collections::HashSet, rc::Weak, sync::Arc};
 
 fn css_error(error: css::CssError) -> OpError {
@@ -576,7 +578,6 @@ fn numeric_array(ctx: &mut Ctx, values: Vec<Value>) -> Result<Value, Value> {
 }
 
 fn math_numeric_base(
-    ctx: &mut Ctx,
     expression: css::typed_numeric::NumericExpression,
     values_key: Value,
 ) -> OpResult<DomCssMathValue> {
@@ -611,7 +612,7 @@ where
     T: lumen_bind::Methods<JsHost>,
 {
     let values_key = ctx.new_symbol(Some("CSSMathValue.values".into()));
-    let base = math_numeric_base(ctx, expression, values_key.clone())?;
+    let base = math_numeric_base(expression, values_key.clone())?;
     let instance = ctx.new_instance(make(base));
     let values = numeric_array(ctx, values).map_err(OpError::thrown)?;
     define_data_property(ctx, &instance, values_key, values, false, false, false)
@@ -2180,7 +2181,7 @@ impl CssStyleSheetText {
         path: &[usize],
         edit: impl FnOnce(&mut CssRuleText) -> Result<(), css::CssError>,
     ) -> Result<(), css::CssError> {
-        let Some((&top_index, rest)) = path.split_first() else {
+        let Some((&top_index, _)) = path.split_first() else {
             return Err(css::CssError {
                 offset: 0,
                 message: "CSS rule index out of range",
@@ -2273,62 +2274,6 @@ impl CssStyleSheetText {
     pub fn replace(&mut self, text: &str) -> Result<(), css::CssError> {
         let parsed = Self::parse(text)?;
         *self = parsed;
-        Ok(())
-    }
-
-    pub fn set_style_rule_declarations(
-        &mut self,
-        index: usize,
-        declarations: &str,
-    ) -> Result<(), css::CssError> {
-        let rules = self.css_rules()?;
-        let Some(rule) = rules.get(index) else {
-            return Err(css::CssError {
-                offset: index,
-                message: "CSS rule index out of range",
-            });
-        };
-        let Some(selector) = rule
-            .selector_text
-            .as_deref()
-            .or(rule.font_face.then_some("@font-face"))
-        else {
-            return Err(css::CssError {
-                offset: index,
-                message: "rule is not a style rule",
-            });
-        };
-        let ranges = top_level_rule_ranges(&self.text)?;
-        let mut output = String::new();
-        for (rule_index, (start, end, open, close)) in ranges.into_iter().enumerate() {
-            if !output.is_empty() {
-                output.push('\n');
-            }
-            if rule_index == index {
-                if open.is_none() || close.is_none() {
-                    return Err(css::CssError {
-                        offset: start,
-                        message: "rule is not a style rule",
-                    });
-                }
-                output.push_str(selector);
-                output.push_str(" {");
-                if !declarations.trim().is_empty() {
-                    output.push(' ');
-                    output.push_str(&if rule.font_face {
-                        css::cssom_font_face_declaration_text(declarations)
-                    } else {
-                        css::cssom_declaration_text(declarations)
-                    });
-                    output.push(' ');
-                }
-                output.push('}');
-            } else {
-                output.push_str(self.text[start..end].trim());
-            }
-        }
-        css::parse(&output)?;
-        self.text = output;
         Ok(())
     }
 
@@ -2923,22 +2868,20 @@ fn top_level_rule_ranges_in_context(
 
 /// A viewport-bound MediaQueryList snapshot. The DOM wrapper can query it on
 /// each `matches` read; dispatching `change` requires a host resize source.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaQueryList {
     query: String,
     environment: MediaEnvironment,
 }
 
+#[cfg(test)]
 impl MediaQueryList {
     pub fn new(query: &str, environment: MediaEnvironment) -> Self {
         Self {
             query: query.to_owned(),
             environment,
         }
-    }
-
-    pub fn media(&self) -> &str {
-        &self.query
     }
 
     pub fn matches(&self) -> bool {
@@ -3564,7 +3507,6 @@ pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
                     continue;
                 }
                 if let Some(event) = JsObject::from_value(event) {
-                    let target = DomEventTarget::from_data(data.target.data_handle());
                     let _ = crate::events::dispatch_event(ctx, This(wrapper), event);
                 }
             }
@@ -5704,12 +5646,6 @@ impl DomCssRuleStyle {
         // parser; quoted semicolons must not be treated as separators.
         css::cssom_declaration_names(&text).map_err(css_error)
     }
-}
-
-/// Validate that a proposed rule parses as a stylesheet before callers mutate
-/// the owning style element. Returning an error leaves the original unchanged.
-pub fn validate_stylesheet(text: &str) -> Result<(), css::CssError> {
-    css::parse(text).map(|_| ())
 }
 
 #[cfg(test)]

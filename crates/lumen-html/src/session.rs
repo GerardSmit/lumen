@@ -1197,7 +1197,7 @@ impl RenderSession {
                 .iter()
                 .filter(|transform| transform.hits.contains(&index))
                 .map(|transform| transform.matrix);
-            let Some(mut bounds) = layout::transformed_bounds(hit.rect, transforms) else {
+            let Some(bounds) = layout::transformed_bounds(hit.rect, transforms) else {
                 continue;
             };
             for clip in frame

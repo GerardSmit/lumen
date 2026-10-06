@@ -1,5 +1,5 @@
 //! Shadow trees keep ordinary DOM links intact; composition is derived on demand.
-use crate::{observe, Dirty, Document, Error, MutationKind, Namespace, NodeId, NodeKind};
+use crate::{Dirty, Document, Error, MutationKind, Namespace, NodeId, NodeKind};
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

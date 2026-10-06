@@ -629,7 +629,7 @@ fn auto_popovers_to_hide_until(
     nodes
         .try_reserve(count.saturating_sub(first_to_hide))
         .map_err(|_| StateError::ResourceLimit)?;
-    for (index, (node, kind, _)) in document
+    for (index, (node, _, _)) in document
         .top_layer_entries()
         .filter(|(_, kind, _)| *kind == Kind::Popover(PopoverMode::Auto))
         .enumerate()

@@ -1501,7 +1501,7 @@ impl Host for JsHost {
         Value::Undefined
     }
 
-    /// `Option::None` is `undefined`; return [`Nullable`] or [`Null`] for a JS `null`.
+    /// `Option::None` is `undefined`; return [`Nullable`] for a JS `null`.
     #[inline(always)]
     fn none(_: &mut Interp) -> Value {
         Value::Undefined
@@ -1691,19 +1691,6 @@ impl<'a> FromArg<'a, JsHost> for BigU64 {
     }
 }
 
-/// A result that is JS `null` (`Option::None` is `undefined`); `Option<Null>` is `null` or
-/// `undefined`.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Null;
-
-impl IntoRet<JsHost> for Null {
-    const MAY_RUN: bool = false;
-    #[inline(always)]
-    fn into_ret(self, _: &mut Interp) -> Result<Value, Value> {
-        Ok(Value::Null)
-    }
-}
-
 /// A nullable result (WebIDL `T?`): `None` is JS `null`, where a bare `Option<T>` is `undefined`.
 #[derive(Clone, Debug, Default)]
 pub struct Nullable<T>(pub Option<T>);
@@ -1823,7 +1810,6 @@ impl IntoRet<JsHost> for &Value {
 pub struct JsArrayBuffer(pub Vec<u8>);
 
 impl Elem for Value {}
-impl Elem for Null {}
 impl Elem for JsObject {}
 impl Elem for JsFunction {}
 impl Elem for BigI64 {}
@@ -5247,8 +5233,6 @@ mod tests {
 
     #[lumen_bind::module(name = "lazyFixtures")]
     mod lazy_fixtures {
-        use super::*;
-
         #[class(name = "LazyThing", hint(js(webidl)))]
         pub struct LazyThing;
 

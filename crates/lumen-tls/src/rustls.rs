@@ -6,21 +6,32 @@
 //! `close_notify` reads as a clean EOF. Clients trust the operating system's certificate store,
 //! falling back to the bundled Mozilla roots when that store yields nothing.
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 use std::collections::HashMap;
 use std::io::{Cursor, ErrorKind, Read, Write};
+#[cfg(any(test, not(unix), target_os = "android"))]
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use std::sync::Mutex;
+use std::time::Duration;
+#[cfg(any(test, not(unix), target_os = "android"))]
+use std::time::Instant;
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{self, CryptoProvider};
+#[cfg(any(test, not(unix), target_os = "android"))]
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::pki_types::PrivateKeyDer;
 use rustls::time_provider::TimeProvider;
-use rustls::{
-    CipherSuite, ClientConfig, ClientConnection, Connection, DigitallySignedStruct,
-    ProtocolVersion, RootCertStore, ServerConfig, ServerConnection, SignatureScheme,
-};
+use rustls::{ClientConfig, ClientConnection, ProtocolVersion, RootCertStore};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::{DigitallySignedStruct, SignatureScheme};
+#[cfg(any(test, not(unix), target_os = "android"))]
+use rustls::{CipherSuite, Connection, ServerConfig, ServerConnection};
 
 pub type RuntimeRandomFill = fn(&mut [u8]) -> Result<(), String>;
 pub type RuntimeUnixTimeSource = fn() -> Option<u64>;
@@ -71,8 +82,6 @@ impl TimeProvider for RuntimeTimeProvider {
         Some(UnixTime::since_unix_epoch(Duration::from_secs(seconds)))
     }
 }
-
-static RUNTIME_TIME_PROVIDER: RuntimeTimeProvider = RuntimeTimeProvider;
 
 fn runtime_provider() -> Result<Arc<CryptoProvider>, String> {
     if RUNTIME_CRYPTO.get().is_none() {
@@ -291,19 +300,23 @@ impl ClientSession {
 
 /// How long a handshake may keep retrying reads that time out. The runtime's sockets carry short
 /// poll-style read timeouts (100 ms), so a single timeout is not a failure.
+#[cfg(any(test, not(unix), target_os = "android"))]
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 pub struct TlsStream {
     connection: Connection,
     stream: TcpStream,
     nonblocking: bool,
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl TlsStream {
     pub fn connect(stream: TcpStream, hostname: &str) -> Result<Self, String> {
         Self::connect_with_options(stream, hostname, &[], true)
     }
 
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn connect_with_alpn(
         stream: TcpStream,
         hostname: &str,
@@ -410,11 +423,13 @@ impl TlsStream {
         Ok(tls)
     }
 
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.stream.set_read_timeout(timeout)
     }
 
     /// The TCP socket under the TLS session, for registering it with a readiness reactor.
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn socket(&self) -> &TcpStream {
         &self.stream
     }
@@ -424,6 +439,7 @@ impl TlsStream {
     /// always accepts what it is given; records the socket would not take stay queued, and
     /// [`Write::flush`] fails with `WouldBlock` until they are out. Call it after the handshake,
     /// which always runs blocking.
+    #[cfg(any(not(unix), target_os = "android"))]
     pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
         self.stream.set_nonblocking(nonblocking)?;
         self.nonblocking = nonblocking;
@@ -532,6 +548,7 @@ impl TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn is_retry(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -549,6 +566,7 @@ fn validate_alpn(protocols: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Read for TlsStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         loop {
@@ -582,6 +600,7 @@ impl Read for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Write for TlsStream {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
         // Drain earlier records first so the plaintext buffer has room for this one.
@@ -602,6 +621,7 @@ impl Write for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl Drop for TlsStream {
     fn drop(&mut self) {
         self.connection.send_close_notify();
@@ -609,12 +629,14 @@ impl Drop for TlsStream {
     }
 }
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn provider() -> &'static Arc<CryptoProvider> {
     static PROVIDER: OnceLock<Arc<CryptoProvider>> = OnceLock::new();
     PROVIDER.get_or_init(|| Arc::new(crypto::ring::default_provider()))
 }
 
 /// The operating system's trust store, or the bundled Mozilla roots if it yields nothing.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn root_store() -> &'static Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS.get_or_init(|| {
@@ -629,6 +651,7 @@ fn root_store() -> &'static Arc<RootCertStore> {
 }
 
 /// Client configs are shared per (verify, ALPN) pair so connections reuse the session cache.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn client_config(verify_peer: bool, protocols: &[String]) -> Result<Arc<ClientConfig>, String> {
     type Key = (bool, Vec<String>);
     static CONFIGS: OnceLock<Mutex<HashMap<Key, Arc<ClientConfig>>>> = OnceLock::new();
@@ -658,6 +681,7 @@ fn client_config(verify_peer: bool, protocols: &[String]) -> Result<Arc<ClientCo
 
 /// Build a verified socket client using the normal root set plus connection-local PEM roots.
 /// Configurations containing caller roots are deliberately not entered in the shared cache.
+#[cfg(any(test, not(unix), target_os = "android"))]
 fn client_config_with_extra_pem(
     protocols: &[String],
     pem: &[u8],
@@ -685,9 +709,11 @@ fn client_config_with_extra_pem(
 
 /// `rejectUnauthorized: false`: any certificate chain and name is accepted, but the handshake
 /// signatures are still checked against the presented certificate.
+#[cfg(any(test, not(unix), target_os = "android"))]
 #[derive(Debug)]
 struct AcceptAnyCertificate(Arc<CryptoProvider>);
 
+#[cfg(any(test, not(unix), target_os = "android"))]
 impl ServerCertVerifier for AcceptAnyCertificate {
     fn verify_server_cert(
         &self,

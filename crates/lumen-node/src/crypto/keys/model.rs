@@ -487,32 +487,6 @@ impl EcKey {
         let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
         Some(asn1::seq(&refs))
     }
-
-    /// The public key as an `elliptic_curve` key of curve `C` (which must be `self.curve`).
-    pub fn public_key<C>(&self) -> KResult<elliptic_curve::PublicKey<C>>
-    where
-        C: elliptic_curve::CurveArithmetic,
-        elliptic_curve::FieldBytesSize<C>: elliptic_curve::sec1::ModulusSize,
-        elliptic_curve::AffinePoint<C>:
-            elliptic_curve::sec1::FromEncodedPoint<C> + elliptic_curve::sec1::ToEncodedPoint<C>,
-    {
-        elliptic_curve::PublicKey::<C>::from_sec1_bytes(&self.point)
-            .map_err(|_| super::invalid_point())
-    }
-
-    /// The private key as an `elliptic_curve` secret key of curve `C` (which must be `self.curve`).
-    pub fn secret_key<C>(&self) -> KResult<elliptic_curve::SecretKey<C>>
-    where
-        C: elliptic_curve::CurveArithmetic,
-    {
-        let d = self.d.as_ref().ok_or_else(not_private)?;
-        elliptic_curve::SecretKey::<C>::from_slice(d).map_err(|_| invalid_private())
-    }
-
-    /// The private scalar as a `p256` key (for P-256 keys).
-    pub fn p256_secret(&self) -> KResult<p256::SecretKey> {
-        self.secret_key::<p256::NistP256>()
-    }
 }
 
 impl OkpKey {
@@ -563,20 +537,6 @@ impl OkpKey {
 
     pub fn x25519_public(&self) -> KResult<x25519_dalek::PublicKey> {
         Ok(x25519_dalek::PublicKey::from(self.public_array::<32>()?))
-    }
-}
-
-impl DhKey {
-    /// DER `DHParameter` (PKCS#3) or X9.42 `DomainParameters` when `q` is known.
-    pub fn params_der(&self) -> Vec<u8> {
-        match &self.q {
-            Some(q) => asn1::seq(&[
-                &asn1::biguint(&self.p),
-                &asn1::biguint(&self.g),
-                &asn1::biguint(q),
-            ]),
-            None => asn1::seq(&[&asn1::biguint(&self.p), &asn1::biguint(&self.g)]),
-        }
     }
 }
 
@@ -833,21 +793,6 @@ pub fn parse_dsa_legacy(der: &[u8]) -> Option<DsaKey> {
         y,
         x: Some(x),
     })
-}
-
-impl DsaKey {
-    /// DER of the legacy OpenSSL `DSAPrivateKey`.
-    pub fn legacy_der(&self) -> Option<Vec<u8>> {
-        let x = self.x.as_ref()?;
-        Some(asn1::seq(&[
-            &asn1::small_uint(0),
-            &asn1::biguint(&self.p),
-            &asn1::biguint(&self.q),
-            &asn1::biguint(&self.g),
-            &asn1::biguint(&self.y),
-            &asn1::biguint(x),
-        ]))
-    }
 }
 
 fn parse_spki(der: &[u8]) -> Option<KResult<AsymKey>> {

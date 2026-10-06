@@ -242,7 +242,10 @@ pub fn lockf(fd: i32, lock: RecordLock) -> R<()> {
 
 /// The names and values of the `fcntl` module's constants on this platform.
 pub fn fcntl_constants() -> Vec<(&'static str, i64)> {
+    #[cfg(unix)]
     let mut v: Vec<(&'static str, i64)> = Vec::new();
+    #[cfg(not(unix))]
+    let v: Vec<(&'static str, i64)> = Vec::new();
     #[cfg(unix)]
     v.extend([
         ("LOCK_SH", 1),

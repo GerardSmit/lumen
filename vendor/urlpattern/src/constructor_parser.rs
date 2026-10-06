@@ -115,7 +115,7 @@ impl<'a> ConstructorStringParser<'a> {
   }
 
   // Ref: https://wicg.github.io/urlpattern/#get-a-safe-token
-  fn get_safe_token(&self, index: usize) -> &Token {
+  fn get_safe_token(&self, index: usize) -> &Token<'_> {
     if index < self.token_list.len() {
       &self.token_list[index]
     } else {

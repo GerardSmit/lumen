@@ -262,14 +262,6 @@ enum PointOrder {
     After,
 }
 
-fn as_ordering(order: PointOrder) -> Ordering {
-    match order {
-        PointOrder::Before => Ordering::Less,
-        PointOrder::Equal => Ordering::Equal,
-        PointOrder::After => Ordering::Greater,
-    }
-}
-
 fn child_count(document: &lumen_html::Document, node: NodeId) -> OpResult<usize> {
     let mut count = 0;
     let mut child = document.first_child(node).map_err(dom_error)?;
@@ -1271,7 +1263,6 @@ fn required_static_range_member(
 
 struct StaticRangeNode {
     endpoint: StaticEndpoint,
-    wrapper: Value,
 }
 
 impl<'a> FromArg<'a, lumen::embed::JsHost> for StaticRangeNode {
@@ -1289,7 +1280,6 @@ impl<'a> FromArg<'a, lumen::embed::JsHost> for StaticRangeNode {
                 },
                 realm: node.realm.clone(),
             },
-            wrapper: value.clone(),
         })
     }
 }
