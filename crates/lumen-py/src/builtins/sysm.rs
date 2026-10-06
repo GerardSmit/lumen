@@ -366,6 +366,12 @@ pub mod sys {
         Ok(())
     }
 
+    /// Private function for getting PyConfig.cpu_count (-1: no `-X cpu_count` / `PYTHON_CPU_COUNT` override).
+    #[op]
+    fn _get_cpu_count_config() -> i64 {
+        -1
+    }
+
     /// Return the current thread switch interval; see sys.setswitchinterval().
     #[op]
     fn getswitchinterval(it: &mut Interp) -> f64 {
