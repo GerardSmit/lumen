@@ -2004,57 +2004,19 @@ fn form_data_with_encoding(
     submitter: Option<NodeId>,
     encoding: &str,
 ) -> OpResult<Value> {
-    // Native host code must resolve constructors from this realm's backing global. In
-    // a browsing context, globalThis is the published WindowProxy and may be cross-origin
-    // guarded while the constructor is being looked up.
-    let global = ctx.global_object();
-    let constructor = ctx
-        .get_member(&global, "FormData")
-        .map_err(|_| OpError::new("TypeError", "FormData constructor is unavailable"))?;
-    let data = ctx
-        .construct_value(constructor, &[])
-        .map_err(OpError::thrown)?;
+    let data = lumen_host::blob::new_form_data(ctx);
     populate_form_data_with_encoding(ctx, realm, form, submitter, data.clone(), encoding)?;
     Ok(data)
 }
 
 fn file_object(ctx: &mut Ctx, file: &FormFile) -> OpResult<Value> {
-    let global = ctx.global_object();
-    let array_ctor = ctx
-        .get_member(&global, "Uint8Array")
-        .map_err(|_| OpError::new("TypeError", "Uint8Array is unavailable"))?;
-    let bytes = ctx
-        .construct_value(array_ctor, &[Value::Num(file.bytes.len() as f64)])
-        .map_err(OpError::thrown)?;
-    for (index, byte) in file.bytes.iter().copied().enumerate() {
-        ctx.set_member(&bytes, &index.to_string(), Value::Num(byte as f64))
-            .map_err(|_| OpError::new("Error", "file byte assignment failed"))?;
-    }
-    let options = Value::Obj(ctx.new_object());
-    ctx.set_member(&options, "type", Value::Str(file.media_type.clone().into()))
-        .map_err(|_| OpError::new("Error", "file type assignment failed"))?;
-    ctx.set_member(
-        &options,
-        "lastModified",
-        Value::Num(file.last_modified as f64),
-    )
-    .map_err(|_| OpError::new("Error", "file timestamp assignment failed"))?;
-    let constructor = ctx
-        .get_member(&global, "File")
-        .map_err(|_| OpError::new("TypeError", "File constructor is unavailable"))?;
-    let array_ctor = ctx
-        .get_member(&global, "Array")
-        .map_err(|_| OpError::new("Error", "Array constructor is unavailable"))?;
-    let parts = ctx
-        .construct_value(array_ctor, &[Value::Num(1.0)])
-        .map_err(OpError::thrown)?;
-    ctx.set_member(&parts, "0", bytes)
-        .map_err(|_| OpError::new("Error", "file parts assignment failed"))?;
-    ctx.construct_value(
-        constructor,
-        &[parts, Value::Str(file.name.clone().into()), options],
-    )
-    .map_err(OpError::thrown)
+    Ok(lumen_host::blob::new_file(
+        ctx,
+        file.bytes.to_vec(),
+        &file.name,
+        &file.media_type,
+        file.last_modified as f64,
+    ))
 }
 
 /// Populate an existing FormData object from a form and dispatch the
@@ -2089,9 +2051,6 @@ fn populate_form_data_with_encoding(
             ));
         }
     }
-    let append = ctx
-        .get_member(&data, "append")
-        .map_err(|_| OpError::new("TypeError", "FormData.append is unavailable"))?;
     // Freeze only the live entry-list inputs before calling author-controlled
     // FormData.append methods. The full FormState also contains unrelated
     // validity, selection, and wrapper state and must not be cloned here.
@@ -2102,16 +2061,22 @@ fn populate_form_data_with_encoding(
         )
     };
     for entry in entries {
-        let value = match entry.value {
-            FormEntryValue::Text(value) => Value::Str(value.into()),
-            FormEntryValue::File(file) => file_object(ctx, &file)?,
-        };
-        ctx.invoke(
-            append.clone(),
-            data.clone(),
-            &[Value::Str(entry.name.into()), value],
-        )
-        .map_err(OpError::thrown)?;
+        match entry.value {
+            FormEntryValue::Text(value) => {
+                lumen_host::blob::append_text(ctx, &data, &entry.name, &value)?
+            }
+            FormEntryValue::File(file) => lumen_host::blob::append_file(
+                ctx,
+                &data,
+                &entry.name,
+                lumen_host::blob::FormFile {
+                    name: file.name,
+                    media_type: file.media_type,
+                    last_modified: file.last_modified as f64,
+                    bytes: file.bytes.to_vec().into(),
+                },
+            )?,
+        }
     }
     realm.dispatch_user_agent(ctx, form, "formdata", false, false, &[("formData", data)])?;
     Ok(())
@@ -2557,88 +2522,21 @@ fn form_entries_from_state(
 }
 
 fn snapshot_form_data(ctx: &mut Ctx, data: &Value) -> OpResult<Vec<FormEntry>> {
-    let global = ctx.global_object();
-    let snapshot = ctx
-        .get_member(&global, "__lumenSnapshotFormData")
-        .map_err(|_| OpError::new("TypeError", "FormData snapshot bridge is unavailable"))?;
-    let values = ctx
-        .invoke(snapshot, global, &[data.clone()])
-        .map_err(OpError::thrown)?;
-    let Value::Num(length) = ctx
-        .get_member(&values, "length")
-        .map_err(|_| OpError::new("TypeError", "FormData snapshot length is unavailable"))?
-    else {
-        return Err(OpError::new(
-            "TypeError",
-            "FormData snapshot is not an array",
-        ));
-    };
-    let mut entries = Vec::with_capacity((length.max(0.0) as usize).min(100_000));
-    for index in 0..(length.max(0.0) as usize).min(100_000) {
-        let entry = ctx
-            .get_member(&values, &index.to_string())
-            .map_err(|_| OpError::new("TypeError", "FormData entry is unavailable"))?;
-        let member = |ctx: &mut Ctx, key: &str| -> OpResult<Value> {
-            ctx.get_member(&entry, key)
-                .map_err(|_| OpError::new("TypeError", "FormData entry field is unavailable"))
-        };
-        let name_value = member(ctx, "name")?;
-        let name = ctx
-            .coerce_string(&name_value)
-            .map_err(OpError::thrown)?
-            .to_string();
-        let kind_value = member(ctx, "kind")?;
-        let kind = ctx
-            .coerce_string(&kind_value)
-            .map_err(OpError::thrown)?
-            .to_string();
-        let value = if kind == "file" {
-            let file_name_value = member(ctx, "fileName")?;
-            let file_name = ctx
-                .coerce_string(&file_name_value)
-                .map_err(OpError::thrown)?
-                .to_string();
-            let media_type_value = member(ctx, "type")?;
-            let media_type = ctx
-                .coerce_string(&media_type_value)
-                .map_err(OpError::thrown)?
-                .to_string();
-            let modified_value = member(ctx, "lastModified")?;
-            let last_modified = ctx
-                .coerce_number(&modified_value)
-                .map_err(OpError::thrown)? as i64;
-            let bytes = member(ctx, "bytes")?;
-            let Value::Num(byte_length) = ctx
-                .get_member(&bytes, "length")
-                .map_err(|_| OpError::new("TypeError", "File byte length is unavailable"))?
-            else {
-                return Err(OpError::new("TypeError", "File bytes are not array-like"));
-            };
-            let mut data =
-                Vec::with_capacity((byte_length.max(0.0) as usize).min(64 * 1024 * 1024));
-            for byte_index in 0..(byte_length.max(0.0) as usize).min(64 * 1024 * 1024) {
-                let byte = ctx
-                    .get_member(&bytes, &byte_index.to_string())
-                    .map_err(|_| OpError::new("TypeError", "File byte is unavailable"))?;
-                data.push(ctx.coerce_number(&byte).map_err(OpError::thrown)? as u8);
-            }
-            FormEntryValue::File(FormFile {
-                name: file_name,
-                media_type,
-                last_modified,
-                bytes: data.into(),
-            })
-        } else {
-            let text_value = member(ctx, "value")?;
-            FormEntryValue::Text(
-                ctx.coerce_string(&text_value)
-                    .map_err(OpError::thrown)?
-                    .to_string(),
-            )
-        };
-        entries.push(FormEntry { name, value });
-    }
-    Ok(entries)
+    Ok(lumen_host::blob::form_data_entries(ctx, data)?
+        .into_iter()
+        .map(|entry| FormEntry {
+            name: entry.name,
+            value: match entry.value {
+                lumen_host::blob::FormValue::Text(text) => FormEntryValue::Text(text),
+                lumen_host::blob::FormValue::File(file) => FormEntryValue::File(FormFile {
+                    name: file.name,
+                    media_type: file.media_type,
+                    last_modified: file.last_modified as i64,
+                    bytes: file.bytes.to_vec().into(),
+                }),
+            },
+        })
+        .collect())
 }
 
 /// Dispatches the cancelable reset event, then restores captured IDL defaults.
@@ -4861,10 +4759,7 @@ mod tests {
             64,
         )
         .unwrap();
-        eval(
-            &mut engine,
-            "globalThis.FormData = class FormData { constructor(form, submitter) { this.items = []; if (form !== undefined) __lumenPopulateFormData(this, form, submitter); } append(name, value) { this.items.push([String(name), String(value)]); } getAll(name) { return this.items.filter(item => item[0] === name).map(item => item[1]); } };",
-        );
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
         let result = eval(
             &mut engine,
             "(() => { const form=document.querySelector('form'),r=document.querySelector('#r'); r.value='8'; const copy=r.cloneNode(), imported=document.importNode(r); form.append(copy,imported); if(copy.value!=='8'||imported.value!=='8')return false; const values=new FormData(form).getAll('v').join(','); if(values!=='8,8,8')return false; form.reset(); return r.value==='4'&&copy.value==='4'&&imported.value==='4'; })()",
@@ -4881,10 +4776,7 @@ mod tests {
             96,
         )
         .unwrap();
-        eval(
-            &mut engine,
-            "globalThis.FormData = class FormData { constructor(form) { this.items = []; if (form) __lumenPopulateFormData(this, form); } append(name, value) { this.items.push([String(name), String(value)]); } getAll(name) { return this.items.filter(entry => entry[0] === name).map(entry => entry[1]); } };",
-        );
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
         let result = eval(
             &mut engine,
             r#"(()=>{
@@ -5322,13 +5214,10 @@ mod tests {
     fn formdata_constructor_preserves_identity_and_dispatches_formdata() {
         let mut engine = Engine::new();
         crate::install(engine.ctx(), "<form><input name='a' value='one'><select name='s'><option value='x'>X</option><option value='y' selected>Y</option></select><textarea name='t'>seed</textarea></form>", 96).unwrap();
-        eval(
-            &mut engine,
-            "globalThis.constructingFormData = null; globalThis.FormData = class FormData { constructor(form, submitter) { this.items = []; if (form !== undefined) { globalThis.constructingFormData = this; __lumenPopulateFormData(this, form, submitter); } } append(name, value) { this.items.push([String(name), String(value)]); } getAll(name) { return this.items.filter(x => x[0] === name).map(x => x[1]); } };",
-        );
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
         let result = eval(
             &mut engine,
-            "(() => { const form = document.querySelector('form'); const select = document.querySelector('select'); const area = document.querySelector('textarea'); select.selectedIndex = -1; area.value = 'live'; let same = false; form.addEventListener('formdata', event => { same = event.formData === globalThis.constructingFormData; event.formData.append('event', 'ran'); }); const data = new FormData(form); return same && data.getAll('a')[0] === 'one' && data.getAll('s').length === 0 && data.getAll('t')[0] === 'live' && data.getAll('event')[0] === 'ran'; })()",
+            "(() => { const form = document.querySelector('form'); const select = document.querySelector('select'); const area = document.querySelector('textarea'); select.selectedIndex = -1; area.value = 'live'; let seen = null; form.addEventListener('formdata', event => { seen = event.formData; event.formData.append('event', 'ran'); }); const data = new FormData(form); const same = seen === data; return same && data.getAll('a')[0] === 'one' && data.getAll('s').length === 0 && data.getAll('t')[0] === 'live' && data.getAll('event')[0] === 'ran'; })()",
         );
         assert!(matches!(result, Value::Bool(true)));
     }
@@ -5342,10 +5231,7 @@ mod tests {
             64,
         )
         .unwrap();
-        eval(
-            &mut engine,
-            "globalThis.FormData = class FormData { constructor(form, submitter) { this.items=[]; if (form !== undefined) __lumenPopulateFormData(this, form, submitter); } append(name, value) { this.items.push([name, value]); } };",
-        );
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
         let result = eval(
             &mut engine,
             r#"(()=>{
@@ -5354,7 +5240,7 @@ mod tests {
                 const invalid=document.querySelector('#invalid');
                 const casefold=document.querySelector('#casefold');
                 const reset=document.querySelector('#reset');
-                const contains=(submitter,name,value)=>new FormData(form,submitter).items.some(entry=>entry[0]===name&&entry[1]===value);
+                const contains=(submitter,name,value)=>[...new FormData(form,submitter)].some(entry=>entry[0]===name&&entry[1]===value);
                 let observed=null;
                 form.addEventListener('submit',event=>{observed=event.submitter;event.preventDefault()});
                 form.requestSubmit(invalid);

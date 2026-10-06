@@ -1460,6 +1460,7 @@ dependencies = [
  "lumen-os",
  "lumen-timers",
  "lumen-web",
+ "lumen-webstreams",
 ]
 
 [[package]]

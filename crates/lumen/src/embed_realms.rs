@@ -546,6 +546,12 @@ impl Interp {
         })
     }
 
+    /// The registered realm whose global object is `global`, if any.
+    pub fn host_realm_for_global(&mut self, global: &Value) -> Option<RealmHandle> {
+        let key = Gc::as_ptr(global.as_obj()?) as usize;
+        self.host_realm_for_key(key)
+    }
+
     /// Resolve a callback's ECMAScript realm using GetFunctionRealm, including
     /// bound functions and callable proxies. Revoked proxies throw their native
     /// TypeError. Retired realms remain available while their functions are live.

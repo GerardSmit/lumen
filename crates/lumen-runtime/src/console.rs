@@ -20,6 +20,7 @@ pub(crate) fn extension() -> Extension {
         }),
         js_init: None,
         js_init_snapshot: None,
+        lazy_globals: &[],
     }
 }
 

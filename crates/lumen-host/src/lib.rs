@@ -38,7 +38,9 @@ pub mod events;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
 /// Typed host services scoped to one realm.
+pub mod random;
 pub mod realm_services;
+pub mod blob;
 pub mod sysfs;
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.
@@ -106,6 +108,26 @@ pub struct Extension {
     /// `LUMENAOT`): the glue's AST, bytecode and (compressed) function text, loaded with
     /// `Engine::load_precompiled` — then `js_init` may be `None` (it is only a fallback).
     pub js_init_snapshot: Option<&'static [u8]>,
+    /// Globals the glue defines and nothing else (no side effects other pieces rely on). When
+    /// non-empty, `install` / `install_realm_in_ctx` do not run the glue at boot: each name is
+    /// published as a lazy global instead, and the glue (`js_init` / `js_init_snapshot`, the
+    /// same sources as the eager path) runs once, in the realm that owns the global, on the
+    /// first access to any listed name. Reflection reports ordinary data properties because the
+    /// engine materializes a lazy global before `Object.getOwnPropertyDescriptor`,
+    /// `Object.keys` and friends see it, and the accessors are replaced by the real properties
+    /// the glue defines. The glue must therefore:
+    ///
+    /// - define every listed name on `globalThis` (it may read other globals, which may be lazy
+    ///   themselves);
+    /// - not read a listed name before defining it (the accessors are already gone, so it reads
+    ///   `undefined`);
+    /// - keep a data property a script put on a listed name beforehand (assigning to a lazy
+    ///   name replaces only that accessor with the assigned value and does not run the glue).
+    ///
+    /// A name the realm already defines is skipped. `in` does not trigger the glue. A glue
+    /// that throws surfaces the error at the first access, and the names are then gone.
+    /// Empty (the default) keeps the eager behavior.
+    pub lazy_globals: &'static [&'static str],
 }
 
 /// Records which extensions initialized their shared OpState during ordinary installation.
@@ -172,8 +194,39 @@ impl Extension {
             state_init: None,
             js_init: None,
             js_init_snapshot: None,
+            lazy_globals: &[],
         }
     }
+
+    /// The glue-only view of this extension that a lazy global group runs on first access.
+    fn glue(&self) -> Extension {
+        Extension {
+            name: self.name,
+            modules: &[],
+            state_init: None,
+            js_init: self.js_init,
+            js_init_snapshot: self.js_init_snapshot,
+            lazy_globals: &[],
+        }
+    }
+
+    fn defers_glue(&self) -> bool {
+        !self.lazy_globals.is_empty() && (self.js_init.is_some() || self.js_init_snapshot.is_some())
+    }
+}
+
+/// Publish `extension.lazy_globals` in the active realm; the glue runs on first access.
+fn defer_glue(ctx: &mut Ctx, extension: &Extension) {
+    let glue = extension.glue();
+    ctx.install_lazy_global_group(
+        extension.lazy_globals,
+        Rc::new(move |ctx, global| {
+            let realm = ctx
+                .host_realm_for_global(global)
+                .ok_or_else(|| ctx.make_error("Error", "lazy extension realm is unavailable"))?;
+            install_realm_glue(ctx, &realm, &glue).map_err(|message| ctx.make_error("Error", message))
+        }),
+    );
 }
 
 /// Install extensions into an engine: state first (an op may fire during install), then ops,
@@ -207,6 +260,10 @@ pub fn install(engine: &mut Engine, extensions: &[Extension]) {
             if m(engine.ctx()).is_err() {
                 panic!("extension {}: installing a module threw", ext.name);
             }
+        }
+        if ext.defers_glue() {
+            defer_glue(engine.ctx(), ext);
+            continue;
         }
         let aot = ext.js_init_snapshot.filter(|b| b.starts_with(b"LUMENAOT"));
         if let Some(blob) = aot {
@@ -319,6 +376,11 @@ pub fn install_realm_in_ctx(
             .map_err(|error| error.to_string())?;
         installed?;
 
+        if extension.defers_glue() {
+            ctx.with_host_realm(realm, |ctx| defer_glue(ctx, extension))
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
         install_realm_glue(ctx, realm, extension)?;
     }
     Ok(())

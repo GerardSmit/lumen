@@ -67,6 +67,7 @@ fn extension_installs_state_globals_and_namespaces() {
         state_init: Some(|state| state.put(Counter(0))),
         js_init: None,
         js_init_snapshot: None,
+        lazy_globals: &[],
     };
     let mut engine = Engine::new();
     install(&mut engine, std::slice::from_ref(&EXT));

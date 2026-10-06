@@ -716,11 +716,233 @@ fn url_inspect_hooks_and_object_urls() {
         "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const options = { breakLength: 80, stylize: (text) => text }; const inspect = (value) => JSON.stringify(value); return new URLSearchParams('a=1&b=2')[sym](2, options, inspect) === 'URLSearchParams { \"a\" => \"1\", \"b\" => \"2\" }' && new URLSearchParams()[sym](2, options, inspect) === 'URLSearchParams {}' && new URLSearchParams('a=1')[sym](-1, { stylize: (text, style) => text + ':' + style }, inspect) === '[Object]:special'; })()",
         "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const options = { breakLength: 3, stylize: (text) => text }; return new URLSearchParams('a=1&b=2')[sym](2, options, (value) => JSON.stringify(value)) === 'URLSearchParams {\\n  \"a\" => \"1\",\\n  \"b\" => \"2\" }'; })()",
         "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const it = new URLSearchParams('a=1&b=2').entries(); it.next(); return it[sym](2, { stylize: (text) => text }, (value) => JSON.stringify(value)) === 'URLSearchParams Iterator { [\"b\",\"2\"] }'; })()",
-        "(() => { const blob = new Blob(['hello'], { type: 'text/plain' }); const url = URL.createObjectURL(blob); const id = url.slice('blob:nodedata:'.length); const registry = Blob[Symbol.for('lumen.blob.internals')].objectURLs; const before = registry.get(id) === blob; URL.revokeObjectURL(url); return url.startsWith('blob:nodedata:') && before && registry.get(id) === undefined; })()",
+        "(() => { const blob = new Blob(['hello'], { type: 'text/plain' }); const url = URL.createObjectURL(blob); const id = url.slice('blob:nodedata:'.length); const internals = globalThis.__lumenBlobInternals; const before = internals.resolveObjectURL(id); URL.revokeObjectURL(url); return url.startsWith('blob:nodedata:') && before instanceof Blob && before !== blob && before.size === 5 && before.type === 'text/plain' && internals.resolveObjectURL(id) === undefined; })()",
         "(() => { URL.revokeObjectURL('http://a/'); URL.revokeObjectURL('nope'); URL.revokeObjectURL('blob:nodedata:unknown'); return true; })()",
         "(() => { try { URL.createObjectURL({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE' && e.message === 'The \"obj\" argument must be an instance of Blob. Received an instance of Object'; } return false; })()",
         "(() => { try { URL.createObjectURL(); } catch (e) { return e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
         "(() => { try { URL.revokeObjectURL(); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn blob_file_and_form_data_keep_web_idl_shape() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        r##"['Blob', 'File', 'FormData'].every((name) => { const d = Object.getOwnPropertyDescriptor(globalThis, name); return d.writable && d.configurable && !d.enumerable; })"##,
+        "Blob.length === 0 && File.length === 2 && FormData.length === 0",
+        "Object.getPrototypeOf(File) === Blob && Object.getPrototypeOf(File.prototype) === Blob.prototype",
+        "Object.prototype.toString.call(new Blob()) === '[object Blob]' && Object.prototype.toString.call(new File([], 'a')) === '[object File]' && Object.prototype.toString.call(new FormData()) === '[object FormData]'",
+        r##"['size', 'type'].every((name) => { const d = Object.getOwnPropertyDescriptor(Blob.prototype, name); return d.enumerable && d.configurable && typeof d.get === 'function' && d.set === undefined; })"##,
+        r##"['name', 'lastModified'].every((name) => { const d = Object.getOwnPropertyDescriptor(File.prototype, name); return d.enumerable && d.configurable && typeof d.get === 'function' && d.set === undefined; })"##,
+        r##"['slice', 'text', 'arrayBuffer', 'bytes', 'stream'].every((name) => Object.getOwnPropertyDescriptor(Blob.prototype, name).enumerable && typeof Blob.prototype[name] === 'function')"##,
+        "Blob.prototype.slice.length === 0 && Blob.prototype.text.length === 0",
+        r##"['append', 'delete', 'get', 'getAll', 'has', 'set', 'entries', 'keys', 'values', 'forEach'].every((name) => Object.getOwnPropertyDescriptor(FormData.prototype, name).enumerable)"##,
+        "FormData.prototype[Symbol.iterator] === FormData.prototype.entries",
+        "FormData.prototype.append.length === 2 && FormData.prototype.set.length === 2 && FormData.prototype.get.length === 1 && FormData.prototype.forEach.length === 1",
+        "(() => { try { Blob(); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { try { new File([]); } catch (e) { return e instanceof TypeError && e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+        "(() => { try { Object.getOwnPropertyDescriptor(Blob.prototype, 'size').get.call({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { try { FormData.prototype.get.call({}, 'a'); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { try { new FormData().append('a'); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+        "(() => { try { new Blob([], { endings: 'bad' }); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_VALUE'; } return false; })()",
+        "(() => { class Mine extends Blob {} const b = new Mine(['ab']); return b instanceof Mine && b.size === 2 && b.slice(1) instanceof Blob; })()",
+        "(() => { class Mine extends File {} const f = new Mine(['a'], 'n.txt'); return f instanceof Mine && f.name === 'n.txt' && f instanceof Blob; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn blob_slice_type_and_part_conversion() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "new Blob(['abc', new Uint8Array([100, 101]), new Blob(['f']), new DataView(new Uint8Array([103]).buffer), new Uint8Array([104]).buffer]).size === 8",
+        "new Blob(['a\\r\\nb'], { endings: 'transparent' }).size === 4",
+        "new Blob(['\\ud800']).size === 3",
+        "new Blob([], { type: 'Text/PLAIN' }).type === 'text/plain' && new Blob([], { type: 'bad\\u00e9' }).type === '' && new Blob([]).type === ''",
+        "(() => { const b = new Blob(['0123456789']); return b.slice(2, 5).size === 3 && b.slice(-3).size === 3 && b.slice(5, 2).size === 0 && b.slice(-100, 100).size === 10 && b.slice(0, 4, 'Text/X').type === 'text/x' && b.slice().type === '' && b.slice(NaN, Infinity).size === 10; })()",
+        "(() => { const b = new Blob(['x'], { type: 'a/b' }); return b.slice().type === '' && b.slice(0, 1, undefined).type === ''; })()",
+        "(() => { try { new Blob('abc'); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
+        "(() => { try { new Blob([], 1); } catch (e) { return e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
+        "new Blob(new Set(['ab', 'c'])).size === 3",
+        "new File(['abc'], 'a.txt', { type: 'Text/Plain', lastModified: 42.9 }).lastModified === 42 && new File([], 'a').lastModified > 1e12 && new File(['abc'], 'a.txt', { type: 'Text/Plain' }).type === 'text/plain'",
+        "(() => { const f = new File(['abcd'], 'a'); const s = f.slice(1, 3); return s instanceof Blob && !(s instanceof File) && s.size === 2; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn blob_reads_resolve_promises_and_stream_chunks() {
+    let mut runtime = Runtime::new_browser();
+    evaluate(
+        &mut runtime,
+        r#"
+        var results = {};
+        const blob = new Blob(['h\u00e9llo ', new Uint8Array([0xf0, 0x9f, 0x98, 0x80])], { type: 'text/plain' });
+        blob.text().then((value) => results.text = value);
+        blob.arrayBuffer().then((value) => results.buffer = value);
+        blob.bytes().then((value) => results.bytes = value);
+        (async () => {
+          const reader = blob.stream().getReader();
+          const chunks = [];
+          for (;;) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); }
+          results.stream = chunks;
+        })();
+        new Blob([new Uint8Array([0xef, 0xbb, 0xbf, 0x41, 0xff])]).text().then((value) => results.bom = value);
+        new Blob([]).stream().getReader().read().then((value) => results.empty = value.done);
+        var invalidThis = [];
+        Blob.prototype.text.call({}).catch((error) => invalidThis.push(error.code));
+        Blob.prototype.arrayBuffer.call({}).catch((error) => invalidThis.push(error.code));
+        "#,
+    );
+    for expression in [
+        "results.text === 'h\\u00e9llo \u{1f600}'",
+        "results.buffer instanceof ArrayBuffer && results.buffer.byteLength === 11",
+        "results.bytes instanceof Uint8Array && results.bytes.length === 11 && results.bytes[0] === 104",
+        "results.stream.length === 1 && results.stream[0] instanceof Uint8Array && results.stream[0].length === 11",
+        "results.bom === 'A\\ufffd'",
+        "results.empty === true",
+        "invalidThis.join() === 'ERR_INVALID_THIS,ERR_INVALID_THIS'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn web_streams_glue_runs_once_on_first_access_to_any_published_global() {
+    let names = "['ReadableStream', 'ReadableStreamDefaultReader', 'ReadableStreamBYOBReader', 'ReadableStreamBYOBRequest', 'ReadableByteStreamController', 'ReadableStreamDefaultController', 'WritableStream', 'WritableStreamDefaultWriter', 'WritableStreamDefaultController', 'TransformStream', 'TransformStreamDefaultController', 'ByteLengthQueuingStrategy', 'CountQueuingStrategy', 'TextEncoderStream', 'TextDecoderStream']";
+    let mut runtime = Runtime::new_browser();
+    evaluate(
+        &mut runtime,
+        &format!(
+            r#"
+        var streamNames = {names};
+        var glueRuns = 0;
+        const nativeDefine = Object.defineProperty;
+        Object.defineProperty = function (target, key, descriptor) {{
+          if (key === Symbol.for('lumen.cloneBody')) glueRuns++;
+          return nativeDefine.call(this, target, key, descriptor);
+        }};
+        var presentBefore = streamNames.every((name) => name in globalThis);
+        var runsBefore = glueRuns;
+        "#
+        ),
+    );
+    for expression in [
+        "presentBefore && runsBefore === 0",
+        "(() => { const d = Object.getOwnPropertyDescriptor(globalThis, 'WritableStream'); return glueRuns === 1 && typeof d.value === 'function' && d.get === undefined && d.set === undefined && d.writable && d.configurable && !d.enumerable; })()",
+        "streamNames.every((name) => { const d = Object.getOwnPropertyDescriptor(globalThis, name); return typeof d.value === 'function' && d.get === undefined && d.writable && d.configurable && !d.enumerable && d.value.name === name; })",
+        "glueRuns === 1",
+        "typeof ReadableStream === 'function' && new ReadableStream() instanceof ReadableStream && glueRuns === 1",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+
+    let mut runtime = Runtime::new_browser();
+    evaluate(
+        &mut runtime,
+        r#"
+        var out = {};
+        globalThis.TransformStream = 'page override';
+        const reader = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2])); c.close(); } }).getReader();
+        reader.read().then((r) => out.chunk = r.value.length);
+        new Blob(['abc']).stream().getReader().read().then((r) => out.blob = r.value.length);
+        new TextEncoderStream();
+        "#,
+    );
+    for expression in [
+        "globalThis.TransformStream === 'page override'",
+        "out.chunk === 2 && out.blob === 3",
+        "typeof WritableStream === 'function' && typeof TextDecoderStream === 'function'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn form_data_operations_iteration_and_file_entries() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const f = new FormData(); f.append('a', '1'); f.append('b', '2'); f.append('a', '3'); return f.get('a') === '1' && f.getAll('a').join() === '1,3' && f.has('b') && !f.has('z') && f.get('z') === null && f.getAll('z').length === 0; })()",
+        "(() => { const f = new FormData(); f.append('a', '1'); f.append('b', '2'); f.append('a', '3'); f.set('a', 'x'); return [...f].map((e) => e.join('=')).join('&') === 'a=x&b=2'; })()",
+        "(() => { const f = new FormData(); f.set('n', 'v'); f.append('m', 'w'); f.delete('n'); return !f.has('n') && [...f.keys()].join() === 'm' && [...f.values()].join() === 'w'; })()",
+        "(() => { const f = new FormData(); f.append(1, 2); return f.get('1') === '2' && typeof f.get('1') === 'string'; })()",
+        "(() => { const f = new FormData(); f.append('\\ud800', '\\udc00'); return f.has('\\ufffd') && f.get('\\ufffd') === '\\ufffd'; })()",
+        "(() => { const f = new FormData(); const b = new Blob(['xy'], { type: 'text/plain' }); f.append('f', b); const v = f.get('f'); return v instanceof File && v !== b && v.name === 'blob' && v.size === 2 && v.type === 'text/plain'; })()",
+        "(() => { const f = new FormData(); const file = new File(['xy'], 'a.txt', { lastModified: 7 }); f.append('f', file); f.append('g', file, 'b.txt'); return f.get('f') === file && f.get('g') !== file && f.get('g').name === 'b.txt' && f.get('g').lastModified === 7 && f.get('g').size === 2; })()",
+        "(() => { try { new FormData().append('a', 'b', 'c'); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { const f = new FormData(); f.append('a', '1'); f.append('b', '2'); const seen = []; const self = {}; f.forEach(function (value, name, form) { seen.push(name + value + (form === f) + (this === self)); }, self); return seen.join() === 'a1truetrue,b2truetrue'; })()",
+        "(() => { const f = new FormData(); f.append('a', '1'); const it = f.entries(); return Object.prototype.toString.call(it) === '[object FormData Iterator]' && it[Symbol.iterator]() === it && it.next().value.join() === 'a,1' && it.next().done === true; })()",
+        "(() => { const f = new FormData(); f.append('a', '1'); const seen = []; f.forEach((value, name) => { seen.push(name); if (seen.length < 3) f.append('n' + seen.length, 'x'); }); return seen.join() === 'a,n1,n2'; })()",
+        "(() => { try { new FormData({}); } catch (e) { return e instanceof TypeError; } return false; })()",
+        "(() => { try { new FormData(undefined, {}); return true; } catch (e) { return false; } })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn form_data_multipart_round_trip_through_fetch_bodies() {
+    let mut runtime = Runtime::new_browser();
+    evaluate(
+        &mut runtime,
+        r#"
+        var results = {};
+        const form = new FormData();
+        form.append('text', 'a\nb');
+        form.append('file', new File(['\u0000bytes\r\n--x'], 'f"n.bin', { type: 'application/x-test' }));
+        const request = new Request('http://a.test/', { method: 'POST', body: form });
+        results.contentType = request.headers.get('content-type');
+        request.formData().then((parsed) => {
+          results.text = parsed.get('text');
+          const file = parsed.get('file');
+          results.file = [file instanceof File, file.name, file.type, file.size];
+          return file.text();
+        }).then((text) => results.fileText = text);
+        new Response(new Blob(['ab'], { type: 'text/x' })).blob().then((blob) => results.blob = [blob.type, blob.size]);
+        results.blobContentType = new Request('http://a.test/', { method: 'POST', body: new Blob(['ab'], { type: 'text/x' }) }).headers.get('content-type');
+        "#,
+    );
+    for expression in [
+        "results.contentType.startsWith('multipart/form-data; boundary=----lumenFormBoundary')",
+        "results.text === 'a\\r\\nb'",
+        "results.file.join('|') === 'true|f\"n.bin|application/x-test|' + new Blob(['\\u0000bytes\\r\\n--x']).size",
+        "results.fileText === '\\u0000bytes\\r\\n--x'",
+        "results.blob.join() === 'text/x,2'",
+        "results.blobContentType === 'text/x'",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn blob_and_file_survive_structured_clone_and_object_urls_follow_the_registry() {
+    let mut runtime = Runtime::new_browser();
+    evaluate(
+        &mut runtime,
+        r#"
+        var results = {};
+        const blob = new Blob(['abc'], { type: 'text/plain' });
+        const file = new File(['de'], 'n.txt', { type: 'a/b', lastModified: 5 });
+        results.blobClone = structuredClone(blob);
+        results.fileClone = structuredClone({ file });
+        results.url = URL.createObjectURL(file);
+        results.second = URL.createObjectURL(file);
+        results.resolved = globalThis.__lumenBlobInternals.resolveObjectURL(results.url.slice('blob:nodedata:'.length));
+        URL.revokeObjectURL(results.url);
+        results.revoked = globalThis.__lumenBlobInternals.resolveObjectURL(results.url.slice('blob:nodedata:'.length));
+        "#,
+    );
+    for expression in [
+        "results.blobClone instanceof Blob && !(results.blobClone instanceof File) && results.blobClone.size === 3 && results.blobClone.type === 'text/plain'",
+        "results.fileClone.file instanceof File && results.fileClone.file.name === 'n.txt' && results.fileClone.file.lastModified === 5 && results.fileClone.file.type === 'a/b' && results.fileClone.file.size === 2",
+        "results.url !== results.second && results.url.startsWith('blob:nodedata:')",
+        "results.resolved instanceof Blob && results.resolved.size === 2 && results.resolved.type === 'a/b'",
+        "results.revoked === undefined",
+        "globalThis.__lumenBlobInternals.resolveObjectURL(results.second.slice('blob:nodedata:'.length)) instanceof Blob",
     ] {
         assert_script(&mut runtime, expression);
     }

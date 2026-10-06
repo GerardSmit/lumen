@@ -1547,33 +1547,7 @@ fn canvas_blob(
 ) -> OpResult<Value> {
     let (bytes, mime) = lumen_html_image::encode_canvas_image(image, image_type, quality)
         .map_err(|_| OpError::new("EncodingError", "canvas image encoding failed"))?;
-    let global = ctx.global_object();
-    let array_ctor = ctx
-        .get_member(&global, "Uint8Array")
-        .map_err(|_| OpError::new("TypeError", "Uint8Array is unavailable"))?;
-    let data = ctx
-        .construct_value(array_ctor, &[Value::Num(bytes.len() as f64)])
-        .map_err(OpError::thrown)?;
-    for (index, byte) in bytes.into_iter().enumerate() {
-        ctx.set_member(&data, &index.to_string(), Value::Num(f64::from(byte)))
-            .map_err(|_| OpError::new("Error", "canvas PNG byte assignment failed"))?;
-    }
-    let array_ctor = ctx
-        .get_member(&global, "Array")
-        .map_err(|_| OpError::new("TypeError", "Array is unavailable"))?;
-    let parts = ctx
-        .construct_value(array_ctor, &[Value::Num(1.0)])
-        .map_err(OpError::thrown)?;
-    ctx.set_member(&parts, "0", data)
-        .map_err(|_| OpError::new("Error", "canvas Blob parts assignment failed"))?;
-    let options = Value::Obj(ctx.new_object());
-    ctx.set_member(&options, "type", Value::Str(mime.into()))
-        .map_err(|_| OpError::new("Error", "canvas Blob type assignment failed"))?;
-    let blob_ctor = ctx
-        .get_member(&global, "Blob")
-        .map_err(|_| OpError::new("TypeError", "Blob constructor is unavailable"))?;
-    ctx.construct_value(blob_ctor, &[parts, options])
-        .map_err(OpError::thrown)
+    Ok(lumen_host::blob::new_blob(ctx, bytes, &mime))
 }
 
 fn canvas_idl_dimension(node: &DomNode, name: &str, fallback: u32) -> u32 {
@@ -5731,10 +5705,7 @@ mod tests {
     fn to_blob_callback_runs_as_a_task_with_encoded_type_and_snapshot() {
         let mut engine = Engine::new();
         super::super::install(engine.ctx(), "<main></main>", 64).unwrap();
-        assert!(matches!(
-            engine.eval_value(include_str!("../../lumen-web/src/js/blob.js")),
-            Ok(Ok(_))
-        ));
+        assert!(lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>(engine.ctx()).is_ok());
         assert!(eval_bool(
             &mut engine,
             "globalThis.__canvasBlobState='pending';(()=>{const c=document.createElement('canvas');c.width=2;c.height=2;const x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,2,2);c.toBlob(blob=>globalThis.__canvasBlobState=blob.type+':'+blob.size,'image/jpeg',0.8)})();globalThis.__canvasBlobState==='pending'"

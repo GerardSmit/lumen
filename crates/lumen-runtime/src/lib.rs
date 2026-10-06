@@ -257,6 +257,7 @@ fn browser_extensions() -> Vec<Extension> {
         lumen_timers::extension(),
         console::extension(),
         lumen_web::extension(),
+        lumen_webstreams::extension(),
         clone_transfer::extension(),
         ports::extension(),
     ]

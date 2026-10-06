@@ -116,6 +116,7 @@ pub fn extension() -> Extension {
         } else {
             Some(JS_GLUE_AOT)
         },
+        lazy_globals: &[],
     }
 }
 

@@ -189,5 +189,6 @@ pub(crate) fn extension() -> Extension {
         state_init: Some(|state| state.put(CloneTransfers::default())),
         js_init: None,
         js_init_snapshot: None,
+        lazy_globals: &[],
     }
 }

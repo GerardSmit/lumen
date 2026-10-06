@@ -180,10 +180,10 @@ function initBody(owner, body) {
     owner[kSourceStream] = body;
     owner._bodyBytes = undefined;
   } else if (body instanceof Blob) {
-    owner._bodyBytes = body[kBlobBytes];
+    owner._bodyBytes = __lumenBlobInternals.bytes(body);
     if (body.type) contentType = body.type;
   } else if (body instanceof FormData) {
-    const encoded = encodeFormData(body);
+    const encoded = __lumenBlobInternals.encodeFormData(body);
     owner._bodyBytes = encoded.bytes;
     contentType = encoded.contentType;
   } else if (typeof body === "string") {
@@ -228,7 +228,7 @@ function bodyMixin(proto) {
     }
     const m = /boundary=([^;]+)/i.exec(ct);
     if (ct.startsWith("multipart/form-data") && m) {
-      return decodeMultipart(await this._consume(), m[1].trim().replace(/^"|"$/g, ""));
+      return __lumenBlobInternals.decodeMultipart(await this._consume(), m[1].trim().replace(/^"|"$/g, ""));
     }
     throw new TypeError(`formData(): unsupported content-type '${ct}'`);
   };

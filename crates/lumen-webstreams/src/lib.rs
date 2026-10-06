@@ -10,10 +10,30 @@ use lumen_host::Extension;
 const JS_GLUE: &str = include_str!(concat!(env!("OUT_DIR"), "/webstreams_browser.js"));
 const JS_GLUE_AOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/webstreams_browser.aot"));
 
+/// Every global the glue publishes (the tail of `webstreams_browser.js`); they are installed
+/// lazily, so the glue runs on first access to any of them rather than at realm boot.
+const GLOBALS: &[&str] = &[
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamBYOBReader",
+    "ReadableStreamBYOBRequest",
+    "ReadableByteStreamController",
+    "ReadableStreamDefaultController",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+    "WritableStreamDefaultController",
+    "TransformStream",
+    "TransformStreamDefaultController",
+    "ByteLengthQueuingStrategy",
+    "CountQueuingStrategy",
+    "TextEncoderStream",
+    "TextDecoderStream",
+];
+
 /// Extension installing Readable/Writable/Transform streams, byte/BYOB readers, queuing
 /// strategies, and text encoder/decoder streams. Install after host globals such as
 /// `TextEncoder`, `TextDecoder`, `AbortController`, `DOMException`, and `queueMicrotask` are
-/// available.
+/// available when the glue first runs (on first access to any published global).
 pub fn extension() -> Extension {
     Extension {
         name: "web-streams",
@@ -21,6 +41,7 @@ pub fn extension() -> Extension {
         state_init: None,
         js_init: Some(JS_GLUE),
         js_init_snapshot: Some(JS_GLUE_AOT),
+        lazy_globals: GLOBALS,
     }
 }
 

@@ -1173,7 +1173,7 @@ pub mod embed {
     pub use crate::embed_convert::{
         class_name, js_name, ArgCx, AsyncHost, BigI64, BigU64, Completer, Deferred, JsArrayBuffer,
         JsFunction, JsHost, JsObject, OpError, OpInfo, OpResult, Promise, SendError, Settle, Slot,
-        NativeIdentityOwner, WeakValue,
+        LazyGroupInit, NativeIdentityOwner, WeakValue,
     };
     /// A sync non-escaping callback argument (`#[op]` parameter type).
     pub use crate::sync_callbacks::{SyncFn, BUILTINS as SYNC_CALLBACK_BUILTINS};

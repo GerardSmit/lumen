@@ -50,7 +50,7 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["blob.js", "fetch.js", "xhr.js"],
+        files: &["fetch.js", "xhr.js"],
         lazy: true,
         defined: &[],
     },

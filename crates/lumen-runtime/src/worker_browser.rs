@@ -53,5 +53,6 @@ pub(crate) fn extension() -> Extension {
             r#"Object.defineProperty(globalThis, "__lumenWorkerOps", { value: globalThis.__worker, configurable: true, enumerable: false, writable: false }); delete globalThis.__worker;"#,
         ),
         js_init_snapshot: None,
+        lazy_globals: &[],
     }
 }

@@ -374,20 +374,8 @@ pub mod bindings {
             ))
         )]
         fn create_object_url(ctx: &mut Ctx, obj: Value) -> OpResult<String> {
-            let created = match blob_internals(ctx)? {
-                Some(internals) => {
-                    let create = ctx
-                        .member_get(&internals, "createObjectURL")
-                        .map_err(OpError::thrown)?;
-                    ctx.invoke(create, internals, std::slice::from_ref(&obj))
-                        .map_err(OpError::thrown)?
-                }
-                None => Value::Null,
-            };
-            match created {
-                Value::Str(id) => Ok(id.as_str().to_owned()),
-                _ => Err(invalid_arg_type(ctx, "obj", "an instance of Blob", &obj)),
-            }
+            crate::blob::create_object_url(ctx, &obj)?
+                .ok_or_else(|| invalid_arg_type(ctx, "obj", "an instance of Blob", &obj))
         }
 
         #[method(
@@ -404,13 +392,7 @@ pub mod bindings {
             let Some(id) = parsed.path.strip_prefix("nodedata:") else {
                 return Ok(());
             };
-            if let Some(internals) = blob_internals(ctx)? {
-                let revoke = ctx
-                    .member_get(&internals, "revokeObjectURL")
-                    .map_err(OpError::thrown)?;
-                ctx.invoke(revoke, internals, &[string(id)])
-                    .map_err(OpError::thrown)?;
-            }
+            crate::blob::revoke_object_url(ctx, id);
             Ok(())
         }
 
@@ -645,19 +627,6 @@ pub mod bindings {
                 true
             })
         }
-    }
-
-    /// `Blob[Symbol.for("lumen.blob.internals")]`, the registry the Blob glue keeps for object
-    /// URLs; `None` when the realm has no Blob.
-    fn blob_internals(ctx: &mut Ctx) -> OpResult<Option<Value>> {
-        let global = ctx.global_object();
-        let blob = ctx.member_get(&global, "Blob").map_err(OpError::thrown)?;
-        if !matches!(blob, Value::Obj(_)) {
-            return Ok(None);
-        }
-        let key = ctx.symbol_for("lumen.blob.internals");
-        let internals = ctx.reflect_get(&blob, &key, &blob).map_err(OpError::thrown)?;
-        Ok(matches!(internals, Value::Obj(_)).then_some(internals))
     }
 
     /// One `[name, value]` pair of a sequence initializer.

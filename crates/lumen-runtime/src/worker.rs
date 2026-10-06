@@ -1461,6 +1461,7 @@ fn worker_scope_extension(include_browser_script_op: bool) -> Extension {
         state_init: None,
         js_init: None,
         js_init_snapshot: None,
+        lazy_globals: &[],
     }
 }
 
@@ -1683,6 +1684,7 @@ pub(crate) fn extension() -> Extension {
         state_init: Some(|state| state.put(WorkerRegistry::default())),
         js_init: None,
         js_init_snapshot: Some(WORKER_AOT),
+        lazy_globals: &[],
     }
 }
 

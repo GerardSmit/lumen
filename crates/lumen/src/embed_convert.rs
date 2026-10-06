@@ -3813,6 +3813,35 @@ enum LazyItem {
     Class(Make<JsHost>),
     /// A module constant; it may instantiate the module's classes, so they are registered first.
     Constant(Make<JsHost>, Rc<[Make<JsHost>]>),
+    /// One of several globals that one initializer defines together (see [`LazyGroup`]).
+    Group(Rc<LazyGroup>),
+}
+
+/// Runs a group's initializer with the interpreter and the global object the group lives on.
+pub type LazyGroupInit = Rc<dyn Fn(&mut Interp, &Value) -> Result<(), Value>>;
+
+/// Globals defined as a side effect of one initializer (typically evaluating JS glue). Each name
+/// is a lazy accessor; the first read or reflection through any of them removes every accessor
+/// the group still owns and then runs the initializer once, which defines the real properties.
+/// A name a script replaced before that keeps the script's value.
+struct LazyGroup {
+    init: RefCell<Option<LazyGroupInit>>,
+    /// Weak: each slot's accessor owns its slot, and the slot owns the group.
+    slots: RefCell<Vec<std::rc::Weak<LazyGlobal>>>,
+}
+
+impl LazyGroup {
+    fn run(&self, i: &mut Interp, global: &Gc) -> Result<(), Value> {
+        let Some(init) = self.init.borrow_mut().take() else {
+            return Ok(());
+        };
+        for slot in self.slots.take().iter().filter_map(std::rc::Weak::upgrade) {
+            if slot.owns(global) {
+                global.borrow_mut().props.remove(&slot.name);
+            }
+        }
+        init(i, &Value::Obj(global.clone()))
+    }
 }
 
 /// One lazily published global: an accessor on its realm's global object that replaces itself
@@ -3868,7 +3897,14 @@ impl LazyGlobal {
                 .get_member(&Value::Obj(global), &self.name)
                 .map_err(abrupt_value);
         }
+        if let LazyItem::Group(group) = &self.item {
+            group.run(i, &global)?;
+            return i
+                .get_member(&Value::Obj(global), &self.name)
+                .map_err(abrupt_value);
+        }
         let value = match &self.item {
+            LazyItem::Group(_) => unreachable!("handled above"),
             LazyItem::Function(f) => i.bound_function(f),
             LazyItem::Class(make) => make(i)?,
             LazyItem::Constant(make, classes) => {
@@ -3894,6 +3930,50 @@ impl LazyGlobal {
         }
         Ok(Value::Undefined)
     }
+}
+
+/// Publish one lazy accessor named `name` on `global` unless the realm already defines it.
+fn install_lazy_slot(
+    ctx: &mut Interp,
+    global: &Gc,
+    name: String,
+    item: LazyItem,
+    enumerable: bool,
+) -> Option<Rc<LazyGlobal>> {
+    if global.borrow().props.contains(&name) {
+        return None;
+    }
+    let slot = Rc::new(LazyGlobal {
+        global: Gc::downgrade(global),
+        name,
+        item,
+        enumerable,
+        getter: RefCell::new(None),
+    });
+    let get: Rc<crate::value::NativeClosure> = {
+        let slot = slot.clone();
+        Rc::new(move |i: &mut Interp, _: Value, _: &[Value]| slot.get(i))
+    };
+    *slot.getter.borrow_mut() = Some(Rc::downgrade(&get));
+    let set: Rc<crate::value::NativeClosure> = {
+        let slot = slot.clone();
+        Rc::new(move |i: &mut Interp, _: Value, args: &[Value]| {
+            slot.set(i, args.first().cloned().unwrap_or(Value::Undefined))
+        })
+    };
+    let materialize = slot.clone();
+    ctx.register_lazy_global(
+        global,
+        &slot.name,
+        Rc::new(move |i: &mut Interp| materialize.get(i).map(|_| ())),
+    );
+    let getter = Value::Obj(ctx.make_native_closure(&format!("get {}", slot.name), 0, get));
+    let setter = Value::Obj(ctx.make_native_closure(&format!("set {}", slot.name), 1, set));
+    global.borrow_mut().props.insert(
+        slot.name.as_str(),
+        Property::accessor_prop(Some(getter), Some(setter), enumerable, true),
+    );
+    Some(slot)
 }
 
 /// Publish everything `items` declares as lazy accessors on the global object. A global the
@@ -3932,39 +4012,7 @@ fn install_items_lazy(ctx: &mut Interp, items: ModuleItems<JsHost>) -> Result<()
         published.push((k.name.to_string(), item, k.enumerable));
     }
     for (name, item, enumerable) in published {
-        if global.borrow().props.contains(&name) {
-            continue;
-        }
-        let slot = Rc::new(LazyGlobal {
-            global: Gc::downgrade(&global),
-            name,
-            item,
-            enumerable,
-            getter: RefCell::new(None),
-        });
-        let get: Rc<crate::value::NativeClosure> = {
-            let slot = slot.clone();
-            Rc::new(move |i: &mut Interp, _: Value, _: &[Value]| slot.get(i))
-        };
-        *slot.getter.borrow_mut() = Some(Rc::downgrade(&get));
-        let set: Rc<crate::value::NativeClosure> = {
-            let slot = slot.clone();
-            Rc::new(move |i: &mut Interp, _: Value, args: &[Value]| {
-                slot.set(i, args.first().cloned().unwrap_or(Value::Undefined))
-            })
-        };
-        let materialize = slot.clone();
-        ctx.register_lazy_global(
-            &global,
-            &slot.name,
-            Rc::new(move |i: &mut Interp| materialize.get(i).map(|_| ())),
-        );
-        let getter = Value::Obj(ctx.make_native_closure(&format!("get {}", slot.name), 0, get));
-        let setter = Value::Obj(ctx.make_native_closure(&format!("set {}", slot.name), 1, set));
-        global.borrow_mut().props.insert(
-            slot.name.as_str(),
-            Property::accessor_prop(Some(getter), Some(setter), enumerable, true),
-        );
+        install_lazy_slot(ctx, &global, name, item, enumerable);
     }
     if let Some(init) = items.init {
         init(ctx, &Value::Obj(global))?;
@@ -4032,6 +4080,28 @@ impl Interp {
     /// with the global object.
     pub fn install_module_lazy<M: Module<JsHost>>(&mut self) -> Result<(), Value> {
         install_items_lazy(self, ModuleItems::of::<M>())
+    }
+
+    /// Publish `names` as non-enumerable lazy globals of the current realm that `init` defines
+    /// together. The first access to any of them (a read, or reflection such as
+    /// `Object.getOwnPropertyDescriptor(globalThis, name)` / `Object.keys`) removes the group's
+    /// remaining accessors and runs `init(interp, global)` exactly once; `init` then defines the
+    /// real properties, so they read as ordinary data properties afterwards. Assigning to a name
+    /// first replaces just that accessor with the assigned value, and `init` must leave such an
+    /// override alone. A name the realm already defines is skipped (earlier providers stay
+    /// canonical); `in` does not run `init`.
+    pub fn install_lazy_global_group(&mut self, names: &[&str], init: LazyGroupInit) {
+        let global = self.global.clone();
+        let group = Rc::new(LazyGroup {
+            init: RefCell::new(Some(init)),
+            slots: RefCell::new(Vec::new()),
+        });
+        for name in names {
+            let item = LazyItem::Group(group.clone());
+            if let Some(slot) = install_lazy_slot(self, &global, (*name).to_string(), item, false) {
+                group.slots.borrow_mut().push(Rc::downgrade(&slot));
+            }
+        }
     }
 
     /// The registration record of the bound fn behind `callee`, if it is one (`op_function`,

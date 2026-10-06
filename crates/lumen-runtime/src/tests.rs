@@ -3352,6 +3352,59 @@ fn node_url_module_uses_native_url_classes() {
 }
 
 #[test]
+fn node_blob_keeps_files_on_disk_and_resolves_object_urls() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const fs = require('fs');
+        const os = require('os');
+        const path = require('path');
+        const buffer = require('buffer');
+        const file = path.join(os.tmpdir(), `lumen-blob-${process.pid}-${Date.now()}.txt`);
+        fs.writeFileSync(file, 'hello file');
+        (async () => {
+          const blob = await fs.openAsBlob(file, { type: 'Text/Plain' });
+          console.log(blob instanceof Blob, blob.size, blob.type);
+          console.log(await blob.slice(6, 10).text());
+          console.log((await blob.arrayBuffer()).byteLength);
+          const url = URL.createObjectURL(blob);
+          const resolved = buffer.resolveObjectURL(url);
+          console.log(resolved instanceof Blob, resolved.size, resolved.type, await resolved.text());
+          try { structuredClone(blob); } catch (error) { console.log(error.code); }
+          const reader = blob.slice(0, 5).stream().getReader();
+          console.log(Buffer.from((await reader.read()).value).toString());
+          console.log(new Blob([blob, '!']).size);
+          const memory = new Blob(['abc'], { type: 'a/b' });
+          const copy = structuredClone(new File([memory], 'n.txt', { lastModified: 9 }));
+          console.log(copy instanceof File, copy.name, copy.lastModified, copy.size);
+          URL.revokeObjectURL(url);
+          console.log(buffer.resolveObjectURL(url));
+          fs.writeFileSync(file, 'a different, longer body');
+          try { await blob.text(); } catch (error) { console.log(error.name); }
+          fs.unlinkSync(file);
+        })().catch((error) => console.log('failed', error));
+        "#,
+    );
+    assert!(err.lines().is_empty(), "stderr: {:?}", err.lines());
+    assert_eq!(
+        out.lines(),
+        [
+            "true 10 text/plain",
+            "file",
+            "10",
+            "true 10 text/plain hello file",
+            "ERR_INVALID_STATE",
+            "hello",
+            "11",
+            "true n.txt 9 3",
+            "undefined",
+            "NotReadableError",
+        ]
+    );
+}
+
+#[test]
 fn native_event_target_follows_node_event_target_semantics() {
     let (mut rt, out, _err) = test_runtime();
     eval_ok(

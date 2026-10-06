@@ -52,6 +52,7 @@ pub mod local_tz;
 pub mod memcat;
 pub mod mime;
 pub mod mt19937;
+pub mod multipart;
 pub mod native;
 pub mod pointer;
 pub mod pem;

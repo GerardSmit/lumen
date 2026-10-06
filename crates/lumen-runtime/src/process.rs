@@ -27,6 +27,7 @@ pub(crate) fn extension() -> Extension {
         state_init: Some(|state: &mut OpState| state.put(ProcStart(Instant::now()))),
         js_init: None,
         js_init_snapshot: Some(JS_INIT_AOT),
+        lazy_globals: &[],
     }
 }
 

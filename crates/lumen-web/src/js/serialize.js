@@ -34,6 +34,7 @@ const T_STROBJ = 20;
 const T_SHARED = 21;
 const T_PORT = 22;
 const T_HOST = 23;
+const T_BLOB = 24;
 
 // Platform objects (KeyObject, CryptoKey, X509Certificate, ...) clone through `[kTransferClone]()`,
 // which returns `{ data, deserializeInfo: "module:name" }`, and are rebuilt on the receiving side by
@@ -141,6 +142,16 @@ function serializeForClone(value, transfer = [], transport = false) {
     if (typeof SharedArrayBuffer === "function" && v instanceof SharedArrayBuffer) {
       if (!transport || !globalThis.__cloneTransfer) throw new DOMException("SharedArrayBuffer sharing requires runtime", "DataCloneError");
       memory.set(v, ref); u8(T_SHARED); return u32(globalThis.__cloneTransfer.exportShared(v));
+    }
+    if (blobInternals?.isBlob(v)) {
+      const [kind, type, name, lastModified, bytes] = blobInternals.snapshot(v);
+      memory.set(v, ref);
+      u8(T_BLOB);
+      str(kind);
+      str(type);
+      str(name);
+      f64(lastModified);
+      return rawBytes(bytes);
     }
     if (v instanceof ArrayBuffer) {
       memory.set(v, ref);
@@ -287,6 +298,17 @@ function deserializeClone(buf) {
       case T_REGEXP: { const source = str(); return new RegExp(source, str()); }
       case T_SHARED: {const value=globalThis.__cloneTransfer.importShared(u32());memory.push(value);return value;}
       case T_PORT: {const value=globalThis.__lumenPortClone.import(u32());memory.push(value);return value;}
+      case T_BLOB: {
+        const kind = str();
+        const type = str();
+        const name = str();
+        const lastModified = f64();
+        const len = u32();
+        const blob = blobInternals.restore(kind, type, name, lastModified, buf.subarray(pos, pos + len));
+        pos += len;
+        memory.push(blob);
+        return blob;
+      }
       case T_ARRAYBUFFER: {
         const len = u32();
         const ab = new ArrayBuffer(len);

@@ -14,6 +14,7 @@ function codedError(Ctor, code, message) {
 const CLONE_ERROR_NAMES = new Set(["Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError"]);
 const cloneAbByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
 const cloneTypedArrayTag = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), Symbol.toStringTag).get;
+const blobInternals = globalThis.__lumenBlobInternals;
 const cloneBrand = (fn, v) => { try { fn.call(v); return true; } catch { return false; } };
 const cloneIsArrayBuffer = (v) => cloneBrand(cloneAbByteLength, v);
 function cloneDataCloneError(message) {
@@ -59,15 +60,14 @@ function structuredClone(value, options) {
     if (v === null || typeof v !== "object") return v;
     if (seen.has(v)) return seen.get(v);
     if (globalThis.__lumenPortClone?.isPort(v)) throw cloneDataCloneError("MessagePort must be listed in transferList.");
-    if (v instanceof Blob && globalThis.__lumenIsFileBackedBlob(v)) {
-      throw codedError(Error, "ERR_INVALID_STATE", "Invalid state: File-backed Blobs are not cloneable");
-    }
     let out;
     if (globalThis.__cloneTransfer && (out=globalThis.__cloneTransfer.cloneShared(v)) !== undefined) {
       seen.set(v,out);
       return out;
     }
-    if (cloneBrand(Date.prototype.getTime, v)) {
+    if (blobInternals?.isBlob(v)) {
+      out = blobInternals.clone(v);
+    } else if (cloneBrand(Date.prototype.getTime, v)) {
       out = new Date(Date.prototype.getTime.call(v));
     } else if (cloneBrand(Boolean.prototype.valueOf, v)) {
       out = Object(Boolean.prototype.valueOf.call(v));

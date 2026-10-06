@@ -33,8 +33,6 @@ fn install_clone_baseline(engine: &mut Engine) {
             "\n",
             include_str!("../../lumen-web/src/js/events.js"),
             "\n",
-            include_str!("../../lumen-web/src/js/blob.js"),
-            "\n",
             include_str!("../../lumen-web/src/js/encoding.js"),
             "\n})();"
         ),

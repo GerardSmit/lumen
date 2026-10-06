@@ -26,7 +26,7 @@
 //!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
 //!   Fetch reads native response bodies incrementally; body consumption and cloning also
 //!   accept asynchronous streams. Request uploads are prepared before transport delivery.
-//! - [ ] `Blob` / `File` / `FormData`, `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
+//! - [ ] `URLPattern`, `crypto.subtle` beyond digest, `WebSocket`
 
 use lumen_bind::NativeError;
 #[cfg(not(target_arch = "wasm32"))]
@@ -731,6 +731,8 @@ pub fn extension() -> Extension {
             lumen_host::lazy_globals::<lumen_host::events::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::events::internals::Module>,
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::blob::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::blob::internals::Module>,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,
             lumen_host::namespace::<websocket::Module>,
@@ -758,6 +760,7 @@ pub fn extension() -> Extension {
             }
         },
         js_init_snapshot: Some(JS_GLUE_AOT),
+        lazy_globals: &[],
     }
 }
 
