@@ -2045,6 +2045,11 @@ fn document_time(realm: &DomRealm) -> Option<f64> {
         .then(|| realm.timeline_sample.get())
 }
 
+/// A CSSNumberish-or-null result: unresolved times are JS `null`, not `undefined`.
+fn time_or_null(time: Option<f64>) -> Value {
+    time.map_or(Value::Null, Value::Num)
+}
+
 fn record_time(record: &Record) -> Option<f64> {
     record.timeline_realm.upgrade().and_then(|realm| document_time(&realm))
 }
@@ -3146,13 +3151,13 @@ impl DomAnimation {
         Ok(pending)
     }
     #[getter(name = "startTime")]
-    fn start_time(&self, ctx: &mut Ctx) -> OpResult<Option<f64>> {
+    fn start_time(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         let state=hub.borrow();
         let record=state.records.get(&self.id)
             .ok_or_else(||OpError::new("InvalidStateError","animation is no longer available"))?;
-        Ok(record.start_resolved.then(||record.start_ms-record.timeline_origin_ms
-            -if record.playback_rate==0.0 {0.0}else{record.start_time_ms/record.playback_rate}))
+        Ok(time_or_null(record.start_resolved.then(||record.start_ms-record.timeline_origin_ms
+            -if record.playback_rate==0.0 {0.0}else{record.start_time_ms/record.playback_rate})))
     }
     #[setter(name = "startTime")]
     fn set_start_time(&self, ctx: &mut Ctx, value: Option<f64>) -> OpResult<()> {
@@ -3179,20 +3184,20 @@ impl DomAnimation {
         settle_finished(ctx,&hub,now)
     }
     #[getter(name = "currentTime")]
-    fn current_time(&self, ctx: &mut Ctx) -> OpResult<Option<f64>> {
+    fn current_time(&self, ctx: &mut Ctx) -> OpResult<Value> {
         let hub=hub(ctx)?;refresh_css_animation_for_accessor(ctx,&hub,self.id)?;
         let state = hub.borrow();
         let record = state.records.get(&self.id)
             .ok_or_else(|| OpError::new("InvalidStateError", "animation is no longer available"))?;
         if record.cancelled {
-            return Ok(None);
+            return Ok(Value::Null);
         }
         let now = record_time(&record);
         if now.is_none() && record.hold_time_ms.is_none() {
-            return Ok(None);
+            return Ok(Value::Null);
         }
         let sample = sample_record(record, now.unwrap_or(0.0));
-        Ok((sample.state != PlaybackState::Idle).then_some(sample.current_time_ms))
+        Ok(time_or_null((sample.state != PlaybackState::Idle).then_some(sample.current_time_ms)))
     }
     #[setter(name = "currentTime")]
     fn set_current_time(&self, ctx: &mut Ctx, value: Option<f64>) -> OpResult<()> {
@@ -3695,11 +3700,11 @@ impl DomDocumentTimeline {
         })
     }
     #[getter(name = "currentTime")]
-    fn current_time(&self) -> Option<f64> {
-        self.realm
+    fn current_time(&self) -> Value {
+        time_or_null(self.realm
             .upgrade()
             .and_then(|realm| document_time(&realm))
-            .map(|time| time - self.origin_time_ms)
+            .map(|time| time - self.origin_time_ms))
     }
     #[getter(name = "duration")]
     fn duration(&self) -> Option<f64> {
