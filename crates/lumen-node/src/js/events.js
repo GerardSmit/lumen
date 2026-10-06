@@ -78,7 +78,7 @@ Object.defineProperties(EventEmitter, {
 });
 
 function isEventTarget(obj) {
-  return obj != null && obj[Symbol.for("lumen.kEvents")] instanceof Map || obj != null && typeof obj.addEventListener === "function" && typeof obj.dispatchEvent === "function"
+  return obj != null && __eventTargetInternals.isEventTarget(obj) || obj != null && typeof obj.addEventListener === "function" && typeof obj.dispatchEvent === "function"
     && typeof obj.on !== "function";
 }
 
@@ -511,12 +511,8 @@ function unwrapListeners(arr) {
   return ret;
 }
 
-// lumen-web's EventTarget keeps its listeners in a Map of type -> [{ callback, ... }].
 function eventTargetListeners(target, type) {
-  const map = target[Symbol.for("lumen.kEvents")];
-  if (!(map instanceof Map)) return [];
-  const list = map.get(String(type));
-  return list ? list.filter((l) => !l.removed).map((l) => (l.weak ? l.callback.deref() : l.callback)).filter((c) => c !== undefined) : [];
+  return __eventTargetInternals.listeners(target, String(type));
 }
 
 function getEventListeners(emitterOrTarget, type) {

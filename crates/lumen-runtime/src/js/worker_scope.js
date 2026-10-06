@@ -76,16 +76,8 @@
   workerLocationValues.set(workerLocation, locationUrl);
   Object.freeze(workerLocation);
 
-  // `EventTarget` keeps its brand and listener table on private symbols. Initialize those same
-  // slots on the engine-owned global so the inherited methods work with `self` as their receiver.
-  const eventTargetSeed = new EventTarget();
-  for (const key of Reflect.ownKeys(eventTargetSeed)) {
-    if (typeof key === "symbol") {
-      Object.defineProperty(globalThis, key, {
-        configurable: true, enumerable: false, writable: true, value: eventTargetSeed[key],
-      });
-    }
-  }
+  // The engine-owned global becomes a native EventTarget so the inherited methods accept `self`.
+  globalThis.__eventTargetInternals.initEventTarget(globalThis);
 
   // EventTarget is the parent interface of WorkerGlobalScope. Teach the constructor's brand
   // check about the engine-owned global while leaving every other EventTarget subclass intact.

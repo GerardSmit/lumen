@@ -11,7 +11,7 @@ use std::{
 mod error_reporting;
 mod event_content_handlers;
 mod events;
-use events::{DomEvent, DomEventTarget, TargetData};
+use events::{DomEvent, DomEventTarget, HtmlTargetExt, TargetData};
 mod attributes;
 mod collections;
 mod dataset;
@@ -2646,7 +2646,7 @@ impl DomRealm {
         let result = if trusted {
             events::dispatch_user_agent_event(ctx, lumen_bind::This(target), event)
         } else {
-            DomEventTarget::dispatch_event(ctx, lumen_bind::This(target), event)
+            crate::events::dispatch_event(ctx, lumen_bind::This(target), event)
         };
         drop(target_data);
         result
@@ -11270,8 +11270,8 @@ fn install_document_with_context_metadata(
         }
     }
     let global = ctx.global_object();
-    // Materialize a host's lazy web-event unit before replacing its DOM classes.
-    // Minimal native hosts have no such unit; the DOM installs its own classes.
+    // Materialize a host's lazy event unit before the DOM publishes its classes, so a failing
+    // host getter surfaces as an install error instead of being overwritten.
     if ctx.has_own_property_value(&global, &Value::str("EventTarget"))
         .map_err(|_| InstallError::Global)? {
         ctx.get_member(&global, "EventTarget")
@@ -11341,7 +11341,7 @@ fn install_document_with_context_metadata(
         ),
         (
             "ErrorEvent",
-            ctx.class_constructor::<ui_events::DomErrorEvent>(),
+            ctx.class_constructor::<lumen_host::events::ErrorEvent>(),
         ),
         (
             "PromiseRejectionEvent",
@@ -15761,17 +15761,13 @@ mod tests {
     #[test]
     fn web_targets_capture_bubble_and_preserve_abort_signals() {
         let mut engine = Engine::new();
-        script(&mut engine, "globalThis.performance = {now:() => 0};");
-        script(
-            &mut engine,
-            include_str!("../../lumen-web/src/js/events.js"),
-        );
+        assert!(lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok());
+        install(engine.ctx(), "<main></main>", 64).unwrap();
         let value = script(
             &mut engine,
-            "const root = new EventTarget(); const leaf = new EventTarget(); leaf.parentNode = root; const order = []; root.addEventListener('ping', e => order.push('capture'+e.eventPhase), true); leaf.addEventListener('ping', e => { order.push('target'+e.eventPhase); e.preventDefault(); }, {passive:true}); root.addEventListener('ping', e => order.push('bubble'+e.eventPhase)); const event = new Event('ping',{bubbles:true,cancelable:true}); const dispatched = leaf.dispatchEvent(event); const controller = new AbortController(); let aborts = 0; controller.signal.addEventListener('abort',() => aborts++); controller.abort(); dispatched && !event.defaultPrevented && event.currentTarget === null && event.eventPhase === 0 && order.join(',') === 'capture1,target2,bubble3' && aborts === 1 && controller.signal.aborted",
+            "const root = document.createElement('div'); const leaf = document.createElement('span'); root.appendChild(leaf); const order = []; root.addEventListener('ping', e => order.push('capture'+e.eventPhase), true); leaf.addEventListener('ping', e => { order.push('target'+e.eventPhase); e.preventDefault(); }, {passive:true}); root.addEventListener('ping', e => order.push('bubble'+e.eventPhase)); const event = new Event('ping',{bubbles:true,cancelable:true}); const dispatched = leaf.dispatchEvent(event); const controller = new AbortController(); let aborts = 0; controller.signal.addEventListener('abort',() => aborts++); controller.abort(); dispatched && !event.defaultPrevented && event.currentTarget === null && event.eventPhase === 0 && order.join(',') === 'capture1,target2,bubble3' && aborts === 1 && controller.signal.aborted",
         );
         assert!(matches!(value, Value::Bool(true)));
-        install(engine.ctx(), "<main></main>", 64).unwrap();
         assert!(matches!(
             script(
                 &mut engine,
@@ -16380,15 +16376,9 @@ mod tests {
     #[test]
     fn node_insertion_adopts_foreign_nodes_and_preserves_identity_and_failure_atomicity() {
         let mut engine = Engine::new();
+        assert!(lumen_host::lazy_globals::<lumen_host::events::bindings::Module>(engine.ctx()).is_ok());
         install(engine.ctx(), "<main></main>", 128).unwrap();
-        script(
-            &mut engine,
-            "globalThis.performance = {now:() => 0}; const NativeEvent = Event;",
-        );
-        script(
-            &mut engine,
-            include_str!("../../lumen-web/src/js/events.js"),
-        );
+        script(&mut engine, "const NativeEvent = Event;");
         let result = script(
             &mut engine,
             r#"

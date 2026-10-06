@@ -88,9 +88,17 @@
 //! keep JavaScript class descriptors. Symbol iteration hooks stay non-enumerable. On an `#[op]`
 //! the same hint makes the installed property enumerable (a Web IDL operation of the global
 //! object such as `atob`). Further JS hints:
-//! - `hint(js(symbol_for = "key"))` on an instance method installs it (non-enumerable) under the
-//!   registry symbol `Symbol.for("key")` instead of a string name
+//! - `hint(js(symbol_for = "key"))` on an instance method or getter installs it (non-enumerable)
+//!   under the registry symbol `Symbol.for("key")` instead of a string name
 //!   (`nodejs.util.inspect.custom`);
+//! - `hint(js(unforgeable))` on a getter also defines it as an own, non-configurable accessor on
+//!   every instance, sharing the prototype accessor's getter (Web IDL `[LegacyUnforgeable]`,
+//!   `Event.isTrusted`); subclasses inherit it;
+//! - `hint(js(invalid_this))` on a class makes a failed receiver check throw Node's
+//!   `ERR_INVALID_THIS` (`Value of "this" must be of type <Class>`);
+//! - `hint(js(error))` on a class makes it a native `Error` subclass: the prototype inherits
+//!   `Error.prototype`, the constructor inherits `Error` and every instance gets `[[ErrorData]]`
+//!   with a captured stack (`DOMException`);
 //! - `hint(js(missing_message = "..", missing_code = ".."))` on an op or member replaces the
 //!   `TypeError` a missing required argument throws with that message and `err.code`;
 //! - `hint(js(also_iterator))` on an instance method also installs the same function object
@@ -111,6 +119,16 @@
 //!
 //! Without `name`/`rename`, each host derives its own name (JS camelCases, Python keeps
 //! `snake_case`), its own arity / `length`, `__text_signature__` and argument-error wording.
+//!
+//! # Native instance state (JS host)
+//! - `Ctx::attach_native_data::<T>(object, value)` gives an existing object (a realm global,
+//!   `performance`) the native state of class `T` without touching its prototype chain.
+//! - `Ctx::set_native_identity_owner::<T>(value)` makes the wrapper a traced owner of the values
+//!   its `NativeIdentityOwner` reports; `Ctx::ensure_native_identity_owner::<T>(value)` does so
+//!   unless the instance already has an owner (a subclass that traces more keeps its own).
+//! - `Ctx::allocate_native_private_slot_name` / `define_native_private_value_slot` /
+//!   `native_private_value_slot` hold a JS value on an instance, traced from the wrapper and
+//!   invisible to script (`CustomEvent.detail`, `AbortController.signal`).
 //!
 //! # Parameters
 //! Named parameters are positional-only unless marked `#[kw]` (positional or keyword) or

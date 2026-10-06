@@ -32,24 +32,6 @@ const UNITS: &[Unit] = &[
         defined: &[],
     },
     Unit {
-        files: &["events.js"],
-        lazy: true,
-        defined: &[
-            ("__cloneTransferableSignal", false),
-            ("__eventTargetInternals", false),
-        ],
-    },
-    Unit {
-        files: &["custom-event.js"],
-        lazy: true,
-        defined: &[],
-    },
-    Unit {
-        files: &["error-events.js"],
-        lazy: true,
-        defined: &[],
-    },
-    Unit {
         files: &["messaging.js"],
         lazy: true,
         // This helper is installed with Object.defineProperty rather than an assignment, so

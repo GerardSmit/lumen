@@ -3,6 +3,7 @@
 //! Oscillator and buffer sources feed a context destination through a validated
 //! graph of gain nodes. PCM generation runs in the owner-side runtime service.
 
+use crate::events::HtmlTargetExt;
 use crate::{DomDocument, DomRealm};
 use lumen::embed::{Ctx, Deferred, JsFunction, JsObject, OpError, OpResult, Value, WeakValue};
 use std::{cell::RefCell, rc::Rc, sync::Arc};

@@ -45,7 +45,7 @@ function structuredClone(value, options) {
   for (const t of transfer) {
     if (t !== null && typeof t === "object" && t[Symbol.for("nodejs.untransferable")] === true) continue;
     if (t instanceof AbortSignal && t[Symbol.for("nodejs.abortsignal.transferable")] === true) {
-      seen.set(t, globalThis.__cloneTransferableSignal(t));
+      seen.set(t, globalThis.__eventTargetInternals.cloneTransferableSignal(t));
       continue;
     }
     if (!cloneIsArrayBuffer(t)) throw cloneDataCloneError("Found invalid value in transferList.");

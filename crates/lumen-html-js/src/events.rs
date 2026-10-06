@@ -1,7 +1,16 @@
+//! HTML event targets. The `Event`/`EventTarget` core is shared with every other runtime
+//! (`lumen_host::events`); this module adds what only a DOM has: the propagation path through
+//! the tree and shadow roots, content-attribute handlers and the realm bookkeeping.
 use super::*;
 use lumen::embed::{JsFunction, JsHost, JsObject, OpError, OpResult};
 use lumen_bind::{CtorRet, Host, This};
+use lumen_host::events::{
+    Callback, DeferredCompile, EventInit, EventPath, HandlerKind, PathEntry, TargetHooks,
+};
+use std::any::Any;
 use std::rc::Weak;
+
+pub(crate) use lumen_host::events::{Event as DomEvent, EventTarget as DomEventTarget, TargetData};
 
 #[lumen_bind::module(name = "__dom_event_targets")]
 pub(crate) mod target_bindings {
@@ -9,42 +18,13 @@ pub(crate) mod target_bindings {
     #[op(rename(js = "hasListeners"))]
     pub fn has_listeners(ctx: &mut Ctx, target: Value, inactive: Vec<Value>) -> OpResult<bool> {
         let target = ctx
-            .with_instance::<DomEventTarget, _>(&target, |target| target.clone())
+            .with_instance::<DomEventTarget, _>(&target, |target| target.data_handle())
             .map_err(|_| OpError::new("TypeError", "Illegal EventTarget receiver"))?;
-        let found = target.data.listeners.borrow().iter().any(|listener| {
-            !listener.removed.get()
-                && listener
-                    .callback
-                    .borrow()
-                    .identity_value()
-                    .is_some_and(|callback| !inactive.iter().any(|value| same(value, callback)))
-        });
-        Ok(found)
+        Ok(target.has_listener_besides(&inactive))
     }
 }
 
-#[derive(Clone)]
-struct Listener {
-    kind: String,
-    callback: Rc<RefCell<ListenerCallback>>,
-    capture: bool,
-    once: bool,
-    passive: bool,
-    handler: bool,
-    removed: Rc<Cell<bool>>,
-}
-
-#[derive(Clone)]
-enum ListenerCallback {
-    Empty,
-    Function(JsFunction),
-    Object(Value),
-    ContentHandler {
-        source: RawContentHandler,
-        compiled: Option<JsFunction>,
-    },
-}
-
+/// The source of a content-attribute event handler, compiled on first dispatch.
 #[derive(Clone)]
 pub(crate) struct RawContentHandler {
     pub(crate) node: NodeId,
@@ -55,208 +35,341 @@ pub(crate) struct RawContentHandler {
     pub(crate) location: String,
 }
 
-impl ListenerCallback {
-    fn from_value(value: Value) -> OpResult<Option<Self>> {
-        match value {
-            Value::Null | Value::Undefined => Ok(None),
-            value if value.is_callable() => Ok(Some(Self::Function(
-                JsFunction::from_value(value).expect("callable JS values convert to JsFunction"),
-            ))),
-            value @ Value::Obj(_) => Ok(Some(Self::Object(value))),
-            _ => Err(OpError::type_error(
-                "EventListener must be a function, object, null, or undefined",
-            )),
-        }
-    }
-
-    fn identity_value(&self) -> Option<&Value> {
-        match self {
-            Self::Function(callback) => Some(callback.value()),
-            Self::Object(callback) => Some(callback),
-            Self::Empty | Self::ContentHandler { .. } => None,
-        }
-    }
-
-    fn function(&self) -> Option<JsFunction> {
-        match self {
-            Self::Function(callback) => Some(callback.clone()),
-            Self::ContentHandler {
-                compiled: Some(callback),
-                ..
-            } => Some(callback.clone()),
-            Self::Empty | Self::Object(_) | Self::ContentHandler { .. } => None,
-        }
-    }
-}
-
-pub(crate) struct TargetData {
+/// The DOM side of an event target: its realm and node, and the dispatch hooks.
+pub(crate) struct HtmlTarget {
     realm: RefCell<Weak<DomRealm>>,
     node: Cell<Option<NodeId>>,
     click_in_progress: Cell<bool>,
-    listeners: RefCell<Vec<Listener>>,
 }
 
-#[derive(Clone)]
-#[lumen_bind::class(name = "EventTarget", hint(js(webidl)))]
-pub struct DomEventTarget {
-    data: Rc<TargetData>,
-}
-
-impl DomEventTarget {
-    /// Enumerate the exact values held by native listener storage. The engine
-    /// discounts these bookkeeping edges and traces them from a reachable DOM
-    /// wrapper, so detached handler/owner cycles do not become blanket roots.
-    pub(crate) fn trace_callback_values(&self, visit: &mut dyn FnMut(&Value)) {
-        for listener in self.data.listeners.borrow().iter() {
-            match &*listener.callback.borrow() {
-                ListenerCallback::Function(callback)
-                | ListenerCallback::ContentHandler { compiled: Some(callback), .. } => {
-                    visit(callback.value());
-                }
-                ListenerCallback::Object(callback) => visit(callback),
-                ListenerCallback::Empty
-                | ListenerCallback::ContentHandler { compiled: None, .. } => {}
-            }
-        }
+impl HtmlTarget {
+    fn data(realm: Option<&Rc<DomRealm>>, node: Option<NodeId>) -> Rc<TargetData> {
+        TargetData::new(Some(Rc::new(Self {
+            realm: RefCell::new(realm.map_or_else(Weak::new, Rc::downgrade)),
+            node: Cell::new(node),
+            click_in_progress: Cell::new(false),
+        })))
     }
 
-    pub(crate) fn associated_realm(&self) -> Option<Rc<DomRealm>> {
-        self.data.realm.borrow().upgrade()
+    fn of(data: &TargetData) -> Option<&HtmlTarget> {
+        data.hooks_as::<HtmlTarget>()
     }
 
-    pub(crate) fn erase_listeners(&self, ctx: &mut Ctx, owner: Option<&Value>) {
-        let mut listeners = self.data.listeners.borrow_mut();
-        if listeners.is_empty() {
-            return;
-        }
-        for listener in listeners.iter() {
-            listener.removed.set(true);
-        }
-        listeners.clear();
-        drop(listeners);
-        if let Some(owner) = owner {
-            ctx.retain_instance(owner, false);
-        }
-    }
-
-    pub(crate) fn try_begin_click(&self) -> bool {
-        !self.data.click_in_progress.replace(true)
-    }
-
-    pub(crate) fn end_click(&self) {
-        self.data.click_in_progress.set(false);
-    }
-
-    pub(crate) fn handler(&self, kind: &str) -> Option<JsFunction> {
-        self.data
-            .listeners
-            .borrow()
-            .iter()
-            .find(|listener| listener.handler && listener.kind == kind)
-            .and_then(|listener| listener.callback.borrow().function())
-    }
-
-    pub(crate) fn has_handler(&self, kind: &str) -> bool {
-        self.data
-            .listeners
-            .borrow()
-            .iter()
-            .any(|listener| listener.handler && listener.kind == kind)
-    }
-
-    pub(crate) fn handler_value(
-        &self,
-        ctx: &mut Ctx,
-        owner: &Value,
-        kind: &str,
-    ) -> OpResult<Value> {
-        let callback = self
-            .data
-            .listeners
-            .borrow()
-            .iter()
-            .find(|listener| listener.handler && listener.kind == kind)
-            .map(|listener| listener.callback.clone());
-        let Some(callback) = callback else {
-            return Ok(Value::Null);
-        };
-        let current = callback.borrow().clone();
-        match current {
-            ListenerCallback::Function(function) => Ok(function.value().clone()),
-            ListenerCallback::ContentHandler {
-                compiled: Some(function),
-                ..
-            } => Ok(function.value().clone()),
-            ListenerCallback::ContentHandler {
-                source,
-                compiled: None,
-            } => {
-                let realm = self.data.realm.borrow().upgrade();
-                let Some(realm) = realm else {
-                    return Ok(Value::Null);
-                };
-                match super::event_content_handlers::compile(ctx, &realm, &source) {
-                    super::event_content_handlers::Compilation::Compiled(function) => {
-                        *callback.borrow_mut() = ListenerCallback::ContentHandler {
-                            source,
-                            compiled: Some(function.clone()),
-                        };
-                        ctx.retain_instance(owner, true);
-                        Ok(function.value().clone())
-                    }
-                    super::event_content_handlers::Compilation::Failed
-                        if realm.has_browsing_context =>
-                    {
-                        *callback.borrow_mut() = ListenerCallback::Empty;
-                        ctx.retain_instance(owner, true);
-                        Ok(Value::Null)
-                    }
-                    super::event_content_handlers::Compilation::Failed
-                    | super::event_content_handlers::Compilation::Inactive => Ok(Value::Null),
-                }
-            }
-            ListenerCallback::Empty | ListenerCallback::Object(_) => Ok(Value::Null),
-        }
-    }
-    pub(crate) fn set_handler(
-        &self,
-        ctx: &mut Ctx,
-        owner: &Value,
-        kind: &str,
-        callback: Option<JsFunction>,
-    ) {
-        let _html_allocations = enter_html_allocation_category();
-        let mut listeners = self.data.listeners.borrow_mut();
-        if let Some(callback) = callback {
-            if let Some(listener) = listeners
-                .iter_mut()
-                .find(|listener| listener.handler && listener.kind == kind)
+    fn closed_roots(document: &lumen_html::Document, node: NodeId) -> OpResult<Vec<u128>> {
+        let mut root = document.root_node(node, false).map_err(dom_error)?;
+        let mut closed = Vec::new();
+        while let Some(host) = document.shadow_host(root).map_err(dom_error)? {
+            if document.shadow_mode(root).map_err(dom_error)? == Some(lumen_html::ShadowMode::Closed)
             {
-                *listener.callback.borrow_mut() = ListenerCallback::Function(callback);
-            } else {
-                listeners.push(Listener {
-                    kind: kind.into(),
-                    callback: Rc::new(RefCell::new(ListenerCallback::Function(callback))),
-                    capture: false,
-                    once: false,
-                    passive: false,
-                    handler: true,
-                    removed: Rc::new(Cell::new(false)),
+                if closed.len() >= 64 {
+                    return Err(OpError::new(
+                        "RangeError",
+                        "event shadow nesting limit exceeded",
+                    ));
+                }
+                closed.push(root.key());
+            }
+            root = document.root_node(host, false).map_err(dom_error)?;
+        }
+        Ok(closed)
+    }
+
+    fn retarget_related(
+        ctx: &mut Ctx,
+        realm: &Rc<DomRealm>,
+        related: &Value,
+        related_node: &Option<(Rc<DomRealm>, NodeId)>,
+        boundary: Option<NodeId>,
+    ) -> OpResult<Value> {
+        let Some((related_realm, id)) = related_node else {
+            return Ok(related.clone());
+        };
+        if !Rc::ptr_eq(related_realm, realm) {
+            return Ok(related.clone());
+        }
+        let id = realm
+            .session
+            .borrow()
+            .document()
+            .retarget(*id, boundary)
+            .map_err(dom_error)?;
+        Ok(realm.wrap(ctx, id))
+    }
+}
+
+impl TargetHooks for HtmlTarget {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn event_path(
+        &self,
+        ctx: &mut Ctx,
+        data: &Rc<TargetData>,
+        receiver: &Value,
+        event: &DomEvent,
+        initial_target: &Value,
+    ) -> OpResult<Option<EventPath>> {
+        let (Some(realm), Some(mut node)) = (self.realm.borrow().upgrade(), self.node.get()) else {
+            return Ok(None);
+        };
+        let related = event.related_original();
+        let related_node = ctx
+            .with_instance::<DomNode, _>(&related, |node| (node.realm.clone(), node.id))
+            .ok();
+        let original = node;
+        let origin_root = realm
+            .session
+            .borrow()
+            .document()
+            .root_node(node, false)
+            .map_err(dom_error)?;
+        let mut entries = vec![PathEntry {
+            value: receiver.clone(),
+            target: data.clone(),
+            adjusted: initial_target.clone(),
+            closed: Self::closed_roots(realm.session.borrow().document(), node)?,
+            related: related.clone(),
+        }];
+        loop {
+            let parent = realm
+                .session
+                .borrow()
+                .document()
+                .event_parent(node, event.composed_flag(), origin_root)
+                .map_err(|_| OpError::new("InvalidStateError", "event target was removed"))?;
+            let Some(parent) = parent else {
+                break;
+            };
+            if entries.len() >= 1024 {
+                return Err(OpError::new("RangeError", "event path limit exceeded"));
+            }
+            let adjusted = realm
+                .session
+                .borrow()
+                .document()
+                .retarget(original, Some(parent))
+                .map_err(dom_error)?;
+            let adjusted = realm.wrap(ctx, adjusted);
+            let related_adjusted =
+                Self::retarget_related(ctx, &realm, &related, &related_node, Some(parent))?;
+            if same(&adjusted, &related_adjusted) {
+                break;
+            }
+            let closed = Self::closed_roots(realm.session.borrow().document(), parent)?;
+            let value = realm.wrap(ctx, parent);
+            if let Some(target) = realm.targets.borrow().get(&parent).and_then(Weak::upgrade) {
+                entries.push(PathEntry {
+                    value,
+                    target,
+                    adjusted,
+                    closed,
+                    related: related_adjusted,
                 });
             }
-        } else {
-            listeners.retain(|listener| {
-                let remove = listener.handler && listener.kind == kind;
-                if remove {
-                    listener.removed.set(true);
-                }
-                !remove
-            });
+            node = parent;
         }
-        ctx.retain_instance(owner, !listeners.is_empty());
+        if node == realm.session.borrow().document().root() {
+            let adjusted = realm
+                .session
+                .borrow()
+                .document()
+                .retarget(original, None)
+                .map_err(dom_error)?;
+            let adjusted = realm.wrap(ctx, adjusted);
+            let related_adjusted =
+                Self::retarget_related(ctx, &realm, &related, &related_node, None)?;
+            if let (Some(value), Some(target)) = (
+                realm
+                    .window_wrapper
+                    .borrow()
+                    .as_ref()
+                    .and_then(WeakValue::upgrade),
+                realm.window_target.borrow().as_ref(),
+            ) {
+                entries.push(PathEntry {
+                    value,
+                    target: target.clone(),
+                    adjusted,
+                    closed: Vec::new(),
+                    related: related_adjusted,
+                });
+            }
+        }
+        if entries.iter().map(|entry| entry.closed.len()).sum::<usize>() > 4096 {
+            return Err(OpError::new(
+                "RangeError",
+                "event shadow path limit exceeded",
+            ));
+        }
+        let clear_target = {
+            let session = realm.session.borrow();
+            let document = session.document();
+            let last = entries
+                .last()
+                .and_then(|entry| Self::of(&entry.target))
+                .and_then(|target| target.node.get());
+            let target = document.retarget(original, last).map_err(dom_error)?;
+            document
+                .shadow_host(document.root_node(target, false).map_err(dom_error)?)
+                .map_err(dom_error)?
+                .is_some()
+        };
+        Ok(Some(EventPath {
+            entries,
+            clear_target,
+        }))
     }
 
-    pub(crate) fn set_content_handler(
+    fn compile_deferred(&self, ctx: &mut Ctx, source: &Rc<dyn Any>) -> DeferredCompile {
+        use super::event_content_handlers::Compilation;
+        let Some(source) = source.downcast_ref::<RawContentHandler>() else {
+            return DeferredCompile::Inactive;
+        };
+        let Some(realm) = self.realm.borrow().upgrade() else {
+            return DeferredCompile::Inactive;
+        };
+        match super::event_content_handlers::compile(ctx, &realm, source) {
+            Compilation::Compiled(function) => DeferredCompile::Compiled(function),
+            Compilation::Failed if realm.has_browsing_context => DeferredCompile::Failed,
+            Compilation::Failed | Compilation::Inactive => DeferredCompile::Inactive,
+        }
+    }
+
+    fn is_global_scope(&self, ctx: &mut Ctx, current: &Value) -> bool {
+        ctx.with_instance::<super::window_globals::DomWindow, _>(current, |_| ())
+            .is_ok()
+    }
+}
+
+/// The HTML-only operations of an event target.
+pub(crate) trait HtmlTargetExt: Sized {
+    fn window(realm: &Rc<DomRealm>) -> Self;
+    fn node(realm: &Rc<DomRealm>, id: NodeId) -> Self;
+    /// A target owned by a platform object rather than a DOM node (a `MediaQueryList`).
+    fn independent(realm: &Rc<DomRealm>) -> Self;
+    fn associated_realm(&self) -> Option<Rc<DomRealm>>;
+    fn rebind_node(&self, realm: &Rc<DomRealm>, node: NodeId);
+    fn try_begin_click(&self) -> bool;
+    fn end_click(&self);
+    fn trace_callback_values(&self, visit: &mut dyn FnMut(&Value));
+    fn erase_listeners(&self, ctx: &mut Ctx, owner: Option<&Value>);
+    fn handler(&self, kind: &str) -> Option<JsFunction>;
+    fn has_handler(&self, kind: &str) -> bool;
+    fn handler_value(&self, ctx: &mut Ctx, owner: &Value, kind: &str) -> OpResult<Value>;
+    fn set_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: Option<JsFunction>);
+    fn set_content_handler(
+        &self,
+        ctx: &mut Ctx,
+        owner: &Value,
+        kind: &str,
+        handler: Option<RawContentHandler>,
+    );
+}
+
+impl HtmlTargetExt for DomEventTarget {
+    fn window(realm: &Rc<DomRealm>) -> Self {
+        Self::from_data(HtmlTarget::data(Some(realm), None))
+    }
+
+    fn node(realm: &Rc<DomRealm>, id: NodeId) -> Self {
+        if let Some(data) = realm.targets.borrow().get(&id).and_then(Weak::upgrade) {
+            return Self::from_data(data);
+        }
+        let data = HtmlTarget::data(Some(realm), Some(id));
+        realm.targets.borrow_mut().insert(id, Rc::downgrade(&data));
+        Self::from_data(data)
+    }
+
+    fn independent(realm: &Rc<DomRealm>) -> Self {
+        Self::from_data(HtmlTarget::data(Some(realm), None))
+    }
+
+    fn associated_realm(&self) -> Option<Rc<DomRealm>> {
+        HtmlTarget::of(self.data())?.realm.borrow().upgrade()
+    }
+
+    fn rebind_node(&self, realm: &Rc<DomRealm>, node: NodeId) {
+        let Some(html) = HtmlTarget::of(self.data()) else {
+            return;
+        };
+        let previous_node = html.node.get();
+        if let (Some(previous), Some(previous_node)) = (html.realm.borrow().upgrade(), previous_node)
+        {
+            previous.targets.borrow_mut().remove(&previous_node);
+        }
+        *html.realm.borrow_mut() = Rc::downgrade(realm);
+        html.node.set(Some(node));
+        if previous_node != Some(node) {
+            self.data().for_each_deferred(|source| {
+                let mut source = source.downcast_ref::<RawContentHandler>()?.clone();
+                source.node = node;
+                Some(Rc::new(source))
+            });
+        }
+        realm
+            .targets
+            .borrow_mut()
+            .insert(node, Rc::downgrade(self.data()));
+    }
+
+    fn try_begin_click(&self) -> bool {
+        HtmlTarget::of(self.data()).is_some_and(|html| !html.click_in_progress.replace(true))
+    }
+
+    fn end_click(&self) {
+        if let Some(html) = HtmlTarget::of(self.data()) {
+            html.click_in_progress.set(false);
+        }
+    }
+
+    /// Enumerate the exact values held by native listener storage. The engine discounts these
+    /// bookkeeping edges and traces them from a reachable DOM wrapper, so detached handler/owner
+    /// cycles do not become blanket roots.
+    fn trace_callback_values(&self, visit: &mut dyn FnMut(&Value)) {
+        self.data().trace_callbacks(visit);
+    }
+
+    fn erase_listeners(&self, ctx: &mut Ctx, owner: Option<&Value>) {
+        if self.data().clear() {
+            if let Some(owner) = owner {
+                ctx.retain_instance(owner, false);
+            }
+        }
+    }
+
+    fn handler(&self, kind: &str) -> Option<JsFunction> {
+        let cell = self.data().handler_cell(kind)?;
+        let function = cell.borrow().function();
+        function
+    }
+
+    fn has_handler(&self, kind: &str) -> bool {
+        self.data().handler_cell(kind).is_some()
+    }
+
+    fn handler_value(&self, ctx: &mut Ctx, _owner: &Value, kind: &str) -> OpResult<Value> {
+        let Some(cell) = self.data().handler_cell(kind) else {
+            return Ok(Value::Null);
+        };
+        Ok(match self.data().resolve_deferred(ctx, &cell) {
+            Callback::Function(function)
+            | Callback::Deferred {
+                compiled: Some(function),
+                ..
+            } => function.value().clone(),
+            _ => Value::Null,
+        })
+    }
+
+    fn set_handler(&self, ctx: &mut Ctx, owner: &Value, kind: &str, callback: Option<JsFunction>) {
+        let _html_allocations = enter_html_allocation_category();
+        self.data()
+            .set_handler(kind, callback.map(Callback::Function), HandlerKind::Html);
+        DomEventTarget::update_retention(ctx, self.data(), owner);
+    }
+
+    fn set_content_handler(
         &self,
         ctx: &mut Ctx,
         owner: &Value,
@@ -264,119 +377,15 @@ impl DomEventTarget {
         handler: Option<RawContentHandler>,
     ) {
         let _html_allocations = enter_html_allocation_category();
-        if let Some(handler) = handler {
-            let mut listeners = self.data.listeners.borrow_mut();
-            if let Some(listener) = listeners
-                .iter_mut()
-                .find(|listener| listener.handler && listener.kind == kind)
-            {
-                *listener.callback.borrow_mut() = ListenerCallback::ContentHandler {
-                    source: handler,
-                    compiled: None,
-                };
-            } else {
-                listeners.push(Listener {
-                    kind: kind.into(),
-                    callback: Rc::new(RefCell::new(ListenerCallback::ContentHandler {
-                        source: handler,
-                        compiled: None,
-                    })),
-                    capture: false,
-                    once: false,
-                    passive: false,
-                    handler: true,
-                    removed: Rc::new(Cell::new(false)),
-                });
-            }
-            ctx.retain_instance(owner, true);
-        } else {
-            let mut listeners = self.data.listeners.borrow_mut();
-            listeners.retain(|listener| {
-                let remove = listener.handler && listener.kind == kind;
-                if remove {
-                    listener.removed.set(true);
-                }
-                !remove
-            });
-            ctx.retain_instance(owner, !listeners.is_empty());
-        }
-    }
-    pub(crate) fn from_data(data: Rc<TargetData>) -> Self {
-        Self { data }
-    }
-    pub(crate) fn data_handle(&self) -> Rc<TargetData> {
-        self.data.clone()
-    }
-    pub(crate) fn rebind_node(&self, realm: &Rc<DomRealm>, node: NodeId) {
-        let previous_node = self.data.node.get();
-        if let Some(previous) = self.data.realm.borrow().upgrade() {
-            if let Some(previous_node) = self.data.node.get() {
-                previous.targets.borrow_mut().remove(&previous_node);
-            }
-        }
-        *self.data.realm.borrow_mut() = Rc::downgrade(realm);
-        self.data.node.set(Some(node));
-        if previous_node != Some(node) {
-            for listener in self.data.listeners.borrow().iter() {
-                if let ListenerCallback::ContentHandler { source, compiled } =
-                    &mut *listener.callback.borrow_mut()
-                {
-                    source.node = node;
-                    *compiled = None;
-                }
-            }
-        }
-        realm
-            .targets
-            .borrow_mut()
-            .insert(node, Rc::downgrade(&self.data));
-    }
-    pub(crate) fn window(realm: &Rc<DomRealm>) -> Self {
-        Self {
-            data: Rc::new(TargetData {
-                realm: RefCell::new(Rc::downgrade(realm)),
-                node: Cell::new(None),
-                click_in_progress: Cell::new(false),
-                listeners: RefCell::new(Vec::new()),
+        self.data().set_handler(
+            kind,
+            handler.map(|source| Callback::Deferred {
+                source: Rc::new(source),
+                compiled: None,
             }),
-        }
-    }
-    pub(crate) fn node(realm: &Rc<DomRealm>, id: NodeId) -> Self {
-        if let Some(data) = realm.targets.borrow().get(&id).and_then(Weak::upgrade) {
-            return Self { data };
-        }
-        let data = Rc::new(TargetData {
-            realm: RefCell::new(Rc::downgrade(realm)),
-            node: Cell::new(Some(id)),
-            click_in_progress: Cell::new(false),
-            listeners: RefCell::new(Vec::new()),
-        });
-        realm.targets.borrow_mut().insert(id, Rc::downgrade(&data));
-        Self { data }
-    }
-
-    /// Creates an event target owned by a platform object rather than a DOM
-    /// node (for example, a MediaQueryList).
-    pub(crate) fn independent(realm: &Rc<DomRealm>) -> Self {
-        Self {
-            data: Rc::new(TargetData {
-                realm: RefCell::new(Rc::downgrade(realm)),
-                node: Cell::new(None),
-                click_in_progress: Cell::new(false),
-                listeners: RefCell::new(Vec::new()),
-            }),
-        }
-    }
-
-    fn target_for_receiver(ctx: &mut Ctx, receiver: Value) -> OpResult<(Self, Value)> {
-        let receiver = match receiver {
-            Value::Null | Value::Undefined => ctx.global_object(),
-            receiver => receiver,
-        };
-        let target = ctx
-            .with_instance::<Self, _>(&receiver, |target| target.clone())
-            .map_err(|_| OpError::new("TypeError", "Illegal invocation"))?;
-        Ok((target, receiver))
+            HandlerKind::Html,
+        );
+        DomEventTarget::update_retention(ctx, self.data(), owner);
     }
 }
 
@@ -403,17 +412,6 @@ pub(crate) fn erase_window_listeners(ctx: &mut Ctx, realm: &DomRealm, owner: Opt
     }
 }
 
-fn flag(ctx: &mut Ctx, options: &Option<Value>, key: &str) -> OpResult<bool> {
-    match options {
-        Some(Value::Bool(value)) if key == "capture" => Ok(*value),
-        Some(value @ Value::Obj(_)) => {
-            let value = ctx.member_get(value, key).map_err(OpError::thrown)?;
-            Ok(ctx.to_boolean(&value))
-        }
-        _ => Ok(false),
-    }
-}
-
 fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Obj(a), Value::Obj(b)) => std::ptr::eq(&**a, &**b),
@@ -421,105 +419,50 @@ fn same(a: &Value, b: &Value) -> bool {
     }
 }
 
-#[lumen_bind::methods]
-impl DomEventTarget {
-    #[constructor]
-    pub(crate) fn new() -> Self {
-        Self {
-            data: Rc::new(TargetData {
-                realm: RefCell::new(Weak::new()),
-                node: Cell::new(None),
-                click_in_progress: Cell::new(false),
-                listeners: RefCell::new(Vec::new()),
-            }),
-        }
-    }
-
-    pub(crate) fn add_event_listener(
-        ctx: &mut Ctx,
-        this: This<Value>,
-        kind: &str,
-        callback: Value,
-        options: Option<Value>,
-    ) -> OpResult<()> {
-        let (target, receiver) = Self::target_for_receiver(ctx, this.0)?;
-        let Some(callback) = ListenerCallback::from_value(callback)? else {
-            return Ok(());
-        };
-        let capture = flag(ctx, &options, "capture")?;
-        let once = flag(ctx, &options, "once")?;
-        let passive = flag(ctx, &options, "passive")?;
-        let _html_allocations = enter_html_allocation_category();
-        let mut listeners = target.data.listeners.borrow_mut();
-        if !listeners.iter().any(|l| {
-            !l.handler
-                && l.kind == kind
-                && l.capture == capture
-                && l.callback
-                    .borrow()
-                    .identity_value()
-                    .is_some_and(|existing| same(existing, callback.identity_value().unwrap()))
-        }) {
-            listeners.push(Listener {
-                kind: kind.into(),
-                callback: Rc::new(RefCell::new(callback)),
-                capture,
-                once,
-                passive,
-                handler: false,
-                removed: Rc::new(Cell::new(false)),
-            });
-            ctx.retain_instance(&receiver, true);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn remove_event_listener(
-        ctx: &mut Ctx,
-        this: This<Value>,
-        kind: &str,
-        callback: Value,
-        options: Option<Value>,
-    ) -> OpResult<()> {
-        let (target, receiver) = Self::target_for_receiver(ctx, this.0)?;
-        let Some(callback) = ListenerCallback::from_value(callback)? else {
-            return Ok(());
-        };
-        let capture = flag(ctx, &options, "capture")?;
-        let _html_allocations = enter_html_allocation_category();
-        let mut listeners = target.data.listeners.borrow_mut();
-        listeners.retain(|l| {
-            let remove = !l.handler
-                && l.kind == kind
-                && l.capture == capture
-                && l.callback
-                    .borrow()
-                    .identity_value()
-                    .is_some_and(|existing| same(existing, callback.identity_value().unwrap()));
-            if remove {
-                l.removed.set(true);
-            }
-            !remove
-        });
-        ctx.retain_instance(&receiver, !listeners.is_empty());
-        Ok(())
-    }
-
-    pub(crate) fn dispatch_event(
-        ctx: &mut Ctx,
-        this: This<Value>,
-        event: JsObject,
-    ) -> OpResult<bool> {
-        dispatch_event_core(ctx, this, event, false, None)
-    }
+/// `dispatchEvent` for an event a platform object creates: its trust stays as constructed.
+pub(crate) fn dispatch_event(ctx: &mut Ctx, this: This<Value>, event: JsObject) -> OpResult<bool> {
+    DomEventTarget::dispatch(ctx, &this.0, event.value())
 }
 
+pub(crate) fn add_event_listener(
+    ctx: &mut Ctx,
+    this: This<Value>,
+    kind: &str,
+    callback: Value,
+    options: Option<Value>,
+) -> OpResult<()> {
+    DomEventTarget::add_event_listener(
+        ctx,
+        this,
+        Value::str(kind),
+        callback,
+        options.unwrap_or(Value::Undefined),
+    )
+}
+
+pub(crate) fn remove_event_listener(
+    ctx: &mut Ctx,
+    this: This<Value>,
+    kind: &str,
+    callback: Value,
+    options: Option<Value>,
+) -> OpResult<()> {
+    DomEventTarget::remove_event_listener(
+        ctx,
+        this,
+        Value::str(kind),
+        callback,
+        options.unwrap_or(Value::Undefined),
+    )
+}
+
+/// Dispatch an event the user agent created: `isTrusted` is true.
 pub(crate) fn dispatch_user_agent_event(
     ctx: &mut Ctx,
     this: This<Value>,
     event: JsObject,
 ) -> OpResult<bool> {
-    dispatch_event_core(ctx, this, event, true, None)
+    DomEventTarget::dispatch_trusted(ctx, &this.0, event.value())
 }
 
 /// HTML's Window lifecycle dispatch uses its associated Document as the
@@ -530,616 +473,12 @@ pub(crate) fn dispatch_user_agent_event_with_target(
     event: JsObject,
     target_override: Value,
 ) -> OpResult<bool> {
-    dispatch_event_core(ctx, this, event, true, Some(target_override))
+    DomEventTarget::dispatch_trusted_with_target(ctx, &this.0, event.value(), target_override)
 }
 
-fn dispatch_event_core(
-    ctx: &mut Ctx,
-    this: This<Value>,
-    event: JsObject,
-    trusted: bool,
-    target_override: Option<Value>,
-) -> OpResult<bool> {
-    let (target, receiver) = DomEventTarget::target_for_receiver(ctx, this.0)?;
-    let event_handle = ctx
-        .with_instance::<DomEvent, _>(event.value(), Clone::clone)
-        .map_err(|_| OpError::new("TypeError", "dispatchEvent requires an Event"))?;
-    let event_value = event.into_value();
-    // Native dispatch state owns observable target Values after dispatch. Make
-    // them edges of this event wrapper rather than opaque external GC roots.
-    ctx.set_native_identity_owner::<DomEvent>(&event_value)?;
-    let event = event_handle;
-    if event.dispatching.get() || !event.initialized.get() {
-        return Err(super::error_reporting::dom_exception(
-            ctx,
-            "InvalidStateError",
-            "The event is not initialized or is already being dispatched",
-        ));
-    }
-    event.dispatching.set(true);
-    event.trusted.set(trusted);
-    event.stopped.set(false);
-    event.immediate.set(false);
-    let initial_target = target_override.unwrap_or_else(|| receiver.clone());
-    *event.target.borrow_mut() = initial_target.clone();
-    let result = (|| {
-        let related = event.related_original.borrow().clone();
-        let related_node = ctx
-            .with_instance::<DomNode, _>(&related, |node| (node.realm.clone(), node.id))
-            .ok();
-        let mut path = vec![(
-            receiver.clone(),
-            target.data.clone(),
-            initial_target.clone(),
-            Vec::new(),
-            related.clone(),
-        )];
-        if let (Some(realm), Some(mut node)) =
-            (target.data.realm.borrow().upgrade(), target.data.node.get())
-        {
-            let original = node;
-            let origin_root = realm
-                .session
-                .borrow()
-                .document()
-                .root_node(node, false)
-                .map_err(dom_error)?;
-            path[0].3 = closed_roots(realm.session.borrow().document(), node)?;
-            loop {
-                let parent = realm
-                    .session
-                    .borrow()
-                    .document()
-                    .event_parent(node, event.composed.get(), origin_root)
-                    .map_err(|_| OpError::new("InvalidStateError", "event target was removed"))?;
-                let Some(parent) = parent else {
-                    break;
-                };
-                if path.len() >= 1024 {
-                    return Err(OpError::new("RangeError", "event path limit exceeded"));
-                }
-                let adjusted = realm
-                    .session
-                    .borrow()
-                    .document()
-                    .retarget(original, Some(parent))
-                    .map_err(dom_error)?;
-                let adjusted = realm.wrap(ctx, adjusted);
-                let related_adjusted = if let Some((related_realm, id)) = &related_node {
-                    if Rc::ptr_eq(related_realm, &realm) {
-                        let id = realm
-                            .session
-                            .borrow()
-                            .document()
-                            .retarget(*id, Some(parent))
-                            .map_err(dom_error)?;
-                        realm.wrap(ctx, id)
-                    } else {
-                        related.clone()
-                    }
-                } else {
-                    related.clone()
-                };
-                if same(&adjusted, &related_adjusted) {
-                    break;
-                }
-                let closed = closed_roots(realm.session.borrow().document(), parent)?;
-                let value = realm.wrap(ctx, parent);
-                if let Some(target) = realm.targets.borrow().get(&parent).and_then(Weak::upgrade) {
-                    path.push((value, target, adjusted, closed, related_adjusted));
-                }
-                node = parent;
-            }
-            if node == realm.session.borrow().document().root() {
-                let adjusted = realm
-                    .session
-                    .borrow()
-                    .document()
-                    .retarget(original, None)
-                    .map_err(dom_error)?;
-                let adjusted = realm.wrap(ctx, adjusted);
-                let related_adjusted = if let Some((related_realm, id)) = &related_node {
-                    if Rc::ptr_eq(related_realm, &realm) {
-                        let id = realm
-                            .session
-                            .borrow()
-                            .document()
-                            .retarget(*id, None)
-                            .map_err(dom_error)?;
-                        realm.wrap(ctx, id)
-                    } else {
-                        related.clone()
-                    }
-                } else {
-                    related.clone()
-                };
-                if let (Some(value), Some(target)) = (
-                    realm
-                        .window_wrapper
-                        .borrow()
-                        .as_ref()
-                        .and_then(WeakValue::upgrade),
-                    realm.window_target.borrow().as_ref(),
-                ) {
-                    path.push((
-                        value,
-                        target.clone(),
-                        adjusted,
-                        Vec::new(),
-                        related_adjusted,
-                    ));
-                }
-            }
-        }
-        if path.iter().map(|entry| entry.3.len()).sum::<usize>() > 4096 {
-            return Err(OpError::new(
-                "RangeError",
-                "event shadow path limit exceeded",
-            ));
-        }
-        let clear_target = if let (Some(realm), Some(original)) =
-            (target.data.realm.borrow().upgrade(), target.data.node.get())
-        {
-            let session = realm.session.borrow();
-            let document = session.document();
-            let target = document
-                .retarget(original, path.last().unwrap().1.node.get())
-                .map_err(dom_error)?;
-            document
-                .shadow_host(document.root_node(target, false).map_err(dom_error)?)
-                .map_err(dom_error)?
-                .is_some()
-        } else {
-            false
-        };
-        *event.path.borrow_mut() = path
-            .iter()
-            .map(|entry| (entry.0.clone(), entry.3.clone()))
-            .collect();
-        for (value, target, adjusted, closed, related) in path.iter().skip(1).rev() {
-            *event.target.borrow_mut() = adjusted.clone();
-            *event.related.borrow_mut() = related.clone();
-            *event.visibility.borrow_mut() = closed.clone();
-            invoke(
-                ctx,
-                &event,
-                &event_value,
-                value,
-                target,
-                true,
-                if same(value, adjusted) { 2 } else { 1 },
-            )?;
-            if event.stopped.get() {
-                break;
-            }
-        }
-        if !event.stopped.get() {
-            *event.target.borrow_mut() = initial_target.clone();
-            *event.related.borrow_mut() = related.clone();
-            *event.visibility.borrow_mut() = path[0].3.clone();
-            invoke(ctx, &event, &event_value, &receiver, &target.data, true, 2)?;
-            if !event.immediate.get() {
-                invoke(ctx, &event, &event_value, &receiver, &target.data, false, 2)?;
-            }
-        }
-        if !event.stopped.get() {
-            for (value, target, adjusted, closed, related) in path.iter().skip(1) {
-                if !event.bubbles.get() && !same(value, adjusted) {
-                    continue;
-                }
-                *event.target.borrow_mut() = adjusted.clone();
-                *event.related.borrow_mut() = related.clone();
-                *event.visibility.borrow_mut() = closed.clone();
-                invoke(
-                    ctx,
-                    &event,
-                    &event_value,
-                    value,
-                    target,
-                    false,
-                    if same(value, adjusted) { 2 } else { 3 },
-                )?;
-                if event.stopped.get() {
-                    break;
-                }
-            }
-        }
-        *event.target.borrow_mut() = if clear_target {
-            Value::Null
-        } else {
-            path.last().unwrap().2.clone()
-        };
-        *event.related.borrow_mut() = if clear_target {
-            Value::Null
-        } else {
-            path.last().unwrap().4.clone()
-        };
-        Ok(!event.canceled.get())
-    })();
-    event.dispatching.set(false);
-    event.phase.set(0);
-    event.stopped.set(false);
-    event.immediate.set(false);
-    *event.current.borrow_mut() = Value::Null;
-    event.path.borrow_mut().clear();
-    event.visibility.borrow_mut().clear();
-    result
-}
-
-fn closed_roots(document: &lumen_html::Document, node: NodeId) -> OpResult<Vec<NodeId>> {
-    let mut root = document.root_node(node, false).map_err(dom_error)?;
-    let mut closed = Vec::new();
-    while let Some(host) = document.shadow_host(root).map_err(dom_error)? {
-        if document.shadow_mode(root).map_err(dom_error)? == Some(lumen_html::ShadowMode::Closed) {
-            if closed.len() >= 64 {
-                return Err(OpError::new(
-                    "RangeError",
-                    "event shadow nesting limit exceeded",
-                ));
-            }
-            closed.push(root);
-        }
-        root = document.root_node(host, false).map_err(dom_error)?;
-    }
-    Ok(closed)
-}
-
-fn invoke(
-    ctx: &mut Ctx,
-    event: &DomEvent,
-    event_value: &Value,
-    value: &Value,
-    target: &TargetData,
-    capture: bool,
-    phase: u8,
-) -> OpResult<()> {
-    let listeners: Vec<Listener> = {
-        let all = target.listeners.borrow();
-        if all.is_empty() {
-            return Ok(());
-        }
-        let kind = event.kind.borrow();
-        all.iter()
-            .filter(|listener| {
-                listener.capture == capture
-                    && !listener.removed.get()
-                    && listener.kind.as_str() == kind.as_str()
-            })
-            .cloned()
-            .collect()
-    };
-    if listeners.is_empty() {
-        return Ok(());
-    }
-    event.phase.set(phase);
-    *event.current.borrow_mut() = value.clone();
-    for listener in listeners {
-        if listener.removed.get() {
-            continue;
-        }
-        if listener.once {
-            listener.removed.set(true);
-            target
-                .listeners
-                .borrow_mut()
-                .retain(|l| !Rc::ptr_eq(&l.removed, &listener.removed));
-            ctx.retain_instance(value, !target.listeners.borrow().is_empty());
-        }
-        event.passive.set(listener.passive);
-        let window_error_handler = listener.handler
-            && listener.kind == "error"
-            && ctx
-                .with_instance::<super::window_globals::DomWindow, _>(value, |_| ())
-                .is_ok()
-            && super::error_reporting::is_error_event(ctx, event_value);
-        let mut callback = listener.callback.borrow().clone();
-        if let ListenerCallback::ContentHandler { source, compiled } = &callback {
-            if let Some(function) = compiled {
-                callback = ListenerCallback::Function(function.clone());
-            } else if let Some(realm) = target.realm.borrow().upgrade() {
-                match super::event_content_handlers::compile(ctx, &realm, source) {
-                    super::event_content_handlers::Compilation::Compiled(function) => {
-                        callback = ListenerCallback::ContentHandler {
-                            source: source.clone(),
-                            compiled: Some(function.clone()),
-                        };
-                        *listener.callback.borrow_mut() = callback.clone();
-                    }
-                    super::event_content_handlers::Compilation::Failed
-                        if realm.has_browsing_context =>
-                    {
-                        callback = ListenerCallback::Empty;
-                        *listener.callback.borrow_mut() = ListenerCallback::Empty;
-                    }
-                    super::event_content_handlers::Compilation::Failed
-                    | super::event_content_handlers::Compilation::Inactive => {}
-                }
-            }
-        }
-        let result = if window_error_handler {
-            invoke_window_error_handler(ctx, &callback, value, event_value)
-        } else {
-            invoke_listener(ctx, &callback, value, event_value)
-        };
-        event.passive.set(false);
-        match result {
-            Ok(Value::Bool(true)) if window_error_handler => event.prevent_default(),
-            Ok(Value::Bool(false)) if listener.handler && !window_error_handler => {
-                event.prevent_default()
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let exception = error.to_value(ctx);
-                let _ = DomRealm::report_exception(ctx, exception);
-            }
-        }
-        if event.immediate.get() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn invoke_window_error_handler(
-    ctx: &mut Ctx,
-    callback: &ListenerCallback,
-    current_target: &Value,
-    event: &Value,
-) -> OpResult<Value> {
-    let callback = callback
-        .function()
-        .expect("event handler IDL attributes store function callbacks only");
-    let args = super::ui_events::error_event_handler_arguments(ctx, event)
-        .expect("special error handling requires a native ErrorEvent");
-    callback.call(ctx, current_target.clone(), &args)
-}
-
-fn invoke_listener(
-    ctx: &mut Ctx,
-    callback: &ListenerCallback,
-    current_target: &Value,
-    event: &Value,
-) -> OpResult<Value> {
-    match callback {
-        ListenerCallback::Empty | ListenerCallback::ContentHandler { compiled: None, .. } => {
-            Ok(Value::Undefined)
-        }
-        ListenerCallback::ContentHandler {
-            compiled: Some(callback),
-            ..
-        } => callback.call(ctx, current_target.clone(), &[event.clone()]),
-        ListenerCallback::Function(callback) => {
-            callback.call(ctx, current_target.clone(), &[event.clone()])
-        }
-        ListenerCallback::Object(object) => {
-            let handle_event = JsObject::from_value(object.clone())
-                .expect("EventListener object is an object")
-                .get(ctx, "handleEvent")?;
-            let handle_event = JsFunction::from_value(handle_event)
-                .ok_or_else(|| OpError::type_error("EventListener.handleEvent is not callable"))?;
-            handle_event.call(ctx, object.clone(), &[event.clone()])
-        }
-    }
-}
-
-#[derive(Clone)]
-#[lumen_bind::class(name = "Event", hint(js(webidl)))]
-pub struct DomEvent {
-    state: Rc<DomEventState>,
-}
-
-impl lumen::embed::NativeIdentityOwner for DomEvent {
-    const TRACES_NATIVE_VALUES: bool = true;
-
-    fn trace_native_identities(&self, _: u64, _: &mut dyn FnMut(&Value)) {}
-
-    fn trace_native_values(&self, visit: &mut dyn FnMut(&Value)) {
-        visit(&self.target.borrow());
-        visit(&self.current.borrow());
-        visit(&self.related_original.borrow());
-        visit(&self.related.borrow());
-        for (target, _) in self.path.borrow().iter() {
-            visit(target);
-        }
-    }
-}
-
-// A cloned handle keeps the same dispatch state after the native base projection
-// is released, allowing callbacks to read and update the original event.
-#[doc(hidden)]
-pub struct DomEventState {
-    kind: RefCell<String>,
-    time_stamp: f64,
-    bubbles: Cell<bool>,
-    cancelable: Cell<bool>,
-    composed: Cell<bool>,
-    initialized: Cell<bool>,
-    trusted: Cell<bool>,
-    path: RefCell<Vec<(Value, Vec<NodeId>)>>,
-    visibility: RefCell<Vec<NodeId>>,
-    related_original: RefCell<Value>,
-    related: RefCell<Value>,
-    target: RefCell<Value>,
-    current: RefCell<Value>,
-    phase: Cell<u8>,
-    dispatching: Cell<bool>,
-    stopped: Cell<bool>,
-    immediate: Cell<bool>,
-    canceled: Cell<bool>,
-    passive: Cell<bool>,
-    movement_x: Cell<f64>,
-    movement_y: Cell<f64>,
-}
-
-#[derive(Clone, Copy)]
-struct EventInit {
-    bubbles: bool,
-    cancelable: bool,
-    composed: bool,
-}
-
-impl std::ops::Deref for DomEvent {
-    type Target = DomEventState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
-impl DomEvent {
-    fn read_init(ctx: &mut Ctx, options: &Option<Value>) -> OpResult<EventInit> {
-        if options
-            .as_ref()
-            .is_some_and(|value| !matches!(value, Value::Obj(_) | Value::Null | Value::Undefined))
-        {
-            return Err(OpError::type_error(
-                "EventInit must be an object, null, or undefined",
-            ));
-        }
-        Ok(EventInit {
-            bubbles: flag(ctx, options, "bubbles")?,
-            cancelable: flag(ctx, options, "cancelable")?,
-            composed: flag(ctx, options, "composed")?,
-        })
-    }
-
-    fn from_init(kind: &str, init: EventInit) -> Self {
-        let EventInit {
-            bubbles,
-            cancelable,
-            composed,
-        } = init;
-        let time_stamp = lumen_host::perf::web_now_ms();
-        Self {
-            state: Rc::new(DomEventState {
-                kind: RefCell::new(kind.into()),
-                time_stamp,
-                bubbles: Cell::new(bubbles),
-                cancelable: Cell::new(cancelable),
-                composed: Cell::new(composed),
-                initialized: Cell::new(true),
-                trusted: Cell::new(false),
-                path: RefCell::new(Vec::new()),
-                visibility: RefCell::new(Vec::new()),
-                related_original: RefCell::new(Value::Null),
-                related: RefCell::new(Value::Null),
-                target: RefCell::new(Value::Null),
-                current: RefCell::new(Value::Null),
-                phase: Cell::new(0),
-                dispatching: Cell::new(false),
-                stopped: Cell::new(false),
-                immediate: Cell::new(false),
-                canceled: Cell::new(false),
-                passive: Cell::new(false),
-                movement_x: Cell::new(0.0),
-                movement_y: Cell::new(0.0),
-            }),
-        }
-    }
-}
-
-#[lumen_bind::methods]
-impl DomEvent {
-    #[constructor(coerce)]
-    pub(crate) fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
-        Ok(Self::from_init(kind, Self::read_init(ctx, &options)?))
-    }
-    #[getter(name = "type")]
-    fn kind(&self) -> String {
-        self.kind.borrow().clone()
-    }
-    #[getter]
-    fn time_stamp(&self) -> f64 {
-        self.time_stamp
-    }
-    #[getter]
-    fn bubbles(&self) -> bool {
-        self.bubbles.get()
-    }
-    #[getter]
-    fn cancelable(&self) -> bool {
-        self.cancelable.get()
-    }
-    #[getter]
-    fn composed(&self) -> bool {
-        self.composed.get()
-    }
-    #[getter]
-    fn is_trusted(&self) -> bool {
-        self.trusted.get()
-    }
-    fn composed_path(&self, ctx: &mut Ctx) -> Value {
-        let visible = self.visibility.borrow();
-        ctx.make_array(
-            self.path
-                .borrow()
-                .iter()
-                .filter(|(_, closed)| closed.iter().all(|root| visible.contains(root)))
-                .map(|(value, _)| value.clone())
-                .collect(),
-        )
-    }
-    #[getter]
-    fn target(&self) -> Value {
-        self.target.borrow().clone()
-    }
-    #[getter]
-    fn current_target(&self) -> Value {
-        self.current.borrow().clone()
-    }
-    #[getter(name = "srcElement")]
-    fn src_element(&self) -> Value {
-        self.target.borrow().clone()
-    }
-    #[getter]
-    fn event_phase(&self) -> u8 {
-        self.phase.get()
-    }
-    #[getter]
-    fn default_prevented(&self) -> bool {
-        self.canceled.get()
-    }
-    #[getter(name = "cancelBubble")]
-    fn cancel_bubble(&self) -> bool {
-        self.stopped.get()
-    }
-    #[setter(name = "cancelBubble", coerce)]
-    fn set_cancel_bubble(&self, value: bool) {
-        if value {
-            self.stopped.set(true);
-        }
-    }
-    #[getter(name = "returnValue")]
-    fn return_value(&self) -> bool {
-        !self.canceled.get()
-    }
-    #[setter(name = "returnValue", coerce)]
-    fn set_return_value(&self, value: bool) {
-        if !value {
-            self.prevent_default();
-        }
-    }
-    #[method(name = "initEvent", coerce)]
-    fn init_event(
-        &self,
-        kind: &str,
-        #[default(false)] bubbles: bool,
-        #[default(false)] cancelable: bool,
-    ) {
-        let _ = self.initialize_legacy(kind, bubbles, cancelable);
-    }
-    fn prevent_default(&self) {
-        if self.cancelable.get() && !self.passive.get() {
-            self.canceled.set(true);
-        }
-    }
-    fn stop_propagation(&self) {
-        self.stopped.set(true);
-    }
-    fn stop_immediate_propagation(&self) {
-        self.stopped.set(true);
-        self.immediate.set(true);
-    }
+pub(crate) fn mark_event_uninitialized(ctx: &mut Ctx, event: &Value) -> OpResult<()> {
+    ctx.with_instance::<DomEvent, _>(event, |event| event.mark_uninitialized())
+        .map_err(|_| OpError::type_error("Event instance required"))
 }
 
 #[lumen_bind::class(name = "SubmitEvent", extends = DomEvent, hint(js(webidl)))]
@@ -1185,7 +524,7 @@ impl DomSubmitEvent {
     #[constructor(coerce)]
     fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<SubmitEventConstructor> {
         let dictionary = options.clone();
-        let init = DomEvent::read_init(ctx, &options)?;
+        let init = EventInit::read(ctx, &options)?;
         let submitter = match super::ui_events::dictionary_member(ctx, &dictionary, "submitter")? {
             None | Some(Value::Null | Value::Undefined) => None,
             Some(value) => {
@@ -1291,7 +630,7 @@ impl DomFormDataEvent {
         options: Option<Value>,
     ) -> OpResult<FormDataEventConstructor> {
         let dictionary = options.clone();
-        let init = DomEvent::read_init(ctx, &options)?;
+        let init = EventInit::read(ctx, &options)?;
         let form_data = super::ui_events::dictionary_member(ctx, &dictionary, "formData")?
             .filter(|value| !matches!(value, Value::Null | Value::Undefined))
             .ok_or_else(|| OpError::type_error("FormDataEvent requires a FormData object"))?;
@@ -1749,6 +1088,211 @@ mod tests {
         );
         assert!(matches!(value, Value::Bool(true)));
     }
+
+    #[test]
+    fn listener_options_control_phase_order_once_passive_and_signal_removal() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const parent = document.createElement('div');
+                const child = document.createElement('span');
+                parent.appendChild(child);
+                const order = [];
+                parent.addEventListener('x', () => order.push('parent-bubble'));
+                parent.addEventListener('x', () => order.push('parent-capture'), {capture: true});
+                child.addEventListener('x', () => order.push('child-bubble'));
+                child.addEventListener('x', () => order.push('child-capture'), true);
+                child.dispatchEvent(new Event('x', {bubbles: true}));
+                check(order.join() === 'parent-capture,child-capture,child-bubble,parent-bubble',
+                    'phase-order:' + order.join());
+
+                let onceCalls = 0;
+                const once = () => onceCalls++;
+                child.addEventListener('once', once, {once: true});
+                child.dispatchEvent(new Event('once'));
+                child.dispatchEvent(new Event('once'));
+                check(onceCalls === 1, 'once');
+
+                let passiveCanceled = true;
+                child.addEventListener('p', event => event.preventDefault(), {passive: true});
+                const passiveEvent = new Event('p', {cancelable: true});
+                child.dispatchEvent(passiveEvent);
+                passiveCanceled = passiveEvent.defaultPrevented;
+                check(!passiveCanceled, 'passive');
+
+                const controller = new AbortController();
+                let signalCalls = 0;
+                child.addEventListener('s', () => signalCalls++, {signal: controller.signal});
+                child.dispatchEvent(new Event('s'));
+                controller.abort();
+                child.dispatchEvent(new Event('s'));
+                check(signalCalls === 1, 'signal');
+                const aborted = AbortSignal.abort();
+                child.addEventListener('s', () => signalCalls++, {signal: aborted});
+                child.dispatchEvent(new Event('s'));
+                check(signalCalls === 1, 'already-aborted-signal');
+
+                let badSignal = false;
+                try { child.addEventListener('s', () => {}, {signal: {}}); }
+                catch (error) { badSignal = error instanceof TypeError; }
+                check(badSignal, 'invalid-signal');
+
+                let immediate = 0;
+                child.addEventListener('i', event => { immediate++; event.stopImmediatePropagation(); });
+                child.addEventListener('i', () => immediate++);
+                child.dispatchEvent(new Event('i'));
+                check(immediate === 1, 'stop-immediate');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("listener option contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "listener option failures: {failures}");
+    }
+
+    #[test]
+    fn is_trusted_is_unforgeable_and_user_agent_events_are_trusted() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const event = new Event('x');
+                const own = Object.getOwnPropertyDescriptor(event, 'isTrusted');
+                check(own && own.configurable === false && own.enumerable === true,
+                    'own-unforgeable-accessor');
+                check(own && own.get === Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted').get,
+                    'shared-getter');
+                let redefined = false;
+                try { Object.defineProperty(event, 'isTrusted', {value: true}); }
+                catch (error) { redefined = error instanceof TypeError; }
+                check(redefined, 'not-redefinable');
+                window.dispatchEvent(event);
+                check(event.isTrusted === false, 'script-dispatch-untrusted');
+                let trusted = null;
+                const button = document.createElement('button');
+                button.addEventListener('click', event => { trusted = event.isTrusted; });
+                button.click();
+                check(trusted !== null, 'click-dispatched');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("isTrusted contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "isTrusted failures: {failures}");
+    }
+
+    #[test]
+    fn abort_signals_and_dom_exceptions_come_from_the_shared_core() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const aborted = AbortSignal.abort();
+                const reason = aborted.reason;
+                check(aborted.aborted && reason instanceof DOMException && reason instanceof Error &&
+                    reason.name === 'AbortError' && reason.code === 20, 'default-reason');
+                const custom = {};
+                check(AbortSignal.abort(custom).reason === custom, 'custom-reason');
+                const first = new AbortController();
+                const second = new AbortController();
+                const any = AbortSignal.any([first.signal, second.signal]);
+                let anyEvents = 0;
+                any.addEventListener('abort', () => anyEvents++);
+                second.abort('why');
+                check(any.aborted && any.reason === 'why' && anyEvents === 1, 'any');
+                let thrown = null;
+                try { aborted.throwIfAborted(); } catch (error) { thrown = error; }
+                check(thrown === reason, 'throw-if-aborted');
+                check(Object.getPrototypeOf(AbortSignal.prototype) === EventTarget.prototype,
+                    'signal-prototype');
+                let illegal = false;
+                try { new AbortSignal(); } catch (error) { illegal = error instanceof TypeError; }
+                check(illegal, 'illegal-constructor');
+                const exception = new DOMException('message', 'NotFoundError');
+                check(exception.code === 8 && DOMException.NOT_FOUND_ERR === 8 &&
+                    DOMException.prototype.NOT_FOUND_ERR === 8 && typeof exception.stack === 'string',
+                    'dom-exception-shape');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("abort contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "abort failures: {failures}");
+    }
+
+    #[test]
+    fn closed_shadow_roots_retarget_events_and_hide_composed_path_entries() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const host = document.createElement('div');
+                document.body.appendChild(host);
+                const root = host.attachShadow({mode: 'closed'});
+                const inner = document.createElement('span');
+                root.appendChild(inner);
+                let outsideTarget = null, outsidePath = null, insideTarget = null, insidePath = null;
+                document.body.addEventListener('x', event => {
+                    outsideTarget = event.target;
+                    outsidePath = event.composedPath();
+                });
+                root.addEventListener('x', event => {
+                    insideTarget = event.target;
+                    insidePath = event.composedPath();
+                });
+                const event = new Event('x', {bubbles: true, composed: true});
+                inner.dispatchEvent(event);
+                check(outsideTarget === host, 'retargeted-to-host');
+                check(outsidePath && !outsidePath.includes(inner) && !outsidePath.includes(root) &&
+                    outsidePath[0] === host, 'closed-path-hidden');
+                check(insideTarget === inner, 'inside-target');
+                check(insidePath && insidePath[0] === inner && insidePath.includes(root),
+                    'inside-path-visible');
+                check(event.target === host && event.composedPath().length === 0,
+                    'retargeted-after-dispatch');
+                const contained = new Event('y', {bubbles: true});
+                inner.dispatchEvent(contained);
+                check(contained.target === null && contained.composedPath().length === 0,
+                    'cleared-after-contained-dispatch');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("shadow retargeting contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "shadow retargeting failures: {failures}");
+    }
+
+    #[test]
+    fn content_attribute_handlers_compile_lazily_and_null_removes_them() {
+        let value = eval(
+            r#"(() => {
+                const failures = [];
+                const check = (ok, name) => { if (!ok) failures.push(name); };
+                const button = document.createElement('button');
+                button.setAttribute('onclick', 'globalThis.attributeClicks = (globalThis.attributeClicks || 0) + 1');
+                check(typeof button.onclick === 'function', 'compiled-on-read');
+                button.dispatchEvent(new Event('click'));
+                check(globalThis.attributeClicks === 1, 'ran');
+                button.onclick = null;
+                button.dispatchEvent(new Event('click'));
+                check(button.onclick === null && globalThis.attributeClicks === 1, 'null-removes');
+                button.onclick = event => false;
+                const cancelable = new Event('click', {cancelable: true});
+                button.dispatchEvent(cancelable);
+                check(cancelable.defaultPrevented, 'false-cancels');
+                return failures.join('|');
+            })()"#,
+        );
+        let Value::Str(failures) = value else {
+            panic!("content handler contract must return diagnostics");
+        };
+        assert!(failures.is_empty(), "content handler failures: {failures}");
+    }
 }
 
 #[lumen_bind::class(name = "PromiseRejectionEvent", extends = DomEvent, hint(js(webidl)))]
@@ -1808,89 +1352,4 @@ impl DomPromiseRejectionEvent {
             reason,
         })
     }
-}
-
-impl DomEvent {
-    pub(crate) fn active_dispatch_target(&self) -> Option<Value> {
-        self.dispatching.get().then(|| self.target.borrow().clone())
-    }
-
-    /// The last retargeted event target remains on the Event after dispatch.
-    /// Derived event attributes whose values are themselves nodes can use it
-    /// to apply the same shadow-boundary adjustment as Event.target.
-    pub(crate) fn target_for_retarget(&self) -> Value {
-        self.target.borrow().clone()
-    }
-
-    pub(crate) fn active_current_target(&self) -> Option<Value> {
-        self.dispatching
-            .get()
-            .then(|| self.current.borrow().clone())
-    }
-
-    /// Apply the common legacy Event initialization steps. Derived event
-    /// initializers call this before updating their own interface fields.
-    pub(crate) fn initialize_legacy(&self, kind: &str, bubbles: bool, cancelable: bool) -> bool {
-        if self.dispatching.get() {
-            return false;
-        }
-        self.initialized.set(true);
-        self.stopped.set(false);
-        self.immediate.set(false);
-        self.canceled.set(false);
-        self.trusted.set(false);
-        *self.target.borrow_mut() = Value::Null;
-        *self.kind.borrow_mut() = kind.into();
-        self.bubbles.set(bubbles);
-        self.cancelable.set(cancelable);
-        true
-    }
-
-    pub(crate) fn legacy_uninitialized(ctx: &mut Ctx) -> OpResult<Self> {
-        let event = Self::new(ctx, "", None)?;
-        mark_uninitialized(&event);
-        Ok(event)
-    }
-
-    pub(crate) fn set_movement(&self, x: f64, y: f64) {
-        self.movement_x.set(x);
-        self.movement_y.set(y);
-    }
-
-    pub(crate) fn movement(&self) -> (f64, f64) {
-        (self.movement_x.get(), self.movement_y.get())
-    }
-
-    pub(crate) fn set_related_target(&self, value: Value) {
-        *self.related_original.borrow_mut() = value.clone();
-        *self.related.borrow_mut() = value;
-    }
-}
-
-fn mark_uninitialized(event: &DomEvent) {
-    event.initialized.set(false);
-    *event.kind.borrow_mut() = String::new();
-    event.bubbles.set(false);
-    event.cancelable.set(false);
-    event.composed.set(false);
-    event.trusted.set(false);
-    *event.target.borrow_mut() = Value::Null;
-    *event.current.borrow_mut() = Value::Null;
-    *event.related_original.borrow_mut() = Value::Null;
-    *event.related.borrow_mut() = Value::Null;
-    event.phase.set(0);
-    event.dispatching.set(false);
-    event.stopped.set(false);
-    event.immediate.set(false);
-    event.canceled.set(false);
-    event.passive.set(false);
-    event.path.borrow_mut().clear();
-    event.visibility.borrow_mut().clear();
-    event.movement_x.set(0.0);
-    event.movement_y.set(0.0);
-}
-
-pub(crate) fn mark_event_uninitialized(ctx: &mut Ctx, event: &Value) -> OpResult<()> {
-    ctx.with_instance_mut::<DomEvent, _>(event, |event| mark_uninitialized(event))
-        .map_err(|_| OpError::type_error("Event instance required"))
 }

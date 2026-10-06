@@ -16,14 +16,29 @@ pub fn invalid_this(type_name: &str) -> OpError {
     )
 }
 
-/// Node's `The "<name>" argument must be <expected>. Received ...` (`ERR_INVALID_ARG_TYPE`).
+/// Node's `The "<name>" argument must be <expected>. Received ...` (`ERR_INVALID_ARG_TYPE`); a
+/// dotted name (`options.signal`) is a property.
 pub fn invalid_arg_type(ctx: &mut Ctx, name: &str, expected: &str, value: &Value) -> OpError {
+    let kind = if name.contains('.') { "property" } else { "argument" };
     coded(
         OpError::type_error(format!(
-            "The \"{name}\" argument must be {expected}.{}",
+            "The \"{name}\" {kind} must be {expected}.{}",
             received_suffix(ctx, value)
         )),
         "ERR_INVALID_ARG_TYPE",
+    )
+}
+
+/// Node's `The "a" and "b" arguments must be specified` (`ERR_MISSING_ARGS`).
+pub fn missing_args(names: &[&str]) -> OpError {
+    let quoted: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+    let text = match quoted.as_slice() {
+        [one] => format!("The {one} argument"),
+        many => format!("The {} arguments", many.join(" and ")),
+    };
+    coded(
+        OpError::type_error(format!("{text} must be specified")),
+        "ERR_MISSING_ARGS",
     )
 }
 

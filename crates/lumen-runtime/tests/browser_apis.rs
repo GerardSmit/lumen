@@ -9,7 +9,7 @@ fn evaluate(runtime: &mut Runtime, source: &str) {
 }
 
 fn assert_script(runtime: &mut Runtime, expression: &str) {
-    evaluate(runtime, &format!("if (!({expression})) throw new Error('browser contract failed: {}')", expression.replace('\'', "\\'")));
+    evaluate(runtime, &format!("if (!({expression})) throw new Error('browser contract failed: {}')", expression.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n")));
 }
 
 #[test]
@@ -721,6 +721,122 @@ fn url_inspect_hooks_and_object_urls() {
         "(() => { try { URL.createObjectURL({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE' && e.message === 'The \"obj\" argument must be an instance of Blob. Received an instance of Object'; } return false; })()",
         "(() => { try { URL.createObjectURL(); } catch (e) { return e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
         "(() => { try { URL.revokeObjectURL(); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn native_event_classes_have_web_idl_shape() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "Event.length === 1 && EventTarget.length === 0 && CustomEvent.length === 1 && ErrorEvent.length === 1",
+        "EventTarget.prototype.addEventListener.length === 2 && EventTarget.prototype.dispatchEvent.length === 1",
+        "Event.NONE === 0 && Event.CAPTURING_PHASE === 1 && Event.AT_TARGET === 2 && Event.BUBBLING_PHASE === 3 && Event.prototype.BUBBLING_PHASE === 3",
+        "Object.getOwnPropertyDescriptor(Event, 'AT_TARGET').writable === false && Object.getOwnPropertyDescriptor(Event, 'AT_TARGET').enumerable === true",
+        "Object.getOwnPropertyDescriptor(Event.prototype, 'type').enumerable === true && typeof Object.getOwnPropertyDescriptor(Event.prototype, 'type').get === 'function'",
+        "Object.getOwnPropertyDescriptor(EventTarget.prototype, 'addEventListener').enumerable === true",
+        "Event.prototype[Symbol.toStringTag] === 'Event' && AbortSignal.prototype[Symbol.toStringTag] === 'AbortSignal' && DOMException.prototype[Symbol.toStringTag] === 'DOMException'",
+        "Object.getPrototypeOf(CustomEvent.prototype) === Event.prototype && Object.getPrototypeOf(ErrorEvent.prototype) === Event.prototype && Object.getPrototypeOf(AbortSignal.prototype) === EventTarget.prototype",
+        "Object.getPrototypeOf(AbortController.prototype) === Object.prototype",
+        "(() => { try { new AbortSignal(); } catch (e) { return e instanceof TypeError && e.code === 'ERR_ILLEGAL_CONSTRUCTOR'; } })()",
+        "(() => { try { EventTarget.prototype.addEventListener.call({}, 'x', () => {}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; } })()",
+        "(() => { try { new Event(); } catch (e) { return e instanceof TypeError && e.code === 'ERR_MISSING_ARGS'; } })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn native_event_dispatch_runs_listeners_in_order_with_dispatch_state() {
+    let mut runtime = Runtime::new_browser();
+    assert_script(&mut runtime, r#"(() => {
+        const target = new EventTarget();
+        const order = [];
+        const event = new Event('ping', {cancelable: true});
+        target.addEventListener('ping', e => {
+            order.push('first:' + e.eventPhase + ':' + (e.target === target) + ':' + (e.currentTarget === target));
+            e.preventDefault();
+        });
+        const handler = { handleEvent(e) { order.push('object:' + (this === handler)); e.stopImmediatePropagation(); } };
+        target.addEventListener('ping', handler);
+        target.addEventListener('ping', () => order.push('never'));
+        target.addEventListener('ping', handler);
+        const result = target.dispatchEvent(event);
+        return result === false && event.defaultPrevented && event.currentTarget === null &&
+            event.eventPhase === 0 && event.isTrusted === false &&
+            order.join() === 'first:2:true:true,object:true';
+    })()"#);
+    assert_script(&mut runtime, r#"(() => {
+        const target = new EventTarget();
+        let calls = 0;
+        const listener = () => calls++;
+        target.addEventListener('x', listener, {once: true});
+        target.dispatchEvent(new Event('x'));
+        target.dispatchEvent(new Event('x'));
+        target.addEventListener('x', listener, true);
+        target.removeEventListener('x', listener);
+        target.dispatchEvent(new Event('x'));
+        target.removeEventListener('x', listener, true);
+        target.dispatchEvent(new Event('x'));
+        return calls === 2;
+    })()"#);
+    assert_script(&mut runtime, r#"(() => {
+        const target = new EventTarget();
+        const event = new Event('x');
+        target.addEventListener('x', () => {
+            try { target.dispatchEvent(event); } catch (e) { event.caught = e.code; }
+        });
+        target.dispatchEvent(event);
+        return event.caught === 'ERR_EVENT_RECURSION';
+    })()"#);
+}
+
+#[test]
+fn native_event_constructors_read_init_and_expose_unforgeable_trust() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const e = new Event('x', {bubbles: 1, cancelable: 'y', composed: {}}); return e.bubbles && e.cancelable && e.composed && e.type === 'x' && e.timeStamp >= 0; })()",
+        "(() => { const e = new CustomEvent('x', {detail: {a: 1}}); return e.detail.a === 1 && new CustomEvent('y').detail === null; })()",
+        "(() => { const e = new ErrorEvent('error', {message: 'm', filename: 'f', lineno: 3, colno: 4, error: 5}); return e.message === 'm' && e.filename === 'f' && e.lineno === 3 && e.colno === 4 && e.error === 5; })()",
+        "(() => { const d = Object.getOwnPropertyDescriptor(new Event('x'), 'isTrusted'); return d.configurable === false && d.get === Object.getOwnPropertyDescriptor(Event.prototype, 'isTrusted').get; })()",
+        "(() => { try { Object.defineProperty(new Event('x'), 'isTrusted', {value: true}); } catch (e) { return e instanceof TypeError; } })()",
+        "(() => { const e = new Event('x', {isTrusted: true}); return e.isTrusted === false; })()",
+        "(() => { let n = 0; try { new Event('x', {get bubbles() { throw 1; }}); } catch (e) { n = e; } return n === 1; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn native_abort_signals_abort_with_dom_exceptions_and_compose() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const s = AbortSignal.abort(); return s.aborted && s.reason instanceof DOMException && s.reason instanceof Error && s.reason.name === 'AbortError' && s.reason.code === 20; })()",
+        "(() => { const c = new AbortController(); const seen = []; c.signal.addEventListener('abort', e => seen.push(e.type + ':' + e.isTrusted)); c.abort('r'); c.abort('later'); return c.signal.reason === 'r' && seen.join() === 'abort:true'; })()",
+        "(() => { const a = new AbortController(), b = new AbortController(); const any = AbortSignal.any([a.signal, b.signal]); b.abort(7); return any.aborted && any.reason === 7 && !a.signal.aborted; })()",
+        "(() => { const s = AbortSignal.abort(); try { s.throwIfAborted(); } catch (e) { return e === s.reason; } })()",
+        "(() => { const c = new AbortController(); let n = 0; const t = new EventTarget(); t.addEventListener('x', () => n++, {signal: c.signal}); t.dispatchEvent(new Event('x')); c.abort(); t.dispatchEvent(new Event('x')); return n === 1; })()",
+        "(() => { try { AbortSignal.any([{}]); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE'; } })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+    evaluate(&mut runtime, "globalThis.timeoutSignal = AbortSignal.timeout(1); globalThis.timeoutSeen = []; timeoutSignal.addEventListener('abort', () => timeoutSeen.push(timeoutSignal.reason.name)); setTimeout(() => {}, 30);");
+    runtime.run_until_idle();
+    assert_script(&mut runtime, "timeoutSignal.aborted && timeoutSeen.join() === 'TimeoutError' && timeoutSignal.reason.code === 23");
+}
+
+#[test]
+fn native_dom_exception_behaves_like_an_error() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const e = new DOMException('m', 'NotFoundError'); return e instanceof Error && e instanceof DOMException && e.name === 'NotFoundError' && e.message === 'm' && e.code === 8 && typeof e.stack === 'string'; })()",
+        "new DOMException().name === 'Error' && new DOMException().message === '' && new DOMException().code === 0",
+        "DOMException.INDEX_SIZE_ERR === 1 && DOMException.DATA_CLONE_ERR === 25 && DOMException.prototype.TIMEOUT_ERR === 23",
+        "Object.getPrototypeOf(DOMException.prototype) === Error.prototype && Object.getPrototypeOf(DOMException) === Error",
+        "(() => { class Custom extends DOMException {} const e = new Custom('m', 'AbortError'); return e instanceof Custom && e.code === 20 && typeof e.stack === 'string'; })()",
+        "(() => { const e = new DOMException('m', {name: 'DataError', cause: 5}); return e.name === 'DataError' && e.cause === 5; })()",
+        "Error.prototype.toString.call(new DOMException('m', 'AbortError')) === 'AbortError: m'",
     ] {
         assert_script(&mut runtime, expression);
     }

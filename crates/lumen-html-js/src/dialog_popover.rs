@@ -5,6 +5,7 @@
 //! renderer/host capabilities. Trusted pointer input calls the shared light-dismiss
 //! helper before dispatching pointer and mouse events.
 
+use crate::events::HtmlTargetExt;
 use super::{
     browsing_context, error_reporting, events, scheduling, ui_events, DomElement, DomRealm,
 };

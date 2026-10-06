@@ -1,5 +1,6 @@
 //! HTML audio element state and its owner-local media command queue.
 
+use crate::events::HtmlTargetExt;
 use lumen::embed::{Ctx, Deferred, OpError, OpResult, Value};
 use std::{
     collections::{HashMap, VecDeque},

@@ -3350,3 +3350,67 @@ fn node_url_module_uses_native_url_classes() {
         ]
     );
 }
+
+#[test]
+fn native_event_target_follows_node_event_target_semantics() {
+    let (mut rt, out, _err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const events = require("events");
+        const failures = [];
+        const check = (ok, name) => { if (!ok) failures.push(name); };
+
+        const target = new EventTarget();
+        const first = () => {};
+        const second = { handleEvent() {} };
+        target.addEventListener("a", first);
+        target.addEventListener("a", second);
+        target.addEventListener("b", first);
+        const listeners = events.getEventListeners(target, "a");
+        check(listeners.length === 2 && listeners[0] === first && listeners[1] === second, "listeners");
+
+        check(target[Symbol.for("lumen.kEvents")] instanceof Map &&
+            target[Symbol.for("lumen.kEvents")].size === 2, "kEvents-snapshot");
+
+        const warnings = [];
+        process.on("warning", (warning) => { warnings.push(warning); });
+        events.setMaxListeners(1, target);
+        target.addEventListener("c", () => {});
+        target.addEventListener("c", () => {});
+
+        const trusted = new Event("t");
+        check(trusted.isTrusted === false, "untrusted");
+        check(Object.keys(Object.getOwnPropertyDescriptors(trusted)).includes("isTrusted"), "own-isTrusted");
+
+        target.addEventListener("d", null);
+        check(events.getEventListeners(target, "d").length === 0, "null-listener-ignored");
+
+        let reported = null;
+        process.once("uncaughtException", (error) => { reported = error; });
+        const failing = new EventTarget();
+        const boom = new Error("listener failure");
+        failing.addEventListener("x", () => { throw boom; });
+        let afterFailure = false;
+        failing.addEventListener("x", () => { afterFailure = true; });
+        check(failing.dispatchEvent(new Event("x")) === true && afterFailure, "failing-listener-does-not-stop-dispatch");
+
+        const signal = AbortSignal.abort();
+        check(signal.reason instanceof DOMException && signal.reason.name === "AbortError", "abort-reason");
+        check(typeof events.once === "function", "once");
+
+        process.nextTick(() => {
+            setImmediate(() => {
+                const warned = warnings.find((w) => w.name === "MaxListenersExceededWarning");
+                const nullWarning = warnings.find((w) => w.name === "AddEventListenerArgumentTypeWarning");
+                check(warned && warned.name === "MaxListenersExceededWarning" && warned.count === 2 && warned.type === "c", "max-listeners-warning");
+                check(nullWarning && nullWarning.name === "AddEventListenerArgumentTypeWarning", "null-warning");
+                check(reported === boom, "reported-through-uncaughtException");
+                console.log(failures.length === 0 ? "ok" : failures.join("|"));
+            });
+        });
+        "#,
+    );
+    rt.run_to_completion();
+    assert_eq!(out.lines(), ["ok"]);
+}

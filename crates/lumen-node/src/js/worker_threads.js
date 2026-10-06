@@ -70,161 +70,16 @@
       this.ports = Object.freeze(init.ports === undefined ? [] : [...init.ports]);
     }
   }
-  const ET = NodeEventTarget.prototype;
-  const kEvents = internals.kEvents;
-  const nodeStyle = new WeakMap(); // registered wrapper -> the user's listener
-  const onceRemoved = new WeakMap(); // `once` listener -> the target's listener-removed hook
+  const emitLazy = internals.emitLazy;
+  const defineEventHandler = internals.defineEventHandler;
   const portState = new WeakMap();
   let receivedPorts = null; // ports created by the deserialization running now
 
-  function listenerList(target, type) {
-    return target[kEvents].get(String(type));
-  }
-  function rethrowAsync(error) {
-    process.nextTick(() => {
-      throw error;
-    });
-  }
+  // Node-style listeners get the message's value, DOM-style ones a MessageEvent built when the
+  // first of them runs. A listener that throws is an uncaught exception, as in Node.
   function hybridDispatch(target, type, nodeValue, makeEvent) {
-    const list = listenerList(target, type);
-    if (!list || list.length === 0) return false;
-    let event;
-    for (const entry of [...list]) {
-      if (entry.removed) continue;
-      if (entry.once) {
-        ET.removeEventListener.call(target, type, entry.callback, { capture: entry.capture });
-        onceRemoved.get(entry.callback)?.(target, String(type));
-      }
-      const original = nodeStyle.get(entry.callback);
-      try {
-        if (original !== undefined) {
-          Reflect.apply(original, target, [nodeValue]);
-        } else {
-          if (event === undefined) {
-            event = makeEvent();
-            event[internals.kTarget] = target;
-            event[internals.kDispatching] = true;
-          }
-          if (typeof entry.callback === "function") Reflect.apply(entry.callback, target, [event]);
-          else entry.callback.handleEvent(event);
-        }
-      } catch (error) {
-        rethrowAsync(error);
-      }
-      if (event !== undefined && event[internals.kStop]) break;
-    }
-    if (event !== undefined) event[internals.kDispatching] = false;
-    return true;
+    return emitLazy(target, type, nodeValue, makeEvent);
   }
-  function validateListener(fn) {
-    if (typeof fn !== "function") throw new __errors.ERR_INVALID_ARG_TYPE("listener", "Function", fn);
-  }
-  function makeNodeTargetMethods(proto, onAdd, onRemove) {
-    const addNode = function (type, listener, once) {
-      validateListener(listener);
-      const wrapper = function () {};
-      nodeStyle.set(wrapper, listener);
-      ET.addEventListener.call(this, type, wrapper, { once });
-      if (once) onceRemoved.set(wrapper, onRemove);
-      onAdd(this, String(type));
-      return this;
-    };
-    const removeNode = function (type, listener) {
-      const list = listenerList(this, type);
-      if (!list) return this;
-      for (let i = list.length - 1; i >= 0; i--) {
-        if (nodeStyle.get(list[i].callback) === listener) {
-          ET.removeEventListener.call(this, type, list[i].callback, { capture: list[i].capture });
-          onRemove(this, String(type));
-          break;
-        }
-      }
-      return this;
-    };
-    const methods = {
-      addEventListener(type, callback, options) {
-        Reflect.apply(ET.addEventListener, this, arguments);
-        if (callback != null) onAdd(this, String(type));
-      },
-      removeEventListener(type, callback, options) {
-        Reflect.apply(ET.removeEventListener, this, arguments);
-        onRemove(this, String(type));
-      },
-      dispatchEvent(event) {
-        if (!(event instanceof NodeEvent)) throw new __errors.ERR_INVALID_ARG_TYPE("event", "Event", event);
-        hybridDispatch(this, event.type, event, () => event);
-        return !event.defaultPrevented;
-      },
-      on(type, listener) { return addNode.call(this, type, listener, false); },
-      addListener(type, listener) { return addNode.call(this, type, listener, false); },
-      once(type, listener) { return addNode.call(this, type, listener, true); },
-      off(type, listener) { return removeNode.call(this, type, listener); },
-      removeListener(type, listener) { return removeNode.call(this, type, listener); },
-      emit(type, arg) {
-        return hybridDispatch(this, type, arg, () => {
-          const event = new NodeEvent(type);
-          event.detail = arg;
-          return event;
-        });
-      },
-      removeAllListeners(type) {
-        const types = type === undefined ? [...this[kEvents].keys()] : [String(type)];
-        for (const t of types) {
-          const list = this[kEvents].get(t);
-          if (!list) continue;
-          for (const entry of [...list]) ET.removeEventListener.call(this, t, entry.callback, { capture: entry.capture });
-          onRemove(this, t);
-        }
-        return this;
-      },
-      listenerCount(type) {
-        return listenerList(this, type)?.length ?? 0;
-      },
-      listeners(type) {
-        return (listenerList(this, type) ?? []).map((e) => nodeStyle.get(e.callback) ?? e.callback);
-      },
-      eventNames() {
-        return [...this[kEvents]].filter(([, list]) => list.length > 0).map(([t]) => t);
-      },
-      setMaxListeners(n) {
-        portStateOf(this).maxListeners = n;
-        return this;
-      },
-      getMaxListeners() {
-        return portStateOf(this).maxListeners ?? EventEmitter.defaultMaxListeners;
-      },
-    };
-    for (const name of Object.keys(methods)) {
-      Object.defineProperty(proto, name, { value: methods[name], writable: true, configurable: true, enumerable: false });
-    }
-  }
-  // `onmessage`-style attributes: a real listener, so it orders with addEventListener ones.
-  function defineEventHandler(proto, name) {
-    const handlers = new WeakMap();
-    Object.defineProperty(proto, `on${name}`, {
-      configurable: true,
-      enumerable: true,
-      get() {
-        return handlers.get(this)?.fn ?? null;
-      },
-      set(fn) {
-        const old = handlers.get(this);
-        if (old) {
-          handlers.delete(this);
-          this.removeEventListener(name, old.wrapped);
-        }
-        if (typeof fn === "function" || (fn !== null && typeof fn === "object")) {
-          const self = this;
-          const wrapped = function (event) {
-            return typeof fn === "function" ? Reflect.apply(fn, self, [event]) : undefined;
-          };
-          handlers.set(this, { fn, wrapped });
-          this.addEventListener(name, wrapped);
-        }
-      },
-    });
-  }
-
   function portStateOf(port) {
     const state = portState.get(port);
     if (state === undefined) throw new __errors.ERR_INVALID_THIS("MessagePort");
@@ -281,6 +136,24 @@
       const state = portStateOf(this);
       return !state.destroyed && !state.closing && !state.closingLocal && state.refed;
     }
+    [internals.kNewListener](size, type) {
+      if (type !== "message" || size !== 1) return;
+      const state = portState.get(this);
+      if (state === undefined || state.destroyed) return;
+      this.ref();
+      this.start();
+    }
+    [internals.kRemoveListener](size, type) {
+      if (type !== "message" || size !== 0) return;
+      const state = portState.get(this);
+      if (state === undefined || state.destroyed) return;
+      this.unref();
+    }
+    removeAllListeners(type) {
+      super.removeAllListeners(type);
+      if (this.listenerCount("message") === 0) this[internals.kRemoveListener](0, "message");
+      return this;
+    }
     [inspectCustom](depth, options) {
       const state = portState.get(this);
       if (state === undefined) return this;
@@ -291,30 +164,10 @@
       return `${this.constructor.name} [EventTarget] ${lazyUtil().inspect(shown, opts)}`;
     }
   }
-  function messagePortListenerAdded(port, type) {
-    if (type !== "message") return;
-    const state = portState.get(port);
-    if (state === undefined || state.destroyed) return;
-    if (port.listenerCount("message") === 1) {
-      port.ref();
-      port.start();
-    }
-  }
-  function messagePortListenerRemoved(port, type) {
-    if (type !== "message") return;
-    const state = portState.get(port);
-    if (state === undefined || state.destroyed) return;
-    if (port.listenerCount("message") === 0) port.unref();
-  }
-  // Node: MessagePort.prototype -> NodeEventTarget.prototype -> EventTarget.prototype, and the
-  // constructor is not callable at all (instances come from MessageChannel or a transfer).
-  const nodeEventTargetProto = Object.create(NodeEventTarget.prototype);
-  makeNodeTargetMethods(nodeEventTargetProto, messagePortListenerAdded, messagePortListenerRemoved);
   function MessagePort() {
     throw nodeError(TypeError, "ERR_CONSTRUCT_CALL_INVALID", "Constructor cannot be called");
   }
   Object.setPrototypeOf(MessagePort, NodeEventTarget);
-  Object.setPrototypeOf(MessagePortMethods.prototype, nodeEventTargetProto);
   Object.defineProperty(MessagePortMethods.prototype, "constructor", { value: MessagePort, writable: true, configurable: true });
   MessagePort.prototype = MessagePortMethods.prototype;
   defineEventHandler(MessagePort.prototype, "message");
@@ -600,11 +453,6 @@
       const opts = { ...options, depth: options.depth == null ? null : options.depth - 1 };
       return `BroadcastChannel ${lazyUtil().inspect({ name: state.name, active: state.port !== null }, opts)}`;
     }
-  }
-  makeNodeTargetMethods(BroadcastChannel.prototype, () => {}, () => {});
-  for (const name of ["on", "addListener", "once", "off", "removeListener", "emit", "removeAllListeners",
-    "listenerCount", "listeners", "eventNames", "setMaxListeners", "getMaxListeners"]) {
-    delete BroadcastChannel.prototype[name];
   }
   defineEventHandler(BroadcastChannel.prototype, "message");
   defineEventHandler(BroadcastChannel.prototype, "messageerror");

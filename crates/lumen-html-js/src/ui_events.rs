@@ -1535,76 +1535,6 @@ impl DomInputEvent {
     }
 }
 
-#[lumen_bind::class(name = "ErrorEvent", extends = DomEvent, hint(js(webidl)))]
-pub(crate) struct DomErrorEvent {
-    base: DomEvent,
-    message: String,
-    filename: String,
-    lineno: u32,
-    colno: u32,
-    error: Value,
-}
-
-#[lumen_bind::methods]
-impl DomErrorEvent {
-    #[constructor(coerce)]
-    fn new(ctx: &mut Ctx, kind: &str, options: Option<Value>) -> OpResult<Self> {
-        let dictionary = options.clone();
-        let base = DomEvent::new(ctx, kind, options)?;
-        let colno = dictionary_unsigned(ctx, &dictionary, "colno", 0, 32)?;
-        let error = dictionary_member(ctx, &dictionary, "error")?.unwrap_or(Value::Undefined);
-        let filename = dictionary_string(ctx, &dictionary, "filename", "", true)?;
-        let lineno = dictionary_unsigned(ctx, &dictionary, "lineno", 0, 32)?;
-        let message = dictionary_string(ctx, &dictionary, "message", "", false)?;
-        Ok(Self {
-            base,
-            message,
-            filename,
-            lineno,
-            colno,
-            error,
-        })
-    }
-
-    #[getter]
-    fn message(&self) -> String {
-        self.message.clone()
-    }
-    #[getter]
-    fn filename(&self) -> String {
-        self.filename.clone()
-    }
-    #[getter]
-    fn lineno(&self) -> u32 {
-        self.lineno
-    }
-    #[getter]
-    fn colno(&self) -> u32 {
-        self.colno
-    }
-    #[getter]
-    fn error(&self) -> Value {
-        self.error.clone()
-    }
-}
-
-/// Snapshot the ErrorEvent fields consumed by Window.onerror's special handling algorithm.
-/// This reads the native IDL attribute state rather than performing JavaScript property gets, so
-/// author-defined own accessors cannot run while the platform prepares callback arguments. The
-/// returned values are detached from the native borrow before script is invoked.
-pub(crate) fn error_event_handler_arguments(ctx: &mut Ctx, event: &Value) -> Option<[Value; 5]> {
-    ctx.with_instance::<DomErrorEvent, _>(event, |event| {
-        [
-            Value::str(&event.message),
-            Value::str(&event.filename),
-            Value::Num(event.lineno as f64),
-            Value::Num(event.colno as f64),
-            event.error.clone(),
-        ]
-    })
-    .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1646,7 +1576,7 @@ mod tests {
             ),
             (
                 "ErrorEvent",
-                engine.ctx().class_constructor::<DomErrorEvent>(),
+                engine.ctx().class_constructor::<lumen_host::events::ErrorEvent>(),
             ),
         ];
         let keyboard = constructors
@@ -1889,7 +1819,7 @@ mod tests {
             .ok()
             .expect("setup script returned a value");
         let arguments =
-            error_event_handler_arguments(engine.ctx(), &event).expect("native ErrorEvent brand");
+            lumen_host::events::ErrorEvent::handler_arguments(engine.ctx(), &event).expect("native ErrorEvent brand");
         let global = engine.ctx().global_object();
         let sentinel = engine
             .ctx()

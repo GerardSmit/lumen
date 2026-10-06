@@ -14,7 +14,7 @@ struct Reporter {
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
     let global = ctx.global_object();
-    let constructor = ctx.class_constructor::<ui_events::DomErrorEvent>();
+    let constructor = ctx.class_constructor::<lumen_host::events::ErrorEvent>();
     let mut legacy_constructors = HashMap::new();
     for name in [
         "BeforeUnloadEvent",
@@ -53,16 +53,17 @@ pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
             active: Rc::new(Cell::new(false)),
         },
     );
+    lumen_host::events::RealmPolicy::install(
+        ctx,
+        lumen_host::events::RealmPolicy {
+            report: report_exception,
+            dom_errors: true,
+        },
+    );
     let function = ctx.bound_function(&lumen_bind::FnItem::of::<report_error::Op>());
     ctx.member_set(&global, "reportError", function)
         .map_err(OpError::thrown)?;
     Ok(())
-}
-
-/// Require the native ErrorEvent data brand. Prototype lookalikes and
-/// author-replaced interface globals do not receive special Window handling.
-pub(crate) fn is_error_event(ctx: &mut Ctx, event: &Value) -> bool {
-    ui_events::error_event_handler_arguments(ctx, event).is_some()
 }
 
 /// Share the realm's existing captured DOMException factory with DOM services.
@@ -108,7 +109,7 @@ pub(crate) fn create_legacy_event(ctx: &mut Ctx, interface: &str) -> OpResult<Va
         }
     };
     if name == "Event" {
-        let event = DomEvent::legacy_uninitialized(ctx)?;
+        let event = DomEvent::legacy_uninitialized();
         return Ok(ctx.new_instance(event));
     }
     let constructor = RealmServices::<Reporter>::current(ctx)

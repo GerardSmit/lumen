@@ -33,8 +33,12 @@ pub use lumen::{well_formed_utf8, Completion, Engine, ParseError};
 pub use lumen_common::compress as codec;
 
 pub mod encoding;
+/// The native `Event` / `EventTarget` / `AbortSignal` / `DOMException` core (`docs/native-events.md`).
+pub mod events;
 /// The process clock behind `performance` and the event loop's milestone and idle counters.
 pub mod perf;
+/// Typed host services scoped to one realm.
+pub mod realm_services;
 pub mod sysfs;
 /// Monotonic and wall clocks that also work on `wasm32-unknown-unknown` (`performance.now()` /
 /// `Date.now()`), where `std::time::Instant::now()` panics.

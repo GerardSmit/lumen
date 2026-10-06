@@ -3236,7 +3236,7 @@ impl DomMediaQueryList {
         options: Option<Value>,
     ) -> OpResult<()> {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
-        DomEventTarget::add_event_listener(ctx, this, kind, callback, options)
+        crate::events::add_event_listener(ctx, this, kind, callback, options)
     }
 
     fn add_listener(&self, ctx: &mut Ctx, this: This<Value>, callback: Value) -> OpResult<()> {
@@ -3244,7 +3244,7 @@ impl DomMediaQueryList {
     }
 
     fn remove_listener(&self, ctx: &mut Ctx, this: This<Value>, callback: Value) -> OpResult<()> {
-        DomEventTarget::remove_event_listener(ctx, this, "change", callback, None)
+        crate::events::remove_event_listener(ctx, this, "change", callback, None)
     }
 
     #[getter]
@@ -3565,7 +3565,7 @@ pub fn notify_media(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {
                 }
                 if let Some(event) = JsObject::from_value(event) {
                     let target = DomEventTarget::from_data(data.target.data_handle());
-                    let _ = DomEventTarget::dispatch_event(ctx, This(wrapper), event);
+                    let _ = crate::events::dispatch_event(ctx, This(wrapper), event);
                 }
             }
         }

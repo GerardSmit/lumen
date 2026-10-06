@@ -728,6 +728,8 @@ pub fn extension() -> Extension {
             url_namespace,
             lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::url::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::events::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::events::internals::Module>,
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,

@@ -767,6 +767,17 @@ impl<'s> ArgCx<'s> {
     pub(crate) fn class_rc<T: Class>(&self, v: &Value, at: Slot) -> Result<Rc<RefCell<T>>, Value> {
         match host_data(self.interp(), v).and_then(|d| d.downcast::<RefCell<T>>().ok()) {
             Some(rc) => Ok(rc),
+            None if at == Slot::THIS && T::DESC.hint("js", "invalid_this").is_some() => {
+                let msg = format!("Value of \"this\" must be of type {}", class_name::<T>());
+                let error = self.interp().make_error("TypeError", msg);
+                if let Value::Obj(object) = &error {
+                    object
+                        .borrow_mut()
+                        .props
+                        .insert("code", Property::plain(Value::str("ERR_INVALID_THIS")));
+                }
+                Err(error)
+            }
             None if at == Slot::THIS => {
                 let msg = format!(
                     "{}: illegal invocation (receiver is not a {})",
@@ -2722,6 +2733,15 @@ fn register_indexed_wrapper(i: &mut Interp, target: &Value, wrapper: &Value) {
 #[derive(Default)]
 struct IndexedClasses(FastMap<(RealmKey, TypeId), Value>);
 
+/// `hint(js(unforgeable))` getters of each class (its own and its base classes'), installed as
+/// own non-configurable accessors on every instance (Web IDL `[LegacyUnforgeable]`). Keyed by
+/// class and, for subclass lookups, by the class prototype.
+#[derive(Default)]
+struct Unforgeables {
+    by_class: FastMap<(RealmKey, TypeId), Rc<[(Rc<str>, Value)]>>,
+    by_proto: FastMap<usize, (WeakGc, Rc<[(Rc<str>, Value)]>)>,
+}
+
 #[derive(Clone)]
 struct NamedPropertyHooks {
     supported: Value,
@@ -3386,6 +3406,24 @@ fn indexed_prevent_extensions(_: &mut Interp, _: Value, _: &[Value]) -> Result<V
 }
 
 fn attach_instance<T: Class>(i: &mut Interp, obj: &Gc, value: T) {
+    if T::DESC.hint("js", "error").is_some() {
+        let stack = i.capture_trace(None);
+        obj.borrow_mut().set_exotic(Exotic::Error, Some(stack));
+    }
+    if let Some(accessors) = i
+        .host_state
+        .get::<Unforgeables>()
+        .and_then(|u| u.by_class.get(&(active_realm_key(i), TypeId::of::<T>())))
+        .cloned()
+    {
+        let mut object = obj.borrow_mut();
+        for (name, getter) in accessors.iter() {
+            object.props.insert(
+                &**name,
+                Property::accessor_prop(Some(getter.clone()), None, true, false),
+            );
+        }
+    }
     let t = host_objects(i);
     if t.map.len() >= t.sweep_at.max(256) {
         sweep(i);
@@ -3563,14 +3601,23 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                 .and_then(|p| p.value().as_obj().cloned())
         });
     let iterator_class = T::DESC.hint("js", "iterator").is_some();
+    let error_class = T::DESC.hint("js", "error").is_some();
     let parent_proto = if iterator_class {
         i.extra_protos.get("%IteratorPrototype%").cloned()
+    } else if error_class && base_proto.is_none() {
+        i.error_protos.get("Error").cloned()
     } else {
         None
     };
+    let base = match base {
+        None if error_class => parent_proto
+            .as_ref()
+            .and_then(|proto| proto.borrow().props.get("constructor").map(|p| p.value())),
+        base => base,
+    };
     let proto = Object::new(Some(
         parent_proto
-            .or(base_proto)
+            .or(base_proto.clone())
             .unwrap_or_else(|| i.object_proto.clone()),
     ));
     let ctor_fn = match members.iter().find(|m| m.desc.role == Role::Constructor) {
@@ -3602,6 +3649,16 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
     crate::builtins::set_to_string_tag(i, &proto, name);
     // Accessors: pair getters and setters by name.
     let mut accessors: Vec<(Cow<'static, str>, Option<Value>, Option<Value>)> = Vec::new();
+    let mut unforgeable: Vec<(Rc<str>, Value)> = base_proto
+        .as_ref()
+        .and_then(|base| {
+            i.host_state
+                .get::<Unforgeables>()
+                .and_then(|u| u.by_proto.get(&(Gc::as_ptr(base) as usize)))
+                .filter(|(weak, _)| weak.upgrade().is_some_and(|live| Gc::ptr_eq(&live, base)))
+                .map(|(_, list)| list.to_vec())
+        })
+        .unwrap_or_default();
     for m in &members {
         let d = m.desc;
         let js = js_name(d);
@@ -3664,8 +3721,20 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                         .insert(key, Property::builtin(Value::Obj(f)));
                 }
             }
+            Role::Getter if d.hint("js", "symbol_for").is_some() => {
+                let description = d.hint("js", "symbol_for").unwrap_or_default();
+                let key = symbol_for_key(i, description);
+                let f = Value::Obj(i.make_native(&format!("get [{description}]"), 0, m.entry));
+                proto
+                    .borrow_mut()
+                    .props
+                    .insert(key, Property::accessor_prop(Some(f), None, false, true));
+            }
             Role::Getter | Role::Proto("len") => {
                 let f = Value::Obj(i.make_native(&format!("get {js}"), 0, m.entry));
+                if d.hint("js", "unforgeable").is_some() {
+                    unforgeable.push((Rc::<str>::from(&*js), f.clone()));
+                }
                 match accessors.iter_mut().find(|a| a.0 == js) {
                     Some(a) => a.1 = Some(f),
                     None => accessors.push((js, Some(f), None)),
@@ -3698,6 +3767,23 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                 .props
                 .insert(constant.name, Property::data(value.clone(), false, true, false));
         }
+    }
+    if !unforgeable.is_empty() {
+        let list: Rc<[(Rc<str>, Value)]> = unforgeable.into();
+        if !i.host_state.has::<Unforgeables>() {
+            i.host_state.put(Unforgeables::default());
+        }
+        let registry = i.host_state.get_mut::<Unforgeables>().unwrap();
+        registry
+            .by_proto
+            .retain(|_, (weak, _)| weak.upgrade().is_some());
+        registry.by_proto.insert(
+            Gc::as_ptr(&proto) as usize,
+            (Gc::downgrade(&proto), list.clone()),
+        );
+        registry
+            .by_class
+            .insert((realm_key.clone(), TypeId::of::<T>()), list);
     }
     let entry = (Value::Obj(ctor), proto);
     if !i.host_state.has::<ClassRegistry>() {
@@ -3998,6 +4084,34 @@ impl Interp {
         Ok(())
     }
 
+    /// Give an existing object the native state of class `T` without changing its prototype (a
+    /// realm global or a host object that already has its prototype chain becomes an
+    /// `EventTarget`). Fails when the object already has native state.
+    pub fn attach_native_data<T: Methods<JsHost>>(
+        &mut self,
+        object: &Value,
+        value: T,
+    ) -> OpResult<()> {
+        let Some(object) = object.as_obj() else {
+            return Err(OpError::new(
+                "TypeError",
+                "native instance requires an object",
+            ));
+        };
+        class_entry::<T>(self);
+        if host_objects(self)
+            .map
+            .contains_key(&(Gc::as_ptr(object) as usize))
+        {
+            return Err(OpError::new(
+                "TypeError",
+                "object already has native instance state",
+            ));
+        }
+        attach_instance(self, object, value);
+        Ok(())
+    }
+
     /// The Rust value behind a class instance (shared handle; borrow it with the `RefCell`
     /// API). `None` when `v` is not a `T` instance.
     pub fn instance_data<T: Class>(&self, v: &Value) -> Option<Rc<RefCell<T>>> {
@@ -4088,6 +4202,21 @@ impl Interp {
         entry.native_values = T::TRACES_NATIVE_VALUES.then_some(trace_native_values::<T>);
         entry.retained = Some(value.clone());
         Ok(())
+    }
+
+    /// [`Self::set_native_identity_owner`] unless the instance already has an owner (a subclass
+    /// that traces more state, such as a DOM node, keeps its own).
+    pub fn ensure_native_identity_owner<T: NativeIdentityOwner>(
+        &mut self,
+        value: &Value,
+    ) -> OpResult<()> {
+        let owned = host_entry_key(self, value)
+            .and_then(|key| host_objects(self).map.get(&key))
+            .is_some_and(|entry| entry.identity_owner.is_some());
+        if owned {
+            return Ok(());
+        }
+        self.set_native_identity_owner::<T>(value)
     }
 
     /// One lazy native wrapper per identity key in this realm.

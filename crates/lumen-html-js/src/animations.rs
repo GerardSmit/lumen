@@ -2324,7 +2324,7 @@ fn fire_event(ctx: &mut Ctx, hub: &Rc<RefCell<AnimationHub>>, id: u32, kind: &st
     let event = ctx.new_instance(event);
     let event = JsObject::from_value(event)
         .ok_or_else(|| OpError::new("TypeError", "could not create animation event"))?;
-    DomEventTarget::dispatch_event(ctx, This(wrapper), event)?;
+    crate::events::dispatch_event(ctx, This(wrapper), event)?;
     Ok(())
 }
 
@@ -3330,7 +3330,7 @@ impl DomAnimation {
             let event = ctx.new_instance(event);
             let event = JsObject::from_value(event)
                 .ok_or_else(|| OpError::new("TypeError", "could not create animation event"))?;
-            DomEventTarget::dispatch_event(ctx, this, event)?;
+            crate::events::dispatch_event(ctx, this, event)?;
         }
         Ok(())
     }

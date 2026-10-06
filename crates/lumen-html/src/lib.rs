@@ -43,6 +43,12 @@ impl NodeId {
     pub const fn index(self) -> usize {
         self.index as usize
     }
+
+    /// An opaque key unique to this node of this document, for hosts that need to record node
+    /// identity without depending on `NodeId`.
+    pub const fn key(self) -> u128 {
+        ((self.document as u128) << 64) | ((self.index as u128) << 32) | self.generation as u128
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

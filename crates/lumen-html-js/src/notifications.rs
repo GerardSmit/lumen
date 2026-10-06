@@ -507,7 +507,7 @@ impl DomNotification {
         options: Option<Value>,
     ) -> OpResult<()> {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
-        DomEventTarget::add_event_listener(ctx, this, kind, callback, options)
+        crate::events::add_event_listener(ctx, this, kind, callback, options)
     }
 
     fn remove_event_listener(
@@ -518,7 +518,7 @@ impl DomNotification {
         callback: Value,
         options: Option<Value>,
     ) -> OpResult<()> {
-        DomEventTarget::remove_event_listener(ctx, this, kind, callback, options)
+        crate::events::remove_event_listener(ctx, this, kind, callback, options)
     }
 
     #[getter]
@@ -866,7 +866,7 @@ fn dispatch_notification_event(ctx: &mut Ctx, data: &NotificationData, kind: &st
     let event = DomEvent::new(ctx, kind, Some(options))?;
     let event = JsObject::from_value(ctx.new_instance(event))
         .ok_or_else(|| OpError::new("TypeError", "notification event is invalid"))?;
-    DomEventTarget::dispatch_event(ctx, This(wrapper), event).map(|_| ())
+    crate::events::dispatch_event(ctx, This(wrapper), event).map(|_| ())
 }
 
 pub(crate) fn install(ctx: &mut Ctx, realm: &Rc<DomRealm>) -> OpResult<()> {

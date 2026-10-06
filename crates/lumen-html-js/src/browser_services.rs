@@ -454,7 +454,7 @@ impl DomPermissionStatus {
         options: Option<Value>,
     ) -> OpResult<()> {
         *self.data.wrapper.borrow_mut() = ctx.weak_value(&this.0);
-        DomEventTarget::add_event_listener(ctx, this, kind, callback, options)
+        crate::events::add_event_listener(ctx, this, kind, callback, options)
     }
 
     #[getter]

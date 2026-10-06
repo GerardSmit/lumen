@@ -3,6 +3,7 @@
 //! Device-backed camera and microphone capture is provided by an embedder
 //! `MediaDevicesHost`; the default host has no inputs and rejects requests.
 
+use crate::events::HtmlTargetExt;
 use crate::{media::VideoFrameSnapshot, DomRealm};
 use lumen::embed::{Ctx, JsObject, OpError, OpResult, Promise, Value, WeakValue};
 use lumen_bind::This;
@@ -849,7 +850,7 @@ fn dispatch_track_event(ctx: &mut Ctx, track: &TrackData, kind: &str) -> OpResul
     let event = crate::events::DomEvent::new(ctx, kind, None)?;
     let event = JsObject::from_value(ctx.new_instance(event))
         .ok_or_else(|| OpError::new("TypeError", "could not construct a track event"))?;
-    crate::events::DomEventTarget::dispatch_event(ctx, This(target), event).map(|_| ())
+    crate::events::dispatch_event(ctx, This(target), event).map(|_| ())
 }
 
 pub(crate) fn canvas_capture_stream(

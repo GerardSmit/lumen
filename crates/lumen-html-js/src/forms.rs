@@ -3905,7 +3905,7 @@ fn click_with_event(
         if trusted {
             events::dispatch_user_agent_event(ctx, lumen_bind::This(receiver), event)
         } else {
-            events::DomEventTarget::dispatch_event(ctx, lumen_bind::This(receiver), event)
+            crate::events::dispatch_event(ctx, lumen_bind::This(receiver), event)
         }
     })();
 

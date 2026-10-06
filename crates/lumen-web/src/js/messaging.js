@@ -3,8 +3,8 @@
 // entangled pair), BroadcastChannel (same-realm), and AbortSignal.any. Message data is
 // serialized SYNCHRONOUSLY at postMessage time via structuredClone and delivered as a task;
 // each BroadcastChannel receiver gets its own clone (mutation isolation, like the spec's
-// per-destination deserialize). This unit is intentionally separate from events.js so its
-// subclasses use the realm's final Event and EventTarget constructors.
+// per-destination deserialize). The subclasses extend the native Event and EventTarget
+// (`lumen_host::events`); a browser embedder may replace those globals first.
 
 function isMessagePortLike(value) {
   if (value === null || typeof value !== "object") return false;
