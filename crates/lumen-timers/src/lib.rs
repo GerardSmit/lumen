@@ -7,9 +7,9 @@
 //! doesn't touch the heap at all — it queues on the loop's [`CallbackQueue`] for the next
 //! turn.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
 use std::time::Duration;
+
+use lumen_common::deadline::DeadlineQueue;
 
 #[cfg(feature = "hosted")]
 use lumen_host::time::Instant;
@@ -57,9 +57,6 @@ struct Entry {
     delay: Duration,
     /// `Some(period)` for `setInterval`: reschedule after each firing.
     repeat: Option<Duration>,
-    /// The deadline the live heap node carries; a node with any other deadline is stale
-    /// (the timer was refreshed) and is skipped like a cancelled one.
-    deadline: Instant,
     /// Node's `timer.unref()`: an unref'd timer still fires if the loop is alive for another
     /// reason, but does not by itself keep it alive.
     refed: bool,
@@ -70,36 +67,15 @@ struct Entry {
 #[derive(Default)]
 pub struct Timers {
     limit: Option<usize>,
-    next_id: u64,
-    heap: BinaryHeap<Reverse<(Instant, u64)>>,
-    entries: HashMap<u64, Entry>,
+    queue: DeadlineQueue<Instant, Entry>,
     unref_count: usize,
 }
 
 impl Timers {
     fn remove_entry(&mut self, id: u64) {
-        if let Some(entry) = self.entries.remove(&id) {
+        if let Some(entry) = self.queue.remove(id) {
             if !entry.refed {
                 self.unref_count -= 1;
-            }
-        }
-    }
-
-    fn release_idle_capacity(&mut self) {
-        if self.entries.is_empty() {
-            self.heap.clear();
-            if self.heap.capacity() > 64 {
-                self.heap = BinaryHeap::new();
-            }
-            if self.entries.capacity() > 64 {
-                self.entries = HashMap::new();
-            }
-        } else {
-            if self.heap.capacity() > 256 && self.heap.len() * 4 < self.heap.capacity() {
-                self.heap.shrink_to(self.heap.len().max(64) * 2);
-            }
-            if self.entries.capacity() > 256 && self.entries.len() * 4 < self.entries.capacity() {
-                self.entries.shrink_to(self.entries.len().max(64) * 2);
             }
         }
     }
@@ -113,35 +89,30 @@ impl Timers {
         repeat: bool,
         deadline: Instant,
     ) -> u64 {
-        self.next_id += 1;
-        let id = self.next_id;
-        self.entries.insert(
-            id,
+        self.queue.insert(
+            deadline,
             Entry {
                 callback,
                 args,
                 owner,
                 delay,
                 repeat: repeat.then_some(delay),
-                deadline,
                 refed: true,
             },
-        );
-        self.heap.push(Reverse((deadline, id)));
-        id
+        )
     }
 
     fn clear(&mut self, id: u64, owner: &RealmHandle) {
         if self
-            .entries
-            .get(&id)
+            .queue
+            .get(id)
             .is_some_and(|entry| entry.owner.same_realm(owner))
         {
             self.remove_entry(id);
         }
-        self.compact_stale_heap();
-        if self.entries.is_empty() {
-            self.release_idle_capacity();
+        self.queue.compact();
+        if self.queue.is_empty() {
+            self.queue.release_idle_capacity();
         }
     }
 
@@ -149,9 +120,9 @@ impl Timers {
     /// This is the host navigation/discard path; it also drops the callbacks and their captured
     /// values immediately. Other realms' timers remain in the shared heap.
     pub fn cancel_realm(&mut self, realm: &RealmHandle) -> usize {
-        let before = self.entries.len();
+        let before = self.queue.len();
         let mut unref_removed = 0;
-        self.entries.retain(|_, entry| {
+        self.queue.retain(|_, entry| {
             let keep = !entry.owner.same_realm(realm);
             if !keep && !entry.refed {
                 unref_removed += 1;
@@ -159,39 +130,25 @@ impl Timers {
             keep
         });
         self.unref_count -= unref_removed;
-        let cancelled = before - self.entries.len();
+        let cancelled = before - self.queue.len();
         if cancelled != 0 {
-            self.compact_stale_heap();
-            self.release_idle_capacity();
+            self.queue.compact();
+            self.queue.release_idle_capacity();
         }
         cancelled
     }
 
     /// Number of pending timer entries owned by `realm`.
     pub fn pending_for_realm(&self, realm: &RealmHandle) -> usize {
-        self.entries
+        self.queue
             .values()
             .filter(|entry| entry.owner.same_realm(realm))
             .count()
     }
 
-    fn compact_stale_heap(&mut self) {
-        // Lazy cancellation leaves stale heap nodes; bound them so clear-heavy scripts
-        // cannot grow the heap without limit.
-        if self.heap.len() > self.entries.len().saturating_mul(2) + 32 {
-            let entries = &self.entries;
-            self.heap.retain(|Reverse((deadline, id))| {
-                entries
-                    .get(id)
-                    .is_some_and(|entry| entry.deadline == *deadline)
-            });
-            self.release_idle_capacity();
-        }
-    }
-
     /// `timer.ref()` / `timer.unref()`; false when the timer no longer exists.
     pub fn set_ref(&mut self, id: u64, owner: &RealmHandle, refed: bool) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.queue.get_mut(id) {
             Some(e) if e.owner.same_realm(owner) => {
                 if e.refed != refed {
                     if refed { self.unref_count -= 1; } else { self.unref_count += 1; }
@@ -206,39 +163,26 @@ impl Timers {
     /// `timer.refresh()`: restart a live timer's delay from now. False when it has already
     /// fired (a one-shot) or was cleared — the caller re-schedules it then.
     pub fn refresh(&mut self, id: u64, owner: &RealmHandle) -> bool {
-        let Some(e) = self
-            .entries
-            .get_mut(&id)
+        let Some(delay) = self
+            .queue
+            .get(id)
             .filter(|entry| entry.owner.same_realm(owner))
+            .map(|entry| entry.delay)
         else {
             return false;
         };
-        e.deadline = Instant::now() + e.delay;
-        self.heap.push(Reverse((e.deadline, id)));
-        true
+        self.queue.rearm(id, Instant::now() + delay)
     }
 
     /// Whether any live ref'd timer remains (the loop stays alive while true).
     pub fn has_pending(&self) -> bool {
-        self.entries.len() > self.unref_count
-    }
-
-    fn is_live(&self, id: u64, deadline: Instant) -> bool {
-        self.entries
-            .get(&id)
-            .is_some_and(|e| e.deadline == deadline)
+        self.queue.len() > self.unref_count
     }
 
     /// When the loop may sleep until. Pops cancelled and stale heap nodes so a cleared or
     /// refreshed timer can't produce a busy-wakeup loop.
     pub fn next_deadline(&mut self) -> Option<Instant> {
-        while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
-            if self.is_live(id, deadline) {
-                return Some(deadline);
-            }
-            self.heap.pop();
-        }
-        None
+        self.queue.next_deadline()
     }
 
     /// Callbacks due at `now`, earliest first. Intervals are rescheduled (from their
@@ -258,48 +202,39 @@ impl Timers {
     /// Taking one at a time and running it before taking the next is what lets a timer callback
     /// cancel or refresh another timer that is due in the same turn, as in Node.
     pub fn take_next_due(&mut self, now: Instant) -> Option<(Value, Vec<Value>, RealmHandle)> {
-        while let Some(Reverse((deadline, id))) = self.heap.peek().copied() {
-            if deadline > now {
-                return None;
+        let (id, deadline) = self.queue.pop_due(now)?;
+        let entry = self.queue.get(id).expect("live entry");
+        let due = (
+            entry.callback.clone(),
+            entry.args.clone(),
+            entry.owner.clone(),
+        );
+        match entry.repeat {
+            Some(period) => {
+                // Keep the cadence, catching up on a short lag (the OS timer granularity makes
+                // a 1 ms interval wake late), but never accumulate an unbounded backlog: an
+                // interval whose callback runs longer than its period would otherwise stay
+                // due forever and starve I/O completions. Past `MAX_INTERVAL_LAG` it re-arms
+                // from the current loop time, as Node does. A zero period
+                // (`setInterval(f, 0)`) is re-armed 1 ms out, so a pass terminates.
+                const MAX_INTERVAL_LAG: Duration = Duration::from_millis(50);
+                let period = period.max(Duration::from_millis(1));
+                let next = deadline + period;
+                let next = if now.saturating_duration_since(next) > MAX_INTERVAL_LAG {
+                    now + period
+                } else {
+                    next
+                };
+                self.queue.rearm(id, next);
             }
-            self.heap.pop();
-            if !self.is_live(id, deadline) {
-                continue; // cancelled, or superseded by a refresh
-            }
-            let entry = self.entries.get_mut(&id).expect("live entry");
-            let due = (
-                entry.callback.clone(),
-                entry.args.clone(),
-                entry.owner.clone(),
-            );
-            match entry.repeat {
-                Some(period) => {
-                    // Keep the cadence, catching up on a short lag (the OS timer granularity makes
-                    // a 1 ms interval wake late), but never accumulate an unbounded backlog: an
-                    // interval whose callback runs longer than its period would otherwise stay
-                    // due forever and starve I/O completions. Past `MAX_INTERVAL_LAG` it re-arms
-                    // from the current loop time, as Node does. A zero period
-                    // (`setInterval(f, 0)`) is re-armed 1 ms out, so a pass terminates.
-                    const MAX_INTERVAL_LAG: Duration = Duration::from_millis(50);
-                    let period = period.max(Duration::from_millis(1));
-                    let next = deadline + period;
-                    entry.deadline = if now.saturating_duration_since(next) > MAX_INTERVAL_LAG {
-                        now + period
-                    } else {
-                        next
-                    };
-                    self.heap.push(Reverse((entry.deadline, id)));
-                }
-                None => {
-                    self.remove_entry(id);
-                    if self.entries.is_empty() {
-                        self.release_idle_capacity();
-                    }
+            None => {
+                self.remove_entry(id);
+                if self.queue.is_empty() {
+                    self.queue.release_idle_capacity();
                 }
             }
-            return Some(due);
         }
-        None
+        Some(due)
     }
 }
 
@@ -357,7 +292,7 @@ fn schedule_delay(
         .ok_or_else(|| NativeError::type_error("timer host state is not installed"))?;
     if timers
         .limit
-        .is_some_and(|limit| timers.entries.len() >= limit)
+        .is_some_and(|limit| timers.queue.len() >= limit)
     {
         return Err(NativeError::overflow("timer capacity exhausted").into());
     }

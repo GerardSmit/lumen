@@ -26,6 +26,7 @@ pub mod crc32;
 pub mod crypt;
 pub mod csv;
 pub mod cycle;
+pub mod deadline;
 pub mod decimal;
 pub mod dedent;
 pub mod editdist;

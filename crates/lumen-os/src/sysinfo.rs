@@ -297,9 +297,7 @@ fn sysctl_bytes(name: &str, buf: &mut [u8]) -> Option<usize> {
 }
 
 pub fn cpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    crate::sched::current().available_parallelism().get()
 }
 
 /// Byte values of `/proc/meminfo` fields (`"MemTotal:"`), 0 for a missing one.

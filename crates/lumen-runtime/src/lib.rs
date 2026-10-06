@@ -296,7 +296,7 @@ pub struct Runtime {
     /// Wakes the loop when it is blocked on completions.
     wake: mpsc::Sender<TaskCompletion>,
     #[cfg(not(target_arch = "wasm32"))]
-    deadline: Option<lumen::limits::Deadline>,
+    deadline: Option<lumen_os::sched::Deadline>,
 }
 
 /// Where the loop stands after [`Runtime::run_until_idle`].
@@ -2182,7 +2182,7 @@ impl Runtime {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn set_deadline(&mut self, limit: Duration) {
         let handle = self.interrupt_handle();
-        self.deadline = Some(lumen::limits::Deadline::start(
+        self.deadline = Some(lumen_os::sched::Deadline::start(
             "lumen-deadline",
             limit,
             move || handle.interrupt(),

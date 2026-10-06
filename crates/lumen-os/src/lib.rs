@@ -24,6 +24,7 @@ pub mod poll;
 pub mod posix;
 pub mod proc;
 pub mod rlimit;
+pub mod sched;
 pub mod signal;
 pub mod spawn;
 pub mod sysinfo;

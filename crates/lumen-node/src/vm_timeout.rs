@@ -1,4 +1,4 @@
-//! `vm` `timeout`: run a function under a deadline. A watchdog thread raises the realm's
+//! `vm` `timeout`: run a function under a deadline. A scheduler timer raises the realm's
 //! script-timeout flag when the deadline passes; every safe point (call, loop turn) then throws
 //! until the run has unwound here, where the throw becomes Node's
 //! `ERR_SCRIPT_EXECUTION_TIMEOUT`. Deadlines nest: an inner run that unwinds because an
@@ -10,9 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lumen_common::limits::Deadline;
 use lumen::embed::OpError;
 use lumen_host::{Ctx, Value};
+use lumen_os::sched::Deadline;
 
 use crate::signals::SigintBreak;
 
