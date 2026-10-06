@@ -37,8 +37,9 @@ function __lazyWeb(names, init) {
   const owns = (name) => {
     const slot = slots[name];
     const now = __lazyGetDescriptor(__lazyGlobal, name);
+    // Enumerability is not compared: the embedder's bootstrap may settle it after install.
     return slot !== undefined && now !== undefined && now.get === slot.get && now.set === slot.set &&
-      now.enumerable === slot.enumerable && now.configurable === slot.configurable;
+      now.configurable === slot.configurable;
   };
   const define = (name, descriptor) => {
     // Object.defineProperty performs ToPropertyKey exactly once. Most bootstrap
