@@ -930,10 +930,12 @@ fn container(
 /// Give this realm `navigator.serviceWorker` and the `ServiceWorker`,
 /// `ServiceWorkerRegistration` and `ServiceWorkerContainer` interfaces, backed by `registry`.
 ///
-/// Call it from the realm's `Navigator` setup, after `navigator` exists, and only for a
-/// secure-context window: the accessor is defined on the `navigator` object itself, so realms
-/// that never call this do not have the property at all. Reading it creates the container (and
-/// the registry subscription) on first use; a script that never reads it costs one closure.
+/// Call it from the realm's `Navigator` setup, after `navigator` exists. The accessor is defined on
+/// the `navigator` object itself, so realms that never call this do not have the property at all;
+/// where it exists it reads `undefined` while the realm's location is not a secure context (the
+/// location is read on every access, so a document URL assigned after the install counts).
+/// Reading it creates the container (and the registry subscription) on first use; a script that
+/// never reads it costs one closure.
 pub fn install_service_workers(
     ctx: &mut Ctx,
     registry: Rc<dyn ServiceWorkerRegistry>,
@@ -959,6 +961,11 @@ pub fn install_service_workers(
                 .ok_or_else(|| {
                     crate::webidl::invalid_this("Navigator").to_value(ctx)
                 })?;
+            if let Some((url, _)) = page_location(ctx) {
+                if !is_secure_context(&url) {
+                    return Ok(Value::Undefined);
+                }
+            }
             container(ctx, &registry, &navigator, &slot).map_err(|error| error.to_value(ctx))
         }),
     );

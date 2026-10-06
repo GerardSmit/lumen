@@ -1,8 +1,8 @@
 # Plan: native workers
 
-Status: steps 1-6 implemented (owner loop, port limits, messaging extension, native receivers,
+Status: steps 1-7 implemented (owner loop, port limits, messaging extension, native receivers,
 native `Worker`/`SharedWorker` and worker global scopes in `lumen-runtime`, native service-worker
-classes in `lumen-host`, Bitnest kernel on native ports and `SharedWorker`); steps 7-8 are design. Goal: delete the last JavaScript worker glue and run one
+classes in `lumen-host`, Bitnest kernel on native ports, `SharedWorker` and service workers); step 8 is design. Goal: delete the last JavaScript worker glue and run one
 native implementation of `Worker`, `SharedWorker`, the service-worker classes and the worker
 global scopes in both `lumen-runtime` and the Bitnest kernel.
 
@@ -280,7 +280,7 @@ Each step builds and passes its tests on its own. Lumen steps: `cargo test -p lu
    the worker, queue full → `QuotaExceededError`, idle realm gets no notify. Behaviour:
    `MessageChannel` and `BroadcastChannel` exist in every kernel realm; trusted events; wire is the
    structured-clone format instead of `Parcel`.
-7. **Kernel: ServiceWorker** (Bitnest). Files: `runtime-services/src/service_worker.rs`
+7. **Kernel: ServiceWorker** (Bitnest, done). Files: `runtime-services/src/service_worker.rs`
    (registry implements `ServiceWorkerRegistry` with subscriber `Control`s, `CloneMessage`
    queues; bindings module and `pump_bindings` deleted), `runtime-services/src/lib.rs`
    (`install_service_worker_script` uses `install_scope(Service)`; `dispatch_service_worker_*`
@@ -571,3 +571,68 @@ startup, registry unit tests (identity, startup state, last-client stop, failure
   (which still pumps every service worker each turn and could use the same wake-flag scheme).
 - Service-worker realms already get the owner loop and ports; step 7 only has to implement
   `ServiceWorkerRegistry` / `ServiceScopeHost` and call `install_scope(Service)`.
+
+## Implementation notes for step 7
+
+Done in Bitnest (`runtime-services/src/service_worker.rs`, `lib.rs`, `http.rs`, `build.rs`,
+`kernel/runtime/src/services/service_worker.rs`, `native_shell.rs`) with two small Lumen changes.
+
+- `ServiceWorkerHost` stays a passive, shared `Rc<RefCell<Registry>>` state machine (the
+  host unit tests are unchanged). Registration ids seen by pages are stable per (origin, scope);
+  worker ids still change per version. Mutations collect `(Control, WorkerEvent)` pairs in an
+  `Outbox` that is flushed after the borrow is released, so a send (which wakes another realm)
+  never runs under the registry borrow.
+- Page side: `PageRegistry` implements `ServiceWorkerRegistry`. Pages are subscribed by origin; a
+  registration snapshot is always pushed before the `UpdateFound` / `StateChange` it explains;
+  `ControllerChange`, `JobSettled` and `ServiceMessage` are pushed too. The page's client URL comes
+  from the realm document, not from the caller. `register()` settles once the worker reaches
+  `installing` (script fetched and validated), as in browsers, not at `installed`.
+- Worker side: `ScopeHost` (`WorkerScopeHost`, kind `Service`) and `ServiceScope`
+  (`ServiceScopeHost`). `install_scope` is given the worker's scope `Control`, created together with
+  the registration. `Lifecycle`, `Fetch` and `ClientMessage` are pushed there; `event_settled` and
+  `fetch_response` come back and drive the state machine, so nothing polls
+  `__bitnestServiceWorkerEventState` any more. The host sends `install` (`start_install`) and
+  `activate` (`advance_waiting`, run from the shell turn and after skipWaiting/claim/settle,
+  guarded by a dirty flag) itself.
+- Limits: 128 queued events per scope control for client messages (`QuotaExceededError`), 32 for
+  fetch events (the fetch fails with a `TypeError`); both use the new `Control::len()`.
+  Messages are `CloneMessage`s in the structured-clone wire format, with no JSON and no `Parcel`.
+- Fetch interception: `queue_fetch` takes typed `Mode`/`Credentials`/`Redirect`; the worker
+  response is a `WorkerResponse` with `Vec<u8>` body, validated in `http.rs` (status, status text,
+  header tokens/values, 64 KiB headers, 16 MiB body) as before.
+- Removed: `service_worker.js` usage and the `html-byte-types` block in `build.rs`,
+  `js/service_worker_scope.js`, the bindings module, `pump_bindings`, the Parcel messaging, the
+  JSON registration polling and `dispatch_service_worker_*`. `queueMicrotask` is copied from
+  `__bitnestHttp` natively and `__lumenUrl`, `__bitnestHttp`, `__bitnestServiceWorker` are deleted
+  from the global in `install_html_byte_types`.
+- Lumen: `Control::len` / `is_empty`; `navigator.serviceWorker` reads `undefined` while the realm
+  location is not a secure context (evaluated per access, so a document URL set after install
+  counts; `"serviceWorker" in navigator` stays true).
+- `importScripts` in a service worker is unsupported (`workers::unsupported`), as before.
+
+### Kernel wake and CPU behaviour (service workers)
+
+- Each worker realm has a wake flag set by its realm waker (which then notifies the shell) and a
+  cached absolute timer deadline. `ServiceWorkerManager::pump` enters a realm only when the flag
+  was set or the deadline is due, running `pump_timers(32)` and storing the next deadline. An idle
+  worker costs one atomic swap per shell turn; no allocation, no JS entry.
+- `next_delay_ms()` feeds the shell idle sleep like `SharedWorkerManager`, so no polling timer
+  runs when nothing is ready. Pushes to a scope control wake coalesced (one wake per empty to
+  non-empty transition).
+- `advance_waiting` is one borrow and one bool when nothing changed; `take_stopped` and
+  `take_diagnostics` are one borrow and an emptiness check.
+- Stopped workers (redundant, unregistered, replaced) are reported through `take_stopped` and
+  dropped by the manager; their scope control is closed and pending fetch tickets fail.
+- Tests in `fetch_policy_tests.rs`: end-to-end `postMessage` (cycle, transferred buffer,
+  `DataCloneError`, `event.source` identity), worker to client messages with a transferred port,
+  the 128-message limit, fetch interception through `FetchEvent`, ordered registration events,
+  an idle worker realm never woken, and the quiet idle container. The kernel `virt` build was run;
+  no QEMU run.
+
+### Left for step 8
+
+- Delete `lumen-web/src/js/service_worker.js` and `shared_worker.js` (nothing in Bitnest uses
+  them now); update the native-* docs listed in step 8.
+- Not done: module service-worker scripts (the manager still rejects them), `importScripts`,
+  `controllerchange` for pages navigated after activation without `clients.claim` stays as the
+  spec (no event).

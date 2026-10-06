@@ -98,6 +98,15 @@ impl Control {
         self.0.queue.is_closed()
     }
 
+    /// Events queued and not yet taken by the realm; a registry bounds its own pushes with it.
+    pub fn len(&self) -> usize {
+        self.0.queue.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.queue.is_empty()
+    }
+
     /// Wake the realm without an event (a worker loop that must look at its stop flag).
     pub fn nudge(&self) {
         self.0.wake();
