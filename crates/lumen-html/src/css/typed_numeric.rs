@@ -1517,9 +1517,9 @@ mod tests {
     #[test]
     fn numeric_primitives_preserve_units_and_reject_extra_tokens() {
         assert_eq!(
-            parse_numeric_value("  -3.14px  "),
+            parse_numeric_value("  -2.5px  "),
             Some(NumericValue {
-                value: -3.14,
+                value: -2.5,
                 unit: NumericUnit::Px,
             })
         );
