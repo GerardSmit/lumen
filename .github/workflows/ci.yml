@@ -20,6 +20,8 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A full run takes about 17 minutes; a hung test should fail the job, not hold it for 6 hours.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
