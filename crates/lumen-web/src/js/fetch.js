@@ -97,12 +97,12 @@ function requestOrigin() {
   }
   const value = globalThis.document && globalThis.document.URL ||
     globalThis.location && globalThis.location.href;
-  const record = value ? __url.parse(String(value), undefined) : null;
-  return record ? record[10] : "null";
+  const origin = value ? __url.origin(String(value)) : undefined;
+  return origin === undefined ? "null" : origin;
 }
 function sameOrigin(a, b) {
-  const first = __url.parse(String(a), undefined), second = __url.parse(String(b), undefined);
-  return first !== null && second !== null && first[10] !== "null" && first[10] === second[10];
+  const first = __url.origin(String(a)), second = __url.origin(String(b));
+  return first !== undefined && second !== undefined && first !== "null" && first === second;
 }
 function corsCheck(headers, origin, credentials) {
   const allowed = headers.get("access-control-allow-origin");

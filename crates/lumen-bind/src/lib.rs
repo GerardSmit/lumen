@@ -92,7 +92,12 @@
 //!   registry symbol `Symbol.for("key")` instead of a string name
 //!   (`nodejs.util.inspect.custom`);
 //! - `hint(js(missing_message = "..", missing_code = ".."))` on an op or member replaces the
-//!   `TypeError` a missing required argument throws with that message and `err.code`.
+//!   `TypeError` a missing required argument throws with that message and `err.code`;
+//! - `hint(js(also_iterator))` on an instance method also installs the same function object
+//!   (non-enumerable) as `[Symbol.iterator]` (`URLSearchParams.prototype.entries`);
+//! - `hint(js(iterator))` on a class makes its prototype inherit `%IteratorPrototype%` and
+//!   drops the prototype's `constructor`, as the prototype of a built-in iterator has it;
+//!   its `#[proto(next)]` is the iterator's `next`.
 //!
 //! # Lazy globals (JS host)
 //! `ctx.install_module_lazy::<M>()` (`Engine::define_lazy_globals`, `lumen_host::lazy_globals`)

@@ -10,7 +10,8 @@
 //!   `atob` / `btoa`: native classes and ops in `lumen_host::encoding`, published lazily
 //! - [x] `structuredClone` (objects/arrays/cycles, Date, RegExp, Map, Set, Error,
 //!   ArrayBuffer, typed arrays; no transfer list)
-//! - [x] `URL` / `URLSearchParams` (see url.rs for the parser's declared subset — no IDNA)
+//! - [x] `URL` / `URLSearchParams`: native classes in `lumen_host::url` over the WHATWG parser in
+//!   `lumen_common::url`, published lazily
 //! - [x] `performance.now()` (+`timeOrigin`), `navigator.userAgent`
 //! - [x] `crypto.getRandomValues` / `crypto.randomUUID` (the OS CSPRNG via
 //!   `lumen_os::proc::entropy`), `crypto.subtle.digest` (SHA-1/256/384/512): native classes in
@@ -726,6 +727,7 @@ pub fn extension() -> Extension {
             lumen_host::namespace::<perf::Module>,
             url_namespace,
             lumen_host::lazy_globals::<lumen_host::encoding::bindings::Module>,
+            lumen_host::lazy_globals::<lumen_host::url::bindings::Module>,
             lumen_host::lazy_globals::<lumen_host::webcrypto::bindings::Module>,
             lumen_host::namespace::<http_ops::Module>,
             lumen_host::namespace::<server::Module>,
@@ -781,7 +783,7 @@ mod perf {
 
 fn url_namespace(ctx: &mut Ctx) -> Result<(), Value> {
     let ns = ctx.namespace_object("__url");
-    ctx.install_module::<lumen_host::url::bindings::Module>(&ns)
+    ctx.install_module::<lumen_host::url::natives::Module>(&ns)
 }
 
 // ---- crypto ----

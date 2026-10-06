@@ -5,70 +5,9 @@
 //! first touches one of the names.
 #[lumen_bind::module(name = "webEncoding")]
 pub mod bindings {
+    use crate::webidl::{coded, received_suffix};
     use lumen::embed::{Ctx, OpError, OpResult, TaKind, This, Value};
     use std::{cell::RefCell, rc::Rc};
-
-    fn coded(error: OpError, code: &'static str) -> OpError {
-        error.with_code(code)
-    }
-
-    /// Node's `Received ...` tail for argument type errors.
-    fn received_suffix(ctx: &mut Ctx, value: &Value) -> String {
-        match value {
-            Value::Null => return " Received null".into(),
-            Value::Undefined => return " Received undefined".into(),
-            _ => {}
-        }
-        if value.is_callable() {
-            let name = ctx
-                .member_get(value, "name")
-                .ok()
-                .and_then(|name| ctx.coerce_string(&name).ok())
-                .unwrap_or_default();
-            return format!(" Received function {name}");
-        }
-        if matches!(value, Value::Obj(_)) {
-            let name = ctx
-                .member_get(value, "constructor")
-                .ok()
-                .filter(|constructor| matches!(constructor, Value::Obj(_)))
-                .and_then(|constructor| ctx.member_get(&constructor, "name").ok())
-                .and_then(|name| ctx.coerce_string(&name).ok())
-                .filter(|name| !name.is_empty());
-            return match name {
-                Some(name) => format!(" Received an instance of {name}"),
-                None => " Received [Object: null prototype] {}".into(),
-            };
-        }
-        let kind = value.type_of();
-        let text = if kind == "symbol" {
-            let global = ctx.global_object();
-            let string = ctx.member_get(&global, "String").unwrap_or(Value::Undefined);
-            ctx.invoke(string, Value::Undefined, &[value.clone()])
-                .ok()
-                .and_then(|text| ctx.coerce_string(&text).ok())
-                .unwrap_or_default()
-        } else {
-            ctx.coerce_string(value).unwrap_or_default()
-        };
-        let mut shown = if kind == "string" {
-            let units = lumen_common::smuggle::utf16_units(&text);
-            if units.len() > 28 {
-                format!(
-                    "'{}...'",
-                    lumen_common::smuggle::utf16_from_units(&units[..25])
-                )
-            } else {
-                format!("'{text}'")
-            }
-        } else {
-            text.to_string()
-        };
-        if kind == "bigint" {
-            shown.push('n');
-        }
-        format!(" Received type {kind} ({shown})")
-    }
 
     /// An `options` argument: absent, `null` or an object. Anything else is Node's
     /// `ERR_INVALID_ARG_TYPE`.

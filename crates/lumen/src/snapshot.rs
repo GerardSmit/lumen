@@ -2465,10 +2465,8 @@ mod tests {
         for file in [
             "events.js",
             "encoding.js",
-            "url.js",
             "fetch.js",
             "server.js",
-            "crypto.js",
         ] {
             let src = std::fs::read_to_string(format!("{dir}{file}")).unwrap();
             assert_roundtrips(&src);

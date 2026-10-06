@@ -40,6 +40,7 @@ pub mod sysfs;
 /// `Date.now()`), where `std::time::Instant::now()` panics.
 pub mod time;
 pub mod url;
+pub mod webidl;
 #[cfg(feature = "webcrypto")]
 pub mod webcrypto;
 

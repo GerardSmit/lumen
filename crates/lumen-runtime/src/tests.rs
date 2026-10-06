@@ -3306,3 +3306,47 @@ fn bun_hash_matches_bun_through_the_glue() {
         ]
     );
 }
+
+#[test]
+fn node_url_module_uses_native_url_classes() {
+    let (mut rt, out, err) = test_runtime();
+    eval_ok(
+        &mut rt,
+        r#"
+        const url = require('url');
+        const util = require('util');
+        const buffer = require('buffer');
+        console.log(url.URL === URL, url.URLSearchParams === URLSearchParams);
+        console.log(url.domainToASCII('español.com'), url.domainToUnicode('xn--espaol-zwa.com'));
+        console.log(url.format(new URL('https://a:b@測試.com/p?q=1#h'), { fragment: false, unicode: true, auth: false, search: false }));
+        console.log(url.fileURLToPath('file:///tmp/a%20b'), url.pathToFileURL('/tmp/a b').href);
+        console.log(util.inspect(new URL('http://u@a.com:81/p?x=1#f')).split('\n')[0]);
+        console.log(util.inspect(new URLSearchParams('a=1&b=2')));
+        console.log(util.inspect(new URLSearchParams('a=1').keys()));
+        const blob = new Blob(['x']);
+        const id = URL.createObjectURL(blob);
+        console.log(buffer.resolveObjectURL(id) !== undefined);
+        URL.revokeObjectURL(id);
+        console.log(buffer.resolveObjectURL(id) === undefined);
+        try { new URL('bad'); } catch (e) { console.log(e.code, e.input); }
+        try { url.fileURLToPath('http://a/'); } catch (e) { console.log(e.code); }
+        "#,
+    );
+    assert!(err.lines().is_empty(), "stderr: {:?}", err.lines());
+    assert_eq!(
+        out.lines(),
+        [
+            "true true",
+            "xn--espaol-zwa.com español.com",
+            "https://測試.com/p",
+            "/tmp/a b file:///tmp/a%20b",
+            "URL {",
+            "URLSearchParams { 'a' => '1', 'b' => '2' }",
+            "URLSearchParams Iterator { 'a' }",
+            "true",
+            "true",
+            "ERR_INVALID_URL bad",
+            "ERR_INVALID_URL_SCHEME",
+        ]
+    );
+}

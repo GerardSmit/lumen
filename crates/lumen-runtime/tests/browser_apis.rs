@@ -579,3 +579,149 @@ fn web_crypto_globals_keep_web_idl_shape() {
     );
     assert_script(&mut runtime, "digestError === 'NotSupportedError'");
 }
+
+#[test]
+fn url_classes_keep_web_idl_shape() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        r##"['URL', 'URLSearchParams'].every((name) => { const d = Object.getOwnPropertyDescriptor(globalThis, name); return d.writable && d.configurable && !d.enumerable; })"##,
+        "URL.length === 1 && URLSearchParams.length === 0",
+        "Object.prototype.toString.call(new URL('http://a/')) === '[object URL]'",
+        "Object.prototype.toString.call(new URLSearchParams()) === '[object URLSearchParams]'",
+        r##"['href', 'origin', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'searchParams', 'hash'].every((name) => { const d = Object.getOwnPropertyDescriptor(URL.prototype, name); return d.enumerable && d.configurable && typeof d.get === 'function'; })"##,
+        r##"['href', 'protocol', 'username', 'password', 'host', 'hostname', 'port', 'pathname', 'search', 'hash'].every((name) => typeof Object.getOwnPropertyDescriptor(URL.prototype, name).set === 'function')"##,
+        "['origin', 'searchParams'].every((name) => Object.getOwnPropertyDescriptor(URL.prototype, name).set === undefined)",
+        r##"['toString', 'toJSON'].every((name) => Object.getOwnPropertyDescriptor(URL.prototype, name).enumerable)"##,
+        r##"['parse', 'canParse', 'createObjectURL', 'revokeObjectURL'].every((name) => { const d = Object.getOwnPropertyDescriptor(URL, name); return d.enumerable && d.writable && d.configurable; })"##,
+        r##"['append', 'delete', 'get', 'getAll', 'has', 'set', 'sort', 'entries', 'forEach', 'keys', 'values', 'toString', 'size'].every((name) => Object.getOwnPropertyDescriptor(URLSearchParams.prototype, name).enumerable)"##,
+        "URLSearchParams.prototype[Symbol.iterator] === URLSearchParams.prototype.entries",
+        "!Object.getOwnPropertyDescriptor(URLSearchParams.prototype, Symbol.iterator).enumerable",
+        "URLSearchParams.prototype.append.length === 2 && URLSearchParams.prototype.delete.length === 1 && URLSearchParams.prototype.has.length === 1 && URLSearchParams.prototype.forEach.length === 1",
+        "URL.parse.length === 1 && URL.canParse.length === 1",
+        "(() => { class Mine extends URL {} const u = new Mine('http://a/x'); return u instanceof Mine && u.pathname === '/x'; })()",
+        "(() => { try { URL('http://a/'); } catch (e) { return e instanceof TypeError; } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn url_getters_setters_and_statics() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        r##"(() => { const u = new URL('HTTPS://user:pw@Example.COM:8443/a/b?x=1#frag'); return [u.href, u.origin, u.protocol, u.username, u.password, u.host, u.hostname, u.port, u.pathname, u.search, u.hash].join('|') === 'https://user:pw@example.com:8443/a/b?x=1#frag|https://example.com:8443|https:|user|pw|example.com:8443|example.com|8443|/a/b|?x=1|#frag'; })()"##,
+        "String(new URL('http://a/?')) === 'http://a/?' && new URL('http://a/?').search === '' && new URL('http://a/#').hash === ''",
+        "JSON.stringify({ u: new URL('http://a/b') }) === '{\"u\":\"http://a/b\"}' && new URL('http://a/b').toJSON() === 'http://a/b'",
+        "new URL('../c?q', 'http://ex.com/a/b/').href === 'http://ex.com/a/c?q'",
+        "new URL('about:blank').host === '' && new URL('file:///c/d').origin === 'null' && new URL('blob:https://ex.com/id').origin === 'https://ex.com'",
+        "(() => { const u = new URL('http://a/'); u.protocol = 'https'; u.username = 'x y'; u.password = 'p'; u.hostname = 'b.org'; u.port = '99'; u.pathname = '/p q'; u.search = 'k=v w'; u.hash = 'h h'; return u.href === 'https://x%20y:p@b.org:99/p%20q?k=v%20w#h%20h'; })()",
+        "(() => { const u = new URL('http://a:81/'); u.host = 'c.net:82'; const first = u.host; u.port = '80'; return first === 'c.net:82' && u.href === 'http://c.net/'; })()",
+        "(() => { const u = new URL('http://a/'); u.port = 'bad'; u.hostname = ''; u.protocol = '1x'; return u.href === 'http://a/'; })()",
+        "(() => { const u = new URL('http://a/'); try { u.href = 'not a url'; } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_URL' && e.input === 'not a url' && u.href === 'http://a/'; } return false; })()",
+        "(() => { try { new URL('nope'); } catch (e) { return e instanceof TypeError && e.message === 'Invalid URL' && e.code === 'ERR_INVALID_URL' && e.input === 'nope' && !('base' in e); } return false; })()",
+        "(() => { try { new URL('/x', 'also bad'); } catch (e) { return e.code === 'ERR_INVALID_URL' && e.input === '/x' && e.base === 'also bad'; } return false; })()",
+        "(() => { try { new URL(); } catch (e) { return e instanceof TypeError && e.code === 'ERR_MISSING_ARGS' && e.message === 'The \"url\" argument must be specified'; } return false; })()",
+        "(() => { try { URL.parse(); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+        "(() => { try { new URL({ toString() { throw new RangeError('boom'); } }); } catch (e) { return e instanceof RangeError; } return false; })()",
+        "URL.parse('nope') === null && URL.parse('/x', 'http://a/') instanceof URL && URL.parse('/x', 'http://a/').href === 'http://a/x' && URL.parse('/x', 'bad') === null",
+        "URL.canParse('http://a') && !URL.canParse('/x') && URL.canParse('/x', 'http://a') && !URL.canParse('/x', 'bad')",
+        "(() => { try { URL.canParse(); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+        "new URL('http://a/\\ud800').pathname === '/%EF%BF%BD'",
+        "(() => { const getter = Object.getOwnPropertyDescriptor(URL.prototype, 'href').get; try { getter.call({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { const setter = Object.getOwnPropertyDescriptor(URL.prototype, 'hash').set; try { setter.call(new URLSearchParams(), 'x'); } catch (e) { return e.code === 'ERR_INVALID_THIS'; } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn url_search_params_stay_linked_to_their_url() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const u = new URL('http://a/?q=1'); return u.searchParams === u.searchParams && u.searchParams instanceof URLSearchParams; })()",
+        "(() => { const u = new URL('http://a/?q=1'); u.searchParams.append('a', 'b c'); return u.search === '?q=1&a=b+c' && u.href === 'http://a/?q=1&a=b+c'; })()",
+        "(() => { const u = new URL('http://a/?q=1&q=2&r=3'); const sp = u.searchParams; sp.delete('q'); sp.set('r', '4'); return u.search === '?r=4'; })()",
+        "(() => { const u = new URL('http://a/?q=1#h'); u.searchParams.delete('q'); return u.href === 'http://a/#h' && u.search === ''; })()",
+        "(() => { const u = new URL('http://a/?b=2&a=1'); u.searchParams.sort(); return u.search === '?a=1&b=2'; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; u.search = '?z=9&z=8'; return sp.get('q') === null && sp.getAll('z').join() === '9,8' && sp.size === 2; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; u.href = 'http://b/?k=v'; return sp.get('k') === 'v' && sp.get('q') === null; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; u.search = ''; return sp.size === 0 && u.searchParams === sp; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; u.pathname = '/other'; u.hash = 'x'; return sp.get('q') === '1' && u.search === '?q=1'; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const it = u.searchParams.keys(); u.search = '?x=1&y=2'; return [...it].join() === 'x,y'; })()",
+        "(() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; const detached = new URLSearchParams(sp); detached.append('z', '1'); return u.search === '?q=1' && sp.size === 1; })()",
+        "(() => { const sp = new URL('http://a/?q=1').searchParams; return sp.toString() === 'q=1'; })()",
+        "(() => { const u = Object.freeze(new URL('http://a/?q=1')); u.searchParams.append('a', '1'); return u.search === '?q=1&a=1'; })()",
+        "(() => { const u = new URL('http://a/?q=1'); u.searchParams.append('k', 'v'); return JSON.stringify(Object.keys(u.searchParams)) === '[]' && u.searchParams.has('k', 'v') && !u.searchParams.has('k', 'w'); })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+    evaluate(
+        &mut runtime,
+        "globalThis.weak = (() => { const u = new URL('http://a/?q=1'); const sp = u.searchParams; sp.__keep = u; return new WeakRef(sp); })();",
+    );
+    runtime.engine().collect_garbage();
+    runtime.engine().collect_garbage();
+    assert_script(&mut runtime, "weak.deref() === undefined");
+}
+
+#[test]
+fn url_search_params_constructor_and_operations() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "new URLSearchParams().toString() === '' && new URLSearchParams(undefined).size === 0 && new URLSearchParams(null).size === 0",
+        "new URLSearchParams('?a=1&b=2').toString() === 'a=1&b=2' && new URLSearchParams('??a=1').get('?a') === '1'",
+        "(() => { const sp = new URLSearchParams('a=1&&b&=c&d=e=f&g=%E4%F6&h=x+y%20z'); return [sp.get('a'), sp.get('b'), sp.get(''), sp.get('d'), sp.get('g'), sp.get('h')].join('|') === '1||c|e=f|\\ufffd\\ufffd|x y z'; })()",
+        "new URLSearchParams({ a: '1', b: 2 }).toString() === 'a=1&b=2'",
+        "new URLSearchParams([['a', '1'], ['b', '2'], ['a', '3']]).toString() === 'a=1&b=2&a=3'",
+        "new URLSearchParams(new Map([['a', '1']])).toString() === 'a=1'",
+        "new URLSearchParams(new URLSearchParams('x=1&x=2')).getAll('x').join() === '1,2'",
+        "new URLSearchParams([['a', 'b'][Symbol.iterator]()].map((it) => it)).toString() === 'a=b'",
+        "(() => { const record = { b: '1' }; Object.defineProperty(record, 'hidden', { value: 'x', enumerable: false }); const plain = new URLSearchParams(record).toString() === 'b=1'; record[Symbol.for('s')] = 'y'; try { new URLSearchParams(record); } catch (e) { return plain && e instanceof TypeError && e.message === 'Cannot convert a Symbol value to a string'; } return false; })()",
+        "new URLSearchParams({ a: '\\ud800' }).get('a') === '\\ufffd' && new URLSearchParams([['\\udc00', 'x']]).has('\\ufffd')",
+        "(() => { const sp = new URLSearchParams('b=2&a=1&a=0&c=9'); sp.append('d', 'x y'); sp.set('a', 'z'); sp.delete('c'); return sp.toString() === 'b=2&a=z&d=x+y' && sp.size === 3; })()",
+        "(() => { const sp = new URLSearchParams('a=1&a=2&b=1'); sp.delete('a', '2'); const kept = sp.toString(); sp.delete('b', undefined); return kept === 'a=1&b=1' && sp.toString() === 'a=1'; })()",
+        "(() => { const sp = new URLSearchParams('a=1&a=2'); return sp.has('a') && sp.has('a', '2') && !sp.has('a', '3') && sp.has('a', undefined) && !sp.has('b') && sp.get('a') === '1' && sp.get('b') === null && sp.getAll('a').join() === '1,2' && sp.getAll('b').length === 0; })()",
+        "(() => { const sp = new URLSearchParams('a=null'); return sp.has('a', null) === true && sp.set('n', null) === undefined && sp.get('n') === 'null'; })()",
+        "(() => { const sp = new URLSearchParams('b=1&\\uE000=3&\\ud83d\\ude00=2&a=0&b=0'); sp.sort(); return [...sp.keys()].join() === 'a,b,b,\\ud83d\\ude00,\\uE000' && sp.getAll('b').join() === '1,0'; })()",
+        "(() => { const sp = new URLSearchParams('a=1&b=2'); const seen = []; sp.forEach(function (value, key, owner) { seen.push(key + value + (owner === sp) + (this.tag)); }, { tag: 't' }); return seen.join() === 'a1truet,b2truet'; })()",
+        "(() => { const sp = new URLSearchParams('a=1&b=2&c=3'); const seen = []; sp.forEach((value, key) => { seen.push(key); if (key === 'a') sp.delete('b'); }); return seen.join() === 'a,c'; })()",
+        "(() => { const sp = new URLSearchParams('a=1&b=2'); return [...sp].map((p) => p.join('=')).join('&') === 'a=1&b=2' && [...sp.keys()].join() === 'a,b' && [...sp.values()].join() === '1,2' && [...sp.entries()].length === 2; })()",
+        "(() => { const sp = new URLSearchParams('a=1'); const it = sp.entries(); const first = it.next(); sp.append('b', '2'); const second = it.next(); const third = it.next(); return first.value.join() === 'a,1' && second.value.join() === 'b,2' && third.done && third.value === undefined; })()",
+        "(() => { const it = new URLSearchParams('a=1').keys(); return it[Symbol.iterator]() === it && Object.prototype.toString.call(it) === '[object URLSearchParams Iterator]'; })()",
+        "(() => { const it = new URLSearchParams().keys(); const proto = Object.getPrototypeOf(it); const iteratorProto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())); return Object.getPrototypeOf(proto) === iteratorProto && Object.getOwnPropertyDescriptor(proto, 'next').enumerable && proto.hasOwnProperty('constructor') === false && proto[Symbol.toStringTag] === 'URLSearchParams Iterator'; })()",
+        "(() => { const it = new URLSearchParams('a=1').keys(); try { it.next.call({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { try { URLSearchParams.prototype.get.call({}, 'a'); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_THIS' && e.message === 'Value of \"this\" must be of type URLSearchParams'; } return false; })()",
+        "(() => { try { Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'size').get.call(null); } catch (e) { return e.code === 'ERR_INVALID_THIS'; } return false; })()",
+        "(() => { const sp = new URLSearchParams(); const errors = []; for (const run of [() => sp.append('a'), () => sp.set('a'), () => sp.get(), () => sp.getAll(), () => sp.has(), () => sp.delete()]) { try { run(); } catch (e) { errors.push(e instanceof TypeError && e.code === 'ERR_MISSING_ARGS' ? e.message : 'bad'); } } return errors.join('|') === 'The \"name\" and \"value\" arguments must be specified|The \"name\" and \"value\" arguments must be specified|The \"name\" argument must be specified|The \"name\" argument must be specified|The \"name\" argument must be specified|The \"name\" argument must be specified'; })()",
+        "(() => { const codes = []; for (const init of [[['a']], [['a', 'b', 'c']], [null], [1], ['ab'], [new Set(['a'])]]) { try { new URLSearchParams(init); codes.push('none'); } catch (e) { codes.push(e instanceof TypeError ? e.code : 'bad'); } } return codes.join() === 'ERR_INVALID_TUPLE,ERR_INVALID_TUPLE,ERR_INVALID_TUPLE,ERR_INVALID_TUPLE,ERR_INVALID_TUPLE,ERR_INVALID_TUPLE'; })()",
+        "(() => { try { new URLSearchParams({ [Symbol.iterator]: 1 }); } catch (e) { return e instanceof TypeError && e.code === 'ERR_ARG_NOT_ITERABLE' && e.message === 'Query pairs must be iterable'; } return false; })()",
+        "(() => { try { new URLSearchParams([['a', Symbol()]]); } catch (e) { return e instanceof TypeError && e.code === undefined; } return false; })()",
+        "(() => { try { new URLSearchParams().forEach(1); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE' && e.message === 'The \"callback\" argument must be of type function. Received type number (1)'; } return false; })()",
+        "(() => { try { new URLSearchParams().forEach(); } catch (e) { return e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
+        "(() => { const sp = new URLSearchParams(); sp.append(1, { toString() { return 'two'; } }); return sp.toString() === '1=two'; })()",
+        "(() => { const sp = new URLSearchParams('a=1'); sp.append({ toString() { sp.delete('a'); return 'k'; } }, 'v'); return sp.toString() === 'k=v'; })()",
+        "(() => { const sp = new URLSearchParams(); sp.append('é €', '😀*-._~!'); return sp.toString() === '%C3%A9+%E2%82%AC=%F0%9F%98%80*-._%7E%21'; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}
+
+#[test]
+fn url_inspect_hooks_and_object_urls() {
+    let mut runtime = Runtime::new_browser();
+    for expression in [
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); return typeof URL.prototype[sym] === 'function' && typeof URLSearchParams.prototype[sym] === 'function' && !Object.getOwnPropertyDescriptor(URL.prototype, sym).enumerable; })()",
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const text = new URL('http://a/?x=1')[sym](2, {}, (value) => Object.keys(value).join() + '|' + String(value.searchParams.get('x')) + '|' + value.constructor.name); return text === 'URL href,origin,protocol,username,password,host,hostname,port,pathname,search,searchParams,hash|1|URL'; })()",
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const url = new URL('http://a/'); return url[sym](-1, {}, () => '') === url; })()",
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const options = { breakLength: 80, stylize: (text) => text }; const inspect = (value) => JSON.stringify(value); return new URLSearchParams('a=1&b=2')[sym](2, options, inspect) === 'URLSearchParams { \"a\" => \"1\", \"b\" => \"2\" }' && new URLSearchParams()[sym](2, options, inspect) === 'URLSearchParams {}' && new URLSearchParams('a=1')[sym](-1, { stylize: (text, style) => text + ':' + style }, inspect) === '[Object]:special'; })()",
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const options = { breakLength: 3, stylize: (text) => text }; return new URLSearchParams('a=1&b=2')[sym](2, options, (value) => JSON.stringify(value)) === 'URLSearchParams {\\n  \"a\" => \"1\",\\n  \"b\" => \"2\" }'; })()",
+        "(() => { const sym = Symbol.for('nodejs.util.inspect.custom'); const it = new URLSearchParams('a=1&b=2').entries(); it.next(); return it[sym](2, { stylize: (text) => text }, (value) => JSON.stringify(value)) === 'URLSearchParams Iterator { [\"b\",\"2\"] }'; })()",
+        "(() => { const blob = new Blob(['hello'], { type: 'text/plain' }); const url = URL.createObjectURL(blob); const id = url.slice('blob:nodedata:'.length); const registry = Blob[Symbol.for('lumen.blob.internals')].objectURLs; const before = registry.get(id) === blob; URL.revokeObjectURL(url); return url.startsWith('blob:nodedata:') && before && registry.get(id) === undefined; })()",
+        "(() => { URL.revokeObjectURL('http://a/'); URL.revokeObjectURL('nope'); URL.revokeObjectURL('blob:nodedata:unknown'); return true; })()",
+        "(() => { try { URL.createObjectURL({}); } catch (e) { return e instanceof TypeError && e.code === 'ERR_INVALID_ARG_TYPE' && e.message === 'The \"obj\" argument must be an instance of Blob. Received an instance of Object'; } return false; })()",
+        "(() => { try { URL.createObjectURL(); } catch (e) { return e.code === 'ERR_INVALID_ARG_TYPE'; } return false; })()",
+        "(() => { try { URL.revokeObjectURL(); } catch (e) { return e.code === 'ERR_MISSING_ARGS'; } return false; })()",
+    ] {
+        assert_script(&mut runtime, expression);
+    }
+}

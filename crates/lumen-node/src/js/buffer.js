@@ -849,7 +849,7 @@ function resolveObjectURL(url) {
     if (split.length !== 2) return;
     const [base, id] = split;
     if (base !== "nodedata") return;
-    const blob = URL[Symbol.for("lumen.url.internals")].objectURLs.get(id);
+    const blob = globalThis.Blob[Symbol.for("lumen.blob.internals")].objectURLs.get(id);
     if (blob === undefined) return;
     return blob.slice(0, blob.size, blob.type);
   } catch {

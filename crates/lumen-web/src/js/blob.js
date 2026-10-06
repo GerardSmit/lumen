@@ -118,18 +118,36 @@ class Blob {
   }
 }
 
-// Typed browser-host bridge. It is intentionally an internal symbol rather
-// than a public Blob method; URL.createObjectURL snapshots these immutable
-// bytes into the per-interpreter managed-resource registry.
+// Internal bridge, intentionally an internal symbol rather than a public Blob method. The native
+// URL.createObjectURL / revokeObjectURL call `createObjectURL` / `revokeObjectURL`; `objectURLs`
+// ("nodedata" id -> Blob) is also what node's buffer.resolveObjectURL reads. `snapshot` hands the
+// immutable bytes to the per-interpreter managed-resource registry of a browser host.
+const objectURLs = new Map();
+function snapshotBlob(blob) {
+  if (!(blob instanceof Blob)) throw new TypeError("expected Blob");
+  return { bytes: blob[kBlobBytes].slice(), type: blob[kBlobType] };
+}
 Object.defineProperty(Blob, Symbol.for("lumen.blob.internals"), {
   value: Object.freeze({
-    snapshot(blob) {
-      if (!(blob instanceof Blob)) throw new TypeError("expected Blob");
-      const bytes = blob[kBlobBytes];
-      return {
-        bytes: bytes.slice(),
-        type: blob[kBlobType],
-      };
+    snapshot: snapshotBlob,
+    objectURLs,
+    createObjectURL(blob) {
+      if (!(blob instanceof Blob)) return null;
+      let id;
+      if (typeof globalThis.__lumenCreateObjectURL === "function") {
+        const snapshot = snapshotBlob(blob);
+        id = globalThis.__lumenCreateObjectURL(snapshot.bytes, snapshot.type);
+      } else if (typeof globalThis.crypto?.randomUUID === "function") {
+        id = globalThis.crypto.randomUUID();
+      } else {
+        throw new Error("secure object URL identifier source is unavailable");
+      }
+      objectURLs.set(id, blob);
+      return `blob:nodedata:${id}`;
+    },
+    revokeObjectURL(id) {
+      objectURLs.delete(id);
+      if (typeof globalThis.__lumenRevokeObjectURL === "function") globalThis.__lumenRevokeObjectURL(id);
     },
   }),
 });

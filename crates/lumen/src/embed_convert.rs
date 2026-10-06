@@ -751,7 +751,7 @@ impl<'s> ArgCx<'s> {
             attach_instance(ctx, o, value);
             return Ok(self.this.clone());
         }
-        let Some((_, class_proto)) = registered_class::<T>(ctx) else {
+        let Some((_, class_proto)) = resolved_class::<T>(ctx) else {
             return Err(unregistered::<T>(ctx));
         };
         let proto = match &nt {
@@ -1012,6 +1012,45 @@ impl Interp {
     /// Array constructor or accepting the array-like fallback of Array.from.
     pub fn iterable_to_list(&mut self, value: &Value, max_items: usize) -> OpResult<Vec<Value>> {
         self.convert_iterable(value, max_items, |_, value| Ok(value))
+    }
+
+    /// The intrinsic `Reflect.ownKeys(target)`: string and symbol keys, in spec order, without
+    /// consulting the author-visible `Reflect`.
+    pub fn reflect_own_keys(&mut self, target: &Value) -> Result<Vec<Value>, Value> {
+        let keys = crate::builtins::reflect::reflect_own_keys(
+            self,
+            Value::Undefined,
+            std::slice::from_ref(target),
+        )?;
+        let length = match self.member_get(&keys, "length")? {
+            Value::Num(length) if length >= 0.0 => length as usize,
+            _ => 0,
+        };
+        (0..length)
+            .map(|index| self.member_get(&keys, &index.to_string()))
+            .collect()
+    }
+
+    /// The well-known symbol `Symbol.<name>` (`"iterator"`, `"toStringTag"`, ...).
+    pub fn well_known_symbol(&mut self, name: &str) -> Option<Value> {
+        let key = crate::builtins::well_known_key(self, name)?;
+        self.sym_from_key(&key)
+    }
+
+    /// `Symbol.for(key)`: the registry symbol, created on first use.
+    pub fn symbol_for(&mut self, key: &str) -> Value {
+        let data = match crate::interpreter::sym_for_get(key) {
+            Some(data) => data,
+            None => {
+                let symbol = self.new_symbol(Some(Rc::from(key)));
+                let Value::Sym(data) = symbol else {
+                    unreachable!("new_symbol must return a symbol")
+                };
+                crate::interpreter::sym_for_insert(key.to_string(), data.clone());
+                data
+            }
+        };
+        Value::Sym(data)
     }
 
     /// PromiseResolve with this realm's intrinsic Promise constructor.
@@ -1502,7 +1541,7 @@ impl Host for JsHost {
     }
 
     fn new_instance<T: Class>(ctx: &mut Interp, value: T) -> Result<Value, Value> {
-        match registered_class::<T>(ctx) {
+        match resolved_class::<T>(ctx) {
             Some((_, proto)) => Ok(new_instance(ctx, value, proto)),
             None => Err(unregistered::<T>(ctx)),
         }
@@ -2425,6 +2464,9 @@ impl Interp {
 #[derive(Default)]
 struct ClassRegistry {
     map: HashMap<(RealmKey, TypeId), (Value, Gc)>,
+    /// Classes of lazily installed modules not built yet, by realm and JS name, so a native
+    /// value of such a class can be wrapped before (or without) its global being read.
+    pending: HashMap<(RealmKey, &'static str), Make<JsHost>>,
 }
 
 /// A realm cache key owns the global whose address identifies that realm. Keeping a strong
@@ -3405,6 +3447,21 @@ fn registered_class<T: Class>(i: &Interp) -> Option<(Value, Gc)> {
         .cloned()
 }
 
+/// `T`'s registration, building it first when `T` belongs to a lazily installed module.
+fn resolved_class<T: Class>(i: &mut Interp) -> Option<(Value, Gc)> {
+    if let Some(entry) = registered_class::<T>(i) {
+        return Some(entry);
+    }
+    let key = (active_realm_key(i), class_name::<T>());
+    let make = i
+        .host_state
+        .get::<ClassRegistry>()
+        .and_then(|r| r.pending.get(&key))
+        .copied()?;
+    make(i).ok()?;
+    registered_class::<T>(i)
+}
+
 #[cold]
 fn unregistered<T: Class>(i: &mut Interp) -> Value {
     let msg = format!(
@@ -3505,7 +3562,17 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                 .get("prototype")
                 .and_then(|p| p.value().as_obj().cloned())
         });
-    let proto = Object::new(Some(base_proto.unwrap_or_else(|| i.object_proto.clone())));
+    let iterator_class = T::DESC.hint("js", "iterator").is_some();
+    let parent_proto = if iterator_class {
+        i.extra_protos.get("%IteratorPrototype%").cloned()
+    } else {
+        None
+    };
+    let proto = Object::new(Some(
+        parent_proto
+            .or(base_proto)
+            .unwrap_or_else(|| i.object_proto.clone()),
+    ));
     let ctor_fn = match members.iter().find(|m| m.desc.role == Role::Constructor) {
         Some(m) => {
             register_op(i, m);
@@ -3529,6 +3596,9 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
         "constructor",
         Property::data(Value::Obj(ctor.clone()), true, false, true),
     );
+    if iterator_class {
+        proto.borrow_mut().props.remove("constructor");
+    }
     crate::builtins::set_to_string_tag(i, &proto, name);
     // Accessors: pair getters and setters by name.
     let mut accessors: Vec<(Cow<'static, str>, Option<Value>, Option<Value>)> = Vec::new();
@@ -3563,6 +3633,17 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
                 if webidl {
                     if let Some(property) = proto.borrow_mut().props.get_mut(&*js) {
                         property.set_enumerable(true);
+                    }
+                }
+                if d.hint("js", "also_iterator").is_some() {
+                    let method = proto.borrow().props.get(&*js).map(|property| property.value());
+                    if let (Some(method), Some(key)) =
+                        (method, crate::builtins::well_known_key(i, "iterator"))
+                    {
+                        proto
+                            .borrow_mut()
+                            .props
+                            .insert(key, Property::builtin(method));
                     }
                 }
             }
@@ -3632,16 +3713,8 @@ fn class_entry<T: Methods<JsHost>>(i: &mut Interp) -> (Value, Gc) {
 
 /// The property key of the registry symbol `Symbol.for(description)`.
 fn symbol_for_key(i: &mut Interp, description: &str) -> String {
-    let data = match crate::interpreter::sym_for_get(description) {
-        Some(data) => data,
-        None => {
-            let symbol = i.new_symbol(Some(Rc::from(description)));
-            let Value::Sym(data) = symbol else {
-                unreachable!("new_symbol must return a symbol")
-            };
-            crate::interpreter::sym_for_insert(description.to_string(), data.clone());
-            data
-        }
+    let Value::Sym(data) = i.symbol_for(description) else {
+        unreachable!("symbol_for must return a symbol")
     };
     Interp::sym_key(&data)
 }
@@ -3755,6 +3828,19 @@ fn install_items_lazy(ctx: &mut Interp, items: ModuleItems<JsHost>) -> Result<()
         .filter(|c| c.desc.exposed_to("js"))
         .map(|c| c.object)
         .collect();
+    if !ctx.host_state.has::<ClassRegistry>() {
+        ctx.host_state.put(ClassRegistry::default());
+    }
+    let realm = active_realm_key(ctx);
+    // `skip(js)` classes have no global but are still value types (e.g. iterators), so they
+    // must be buildable on demand too.
+    for c in items.classes.iter() {
+        ctx.host_state
+            .get_mut::<ClassRegistry>()
+            .unwrap()
+            .pending
+            .insert((realm.clone(), c.desc.name_for("js")), c.object);
+    }
     for k in &items.constants {
         let item = LazyItem::Constant(k.value, classes.clone());
         published.push((k.name.to_string(), item, k.enumerable));
