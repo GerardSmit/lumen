@@ -1,5 +1,5 @@
 //! Event delivery for a host that has no event loop of its own and instead gives each realm a
-//! turn from its own scheduler (the Bitnest kernel's shell). Design: `docs/plans/native-workers.md`.
+//! turn from its own scheduler (the Bitnest kernel's shell). Design: `docs/native-workers.md`.
 //!
 //! A realm installs the loop with [`install`]; from then on everything that completes through the
 //! realm's [`CompletionSender`] (port wakes, worker control events) is counted, queued on an

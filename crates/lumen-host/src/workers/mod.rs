@@ -1,5 +1,5 @@
 //! `Worker`, `SharedWorker` and the worker global scopes as native classes over a host-supplied
-//! [`WorkerBackend`]. Design: `docs/plans/native-workers.md`.
+//! [`WorkerBackend`]. Design: `docs/native-workers.md`.
 //!
 //! - [`control`]: [`Control`], the `Send` event queue between a worker and the object that
 //!   represents it in another realm.

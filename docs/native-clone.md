@@ -10,7 +10,7 @@ are deleted.
 | Item | Contents |
 | --- | --- |
 | `structured_clone::bindings` | the `structuredClone` global (install with `lazy_globals`) |
-| `structured_clone::internals` | `__serializeForClone(value, transfer, transport, bridge)` and `__deserializeClone(bytes, bridge)`, for the worker glue and `worker_threads` (install with `lazy_globals`; they are globals, not a namespace) |
+| `structured_clone::internals` | `__serializeForClone(value, transfer, transport, bridge)` and `__deserializeClone(bytes, bridge)`, for `node:worker_threads` and tests (install with `lazy_globals`; they are globals, not a namespace) |
 | `structured_clone::serialize` / `deserialize` | the same halves for Rust embedders; `messaging::channel` calls them directly |
 | `structured_clone::structured_clone` | the local copy with a validated transfer list |
 | `clone_transfer` | attachments (`SharedArrayBuffer` memory, port endpoints) of the message being built or read; its `__cloneTransfer` namespace keeps only the capability checks the tests drive |

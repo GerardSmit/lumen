@@ -43,7 +43,6 @@ use lumen_host::OpError;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use lumen::embed::JsFunction;
@@ -51,7 +50,8 @@ use lumen_host::workers::{
     self, Control, DedicatedSpec, ScopeInstall, ScopeKind, SharedSpec, WorkerBackend, WorkerEvent,
     WorkerScopeHost,
 };
-use lumen_host::{CompletionSender, Ctx, Extension, TaskId, TaskRegistry, Value};
+use lumen_host::{Ctx, Extension, TaskId, TaskRegistry, Value};
+use lumen_os::channel::Pop;
 
 use crate::Runtime;
 use lumen_host::clone_transfer::{self, CloneMessage};
@@ -71,11 +71,11 @@ enum ToMain {
     Exited(i32),
 }
 
-/// Where a worker thread's reports go: a node worker's blocking inbox, a page `Worker`'s control,
-/// or the clients of a shared worker.
+/// Where a worker thread's reports go: the `Control` of a node worker's or page `Worker`'s parent
+/// object, or the clients of a shared worker.
 #[derive(Clone)]
 enum Parent {
-    Node(Sender<ToMain>),
+    Node(Control),
     Web(Control),
     Shared(Weak<SharedWorkerHost>),
 }
@@ -83,8 +83,13 @@ enum Parent {
 impl Parent {
     fn send(&self, event: ToMain) {
         match self {
-            Parent::Node(tx) => {
-                let _ = tx.send(event);
+            Parent::Node(control) => {
+                control.send(match event {
+                    ToMain::Online => WorkerEvent::Online,
+                    ToMain::OutOfMemory => WorkerEvent::OutOfMemory,
+                    ToMain::Error(message) => WorkerEvent::Error(message),
+                    ToMain::Exited(code) => WorkerEvent::Exit(code),
+                });
             }
             Parent::Web(control) => match event {
                 ToMain::Error(message) => {
@@ -122,14 +127,15 @@ struct WorkerEntry {
     node: Option<NodeLink>,
 }
 
-/// What a node worker's parent keeps: the sender whose drop wakes the worker's loop on terminate,
-/// and the `worker_threads` event callback with its loop-task bookkeeping.
+/// What a node worker's parent keeps: the control whose closing wakes the worker's loop on
+/// terminate, the control the worker reports on, and the `worker_threads` event callback with
+/// its loop-task bookkeeping.
 struct NodeLink {
-    to_worker: Option<Sender<()>>,
+    to_worker: Control,
+    events: Control,
     dispatch: Value,
-    /// Whether this worker's main-side inbox keeps the main loop alive (`worker.unref()` clears).
-    keep_alive: bool,
-    /// The currently armed inbox task, so `setRef` can re-mark it in flight.
+    /// The loop task listening on `events`; `setRef` re-marks it. It keeps the main loop alive
+    /// until the worker exits unless `worker.unref()` cleared that.
     inbox_task: Option<TaskId>,
 }
 
@@ -275,8 +281,8 @@ struct WorkerSpec {
     inside: Option<PortTransfer>,
     /// A shared worker's control, on which its clients connect.
     scope_control: Option<Control>,
-    /// Node mode: the receiver whose disconnect wakes the loop when the parent terminates.
-    node_inbox: Option<Receiver<()>>,
+    /// Node mode: the control whose closing wakes the loop when the parent terminates.
+    node_wake: Option<Control>,
 }
 
 /// Normalize a web Worker constructor URL and enforce the same-origin rule before starting its
@@ -398,7 +404,7 @@ impl WorkerBackend for ThreadBackend {
             parent: Parent::Web(spec.control),
             inside: Some(spec.inside),
             scope_control: None,
-            node_inbox: None,
+            node_wake: None,
         };
         let id = {
             let reg = registry(ctx);
@@ -525,7 +531,7 @@ fn get_or_start_shared_worker(
         parent: Parent::Shared(Arc::downgrade(&host)),
         inside: None,
         scope_control: Some(scope),
-        node_inbox: None,
+        node_wake: None,
     };
     if let Err(error) = start_thread(
         format!("lumen-shared-worker-{thread_id}"),
@@ -605,8 +611,8 @@ pub(crate) fn terminate_all(ctx: &mut Ctx) {
         for w in reg.workers.values_mut() {
             w.stop.store(true, Ordering::SeqCst);
             w.kill.store(true, Ordering::SeqCst);
-            if let Some(node) = &mut w.node {
-                node.to_worker = None;
+            if let Some(node) = &w.node {
+                node.to_worker.close();
             }
         }
         reg.shared_clients
@@ -621,36 +627,19 @@ pub(crate) fn terminate_all(ctx: &mut Ctx) {
     }
 }
 
-/// The worker→main inbox of a node worker, carried by value through each completion so the next
-/// receive re-arms.
-struct MainInbox {
-    id: u64,
-    rx: Receiver<ToMain>,
-}
-
-struct MainInboxResult {
-    id: u64,
-    event: ToMain,
-    inbox: Option<MainInbox>,
-}
-
-fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
-    let id = inbox.id;
-    let (dispatch, keep_alive) = match registry(ctx)
-        .workers
-        .get(&id)
-        .and_then(|w| w.node.as_ref())
-    {
-        Some(node) => (node.dispatch.clone(), node.keep_alive),
-        None => return, // already gone
+/// Listen for a node worker's reports on its `events` control, one per turn so a throwing
+/// `worker_threads` callback leaves the rest queued.
+fn listen_main_inbox(ctx: &mut Ctx, id: u64) -> Result<(), OpError> {
+    let callback = ctx.new_native_fn(
+        "",
+        0,
+        Rc::new(move |ctx: &mut Ctx, _this: Value, _: &[Value]| main_inbox_wake(ctx, id)),
+    );
+    let events = match registry(ctx).workers.get(&id).and_then(|w| w.node.as_ref()) {
+        Some(node) => node.events.clone(),
+        None => return Ok(()),
     };
-    let task = lumen_host::register_task(ctx, dispatch, None, decode_main_inbox);
-    let reg = ctx
-        .host_mut::<TaskRegistry>()
-        .expect("task registry installed");
-    if !keep_alive {
-        reg.set_unref(task);
-    }
+    let task = events.listen(ctx, callback)?;
     if let Some(node) = registry(ctx)
         .workers
         .get_mut(&id)
@@ -658,47 +647,48 @@ fn arm_main_inbox(ctx: &mut Ctx, inbox: MainInbox) {
     {
         node.inbox_task = Some(task);
     }
-    let sender = ctx
-        .op_state()
-        .get::<CompletionSender>()
-        .expect("completion sender installed")
-        .clone();
-    sender.run_blocking(task, move || {
-        let event = inbox.rx.recv().unwrap_or(ToMain::Exited(1));
-        let done = matches!(event, ToMain::Exited(_));
-        Box::new(MainInboxResult {
-            id,
-            event,
-            inbox: (!done).then_some(inbox),
-        })
-    });
+    Ok(())
 }
 
-fn decode_main_inbox(
-    ctx: &mut Ctx,
-    payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    let MainInboxResult { id, event, inbox } = *payload
-        .downcast::<MainInboxResult>()
-        .expect("main inbox payload");
-    if let Some(inbox) = inbox {
-        arm_main_inbox(ctx, inbox);
-    }
-    match event {
-        ToMain::Online => Ok(vec![Value::from_string("online".into())]),
-        ToMain::OutOfMemory => Ok(vec![Value::from_string("oom".into())]),
-        ToMain::Error(msg) => Ok(vec![
-            Value::from_string("error".into()),
-            Value::from_string(msg),
-        ]),
-        ToMain::Exited(code) => {
-            registry(ctx).workers.remove(&id);
-            Ok(vec![
-                Value::from_string("exit".into()),
-                Value::Num(code as f64),
-            ])
+fn main_inbox_wake(ctx: &mut Ctx, id: u64) -> Result<Value, Value> {
+    let Some((events, dispatch, task)) = registry(ctx)
+        .workers
+        .get(&id)
+        .and_then(|w| w.node.as_ref())
+        .map(|node| (node.events.clone(), node.dispatch.clone(), node.inbox_task))
+    else {
+        return Ok(Value::Undefined);
+    };
+    let event = match events.pop() {
+        Pop::Message(event) => event,
+        Pop::Closed => {
+            if let Some(task) = task {
+                events.unlisten(ctx, task);
+            }
+            return Ok(Value::Undefined);
         }
-    }
+        Pop::Empty => return Ok(Value::Undefined),
+    };
+    let args = match event {
+        WorkerEvent::Online => vec![Value::from_string("online".into())],
+        WorkerEvent::OutOfMemory => vec![Value::from_string("oom".into())],
+        WorkerEvent::Error(message) => {
+            vec![Value::from_string("error".into()), Value::from_string(message)]
+        }
+        WorkerEvent::Exit(code) => {
+            registry(ctx).workers.remove(&id);
+            if let Some(task) = task {
+                events.unlisten(ctx, task);
+            }
+            vec![Value::from_string("exit".into()), Value::Num(code as f64)]
+        }
+        _ => {
+            events.rewake();
+            return Ok(Value::Undefined);
+        }
+    };
+    events.rewake();
+    ctx.invoke(dispatch, Value::Undefined, &args)
 }
 
 // ---- worker side ------------------------------------------------------------------------------
@@ -963,8 +953,8 @@ fn run_worker(mut spec: WorkerSpec, stop: Arc<AtomicBool>, kill: Arc<AtomicBool>
     parent.send(ToMain::Online);
 
     if spec.is_node {
-        let inbox = spec.node_inbox.take();
-        run_node_worker(&mut rt, &spec, inbox, &stop, &kill);
+        let wake = spec.node_wake.take();
+        run_node_worker(&mut rt, &spec, wake, &stop, &kill);
         exit.out_of_memory = rt.engine().heap_limit_hit();
         exit.code = if exit.out_of_memory {
             1
@@ -1084,7 +1074,7 @@ fn boot_node_worker(rt: &mut Runtime, spec: &mut WorkerSpec) -> Result<(), Strin
 fn run_node_worker(
     rt: &mut Runtime,
     spec: &WorkerSpec,
-    inbox: Option<Receiver<()>>,
+    wake: Option<Control>,
     stop: &AtomicBool,
     kill: &AtomicBool,
 ) {
@@ -1140,8 +1130,8 @@ fn run_node_worker(
     if kill.load(Ordering::SeqCst) || rt.halted() {
         return;
     }
-    if let Some(inbox) = inbox {
-        arm_terminate_wake(rt.engine().ctx(), inbox);
+    if let Some(wake) = wake {
+        arm_terminate_wake(rt.engine().ctx(), &wake);
     }
     rt.run_worker_loop(stop);
     let before_exit = hook(rt, "beforeExit");
@@ -1170,34 +1160,20 @@ fn worker_exit_code(rt: &mut Runtime) -> Option<i32> {
         .and_then(|w| w.exit_code)
 }
 
-/// An unref'd task that completes when the parent drops its sender (terminate), so a node
-/// worker blocked in its loop notices the stop flag at once instead of at the next poll.
-fn arm_terminate_wake(ctx: &mut Ctx, rx: Receiver<()>) {
+/// An unref'd listener on the control the parent closes on terminate, so a node worker blocked in
+/// its loop notices the stop flag at once instead of at the next poll.
+fn arm_terminate_wake(ctx: &mut Ctx, wake: &Control) {
     let nothing = ctx.new_native_fn(
         "",
         0,
         Rc::new(|_: &mut Ctx, _this: Value, _: &[Value]| Ok(Value::Undefined)),
     );
-    let task = lumen_host::register_task(ctx, nothing, None, decode_terminate_wake);
+    let Ok(task) = wake.listen(ctx, nothing) else {
+        return;
+    };
     ctx.host_mut::<TaskRegistry>()
         .expect("task registry installed")
         .set_unref(task);
-    let sender = ctx
-        .op_state()
-        .get::<CompletionSender>()
-        .expect("completion sender installed")
-        .clone();
-    sender.run_blocking(task, move || {
-        let _ = rx.recv();
-        Box::new(())
-    });
-}
-
-fn decode_terminate_wake(
-    _ctx: &mut Ctx,
-    _payload: Box<dyn std::any::Any + Send>,
-) -> Result<Vec<Value>, Value> {
-    Ok(Vec::new())
 }
 
 #[lumen_bind::module(name = "__wself")]
@@ -1291,8 +1267,8 @@ mod worker_ops {
             None
         };
         let init = init.map(|bytes| clone_transfer::take_message(ctx, bytes));
-        let (to_worker_tx, to_worker_rx) = channel::<()>();
-        let (to_main_tx, to_main_rx) = channel::<ToMain>();
+        let to_worker = Control::new();
+        let events = Control::new();
         let stop = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
         let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
@@ -1307,9 +1283,9 @@ mod worker_ops {
                     stop: Arc::clone(&stop),
                     kill: Arc::clone(&kill),
                     node: Some(NodeLink {
-                        to_worker: Some(to_worker_tx),
+                        to_worker: to_worker.clone(),
+                        events: events.clone(),
                         dispatch: dispatch.clone(),
-                        keep_alive: true,
                         inbox_task: None,
                     }),
                 },
@@ -1347,10 +1323,10 @@ mod worker_ops {
             shared_env,
             ports: Some((public_worker, internal_worker)),
             limits,
-            parent: Parent::Node(to_main_tx),
+            parent: Parent::Node(events),
             inside: None,
             scope_control: None,
-            node_inbox: Some(to_worker_rx),
+            node_wake: Some(to_worker),
         };
         start_thread(
             format!("lumen-worker-{thread_id}"),
@@ -1360,7 +1336,7 @@ mod worker_ops {
         )
         .expect("spawn worker thread");
 
-        arm_main_inbox(ctx, MainInbox { id, rx: to_main_rx });
+        listen_main_inbox(ctx, id).map_err(|error| error.to_value(ctx))?;
         let o = Value::Obj(ctx.new_object());
         let _ = ctx.set_member(&o, "id", Value::Num(id as f64));
         let _ = ctx.set_member(&o, "threadId", Value::Num(thread_id as f64));
@@ -1369,8 +1345,8 @@ mod worker_ops {
         Ok(o)
     }
 
-    /// `__lumenWorkerOps.terminate(id)` — set the shared stop flag and drop the worker's inbox
-    /// sender (so a blocked receive unblocks). The worker loop exits at its next poll and posts
+    /// `__lumenWorkerOps.terminate(id)` — set the shared stop flag and close the worker's wake
+    /// control (so a blocked loop wakes). The worker loop exits at its next poll and posts
     /// `Exited`, which is still delivered (the registry entry lives until then) so `'exit'` fires
     /// with the code.
     #[op(name = "terminate", coerce)]
@@ -1378,8 +1354,8 @@ mod worker_ops {
         if let Some(w) = registry(ctx).workers.get_mut(&(id as u64)) {
             w.stop.store(true, Ordering::SeqCst);
             w.kill.store(true, Ordering::SeqCst);
-            if let Some(node) = &mut w.node {
-                node.to_worker = None;
+            if let Some(node) = &w.node {
+                node.to_worker.close();
             }
         }
     }
@@ -1391,13 +1367,10 @@ mod worker_ops {
         let keep = keep.unwrap_or(false);
         let task = match registry(ctx)
             .workers
-            .get_mut(&(id as u64))
-            .and_then(|w| w.node.as_mut())
+            .get(&(id as u64))
+            .and_then(|w| w.node.as_ref())
         {
-            Some(node) => {
-                node.keep_alive = keep;
-                node.inbox_task
-            }
+            Some(node) => node.inbox_task,
             None => return,
         };
         if let (Some(task), Some(reg)) = (task, ctx.host_mut::<TaskRegistry>()) {

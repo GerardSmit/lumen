@@ -4,8 +4,9 @@
 `BroadcastChannel` and `Performance` (with the `performance` and `self` globals) are native
 `lumen_bind` classes in `lumen_host`. They replace `lumen-web`'s `messaging.js` and `platform.js`.
 `Worker`, `SharedWorker` and the worker global scopes are native too (`lumen_host::workers`).
-The kernel installs the same extensions (owner loop, ports, `clone_transfer`, `messaging`) and has no transport of its own for
-shared workers; service workers still use a kernel `Parcel` path until step 7 of the worker plan.
+The Bitnest kernel installs the same extensions (owner loop, ports, `clone_transfer`, `messaging`) and has no
+transport of its own: shared and service workers use these ports too. The design is in
+[native-workers.md](native-workers.md).
 
 ## Ownership
 
@@ -21,7 +22,7 @@ shared workers; service workers still use a kernel `Parcel` path until step 7 of
 Install `messaging::event_bindings::Module` and `messaging::channel_bindings::Module` with
 `lazy_globals`, `messaging::shared::Module` with `namespace`, and call
 `messaging::install_port_clone` and `performance::install_globals` as module initializers.
-`lumen-web`'s extension does all of this through `messaging::install` (also `messaging::extension()`, which the kernel will use); ports additionally need `lumen_host::ports::extension()`
+`lumen-web`'s extension does all of this through `messaging::install` (also `messaging::extension()`, which the kernel uses); ports additionally need `lumen_host::ports::extension()`
 and `clone_transfer::extension()` (the runtime lists them) and an event loop. `new MessageChannel()`
 without the ports extension throws a `TypeError`.
 
@@ -83,7 +84,7 @@ replaces. Nothing mutates a global any more.
   implicit port pair, so transfer lists work). The returned `NativeReceiver` posts, closes and
   pins.
 - `owner_loop` drives all of this in a host without an event loop; see
-  [plans/native-workers.md](plans/native-workers.md).
+  [native-workers.md](native-workers.md).
 
 ## BroadcastChannel
 

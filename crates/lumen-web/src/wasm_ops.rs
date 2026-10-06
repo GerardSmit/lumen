@@ -54,9 +54,6 @@ enum Kind {
 struct MemBuf {
     addr: usize,
     buf: Value,
-    /// The length captured by this buffer. Unshared growth detaches and replaces it; shared
-    /// growth preserves it and makes the next `memory.buffer` a new wrapper over the same bytes.
-    len: usize,
     shared: bool,
     generation: u64,
 }
@@ -88,7 +85,6 @@ fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
             ws.bufs[i] = MemBuf {
                 addr: b.addr,
                 buf,
-                len: m.bytes.len(),
                 shared: true,
                 generation: m.generation,
             };
@@ -99,7 +95,6 @@ fn refresh(ctx: &mut Ctx, mems: &[MemEntity]) {
             ws.bufs[i] = MemBuf {
                 addr: b.addr,
                 buf,
-                len: m.bytes.len(),
                 shared: false,
                 generation: m.generation,
             };
@@ -645,7 +640,6 @@ fn alloc_memory(
                 ws.bufs.push(MemBuf {
                     addr,
                     buf: buffer.clone(),
-                    len: initial_bytes,
                     shared: true,
                     generation: 0,
                 });
@@ -712,7 +706,6 @@ fn memory_buffer(ctx: &mut Ctx, addr: usize) -> OpResult<Value> {
     let store = std::mem::take(&mut ws.store);
     let r = match store.memories.get(addr) {
         Some(m) => {
-            let len = m.bytes.len();
             let (buf, shared) = if let Some(handle) = m
                 .bytes
                 .shared_handle()
@@ -726,7 +719,6 @@ fn memory_buffer(ctx: &mut Ctx, addr: usize) -> OpResult<Value> {
             ws.bufs.push(MemBuf {
                 addr,
                 buf: buf.clone(),
-                len,
                 shared,
                 generation: m.generation,
             });

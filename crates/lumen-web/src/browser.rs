@@ -176,9 +176,6 @@ pub(crate) mod websocket {
     use super::*;
     use crate::websocket_class::Outgoing;
 
-    #[derive(Default)]
-    pub(crate) struct WsRegistry;
-
     /// Open a browser `WebSocket`; the host pushes `open` / `text` / `binary` / `close` / `error`
     /// events for the returned id into `dispatch`.
     pub(crate) fn connect_socket(
@@ -252,9 +249,6 @@ pub(crate) mod websocket {
 
 pub(crate) mod server {
     use super::*;
-
-    #[derive(Default)]
-    pub(crate) struct ServerRegistry;
 
     pub(crate) use bindings::Module;
 

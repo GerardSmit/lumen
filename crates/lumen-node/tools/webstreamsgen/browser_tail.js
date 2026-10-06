@@ -2,16 +2,9 @@
 // modules; Node-only CompressionStream adapters are intentionally not published without a real
 // host zlib backend.
 const web = require('stream/web');
-const { readableStreamDefaultReaderReadSync, readableStreamTee } =
-  require('internal/webstreams/readablestream');
+const { readableStreamTee } = require('internal/webstreams/readablestream');
 Object.defineProperty(web.ReadableStream.prototype, Symbol.for('lumen.cloneBody'), {
   value() { return readableStreamTee(this, true); },
-  writable: true,
-  enumerable: false,
-  configurable: true,
-});
-Object.defineProperty(web.ReadableStreamDefaultReader.prototype, Symbol.for('lumen.readSync'), {
-  value() { return readableStreamDefaultReaderReadSync(this); },
   writable: true,
   enumerable: false,
   configurable: true,

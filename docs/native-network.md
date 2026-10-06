@@ -218,5 +218,5 @@ same module exists and the operations throw `unsupported`.
 
 ## Still JavaScript
 
-`service_worker.js` and `shared_worker.js` (only the Bitnest kernel still concatenates them;
-`lumen-web` has no JS glue left, see [native-events.md](native-events.md)).
+None in `lumen-web`: it has no JS glue left ([native-events.md](native-events.md)), and the service-worker and
+shared-worker classes are native ([native-workers.md](native-workers.md)).

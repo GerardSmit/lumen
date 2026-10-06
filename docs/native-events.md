@@ -184,5 +184,6 @@ object. The native core:
   realm's `Navigator` (`DomNavigator`, `lumen-html-js`) `extends` it. The extension drops the raw
   `__http` namespace after registering the transport and no longer creates `__url`.
 - Worker and SharedWorker page classes and the worker global scopes are native
-  (`lumen_host::workers`, [plans/native-workers.md](plans/native-workers.md)); `messaging.js` and
-  `platform.js` moved to [native-messaging.md](native-messaging.md). Service-worker classes remain.
+  (`lumen_host::workers`, [native-workers.md](native-workers.md)), as are the service-worker classes;
+  `messaging.js` and `platform.js` moved to [native-messaging.md](native-messaging.md). `lumen-web` has no
+  `src/js` directory left.

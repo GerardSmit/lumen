@@ -14,66 +14,7 @@ const mods = [
   ['internal/webstreams/compression', 'internal_webstreams_compression.js'],
   ['stream/web', 'stream_web.js'],
 ];
-const patches = {
-  'internal/webstreams/readablestream': [
-    [`  const startResult = startAlgorithm();
-
-  PromisePrototypeThen(
-    PromiseResolve(startResult),
-    () => {
-      controller[kState].started = true;
-      assert(!controller[kState].pulling);
-      assert(!controller[kState].pullAgain);
-      readableStreamDefaultControllerCallPullIfNeeded(controller);`,
-     `  const startResult = startAlgorithm();
-  // lumen: a synchronous start is complete for readableStreamDefaultReaderReadSync.
-  controller[kState].syncStart = typeof startResult?.then !== 'function';
-
-  PromisePrototypeThen(
-    PromiseResolve(startResult),
-    () => {
-      if (controller[kState].started) return; // lumen: started early by a synchronous read
-      controller[kState].started = true;
-      assert(!controller[kState].pulling);
-      assert(!controller[kState].pullAgain);
-      readableStreamDefaultControllerCallPullIfNeeded(controller);`],
-    [`function setupReadableStreamBYOBReader(reader, stream) {`,
-     `// lumen: one read that completes synchronously or not at all, for lumen-web's buffered
-// Request/Response bodies (now native in `lumen_host::net`). Returns \`{ pending: true }\` when the source cannot produce
-// a chunk without awaiting; the read request is then withdrawn, leaving the stream as it was.
-function readableStreamDefaultReaderReadSync(reader) {
-  if (!isReadableStreamDefaultReader(reader))
-    throw new ERR_INVALID_THIS('ReadableStreamDefaultReader');
-  const { stream } = reader[kState];
-  if (stream === undefined)
-    throw new ERR_INVALID_STATE.TypeError('The reader is not attached to a stream');
-  const { controller } = stream[kState];
-  if (!isReadableByteStreamController(controller) &&
-      !controller[kState].started && controller[kState].syncStart) {
-    controller[kState].started = true;
-  }
-  let result;
-  const readRequest = {
-    [kChunk](value) { result = { value, done: false }; },
-    [kClose]() { result = { value: undefined, done: true }; },
-    [kError](error) { result = { error }; },
-  };
-  readableStreamDefaultReaderRead(reader, readRequest);
-  if (result === undefined) {
-    const { readRequests } = reader[kState];
-    const at = readRequests.indexOf(readRequest);
-    if (at !== -1) readRequests.splice(at, 1);
-    return { pending: true };
-  }
-  if ('error' in result) throw result.error;
-  return result;
-}
-
-function setupReadableStreamBYOBReader(reader, stream) {`],
-    [`  readableStreamDefaultReaderRead,\n  setupReadableStreamBYOBReader,`,
-     `  readableStreamDefaultReaderRead,\n  readableStreamDefaultReaderReadSync, // lumen\n  setupReadableStreamBYOBReader,`],
-  ],
-};
+const patches = {};
 const browserPatches = {
   'internal/webstreams/readablestream': [
     // The browser realm has no `process`; a microtask is the nearest host-independent tick.

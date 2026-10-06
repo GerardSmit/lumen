@@ -25,7 +25,7 @@
 //!   `Connection: close`, buffered bodies, http only — see `server.rs` for what's deferred.
 //! - [x] Streams (`ReadableStream`, `WritableStream`, `TransformStream`, the text and compression
 //!   streams, queuing strategies) come from lumen-node's `webstreams.js` (Node's own WHATWG
-//!   streams), which the runtime installs alongside this crate; the glue here only consumes them.
+//!   streams), which the runtime installs alongside this crate; this crate only consumes them.
 //!   Fetch reads native response bodies incrementally; body consumption and cloning also
 //!   accept asynchronous streams. Request uploads are prepared before transport delivery.
 //! - [x] `WebSocket` and `EventSource`: native classes (`websocket_class.rs`, `eventsource_class.rs`)
@@ -37,7 +37,9 @@
 use lumen_bind::NativeError;
 #[cfg(not(target_arch = "wasm32"))]
 use lumen_host::SpawnHandle;
-use lumen_host::{Ctx, Extension, OpError, OpState, Value};
+#[cfg(not(target_arch = "wasm32"))]
+use lumen_host::OpError;
+use lumen_host::{Ctx, Extension, OpState, Value};
 
 #[lumen_bind::module(name = "__http_policy")]
 mod http_policy {
@@ -196,6 +198,7 @@ mod request_control;
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod sse;
+#[cfg(not(target_arch = "wasm32"))]
 mod url;
 #[cfg(not(target_arch = "wasm32"))]
 mod websocket;

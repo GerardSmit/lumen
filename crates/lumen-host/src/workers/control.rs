@@ -23,6 +23,8 @@ pub enum WorkerEvent {
     Error(String),
     /// The worker's realm is gone; the code is node's exit code.
     Exit(i32),
+    /// The worker hit its heap limit (node's `ERR_WORKER_OUT_OF_MEMORY`); web workers ignore it.
+    OutOfMemory,
     /// The connection is over: a `SharedWorker`'s `close` event, or a shared worker's wake to stop.
     Close,
     /// A client connected to a shared worker: the worker-side end of its port.
@@ -112,19 +114,21 @@ impl Control {
         self.0.wake();
     }
 
-    pub(crate) fn pop(&self) -> Pop<WorkerEvent> {
+    pub fn pop(&self) -> Pop<WorkerEvent> {
         self.0.queue.pop()
     }
 
-    pub(crate) fn rewake(&self) {
+    pub fn rewake(&self) {
         self.0.rewake();
     }
 
-    pub(crate) fn listen(&self, ctx: &mut Ctx, callback: Value) -> Result<TaskId, OpError> {
+    /// Bind the calling realm: `callback` runs as a loop task whenever the control is woken. It
+    /// pops what it wants and calls [`rewake`](Self::rewake) when more remains.
+    pub fn listen(&self, ctx: &mut Ctx, callback: Value) -> Result<TaskId, OpError> {
         self.0.listen(ctx, callback)
     }
 
-    pub(crate) fn unlisten(&self, ctx: &mut Ctx, task: TaskId) {
+    pub fn unlisten(&self, ctx: &mut Ctx, task: TaskId) {
         self.0.unlisten(ctx, task);
     }
 }

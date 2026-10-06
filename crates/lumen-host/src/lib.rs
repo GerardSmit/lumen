@@ -69,7 +69,7 @@ pub mod time;
 pub mod url;
 pub mod url_pattern;
 pub mod webidl;
-/// `Worker`, `SharedWorker` and the worker global scopes (`docs/plans/native-workers.md`).
+/// `Worker`, `SharedWorker` and the worker global scopes (`docs/native-workers.md`).
 pub mod workers;
 #[cfg(feature = "webcrypto")]
 pub mod webcrypto;

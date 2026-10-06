@@ -622,21 +622,6 @@ fn http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
 
-fn read_body(
-    reader: &mut impl BufRead,
-    headers: &[(String, String)],
-    method: &str,
-    status: u16,
-) -> std::io::Result<Vec<u8>> {
-    let framing = lumen_os::http_body::framing(method, status, headers)?;
-    let mut reader = BodyReader::new(reader, framing, MAX_BODY)?;
-    let mut body = Vec::new();
-    while let Some(chunk) = reader.read_chunk(64 << 10)? {
-        body.extend(chunk);
-    }
-    Ok(body)
-}
-
 pub(crate) fn read_chunked(reader: &mut impl BufRead) -> std::io::Result<Vec<u8>> {
     let mut reader = BodyReader::new(reader, Framing::Chunked, MAX_BODY)?;
     let mut body = Vec::new();
