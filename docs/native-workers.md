@@ -66,11 +66,16 @@ directions of the node worker's lifecycle are `Control`s: the worker reports `on
 parent wakes a blocked worker loop on `terminate()` by closing a worker-side `Control`. Neither
 needs a blocking thread.
 
-The worker loop still waits with a 50 ms `recv_timeout`. It is a fallback, not the wake path:
-`terminate()`, `terminate_all` for node workers, port close, and shared-worker control events all
-wake the loop at once. It stays because (1) an embedded parent's workers share the embedder's
-`AtomicBool` interrupt, which nothing can wake, (2) `terminate_all` sets the stop flag of web
-workers without a wake handle, and (3) `idle_collect` maintenance runs on the poll tick.
+The worker loop has no poll. It blocks on its completion channel with no timeout, or with the
+earlier of its next timer and its `idle_collect` maintenance deadline (the same merge `run_loop`
+uses), so an idle worker arms nothing and wakes for nothing. Every way a worker is stopped wakes it:
+`terminate()`, `terminate_all` (web and node workers; each registry entry keeps the worker's
+`RuntimeWaker`, set once the worker's realm exists, and the waker fires after the stop flags are
+raised), port close, and shared-worker control events. An embedded parent's workers subscribe their
+waker to the parent's `InterruptHandle` (`WorkerEmbedding.interrupt`), whose `subscribe` fans the
+wake out to every subscriber and unsubscribes on drop. An embedder must stop a realm through its
+`Terminator` or `InterruptHandle`; storing into the bare `Embedding.interrupt` flag raises it but
+wakes no blocked loop, worker or otherwise.
 
 ## Bitnest kernel
 
@@ -99,7 +104,6 @@ move between realms with no copy of the transport).
 
 - Module service-worker scripts are rejected by the kernel manager; `importScripts` is unsupported
   in kernel service and shared workers.
-- The 50 ms fallback poll in `Runtime::worker_loop` (see above).
 - Not run: the `lumen-host`, `lumen-runtime` and `bitnest-runtime-services` tests written for the
   native workers (only compiled), and no QEMU run of the kernel workers.
 - `node:worker_threads` keeps its own `MessagePort` / `MessageChannel` / `BroadcastChannel`

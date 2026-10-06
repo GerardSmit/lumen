@@ -15,4 +15,4 @@ pub use alloc::CappedAlloc;
 #[cfg(not(target_arch = "wasm32"))]
 pub use deadline::Deadline;
 pub use heap::{HeapBudget, HeapScope};
-pub use stop::{Abort, InterruptHandle, StopFlags};
+pub use stop::{Abort, InterruptHandle, InterruptSubscription, StopFlags};

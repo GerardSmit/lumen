@@ -1033,6 +1033,110 @@ fn idle_worker_loop_reclaims_before_silent_task_completion() {
     idle_loop_reclaims_setup_cycles(true);
 }
 
+struct IdleWorker {
+    waker: RuntimeWaker,
+    wakeups: Arc<AtomicU64>,
+    exited: mpsc::Receiver<Instant>,
+}
+
+/// A worker loop kept alive by a task that never completes, with its maintenance pass quiet, so
+/// the only thing that can end or wake it is what the test does.
+fn start_idle_worker(parent: Option<WorkerEmbedding>, stop: Arc<AtomicBool>) -> IdleWorker {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (exited_tx, exited) = mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            let mut rt = Runtime::new_worker(parent);
+            let live = rt.engine().ctx().live_object_count();
+            rt.idle_gc = (Instant::now(), live);
+            rt.engine()
+                .eval("globalThis.never = () => {}; 0", false)
+                .expect("setup parses");
+            let global = rt.engine().global_this();
+            let callback = rt
+                .engine()
+                .ctx()
+                .get_member(&global, "never")
+                .unwrap_or_else(|_| panic!("callback exists"));
+            lumen_host::register_task(rt.engine().ctx(), callback, None, |_, _| Ok(Vec::new()));
+            ready_tx
+                .send((rt.waker(), Arc::clone(&rt.loop_wakeups)))
+                .unwrap();
+            rt.run_worker_loop(&stop);
+            exited_tx.send(Instant::now()).unwrap();
+        })
+        .unwrap();
+    let (waker, wakeups) = ready_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+    IdleWorker {
+        waker,
+        wakeups,
+        exited,
+    }
+}
+
+const SETTLE: Duration = Duration::from_millis(100);
+const PROMPT: Duration = Duration::from_millis(40);
+
+#[test]
+fn stopping_an_idle_worker_wakes_it_at_once() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let kill = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(SETTLE);
+    let slot = worker::WakeSlot::default();
+    let _ = slot.set(worker.waker.clone());
+    let stopped = Instant::now();
+    worker::stop_worker(&stop, &kill, &slot);
+    let exited = worker
+        .exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("an idle worker never saw its stop flag");
+    assert!(exited - stopped < PROMPT, "{:?}", exited - stopped);
+}
+
+#[test]
+fn an_idle_worker_loop_does_not_wake() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = start_idle_worker(None, Arc::clone(&stop));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(worker.wakeups.load(Ordering::Relaxed), 0);
+    stop.store(true, Ordering::SeqCst);
+    worker.waker.wake();
+    worker.exited.recv_timeout(Duration::from_secs(5)).unwrap();
+}
+
+#[test]
+fn a_parent_interrupt_wakes_an_idle_worker() {
+    let mut parent = Runtime::new_embedded(Embedding {
+        argv: vec!["host".into()],
+        env: Vec::new(),
+        cwd: std::env::current_dir().unwrap(),
+        stdin: Box::new(std::io::empty()),
+        stdout: SharedWriter::new(std::io::sink()),
+        stderr: SharedWriter::new(std::io::sink()),
+        interrupt: Arc::new(AtomicBool::new(false)),
+        live_object_limit: None,
+        spawner: None,
+    });
+    let embedding = parent
+        .engine()
+        .ctx()
+        .op_state()
+        .get::<WorkerEmbedding>()
+        .cloned()
+        .expect("an embedded realm hands its workers an embedding");
+    let worker = start_idle_worker(Some(embedding), Arc::new(AtomicBool::new(false)));
+    std::thread::sleep(SETTLE);
+    let interrupted = Instant::now();
+    parent.terminator().expect("embedded").terminate();
+    let exited = worker
+        .exited
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the parent's interrupt never woke the worker");
+    assert!(exited - interrupted < PROMPT, "{:?}", exited - interrupted);
+}
+
 #[test]
 fn console_streams_and_renders_common_values() {
     let (mut rt, out, err) = test_runtime();

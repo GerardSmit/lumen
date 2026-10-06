@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 /// Why a run was cut short beyond its own budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,14 +11,42 @@ pub enum Abort {
     Heap,
 }
 
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct Subscribers {
+    next: u64,
+    wakes: Vec<(u64, Wake)>,
+}
+
 /// Requests that a running engine stop. Cloneable and `Send`, so a watchdog thread or a signal
 /// handler can hold one. The request stays raised until [`InterruptHandle::clear`]. A host that
-/// blocks somewhere the engine cannot poll (an event loop) installs a wake hook that
-/// [`InterruptHandle::interrupt`] runs after raising the flag.
+/// blocks somewhere the engine cannot poll (an event loop) subscribes a wake that
+/// [`InterruptHandle::interrupt`] runs after raising the flag. Clones share the flag and the
+/// subscriptions.
 #[derive(Clone, Default)]
 pub struct InterruptHandle {
     flag: Arc<AtomicBool>,
-    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    subscribers: Arc<Mutex<Subscribers>>,
+}
+
+/// A wake registered with [`InterruptHandle::subscribe`]; dropping it unsubscribes.
+#[must_use = "dropping the subscription unsubscribes the wake"]
+pub struct InterruptSubscription {
+    subscribers: Weak<Mutex<Subscribers>>,
+    id: u64,
+}
+
+impl Drop for InterruptSubscription {
+    fn drop(&mut self) {
+        if let Some(subscribers) = self.subscribers.upgrade() {
+            lock(&subscribers).wakes.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+fn lock(subscribers: &Mutex<Subscribers>) -> MutexGuard<'_, Subscribers> {
+    subscribers.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl InterruptHandle {
@@ -28,17 +56,40 @@ impl InterruptHandle {
 
     /// A handle over a flag the embedder owns.
     pub fn from_flag(flag: Arc<AtomicBool>) -> InterruptHandle {
-        InterruptHandle { flag, wake: None }
+        InterruptHandle {
+            flag,
+            subscribers: Arc::default(),
+        }
     }
 
-    pub fn with_wake(mut self, wake: impl Fn() + Send + Sync + 'static) -> InterruptHandle {
-        self.wake = Some(Arc::new(wake));
+    /// Run `wake` on every [`interrupt`](InterruptHandle::interrupt), for the life of the handle
+    /// and its clones.
+    pub fn with_wake(self, wake: impl Fn() + Send + Sync + 'static) -> InterruptHandle {
+        std::mem::forget(self.subscribe(Arc::new(wake)));
         self
+    }
+
+    /// Run `wake` on every [`interrupt`](InterruptHandle::interrupt) until the returned
+    /// subscription is dropped. The wake runs on the interrupting thread and must not block.
+    pub fn subscribe(&self, wake: Arc<dyn Fn() + Send + Sync>) -> InterruptSubscription {
+        let mut subscribers = lock(&self.subscribers);
+        let id = subscribers.next;
+        subscribers.next += 1;
+        subscribers.wakes.push((id, wake));
+        InterruptSubscription {
+            subscribers: Arc::downgrade(&self.subscribers),
+            id,
+        }
     }
 
     pub fn interrupt(&self) {
         self.flag.store(true, SeqCst);
-        if let Some(wake) = &self.wake {
+        let wakes: Vec<Wake> = lock(&self.subscribers)
+            .wakes
+            .iter()
+            .map(|(_, wake)| Arc::clone(wake))
+            .collect();
+        for wake in wakes {
             wake();
         }
     }
@@ -196,6 +247,24 @@ mod tests {
         assert_eq!(woken.load(Relaxed), 1);
         handle.clear();
         assert!(!copy.is_interrupted());
+    }
+
+    #[test]
+    fn subscriptions_fan_out_and_unsubscribe_on_drop() {
+        let handle = InterruptHandle::new();
+        let (a, b) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (sa, sb) = (a.clone(), b.clone());
+        let first = handle.subscribe(Arc::new(move || {
+            sa.fetch_add(1, Relaxed);
+        }));
+        let _second = handle.clone().subscribe(Arc::new(move || {
+            sb.fetch_add(1, Relaxed);
+        }));
+        handle.interrupt();
+        assert_eq!((a.load(Relaxed), b.load(Relaxed)), (1, 1));
+        drop(first);
+        handle.interrupt();
+        assert_eq!((a.load(Relaxed), b.load(Relaxed)), (1, 2));
     }
 
     #[test]

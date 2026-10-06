@@ -29,10 +29,14 @@
 //!
 //! ## What's intentionally v1
 //! - **Cooperative terminate**: `terminate()` (and the worker's `close()`/`process.exit()`) set a
-//!   shared stop flag the worker loop polls; a worker stuck in a long *synchronous* JS task
-//!   finishes it first (no preemption — the engine has no interrupt point). Pending timers are
-//!   dropped on stop. Likewise `process.exit()` in a worker stops at the next loop poll rather
-//!   than instantly.
+//!   shared stop flag the worker loop checks between turns; a worker stuck in a long
+//!   *synchronous* JS task finishes it first (no preemption — the engine has no interrupt point).
+//!   Pending timers are dropped on stop. Likewise `process.exit()` in a worker stops at the next
+//!   loop turn rather than instantly.
+//! - **No poll**: an idle worker loop blocks with no timeout (or until its next timer or
+//!   `idle_collect` pass). Every stop path wakes it: `terminate()` and `terminate_all` raise the
+//!   flags and wake the worker's `RuntimeWaker`, and an embedded parent's workers subscribe to
+//!   the parent's `InterruptHandle`.
 //! - Native capability envelopes share `SharedArrayBuffer` backing and transfer MessagePort
 //!   ownership; fixed-length ordinary ArrayBuffers use byte transport and true sender detachment.
 //!   Other transferable types/resizable buffers remain explicitly unsupported.
@@ -124,7 +128,22 @@ struct WorkerEntry {
     /// Set by `terminate()` only: the worker realm's engine interrupt, so running JS (a busy
     /// loop, a microtask or nextTick storm) is stopped at its next safe point, not just the loop.
     kill: Arc<AtomicBool>,
+    /// The worker loop's waker, set once its realm exists: whoever raises `stop` wakes the loop,
+    /// which blocks with no timeout while idle.
+    wake: WakeSlot,
     node: Option<NodeLink>,
+}
+
+pub(crate) type WakeSlot = Arc<OnceLock<crate::RuntimeWaker>>;
+
+/// Ask a worker to stop and wake its loop. The flags go first: the worker publishes its waker
+/// before it reads them, so one side always sees the other.
+pub(crate) fn stop_worker(stop: &AtomicBool, kill: &AtomicBool, wake: &WakeSlot) {
+    stop.store(true, Ordering::SeqCst);
+    kill.store(true, Ordering::SeqCst);
+    if let Some(waker) = wake.get() {
+        waker.wake();
+    }
 }
 
 /// What a node worker's parent keeps: the control whose closing wakes the worker's loop on
@@ -353,6 +372,7 @@ fn start_thread(
     spec: WorkerSpec,
     stop: Arc<AtomicBool>,
     kill: Arc<AtomicBool>,
+    wake: WakeSlot,
 ) -> std::io::Result<()> {
     std::thread::Builder::new()
         .name(name)
@@ -361,7 +381,7 @@ fn start_thread(
         .stack_size(lumen::THREAD_STACK_SIZE)
         .spawn(move || {
             lumen::set_thread_stack_size(lumen::THREAD_STACK_SIZE);
-            run_worker(spec, stop, kill);
+            run_worker(spec, stop, kill, wake);
         })
         .map(|_| ())
 }
@@ -378,6 +398,7 @@ impl WorkerBackend for ThreadBackend {
         };
         let stop = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
+        let wake = WakeSlot::default();
         let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
         let worker = WorkerSpec {
             entry,
@@ -415,12 +436,13 @@ impl WorkerBackend for ThreadBackend {
                 WorkerEntry {
                     stop: Arc::clone(&stop),
                     kill: Arc::clone(&kill),
+                    wake: Arc::clone(&wake),
                     node: None,
                 },
             );
             id
         };
-        if let Err(error) = start_thread(format!("lumen-worker-{thread_id}"), worker, stop, kill) {
+        if let Err(error) = start_thread(format!("lumen-worker-{thread_id}"), worker, stop, kill, wake) {
             registry(ctx).workers.remove(&id);
             return Err(NativeError::runtime(format!(
                 "could not start worker: {error}"
@@ -431,8 +453,7 @@ impl WorkerBackend for ThreadBackend {
 
     fn terminate(&self, ctx: &mut Ctx, id: u64) {
         if let Some(entry) = registry(ctx).workers.get(&id) {
-            entry.stop.store(true, Ordering::SeqCst);
-            entry.kill.store(true, Ordering::SeqCst);
+            stop_worker(&entry.stop, &entry.kill, &entry.wake);
         }
     }
 
@@ -538,6 +559,7 @@ fn get_or_start_shared_worker(
         spec,
         stop,
         kill,
+        WakeSlot::default(),
     ) {
         workers.remove(&key);
         return Err(NativeError::runtime(format!(
@@ -609,8 +631,7 @@ fn publish_shared_worker_final_url(spec: &WorkerSpec, final_url: &str) {
 pub(crate) fn terminate_all(ctx: &mut Ctx) {
     let ports = if let Some(reg) = ctx.host_mut::<WorkerRegistry>() {
         for w in reg.workers.values_mut() {
-            w.stop.store(true, Ordering::SeqCst);
-            w.kill.store(true, Ordering::SeqCst);
+            stop_worker(&w.stop, &w.kill, &w.wake);
             if let Some(node) = &w.node {
                 node.to_worker.close();
             }
@@ -797,7 +818,12 @@ impl WorkerScopeHost for ScopeHost {
 
 /// The worker thread's whole lifecycle: build a realm, run the entry, then pump the loop until
 /// stopped (or, node mode, idle), bridging messages both ways.
-fn run_worker(mut spec: WorkerSpec, stop: Arc<AtomicBool>, kill: Arc<AtomicBool>) {
+fn run_worker(
+    mut spec: WorkerSpec,
+    stop: Arc<AtomicBool>,
+    kill: Arc<AtomicBool>,
+    wake: WakeSlot,
+) {
     // An embedded parent's workers share its interrupt (the embedder ends them together);
     // otherwise `terminate()` interrupts this realm's JS directly.
     let parent = spec.parent.clone();
@@ -816,6 +842,7 @@ fn run_worker(mut spec: WorkerSpec, stop: Arc<AtomicBool>, kill: Arc<AtomicBool>
     } else {
         Runtime::new_browser_worker(spec.embedding.clone())
     };
+    let _ = wake.set(rt.waker());
     // The extension installs a default FetchConfig in every Runtime. Replace it before any
     // worker bootstrap or module entry can issue requests, using the parent's captured snapshot.
     rt.engine().ctx().op_state().put(spec.fetch_config.clone());
@@ -1271,6 +1298,7 @@ mod worker_ops {
         let events = Control::new();
         let stop = Arc::new(AtomicBool::new(false));
         let kill = Arc::new(AtomicBool::new(false));
+        let wake = WakeSlot::default();
         let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::SeqCst);
 
         let id = {
@@ -1282,6 +1310,7 @@ mod worker_ops {
                 WorkerEntry {
                     stop: Arc::clone(&stop),
                     kill: Arc::clone(&kill),
+                    wake: Arc::clone(&wake),
                     node: Some(NodeLink {
                         to_worker: to_worker.clone(),
                         events: events.clone(),
@@ -1333,6 +1362,7 @@ mod worker_ops {
             spec,
             stop,
             kill,
+            wake,
         )
         .expect("spawn worker thread");
 
@@ -1352,8 +1382,7 @@ mod worker_ops {
     #[op(name = "terminate", coerce)]
     fn op_worker_terminate(ctx: &mut Ctx, id: f64) {
         if let Some(w) = registry(ctx).workers.get_mut(&(id as u64)) {
-            w.stop.store(true, Ordering::SeqCst);
-            w.kill.store(true, Ordering::SeqCst);
+            stop_worker(&w.stop, &w.kill, &w.wake);
             if let Some(node) = &w.node {
                 node.to_worker.close();
             }

@@ -163,6 +163,7 @@ pub enum RealmExit {
 /// the same termination an interrupt raised inside JS gives, stops the realm's workers and
 /// closes its sockets and listeners. Interrupting is permanent for the realm.
 pub use lumen::limits::InterruptHandle;
+use lumen::limits::InterruptSubscription;
 
 /// The wake-up that carries a signal for the realm's own `process.on` listeners: its payload is
 /// the signal number.
@@ -226,7 +227,7 @@ pub(crate) struct WorkerEmbedding {
     env: Vec<(String, String)>,
     stdout: SharedWriter,
     stderr: SharedWriter,
-    interrupt: Arc<AtomicBool>,
+    interrupt: InterruptHandle,
     spawner: Option<Arc<dyn Spawner>>,
     owned_fds: Vec<i32>,
     tree: Arc<child_realm::RealmTree>,
@@ -286,7 +287,12 @@ pub struct Runtime {
     idle_gc: (Instant, i64),
     idle_gc_followup: bool,
     /// Embedded realms only: the stop request (see [`Terminator`]).
-    interrupt: Option<Arc<AtomicBool>>,
+    interrupt: Option<InterruptHandle>,
+    /// Wakes this loop when `interrupt` is raised through its handle.
+    interrupt_wake: Option<InterruptSubscription>,
+    /// Blocking waits the worker loop returned from; tests assert an idle worker has none.
+    #[cfg(test)]
+    pub(crate) loop_wakeups: Arc<AtomicU64>,
     /// Embedded realms only: the child realms this one started (see `child_realm`).
     child_realms: Option<Arc<child_realm::ChildRealms>>,
     /// A signal's default action stopped the realm (see `deliver_signal`).
@@ -394,6 +400,18 @@ impl Default for Runtime {
     }
 }
 
+/// A wake for a loop blocked on completions, which no task id matches, so the loop finds nothing
+/// to settle and sees the interrupt flag.
+fn loop_wake(tx: &mpsc::Sender<TaskCompletion>) -> Arc<dyn Fn() + Send + Sync> {
+    let tx = tx.clone();
+    Arc::new(move || {
+        let _ = tx.send(TaskCompletion {
+            task: TaskId::MAX,
+            result: Box::new(()),
+        });
+    })
+}
+
 impl Runtime {
     /// An engine with the runtime globals installed: timers, streaming `console`, minimal
     /// `process`, `queueMicrotask`.
@@ -440,6 +458,7 @@ impl Runtime {
             .map(|p| p.owned_fds.clone())
             .unwrap_or_default();
         let tree = parent.as_ref().map(|p| Arc::clone(&p.tree));
+        let parent_interrupt = parent.as_ref().map(|p| p.interrupt.clone());
         let mut runtime = Self::build(
             parent.map(|p| Embedding {
                 argv: vec![p.exec_path],
@@ -448,13 +467,16 @@ impl Runtime {
                 stdin: Box::new(std::io::empty()),
                 stdout: p.stdout,
                 stderr: p.stderr,
-                interrupt: p.interrupt,
+                interrupt: Arc::clone(p.interrupt.flag()),
                 live_object_limit: None,
                 spawner: p.spawner,
             }),
             tree,
             providers,
         );
+        if let Some(handle) = parent_interrupt {
+            runtime.share_interrupt(handle);
+        }
         // A worker shares its realm's descriptors: closing one there must not close the host's.
         if let Some(realm) = runtime.engine.ctx().host_mut::<RealmProcess>() {
             realm.owned_fds = owned_fds;
@@ -530,18 +552,19 @@ impl Runtime {
                 stderr: Arc::clone(&e.stderr.0),
                 spawner: e.spawner.clone(),
             });
+            let handle = InterruptHandle::from_flag(Arc::clone(&e.interrupt));
             engine.ctx().op_state().put(WorkerEmbedding {
                 exec_path,
                 cwd: e.cwd,
                 env: e.env.clone(),
                 stdout: e.stdout.clone(),
                 stderr: e.stderr.clone(),
-                interrupt: Arc::clone(&e.interrupt),
+                interrupt: handle.clone(),
                 spawner: e.spawner,
                 owned_fds: Vec::new(),
                 tree,
             });
-            interrupt = Some(e.interrupt);
+            interrupt = Some(handle);
             embedded_io = Some((e.argv, e.env, e.stdout, e.stderr));
         }
         // queueMicrotask, on the engine's job queue. A thrown callback error becomes an
@@ -638,11 +661,17 @@ impl Runtime {
         lumen_host::perf::mark(lumen_host::perf::Milestone::BootstrapComplete);
         #[cfg(all(feature = "parallel", not(target_os = "none")))]
         parallel::install(&mut engine);
+        let interrupt_wake = interrupt
+            .as_ref()
+            .map(|handle| handle.subscribe(loop_wake(&tx)));
         Runtime {
             engine,
             root_providers: providers,
             pool,
             interrupt,
+            interrupt_wake,
+            #[cfg(test)]
+            loop_wakeups: Arc::default(),
             child_realms,
             signal_exit: None,
             tick_recovery: false,
@@ -1243,9 +1272,9 @@ impl Runtime {
 
     /// Like [`run_to_completion`](Runtime::run_to_completion), but for a Worker: it does NOT exit
     /// when idle (the armed message inbox keeps it alive), and it returns promptly when `stop` is
-    /// set — a cooperative terminate that also drops any still-pending timers. The blocking wait
-    /// polls `stop` on a short interval so a `terminate()` from another thread is noticed even
-    /// with no message or timer due.
+    /// set — a cooperative terminate that also drops any still-pending timers. The loop blocks
+    /// with no timeout when nothing is armed, so whoever sets `stop` (or raises the realm
+    /// interrupt) must also wake it, through [`Runtime::waker`] or the interrupt handle.
     pub fn run_worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
         self.worker_loop(stop);
         lumen_host::perf::mark_loop_exit();
@@ -1255,7 +1284,6 @@ impl Runtime {
     }
 
     fn worker_loop(&mut self, stop: &std::sync::atomic::AtomicBool) {
-        let poll = Duration::from_millis(50);
         loop {
             if stop.load(Ordering::SeqCst) || self.interrupted() {
                 return;
@@ -1294,23 +1322,29 @@ impl Runtime {
             if self.ticks_pending() {
                 continue;
             }
-            let _ = self.idle_collect(); // The 50-ms stop poll also services maintenance.
-            let wait = match self.next_timer_deadline() {
+            let deadline = self.wait_deadline();
+            let blocked = Instant::now();
+            let received = match deadline {
                 Some(deadline) => {
                     let now = Instant::now();
                     if deadline <= now {
                         continue;
                     }
-                    (deadline - now).min(poll)
+                    self.completions.recv_timeout(deadline - now)
                 }
-                None => poll,
+                None => self
+                    .completions
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             };
-            let blocked = Instant::now();
-            let received = self.completions.recv_timeout(wait);
             lumen_host::perf::add_idle(blocked.elapsed());
-            if let Ok(done) = received {
-                self.dispatch(done);
+            match received {
+                Ok(done) => self.dispatch(done),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
+            #[cfg(test)]
+            self.loop_wakeups.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1534,10 +1568,7 @@ impl Runtime {
             // A pending idle pass must not wait forever behind an otherwise silent task.
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let deadline = match (self.next_timer_deadline(), maintenance) {
-                    (Some(timer), Some(gc)) => Some(timer.min(gc)),
-                    (timer, gc) => timer.or(gc),
-                };
+                let deadline = self.wait_deadline_with(maintenance);
                 match deadline {
                     Some(deadline) => {
                         let now = Instant::now();
@@ -1563,6 +1594,20 @@ impl Runtime {
                     },
                 }
             }
+        }
+    }
+
+    /// When a blocking wait must end by itself: the next timer or the idle maintenance pass,
+    /// whichever is first. `None` blocks until something is delivered.
+    fn wait_deadline(&mut self) -> Option<Instant> {
+        let maintenance = self.idle_collect();
+        self.wait_deadline_with(maintenance)
+    }
+
+    fn wait_deadline_with(&mut self, maintenance: Option<Instant>) -> Option<Instant> {
+        match (self.next_timer_deadline(), maintenance) {
+            (Some(timer), Some(gc)) => Some(timer.min(gc)),
+            (timer, gc) => timer.or(gc),
         }
     }
 
@@ -1869,8 +1914,8 @@ impl Runtime {
         };
         if !handled && child_realm::terminates_by_default(signal) {
             self.signal_exit.get_or_insert(signal);
-            if let Some(flag) = &self.interrupt {
-                flag.store(true, Ordering::SeqCst);
+            if let Some(handle) = &self.interrupt {
+                handle.flag().store(true, Ordering::SeqCst);
             }
         }
         self.checkpoint();
@@ -2133,7 +2178,7 @@ impl Runtime {
     fn interrupted(&self) -> bool {
         self.interrupt
             .as_ref()
-            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+            .is_some_and(|handle| handle.flag().load(Ordering::SeqCst))
     }
 
     /// The loop stops: a fatal error, or the embedder / `process.exit` asked the realm to end.
@@ -2145,7 +2190,14 @@ impl Runtime {
     /// the loop treats it like an embedder's interrupt (a terminated realm reports nothing).
     pub(crate) fn set_worker_interrupt(&mut self, flag: Arc<AtomicBool>) {
         self.engine.set_interrupt(Arc::clone(&flag));
-        self.interrupt = Some(flag);
+        self.share_interrupt(InterruptHandle::from_flag(flag));
+    }
+
+    /// Stop on `handle` (an embedded parent's, shared with its other workers) and wake this loop
+    /// when it is raised.
+    fn share_interrupt(&mut self, handle: InterruptHandle) {
+        self.interrupt_wake = Some(handle.subscribe(loop_wake(&self.wake)));
+        self.interrupt = Some(handle);
     }
 
     /// A handle that stops this runtime from any thread, however it is blocked (see
@@ -2153,28 +2205,12 @@ impl Runtime {
     /// the live-object ceiling or the heap limit also terminates the realm instead of throwing a
     /// catchable `RangeError`.
     pub fn interrupt_handle(&mut self) -> InterruptHandle {
-        let flag = match &self.interrupt {
-            Some(flag) => Arc::clone(flag),
-            None => {
-                let flag = Arc::new(AtomicBool::new(false));
-                self.engine.set_interrupt(Arc::clone(&flag));
-                self.interrupt = Some(Arc::clone(&flag));
-                flag
-            }
-        };
-        self.handle_for(flag)
-    }
-
-    /// A handle over `flag` that also wakes this runtime's loop, which no task id matches, so the
-    /// loop finds nothing to settle and sees the flag.
-    fn handle_for(&self, flag: Arc<AtomicBool>) -> InterruptHandle {
-        let wake = self.wake.clone();
-        InterruptHandle::from_flag(flag).with_wake(move || {
-            let _ = wake.send(TaskCompletion {
-                task: TaskId::MAX,
-                result: Box::new(()),
-            });
-        })
+        if self.interrupt.is_none() {
+            let handle = InterruptHandle::new();
+            self.engine.set_interrupt(Arc::clone(handle.flag()));
+            self.share_interrupt(handle);
+        }
+        self.interrupt.clone().expect("interrupt installed")
     }
 
     /// Interrupt this runtime once `limit` has passed, as [`InterruptHandle::interrupt`] would.
@@ -2212,7 +2248,7 @@ impl Runtime {
     /// A handle that stops this realm from another thread. `None` unless embedded.
     pub fn terminator(&self) -> Option<Terminator> {
         Some(Terminator {
-            handle: self.handle_for(Arc::clone(self.interrupt.as_ref()?)),
+            handle: self.interrupt.clone()?,
             wake: self.wake.clone(),
         })
     }
